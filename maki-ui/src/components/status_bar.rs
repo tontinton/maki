@@ -8,7 +8,7 @@ use super::{RetryInfo, Status};
 use crate::animation::spinner_frame;
 use crate::theme;
 
-use maki_providers::{ModelPricing, TokenUsage, format_tokens};
+use maki_providers::format_tokens;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -23,11 +23,12 @@ const CWD_MODEL_SEPARATOR: &str = "  ";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
 
-pub struct UsageStats<'a> {
-    pub global_usage: &'a TokenUsage,
+pub struct UsageStats {
+    /// The whole session's bill, drawn next to the focused chat's own once
+    /// subagents make the two differ.
+    pub global_cost: Option<f64>,
     pub context_size: u32,
     pub cost: Option<f64>,
-    pub pricing: &'a ModelPricing,
     pub context_window: u32,
     pub show_global: bool,
 }
@@ -37,7 +38,7 @@ pub struct StatusBarContext<'a> {
     pub mode_label: Cow<'static, str>,
     pub mode_style: Style,
     pub model_id: &'a str,
-    pub stats: UsageStats<'a>,
+    pub stats: UsageStats,
     pub auto_scroll: bool,
     pub chat_name: Option<&'a str>,
     pub retry_info: Option<&'a RetryInfo>,
@@ -209,11 +210,8 @@ impl StatusBar {
                     Style::new().fg(theme::current().foreground),
                 ));
 
-                if ctx.stats.show_global && !ctx.stats.pricing.is_zero() {
-                    let global_text = format!(
-                        " \u{03a3}${:.3} ",
-                        ctx.stats.global_usage.cost(ctx.stats.pricing, ctx.fast),
-                    );
+                if let Some(global) = ctx.stats.global_cost.filter(|_| ctx.stats.show_global) {
+                    let global_text = format!(" \u{03a3}${global:.3} ");
                     rest_spans.push(Span::styled(
                         global_text,
                         Style::new().fg(theme::current().foreground),
@@ -354,6 +352,64 @@ mod tests {
     const FLASH_TTL: Duration = Duration::from_secs(3600);
     const FLASH_MSG: &str = "Copied";
     const STALE_BRANCH: &str = "/nowhere:gone";
+    const BAR_WIDTH: u16 = 120;
+    const MODEL_ID: &str = "test-model";
+    const CONTEXT_SIZE: u32 = 12_000;
+    const CHAT_COST: f64 = 0.25;
+    const CHAT_COST_TEXT: &str = "$0.250";
+    const SESSION_COST: f64 = 1.5;
+    const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
+    const SIGMA: char = '\u{03a3}';
+
+    fn render(global_cost: Option<f64>, show_global: bool) -> String {
+        let bar = StatusBar::new(FLASH_TTL);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
+        let ctx = StatusBarContext {
+            status: &Status::Idle,
+            mode_label: "build".into(),
+            mode_style: Style::new(),
+            model_id: MODEL_ID,
+            stats: UsageStats {
+                global_cost,
+                context_size: CONTEXT_SIZE,
+                cost: Some(CHAT_COST),
+                context_window: crate::components::TEST_CONTEXT_WINDOW,
+                show_global,
+            },
+            auto_scroll: true,
+            chat_name: None,
+            retry_info: None,
+            thinking_label: None,
+            fast: false,
+            workflow: false,
+            restoring: false,
+        };
+        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
+        crate::components::buffer_text(terminal.backend().buffer())
+    }
+
+    /// The sigma is the whole session's bill, and only the session can hand it
+    /// over. Pricing the focused chat's counters instead (what the bar used to
+    /// do) tells the user a paid session was free, or bills another chat's
+    /// tokens at this model's rates. A lone chat has nothing extra to show.
+    #[test_case(Some(SESSION_COST), true  => true  ; "subagents_add_the_session_total")]
+    #[test_case(Some(SESSION_COST), false => false ; "single_chat_shows_its_own_cost_only")]
+    #[test_case(None,               true  => false ; "unpriced_session_claims_nothing")]
+    fn session_total_appears_only_when_there_is_one_to_show(
+        global_cost: Option<f64>,
+        show_global: bool,
+    ) -> bool {
+        let text = render(global_cost, show_global);
+        assert_eq!(text.matches(CHAT_COST_TEXT).count(), 1, "{text}");
+        let shown = text.matches(SESSION_COST_TEXT).count() == 1;
+        assert_eq!(
+            text.contains(SIGMA),
+            shown,
+            "a sigma carrying another number is a misrender: {text}"
+        );
+        shown
+    }
 
     #[test_case("/home/user/projects/app", "/home/user", "~/projects/app" ; "inside_home")]
     #[test_case("/tmp/other", "/home/user", "/tmp/other"                  ; "outside_home")]

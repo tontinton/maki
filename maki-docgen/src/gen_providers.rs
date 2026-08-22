@@ -524,6 +524,16 @@ fn write_section(out: &mut String, section: &ProviderSection) {
         let _ = writeln!(out, "- **Features**: {features}");
     }
 
+    // Rendered from the schedule, so the docs cannot drift from what we bill.
+    if let Some(schedule) = ManifestRegistry::get(&section.kind.to_string())
+        .and_then(|manifest| manifest.pricing_schedule)
+    {
+        let _ = writeln!(
+            out,
+            "- **Peak pricing**: the prices below are off-peak; each turn is billed as it happens, at {schedule}"
+        );
+    }
+
     let _ = writeln!(out);
 
     if section.entries.is_empty() {

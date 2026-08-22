@@ -7,6 +7,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::pricing::{PricingSchedule, PricingWindow};
 use crate::provider::{BoxFuture, Provider};
 use crate::types::{ProviderUsage, UsageLimit};
 use crate::{
@@ -41,6 +42,13 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
     needs_url: false,
 });
 
+/// Peak hours double every rate, and the tables below quote the off-peak ones.
+/// <https://api-docs.deepseek.com/quick_start/pricing/>
+pub(crate) const PEAK_HOURS: PricingSchedule = PricingSchedule::new(PEAK_WINDOWS, PEAK_MULTIPLIER);
+
+const PEAK_WINDOWS: &[PricingWindow] = &[PricingWindow::hours(1, 4), PricingWindow::hours(6, 10)];
+const PEAK_MULTIPLIER: f64 = 2.0;
+
 pub(crate) const fn models() -> &'static [ModelEntry] {
     &[
         ModelEntry {
@@ -50,10 +58,10 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             vision: false,
             default: true,
             pricing: ModelPricing {
-                input: 0.14,
-                output: 0.28,
+                input: 0.22,
+                output: 0.66,
                 cache_write: 0.00,
-                cache_read: 0.0028,
+                cache_read: 0.007,
                 fast: None,
             },
             max_output_tokens: Some(384_000),
@@ -66,10 +74,10 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             vision: false,
             default: true,
             pricing: ModelPricing {
-                input: 0.435,
-                output: 0.87,
+                input: 0.66,
+                output: 1.98,
                 cache_write: 0.00,
-                cache_read: 0.003625,
+                cache_read: 0.022,
                 fast: None,
             },
             max_output_tokens: Some(384_000),
@@ -247,10 +255,27 @@ fn pad_reasoning_content(model_id: &str, body: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::ManifestRegistry;
     use serde_json::json;
 
     const V4: &str = "deepseek-v4-pro";
     const R1: &str = "deepseek-reasoner";
+    /// The hours and the surcharge as the pricing page states them.
+    const PUBLISHED_PEAK_HOURS: &str = "2x during 01:00-04:00, 06:00-10:00 UTC";
+
+    /// `PEAK_HOURS` only reaches a bill through the manifest, and a schedule
+    /// that never got hooked up looks exactly like off-peak all day. The
+    /// published hours are pinned here too, since either drifting bills every
+    /// DeepSeek turn at the wrong rate.
+    #[test]
+    fn the_manifest_bills_the_published_peak_hours() {
+        let schedule = ManifestRegistry::get(CONFIG.slug)
+            .expect("deepseek is a builtin")
+            .pricing_schedule
+            .expect("deepseek bills by the clock");
+        assert_eq!(schedule.to_string(), PEAK_HOURS.to_string());
+        assert_eq!(PEAK_HOURS.to_string(), PUBLISHED_PEAK_HOURS);
+    }
 
     #[test]
     fn v4_pads_only_assistant_turns_without_reasoning() {

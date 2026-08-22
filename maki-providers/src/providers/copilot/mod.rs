@@ -1269,7 +1269,7 @@ mod tests {
         };
         let cost = Model::from_spec(spec)
             .unwrap()
-            .cost_of(&usage, false)
+            .list_cost(&usage, false)
             .unwrap();
         assert!((cost - expected).abs() < 1e-9);
     }

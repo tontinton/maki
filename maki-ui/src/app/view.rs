@@ -268,6 +268,7 @@ impl App {
         if self.usage_modal.is_open() {
             let ctx = UsageModalContext {
                 total: &self.state.token_usage,
+                total_cost: self.state.cost,
                 by_model: self.state.session.usage_by_model(),
                 model: &self.state.model,
                 fast: self.state.fast,
@@ -298,10 +299,9 @@ impl App {
                 .as_deref()
                 .unwrap_or(&self.state.session.model),
             stats: UsageStats {
-                global_usage: &self.state.token_usage,
+                global_cost: self.state.cost,
                 context_size: chat.context_size,
                 cost: chat.cost,
-                pricing: &self.state.model.pricing,
                 context_window: self.state.model.context_window,
                 show_global: self.chats.len() > 1,
             },

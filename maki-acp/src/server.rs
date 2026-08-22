@@ -27,8 +27,9 @@ use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
-use maki_providers::{Message, TokenUsage, add_cost};
+use maki_providers::{Message, TokenUsage, add_cost, settle_session};
 use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::sessions::StoredTokenUsage;
 use serde::Serialize;
 use serde_json::Value;
 use smol::io::AsyncBufReadExt;
@@ -37,6 +38,8 @@ use tracing::{debug, warn};
 use crate::{AcpParams, elicitation, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
+/// ACP has no fast-mode toggle, so a restored total is priced at standard rates.
+const RESTORED_FAST: bool = false;
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
@@ -273,13 +276,13 @@ async fn load_session(
         .0
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
-    let (history, recorded_cwd, restored_usage, restored_model) = load_history(session_ref.id())?;
+    let mut restored = load_history(session_ref.id())?;
     close_session(srv).await;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
-    let replay_cwd = recorded_cwd.as_deref().unwrap_or(&req.cwd);
-    for update in translate::replay_history(&history, replay_cwd, home.as_deref()) {
+    let replay_cwd = restored.cwd.as_deref().unwrap_or(&req.cwd);
+    for update in translate::replay_history(&restored.history, replay_cwd, home.as_deref()) {
         session_update(&srv.out_tx, &sid, update);
     }
     let cwd = req.cwd.clone();
@@ -288,18 +291,21 @@ async fn load_session(
         params,
         req.cwd,
         Some(session_ref),
-        history,
+        restored.history,
         mcp.clone(),
     );
     let spec = params.model.spec();
     let resp = methods::load_session_response()
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-    // The restored total predates any per-turn cost, so price it once with
-    // the model the session recorded (the current default may cost 10x more
-    // or less); later turns add their own exact cost.
-    let restored_cost = Model::from_spec(&restored_model)
-        .map(|m| m.cost_of(&restored_usage, false))
-        .unwrap_or_else(|_| params.model.cost_of(&restored_usage, false));
+    // Priced against the model the session recorded, not the one selected now
+    // (which may cost 10x more or less). Later turns add their own exact cost.
+    let recorded_model = Model::from_spec(&restored.model).unwrap_or_else(|_| params.model.clone());
+    let restored_cost = settle_session(
+        &restored.usage,
+        &mut restored.by_model,
+        &recorded_model,
+        RESTORED_FAST,
+    );
     install_session(srv, handle, mcp, spec, pending, cwd, restored_cost);
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
@@ -515,9 +521,17 @@ fn install_session(
     });
 }
 
-fn load_history(
-    session_id: MakiId,
-) -> Result<(Vec<Message>, Option<PathBuf>, TokenUsage, String), AcpError> {
+#[derive(Debug)]
+struct Restored {
+    history: Vec<Message>,
+    /// Only set when the session recorded an absolute cwd.
+    cwd: Option<PathBuf>,
+    usage: TokenUsage,
+    by_model: HashMap<String, StoredTokenUsage>,
+    model: String,
+}
+
+fn load_history(session_id: MakiId) -> Result<Restored, AcpError> {
     let storage = maki_storage::StateDir::resolve()
         .map_err(|e| AcpError::internal_error().data(json_str(&e)))?;
     load_history_from(&storage, session_id)
@@ -529,7 +543,7 @@ fn load_history(
 fn load_history_from(
     storage: &maki_storage::StateDir,
     session_id: MakiId,
-) -> Result<(Vec<Message>, Option<PathBuf>, TokenUsage, String), AcpError> {
+) -> Result<Restored, AcpError> {
     let session: maki_storage::sessions::Session<
         Message,
         maki_providers::TokenUsage,
@@ -542,9 +556,13 @@ fn load_history_from(
     } else {
         None
     };
-    let usage = session.token_usage;
-    let model = session.model.clone();
-    Ok((session.take_messages(), recorded, usage, model))
+    Ok(Restored {
+        cwd: recorded,
+        usage: session.token_usage,
+        by_model: session.usage_by_model().clone(),
+        model: session.model.clone(),
+        history: session.take_messages(),
+    })
 }
 
 fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
@@ -837,6 +855,12 @@ mod tests {
     const UNKNOWN_ID: i64 = 1002;
     const DISCOVERED_SPEC: &str = "openrouter/discovered-model";
     const OFFLINE_SPEC: &str = "openai/gpt-5";
+    const SELECTED_SPEC: &str = "openai/gpt-5.6-sol";
+    /// Neither resolves in the price tables, so nothing can re-price a restored
+    /// session back onto the recorded number by luck.
+    const RETIRED_SPEC: &str = "retired-vendor/retired-model-9000";
+    const RETIRED_MODEL_ID: &str = "retired-model-9000";
+    const RECORDED_COST: f64 = 1.25;
 
     fn allow_once(id: i64) -> Value {
         serde_json::json!({
@@ -986,14 +1010,61 @@ mod tests {
         session.save(&dir).unwrap();
 
         let id: MakiId = session.id;
-        let (history, recorded, usage, model) = load_history_from(&dir, id).unwrap();
-        assert_eq!(model, "anthropic/test-model");
+        let restored = load_history_from(&dir, id).unwrap();
+        assert_eq!(restored.model, "anthropic/test-model");
         assert_eq!(
-            serde_json::to_value(&history).unwrap(),
+            serde_json::to_value(&restored.history).unwrap(),
             serde_json::to_value(&messages).unwrap()
         );
-        assert_eq!(recorded, Some(PathBuf::from("/project")));
-        assert_eq!(usage, session.token_usage);
+        assert_eq!(restored.cwd, Some(PathBuf::from("/project")));
+        assert_eq!(restored.usage, session.token_usage);
+    }
+
+    /// Resuming must bill what the session actually paid. If `by_model` came
+    /// back empty or lost its recorded costs, ACP would re-price the restored
+    /// total against today's table and disagree with the TUI.
+    #[test]
+    fn load_history_prices_a_resumed_session_at_what_it_paid() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+            Session::new(RETIRED_SPEC, "/project");
+        session.token_usage = TokenUsage {
+            input: 1_000_000,
+            output: 200_000,
+            ..Default::default()
+        };
+        session.add_model_usage(
+            RETIRED_MODEL_ID,
+            StoredTokenUsage {
+                input: 1_000_000,
+                output: 200_000,
+                cost: Some(RECORDED_COST),
+                ..Default::default()
+            },
+        );
+        session.save(&dir).unwrap();
+
+        let mut restored = load_history_from(&dir, session.id).unwrap();
+        assert_eq!(
+            restored.by_model[RETIRED_MODEL_ID].cost,
+            Some(RECORDED_COST),
+            "the per-model breakdown survives the file"
+        );
+
+        // Mirrors `load_session`: the recorded spec no longer parses, so the
+        // selected model stands in, and that must not change the bill.
+        let recorded_model = Model::from_spec(&restored.model)
+            .unwrap_or_else(|_| Model::from_spec(SELECTED_SPEC).expect("a shipped model"));
+        assert_eq!(
+            settle_session(
+                &restored.usage,
+                &mut restored.by_model,
+                &recorded_model,
+                RESTORED_FAST
+            ),
+            Some(RECORDED_COST)
+        );
     }
 
     #[test]
@@ -1003,8 +1074,7 @@ mod tests {
         let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
             Session::new("anthropic/test-model", "relative/project");
         session.save(&dir).unwrap();
-        let (_, recorded, _, _) = load_history_from(&dir, session.id).unwrap();
-        assert_eq!(recorded, None);
+        assert_eq!(load_history_from(&dir, session.id).unwrap().cwd, None);
     }
 
     #[test]

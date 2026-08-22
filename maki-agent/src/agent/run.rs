@@ -409,7 +409,7 @@ impl<'h> Agent<'h> {
                 model: self.model.id.clone(),
                 cost: self
                     .model
-                    .cost_of(&response.usage, self.opts.clamped(&self.model).fast),
+                    .billed_cost(&response.usage, self.opts.clamped(&self.model).fast),
                 context_size: Some(response.usage.context_tokens()),
                 context_window: self.model.context_window,
             })))

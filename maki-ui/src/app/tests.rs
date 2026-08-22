@@ -891,6 +891,11 @@ const MAIN_TOKENS: TokenUsage = TokenUsage {
     cache_read: 0,
 };
 const MAIN_COST: Option<f64> = Some(0.002);
+const MAIN_MODEL: &str = "main-model";
+
+fn main_turn() -> Msg {
+    agent_msg(turn_complete(MAIN_TOKENS, MAIN_MODEL, MAIN_COST))
+}
 
 fn sub_turn_complete() -> Msg {
     subagent_msg(
@@ -904,6 +909,106 @@ fn sub_turn_complete() -> Msg {
 /// usage, not how it is spelled (maki-providers covers the spelling).
 fn sub_usage_text() -> String {
     SUB_TOKENS.format_sum_cost(SUB_COST)
+}
+
+/// Each turn bills at the rates of the model that ran it, subagent tiers
+/// included, so the session total is the sum of what the turns recorded.
+#[test]
+fn session_cost_sums_what_each_model_recorded() {
+    let mut app = streaming_app();
+    app.update(main_turn());
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(sub_turn_complete());
+
+    let expected = MAIN_COST.unwrap() + SUB_COST.unwrap();
+    assert_eq!(app.state.cost, Some(expected));
+    let stored: f64 = app
+        .state
+        .session
+        .usage_by_model()
+        .values()
+        .filter_map(|u| u.cost)
+        .sum();
+    assert_eq!(stored, expected);
+}
+
+const RESTORED_COST: f64 = 0.42;
+/// Counters big enough that re-pricing them could never land on
+/// [`RESTORED_COST`], so a total derived from them stands out.
+const RESTORED_TOKENS: TokenUsage = TokenUsage {
+    input: 1_000_000,
+    output: 0,
+    cache_creation: 0,
+    cache_read: 0,
+};
+const RESTORED_MODEL: &str = "model-that-ran-before";
+const SIGMA_MISSING: &str = "the status bar must draw the session total";
+const COST_WAS_NOT_BILLED: &str = "the turn must bill something for the reset to prove anything";
+
+/// A new session opens on a clean bill. The total is never re-derived from the
+/// counters, so anything left behind here follows the user forever.
+#[test]
+fn reset_session_clears_the_bill_and_the_model_breakdown() {
+    let mut app = streaming_app();
+    app.update(main_turn());
+    assert_eq!(app.state.cost, MAIN_COST, "{COST_WAS_NOT_BILLED}");
+
+    app.reset_session();
+
+    assert_eq!(app.state.cost, None);
+    assert!(app.state.session.usage_by_model().is_empty());
+}
+
+/// `None` is what hides the cost, so an unpriced turn must leave the total
+/// alone. `Some(0.0)` would advertise a free session.
+#[test_case(None, None ; "unpriced_turns_only")]
+#[test_case(MAIN_COST, MAIN_COST ; "priced_turn_after_an_unpriced_one")]
+fn session_cost_counts_only_priced_turns(second: Option<f64>, expected: Option<f64>) {
+    let mut app = streaming_app();
+    // How an unpriced session opens; `session_state` covers the seeding.
+    app.state.cost = None;
+    app.update(agent_msg(turn_complete(MAIN_TOKENS, MAIN_MODEL, None)));
+
+    app.update(agent_msg(turn_complete(MAIN_TOKENS, MAIN_MODEL, second)));
+
+    assert_eq!(app.state.cost, expected);
+}
+
+/// The restored bill is a running total later turns add to, so a resumed
+/// session shows what it paid back then plus what it pays now, never its
+/// counters re-priced at today's rates.
+#[test]
+fn resumed_session_keeps_adding_to_the_restored_bill() {
+    let mut app = test_app();
+    let mut stored = AppSession::new("test-model", "/tmp");
+    stored.token_usage = RESTORED_TOKENS;
+    stored.add_model_usage(RESTORED_MODEL, RESTORED_TOKENS.billed(Some(RESTORED_COST)));
+
+    app.apply_loaded_session(stored, &test_model());
+    assert_eq!(app.state.cost, Some(RESTORED_COST));
+    assert_eq!(app.chats[0].cost, Some(RESTORED_COST));
+
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(main_turn());
+
+    assert_eq!(app.state.cost, Some(RESTORED_COST + MAIN_COST.unwrap()));
+}
+
+/// The sigma the status bar draws once subagents split the bill is the session
+/// total itself, so it cannot drift from what `/usage` sums.
+#[test]
+fn status_bar_sigma_draws_the_session_cost() {
+    let mut app = app_with_subagent();
+    app.update(main_turn());
+    app.update(sub_turn_complete());
+
+    let total = app.state.cost.expect("both turns were priced");
+    let sigma = format!("\u{03a3}${total:.3}");
+    assert!(
+        rendered(&mut app).contains(&sigma),
+        "{SIGMA_MISSING}: {sigma}"
+    );
 }
 
 #[test]
@@ -936,11 +1041,7 @@ fn subagent_turn_complete_updates_matching_parent_header_with_last_turn() {
 #[test_case(true  ; "subagent_stamp_is_not_overwritten")]
 fn parent_turn_flush_stamps_the_last_unstamped_tool(subagent_ran: bool) {
     let mut app = streaming_app();
-    app.update(agent_msg(turn_complete(
-        MAIN_TOKENS,
-        "main-model",
-        MAIN_COST,
-    )));
+    app.update(main_turn());
     app.update(agent_msg(tool_start(TASK_ID, "task")));
     if subagent_ran {
         app.update(sub_turn_complete());

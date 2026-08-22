@@ -83,7 +83,7 @@ pub enum SessionError {
 /// Per-model token breakdown entry. Mirrors the four usage counters tracked by
 /// the active provider; kept storage-local to avoid a circular dependency on
 /// `maki-providers`.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StoredTokenUsage {
     #[serde(default)]
     pub input: u32,
@@ -93,6 +93,12 @@ pub struct StoredTokenUsage {
     pub cache_creation: u32,
     #[serde(default)]
     pub cache_read: u32,
+    /// What the turns billed, in USD. Prices move (some providers by the hour),
+    /// so re-pricing these counters later would be fiction. `None` on unpriced
+    /// models, and on entries written before we recorded it until the next load
+    /// settles an estimate into them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
 }
 
 impl StoredTokenUsage {
@@ -113,6 +119,16 @@ impl std::ops::AddAssign for StoredTokenUsage {
         self.output = self.output.saturating_add(rhs.output);
         self.cache_creation = self.cache_creation.saturating_add(rhs.cache_creation);
         self.cache_read = self.cache_read.saturating_add(rhs.cache_read);
+        add_cost(&mut self.cost, rhs.cost);
+    }
+}
+
+/// The one way costs are summed, re-exported by `maki-providers` so every
+/// running total agrees: `None` until the first priced turn shows up, and from
+/// there it only grows.
+pub fn add_cost(total: &mut Option<f64>, addend: Option<f64>) {
+    if let Some(addend) = addend {
+        *total = Some(total.unwrap_or_default() + addend);
     }
 }
 
@@ -1535,6 +1551,13 @@ where
         &self.usage_by_model
     }
 
+    /// For settling costs on load; every other write goes through
+    /// [`Self::add_model_usage`].
+    pub fn usage_by_model_mut(&mut self) -> &mut HashMap<String, StoredTokenUsage> {
+        self.touch();
+        &mut self.usage_by_model
+    }
+
     pub fn set_title(&mut self, title: String) {
         if self.title == title {
             return;
@@ -1717,6 +1740,8 @@ mod tests {
     type TestSession = Session<Value, Value, Value>;
 
     const LEGACY_HEX_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const SONNET_COST: f64 = 0.42;
+    const HAIKU_COST: f64 = 0.08;
     const TAMPERED_TITLE: &str = "tampered cached title";
     const PENDING_DRAFT: &str = "half typed thought";
     /// Two of these already break the byte budget.
@@ -1843,6 +1868,7 @@ mod tests {
                 output: 20,
                 cache_creation: 5,
                 cache_read: 40,
+                cost: Some(SONNET_COST),
             },
         );
         session.add_model_usage(
@@ -1850,6 +1876,7 @@ mod tests {
             super::StoredTokenUsage {
                 input: 30,
                 output: 10,
+                cost: Some(HAIKU_COST),
                 ..Default::default()
             },
         );
@@ -1861,7 +1888,96 @@ mod tests {
         assert_eq!(sonnet.output, 20);
         assert_eq!(sonnet.cache_read, 40);
         assert_eq!(sonnet.total_input(), 145);
+        assert_eq!(sonnet.cost, Some(SONNET_COST));
         assert_eq!(loaded.usage_by_model()["claude-haiku-4"].total(), 40);
+        assert_eq!(
+            loaded.usage_by_model()["claude-haiku-4"].cost,
+            Some(HAIKU_COST)
+        );
+    }
+
+    /// A turn that reports no price must not erase what was already billed.
+    #[test_case(None, None, None ; "unpriced_stays_unpriced")]
+    #[test_case(None, Some(SONNET_COST), Some(SONNET_COST) ; "first_price_starts_the_total")]
+    #[test_case(Some(SONNET_COST), Some(HAIKU_COST), Some(SONNET_COST + HAIKU_COST) ; "priced_turns_accumulate")]
+    #[test_case(Some(SONNET_COST), None, Some(SONNET_COST) ; "unpriced_turn_keeps_the_total")]
+    fn add_cost_only_grows_a_total(
+        mut total: Option<f64>,
+        addend: Option<f64>,
+        expected: Option<f64>,
+    ) {
+        super::add_cost(&mut total, addend);
+        assert_eq!(total, expected);
+    }
+
+    fn usage(input: u32, cost: Option<f64>) -> super::StoredTokenUsage {
+        super::StoredTokenUsage {
+            input,
+            cost,
+            ..Default::default()
+        }
+    }
+
+    fn saved_usage_by_model(dir: &Path, id: MakiId) -> Value {
+        let text = fs::read_to_string(jsonl_path(dir, id)).unwrap();
+        let meta = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|record| record["t"] == "meta")
+            .expect("saved session has a meta record");
+        meta["usage_by_model"].clone()
+    }
+
+    /// Session files predate `cost`, so an entry without the key loads unpriced
+    /// with its counters intact, and saving it back must not mint one: older
+    /// builds still read these files.
+    #[test]
+    fn legacy_usage_entry_loads_unpriced_and_stays_that_way_on_disk() {
+        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
+        let json = format!(
+            r#"{{"t":"header","v":2,"id":"{LEGACY_HEX_ID}","model":"m","cwd":"/","created_at":0}}
+{{"t":"meta","title":"t","token_usage":null,"updated_at":0,"usage_by_model":{{"m":{{"input":7,"output":3}}}}}}"#
+        );
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(format!("{LEGACY_HEX_ID}.jsonl")), json).unwrap();
+
+        let mut loaded = TestSession::load_from(id, tmp.path()).unwrap();
+        let entry = loaded.usage_by_model()["m"];
+        assert_eq!(entry.cost, None, "no key means unpriced, not free");
+        assert_eq!((entry.input, entry.output), (7, 3));
+
+        let dir = tmp.path().join("rewritten");
+        fs::create_dir(&dir).unwrap();
+        loaded.save_to(&dir).unwrap();
+        assert!(
+            saved_usage_by_model(&dir, id)["m"].get("cost").is_none(),
+            "an unpriced entry writes no cost key"
+        );
+    }
+
+    /// What a turn billed is written verbatim, read back verbatim, and keeps
+    /// adding up after a reload. A later unpriced turn must not throw away what
+    /// the earlier ones paid.
+    #[test]
+    fn recorded_costs_survive_a_reload_and_keep_adding_up() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("anthropic/claude-sonnet-4", "/project");
+        session.add_model_usage("claude-sonnet-4", usage(100, Some(SONNET_COST)));
+        session.add_model_usage("claude-haiku-4", usage(30, None));
+        session.save_to(dir).unwrap();
+
+        let on_disk = saved_usage_by_model(dir, session.id);
+        assert_eq!(on_disk["claude-sonnet-4"]["cost"], Value::from(SONNET_COST));
+
+        let mut loaded = TestSession::load_from(session.id, dir).unwrap();
+        loaded.add_model_usage("claude-sonnet-4", usage(50, None));
+        loaded.add_model_usage("claude-haiku-4", usage(10, Some(HAIKU_COST)));
+
+        let sonnet = loaded.usage_by_model()["claude-sonnet-4"];
+        assert_eq!((sonnet.input, sonnet.cost), (150, Some(SONNET_COST)));
+        let haiku = loaded.usage_by_model()["claude-haiku-4"];
+        assert_eq!((haiku.input, haiku.cost), (40, Some(HAIKU_COST)));
     }
 
     #[test]

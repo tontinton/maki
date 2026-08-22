@@ -2,16 +2,19 @@ pub(crate) mod error;
 pub mod manifest;
 pub mod model;
 pub mod model_registry;
+pub mod pricing;
 pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
 pub(crate) mod types;
 
 pub use error::AgentError;
+pub use maki_storage::sessions::add_cost;
 pub use model::{
     FastPricing, Model, ModelEntry, ModelError, ModelFamily, ModelInfo, ModelPricing, ModelTier,
-    ThinkingSupport, TokenUsage, add_cost, format_tokens,
+    ThinkingSupport, TokenUsage, format_tokens,
 };
+pub use pricing::{model_cost, settle_session};
 pub use providers::Timeouts;
 pub use providers::catalog::ProviderData;
 pub use providers::catalog::{

@@ -1242,10 +1242,11 @@ impl App {
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.state.token_usage += tc.usage;
+            add_cost(&mut self.state.cost, tc.cost);
             add_cost(&mut self.chats[chat_idx].cost, tc.cost);
             self.state
                 .session_mut()
-                .add_model_usage(&tc.model, tc.usage.into());
+                .add_model_usage(&tc.model, tc.usage.billed(tc.cost));
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {

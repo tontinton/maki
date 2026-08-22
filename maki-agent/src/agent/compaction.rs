@@ -97,7 +97,7 @@ fn finish_compact(
         message: response.message.clone(),
         usage: response.usage,
         model: model.id.clone(),
-        cost: model.cost_of(&response.usage, false),
+        cost: model.billed_cost(&response.usage, false),
         context_size: Some(response.usage.output),
         context_window: model.context_window,
     })));

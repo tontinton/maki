@@ -194,12 +194,7 @@ impl App {
             &self.ui_config.tool_output_lines,
         );
         self.main_chat().load_messages(display_msgs);
-        // The restored total predates any per-turn cost, so price it once with the
-        // selected model. Later turns add their own exact cost.
-        let cost = self
-            .state
-            .model
-            .cost_of(&self.state.token_usage, self.state.fast);
+        let cost = self.state.cost;
         let context_size = self.state.context_size;
         let main = self.main_chat();
         main.cost = cost;
@@ -289,6 +284,7 @@ impl App {
         self.checkpoint_now();
         self.reset_ui_chrome();
         self.state.token_usage = TokenUsage::default();
+        self.state.cost = None;
         self.state.context_size = 0;
         self.state.plan = PlanState::None;
         if self.state.mode == Mode::Plan {

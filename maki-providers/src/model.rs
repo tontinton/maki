@@ -9,6 +9,7 @@ use std::ops::AddAssign;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use jiff::Timestamp;
 use maki_config::ModelPolicy;
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredTokenUsage};
 use serde::{Deserialize, Serialize};
@@ -382,9 +383,24 @@ impl Model {
         format!("{}/{}", self.provider, self.id)
     }
 
+    /// What the provider charges right now, so it is only ever correct for a
+    /// turn that just finished: under a
+    /// [`PricingSchedule`](crate::pricing::PricingSchedule) the answer moves
+    /// with the clock. Anything historical wants [`Self::list_cost`].
+    ///
     /// `None` on an unpriced model (oauth, local), so callers can hide the cost
     /// instead of showing a misleading "$0.000".
-    pub fn cost_of(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
+    pub fn billed_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
+        let cost = self.list_cost(usage, fast)?;
+        let schedule = ManifestRegistry::for_slug(&self.provider).and_then(|m| m.pricing_schedule);
+        Some(schedule.map_or(cost, |s| cost * s.multiplier_at(Timestamp::now())))
+    }
+
+    /// The quoted rates, with no wall-clock surcharge. Deterministic, which is
+    /// what makes it right for re-pricing a session whose turns never recorded
+    /// what they paid: the rate back then is unknown, and the table price is
+    /// the honest guess.
+    pub fn list_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
         (!self.pricing.is_zero()).then(|| usage.cost(&self.pricing, fast))
     }
 
@@ -532,18 +548,20 @@ impl From<StoredTokenUsage> for TokenUsage {
     }
 }
 
-impl From<TokenUsage> for StoredTokenUsage {
-    fn from(u: TokenUsage) -> Self {
-        Self {
-            input: u.input,
-            output: u.output,
-            cache_creation: u.cache_creation,
-            cache_read: u.cache_read,
+impl TokenUsage {
+    /// Ready to store, with what the turn was billed. No `From<TokenUsage>` on
+    /// purpose: a caller that forgets the cost quietly loses money from the
+    /// session total, so saying it out loud is mandatory.
+    pub fn billed(&self, cost: Option<f64>) -> StoredTokenUsage {
+        StoredTokenUsage {
+            input: self.input,
+            output: self.output,
+            cache_creation: self.cache_creation,
+            cache_read: self.cache_read,
+            cost,
         }
     }
-}
 
-impl TokenUsage {
     pub fn total_input(&self) -> u32 {
         self.input
             .saturating_add(self.cache_read)
@@ -575,7 +593,9 @@ impl TokenUsage {
         }
     }
 
-    pub fn cost(&self, pricing: &ModelPricing, fast: bool) -> f64 {
+    /// Crate-private on purpose: pricing outside [`Model`] skips the provider's
+    /// schedule.
+    pub(crate) fn cost(&self, pricing: &ModelPricing, fast: bool) -> f64 {
         let (input, output, cache_write, cache_read) = match &pricing.fast {
             Some(f) if fast => (
                 f.input,
@@ -594,13 +614,6 @@ impl TokenUsage {
             + self.output as f64 * output / PER_MILLION
             + self.cache_creation as f64 * cache_write / PER_MILLION
             + self.cache_read as f64 * cache_read / PER_MILLION
-    }
-}
-
-/// A total stays `None` (unpriced) until the first priced turn shows up.
-pub fn add_cost(total: &mut Option<f64>, turn: Option<f64>) {
-    if let Some(turn) = turn {
-        *total = Some(total.unwrap_or_default() + turn);
     }
 }
 
@@ -646,6 +659,27 @@ mod tests {
         ModelTier::Strong,
         ModelTier::Compaction,
     ];
+
+    const EPSILON: f64 = 1e-10;
+    /// The only builtin whose rates move with the wall clock.
+    const SCHEDULED_PROVIDERS: [&str; 1] = ["deepseek"];
+    const DEEPSEEK_SPEC: &str = "deepseek/deepseek-v4-pro";
+    const UNPRICED_DEEPSEEK_SPEC: &str = "deepseek/my-custom-model";
+    const MILLION: u32 = 1_000_000;
+    const INPUT_ONLY: TokenUsage = TokenUsage {
+        input: MILLION,
+        output: 0,
+        cache_creation: 0,
+        cache_read: 0,
+    };
+    /// Four counters that cannot be confused with each other.
+    const COUNTERS: TokenUsage = TokenUsage {
+        input: 11,
+        output: 22,
+        cache_creation: 33,
+        cache_read: 44,
+    };
+    const RECORDED_COST: f64 = 0.25;
 
     #[test_case(999, "999"         ; "under_thousand")]
     #[test_case(1_000, "1.0k"      ; "thousand")]
@@ -1047,5 +1081,73 @@ mod tests {
         );
         assert_eq!(wrapped.spec(), format!("my-ollama-wrap/{model_id}"));
         assert_eq!(wrapped.context_window, expected_window);
+    }
+
+    /// A schedule hung on the wrong manifest silently doubles every turn of a
+    /// provider that bills flat.
+    #[test]
+    fn only_deepseek_bills_by_the_clock() {
+        let scheduled: Vec<&str> = ManifestRegistry::builtins()
+            .iter()
+            .filter(|m| m.pricing_schedule.is_some())
+            .map(|m| m.slug)
+            .collect();
+        assert_eq!(scheduled, SCHEDULED_PROVIDERS);
+    }
+
+    /// Nothing else pins the wiring: a real DeepSeek model has to pick the
+    /// schedule up out of its manifest, and `list_cost` has to stay out of it.
+    /// `billed_cost` reads the real clock, so the expectation is sampled either
+    /// side of the call in case the hour ticks over mid-test.
+    #[test]
+    fn deepseek_bills_its_peak_surcharge_on_top_of_the_table() {
+        let model = Model::from_spec(DEEPSEEK_SPEC).unwrap();
+        let schedule = ManifestRegistry::for_slug(&model.provider)
+            .and_then(|m| m.pricing_schedule)
+            .expect("deepseek bills by the clock");
+
+        let list = model.list_cost(&INPUT_ONLY, false).unwrap();
+        let table_price = f64::from(INPUT_ONLY.input) * model.pricing.input / PER_MILLION;
+        assert!(
+            (list - table_price).abs() < EPSILON,
+            "list_cost {list} must be the table price {table_price}, surcharge free"
+        );
+
+        let before = schedule.multiplier_at(Timestamp::now());
+        let billed = model.billed_cost(&INPUT_ONLY, false).unwrap();
+        let after = schedule.multiplier_at(Timestamp::now());
+        assert!(
+            [before, after]
+                .iter()
+                .any(|multiplier| (billed - list * multiplier).abs() < EPSILON),
+            "billed {billed} is not {list} scaled by the schedule ({before} or {after})"
+        );
+    }
+
+    /// A schedule must not turn "no price" into "$0.000". Callers hide `None`,
+    /// and any multiple of nothing is still nothing.
+    #[test]
+    fn unpriced_models_stay_unpriced_under_a_schedule() {
+        let model = Model::from_spec(UNPRICED_DEEPSEEK_SPEC).unwrap();
+        assert!(model.pricing.is_zero());
+        assert_eq!(model.list_cost(&INPUT_ONLY, false), None);
+        assert_eq!(model.billed_cost(&INPUT_ONLY, false), None);
+    }
+
+    /// Every later total is rebuilt from what was stored, so storing a turn must
+    /// not shuffle the counters, invent one, or drop the cost.
+    #[test]
+    fn billed_stores_every_counter_and_the_cost() {
+        assert_eq!(
+            COUNTERS.billed(Some(RECORDED_COST)),
+            StoredTokenUsage {
+                input: COUNTERS.input,
+                output: COUNTERS.output,
+                cache_creation: COUNTERS.cache_creation,
+                cache_read: COUNTERS.cache_read,
+                cost: Some(RECORDED_COST),
+            }
+        );
+        assert_eq!(COUNTERS.billed(None).cost, None);
     }
 }

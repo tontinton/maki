@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use maki_config::ClockFormat;
-use maki_providers::{Model, ModelPricing, ProviderUsage, TokenUsage, format_tokens};
+use maki_providers::{Model, ProviderUsage, TokenUsage, format_tokens, model_cost};
 use maki_storage::sessions::StoredTokenUsage;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -43,6 +43,9 @@ pub enum UsageFetchState {
 
 pub struct UsageModalContext<'a> {
     pub total: &'a TokenUsage,
+    /// What the session billed, from [`maki_providers::session_cost`]. `None`
+    /// means nothing here is priced, so the modal shows tokens only.
+    pub total_cost: Option<f64>,
     pub by_model: &'a HashMap<String, StoredTokenUsage>,
     pub model: &'a Model,
     pub fast: bool,
@@ -144,17 +147,6 @@ impl UsageModal {
     }
 }
 
-fn pricing_for(id: &str, current: &Model) -> Option<ModelPricing> {
-    if id == current.id {
-        return Some(current.pricing.clone());
-    }
-    Model::from_spec(id).ok().map(|m| m.pricing).or_else(|| {
-        Model::from_spec(&format!("{}/{}", current.provider, id))
-            .ok()
-            .map(|m| m.pricing)
-    })
-}
-
 fn build_lines(
     ctx: &UsageModalContext,
     quota: Option<&UsageFetchState>,
@@ -168,12 +160,7 @@ fn build_lines(
         theme.keybind_section,
     )));
 
-    let total_cost = if ctx.model.pricing.is_zero() {
-        None
-    } else {
-        Some(ctx.total.cost(&ctx.model.pricing, ctx.fast))
-    };
-    lines.push(Line::from(totals_row(ctx.total, total_cost, theme)));
+    lines.push(Line::from(totals_row(ctx.total, ctx.total_cost, theme)));
 
     if let Some(state) = quota {
         lines.push(Line::default());
@@ -206,10 +193,7 @@ fn build_lines(
     lines.push(Line::from(header_row(model_w, theme)));
 
     for (id, usage) in entries {
-        let pricing = pricing_for(id, ctx.model);
-        let cost = pricing
-            .as_ref()
-            .map(|p| TokenUsage::from(*usage).cost(p, ctx.fast));
+        let cost = model_cost(id, usage, ctx.model, ctx.fast);
         lines.push(Line::from(model_row(
             id,
             usage,
@@ -406,6 +390,23 @@ mod tests {
     use std::sync::Arc;
     use test_case::test_case;
 
+    const RECORDED_COST: f64 = 0.123;
+    const RECORDED_TEXT: &str = "0.123";
+    /// 1M input tokens at the test model's $3/1M: what the modal would print if
+    /// it re-priced the counters.
+    const REPRICED_TEXT: &str = "3.000";
+    const ONE_MILLION: u32 = 1_000_000;
+    const ONE_MILLION_TEXT: &str = "1.0m";
+    const UNKNOWN_MODEL: &str = "a-model-no-table-has-ever-heard-of";
+    const NO_COST_TEXT: &str = "—";
+
+    fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
     }
@@ -510,6 +511,89 @@ mod tests {
         assert!(err[0].spans.iter().any(|s| s.content.contains("nope")));
     }
 
+    fn stored(cost: Option<f64>) -> StoredTokenUsage {
+        StoredTokenUsage {
+            input: ONE_MILLION,
+            cost,
+            ..Default::default()
+        }
+    }
+
+    fn modal_rows(
+        total: &TokenUsage,
+        total_cost: Option<f64>,
+        by_model: &HashMap<String, StoredTokenUsage>,
+        model: &Model,
+    ) -> Vec<String> {
+        let ctx = UsageModalContext {
+            total,
+            total_cost,
+            by_model,
+            model,
+            fast: false,
+            clock_format: ClockFormat::Hour24,
+        };
+        line_texts(&build_lines(&ctx, None, &crate::theme::current()))
+    }
+
+    /// A recorded cost is what the turn was billed, and re-pricing its tokens
+    /// restates the bill every time a provider moves its rates (DeepSeek moves
+    /// them twice a day). A model the tables cannot resolve shows nothing,
+    /// since charging it the selected model's rates invents a bill.
+    #[test]
+    fn model_rows_show_what_was_recorded_and_never_todays_price() {
+        let model = test_model();
+        let total = TokenUsage {
+            input: 2 * ONE_MILLION,
+            ..Default::default()
+        };
+        let by_model = HashMap::from([
+            (model.id.clone(), stored(Some(RECORDED_COST))),
+            (UNKNOWN_MODEL.to_string(), stored(None)),
+        ]);
+
+        let rows = modal_rows(&total, Some(RECORDED_COST), &by_model, &model);
+        let row = |id: &str| {
+            rows.iter()
+                .find(|t| t.contains(id))
+                .unwrap_or_else(|| panic!("no row for {id}: {rows:?}"))
+                .clone()
+        };
+
+        let recorded_row = row(&model.id);
+        assert!(recorded_row.contains(RECORDED_TEXT), "{recorded_row}");
+        assert!(!recorded_row.contains(REPRICED_TEXT), "{recorded_row}");
+
+        let unknown_row = row(UNKNOWN_MODEL);
+        assert!(unknown_row.contains(NO_COST_TEXT), "{unknown_row}");
+        assert!(!unknown_row.contains(REPRICED_TEXT), "{unknown_row}");
+    }
+
+    /// The session's bill arrives already computed, from the turns that paid it.
+    /// These counters would price to [`REPRICED_TEXT`] against the selected
+    /// model, so a modal doing its own arithmetic prints a different number,
+    /// and "$0.000" for a session nothing priced.
+    #[test_case(Some(RECORDED_COST) => Some(RECORDED_TEXT.to_string()) ; "prints_the_bill_it_was_handed")]
+    #[test_case(None                => None                            ; "unpriced_session_shows_tokens_only")]
+    fn totals_row_never_re_prices_the_counters(total_cost: Option<f64>) -> Option<String> {
+        let model = test_model();
+        assert!(!model.pricing.is_zero(), "the fallback must be tempting");
+        let total = TokenUsage {
+            input: ONE_MILLION,
+            ..Default::default()
+        };
+
+        let rows = modal_rows(&total, total_cost, &HashMap::new(), &model);
+        // With no breakdown, the totals row is the only one carrying counters.
+        let totals = rows
+            .iter()
+            .find(|t| t.contains(ONE_MILLION_TEXT))
+            .unwrap_or_else(|| panic!("no totals row: {rows:?}"));
+        totals
+            .split_once('$')
+            .map(|(_, cost)| cost.trim().to_string())
+    }
+
     fn slot(state: UsageFetchState) -> ArcSwapOption<UsageFetchState> {
         ArcSwapOption::from_pointee(state)
     }
@@ -520,6 +604,7 @@ mod tests {
         let model = test_model();
         let ctx = UsageModalContext {
             total: &TokenUsage::default(),
+            total_cost: None,
             by_model: &HashMap::new(),
             model: &model,
             fast: false,

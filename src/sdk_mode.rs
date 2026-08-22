@@ -28,7 +28,7 @@ use maki_agent::{
 };
 use maki_config::ModelPolicy;
 use maki_providers::model::Model;
-use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage};
+use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::Session;
@@ -554,10 +554,10 @@ pub fn run(params: SdkParams) -> Result<()> {
         shared: Arc::clone(&shared),
         answer_tx: handle.answer_tx.clone(),
         include_partial_messages: cli.include_partial_messages,
-        fast,
         synth: StreamSynth::new(),
         tool_inputs: HashMap::new(),
         result_text: String::new(),
+        cost: None,
         request_counter: 0,
     }
     .spawn(handle.event_rx.clone());
@@ -853,10 +853,12 @@ struct EventPump {
     shared: Arc<Mutex<Shared>>,
     answer_tx: Sender<String>,
     include_partial_messages: bool,
-    fast: bool,
     synth: StreamSynth,
     tool_inputs: HashMap<String, (String, Value)>,
     result_text: String,
+    /// Summed as the turns land: rates move mid-prompt, and only a turn knows
+    /// the rate it paid.
+    cost: Option<f64>,
     request_counter: u64,
 }
 
@@ -887,6 +889,7 @@ impl EventPump {
         self.synth.reset();
         self.tool_inputs.clear();
         self.result_text.clear();
+        self.cost = None;
         self.shared.lock().unwrap().pending.clear();
     }
 
@@ -897,13 +900,9 @@ impl EventPump {
         num_turns: u32,
         usage: TokenUsage,
     ) -> Result<()> {
-        let (duration_ms, total_cost_usd) = {
-            let shared = self.shared.lock().unwrap();
-            (
-                shared.turn_start.elapsed().as_millis(),
-                usage.cost(&shared.model.pricing, self.fast),
-            )
-        };
+        let duration_ms = self.shared.lock().unwrap().turn_start.elapsed().as_millis();
+        // Zero on an unpriced model, which is what its turns reported too.
+        let total_cost_usd = self.cost.unwrap_or_default();
         self.writer.emit(WireInner::Result(ResultPayload {
             subtype: if is_error {
                 "error_during_execution"
@@ -989,6 +988,7 @@ impl EventPump {
                 )?;
             }
             AgentEvent::TurnComplete(tc) => {
+                add_cost(&mut self.cost, tc.cost);
                 if self.include_partial_messages {
                     let events = self.synth.finish_message(&tc.usage);
                     self.emit_stream(events)?;
