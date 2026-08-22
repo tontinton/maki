@@ -2,6 +2,7 @@ mod gen_commands;
 mod gen_config;
 mod gen_keybindings;
 mod gen_lua_api;
+mod gen_plugins;
 mod gen_providers;
 mod gen_tools;
 mod lua_util;
@@ -9,8 +10,24 @@ mod lua_util;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::thread;
 
 const CONTENT_DIR: &str = "site/docs/content";
+
+type Page = (&'static str, fn() -> String);
+
+/// One entry per generated page. Every generator is a slow, self-contained
+/// string build (it boots a Lua host, walks the tool registry, and so on), so
+/// they each get a thread.
+const PAGES: [Page; 7] = [
+    ("tools", gen_tools::generate),
+    ("plugins", gen_plugins::generate),
+    ("providers", gen_providers::generate),
+    ("configuration", gen_config::generate),
+    ("lua-api", gen_lua_api::generate),
+    ("keybindings", gen_keybindings::generate),
+    ("commands", gen_commands::generate),
+];
 
 fn page_path(section: &str) -> PathBuf {
     Path::new(CONTENT_DIR).join(section).join("_index.md")
@@ -44,34 +61,10 @@ fn check_file(path: &Path, expected: &str) -> bool {
 fn main() -> ExitCode {
     let check = std::env::args().any(|a| a == "--check");
 
-    let ((tools, providers), ((config, lua_api), (keybindings, commands))) =
-        smol::block_on(async {
-            smol::future::zip(
-                smol::future::zip(
-                    smol::unblock(gen_tools::generate),
-                    smol::unblock(gen_providers::generate),
-                ),
-                smol::future::zip(
-                    smol::future::zip(
-                        smol::unblock(gen_config::generate),
-                        smol::unblock(gen_lua_api::generate),
-                    ),
-                    smol::future::zip(
-                        smol::unblock(gen_keybindings::generate),
-                        smol::unblock(gen_commands::generate),
-                    ),
-                ),
-            )
-            .await
-        });
-    let outputs = [
-        (page_path("tools"), tools),
-        (page_path("providers"), providers),
-        (page_path("configuration"), config),
-        (page_path("lua-api"), lua_api),
-        (page_path("keybindings"), keybindings),
-        (page_path("commands"), commands),
-    ];
+    let outputs = thread::scope(|scope| {
+        let running = PAGES.map(|(section, generate)| (page_path(section), scope.spawn(generate)));
+        running.map(|(path, page)| (path, page.join().unwrap()))
+    });
 
     if check {
         let mismatches = outputs

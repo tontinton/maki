@@ -19,6 +19,7 @@ const REFERENCE_PLACEHOLDER: &str = "__MAKI_REFERENCE_PATH__";
 const EXAMPLE: &str = include_str!("../../plugins/glob/init.lua");
 
 const PERMISSIONS_ANCHOR: &str = "plugin-permissions";
+const REFERENCE_URL: &str = "/docs/lua-api/";
 
 /// Generated from [`Permission::ALL`] so the reference can never drift from
 /// the real gate set. `anchored` adds the explicit heading id for the site;
@@ -62,43 +63,112 @@ const GUIDE: &str = r#"# Writing maki plugins
 
 Maki plugins are plain Lua files (Luau) that run inside maki. A plugin can
 register tools the LLM calls, slash commands, keymaps, prompt hints, and
-custom UI. Everything lives under the global `maki` table. An index of the
-full API reference is at the end of this document.
+custom UI. Everything lives under the global `maki` table. The full API
+reference is at the end of this document.
 
 ## Where plugin code goes
 
-- `~/.config/maki/init.lua` - global, loaded for every project
-- `<project>/.maki/init.lua` - project-local
+Plugins live in the maki config dir. There are two of them, same layout:
 
-Either file can call `maki.setup({ ... })` for configuration and register
-tools or commands. There are no separate plugin directories yet.
+- `~/.config/maki/` - global, every project (if `~/.maki/` exists, maki reads
+  that one instead)
+- `<project>/.maki/` - this project only
+
+```
+init.lua        the only file maki runs; require()s plugins, calls maki.setup()
+lua/<name>.lua  plugin modules, loaded by require("<name>")
+plugin.toml     permission grants for every Lua file in the dir
+```
+
+Nothing under `lua/` loads on its own. A module name is its path under `lua/`
+without the extension: `lua/browser.lua` is `require("browser")`,
+`lua/acme/tools.lua` is `require("acme.tools")`. `require` is sandboxed to
+that directory, you cannot reach files outside it.
+
+## Creating a plugin
+
+1. Write the code in `~/.config/maki/lua/<name>.lua`. The `maki` global is
+   already there, nothing to import. For a project-only plugin use
+   `<project>/.maki/` here and in every step below.
+
+```lua
+maki.api.register_tool({
+  name = "hello",
+  description = "Say hello to a name.",
+  parameters = { type = "object", properties = { name = { type = "string" } }, required = { "name" } },
+  handler = function(args)
+    return { llm_output = "hello " .. args.name }
+  end,
+})
+```
+
+2. Load it from `~/.config/maki/init.lua`, creating that file if missing:
+
+```lua
+require("hello")
+```
+
+3. Grant the permissions it needs in `~/.config/maki/plugin.toml`, creating
+   that file if missing. Without the file every gated call is denied.
+
+```toml
+[permissions]
+fs_read = true
+run = true
+```
+
+4. Run `/reload`, then read the log as described below, to see that it loaded
+   and what it printed.
+
+Leave `maki.api.register_options` to bundled plugins: maki rejects a
+`plugins.<name>` table for a plugin it does not ship, and startup fails. Keep
+settings in a local table, or export a `setup(opts)` function `init.lua` calls.
 
 {PERMISSIONS}
 
 ## Development loop
 
-You cannot run slash commands or restart maki. After editing, ask the user
-to run `/reload` (rebuilds plugins and config in place). Until then your
-changes are not live. If a backtrace comes out useless, suggest restarting
-with `--no-jit`.
+`/reload` rebuilds plugins and config in place, no restart needed. Until it
+runs, an edited plugin is still the old one.
 
 To debug, add `maki.log.info|warn|error(...)` calls. They write to `maki.log`
-in the dir `maki.env.logs_dir()` returns (Linux: `~/.local/logs/maki/`).
-Read that file yourself after the user reloads and reproduces.
+in the dir `maki.env.logs_dir()` returns (Linux: `~/.local/logs/maki/`). When
+a backtrace comes out useless, start maki with `--no-jit`: plugins then run on
+the interpreter, with full debug info.
 
-## Conventions
+{AGENT_NOTES}## Conventions
 
 - Fallible runtime calls return a `(value, err)` pair; check `err` before using `value`.
 - Tool handlers report failures with `{ llm_output = "error: ...", is_error = true }`, not by raising.
 - The model picks tools by reading `description`, so state precisely what the tool does and when to use it.
-- Reusable helpers ship with maki; see "Shared helper modules" in the reference file.
+- Reusable helpers ship with maki; see "Shared helper modules" in the API reference.
 
 ## A complete real example
 
-The bundled `glob` tool, verbatim: options registration, schema, header and
-restore hooks, error handling, LLM output truncation, collapsible UI view:
+The bundled `glob` tool, verbatim: schema, header and restore hooks, error
+handling, LLM output truncation, collapsible UI view. It is a bundled plugin,
+so it opens with `register_options`, which your own plugin skips:
 
 ```lua
+"#;
+
+/// Everything that only makes sense to the agent lives here, so the website
+/// page reads like a page and not like someone else's instructions. The blank
+/// line at the end belongs to the block: the slot sits flush against the next
+/// heading, so leaving it out leaves no hole.
+const AGENT_NOTES: &str = r#"## Notes for the agent
+
+- Never write a plugin into maki's own source tree. The `plugins/` directory
+  of the maki repo holds the plugins that ship with maki, compiled into the
+  binary, so a file dropped there does nothing until maki is rebuilt. That
+  holds even when the project you have open is a maki checkout.
+- Both global config dirs can exist, and `~/.maki/` wins, so look before you
+  write.
+- The config dir sits outside the project, but it is an ordinary directory:
+  create files there with the normal write and edit tools.
+- You cannot run slash commands or restart maki, so ask the user to run
+  `/reload` and to reproduce the problem, then read the log yourself.
+
 "#;
 
 const HEADER: &str = r#"# Lua API
@@ -106,6 +176,8 @@ const HEADER: &str = r#"# Lua API
 Maki plugins are plain Lua files. Everything a plugin can touch lives under
 one global table: `maki`. This reference documents every module, function,
 and method. It is generated straight from the source code by `maki-docgen`.
+For where plugin files live and how to load them, read the
+[Plugins guide](/docs/plugins/) first.
 
 The API tries to mirror Neovim as much as possible (`maki.fs`, `maki.uv`,
 `maki.treesitter`, `maki.keymap`, `maki.base64`), signatures are kept identical
@@ -166,12 +238,22 @@ const HELPERS_INTRO: &str = "## Shared helper modules\n\nThese ship inside maki;
 
 const FULL_SOURCE_MAX_BYTES: usize = 1024;
 
+/// One guide for both readers, so the skill and the website cannot drift.
+/// The caller fills the two slots that differ: permission rules spelled out
+/// for the skill and linked for the site, and the agent-only notes.
+fn guide(permissions: &str, agent_notes: &str) -> String {
+    let body = GUIDE
+        .replace("{PERMISSIONS}", permissions)
+        .replace("{AGENT_NOTES}", agent_notes);
+    format!("{body}{EXAMPLE}```\n")
+}
+
 /// The skill carries the guide, example, and a line-numbered index into
 /// {reference}; the skill plugin writes the full reference to disk so the
 /// model reads only the sections it needs.
 fn skill_content(reference: &str) -> String {
     format!(
-        "{guide}{EXAMPLE}```\n\n# Full API reference\n\n\
+        "{guide}\n# Full API reference\n\n\
          The complete Lua API reference - every function with parameters, return\n\
          values, and examples, plus shared helper module sources - is on disk at:\n\n\
          `{REFERENCE_PLACEHOLDER}`\n\n\
@@ -182,7 +264,7 @@ fn skill_content(reference: &str) -> String {
          Signatures use Neovim notation: `{{path}}` is required, `{{opts?}}` is\n\
          optional, `{{...}}` is variadic.\n{}",
         reference_index(reference),
-        guide = GUIDE.replace("{PERMISSIONS}", permissions_section(false).trim_end()),
+        guide = guide(permissions_section(false).trim_end(), AGENT_NOTES),
     )
 }
 
@@ -213,6 +295,25 @@ pub(crate) fn virtual_module(lua: &Lua, modname: &str) -> Option<mlua::Result<Ta
 /// an overview table, plus the shared helper modules.
 pub fn site_page() -> String {
     format!("{}\n{}", render(false), helpers_section())
+}
+
+/// The body of the website's "Plugins" page: the guide the skill hands the
+/// model, with the permission rules linked instead of copied.
+pub fn guide_page() -> String {
+    let permissions = format!(
+        "## Permissions and plugin.toml\n\n\
+         Sensitive APIs are gated per plugin file, and a plugin without a\n\
+         `plugin.toml` next to it gets nothing. The gates and the file format are\n\
+         in [the reference]({REFERENCE_URL}#{PERMISSIONS_ANCHOR})."
+    );
+    format!(
+        "{}\n## Full API reference\n\n\
+         Every module, function, and method is in the [Lua API reference]({REFERENCE_URL}).\n\
+         The agent gets the same document on disk through the builtin\n\
+         `maki-plugin-dev` skill, so asking it to write a plugin for you works\n\
+         without pasting any of this.\n",
+        guide(&permissions, ""),
+    )
 }
 
 /// The full API reference plus the shared helper modules: the exact document
@@ -572,7 +673,12 @@ fn render(compact: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{reference, reference_index, skeleton, skill_content};
+    use super::{
+        AGENT_NOTES, PERMISSIONS_ANCHOR, REFERENCE_URL, guide_page, reference, reference_index,
+        site_page, skeleton, skill_content,
+    };
+
+    const AGENT_VOICE: &str = "ask the user";
 
     const MODULE: &str = "-- Header line one.\n-- Header line two.\nlocal M = {}\nM.__index = M\nM.CONST = \"x\"\nM.specs = {\n  a = 1,\n}\nlocal function private()\nend\n-- Doc for pub.\nfunction M.pub(a, b)\n  local inner = 1\nend\nfunction M:_hidden()\nend\nfunction M:method()\nend\nreturn M\n";
 
@@ -595,6 +701,32 @@ mod tests {
             ## Shared helper modules - L15\n\
             - L17 `require(\"maki.color\")` - Terminal colors helper.\n";
         assert_eq!(reference_index(reference), expected);
+    }
+
+    /// The website reader is not the agent, so nothing addressed to the agent
+    /// may leak out of [`AGENT_NOTES`] into the shared guide.
+    #[test]
+    fn only_the_skill_speaks_to_the_agent() {
+        let skill = skill_content("");
+        assert!(skill.contains(AGENT_NOTES.trim_end()));
+        assert!(
+            skill.contains(AGENT_VOICE),
+            "the notes must say \"{AGENT_VOICE}\", or the check below proves nothing"
+        );
+        assert!(
+            !guide_page().contains(AGENT_VOICE),
+            "website guide should never say \"{AGENT_VOICE}\""
+        );
+    }
+
+    #[test]
+    fn guide_permission_link_has_an_anchor_in_the_reference() {
+        let link = format!("{REFERENCE_URL}#{PERMISSIONS_ANCHOR}");
+        assert!(guide_page().contains(&link), "guide should link {link}");
+        assert!(
+            site_page().contains(&format!("{{#{PERMISSIONS_ANCHOR}}}")),
+            "lua api page should carry the {PERMISSIONS_ANCHOR} anchor for {link}"
+        );
     }
 
     #[test]

@@ -2730,7 +2730,6 @@ dependencies = [
  "maki-ui",
  "regex",
  "serde_json",
- "smol",
  "strum 0.27.2",
  "test-case",
 ]

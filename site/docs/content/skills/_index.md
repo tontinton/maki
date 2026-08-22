@@ -55,7 +55,7 @@ Skills are not slash commands: typing `/git-release` does nothing unless you als
 
 ## The builtin: maki-plugin-dev
 
-Maki ships one skill, `maki-plugin-dev`. It teaches the agent how to write maki Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. Turn it off if you never write plugins:
+Maki ships one skill, `maki-plugin-dev`. It teaches the agent how to write maki Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough. Turn it off if you never write plugins:
 
 ```lua
 -- ~/.config/maki/init.lua
