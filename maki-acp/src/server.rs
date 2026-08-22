@@ -109,11 +109,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
 
     let (in_tx, in_rx) = flume::unbounded::<Incoming>();
     // Weak, so a discovery still in flight cannot keep the loop alive once stdin closes.
-    discover_models(
-        server.model_specs.clone(),
-        Arc::clone(&params.model_policy),
-        in_tx.downgrade(),
-    );
+    discover_models(Arc::clone(&params.model_policy), in_tx.downgrade());
     let reader_task = smol::spawn(read_stdin(in_tx));
 
     while let Ok(incoming) = in_rx.recv_async().await {
@@ -147,35 +143,38 @@ async fn read_stdin(tx: Sender<Incoming>) -> std::io::Result<()> {
 
 /// Static manifests miss providers that only list their models over the wire
 /// (OpenRouter and friends), so the same discovery the TUI runs happens here,
-/// in the background.
-fn discover_models(mut specs: Vec<String>, policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
+/// in the background. Each batch leaves the moment it lands: the slowest source
+/// is a cold catalog download, and a provider the client could already pick from
+/// should not wait behind it.
+fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
     smol::spawn(async move {
         fetch_all_models(
             &policy,
             |batch| {
-                for spec in batch.models {
-                    if !specs.contains(&spec) {
-                        specs.push(spec);
-                    }
+                if let Some(tx) = tx.upgrade() {
+                    let _ = tx.send(Incoming::Models(batch.models));
                 }
             },
             None,
         )
         .await;
-        if let Some(tx) = tx.upgrade() {
-            let _ = tx.send_async(Incoming::Models(specs)).await;
-        }
     })
     .detach();
 }
 
-/// Discovery lands after the client already built its selector from the offline
-/// list, so the fuller list gets pushed to the live session.
-fn refresh_models(srv: &mut Server, specs: Vec<String>) {
-    if specs == srv.model_specs {
+/// Discovery lands in batches after the client built its selector from the
+/// offline list, so every batch that adds something announces the fuller list.
+fn refresh_models(srv: &mut Server, batch: Vec<String>) {
+    let known = srv.model_specs.len();
+    for spec in batch {
+        if !srv.model_specs.contains(&spec) {
+            srv.model_specs.push(spec);
+        }
+    }
+    if srv.model_specs.len() == known {
         return;
     }
-    srv.model_specs = specs;
+    // Merged even with no session yet, since session/new builds its selector from this list.
     let Some(session) = &srv.session else { return };
     let option = methods::model_config_option(&session.current_model, &srv.model_specs);
     session_update(
@@ -837,6 +836,7 @@ mod tests {
     const ANSWERED_ID: i64 = 1001;
     const UNKNOWN_ID: i64 = 1002;
     const DISCOVERED_SPEC: &str = "openrouter/discovered-model";
+    const OFFLINE_SPEC: &str = "openai/gpt-5";
 
     fn allow_once(id: i64) -> Value {
         serde_json::json!({
@@ -938,21 +938,26 @@ mod tests {
     #[test]
     fn discovered_models_are_pushed_to_the_client() {
         let (mut srv, .., out_rx) = server_with_ask(AskKind::Permission);
-        let specs = vec![DISCOVERED_SPEC.to_owned()];
+        srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
+        let batch = vec![DISCOVERED_SPEC.to_owned()];
 
-        refresh_models(&mut srv, specs.clone());
+        refresh_models(&mut srv, batch.clone());
         let update = out_rx.try_recv().expect("the fuller list is announced");
         let option = &update["params"]["update"]["configOptions"][0];
         assert_eq!(option["id"], methods::MODEL_CONFIG_ID);
+        let selectable: Vec<&str> = option["options"]
+            .as_array()
+            .expect("the option is a select")
+            .iter()
+            .filter_map(|o| o["value"].as_str())
+            .collect();
         assert!(
-            option["options"]
-                .as_array()
-                .is_some_and(|opts| opts.iter().any(|o| o["value"] == DISCOVERED_SPEC)),
-            "the discovered spec is selectable"
+            selectable.contains(&OFFLINE_SPEC) && selectable.contains(&DISCOVERED_SPEC),
+            "a batch is merged into the offline list, not swapped for it: {selectable:?}"
         );
 
-        refresh_models(&mut srv, specs);
-        assert!(out_rx.is_empty(), "an unchanged list is not re-announced");
+        refresh_models(&mut srv, batch);
+        assert!(out_rx.is_empty(), "a batch adding nothing is not announced");
     }
 
     #[test]

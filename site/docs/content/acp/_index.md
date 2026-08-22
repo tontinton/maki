@@ -36,7 +36,7 @@ The `model` value is a `provider/model-id` spec, same format as `maki --model`.
 ## What works
 
 - **Sessions persist.** Loading a session replays the full conversation in the editor, so you can resume where you left off.
-- **Model switching.** Pick a model from the editor's dropdown, mid-session. All configured providers show up. Providers that list their models over the wire (OpenRouter and friends) are discovered in the background, so the dropdown fills up a moment after the session starts.
+- **Model switching.** Pick a model from the editor's dropdown, mid-session. All configured providers show up. Providers that list their models over the wire (OpenRouter and friends) are discovered in the background, so the dropdown keeps filling up for a moment after the session starts, one provider at a time.
 - **Modes.** Switch between build (full access) and plan (plan-file writes only) from the editor.
 - **Permissions.** Tool permission prompts appear in the editor: allow or reject, once or always.
 - **Questions.** The `question` tool becomes a native form in the editor (ACP elicitation). If the client does not support elicitation, the tool is dropped and the model asks in plain text.
