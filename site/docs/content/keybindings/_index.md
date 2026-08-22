@@ -19,7 +19,6 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+S` | File picker |
 | `Ctrl+O` | Open plan in editor |
 | `Ctrl+T` | Toggle plan panel |
-| `Ctrl+X` | Open tasks |
 | `Ctrl+M` | Model picker |
 
 ## Editing
@@ -95,12 +94,13 @@ Built-in plugins register these themselves, and your own plugins can add more wi
 | Key | Action |
 |-----|--------|
 | `Ctrl+P` | Browse sessions |
+| `Ctrl+X` | Open tasks |
 
 ## Context Inheritance
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Task Picker, Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker
+- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker
 
 ## Overriding Keybindings
 

@@ -157,15 +157,7 @@ local function render()
   local inner = board.width - 4
   local input = board.rename and board.rename.input or board.input
   local prefix = board.rename and RENAME_PREFIX or FILTER_PREFIX
-  for _, ln in ipairs(input:render(prefix, dispw(prefix), inner).lines) do
-    lines[#lines + 1] = ln
-  end
-  lines[#lines + 1] = {}
-  -- The query and its blank spacer stay pinned while the list scrolls.
-  if #lines ~= board.reserved then
-    board.reserved = #lines
-    board.win:set_config({ reserved_top = board.reserved })
-  end
+  board.reserved = ListPicker.render_header(board.win, lines, input, prefix, inner)
   local cursor_line = board.reserved
   local words = filter_words()
   for i, s in ipairs(board.items) do
@@ -461,7 +453,6 @@ local function open()
     width = "70%",
     height = "70%",
     border = "rounded",
-    reserved_top = 2,
     focus = true,
     footer = FILTER_KEYS,
   })
@@ -470,7 +461,7 @@ local function open()
     buf = buf,
     width = win.width,
     height = win.height,
-    reserved = 2,
+    reserved = 0,
     input = TextInput.new(),
     all = {},
     items = {},

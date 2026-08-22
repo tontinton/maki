@@ -142,8 +142,23 @@ impl MessagesPanel {
         self.restore_event_tx = event_tx;
     }
 
-    pub fn push(&mut self, msg: DisplayMessage) {
+    /// Hands back the index of the message, which [`Self::replace`] needs to
+    /// correct it later.
+    pub fn push(&mut self, msg: DisplayMessage) -> usize {
         self.messages.push(msg);
+        self.messages.len() - 1
+    }
+
+    /// Drops the whole segment cache, so keep it for one-off corrections and
+    /// never for streaming. Marking the message stale is not enough: only the
+    /// segments the viewport reaches get reflowed, so a fix above it would
+    /// keep painting the old bubble.
+    pub fn replace(&mut self, index: usize, msg: DisplayMessage) {
+        let Some(slot) = self.messages.get_mut(index) else {
+            return;
+        };
+        *slot = msg;
+        self.cache.clear();
     }
 
     pub fn load_messages(&mut self, mut msgs: Vec<DisplayMessage>) {
@@ -475,6 +490,11 @@ impl MessagesPanel {
     #[cfg(test)]
     pub fn message_count(&self) -> usize {
         self.messages.len()
+    }
+
+    #[cfg(test)]
+    pub fn message_at(&self, index: usize) -> Option<&DisplayMessage> {
+        self.messages.get(index)
     }
 
     pub fn last_message_text(&self) -> &str {

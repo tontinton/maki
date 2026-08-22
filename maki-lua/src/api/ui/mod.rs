@@ -254,7 +254,7 @@ fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResu
 /// your terminal grabs it first: bind a new key with `maki.keymap.set`
 /// and call this from it.
 ///
-/// Valid names: `"file_picker"`, `"search"`, `"tasks"`, `"help"`,
+/// Valid names: `"file_picker"`, `"search"`, `"help"`,
 /// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
 /// `"prev_chat"`, `"next_chat"`.
 ///

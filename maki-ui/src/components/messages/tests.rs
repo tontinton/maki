@@ -1,5 +1,6 @@
 use super::segment;
 use super::*;
+use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
@@ -2217,6 +2218,7 @@ fn anchored_resize_keeps_the_topmost_visible_segment() {
         "an anchored mid-transcript resize must not flip to the bottom pin"
     );
 }
+
 const THEME_CODE: &str = "fn main() { let x = 1; }";
 const THEME_CODE_KEYWORDS: [&str; 3] = ["fn", "main", "let"];
 
@@ -2283,4 +2285,73 @@ fn theme_switch_repaints_highlighted_code() {
         code_span_styles(&panel, "t1"),
         "a theme switch must re-highlight, not splice old-palette lines back"
     );
+}
+
+const FIRST_TEXT: &str = "run the migration";
+const FOLLOW_UP_TEXT: &str = "and then deploy";
+const STALE_BUBBLE_MSG: &str = "the superseded bubble must disappear from the viewport";
+const UNTOUCHED_MSG: &str = "a rejected replace must leave the transcript untouched";
+
+fn style_of(terminal: &ratatui::Terminal<TestBackend>, text: &str) -> Style {
+    let buf = terminal.backend().buffer();
+    for y in 0..buf.area.height {
+        let row: String = (0..buf.area.width)
+            .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
+            .collect();
+        if let Some(col) = row.find(text) {
+            return buf.cell((col as u16, y)).unwrap().style();
+        }
+    }
+    panic!("{text} was never rendered");
+}
+
+/// `Chat::mark_finished` corrects a bubble long after it was drawn, with the
+/// transcript still growing in between. Unless `replace` throws the baked
+/// segments away, the viewport keeps painting a green "Done!" the message
+/// vector no longer holds.
+#[test]
+fn replace_repaints_the_corrected_bubble_in_place() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, FIRST_TEXT.into()));
+    let bubble = panel.push(DisplayMessage::new(DisplayRole::Done, DONE_TEXT.into()));
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        FOLLOW_UP_TEXT.into(),
+    ));
+    let done_style = style_of(&render(&mut panel, 80, 24), DONE_TEXT);
+
+    panel.replace(
+        bubble,
+        DisplayMessage::new(DisplayRole::Error, ERROR_TEXT.into()),
+    );
+
+    let rendered = render(&mut panel, 80, 24);
+    let text = buffer_text(&rendered);
+    let texts: Vec<&str> = panel.messages.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, [FIRST_TEXT, ERROR_TEXT, FOLLOW_UP_TEXT]);
+    assert!(text.contains(ERROR_TEXT), "got: {text}");
+    assert!(text.contains(FOLLOW_UP_TEXT), "got: {text}");
+    assert!(!text.contains(DONE_TEXT), "{STALE_BUBBLE_MSG}: {text}");
+    assert_ne!(
+        style_of(&rendered, ERROR_TEXT),
+        done_style,
+        "the corrected bubble kept the success styling"
+    );
+}
+
+#[test]
+fn replace_past_the_end_is_a_noop() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::Done, DONE_TEXT.into()));
+    rebuild(&mut panel);
+
+    panel.replace(
+        panel.message_count(),
+        DisplayMessage::new(DisplayRole::Error, ERROR_TEXT.into()),
+    );
+
+    assert_eq!(panel.message_count(), 1, "{UNTOUCHED_MSG}");
+    let text = buffer_text(&render(&mut panel, 80, 10));
+    assert!(text.contains(DONE_TEXT), "{UNTOUCHED_MSG}: {text}");
+    assert!(!text.contains(ERROR_TEXT), "{UNTOUCHED_MSG}: {text}");
 }

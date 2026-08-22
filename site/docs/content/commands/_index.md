@@ -13,7 +13,6 @@ Type `/` in the input box to open the command palette.
 
 | Command | Description |
 |---------|-------------|
-| `/tasks` | Browse and search tasks |
 | `/compact` | Summarize and compact conversation history |
 | `/new` | Start a new session |
 | `/help` | Show keybindings |
@@ -34,6 +33,7 @@ Type `/` in the input box to open the command palette.
 | `/memory` | View, edit, and delete memory files |
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |
+| `/tasks` | Browse and search tasks |
 
 ## Sessions
 

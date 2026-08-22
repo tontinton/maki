@@ -129,8 +129,9 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///
 /// Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 /// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
-/// `"SessionFocusChanged"`, and `"SessionStatusChanged"`. Plugins can also
-/// fire their own events with `exec_autocmds`.
+/// `"SessionFocusChanged"`, `"SessionStatusChanged"`, and
+/// `"TaskStatusChanged"`. Plugins can also fire their own events with
+/// `exec_autocmds`.
 ///
 /// Each host event carries `data.session_id`. For `"SessionReset"` that
 /// is the session being left behind; the other events name the session now
@@ -139,6 +140,11 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// initial startup. `"SessionStatusChanged"` fires whenever a session moves
 /// between `"working"`, `"needs_input"`, and `"idle"`; it carries
 /// `data.status`, `data.title`, and `data.focused` (boolean).
+/// `"TaskStatusChanged"` fires when a subagent starts, or when one moves
+/// between `"working"`, `"done"`, and `"error"`; it carries `data.id` and
+/// `data.name` alongside `data.status`. A task that comes back from disk
+/// already finished stays quiet, so reloading a session does not replay
+/// old tasks.
 ///
 /// @param event string|string[] Event name or list of names.
 /// @param opts table Options:

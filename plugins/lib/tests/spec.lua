@@ -1436,4 +1436,46 @@ case("render_lines_nil_sections_mix_with_grouped", function()
   eq(item_lines[2], 3, "nil-section item follows without a new header")
 end)
 
+local function mock_win()
+  local w = {}
+  function w:set_config(cfg)
+    self.reserved_top = cfg.reserved_top
+  end
+  return w
+end
+
+-- A query that wraps, or one pasted with a newline, grows the header past the
+-- single line a picker would guess. Whatever it draws is what the window pins,
+-- or the query scrolls out from under itself.
+case("render_header_pins_the_height_it_actually_drew", function()
+  local TextInput = require("maki.text_input")
+  local win = mock_win()
+  local input = TextInput.new()
+  local lines = {}
+
+  eq(ListPicker.render_header(win, lines, input, "> ", 40), 2, "empty query is one line plus a spacer")
+  eq(win.reserved_top, 2)
+  eq(#lines, 2)
+
+  input:insert_text(string.rep("x", 60))
+  lines = {}
+  eq(ListPicker.render_header(win, lines, input, "> ", 40), 3, "a wrapped query is two lines plus a spacer")
+  eq(win.reserved_top, 3)
+  eq(#lines, 3)
+
+  input:clear()
+  input:insert_text("a\nb")
+  lines = {}
+  eq(ListPicker.render_header(win, lines, input, "> ", 40), 3, "a pasted newline is two lines plus a spacer")
+  eq(win.reserved_top, 3)
+
+  -- Shrinking back matters too: a header pinned taller than it draws leaves a
+  -- gap and mis-scrolls the list under it.
+  input:clear()
+  lines = {}
+  eq(ListPicker.render_header(win, lines, input, "> ", 40), 2, "clearing the query shrinks the header back")
+  eq(win.reserved_top, 2)
+  eq(#lines, 2)
+end)
+
 th.report()

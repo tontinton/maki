@@ -4,9 +4,14 @@
 -- This plugin owns structured output and subagent concurrency; Rust exposes
 -- primitives only (`maki.agent.session`, `maki.json.schema_validator`,
 -- `maki.async.semaphore`).
+--
+-- It also owns the /tasks picker over the subagents spawned here: picker.lua
+-- registers the command and the keymap when this file is loaded, so the two
+-- cannot be enabled apart and left pointing at each other's absence.
 
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
+require("picker")
 
 local STRUCTURED_OUTPUT_NAME = "structured_output"
 local STRUCTURED_OUTPUT_DESCRIPTION = "Report your final result. Call it exactly once when your task is complete."

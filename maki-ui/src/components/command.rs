@@ -25,11 +25,6 @@ pub struct BuiltinCommand {
 
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
-        name: "/tasks",
-        description: "Browse and search tasks",
-        max_args: 0,
-    },
-    BuiltinCommand {
         name: "/compact",
         description: "Summarize and compact conversation history",
         max_args: 0,
@@ -687,7 +682,7 @@ mod tests {
     }
 
     #[test_case("/compact ", false ; "zero_arg_cmd_with_space")]
-    #[test_case("/tasks ", false   ; "zero_arg_tasks_with_space")]
+    #[test_case("/help ", false     ; "zero_arg_help_with_space")]
     #[test_case("/cd ", true        ; "one_arg_cmd_with_space")]
     #[test_case("/cd ~/foo", true   ; "one_arg_cmd_mid_arg")]
     #[test_case("/cd  ~/foo", true  ; "one_arg_cmd_double_space")]
@@ -882,7 +877,7 @@ mod tests {
 
     #[test_case("/cmp", "/compact" ; "compact_fuzzy")]
     #[test_case("/new", "/new" ; "new_exact")]
-    #[test_case("/tsk", "/tasks" ; "tasks_fuzzy")]
+    #[test_case("/thm", "/theme" ; "theme_fuzzy")]
     fn nucleo_highlights_matching_indices(input: &str, expected_cmd: &str) {
         let p = synced(input);
         assert!(p.is_active(), "Input '{}' should activate palette", input);

@@ -66,12 +66,16 @@ pub fn load_builtin_plugin_commands() -> Vec<LuaPluginCommand> {
     };
     let mut commands: Vec<LuaPluginCommand> = entries
         .filter_map(|e| e.ok())
-        .flat_map(|e| {
-            let path = e.path().join("init.lua");
-            let source = std::fs::read_to_string(&path).ok()?;
-            Some(parse_lua_commands(&source))
+        .flat_map(|plugin| {
+            std::fs::read_dir(plugin.path())
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "lua"))
+                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                .flat_map(|source| parse_lua_commands(&source))
+                .collect::<Vec<_>>()
         })
-        .flatten()
         .collect();
     commands.sort_by(|a, b| a.name.cmp(&b.name));
     commands

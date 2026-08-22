@@ -16,6 +16,7 @@ use maki_storage::id::SessionRef;
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
 
+const BUILTIN_COMMANDS: &[&str] = &["/sessions", "/rename", "/tasks"];
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
 const USAGE_TOOL_NAME: &str = "usage_child";
 const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
@@ -2745,16 +2746,16 @@ fn unload_clears_commands() {
     assert_eq!(host.command_reader().load().commands.len(), 0);
 }
 
+/// `/tasks` and `/sessions` used to be Rust commands. The plugins that took
+/// them over have to keep the names, or the palette quietly loses a row.
 #[test]
-fn sessions_plugin_registers_commands() {
+fn builtin_plugins_register_their_commands() {
     let (_reg, host) = builtins_host();
     let snap = host.command_reader().load();
     let names: Vec<&str> = snap.commands.iter().map(|c| c.name.as_ref()).collect();
-    assert!(
-        names.contains(&"/sessions"),
-        "missing /sessions in {names:?}"
-    );
-    assert!(names.contains(&"/rename"), "missing /rename in {names:?}");
+    for command in BUILTIN_COMMANDS {
+        assert!(names.contains(command), "missing {command} in {names:?}");
+    }
 }
 
 #[test]

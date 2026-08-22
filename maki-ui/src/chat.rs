@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::app::tasks::{TaskOutcome, TaskStatus};
 use crate::components::messages::{MessagesPanel, PromptProgress};
 use crate::components::tool_display::append_annotation;
 use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
@@ -52,7 +53,12 @@ pub struct Chat {
     pub model_id: Option<String>,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
-    finished: bool,
+    /// The ending and the index of the bubble announcing it, so a later, better
+    /// informed outcome can fix that bubble instead of appending a second one.
+    finish: Option<(TaskOutcome, usize)>,
+    /// `None` for the main chat, the subagent's `tool_use_id` otherwise. That
+    /// is the handle `maki.task` addresses a task by, see `app::tasks`.
+    task_id: Option<Arc<str>>,
 }
 
 impl Chat {
@@ -64,8 +70,29 @@ impl Chat {
             model_id: None,
             pending_turn_usage: None,
             messages_panel: MessagesPanel::new(ui_config, lua_event_handle),
-            finished: false,
+            finish: None,
+            task_id: None,
         }
+    }
+
+    pub(crate) fn subagent(
+        task_id: &str,
+        name: String,
+        ui_config: UiConfig,
+        lua_event_handle: maki_lua::EventHandle,
+    ) -> Self {
+        Self {
+            task_id: Some(Arc::from(task_id)),
+            ..Self::new(name, ui_config, lua_event_handle)
+        }
+    }
+
+    pub(crate) fn task_id(&self) -> Option<&Arc<str>> {
+        self.task_id.as_ref()
+    }
+
+    pub(crate) fn task_status(&self) -> TaskStatus {
+        self.finish.map(|(outcome, _)| outcome).into()
     }
 
     pub fn set_pending_turn_usage(&mut self, usage: String) {
@@ -305,18 +332,27 @@ impl Chat {
         self.messages_panel.push(msg);
     }
 
-    pub fn mark_finished(&mut self, role: DisplayRole, text: &str) {
-        if self.finished {
+    /// Ends the transcript with the bubble [`TaskOutcome::role`] picks. A chat
+    /// only ever grows one ending, but a caller who knows more than the one who
+    /// got here first rewrites it in place. See [`TaskOutcome::refines`].
+    pub(crate) fn mark_finished(&mut self, outcome: TaskOutcome, text: &str) {
+        if let Some((previous, bubble)) = self.finish {
+            if outcome.refines(previous) {
+                self.finish = Some((outcome, bubble));
+                self.messages_panel
+                    .replace(bubble, DisplayMessage::new(outcome.role(), text.into()));
+            }
             return;
         }
-        self.finished = true;
         self.messages_panel.flush();
-        self.messages_panel
-            .push(DisplayMessage::new(role, text.into()));
+        let bubble = self
+            .messages_panel
+            .push(DisplayMessage::new(outcome.role(), text.into()));
+        self.finish = Some((outcome, bubble));
     }
 
     pub fn is_finished(&self) -> bool {
-        self.finished
+        self.finish.is_some()
     }
 
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
@@ -363,6 +399,11 @@ impl Chat {
     #[cfg(test)]
     pub fn message_count(&self) -> usize {
         self.messages_panel.message_count()
+    }
+
+    #[cfg(test)]
+    pub fn message_at(&self, index: usize) -> Option<&DisplayMessage> {
+        self.messages_panel.message_at(index)
     }
 
     #[cfg(test)]
@@ -663,13 +704,44 @@ mod tests {
         HashMap::new()
     }
 
-    #[test]
-    fn tool_lifecycle() {
-        let mut chat = Chat::new(
-            "Main".into(),
+    const MAIN_NAME: &str = "Main";
+    const SUBAGENT_NAME: &str = "research";
+    const TASK_ID: &str = "toolu_01";
+    const USER_TEXT: &str = "one more thing";
+    const REPLY_TEXT: &str = "on it";
+
+    fn chat() -> Chat {
+        Chat::new(
+            MAIN_NAME.into(),
             UiConfig::default(),
             maki_lua::EventHandle::disconnected_for_test(),
-        );
+        )
+    }
+
+    fn subagent_chat() -> Chat {
+        Chat::subagent(
+            TASK_ID,
+            SUBAGENT_NAME.into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+        )
+    }
+
+    fn end(chat: &mut Chat, outcome: TaskOutcome) {
+        let text = match outcome {
+            TaskOutcome::Error => ERROR_TEXT,
+            TaskOutcome::Unknown | TaskOutcome::Done => DONE_TEXT,
+        };
+        chat.mark_finished(outcome, text);
+    }
+
+    fn text_delta(chat: &mut Chat, text: &str) {
+        chat.handle_event(AgentEvent::TextDelta { text: text.into() }, None);
+    }
+
+    #[test]
+    fn tool_lifecycle() {
+        let mut chat = chat();
         chat.handle_event(tool_start("t1", "bash"), None);
         assert_eq!(chat.in_progress_count(), 1);
 
@@ -682,11 +754,7 @@ mod tests {
 
     #[test]
     fn plan_write_renders_file_content() {
-        let mut chat = Chat::new(
-            "Main".into(),
-            UiConfig::default(),
-            maki_lua::EventHandle::disconnected_for_test(),
-        );
+        let mut chat = chat();
         let dir = tempfile::tempdir().unwrap();
         let plan_path = dir.path().join("plan.md");
         std::fs::write(&plan_path, "# My Plan\n\n- Step 1").unwrap();
@@ -706,11 +774,7 @@ mod tests {
 
     #[test]
     fn plan_write_ignores_different_path() {
-        let mut chat = Chat::new(
-            "Main".into(),
-            UiConfig::default(),
-            maki_lua::EventHandle::disconnected_for_test(),
-        );
+        let mut chat = chat();
         let plan_path = Path::new("/plans/123.md");
         chat.handle_event(tool_start("w1", "write"), Some(plan_path));
         let (output, wp) = write_output("src/main.rs");
@@ -723,11 +787,7 @@ mod tests {
 
     #[test]
     fn plan_edit_shows_path_only() {
-        let mut chat = Chat::new(
-            "Main".into(),
-            UiConfig::default(),
-            maki_lua::EventHandle::disconnected_for_test(),
-        );
+        let mut chat = chat();
         let dir = tempfile::tempdir().unwrap();
         let plan_path = dir.path().join("plan.md");
         std::fs::write(&plan_path, "# My Plan\n\n- Step 1").unwrap();
@@ -1045,11 +1105,7 @@ mod tests {
 
     #[test]
     fn compaction_done_flushes_streaming_buffers() {
-        let mut chat = Chat::new(
-            "Main".into(),
-            UiConfig::default(),
-            maki_lua::EventHandle::disconnected_for_test(),
-        );
+        let mut chat = chat();
 
         chat.handle_event(AgentEvent::AutoCompacting, None);
         assert_eq!(chat.message_count(), 1);
@@ -1078,5 +1134,122 @@ mod tests {
         chat.flush();
         assert_eq!(chat.message_count(), 4);
         assert_eq!(chat.last_message_text(), "new");
+    }
+
+    /// The transcript keeps growing after the ending, since the subagent chat
+    /// stays on screen while the parent turn talks on. A fix aimed at the last
+    /// message would eat whatever landed in between.
+    #[test]
+    fn a_correction_rewrites_the_recorded_bubble_not_the_last_one() {
+        let mut chat = chat();
+        end(&mut chat, TaskOutcome::Unknown);
+        let ending = chat.message_count() - 1;
+
+        chat.show_user_message(USER_TEXT);
+        text_delta(&mut chat, REPLY_TEXT);
+        chat.flush();
+        let before = chat.message_count();
+
+        end(&mut chat, TaskOutcome::Error);
+
+        assert_eq!(chat.message_count(), before);
+        let bubble = chat
+            .message_at(ending)
+            .expect("recorded ending still there");
+        assert_eq!(bubble.text, ERROR_TEXT);
+        assert_eq!(bubble.role, DisplayRole::Error);
+        assert_eq!(
+            chat.message_at(ending + 1).map(|m| &m.role),
+            Some(&DisplayRole::User)
+        );
+        assert_eq!(
+            chat.message_at(ending + 1).map(|m| m.text.as_str()),
+            Some(USER_TEXT)
+        );
+        assert_eq!(chat.last_message_text(), REPLY_TEXT);
+        assert_eq!(chat.last_message_role(), Some(&DisplayRole::Assistant));
+    }
+
+    /// The stream is flushed before the ending is pushed, so a reply still in
+    /// the buffer keeps its place ahead of it and the recorded index points at
+    /// the ending, not at the flushed text.
+    #[test]
+    fn a_pending_stream_lands_before_the_ending_bubble() {
+        let mut chat = chat();
+        text_delta(&mut chat, REPLY_TEXT);
+        assert!(!chat.streaming_text_is_empty());
+
+        end(&mut chat, TaskOutcome::Unknown);
+
+        assert!(chat.streaming_text_is_empty());
+        assert_eq!(chat.message_count(), 2);
+        assert_eq!(
+            chat.message_at(0).map(|m| m.text.as_str()),
+            Some(REPLY_TEXT)
+        );
+        assert_eq!(chat.last_message_text(), DONE_TEXT);
+
+        end(&mut chat, TaskOutcome::Error);
+
+        assert_eq!(chat.message_count(), 2);
+        assert_eq!(
+            chat.message_at(0).map(|m| m.text.as_str()),
+            Some(REPLY_TEXT)
+        );
+        assert_eq!(
+            chat.message_at(0).map(|m| &m.role),
+            Some(&DisplayRole::Assistant)
+        );
+        assert_eq!(chat.last_message_text(), ERROR_TEXT);
+        assert_eq!(chat.last_message_role(), Some(&DisplayRole::Error));
+    }
+
+    /// Every order two endings can arrive in. Only the placeholder gives way,
+    /// a verdict is never walked back, and no order grows a second bubble.
+    #[test_case(TaskOutcome::Unknown, TaskOutcome::Done, DONE_TEXT, DisplayRole::Done, TaskStatus::Done   ; "placeholder_settles_as_done")]
+    #[test_case(TaskOutcome::Unknown, TaskOutcome::Error, ERROR_TEXT, DisplayRole::Error, TaskStatus::Error ; "placeholder_corrected_to_error")]
+    #[test_case(TaskOutcome::Done, TaskOutcome::Error, DONE_TEXT, DisplayRole::Done, TaskStatus::Done     ; "verdict_survives_late_error")]
+    #[test_case(TaskOutcome::Error, TaskOutcome::Done, ERROR_TEXT, DisplayRole::Error, TaskStatus::Error  ; "verdict_survives_late_done")]
+    #[test_case(TaskOutcome::Done, TaskOutcome::Done, DONE_TEXT, DisplayRole::Done, TaskStatus::Done      ; "repeated_verdict")]
+    #[test_case(TaskOutcome::Unknown, TaskOutcome::Unknown, DONE_TEXT, DisplayRole::Done, TaskStatus::Done ; "repeated_placeholder")]
+    fn a_second_ending_never_adds_a_bubble(
+        first: TaskOutcome,
+        second: TaskOutcome,
+        text: &str,
+        role: DisplayRole,
+        status: TaskStatus,
+    ) {
+        let mut chat = chat();
+        chat.show_user_message(USER_TEXT);
+        end(&mut chat, first);
+        let count = chat.message_count();
+
+        end(&mut chat, second);
+
+        assert_eq!(chat.message_count(), count);
+        assert_eq!(chat.last_message_text(), text);
+        assert_eq!(chat.last_message_role(), Some(&role));
+        assert_eq!(chat.task_status(), status);
+    }
+
+    /// The shape `maki.task.list()` serializes: the main chat is not a task,
+    /// and a subagent is one from the moment it starts, working until an
+    /// ending lands on it.
+    #[test]
+    fn only_a_subagent_reports_a_task_and_its_status() {
+        let main = chat();
+        assert!(main.task_id().is_none());
+        assert!(!main.is_finished());
+
+        let mut sub = subagent_chat();
+        assert_eq!(sub.task_id().map(|id| &**id), Some(TASK_ID));
+        assert_eq!(sub.task_status(), TaskStatus::Working);
+        assert!(!sub.is_finished());
+
+        end(&mut sub, TaskOutcome::Error);
+
+        assert!(sub.is_finished());
+        assert_eq!(sub.task_status(), TaskStatus::Error);
+        assert_eq!(sub.task_id().map(|id| &**id), Some(TASK_ID));
     }
 }

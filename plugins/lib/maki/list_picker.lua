@@ -180,6 +180,20 @@ local function render_lines(items, selected, width, query)
   return lines, item_lines
 end
 
+-- Draws the filter query and its blank spacer into {lines}, pins that height on
+-- {win} and returns it, which is also the first scrollable line. Drawing and
+-- pinning belong together: a query that wraps, or one pasted with a newline,
+-- makes the header taller than a picker would guess, and a reserved_top guessed
+-- elsewhere then mis-scrolls the list.
+function ListPicker.render_header(win, lines, input, prefix, inner)
+  for _, ln in ipairs(input:render(prefix, utf8.len(prefix) or #prefix, inner).lines) do
+    lines[#lines + 1] = ln
+  end
+  lines[#lines + 1] = {}
+  win:set_config({ reserved_top = #lines })
+  return #lines
+end
+
 -- Open a fuzzy-filter picker in a floating window and block until the user
 -- decides. {items} is a list of strings or { label, detail? } tables. {opts}:
 -- title, footer, cursor (initial index), submit_keys (extra submit keys

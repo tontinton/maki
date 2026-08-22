@@ -16,6 +16,7 @@ pub(crate) mod options;
 pub(crate) mod session;
 pub(crate) mod slot;
 pub(crate) mod split;
+pub(crate) mod task;
 pub(crate) mod text;
 pub(crate) mod tool;
 pub(crate) mod treesitter;
@@ -74,6 +75,7 @@ pub(crate) fn create_maki_global(
         "model",
         model::create_model_table(lua, ui_action_tx.clone())?,
     )?;
+    maki.set("task", task::create_task_table(lua, ui_action_tx.clone())?)?;
     maki.set(
         "ui",
         ui::create_ui_table(lua, ui_action_tx.clone(), Arc::clone(&plugin))?,

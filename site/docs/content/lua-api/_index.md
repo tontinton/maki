@@ -104,6 +104,7 @@ The rules:
 | [`maki.model`](#maki-model) | The model behind the focused session. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
 | [`maki.session`](#maki-session) | Host session primitives. |
+| [`maki.task`](#maki-task) | The subagents of the focused session and their transcripts. |
 | [`maki.text`](#maki-text) | Text transformation utilities. |
 | [`maki.treesitter`](#maki-treesitter) | Tree-sitter parsing and query API. |
 | [`maki.treesitter.language`](#maki-treesitter-language) | Language registry for tree-sitter grammars. |
@@ -562,8 +563,9 @@ Listen for one or more events. Returns an id you can pass to
 
 Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
-`"SessionFocusChanged"`, and `"SessionStatusChanged"`. Plugins can also
-fire their own events with `exec_autocmds`.
+`"SessionFocusChanged"`, `"SessionStatusChanged"`, and
+`"TaskStatusChanged"`. Plugins can also fire their own events with
+`exec_autocmds`.
 
 Each host event carries `data.session_id`. For `"SessionReset"` that
 is the session being left behind; the other events name the session now
@@ -572,6 +574,11 @@ running or focused. Tool events also carry `data.tool_id` and `data.tool`.
 initial startup. `"SessionStatusChanged"` fires whenever a session moves
 between `"working"`, `"needs_input"`, and `"idle"`; it carries
 `data.status`, `data.title`, and `data.focused` (boolean).
+`"TaskStatusChanged"` fires when a subagent starts, or when one moves
+between `"working"`, `"done"`, and `"error"`; it carries `data.id` and
+`data.name` alongside `data.status`. A task that comes back from disk
+already finished stays quiet, so reloading a session does not replay
+old tasks.
 
 **Parameters:**
 
@@ -2974,6 +2981,61 @@ local _, err = maki.session.set_title({ id = id, title = "refactor" })
 ```
 
 
+## maki.task {#maki-task}
+
+The subagents of the focused session and their transcripts. Tasks are
+spawned by the `task` tool and addressed by an id that survives a reload.
+Without an interactive UI every function returns
+`nil, "no interactive UI attached"`.
+
+---
+
+### `maki.task.list()` {#maki-task-list}
+
+```lua
+maki.task.list()
+```
+
+Lists the focused session's chats in chat order. Entry 1 is always the main
+chat, with id `"main"` and no `status`: its work is the session's own, and
+`maki.session.live()` already reports that. The rest are subagents, keyed by
+the tool call that spawned them.
+
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, name, focused, status?}` where
+  `status` is `"working"`, `"done"`, or `"error"`, or nil and an error.
+
+**Example:**
+
+```lua
+for _, t in ipairs(maki.task.list() or {}) do
+  print(t.name, t.status or "main")
+end
+```
+
+---
+
+### `maki.task.focus()` {#maki-task-focus}
+
+```lua
+maki.task.focus({id})
+```
+
+Shows a task's transcript, the way the chat cycling keys do. An id from
+another session returns an error instead of landing on the wrong task.
+
+**Parameters:**
+
+- `{id}` (`string`) Task id, as returned by `list()`. `"main"` is the main chat.
+
+**Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+
+**Example:**
+
+```lua
+local _, err = maki.task.focus("main")
+```
+
+
 ## maki.text {#maki-text}
 
 Text transformation utilities.
@@ -4404,7 +4466,7 @@ would. Handy when a default key never reaches maki because tmux or
 your terminal grabs it first: bind a new key with `maki.keymap.set`
 and call this from it.
 
-Valid names: `"file_picker"`, `"search"`, `"tasks"`, `"help"`,
+Valid names: `"file_picker"`, `"search"`, `"help"`,
 `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
 `"prev_chat"`, `"next_chat"`.
 
@@ -5144,6 +5206,13 @@ function M.replace(content, old_string, new_string, replace_all)
 ### `require("maki.list_picker")`
 
 ```lua
+-- Draws the filter query and its blank spacer into {lines}, pins that height on
+-- {win} and returns it, which is also the first scrollable line. Drawing and
+-- pinning belong together: a query that wraps, or one pasted with a newline,
+-- makes the header taller than a picker would guess, and a reserved_top guessed
+-- elsewhere then mis-scrolls the list.
+function ListPicker.render_header(win, lines, input, prefix, inner)
+
 -- Open a fuzzy-filter picker in a floating window and block until the user
 -- decides. {items} is a list of strings or { label, detail? } tables. {opts}:
 -- title, footer, cursor (initial index), submit_keys (extra submit keys

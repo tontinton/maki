@@ -25,7 +25,7 @@ use maki_agent::{
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionRequest,
-    UiAction, UiReply,
+    TaskRequest, UiAction, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -40,6 +40,7 @@ use tracing::{info, warn};
 use crate::AppSession;
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
 use crate::app::shell::{ShellEvent, spawn_shell};
+use crate::app::tasks::{TaskStatus, diff_task_states};
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
 use crate::color_compat;
 use crate::components::input::Submission;
@@ -265,6 +266,9 @@ struct SessionRuntime {
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     last_status: SessionStatus,
+    /// Keyed by task id, never by position: a session reset reuses positions,
+    /// so a new task would inherit the old one's status.
+    last_tasks: Vec<(Arc<str>, TaskStatus)>,
     notifications: RunNotificationState,
 }
 
@@ -362,6 +366,7 @@ impl SpawnCtx {
             shell_tx,
             shell_rx,
             last_status: SessionStatus::Idle,
+            last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
         }
     }
@@ -775,6 +780,7 @@ impl<'t> EventLoop<'t> {
         self.emit_focus_change();
         dirty |= self.start_mailbox_runs();
         self.emit_status_changes();
+        self.emit_task_changes();
         self.emit_notifications();
         // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
         // can never send it, so fail instead of hanging forever.
@@ -819,6 +825,9 @@ impl<'t> EventLoop<'t> {
             }
             UiAction::Model { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_model_request(req));
+            }
+            UiAction::Task { req, reply_tx } => {
+                let _ = reply_tx.send(self.handle_task_request(req));
             }
             UiAction::WinSaveView { reply_tx } => {
                 let _ = reply_tx.send(self.focused_app().win_view());
@@ -884,6 +893,26 @@ impl<'t> EventLoop<'t> {
                     "focused": i == self.focused,
                 }),
             );
+        }
+    }
+
+    /// One diff per frame covers every path that finishes, cancels or errors a
+    /// chat, so none of them has to remember to fire an event.
+    fn emit_task_changes(&mut self) {
+        let handle = &self.ctx.lua_event_handle;
+        for rt in &mut self.sessions {
+            let session_id = rt.app.state.session.id;
+            diff_task_states(&mut rt.last_tasks, rt.app.task_states(), |task| {
+                handle.fire_autocmd(
+                    "TaskStatusChanged",
+                    json!({
+                        "session_id": session_id,
+                        "id": task.id,
+                        "name": task.name,
+                        "status": task.status,
+                    }),
+                );
+            });
         }
     }
 
@@ -1094,6 +1123,13 @@ impl<'t> EventLoop<'t> {
                 }
                 Ok(app.model_state())
             }
+        }
+    }
+
+    fn handle_task_request(&mut self, req: TaskRequest) -> UiReply {
+        match req {
+            TaskRequest::List => Ok(json!(self.focused_app().tasks())),
+            TaskRequest::Focus { id } => self.focused_app().focus_task(&id).map(|()| json!(true)),
         }
     }
 

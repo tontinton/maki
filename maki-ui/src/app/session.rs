@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+use crate::app::tasks::TaskOutcome;
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
-use crate::components::DisplayRole;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{Action, LoadedSession};
 use maki_agent::agent::estimate_message_tokens;
@@ -178,7 +178,6 @@ impl App {
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.status_bar.clear_flash();
-        self.task_picker_original = None;
         self.last_esc = None;
         self.restoring = Arc::new(AtomicBool::new(false));
         self.plan_form.reset();
@@ -210,25 +209,34 @@ impl App {
         // mirrors back, so emptying the session here would only make the next
         // checkpoint write the same list again.
         for sa in self.state.session.subagents().to_vec() {
-            let idx = self.chats.len();
-            self.chat_index.insert(sa.tool_use_id.clone(), idx);
-            let mut chat = Chat::new(
+            // A subagent reaches disk when it spawns but its transcript only
+            // when it ends, so one without an entry here never got to finish:
+            // leftovers from a kill mid-turn. It has nothing to show, and
+            // restoring it would park a task no agent backs at the top of the
+            // picker, running forever. `sync_subagents` below drops it for good.
+            let Some(messages) = self.state.session.subagent_messages().get(&sa.tool_use_id) else {
+                continue;
+            };
+            let (display, items) = history_to_display(
+                messages,
+                self.state.session.tool_outputs(),
+                &self.ui_config.tool_output_lines,
+            );
+            self.chat_index
+                .insert(sa.tool_use_id.clone(), self.chats.len());
+            let mut chat = Chat::subagent(
+                &sa.tool_use_id,
                 sa.name,
                 self.ui_config.clone(),
                 self.lua_event_handle.clone(),
             );
             chat.set_restore_channel(self.restore_event_tx.clone());
             chat.model_id = sa.model;
-            if let Some(messages) = self.state.session.subagent_messages().get(&sa.tool_use_id) {
-                let (display, items) = history_to_display(
-                    messages,
-                    self.state.session.tool_outputs(),
-                    &self.ui_config.tool_output_lines,
-                );
-                chat.load_messages(display);
-                chat.mark_finished(DisplayRole::Done, DONE_TEXT);
-                self.fire_restore_items(items);
-            }
+            chat.load_messages(display);
+            // The session file keeps the transcript but never how it ended,
+            // so a reload admits that instead of guessing.
+            chat.mark_finished(TaskOutcome::Unknown, DONE_TEXT);
+            self.fire_restore_items(items);
             self.chats.push(chat);
         }
 

@@ -142,7 +142,6 @@ pub mod key {
     pub const FILE_PICKER: Bind = ctrl_bind!('s');
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
     pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
-    pub const TASKS: Bind = ctrl_bind!('x');
     pub const MODEL_PICKER: Bind = ctrl_bind!('m');
     pub const REFRESH: Bind = ctrl_bind!('r');
     pub const SUSPEND: Bind = ctrl_bind!('z');
@@ -164,7 +163,6 @@ pub enum KeybindContext {
     Streaming,
     Picker,
     FormInput,
-    TaskPicker,
     RewindPicker,
     ThemePicker,
     ModelPicker,
@@ -182,7 +180,6 @@ impl KeybindContext {
             Self::Streaming => "While Streaming",
             Self::Picker => "Pickers",
             Self::FormInput => "Form",
-            Self::TaskPicker => "Task Picker",
             Self::RewindPicker => "Rewind Picker",
             Self::ThemePicker => "Theme Picker",
             Self::ModelPicker => "Model Picker",
@@ -195,8 +192,7 @@ impl KeybindContext {
 
     pub const fn parent(self) -> Option<KeybindContext> {
         match self {
-            Self::TaskPicker
-            | Self::RewindPicker
+            Self::RewindPicker
             | Self::ThemePicker
             | Self::ModelPicker
             | Self::QueueFocus
@@ -336,12 +332,6 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::PLAN_TOGGLE.label),
         description: "Toggle plan panel",
-        context: KeybindContext::General,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::TASKS.label),
-        description: "Open tasks",
         context: KeybindContext::General,
         platform: Platform::All,
     },
