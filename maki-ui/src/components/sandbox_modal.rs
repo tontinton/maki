@@ -1075,16 +1075,23 @@ impl SandboxModal {
                 if mount.usage == MountUsage::OnlyPath {
                     continue;
                 }
-                let name = mount.dir_name();
-                lines.push(Line::from(Span::styled(
+                let label = if mount.usage == MountUsage::SymLink {
                     format!(
-                        "    /home/maki/{name}  ←  {}  ({})  [{}]",
+                        "    {}  →  {}  (symlink)  [{}]",
+                        mount.sandbox_internal_path(),
+                        mount.path,
+                        profile.name
+                    )
+                } else {
+                    format!(
+                        "    /home/maki/{}  ←  {}  ({})  [{}]",
+                        mount.dir_name(),
                         mount.path,
                         mount.usage.label(),
                         profile.name
-                    ),
-                    Style::default(),
-                )));
+                    )
+                };
+                lines.push(Line::from(Span::styled(label, Style::default())));
             }
         }
 
@@ -1419,6 +1426,7 @@ mod tests {
     use super::*;
     use crate::components::key as key_ev;
     use crossterm::event::KeyCode;
+    use maki_sandbox::profiles::ProfileMount;
     use test_case::test_case;
 
     fn test_info() -> SandboxInfo {
@@ -1541,6 +1549,46 @@ mod tests {
         assert_eq!(modal.info_focus, Some(InfoFocus::Profile(0)));
         modal.handle_key(key_ev(KeyCode::Down));
         assert_eq!(modal.info_focus, Some(InfoFocus::Profile(1)));
+    }
+
+    #[test]
+    fn info_renders_symlink_mounts_at_absolute_sandbox_path() {
+        let profile = SandboxProfile {
+            name: "rust".into(),
+            mounts: vec![
+                ProfileMount::rw("~/.cargo"),
+                ProfileMount::sym_link("/etc/alternatives/cc"),
+            ],
+        };
+        let mut modal = SandboxModal::new(
+            SandboxInfo {
+                enabled: true,
+                env_entries: vec![],
+                allowed_env: vec![],
+                workspace_dir: "/tmp".into(),
+                workspace_name: "tmp".into(),
+                home_mounts: vec![],
+                profiles: vec![(profile, true)],
+                extra_workspace_dirs: vec![],
+            },
+            None,
+        );
+        let mut lines = Vec::new();
+        modal.render_info(&mut lines);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("/etc/alternatives/cc  →  /etc/alternatives/cc"),
+            "symlink should render as absolute sandbox path, got:\n{text}"
+        );
+        assert!(
+            !text.contains("/home/maki//etc"),
+            "symlink must not be treated as a home-relative path"
+        );
+        assert!(text.contains("/home/maki/.cargo  ←  "));
     }
 
     #[test]
