@@ -115,7 +115,7 @@ local function build_grep_view(entries, ctx)
       end
     end
   end
-  local nr_fmt = "%" .. math.max(1, math.floor(math.log(max_nr + 1, 10)) + 1) .. "d "
+  local nr_fmt = ToolView.line_nr_fmt(max_nr) .. " "
 
   local hl_tasks = {}
 

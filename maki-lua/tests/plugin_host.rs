@@ -4017,11 +4017,10 @@ mod read_tool_required_params {
     }
 
     #[test]
-    fn limit_zero_parses_and_reads_to_cap() {
+    fn limit_zero_reads_to_end_with_right_aligned_line_numbers() {
         let (reg, _host) = builtins_host();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.txt");
-        // Write 100 lines
         let content = (1..=100i32)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
@@ -4038,14 +4037,13 @@ mod read_tool_required_params {
             }),
         );
         let out = out.expect("read should succeed");
-        // limit=0 means read to end (capped at 2000). 100 lines < 2000, so all should be read.
         assert!(
-            out.contains("1: line 1"),
-            "should start at line 1, got: {out}"
+            out.starts_with("  1: line 1\n"),
+            "line 1 must be padded to the width of line 100, got: {out}"
         );
         assert!(
-            out.contains("100: line 100"),
-            "should include last line, got: {out}"
+            out.ends_with("\n100: line 100"),
+            "limit=0 should read to the end, got: {out}"
         );
     }
 

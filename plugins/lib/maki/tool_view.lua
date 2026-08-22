@@ -15,9 +15,10 @@ local function format_line_nr(fmt, idx)
   return { string.format(fmt, idx), "line_nr" }
 end
 
-local function line_nr_fmt(count)
-  local w = math.max(1, math.floor(math.log(count, 10)) + 1)
-  return "%" .. w .. "d "
+-- Right aligned, so the content column stays put when a number gains a digit.
+-- Formats the number alone, callers add their own separator.
+function ToolView.line_nr_fmt(max_line_nr)
+  return "%" .. #tostring(max_line_nr) .. "d"
 end
 
 -- Truncate a UTF-8 string at a byte boundary that is also a codepoint
@@ -190,7 +191,7 @@ function ToolView:set_highlight(content, ext)
   end
   local lines = maki.split(content, "\n")
 
-  local fmt = line_nr_fmt(#lines)
+  local fmt = ToolView.line_nr_fmt(#lines) .. " "
   for idx, line in ipairs(lines) do
     self:append({ format_line_nr(fmt, idx), { line } })
   end

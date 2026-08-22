@@ -8,6 +8,7 @@ local SINGLE_CANDIDATE_THRESHOLD = 0.0
 local MULTI_CANDIDATE_THRESHOLD = 0.3
 local CONTEXT_AWARE_LINE_MIN = 3
 local CONTEXT_AWARE_MATCH_RATIO = 0.5
+local INDENT_PATTERN = "^[ \t]*"
 
 local function split_lines(s)
   local lines = {}
@@ -42,6 +43,86 @@ end
 
 local function trim(s)
   return s:match("^%s*(.-)%s*$")
+end
+
+local function indent_of(line)
+  return line:match(INDENT_PATTERN)
+end
+
+-- Only `old_string` was ever checked against the file, so the drift between the
+-- two is the sole evidence of what the matcher forgave. Positions correspond
+-- when the line counts agree, which every matcher but `block_anchor` guarantees;
+-- otherwise only lines whose content agrees are the same line.
+local function indent_drift(matched, find)
+  local file_lines, model_lines = split_lines(matched), split_lines(find)
+  local paired_by_position = #file_lines == #model_lines
+  local drift, forgave = {}, false
+  for i = 1, math.min(#file_lines, #model_lines) do
+    local file_line, model_line = file_lines[i], model_lines[i]
+    local same_line = paired_by_position or trim(file_line) == trim(model_line)
+    if same_line and trim(file_line) ~= "" and trim(model_line) ~= "" then
+      local model_indent, file_indent = indent_of(model_line), indent_of(file_line)
+      if drift[model_indent] == nil then
+        drift[model_indent] = file_indent
+        forgave = forgave or model_indent ~= file_indent
+      end
+    end
+  end
+  return forgave and drift or nil
+end
+
+-- A column the model never used is extrapolated from the deepest one it did, so
+-- a level the replacement adds keeps the shape the model gave it. A column
+-- shallower than any in the block belongs to a line that leaves the block, a new
+-- top level definition say, so it stays where the model put it.
+local function rebase(drift, indent)
+  local exact_column = drift[indent]
+  if exact_column then
+    return exact_column
+  end
+  local deepest
+  for model_indent in pairs(drift) do
+    if #model_indent < #indent and indent:sub(1, #model_indent) == model_indent then
+      if not deepest or #model_indent > #deepest then
+        deepest = model_indent
+      end
+    end
+  end
+  return deepest and drift[deepest] .. indent:sub(#deepest + 1) or indent
+end
+
+-- The model can write `old_string` sloppily and `new_string` in the file's own
+-- frame, and then there is nothing left to correct.
+local function written_in_file_frame(drift, replacement)
+  local file_columns = {}
+  for _, file_indent in pairs(drift) do
+    file_columns[file_indent] = true
+  end
+  for _, line in ipairs(split_lines(replacement)) do
+    if trim(line) ~= "" and not file_columns[indent_of(line)] then
+      return false
+    end
+  end
+  return true
+end
+
+-- Corrects exactly what the match forgave in `old_string`, and nothing else.
+local function reindent(matched, find, replacement)
+  local drift = indent_drift(matched, find)
+  if not drift or written_in_file_frame(drift, replacement) then
+    return replacement
+  end
+
+  local out = {}
+  for i, line in ipairs(split_lines(replacement)) do
+    local indent = indent_of(line)
+    if trim(line) == "" then
+      out[i] = line
+    else
+      out[i] = rebase(drift, indent) .. line:sub(#indent + 1)
+    end
+  end
+  return table.concat(out, "\n")
 end
 
 local function escape_pattern(s)
@@ -468,20 +549,44 @@ end
 local REPLACERS = { exact, line_trimmed, block_anchor, whitespace_normalized, indentation_flexible }
 local LATE_REPLACERS = { trimmed_boundary, context_aware }
 
-local function replace_all_occurrences(content, matched, replacement)
-  local result = {}
+-- An empty candidate matches at every offset and would splice forever, so it
+-- is made to match nowhere instead.
+local function occurrences(content, matched)
+  local at = {}
+  if matched == "" then
+    return at
+  end
   local pos = 1
   while true do
-    local s, e = content:find(matched, pos, true)
+    local s = content:find(matched, pos, true)
     if not s then
-      break
+      return at
     end
-    result[#result + 1] = content:sub(pos, s - 1)
-    result[#result + 1] = replacement
-    pos = e + 1
+    at[#at + 1] = s
+    pos = s + #matched
   end
-  result[#result + 1] = content:sub(pos)
-  return table.concat(result)
+end
+
+local function splice(content, at, len, replacement)
+  local out, pos = {}, 1
+  for _, s in ipairs(at) do
+    out[#out + 1] = content:sub(pos, s - 1)
+    out[#out + 1] = replacement
+    pos = s + len
+  end
+  out[#out + 1] = content:sub(pos)
+  return table.concat(out)
+end
+
+-- Indentation only means something for a block that starts its own line; a match
+-- landing mid line keeps whatever the model wrote.
+local function all_start_a_line(content, at)
+  for _, s in ipairs(at) do
+    if s > 1 and content:sub(s - 1, s - 1) ~= "\n" then
+      return false
+    end
+  end
+  return true
 end
 
 -- Replace {old_string} with {new_string} in {content}, tolerating small
@@ -494,16 +599,17 @@ function M.replace(content, old_string, new_string, replace_all)
 
   local any_found = false
 
-  local function try_match(candidates, replacement)
+  local function try_match(candidates, find, replacement)
     for _, matched in ipairs(candidates) do
-      local first = content:find(matched, 1, true)
-      if first then
+      local at = occurrences(content, matched)
+      if #at > 0 then
         any_found = true
-        if replace_all then
-          return replace_all_occurrences(content, matched, replacement)
-        end
-        if not content:find(matched, first + #matched, true) then
-          return content:sub(1, first - 1) .. replacement .. content:sub(first + #matched)
+        if replace_all or #at == 1 then
+          local text = replacement
+          if all_start_a_line(content, at) then
+            text = reindent(matched, find, replacement)
+          end
+          return splice(content, at, #matched, text)
         end
       end
     end
@@ -511,7 +617,7 @@ function M.replace(content, old_string, new_string, replace_all)
   end
 
   for _, r in ipairs(REPLACERS) do
-    local res = try_match(r(content, old_string), new_string)
+    local res = try_match(r(content, old_string), old_string, new_string)
     if res then
       return res, nil
     end
@@ -519,14 +625,14 @@ function M.replace(content, old_string, new_string, replace_all)
 
   local unescaped = unescape(old_string)
   if unescaped ~= old_string then
-    local res = try_match(escape_normalized(content, unescaped), unescape(new_string))
+    local res = try_match(escape_normalized(content, unescaped), unescaped, unescape(new_string))
     if res then
       return res, nil
     end
   end
 
   for _, r in ipairs(LATE_REPLACERS) do
-    local res = try_match(r(content, old_string), new_string)
+    local res = try_match(r(content, old_string), old_string, new_string)
     if res then
       return res, nil
     end

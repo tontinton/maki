@@ -34,11 +34,6 @@ local function new_view(ctx, buf)
   return ToolView.new(buf, { max_lines = ctx:tool_output_lines().code_execution or 30 })
 end
 
-local function line_nr_fmt(count)
-  local w = math.max(1, math.floor(math.log(count, 10)) + 1)
-  return "%" .. w .. "d "
-end
-
 -- One body builder for every path (start preview, handler, restore), so the
 -- script renders the same no matter which lifecycle callbacks ran. The
 -- header is always rebuilt from scratch; nothing mutates existing lines.
@@ -51,7 +46,7 @@ local function build_body(ctx, code)
   local function header()
     local total = #lines
     local shown = view.expanded and total or math.min(total, MAX_SCRIPT_LINES)
-    local fmt = line_nr_fmt(shown)
+    local fmt = ToolView.line_nr_fmt(shown) .. " "
     local out = {}
     for i = 1, shown do
       local spans = { { string.format(fmt, i), "line_nr" } }

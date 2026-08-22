@@ -1,73 +1,12 @@
-local function line_nr_fmt(count)
-  local w = math.max(1, math.floor(math.log(count + 1, 10)) + 1)
-  return "%" .. w .. "d "
-end
+local helpers = require("read_helpers")
 
-local function truncate_bytes(line, max_bytes)
-  if #line <= max_bytes then
-    return line
-  end
-  local i = max_bytes
-  while i > 0 and line:byte(i) >= 0x80 and line:byte(i) < 0xC0 do
-    i = i - 1
-  end
-  if i > 0 and line:byte(i) >= 0xC0 then
-    i = i - 1
-  end
-  return line:sub(1, i) .. "..."
-end
-
-local function split_lines(content)
-  local lines = {}
-  local pos = 1
-  while pos <= #content do
-    local nl = content:find("\n", pos, true)
-    if nl then
-      local line = content:sub(pos, nl - 1)
-      lines[#lines + 1] = line:find("\r$") and line:sub(1, -2) or line
-      pos = nl + 1
-    else
-      local line = content:sub(pos)
-      lines[#lines + 1] = line:find("\r$") and line:sub(1, -2) or line
-      pos = #content + 1
-    end
-  end
-  return lines
-end
+local truncate_bytes = helpers.truncate_bytes
+local split_lines = helpers.split_lines
 
 local th = require("maki.test_helpers")
 
 local case = th.case
 local eq = th.eq
-local mktmpdir = function()
-  return th.mktmpdir("read_spec")
-end
-local rmtree = th.rmtree
-
--- line_nr_fmt: table-driven across all boundaries + alignment
-
-case("line_nr_fmt_boundaries_and_alignment", function()
-  local vectors = {
-    { 0, "%1d " },
-    { 1, "%1d " },
-    { 8, "%1d " },
-    { 9, "%2d " },
-    { 10, "%2d " },
-    { 98, "%2d " },
-    { 99, "%3d " },
-    { 100, "%3d " },
-    { 999, "%4d " },
-    { 1000, "%4d " },
-  }
-  for _, v in ipairs(vectors) do
-    eq(line_nr_fmt(v[1]), v[2], "count=" .. v[1])
-  end
-  local fmt = line_nr_fmt(100)
-  eq(string.format(fmt, 1), "  1 ")
-  eq(string.format(fmt, 100), "100 ")
-end)
-
--- truncate_bytes: ASCII + all UTF-8 widths
 
 case("truncate_ascii", function()
   eq(truncate_bytes("", 10), "")
@@ -99,8 +38,6 @@ case("truncate_utf8_boundary_safety", function()
   eq(truncate_bytes(s, 4), "\xC3\xA9...")
   eq(truncate_bytes(s, 2), "...")
 end)
-
--- split_lines: table-driven
 
 case("split_lines", function()
   local vectors = {

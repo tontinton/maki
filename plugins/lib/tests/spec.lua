@@ -1,20 +1,9 @@
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
+local th = require("maki.test_helpers")
 
-local failures = {}
-
-local function case(name, fn)
-  local ok, err = pcall(fn)
-  if not ok then
-    table.insert(failures, name .. ": " .. tostring(err))
-  end
-end
-
-local function eq(actual, expected, msg)
-  if actual ~= expected then
-    error((msg or "") .. "\nexpected: " .. tostring(expected) .. "\n  actual: " .. tostring(actual))
-  end
-end
+local case = th.case
+local eq = th.eq
 
 -- Mock buf that records set_lines calls
 local function mock_buf()
@@ -62,6 +51,21 @@ case("truncate_trailing_newlines_counted", function()
 end)
 
 -- ToolView tests
+
+case("tool_view_line_nr_fmt_right_aligns_to_max_width", function()
+  local vectors = {
+    { 0, "1" },
+    { 9, "1" },
+    { 10, " 1" },
+    { 99, " 1" },
+    { 100, "  1" },
+    { 1000, "   1" },
+  }
+  for _, v in ipairs(vectors) do
+    eq(string.format(ToolView.line_nr_fmt(v[1]), 1), v[2], "max_line_nr=" .. v[1])
+  end
+  eq(string.format(ToolView.line_nr_fmt(100), 100), "100")
+end)
 
 case("tool_view_tail_keeps_last_n", function()
   local buf = mock_buf()
@@ -1432,6 +1436,4 @@ case("render_lines_nil_sections_mix_with_grouped", function()
   eq(item_lines[2], 3, "nil-section item follows without a new header")
 end)
 
-if #failures > 0 then
-  error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
-end
+th.report()

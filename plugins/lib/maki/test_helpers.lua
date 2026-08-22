@@ -21,6 +21,12 @@ function M.eq(actual, expected, msg)
   end
 end
 
+function M.has(s, substr, msg)
+  if not s:find(substr, 1, true) then
+    error((msg or "") .. "\nexpected to contain: " .. tostring(substr) .. "\n  actual: " .. tostring(s))
+  end
+end
+
 local _tmpdir_counter = 0
 
 function M.mktmpdir(prefix)

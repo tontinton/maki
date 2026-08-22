@@ -5256,6 +5256,7 @@ return shorten_path
 -- and surfaced by `report()` at the end.
 function M.case(name, fn)
 function M.eq(actual, expected, msg)
+function M.has(s, substr, msg)
 function M.mktmpdir(prefix)
 function M.rmtree(dir)
 function M.report()
@@ -5332,6 +5333,10 @@ function TextInput:render(prefix, prefix_width, width)
 -- stays a pure flag flip + re-render, deterministic across replays.
 -- Async highlighting goes through `maki.async.run`; during restore the
 -- runtime runs those tasks inline before snapshotting.
+
+-- Right aligned, so the content column stays put when a number gains a digit.
+-- Formats the number alone, callers add their own separator.
+function ToolView.line_nr_fmt(max_line_nr)
 
 -- opts: max_lines (default 80) shown while collapsed, keep "head"|"tail"
 -- (default "tail"), max_expand_lines (default 2000) kept for expansion,

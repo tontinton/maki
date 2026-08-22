@@ -1,25 +1,9 @@
 local fr = require("maki.fuzzy_replace")
+local th = require("maki.test_helpers")
 
-local failures = {}
-
-local function case(name, fn)
-  local ok, err = pcall(fn)
-  if not ok then
-    table.insert(failures, name .. ": " .. tostring(err))
-  end
-end
-
-local function eq(actual, expected, msg)
-  if actual ~= expected then
-    error((msg or "") .. "\nexpected: " .. tostring(expected) .. "\n  actual: " .. tostring(actual))
-  end
-end
-
-local function has(s, substr, msg)
-  if not s:find(substr, 1, true) then
-    error((msg or "") .. "\nexpected to contain: " .. tostring(substr) .. "\n  actual: " .. tostring(s))
-  end
-end
+local case = th.case
+local eq = th.eq
+local has = th.has
 
 local R = "REPLACED"
 local NO_MATCH = fr.NO_MATCH
@@ -41,6 +25,76 @@ end)
 case("different_indentation", function()
   local result = fr.replace("    fn f() {\n        bar();\n    }", "fn f() {\n    bar();\n}", R, false)
   has(result, R)
+end)
+
+case("fuzzy_match_reindents_new_string", function()
+  local content = "class Foo\n  def bar\n    baz(\n      a,\n    )\n  end\nend\n"
+  local old = "def bar\n  baz(\n    a,\n  )\nend"
+  local new = "def bar\n  baz(\n    a,\n    b,\n  )\nend"
+  local result = fr.replace(content, old, new, false)
+  eq(result, "class Foo\n  def bar\n    baz(\n      a,\n      b,\n    )\n  end\nend\n")
+end)
+
+case("reindent_ignores_new_string_own_indentation", function()
+  local content = "class A\n  def f\n    x\n  end\nend\n"
+  local old = "def f\n  x\nend"
+  local new = "  def f\n    y\n  end"
+  local result = fr.replace(content, old, new, false)
+  eq(result, "class A\n  def f\n    y\n  end\nend\n")
+end)
+
+case("reindent_converts_spaces_to_tabs", function()
+  local content = "\tfn f() {\n\t\tif x {\n\t\t\tg();\n\t\t}\n\t}"
+  local old = "fn f() {\n    if x {\n        g();\n    }\n}"
+  local new = "fn f() {\n    if x {\n        h();\n    }\n}"
+  local result = fr.replace(content, old, new, false)
+  eq(result, "\tfn f() {\n\t\tif x {\n\t\t\th();\n\t\t}\n\t}")
+end)
+
+case("reindent_leaves_a_correct_new_string_alone", function()
+  local content = "def f():\n    a = 1 \n    return a\n"
+  local old = "    a = 1\n    return a"
+  local new = "    a = 1\n    return a\n\n\ndef g():\n    return 2"
+  local result = fr.replace(content, old, new, false)
+  eq(result, "def f():\n    a = 1\n    return a\n\n\ndef g():\n    return 2\n")
+end)
+
+case("reindent_leaves_a_line_that_exits_the_block_alone", function()
+  local content = "def f():\n    a = 1\n    return a\n"
+  local new = "  a = 1\n  return a\n\n\ndef g():\n  return 2"
+  local result = fr.replace(content, "  a = 1\n  return a", new, false)
+  eq(result, "def f():\n    a = 1\n    return a\n\n\ndef g():\n    return 2\n")
+end)
+
+case("reindent_keeps_the_block_when_a_column_zero_line_is_dropped", function()
+  local content = "def f():\n    a = 1\n# TODO\n    b = 2\n"
+  local old = "  a = 1\n# TODO\n  b = 2"
+  local result = fr.replace(content, old, "  a = 1\n  b = 2", false)
+  eq(result, "def f():\n    a = 1\n    b = 2\n")
+end)
+
+case("reindent_takes_its_widths_from_the_block_not_the_file", function()
+  local content = 'M = """\n\tgcc x.c\n"""\n\ndef g():\n    if x:\n        foo()\n'
+  local old = "  if x:\n    foo()"
+  local result = fr.replace(content, old, "  if x:\n    foo()\n    baz()", false)
+  eq(result, 'M = """\n\tgcc x.c\n"""\n\ndef g():\n    if x:\n        foo()\n        baz()\n')
+end)
+
+case("reindent_leaves_a_midline_match_alone", function()
+  local result = fr.replace("    let x = compute(a,  b);", "compute(a, b)", "compute(c, d)", false)
+  eq(result, "    let x = compute(c, d);")
+end)
+
+case("reindent_applies_to_every_replaced_occurrence", function()
+  local content = "  a();\n  b();\nx\n  a();\n  b();\n"
+  local result = fr.replace(content, "a();\nb();", "a();\nc();\nb();", true)
+  eq(result, "  a();\n  c();\n  b();\nx\n  a();\n  c();\n  b();\n")
+end)
+
+case("exact_match_keeps_new_string_indentation", function()
+  local content = "  a\n  b\n"
+  local result = fr.replace(content, "  a\n  b", "  a\n      b", false)
+  eq(result, "  a\n      b\n")
 end)
 
 case("whitespace_collapsed", function()
@@ -152,16 +206,21 @@ case("empty_content_no_match", function()
   eq(err, NO_MATCH)
 end)
 
-case("empty_old_string", function()
-  local result, err = fr.replace("abc", "", "x", false)
-  eq(result, nil)
-  eq(err, EMPTY_OLD_STRING)
-end)
-
-case("empty_old_string_replace_all_does_not_hang", function()
-  local result, err = fr.replace("abc", "", "x", true)
-  eq(result, nil)
-  eq(err, EMPTY_OLD_STRING)
+-- An old_string that trims down to nothing used to match at every offset, so
+-- replace_all spliced forever. A regression hangs here instead of failing.
+case("degenerate_old_string_is_rejected", function()
+  local vectors = {
+    { "abc", "", false, EMPTY_OLD_STRING },
+    { "abc", "", true, EMPTY_OLD_STRING },
+    { "a\n\nb", "   ", true, NO_MATCH },
+  }
+  for _, v in ipairs(vectors) do
+    local content, old, replace_all, expected_err = table.unpack(v)
+    local msg = ("old_string=%q replace_all=%s"):format(old, tostring(replace_all))
+    local result, err = fr.replace(content, old, "x", replace_all)
+    eq(result, nil, msg)
+    eq(err, expected_err, msg)
+  end
 end)
 
 case("replace_all_no_occurrences", function()
@@ -186,13 +245,6 @@ case("lua_pattern_special_chars", function()
   local result = fr.replace(content, "assert(x % 2 == 0);", R, false)
   has(result, R)
   has(result, "foo(a+b).bar;")
-end)
-
-case("tabs_vs_spaces_indentation", function()
-  local content = "\tfn f() {\n\t\tbar();\n\t}"
-  local search = "    fn f() {\n        bar();\n    }"
-  local result = fr.replace(content, search, R, false)
-  has(result, R)
 end)
 
 case("double_backslash_literal", function()
@@ -281,6 +333,4 @@ case("insert_after_mode", function()
   has(e2, "out of range")
 end)
 
-if #failures > 0 then
-  error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
-end
+th.report()
