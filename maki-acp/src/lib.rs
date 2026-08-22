@@ -13,6 +13,7 @@ use maki_agent::{AgentConfig, PermissionsConfig};
 use maki_config::ModelPolicy;
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
+use maki_storage::id::MakiId;
 
 pub struct AcpParams {
     pub model: Model,
@@ -25,7 +26,7 @@ pub struct AcpParams {
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     /// Called when an ACP session is replaced or the server exits.
-    pub on_session_end: Option<Arc<dyn Fn(maki_storage::id::MakiId) + Send + Sync>>,
+    pub on_session_end: Option<Arc<dyn Fn(MakiId) + Send + Sync>>,
 }
 
 pub fn run(params: AcpParams) -> color_eyre::Result<()> {

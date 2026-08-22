@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 
-use crate::api::util::dispatch::{DepthGuard, call_isolated};
+use crate::api::util::dispatch::DepthGuard;
+use crate::runtime::{run_detached, strip_traceback};
 
 static NEXT_AUTOCMD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -55,6 +56,12 @@ fn pattern_matches(patterns: Option<&[String]>, fired: Option<&str>) -> bool {
 }
 
 /// One dispatch path for host-fired and plugin-fired events. Never throws.
+/// Each callback runs in its own coroutine under its own detached task
+/// scope, so it may suspend (the `maki.fs.*` helpers park on
+/// `smol::unblock`); an inline resume would die with "attempt to yield
+/// across metamethod / C-call boundary". The per-callback scope also means
+/// task-owned jobs a handler starts die with that handler instead of
+/// outliving it to the end of the batch.
 ///
 /// The snapshot below looks racy but is not: all Lua runs on the runtime
 /// thread and plugin unloads arrive through the request channel, so nothing
@@ -63,8 +70,8 @@ fn pattern_matches(patterns: Option<&[String]>, fired: Option<&str>) -> bool {
 /// `data` is shared across callbacks (nvim does the same), but each callback
 /// gets its own `ev` table, so one plugin's mutation cannot leak into the
 /// next.
-pub(crate) fn dispatch(lua: &Lua, event: &str, pattern: Option<&str>, data: Value) {
-    let Ok(_guard) = DepthGuard::enter(lua, "autocmd", event) else {
+pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, data: Value) {
+    let Ok(_guard) = DepthGuard::enter(&lua, "autocmd", &event) else {
         tracing::warn!(event, "autocmd dispatch exceeded max depth, skipping");
         return;
     };
@@ -72,14 +79,14 @@ pub(crate) fn dispatch(lua: &Lua, event: &str, pattern: Option<&str>, data: Valu
         let Some(mut store) = lua.app_data_mut::<AutocmdStore>() else {
             return;
         };
-        let Some(entries) = store.listeners.get_mut(event) else {
+        let Some(entries) = store.listeners.get_mut(&event) else {
             return;
         };
         let mut snapshot = Vec::new();
         // Drop `once` entries now, at snapshot time: if a callback refires
         // the same event they are already gone, so they stay exactly-once.
         entries.retain(|e| {
-            let fires = pattern_matches(e.patterns.as_deref(), pattern);
+            let fires = pattern_matches(e.patterns.as_deref(), pattern.as_deref());
             if fires {
                 snapshot.push((e.id, Arc::clone(&e.plugin), e.callback.clone()));
             }
@@ -88,14 +95,26 @@ pub(crate) fn dispatch(lua: &Lua, event: &str, pattern: Option<&str>, data: Valu
         snapshot
     };
     for (id, plugin, callback) in snapshot {
-        let ev = match make_ev_table(lua, id, event, pattern, &data) {
+        let ev = match make_ev_table(&lua, id, &event, pattern.as_deref(), &data) {
             Ok(ev) => ev,
             Err(e) => {
                 tracing::warn!(event, error = %e, "failed to build autocmd ev table");
                 return;
             }
         };
-        call_isolated::<()>(lua, &callback, ev, event, &plugin);
+        if let Err(e) = run_detached(&lua, async {
+            let thread = lua.create_thread(callback)?;
+            thread.into_async::<()>(ev)?.await
+        })
+        .await
+        {
+            tracing::warn!(
+                event,
+                plugin = &*plugin,
+                error = %strip_traceback(&e),
+                "plugin callback failed"
+            );
+        }
     }
 }
 
@@ -148,6 +167,13 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// asked for it; it carries `data.model` in the shape `maki.model.get`
 /// returns, plus `data.previous_spec`. Picking the model already in use stays
 /// quiet, and so does startup.
+///
+/// On the exit paths (UI shutdown, ACP EOF, headless completion) the host is
+/// already tearing down, so handlers get a short grace period and must not
+/// depend on `maki.fn` UI roundtrips; write state out with `maki.fs` instead.
+///
+/// Jobs started inside a callback die with the dispatch unless you await
+/// them there (`jobwait`) or hand them to a session (`owner = "session"`).
 ///
 /// @param event string|string[] Event name or list of names.
 /// @param opts table Options:
@@ -205,7 +231,7 @@ fn del_autocmd(lua: &Lua, id: u64) -> LuaResult<()> {
 }
 
 /// Fire one or more events manually. Every matching autocmd callback
-/// runs synchronously before this function returns.
+/// runs to completion before this function returns.
 ///
 /// @param event string|string[] Event name or list of names to fire.
 /// @param opts table? Options:
@@ -218,7 +244,7 @@ fn del_autocmd(lua: &Lua, id: u64) -> LuaResult<()> {
 ///   data = { msg = "hello" },
 /// })
 #[lua_fn]
-fn exec_autocmds(lua: &Lua, event: Value, opts: Option<Table>) -> LuaResult<()> {
+async fn exec_autocmds(lua: Lua, event: Value, opts: Option<Table>) -> LuaResult<()> {
     let events = parse_string_or_seq(event, "event")?;
     let (pattern, data) = match opts {
         Some(opts) => {
@@ -232,7 +258,7 @@ fn exec_autocmds(lua: &Lua, event: Value, opts: Option<Table>) -> LuaResult<()> 
         None => (None, Value::Nil),
     };
     for event in events {
-        dispatch(lua, &event, pattern.as_deref(), data.clone());
+        dispatch(lua.clone(), event, pattern.clone(), data.clone()).await;
     }
     Ok(())
 }

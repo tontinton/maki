@@ -657,6 +657,13 @@ asked for it; it carries `data.model` in the shape `maki.model.get`
 returns, plus `data.previous_spec`. Picking the model already in use stays
 quiet, and so does startup.
 
+On the exit paths (UI shutdown, ACP EOF, headless completion) the host is
+already tearing down, so handlers get a short grace period and must not
+depend on `maki.fn` UI roundtrips; write state out with `maki.fs` instead.
+
+Jobs started inside a callback die with the dispatch unless you await
+them there (`jobwait`) or hand them to a session (`owner = "session"`).
+
 **Parameters:**
 
 - `{event}` (`string|string[]`) Event name or list of names.
@@ -707,7 +714,7 @@ maki.api.exec_autocmds({event}, {opts?})
 ```
 
 Fire one or more events manually. Every matching autocmd callback
-runs synchronously before this function returns.
+runs to completion before this function returns.
 
 **Parameters:**
 
@@ -1633,6 +1640,29 @@ maki.fn.jobstop(id)
 
 ---
 
+### `maki.fn.jobforget()` {#maki-fn-jobforget}
+
+```lua
+maki.fn.jobforget({job_id})
+```
+
+Drop an exited session-owned job from the store. Running jobs are left
+alone; use `jobstop` to kill those. Unknown ids are a no-op.
+
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{job_id}` (`integer`) Job id returned by `jobstart`.
+
+**Example:**
+
+```lua
+maki.fn.jobforget(id)
+```
+
+---
+
 ### `maki.fn.jobwait()` {#maki-fn-jobwait}
 
 ```lua
@@ -1648,7 +1678,8 @@ before the timeout.
 
 While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 callbacks fire as events arrive (like Neovim), so you can stream
-output into a buffer while parked here.
+output into a buffer while parked here. A job that already exited
+answers from its snapshot instead and fires no callbacks.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -1705,8 +1736,9 @@ maki.fn.joblist({session?})
 ```
 
 List jobs this plugin can see, including exited session-owned jobs (so an
-id started before a reload stays findable). Pass a session id to restrict
-session-owned jobs to that session.
+id started before a reload stays findable). Rows identify the job; call
+`jobinfo` for tails. Pass a session id to restrict session-owned jobs to
+that session.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -1715,7 +1747,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 - `{session?}` (`string?`) Session id filter.
 
 **Returns:** (`table`) array of `{ id, command, pid, session, status, exit_code,
-  elapsed_secs, stdout_lines, stderr_lines }`.
+  elapsed_secs }`.
 
 **Example:**
 
@@ -2172,6 +2204,33 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 ```lua
 local ok, err = maki.fs.write("out.txt", "hello world")
 if err then print("write failed: " .. err) end
+```
+
+---
+
+### `maki.fs.append()` {#maki-fs-append}
+
+```lua
+maki.fs.append({path}, {content})
+```
+
+Append {content} to the file at {path}, creating it (but not its parent
+directory) if it does not exist.
+
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{path}` (`string`) Destination file path. `~/` is expanded.
+- `{content}` (`string`) Text to append.
+
+**Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
+
+**Example:**
+
+```lua
+local ok, err = maki.fs.append("out.log", "line\n")
+if err then print("append failed: " .. err) end
 ```
 
 ---

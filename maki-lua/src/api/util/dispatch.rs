@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use mlua::{FromLuaMulti, Function, IntoLuaMulti, Lua};
 
-use crate::runtime::TaskScope;
+use crate::runtime::{TaskScope, strip_traceback};
 
 pub(crate) const MAX_HOOK_DEPTH: u8 = 8;
 
@@ -70,7 +70,7 @@ pub(crate) fn call_isolated<R: FromLuaMulti>(
     match func.call::<R>(args) {
         Ok(r) => Some(r),
         Err(e) => {
-            tracing::warn!(seam, plugin, error = %e, "plugin callback failed");
+            tracing::warn!(seam, plugin, error = %strip_traceback(&e), "plugin callback failed");
             None
         }
     }

@@ -2366,7 +2366,7 @@ maki.api.register_tool({{
         "reloaded plugin should see the live session job, got {state}"
     );
 
-    host.event_handle().end_session(session);
+    host.event_handle().end_sessions_blocking([session]);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while test_kill_process_group(pid).is_ok() {
         assert!(
@@ -2447,20 +2447,11 @@ local seen
     let pid = Pid::from_raw(pid).unwrap();
     assert!(test_kill_process_group(pid).is_ok());
 
-    host.event_handle().end_session(session);
+    host.event_handle().end_sessions_blocking([session]);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let seen = loop {
-        let seen = exec_tool(&reg, "probe_order_job", json!({})).unwrap();
-        if !seen.starts_with("not-yet") {
-            break seen;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "SessionEnd handler never ran"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    // `wait = true` answers only after handlers dispatched and jobs reaped,
+    // so what the handler saw is settled.
+    let seen = exec_tool(&reg, "probe_order_job", json!({})).unwrap();
     assert!(
         seen.starts_with("running:"),
         "SessionEnd handler should see the live job, got {seen}"
@@ -2474,6 +2465,165 @@ local seen
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn autocmd_task_jobs_die_with_their_own_callback() {
+    let (reg, host) = builtins_host();
+    const GONE: &str = "gone";
+    let src = format!(
+        r#"
+local job
+seen = "unset"
+maki.api.create_autocmd("ProbeIsolation", {{
+    callback = function()
+        job = maki.fn.jobstart("sleep 30")
+    end,
+}})
+maki.api.create_autocmd("ProbeIsolation", {{
+    callback = function()
+        local info = job and maki.fn.jobinfo(job) or nil
+        seen = info and ("alive:" .. info.status) or "{GONE}"
+    end,
+}})
+maki.api.register_tool({{
+    name = "probe_isolation",
+    description = "reports what the second handler saw",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        return seen
+    end,
+}})
+"#
+    );
+    host.load_source("isolation_probe", &src).unwrap();
+
+    host.event_handle()
+        .fire_autocmd("ProbeIsolation", json!({}));
+
+    // FireAutocmd and CallTool queue on the same channel and dispatch is
+    // awaited in order, so the second handler has already run here. A shared
+    // batch scope would report the first handler's job as alive.
+    assert_eq!(exec_tool(&reg, "probe_isolation", json!({})).unwrap(), GONE);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_end_autocmds_may_suspend() {
+    let (reg, host) = builtins_host();
+
+    let dir = std::env::temp_dir().join(format!("maki-sessionend-suspend-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join("marker.txt");
+    std::fs::write(&marker, "x").unwrap();
+
+    const RM_FAILED: &str = "err:";
+    let src = format!(
+        r#"
+local rm_result
+maki.api.create_autocmd("SessionEnd", {{
+    callback = function(ev)
+        local ok, res = pcall(maki.fs.rm, ev.data.dir, {{ recursive = true, force = true }})
+        rm_result = ok and "ok" or "{RM_FAILED}" .. tostring(res)
+    end,
+}})
+maki.api.register_tool({{
+    name = "rm_probe",
+    description = "reports what the SessionEnd handler saw",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        return rm_result or "unset"
+    end,
+}})
+"#,
+    );
+    host.load_source("sessionend_suspend", &src).unwrap();
+
+    host.event_handle()
+        .fire_autocmd("SessionEnd", json!({ "dir": dir.display().to_string() }));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let seen = loop {
+        match exec_tool(&reg, "rm_probe", json!({})) {
+            Ok(seen) if seen != "unset" => break seen,
+            _ if std::time::Instant::now() < deadline => {}
+            other => panic!("SessionEnd probe never settled: {other:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(seen, "ok", "fs.rm must not die on a yield boundary");
+    assert!(!marker.exists(), "fs.rm should have removed the tree");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn jobwait_streams_events_to_suspending_callbacks() {
+    let (reg, host) = builtins_host();
+
+    let dir = std::env::temp_dir().join(format!("maki-jobwait-suspend-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let meta = dir.join("meta.json");
+
+    let session = maki_storage::id::MakiId::generate();
+    // The process must still run when wait_suspending_job calls jobwait:
+    // an already-exited job answers from its snapshot without delivering
+    // on_exit, which would make the assertion below race the event pump.
+    const EXIT_CB_FAILED: &str = "exit_cb_failed";
+    let src = format!(
+        r#"
+local job_id
+local exit_cb_result
+maki.api.register_tool({{
+    name = "start_suspending_job",
+    description = "starts a session-owned job whose on_exit writes a file",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        job_id = maki.fn.jobstart("sleep 2", {{
+            owner = "session",
+            session = "{session}",
+            on_exit = function(_, code)
+                local ok, res = pcall(maki.fs.atomic_write, "{}", tostring(code))
+                exit_cb_result = ok and "ok" or "{EXIT_CB_FAILED}:" .. tostring(res)
+            end,
+        }})
+        return tostring(job_id)
+    end,
+}})
+maki.api.register_tool({{
+    name = "wait_suspending_job",
+    description = "waits like monitor_wait does",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local ok, res = pcall(maki.fn.jobwait, job_id, 10000)
+        if not ok then
+            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
+        end
+        return "exit:" .. tostring(res and res.exit_code) .. "|exit_cb:" .. tostring(exit_cb_result)
+    end,
+}})
+"#,
+        meta.display(),
+    );
+    host.load_source("jobwait_suspend", &src).unwrap();
+
+    exec_tool(&reg, "start_suspending_job", json!({})).unwrap();
+    let waited = exec_tool(&reg, "wait_suspending_job", json!({})).unwrap();
+    assert_eq!(
+        waited, "exit:0|exit_cb:ok",
+        "jobwait must report the exit and on_exit must survive suspending fs calls"
+    );
+    assert!(
+        std::path::Path::new(&meta).exists(),
+        "on_exit should have written the meta file"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -5468,4 +5618,179 @@ mod read_tool_required_params {
             "offset beyond file should return empty, got: {out}"
         );
     }
+}
+
+#[test]
+fn jobwait_reentrant_self_wait_in_on_exit() {
+    let (reg, host) = builtins_host();
+    let session = maki_storage::id::MakiId::generate();
+    let src = format!(
+        r#"
+local job_id
+maki.api.register_tool({{
+    name = "start_self_wait_job",
+    description = "session job whose on_exit reenters jobwait on itself",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        job_id = maki.fn.jobstart("sleep 1", {{
+            owner = "session",
+            session = "{session}",
+            on_exit = function(id, code)
+                local ok, res = pcall(maki.fn.jobwait, id, 2000)
+                if not ok then
+                    error("self-wait errored: " .. tostring(res))
+                end
+                if res == nil then
+                    error("self-wait timed out")
+                end
+                if res.exit_code ~= code then
+                    error("self-wait code mismatch")
+                end
+            end,
+        }})
+        return tostring(job_id)
+    end,
+}})
+maki.api.register_tool({{
+    name = "wait_self_wait_job",
+    description = "outer wait like monitor_wait",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local ok, res = pcall(maki.fn.jobwait, job_id, 10000)
+        if not ok then
+            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
+        end
+        if res == nil then
+            return {{ llm_output = "error: outer wait timed out", is_error = true }}
+        end
+        return "exit:" .. tostring(res.exit_code)
+    end,
+}})
+"#
+    );
+    host.load_source("selfwait", &src).unwrap();
+
+    exec_tool(&reg, "start_self_wait_job", json!({})).unwrap();
+    let out = exec_tool(&reg, "wait_self_wait_job", json!({})).unwrap();
+    assert_eq!(
+        out, "exit:0",
+        "reentrant self-wait must not poison the outer wait"
+    );
+    let after = exec_tool(&reg, "wait_self_wait_job", json!({})).unwrap();
+    assert!(
+        after.starts_with("exit:"),
+        "VM must stay usable, got: {after}"
+    );
+}
+
+#[test]
+fn jobwait_returns_after_session_end_kill() {
+    let (reg, host) = builtins_host();
+    let session = maki_storage::id::MakiId::generate();
+    let src = format!(
+        r#"
+local job_id
+maki.api.register_tool({{
+    name = "start_long_job",
+    description = "session job that outlives the wait",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        job_id = maki.fn.jobstart("sleep 30", {{
+            owner = "session",
+            session = "{session}",
+        }})
+        return tostring(job_id)
+    end,
+}})
+maki.api.register_tool({{
+    name = "wait_long_job",
+    description = "parks in jobwait until killed or timeout",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local ok, res = pcall(maki.fn.jobwait, job_id, 25000)
+        if not ok then
+            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
+        end
+        if res == nil then
+            return "timeout"
+        end
+        return "exit:" .. tostring(res.exit_code)
+    end,
+}})
+"#
+    );
+    host.load_source("endkill", &src).unwrap();
+    exec_tool(&reg, "start_long_job", json!({})).unwrap();
+
+    let reg2 = Arc::clone(&reg);
+    let wait_handle =
+        std::thread::spawn(move || exec_tool(&reg2, "wait_long_job", json!({})).unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    host.event_handle().end_sessions_blocking([session]);
+    let out = wait_handle.join().expect("wait thread must not panic");
+    assert!(
+        out.starts_with("exit:") || out == "timeout",
+        "parked jobwait must return after session end, got: {out}"
+    );
+}
+
+#[test]
+fn jobwait_callback_error_still_delivers_exit() {
+    let (reg, host) = builtins_host();
+    let session = maki_storage::id::MakiId::generate();
+    let src = format!(
+        r#"
+local job_id
+maki.api.register_tool({{
+    name = "start_boom_job",
+    description = "job whose on_stdout raises",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        job_id = maki.fn.jobstart("echo one; echo two; echo three", {{
+            owner = "session",
+            session = "{session}",
+            on_stdout = function(_, line)
+                if line == "two" then
+                    error("boom on stdout")
+                end
+            end,
+        }})
+        return tostring(job_id)
+    end,
+}})
+maki.api.register_tool({{
+    name = "wait_boom_job",
+    description = "waits past the failing callback",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local ok, res = pcall(maki.fn.jobwait, job_id, 10000)
+        if not ok then
+            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
+        end
+        if res == nil then
+            return {{ llm_output = "error: timed out", is_error = true }}
+        end
+                return "exit:" .. tostring(res.exit_code) .. "|stdout:" .. tostring(res.stdout)
+    end,
+}})
+"#
+    );
+    host.load_source("boomjob", &src).unwrap();
+    exec_tool(&reg, "start_boom_job", json!({})).unwrap();
+    let out = exec_tool(&reg, "wait_boom_job", json!({})).unwrap();
+    assert!(
+        out.starts_with("exit:0"),
+        "a failing on_stdout must not swallow the exit, got: {out}"
+    );
+    let again = exec_tool(&reg, "wait_boom_job", json!({})).unwrap();
+    assert!(
+        again.starts_with("exit:"),
+        "VM must stay usable, got: {again}"
+    );
 }

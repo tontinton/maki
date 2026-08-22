@@ -247,7 +247,7 @@ end }})
     );
     load(&host, "listener", &listener);
     let session = maki_storage::id::MakiId::generate();
-    host.event_handle().end_session(session);
+    host.event_handle().end_sessions_blocking([session]);
     assert_eq!(
         exec_tool(&reg, "probe_session_end"),
         format!("SessionEnd|{session}")

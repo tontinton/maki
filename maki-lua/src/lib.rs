@@ -33,6 +33,7 @@ pub mod test_support {
     use crate::api::util::command::{
         HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
     };
+    use maki_storage::id::MakiId;
 
     pub struct LuaCommandWriterHandle(LuaCommandWriter);
 
@@ -110,10 +111,10 @@ pub mod test_support {
         }
 
         /// Next `SessionEnd` request as the session being left behind.
-        pub fn try_recv_end_session(&self) -> Option<maki_storage::id::MakiId> {
+        pub fn try_recv_end_session(&self) -> Option<MakiId> {
             use crate::runtime::Request;
             while let Ok(req) = self.0.try_recv() {
-                if let Request::EndSession { session } = req {
+                if let Request::EndSession { session, .. } = req {
                     return Some(session);
                 }
             }

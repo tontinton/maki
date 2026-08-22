@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use include_dir::{Dir, include_dir};
 use maki_agent::permissions::PluginRuleStore;
@@ -22,6 +22,7 @@ use crate::runtime::{
     self, ClickFallback, ConfigScope, LoadChunk, LoadContext, LuaThread, Request, RestoreItem,
 };
 use maki_agent::prompt::ResolvedSlots;
+use maki_storage::id::MakiId;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const USER_PLUGIN: &str = "user";
@@ -952,10 +953,48 @@ impl EventHandle {
         });
     }
 
-    /// Kill session-owned jobs and fire `SessionEnd`. Call from every
-    /// session-end path so a Lua monitor can stay a plugin.
-    pub fn end_session(&self, session: maki_storage::id::MakiId) {
-        let _ = self.tx.try_send(Request::EndSession { session });
+    /// Queue the kill of session-owned jobs and the `SessionEnd` dispatch,
+    /// then return. Call from every session-end path so a Lua monitor can
+    /// stay a plugin. Process exit wants [`Self::end_sessions_blocking`].
+    pub fn end_session(&self, session: MakiId) {
+        let _ = self.tx.try_send(Request::EndSession {
+            session,
+            reply: None,
+        });
+    }
+
+    /// [`Self::end_session`] for process exit: block until the handlers ran
+    /// and the jobs were reaped, so the `Shutdown` that follows on the
+    /// priority lane cannot skip ahead of them.
+    ///
+    /// Every session is queued first and the deadline is shared, so quitting
+    /// with many tabs open costs one `SHUTDOWN_TIMEOUT`, not one per tab.
+    pub fn end_sessions_blocking(&self, sessions: impl IntoIterator<Item = MakiId>) {
+        let waits: Vec<_> = sessions
+            .into_iter()
+            .filter_map(|session| Some((session, self.send_end_session(session)?)))
+            .collect();
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        for (session, reply_rx) in waits {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if reply_rx.recv_timeout(left).is_err() {
+                tracing::warn!(
+                    session = %session,
+                    "SessionEnd did not finish within timeout, continuing teardown"
+                );
+            }
+        }
+    }
+
+    fn send_end_session(&self, session: MakiId) -> Option<flume::Receiver<()>> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send(Request::EndSession {
+                session,
+                reply: Some(reply_tx),
+            })
+            .ok()?;
+        Some(reply_rx)
     }
 
     pub fn run_keybind_callback(&self, id: u64) -> bool {

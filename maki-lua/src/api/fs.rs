@@ -425,6 +425,32 @@ async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>
     Ok(pair(smol::fs::write(&abs, content).await.map(|()| true)))
 }
 
+/// Append {content} to the file at {path}, creating it (but not its parent
+/// directory) if it does not exist.
+///
+/// @param path string Destination file path. `~/` is expanded.
+/// @param content string Text to append.
+/// @return (true?, string?) `true` on success, or nil plus an error message.
+/// @example
+/// local ok, err = maki.fs.append("out.log", "line\n")
+/// if err then print("append failed: " .. err) end
+#[lua_fn(guard = FsWrite)]
+async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+    let abs = make_absolute(&path)?;
+    // `smol::fs::File` writes through a background task and answers before
+    // the bytes reach the file, so a plain `unblock` keeps append ordered.
+    let result = smol::unblock(move || {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&abs)
+            .and_then(|mut f| f.write_all(content.as_bytes()))
+    })
+    .await;
+    Ok(pair(result.map(|()| true)))
+}
+
 /// Atomically replace {path} with {content}. The parent directory must exist.
 /// Readers observe either the old file or the complete new file.
 /// Existing file permissions are preserved. On Unix, new files use mode 0600.
@@ -678,7 +704,7 @@ lua_table! {
     "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions), DOCS [
         read(perms), read_bytes(perms), metadata(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
-        dir(perms), write(perms), atomic_write(perms), rm(perms), mkdir(perms),
+        dir(perms), write(perms), append(perms), atomic_write(perms), rm(perms), mkdir(perms),
         glob(perms), grep(perms),
     ]
 }
@@ -989,6 +1015,64 @@ mod tests {
 
         let error = smol::block_on(
             atomic_write.call_async::<(Value, Value)>((file.to_str().unwrap(), FIRST_CONTENT)),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains(FS_WRITE_PERMISSION));
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn append_creates_then_appends_to_file() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("out.log");
+        let lua = Lua::new();
+        let table = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let append: mlua::Function = table.get("append").unwrap();
+
+        let (ok, err): (Value, Value) =
+            smol::block_on(append.call_async((file.to_str().unwrap(), FIRST_CONTENT))).unwrap();
+        assert_eq!(ok, Value::Boolean(true));
+        assert_eq!(err, Value::Nil);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), FIRST_CONTENT);
+
+        let (ok, err): (Value, Value) =
+            smol::block_on(append.call_async((file.to_str().unwrap(), REPLACEMENT_CONTENT)))
+                .unwrap();
+        assert_eq!(ok, Value::Boolean(true));
+        assert_eq!(err, Value::Nil);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("{FIRST_CONTENT}{REPLACEMENT_CONTENT}")
+        );
+    }
+
+    #[test]
+    fn append_returns_error_when_parent_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("missing/out.log");
+        let lua = Lua::new();
+        let table = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let append: mlua::Function = table.get("append").unwrap();
+
+        let (ok, err): (Value, Value) =
+            smol::block_on(append.call_async((file.to_str().unwrap(), FIRST_CONTENT))).unwrap();
+
+        assert_eq!(ok, Value::Nil);
+        assert!(matches!(err, Value::String(_)));
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn append_requires_fs_write_permission() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("out.log");
+        let lua = Lua::new();
+        let table = create_fs_table(&lua, &PluginPermissions::denied()).unwrap();
+        let append: mlua::Function = table.get("append").unwrap();
+
+        let error = smol::block_on(
+            append.call_async::<(Value, Value)>((file.to_str().unwrap(), FIRST_CONTENT)),
         )
         .unwrap_err();
 

@@ -1565,9 +1565,10 @@ impl<'t> EventLoop<'t> {
             elapsed
         };
         let exit = self.sessions[self.focused].app.exit_request;
-        for rt in &self.sessions {
-            self.ctx.lua_event_handle.end_session(rt.id());
-        }
+        self.ctx
+            .lua_event_handle
+            .end_sessions_blocking(self.sessions.iter().map(SessionRuntime::id));
+        let session_end_ms = lap();
         if let Some(ref h) = self.ctx.mcp_handle {
             mcp::kill_process_groups(&h.reader().load().pids);
         }
@@ -1602,6 +1603,7 @@ impl<'t> EventLoop<'t> {
         }
         let storage_drain_ms = lap();
         info!(
+            session_end_ms,
             kill_mcp_ms,
             save_sessions_ms,
             join_agents_ms,

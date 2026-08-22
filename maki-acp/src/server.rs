@@ -75,7 +75,7 @@ struct Server {
     model_policy: Arc<ModelPolicy>,
     client_elicits_form: bool,
     session: Option<SessionState>,
-    on_session_end: Option<Arc<dyn Fn(maki_storage::id::MakiId) + Send + Sync>>,
+    on_session_end: Option<Arc<dyn Fn(MakiId) + Send + Sync>>,
 }
 
 impl Server {

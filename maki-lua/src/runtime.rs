@@ -26,10 +26,11 @@ use mlua::{Chunk, ChunkMode, Compiler, Function, Lua, RegistryKey, Table, Value 
 use serde_json::Value;
 
 use maki_config::RawConfig;
+use maki_storage::id::MakiId;
 
 use crate::api::autocmd::AutocmdStore;
 use crate::api::create_maki_global;
-use crate::api::r#fn::{JobOwner, JobStore, deliver_job_event};
+use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
@@ -98,6 +99,11 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 /// tool's rendered output.
 const RESTORE_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
 const TURN_END_EVENT: &str = "TurnEnd";
+/// Cap on the last delivery pass a scope makes before it reaps its jobs. A job
+/// printing faster than we deliver always has another event queued, so an
+/// unbounded pass would never reach the reap.
+const FINAL_DRAIN_BUDGET: usize = 256;
+const SESSION_END_EVENT: &str = "SessionEnd";
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.
 const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
@@ -291,7 +297,8 @@ pub enum Request {
     },
     /// Reap session-owned jobs and fire `SessionEnd`.
     EndSession {
-        session: maki_storage::id::MakiId,
+        session: MakiId,
+        reply: Option<flume::Sender<()>>,
     },
     ClickTool {
         tool_use_id: String,
@@ -322,6 +329,21 @@ pub enum Request {
         live: LiveCtx,
         ctx: Box<LuaCtx>,
         reply: flume::Sender<()>,
+    },
+}
+
+/// Host-fired hooks, taken off the request loop. Their handlers can suspend
+/// (job and `maki.fs` awaits), and awaiting one inline would stop the loop
+/// from serving anything else, including the priority lane. One consumer
+/// keeps them in the order the host fired them.
+enum HostHook {
+    Autocmd {
+        event: String,
+        data: Value,
+    },
+    EndSession {
+        session: MakiId,
+        reply: Option<flume::Sender<()>>,
     },
 }
 
@@ -1056,22 +1078,79 @@ pub(crate) async fn run_command_scoped<F: Future>(lua: &Lua, depth: u8, fut: F) 
 
 async fn run_scoped<F: Future>(lua: &Lua, scope: TaskScope, fut: F) -> F::Output {
     let handle = Arc::clone(scope.handle());
+    let owner = JobOwner::Task(lock_cell(&handle).id);
     let pump = async {
-        let mut event_buf = Vec::new();
         loop {
-            let owner = JobOwner::Task(lock_cell(&handle).id);
-            with_jobs(lua, |store| store.drain_events(&owner, &mut event_buf));
-            for (job_id, event) in event_buf.drain(..) {
-                if let Err(e) = deliver_job_event(lua, job_id, &event) {
-                    tracing::warn!(error = %strip_traceback(&e), "detached job callback failed");
-                }
-            }
+            deliver_pending(lua, usize::MAX, || {
+                with_jobs(lua, |store| store.next_event(&owner))
+            })
+            .await;
             smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
         }
     };
     let out = scope.scope_future(smol::future::or(fut, pump)).await;
+    // `or` drops the pump the moment {fut} wins, so one last pass under the
+    // same scope delivers whatever arrived in between; the scope teardown
+    // right after reaps any task job. Only a callback caught mid-suspend at
+    // that instant is lost, never a whole event: `deliver_pending` leaves
+    // events in the channel until the delivery that records them starts.
+    scope
+        .scope_future(deliver_pending(lua, FINAL_DRAIN_BUDGET, || {
+            with_jobs(lua, |store| store.next_event(&owner))
+        }))
+        .await;
     drop(scope);
     out
+}
+
+async fn run_host_hook(lua: &Lua, hook: HostHook) {
+    match hook {
+        HostHook::Autocmd { event, data } => {
+            let data = json_to_lua(lua, &data).unwrap_or(LuaValue::Nil);
+            let is_turn_end = event == TURN_END_EVENT;
+            crate::api::autocmd::dispatch(lua.clone(), event, None, data).await;
+            if is_turn_end {
+                lua.gc_collect().ok();
+            }
+        }
+        HostHook::EndSession { session, reply } => {
+            // Handlers may still inspect or stop the jobs, so the event fires
+            // before the reap.
+            let data = json_to_lua(
+                lua,
+                &serde_json::json!({ "session_id": session.to_string() }),
+            )
+            .unwrap_or(LuaValue::Nil);
+            crate::api::autocmd::dispatch(lua.clone(), SESSION_END_EVENT.to_owned(), None, data)
+                .await;
+            with_jobs(lua, |store| store.kill_session(lua, session));
+            if let Some(reply) = reply {
+                let _ = reply.send(());
+            }
+        }
+    }
+}
+
+/// Fire job callbacks for up to {budget} queued events, one at a time so a
+/// dropped caller cannot strand a batch. Failures are logged and the drain
+/// continues: the event is already recorded and the next one still needs
+/// delivering.
+async fn deliver_pending(
+    lua: &Lua,
+    budget: usize,
+    mut next: impl FnMut() -> Option<(u32, JobEvent)>,
+) {
+    for _ in 0..budget {
+        let Some((job_id, event)) = next() else {
+            return;
+        };
+        if let Err(e) = deliver_job_event(lua, job_id, &event).await {
+            tracing::warn!(job_id, error = %strip_traceback(&e), "job callback failed");
+        }
+        // A callback with nothing to await never yields, so a job printing
+        // faster than we deliver would hold the executor here forever.
+        smol::future::yield_now().await;
+    }
 }
 
 impl Drop for TaskScope {
@@ -1082,7 +1161,14 @@ impl Drop for TaskScope {
             cell.id
         };
         with_jobs(&self.lua, |store| {
-            store.kill_owner(&self.lua, &JobOwner::Task(task_id));
+            let leftovers = store.kill_owner(&self.lua, &JobOwner::Task(task_id));
+            if !leftovers.is_empty() {
+                tracing::warn!(
+                    task = task_id,
+                    jobs = ?leftovers,
+                    "scope finished with live jobs; they were killed"
+                );
+            }
         });
         match self.prev.take() {
             Some(p) => {
@@ -1105,7 +1191,9 @@ pin_project_lite::pin_project! {
         // fired. Without it nothing would poll us while the handler sits parked
         // in an await, and the hooks would wait on a child event that may
         // never come. Already `Box::pin`ned, so no structural pinning needed.
-        cancel_wait: Option<Pin<Box<dyn Future<Output = ()>>>>,
+        // `+ Send` keeps every ScopedFuture usable under mlua's `send` feature,
+        // including ones awaited inside `create_async_function` bodies.
+        cancel_wait: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
         #[pin]
         inner: F,
     }
@@ -2515,8 +2603,6 @@ async fn dispatch_async(
         };
     }
 
-    let mut event_buf = Vec::new();
-
     loop {
         // No grace here: the handler already returned, so there is no Lua
         // frame left to unwind. Bound before the match so the guard drops
@@ -2540,29 +2626,26 @@ async fn dispatch_async(
             Err(flume::TryRecvError::Empty) => {}
         }
 
-        with_jobs(lua, |store| store.drain_events(&owner, &mut event_buf));
-
-        if event_buf.is_empty() {
-            if with_jobs(lua, |store| store.is_empty(&owner)) {
-                smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
-                return match finish_rx.try_recv() {
-                    Ok(reply) => reply,
-                    _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
-                };
+        if let Some((job_id, event)) = with_jobs(lua, |store| store.next_event(&owner)) {
+            if let Err(e) = deliver_job_event(lua, job_id, &event).await {
+                return ToolCallReply::err(format!("job callback error: {}", strip_traceback(&e)));
             }
-            smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+            smol::future::yield_now().await;
             continue;
         }
 
-        for (job_id, event) in event_buf.drain(..) {
-            if let Err(e) = deliver_job_event(lua, job_id, &event) {
-                return ToolCallReply::err(format!("job callback error: {}", strip_traceback(&e)));
-            }
+        if with_jobs(lua, |store| store.is_empty(&owner)) {
+            smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+            return match finish_rx.try_recv() {
+                Ok(reply) => reply,
+                _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
+            };
         }
+        smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
     }
 }
 
-fn strip_traceback(err: &mlua::Error) -> String {
+pub(crate) fn strip_traceback(err: &mlua::Error) -> String {
     match err {
         mlua::Error::CallbackError { cause, .. } => {
             let mut inner = cause;
@@ -2859,21 +2942,22 @@ pub fn spawn(
             {
                 let lua = rt.lua.clone();
                 ex.spawn(async move {
-                    let mut event_buf = Vec::new();
                     loop {
-                        with_jobs(&lua, |store| {
-                            store.drain_plugin_events(&mut event_buf);
-                        });
-                        if !event_buf.is_empty() {
+                        // Pop before building the scope so an idle pump costs
+                        // nothing. The delivery scope republishes the task
+                        // handle across callback yields: an unscoped resume
+                        // would run under whatever task the executor
+                        // interleaved, misrouting jobs and watchdog state.
+                        if let Some(first) = with_jobs(&lua, |store| store.next_plugin_event()) {
+                            let mut first = Some(first);
                             let scope = TaskScope::delivery(&lua);
-                            for (job_id, event) in event_buf.drain(..) {
-                                if let Err(e) = deliver_job_event(&lua, job_id, &event) {
-                                    tracing::warn!(
-                                        error = %strip_traceback(&e),
-                                        "plugin job callback failed"
-                                    );
-                                }
-                            }
+                            scope
+                                .scope_future(deliver_pending(&lua, usize::MAX, || {
+                                    first
+                                        .take()
+                                        .or_else(|| with_jobs(&lua, |s| s.next_plugin_event()))
+                                }))
+                                .await;
                             drop(scope);
                         }
                         smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
@@ -2883,6 +2967,20 @@ pub fn spawn(
             }
             let gate = Rc::new(InflightGate::new(rt.lua.clone()));
             let restores = Rc::new(RestoreTracker::default());
+            let (hook_tx, hook_rx) = flume::unbounded::<HostHook>();
+            {
+                let lua = rt.lua.clone();
+                let gate = Rc::clone(&gate);
+                ex.spawn(async move {
+                    while let Ok(hook) = hook_rx.recv_async().await {
+                        // Counted as in-flight so a plugin reload waiting on
+                        // `drain_barrier` cannot land mid-handler.
+                        let _guard = GateGuard::new(&gate);
+                        run_host_hook(&lua, hook).await;
+                    }
+                })
+                .detach();
+            }
             let spawn_rx = rt
                 .lua
                 .app_data_ref::<SpawnQueue>()
@@ -3190,24 +3288,10 @@ pub fn spawn(
                             .detach();
                         }
                         Request::FireAutocmd { event, data } => {
-                            let data = json_to_lua(&rt.lua, &data).unwrap_or(LuaValue::Nil);
-                            crate::api::autocmd::dispatch(&rt.lua, &event, None, data);
-                            if event == TURN_END_EVENT {
-                                rt.lua.gc_collect().ok();
-                            }
+                            let _ = hook_tx.send(HostHook::Autocmd { event, data });
                         }
-                        Request::EndSession { session } => {
-                            // Handlers may still inspect or stop the jobs, so
-                            // the event fires before the reap.
-                            let data = json_to_lua(
-                                &rt.lua,
-                                &serde_json::json!({ "session_id": session.to_string() }),
-                            )
-                            .unwrap_or(LuaValue::Nil);
-                            crate::api::autocmd::dispatch(&rt.lua, "SessionEnd", None, data);
-                            with_jobs(&rt.lua, |store| {
-                                store.kill_session(&rt.lua, session);
-                            });
+                        Request::EndSession { session, reply } => {
+                            let _ = hook_tx.send(HostHook::EndSession { session, reply });
                         }
                         Request::Describe {
                             plugin,
@@ -3318,6 +3402,19 @@ mod tests {
         let lua = Lua::new();
         lua.set_app_data(BufferStore::new());
         lua
+    }
+
+    /// A job printing faster than we deliver never runs its channel dry, so the
+    /// last pass a scope makes before reaping it has to stop on its own.
+    #[test]
+    fn the_bounded_drain_stops_on_an_endless_stream() {
+        let lua = test_lua();
+        let mut offered = 0usize;
+        smol::block_on(deliver_pending(&lua, FINAL_DRAIN_BUDGET, || {
+            offered += 1;
+            (offered <= FINAL_DRAIN_BUDGET * 2).then(|| (1, JobEvent::Stdout("spam".into())))
+        }));
+        assert_eq!(offered, FINAL_DRAIN_BUDGET);
     }
 
     #[test]
