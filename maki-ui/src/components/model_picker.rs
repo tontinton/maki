@@ -18,6 +18,7 @@ use crate::theme;
 
 const TITLE: &str = " Models ";
 const RECENT_SECTION: &str = "Recent";
+const FREE_LABEL: &str = "Free";
 const FREE_PREFIX: &str = "Free · ";
 
 fn footer_line() -> Line<'static> {
@@ -71,6 +72,7 @@ struct ModelEntry {
     suffix: Option<String>,
     tier: String,
     override_tiers: Vec<ModelTier>,
+    free: bool,
 }
 
 impl PickerItem for ModelEntry {
@@ -174,6 +176,7 @@ impl ModelPicker {
         full.sort_by(|a, b| {
             a.provider_display
                 .cmp(&b.provider_display)
+                .then_with(|| b.free.cmp(&a.free))
                 .then_with(|| a.id.cmp(&b.id))
         });
         entries.extend(full);
@@ -298,10 +301,10 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
             .collect::<Vec<_>>()
             .join("/")
     };
-    let tier = if free {
-        format!("{FREE_PREFIX}{tier}")
-    } else {
-        tier
+    let tier = match (free, tier.is_empty()) {
+        (true, true) => FREE_LABEL.to_string(),
+        (true, false) => format!("{FREE_PREFIX}{tier}"),
+        (false, _) => tier,
     };
     let id = model_id.to_string();
     Some(ModelEntry {
@@ -311,12 +314,15 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         suffix: None,
         tier,
         override_tiers,
+        free,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_providers::ModelInfo;
+    use maki_providers::ModelPricing;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -626,5 +632,67 @@ mod tests {
         let entry = p.picker.selected_item().expect("selection after refresh");
         assert_eq!(entry.spec, "zai/glm-5");
         assert_eq!(entry.section(), Some("Z.AI"));
+    }
+
+    fn discovered(id: &str, pricing: ModelPricing) -> ModelInfo {
+        ModelInfo {
+            pricing: Some(pricing),
+            ..ModelInfo::id_only(id.into())
+        }
+    }
+
+    const OX_SPEC: &str = "openrouter/stealth/ox-alpha";
+    const PAID_ID: &str = "vendor/paid-model";
+    const PAID_PRICING: ModelPricing = ModelPricing {
+        input: 3.0,
+        output: 15.0,
+        cache_write: 0.0,
+        cache_read: 0.0,
+        fast: None,
+    };
+
+    fn register_openrouter_models() {
+        model_registry::set_known_models(
+            "openrouter",
+            vec![
+                discovered("stealth/ox-alpha", ModelPricing::ZERO),
+                discovered(PAID_ID, PAID_PRICING),
+            ],
+        );
+    }
+
+    #[test]
+    fn zero_priced_discovery_marks_entry_free() {
+        register_openrouter_models();
+        let entry = parse_model_entry(OX_SPEC).unwrap();
+        assert!(
+            entry.tier.starts_with(FREE_PREFIX),
+            "zero-priced discovery must mark the entry free"
+        );
+    }
+
+    #[test]
+    fn paid_discovery_not_marked_free() {
+        register_openrouter_models();
+        let entry = parse_model_entry(&format!("openrouter/{PAID_ID}")).unwrap();
+        assert!(
+            !entry.tier.starts_with(FREE_PREFIX),
+            "paid discovery must not mark the entry free"
+        );
+    }
+
+    #[test]
+    fn free_models_sort_before_paid_within_a_provider() {
+        register_openrouter_models();
+        let models = Arc::new(ArcSwapOption::empty());
+        models.store(Some(Arc::new(vec![
+            format!("openrouter/{PAID_ID}"),
+            OX_SPEC.into(),
+        ])));
+        let mut p = ModelPicker::new(models);
+        p.open("");
+        let entries = p.load_entries();
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["stealth/ox-alpha", PAID_ID]);
     }
 }

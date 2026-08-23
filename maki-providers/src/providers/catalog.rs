@@ -1025,6 +1025,7 @@ mod tests {
             thinking_override: None,
             supports_vision_override: None,
             pricing: ModelPricing::default(),
+            discovered_free: false,
             max_output_tokens: None,
             context_window: 0,
             thinking_fields: None,

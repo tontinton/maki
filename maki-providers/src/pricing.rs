@@ -207,6 +207,7 @@ mod tests {
                 input: input_rate,
                 ..ModelPricing::ZERO
             },
+            discovered_free: false,
             max_output_tokens: None,
             context_window: 0,
             thinking_fields: None,

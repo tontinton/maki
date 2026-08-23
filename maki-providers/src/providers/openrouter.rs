@@ -117,28 +117,26 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
     let supports_vision = input_modalities.iter().any(|m| m.as_str() == Some("image"));
 
     // Parse with OpenRouter-specific pricing field names. OpenRouter reports
-    // per-token prices; scale to $/M as `ModelPricing` expects.
+    // per-token prices; scale to $/M as `ModelPricing` expects. A missing or
+    // unparsable price stays `None` so it never reads as free.
     let id = m["id"].as_str()?;
     let context_window = m["context_length"]
         .as_u64()
         .and_then(|v| u32::try_from(v).ok());
     let per_token =
         |p: &Value| -> Option<f64> { Some(p.as_str()?.parse::<f64>().ok()? * PER_MILLION) };
-    let pricing = m["pricing"]
-        .as_object()
-        .and_then(|p| {
-            Some(ModelPricing {
-                input: per_token(p.get("prompt")?)?,
-                output: per_token(p.get("completion")?)?,
-                cache_write: p
-                    .get("input_cache_write")
-                    .and_then(per_token)
-                    .unwrap_or(0.0),
-                cache_read: p.get("input_cache_read").and_then(per_token).unwrap_or(0.0),
-                fast: None,
-            })
+    let pricing = m["pricing"].as_object().and_then(|p| {
+        Some(ModelPricing {
+            input: per_token(p.get("prompt")?)?,
+            output: per_token(p.get("completion")?)?,
+            cache_write: p
+                .get("input_cache_write")
+                .and_then(per_token)
+                .unwrap_or(0.0),
+            cache_read: p.get("input_cache_read").and_then(per_token).unwrap_or(0.0),
+            fast: None,
         })
-        .unwrap_or_default();
+    });
 
     let reasoning = m
         .get("reasoning")
@@ -170,7 +168,7 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
         id: id.to_string(),
         context_window,
         max_output_tokens: None,
-        pricing: Some(pricing),
+        pricing,
         supports_thinking: Some(supports_thinking),
         supports_vision: Some(supports_vision),
         tier: None,
@@ -244,6 +242,8 @@ mod tests {
     use super::*;
     use crate::ThinkingConfig;
 
+    const UNKNOWN_PRICE_STAYS_UNKNOWN: &str = "a price we cannot read must not become a zero price";
+
     fn kimi_k3_json() -> Value {
         json!({
             "id": "moonshotai/kimi-k3",
@@ -288,6 +288,19 @@ mod tests {
         assert_eq!(pricing.cache_write, 3.75);
     }
 
+    /// A price we cannot read used to collapse to an all-zero `ModelPricing`,
+    /// which downstream reads as "free". Unknown has to stay unknown.
+    #[test_case(json!(null)                                       ; "no_pricing_object")]
+    #[test_case(json!({"prompt": "0.000003"})                     ; "no_completion")]
+    #[test_case(json!({"prompt": "n/a", "completion": "0.000015"}) ; "unparsable_prompt")]
+    fn parse_model_keeps_unusable_pricing_unknown(pricing: Value) {
+        let mut m = kimi_k3_json();
+        m["pricing"] = pricing;
+
+        let info = parse_model(&m).expect("model should parse");
+        assert!(info.pricing.is_none(), "{UNKNOWN_PRICE_STAYS_UNKNOWN}");
+    }
+
     #[test]
     fn parse_model_reasoning_efforts_skips_unknown_and_sorts() {
         let mut m = kimi_k3_json();
@@ -317,6 +330,7 @@ mod tests {
             thinking_override: None,
             supports_vision_override: None,
             pricing: ModelPricing::default(),
+            discovered_free: false,
             max_output_tokens: Some(8192),
             context_window: 200_000,
             thinking_fields: None,

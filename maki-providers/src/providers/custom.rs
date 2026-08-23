@@ -152,6 +152,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         thinking_override,
         supports_vision_override,
         pricing,
+        discovered_free: false,
         max_output_tokens,
         context_window,
         thinking_fields: None,

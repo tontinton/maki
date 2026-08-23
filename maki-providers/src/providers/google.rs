@@ -701,6 +701,7 @@ mod tests {
             supports_tool_examples_override: None,
             thinking_override: None,
             pricing: ModelPricing::default(),
+            discovered_free: false,
             max_output_tokens: Some(8192),
             context_window: 1_048_576,
             thinking_fields: None,
