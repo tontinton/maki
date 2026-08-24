@@ -94,10 +94,11 @@ impl Provider for CommandCodeCredits {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
-            let base = auth.base_url.as_deref().unwrap_or(CREDITS_BASE_URL);
-            let url = format!("{}/models", base.trim_end_matches('/'));
-            let body = self.compat.get_text(&auth, &url).await?;
-            super::parse_models(&body)
+            // Through the compat layer so a `providers.toml` base URL resolves
+            // the same way it does for streaming.
+            self.compat
+                .fetch_and_parse_models(&auth, super::parse_model)
+                .await
         })
     }
 

@@ -106,6 +106,9 @@ impl CommandCode {
         )
     }
 
+    // Mirrors the trait's request shape; splitting it would only move the
+    // same arguments one call deeper.
+    #[allow(clippy::too_many_arguments)]
     fn build_body(
         &self,
         model: &Model,
@@ -114,6 +117,7 @@ impl CommandCode {
         tools: &Value,
         opts: RequestOptions,
         working_dir: &str,
+        session_id: Option<&SessionRef>,
     ) -> Value {
         let mut params = json!({
             "model": model.id,
@@ -151,10 +155,11 @@ impl CommandCode {
             "taste": Value::Null,
             "skills": Value::Null,
             "params": params,
-            "threadId": thread_id(),
+            "threadId": thread_id(session_id),
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn do_stream(
         &self,
         model: &Model,
@@ -163,6 +168,7 @@ impl CommandCode {
         tools: &Value,
         event_tx: &Sender<ProviderEvent>,
         opts: RequestOptions,
+        session_id: Option<&SessionRef>,
     ) -> Result<StreamResponse, AgentError> {
         // One getcwd per request: the envelope and the project-slug header
         // must agree, and they cannot if each reads the cwd separately.
@@ -176,6 +182,7 @@ impl CommandCode {
             tools,
             opts,
             &working_dir,
+            session_id,
         ))?;
         let url = format!("{}/alpha/generate", self.base());
         let request = self
@@ -232,13 +239,13 @@ fn project_slug(path: &str) -> String {
     }
 }
 
-/// A fresh RFC 4122 string per request, matching the reference client. The
-/// endpoint treats it as an opaque conversation key.
+/// The conversation key the endpoint caches against, so it has to be stable
+/// across a session's turns: usage comes back with `cacheReadTokens`, and a
+/// fresh id every request would make each turn look like a new thread.
 ///
-/// ponytail: per-request id means no server-side thread reuse. Thread it from
-/// `SessionRef` if Command Code turns out to cache across a thread.
-fn thread_id() -> String {
-    MakiId::generate().hyphenated()
+/// Only a provider call outside any session falls back to a fresh id.
+fn thread_id(session_id: Option<&SessionRef>) -> String {
+    session_id.map_or_else(|| MakiId::generate().hyphenated(), |s| s.id().hyphenated())
 }
 
 /// maki hands tools over in the Anthropic shape, which is what the endpoint
@@ -598,9 +605,9 @@ impl Provider for CommandCode {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts))
+        Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts, session_id))
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
@@ -664,6 +671,7 @@ mod tests {
             &json!([]),
             RequestOptions::default(),
             "/tmp/proj",
+            None,
         );
         assert_eq!(body["params"]["max_tokens"], MAX_GENERATE_TOKENS);
         assert_eq!(body["params"]["system"], "sys");
@@ -806,15 +814,20 @@ mod tests {
     }
 
     #[test]
-    fn thread_id_is_a_hyphenated_uuid() {
-        let id = thread_id();
+    fn thread_id_follows_the_session_so_the_endpoint_can_cache() {
+        let session = SessionRef::from_id(MakiId::generate());
+        assert_eq!(thread_id(Some(&session)), thread_id(Some(&session)));
+        assert_eq!(thread_id(Some(&session)), session.id().hyphenated());
+
+        // No session: a fresh hyphenated uuid, still what the endpoint wants.
+        let id = thread_id(None);
         assert_eq!(id.len(), 36);
         assert_eq!(
             id.match_indices('-').map(|(i, _)| i).collect::<Vec<_>>(),
             vec![8, 13, 18, 23]
         );
         assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
-        assert_ne!(thread_id(), thread_id());
+        assert_ne!(thread_id(None), thread_id(None));
     }
 
     #[test]

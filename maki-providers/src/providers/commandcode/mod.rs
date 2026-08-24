@@ -15,7 +15,6 @@
 
 use maki_storage::sessions::Effort;
 use maki_storage::sessions::Effort::{High, Low, Max, Medium, XHigh};
-use serde::Deserialize;
 use serde_json::Value;
 
 use crate::model::{Model, ModelEntry, ModelInfo, ThinkingSupport};
@@ -230,42 +229,33 @@ pub(super) fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> Reso
     auth
 }
 
-#[derive(Deserialize)]
-struct CatalogModel {
-    id: String,
-    context_length: Option<u32>,
+/// One row of `GET /provider/v1/models`, shared because both providers read
+/// the same catalog and both need the [`CATALOG`] capabilities folded in.
+pub(super) fn parse_model(m: &Value) -> Option<ModelInfo> {
+    let id = m["id"].as_str()?;
+    let entry = catalog_entry(id);
+    Some(ModelInfo {
+        context_window: m["context_length"]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok()),
+        // The catalog exposes no output ceiling, and the context window is not
+        // one: an 8k model would end up spending its whole window on output.
+        // Left unset so `ProviderManifest::fallback_max_output` decides.
+        max_output_tokens: None,
+        supports_thinking: entry.map(|(_, efforts, _)| !efforts.is_empty()),
+        supports_vision: entry.map(|(_, _, vision)| *vision),
+        ..ModelInfo::id_only(id.to_string())
+    })
 }
 
-#[derive(Deserialize)]
-struct CatalogResponse {
-    data: Vec<CatalogModel>,
-}
-
-/// Parses `GET /provider/v1/models`, shared because both providers read the
-/// same catalog and both need the [`CATALOG`] capabilities folded in.
+/// The whole catalog response, for [`plan`], which does not go through the
+/// compat layer's `fetch_and_parse_models`.
 pub(super) fn parse_models(body: &str) -> Result<Vec<ModelInfo>, AgentError> {
-    let catalog: CatalogResponse = serde_json::from_str(body)?;
-    let mut infos: Vec<ModelInfo> = catalog
-        .data
-        .into_iter()
-        .map(|m| {
-            let entry = catalog_entry(&m.id);
-            ModelInfo {
-                context_window: m.context_length,
-                // The catalog exposes no output ceiling, so the context window
-                // stands in for it, as the reference client does. A model whose
-                // real cap is under 64k would be asked for more than it allows.
-                max_output_tokens: Some(
-                    m.context_length
-                        .unwrap_or(MAX_GENERATE_TOKENS)
-                        .min(MAX_GENERATE_TOKENS),
-                ),
-                supports_thinking: entry.map(|(_, efforts, _)| !efforts.is_empty()),
-                supports_vision: entry.map(|(_, _, vision)| *vision),
-                ..ModelInfo::id_only(m.id)
-            }
-        })
-        .collect();
+    let body: Value = serde_json::from_str(body)?;
+    let mut infos: Vec<ModelInfo> = body["data"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(parse_model).collect())
+        .unwrap_or_default();
     infos.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(infos)
 }
@@ -351,13 +341,14 @@ mod tests {
         ]}"#;
         let models = parse_models(body).unwrap();
         assert_eq!(models.len(), 3);
-        // Sorted by id, and the output ceiling never exceeds the endpoint cap.
+        // Sorted by id, and the context window never leaks into the output cap.
         assert_eq!(models[0].id, "brand/new-model");
-        assert_eq!(models[0].max_output_tokens, Some(8_000));
+        assert_eq!(models[0].context_window, Some(8_000));
+        assert_eq!(models[0].max_output_tokens, None);
         assert_eq!(models[0].supports_vision, None);
 
         let opus = models.iter().find(|m| m.id == "claude-opus-5").unwrap();
-        assert_eq!(opus.max_output_tokens, Some(MAX_GENERATE_TOKENS));
+        assert_eq!(opus.max_output_tokens, None);
         assert_eq!(opus.supports_vision, Some(true));
         assert_eq!(opus.supports_thinking, Some(true));
 
