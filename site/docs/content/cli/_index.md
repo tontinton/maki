@@ -24,12 +24,12 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--yolo` | yes | yes | yes (or `--permission-mode bypassPermissions`) |
 | `--no-plugins` / `--no-commands` / `--no-rtk` / `--no-jit` | yes | yes | yes |
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
-| `-c` / `--continue`, `-s` / `--session` | yes | no (always new session) | yes |
+| `-c` / `--continue`, `-s` / `--session`, `--session-id` | yes | no (always new session) | yes |
 | `--exit-on-done` | yes | n/a (always exits) | n/a |
 | `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | no | no | yes |
-| `--max-turns`, `--session-id`, `--fork-session` | no | no | yes |
+| `--max-turns`, `--fork-session` | no | no | yes |
 | `--permission-mode` | no | no | yes |
 | `--include-partial-messages` | no | no | yes |
 
@@ -53,7 +53,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers) |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
-| `--session-id <ID>` | Session id for SDK mode |
+| `--session-id <ID>` | Run under this id (UUID or maki base58): resume it if it exists, else start a new session with it. Lets a launcher pick the id up front and resume later without scanning the sessions dir (TUI / SDK) |
 | `--fork-session` | Load a session's history under a new id (SDK) |
 | `--max-turns <N>` | Cap agent turns (SDK) |
 | `--system-prompt <TEXT>` | Replace the system prompt (SDK only) |

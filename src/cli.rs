@@ -97,7 +97,7 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',', visible_alias = "disallowedTools")]
     pub disallowed_tools: Vec<String>,
 
-    /// Session ID for SDK mode
+    /// Run under this session ID (UUID or maki base58): resumes it if it exists, otherwise starts a new session with it
     #[arg(long)]
     pub session_id: Option<String>,
 

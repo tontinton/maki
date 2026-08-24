@@ -48,8 +48,7 @@ impl SessionStore {
         match StoredSession::load(session_id, &dir) {
             Ok(session) => Self { dir, session },
             Err(_) => {
-                let mut session = StoredSession::new(model_spec, cwd);
-                session.id = session_id;
+                let session = StoredSession::with_id(session_id, model_spec, cwd);
                 let mut store = Self { dir, session };
                 store.save();
                 store

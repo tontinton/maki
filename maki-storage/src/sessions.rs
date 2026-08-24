@@ -1363,10 +1363,16 @@ where
     T: Serialize + DeserializeOwned,
 {
     pub fn new(model: &str, cwd: &str) -> Self {
+        Self::with_id(MakiId::generate(), model, cwd)
+    }
+
+    /// For callers that pick the id up front, like a launcher that wants to
+    /// resume the session later without scanning the sessions dir.
+    pub fn with_id(id: MakiId, model: &str, cwd: &str) -> Self {
         let now = now_epoch();
         Self {
             version: SESSION_VERSION,
-            id: MakiId::generate(),
+            id,
             title: DEFAULT_TITLE.into(),
             cwd: cwd.into(),
             model: model.into(),

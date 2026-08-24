@@ -6,15 +6,16 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use color_eyre::Result;
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{Context, bail, eyre};
 
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
 use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_providers::model::Model;
-use maki_storage::StateDir;
 use maki_storage::id::MakiId;
+use maki_storage::sessions::SessionError;
+use maki_storage::{StateDir, StorageError};
 use maki_ui::{AppSession, RunOutcome};
 
 use crate::cli::{Cli, normalize_tool_name};
@@ -23,6 +24,7 @@ use crate::setup;
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
+const SESSION_FLAGS_CONFLICT: &str = "pass either --session or --session-id, not both";
 
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
 /// Dropping it joins the Lua thread via `PluginHost::drop`.
@@ -187,20 +189,32 @@ fn build_stack(
     ))
 }
 
-fn resolve_session(
-    continue_session: bool,
-    session_id: Option<&str>,
-    model: &str,
-    cwd: &str,
-    storage: &StateDir,
-) -> Result<AppSession> {
-    if let Some(raw) = session_id {
-        let id: MakiId = raw
-            .parse()
-            .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
-        return AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"));
+fn parse_session_id(raw: &str) -> Result<MakiId> {
+    raw.parse()
+        .map_err(|e| eyre!("invalid session id {raw:?}: {e}"))
+}
+
+fn resolve_session(cli: &Cli, model: &str, cwd: &str, storage: &StateDir) -> Result<AppSession> {
+    if cli.session.is_some() && cli.session_id.is_some() {
+        bail!(SESSION_FLAGS_CONFLICT);
     }
-    if continue_session {
+    if let Some(raw) = cli.session.as_deref() {
+        let id = parse_session_id(raw)?;
+        return AppSession::load(id, storage).map_err(|e| eyre!("{e}"));
+    }
+    if let Some(raw) = cli.session_id.as_deref() {
+        let id = parse_session_id(raw)?;
+        // Only a missing session becomes a new one under that id; a broken
+        // file stays an error so it is never silently replaced.
+        return match AppSession::load(id, storage) {
+            Ok(session) => Ok(session),
+            Err(SessionError::Storage(StorageError::NotFound(_))) => {
+                Ok(AppSession::with_id(id, model, cwd))
+            }
+            Err(e) => Err(eyre!("{e}")),
+        };
+    }
+    if cli.continue_session {
         match AppSession::latest(cwd, storage) {
             Ok(Some(session)) => return Ok(session),
             Ok(None) => {
@@ -284,8 +298,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
 
     let cwd_str = cwd.to_string_lossy().into_owned();
     let mut tabs = vec![resolve_session(
-        cli.continue_session,
-        cli.session.as_deref(),
+        &cli,
         &stack.model.spec(),
         &cwd_str,
         &storage,
@@ -418,11 +431,85 @@ fn warn_stale_config_toml(cwd: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use color_eyre::eyre::eyre;
+    use clap::Parser;
     use maki_config::RawConfig;
+    use maki_storage::sessions::SESSIONS_DIR;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tempfile::{TempDir, tempdir};
+    use test_case::test_case;
+
+    const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
+    const CWD: &str = "/project";
+    const MODEL_SPEC: &str = "anthropic/claude-test";
+    const TITLE: &str = "saved earlier";
+
+    fn state_dir(tmp: &TempDir) -> StateDir {
+        StateDir::from_path(tmp.path().to_path_buf())
+    }
+
+    fn resolve(tmp: &TempDir, args: &[&str]) -> Result<AppSession> {
+        let cli = Cli::parse_from([&["maki"], args].concat());
+        resolve_session(&cli, MODEL_SPEC, CWD, &state_dir(tmp))
+    }
+
+    #[test]
+    fn session_id_starts_a_new_session_under_that_id() {
+        let tmp = tempdir().unwrap();
+        let session = resolve(&tmp, &["--session-id", SESSION_ID]).unwrap();
+        assert_eq!(session.id, SESSION_ID.parse::<MakiId>().unwrap());
+        assert_eq!(session.cwd, CWD);
+        assert_eq!(session.model, MODEL_SPEC);
+        assert!(session.messages().is_empty());
+    }
+
+    #[test_case("--session-id" ; "session_id")]
+    #[test_case("--session" ; "session")]
+    fn existing_session_is_resumed(flag: &str) {
+        let tmp = tempdir().unwrap();
+        let mut saved = AppSession::with_id(SESSION_ID.parse().unwrap(), MODEL_SPEC, CWD);
+        saved.set_title(TITLE.into());
+        saved.save(&state_dir(&tmp)).unwrap();
+
+        let session = resolve(&tmp, &[flag, SESSION_ID]).unwrap();
+        assert_eq!(session.id, saved.id);
+        assert_eq!(session.title, TITLE);
+    }
+
+    /// Legacy `.json` logs parse strictly, so a broken one surfaces as a load
+    /// error rather than a fresh session under the same id.
+    #[test]
+    fn session_id_does_not_replace_a_broken_session() {
+        let tmp = tempdir().unwrap();
+        let id: MakiId = SESSION_ID.parse().unwrap();
+        let sessions = tmp.path().join(SESSIONS_DIR);
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join(format!("{id}.json")), "not a session").unwrap();
+
+        assert!(resolve(&tmp, &["--session-id", SESSION_ID]).is_err());
+    }
+
+    #[test]
+    fn session_flag_alone_requires_the_session_to_exist() {
+        let tmp = tempdir().unwrap();
+        assert!(resolve(&tmp, &["--session", SESSION_ID]).is_err());
+    }
+
+    #[test_case("--session-id")]
+    #[test_case("--session")]
+    fn malformed_session_id_is_rejected(flag: &str) {
+        let tmp = tempdir().unwrap();
+        assert!(resolve(&tmp, &[flag, "not-an-id"]).is_err());
+    }
+
+    #[test]
+    fn session_and_session_id_together_is_an_error() {
+        let tmp = tempdir().unwrap();
+        let err =
+            resolve(&tmp, &["--session", SESSION_ID, "--session-id", SESSION_ID]).unwrap_err();
+        assert_eq!(err.to_string(), SESSION_FLAGS_CONFLICT);
+    }
 
     /// `second_saw_first` requires both joins: `defer` joining the first
     /// closure before spawning the second, and `Drop` joining the second
@@ -500,9 +587,7 @@ mod tests {
     /// `init.lua` must not be executed in that mode.
     #[test]
     fn no_plugins_skips_broken_init_lua_but_keeps_host_alive() {
-        use clap::Parser;
         use maki_agent::tools::ToolRegistry;
-        use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir");
         let maki_dir: PathBuf = dir.path().join(".maki");
@@ -538,9 +623,7 @@ mod tests {
     /// cannot silently regress into a tautology.
     #[test]
     fn broken_init_lua_errors_without_no_plugins() {
-        use clap::Parser;
         use maki_agent::tools::ToolRegistry;
-        use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir");
         let maki_dir: PathBuf = dir.path().join(".maki");
