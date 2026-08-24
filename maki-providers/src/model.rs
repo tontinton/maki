@@ -646,6 +646,7 @@ impl AddAssign for TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use test_case::test_case;
 
     fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
@@ -1072,9 +1073,19 @@ mod tests {
         assert!(!vision("synthetic/syn:test-blind"));
     }
 
+    /// `set_known_models` replaces a provider's whole discovered list, so two
+    /// tests seeding the same slug clobber each other when they run in
+    /// parallel. Everyone seeding `ollama` takes this in turn.
+    static OLLAMA_DISCOVERY: Mutex<()> = Mutex::new(());
+
+    fn seeding_ollama() -> std::sync::MutexGuard<'static, ()> {
+        OLLAMA_DISCOVERY.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn discovered_context_window_flows_into_from_base_for_unknown_model() {
         use crate::model::ModelInfo;
+        let _seeding = seeding_ollama();
 
         let model_id = "test-discovered-context-window-model";
         let expected_window: u32 = 131_072;
@@ -1106,6 +1117,7 @@ mod tests {
     #[test_case(Some(PAID_PRICING),       false ; "priced_is_not_free")]
     #[test_case(None,                     false ; "unknown_price_is_not_free")]
     fn discovered_pricing_decides_free(pricing: Option<ModelPricing>, expected: bool) {
+        let _seeding = seeding_ollama();
         let model_id = "test-discovered-free-model";
         model_registry::set_known_models(
             "ollama",
