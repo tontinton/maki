@@ -138,6 +138,7 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
             cache_write: entry.price("caching_price").unwrap_or(0.0),
             cache_read: entry.price("cached_price").unwrap_or(0.0),
             fast: None,
+            subsidised_by: None,
         }),
         _ => None,
     };

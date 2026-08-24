@@ -21,7 +21,7 @@ use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, Tool
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{
     BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader, PackCommand,
-    PackPlan, PackPreparation, PackReport, SessionEndReason,
+    PackPlan, PackPreparation, PackReport, PlanActionReader, SessionEndReason,
 };
 use maki_providers::{
     ContentBlock, Effort, Message, RequestOptions, Role, THINKING_USAGE, TokenUsage,
@@ -132,6 +132,7 @@ fn build_app_with_session(
         lua_commands,
         KeymapReader::empty(),
         HintReader::empty(),
+        PlanActionReader::empty(),
         writer,
         UiConfig::default(),
         100,
@@ -327,6 +328,7 @@ fn turn_complete(usage: TokenUsage, model: &str, cost: Option<f64>) -> AgentEven
         usage,
         model: model.into(),
         cost,
+        list_cost: None,
         context_size: None,
         context_window: 0,
     }))

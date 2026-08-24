@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
+use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, MessageKind, Role};
 use maki_storage::sessions::next_epoch;
 use tracing::warn;
 
@@ -39,6 +39,30 @@ impl History {
 
     pub fn as_slice(&self) -> &[Message] {
         &self.snapshot.messages
+    }
+
+    /// The newest real user turn: observations and non-text content are
+    /// skipped, so reviewers see what the human last asked for.
+    /// Up to {n} most recent real user texts, oldest first.
+    pub fn recent_user_texts(&self, n: usize) -> Vec<&str> {
+        let mut texts: Vec<&str> = self
+            .snapshot
+            .messages
+            .iter()
+            .rev()
+            .filter_map(|msg| {
+                if !matches!(msg.role, Role::User) || matches!(msg.kind, MessageKind::Observation) {
+                    return None;
+                }
+                msg.content.iter().find_map(|block| match block {
+                    ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+                    _ => None,
+                })
+            })
+            .take(n)
+            .collect();
+        texts.reverse();
+        texts
     }
 
     pub fn push(&mut self, msg: Message) {

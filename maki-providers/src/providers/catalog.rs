@@ -664,6 +664,7 @@ fn parse_model(model: &schema::CatalogModel) -> CatalogMeta {
             cache_write: cost.cache_write.unwrap_or(0.0),
             cache_read: cost.cache_read.unwrap_or(0.0),
             fast: None,
+            subsidised_by: None,
         }),
         supports_thinking: model.reasoning,
         supports_vision,

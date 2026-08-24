@@ -193,6 +193,7 @@ fn model_info(entry: &Value) -> Option<ModelInfo> {
                 * per_million,
             cache_read: info["cache_read_input_token_cost"].as_f64().unwrap_or(0.0) * per_million,
             fast: None,
+            subsidised_by: None,
         })
     } else {
         None

@@ -1035,7 +1035,9 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
+    use maki_agent::permissions::{
+        PermissionCheck, PermissionError, PermissionManager, ReviewSource,
+    };
     use maki_agent::tools::PermissionScopes;
     use maki_agent::{
         CancelToken, DoneReason, EventSender, SubagentInfo, ToolStartEvent, TurnCompleteEvent,
@@ -1380,6 +1382,7 @@ mod tests {
             usage: TokenUsage::default(),
             model: SELECTED_SPEC.to_owned(),
             cost: Some(cost),
+            list_cost: None,
             context_size: None,
             context_window: CONTEXT_WINDOW,
         })
@@ -1552,6 +1555,7 @@ mod tests {
             request_id,
             &CancelToken::none(),
             None,
+            ReviewSource::none(),
         ))
     }
 

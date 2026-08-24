@@ -200,6 +200,12 @@ pub struct ProviderDef {
     /// missing name instead of a silent 401.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    /// Set when this provider's cost is prepaid via a flat subscription
+    /// (e.g. `"Max"` for Claude Max through cliproxy). Every model resolved
+    /// through it bills `$0` while still tracking the published list
+    /// price as a reference; see [`maki_providers::ModelPricing::subsidised_by`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subsidised_by: Option<String>,
     /// Opencode-only: when `Some(false)`, free catalog models are hidden
     /// entirely. Defaults to `false` when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

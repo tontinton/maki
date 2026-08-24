@@ -10,6 +10,7 @@ use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 
 use crate::api::util::dispatch::{DepthGuard, Reentry, call_swallowing};
+use crate::plugin_permissions::PluginPermissions;
 
 /// Slot names the host fires itself. A plugin declaring one would shadow a
 /// point whose firing order dispatch guarantees, so the namespace is closed.
@@ -373,6 +374,10 @@ fn declare_slot(
 /// tool declares, and a tool declaring none costs every permission. See
 /// [Hooks](/docs/hooks/).
 ///
+/// Wrapping a plugin-declared slot you do not own steers a chain someone
+/// else's plugin trusts, so it costs full trust (every permission granted).
+/// Layering your own slot is free.
+///
 /// @param name string Slot name to wrap.
 /// @param wrapper function Layer: `function(prev, ...)`. Call `prev(...)` to continue.
 /// @return
@@ -381,9 +386,26 @@ fn declare_slot(
 ///   return prev("[" .. text .. "]")
 /// end)
 #[lua_fn]
-fn set_slot(lua: &Lua, #[ctx] plugin: Arc<str>, name: String, wrapper: Function) -> LuaResult<()> {
+fn set_slot(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    #[ctx] permissions: PluginPermissions,
+    name: String,
+    wrapper: Function,
+) -> LuaResult<()> {
     let mut store = slot_store_mut(lua)?;
-    store.slots.entry(name).or_default().layers.push(SlotLayer {
+    let entry = store.slots.entry(name.clone()).or_default();
+    // Host `tool.*` slots gate at chain-fire time via `layer_delegation` so a
+    // reload that narrows permissions takes effect on the next call.
+    let host_slot = name.starts_with(HOST_PREFIX);
+    let self_owned = entry.owner.as_deref() == Some(plugin.as_ref());
+    if !host_slot && !self_owned && !permissions.holds_all() {
+        return Err(mlua::Error::runtime(format!(
+            "set_slot: wrapping '{name}' steers another plugin's chain and requires full trust; \
+             grant every permission in plugin.toml or wrap only slots your plugin declares"
+        )));
+    }
+    entry.layers.push(SlotLayer {
         plugin: Arc::clone(&plugin),
         func: wrapper,
     });
@@ -420,8 +442,8 @@ fn get_slots(lua: &Lua) -> LuaResult<Table> {
 }
 
 lua_table! {
-    extend "maki.api" => pub(crate) fn add_slot_methods(plugin: Arc<str>), DOCS [
-        declare_slot(plugin), set_slot(plugin), get_slots,
+    extend "maki.api" => pub(crate) fn add_slot_methods(plugin: Arc<str>, permissions: PluginPermissions), DOCS [
+        declare_slot(plugin), set_slot(plugin, permissions), get_slots,
     ]
 }
 
