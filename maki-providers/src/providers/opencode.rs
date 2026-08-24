@@ -156,7 +156,7 @@ impl Opencode {
             let (meta, provider_data) = guard.lookup(&sub_provider, &actual_id)?;
             let state_dir = &guard.state_dir;
             let auth = provider_data
-                .resolve_auth_with_override(auth_override.as_ref(), state_dir)
+                .resolve_auth_with_override(auth_override.as_ref(), state_dir)?
                 .ok_or_else(|| {
                     config_error(format!(
                         "authentication required for provider '{sub_provider}', run `maki auth login {sub_provider}`"

@@ -204,11 +204,9 @@ fn client_mode() -> &'static str {
     }
 }
 
-pub(crate) fn build_oauth_resolved(tokens: &OAuthTokens) -> ResolvedAuth {
-    ResolvedAuth {
-        base_url: Some(CLI_BASE_URL.into()),
-        headers: oauth_headers(&tokens.access),
-    }
+pub(crate) fn build_oauth_resolved(tokens: &OAuthTokens) -> Result<ResolvedAuth, AgentError> {
+    Ok(ResolvedAuth::new(PROVIDER, oauth_headers(&tokens.access))?
+        .with_base_url(Some(CLI_BASE_URL.into())))
 }
 
 pub(crate) fn is_oauth(dir: &StateDir) -> bool {
@@ -219,13 +217,13 @@ pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
     if let Some(tokens) = load_tokens(dir, PROVIDER) {
         if !tokens.is_expired() {
             debug!("using xAI OAuth authentication");
-            return Ok(build_oauth_resolved(&tokens));
+            return build_oauth_resolved(&tokens);
         }
         match refresh_tokens(&tokens) {
             Ok(fresh) => {
                 save_tokens(dir, PROVIDER, &fresh)?;
                 debug!("using xAI OAuth authentication (refreshed)");
-                return Ok(build_oauth_resolved(&fresh));
+                return build_oauth_resolved(&fresh);
             }
             Err(e) => {
                 warn!(error = %e, "xAI OAuth refresh failed, clearing stale tokens");
@@ -237,7 +235,7 @@ pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
 
     if let Ok(pool) = KeyPool::resolve(PROVIDER, API_KEY_ENV) {
         debug!("using xAI API key authentication");
-        return Ok(ResolvedAuth::bearer(pool.current()));
+        return ResolvedAuth::bearer(PROVIDER, pool.current());
     }
 
     Err(AgentError::Config {

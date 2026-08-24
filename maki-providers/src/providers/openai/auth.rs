@@ -249,22 +249,16 @@ pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentE
 
 pub(crate) const CODING_PLAN_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
-pub(crate) fn build_oauth_resolved(tokens: &OAuthTokens) -> ResolvedAuth {
-    ResolvedAuth {
-        base_url: None,
-        headers: vec![("authorization".into(), format!("Bearer {}", tokens.access))],
-    }
+pub(crate) fn build_oauth_resolved(tokens: &OAuthTokens) -> Result<ResolvedAuth, AgentError> {
+    ResolvedAuth::bearer(PROVIDER, &tokens.access)
 }
 
-pub(crate) fn build_coding_plan_resolved(tokens: &OAuthTokens) -> ResolvedAuth {
+pub(crate) fn build_coding_plan_resolved(tokens: &OAuthTokens) -> Result<ResolvedAuth, AgentError> {
     let mut headers = vec![("authorization".into(), format!("Bearer {}", tokens.access))];
     if let Some(account_id) = &tokens.account_id {
         headers.push(("chatgpt-account-id".into(), account_id.clone()));
     }
-    ResolvedAuth {
-        base_url: Some(CODING_PLAN_BASE_URL.into()),
-        headers,
-    }
+    Ok(ResolvedAuth::new(PROVIDER, headers)?.with_base_url(Some(CODING_PLAN_BASE_URL.into())))
 }
 
 pub(crate) fn is_oauth(dir: &StateDir) -> bool {
@@ -275,13 +269,13 @@ pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
     if let Some(tokens) = load_tokens(dir, PROVIDER) {
         if !tokens.is_expired() {
             debug!("using OpenAI OAuth authentication");
-            return Ok(build_oauth_resolved(&tokens));
+            return build_oauth_resolved(&tokens);
         }
         match refresh_tokens(&tokens) {
             Ok(fresh) => {
                 save_tokens(dir, PROVIDER, &fresh)?;
                 debug!("using OpenAI OAuth authentication (refreshed)");
-                return Ok(build_oauth_resolved(&fresh));
+                return build_oauth_resolved(&fresh);
             }
             Err(e) => {
                 warn!(error = %e, "OpenAI OAuth refresh failed, clearing stale tokens");
@@ -292,18 +286,12 @@ pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
 
     if let Ok(key) = env::var("OPENAI_API_KEY") {
         debug!("using OpenAI API key authentication");
-        return Ok(ResolvedAuth {
-            base_url: None,
-            headers: vec![("authorization".into(), format!("Bearer {key}"))],
-        });
+        return ResolvedAuth::bearer(PROVIDER, &key);
     }
 
     if let Some(creds) = maki_storage::auth::load_provider_credentials(dir, PROVIDER) {
         debug!("using OpenAI saved API key");
-        return Ok(ResolvedAuth {
-            base_url: None,
-            headers: vec![("authorization".into(), format!("Bearer {}", creds.api_key))],
-        });
+        return ResolvedAuth::bearer(PROVIDER, &creds.api_key);
     }
 
     Err(AgentError::Config {

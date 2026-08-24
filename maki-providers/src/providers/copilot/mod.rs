@@ -24,10 +24,11 @@ use crate::{
 
 pub mod auth;
 
+const SLUG: &str = "copilot";
 const DEFAULT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
 
 inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "copilot",
+    slug: SLUG,
     display_name: "Copilot",
     protocol: maki_config::providers::Protocol::Openai,
     default_base_url: DEFAULT_API_ENDPOINT,
@@ -621,10 +622,9 @@ impl Copilot {
                 &effort_dialect(&info),
             );
         }
-        let resolved = super::ResolvedAuth {
-            base_url: Some(auth.endpoint.clone()),
-            headers: copilot_headers(&auth, Some("conversation-agent")),
-        };
+        let resolved =
+            super::ResolvedAuth::new(SLUG, copilot_headers(&auth, Some("conversation-agent")))?
+                .with_base_url(Some(auth.endpoint.clone()));
         responses::do_stream(
             &self.client,
             model,

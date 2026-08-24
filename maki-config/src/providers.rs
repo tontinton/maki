@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::process;
@@ -181,6 +181,25 @@ pub struct ProviderDef {
     pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub discover_models: bool,
+    /// Extra HTTP headers sent with every request to this provider. Values
+    /// expand `${VAR}` from the environment, so gateway credentials (e.g.
+    /// Cloudflare Access service tokens in front of a private endpoint) never
+    /// land in the config file:
+    ///
+    /// ```toml
+    /// [anthropic]
+    /// base_url = "https://gw.internal/anthropic"
+    /// [anthropic.headers]
+    /// CF-Access-Client-Id = "${CF_ACCESS_CLIENT_ID}"
+    /// CF-Access-Client-Secret = "${CF_ACCESS_CLIENT_SECRET}"
+    /// ```
+    ///
+    /// A same-name header (case-insensitive) replaces the built-in auth
+    /// header instead of appending, and keeps winning across key rotations.
+    /// An unset or empty variable fails the whole provider so callers see the
+    /// missing name instead of a silent 401.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     /// Opencode-only: when `Some(false)`, free catalog models are hidden
     /// entirely. Defaults to `false` when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -402,6 +421,22 @@ pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test]
+    fn provider_def_parses_custom_headers() {
+        let def: ProviderDef = toml::from_str(
+            "base_url = \"https://gw.example.com/v1\"\n[headers]\n\"CF-Access-Client-Id\" = \"${CF_ID}\"\n\"CF-Access-Client-Secret\" = \"${CF_SECRET}\"\n",
+        )
+        .unwrap();
+        assert_eq!(def.headers.len(), 2);
+        assert_eq!(def.headers["CF-Access-Client-Id"], "${CF_ID}");
+    }
+
+    #[test]
+    fn provider_def_without_headers_is_empty() {
+        let def: ProviderDef = toml::from_str("base_url = \"https://x\"\n").unwrap();
+        assert!(def.headers.is_empty());
+    }
 
     #[test]
     fn provider_def_roundtrip() {

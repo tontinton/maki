@@ -20,6 +20,7 @@ use super::{KeyPool, ResolvedAuth, http_client, next_sse_line};
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const ENV_VAR: &str = "GEMINI_API_KEY";
+const API_KEY_HEADER: &str = "x-goog-api-key";
 const FLASH_MAX_THINKING: u32 = 24_576;
 const PRO_MAX_THINKING: u32 = 32_768;
 
@@ -104,11 +105,11 @@ fn resolve_google_base_url() -> Option<String> {
     maki_config::providers::resolve_base_url("google", config.get("google"))
 }
 
-fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> ResolvedAuth {
-    ResolvedAuth {
-        base_url,
-        headers: vec![("x-goog-api-key".into(), key.to_string())],
-    }
+fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> Result<ResolvedAuth, AgentError> {
+    Ok(
+        ResolvedAuth::new("google", vec![(API_KEY_HEADER.into(), key.to_string())])?
+            .with_base_url(base_url),
+    )
 }
 
 pub struct Google {
@@ -124,7 +125,7 @@ impl Google {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let pool = KeyPool::resolve("google", ENV_VAR)?;
         let resolved_base_url = resolve_google_base_url();
-        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone());
+        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone())?;
         Ok(Self {
             client: http_client(timeouts),
             auth: Arc::new(Mutex::new(resolved)),
@@ -162,7 +163,7 @@ impl Google {
         let auth = self.auth.lock().unwrap();
         auth.headers
             .iter()
-            .find(|(k, _)| k == "x-goog-api-key")
+            .find(|(k, _)| k == API_KEY_HEADER)
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
     }
@@ -295,19 +296,17 @@ impl Provider for Google {
         Box::pin(async {
             let pool = KeyPool::resolve("google", ENV_VAR)?;
             *self.auth.lock().unwrap() =
-                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone());
+                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
             Ok(())
         })
     }
 
     fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
         Box::pin(async {
-            let base_url = self.resolved_base_url.clone();
-            Ok(self.key_pool.as_ref().is_some_and(|p| {
-                p.rotate_auth(&self.auth, |key| {
-                    resolve_auth_from_key(key, base_url.clone())
-                })
-            }))
+            Ok(self
+                .key_pool
+                .as_ref()
+                .is_some_and(|p| p.rotate_key_header(&self.auth, API_KEY_HEADER, str::to_string)))
         })
     }
 }
@@ -677,10 +676,10 @@ mod tests {
     const GEMINI_API_KEY: &str = "test-key";
 
     fn test_auth() -> Arc<Mutex<ResolvedAuth>> {
-        Arc::new(Mutex::new(ResolvedAuth {
-            base_url: None,
-            headers: vec![("x-goog-api-key".into(), GEMINI_API_KEY.into())],
-        }))
+        Arc::new(Mutex::new(ResolvedAuth::for_test(
+            None,
+            vec![("x-goog-api-key".into(), GEMINI_API_KEY.into())],
+        )))
     }
 
     fn test_timeouts() -> super::super::Timeouts {

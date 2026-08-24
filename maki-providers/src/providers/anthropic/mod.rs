@@ -35,6 +35,7 @@ const LABEL_SESSION: &str = "Current session";
 const LABEL_WEEK_ALL: &str = "Current week (all models)";
 
 const ENV_VAR: &str = "ANTHROPIC_API_KEY";
+const API_KEY_HEADER: &str = "x-api-key";
 
 inventory::submit!(maki_config::providers::BuiltInProvider {
     slug: "anthropic",
@@ -240,11 +241,14 @@ fn resolve_anthropic_base_url() -> Option<String> {
     maki_config::providers::resolve_base_url("anthropic", config.get("anthropic"))
 }
 
-fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> super::ResolvedAuth {
-    super::ResolvedAuth {
-        base_url,
-        headers: vec![("x-api-key".into(), key.to_string())],
-    }
+fn resolve_auth_from_key(
+    key: &str,
+    base_url: Option<String>,
+) -> Result<super::ResolvedAuth, AgentError> {
+    Ok(
+        super::ResolvedAuth::new("anthropic", vec![(API_KEY_HEADER.into(), key.to_string())])?
+            .with_base_url(base_url),
+    )
 }
 
 pub struct Anthropic {
@@ -262,7 +266,7 @@ impl Anthropic {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
         let resolved_base_url = resolve_anthropic_base_url();
-        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone());
+        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone())?;
         debug!(keys = pool.len(), "using API key authentication");
         Ok(Self {
             client: super::http_client(timeouts),
@@ -440,7 +444,7 @@ impl Provider for Anthropic {
         Box::pin(async {
             let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
             *self.auth.lock().unwrap() =
-                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone());
+                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
             debug!("reloaded Anthropic auth from env");
             Ok(())
         })
@@ -448,12 +452,10 @@ impl Provider for Anthropic {
 
     fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
         Box::pin(async {
-            let base_url = self.resolved_base_url.clone();
-            Ok(self.key_pool.as_ref().is_some_and(|p| {
-                p.rotate_auth(&self.auth, |key| {
-                    resolve_auth_from_key(key, base_url.clone())
-                })
-            }))
+            Ok(self
+                .key_pool
+                .as_ref()
+                .is_some_and(|p| p.rotate_key_header(&self.auth, API_KEY_HEADER, str::to_string)))
         })
     }
 
@@ -624,17 +626,19 @@ mod tests {
     #[test_case("x-api-key", None, false ; "api_key_not_eligible")]
     #[test_case("Authorization", Some("https://proxy.example.com/v1/messages"), false ; "foreign_base_url_not_eligible")]
     fn usage_eligibility(header: &str, base_url: Option<&str>, expected: bool) {
-        let auth = crate::providers::ResolvedAuth {
-            base_url: base_url.map(String::from),
-            headers: vec![(header.into(), "token".into())],
-        };
+        let auth = crate::providers::ResolvedAuth::for_test(
+            base_url.map(String::from),
+            vec![(header.into(), "token".into())],
+        );
         assert_eq!(usage_eligible(&auth, None), expected);
     }
 
     #[test]
     fn with_auth_keeps_third_party_endpoint_ineligible() {
-        let mut auth = crate::providers::ResolvedAuth::bearer("token");
-        auth.base_url = Some(THIRD_PARTY_BASE_URL.into());
+        let auth = crate::providers::ResolvedAuth::for_test(
+            Some(THIRD_PARTY_BASE_URL.into()),
+            vec![("authorization".into(), "Bearer token".into())],
+        );
         let provider = Anthropic::with_auth(
             Arc::new(Mutex::new(auth)),
             crate::providers::Timeouts::default(),
@@ -648,10 +652,10 @@ mod tests {
 
     #[test]
     fn usage_eligible_when_url_matches_configured_override() {
-        let auth = crate::providers::ResolvedAuth {
-            base_url: Some(THIRD_PARTY_BASE_URL.into()),
-            headers: vec![("Authorization".into(), "token".into())],
-        };
+        let auth = crate::providers::ResolvedAuth::for_test(
+            Some(THIRD_PARTY_BASE_URL.into()),
+            vec![("Authorization".into(), "token".into())],
+        );
         assert!(usage_eligible(&auth, Some(THIRD_PARTY_BASE_URL)));
         assert!(!usage_eligible(
             &auth,

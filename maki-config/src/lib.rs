@@ -214,6 +214,36 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
     },
 ];
 
+/// Expand `${VAR}` references in a config value from the process environment.
+/// A variable that is unset OR set to empty fails with `Err(var)`, so callers
+/// reject the whole value instead of sending a partially expanded one (e.g.
+/// `Bearer ` with nothing after it). An unterminated `${` passes through
+/// literally; there is no escape syntax for a literal `${`.
+pub fn expand_env(value: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                let var = &after[..end];
+                match std::env::var(var) {
+                    Ok(v) if !v.is_empty() => out.push_str(&v),
+                    _ => return Err(var.to_string()),
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("invalid config: {section}.{field} = {value} is below minimum ({min})")]
@@ -3612,6 +3642,66 @@ mod tests {
         assert_eq!(
             perms.rules[0].tool,
             ToolKey::parse("github.delete").unwrap()
+        );
+    }
+
+    // Uniquely named vars per test: env is process-global and tests run in parallel.
+
+    #[test]
+    fn expand_env_literal_text_passes_through() {
+        assert_eq!(expand_env("plain value").as_deref(), Ok("plain value"));
+    }
+
+    #[test]
+    fn expand_env_expands_whole_value_var() {
+        unsafe { std::env::set_var("MAKI_TEST_HDR_WHOLE_71535", "secret") };
+        assert_eq!(
+            expand_env("${MAKI_TEST_HDR_WHOLE_71535}").as_deref(),
+            Ok("secret")
+        );
+    }
+
+    #[test]
+    fn expand_env_expands_mid_string_var() {
+        unsafe { std::env::set_var("MAKI_TEST_HDR_MID_71535", "tok") };
+        assert_eq!(
+            expand_env("Bearer ${MAKI_TEST_HDR_MID_71535}!").as_deref(),
+            Ok("Bearer tok!")
+        );
+    }
+
+    #[test]
+    fn expand_env_expands_multiple_vars() {
+        unsafe { std::env::set_var("MAKI_TEST_HDR_A_71535", "a") };
+        unsafe { std::env::set_var("MAKI_TEST_HDR_B_71535", "b") };
+        assert_eq!(
+            expand_env("${MAKI_TEST_HDR_A_71535}-${MAKI_TEST_HDR_B_71535}").as_deref(),
+            Ok("a-b")
+        );
+    }
+
+    #[test]
+    fn expand_env_unset_var_names_the_variable() {
+        assert_eq!(
+            expand_env("Bearer ${MAKI_TEST_HDR_UNSET_71535}"),
+            Err("MAKI_TEST_HDR_UNSET_71535".to_string())
+        );
+    }
+
+    #[test]
+    fn expand_env_unterminated_brace_passes_through() {
+        assert_eq!(
+            expand_env("x ${NOT_CLOSED").as_deref(),
+            Ok("x ${NOT_CLOSED")
+        );
+    }
+
+    #[test]
+    fn expand_env_empty_var_is_treated_as_unset() {
+        unsafe { std::env::set_var("MAKI_TEST_HDR_EMPTY_71535", "") };
+        assert_eq!(
+            expand_env("Bearer ${MAKI_TEST_HDR_EMPTY_71535}"),
+            Err("MAKI_TEST_HDR_EMPTY_71535".to_string())
         );
     }
 }

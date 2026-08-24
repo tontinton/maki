@@ -160,7 +160,7 @@ impl OpenAi {
             match auth::refresh_tokens(&tokens) {
                 Ok(fresh) => {
                     maki_storage::auth::save_tokens(&storage, auth::PROVIDER, &fresh)?;
-                    Ok(auth::build_oauth_resolved(&fresh))
+                    auth::build_oauth_resolved(&fresh)
                 }
                 Err(e) => {
                     warn!(error = %e, "OpenAI OAuth refresh failed, clearing stale tokens");
@@ -195,7 +195,7 @@ impl OpenAi {
         if let Some(storage) = self.storage.as_ref()
             && let Some(tokens) = maki_storage::auth::load_tokens(storage, auth::PROVIDER)
         {
-            return Ok(auth::build_coding_plan_resolved(&tokens));
+            return auth::build_coding_plan_resolved(&tokens);
         }
         // Fall back to standard API key via the Responses API. Env /
         // providers.toml base_url overrides the platform API only, never the
