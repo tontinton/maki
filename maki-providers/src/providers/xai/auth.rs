@@ -1,8 +1,6 @@
 use std::io::{self, Write};
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::str;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
@@ -17,7 +15,9 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, error, warn};
 
 use crate::AgentError;
-use crate::providers::{KeyPool, ResolvedAuth, urlenc};
+use crate::providers::{
+    CallbackRequest, KeyPool, LoopbackCallback, Reply, ResolvedAuth, random_token, urlenc,
+};
 
 use super::catalog;
 
@@ -25,7 +25,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_TIMEOUT: Duration = Duration::from_secs(300);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
-const ACCEPT_POLL: Duration = Duration::from_millis(100);
 const DEFAULT_EXPIRES_SECS: u64 = 3600;
 const GROK_CLI_DEFAULT_TTL_MS: u64 = 6 * 60 * 60 * 1000;
 const MS_THRESHOLD: f64 = 10_000_000_000.0;
@@ -522,9 +521,9 @@ fn browser_login() -> Result<OAuthTokens, AgentError> {
     let (verifier, challenge) = pkce_pair()?;
     let state = random_token()?;
     let nonce = random_token()?;
-    let listener = bind_callback()?;
-    let port = listener.local_addr()?.port();
-    let redirect_uri = format!("http://{REDIRECT_HOST}:{port}{REDIRECT_PATH}");
+    // No CORS: the browser navigates here, it does not `fetch` here.
+    let listener = LoopbackCallback::bind("xAI OAuth", [REDIRECT_PORT], None)?;
+    let redirect_uri = format!("http://{REDIRECT_HOST}:{}{REDIRECT_PATH}", listener.port()?);
 
     let authorize_url = format!(
         "{AUTHORIZE_URL}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}&nonce={}",
@@ -543,7 +542,7 @@ fn browser_login() -> Result<OAuthTokens, AgentError> {
     println!("Waiting for xAI OAuth callback on {redirect_uri}...");
     println!("If the redirect cannot reach this process, paste the complete redirect URL below.");
 
-    let callback = wait_for_callback(listener, &state)?;
+    let callback = wait_for_callback(&listener, &state)?;
     if let Some(error) = callback.error {
         return Err(AgentError::Config {
             message: format!("xAI authorization failed: {error}"),
@@ -576,122 +575,48 @@ struct CallbackResult {
     error: Option<String>,
 }
 
-fn bind_callback() -> Result<TcpListener, AgentError> {
-    TcpListener::bind((REDIRECT_HOST, REDIRECT_PORT))
-        .or_else(|_| TcpListener::bind((REDIRECT_HOST, 0)))
-        .and_then(|listener| {
-            listener.set_nonblocking(true)?;
-            Ok(listener)
-        })
-        .map_err(|e| AgentError::Config {
-            message: format!("xAI OAuth callback server: {e}"),
-        })
-}
-
 fn wait_for_callback(
-    listener: TcpListener,
+    listener: &LoopbackCallback,
     expected_state: &str,
 ) -> Result<CallbackResult, AgentError> {
-    let deadline = Instant::now() + CALLBACK_TIMEOUT;
-    let paste_rx = spawn_paste_reader();
-    loop {
-        if Instant::now() >= deadline {
-            return Err(AgentError::Config {
-                message: CALLBACK_TIMEOUT_MSG.into(),
-            });
-        }
-        if let Ok(pasted) = paste_rx.try_recv() {
-            return parse_callback_input(&pasted, expected_state);
-        }
-
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let mut buf = [0u8; 4096];
-                stream.set_nonblocking(false).ok();
-                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]);
-                let Some(target) = request.split_whitespace().nth(1) else {
-                    continue;
-                };
-                if !target.starts_with(REDIRECT_PATH) {
-                    let _ = write_http(&mut stream, 404, "text/plain; charset=utf-8", "Not found");
-                    continue;
-                }
-                match parse_callback_target(target, expected_state) {
-                    Ok(result) => {
-                        let html = if result.error.is_some() {
-                            "<html><body><h1>xAI authorization failed.</h1>You can close this tab.</body></html>"
-                        } else {
-                            "<html><body><h1>xAI authorization received.</h1>You can close this tab.</body></html>"
-                        };
-                        let _ = write_http(&mut stream, 200, "text/html; charset=utf-8", html);
-                        return Ok(result);
-                    }
-                    Err(_) => {
-                        let _ = write_http(
-                            &mut stream,
-                            400,
-                            "text/html; charset=utf-8",
-                            "<html><body><h1>xAI authorization state mismatch.</h1>Please return to maki and try again.</body></html>",
-                        );
-                    }
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(ACCEPT_POLL);
-            }
-            Err(e) => {
-                return Err(AgentError::Config {
-                    message: format!("xAI OAuth callback: {e}"),
-                });
-            }
-        }
-    }
-}
-
-fn spawn_paste_reader() -> mpsc::Receiver<String> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        loop {
-            let mut line = String::new();
-            match io::stdin().read_line(&mut line) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {
-                    let pasted = line.trim().to_string();
-                    if !pasted.is_empty() && tx.send(pasted).is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-    });
-    rx
-}
-
-fn write_http(
-    stream: &mut impl Write,
-    status: u16,
-    content_type: &str,
-    body: &str,
-) -> io::Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        if status == 200 {
-            "OK"
-        } else if status == 404 {
-            "Not Found"
-        } else {
-            "Bad Request"
-        },
-        body.len(),
+    listener.wait(
+        CALLBACK_TIMEOUT,
+        CALLBACK_TIMEOUT_MSG,
+        |request, reply| handle_request(request, reply, expected_state),
+        |pasted| parse_callback_input(pasted, expected_state).map(Some),
     )
 }
 
-fn parse_callback_target(target: &str, expected_state: &str) -> Result<CallbackResult, AgentError> {
-    let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
-    parse_callback_query(query, expected_state)
+/// `Ok(None)` means the redirect has not arrived yet: a stray probe, or a
+/// callback whose state did not match the one we minted.
+fn handle_request(
+    request: &CallbackRequest,
+    reply: &mut Reply,
+    expected_state: &str,
+) -> Result<Option<CallbackResult>, AgentError> {
+    if !request.target.starts_with(REDIRECT_PATH) {
+        reply.send(404, "text/plain; charset=utf-8", "Not found");
+        return Ok(None);
+    }
+    match parse_callback_query(request.query(), expected_state) {
+        Ok(result) => {
+            let html = if result.error.is_some() {
+                "<html><body><h1>xAI authorization failed.</h1>You can close this tab.</body></html>"
+            } else {
+                "<html><body><h1>xAI authorization received.</h1>You can close this tab.</body></html>"
+            };
+            reply.send(200, "text/html; charset=utf-8", html);
+            Ok(Some(result))
+        }
+        Err(_) => {
+            reply.send(
+                400,
+                "text/html; charset=utf-8",
+                "<html><body><h1>xAI authorization state mismatch.</h1>Please return to maki and try again.</body></html>",
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn parse_callback_input(input: &str, expected_state: &str) -> Result<CallbackResult, AgentError> {
@@ -769,14 +694,6 @@ fn pkce_pair() -> Result<(String, String), AgentError> {
     let digest = Sha256::digest(verifier.as_bytes());
     let challenge = URL_SAFE_NO_PAD.encode(digest);
     Ok((verifier, challenge))
-}
-
-fn random_token() -> Result<String, AgentError> {
-    let mut buf = [0u8; 32];
-    getrandom::fill(&mut buf).map_err(|e| AgentError::Config {
-        message: format!("CSPRNG unavailable: {e}"),
-    })?;
-    Ok(URL_SAFE_NO_PAD.encode(buf))
 }
 
 pub(crate) fn grok_cli_credentials() -> Option<OAuthTokens> {
