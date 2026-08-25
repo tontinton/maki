@@ -258,6 +258,10 @@ async fn new_session(
     let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
     let cwd = req.cwd.clone();
     let (handle, pending) = spawn_session(srv, params, req.cwd, None, Vec::new(), mcp.clone());
+    maki_otel::emit::session_started(
+        maki_otel::emit::START_FRESH,
+        Some(handle.session_id.as_str()),
+    );
     let spec = params.model.spec();
     let resp = methods::new_session_response(handle.session_id.as_str())
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
@@ -293,6 +297,10 @@ async fn load_session(
         Some(session_ref),
         restored.history,
         mcp.clone(),
+    );
+    maki_otel::emit::session_started(
+        maki_otel::emit::START_RESUME,
+        Some(handle.session_id.as_str()),
     );
     let spec = params.model.spec();
     let resp = methods::load_session_response()

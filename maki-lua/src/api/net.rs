@@ -2,7 +2,7 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use futures_lite::io::AsyncReadExt;
-use isahc::config::{Configurable, RedirectPolicy};
+use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use isahc::{AsyncBody, HttpClient, Request};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
@@ -161,6 +161,10 @@ async fn do_request(params: RequestParams) -> Result<ResponseData, String> {
     let client = HttpClient::builder()
         .timeout(params.timeout)
         .redirect_policy(RedirectPolicy::Follow)
+        // The workspace enables curl's http2 feature for OTLP over gRPC. This
+        // client fetches arbitrary user URLs, so keep it on HTTP/1.1 rather
+        // than change how every one of them is negotiated.
+        .version_negotiation(VersionNegotiation::http11())
         .build()
         .map_err(|e| format!("client error: {e}"))?;
 

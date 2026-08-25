@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use futures_lite::StreamExt;
 use futures_lite::io::AsyncBufRead;
-use isahc::config::Configurable;
+use isahc::config::{Configurable, VersionNegotiation};
 use isahc::http::request::Builder;
 use serde::Deserialize;
 use tracing::debug;
@@ -170,6 +170,10 @@ pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
     isahc::HttpClient::builder()
         .connect_timeout(timeouts.connect)
         .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, timeouts.low_speed)
+        // The workspace enables curl's http2 feature for OTLP over gRPC, which
+        // would otherwise flip provider streaming to h2 over TLS. Streaming is
+        // tuned for HTTP/1.1, so pin it.
+        .version_negotiation(VersionNegotiation::http11())
         .build()
         .expect("failed to build HTTP client")
 }

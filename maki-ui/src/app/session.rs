@@ -298,6 +298,10 @@ impl App {
             &self.state.session.model,
             &self.state.session.cwd,
         ));
+        maki_otel::emit::session_started(
+            maki_otel::emit::START_FRESH,
+            Some(&self.state.session.id.to_string()),
+        );
         self.install_local_history();
         vec![Action::NewSession]
     }

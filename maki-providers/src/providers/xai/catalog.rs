@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use isahc::ReadResponseExt;
-use isahc::config::{Configurable, RedirectPolicy};
+use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use maki_storage::auth::now_millis;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -191,6 +191,8 @@ fn fetch_catalog(access: &str) -> FetchOutcome {
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(FETCH_TIMEOUT)
         .redirect_policy(RedirectPolicy::None)
+        // curl carries http2 for OTLP.
+        .version_negotiation(VersionNegotiation::http11())
         .build()
     {
         Ok(client) => client,

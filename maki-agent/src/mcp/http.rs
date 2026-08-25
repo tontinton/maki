@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use async_lock::Mutex;
 use isahc::HttpClient;
-use isahc::config::{Configurable, RedirectPolicy};
+use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use isahc::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use isahc::http::{Method, Request, StatusCode, header::HeaderMap};
 use maki_storage::StateDir;
@@ -57,6 +57,10 @@ impl HttpTransport {
     ) -> Result<Self, McpError> {
         let client = HttpClient::builder()
             .redirect_policy(RedirectPolicy::Limit(MAX_REDIRECTS))
+            // The workspace enables curl's http2 feature for OTLP over gRPC,
+            // which would otherwise flip this transport to h2 over TLS. Its
+            // streaming responses are tuned for HTTP/1.1, so pin it.
+            .version_negotiation(VersionNegotiation::http11())
             .timeout(timeout)
             .build()
             .map_err(|e: isahc::Error| McpError::StartFailed {

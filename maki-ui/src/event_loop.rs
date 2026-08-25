@@ -1019,6 +1019,10 @@ impl<'t> EventLoop<'t> {
                 };
                 let idx = self.push_runtime(self.ctx.spawn_runtime(session));
                 let id = self.sessions[idx].id();
+                maki_otel::emit::session_started(
+                    maki_otel::emit::START_FRESH,
+                    Some(&id.to_string()),
+                );
                 if let Some(prompt) = prompt {
                     let _ = self.submit_text(idx, prompt);
                 }

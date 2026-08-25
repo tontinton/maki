@@ -482,6 +482,14 @@ pub fn run(params: SdkParams) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
     let (session_id, initial_history) = resolve_session(&cli, &working_dir)?;
+    crate::setup::report_session_start(
+        if initial_history.is_empty() {
+            maki_otel::emit::START_FRESH
+        } else {
+            maki_otel::emit::START_RESUME
+        },
+        session_id.as_ref(),
+    );
 
     let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start_connected(&cwd));
     if !mcp_config_errors.is_empty() {

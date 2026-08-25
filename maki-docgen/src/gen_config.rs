@@ -5,7 +5,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_config::{
     AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
     DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, ProviderConfig, StorageConfig,
-    TOP_LEVEL_FIELDS, ToolOutputLines, UiConfig,
+    TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
@@ -138,6 +138,17 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
 }
 
+fn write_telemetry_section(out: &mut String) {
+    write_section(out, "[telemetry]", TelemetryConfig::FIELDS);
+    writeln!(
+        out,
+        "Every field also has an environment variable, listed above, and the \
+         variable wins. See [Telemetry](/docs/telemetry/) for the full \
+         picture.\n"
+    )
+    .unwrap();
+}
+
 fn write_tool_output_section(out: &mut String) {
     writeln!(out, "### `ui.tool_output_lines`\n").unwrap();
     writeln!(
@@ -236,6 +247,7 @@ All fields are optional. Typos in field names cause an error right away.
     write_section(&mut out, "[agent]", AgentConfig::FIELDS);
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
+    write_telemetry_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
     writeln!(

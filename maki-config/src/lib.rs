@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -234,6 +234,7 @@ pub struct RawConfig {
     pub agent: AgentFileConfig,
     pub provider: ProviderFileConfig,
     pub storage: StorageFileConfig,
+    pub telemetry: TelemetryConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
     /// Renamed to `plugins`; kept so old configs fail with a pointer to the
     /// new name instead of a generic unknown-field error.
@@ -254,6 +255,7 @@ impl RawConfig {
         self.agent.merge(overlay.agent);
         self.provider.merge(overlay.provider);
         self.storage.merge(overlay.storage);
+        self.telemetry.merge(overlay.telemetry);
         for (name, plugin) in overlay.plugins {
             let entry = self.plugins.entry(name).or_default();
             if plugin.enabled.is_some() {
@@ -284,6 +286,7 @@ impl RawConfig {
             agent: AgentConfig::from_file(self.agent, no_rtk, disabled_tools),
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
+            telemetry: self.telemetry,
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_plugins(self.plugins),
         })
@@ -831,6 +834,7 @@ pub struct Config {
     pub agent: AgentConfig,
     pub provider: ProviderConfig,
     pub storage: StorageConfig,
+    pub telemetry: TelemetryConfig,
     pub permissions: PermissionsConfig,
     pub plugins: PluginsConfig,
 }
@@ -1264,6 +1268,175 @@ impl StorageConfig {
             max_log_files: f.max_log_files.unwrap_or(DEFAULT_MAX_LOG_FILES),
             input_history_size: f.input_history_size.unwrap_or(DEFAULT_INPUT_HISTORY_SIZE),
         }
+    }
+}
+
+/// OpenTelemetry export settings. Every field also has an `OTEL_*` (or
+/// `MAKI_*`) environment variable, which wins over what is set here.
+///
+/// Fields stay optional: `maki-otel` owns the defaults, resolution and
+/// validation, so the meaning of "unset" is decided in one place.
+#[derive(Deserialize, Debug, Clone, ConfigSection)]
+#[serde(default, deny_unknown_fields)]
+#[config(section = "telemetry")]
+pub struct TelemetryConfig {
+    #[config(default = None, ty = "bool", default_doc = "false",
+             desc = "Master switch. Env: `MAKI_ENABLE_TELEMETRY`")]
+    pub enabled: Option<bool>,
+
+    #[config(default = None, ty = "string", default_doc = "none",
+             desc = "Where metrics go: `otlp`, `console`, `none`, or a comma-separated mix. Env: `OTEL_METRICS_EXPORTER`")]
+    pub metrics_exporter: Option<String>,
+
+    #[config(default = None, ty = "string", default_doc = "none",
+             desc = "Where events go: `otlp`, `console`, `none`, or a comma-separated mix. Env: `OTEL_LOGS_EXPORTER`")]
+    pub logs_exporter: Option<String>,
+
+    #[config(default = None, ty = "string", default_doc = "-",
+             desc = "OTLP protocol: `grpc`, `http/protobuf`, or `http/json`. Required when an exporter is `otlp`. Env: `OTEL_EXPORTER_OTLP_PROTOCOL`")]
+    pub protocol: Option<String>,
+
+    #[config(default = None, ty = "string", default_doc = "-",
+             desc = "Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs`. Env: `OTEL_EXPORTER_OTLP_ENDPOINT`")]
+    pub endpoint: Option<String>,
+
+    #[config(default = None, ty = "table", default_doc = "{}",
+             desc = "Extra headers sent with every export. Env: `OTEL_EXPORTER_OTLP_HEADERS`")]
+    pub headers: Option<BTreeMap<String, String>>,
+
+    #[config(default = None, ty = "integer", default_doc = "10000",
+             desc = "Per-export request timeout (ms). Env: `OTEL_EXPORTER_OTLP_TIMEOUT`")]
+    pub timeout_ms: Option<u64>,
+
+    #[config(default = None, ty = "string", default_doc = "none",
+             desc = "Payload compression: `gzip` or `none`. Env: `OTEL_EXPORTER_OTLP_COMPRESSION`")]
+    pub compression: Option<String>,
+
+    #[config(default = None, ty = "string", default_doc = "-",
+             desc = "Metrics-only protocol override. Env: `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL`")]
+    pub metrics_protocol: Option<String>,
+
+    #[config(default = None, ty = "string", default_doc = "-",
+             desc = "Metrics-only endpoint, used verbatim with no path appended. Env: `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`")]
+    pub metrics_endpoint: Option<String>,
+
+    #[config(default = None, ty = "table", default_doc = "{}",
+             desc = "Metrics-only headers, merged over `headers`. Env: `OTEL_EXPORTER_OTLP_METRICS_HEADERS`")]
+    pub metrics_headers: Option<BTreeMap<String, String>>,
+
+    #[config(default = None, ty = "integer", default_doc = "-",
+             desc = "Metrics-only request timeout (ms). Env: `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT`")]
+    pub metrics_timeout_ms: Option<u64>,
+
+    #[config(default = None, ty = "string", default_doc = "-",
+             desc = "Logs-only protocol override. Env: `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL`")]
+    pub logs_protocol: Option<String>,
+
+    #[config(default = None, ty = "string", default_doc = "-",
+             desc = "Logs-only endpoint, used verbatim with no path appended. Env: `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`")]
+    pub logs_endpoint: Option<String>,
+
+    #[config(default = None, ty = "table", default_doc = "{}",
+             desc = "Logs-only headers, merged over `headers`. Env: `OTEL_EXPORTER_OTLP_LOGS_HEADERS`")]
+    pub logs_headers: Option<BTreeMap<String, String>>,
+
+    #[config(default = None, ty = "integer", default_doc = "-",
+             desc = "Logs-only request timeout (ms). Env: `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT`")]
+    pub logs_timeout_ms: Option<u64>,
+
+    #[config(default = None, ty = "integer", default_doc = "60000",
+             desc = "How often metrics are exported (ms). Env: `OTEL_METRIC_EXPORT_INTERVAL`")]
+    pub metrics_interval_ms: Option<u64>,
+
+    #[config(default = None, ty = "integer", default_doc = "30000",
+             desc = "Deadline for one metrics export, retries included (ms). Env: `OTEL_METRIC_EXPORT_TIMEOUT`")]
+    pub metrics_export_timeout_ms: Option<u64>,
+
+    #[config(default = None, ty = "integer", default_doc = "5000",
+             desc = "How often queued events are flushed (ms). Env: `OTEL_LOGS_EXPORT_INTERVAL` or `OTEL_BLRP_SCHEDULE_DELAY`")]
+    pub logs_interval_ms: Option<u64>,
+
+    #[config(default = None, ty = "integer", default_doc = "2048",
+             desc = "Event queue capacity. Events are dropped and counted when it is full. Env: `OTEL_BLRP_MAX_QUEUE_SIZE`")]
+    pub logs_max_queue_size: Option<usize>,
+
+    #[config(default = None, ty = "integer", default_doc = "512",
+             desc = "Maximum events per export request. Env: `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`")]
+    pub logs_max_export_batch_size: Option<usize>,
+
+    #[config(default = None, ty = "integer", default_doc = "30000",
+             desc = "Deadline for one events export, retries included (ms). Env: `OTEL_BLRP_EXPORT_TIMEOUT`")]
+    pub logs_export_timeout_ms: Option<u64>,
+
+    #[config(default = None, ty = "string", default_doc = "delta",
+             desc = "Metric temporality: `delta` or `cumulative`. Env: `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`")]
+    pub metrics_temporality: Option<String>,
+
+    #[config(default = None, ty = "string", default_doc = "maki",
+             desc = "`service.name` on the exported resource. Env: `OTEL_SERVICE_NAME`")]
+    pub service_name: Option<String>,
+
+    #[config(default = None, ty = "table", default_doc = "{}",
+             desc = "Extra resource attributes, your place for team or environment labels. Env: `OTEL_RESOURCE_ATTRIBUTES`")]
+    pub resource_attributes: Option<BTreeMap<String, String>>,
+
+    #[config(default = None, ty = "bool", default_doc = "true",
+             desc = "Attach `session.id` to metrics. Turn off to keep metric cardinality low. Env: `OTEL_METRICS_INCLUDE_SESSION_ID`")]
+    pub metrics_include_session_id: Option<bool>,
+
+    #[config(default = None, ty = "bool", default_doc = "false",
+             desc = "Attach `app.version` to metrics. Env: `OTEL_METRICS_INCLUDE_VERSION`")]
+    pub metrics_include_version: Option<bool>,
+
+    #[config(default = None, ty = "bool", default_doc = "false",
+             desc = "Include prompt text in `maki.user_prompt` events. Off by default. Env: `OTEL_LOG_USER_PROMPTS`")]
+    pub log_user_prompts: Option<bool>,
+
+    #[config(default = None, ty = "bool", default_doc = "false",
+             desc = "Include tool input in `maki.tool_result` events. Off by default. Env: `OTEL_LOG_TOOL_DETAILS`")]
+    pub log_tool_details: Option<bool>,
+
+    #[config(default = None, ty = "integer", default_doc = "10240",
+             desc = "Character cap on any logged prompt or tool input. Env: `MAKI_OTEL_CONTENT_MAX_LENGTH`")]
+    pub content_max_length: Option<usize>,
+}
+
+impl TelemetryConfig {
+    fn merge(&mut self, overlay: TelemetryConfig) {
+        merge_option!(
+            self,
+            overlay,
+            enabled,
+            metrics_exporter,
+            logs_exporter,
+            protocol,
+            endpoint,
+            headers,
+            timeout_ms,
+            compression,
+            metrics_protocol,
+            metrics_endpoint,
+            metrics_headers,
+            metrics_timeout_ms,
+            logs_protocol,
+            logs_endpoint,
+            logs_headers,
+            logs_timeout_ms,
+            metrics_interval_ms,
+            metrics_export_timeout_ms,
+            logs_interval_ms,
+            logs_max_queue_size,
+            logs_max_export_batch_size,
+            logs_export_timeout_ms,
+            metrics_temporality,
+            service_name,
+            resource_attributes,
+            metrics_include_session_id,
+            metrics_include_version,
+            log_user_prompts,
+            log_tool_details,
+            content_max_length
+        );
     }
 }
 
@@ -2322,6 +2495,7 @@ mod tests {
             agent: AgentConfig::default(),
             provider: ProviderConfig::default(),
             storage: StorageConfig::default(),
+            telemetry: TelemetryConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::default(),
         };

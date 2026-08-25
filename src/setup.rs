@@ -1,3 +1,4 @@
+use std::fmt::Display;
 use std::sync::Mutex;
 
 use color_eyre::Result;
@@ -133,6 +134,22 @@ pub fn install_panic_log_hook() {
         );
         prev(info);
     }));
+}
+
+/// Telemetry is opt-in and must never stop maki from starting, so a bad
+/// setting is a warning in the log, not an error to the user. Call this after
+/// `init_logging` or the warning has nowhere to go.
+pub fn init_telemetry(config: &maki_config::TelemetryConfig) {
+    if let Err(error) = maki_otel::init(config) {
+        tracing::warn!(%error, "telemetry disabled");
+    }
+}
+
+/// Headless runs without a session id still count, they just stay
+/// unattributed.
+pub fn report_session_start(start_type: &'static str, session_id: Option<impl Display>) {
+    let id = session_id.map(|id| id.to_string());
+    maki_otel::emit::session_started(start_type, id.as_deref());
 }
 
 pub fn init_logging(storage_config: &maki_config::StorageConfig) {

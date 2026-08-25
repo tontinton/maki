@@ -11,7 +11,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_lite::future;
 use isahc::HttpClient;
-use isahc::config::{Configurable, RedirectPolicy};
+use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use maki_storage::StateDir;
 use maki_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
 use tracing::{info, warn};
@@ -320,6 +320,8 @@ fn is_headless() -> bool {
 fn build_http_client(timeout: Duration) -> Result<HttpClient, isahc::Error> {
     HttpClient::builder()
         .redirect_policy(RedirectPolicy::Limit(super::http::MAX_REDIRECTS))
+        // Same pin as mcp::http, so oauth and data traffic match.
+        .version_negotiation(VersionNegotiation::http11())
         .timeout(timeout)
         .build()
 }

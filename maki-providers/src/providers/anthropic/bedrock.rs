@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use flume::Sender;
 use hmac::{Hmac, Mac};
-use isahc::config::Configurable;
+use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{HttpClient, ReadResponseExt, Request};
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
@@ -171,6 +171,8 @@ fn fetch_container_credentials(
     let client = HttpClient::builder()
         .connect_timeout(CONTAINER_METADATA_TIMEOUT)
         .timeout(CONTAINER_METADATA_TIMEOUT)
+        // curl carries http2 for OTLP.
+        .version_negotiation(VersionNegotiation::http11())
         .build()
         .map_err(|e| AgentError::Config {
             message: format!("container creds http client: {e}"),
