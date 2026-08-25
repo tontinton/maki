@@ -2,7 +2,7 @@ use std::io;
 use std::process::Command;
 use std::time::Duration;
 
-use isahc::config::Configurable;
+use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{AsyncReadResponseExt, ReadResponseExt, Request};
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
@@ -42,6 +42,8 @@ fn client() -> Result<isahc::HttpClient, VersionError> {
     Ok(isahc::HttpClient::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
+        // curl carries http2 for OTLP.
+        .version_negotiation(VersionNegotiation::http11())
         .build()?)
 }
 

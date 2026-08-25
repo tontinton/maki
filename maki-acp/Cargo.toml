@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
+maki-otel = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
 agent-client-protocol-schema = { workspace = true }

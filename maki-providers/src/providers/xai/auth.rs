@@ -9,7 +9,7 @@ use std::{env, fs, thread};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use isahc::ReadResponseExt;
-use isahc::config::{Configurable, RedirectPolicy};
+use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, now_millis, save_tokens};
 use serde::Deserialize;
@@ -98,6 +98,8 @@ fn http_client(timeout: Duration) -> Result<isahc::HttpClient, AgentError> {
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(timeout)
         .redirect_policy(RedirectPolicy::None)
+        // curl carries http2 for OTLP.
+        .version_negotiation(VersionNegotiation::http11())
         .build()
         .map_err(|e| AgentError::Config {
             message: format!("http client: {e}"),

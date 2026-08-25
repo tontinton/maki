@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use flume::Sender;
-use isahc::config::Configurable;
+use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use maki_config::providers::builtin_provider;
 use serde_json::Value;
@@ -595,6 +595,8 @@ fn init_catalog_blocking(
     let client = isahc::HttpClient::builder()
         .connect_timeout(Duration::from_secs(10))
         .low_speed_timeout(1, Duration::from_secs(30))
+        // curl carries http2 for OTLP.
+        .version_negotiation(VersionNegotiation::http11())
         .build()
         .expect("failed to build catalog HTTP client");
 

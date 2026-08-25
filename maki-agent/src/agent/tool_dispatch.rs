@@ -1,8 +1,9 @@
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tracing::{debug, error, warn};
@@ -25,6 +26,27 @@ const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 
 const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
+
+const SOURCE_NATIVE: &str = "native";
+const SOURCE_LOCAL: &str = "local";
+const SOURCE_UNKNOWN: &str = "unknown";
+/// A name that still carries one means the MCP server behind it is gone.
+const MCP_NAME_SEPARATOR: &str = "__";
+const BASH_TOOL: &str = "bash";
+const BASH_COMMAND_FIELD: &str = "command";
+const GIT_COMMIT: &str = "git commit";
+const GH_PR_CREATE: &str = "gh pr create";
+
+const ERROR_CANCELLED: &str = "cancelled";
+const ERROR_TIMEOUT: &str = "timeout";
+const ERROR_DENIED: &str = "permission_denied";
+const ERROR_NOT_FOUND: &str = "not_found";
+const ERROR_INVALID_INPUT: &str = "invalid_input";
+const ERROR_OTHER: &str = "error";
+
+/// A telemetry counter is not worth an unbounded diff; past this,
+/// `similar` returns a coarser but still valid one.
+const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub(super) struct RecentCalls(VecDeque<(String, u64)>);
 
@@ -58,9 +80,31 @@ impl RecentCalls {
     }
 }
 
+/// Every tool call in maki lands here (native, Lua, MCP, subagents, batch
+/// children), which makes it the one place telemetry has to wrap.
+pub async fn run(
+    registry: &ToolRegistry,
+    mcp: Option<&McpSession>,
+    id: String,
+    name: &str,
+    input: &Value,
+    ctx: &ToolContext,
+    emit: Emit,
+) -> ToolDoneEvent {
+    if !maki_otel::enabled() {
+        return run_inner(registry, mcp, id, name, input, ctx, emit).await;
+    }
+    let canonical = super::streaming::canonical_tool_name(name);
+    let source = tool_source(registry, ctx, canonical);
+    let started = Instant::now();
+    let done = run_inner(registry, mcp, id, name, input, ctx, emit).await;
+    report(&done, canonical, &source, input, started.elapsed());
+    done
+}
+
 /// Parse errors and unknown tools skip the start event so the UI never
 /// shows a phantom spinner.
-pub async fn run(
+async fn run_inner(
     registry: &ToolRegistry,
     mcp: Option<&McpSession>,
     id: String,
@@ -467,6 +511,89 @@ pub(super) async fn process_tool_calls(
     })?;
     history.push(tool_msg);
     Ok(())
+}
+
+fn tool_source(registry: &ToolRegistry, ctx: &ToolContext, name: &str) -> Cow<'static, str> {
+    if ctx.local_tools.contains_key(name) {
+        return Cow::Borrowed(SOURCE_LOCAL);
+    }
+    match registry.get(name) {
+        Some(entry) => entry.source.as_log_field(),
+        None if name.contains(MCP_NAME_SEPARATOR) => Cow::Borrowed(SOURCE_UNKNOWN),
+        None => Cow::Borrowed(SOURCE_NATIVE),
+    }
+}
+
+/// Low-cardinality buckets, because a raw error message would give the
+/// collector a new attribute value on every call.
+fn classify_error(text: &str) -> &'static str {
+    let text = text.to_ascii_lowercase();
+    if text.contains("cancel") {
+        ERROR_CANCELLED
+    } else if text.contains("timed out") || text.contains("timeout") {
+        ERROR_TIMEOUT
+    } else if text.contains("permission denied") || text.contains("not allowed") {
+        ERROR_DENIED
+    } else if text.contains("no such file") || text.contains("not found") {
+        ERROR_NOT_FOUND
+    } else if text.contains("invalid") || text.contains("expected") {
+        ERROR_INVALID_INPUT
+    } else {
+        ERROR_OTHER
+    }
+}
+
+fn changed_lines(before: &str, after: &str) -> (u64, u64) {
+    let mut added = 0;
+    let mut removed = 0;
+    let diff = similar::TextDiff::configure()
+        .timeout(DIFF_TIMEOUT)
+        .diff_lines(before, after);
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Insert => added += 1,
+            similar::ChangeTag::Delete => removed += 1,
+            similar::ChangeTag::Equal => {}
+        }
+    }
+    (added, removed)
+}
+
+/// The same heuristic Claude Code uses: look at what the shell was asked to
+/// do, not at what it printed.
+fn git_activity(name: &str, input: &Value) {
+    if name != BASH_TOOL {
+        return;
+    }
+    let Some(command) = input.get(BASH_COMMAND_FIELD).and_then(Value::as_str) else {
+        return;
+    };
+    if command.contains(GIT_COMMIT) {
+        maki_otel::emit::commit_created();
+    }
+    if command.contains(GH_PR_CREATE) {
+        maki_otel::emit::pull_request_created();
+    }
+}
+
+fn report(done: &ToolDoneEvent, name: &str, source: &str, input: &Value, took: Duration) {
+    let error_text = done.is_error.then(|| done.output.as_text());
+    let tool_input = maki_otel::logs_tool_details().then(|| input.to_string());
+    maki_otel::emit::tool_result(&maki_otel::emit::ToolResult {
+        tool_name: name,
+        tool_source: source,
+        success: !done.is_error,
+        duration: took,
+        error_type: error_text.as_deref().map(classify_error),
+        tool_input: tool_input.as_deref(),
+    });
+    if let ToolOutput::Diff { before, after, .. } = &done.output {
+        let (added, removed) = changed_lines(before, after);
+        maki_otel::emit::lines_of_code(added, removed);
+    }
+    if !done.is_error {
+        git_activity(name, input);
+    }
 }
 
 /// Test-only entry that skips native lookup, letting plan-mode and MCP tests
@@ -1001,5 +1128,31 @@ mod tests {
                 "execute must not run after denial"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use test_case::test_case;
+
+    use super::*;
+
+    const BEFORE: &str = "a\nb\nc\n";
+    const AFTER: &str = "a\nB\nc\nd\n";
+
+    #[test_case("operation was cancelled", ERROR_CANCELLED; "cancelled")]
+    #[test_case("command timed out after 120s", ERROR_TIMEOUT; "timed_out")]
+    #[test_case("permission denied: bash", ERROR_DENIED; "denied")]
+    #[test_case("no such file or directory", ERROR_NOT_FOUND; "missing_file")]
+    #[test_case("invalid input: expected a string", ERROR_INVALID_INPUT; "invalid")]
+    #[test_case("boom", ERROR_OTHER; "fallback")]
+    fn errors_bucket_into_low_cardinality_types(text: &str, expected: &str) {
+        assert_eq!(classify_error(text), expected);
+    }
+
+    #[test]
+    fn diffs_count_added_and_removed_lines() {
+        assert_eq!(changed_lines(BEFORE, AFTER), (2, 1));
+        assert_eq!(changed_lines(BEFORE, BEFORE), (0, 0));
     }
 }

@@ -195,6 +195,7 @@ pub fn run(
         cwd,
         task,
     } = handle;
+    crate::setup::report_session_start(maki_otel::emit::START_FRESH, Some(&session_id));
     let start = Instant::now();
 
     let mut verbose_out = match format {

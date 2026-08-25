@@ -198,11 +198,16 @@ fn resolve_session(
         let id: MakiId = raw
             .parse()
             .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
-        return AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"));
+        let session = AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        setup::report_session_start(maki_otel::emit::START_RESUME, Some(session.id));
+        return Ok(session);
     }
     if continue_session {
         match AppSession::latest(cwd, storage) {
-            Ok(Some(session)) => return Ok(session),
+            Ok(Some(session)) => {
+                setup::report_session_start(maki_otel::emit::START_CONTINUE, Some(session.id));
+                return Ok(session);
+            }
             Ok(None) => {
                 tracing::info!("no previous session found for this directory, starting new");
             }
@@ -211,7 +216,9 @@ fn resolve_session(
             }
         }
     }
-    Ok(AppSession::new(model, cwd))
+    let session = AppSession::new(model, cwd);
+    setup::report_session_start(maki_otel::emit::START_FRESH, Some(session.id));
+    Ok(session)
 }
 
 fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
@@ -238,6 +245,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     let (mut stack, _) = build_stack(&cli, &cwd, &storage, None)?;
 
     setup::init_logging(&stack.config.storage);
+    setup::init_telemetry(&stack.config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
 
@@ -363,6 +371,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     "plugin host and teardown joined"
                 );
                 if code != 0 {
+                    maki_otel::shutdown(crate::TELEMETRY_SHUTDOWN_TIMEOUT);
                     std::process::exit(code);
                 }
                 return Ok(());
@@ -385,7 +394,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 let (new_stack, new_warnings) = build_stack(&cli, &cwd, &storage, Some(last_good))?;
                 tabs = reloaded;
                 if tabs.is_empty() {
-                    tabs.push(AppSession::new(&new_stack.model.spec(), &cwd_str));
+                    let session = AppSession::new(&new_stack.model.spec(), &cwd_str);
+                    setup::report_session_start(maki_otel::emit::START_FRESH, Some(session.id));
+                    tabs.push(session);
                 }
                 stack = new_stack;
                 warnings = new_warnings;
