@@ -63,13 +63,12 @@ impl StreamingCache {
         prefix_style: Style,
         width: u16,
     ) -> bool {
-        let theme_gen = theme::generation();
-        let key = CacheKey::for_text(visible, width, theme_gen);
+        let key = CacheKey::for_text(visible, width, theme::generation());
         if self.key == Some(key) {
             return false;
         }
         let text = maki_markdown::render::truncate_long_lines_at(visible, STREAMING_MAX_LINE_BYTES);
-        let semantic = renderer.render(text.as_ref(), width, theme_gen);
+        let semantic = renderer.render(text.as_ref(), width);
         self.lines = paint_semantic(&semantic, prefix, text_style, prefix_style);
         self.key = Some(key);
         true
@@ -95,7 +94,7 @@ impl StreamingContent {
         Self {
             typewriter: Typewriter::with_speed(ms_per_char),
             cache: StreamingCache::default(),
-            renderer: Renderer::unwrapped(),
+            renderer: Renderer::streaming(),
             prefix,
             text_style,
             prefix_style,
@@ -109,12 +108,12 @@ impl StreamingContent {
     pub fn clear(&mut self) {
         self.typewriter.clear();
         self.cache.invalidate();
-        self.renderer = Renderer::unwrapped();
+        self.renderer = Renderer::streaming();
     }
 
     pub fn take_all(&mut self) -> String {
         self.cache.invalidate();
-        self.renderer = Renderer::unwrapped();
+        self.renderer = Renderer::streaming();
         self.typewriter.take_all()
     }
 
@@ -182,12 +181,27 @@ mod tests {
     use ratatui::style::Style;
     use test_case::test_case;
 
-    fn cache_lines_text(cache: &StreamingCache) -> Vec<String> {
-        cache
-            .lines
+    /// A zero character delay makes every `render_lines` reveal the whole
+    /// buffer, so nothing here depends on wall-clock timing.
+    const INSTANT: u64 = 0;
+    const CHUNK_BYTES: usize = 5;
+    const TEST_WIDTH: u16 = 80;
+    const THEME_A: &str = "dracula";
+    const THEME_B: &str = "tokyonight";
+    const FIRST_MESSAGE: &str = "intro\n```rust\nfn main() {\n    let x = 42;\n}\n```\ntail";
+    /// Code block at the same index as the first message, different language and
+    /// a shorter body: exactly the shape a reused `CodeHighlighter` gets wrong.
+    const SECOND_MESSAGE: &str = "```python\nx = 1\ny = 2\n```\nend";
+
+    fn lines_text(lines: &[Line<'static>]) -> Vec<String> {
+        lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    fn cache_lines_text(cache: &StreamingCache) -> Vec<String> {
+        lines_text(&cache.lines)
     }
 
     fn full_render_lines(text: &str, prefix: &str, width: u16) -> Vec<String> {
@@ -199,7 +213,85 @@ mod tests {
     }
 
     fn fresh_renderer() -> Renderer {
-        Renderer::unwrapped()
+        Renderer::streaming()
+    }
+
+    fn stream_message(sc: &mut StreamingContent, text: &str) -> Vec<Line<'static>> {
+        let mut sent = 0;
+        while sent < text.len() {
+            let mut end = (sent + CHUNK_BYTES).min(text.len());
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            sc.push(&text[sent..end]);
+            sc.render_lines(TEST_WIDTH);
+            sent = end;
+        }
+        sc.render_lines(TEST_WIDTH).to_vec()
+    }
+
+    /// Every render truncates the highlighter vector to the number of code
+    /// blocks it saw, so a second message arriving with its fence already
+    /// complete is where stale state actually survives.
+    fn show_message(sc: &mut StreamingContent, text: &str) -> Vec<Line<'static>> {
+        sc.push(text);
+        sc.render_lines(TEST_WIDTH).to_vec()
+    }
+
+    /// The streaming highlighters are keyed by block position, ignore a language
+    /// change, and replay their old spans when the new code is shorter. So a
+    /// `StreamingContent` that does not rebuild its renderer on `take_all` or
+    /// `clear` paints the previous message's code inside the next one.
+    #[test_case(true  ; "take_all")]
+    #[test_case(false ; "clear")]
+    fn renderer_resets_between_messages(via_take_all: bool) {
+        // The default syntect theme paints every scope the same colour, so
+        // without a real one a leaked language would not show up in the styles.
+        theme::set(theme::load_by_name(THEME_A).expect(THEME_A));
+        let style = Style::default();
+        let mut sc = StreamingContent::new("", style, style, INSTANT);
+        stream_message(&mut sc, FIRST_MESSAGE);
+        if via_take_all {
+            assert_eq!(sc.take_all(), FIRST_MESSAGE);
+        } else {
+            sc.clear();
+        }
+        let reused = show_message(&mut sc, SECOND_MESSAGE);
+
+        let expected = show_message(
+            &mut StreamingContent::new("", style, style, INSTANT),
+            SECOND_MESSAGE,
+        );
+        assert_eq!(
+            reused, expected,
+            "second message must not inherit the first message's highlighter state"
+        );
+    }
+
+    /// `StreamingCache` keys on `theme::generation()` while the renderer inside
+    /// it keys on `maki_highlight::theme_generation()`. The two only agree
+    /// because `theme::set` refreshes the syntax theme, and if that coupling
+    /// breaks, unchanged text keeps the old palette forever.
+    #[test]
+    fn theme_change_repaints_identical_text() {
+        let style = Style::default();
+        let mut cache = StreamingCache::default();
+        let mut renderer = fresh_renderer();
+        theme::set(theme::load_by_name(THEME_A).expect(THEME_A));
+        cache.get_or_update(&mut renderer, FIRST_MESSAGE, "", style, style, TEST_WIDTH);
+        let before = cache.lines.clone();
+
+        theme::set(theme::load_by_name(THEME_B).expect(THEME_B));
+        let rerendered =
+            cache.get_or_update(&mut renderer, FIRST_MESSAGE, "", style, style, TEST_WIDTH);
+
+        assert!(rerendered, "a theme change must miss the cache");
+        assert_eq!(
+            cache_lines_text(&cache),
+            lines_text(&before),
+            "only the palette changed, the text must not"
+        );
+        assert_ne!(cache.lines, before, "the repaint must use the new palette");
     }
 
     #[test_case(

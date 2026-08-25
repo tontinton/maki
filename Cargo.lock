@@ -2862,6 +2862,7 @@ version = "0.4.12"
 dependencies = [
  "fastrand",
  "maki-highlight",
+ "syntect",
  "test-case",
  "unicode-width",
 ]

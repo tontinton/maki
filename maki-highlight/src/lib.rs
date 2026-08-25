@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use syntect::highlighting::{
@@ -11,12 +13,16 @@ use syntect::util::LinesWithEndings;
 
 const TOKEN_ALIASES: &[(&str, &str)] = &[("jsx", "js")];
 pub const TAB_SPACES: &str = "  ";
+const BLOCK_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 type Rgb = (u8, u8, u8);
+pub type BlockSegments = Arc<Vec<Vec<StyledSegment>>>;
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<RwLock<Arc<Theme>>> = OnceLock::new();
 static UI_COLORS: OnceLock<RwLock<HashMap<String, Rgb>>> = OnceLock::new();
+static BLOCK_CACHE: OnceLock<RwLock<BlockCache>> = OnceLock::new();
+static THEME_GEN: AtomicU64 = AtomicU64::new(0);
 
 fn theme_lock() -> &'static RwLock<Arc<Theme>> {
     THEME.get_or_init(|| RwLock::new(Arc::new(Theme::default())))
@@ -35,6 +41,105 @@ pub fn is_ready() -> bool {
 
 pub fn set_theme(theme: Theme) {
     *theme_lock().write().unwrap_or_else(|e| e.into_inner()) = Arc::new(theme);
+    // Bump first: a highlight already in flight read the old generation, so its
+    // insert lands under a key nobody will look up again.
+    THEME_GEN.fetch_add(1, Ordering::Release);
+    block_cache_lock()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// Bumped by every [`set_theme`]. Anything derived from the theme, like an
+/// incremental [`CodeHighlighter`] or a bag of painted lines, is stale once
+/// this changes.
+pub fn theme_generation() -> u64 {
+    THEME_GEN.load(Ordering::Acquire)
+}
+
+fn block_cache_lock() -> &'static RwLock<BlockCache> {
+    BLOCK_CACHE.get_or_init(RwLock::default)
+}
+
+/// The byte length rides along with the hash, so an accidental hit needs both
+/// to collide. A miss only costs a re-highlight, a false hit costs wrong colors.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct BlockKey {
+    hash: u64,
+    code_bytes: usize,
+    theme_gen: u64,
+}
+
+impl BlockKey {
+    fn new(lang: &str, code: &str) -> Self {
+        let mut hasher = DefaultHasher::new();
+        lang.hash(&mut hasher);
+        code.hash(&mut hasher);
+        Self {
+            hash: hasher.finish(),
+            code_bytes: code.len(),
+            theme_gen: theme_generation(),
+        }
+    }
+}
+
+fn segments_bytes(segments: &[Vec<StyledSegment>]) -> usize {
+    segments
+        .iter()
+        .map(|line| {
+            size_of::<Vec<StyledSegment>>()
+                + line
+                    .iter()
+                    .map(|seg| size_of::<StyledSegment>() + seg.text.len())
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+/// Budgeted in bytes, since entries range from a one-liner to a whole file.
+///
+/// Eviction picks an arbitrary entry on purpose. A resize walks the transcript
+/// in order, so an LRU (or dropping a whole generation) always throws out
+/// exactly what the walk asks for next and misses every time once the
+/// transcript outgrows the budget. Arbitrary eviction keeps a stable subset
+/// instead, and the hit rate settles near `budget / working set`.
+#[derive(Default)]
+struct BlockCache {
+    entries: HashMap<BlockKey, (BlockSegments, usize)>,
+    bytes: usize,
+}
+
+impl BlockCache {
+    fn get(&self, key: BlockKey) -> Option<BlockSegments> {
+        self.entries.get(&key).map(|(segs, _)| Arc::clone(segs))
+    }
+
+    /// Evicts before inserting, so the incoming entry is never its own victim.
+    fn insert(&mut self, key: BlockKey, segments: BlockSegments, budget: usize) {
+        let bytes = segments_bytes(&segments);
+        if bytes > budget {
+            return;
+        }
+        self.remove(key);
+        while self.bytes + bytes > budget
+            && let Some(&victim) = self.entries.keys().next()
+        {
+            self.remove(victim);
+        }
+        self.entries.insert(key, (segments, bytes));
+        self.bytes += bytes;
+    }
+
+    fn remove(&mut self, key: BlockKey) {
+        if let Some((_, bytes)) = self.entries.remove(&key) {
+            self.bytes -= bytes;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
 }
 
 pub fn theme() -> Arc<Theme> {
@@ -215,6 +320,30 @@ pub fn highlight_code(lang: &str, code: &str, prefix: &str) -> Vec<Vec<StyledSeg
         .collect()
 }
 
+/// Highlights a whole block, memoized on its content.
+///
+/// Highlighting is by far the most expensive part of a markdown render (syntect
+/// burns ~270us of regex per line) and the result does not depend on terminal
+/// width, so laying the same text out again after a resize should never pay for
+/// it twice. Callers streaming a growing block stay on [`CodeHighlighter`]:
+/// it is incremental, and would miss this cache on every token.
+pub fn highlight_block(lang: &str, code: &str) -> BlockSegments {
+    let key = BlockKey::new(lang, code);
+    if let Some(hit) = block_cache_lock()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+    {
+        return hit;
+    }
+    let segments: BlockSegments = Arc::new(highlight_code(lang, code, ""));
+    block_cache_lock()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, Arc::clone(&segments), BLOCK_CACHE_MAX_BYTES);
+    segments
+}
+
 pub fn highlight_lines_independent(lang: &str, code: &str) -> Vec<Vec<StyledSegment>> {
     let syntax = syntax_for_token(lang);
     LinesWithEndings::from(code)
@@ -319,8 +448,22 @@ impl CodeHighlighter {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+    use std::thread;
+
     use super::*;
     use test_case::test_case;
+
+    const BUDGETED_ENTRIES: usize = 32;
+    const RUST: &str = "rust";
+
+    /// The theme and the block cache are process globals. Nextest gives every
+    /// test its own process, `cargo test` does not, so tests that swap the theme
+    /// or read the cache take this first and cannot be tripped up by a sibling.
+    fn exclusive_globals() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn segments_text(segs: &[StyledSegment]) -> String {
         segs.iter().map(|s| s.text.as_str()).collect()
@@ -380,6 +523,7 @@ mod tests {
 
     #[test]
     fn set_theme_applies_without_panic() {
+        let _globals = exclusive_globals();
         warmup();
         for _ in 0..3 {
             set_theme(Theme::default());
@@ -475,6 +619,239 @@ mod tests {
         let seg_fresh = fresh.highlight_line("    let x = 1;\n");
 
         assert_eq!(seg_from_state, seg_fresh);
+    }
+
+    #[test_case(RUST, "fn main() {\n    let x = 1;\n}\n"; "rust_block")]
+    #[test_case(RUST, ""; "empty_code")]
+    #[test_case("totally_unknown_xyz", "!!! not a language !!!\n"; "unknown_language")]
+    fn highlight_block_matches_an_uncached_highlight(lang: &str, code: &str) {
+        let _globals = exclusive_globals();
+        warmup();
+        assert_eq!(*highlight_block(lang, code), highlight_code(lang, code, ""));
+    }
+
+    #[test]
+    fn highlight_block_memoizes_per_language() {
+        let _globals = exclusive_globals();
+        warmup();
+        const CODE: &str = "x = 1\n";
+        let rust = highlight_block(RUST, CODE);
+        assert!(
+            Arc::ptr_eq(&rust, &highlight_block(RUST, CODE)),
+            "the same block must hand back the same allocation"
+        );
+        assert!(
+            !Arc::ptr_eq(&rust, &highlight_block("python", CODE)),
+            "the language is part of the key"
+        );
+    }
+
+    /// Hashing the language and the code into one stream would make
+    /// `("rust", "x")` and `("rus", "tx")` the same key, and a false hit paints
+    /// a block with another block's colors.
+    #[test_case((RUST, "x"), ("rus", "tx"); "language_code_boundary")]
+    #[test_case((RUST, "let a = 1;\n"), (RUST, "let b = 2;\n"); "equal_length_bodies")]
+    fn distinct_blocks_get_distinct_keys(left: (&str, &str), right: (&str, &str)) {
+        assert!(BlockKey::new(left.0, left.1) != BlockKey::new(right.0, right.1));
+    }
+
+    /// `set_theme` bumps the generation before clearing, so a highlight that
+    /// started earlier and finishes after the clear lands under a key no later
+    /// lookup can mint. Bumping after the clear would leave that insert
+    /// reachable, serving the old palette until the next theme change.
+    #[test]
+    fn a_theme_change_orphans_the_blocks_highlighted_before_it() {
+        const CODE: &str = "let themed = 1;\n";
+        let _globals = exclusive_globals();
+        warmup();
+        let stale_key = BlockKey::new(RUST, CODE);
+        highlight_block(RUST, CODE);
+
+        set_theme(Theme::default());
+        assert_eq!(
+            block_cache_lock().read().unwrap().bytes,
+            0,
+            "set_theme must clear the cache"
+        );
+
+        let racing = one_line();
+        block_cache_lock().write().unwrap().insert(
+            stale_key,
+            Arc::clone(&racing),
+            BLOCK_CACHE_MAX_BYTES,
+        );
+        assert!(
+            !Arc::ptr_eq(&racing, &highlight_block(RUST, CODE)),
+            "an insert under a key minted before the bump must be unreachable"
+        );
+    }
+
+    fn block_of(lines: usize) -> BlockSegments {
+        Arc::new(vec![vec![StyledSegment::fallback("x".into())]; lines])
+    }
+
+    fn one_line() -> BlockSegments {
+        block_of(1)
+    }
+
+    fn assert_bytes_match_entries(cache: &BlockCache) {
+        assert_eq!(
+            cache.bytes,
+            cache
+                .entries
+                .values()
+                .map(|(segs, _)| segments_bytes(segs))
+                .sum::<usize>(),
+            "the byte tally must track the entries it holds"
+        );
+    }
+
+    /// A budget that fits exactly `BUDGETED_ENTRIES` of [`one_line`].
+    fn tiny_budget() -> usize {
+        segments_bytes(&one_line()) * BUDGETED_ENTRIES
+    }
+
+    /// Replays what a resize does: walk every block in order, over and over.
+    /// Returns hits per pass.
+    fn tiny_cache_scan(blocks: usize, passes: usize) -> (Vec<usize>, BlockCache) {
+        let budget = tiny_budget();
+        let mut cache = BlockCache::default();
+        let mut hits = Vec::new();
+        for _ in 0..passes {
+            let mut pass_hits = 0;
+            for i in 0..blocks {
+                let key = BlockKey::new(RUST, &i.to_string());
+                if cache.get(key).is_some() {
+                    pass_hits += 1;
+                } else {
+                    cache.insert(key, one_line(), budget);
+                }
+            }
+            hits.push(pass_hits);
+        }
+        (hits, cache)
+    }
+
+    /// Arbitrary eviction is the whole point: an LRU or a generational rotation
+    /// would score a flat zero once the walk outgrows the budget. How far above
+    /// zero we land is `HashMap` iteration order talking, so only the floor is
+    /// ours to assert.
+    #[test_case(BUDGETED_ENTRIES, BUDGETED_ENTRIES; "a_scan_that_fits_stays_fully_warm")]
+    #[test_case(BUDGETED_ENTRIES * 4, 1; "a_scan_that_overflows_still_hits")]
+    fn a_repeated_scan_keeps_hitting_within_budget(blocks: usize, min_hits: usize) {
+        const PASSES: usize = 3;
+        let (hits, cache) = tiny_cache_scan(blocks, PASSES);
+        assert_eq!(hits[0], 0, "nothing is warm on the first pass");
+        assert!(
+            hits[1..].iter().all(|&pass| pass >= min_hits),
+            "a scan of {blocks} blocks must keep serving at least {min_hits}, got {hits:?}"
+        );
+        assert!(cache.bytes <= tiny_budget(), "{} over budget", cache.bytes);
+        assert_bytes_match_entries(&cache);
+    }
+
+    /// An entry too big for even an empty cache gets dropped, rather than spun
+    /// through the eviction loop until the cache is empty and it still does not
+    /// fit.
+    #[test]
+    fn block_cache_drops_an_entry_bigger_than_the_budget() {
+        const OVERSIZED_LINES: usize = BUDGETED_ENTRIES + 1;
+        let budget = tiny_budget();
+        let mut cache = BlockCache::default();
+        let resident = BlockKey::new(RUST, "resident");
+        cache.insert(resident, one_line(), budget);
+        let bytes_before = cache.bytes;
+
+        cache.insert(
+            BlockKey::new(RUST, "oversized"),
+            block_of(OVERSIZED_LINES),
+            budget,
+        );
+
+        assert!(
+            cache.get(BlockKey::new(RUST, "oversized")).is_none(),
+            "an entry over the whole budget must not be cached"
+        );
+        assert!(
+            cache.get(resident).is_some(),
+            "a rejected insert must not evict what already fits"
+        );
+        assert_eq!(cache.bytes, bytes_before);
+    }
+
+    /// Without the `remove` before the insert, the replaced value's bytes stay
+    /// on the tally forever. A block streamed at growing lengths would then
+    /// drift up to the budget and evict everything on every insert while
+    /// holding almost nothing.
+    #[test]
+    fn reinserting_a_key_does_not_double_count_its_bytes() {
+        const GROWN_LINES: usize = 4;
+        let budget = tiny_budget();
+        let mut cache = BlockCache::default();
+        let key = BlockKey::new(RUST, "same");
+
+        cache.insert(key, one_line(), budget);
+        cache.insert(key, block_of(GROWN_LINES), budget);
+        cache.insert(key, one_line(), budget);
+
+        assert_eq!(cache.entries.len(), 1);
+        assert_bytes_match_entries(&cache);
+    }
+
+    /// The eviction loop picks an arbitrary key, so inserting first would let it
+    /// pick the incoming one and hand the caller a value the cache never holds.
+    #[test]
+    fn eviction_spares_the_entry_being_inserted() {
+        let budget = tiny_budget();
+        let mut cache = BlockCache::default();
+        for i in 0..BUDGETED_ENTRIES {
+            cache.insert(BlockKey::new(RUST, &i.to_string()), one_line(), budget);
+        }
+        assert_eq!(cache.bytes, budget, "the cache must start out exactly full");
+
+        let incoming = BlockKey::new(RUST, "incoming");
+        cache.insert(incoming, block_of(BUDGETED_ENTRIES), budget);
+
+        assert!(
+            cache.get(incoming).is_some(),
+            "the entry that forced the eviction must survive it"
+        );
+        assert_eq!(cache.entries.len(), 1, "it takes the budget on its own");
+        assert_bytes_match_entries(&cache);
+    }
+
+    /// `highlight_block` drops the read lock before taking the write lock, so a
+    /// theme change can slip in between, and whatever comes back must still be
+    /// an honest highlight of its own input. The theme swapped in here is the
+    /// one already installed, so `highlight_code` stays a valid expectation
+    /// while the generation churns underneath.
+    #[test]
+    fn concurrent_blocks_survive_a_theme_change() {
+        const THREADS: usize = 4;
+        const ITERATIONS: usize = 8;
+        let _globals = exclusive_globals();
+        warmup();
+
+        thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for i in 0..ITERATIONS {
+                        let code = format!("let v{i} = {i};\n");
+                        assert_eq!(
+                            *highlight_block(RUST, &code),
+                            highlight_code(RUST, &code, "")
+                        );
+                    }
+                });
+            }
+            scope.spawn(|| {
+                for _ in 0..THREADS * ITERATIONS {
+                    set_theme(Theme::default());
+                }
+            });
+        });
+
+        assert_bytes_match_entries(&block_cache_lock().read().unwrap());
     }
 
     #[test_case("jsx", "js"; "jsx_alias")]

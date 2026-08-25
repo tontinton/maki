@@ -239,7 +239,7 @@ pub fn text_to_lines(
         }
         None => text,
     };
-    let semantic = render::Renderer::unwrapped().render(text, width, 0);
+    let semantic = render::Renderer::unwrapped().render(text, width);
     paint_semantic(&semantic, prefix, text_style, prefix_style)
 }
 
@@ -288,6 +288,12 @@ mod tests {
     use test_case::test_case;
 
     const TEST_WIDTH: u16 = 80;
+    const THEME_A: &str = "dracula";
+    const THEME_B: &str = "tokyonight";
+    /// Long enough to wrap at `NARROW_WIDTH` and not at the wider ones.
+    const WRAPPING_CODE_TEXT: &str = "```rust\nfn main() { let answer: usize = compute_the_answer(&universe, &everything); }\nlet x = 1;\n```";
+    const NARROW_WIDTH: u16 = 24;
+    const WIDE_WIDTH: u16 = 200;
 
     fn text_to_lines(
         text: &str,
@@ -309,6 +315,23 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// Only the spans of code lines (the ones carrying a gutter bar), so the
+    /// assertion tracks the syntax palette and not the surrounding text styles.
+    fn code_span_styles(lines: &[Line<'_>]) -> Vec<Style> {
+        lines
+            .iter()
+            .filter(|l| l.spans.iter().any(|s| s.content.as_ref() == CODE_BAR))
+            .flat_map(|l| &l.spans)
+            .filter(|s| s.content.as_ref() != CODE_BAR)
+            .map(|s| s.style)
+            .collect()
+    }
+
+    fn render_code(width: u16) -> Vec<Line<'static>> {
+        let style = Style::default();
+        text_to_lines(WRAPPING_CODE_TEXT, "", style, style, width)
     }
 
     fn find_span<'a>(lines: &'a [Line<'_>], needle: &str) -> &'a Span<'a> {
@@ -540,6 +563,38 @@ mod tests {
                 .iter()
                 .map(|s| (&s.content, s.style.fg))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// `highlight_block` memoizes on language plus code only: nothing but
+    /// `set_theme` may invalidate it, and width may never reach it. A false hit
+    /// on either axis leaves wrong colours, or another width's line breaks, on
+    /// screen for the rest of the session.
+    #[test]
+    fn the_code_memo_follows_the_theme_and_ignores_the_width() {
+        const WIDTHS: [u16; 3] = [NARROW_WIDTH, TEST_WIDTH, WIDE_WIDTH];
+        theme::set(theme::load_by_name(THEME_A).expect(THEME_A));
+        let under_a = WIDTHS.map(render_code);
+        assert!(
+            under_a[0].len() > under_a[2].len(),
+            "the narrow width must actually wrap a code line"
+        );
+
+        theme::set(theme::load_by_name(THEME_B).expect(THEME_B));
+        for (a, b) in under_a.iter().zip(WIDTHS.map(render_code)) {
+            assert_eq!(lines_text(a), lines_text(&b), "text must not change");
+            assert_ne!(
+                code_span_styles(a),
+                code_span_styles(&b),
+                "a theme change must reach the cached highlight"
+            );
+        }
+
+        theme::set(theme::load_by_name(THEME_A).expect(THEME_A));
+        assert_eq!(
+            WIDTHS.map(render_code),
+            under_a,
+            "a warm memo must restore every width exactly as it first rendered"
         );
     }
 

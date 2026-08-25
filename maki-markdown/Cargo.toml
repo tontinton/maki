@@ -13,5 +13,6 @@ maki-highlight = { workspace = true }
 unicode-width = { workspace = true }
 
 [dev-dependencies]
+syntect = { workspace = true }
 test-case = { workspace = true }
 fastrand = { workspace = true }
