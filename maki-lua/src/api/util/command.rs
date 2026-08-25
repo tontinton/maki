@@ -312,6 +312,9 @@ pub struct FloatConfig {
     pub order: u16,
     pub visible: bool,
     pub needs_input: bool,
+    /// Opt in to corner stacking: the UI offsets this window past the other
+    /// stacked windows sharing its anchor. Open time only, so no patch field.
+    pub stack: bool,
 }
 
 impl Default for FloatConfig {
@@ -334,6 +337,7 @@ impl Default for FloatConfig {
             order: 50,
             visible: true,
             needs_input: false,
+            stack: false,
         }
     }
 }

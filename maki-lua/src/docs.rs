@@ -76,6 +76,8 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::model::DOCS,
         &api::net::DOCS,
         &api::session::DOCS,
+        &api::top::DOCS,
+        &api::top::TIMER_DOCS,
         &api::task::DOCS,
         &api::text::DOCS,
         &api::treesitter::DOCS,
@@ -115,10 +117,19 @@ mod tests {
     }
 
     fn table_keys(table: &Table) -> BTreeSet<String> {
-        table
+        let mut keys: BTreeSet<String> = table
             .pairs::<String, Value>()
             .map(|pair| pair.unwrap().0)
-            .collect()
+            .collect();
+        // `maki.notify` is stashed in the `__index` table (see
+        // `create_maki_global`), so the drift check has to see through the
+        // metatable to consider it registered.
+        if let Some(mt) = table.metatable()
+            && let Ok(idx) = mt.get::<Table>("__index")
+        {
+            keys.extend(idx.pairs::<String, Value>().map(|p| p.unwrap().0));
+        }
+        keys
     }
 
     /// Docs and registration live side by side; this test keeps them equal so

@@ -197,7 +197,10 @@ end
 -- Open a fuzzy-filter picker in a floating window and block until the user
 -- decides. {items} is a list of strings or { label, detail? } tables. {opts}:
 -- title, footer, cursor (initial index), submit_keys (extra submit keys
--- besides enter). Returns { type = "choice"|"delete", index } or
+-- besides enter), action_keys (keys that close the picker and report
+-- themselves, like { "R" } for a refresh binding. Use uppercase keys, since
+-- lowercase ones keep feeding the filter). Returns
+-- { type = "choice"|"delete", index }, { type = "key", key, index? } or
 -- { type = "close" }.
 function ListPicker.open(items, opts)
   opts = opts or {}
@@ -205,6 +208,12 @@ function ListPicker.open(items, opts)
   if opts.submit_keys then
     for _, k in ipairs(opts.submit_keys) do
       submit_keys[k] = true
+    end
+  end
+  local action_keys = {}
+  if opts.action_keys then
+    for _, k in ipairs(opts.action_keys) do
+      action_keys[k] = true
     end
   end
   local width
@@ -303,6 +312,13 @@ function ListPicker.open(items, opts)
           win:close()
           return { type = "choice", index = original_indices[cursor] }
         end
+      elseif action_keys[ev.key] then
+        win:close()
+        return {
+          type = "key",
+          key = ev.key,
+          index = #filtered > 0 and original_indices[cursor] or nil,
+        }
       else
         local result = input:handle_key(ev.key)
         if result == TextInput.Result.CHANGED then

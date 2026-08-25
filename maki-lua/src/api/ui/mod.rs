@@ -75,18 +75,36 @@ pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
         .collect()
 }
 
-/// Creates a new buffer for building UI content. The first buffer you
-/// create in a task becomes the "live" buffer, streamed to the UI while
-/// your tool runs. Create more buffers for secondary content like
-/// floating windows.
+/// Creates a new buffer for building UI content. The first buffer
+/// created in a task becomes the "live" buffer, streamed to the UI while
+/// the tool runs, which is what the tool's own output pane wants. A
+/// float that opens during a tool call would take that spot away, so
+/// create its buffer with `{ scratch = true }`. It matches nvim's
+/// `nvim_create_buf(false, true)`.
 ///
+/// @param opts table? Optional. `scratch` (boolean) keeps the buffer out of the live slot, default false.
 /// @return (Buf) Buffer handle.
 /// @example
-/// local buf = maki.ui.buf()
-/// buf:line("hello world")
+/// -- The tool's output pane:
+/// local out = maki.ui.buf()
+/// out:line("hello world")
+///
+/// -- A float raised during a tool call needs its own buffer:
+/// local toast = maki.ui.buf({ scratch = true })
+/// toast:line("copied!")
 #[lua_fn]
-fn buf(lua: &Lua) -> LuaResult<buf::BufHandle> {
-    Ok(with_task_bufs(lua, |store| store.create_live()))
+fn buf(lua: &Lua, opts: Option<Table>) -> LuaResult<buf::BufHandle> {
+    let scratch = match opts {
+        Some(t) => t.get::<Option<bool>>("scratch")?.unwrap_or(false),
+        None => false,
+    };
+    Ok(with_task_bufs(lua, |store| {
+        if scratch {
+            store.create()
+        } else {
+            store.create_live()
+        }
+    }))
 }
 
 /// Looks up a semantic color from the current theme. Use this to keep
@@ -356,6 +374,7 @@ async fn open_editor(
 ///   - focus (boolean): whether the window takes keyboard focus on open. Default true.
 ///   - visible (boolean): whether the window is initially visible. Default true.
 ///   - needs_input (boolean): whether the window means the session needs user input. Default false.
+///   - stack (boolean): offset the window past the other stacked windows sharing its anchor, in open order, with a one row gap. Closing one moves the rest up. Floating windows only. Default false.
 /// @return (Win) Window handle.
 /// @example
 /// local buf = maki.ui.buf()
@@ -398,6 +417,7 @@ fn open_win(
     let order: u16 = opts.get("order").unwrap_or(50);
     let visible: bool = opts.get("visible").unwrap_or(true);
     let needs_input: bool = opts.get("needs_input").unwrap_or(false);
+    let stack: bool = opts.get("stack").unwrap_or(false);
 
     let config = FloatConfig {
         width,
@@ -417,6 +437,7 @@ fn open_win(
         order,
         visible,
         needs_input,
+        stack,
     };
 
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));

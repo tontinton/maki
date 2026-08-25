@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_lock::{Semaphore, SemaphoreGuardArc};
 use futures::future::join_all;
@@ -195,6 +196,26 @@ async fn gather(lua: Lua, fns: Table) -> LuaResult<Table> {
     Ok(out)
 }
 
+/// Suspend the calling task for {ms} milliseconds. The plugin thread is
+/// never blocked, so other tasks and the UI keep running, and a cancel
+/// still lands while you sleep.
+///
+/// For a timer that has to outlive the tool call that started it, such
+/// as a toast dismissing itself, use `maki.defer_fn`.
+///
+/// @param ms integer Milliseconds to sleep.
+/// @return
+/// @example
+/// maki.async.run(function()
+///   maki.async.sleep(4000)
+///   win:close()
+/// end)
+#[lua_fn]
+async fn sleep(_lua: Lua, ms: u64) -> LuaResult<()> {
+    smol::Timer::after(Duration::from_millis(ms)).await;
+    Ok(())
+}
+
 /// Create a counting semaphore that allows at most {n} concurrent permits.
 /// Use this to limit how many tasks hit a resource at the same time.
 ///
@@ -302,7 +323,7 @@ lua_table! {
     /// })
     /// ```
     extend "maki.async" => pub(crate) fn add_async_fns(), DOCS [
-        run, manual r#await, manual wrap, manual join, gather, semaphore, on_cancel,
+        run, sleep, manual r#await, manual wrap, manual join, gather, semaphore, on_cancel,
     ]
 }
 
