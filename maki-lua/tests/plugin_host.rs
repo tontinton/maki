@@ -2251,6 +2251,41 @@ fn project_init_cannot_change_global_packages(source: &str) {
 }
 
 #[test]
+fn a_named_config_cannot_change_global_packages() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+
+    let error = host
+        .send_run_init_lua(
+            r#"maki.pack.add({ "https://example.com/demo" })"#.to_owned(),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .expect_err("only the global config may change packages");
+
+    assert!(
+        error.to_string().contains(GLOBAL_PACK_ONLY_ERR),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn global_init_can_declare_managed_packages() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+
+    let _ = host
+        .send_run_init_lua(
+            r#"maki.pack.add({ "https://example.com/demo" })"#.to_owned(),
+            "global/init.lua".to_owned(),
+            None,
+        )
+        .unwrap();
+
+    let declared = host.declared_packages().unwrap();
+    assert_eq!(declared.len(), 1);
+    assert_eq!(declared[0].spec.name, "demo");
+}
+
+#[test]
 fn project_init_can_activate_an_installed_global_package() {
     let host = PluginHost::new(fresh_registry()).unwrap();
 
@@ -2268,6 +2303,19 @@ fn project_init_can_activate_an_installed_global_package() {
             name: "demo".to_owned()
         }]
     );
+}
+
+#[test]
+fn project_init_can_inspect_global_packages() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+
+    let _ = host
+        .send_run_init_lua(
+            r#"assert(type(maki.pack.get) == "function")"#.to_owned(),
+            "project/init.lua".to_owned(),
+            None,
+        )
+        .unwrap();
 }
 
 #[test_case::test_case(
@@ -2397,7 +2445,7 @@ maki.pack.add({{
 })
 "#
         .to_owned(),
-        "test_init.lua".to_owned(),
+        "global/init.lua".to_owned(),
         None,
     )
     .unwrap();
@@ -2437,7 +2485,7 @@ maki.pack.add({ "https://example.com/broken" }, {
 })
 "#
         .to_owned(),
-        "test_init.lua".to_owned(),
+        "global/init.lua".to_owned(),
         None,
     )
     .unwrap();
@@ -2482,7 +2530,7 @@ maki.api.create_autocmd("PackChanged", {
 })
 "#
         .to_owned(),
-        "test_init.lua".to_owned(),
+        "global/init.lua".to_owned(),
         None,
     )
     .unwrap();

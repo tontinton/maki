@@ -141,7 +141,7 @@ fn run_pack_command(
         }
         Err(error) => messages.push(format!("could not refresh package state: {error}")),
     }
-    super::sanitize_warnings(messages)
+    messages
 }
 
 fn reserved_command_names(commands: &[CustomCommand]) -> Vec<String> {
@@ -603,7 +603,12 @@ pub fn run(mut cli: Cli) -> Result<()> {
             } => {
                 let started = Instant::now();
                 let reserved = reserved_command_names(&stack.commands);
-                warnings = run_pack_command(&stack, &command, cli.no_plugins, &reserved);
+                warnings = super::sanitize_warnings(run_pack_command(
+                    &stack,
+                    &command,
+                    cli.no_plugins,
+                    &reserved,
+                ));
                 tabs = reloaded;
                 if tabs.is_empty() {
                     tabs.push(AppSession::new(&stack.model.spec(), &cwd_str));

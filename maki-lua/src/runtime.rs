@@ -2114,11 +2114,10 @@ impl LuaRuntime {
                     .map_err(&map_err)?;
             maki.set("setup", setup_fn).map_err(&map_err)?;
 
-            // Project config keeps the read API but cannot mutate the global
-            // package set. A checked-out repository must not fetch code or
-            // rewrite the user's lockfile when it opens.
+            // Non-global config keeps the read API but cannot mutate the
+            // shared package set.
             let pack = crate::api::pack::create_pack_table(&self.lua).map_err(&map_err)?;
-            if config.scope == &ConfigScope::Project {
+            if config.scope != &ConfigScope::Global {
                 crate::api::pack::restrict_management(&self.lua, &pack).map_err(&map_err)?;
             }
             maki.set("pack", pack).map_err(&map_err)?;
