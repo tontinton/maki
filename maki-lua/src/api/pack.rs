@@ -1478,8 +1478,12 @@ mod tests {
             .create_sequence_from(["https://github.com/user/repo"])
             .unwrap();
         let load = lua.create_table().unwrap();
-        load.set("event", lua.create_sequence_from(["TurnStart"]).unwrap())
-            .unwrap();
+        load.set(
+            "event",
+            lua.create_sequence_from(["TurnStart", "TaskStatusChanged"])
+                .unwrap(),
+        )
+        .unwrap();
         load.set("cmd", "/demo").unwrap();
         let opts = lua.create_table().unwrap();
         opts.set("load", load).unwrap();
@@ -1494,7 +1498,10 @@ mod tests {
                 declared.specs[0].load
             );
         };
-        assert_eq!(triggers.event, vec!["TurnStart".to_owned()]);
+        assert_eq!(
+            triggers.event,
+            vec!["TurnStart".to_owned(), "TaskStatusChanged".to_owned()]
+        );
         assert_eq!(
             triggers.cmd,
             vec!["/demo".to_owned()],
