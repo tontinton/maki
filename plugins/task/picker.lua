@@ -22,6 +22,7 @@ local DONE_ICON = "✓ "
 local ERROR_ICON = "✗ "
 local NO_MATCHES_HINT = "  No matches"
 local FOOTER_KEYS = { { "Enter", "open" }, { "Esc", "cancel" } }
+local HINT_KEY = "Ctrl+X"
 -- The main chat has no status, so it falls through to MAIN.
 local ICONS = {
   working = { RUNNING_ICON, "accent", true },
@@ -34,6 +35,31 @@ local board = nil
 
 local function dispw(s)
   return utf8.len(s) or #s
+end
+
+-- Opening a subagent puts its transcript where the main chat was, and the picker
+-- is the only way back, so the input area advertises the key while the session
+-- has subagents. maki.task.list() suspends and autocmd callbacks cannot, so the
+-- round-trip runs off to the side.
+local function refresh_hint()
+  maki.async.run(function()
+    local n = 0
+    for _, task in ipairs(maki.task.list() or {}) do
+      -- The main chat is listed too, and it is the one entry without a status.
+      if task.status then
+        n = n + 1
+      end
+    end
+    if n == 0 then
+      maki.ui.set_status_hint(nil)
+    else
+      maki.ui.set_status_hint({
+        { string.format(" %d %s ", n, n == 1 and "task" or "tasks"), "foreground" },
+        { HINT_KEY, "keybind_key" },
+        { " ", "" },
+      })
+    end
+  end)
 end
 
 local function icon_of(task)
@@ -291,6 +317,11 @@ maki.api.create_autocmd("SessionFocusChanged", {
       board.expired = true
     end
   end,
+})
+
+-- Every way the subagent count of the focused session can change.
+maki.api.create_autocmd({ "TaskStatusChanged", "SessionFocusChanged", "SessionReset" }, {
+  callback = refresh_hint,
 })
 
 maki.api.register_command({
