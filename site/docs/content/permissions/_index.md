@@ -48,7 +48,7 @@ File-write tools are pre-allowed inside the project working directory (cwd at se
 | `write` | `<cwd>/**` | Outside cwd requires permission |
 | `edit` | `<cwd>/**` | Outside cwd requires permission |
 | `multiedit` | `<cwd>/**` | Outside cwd requires permission |
-| `edit_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
+| `edit_lines` | `<cwd>/**` | Outside cwd requires permission |
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `task` | `*` | Subagent spawning always allowed |
 

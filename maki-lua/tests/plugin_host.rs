@@ -2435,12 +2435,12 @@ fn builtin_opts_flow_from_setup_plugins() {
 
 #[test_case::test_case(
     serde_json::json!({}),
-    &["edit", "multiedit"], &["edit_lines", "insert_lines"]
-    ; "multiedit_on_others_opt_in"
+    &["edit", "multiedit", "edit_lines"], &["insert_lines"]
+    ; "defaults_on_insert_lines_opt_in"
 )]
 #[test_case::test_case(
-    serde_json::json!({ "multiedit": false, "edit_lines": true }),
-    &["edit", "edit_lines"], &["multiedit", "insert_lines"]
+    serde_json::json!({ "multiedit": false, "edit_lines": false, "insert_lines": true }),
+    &["edit", "insert_lines"], &["multiedit", "edit_lines"]
     ; "toggles_flip_sub_tools"
 )]
 fn edit_sub_tools_follow_edit_opts(opts: serde_json::Value, on: &[&str], off: &[&str]) {

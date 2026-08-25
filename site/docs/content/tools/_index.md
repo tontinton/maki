@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 21 built-in tools in this reference (19 on by default, 2 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 21 built-in tools in this reference (20 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -71,7 +71,7 @@ Prefer this over edit when making multiple changes to the same file.
 | `edits` | array | yes | Array of edit operations to apply sequentially |
 | `path` | string | yes | Absolute path to the file |
 
-### `edit_lines` <span class="badge badge-optin">opt-in</span> {#edit_lines}
+### `edit_lines` {#edit_lines}
 
 Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.
 

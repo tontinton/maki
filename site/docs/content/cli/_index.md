@@ -63,7 +63,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 
 ### Tool name lists
 
-`--allowed-tools` / `--disallowed-tools` accept Claude Code PascalCase (`Read,Edit,Bash`) or snake_case (`read,edit,bash`). Maki lowercases PascalCase to snake_case and checks the result against the built-in tool names, so `CodeExecution` works but `MultiEdit` errors: it normalizes to `multi_edit`, and the tool is called `multiedit`. Write `multiedit` or `edit_lines` as-is. Unknown names error out with the list of valid names. The opt-in edit tools (`edit_lines`, `insert_lines`, `multiedit`) are always valid names here, even while disabled; listing one does nothing until you enable the tool in config.
+`--allowed-tools` / `--disallowed-tools` accept Claude Code PascalCase (`Read,Edit,Bash`) or snake_case (`read,edit,bash`). Maki lowercases PascalCase to snake_case and checks the result against the built-in tool names, so `CodeExecution` works but `MultiEdit` errors: it normalizes to `multi_edit`, and the tool is called `multiedit`. Write `multiedit` or `edit_lines` as-is. Unknown names error out with the list of valid names. The edit plugin's sub-tools (`multiedit`, `edit_lines`, `insert_lines`) are valid names here even when disabled. Listing a disabled tool has no effect until you enable it in config.
 
 ### Permission modes (SDK)
 

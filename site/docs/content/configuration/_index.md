@@ -179,7 +179,7 @@ The `plugins` table turns plugins on or off and passes options to them. All bund
 
 Each plugin checks its own options at startup. A typo, a wrong type, or an unknown plugin name gives you a clear error right away.
 
-The edit plugin's extra tools are options too: `plugins.edit = { multiedit = false, edit_lines = true }`. The old `tools` table is gone. If your config still uses it, Maki stops at startup and shows you the new form.
+The edit plugin's extra tools are options too: `plugins.edit = { multiedit = false, insert_lines = true }`. The old `tools` table is gone. If your config still uses it, Maki stops at startup and shows you the new form.
 
 This table is for bundled plugins only. Your own plugins go in `~/.config/maki/lua/`, see [Plugins](/docs/plugins/).
 
@@ -213,7 +213,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `edit_lines` | boolean | `false` | - | Provide the opt-in `edit_lines` tool. |
+| `edit_lines` | boolean | `true` | - | Provide the `edit_lines` tool. |
 | `insert_lines` | boolean | `false` | - | Provide the opt-in `insert_lines` tool. |
 | `multiedit` | boolean | `true` | - | Provide the `multiedit` tool. |
 

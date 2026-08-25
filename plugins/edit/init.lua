@@ -235,7 +235,7 @@ end
 
 local opts = maki.api.register_options({
   multiedit = { default = true, desc = "Provide the `multiedit` tool." },
-  edit_lines = { default = false, desc = "Provide the opt-in `edit_lines` tool." },
+  edit_lines = { default = true, desc = "Provide the `edit_lines` tool." },
   insert_lines = { default = false, desc = "Provide the opt-in `insert_lines` tool." },
 })
 
