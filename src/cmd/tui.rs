@@ -115,13 +115,8 @@ fn run_pack_command(
     );
     let mut messages = vec![report.summary()];
     messages.extend(report.failures.iter().cloned());
-    let discovery = maki_lua::discover_installed(no_plugins);
-    messages.extend(
-        discovery
-            .problems
-            .into_iter()
-            .map(|problem| super::sanitize_warning(format!("skipping package: {problem}"))),
-    );
+    let discovery = super::discover_external_packages(no_plugins);
+    messages.extend(discovery.warnings);
     let available: Vec<DiscoveredPackage> = discovery
         .packages
         .into_iter()
@@ -146,7 +141,7 @@ fn run_pack_command(
         }
         Err(error) => messages.push(format!("could not refresh package state: {error}")),
     }
-    messages
+    super::sanitize_warnings(messages)
 }
 
 fn reserved_command_names(commands: &[CustomCommand]) -> Vec<String> {
@@ -276,17 +271,12 @@ fn build_stack(
 
     // Discovered before the config is built, so `plugins.<name>` can configure
     // an installed package, and reused afterwards to load it.
-    let discovery = maki_lua::discover_installed(cli.no_plugins);
+    let discovery = super::discover_external_packages(cli.no_plugins);
     // Taken before the problems are consumed, and includes the names
     // discovery refused, so a package it could not read does not become a
     // config error pointing at the user's `plugins.<name>` table.
-    let names = discovery.known_names();
-    warnings.extend(
-        discovery
-            .problems
-            .into_iter()
-            .map(|problem| super::sanitize_warning(format!("skipping package: {problem}"))),
-    );
+    let names = discovery.names;
+    warnings.extend(discovery.warnings);
     let packages = discovery.packages;
 
     let (fallback_config, fallback_model) = fallback.unzip();
@@ -321,16 +311,29 @@ fn build_stack(
         // is already a visible act: it reaches the network, writes the
         // lockfile, and can run the fetched code under a package name the
         // fallback config happens to enable.
-        Ok(_) if config_rejected => {
+        Ok(declared) if config_rejected => {
+            let installed =
+                maki_lua::resolve_declared_on_disk(&declared, !cli.print && !cli.is_sdk_mode());
+            warnings.extend(installed.failures);
+            let available: Vec<DiscoveredPackage> = packages
+                .iter()
+                .chain(installed.packages.iter())
+                .cloned()
+                .collect();
             catalog_packages(
                 &plugin_host,
-                &packages,
-                &[],
+                &available,
+                &declared,
                 &reserved,
                 &config.plugins,
                 &mut warnings,
             );
             warnings.extend(plugin_host.load_packages(&packages, &config.plugins));
+            warnings.extend(plugin_host.load_declared_packages(
+                &installed.packages,
+                &declared,
+                &config.plugins,
+            ));
             warnings.push("package changes in the rejected config were not applied".to_owned());
             // Nothing drains the queue on this path, so it is closed here
             // instead. Left open, every later `maki.packadd` that the runtime
@@ -394,7 +397,7 @@ fn build_stack(
             model,
             needs_login,
         },
-        warnings,
+        super::sanitize_warnings(warnings),
     ))
 }
 

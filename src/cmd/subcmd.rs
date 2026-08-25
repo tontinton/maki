@@ -543,14 +543,9 @@ pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
 
     let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
-    let discovery = maki_lua::discover_installed(no_plugins);
-    let names = discovery.known_names();
-    for problem in discovery.problems {
-        eprintln!(
-            "warning: {}",
-            super::sanitize_warning(format!("skipping package: {problem}"))
-        );
-    }
+    let discovery = super::discover_external_packages(no_plugins);
+    let names = discovery.names;
+    super::report_warnings(discovery.warnings);
     let config = load_effective_config(&host, no_plugins, &cwd, &names)?;
 
     smol::block_on(fetch_all_models(
@@ -599,14 +594,9 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
     let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
 
-    let discovery = maki_lua::discover_installed(no_plugins);
-    let names = discovery.known_names();
-    for problem in discovery.problems {
-        eprintln!(
-            "warning: {}",
-            super::sanitize_warning(format!("skipping package: {problem}"))
-        );
-    }
+    let discovery = super::discover_external_packages(no_plugins);
+    let names = discovery.names;
+    super::report_warnings(discovery.warnings);
     let packages = discovery.packages;
     let raw_config = host
         .load_init_files_or_skip(no_plugins, &cwd)
@@ -632,7 +622,7 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
 
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
-    for warning in super::load_external_packages(
+    super::report_warnings(super::load_external_packages(
         &host,
         &packages,
         &declared,
@@ -640,9 +630,7 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
         &config.plugins,
         maki_lua::Interaction::None,
         false,
-    )? {
-        eprintln!("warning: {warning}");
-    }
+    )?);
 
     let abs_path = Path::new(path)
         .canonicalize()
@@ -728,14 +716,9 @@ pub fn prompt(
     let reg = ToolRegistry::global_arc();
     let mut host =
         PluginHost::with_jit(Arc::clone(reg), !no_jit).context("initialize lua plugin host")?;
-    let discovery = maki_lua::discover_installed(no_plugins);
-    let package_names = discovery.known_names();
-    for problem in discovery.problems {
-        eprintln!(
-            "warning: {}",
-            super::sanitize_warning(format!("skipping package: {problem}"))
-        );
-    }
+    let discovery = super::discover_external_packages(no_plugins);
+    let package_names = discovery.names;
+    super::report_warnings(discovery.warnings);
     let packages = discovery.packages;
     let raw_config = host
         .load_init_files_or_skip(no_plugins, &cwd)
@@ -758,7 +741,7 @@ pub fn prompt(
         .context("invalid config")?;
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
-    for warning in super::load_external_packages(
+    super::report_warnings(super::load_external_packages(
         &host,
         &packages,
         &declared,
@@ -766,9 +749,7 @@ pub fn prompt(
         &config.plugins,
         maki_lua::Interaction::None,
         false,
-    )? {
-        eprintln!("warning: {warning}");
-    }
+    )?);
 
     if tools {
         let ctx = DescriptionContext {

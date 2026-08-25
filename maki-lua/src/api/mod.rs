@@ -98,6 +98,7 @@ pub(crate) fn create_maki_global(
         keymap::create_keymap_table(lua, Arc::clone(&plugin))?,
     )?;
     maki.set("pack", pack::create_pack_read_table(lua)?)?;
+    pack::add_packadd(lua, &maki)?;
 
     Ok(maki)
 }

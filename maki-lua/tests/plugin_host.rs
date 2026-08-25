@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 const BUILTIN_COMMANDS: &[&str] = &["/sessions", "/rename", "/tasks"];
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
+const GLOBAL_PACK_ONLY_ERR: &str = "only available in the global init.lua";
 const USAGE_TOOL_NAME: &str = "usage_child";
 const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
 const USAGE_OUTPUT: &str = "usage_done";
@@ -1179,6 +1180,45 @@ fn require_symlink_out_of_package_blocked() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn global_init_can_require_a_symlinked_module() {
+    let config = tempfile::TempDir::new().unwrap();
+    let modules = config.path().join("lua");
+    std::fs::create_dir_all(&modules).unwrap();
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    let target = elsewhere.path().join("shared.lua");
+    std::fs::write(&target, "return { value = 42 }\n").unwrap();
+    std::os::unix::fs::symlink(&target, modules.join("shared.lua")).unwrap();
+
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    let _ = host
+        .send_run_init_lua(
+            "assert(require('shared').value == 42)".to_owned(),
+            "global/init.lua".to_owned(),
+            Some(config.path().to_path_buf()),
+        )
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn global_init_can_use_a_symlinked_lua_directory() {
+    let config = tempfile::TempDir::new().unwrap();
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    std::fs::write(elsewhere.path().join("shared.lua"), "return true\n").unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), config.path().join("lua")).unwrap();
+
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    let _ = host
+        .send_run_init_lua(
+            "assert(require('shared'))".to_owned(),
+            "global/init.lua".to_owned(),
+            Some(config.path().to_path_buf()),
+        )
+        .unwrap();
+}
+
 #[test]
 fn require_circular_returns_sentinel_and_caches_real_value() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -2189,6 +2229,45 @@ fn setup_happy_path() {
         .unwrap();
     let raw = raw.expect("expected Some(RawConfig)");
     assert_eq!(raw.agent.max_output_lines, Some(3000));
+}
+
+#[test_case::test_case(
+    r#"maki.pack.add({ "https://example.com/demo" })"#;
+    "add"
+)]
+#[test_case::test_case("maki.pack.update()"; "update")]
+#[test_case::test_case(r#"maki.pack.del({ "demo" })"#; "delete")]
+fn project_init_cannot_change_global_packages(source: &str) {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+
+    let error = host
+        .send_run_init_lua(source.to_owned(), "project/init.lua".to_owned(), None)
+        .expect_err("project config must not change global packages");
+
+    assert!(
+        error.to_string().contains(GLOBAL_PACK_ONLY_ERR),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn project_init_can_activate_an_installed_global_package() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+
+    let _ = host
+        .send_run_init_lua(
+            r#"maki.packadd("demo")"#.to_owned(),
+            "project/init.lua".to_owned(),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        host.seal_pack_ops().unwrap(),
+        [maki_lua::PackOp::Activate {
+            name: "demo".to_owned()
+        }]
+    );
 }
 
 #[test_case::test_case(

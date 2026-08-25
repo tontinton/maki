@@ -159,13 +159,10 @@ mod tests {
                 .insert(key);
         }
 
-        // Documented here but attached by the runtime rather than by
-        // `create_maki_global`, so the table built for this test has none of
-        // them. `setup` and `version` are attached only when a config store is
-        // present, which is what limits them to `init.lua`; `packadd` is
-        // attached for every plugin, just later. The global `pack` table has
-        // only its read API until the runtime replaces it for `init.lua`.
-        const RUNTIME_ATTACHED: [&str; 3] = ["setup", "version", "packadd"];
+        // `setup` and `version` are attached only when a config store is
+        // present, which is what limits them to `init.lua`. The global `pack`
+        // table has only its read API until the runtime replaces it there.
+        const RUNTIME_ATTACHED: [&str; 2] = ["setup", "version"];
 
         for (name, mut expected) in documented {
             if RUNTIME_ATTACHED

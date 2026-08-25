@@ -21,14 +21,9 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
     let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
 
-    let discovery = maki_lua::discover_installed(no_plugins);
-    let names = discovery.known_names();
-    for problem in discovery.problems {
-        eprintln!(
-            "warning: {}",
-            super::sanitize_warning(format!("skipping package: {problem}"))
-        );
-    }
+    let discovery = super::discover_external_packages(no_plugins);
+    let names = discovery.names;
+    super::report_warnings(discovery.warnings);
     let packages = discovery.packages;
     let raw_config = plugin_host
         .load_init_files_or_skip(no_plugins, &cwd)
@@ -63,7 +58,7 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
     plugin_host
         .load_builtins(&config.plugins)
         .context("load builtin plugins")?;
-    for warning in super::load_external_packages(
+    super::report_warnings(super::load_external_packages(
         &plugin_host,
         &packages,
         &declared,
@@ -71,9 +66,7 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
         &config.plugins,
         maki_lua::Interaction::None,
         false,
-    )? {
-        eprintln!("warning: {warning}");
-    }
+    )?);
 
     let timeouts = maki_providers::Timeouts {
         connect: config.provider.connect_timeout,

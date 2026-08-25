@@ -15,7 +15,7 @@ use maki_lua_macro::{lua_fn, lua_table};
 use crate::api::options::PluginOpts;
 use crate::plugin_permissions::PluginPermissions;
 use maki_pack::{Spec, Version};
-use mlua::{Lua, RegistryKey, Result as LuaResult, Table, Value as LuaValue};
+use mlua::{Lua, MultiValue, RegistryKey, Result as LuaResult, Table, Value as LuaValue};
 
 /// When a declared package should load.
 ///
@@ -95,8 +95,6 @@ impl Declared {
 #[derive(Debug, Default, Clone)]
 pub struct PackDeclarations {
     pub specs: Vec<Declared>,
-    /// `confirm` from the first `add` call, including an empty call.
-    pub lock_confirm: Option<bool>,
     /// Package owners that loaded successfully in this runtime.
     pub active: BTreeSet<String>,
     /// Operations recorded by Lua for the host to perform after the calling
@@ -232,6 +230,9 @@ pub struct PackChange {
 }
 
 pub type PackStore = Arc<Mutex<PackDeclarations>>;
+
+#[derive(Clone)]
+pub(crate) struct PackRuntimeTx(pub flume::Sender<crate::runtime::Request>);
 
 fn reject_unknown_fields(table: &Table, allowed: &[&str], context: &str) -> LuaResult<()> {
     for pair in table.clone().pairs::<LuaValue, LuaValue>() {
@@ -381,8 +382,8 @@ fn parse_spec(lua: &Lua, value: LuaValue) -> LuaResult<(Spec, Option<Arc<Registr
 /// package failure never stops maki from starting.
 /// The first declaration of a package name wins for the current session.
 ///
-/// Only available inside `init.lua`. Declaring a package fetches code, so it is
-/// configuration rather than something a downloaded plugin may do.
+/// Only available inside the global `init.lua`. Declaring a package fetches
+/// code and changes state shared by every project.
 ///
 /// @param specs table List of specs. Each is a source string, or a table with
 ///   `src` (string, required), `name` (string), `version` (string or
@@ -422,7 +423,6 @@ fn add(lua: &Lua, specs: Table, opts: Option<Table>) -> LuaResult<()> {
     }
 
     let mut declarations = store.lock().expect("pack declarations");
-    declarations.lock_confirm.get_or_insert(confirm);
     for declared in parsed {
         if !declarations
             .specs
@@ -710,11 +710,26 @@ pub(crate) fn create_pack_read_table(lua: &Lua) -> LuaResult<Table> {
     Ok(table)
 }
 
+pub(crate) fn restrict_management(lua: &Lua, table: &Table) -> LuaResult<()> {
+    for method in ["add", "update", "del"] {
+        table.set(
+            method,
+            lua.create_function(move |_, _: MultiValue| -> LuaResult<()> {
+                Err(mlua::Error::runtime(format!(
+                    "maki.pack.{method} is only available in the global init.lua"
+                )))
+            })?,
+        )?;
+    }
+    Ok(())
+}
+
 /// Update packages to what their version now resolves to, like
 /// `vim.pack.update`.
 ///
 /// The work happens after this call returns, because updating unloads and
 /// reloads the package and unloading waits on the runtime this call occupies.
+/// Only available inside the global `init.lua`.
 ///
 /// @param names table? Package names. Omit for every declared package.
 /// @param opts table? `offline` works without the network. `target` is
@@ -817,6 +832,7 @@ fn parse_update_options(opts: Option<Table>) -> LuaResult<UpdateOptions> {
 /// Remove packages, like `vim.pack.del`.
 ///
 /// Runs after this call returns, for the same reason as `update`.
+/// Only available inside the global `init.lua`.
 ///
 /// @param names table Package names to remove.
 /// @param opts table? `force` allows removal of an active package.
@@ -886,11 +902,10 @@ fn packadd(lua: &Lua, name: String) -> LuaResult<()> {
 /// It sits beside the other always-available functions rather than inside
 /// `maki.pack`, because that table exists only for `init.lua` while activation
 /// is something any plugin may do.
-pub(crate) fn add_packadd(
-    lua: &Lua,
-    maki: &Table,
-    runtime_tx: Option<flume::Sender<crate::runtime::Request>>,
-) -> LuaResult<()> {
+pub(crate) fn add_packadd(lua: &Lua, maki: &Table) -> LuaResult<()> {
+    let runtime_tx = lua
+        .app_data_ref::<PackRuntimeTx>()
+        .map(|runtime| runtime.0.clone());
     let function = match runtime_tx {
         Some(tx) => {
             let store = lua
@@ -949,11 +964,11 @@ pub(crate) fn add_packadd(
 }
 
 lua_table! {
-    /// Declaring external packages, modelled after `vim.pack`.
+    /// Manage global external packages, modelled after `vim.pack`.
     ///
-    /// Available only inside `init.lua`, because installing a package fetches
-    /// code and that is a configuration decision rather than something a
-    /// plugin may do for itself.
+    /// `get` is read-only and available to project config and plugins.
+    /// `add`, `update`, and `del` are available only inside the global
+    /// `init.lua`, because they change state shared by every project.
     ///
     /// ```lua
     /// maki.pack.add({ "https://github.com/user/maki-goal" })
@@ -1062,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_add_call_sets_lockfile_confirmation_even_when_empty() {
+    fn an_empty_add_does_not_change_later_confirmation() {
         let (lua, store) = lua_with_store();
         let opts = lua.create_table().unwrap();
         opts.set("confirm", false).unwrap();
@@ -1077,7 +1092,6 @@ mod tests {
             .unwrap();
 
         let declarations = store.lock().unwrap();
-        assert_eq!(declarations.lock_confirm, Some(false));
         assert!(declarations.specs[0].confirm);
     }
 
@@ -1322,7 +1336,7 @@ mod tests {
     fn packadd_registers_on_the_root_table_and_queues_activation() {
         let (lua, store) = lua_with_store();
         let maki = lua.create_table().unwrap();
-        add_packadd(&lua, &maki, None).unwrap();
+        add_packadd(&lua, &maki).unwrap();
 
         let f: mlua::Function = maki.get("packadd").expect("packadd should be registered");
         f.call::<()>("demo").unwrap();
@@ -1339,7 +1353,7 @@ mod tests {
     fn startup_packadd_queues_one_activation_per_package() {
         let (lua, store) = lua_with_store();
         let maki = lua.create_table().unwrap();
-        add_packadd(&lua, &maki, None).unwrap();
+        add_packadd(&lua, &maki).unwrap();
         let function: mlua::Function = maki.get("packadd").unwrap();
 
         function.call::<()>("demo").unwrap();
@@ -1353,7 +1367,8 @@ mod tests {
         let (lua, store) = lua_with_store();
         let maki = lua.create_table().unwrap();
         let (tx, _rx) = flume::unbounded();
-        add_packadd(&lua, &maki, Some(tx)).unwrap();
+        lua.set_app_data(PackRuntimeTx(tx));
+        add_packadd(&lua, &maki).unwrap();
         let function: mlua::Function = maki.get("packadd").unwrap();
 
         function.call::<()>("demo").unwrap();
@@ -1369,7 +1384,7 @@ mod tests {
     fn packadd_after_the_drain_is_refused() {
         let (lua, store) = lua_with_store();
         let maki = lua.create_table().unwrap();
-        add_packadd(&lua, &maki, None).unwrap();
+        add_packadd(&lua, &maki).unwrap();
         store.lock().unwrap().drained = true;
 
         let f: mlua::Function = maki.get("packadd").expect("packadd should be registered");
@@ -1390,7 +1405,7 @@ mod tests {
     fn packadd_refuses_an_unsafe_name() {
         let (lua, store) = lua_with_store();
         let maki = lua.create_table().unwrap();
-        add_packadd(&lua, &maki, None).unwrap();
+        add_packadd(&lua, &maki).unwrap();
         let f: mlua::Function = maki.get("packadd").unwrap();
 
         assert!(f.call::<()>("../escape").is_err());

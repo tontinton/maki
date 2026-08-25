@@ -111,10 +111,9 @@ struct InstallCandidate {
 }
 
 fn install_candidates(
-    specs: &[crate::api::pack::Declared],
+    specs: &[&crate::api::pack::Declared],
     lock: &maki_pack::lockfile::Lockfile,
     manager: &maki_pack::manager::Manager,
-    lock_confirm: Option<bool>,
 ) -> Vec<InstallCandidate> {
     let mut candidates = Vec::new();
     for name in lock.install_order() {
@@ -124,26 +123,27 @@ fn install_candidates(
         let Some(entry) = lock.get(name) else {
             continue;
         };
-        let current = specs.iter().find(|declared| declared.spec.name == name);
-        if current.is_some_and(|declared| declared.spec.src != entry.src) {
+        let Some(current) = specs
+            .iter()
+            .copied()
+            .find(|declared| declared.spec.name == name)
+        else {
+            continue;
+        };
+        if current.spec.src != entry.src {
             continue;
         }
         let spec = Spec::new(entry.src.clone()).with_name(name.to_owned());
-        let declared = current
-            .cloned()
-            .map(|mut declared| {
-                declared.spec = spec.clone();
-                declared
-            })
-            .unwrap_or_else(|| synthetic_declared(spec.clone()));
+        let mut declared = current.clone();
+        declared.spec = spec.clone();
         candidates.push(InstallCandidate {
             declared,
             spec,
-            confirm: lock_confirm.unwrap_or(true),
+            confirm: current.confirm,
             source_changed: false,
         });
     }
-    for declared in specs {
+    for declared in specs.iter().copied() {
         let source_changed = lock
             .get(&declared.spec.name)
             .is_some_and(|entry| entry.src != declared.spec.src);
@@ -158,6 +158,37 @@ fn install_candidates(
         }
     }
     candidates
+}
+
+fn runnable_declarations<'a>(
+    specs: &'a [crate::api::pack::Declared],
+    manual: &Discovery,
+    report: &mut InstallReport,
+) -> Vec<&'a crate::api::pack::Declared> {
+    let manual_names = manual.known_names();
+    specs
+        .iter()
+        .filter(|declared| {
+            let name = &declared.spec.name;
+            if let Some(error) = owner_conflict(name) {
+                report.failures.push(error);
+                return false;
+            }
+            if manual_names.iter().any(|manual| manual == name) {
+                let path = manual
+                    .packages
+                    .iter()
+                    .find(|package| package.name == *name)
+                    .map(|package| format!(" at {}", package.dir.display()))
+                    .unwrap_or_default();
+                report.failures.push(format!(
+                    "{name}: managed package name conflicts with manual package{path}"
+                ));
+                return false;
+            }
+            true
+        })
+        .collect()
 }
 
 /// Reads the approval store.
@@ -267,6 +298,7 @@ fn resolved_on_disk(
     specs: &[crate::api::pack::Declared],
     site: &Path,
     lock: &maki_pack::lockfile::Lockfile,
+    delivers_agent_events: bool,
     failures: &mut Vec<String>,
 ) -> Vec<DiscoveredPackage> {
     let manager = maki_pack::manager::Manager::new(site);
@@ -285,7 +317,7 @@ fn resolved_on_disk(
                 // Named here, because the caller only reports why installing
                 // stopped. Dropping this would make the package vanish with
                 // the lock error as the only clue.
-                failures.push(sanitize_message(&format!("{}: {problem}", spec.name)));
+                failures.push(format!("{}: {problem}", spec.name));
                 continue;
             }
         };
@@ -296,26 +328,45 @@ fn resolved_on_disk(
                 src: spec.src.clone(),
             },
             dir,
-            eager: matches!(declared.load, crate::api::pack::LoadMode::Eager),
+            eager: declared.loads_at_start(delivers_agent_events),
         });
     }
     found
 }
 
-/// Installs the packages `init.lua` declared, and reports where each one
-/// landed.
-///
-/// Runs on the caller's thread, never the Lua thread: installing clones, and
-/// loading blocks on a reply from the runtime, so doing either from inside a
-/// Lua call would wait on a message that cannot be processed until it returns.
-///
-/// A package that fails to install is reported and skipped. One unreachable
-/// repository must not stop maki from starting, or a network problem would
-/// make the editor unusable.
+pub fn resolve_declared_on_disk(
+    specs: &[crate::api::pack::Declared],
+    delivers_agent_events: bool,
+) -> InstallReport {
+    let mut report = InstallReport::default();
+    let site = match site_dir() {
+        Ok(site) => site,
+        Err(error) => {
+            report.failures.push(format!(
+                "no data directory, so packages cannot be resolved: {error}"
+            ));
+            return report;
+        }
+    };
+    let Some(lock) = read_lockfile(lockfile_path().as_deref()) else {
+        report
+            .failures
+            .push("pack lockfile is unreadable; no package was resolved".to_owned());
+        return report;
+    };
+    report.packages = resolved_on_disk(
+        specs,
+        &site,
+        &lock,
+        delivers_agent_events,
+        &mut report.failures,
+    );
+    report
+}
+
 /// What the approval pass reads while it decides what each package may have.
 struct Grant<'a> {
     manager: &'a maki_pack::manager::Manager,
-    manual: &'a [DiscoveredPackage],
     lock: &'a maki_pack::lockfile::Lockfile,
     interaction: Interaction,
     delivers_agent_events: bool,
@@ -329,13 +380,12 @@ struct Grant<'a> {
 /// describes. Deciding what a package may have has to be a separate step from
 /// putting it on disk, or the download would be deciding its own access.
 fn grant_installed(
-    specs: &[crate::api::pack::Declared],
+    specs: &[&crate::api::pack::Declared],
     ctx: &Grant<'_>,
     report: &mut InstallReport,
 ) {
     let Grant {
         manager,
-        manual,
         lock,
         interaction,
         delivers_agent_events,
@@ -363,31 +413,7 @@ fn grant_installed(
             revoked_sources.insert(name.clone());
         }
     }
-    for declared in specs {
-        if let Some(error) = owner_conflict(&declared.spec.name) {
-            if !report
-                .failures
-                .iter()
-                .any(|failure| failure.starts_with(&format!("{}:", declared.spec.name)))
-            {
-                report.failures.push(error);
-            }
-            continue;
-        }
-        if let Some(manual) = manual.iter().find(|p| p.name == declared.spec.name) {
-            if !report
-                .failures
-                .iter()
-                .any(|failure| failure.starts_with(&format!("{}:", declared.spec.name)))
-            {
-                report.failures.push(format!(
-                    "{}: managed package name conflicts with manual package at {}",
-                    declared.spec.name,
-                    manual.dir.display()
-                ));
-            }
-            continue;
-        }
+    for declared in specs.iter().copied() {
         let Some(dir) = manager.resolve(lock, &declared.spec.name) else {
             continue;
         };
@@ -403,10 +429,9 @@ fn grant_installed(
         let requested = match load_requested_permissions(&dir) {
             Ok(requested) => requested,
             Err(problem) => {
-                report.failures.push(sanitize_message(&format!(
-                    "{}: {problem}",
-                    declared.spec.name
-                )));
+                report
+                    .failures
+                    .push(format!("{}: {problem}", declared.spec.name));
                 continue;
             }
         };
@@ -466,15 +491,22 @@ fn grant_installed(
     }
 }
 
+/// Installs the packages the global `init.lua` declared and reports where each
+/// one landed.
+///
+/// Runs on the caller's thread, never the Lua thread: installing clones, and
+/// loading blocks on a reply from the runtime, so doing either from inside a
+/// Lua call would wait on a message that cannot be processed until it returns.
+/// One unreachable repository is reported and skipped so a network problem
+/// does not stop Maki from starting.
 pub fn install_declared(
     host: &crate::loader::PluginHost,
     specs: &[crate::api::pack::Declared],
-    lock_confirm: Option<bool>,
     interaction: Interaction,
     delivers_agent_events: bool,
 ) -> InstallReport {
     let mut report = InstallReport::default();
-    if specs.is_empty() && lock_confirm.is_none() {
+    if specs.is_empty() {
         return report;
     }
     let site = match site_dir() {
@@ -496,18 +528,23 @@ pub fn install_declared(
         Some(path) => match maki_pack::lock::Lock::acquire(&path) {
             Ok(guard) => Some(guard),
             Err(e) => {
-                // The error names the lock file and the process holding it,
-                // and says to delete it if that process is gone. Reporting a
-                // bare "another process" would be wrong after a crash.
+                // The error names the lock file. The kernel releases the lock
+                // when its process exits, including after a crash.
                 tracing::error!(error = %e, "could not take the package lock");
-                report.failures.push(sanitize_message(&e.to_string()));
+                report.failures.push(e.to_string());
                 // Installing needs the lock; reading what is already there
                 // does not. Returning nothing would tell the session it has
                 // no managed packages at all, because discovery skips the
                 // managed group, so a second maki started during a clone
                 // would come up with every package the user has missing.
                 if let Some(lock) = read_lockfile(lock_path.as_deref()) {
-                    report.packages = resolved_on_disk(specs, &site, &lock, &mut report.failures);
+                    report.packages = resolved_on_disk(
+                        specs,
+                        &site,
+                        &lock,
+                        delivers_agent_events,
+                        &mut report.failures,
+                    );
                 }
                 return report;
             }
@@ -526,10 +563,10 @@ pub fn install_declared(
     };
     let original_lock = lock.clone();
     let manager = maki_pack::manager::Manager::new(&site);
-    let manual = discover(&site).packages;
-    let collides = |name: &str| manual.iter().find(|package| package.name == name);
+    let manual = discover(&site);
+    let runnable = runnable_declarations(specs, &manual, &mut report);
     let mut source_changes = std::collections::BTreeSet::new();
-    let candidates = install_candidates(specs, &lock, &manager, lock_confirm);
+    let candidates = install_candidates(&runnable, &lock, &manager);
 
     let requiring_confirmation: Vec<String> = candidates
         .iter()
@@ -549,18 +586,6 @@ pub fn install_declared(
         ));
     let mut accepted = Vec::new();
     for candidate in candidates {
-        if let Some(error) = owner_conflict(&candidate.spec.name) {
-            report.failures.push(error);
-            continue;
-        }
-        if let Some(manual) = collides(&candidate.spec.name) {
-            report.failures.push(format!(
-                "{}: managed package name conflicts with manual package at {}",
-                candidate.spec.name,
-                manual.dir.display()
-            ));
-            continue;
-        }
         if candidate.confirm && !confirmed {
             report.failures.push(format!(
                 "{}: installation requires confirmation; set confirm = false for a non-interactive install",
@@ -637,10 +662,9 @@ pub fn install_declared(
     }
 
     grant_installed(
-        specs,
+        &runnable,
         &Grant {
             manager: &manager,
-            manual: &manual,
             lock: &lock,
             interaction,
             delivers_agent_events,
@@ -687,7 +711,6 @@ struct PreparedUpdate {
     installed: maki_pack::manager::Installed,
     was_active: bool,
     force: bool,
-    source_changed: bool,
     review: String,
 }
 
@@ -962,10 +985,10 @@ fn prepare_updates(
                     continue;
                 }
             };
-        if existed && previous.src == declaration.spec.src && previous.rev == installed.rev {
+        if existed && previous.rev == installed.rev {
             continue;
         }
-        let subjects = if previous.src == declaration.spec.src {
+        let subjects =
             match smol::block_on(manager.revision_log(name, &previous.rev, &installed.rev)) {
                 Ok(subjects) => subjects,
                 Err(error) => {
@@ -976,10 +999,7 @@ fn prepare_updates(
                         .push(format!("{name}: could not review update: {message}"));
                     continue;
                 }
-            }
-        } else {
-            Vec::new()
-        };
+            };
         let mut review = format!("{name}: {} -> {}", previous.rev, installed.rev);
         for subject in subjects {
             review.push_str("\n    ");
@@ -990,7 +1010,6 @@ fn prepare_updates(
             installed,
             was_active: active.contains(name),
             force: options.force,
-            source_changed: previous.src != declaration.spec.src,
             review,
         });
     }
@@ -1121,11 +1140,10 @@ pub fn apply_pack_ops(
         Some(path) => match maki_pack::lock::Lock::acquire(&path) {
             Ok(guard) => Some(guard),
             Err(e) => {
-                // The error names the lock file and the process holding it,
-                // and says to delete it if that process is gone. Reporting a
-                // bare "another process" would be wrong after a crash.
+                // The error names the lock file. The kernel releases the lock
+                // when its process exits, including after a crash.
                 tracing::error!(error = %e, "could not take the package lock");
-                report.failures.push(sanitize_message(&e.to_string()));
+                report.failures.push(e.to_string());
                 return report;
             }
         },
@@ -1180,7 +1198,6 @@ pub fn apply_pack_ops(
     let mut approvals = read_approvals_for_write();
     let approvals_before = approvals.clone();
     let mut approvals_changed = false;
-    let mut revoked_sources = std::collections::BTreeSet::new();
     let mut approved = Vec::new();
     for update in prepared {
         let name = &update.declared.spec.name;
@@ -1204,13 +1221,7 @@ pub fn apply_pack_ops(
             approvals,
         ) {
             Ok(changed) => {
-                let revoked = update.source_changed
-                    && !changed
-                    && revoke_mismatched_approval(approvals, name, &update.declared.spec.src);
-                if revoked {
-                    revoked_sources.insert(name.clone());
-                }
-                approvals_changed |= changed || revoked;
+                approvals_changed |= changed;
                 approved.push((update, changed));
             }
             Err(message) => report.failures.push(message),
@@ -1232,11 +1243,6 @@ pub fn apply_pack_ops(
                 true
             }
         });
-        for name in revoked_sources {
-            report.failures.push(format!(
-                "{name}: the old source permission approval could not be revoked"
-            ));
-        }
     }
 
     let mut approved: std::collections::BTreeMap<String, PreparedUpdate> = approved
@@ -1315,7 +1321,9 @@ pub fn apply_pack_ops(
                 let Some(change) = prepared_deletes.remove(name) else {
                     continue;
                 };
-                if let Err(error) = host.unload(name) {
+                if change.active
+                    && let Err(error) = host.unload(name)
+                {
                     tracing::error!(package = %name, %error, "failed to unload package");
                     report.failures.push(format!(
                         "{name}: owner cleanup failed, so it was not removed: {error}"
@@ -1982,7 +1990,7 @@ impl PackReport {
 /// outside it (an unsatisfied version range, for one) never passed through
 /// that, so the redaction is applied at the point of logging instead.
 pub(crate) fn redact_error(e: &impl std::fmt::Display) -> String {
-    sanitize_message(&maki_pack::git::redact(&e.to_string()))
+    maki_pack::git::redact(&e.to_string())
 }
 
 /// Finds where an activatable package lives, and how far to trust it.
@@ -2160,10 +2168,6 @@ fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     maki_storage::atomic_write(path, text.as_bytes()).map_err(std::io::Error::other)
 }
 
-/// What a discovery walk found, and what it had to refuse.
-///
-/// Problems are collected rather than returned as one error, because one
-/// unusable package must not stop the others from loading.
 /// Something the walk could not use, and the name it had for it.
 ///
 /// One record and not two lists, because the name and the reason are two
@@ -2183,6 +2187,10 @@ impl std::fmt::Display for Problem {
     }
 }
 
+/// What a discovery walk found, and what it had to refuse.
+///
+/// Problems are collected rather than returned as one error, because one
+/// unusable package must not stop the others from loading.
 #[derive(Debug, Default)]
 pub struct Discovery {
     pub packages: Vec<DiscoveredPackage>,
@@ -2570,8 +2578,6 @@ mod tests {
     }
 
     /// The rule that decides whether installing is a fresh trust decision.
-    /// `.maki/init.lua` is project local, so a repository maki opens can point
-    /// a name the user already trusts somewhere else.
     #[test]
     fn a_package_is_only_installed_when_the_recorded_source_matches() {
         let src = "https://example.com/demo";
@@ -2605,6 +2611,7 @@ mod tests {
             &[declared_pack("demo", src)],
             site.path(),
             &lock,
+            false,
             &mut failures,
         );
         assert_eq!(found.len(), 1, "the installed package is still usable");
@@ -2618,12 +2625,36 @@ mod tests {
             &[declared_pack("demo", "https://elsewhere.example/demo")],
             site.path(),
             &lock,
+            false,
             &mut failures,
         );
         assert!(
             moved.is_empty(),
             "the recorded revision describes the old source only"
         );
+    }
+
+    #[test]
+    fn on_disk_event_package_loads_when_the_mode_has_no_agent_events() {
+        let src = "https://example.com/demo";
+        let (site, lock) = installed_site("demo", src);
+        let mut declared = declared_pack("demo", src);
+        declared.load = crate::api::pack::LoadMode::Triggered(crate::api::pack::Triggers {
+            event: vec!["TurnStart".to_owned()],
+            ..Default::default()
+        });
+
+        let without_events = resolved_on_disk(
+            std::slice::from_ref(&declared),
+            site.path(),
+            &lock,
+            false,
+            &mut Vec::new(),
+        );
+        let with_events = resolved_on_disk(&[declared], site.path(), &lock, true, &mut Vec::new());
+
+        assert!(without_events[0].eager);
+        assert!(!with_events[0].eager);
     }
 
     fn active_set(names: &[&str]) -> std::collections::BTreeSet<String> {
@@ -2778,7 +2809,8 @@ mod tests {
         let mut declared = declared_named(&["demo"]);
         declared[0].spec.src = "https://example.com/new".to_owned();
 
-        let candidates = install_candidates(&declared, &lock, &manager, Some(false));
+        let runnable: Vec<_> = declared.iter().collect();
+        let candidates = install_candidates(&runnable, &lock, &manager);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].spec.src, "https://example.com/new");
@@ -2801,7 +2833,8 @@ mod tests {
         let mut declared = declared_named(&["demo"]);
         declared[0].spec.src = "https://example.com/new".to_owned();
 
-        let candidates = install_candidates(&declared, &lock, &manager, Some(true));
+        let runnable: Vec<_> = declared.iter().collect();
+        let candidates = install_candidates(&runnable, &lock, &manager);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].spec.src, "https://example.com/new");
@@ -2822,7 +2855,8 @@ mod tests {
         .unwrap();
         let declared = declared_named(&["demo"]);
 
-        assert!(install_candidates(&declared, &lock, &manager, Some(true)).is_empty());
+        let runnable: Vec<_> = declared.iter().collect();
+        assert!(install_candidates(&runnable, &lock, &manager).is_empty());
     }
 
     #[test]
@@ -2831,15 +2865,30 @@ mod tests {
         let manager = maki_pack::manager::Manager::new(site.path());
         let mut lock = maki_pack::lockfile::Lockfile::default();
         lock.record("demo", "https://example.com/demo", "abc123");
-        let declared = declared_named(&["demo"]);
+        let mut declared = declared_named(&["demo"]);
+        declared[0].confirm = false;
 
-        let candidates = install_candidates(&declared, &lock, &manager, Some(true));
+        let runnable: Vec<_> = declared.iter().collect();
+        let candidates = install_candidates(&runnable, &lock, &manager);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(
             candidates[0].declared.load,
             crate::api::pack::LoadMode::Eager
         );
+        assert!(!candidates[0].confirm);
+    }
+
+    #[test]
+    fn an_undeclared_lock_entry_is_not_restored() {
+        let site = tempfile::TempDir::new().unwrap();
+        let manager = maki_pack::manager::Manager::new(site.path());
+        let mut lock = maki_pack::lockfile::Lockfile::default();
+        lock.record("orphan", "https://example.com/orphan", "abc123");
+
+        let candidates = install_candidates(&[], &lock, &manager);
+
+        assert!(candidates.is_empty());
     }
 
     #[test]
@@ -3061,6 +3110,61 @@ mod tests {
         )
         .expect_err("naming it explicitly is still not an install");
         assert!(err.contains("beta"), "{err}");
+    }
+
+    #[test]
+    fn update_apply_path_rejects_a_missing_lock_entry() {
+        let site = tempfile::TempDir::new().unwrap();
+        let manager = maki_pack::manager::Manager::new(site.path());
+        let declared = declared_named(&["demo"]);
+        let operation = crate::api::pack::PackOp::Update {
+            name: "demo".to_owned(),
+            options: Default::default(),
+        };
+        let mut lock = maki_pack::lockfile::Lockfile::default();
+        let mut report = PackReport::default();
+
+        let prepared = prepare_updates(
+            &[&operation],
+            &Prepare {
+                declared: &declared,
+                manager: &manager,
+                active: &Default::default(),
+            },
+            &mut lock,
+            &mut report,
+        );
+
+        assert!(prepared.is_empty());
+        assert!(report.failures[0].contains("not installed"));
+    }
+
+    #[test]
+    fn update_apply_path_rejects_a_changed_source() {
+        let site = tempfile::TempDir::new().unwrap();
+        let manager = maki_pack::manager::Manager::new(site.path());
+        let declared = declared_named(&["demo"]);
+        let operation = crate::api::pack::PackOp::Update {
+            name: "demo".to_owned(),
+            options: Default::default(),
+        };
+        let mut lock = maki_pack::lockfile::Lockfile::default();
+        lock.record("demo", "https://elsewhere.example/demo", "abc123");
+        let mut report = PackReport::default();
+
+        let prepared = prepare_updates(
+            &[&operation],
+            &Prepare {
+                declared: &declared,
+                manager: &manager,
+                active: &Default::default(),
+            },
+            &mut lock,
+            &mut report,
+        );
+
+        assert!(prepared.is_empty());
+        assert!(report.failures[0].contains("source changed"));
     }
 
     #[test]

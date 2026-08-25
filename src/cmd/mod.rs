@@ -14,10 +14,39 @@ use crate::update;
 
 /// Strips control characters out of a message before it reaches a terminal.
 ///
-/// One rule, shared with the package code that formats its own warnings: a
-/// second copy here could start disagreeing about what is safe to print.
+/// Package code returns raw errors so logs keep their full detail. Terminal
+/// and UI boundaries call this function once before they display a warning.
 fn sanitize_warning(message: impl std::fmt::Display) -> String {
     maki_lua::sanitize_message(&message.to_string())
+}
+
+fn sanitize_warnings(warnings: Vec<String>) -> Vec<String> {
+    warnings.into_iter().map(sanitize_warning).collect()
+}
+
+fn report_warnings(warnings: Vec<String>) {
+    for warning in sanitize_warnings(warnings) {
+        eprintln!("warning: {warning}");
+    }
+}
+
+struct PackageDiscovery {
+    names: Vec<String>,
+    packages: Vec<DiscoveredPackage>,
+    warnings: Vec<String>,
+}
+
+fn discover_external_packages(no_plugins: bool) -> PackageDiscovery {
+    let discovery = maki_lua::discover_installed(no_plugins);
+    PackageDiscovery {
+        names: discovery.known_names(),
+        packages: discovery.packages,
+        warnings: discovery
+            .problems
+            .into_iter()
+            .map(|problem| format!("skipping package: {problem}"))
+            .collect(),
+    }
 }
 
 fn load_external_packages(
@@ -29,16 +58,7 @@ fn load_external_packages(
     interaction: Interaction,
     delivers_agent_events: bool,
 ) -> Result<Vec<String>> {
-    let lock_confirm = host
-        .pack_lock_confirm()
-        .context("read package confirmation")?;
-    let installed = maki_lua::install_declared(
-        host,
-        declared,
-        lock_confirm,
-        interaction,
-        delivers_agent_events,
-    );
+    let installed = maki_lua::install_declared(host, declared, interaction, delivers_agent_events);
     let mut warnings = installed.failures;
     let available: Vec<DiscoveredPackage> = packages
         .iter()

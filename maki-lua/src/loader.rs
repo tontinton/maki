@@ -16,10 +16,13 @@ use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
 use crate::error::PluginError;
 use crate::pack::DiscoveredPackage;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
-use crate::runtime::{self, ClickFallback, LoadChunk, LuaThread, Request, RestoreItem};
+use crate::runtime::{
+    self, ClickFallback, ConfigScope, LoadChunk, LuaThread, Request, RestoreItem,
+};
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const HOST_REPLY_BACKSTOP: Duration = Duration::from_secs(5);
 
 /// How long a load or an unload waits for the runtime to answer.
 ///
@@ -29,11 +32,11 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// been restored, which turned that into a process hung with no UI and no
 /// message.
 ///
-/// Derived from the runtime's own load budget rather than picked: a shorter
-/// deadline would report a load that is still legitimately running as stuck,
-/// and that load would then commit its registrations after its caller had
-/// already treated it as failed.
-const HOST_REPLY_TIMEOUT: Duration = Duration::from_secs(crate::runtime::LOAD_TIMEOUT_SECS + 5);
+/// The default async task deadline is the useful lower bound for the drain.
+/// A task can set a longer deadline, so this remains a backstop rather than a
+/// proof that the queued request has stopped.
+const HOST_REPLY_TIMEOUT: Duration =
+    crate::runtime::ASYNC_RUN_DEFAULT_DEADLINE.saturating_add(HOST_REPLY_BACKSTOP);
 
 /// A reply that has not come yet, told apart from one that never can.
 ///
@@ -331,12 +334,20 @@ impl PluginHost {
         let mut merged: Option<RawConfig> = None;
 
         for global_dir in maki_config::global_config_dirs() {
-            self.run_init_file(&global_dir.join("init.lua"), "global/init.lua", &mut merged)?;
+            self.run_init_file(
+                &global_dir.join("init.lua"),
+                ConfigScope::Global,
+                &mut merged,
+            )?;
             if merged.is_some() {
                 break;
             }
         }
-        self.run_init_file(&cwd.join(".maki/init.lua"), "project/init.lua", &mut merged)?;
+        self.run_init_file(
+            &cwd.join(".maki/init.lua"),
+            ConfigScope::Project,
+            &mut merged,
+        )?;
 
         Ok(merged)
     }
@@ -358,7 +369,7 @@ impl PluginHost {
     fn run_init_file(
         &self,
         path: &Path,
-        label: &str,
+        scope: ConfigScope,
         merged: &mut Option<RawConfig>,
     ) -> Result<(), PluginError> {
         if !path.is_file() {
@@ -369,7 +380,7 @@ impl PluginHost {
             source: e,
         })?;
         let plugin_dir = path.parent().map(Path::to_path_buf);
-        if let Some(raw) = self.send_run_init_lua(source, label.to_owned(), plugin_dir)? {
+        if let Some(raw) = self.send_config_lua(source, scope, plugin_dir)? {
             match merged {
                 Some(existing) => existing.merge(raw),
                 None => *merged = Some(raw),
@@ -488,12 +499,21 @@ impl PluginHost {
         source_name: String,
         plugin_dir: Option<PathBuf>,
     ) -> Result<Option<RawConfig>, PluginError> {
+        self.send_config_lua(source, ConfigScope::named(source_name), plugin_dir)
+    }
+
+    fn send_config_lua(
+        &self,
+        source: String,
+        scope: ConfigScope,
+        plugin_dir: Option<PathBuf>,
+    ) -> Result<Option<RawConfig>, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
             .tx
             .send(Request::RunInitLua {
                 source,
-                source_name,
+                scope,
                 plugin_dir,
                 reply: reply_tx,
             })
@@ -582,15 +602,6 @@ impl PluginHost {
         self.inner
             .tx
             .send(Request::CollectPackages { reply: reply_tx })
-            .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)
-    }
-
-    pub fn pack_lock_confirm(&self) -> Result<Option<bool>, PluginError> {
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        self.inner
-            .tx
-            .send(Request::CollectPackConfirm { reply: reply_tx })
             .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)
     }
@@ -964,6 +975,8 @@ mod tests {
     use std::time::Instant;
     use test_case::test_case;
 
+    const NON_CUSTOM_LOADER_ERROR: &str = "run_pack_loader: not a custom load";
+
     fn package_with_source(source: &str) -> tempfile::TempDir {
         let package = tempfile::TempDir::new().unwrap();
         let plugin_dir = package.path().join("plugin");
@@ -1078,6 +1091,31 @@ mod tests {
             PluginOpts::default(),
         )
         .expect("an active package must not run twice");
+    }
+
+    #[test]
+    fn public_pack_loader_rejects_a_non_custom_declaration() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let declared = crate::api::pack::Declared {
+            spec: maki_pack::Spec::new("https://example.com/demo.git"),
+            load: crate::api::pack::LoadMode::Eager,
+            confirm: true,
+            data: None,
+        };
+
+        let error = host
+            .run_pack_loader(
+                declared,
+                Path::new("."),
+                PluginPermissions::trusted(),
+                PluginOpts::default(),
+            )
+            .expect_err("a non-custom declaration must return an error");
+
+        assert!(
+            error.to_string().contains(NON_CUSTOM_LOADER_ERROR),
+            "{error}"
+        );
     }
 
     /// `/packupdate` unloads and loads an owner after the terminal has been

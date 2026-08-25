@@ -84,7 +84,7 @@ The rules:
 | Module | What it is for |
 | --- | --- |
 | [`maki`](#maki) | The global entry point. |
-| [`maki.pack`](#maki-pack) | Declaring external packages, modelled after `vim.pack`. |
+| [`maki.pack`](#maki-pack) | Manage global external packages, modelled after `vim.pack`. |
 | [`maki.version`](#maki-version) | Version constraints, modelled after `vim.version`. |
 | [`maki.api`](#maki-api) | Plugin registration. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
@@ -212,11 +212,11 @@ maki.packadd("maki-goal")
 
 ## maki.pack {#maki-pack}
 
-Declaring external packages, modelled after `vim.pack`.
+Manage global external packages, modelled after `vim.pack`.
 
-Available only inside `init.lua`, because installing a package fetches
-code and that is a configuration decision rather than something a
-plugin may do for itself.
+`get` is read-only and available to project config and plugins.
+`add`, `update`, and `del` are available only inside the global
+`init.lua`, because they change state shared by every project.
 
 ```lua
 maki.pack.add({ "https://github.com/user/maki-goal" })
@@ -237,8 +237,8 @@ after `init.lua` finishes, so a slow clone never blocks the call and a
 package failure never stops maki from starting.
 The first declaration of a package name wins for the current session.
 
-Only available inside `init.lua`. Declaring a package fetches code, so it is
-configuration rather than something a downloaded plugin may do.
+Only available inside the global `init.lua`. Declaring a package fetches
+code and changes state shared by every project.
 
 **Parameters:**
 
@@ -326,6 +326,7 @@ Update packages to what their version now resolves to, like
 
 The work happens after this call returns, because updating unloads and
 reloads the package and unloading waits on the runtime this call occupies.
+Only available inside the global `init.lua`.
 
 **Parameters:**
 
@@ -357,6 +358,7 @@ maki.pack.del({names}, {opts?})
 Remove packages, like `vim.pack.del`.
 
 Runs after this call returns, for the same reason as `update`.
+Only available inside the global `init.lua`.
 
 **Parameters:**
 

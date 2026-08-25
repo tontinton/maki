@@ -13,7 +13,8 @@ on disk, or it can install one from a Git repository and lock it to one commit.
 
 ## Install from Git
 
-Declare managed packages in `init.lua`:
+Declare managed packages in the global `init.lua`, normally
+`~/.config/maki/init.lua`:
 
 ```lua
 maki.pack.add({
@@ -30,8 +31,13 @@ Maki shows all new packages in one install prompt. It writes the selected Git
 commit to `pack-lock.json` in your config directory. Commit this file if you
 want another machine to install the same revisions.
 
-The first `maki.pack.add` call restores missing lockfile entries in
-alphabetical order before it installs new declarations.
+Package installation is global. A project `.maki/init.lua` cannot add, update,
+or remove packages because all projects share the same lockfile and package
+directory. Project config can use `maki.pack.get` to inspect global packages
+and `maki.packadd` to activate an installed and approved package.
+
+Maki restores a missing checkout only when the global config still declares
+the package and its source matches the lockfile entry.
 
 Set `confirm = false` only when the package source is already trusted and Maki
 must run without a terminal:
@@ -157,7 +163,7 @@ Remove a package from `maki.pack.add` before you delete it. Maki rejects a
 deletion while the package is still declared because the next reload would
 install it again.
 
-The Lua forms are available in `init.lua`:
+The Lua forms are available in the global `init.lua`:
 
 ```lua
 maki.pack.update({ "maki-goal" }, { force = true })
@@ -185,7 +191,13 @@ A package directory can contain sorted `plugin/*.lua` entry files and modules
 at `lua/<module>.lua` or `lua/<module>/init.lua`.
 
 Managed packages use immutable revision directories under
-`site/pack/core/<name>/<commit>/`. Maki preserves relative symbolic links whose
-targets stay inside the package. It skips absolute links and links that leave
-the package. It does not fetch submodule working trees. Install a package by
-hand if it needs an external link or a submodule.
+`<maki-data>/site/pack/core/<name>/<commit>/`. An update creates a new revision
+directory. Maki does not remove old revision directories automatically because
+another running process can still use one. To reclaim space, stop all Maki
+processes, keep the commit recorded in `pack-lock.json`, and remove older commit
+directories for that package.
+
+Maki preserves relative symbolic links whose targets stay inside the package.
+It skips absolute links and links that leave the package. It does not fetch
+submodule working trees. Install a package by hand if it needs an external
+link or a submodule.

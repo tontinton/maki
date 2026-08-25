@@ -22,7 +22,7 @@ pub use loader::{EventHandle, PluginHost};
 pub use pack::{
     DiscoveredPackage, Discovery, InstallReport, Interaction, PackCommand, PackReport,
     apply_pack_ops, arm_packages, discover, discover_installed, drain_pack_ops, install_declared,
-    installed_names, installed_package, plan_command, sanitize_message,
+    installed_names, installed_package, plan_command, resolve_declared_on_disk, sanitize_message,
 };
 pub use plugin_permissions::{Permission, PluginPermissions, Requested};
 pub use runtime::{KILL_GRACE, RestoreItem, WARM_TOOL_CAP};
