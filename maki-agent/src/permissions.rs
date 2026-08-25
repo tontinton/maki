@@ -18,6 +18,14 @@ pub const DEFAULT_DENY_GUIDANCE: &str =
 /// Tests assert on this exact prefix; a wording tweak here updates them in one place.
 pub const PERMISSION_DENIED_PREFIX: &str = "Permission denied for";
 
+/// Values for the `source` attribute on `maki.tool_decision` events.
+pub const DECISION_SOURCE_RULE: &str = "rule";
+pub const DECISION_SOURCE_YOLO: &str = "yolo";
+pub const DECISION_SOURCE_USER_ONCE: &str = "user_once";
+pub const DECISION_SOURCE_USER_SESSION: &str = "user_session";
+pub const DECISION_SOURCE_USER_ALWAYS: &str = "user_always";
+pub const DECISION_SOURCE_USER_ABORT: &str = "user_abort";
+
 fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
     let cwd_glob = format!(
         "{}/**",
@@ -102,6 +110,17 @@ pub enum PermissionAnswer {
 }
 
 impl PermissionAnswer {
+    pub fn decision_source(&self) -> &'static str {
+        match self {
+            Self::AllowOnce | Self::Deny | Self::DenyWithGuidance(_) => DECISION_SOURCE_USER_ONCE,
+            Self::AllowSession => DECISION_SOURCE_USER_SESSION,
+            Self::AllowAlwaysLocal
+            | Self::AllowAlwaysGlobal
+            | Self::DenyAlwaysLocal
+            | Self::DenyAlwaysGlobal => DECISION_SOURCE_USER_ALWAYS,
+        }
+    }
+
     pub fn is_allow(&self) -> bool {
         matches!(
             self,
@@ -496,15 +515,31 @@ impl PermissionManager {
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
         let tool_string = tool.to_string();
         let scope_display = || scopes.scopes.join("; ");
-        let deny = |guidance: Option<String>| match guidance {
-            Some(g) => PermissionError::with_guidance(&tool_string, &scope_display(), g),
-            None => PermissionError::new(&tool_string, &scope_display()),
+        // Every deny is built here and every approval passes through
+        // `allowed`, so reporting cannot drift from what the caller gets.
+        let deny = |source: &'static str, guidance: Option<String>| {
+            maki_otel::emit::tool_decision(&tool_string, maki_otel::emit::DECISION_REJECT, source);
+            match guidance {
+                Some(g) => PermissionError::with_guidance(&tool_string, &scope_display(), g),
+                None => PermissionError::new(&tool_string, &scope_display()),
+            }
+        };
+        let allowed = |source: &'static str| {
+            maki_otel::emit::tool_decision(&tool_string, maki_otel::emit::DECISION_ACCEPT, source);
+            Ok(())
+        };
+        let by_rule = || {
+            if self.yolo.load(Ordering::Relaxed) {
+                DECISION_SOURCE_YOLO
+            } else {
+                DECISION_SOURCE_RULE
+            }
         };
 
         let (pt, ps, force_prompt) =
             match self.check_inner(tool, &scope_refs, scopes.force_prompt, plan_path) {
-                PermissionCheck::Allowed => return Ok(()),
-                PermissionCheck::Denied => return Err(deny(None)),
+                PermissionCheck::Allowed => return allowed(by_rule()),
+                PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
                 PermissionCheck::NeedsPrompt {
                     tool,
                     scopes,
@@ -514,14 +549,14 @@ impl PermissionManager {
 
         let Some(rx) = user_response_rx else {
             warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
-            return Err(deny(None));
+            return Err(deny(DECISION_SOURCE_USER_ABORT, None));
         };
 
         let guard = rx.lock().await;
         let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
         let (t2, s2) = match self.check_inner(&pt, &refs, force_prompt, plan_path) {
-            PermissionCheck::Allowed => return Ok(()),
-            PermissionCheck::Denied => return Err(deny(None)),
+            PermissionCheck::Allowed => return allowed(by_rule()),
+            PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
             PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
         };
 
@@ -537,19 +572,20 @@ impl PermissionManager {
             Ok(Ok(a)) => a,
             Ok(Err(_)) => {
                 warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
-                return Err(deny(None));
+                return Err(deny(DECISION_SOURCE_USER_ABORT, None));
             }
-            Err(_) => return Err(deny(None)),
+            Err(_) => return Err(deny(DECISION_SOURCE_USER_ABORT, None)),
         };
 
         let Some(answer) = PermissionAnswer::decode(&answer) else {
-            return Err(deny(None));
+            return Err(deny(DECISION_SOURCE_USER_ABORT, None));
         };
         self.apply_decision(&t2, &s2, &answer);
+        let source = answer.decision_source();
         if answer.is_allow() {
-            Ok(())
+            allowed(source)
         } else {
-            Err(deny(answer.guidance().map(String::from)))
+            Err(deny(source, answer.guidance().map(String::from)))
         }
     }
 }

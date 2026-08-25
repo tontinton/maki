@@ -2,7 +2,7 @@ use std::time::Duration;
 use std::{env, thread};
 
 use isahc::ReadResponseExt;
-use isahc::config::Configurable;
+use isahc::config::{Configurable, VersionNegotiation};
 use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, now_millis, save_tokens};
 use serde::Deserialize;
@@ -49,6 +49,8 @@ fn http_client(timeout: Duration) -> Result<isahc::HttpClient, AgentError> {
     isahc::HttpClient::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(timeout)
+        // curl carries http2 for OTLP.
+        .version_negotiation(VersionNegotiation::http11())
         .build()
         .map_err(|e| AgentError::Config {
             message: format!("http client: {e}"),

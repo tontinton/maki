@@ -49,6 +49,7 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
     let model = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
 
     setup::init_logging(&config.storage);
+    setup::init_telemetry(&config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
 

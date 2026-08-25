@@ -14,6 +14,11 @@ impl RetryState {
         Self::default()
     }
 
+    /// Retries burned so far; the attempt currently failing is this plus one.
+    pub fn attempts(&self) -> u32 {
+        self.attempt
+    }
+
     pub fn next_delay(&mut self) -> (u32, Duration) {
         self.attempt += 1;
         let delay = (DELAY.saturating_mul(self.attempt)).min(MAX_DELAY);

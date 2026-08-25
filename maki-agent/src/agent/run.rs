@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::Value;
 use tracing::{error, info, warn};
@@ -223,8 +224,27 @@ impl<'h> Agent<'h> {
             message_len = message.len(),
             "agent run started"
         );
+        // Subagents are prompted by the machine inside the parent's window;
+        // counting them would inflate prompts and busy time.
+        let top_level = self.audience.contains(ToolAudience::MAIN);
+        if top_level {
+            // Tabs and frontends share one process, so attribution follows
+            // whichever session actually runs a turn, not whoever last
+            // called `set_session_id`.
+            if let Some(session) = &self.session_id {
+                maki_otel::set_session_id(session.as_str());
+            }
+            maki_otel::emit::user_prompt(&message);
+        }
 
-        let reason = match self.run_loop().await {
+        // Every frontend enters here, so busy time is measured here; a turn
+        // that failed was still busy.
+        let busy_since = Instant::now();
+        let result = self.run_loop().await;
+        if top_level {
+            maki_otel::emit::active_time(busy_since.elapsed());
+        }
+        let reason = match result {
             Ok(reason) => reason,
             Err(AgentError::Cancelled) => {
                 sanitize_cancelled_history(self.history, self.rollback_len);
