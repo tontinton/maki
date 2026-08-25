@@ -13,11 +13,17 @@ pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-pub fn render_vertical_scrollbar(frame: &mut Frame, area: Rect, content_len: u16, position: u16) {
-    if !ENABLED.load(Ordering::Relaxed) {
+/// Lets a caller skip counting rows it would only hand to a scrollbar nobody
+/// draws. Worth asking when the count is not already lying around.
+pub fn is_enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn render_vertical_scrollbar(frame: &mut Frame, area: Rect, content_len: u32, position: u32) {
+    if !is_enabled() {
         return;
     }
-    let max_scroll = content_len.saturating_sub(area.height);
+    let max_scroll = content_len.saturating_sub(u32::from(area.height));
     let mut state = ScrollbarState::default()
         .content_length(max_scroll as usize + 1)
         .position(position as usize);

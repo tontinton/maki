@@ -581,7 +581,7 @@ fn render_ready<T: PickerItem>(
     let total_visual = visual_rows_in_range(&s.filtered, &s.items, 0, s.filtered.len());
     if total_visual as u16 > viewport_h {
         let visual_offset = visual_rows_in_range(&s.filtered, &s.items, 0, s.scroll_offset);
-        render_vertical_scrollbar(frame, list_area, total_visual as u16, visual_offset as u16);
+        render_vertical_scrollbar(frame, list_area, total_visual as u32, visual_offset as u32);
     }
 
     s.inner_area = inner;

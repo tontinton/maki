@@ -308,42 +308,6 @@ impl SegmentCache {
         self.msg_count
     }
 
-    pub fn total_height(&self, width: u16) -> u32 {
-        self.segments.iter().map(|s| s.height(width) as u32).sum()
-    }
-
-    pub fn segment_at_row(&self, doc_row: u32, width: u16) -> Option<(usize, &Segment, u32)> {
-        let mut cumulative: u32 = 0;
-        for (i, seg) in self.segments.iter().enumerate() {
-            let seg_start = cumulative;
-            cumulative += seg.height(width) as u32;
-            if doc_row < cumulative {
-                return Some((i, seg, seg_start));
-            }
-        }
-        None
-    }
-
-    /// The segment holding `doc_row` and the row's offset inside it. Survives
-    /// a reflow, which a bare document-line offset does not.
-    pub fn anchor_at(&self, doc_row: u32, width: u16) -> Option<(usize, u16)> {
-        let (i, _, start) = self.segment_at_row(doc_row, width)?;
-        Some((i, (doc_row - start).min(u16::MAX as u32) as u16))
-    }
-
-    /// Where `anchor` sits now, clamped in case the reflow shrank the segment
-    /// it points into.
-    pub fn anchor_offset(&self, (idx, rel): (usize, u16), width: u16) -> u32 {
-        let before: u32 = self
-            .segments
-            .iter()
-            .take(idx)
-            .map(|s| s.height(width) as u32)
-            .sum();
-        let h = self.segments.get(idx).map_or(0, |s| s.height(width));
-        before + rel.min(h.saturating_sub(1)) as u32
-    }
-
     pub fn segments(&self) -> &[Segment] {
         &self.segments
     }

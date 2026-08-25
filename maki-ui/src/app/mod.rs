@@ -434,8 +434,8 @@ impl App {
         self.chats[self.active_chat].win_view()
     }
 
-    pub(crate) fn set_scroll_top(&mut self, top: u16) {
-        self.active_chat().set_scroll_top(top);
+    pub(crate) fn scroll_to_row(&mut self, doc_row: u32) {
+        self.active_chat().scroll_to_row(doc_row);
     }
 
     fn clear_selection_unless_pending_copy(&mut self) {
@@ -637,8 +637,8 @@ impl App {
                 SearchAction::Close(saved) => {
                     let chat = &mut self.chats[self.active_chat];
                     chat.set_highlight_segment(None);
-                    if let Some((top, auto)) = saved {
-                        chat.restore_scroll(top, auto);
+                    if let Some((pos, auto)) = saved {
+                        chat.restore_scroll(pos, auto);
                     }
                     self.search_modal.close();
                 }
@@ -759,9 +759,9 @@ impl App {
                 self.file_picker.open(&self.state.session.cwd);
             }
             BuiltinAction::Search => {
-                let top = self.chats[self.active_chat].scroll_top();
+                let pos = self.chats[self.active_chat].scroll_pos();
                 let auto = self.chats[self.active_chat].auto_scroll();
-                self.search_modal.open(top, auto);
+                self.search_modal.open(pos, auto);
             }
             BuiltinAction::Help => self.help_modal.toggle(),
             BuiltinAction::PlanToggle => {

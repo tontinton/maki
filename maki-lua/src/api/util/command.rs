@@ -436,8 +436,8 @@ pub type UiReply = Result<serde_json::Value, String>;
 /// UI; `maki.fn.winsaveview` is what puts it in Vim's 1-based shape.
 /// `auto_scroll` is true while the transcript follows streaming output.
 pub struct WinView {
-    pub scroll_top: u16,
-    pub line_count: u16,
+    pub scroll_top: u32,
+    pub line_count: u32,
     pub height: u16,
     pub auto_scroll: bool,
 }
@@ -489,7 +489,7 @@ pub enum UiAction {
         reply_tx: flume::Sender<WinView>,
     },
     WinRestView {
-        scroll_top: u16,
+        scroll_top: u32,
     },
     Builtin(BuiltinAction),
     /// `reply_tx` answers whether {cmdline} resolved to a known command, not

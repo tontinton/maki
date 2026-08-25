@@ -199,13 +199,13 @@ fn scroll_up_pins_viewport_during_streaming() {
     panel.scroll(1);
     panel.scroll(1);
     render(&mut panel, 80, 10);
-    let pinned = panel.scroll_top;
+    let pinned = panel.scroll;
 
     panel.text_delta("b\nb\nb\n");
     render(&mut panel, 80, 10);
 
     assert!(!panel.auto_scroll);
-    assert_eq!(panel.scroll_top, pinned);
+    assert_eq!(panel.scroll, pinned);
 }
 
 fn render_sel(
@@ -573,16 +573,16 @@ fn selection_freezes_viewport_during_auto_scroll() {
     panel.streaming_text.set_buffer(&"a\n".repeat(30));
     render(&mut panel, 80, 10);
     assert!(panel.auto_scroll);
-    let scroll_before = panel.scroll_top;
-    assert!(scroll_before > 0);
+    let scroll_before = panel.scroll;
+    assert!(scroll_before > ScrollPos::default());
 
     panel.streaming_text.set_buffer(&"a\n".repeat(35));
     render_sel(&mut panel, 80, 10, true);
-    assert_eq!(panel.scroll_top, scroll_before);
+    assert_eq!(panel.scroll, scroll_before);
     assert!(panel.auto_scroll);
 
     render_sel(&mut panel, 80, 10, false);
-    assert!(panel.scroll_top > scroll_before);
+    assert!(panel.scroll > scroll_before);
     assert!(panel.auto_scroll);
 }
 
@@ -707,24 +707,131 @@ fn win_view_clamps_a_restored_offset_past_the_end() {
         .set_buffer(&"a\n".repeat(LINES as usize));
     render(&mut panel, 80, HEIGHT);
 
-    panel.restore_scroll(u16::MAX, true);
+    panel.restore_scroll(
+        ScrollPos {
+            seg: usize::MAX,
+            row: u16::MAX,
+        },
+        true,
+    );
 
     let view = panel.win_view();
-    assert_eq!(view.scroll_top, panel.max_scroll());
-    assert_eq!(view.line_count, LINES);
+    assert_eq!(view.scroll_top, u32::from(LINES - HEIGHT));
+    assert_eq!(view.line_count, u32::from(LINES));
     assert_eq!(view.height, HEIGHT);
     assert!(view.auto_scroll);
 }
 
+/// Enough follows the tall segment that the bottom pin does not clamp the
+/// scroll position back into range on its own.
+const TAIL_MSGS: usize = 20;
+const WIDE: u16 = 200;
+
+fn push_tail_msgs(panel: &mut MessagesPanel) {
+    for i in 0..TAIL_MSGS {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("tail {i}"),
+        ));
+    }
+}
+
+fn top_row_text(terminal: &ratatui::Terminal<TestBackend>) -> String {
+    let buf = terminal.backend().buffer();
+    (0..buf.area.width)
+        .filter_map(|x| buf.cell((x, 0)).map(|c| c.symbol()))
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+fn assert_scroll_draws(panel: &MessagesPanel, terminal: &ratatui::Terminal<TestBackend>) {
+    let scroll = panel.scroll;
+    let height = panel
+        .cache
+        .get(scroll.seg)
+        .map_or(0, |s| s.height(WIDE - 1));
+    assert!(
+        scroll.row < height,
+        "{scroll:?} sits past the {height} rows of its segment"
+    );
+    assert!(
+        !top_row_text(terminal).is_empty(),
+        "the top of the viewport drew nothing"
+    );
+}
+
+/// A segment can shrink under a stored scroll row: re-wrapping it wider is one
+/// way, collapsing it back to a header is another. `Layout` reads a row past a
+/// segment's end as "nothing left here" while `RenderCursor` carries the excess
+/// into every segment below it, so leaving the row out of range draws an empty
+/// transcript that only scrolling down escapes.
 #[test]
-fn scroll_clamps_to_max_scroll() {
+fn a_wider_wrap_keeps_the_scroll_inside_its_segment() {
+    const NARROW: u16 = 40;
+    const HEIGHT: u16 = 10;
+    const LINES: usize = 60;
+    const LINE_WIDTH: usize = 150;
+    /// Deep into the tall segment, but short of the messages that follow it.
+    const DEEP_SCROLL: i32 = -200;
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let text = (0..LINES)
+        .map(|i| format!("line{i:02} {}", "w".repeat(LINE_WIDTH)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, text));
+    push_tail_msgs(&mut panel);
+    render(&mut panel, NARROW, HEIGHT);
+    panel.scroll_to_top();
+    render(&mut panel, NARROW, HEIGHT);
+    panel.scroll(DEEP_SCROLL);
+    render(&mut panel, NARROW, HEIGHT);
+
+    let terminal = render(&mut panel, WIDE, HEIGHT);
+    assert_scroll_draws(&panel, &terminal);
+}
+
+#[test]
+fn collapsing_a_tool_keeps_the_scroll_inside_its_segment() {
+    const HEIGHT: u16 = 24;
+    const OUTPUT_LINES: usize = 400;
+    const DEEP_SCROLL: i32 = -300;
+
+    let mut panel = panel_with_long_tool(OUTPUT_LINES);
+    push_tail_msgs(&mut panel);
+    let area = Rect::new(0, 0, WIDE, HEIGHT);
+    assert!(panel.toggle_expansion_at(area.y, area), "expand");
+    render(&mut panel, WIDE, HEIGHT);
+    panel.scroll_to_top();
+    render(&mut panel, WIDE, HEIGHT);
+    panel.scroll(DEEP_SCROLL);
+    render(&mut panel, WIDE, HEIGHT);
+
+    assert!(panel.toggle_expansion_at(area.y, area), "collapse");
+    let terminal = render(&mut panel, WIDE, HEIGHT);
+    assert_scroll_draws(&panel, &terminal);
+}
+/// `scroll` clamps as it moves, so an overscroll banks no rows: the wheel
+/// answers on the first tick back up instead of eating three dead ones.
+#[test]
+fn overscrolling_down_banks_no_rows() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.streaming_text.set_buffer(&"a\n".repeat(15));
     render(&mut panel, 80, 10);
-    let max = panel.max_scroll();
+    let bottom = panel.scroll;
 
     panel.scroll(-3);
-    assert_eq!(panel.scroll_top, max);
+    assert_eq!(panel.scroll, bottom, "there is nothing below the bottom");
+
+    panel.scroll(1);
+    assert_eq!(
+        panel.scroll,
+        ScrollPos {
+            row: bottom.row - 1,
+            ..bottom
+        }
+    );
 }
 
 #[test_case("bash", 1, 1 ; "known_tool_creates_message")]
@@ -1084,6 +1191,51 @@ fn read_code_with_instructions(blocks: Vec<InstructionBlock>) -> ToolOutput {
 fn prev_segment_is_spacer(panel: &MessagesPanel, tool_id: &str) -> bool {
     let idx = panel.cache.find_by_tool_id(tool_id).unwrap();
     panel.cache.get(idx - 1).unwrap().tool_id.is_none()
+}
+
+fn done_with_instructions(id: &str) -> ToolDoneEvent {
+    ToolDoneEvent {
+        id: id.into(),
+        tool: "read".into(),
+        output: read_code_with_instructions(instruction_blocks()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    }
+}
+
+fn scrolled_tool(panel: &MessagesPanel) -> Option<&str> {
+    panel.cache.get(panel.scroll.seg)?.tool_id.as_deref()
+}
+
+/// Instructions arrive with a tool's output, so a tool finishing beside slower
+/// siblings inserts two segments above segments that already exist. The scroll
+/// position names a segment by index, and a renumbering it does not follow
+/// leaves it naming the pair that got shoved down instead.
+#[test]
+fn a_late_instruction_segment_keeps_the_scroll_on_its_segment() {
+    const HEIGHT: u16 = 10;
+    const SLOW_TOOL: &str = "t2";
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", "read"));
+    panel.tool_start(start(SLOW_TOOL, BASH_TOOL_NAME));
+    push_tail_msgs(&mut panel);
+    render(&mut panel, 80, HEIGHT);
+
+    let target = panel.cache.find_by_tool_id(SLOW_TOOL).unwrap();
+    panel.scroll_to_segment(target);
+    render(&mut panel, 80, HEIGHT);
+    assert_eq!(
+        scrolled_tool(&panel),
+        Some(SLOW_TOOL),
+        "the scroll must start on the slow tool"
+    );
+
+    panel.tool_done(done_with_instructions("t1"));
+    render(&mut panel, 80, HEIGHT);
+
+    assert_eq!(scrolled_tool(&panel), Some(SLOW_TOOL));
 }
 
 #[test]
@@ -2102,28 +2254,17 @@ fn big_widen_keeps_no_stale_segment_in_the_viewport() {
 
     // 3x widen: content shrinks and the bottom pin pulls up, so a single
     // pre-reflow pass would leave stale segments in the viewport.
-    let vh = 30u32;
-    let top = panel.scroll_top() as u32;
-    let mut offset: u32 = 0;
-    for seg in panel.cache.segments() {
-        let h = seg.height(240) as u32;
-        let in_view = offset < top.saturating_add(vh) && offset + h > top;
-        assert!(
-            !(in_view && seg.stale),
-            "a stale segment overlaps the viewport after a big widen"
-        );
-        offset += h;
-    }
+    assert_no_stale_segment_in_the_viewport(&panel);
     assert!(
         panel.cache.segments().iter().any(|s| s.stale),
         "off-viewport segments must stay stale so the test exercises convergence"
     );
 }
 
-/// `scroll_top` sits inside the anchor segment, so a downward window measured
-/// from that segment's start can be consumed entirely by rows above the first
-/// visible one, leaving the screen full of segments still wrapped at the old
-/// width.
+/// The scroll position sits inside its segment, so a downward reflow window
+/// measured from that segment's start can be consumed entirely by rows above
+/// the first visible one, leaving the screen full of segments still wrapped at
+/// the old width.
 #[test]
 fn resize_low_in_a_tall_segment_leaves_no_stale_segment_in_the_viewport() {
     const VIEWPORT_HEIGHT: u16 = 10;
@@ -2145,7 +2286,7 @@ fn resize_low_in_a_tall_segment_leaves_no_stale_segment_in_the_viewport() {
 
     // Five rows from the bottom of the tall first segment: the rest of the
     // viewport is filled by the segments after it.
-    panel.set_scroll_top(TALL_LINES as u16 - 5);
+    panel.scroll_to_row(TALL_LINES as u32 - 5);
     render(&mut panel, 80, VIEWPORT_HEIGHT);
     assert!(
         !panel.auto_scroll(),
@@ -2154,21 +2295,12 @@ fn resize_low_in_a_tall_segment_leaves_no_stale_segment_in_the_viewport() {
 
     render(&mut panel, 40, VIEWPORT_HEIGHT);
 
-    let top = panel.scroll_top() as u32;
-    let mut offset: u32 = 0;
-    for seg in panel.cache.segments() {
-        let h = seg.height(39) as u32;
-        let in_view = offset < top + VIEWPORT_HEIGHT as u32 && offset + h > top;
-        assert!(
-            !(in_view && seg.stale),
-            "a stale segment overlaps the viewport after resizing low in a tall segment"
-        );
-        offset += h;
-    }
+    assert_no_stale_segment_in_the_viewport(&panel);
 }
 
-#[test]
-fn anchored_resize_keeps_the_topmost_visible_segment() {
+/// Wrapped messages with the viewport parked mid-transcript, away from the
+/// bottom pin that would otherwise do the positioning for us.
+fn panel_scrolled_to_the_middle() -> MessagesPanel {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     for i in 0..40 {
         panel.push(DisplayMessage::new(
@@ -2177,31 +2309,46 @@ fn anchored_resize_keeps_the_topmost_visible_segment() {
         ));
     }
     render(&mut panel, 80, 10);
-    panel.set_scroll_top(panel.max_scroll() / 2); // mid-transcript, unpins
+    panel.scroll_to_segment(panel.cache.len() / 2);
     render(&mut panel, 80, 10);
     assert!(
         !panel.auto_scroll(),
         "the test must start anchored, not pinned"
     );
-    let before = panel
-        .cache
-        .anchor_at(panel.scroll_top() as u32, 79)
-        .expect("scroll_top lands inside a segment");
+    panel
+}
 
-    render(&mut panel, 40, 10);
+/// The headline claim of scrolling in `(segment, row)`: a resize is not a
+/// scroll, at any width.
+#[test_case(40  ; "narrow")]
+#[test_case(120 ; "widen")]
+fn resize_does_not_move_the_scroll_position(width: u16) {
+    let mut panel = panel_scrolled_to_the_middle();
+    let before = panel.scroll_pos();
 
-    let after = panel
-        .cache
-        .anchor_at(panel.scroll_top() as u32, 39)
-        .expect("scroll_top still lands inside a segment after the resize");
+    render(&mut panel, width, 10);
+
     assert_eq!(
-        after.0, before.0,
-        "narrowing must not slide the anchored topmost segment off the viewport"
+        panel.scroll_pos(),
+        before,
+        "a resize must leave the viewport where the reader put it"
     );
     assert!(
         !panel.auto_scroll(),
         "an anchored mid-transcript resize must not flip to the bottom pin"
     );
+}
+
+#[test]
+fn winsaveview_round_trips_through_winrestview() {
+    let mut panel = panel_scrolled_to_the_middle();
+    let pos = panel.scroll_pos();
+
+    let saved = panel.win_view();
+    panel.scroll_to_top();
+    panel.scroll_to_row(saved.scroll_top);
+
+    assert_eq!(panel.scroll_pos(), pos);
 }
 
 const THEME_CODE: &str = "fn main() { let x = 1; }";
@@ -2339,4 +2486,124 @@ fn replace_past_the_end_is_a_noop() {
     let text = buffer_text(&render(&mut panel, 80, 10));
     assert!(text.contains(DONE_TEXT), "{UNTOUCHED_MSG}: {text}");
     assert!(!text.contains(ERROR_TEXT), "{UNTOUCHED_MSG}: {text}");
+}
+
+/// Walks the viewport the way `view` does: from the scroll position, not from
+/// the top of the document.
+fn assert_no_stale_segment_in_the_viewport(panel: &MessagesPanel) {
+    let start = panel.scroll_pos();
+    let last = panel
+        .layout()
+        .advance(start, u32::from(panel.viewport_height).saturating_sub(1));
+    let width = panel.viewport_width;
+    for (i, seg) in panel
+        .cache
+        .segments()
+        .iter()
+        .enumerate()
+        .take(last.seg + 1)
+        .skip(start.seg)
+    {
+        assert!(
+            !seg.stale,
+            "segment {i} is stale but overlaps the viewport at width {width}"
+        );
+    }
+}
+
+/// `view` draws the streaming tail in the order `rebuild_line_cache` will push
+/// it, so the flush at the end of a turn is a no-op for the scroll position.
+/// Without that the view yanks to the bottom the moment the turn ends.
+#[test]
+fn scroll_position_survives_a_flush() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "go".into()));
+    panel.streaming_text.set_buffer(
+        &(0..60)
+            .map(|i| format!("stream_{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    render(&mut panel, 80, 10);
+    panel.scroll(2);
+    let before = buffer_text(&render(&mut panel, 80, 10));
+
+    panel.flush();
+
+    assert_eq!(
+        buffer_text(&render(&mut panel, 80, 10)),
+        before,
+        "the flush moved the content under the viewport"
+    );
+}
+
+fn panel_with_snapshot_tools(count: usize) -> MessagesPanel {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    for i in 0..count {
+        let id = format!("t{i}");
+        panel.tool_start(start(&id, BASH_TOOL_NAME));
+        panel.tool_done(done(&id));
+        panel.tool_snapshot(
+            &id,
+            BufferSnapshot::from_arc(Arc::new(vec![snap_line(&format!("out {i}"))])),
+            None,
+        );
+    }
+    panel
+}
+
+/// A click arrives as a screen row, so it only means something relative to
+/// the scroll position. Counted from the top of the document it would land on
+/// the first segment, and on yet another one after a resize.
+#[test]
+fn a_click_on_the_top_row_reaches_the_scrolled_segment() {
+    const TARGET: &str = "t2";
+
+    let mut panel = panel_with_snapshot_tools(10);
+    render(&mut panel, 80, 10);
+    panel.scroll_to_segment(panel.cache.find_by_tool_id(TARGET).unwrap());
+
+    for width in [80, 40] {
+        render(&mut panel, width, 10);
+        let area = Rect::new(0, 0, width, 10);
+        assert!(
+            panel.handle_click(area.y, area),
+            "no click at width {width}"
+        );
+    }
+
+    assert_eq!(panel.lua_clicks.get(TARGET).map(Vec::len), Some(2));
+    assert_eq!(panel.lua_clicks.len(), 1, "no other tool was clicked");
+}
+
+/// A document row used to be a `u16`, so a long session silently clamped: the
+/// scrollbar and `winsaveview` both reported a transcript far shorter than it
+/// was, and the bottom pin wrapped around to the wrong segment.
+#[test]
+fn transcript_past_u16_max_rows_keeps_its_document_rows() {
+    const MSGS: usize = 700;
+    const LINES: usize = 100;
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let body = (0..LINES)
+        .map(|i| format!("line {i:03}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for _ in 0..MSGS {
+        panel.push(DisplayMessage::new(DisplayRole::Error, body.clone()));
+    }
+    render(&mut panel, 80, 10);
+
+    let view = panel.win_view();
+    assert!(
+        view.line_count > u32::from(u16::MAX),
+        "the transcript has to pass the old clamp: {}",
+        view.line_count
+    );
+    assert_eq!(view.scroll_top, view.line_count - u32::from(view.height));
+    assert_eq!(
+        panel.scroll_pos().seg,
+        panel.cache.len() - 1,
+        "the bottom pin must land in the last segment, not wrap"
+    );
 }

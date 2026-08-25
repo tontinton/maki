@@ -492,8 +492,8 @@ impl FloatManager {
             render_vertical_scrollbar(
                 frame,
                 scroll_area,
-                scrollable as u16,
-                win.scroll_offset as u16,
+                scrollable as u32,
+                win.scroll_offset as u32,
             );
         }
 

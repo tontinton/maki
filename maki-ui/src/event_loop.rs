@@ -838,7 +838,7 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(self.focused_app().win_view());
             }
             UiAction::WinRestView { scroll_top } => {
-                self.focused_app().set_scroll_top(scroll_top);
+                self.focused_app().scroll_to_row(scroll_top);
             }
             UiAction::Builtin(action) => {
                 let actions = self.focused_app().run_builtin(action);

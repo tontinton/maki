@@ -372,7 +372,12 @@ impl FilePickerModal {
         render_search(frame, search_area, s);
 
         if match_count > s.viewport_height as u16 {
-            render_vertical_scrollbar(frame, list_area, match_count, s.scroll_offset as u16);
+            render_vertical_scrollbar(
+                frame,
+                list_area,
+                u32::from(match_count),
+                s.scroll_offset as u32,
+            );
         }
 
         popup

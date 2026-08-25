@@ -12,9 +12,11 @@ pub(super) struct RenderCursor {
 }
 
 impl RenderCursor {
-    pub fn new(scroll_top: u16, viewport: Rect) -> Self {
+    /// `skip` is the number of rows to drop from the first segment drawn, not
+    /// a document offset.
+    pub fn new(skip: u16, viewport: Rect) -> Self {
         Self {
-            skip: scroll_top,
+            skip,
             y: viewport.y,
             bottom: viewport.y + viewport.height,
             viewport,

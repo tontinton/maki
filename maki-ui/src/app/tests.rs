@@ -5,6 +5,7 @@ use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
+use crate::components::messages::ScrollPos;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
@@ -1308,7 +1309,7 @@ fn open_help(app: &mut App) {
 }
 
 fn open_search(app: &mut App) {
-    app.search_modal.open(0, true);
+    app.search_modal.open(ScrollPos::default(), true);
 }
 
 fn focus_queue(app: &mut App) {
@@ -1325,7 +1326,7 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
     let mut app = app_with_subagent();
     setup(&mut app);
     let before = app.active_chat;
-    let scroll_before = app.chats[app.active_chat].scroll_top();
+    let scroll_before = app.chats[app.active_chat].scroll_pos();
 
     for k in OVERLAY_BLOCKED_KEYS {
         app.update(Msg::Key(*k));
@@ -1336,7 +1337,7 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
         "active_chat changed through overlay"
     );
     assert_eq!(
-        app.chats[app.active_chat].scroll_top(),
+        app.chats[app.active_chat].scroll_pos(),
         scroll_before,
         "scroll changed through overlay"
     );
@@ -1847,10 +1848,10 @@ fn scroll_preserves_dragging_and_updates_cursor() {
         })
         .unwrap();
 
-    let max_scroll = app.active_chat().scroll_top();
+    let bottom = app.active_chat().scroll_pos();
     assert!(
-        max_scroll > 0,
-        "scroll_top should be non-zero after rendering scrollable content"
+        bottom > ScrollPos::default(),
+        "the transcript must overflow the viewport for this to prove anything"
     );
 
     app.update(Msg::Scroll {
@@ -1858,11 +1859,12 @@ fn scroll_preserves_dragging_and_updates_cursor() {
         row: DRAG_ROW,
         delta: SCROLL_LINES,
     });
-    let scroll_before = app.active_chat().scroll_top();
+    let scroll_before = app.active_chat().scroll_pos();
     assert!(
-        scroll_before < max_scroll,
-        "scroll up should move scroll_top away from max_scroll"
+        scroll_before < bottom,
+        "scroll up should move the viewport away from the bottom"
     );
+    let doc_before = app.active_chat().scroll_doc_row();
 
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
@@ -1885,7 +1887,7 @@ fn scroll_preserves_dragging_and_updates_cursor() {
     );
 
     let (start, end) = app.selection_state.as_ref().unwrap().sel().normalized();
-    let anchor_row = scroll_before as u32 + DRAG_ROW as u32;
+    let anchor_row = doc_before + DRAG_ROW as u32;
     assert_eq!(start.row, anchor_row, "anchor keeps its doc row");
     assert_eq!(
         end.row,
@@ -2971,17 +2973,17 @@ fn send_to_agent_unknown_subagent_falls_back_to_main() {
     assert_eq!(app.pending_input, PendingInput::None);
 }
 
-#[test_case(42, false ; "restores_scroll_position")]
-#[test_case(0,  true  ; "restores_auto_scroll")]
-fn search_escape_restores_scroll(scroll_top: u16, auto_scroll: bool) {
+#[test_case(ScrollPos { seg: 4, row: 2 }, false ; "restores_scroll_position")]
+#[test_case(ScrollPos::default(),          true  ; "restores_auto_scroll")]
+fn search_escape_restores_scroll(scroll: ScrollPos, auto_scroll: bool) {
     let mut app = test_app();
-    app.active_chat().restore_scroll(scroll_top, auto_scroll);
+    app.active_chat().restore_scroll(scroll, auto_scroll);
 
     app.update(Msg::Key(kb::SEARCH.to_key_event()));
     app.update(Msg::Key(key(KeyCode::Esc)));
 
     assert!(!app.search_modal.is_open());
-    assert_eq!(app.active_chat().scroll_top(), scroll_top);
+    assert_eq!(app.active_chat().scroll_pos(), scroll);
     assert_eq!(app.active_chat().auto_scroll(), auto_scroll);
 }
 

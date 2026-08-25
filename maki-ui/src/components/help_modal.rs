@@ -215,7 +215,7 @@ impl HelpModal {
         frame.render_widget(paragraph, inner);
 
         if total > viewport_h {
-            render_vertical_scrollbar(frame, inner, total, scroll);
+            render_vertical_scrollbar(frame, inner, u32::from(total), u32::from(scroll));
         }
 
         popup

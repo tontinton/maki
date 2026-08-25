@@ -1,10 +1,14 @@
 mod render;
+mod scroll;
 mod segment;
 mod selection;
 #[cfg(test)]
 mod tests;
 
+pub use self::scroll::ScrollPos;
+
 use self::render::RenderCursor;
+use self::scroll::{Layout, TailPart};
 use self::segment::{Segment, SegmentCache};
 
 use super::tool_display::{
@@ -12,9 +16,7 @@ use super::tool_display::{
     build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
     thinking_style, truncate_to_header, user_style,
 };
-use super::{
-    DisplayMessage, DisplayRole, ToolRole, ToolStatus, apply_scroll_delta, code_view::SectionFlags,
-};
+use super::{DisplayMessage, DisplayRole, ToolRole, ToolStatus, code_view::SectionFlags};
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
 use crate::markdown::{hr_line, plain_lines, text_to_lines, truncate_output};
@@ -30,7 +32,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::scrollbar::render_vertical_scrollbar;
+use super::scrollbar::{self, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
 use maki_agent::{
     BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND, SharedBuf, ToolDoneEvent,
@@ -48,6 +50,8 @@ use tracing::warn;
 
 const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
+/// Spacer plus instruction segment, inserted as a pair.
+const INSTRUCTION_SEGMENTS: usize = 2;
 
 #[derive(Clone, Copy)]
 pub struct PromptProgress {
@@ -61,12 +65,14 @@ pub struct MessagesPanel {
     streaming_thinking: StreamingContent,
     streaming_text: StreamingContent,
     started_at: Instant,
-    scroll_top: u16,
+    scroll: ScrollPos,
     auto_scroll: bool,
     viewport_height: u16,
     viewport_width: u16,
     cache: SegmentCache,
-    last_total_lines: u16,
+    /// The streaming tail the last `view` drew, in the order it drew it. Lets
+    /// the row walk and clicks address the tail between frames.
+    tail: Vec<(TailPart, u16)>,
     hl_worker: RenderWorker,
     theme_generation: u64,
     highlight_segment: Option<usize>,
@@ -113,12 +119,12 @@ impl MessagesPanel {
                 ms,
             ),
             started_at: Instant::now(),
-            scroll_top: u16::MAX,
+            scroll: ScrollPos::default(),
             auto_scroll: true,
             viewport_height: 24,
             viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
             cache: SegmentCache::new(),
-            last_total_lines: 0,
+            tail: Vec::new(),
             hl_worker: RenderWorker::new(),
             theme_generation: theme::generation(),
             highlight_segment: None,
@@ -377,8 +383,16 @@ impl MessagesPanel {
             let mut seg = Segment::with_tool(inst_id);
             seg.search_text = tl.search_text.clone();
             seg.apply_highlight(tl, &self.hl_worker);
-            self.cache.insert(parent_idx + 1, Segment::spacer());
-            self.cache.insert(parent_idx + 2, seg);
+            let at = parent_idx + 1;
+            self.cache.insert(at, Segment::spacer());
+            self.cache.insert(at + 1, seg);
+            // Instructions arrive with the tool's output, so a tool finishing
+            // beside slower siblings inserts above segments that already
+            // exist. The scroll position names one by index, and left alone it
+            // would quietly start naming the segment two slots higher.
+            if self.scroll.seg >= at {
+                self.scroll.seg += INSTRUCTION_SEGMENTS;
+            }
         }
     }
 
@@ -559,14 +573,29 @@ impl MessagesPanel {
         }
     }
 
+    fn layout(&self) -> Layout<'_> {
+        Layout::new(&self.cache, &self.tail, self.viewport_width)
+    }
+
+    /// Positive scrolls up. Clamping is immediate rather than deferred to the
+    /// next `view`, so scrolling back up starts from the bottom row and not
+    /// from wherever an overscroll left the position.
     pub fn scroll(&mut self, delta: i32) {
-        self.set_scroll_top(apply_scroll_delta(self.scroll_top, delta));
+        let rows = delta.unsigned_abs();
+        let layout = self.layout();
+        let moved = if delta >= 0 {
+            layout.retreat(self.scroll, rows)
+        } else {
+            layout.advance(self.scroll, rows)
+        };
+        let clamped = moved.min(layout.bottom(self.viewport_height));
+        self.scroll_to(clamped);
     }
 
     /// Always unpins, and the next `view` re-pins if this lands on the
     /// bottom line.
-    pub fn set_scroll_top(&mut self, top: u16) {
-        self.scroll_top = top.min(self.max_scroll());
+    fn scroll_to(&mut self, pos: ScrollPos) {
+        self.scroll = pos;
         self.auto_scroll = false;
     }
 
@@ -575,7 +604,7 @@ impl MessagesPanel {
     }
 
     pub fn scroll_to_top(&mut self) {
-        self.set_scroll_top(0);
+        self.scroll_to(ScrollPos::default());
     }
 
     pub fn enable_auto_scroll(&mut self) {
@@ -583,20 +612,20 @@ impl MessagesPanel {
     }
 
     pub fn scroll_to_segment(&mut self, segment_index: usize) {
-        let width = self.viewport_width;
-        let offset = self
-            .cache
-            .segments()
-            .iter()
-            .take(segment_index)
-            .map(|s| s.height(width) as u32)
-            .sum::<u32>()
-            .min(u16::MAX as u32) as u16;
-        self.set_scroll_top(offset);
+        self.scroll_to(ScrollPos {
+            seg: segment_index,
+            row: 0,
+        });
     }
 
-    pub fn restore_scroll(&mut self, scroll_top: u16, auto_scroll: bool) {
-        self.scroll_top = scroll_top;
+    /// Backs `maki.fn.winrestview`, the one caller that still speaks in
+    /// document rows.
+    pub fn scroll_to_row(&mut self, doc_row: u32) {
+        self.scroll_to(self.layout().at_row(doc_row));
+    }
+
+    pub fn restore_scroll(&mut self, scroll: ScrollPos, auto_scroll: bool) {
+        self.scroll = scroll;
         self.auto_scroll = auto_scroll;
     }
 
@@ -616,13 +645,15 @@ impl MessagesPanel {
         if area.height == 0 {
             return false;
         }
-        let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
+        let pos = self
+            .layout()
+            .advance(self.scroll, u32::from(row.saturating_sub(area.y)));
         let width = self.viewport_width;
-        // Both fallbacks toggle thinking: a row past the cached segments
+        // Both fallbacks toggle thinking: a position past the cached segments
         // belongs to the still-streaming indicator, and a segment without a
         // tool_id is a finished message's text.
-        let Some((_, seg, seg_start)) = self.cache.segment_at_row(doc_row, width) else {
-            return self.try_toggle_collapsed_thinking(doc_row, width);
+        let Some(seg) = self.cache.get(pos.seg) else {
+            return self.try_toggle_collapsed_thinking(pos);
         };
         let Some(tool_id) = seg.tool_id.as_deref() else {
             let msg_idx = seg.msg_index;
@@ -630,8 +661,9 @@ impl MessagesPanel {
         };
 
         if self.has_snapshot(tool_id) {
-            let rel = u16::try_from(doc_row - seg_start).unwrap_or(u16::MAX);
-            let buf_row = seg.source_line_at(rel, width).map_or(0, |l| seg.buf_row(l));
+            let buf_row = seg
+                .source_line_at(pos.row, width)
+                .map_or(0, |l| seg.buf_row(l));
             if self.tool_in_progress(tool_id) {
                 self.lua_event_handle
                     .request_click(tool_id.to_owned(), buf_row);
@@ -766,6 +798,9 @@ impl MessagesPanel {
         }
 
         if self.show_idle_splash() {
+            // Every other exit rebuilds the tail; this one has to drop it, or
+            // `Layout` keeps answering with rows nothing draws any more.
+            self.tail.clear();
             let accent = self.accent.resolve();
             self.idle_splash.render(area, frame.buffer_mut(), accent);
             return;
@@ -791,50 +826,30 @@ impl MessagesPanel {
             self.update_spinners();
         }
 
-        let cached_count = self.cache.len();
-        let spacer_lines: [Line<'static>; 1] = [Line::default()];
-        let mut streaming_heights: Vec<u16> = Vec::new();
-
-        let thinking_collapsed = self.streaming_thinking_collapsed();
-        let collapsed_thinking_lines = if thinking_collapsed {
+        let collapsed_thinking_lines = if self.streaming_thinking_collapsed() {
             self.build_streaming_collapsed_lines()
         } else {
             Vec::new()
         };
+        self.tail = self.build_tail(width, &collapsed_thinking_lines);
 
-        if thinking_collapsed {
-            if cached_count > 0 || !streaming_heights.is_empty() {
-                streaming_heights.push(1);
-            }
-            streaming_heights.push(collapsed_thinking_lines.len() as u16);
-        } else if !self.streaming_thinking.is_empty() {
-            let lines = self.streaming_thinking.render_lines(width);
-            if cached_count > 0 || !streaming_heights.is_empty() {
-                streaming_heights.push(1);
-            }
-            streaming_heights.push(wrap::total_rows(lines, width));
-        }
-
-        if !self.streaming_text.is_empty() {
-            let lines = self.streaming_text.render_lines(width);
-            if cached_count > 0 || !streaming_heights.is_empty() {
-                streaming_heights.push(1);
-            }
-            streaming_heights.push(wrap::total_rows(lines, width));
-        }
-
-        let streaming_sum: u32 = streaming_heights.iter().map(|&h| h as u32).sum();
-        // The reflow window is picked from `scroll_top` and the bottom pin,
-        // and the reflow changes the heights both are derived from: resolve
+        // The reflow window is picked from `scroll` and the bottom pin, and
+        // the reflow changes the heights both are derived from: resolve
         // before to aim the window, and after to place the result.
-        self.resolve_scroll(width, streaming_sum, has_selection);
-        self.reflow_viewport(width, has_selection);
-        let total_lines = self.resolve_scroll(width, streaming_sum, has_selection);
+        self.resolve_scroll(has_selection);
+        self.reflow_viewport(width);
+        self.resolve_scroll(has_selection);
 
         let viewport = Rect::new(area.x, area.y, width, area.height);
-        let mut cursor = RenderCursor::new(self.scroll_top, viewport);
+        let mut cursor = RenderCursor::new(self.scroll.row, viewport);
 
-        for (i, seg) in self.cache.segments().iter().enumerate() {
+        for (i, seg) in self
+            .cache
+            .segments()
+            .iter()
+            .enumerate()
+            .skip(self.scroll.seg)
+        {
             if cursor.past_bottom() {
                 break;
             }
@@ -844,29 +859,24 @@ impl MessagesPanel {
             cursor.render(seg.lines(), h, style, highlight, frame);
         }
 
-        let mut height_idx = 0usize;
-        let streamed: [(&StreamingContent, bool); 2] = [
-            (&self.streaming_thinking, thinking_collapsed),
-            (&self.streaming_text, false),
-        ];
-        for (sc, collapsed) in streamed {
-            if sc.is_empty() || height_idx >= streaming_heights.len() || cursor.past_bottom() {
-                continue;
+        let spacer_lines: [Line<'static>; 1] = [Line::default()];
+        for &(part, h) in self
+            .tail
+            .iter()
+            .skip(self.scroll.seg.saturating_sub(self.cache.len()))
+        {
+            if cursor.past_bottom() {
+                break;
             }
-            if cached_count > 0 || height_idx > 0 {
-                let h = streaming_heights[height_idx];
-                height_idx += 1;
-                cursor.render(&spacer_lines, h, None, false, frame);
-            }
-            if height_idx < streaming_heights.len() {
-                let h = streaming_heights[height_idx];
-                height_idx += 1;
-                if collapsed {
-                    cursor.render(&collapsed_thinking_lines, h, None, false, frame);
-                } else {
-                    cursor.render(sc.cached_lines(), h, None, false, frame);
+            let lines = match part {
+                TailPart::Spacer => &spacer_lines[..],
+                TailPart::Thinking if !collapsed_thinking_lines.is_empty() => {
+                    &collapsed_thinking_lines
                 }
-            }
+                TailPart::Thinking => self.streaming_thinking.cached_lines(),
+                TailPart::Text => self.streaming_text.cached_lines(),
+            };
+            cursor.render(lines, h, None, false, frame);
         }
 
         if let Some(pp) = self.prompt_progress
@@ -895,31 +905,76 @@ impl MessagesPanel {
             );
         }
 
-        if total_lines > area.height {
-            render_vertical_scrollbar(frame, area, total_lines, self.scroll_top);
+        // Both walks are O(transcript) and a resize makes each one re-wrap
+        // every segment it touches, so they stay behind the toggle that
+        // decides whether anything is drawn from them.
+        if scrollbar::is_enabled() {
+            let layout = self.layout();
+            let total_rows = layout.total_rows();
+            if total_rows > u32::from(area.height) {
+                render_vertical_scrollbar(frame, area, total_rows, layout.doc_row(self.scroll));
+            }
         }
     }
 
-    fn max_scroll(&self) -> u16 {
-        self.last_total_lines.saturating_sub(self.viewport_height)
+    /// The streaming tail, in the same order and under the same spacer rule
+    /// `rebuild_line_cache` uses when the turn flushes. A [`ScrollPos`] in the
+    /// tail keeps pointing at the same content across that flush only while
+    /// the two agree, so anything added here needs its segment there.
+    fn build_tail(
+        &mut self,
+        width: u16,
+        collapsed_thinking: &[Line<'static>],
+    ) -> Vec<(TailPart, u16)> {
+        let has_cached = self.cache.len() > 0;
+        let mut tail: Vec<(TailPart, u16)> = Vec::new();
+        // Mirrors `SegmentCache::push_spacer_if_needed`: a part is separated
+        // from whatever precedes it in the document.
+        let mut push = |part, height| {
+            if has_cached || !tail.is_empty() {
+                tail.push((TailPart::Spacer, 1));
+            }
+            tail.push((part, height));
+        };
+
+        if self.streaming_thinking_collapsed() {
+            push(TailPart::Thinking, collapsed_thinking.len() as u16);
+        } else if !self.streaming_thinking.is_empty() {
+            let h = wrap::total_rows(self.streaming_thinking.render_lines(width), width);
+            push(TailPart::Thinking, h);
+        }
+        if !self.streaming_text.is_empty() {
+            let h = wrap::total_rows(self.streaming_text.render_lines(width), width);
+            push(TailPart::Text, h);
+        }
+        tail
     }
 
-    pub fn scroll_top(&self) -> u16 {
-        self.scroll_top
+    pub fn scroll_pos(&self) -> ScrollPos {
+        self.scroll
+    }
+
+    /// Selections still count rows from the top of the document, so they need
+    /// this bridge until they are anchored to segments too.
+    pub fn scroll_doc_row(&self) -> u32 {
+        self.layout().doc_row(self.scroll)
     }
 
     /// Backs `maki.fn.winsaveview`. The clamp matters: a pinned or restored
-    /// `scroll_top` can sit past the end until the next `view` resolves it
+    /// scroll position can sit past the end until the next `view` resolves it
     /// against the current line count.
     pub fn win_view(&self) -> WinView {
+        let layout = self.layout();
+        let bottom = layout.bottom(self.viewport_height);
         WinView {
-            scroll_top: self.scroll_top.min(self.max_scroll()),
-            line_count: self.last_total_lines,
+            scroll_top: layout.doc_row(layout.clamp(self.scroll.min(bottom))),
+            line_count: layout.total_rows(),
             height: self.viewport_height,
             auto_scroll: self.auto_scroll,
         }
     }
 
+    #[cfg(test)]
     pub fn segment_heights(&self) -> Vec<u16> {
         let width = self.viewport_width;
         self.cache
@@ -1155,19 +1210,19 @@ impl MessagesPanel {
         thinking_indicator(logical_line_count(text))
     }
 
-    fn try_toggle_collapsed_thinking(&mut self, doc_row: u32, width: u16) -> bool {
-        if !self.streaming_thinking_collapsed() {
+    /// `pos` is past the cached segments, so it names a tail part: the click
+    /// toggles only when that part is the collapsed thinking indicator.
+    fn try_toggle_collapsed_thinking(&mut self, pos: ScrollPos) -> bool {
+        let part = pos
+            .seg
+            .checked_sub(self.cache.len())
+            .and_then(|i| self.tail.get(i))
+            .map(|&(p, _)| p);
+        if part != Some(TailPart::Thinking) || !self.streaming_thinking_collapsed() {
             return false;
         }
-        let cached_height = self.cache.total_height(width);
-        let spacer = if self.cache.len() > 0 { 1 } else { 0 };
-        let thinking_start = cached_height + spacer;
-        let height = self.build_streaming_collapsed_lines().len() as u32;
-        if doc_row >= thinking_start && doc_row < thinking_start + height {
-            self.thinking_collapsed = false;
-            return true;
-        }
-        false
+        self.thinking_collapsed = false;
+        true
     }
 
     fn try_toggle_cached_thinking(&mut self, msg_idx: Option<usize>, width: u16) -> bool {
@@ -1330,76 +1385,52 @@ impl MessagesPanel {
         self.cache.mark_built(self.messages.len());
     }
 
-    /// Clamps `scroll_top` against the document height and applies the bottom
-    /// pin, returning the total the scrollbar draws from.
-    fn resolve_scroll(&mut self, width: u16, streaming_sum: u32, has_selection: bool) -> u16 {
-        let total_lines: u16 =
-            (self.cache.total_height(width) + streaming_sum).min(u16::MAX as u32) as u16;
-        self.last_total_lines = total_lines;
-        let max_scroll = total_lines.saturating_sub(self.viewport_height);
-        self.scroll_top = self.scroll_top.min(max_scroll);
+    /// Clamps the scroll position against the document end and applies the
+    /// bottom pin.
+    fn resolve_scroll(&mut self, has_selection: bool) {
+        let bottom = self.layout().bottom(self.viewport_height);
+        self.scroll = self.layout().clamp(self.scroll.min(bottom));
         if !has_selection {
-            if self.scroll_top >= max_scroll {
+            if self.scroll >= bottom {
                 self.auto_scroll = true;
             }
             if self.auto_scroll {
-                self.scroll_top = max_scroll;
+                self.scroll = bottom;
             }
         }
-        total_lines
     }
 
-    /// Re-lays out the stale segments the viewport plus its margin reaches,
-    /// keeping the topmost visible one pinned: `scroll_top` is a line offset,
-    /// so re-laying out anything above the viewport would slide the content
-    /// the reader is looking at.
+    /// Re-lays out the stale segments the viewport plus its margin reaches.
+    /// The scroll position names a segment, so reflowing cannot slide the
+    /// content the reader is looking at; the window only has to cover what is
+    /// on screen.
     ///
-    /// The window is walked outward from an anchor segment, counting heights
-    /// only after each segment is reflowed. Document offsets move as the
-    /// reflow runs, so a window expressed in them would need repeated passes
-    /// to settle; this one is right the first time.
-    fn reflow_viewport(&mut self, width: u16, has_selection: bool) {
-        // `resolve_scroll` only pins to the bottom when it owns the scroll, so
-        // that is exactly when the viewport is the document tail.
-        let pinned_to_bottom = self.auto_scroll && !has_selection;
-        let anchor = (!pinned_to_bottom)
-            .then(|| self.cache.anchor_at(self.scroll_top as u32, width))
-            .flatten();
-        let viewport = self.viewport_height as u32;
+    /// Heights are counted after each segment is reflowed, so the window is
+    /// right the first time.
+    fn reflow_viewport(&mut self, width: u16) {
+        let viewport = u32::from(self.viewport_height);
         let margin = viewport.saturating_mul(REFLOW_MARGIN_VIEWPORTS);
-        let below = viewport.saturating_add(margin);
-        // Pinned to the bottom (or scrolled into the streaming tail): the
-        // viewport is the last `below` lines, so the window is all above.
-        //
-        // Anchored, the first visible row sits `rel` rows into the anchor
+        // The first visible row sits `scroll.row` rows into the starting
         // segment, so the downward window has to clear those before it starts
-        // covering the viewport; counting from the segment's start instead
-        // leaves stale segments on screen whenever `rel` exceeds the margin.
-        let (start, above, below) = match anchor {
-            Some((i, rel)) => (i, margin, below.saturating_add(rel as u32)),
-            None => (self.cache.len().saturating_sub(1), below, below),
-        };
-        let len_before = self.cache.len();
+        // covering the viewport.
+        let below = viewport
+            .saturating_add(margin)
+            .saturating_add(u32::from(self.scroll.row));
+        // A scroll position in the streaming tail has no segment to start
+        // from; the last cached one is the closest thing above it.
+        let start = self.scroll.seg.min(self.cache.len().saturating_sub(1));
 
-        let mut acc = 0;
-        let mut i = start;
-        while i < self.cache.len() && acc < below {
-            acc += self.reflowed_height(i, width);
-            i += 1;
-        }
-        let mut acc = 0;
-        let mut i = start;
-        while i > 0 && acc < above {
-            i -= 1;
-            acc += self.reflowed_height(i, width);
-        }
+        self.reflow_run(start..self.cache.len(), below, width);
+        self.reflow_run((0..start).rev(), margin, width);
+    }
 
-        // A rebuild can insert a missing instruction segment, which shifts the
-        // anchor index. Rare enough to just skip the pin for one frame.
-        if let Some(anchor) = anchor
-            && self.cache.len() == len_before
-        {
-            self.scroll_top = self.cache.anchor_offset(anchor, width).min(u16::MAX as u32) as u16;
+    fn reflow_run(&mut self, indices: impl Iterator<Item = usize>, row_budget: u32, width: u16) {
+        let mut rows = 0;
+        for i in indices {
+            if rows >= row_budget {
+                return;
+            }
+            rows += self.reflowed_height(i, width);
         }
     }
 
