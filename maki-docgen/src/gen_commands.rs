@@ -88,7 +88,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/fast`**: Anthropic fast mode (Opus only; ignored on other models). Config: `always_fast = true`."
+        "- **`/fast`**: fast mode (Anthropic Opus and OpenAI GPT-5.4+ only; ignored on other models). Config: `always_fast = true`."
     )
     .unwrap();
     writeln!(

@@ -85,16 +85,17 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
-| Weak | **gpt-5.6-luna** (default) | $1.00 / $6.00 | 372K ctx / 128K out |
+| Weak | **gpt-5.6-luna** (default) | $0.20 / $1.20 | 372K ctx / 128K out |
 | Weak | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
 | Weak | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
 | Weak | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
-| Medium | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
+| Medium | **gpt-5.6-terra** (default) | $2.00 / $12.00 | 372K ctx / 128K out |
 | Medium | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
 | Medium | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
 | Medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
 | Medium | gpt-5.1-codex-mini | $0.25 / $2.00 | 400K ctx / 128K out |
-| Strong | **gpt-5.6-sol** (default) | $5.00 / $30.00 | 372K ctx / 128K out |
+| Strong | **gpt-5.6-sol** (default) | $4.00 / $20.00 | 372K ctx / 128K out |
+| Strong | gpt-5.5-pro | $30.00 / $180.00 | 1050K ctx / 128K out |
 | Strong | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
 | Strong | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
 | Strong | o3 | $2.00 / $8.00 | 200K ctx / 100K out |

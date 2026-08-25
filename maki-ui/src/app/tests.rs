@@ -3929,6 +3929,21 @@ fn fast_toggle_on_off_on_opus() {
 }
 
 #[test]
+fn fast_toggle_on_off_on_openai_fast_model() {
+    let mut app = test_app();
+    app.state.model = maki_providers::Model::from_spec("openai/gpt-5.5").unwrap();
+    assert!(!app.state.fast);
+
+    app.execute_command(cmd("/fast"), 0);
+    assert!(app.state.fast);
+    assert_eq!(app.status_bar.flash_text(), Some(FAST_ON_MSG));
+
+    app.execute_command(cmd("/fast"), 0);
+    assert!(!app.state.fast);
+    assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
+}
+
+#[test]
 fn workflow_toggle_flows_into_agent_input() {
     let mut app = test_app();
     let msg = QueuedMessage {
@@ -3972,8 +3987,10 @@ fn subagent_history_finishes_workflow_chat() {
     assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
 }
 
+/// `gpt-5.5-pro` is an OpenAI model that sells no fast tier, unlike `gpt-5.5`.
 #[test_case(SONNET_SPEC ; "non_opus_anthropic")]
-#[test_case("openai/gpt-5.5" ; "non_anthropic")]
+#[test_case("openai/gpt-5.5-pro" ; "openai_without_fast_tier")]
+#[test_case("google/gemini-2.5-pro" ; "provider_without_fast")]
 fn fast_flashes_error_on_ineligible_model(spec: &str) {
     let mut app = test_app();
     app.state.model = maki_providers::Model::from_spec(spec).unwrap();

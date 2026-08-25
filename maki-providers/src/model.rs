@@ -45,9 +45,10 @@ pub struct ModelPricing {
     pub output: f64,
     pub cache_write: f64,
     pub cache_read: f64,
-    /// Anthropic fast mode charges a premium that differs per model. `None`
-    /// means the model has no fast tier, so asking for fast mode quietly falls
-    /// back to standard rates instead of overcharging.
+    /// Fast-tier rates, which carry a premium that differs per model (2x on
+    /// most, 2.5x on `gpt-5.5`). `None` means the model has no fast tier, so
+    /// asking for fast mode quietly falls back to standard rates instead of
+    /// overcharging.
     #[serde(default)]
     pub fast: Option<FastPricing>,
 }
@@ -82,9 +83,9 @@ impl ModelInfo {
     }
 }
 
-/// Cache rates are missing on purpose: Anthropic derives them from `input` with
-/// the same multipliers it uses for standard pricing, so storing them would just
-/// invite the two copies to drift apart.
+/// Cache rates are missing on purpose: both Anthropic and OpenAI scale the
+/// cache columns with the input rate, so [`TokenUsage::cost`] derives them from
+/// the standard entry rather than storing a second copy that could drift.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FastPricing {
     pub input: f64,
@@ -103,10 +104,6 @@ impl ModelPricing {
     pub fn is_zero(&self) -> bool {
         self.input == 0.0 && self.output == 0.0 && self.cache_write == 0.0 && self.cache_read == 0.0
     }
-
-    /// Cache multipliers Anthropic applies on top of the base input rate.
-    const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
-    const CACHE_READ_MULTIPLIER: f64 = 0.10;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +203,11 @@ impl ModelFamily {
     }
 }
 
-const FAST_PROVIDER: &str = "anthropic";
+/// Providers whose direct API exposes a paid fast/priority tier. Anthropic
+/// calls it fast mode (`speed: "fast"`), OpenAI calls it Fast mode and takes
+/// it as `service_tier`. Resellers (Copilot, OpenRouter, Bedrock) are absent
+/// on purpose: they surface the same model ids without the tier.
+const FAST_PROVIDERS: &[&str] = &["anthropic", "openai"];
 
 /// `Required` marks APIs that reject requests with thinking disabled;
 /// [`crate::RequestOptions::clamped`] raises `Off` to minimal effort for them.
@@ -377,12 +378,13 @@ impl Model {
 
     /// A model supports fast mode exactly when it carries fast-tier pricing, so
     /// capability and billing can never disagree. The provider gate keeps fast
-    /// mode to Anthropic-based providers, resolved through the base manifest so
-    /// oauth scripts keep it; Bedrock separately ignores `opts.fast` at request
-    /// time.
+    /// mode to providers whose direct API sells it ([`FAST_PROVIDERS`]),
+    /// resolved through the base manifest so oauth scripts keep it; Bedrock
+    /// separately ignores `opts.fast` at request time.
     pub fn supports_fast(&self) -> bool {
         self.pricing.fast.is_some()
-            && ManifestRegistry::for_slug(&self.provider).is_some_and(|m| m.slug == FAST_PROVIDER)
+            && ManifestRegistry::for_slug(&self.provider)
+                .is_some_and(|m| FAST_PROVIDERS.contains(&m.slug))
     }
 
     pub fn spec(&self) -> String {
@@ -606,12 +608,24 @@ impl TokenUsage {
     /// schedule.
     pub(crate) fn cost(&self, pricing: &ModelPricing, fast: bool) -> f64 {
         let (input, output, cache_write, cache_read) = match &pricing.fast {
-            Some(f) if fast => (
-                f.input,
-                f.output,
-                f.input * ModelPricing::CACHE_WRITE_MULTIPLIER,
-                f.input * ModelPricing::CACHE_READ_MULTIPLIER,
-            ),
+            Some(f) if fast => {
+                // Both vendors scale the cache columns with the input rate, so
+                // deriving them keeps one source of truth. Scale by the ratio
+                // rather than reapplying the standard multipliers: OpenAI bills
+                // nothing for cache writes before the GPT-5.6 family, and a
+                // flat 1.25x would invent a charge that does not exist there.
+                let ratio = if pricing.input > 0.0 {
+                    f.input / pricing.input
+                } else {
+                    1.0
+                };
+                (
+                    f.input,
+                    f.output,
+                    pricing.cache_write * ratio,
+                    pricing.cache_read * ratio,
+                )
+            }
             _ => (
                 pricing.input,
                 pricing.output,
@@ -1039,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn supports_fast_false_for_non_anthropic_even_with_fast_pricing() {
+    fn supports_fast_false_for_provider_without_a_fast_tier() {
         let mut model = Model::from_base(
             ManifestRegistry::get("google").unwrap(),
             "google",

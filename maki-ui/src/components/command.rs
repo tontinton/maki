@@ -96,7 +96,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/fast",
-        description: "Toggle Anthropic fast mode (Opus only)",
+        description: "Toggle fast mode (Anthropic Opus / OpenAI GPT-5.4+)",
         max_args: 0,
     },
     BuiltinCommand {
