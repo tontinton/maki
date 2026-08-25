@@ -103,12 +103,23 @@ impl<'a> Layout<'a> {
         self.retreat(self.end(), u32::from(viewport))
     }
 
+    /// Rows between two positions, or 0 when `to` is not below `from`. Only
+    /// the segments in between are walked, so projecting a position into the
+    /// viewport costs what is on screen.
+    pub fn rows_from(&self, from: ScrollPos, to: ScrollPos) -> u32 {
+        if to <= from {
+            return 0;
+        }
+        (from.seg..to.seg.min(self.len()))
+            .map(|i| u32::from(self.height(i)))
+            .fold(u32::from(to.row), u32::saturating_add)
+            .saturating_sub(u32::from(from.row))
+    }
+
     /// O(transcript): only the scrollbar and `winsaveview` need a document
     /// row, and both read cached heights rather than re-wrapping.
     pub fn doc_row(&self, pos: ScrollPos) -> u32 {
-        (0..pos.seg.min(self.len()))
-            .map(|i| u32::from(self.height(i)))
-            .fold(u32::from(pos.row), u32::saturating_add)
+        self.rows_from(ScrollPos::default(), pos)
     }
 
     pub fn total_rows(&self) -> u32 {
@@ -176,5 +187,15 @@ mod tests {
         assert_eq!(layout.at_row(4), pos(2, 0));
         assert_eq!(layout.doc_row(pos(2, 3)), 7);
         assert_eq!(layout.bottom(2), pos(2, 2));
+    }
+
+    #[test_case(pos(0, 2), pos(1, 1), 2 ; "counts_rows_between")]
+    #[test_case(pos(1, 1), pos(0, 2), 0 ; "target_above_never_underflows")]
+    fn rows_from_counts_down(from: ScrollPos, to: ScrollPos, expected: u32) {
+        let cache = cache(&[3, 2]);
+        assert_eq!(
+            Layout::new(&cache, &[], WIDTH).rows_from(from, to),
+            expected
+        );
     }
 }

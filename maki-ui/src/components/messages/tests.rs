@@ -3,7 +3,7 @@ use super::*;
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::repaint::expect::{OWED, QUIET};
-use crate::selection::{Selection, SelectionZone};
+use crate::selection::{DocPos, Selection, SelectionZone};
 use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
@@ -877,15 +877,33 @@ fn stream_reset_clears_streaming_and_fails_tools() {
 
 const MAKI_PREFIX_LEN: u16 = 6;
 
-fn make_sel(area: Rect, anchor: (u32, u16), cursor: (u32, u16)) -> Selection {
+/// Selections live per segment, so the tests that think in document rows
+/// convert through the same walker the panel uses.
+fn doc_at(panel: &MessagesPanel, row: u32, col: u16) -> DocPos {
+    let pos = panel.layout().at_row(row);
+    DocPos {
+        seg: pos.seg,
+        row: pos.row,
+        col,
+    }
+}
+
+fn seg_start_row(panel: &MessagesPanel, seg: usize) -> u32 {
+    panel.layout().doc_row(ScrollPos { seg, row: 0 })
+}
+
+fn make_sel(
+    panel: &MessagesPanel,
+    area: Rect,
+    anchor: (u32, u16),
+    cursor: (u32, u16),
+) -> Selection {
     let mut sel = Selection::start(
-        area.y + anchor.0 as u16,
-        anchor.1,
+        doc_at(panel, anchor.0, anchor.1),
         area,
         SelectionZone::Messages,
-        0,
     );
-    sel.update(area.y + cursor.0 as u16, cursor.1, 0);
+    sel.update(doc_at(panel, cursor.0, cursor.1));
     sel
 }
 
@@ -903,7 +921,7 @@ fn extract_partial_column_selection() {
     let panel = panel_with_msgs(&["Hello world"], 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     let world_start = MAKI_PREFIX_LEN + "Hello ".len() as u16;
-    let sel = make_sel(area, (0, world_start), (0, world_start + 4));
+    let sel = make_sel(&panel, area, (0, world_start), (0, world_start + 4));
     let text = panel.extract_selection_text(&sel, area);
     assert_eq!(text, "world");
 }
@@ -911,11 +929,9 @@ fn extract_partial_column_selection() {
 #[test]
 fn extract_skips_out_of_range_segments() {
     let panel = panel_with_msgs(&["seg0", "seg1", "seg2"], 80, 24);
-    let heights = panel.segment_heights();
-    let total: u16 = heights.iter().sum();
-    let mid = total / 2;
+    let mid = panel.layout().total_rows() / 2;
     let area = Rect::new(0, 0, 80, 24);
-    let sel = make_sel(area, (mid as u32, 0), (mid as u32, 79));
+    let sel = make_sel(&panel, area, (mid, 0), (mid, 79));
     let text = panel.extract_selection_text(&sel, area);
     assert!(text.contains("seg1"));
     assert!(!text.contains("seg0"));
@@ -932,10 +948,10 @@ fn extract_off_screen_rows_via_temp_buffer() {
     panel.push(DisplayMessage::new(DisplayRole::Assistant, text));
     render(&mut panel, 80, 5);
 
-    let total: u16 = panel.segment_heights().iter().sum();
+    let total = panel.layout().total_rows();
     assert!(total > 5, "content must exceed viewport");
-    let sel_area = Rect::new(0, 0, 80, total);
-    let sel = make_sel(sel_area, (1, 0), ((total - 1) as u32, 79));
+    let sel_area = Rect::new(0, 0, 80, total as u16);
+    let sel = make_sel(&panel, sel_area, (1, 0), (total - 1, 79));
 
     let extracted = panel.extract_selection_text(&sel, sel_area);
     assert!(!extracted.contains("line 0"), "first line excluded");
@@ -945,10 +961,9 @@ fn extract_off_screen_rows_via_temp_buffer() {
 #[test]
 fn extract_mixed_fully_enclosed_and_partial() {
     let panel = panel_with_msgs(&["full segment", "partial here"], 80, 24);
-    let heights = panel.segment_heights().to_vec();
     let area = Rect::new(0, 0, 80, 24);
-    let seg1_start = heights[0] + heights[1];
-    let sel = make_sel(area, (0, 0), (seg1_start as u32, MAKI_PREFIX_LEN + 6));
+    let seg1_start = seg_start_row(&panel, 2);
+    let sel = make_sel(&panel, area, (0, 0), (seg1_start, MAKI_PREFIX_LEN + 6));
     let text = panel.extract_selection_text(&sel, area);
     assert!(text.contains("full segment"));
     assert!(text.contains("partial"));
@@ -962,10 +977,10 @@ fn extract_partial_col_symmetric(msgs: &[&str], expect_start: &str, expect_end: 
         panel.push(DisplayMessage::new(DisplayRole::Assistant, text.into()));
     }
     render(&mut panel, 80, 24);
-    let total: u16 = panel.segment_heights().iter().sum();
+    let total = panel.layout().total_rows();
     let area = Rect::new(0, 0, 80, 24);
-    let down = make_sel(area, (0, MAKI_PREFIX_LEN), ((total - 1) as u32, 79));
-    let up = make_sel(area, ((total - 1) as u32, 79), (0, MAKI_PREFIX_LEN));
+    let down = make_sel(&panel, area, (0, MAKI_PREFIX_LEN), (total - 1, 79));
+    let up = make_sel(&panel, area, (total - 1, 79), (0, MAKI_PREFIX_LEN));
     let text_down = panel.extract_selection_text(&down, area);
     let text_up = panel.extract_selection_text(&up, area);
     assert!(text_down.contains(expect_start));
@@ -981,9 +996,9 @@ fn extract_wrapped_no_soft_breaks(template: &str, anchor: (u32, u16)) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.push(DisplayMessage::new(DisplayRole::Assistant, msg));
     render(&mut panel, 40, 30);
-    let total: u16 = panel.segment_heights().iter().sum();
+    let total = panel.layout().total_rows();
     let area = Rect::new(0, 0, 40, 30);
-    let sel = make_sel(area, anchor, ((total - 1) as u32, 39));
+    let sel = make_sel(&panel, area, anchor, (total - 1, 39));
     let text = panel.extract_selection_text(&sel, area);
     assert!(
         text.contains(&long),
@@ -999,10 +1014,9 @@ fn extract_partial_last_line_truncated() {
         "first\nABCDEFGHIJKLMNOP".into(),
     ));
     render(&mut panel, 80, 24);
-    let total: u16 = panel.segment_heights().iter().sum();
+    let total = panel.layout().total_rows();
     let area = Rect::new(0, 0, 80, 24);
-    let last_row = (total - 1) as u32;
-    let sel = make_sel(area, (0, 0), (last_row, 3));
+    let sel = make_sel(&panel, area, (0, 0), (total - 1, 3));
     let text = panel.extract_selection_text(&sel, area);
     assert_eq!(text.lines().last().unwrap(), "ABCD");
 }
@@ -1054,8 +1068,8 @@ fn toggle_expand_collapse_truncated_tool() {
 fn extract_selection_copies_visible_content_only() {
     let panel = panel_with_long_tool(200);
     let area = Rect::new(0, 0, 80, 24);
-    let total: u16 = panel.segment_heights().iter().sum();
-    let sel = make_sel(area, (0, 0), ((total - 1) as u32, 79));
+    let total = panel.layout().total_rows();
+    let sel = make_sel(&panel, area, (0, 0), (total - 1, 79));
     let text = panel.extract_selection_text(&sel, area);
     assert!(
         !text.contains("line 50"),
@@ -2079,9 +2093,9 @@ fn copy_after_resize_keeps_offscreen_text() {
     render(&mut panel, 80, 10);
     render(&mut panel, 40, 10);
 
-    let total: u32 = panel.segment_heights().iter().map(|&h| h as u32).sum();
+    let total = panel.layout().total_rows();
     let area = Rect::new(0, 0, 40, 10);
-    let sel = make_sel(area, (0, 0), (total - 1, 39));
+    let sel = make_sel(&panel, area, (0, 0), (total - 1, 39));
     let text = panel.extract_selection_text(&sel, area);
 
     // The top of the transcript is far off-screen and never gets reflowed.
@@ -2605,5 +2619,51 @@ fn transcript_past_u16_max_rows_keeps_its_document_rows() {
         panel.scroll_pos().seg,
         panel.cache.len() - 1,
         "the bottom pin must land in the last segment, not wrap"
+    );
+}
+
+fn first_row_of(panel: &MessagesPanel, needle: &str, col: u16) -> DocPos {
+    let seg = panel
+        .segment_search_texts()
+        .iter()
+        .position(|text| text.contains(needle))
+        .unwrap_or_else(|| panic!("no segment holds {needle}"));
+    DocPos { seg, row: 0, col }
+}
+
+/// A message above the selection re-wraps, which moves every document row
+/// below it. Anchored to segments the copy does not notice; anchored to rows
+/// it would silently return different text.
+#[test]
+fn selection_survives_a_resize() {
+    const ALPHA: &str = "alpha";
+    const BETA: &str = "beta";
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "x".repeat(200)));
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, ALPHA.into()));
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, BETA.into()));
+    render(&mut panel, 80, 24);
+
+    let wide = Rect::new(0, 0, 80, 24);
+    let mut sel = Selection::start(
+        first_row_of(&panel, ALPHA, MAKI_PREFIX_LEN),
+        wide,
+        SelectionZone::Messages,
+    );
+    sel.update(first_row_of(&panel, BETA, wide.width - 1));
+
+    let before = panel.extract_selection_text(&sel, wide);
+    assert!(
+        before.contains(ALPHA) && before.contains(BETA),
+        "the selection must span both messages to start with: {before:?}"
+    );
+
+    render(&mut panel, 40, 24);
+
+    assert_eq!(
+        panel.extract_selection_text(&sel, Rect::new(0, 0, 40, 24)),
+        before,
+        "the reflow above the selection dragged the copy with it"
     );
 }

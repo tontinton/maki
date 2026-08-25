@@ -1,7 +1,10 @@
 use std::time::{Duration, Instant};
 
 use crate::clipboard::CopyResult;
-use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
+use crate::selection::{
+    self, ContentRegion, DocPos, EdgeScroll, RowPos, ScreenSelection, Selection, SelectionState,
+    SelectionZone,
+};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
@@ -26,15 +29,9 @@ impl App {
                         self.input_box
                             .handle_click(zone.area, event.row, event.column, focused);
                     }
-                    let scroll = self.scroll_offset(zone.zone);
+                    let pos = self.doc_pos(zone.zone, zone.area, event.row, event.column);
                     self.selection_state = Some(SelectionState::Dragging {
-                        sel: Selection::start(
-                            event.row,
-                            event.column,
-                            zone.area,
-                            zone.zone,
-                            scroll,
-                        ),
+                        sel: Selection::start(pos, zone.area, zone.zone),
                         edge_scroll: None,
                         last_drag_col: event.column,
                     });
@@ -67,12 +64,7 @@ impl App {
             _ => None,
         };
         match self.scroll_at(column, row, delta) {
-            Some(zone) if drag_zone == Some(zone) => {
-                let scroll = self.scroll_offset(zone);
-                if let Some(SelectionState::Dragging { sel, .. }) = &mut self.selection_state {
-                    sel.update(row, column, scroll);
-                }
-            }
+            Some(zone) if drag_zone == Some(zone) => self.drag_selection_to(row, column),
             _ => self.clear_selection_unless_pending_copy(),
         }
     }
@@ -119,22 +111,31 @@ impl App {
             if first_edge_hit {
                 self.scroll_zone(zone, dir);
             }
-            self.update_selection_to_edge(zone, col);
+            self.update_selection_to_edge(col);
         } else {
             if let Some(SelectionState::Dragging { edge_scroll, .. }) = &mut self.selection_state {
                 *edge_scroll = None;
             }
-            let scroll = self.scroll_offset(zone);
-            if let Some(SelectionState::Dragging { sel, .. }) = &mut self.selection_state {
-                sel.update(row, col, scroll);
-            }
+            self.drag_selection_to(row, col);
         }
     }
 
-    fn update_selection_to_edge(&mut self, zone: SelectionZone, col: u16) {
-        let scroll = self.scroll_offset(zone);
+    /// Moves the drag cursor, always in the zone and area the drag started in.
+    /// Reading the document position needs `&self` while writing it needs
+    /// `&mut self`, hence the two matches.
+    fn drag_selection_to(&mut self, row: u16, col: u16) {
+        let Some(SelectionState::Dragging { ref sel, .. }) = self.selection_state else {
+            return;
+        };
+        let pos = self.doc_pos(sel.zone, sel.area, row, col);
+        if let Some(SelectionState::Dragging { sel, .. }) = &mut self.selection_state {
+            sel.update(pos);
+        }
+    }
+
+    fn update_selection_to_edge(&mut self, col: u16) {
         let Some(SelectionState::Dragging {
-            ref mut sel,
+            ref sel,
             ref edge_scroll,
             ..
         }) = self.selection_state
@@ -146,7 +147,7 @@ impl App {
         } else {
             sel.area.bottom().saturating_sub(1)
         };
-        sel.update(edge_row, col, scroll);
+        self.drag_selection_to(edge_row, col);
     }
 
     pub fn tick_edge_scroll(&mut self) -> Dirty {
@@ -170,7 +171,7 @@ impl App {
         };
 
         self.scroll_zone(zone, dir);
-        self.update_selection_to_edge(zone, col);
+        self.update_selection_to_edge(col);
         Dirty::YES
     }
 
@@ -186,8 +187,7 @@ impl App {
                 self.chats[render_chat].extract_selection_text(sel, msg_area)
             }
             SelectionZone::Input => {
-                let scroll = self.scroll_offset(sel.zone);
-                let Some(screen_sel) = sel.to_screen(scroll) else {
+                let Some(screen_sel) = self.screen_selection(sel, render_chat) else {
                     self.selection_state = None;
                     return;
                 };
@@ -202,8 +202,7 @@ impl App {
                 selection::extract_selected_text(buf, &screen_sel, &regions)
             }
             SelectionZone::Overlay => {
-                let scroll = self.scroll_offset(sel.zone);
-                let Some(screen_sel) = sel.to_screen(scroll) else {
+                let Some(screen_sel) = self.screen_selection(sel, render_chat) else {
                     self.selection_state = None;
                     return;
                 };
@@ -227,11 +226,28 @@ impl App {
         self.zones.zone_at(row, col)
     }
 
-    pub(super) fn scroll_offset(&self, zone: SelectionZone) -> u32 {
+    /// The one place a screen position becomes a document position. The
+    /// transcript's document is segments, every other zone's is a flat list of
+    /// rows starting at that zone's own scroll offset.
+    pub(super) fn doc_pos(&self, zone: SelectionZone, area: Rect, row: u16, col: u16) -> DocPos {
+        let rel = selection::row_in_area(row, area);
+        let col = selection::clamp_col(col, area);
         match zone {
-            SelectionZone::Messages => self.chats[self.active_chat].scroll_doc_row(),
-            SelectionZone::Input => self.input_box.scroll_y() as u32,
-            SelectionZone::Overlay => 0,
+            SelectionZone::Messages => self.chats[self.active_chat].doc_pos_at(rel, col),
+            SelectionZone::Input => {
+                DocPos::flat(self.input_box.scroll_y().saturating_add(rel), col)
+            }
+            SelectionZone::Overlay => DocPos::flat(rel, col),
+        }
+    }
+
+    pub(super) fn screen_selection(&self, sel: &Selection, chat: usize) -> Option<ScreenSelection> {
+        match sel.zone {
+            SelectionZone::Messages => sel.to_screen(|pos| self.chats[chat].project_row(pos)),
+            SelectionZone::Input => {
+                sel.to_screen(|pos| RowPos::flat(pos, sel.area, self.input_box.scroll_y()))
+            }
+            SelectionZone::Overlay => sel.to_screen(|pos| RowPos::flat(pos, sel.area, 0)),
         }
     }
 

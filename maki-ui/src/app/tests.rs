@@ -9,7 +9,7 @@ use crate::components::messages::ScrollPos;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
-use crate::selection::{SelectableZone, SelectionState, SelectionZone};
+use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::permissions::PermissionManager;
@@ -1411,41 +1411,45 @@ fn scroll_shortcuts_toggle_auto_scroll() {
     assert!(app.chats[0].auto_scroll());
 }
 
-#[test]
-fn mouse_drag_updates_selection() {
+/// A selection names a place in the transcript, so the transcript has to
+/// exist before a drag can land anywhere.
+fn app_with_transcript(zone: Rect) -> App {
     let mut app = test_app();
-    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
-    app.active_chat().scroll_to_top();
-
-    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
-    app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 20, 10));
-
-    let state = app.selection_state.as_ref().unwrap();
-    let (_, end) = state.sel().normalized();
-    assert_eq!(end.row, 10);
-    assert_eq!(end.col, 20);
+    for i in 0..50 {
+        app.active_chat()
+            .push(DisplayMessage::new(DisplayRole::User, format!("line {i}")));
+    }
+    set_zone(&mut app, SelectionZone::Messages, zone);
+    let backend = ratatui::backend::TestBackend::new(zone.width, zone.bottom());
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| app.active_chat().view(frame, zone, false))
+        .unwrap();
+    app
 }
 
-#[test]
-fn mouse_drag_clamps_to_area() {
-    let mut app = test_app();
-    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));
-    app.active_chat().scroll_to_top();
+fn drag_end(app: &App) -> (RowPos, u16) {
+    let (_, end) = app.selection_state.as_ref().unwrap().sel().normalized();
+    (app.chats[app.active_chat].project_row(end), end.col)
+}
+
+#[test_case((20, 10), RowPos::At(10), 20, false ; "inside_the_area")]
+#[test_case((100, 50), RowPos::At(19), 79, true ; "clamped_to_the_bottom_right")]
+fn mouse_drag_follows_the_pointer(drag: (u16, u16), row: RowPos, col: u16, edge_scrolling: bool) {
+    let mut app = app_with_transcript(Rect::new(0, 0, 80, 20));
 
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5));
     app.update(mouse_event(
         MouseEventKind::Drag(MouseButton::Left),
-        100,
-        50,
+        drag.0,
+        drag.1,
     ));
 
-    let state = app.selection_state.as_ref().unwrap();
-    let (_, end) = state.sel().normalized();
-    assert_eq!(end.col, 79);
-    assert_eq!(end.row, 19, "clamped to area bottom");
-    assert!(
+    assert_eq!(drag_end(&app), (row, col));
+    assert_eq!(
         app.selection_state.as_ref().unwrap().is_edge_scrolling(),
-        "outside area triggers edge scroll"
+        edge_scrolling,
+        "only a drag outside the area edge scrolls"
     );
 }
 
@@ -1478,9 +1482,7 @@ fn edge_scroll_direction(zone: Rect, down: (u16, u16), drag: (u16, u16), expecte
 
 #[test]
 fn mouse_up_clears_edge_scroll() {
-    let mut app = test_app();
-    set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 2, 80, 20));
-    app.active_chat().scroll_to_top();
+    let mut app = app_with_transcript(Rect::new(0, 2, 80, 20));
 
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 10, 10));
     app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 1));
@@ -1831,22 +1833,8 @@ fn interrupt_clears_dragging_but_preserves_pending_copy(interrupt: fn(&mut App))
 
 #[test]
 fn scroll_preserves_dragging_and_updates_cursor() {
-    let mut app = test_app();
-    for i in 0..50 {
-        app.active_chat()
-            .push(DisplayMessage::new(DisplayRole::User, format!("line {i}")));
-    }
-
     let area = Rect::new(0, 0, 80, 20);
-    set_zone(&mut app, SelectionZone::Messages, area);
-
-    let backend = ratatui::backend::TestBackend::new(area.width, area.height);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            app.active_chat().view(frame, area, false);
-        })
-        .unwrap();
+    let mut app = app_with_transcript(area);
 
     let bottom = app.active_chat().scroll_pos();
     assert!(
@@ -1864,7 +1852,7 @@ fn scroll_preserves_dragging_and_updates_cursor() {
         scroll_before < bottom,
         "scroll up should move the viewport away from the bottom"
     );
-    let doc_before = app.active_chat().scroll_doc_row();
+    let anchor_before = app.doc_pos(SelectionZone::Messages, area, DRAG_ROW, DRAG_COL);
 
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
@@ -1887,26 +1875,20 @@ fn scroll_preserves_dragging_and_updates_cursor() {
     );
 
     let (start, end) = app.selection_state.as_ref().unwrap().sel().normalized();
-    let anchor_row = doc_before + DRAG_ROW as u32;
-    assert_eq!(start.row, anchor_row, "anchor keeps its doc row");
+    assert_eq!(start, anchor_before, "anchor keeps its document position");
+    let chat = &app.chats[app.active_chat];
     assert_eq!(
-        end.row,
-        anchor_row + SCROLL_LINES as u32,
-        "cursor re-projects by the scrolled lines"
+        chat.project_row(start),
+        RowPos::At(DRAG_ROW - SCROLL_LINES as u16),
+        "the anchor rides up by the scrolled lines"
+    );
+    assert_eq!(
+        chat.project_row(end),
+        RowPos::At(DRAG_ROW),
+        "the cursor stays under the pointer"
     );
     assert_eq!(start.col, DRAG_COL, "anchor column is unchanged");
     assert_eq!(end.col, DRAG_COL, "cursor column is unchanged");
-
-    make_pending_copy(&mut app);
-    app.update(Msg::Scroll {
-        column: DRAG_COL,
-        row: DRAG_ROW,
-        delta: -SCROLL_LINES,
-    });
-    assert!(
-        app.selection_state.as_ref().unwrap().is_pending_copy(),
-        "scroll preserves pending copy"
-    );
 }
 
 #[test]

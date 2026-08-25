@@ -11,7 +11,7 @@ use crate::components::tool_display::append_annotation;
 use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
 
-use crate::selection::Selection;
+use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
@@ -271,8 +271,12 @@ impl Chat {
         self.messages_panel.scroll_pos()
     }
 
-    pub fn scroll_doc_row(&self) -> u32 {
-        self.messages_panel.scroll_doc_row()
+    pub fn doc_pos_at(&self, rel_row: u16, col: u16) -> DocPos {
+        self.messages_panel.doc_pos_at(rel_row, col)
+    }
+
+    pub fn project_row(&self, pos: DocPos) -> RowPos {
+        self.messages_panel.project_row(pos)
     }
 
     pub fn segment_search_texts(&self) -> Vec<&str> {

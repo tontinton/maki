@@ -112,11 +112,11 @@ impl Segment {
     /// measured at an older width, which is what keeps a resize off the
     /// O(transcript) path: re-measuring means re-wrapping every line.
     ///
-    /// Render, `segment_at_row` and the scrollbar all read this same number so
-    /// the layout stays self consistent, and `reflow_viewport` keeps every
-    /// segment the viewport can reach fresh. A caller that re-wraps the lines
-    /// itself has to use `drawn_height`, or it disagrees with the layout by
-    /// however much the width moved.
+    /// Render, [`super::scroll::Layout`] and the scrollbar all read this same
+    /// number so the layout stays self consistent, and `reflow_viewport` keeps
+    /// every segment the viewport can reach fresh. A caller that re-wraps the
+    /// lines itself has to use `drawn_height`, or it disagrees with the layout
+    /// by however much the width moved.
     pub fn height(&self, width: u16) -> u16 {
         if let Some(c) = self.cached_height.get()
             && (c.at_width == width || self.stale)

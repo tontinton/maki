@@ -5,43 +5,29 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 
+/// Copies the segments the selection spans. The streaming tail lives past the
+/// cache, so text still arriving is not copyable.
 pub(super) fn extract_selection_text(
     cache: &SegmentCache,
-    viewport_width: u16,
+    width: u16,
     sel: &Selection,
     msg_area: Rect,
 ) -> String {
-    let (doc_start, doc_end) = sel.normalized();
-    let width = viewport_width;
-
-    let heights: Vec<u16> = cache.segments().iter().map(|s| s.height(width)).collect();
+    let (start, end) = sel.normalized();
 
     let mut out = String::new();
-    let mut doc_row: u32 = 0;
-
-    for (i, &h) in heights.iter().enumerate() {
-        let seg_start = doc_row;
-        let seg_end = doc_row + h as u32;
-        doc_row = seg_end;
-
-        if seg_end <= doc_start.row || seg_start > doc_end.row {
+    for i in start.seg..end.seg.saturating_add(1).min(cache.len()) {
+        let Some(seg) = cache.get(i) else { continue };
+        if seg.lines().is_empty() {
             continue;
         }
-
         if !out.is_empty() {
             out.push('\n');
         }
 
-        let Some(seg) = cache.get(i) else { continue };
-
-        if seg.lines().is_empty() {
-            continue;
-        }
-
-        // `h` is the document layout height, which can predate a resize (see
-        // `Segment::height`), while the wrap below happens at the real width.
-        // The rows we copy come from that wrap, so measure and clamp against
-        // it, and take the whole segment whenever the selection covers it.
+        // The rows we copy come from this wrap at the real width, so clamp
+        // against it: a reflow can shrink a segment under a stored row, and
+        // the layout height can predate a resize entirely.
         let drawn = seg.drawn_height(width);
         let tmp_area = Rect::new(0, 0, width, drawn);
         let mut tmp = Buffer::empty(tmp_area);
@@ -49,22 +35,18 @@ pub(super) fn extract_selection_text(
             .wrap(Wrap { trim: false })
             .render(tmp_area, &mut tmp);
 
-        let rel_start = (doc_start.row.saturating_sub(seg_start) as u16).min(drawn);
-        let rel_end = if doc_end.row + 1 >= seg_end {
-            drawn
+        let (rel_start, start_col) = if i == start.seg {
+            (start.row.min(drawn), start.col.saturating_sub(msg_area.x))
         } else {
-            ((doc_end.row + 1 - seg_start) as u16).min(drawn)
+            (0, 0)
         };
-
-        let start_col = if seg_start > doc_start.row {
-            0
+        let (rel_end, end_col) = if i == end.seg {
+            (
+                end.row.saturating_add(1).min(drawn),
+                end.col.saturating_sub(msg_area.x),
+            )
         } else {
-            doc_start.col.saturating_sub(msg_area.x)
-        };
-        let end_col = if seg_end < doc_end.row + 1 {
-            width.saturating_sub(1)
-        } else {
-            doc_end.col.saturating_sub(msg_area.x)
+            (drawn, width.saturating_sub(1))
         };
 
         let ss = ScreenSelection {

@@ -21,7 +21,7 @@ use crate::animation::spinner_str;
 use crate::components::keybindings::key;
 use crate::markdown::{hr_line, plain_lines, text_to_lines, truncate_output};
 use crate::render_worker::RenderWorker;
-use crate::selection::Selection;
+use crate::selection::{DocPos, RowPos, Selection};
 use crate::splash::{ColorTransition, Splash};
 use crate::theme;
 use crate::update;
@@ -954,10 +954,33 @@ impl MessagesPanel {
         self.scroll
     }
 
-    /// Selections still count rows from the top of the document, so they need
-    /// this bridge until they are anchored to segments too.
-    pub fn scroll_doc_row(&self) -> u32 {
-        self.layout().doc_row(self.scroll)
+    /// Where a click at `rel_row` rows into the viewport lands, as a place a
+    /// resize cannot move.
+    pub fn doc_pos_at(&self, rel_row: u16, col: u16) -> DocPos {
+        let pos = self.layout().advance(self.scroll, u32::from(rel_row));
+        DocPos {
+            seg: pos.seg,
+            row: pos.row,
+            col,
+        }
+    }
+
+    /// Walks at most a viewport worth of segments, so a live selection costs
+    /// O(viewport) per frame rather than O(transcript).
+    pub fn project_row(&self, pos: DocPos) -> RowPos {
+        let at = ScrollPos {
+            seg: pos.seg,
+            row: pos.row,
+        };
+        if at < self.scroll {
+            return RowPos::Above;
+        }
+        let rows = self.layout().rows_from(self.scroll, at);
+        if rows >= u32::from(self.viewport_height) {
+            RowPos::Below
+        } else {
+            RowPos::At(rows as u16)
+        }
     }
 
     /// Backs `maki.fn.winsaveview`. The clamp matters: a pinned or restored
@@ -972,16 +995,6 @@ impl MessagesPanel {
             height: self.viewport_height,
             auto_scroll: self.auto_scroll,
         }
-    }
-
-    #[cfg(test)]
-    pub fn segment_heights(&self) -> Vec<u16> {
-        let width = self.viewport_width;
-        self.cache
-            .segments()
-            .iter()
-            .map(|s| s.height(width))
-            .collect()
     }
 
     pub fn segment_search_texts(&self) -> Vec<&str> {
