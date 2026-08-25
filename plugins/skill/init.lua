@@ -2,11 +2,14 @@ local SKILL_FILE = "SKILL.md"
 local NOT_FOUND = "skill not found: "
 local REFERENCE_FILE = "lua-api.md"
 local REFERENCE_UNAVAILABLE = "(unavailable; full reference inlined below)"
+local ListPicker = require("maki.list_picker")
 local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
+local build_picker_items = helpers.build_picker_items
+local build_skill_marker = helpers.build_skill_marker
 
 local PROJECT_SKILL_DIRS = {
   ".maki/skills",
@@ -131,7 +134,27 @@ end
 
 local boot_skills = discover_skills()
 local description = "Load a skill that provides instructions and workflows for specific tasks."
+  .. " If the user writes $skill:name in their message, load the skill named name first."
   .. build_skill_list(boot_skills)
+
+local function open_skill_picker(skills)
+  local items, sorted = build_picker_items(skills)
+  if #items == 0 then
+    maki.ui.flash("No skills available")
+    return nil
+  end
+  local event = ListPicker.open(items, {
+    title = " Skills ",
+    footer = {
+      { "Enter", "select" },
+      { "Esc", "cancel" },
+    },
+  })
+  if event.type ~= "choice" then
+    return nil
+  end
+  return sorted[event.index]
+end
 
 maki.api.register_tool({
   name = "skill",
@@ -207,3 +230,23 @@ maki.api.register_tool({
     }
   end,
 })
+
+local function insert_skill_marker(suffix)
+  local skill = open_skill_picker(discover_skills())
+  if skill then
+    maki.ui.insert_input(build_skill_marker(skill.name, suffix))
+  end
+end
+
+maki.api.register_command({
+  name = "/skill",
+  description = "Pick a skill and insert a visible $skill:name marker into the prompt",
+  nargs = "*",
+  handler = function(opts)
+    insert_skill_marker(opts.args)
+  end,
+})
+
+maki.keymap.set("n", "<M-s>", function()
+  insert_skill_marker()
+end, { desc = "Insert skill marker" })

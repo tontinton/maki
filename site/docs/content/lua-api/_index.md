@@ -4393,6 +4393,28 @@ maki.ui.flash("Copied to clipboard!")
 
 ---
 
+### `maki.ui.insert_input()` {#maki-ui-insert_input}
+
+```lua
+maki.ui.insert_input({text})
+```
+
+Inserts {text} into the main prompt input at the current cursor.
+Good for commands that want to generate visible prompt text instead
+of hidden state.
+
+**Parameters:**
+
+- `{text}` (`string`) Text to insert.
+
+**Example:**
+
+```lua
+maki.ui.insert_input("$rust-review ")
+```
+
+---
+
 ### `maki.ui.action()` {#maki-ui-action}
 
 ```lua

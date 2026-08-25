@@ -25,6 +25,7 @@ use crate::selection::LineBreaks;
 const CHEVRON: &str = super::CHEVRON;
 const NEWLINE_PAD: &str = "  ";
 const PREFIX_WIDTH: u16 = 2;
+const SKILL_MARKER_PREFIX: &str = "$skill:";
 const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
     "research how something works",
     "fix a bug",
@@ -553,6 +554,7 @@ fn wrap_line(
 ) -> Vec<Line<'static>> {
     let chars: Vec<char> = line.chars().collect();
     let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(1)).collect();
+    let skill_spans = shell_spans.is_none().then(|| skill_marker_spans(line));
 
     wrap_ranges(&widths, ew, is_cursor_line)
         .into_iter()
@@ -570,8 +572,7 @@ fn wrap_line(
             let chunk_spans = if let Some(styled) = &shell_spans {
                 slice_styled_spans(styled, start, end)
             } else {
-                let chunk_text: String = chars[start..end].iter().collect();
-                vec![Span::raw(chunk_text)]
+                slice_styled_spans(skill_spans.as_deref().unwrap_or_default(), start, end)
             };
 
             if is_cursor_line && cursor_x >= start && cursor_x <= end {
@@ -625,6 +626,57 @@ fn shell_highlight_spans(line: &str) -> Option<Vec<Span<'static>>> {
         spans.push(span);
     }
     Some(spans)
+}
+
+fn skill_marker_spans(line: &str) -> Vec<Span<'static>> {
+    let marker_style = theme::current().accent.add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    let mut chars = line.char_indices().peekable();
+    let mut plain_start = 0;
+
+    while let Some((start, ch)) = chars.next() {
+        if ch != '$' {
+            continue;
+        }
+        let at_token_start = start == 0
+            || line[..start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        if !at_token_start {
+            continue;
+        }
+        if line[start..]
+            .strip_prefix(SKILL_MARKER_PREFIX)
+            .and_then(|rest| rest.chars().next())
+            .is_none_or(char::is_whitespace)
+        {
+            continue;
+        }
+
+        let mut end = line.len();
+        while let Some((idx, next)) = chars.peek().copied() {
+            if next.is_whitespace() {
+                end = idx;
+                break;
+            }
+            chars.next();
+        }
+
+        if plain_start < start {
+            spans.push(Span::raw(line[plain_start..start].to_owned()));
+        }
+        spans.push(Span::styled(line[start..end].to_owned(), marker_style));
+        plain_start = end;
+    }
+
+    if spans.is_empty() {
+        return vec![Span::raw(line.to_owned())];
+    }
+    if plain_start < line.len() {
+        spans.push(Span::raw(line[plain_start..].to_owned()));
+    }
+    spans
 }
 
 fn slice_styled_spans(
@@ -1039,6 +1091,102 @@ mod tests {
             rendered_row(&terminal, 1),
             format!("{CHEVRON}{ASK_PREFIX}{HINT}{ASK_SUFFIX}")
         );
+    }
+
+    fn assert_marker_style(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        row: u16,
+        col: u16,
+        text: &str,
+    ) {
+        let buf = terminal.backend().buffer();
+        let marker_style = theme::current().accent.add_modifier(Modifier::BOLD);
+        for (offset, ch) in text.chars().enumerate() {
+            let cell = buf.cell((col + offset as u16, row)).unwrap();
+            assert_eq!(cell.symbol(), ch.to_string());
+            assert_eq!(cell.style().fg, marker_style.fg);
+            assert_eq!(cell.style().add_modifier, marker_style.add_modifier);
+        }
+    }
+
+    fn assert_not_marker_style(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        row: u16,
+        col: u16,
+        text: &str,
+    ) {
+        let buf = terminal.backend().buffer();
+        let marker_style = theme::current().accent.add_modifier(Modifier::BOLD);
+        for (offset, ch) in text.chars().enumerate() {
+            let cell = buf.cell((col + offset as u16, row)).unwrap();
+            assert_eq!(cell.symbol(), ch.to_string());
+            assert_ne!(cell.style().fg, marker_style.fg);
+        }
+    }
+
+    fn marker_column(line: &str, marker: &str) -> u16 {
+        let offset = line.find(marker).expect("marker should exist");
+        PREFIX_WIDTH + line[..offset].chars().count() as u16
+    }
+
+    #[test]
+    fn skill_marker_gets_accent_style() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, "$skill:maki-plugin-dev review this");
+        let terminal = render_input(&mut input, 40, 4);
+        assert_marker_style(&terminal, 1, PREFIX_WIDTH, "$skill:maki-plugin-dev");
+        let trailing = terminal
+            .backend()
+            .buffer()
+            .cell((
+                (PREFIX_WIDTH as usize + "$skill:maki-plugin-dev".chars().count()) as u16,
+                1,
+            ))
+            .unwrap();
+        let marker_style = theme::current().accent.add_modifier(Modifier::BOLD);
+        assert_eq!(trailing.symbol(), " ");
+        assert_ne!(trailing.style().fg, marker_style.fg);
+    }
+
+    #[test]
+    fn multiple_skill_markers_get_accent_style() {
+        let line = "$skill:agent-aget $skill:beads review this";
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, line);
+        let terminal = render_input(&mut input, 40, 4);
+        assert_marker_style(
+            &terminal,
+            1,
+            marker_column(line, "$skill:agent-aget"),
+            "$skill:agent-aget",
+        );
+        assert_marker_style(
+            &terminal,
+            1,
+            marker_column(line, "$skill:beads"),
+            "$skill:beads",
+        );
+    }
+
+    #[test_case("$50" ; "price")]
+    #[test_case("$PATH" ; "environment_variable")]
+    #[test_case("$beads" ; "legacy_marker")]
+    #[test_case("$skill:" ; "missing_name")]
+    fn non_skill_tokens_do_not_get_accent_style(line: &str) {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, line);
+        let terminal = render_input(&mut input, 40, 4);
+        assert_not_marker_style(&terminal, 1, PREFIX_WIDTH, line);
+    }
+
+    #[test]
+    fn wrapped_skill_marker_keeps_accent_style() {
+        let width = 14;
+        let line = format!("{} $skill:beads", "x".repeat(effective_width(width) - 1));
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, &line);
+        let terminal = render_input(&mut input, width as u16, 5);
+        assert_marker_style(&terminal, 2, 0, "$skill:beads");
     }
 
     fn test_image() -> ImageSource {
