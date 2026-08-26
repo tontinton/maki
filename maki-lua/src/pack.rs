@@ -5,7 +5,9 @@
 //! installs are resolved from recorded state instead, and never appear here.
 
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::error::PluginError;
 use crate::loader::is_bundled;
@@ -27,14 +29,36 @@ pub fn sanitize_message(message: &str) -> String {
 /// The group name reserved for packages maki installs itself. Manual discovery
 /// skips it, so one package can never be found twice, once from disk and once
 /// from recorded state, with the two disagreeing about its revision.
-pub const MANAGED_GROUP: &str = "core";
+///
+/// Re-exported rather than repeated: `maki-pack` decides where it puts a
+/// checkout, and a second copy here that drifted would stop discovery skipping
+/// the directory it writes.
+pub use maki_pack::paths::MANAGED_GROUP;
 
 /// `<data>/site`, the root Neovim would call a package path.
 pub fn site_dir() -> Result<PathBuf, std::io::Error> {
     maki_storage::paths::data_dir().map(|d| d.join("site"))
 }
 
-#[derive(Debug)]
+/// How a package reached the disk, which is what decides whose word grants its
+/// permissions.
+///
+/// This is a distinction the code needs and did not have. A manifest is written
+/// by whoever wrote the package. For a package the user placed by hand that is
+/// effectively the user, so the manifest is their own statement of intent. For
+/// a package maki fetched it is a stranger, and letting the manifest grant
+/// itself permissions would make the request self-certifying: a later revision
+/// could add `run = true` and start subprocesses without anyone agreeing to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// The user put the files under `pack/<group>/`. Trusted like `init.lua`.
+    Manual,
+    /// Maki cloned it from this source. The source is part of the approval key,
+    /// so re-pointing a name at another repository does not inherit its grants.
+    Fetched { src: String },
+}
+
+#[derive(Debug, Clone)]
 pub struct DiscoveredPackage {
     pub name: String,
     /// Canonical package root. Resolved once, here, so the manifest, the
@@ -42,9 +66,603 @@ pub struct DiscoveredPackage {
     pub dir: PathBuf,
     /// `start/` packages load at startup; `opt/` packages wait to be activated.
     pub eager: bool,
-    /// What the package's manifest asks for. A manually installed package is
-    /// granted this directly: the user placed the files.
+    /// What the package's manifest asks for. Never a grant on its own for a
+    /// fetched package; see `Origin`.
     pub requested: Requested,
+    pub origin: Origin,
+    pub revision_guard: Option<Arc<maki_pack::lock::Lock>>,
+}
+
+/// `pack-lock.json`, beside the user's configuration so it can be committed.
+///
+/// `global_config_dirs` returns several candidates in the order `init.lua` is
+/// searched for, so the first that exists is the one whose `maki.pack.add`
+/// declared these packages, and a custom config directory keeps its lockfile
+/// rather than leaving it behind in XDG. With none of them created yet there is
+/// nothing to sit beside, and the last candidate is the one
+/// `append_permission_rule` already treats as writable.
+pub fn lockfile_path() -> Option<PathBuf> {
+    let dirs = maki_config::global_config_dirs();
+    dirs.iter()
+        .find(|dir| dir.is_dir())
+        .cloned()
+        .or_else(|| dirs.into_iter().next_back())
+        .map(|dir| dir.join("pack-lock.json"))
+}
+
+/// `pack-approvals.json`, in the state directory beside the checkouts.
+///
+/// Deliberately not beside the lockfile. A lockfile is meant to be committed,
+/// so a package set reproduces on another machine. An approval is the opposite
+/// kind of fact: one person's decision to trust one repository on one machine,
+/// which must not travel with a repository into someone else's checkout.
+pub fn approvals_path() -> Option<PathBuf> {
+    site_dir().ok().map(|dir| dir.join("pack-approvals.json"))
+}
+
+/// Reads the approval store.
+///
+/// An unreadable store yields no approvals rather than a default-open one. The
+/// failure mode is then a package that loads with nothing granted, which is
+/// visible and recoverable, instead of one that loads with everything granted.
+pub fn read_approvals() -> maki_pack::approvals::Approvals {
+    let Some(path) = approvals_path() else {
+        return maki_pack::approvals::Approvals::default();
+    };
+    read_approvals_file(&path).unwrap_or_default()
+}
+
+fn read_approvals_file(path: &Path) -> Option<maki_pack::approvals::Approvals> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(maki_pack::approvals::Approvals::default());
+        }
+        Err(error) => {
+            tracing::error!(
+                path = %path.display(),
+                %error,
+                "pack approval store could not be read; granting nothing"
+            );
+            return None;
+        }
+    };
+    match serde_json::from_str(&text) {
+        Ok(approvals) => Some(approvals),
+        Err(e) => {
+            tracing::error!(
+                path = %path.display(),
+                error = %e,
+                "pack approval store is unreadable; granting nothing"
+            );
+            None
+        }
+    }
+}
+
+fn read_approvals_for_write() -> Option<maki_pack::approvals::Approvals> {
+    approvals_path()
+        .map(|path| read_approvals_file(&path))
+        .unwrap_or_else(|| Some(maki_pack::approvals::Approvals::default()))
+}
+
+/// Effective permissions for a package about to load.
+///
+/// The whole point of `Origin`: a fetched package's own manifest is a request,
+/// and a request is not a grant.
+pub fn effective_permissions(
+    pkg: &DiscoveredPackage,
+) -> crate::plugin_permissions::PluginPermissions {
+    granted(pkg, &read_approvals())
+}
+
+/// The rule itself, with the store passed in.
+///
+/// Separated from the disk read so it can be tested against a store built in
+/// the test rather than against whatever the person running the tests happens
+/// to have approved.
+pub fn granted(
+    pkg: &DiscoveredPackage,
+    approvals: &maki_pack::approvals::Approvals,
+) -> crate::plugin_permissions::PluginPermissions {
+    match &pkg.origin {
+        Origin::Manual => pkg.requested.clone().granted_for_manual_install(),
+        Origin::Fetched { src } => {
+            let key = maki_pack::approvals::ApprovalKey::new(pkg.name.clone(), src);
+            let approved = crate::plugin_permissions::PluginPermissions::from_approved(
+                approvals
+                    .get(&key)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(String::as_str),
+            );
+            pkg.requested.intersect(&approved)
+        }
+    }
+}
+
+/// Whether this entry point can ask the user a question.
+///
+/// An install runs downloaded code, so it is a trust decision. A run with no
+/// terminal cannot take one, and must refuse rather than assume consent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interaction {
+    Tty,
+    None,
+}
+
+impl Interaction {
+    fn confirm(self, prompt: &str) -> bool {
+        if self != Self::Tty || !io::stdin().is_terminal() {
+            return false;
+        }
+        eprint!("{} [y/N] ", sanitize_message(prompt));
+        let _ = io::stderr().flush();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y")
+    }
+}
+
+/// What an install pass produced, and what it could not.
+///
+/// Failures are returned rather than only logged: installation runs before
+/// logging is set up, so a message written there reaches nobody.
+#[derive(Debug, Default)]
+pub struct InstallReport {
+    pub packages: Vec<DiscoveredPackage>,
+    pub failures: Vec<String>,
+}
+
+/// Whether a declared package is already installed from the source it names.
+///
+/// Both halves matter. A recorded revision only describes the source it was
+/// recorded for, so a name pointed at a different repository is neither
+/// installed nor covered by the decision that trusted the old one.
+fn installed_from_declared_source(
+    declared: &crate::api::pack::Declared,
+    lock: &maki_pack::lockfile::Lockfile,
+    manager: &maki_pack::manager::Manager,
+) -> bool {
+    let spec = &declared.spec;
+    lock.get(&spec.name)
+        .is_some_and(|entry| entry.src == spec.src)
+        && manager.resolve(lock, &spec.name).is_some()
+}
+
+/// The declared packages that are already installed at the source and revision
+/// the lockfile records.
+///
+/// Reads only: no git, no lock, no network. This is what a session still has
+/// when it cannot install, so one held lock does not take away the packages
+/// the user already had.
+fn resolved_on_disk(
+    specs: &[crate::api::pack::Declared],
+    site: &Path,
+    lock: &maki_pack::lockfile::Lockfile,
+    failures: &mut Vec<String>,
+) -> Vec<DiscoveredPackage> {
+    let manager = maki_pack::manager::Manager::new(site);
+    let approvals = read_approvals();
+    let mut found = Vec::new();
+    for declared in specs {
+        let spec = &declared.spec;
+        if !installed_from_declared_source(declared, lock, &manager) {
+            continue;
+        }
+        let Some(dir) = manager.resolve(lock, &spec.name) else {
+            continue;
+        };
+        let revision = lock
+            .get(&spec.name)
+            .expect("resolved lock entry")
+            .rev
+            .as_str();
+        let revision_guard = match maki_pack::lock::Lock::acquire_shared(
+            &maki_pack::paths::revision_lock(site, &spec.name, revision),
+        ) {
+            Ok(guard) => Arc::new(guard),
+            Err(error) => {
+                failures.push(format!("{}: {}", spec.name, redact_error(&error)));
+                continue;
+            }
+        };
+        let requested = match load_requested_permissions(&dir) {
+            Ok(requested) => requested,
+            Err(problem) => {
+                // Named here, because the caller only reports why installing
+                // stopped. Dropping this would make the package vanish with
+                // the lock error as the only clue.
+                failures.push(format!("{}: {problem}", spec.name));
+                continue;
+            }
+        };
+        let key = maki_pack::approvals::ApprovalKey::new(spec.name.clone(), &spec.src);
+        let missing = missing_permissions(&requested, approvals.get(&key).unwrap_or(&[]));
+        if !missing.is_empty() {
+            failures.push(format!(
+                "{}: permission approval is required for {}",
+                spec.name,
+                missing.join(", ")
+            ));
+            continue;
+        }
+        found.push(DiscoveredPackage {
+            name: spec.name.clone(),
+            requested,
+            origin: Origin::Fetched {
+                src: spec.src.clone(),
+            },
+            dir,
+            eager: matches!(
+                declared.load,
+                crate::api::pack::LoadMode::Eager | crate::api::pack::LoadMode::Custom(_)
+            ),
+            revision_guard: Some(revision_guard),
+        });
+    }
+    found
+}
+
+fn missing_permissions(requested: &Requested, approved: &[String]) -> Vec<String> {
+    requested
+        .names()
+        .into_iter()
+        .filter(|name| !approved.iter().any(|approved| approved == name))
+        .collect()
+}
+
+fn runnable_declarations<'a>(
+    specs: &'a [crate::api::pack::Declared],
+    manual: &Discovery,
+    report: &mut InstallReport,
+) -> Vec<&'a crate::api::pack::Declared> {
+    let manual_names = manual.known_names();
+    specs
+        .iter()
+        .filter(|declared| {
+            let name = &declared.spec.name;
+            if let Some(error) = owner_conflict(name) {
+                report.failures.push(error);
+                return false;
+            }
+            if manual_names.iter().any(|manual| manual == name) {
+                let path = manual
+                    .packages
+                    .iter()
+                    .find(|package| package.name == *name)
+                    .map(|package| format!(" at {}", package.dir.display()))
+                    .unwrap_or_default();
+                report.failures.push(format!(
+                    "{name}: managed package name conflicts with manual package{path}"
+                ));
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+fn grant_installed(
+    specs: &[&crate::api::pack::Declared],
+    site: &Path,
+    manager: &maki_pack::manager::Manager,
+    lock: &maki_pack::lockfile::Lockfile,
+    interaction: Interaction,
+    report: &mut InstallReport,
+) {
+    let Some(mut approvals) = read_approvals_for_write() else {
+        report
+            .failures
+            .push("the package approval store is unreadable, so no package was loaded".to_owned());
+        return;
+    };
+    let mut approvals_changed = false;
+    let mut newly_approved = std::collections::BTreeSet::new();
+
+    for declared in specs.iter().copied() {
+        let spec = &declared.spec;
+        if lock
+            .get(&spec.name)
+            .is_none_or(|entry| entry.src != spec.src)
+        {
+            continue;
+        }
+        let Some(dir) = manager.resolve(lock, &spec.name) else {
+            continue;
+        };
+        let revision = lock
+            .get(&spec.name)
+            .expect("resolved lock entry")
+            .rev
+            .as_str();
+        let revision_guard = match maki_pack::lock::Lock::acquire_shared(
+            &maki_pack::paths::revision_lock(site, &spec.name, revision),
+        ) {
+            Ok(guard) => Arc::new(guard),
+            Err(error) => {
+                report
+                    .failures
+                    .push(format!("{}: {}", spec.name, redact_error(&error)));
+                continue;
+            }
+        };
+        let requested = match load_requested_permissions(&dir) {
+            Ok(requested) => requested,
+            Err(problem) => {
+                report.failures.push(format!("{}: {problem}", spec.name));
+                continue;
+            }
+        };
+        let key = maki_pack::approvals::ApprovalKey::new(spec.name.clone(), &spec.src);
+        let requested_names = requested.names();
+        let missing = missing_permissions(&requested, approvals.get(&key).unwrap_or(&[]));
+
+        if approvals.get(&key).is_none() {
+            approvals_changed |= approvals.revoke(&spec.name);
+        }
+        if !missing.is_empty() {
+            if !interaction.confirm(&format!(
+                "Allow package {} these permissions: {}?",
+                spec.name,
+                missing.join(", ")
+            )) {
+                report.failures.push(format!(
+                    "{}: permission approval is required for {}",
+                    spec.name,
+                    missing.join(", ")
+                ));
+                continue;
+            }
+            approvals.approve(&key, requested_names);
+            approvals_changed = true;
+            newly_approved.insert(spec.name.clone());
+        }
+        report.packages.push(DiscoveredPackage {
+            name: spec.name.clone(),
+            requested,
+            origin: Origin::Fetched {
+                src: spec.src.clone(),
+            },
+            dir,
+            eager: matches!(
+                declared.load,
+                crate::api::pack::LoadMode::Eager | crate::api::pack::LoadMode::Custom(_)
+            ),
+            revision_guard: Some(revision_guard),
+        });
+    }
+
+    if approvals_changed && !write_approvals(&approvals) {
+        let packages = std::mem::take(&mut report.packages);
+        for package in packages {
+            if newly_approved.contains(&package.name) {
+                report.failures.push(format!(
+                    "{}: permission approval could not be saved",
+                    package.name
+                ));
+            } else {
+                report.packages.push(package);
+            }
+        }
+    }
+}
+
+/// Installs the packages the global `init.lua` declared and reports where each
+/// one landed.
+///
+/// Runs on the caller's thread, never the Lua thread: installing clones, and
+/// loading blocks on a reply from the runtime, so doing either from inside a
+/// Lua call would wait on a message that cannot be processed until it returns.
+/// One unreachable repository is reported and skipped so a network problem
+/// does not stop Maki from starting.
+pub fn install_declared(
+    specs: &[crate::api::pack::Declared],
+    interaction: Interaction,
+) -> InstallReport {
+    let mut report = InstallReport::default();
+    let site = match site_dir() {
+        Ok(site) => site,
+        Err(error) => {
+            report.failures.push(format!(
+                "no data directory, so no package was installed: {error}"
+            ));
+            return report;
+        }
+    };
+
+    let lock_path = lockfile_path();
+
+    // Held across the whole read, install, and write. Atomic rename gives
+    // durability but not isolation: without this, two processes could each read
+    // the same lockfile and the second write would discard the first's entries.
+    let _guard = match lock_path.as_deref().map(maki_pack::paths::sidecar_lock) {
+        Some(path) => match maki_pack::lock::Lock::acquire(&path) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                // The kernel releases the lock when its process exits,
+                // including after a crash.
+                tracing::error!(error = %e, "could not take the package lock");
+                report.failures.push(redact_error(&e));
+                // Installing needs the lock; reading what is already there
+                // does not. Returning nothing would tell the session it has
+                // no managed packages at all, because discovery skips the
+                // managed group, so a second maki started during a clone
+                // would come up with every package the user has missing.
+                if let Some(lock) = read_lockfile(lock_path.as_deref()) {
+                    report.packages = resolved_on_disk(specs, &site, &lock, &mut report.failures);
+                }
+                return report;
+            }
+        },
+        None => None,
+    };
+
+    let mut lock = match read_lockfile(lock_path.as_deref()) {
+        Some(lock) => lock,
+        None => {
+            report
+                .failures
+                .push("the pack lockfile is unreadable, so no package was installed".to_owned());
+            return report;
+        }
+    };
+
+    let manager = maki_pack::manager::Manager::new(&site);
+    for error in manager.prune(&lock) {
+        tracing::warn!(error = %error, "could not prune a stale package revision");
+        report.failures.push(redact_error(&error));
+    }
+    if specs.is_empty() {
+        return report;
+    }
+    let manual = discover(&site);
+    let runnable = runnable_declarations(specs, &manual, &mut report);
+    let mut changed = false;
+
+    // Asked once for the whole batch, before anything is cloned. A package
+    // already recorded at the revision it asks for is not a new trust
+    // decision, so only a fresh source prompts. Credentials are redacted,
+    // because the prompt is the one place a source is shown in full.
+    let new_sources: Vec<String> = runnable
+        .iter()
+        .copied()
+        .filter(|declared| {
+            declared.confirm && !installed_from_declared_source(declared, &lock, &manager)
+        })
+        .map(|declared| {
+            format!(
+                "{} from {}",
+                declared.spec.name,
+                maki_pack::git::redact(&declared.spec.src)
+            )
+        })
+        .collect();
+    let confirmed = new_sources.is_empty()
+        || interaction.confirm(&format!(
+            "Install these packages?\n  {}",
+            new_sources.join("\n  ")
+        ));
+
+    for declared in runnable.iter().copied() {
+        let spec = &declared.spec;
+        if declared.confirm
+            && !installed_from_declared_source(declared, &lock, &manager)
+            && !confirmed
+        {
+            report.failures.push(format!(
+                "{}: installation requires confirmation; set confirm = false for a non-interactive install",
+                spec.name
+            ));
+            continue;
+        }
+        let result = match smol::block_on(manager.ensure_installed(spec, &mut lock)) {
+            Ok(result) => result,
+            Err(e) => {
+                let message = redact_error(&e);
+                tracing::error!(package = %spec.name, error = %message, "failed to install package");
+                report
+                    .failures
+                    .push(format!("{}: failed to install: {message}", spec.name));
+                continue;
+            }
+        };
+        changed |= result.changed;
+    }
+
+    // Written once, after the installs, and only when something moved.
+    if changed {
+        let recorded = match lock_path {
+            Some(path) => write_lockfile(&path, &lock),
+            None => false,
+        };
+        if !recorded {
+            // The packages are on disk but nothing records where. The next
+            // start reads the old lockfile and would not find them, so they
+            // must not be reported as installed either.
+            report.packages.clear();
+            report
+                .failures
+                .push("the pack lockfile could not be written, so no package was used".to_owned());
+            return report;
+        }
+    }
+
+    grant_installed(&runnable, &site, &manager, &lock, interaction, &mut report);
+    report
+}
+
+fn owner_conflict(name: &str) -> Option<String> {
+    is_bundled(name)
+        .then(|| format!("{name}: managed package name conflicts with a builtin plugin"))
+}
+
+fn redact_error(error: &impl std::fmt::Display) -> String {
+    sanitize_message(&maki_pack::git::redact(&error.to_string()))
+}
+
+pub(crate) fn read_lockfile(path: Option<&Path>) -> Option<maki_pack::lockfile::Lockfile> {
+    let Some(path) = path else {
+        return Some(maki_pack::lockfile::Lockfile::default());
+    };
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(maki_pack::lockfile::Lockfile::default());
+        }
+        Err(error) => {
+            tracing::error!(path = %path.display(), %error, "pack lockfile could not be read");
+            return None;
+        }
+    };
+    match maki_pack::lockfile::Lockfile::from_json(&text) {
+        Ok(lock) => Some(lock),
+        Err(e) => {
+            tracing::error!(error = %e, "pack lockfile is unreadable; refusing to change packages");
+            None
+        }
+    }
+}
+
+fn write_approvals(approvals: &maki_pack::approvals::Approvals) -> bool {
+    let Some(path) = approvals_path() else {
+        return false;
+    };
+    match serde_json::to_string_pretty(approvals) {
+        Ok(text) => match write_atomically(&path, &text) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::error!(path = %path.display(), %error, "failed to write pack approvals");
+                false
+            }
+        },
+        Err(error) => {
+            tracing::error!(%error, "failed to serialize pack approvals");
+            false
+        }
+    }
+}
+
+fn write_lockfile(path: &Path, lock: &maki_pack::lockfile::Lockfile) -> bool {
+    match lock.to_json() {
+        Ok(text) => match write_atomically(path, &text) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(path = %path.display(), error = %e, "failed to write pack lockfile");
+                false
+            }
+        },
+        Err(e) => {
+            tracing::error!(error = %e, "failed to serialize pack lockfile");
+            false
+        }
+    }
+}
+
+fn write_atomically(path: &Path, text: &str) -> Result<(), maki_storage::StorageError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    maki_storage::atomic_write(path, text.as_bytes())
 }
 
 /// Something the walk could not use, and the name it had for it.
@@ -222,6 +840,11 @@ pub fn discover(site: &Path) -> Discovery {
                     dir: root,
                     eager,
                     requested,
+                    // Found by walking `pack/<group>/`, which is where a user
+                    // puts files by hand. Maki's own checkouts are resolved
+                    // through the lockfile, never discovered this way.
+                    origin: Origin::Manual,
+                    revision_guard: None,
                 });
             }
         }
@@ -235,9 +858,15 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::error::PluginError;
-    use crate::plugin_permissions::Permission;
+    use crate::plugin_permissions::{Permission, Requested};
 
-    use super::{MANAGED_GROUP, Problem, discover, sanitize_message};
+    use super::{
+        DiscoveredPackage, MANAGED_GROUP, Origin, Problem, discover, granted,
+        installed_from_declared_source, missing_permissions, read_approvals_file, read_lockfile,
+        resolved_on_disk, sanitize_message,
+    };
+
+    const TEST_REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
     fn terminal_messages_keep_layout_but_remove_control_characters() {
@@ -247,11 +876,237 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_lockfile_read_error_is_not_treated_as_a_missing_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        assert!(read_lockfile(Some(dir.path())).is_none());
+    }
+
+    #[test]
+    fn a_missing_lockfile_reads_as_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("missing.json");
+
+        assert!(read_lockfile(Some(&path)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_malformed_approval_store_is_not_treated_as_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("approvals.json");
+        fs::write(&path, "not json").unwrap();
+
+        assert!(read_approvals_file(&path).is_none());
+    }
+
+    #[test]
+    fn a_missing_approval_store_reads_as_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("approvals.json");
+
+        assert!(read_approvals_file(&path).unwrap().is_empty());
+    }
+
     fn make_package(site: &Path, group: &str, sub: &str, name: &str) -> PathBuf {
         let dir = site.join("pack").join(group).join(sub).join(name);
         fs::create_dir_all(dir.join("plugin")).unwrap();
         fs::write(dir.join("plugin").join("init.lua"), "").unwrap();
         dir
+    }
+
+    /// Builds a package whose manifest asks for everything, which is the
+    /// interesting case: the question is never what it asked for, but whose
+    /// word turns the request into a grant.
+    fn greedy(name: &str, origin: Origin) -> DiscoveredPackage {
+        let manifest = toml::from_str::<toml::Value>(
+            "[permissions]\nfs_read = true\nfs_write = true\nnet = true\nrun = true\nenv = true\n",
+        )
+        .unwrap();
+        DiscoveredPackage {
+            name: name.to_owned(),
+            dir: PathBuf::from("/nowhere"),
+            eager: true,
+            requested: Requested::from_manifest(&manifest),
+            origin,
+            revision_guard: None,
+        }
+    }
+
+    /// A package the user placed by hand is trusted like `init.lua`: they put
+    /// the files there, so its manifest is their own statement.
+    #[test]
+    fn a_manual_package_is_granted_what_its_manifest_asks_for() {
+        let pkg = greedy("demo", Origin::Manual);
+        let effective = granted(&pkg, &maki_pack::approvals::Approvals::default());
+
+        for perm in Permission::ALL {
+            assert!(
+                effective.is_allowed(perm),
+                "{perm} should be granted to a manually installed package"
+            );
+        }
+    }
+
+    /// The negative half of the pair above, and the defect this exists to
+    /// prevent: downloaded code must not be able to certify its own
+    /// permissions by writing them into the manifest it ships.
+    #[test]
+    fn a_fetched_package_is_granted_nothing_without_an_approval() {
+        let pkg = greedy(
+            "demo",
+            Origin::Fetched {
+                src: "https://example.com/demo".to_owned(),
+            },
+        );
+        let effective = granted(&pkg, &maki_pack::approvals::Approvals::default());
+
+        for perm in Permission::ALL {
+            assert!(
+                !effective.is_allowed(perm),
+                "{perm} must not be granted to fetched code with no approval"
+            );
+        }
+    }
+
+    /// An approval grants only what it names, and only where the package also
+    /// asked for it. Both halves have to agree.
+    #[test]
+    fn a_fetched_package_is_granted_the_intersection_of_request_and_approval() {
+        let src = "https://example.com/demo";
+        let pkg = greedy(
+            "demo",
+            Origin::Fetched {
+                src: src.to_owned(),
+            },
+        );
+
+        let mut approvals = maki_pack::approvals::Approvals::default();
+        approvals.approve(
+            &maki_pack::approvals::ApprovalKey::new("demo", src),
+            vec!["run".to_owned()],
+        );
+        let effective = granted(&pkg, &approvals);
+
+        assert!(effective.is_allowed(Permission::Run), "run was approved");
+        assert!(
+            !effective.is_allowed(Permission::Net),
+            "net was requested but never approved"
+        );
+    }
+
+    /// The reason an approval is keyed by source as well as name. Pointing a
+    /// name at another repository is a new trust decision, so the grants
+    /// recorded for the old one must not carry over.
+    #[test]
+    fn an_approval_does_not_survive_a_changed_source() {
+        let mut approvals = maki_pack::approvals::Approvals::default();
+        approvals.approve(
+            &maki_pack::approvals::ApprovalKey::new("demo", "https://example.com/demo"),
+            vec!["run".to_owned()],
+        );
+
+        let moved = greedy(
+            "demo",
+            Origin::Fetched {
+                src: "https://elsewhere.example/demo".to_owned(),
+            },
+        );
+        assert!(
+            !granted(&moved, &approvals).is_allowed(Permission::Run),
+            "an approval for one repository must not grant another"
+        );
+    }
+
+    #[test]
+    fn missing_permissions_reports_each_unapproved_request() {
+        let manifest = toml::from_str::<toml::Value>(
+            "[permissions]\nfs_read = true\nnet = true\nrun = true\n",
+        )
+        .unwrap();
+        let requested = Requested::from_manifest(&manifest);
+
+        assert_eq!(
+            missing_permissions(&requested, &["net".to_owned()]),
+            ["fs_read".to_owned(), "run".to_owned()]
+        );
+    }
+
+    fn declared_pack(name: &str, src: &str) -> crate::api::pack::Declared {
+        crate::api::pack::Declared {
+            spec: maki_pack::Spec::new(src).with_name(name),
+            load: crate::api::pack::LoadMode::Eager,
+            confirm: true,
+            data: None,
+        }
+    }
+
+    /// Sets up a site where `name` is installed from `src` at one revision.
+    fn installed_site(name: &str, src: &str) -> (tempfile::TempDir, maki_pack::lockfile::Lockfile) {
+        let site = tempfile::TempDir::new().unwrap();
+        let mut lock = maki_pack::lockfile::Lockfile::default();
+        lock.record(name, src, TEST_REV);
+        fs::create_dir_all(maki_pack::paths::revision_dir(site.path(), name, TEST_REV)).unwrap();
+        (site, lock)
+    }
+
+    /// The rule that decides whether installing is a fresh trust decision.
+    /// `.maki/init.lua` is project local, so a repository maki opens can point
+    /// a name the user already trusts somewhere else: matching on the name
+    /// alone skipped the prompt and cloned the new source on the strength of
+    /// the old decision.
+    #[test]
+    fn a_package_is_only_installed_when_the_recorded_source_matches() {
+        let src = "https://example.com/demo";
+        let (site, lock) = installed_site("demo", src);
+        let manager = maki_pack::manager::Manager::new(site.path());
+
+        assert!(
+            installed_from_declared_source(&declared_pack("demo", src), &lock, &manager),
+            "same name, same source, and on disk"
+        );
+        assert!(
+            !installed_from_declared_source(
+                &declared_pack("demo", "https://elsewhere.example/demo"),
+                &lock,
+                &manager
+            ),
+            "a name pointed at another repository is a new trust decision"
+        );
+    }
+
+    /// A held lock stops an install, but it does not make the packages already
+    /// on disk disappear. Discovery skips the managed group, so reporting none
+    /// left the session with every managed package missing.
+    #[test]
+    fn packages_already_on_disk_resolve_without_git_or_a_lock() {
+        let src = "https://example.com/demo";
+        let (site, lock) = installed_site("demo", src);
+
+        let mut failures = Vec::new();
+        let found = resolved_on_disk(
+            &[declared_pack("demo", src)],
+            site.path(),
+            &lock,
+            &mut failures,
+        );
+        assert_eq!(found.len(), 1, "the installed package is still usable");
+        assert_eq!(found[0].name, "demo");
+        assert_eq!(
+            found[0].dir,
+            maki_pack::paths::revision_dir(site.path(), "demo", TEST_REV)
+        );
+
+        let moved = resolved_on_disk(
+            &[declared_pack("demo", "https://elsewhere.example/demo")],
+            site.path(),
+            &lock,
+            &mut failures,
+        );
+        assert!(
+            moved.is_empty(),
+            "the recorded revision describes the old source only"
+        );
     }
 
     /// A package maki itself refused is still a name the user can write in

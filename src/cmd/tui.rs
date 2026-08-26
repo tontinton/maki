@@ -11,7 +11,7 @@ use color_eyre::eyre::Context;
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
 use maki_config::{Config, load_env_files, load_permissions};
-use maki_lua::PluginHost;
+use maki_lua::{Interaction, PluginHost};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
@@ -85,7 +85,7 @@ fn load_config(
     plugin_host: &PluginHost,
     cli: &Cli,
     cwd: &Path,
-    names: &[String],
+    names: &super::KnownNames<'_>,
 ) -> Result<Config> {
     let raw_config = plugin_host
         .load_init_files_or_skip(cli.no_plugins, cwd)
@@ -93,8 +93,9 @@ fn load_config(
 
     let mut config = raw_config
         .unwrap_or_default()
-        .into_config(names)
+        .into_config(&names(plugin_host)?)
         .context("invalid config")?;
+    config.permissions = load_permissions(cwd);
     config.permissions = load_permissions(cwd);
 
     if cli.yolo || config.always_yolo {
@@ -132,7 +133,6 @@ fn config_or_fallback(
         (Err(e), None) => Err(e),
     }
 }
-
 /// The one construction path for a generation: first startup passes
 /// `fallback: None` (fail-fast); `/reload` passes the last-good config and
 /// model so a broken config reopens the UI with a warning instead of exiting.
@@ -140,6 +140,7 @@ fn build_stack(
     cli: &Cli,
     cwd: &Path,
     storage: &StateDir,
+    interaction: Interaction,
     fallback: Option<(Config, Model)>,
 ) -> Result<(Stack, Vec<String>)> {
     let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
@@ -154,6 +155,7 @@ fn build_stack(
         } else {
             super::BuiltinFailure::Fatal
         },
+        interaction,
         |host, names, warnings| {
             config_or_fallback(
                 load_config(host, cli, cwd, names),
@@ -246,7 +248,14 @@ pub fn run(mut cli: Cli) -> Result<()> {
     load_env_files(&cwd);
     warn_stale_config_toml(&cwd);
 
-    let (mut stack, startup_warnings) = build_stack(&cli, &cwd, &storage, None)?;
+    // Only the interactive UI can answer an install confirmation, so the other
+    // modes refuse the install with its reason even when a terminal is attached.
+    let interaction = if cli.print || cli.is_sdk_mode() {
+        Interaction::None
+    } else {
+        Interaction::Tty
+    };
+    let (mut stack, startup_warnings) = build_stack(&cli, &cwd, &storage, interaction, None)?;
 
     setup::init_logging(&stack.config.storage);
     setup::init_telemetry(&stack.config.telemetry);
@@ -405,7 +414,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 stack.plugin_host.begin_shutdown();
                 ToolRegistry::global().clear_lua();
                 teardown.defer(move || drop(stack));
-                let (new_stack, new_warnings) = build_stack(&cli, &cwd, &storage, Some(last_good))?;
+                let (new_stack, new_warnings) =
+                    build_stack(&cli, &cwd, &storage, interaction, Some(last_good))?;
                 tabs = reloaded;
                 if tabs.is_empty() {
                     let session = AppSession::new(&new_stack.model.spec(), &cwd_str);
@@ -448,6 +458,10 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn no_names(_: &PluginHost) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 
     /// `second_saw_first` requires both joins: `defer` joining the first
     /// closure before spawning the second, and `Drop` joining the second
@@ -544,7 +558,7 @@ mod tests {
         let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
             .expect("live host boots under --no-plugins");
 
-        let config = load_config(&plugin_host, &cli, dir.path(), &[])
+        let config = load_config(&plugin_host, &cli, dir.path(), &no_names)
             .expect("no-plugins must skip the broken init.lua and still load defaults");
         assert!(
             !config.plugins.names.is_empty(),
@@ -582,7 +596,7 @@ mod tests {
         let mut plugin_host =
             PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
 
-        match load_config(&plugin_host, &cli, dir.path(), &[]) {
+        match load_config(&plugin_host, &cli, dir.path(), &no_names) {
             Err(_) => {}
             Ok(_) => panic!("broken init.lua must error without --no-plugins"),
         }

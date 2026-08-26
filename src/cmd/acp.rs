@@ -25,12 +25,13 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
         &mut plugin_host,
         no_plugins,
         super::BuiltinFailure::Fatal,
+        maki_lua::Interaction::None,
         |host, names, _| {
             let mut config = host
                 .load_init_files_or_skip(no_plugins, &cwd)
                 .context("load init.lua files")?
                 .unwrap_or_default()
-                .into_config(names)
+                .into_config(&names(host)?)
                 .context("invalid config")?;
             config.permissions = load_permissions(&cwd);
 

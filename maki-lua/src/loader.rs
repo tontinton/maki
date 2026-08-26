@@ -16,7 +16,9 @@ use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
 use crate::error::PluginError;
 use crate::pack::DiscoveredPackage;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
-use crate::runtime::{self, ClickFallback, LoadChunk, LuaThread, Request, RestoreItem};
+use crate::runtime::{
+    self, ClickFallback, ConfigScope, LoadChunk, LuaThread, Request, RestoreItem,
+};
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -255,12 +257,20 @@ impl PluginHost {
         let mut merged: Option<RawConfig> = None;
 
         for global_dir in maki_config::global_config_dirs() {
-            self.run_init_file(&global_dir.join("init.lua"), "global/init.lua", &mut merged)?;
+            self.run_init_file(
+                &global_dir.join("init.lua"),
+                ConfigScope::Global,
+                &mut merged,
+            )?;
             if merged.is_some() {
                 break;
             }
         }
-        self.run_init_file(&cwd.join(".maki/init.lua"), "project/init.lua", &mut merged)?;
+        self.run_init_file(
+            &cwd.join(".maki/init.lua"),
+            ConfigScope::Project,
+            &mut merged,
+        )?;
 
         Ok(merged)
     }
@@ -282,7 +292,7 @@ impl PluginHost {
     fn run_init_file(
         &self,
         path: &Path,
-        label: &str,
+        scope: ConfigScope,
         merged: &mut Option<RawConfig>,
     ) -> Result<(), PluginError> {
         if !path.is_file() {
@@ -293,7 +303,7 @@ impl PluginHost {
             source: e,
         })?;
         let plugin_dir = path.parent().map(Path::to_path_buf);
-        if let Some(raw) = self.send_run_init_lua(source, label.to_owned(), plugin_dir)? {
+        if let Some(raw) = self.send_config_lua(source, scope, plugin_dir)? {
             match merged {
                 Some(existing) => existing.merge(raw),
                 None => *merged = Some(raw),
@@ -361,11 +371,14 @@ impl PluginHost {
                 None,
                 PluginPermissions::trusted(),
                 opts,
+                None,
+                false,
             )?;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn send_load(
         &self,
         name: Arc<str>,
@@ -373,6 +386,8 @@ impl PluginHost {
         plugin_dir: Option<PathBuf>,
         permissions: PluginPermissions,
         opts: PluginOpts,
+        revision_guard: Option<Arc<maki_pack::lock::Lock>>,
+        package: bool,
     ) -> Result<(), PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
@@ -383,6 +398,8 @@ impl PluginHost {
                 plugin_dir,
                 permissions,
                 opts,
+                revision_guard,
+                package,
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
@@ -406,12 +423,21 @@ impl PluginHost {
         source_name: String,
         plugin_dir: Option<PathBuf>,
     ) -> Result<Option<RawConfig>, PluginError> {
+        self.send_config_lua(source, ConfigScope::named(source_name), plugin_dir)
+    }
+
+    fn send_config_lua(
+        &self,
+        source: String,
+        scope: ConfigScope,
+        plugin_dir: Option<PathBuf>,
+    ) -> Result<Option<RawConfig>, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
             .tx
             .send(Request::RunInitLua {
                 source,
-                source_name,
+                scope,
                 plugin_dir,
                 reply: reply_tx,
             })
@@ -448,6 +474,8 @@ impl PluginHost {
             None,
             PluginPermissions::trusted(),
             Arc::new(opts),
+            None,
+            false,
         )
     }
 
@@ -463,6 +491,8 @@ impl PluginHost {
             None,
             permissions,
             PluginOpts::default(),
+            None,
+            false,
         )
     }
 
@@ -483,7 +513,44 @@ impl PluginHost {
             plugin_dir,
             permissions,
             PluginOpts::default(),
+            None,
+            false,
         )
+    }
+
+    /// Packages declared by `maki.pack.add` in `init.lua`.
+    ///
+    /// Read after the init files have run, which is when the declared set is
+    /// complete and before anything is installed.
+    pub fn declared_packages(&self) -> Result<Vec<crate::api::pack::Declared>, PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::CollectPackages { reply: reply_tx })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    fn run_pack_loader(
+        &self,
+        declared: crate::api::pack::Declared,
+        package: &DiscoveredPackage,
+        permissions: PluginPermissions,
+        opts: PluginOpts,
+    ) -> Result<(), PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::RunPackLoader {
+                declared,
+                path: package.dir.clone(),
+                permissions,
+                opts,
+                revision_guard: package.revision_guard.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)?
     }
 
     /// Loads one external package directory as a single owner.
@@ -497,6 +564,17 @@ impl PluginHost {
         dir: &Path,
         permissions: PluginPermissions,
         opts: PluginOpts,
+    ) -> Result<(), PluginError> {
+        self.load_package_with_guard(name, dir, permissions, opts, None)
+    }
+
+    fn load_package_with_guard(
+        &self,
+        name: &str,
+        dir: &Path,
+        permissions: PluginPermissions,
+        opts: PluginOpts,
+        revision_guard: Option<Arc<maki_pack::lock::Lock>>,
     ) -> Result<(), PluginError> {
         // Refused here and not only in discovery, because loading an owner
         // drops that owner's existing registrations first. A package named
@@ -532,15 +610,22 @@ impl PluginHost {
             })?;
             chunks.push(LoadChunk::new(path.display().to_string(), source));
         }
-        self.send_load(Arc::from(name), chunks, Some(root), permissions, opts)
+        self.send_load(
+            Arc::from(name),
+            chunks,
+            Some(root),
+            permissions,
+            opts,
+            revision_guard,
+            true,
+        )
     }
-
     /// Refuses further `maki.packadd` calls, and returns anything the queue
     /// still holds.
     ///
     /// One call and not a read followed by a close, because a Lua task can
     /// record an activation between the two and closing would strand it.
-    fn seal_pack_ops(&self) -> Result<Vec<crate::api::pack::PackOp>, PluginError> {
+    pub fn seal_pack_ops(&self) -> Result<Vec<crate::api::pack::PackOp>, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
             .tx
@@ -575,6 +660,24 @@ impl PluginHost {
         packages: &[DiscoveredPackage],
         config: &PluginsConfig,
     ) -> Vec<String> {
+        self.load_packages_inner(packages, &[], config)
+    }
+
+    pub fn load_declared_packages(
+        &self,
+        packages: &[DiscoveredPackage],
+        declared: &[crate::api::pack::Declared],
+        config: &PluginsConfig,
+    ) -> Vec<String> {
+        self.load_packages_inner(packages, declared, config)
+    }
+
+    fn load_packages_inner(
+        &self,
+        packages: &[DiscoveredPackage],
+        declared: &[crate::api::pack::Declared],
+        config: &PluginsConfig,
+    ) -> Vec<String> {
         let mut failures = Vec::new();
         let mut loaded: Vec<&str> = Vec::new();
         let mut round: Vec<&DiscoveredPackage> = packages
@@ -593,11 +696,32 @@ impl PluginHost {
                     .cloned()
                     .map(Arc::new)
                     .unwrap_or_default();
-                // A package the user installed by hand is granted what it asks
-                // for. Only a package maki fetched needs an approval as well.
-                let permissions = pkg.requested.clone().granted_for_manual_install();
+                let permissions = crate::pack::effective_permissions(pkg);
                 loaded.push(&pkg.name);
-                if let Err(e) = self.load_package(&pkg.name, &pkg.dir, permissions, opts) {
+                let custom = declared
+                    .iter()
+                    .find(|declaration| declaration.spec.name == pkg.name)
+                    .filter(|declaration| {
+                        matches!(declaration.load, crate::api::pack::LoadMode::Custom(_))
+                            && matches!(
+                                &pkg.origin,
+                                crate::pack::Origin::Fetched { src }
+                                    if src == &declaration.spec.src
+                            )
+                    });
+                let result = match custom {
+                    Some(declaration) => {
+                        self.run_pack_loader(declaration.clone(), pkg, permissions, opts)
+                    }
+                    None => self.load_package_with_guard(
+                        &pkg.name,
+                        &pkg.dir,
+                        permissions,
+                        opts,
+                        pkg.revision_guard.clone(),
+                    ),
+                };
+                if let Err(e) = result {
                     tracing::error!(
                         package = %pkg.name,
                         path = %pkg.dir.display(),

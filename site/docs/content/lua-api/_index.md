@@ -84,6 +84,7 @@ The rules:
 | Module | What it is for |
 | --- | --- |
 | [`maki`](#maki) | The global entry point. |
+| [`maki.pack`](#maki-pack) | Declare global packages and inspect package state. |
 | [`maki.api`](#maki-api) | Plugin registration. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
@@ -185,20 +186,62 @@ maki.split("\nhello\nworld\n", "\n", { trimempty = true }) -- { "hello", "world"
 maki.packadd({name})
 ```
 
-Activate an installed `opt/` package, like `:packadd`.
-
-Loading happens after this call returns. The startup package pass reports
-an unknown, disabled, or failed package.
+Load an installed package that is not active.
 
 **Parameters:**
 
-- `{name}` (`string`) Package to activate.
+- `{name}` (`string`) Package name.
+
+
+## maki.pack {#maki-pack}
+
+Declare global packages and inspect package state.
+
+`add` is available only in the global `init.lua`. `get` is read-only
+and is available in project config and packages.
+
+---
+
+### `maki.pack.add()` {#maki-pack-add}
+
+```lua
+maki.pack.add({specs}, {opts?})
+```
+
+Declare global packages after the global `init.lua` finishes.
+
+**Parameters:**
+
+- `{specs}` (`table`) Sources or tables with `src`, `name`, `version`, and `data`.
+- `{opts?}` (`table?`) `confirm` controls source confirmation. `load` is a
+
+  boolean or a custom loader function.
+
 
 **Example:**
 
 ```lua
-maki.packadd("maki-goal")
+maki.pack.add({
+  { src = "https://github.com/user/maki-goal", version = "main" },
+})
 ```
+
+---
+
+### `maki.pack.get()` {#maki-pack-get}
+
+```lua
+maki.pack.get({names?}, {opts?})
+```
+
+Get package state without changing the installed set.
+
+**Parameters:**
+
+- `{names?}` (`table?`) Package names. Omit for all managed packages.
+- `{opts?}` (`table?`) Reserved. Omit it.
+
+**Returns:** (`table`) Package records with `spec`, `path`, `rev`, and `active`.
 
 
 ## maki.api {#maki-api}
