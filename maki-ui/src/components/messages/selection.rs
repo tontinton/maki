@@ -26,27 +26,26 @@ pub(super) fn extract_selection_text(
         }
 
         // The rows we copy come from this wrap at the real width, so clamp
-        // against it: a reflow can shrink a segment under a stored row, and
-        // the layout height can predate a resize entirely.
-        let drawn = seg.drawn_height(width);
-        let tmp_area = Rect::new(0, 0, width, drawn);
+        // against it: a reflow can shrink a segment under a stored row.
+        let rows = seg.height(width);
+        let tmp_area = Rect::new(0, 0, width, rows);
         let mut tmp = Buffer::empty(tmp_area);
         Paragraph::new(seg.lines().to_vec())
             .wrap(Wrap { trim: false })
             .render(tmp_area, &mut tmp);
 
         let (rel_start, start_col) = if i == start.seg {
-            (start.row.min(drawn), start.col.saturating_sub(msg_area.x))
+            (start.row.min(rows), start.col.saturating_sub(msg_area.x))
         } else {
             (0, 0)
         };
         let (rel_end, end_col) = if i == end.seg {
             (
-                end.row.saturating_add(1).min(drawn),
+                end.row.saturating_add(1).min(rows),
                 end.col.saturating_sub(msg_area.x),
             )
         } else {
-            (drawn, width.saturating_sub(1))
+            (rows, width.saturating_sub(1))
         };
 
         let ss = ScreenSelection {

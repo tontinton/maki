@@ -788,8 +788,8 @@ impl MessagesPanel {
         let width = area.width.saturating_sub(1);
         let theme_gen = theme::generation();
         let theme_changed = self.theme_generation != theme_gen;
-        let width_changed = self.viewport_width != width || theme_changed;
-        if width_changed {
+        let needs_reflow = self.viewport_width != width || theme_changed;
+        if needs_reflow {
             self.viewport_width = width;
             self.theme_generation = theme_gen;
         }
@@ -806,8 +806,8 @@ impl MessagesPanel {
             return;
         }
 
-        if width_changed {
-            self.cache.mark_all_width_stale();
+        if needs_reflow {
+            self.cache.mark_all_stale();
             let thinking = thinking_style();
             let assistant = assistant_style();
             self.streaming_thinking.set_style(
@@ -1416,7 +1416,8 @@ impl MessagesPanel {
     /// Re-lays out the stale segments the viewport plus its margin reaches.
     /// The scroll position names a segment, so reflowing cannot slide the
     /// content the reader is looking at; the window only has to cover what is
-    /// on screen.
+    /// on screen. Skipping the rest only costs fidelity, see
+    /// [`Segment::stale`].
     ///
     /// Heights are counted after each segment is reflowed, so the window is
     /// right the first time.
@@ -1487,8 +1488,8 @@ impl MessagesPanel {
             .get(msg_idx)
             .is_some_and(|m| matches!(m.role, DisplayRole::Thinking) && m.thinking_collapsed);
         if collapsed {
-            // Geometry is width-independent, but `width_changed` also fires on
-            // theme changes; rebuild so spans pick up the new palette.
+            // Geometry is width-independent, but a theme change marks segments
+            // stale too; rebuild so spans pick up the new palette.
             self.rebuild_thinking_segment(msg_idx, width);
         } else {
             self.reflow_text_segment(seg_idx, width);

@@ -63,7 +63,12 @@ pub(super) struct Segment {
     pub spinner_lines: Vec<(usize, usize)>,
     snapshot_base: Option<usize>,
     pub content_indent: &'static str,
-    /// Lines were laid out at a width or theme that is no longer current.
+    /// The lines were built for another width or theme, so code blocks and
+    /// tables are still wrapped to the old width and spans carry the old
+    /// palette. Only the content ages, never the height, so a segment the
+    /// reflow window never reaches merely looks dated; it cannot desync the
+    /// layout from what is painted.
+    ///
     /// Cleared by `set_lines` (whole vector replaced) and up front by
     /// `reflow_segment`; partial splices (`apply_highlight_result`) leave it
     /// set so the segment still reflows later.
@@ -108,18 +113,13 @@ impl Segment {
         self.invalidate_height();
     }
 
-    /// Height in the document layout. While `stale` is set this is the height
-    /// measured at an older width, which is what keeps a resize off the
-    /// O(transcript) path: re-measuring means re-wrapping every line.
-    ///
-    /// Render, [`super::scroll::Layout`] and the scrollbar all read this same
-    /// number so the layout stays self consistent, and `reflow_viewport` keeps
-    /// every segment the viewport can reach fresh. A caller that re-wraps the
-    /// lines itself has to use `drawn_height`, or it disagrees with the layout
-    /// by however much the width moved.
+    /// Rows the lines take at `width`, measured at that width whatever
+    /// [`Self::stale`] says. Render, [`super::scroll::Layout`], the scrollbar
+    /// and the copy path all read this one number, so none of them can
+    /// disagree on how tall a segment is.
     pub fn height(&self, width: u16) -> u16 {
         if let Some(c) = self.cached_height.get()
-            && (c.at_width == width || self.stale)
+            && c.at_width == width
         {
             return c.height;
         }
@@ -129,12 +129,6 @@ impl Segment {
             height: h,
         }));
         h
-    }
-
-    /// Rows the lines really take at `width`, ignoring the cache. Same as
-    /// `height` for any segment that is not stale.
-    pub fn drawn_height(&self, width: u16) -> u16 {
-        wrap::total_rows(&self.lines, width)
     }
 
     /// Maps a display row (after wrapping) back to the source line index.
@@ -347,7 +341,7 @@ impl SegmentCache {
             .collect()
     }
 
-    pub fn mark_all_width_stale(&mut self) {
+    pub fn mark_all_stale(&mut self) {
         for seg in &mut self.segments {
             seg.stale = true;
         }

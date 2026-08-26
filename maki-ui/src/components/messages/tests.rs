@@ -1077,6 +1077,35 @@ fn extract_selection_copies_visible_content_only() {
     );
 }
 
+/// A segment far above the viewport is never reflowed, so its lines stay
+/// wrapped for the old width. The copy path must still yield the whole
+/// message: sizing the buffer from a height measured at another width used to
+/// clip every off-screen line it copied.
+#[test]
+fn copy_after_resize_keeps_offscreen_text() {
+    const MSGS: usize = 30;
+    let body = "x".repeat(60);
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    for i in 0..MSGS {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("m{i:02}{body}"),
+        ));
+    }
+    render(&mut panel, 80, 10);
+    render(&mut panel, 40, 10);
+
+    let area = Rect::new(0, 0, 40, 10);
+    let sel = make_sel(&panel, area, (0, 0), (panel.layout().total_rows() - 1, 39));
+
+    let text = panel.extract_selection_text(&sel, area);
+    assert!(
+        text.contains(&format!("m00{body}")),
+        "off-screen message was truncated in the copy: {text:?}"
+    );
+}
+
 #[test]
 fn toggle_returns_false_for_non_expandable() {
     let mut panel = panel_with_long_tool(3);
@@ -2054,55 +2083,55 @@ fn stream_reset_clears_thinking_expand_state() {
 }
 
 #[test]
-fn stale_height_keeps_the_old_width_but_drawn_height_does_not() {
-    let long_line = Line::from("x".repeat(80));
-    let mut seg = Segment::with_lines(vec![long_line.clone()], "test".into(), None);
+fn height_measures_the_width_asked_for_even_while_stale() {
+    let mut seg = Segment::with_lines(vec![Line::from("x".repeat(80))], "test".into(), None);
+    // Measure once so the cache holds a height for the pre-resize width.
+    assert_eq!(seg.height(80), 1, "80 chars at width 80 fits on one line");
 
-    let h_wide = seg.height(80);
-    assert_eq!(h_wide, 1, "80 chars at width 80 fits on one line");
-
-    // Keeping the old height is what keeps a resize cheap: the document
-    // layout stays put until the segment is really reflowed.
+    // Staleness is about content, not geometry, and every caller has to see
+    // the same number or the copy path clips what the screen paints.
     seg.stale = true;
     assert_eq!(
         seg.height(40),
-        h_wide,
-        "stale segment should return old cached height, not recompute"
-    );
-    // Callers that re-wrap the lines themselves need the real number.
-    assert_eq!(
-        seg.drawn_height(40),
         2,
-        "drawn_height must report what the lines really take at the new width"
+        "a stale segment must report what its lines really draw as"
     );
-
-    seg.set_lines(vec![long_line]);
-    assert_eq!(seg.height(40), 2, "80 chars at width 40 wraps to two lines");
 }
 
+/// The copy path sizes its buffer from `height` and then re-wraps the lines
+/// itself, so a height left over from the old width used to clip every off
+/// screen line it copied.
 #[test]
-fn copy_after_resize_keeps_offscreen_text() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    let body = "x".repeat(60);
-    for i in 0..30 {
-        panel.push(DisplayMessage::new(
-            DisplayRole::Assistant,
-            format!("m{i:02}{body}"),
-        ));
-    }
-    render(&mut panel, 80, 10);
-    render(&mut panel, 40, 10);
+fn resize_leaves_the_document_a_fresh_panel_would_build() {
+    const WIDE: u16 = 120;
+    const NARROW: u16 = 40;
+    const HEIGHT: u16 = 10;
 
-    let total = panel.layout().total_rows();
-    let area = Rect::new(0, 0, 40, 10);
-    let sel = make_sel(&panel, area, (0, 0), (total - 1, 39));
-    let text = panel.extract_selection_text(&sel, area);
+    let body = "x".repeat(120);
+    let texts: Vec<String> = (0..40).map(|i| format!("m{i:02} {body}")).collect();
+    let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
 
-    // The top of the transcript is far off-screen and never gets reflowed.
-    // Selection sizes its buffer from `height` and then re-wraps, so a height
-    // measured at the old width would clip every line it copies.
+    let mut resized = panel_with_msgs(&texts, WIDE, HEIGHT);
+    render(&mut resized, NARROW, HEIGHT);
     assert!(
-        text.contains(&format!("m00{body}")),
+        resized.cache.segments().iter().any(|s| s.stale),
+        "the test needs segments the reflow window never reached"
+    );
+
+    let total = resized.layout().total_rows();
+    assert_eq!(
+        total,
+        panel_with_msgs(&texts, NARROW, HEIGHT)
+            .layout()
+            .total_rows(),
+        "stale segments must be measured at the width on screen"
+    );
+
+    let area = Rect::new(0, 0, NARROW, HEIGHT);
+    let sel = make_sel(&resized, area, (0, 0), (total - 1, NARROW - 1));
+    let text = resized.extract_selection_text(&sel, area);
+    assert!(
+        text.contains(texts[0]),
         "off-screen message was truncated in the copy: {text:?}"
     );
 }
@@ -2187,7 +2216,7 @@ fn reflow_rebuilds_collapsed_thinking_instead_of_only_stamping() {
     // Change what the indicator renders, then mark it stale the way a theme
     // change does. Clearing the flag without rebuilding keeps the old spans.
     panel.messages[0].text = "one\ntwo\nthree\nfour".to_string();
-    panel.cache.mark_all_width_stale();
+    panel.cache.mark_all_stale();
     render(&mut panel, 80, 10);
 
     assert!(
@@ -2209,7 +2238,7 @@ fn reflow_runs_without_a_width_or_scroll_change() {
     render(&mut panel, 80, 10);
 
     // Segments go stale between frames without either trigger firing.
-    panel.cache.mark_all_width_stale();
+    panel.cache.mark_all_stale();
     render(&mut panel, 80, 10);
 
     assert!(
