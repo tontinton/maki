@@ -212,6 +212,12 @@ impl OpenAiCompatProvider {
         let url = format!("{base}/models");
         let body_text = self.get_text(auth, &url).await?;
         let body: Value = serde_json::from_str(&body_text)?;
+        debug!(
+            provider = self.config.provider_name,
+            base_url = %base,
+            response = %serde_json::to_string_pretty(&body).unwrap_or_else(|_| body_text.clone()),
+            "live /models response"
+        );
 
         let mut models: Vec<crate::model::ModelInfo> = body["data"]
             .as_array()
