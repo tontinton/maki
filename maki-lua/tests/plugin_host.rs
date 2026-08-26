@@ -2749,14 +2749,10 @@ fn monitor_plugin_writes_logs_and_reports_after_exit() {
     );
 
     host.event_handle().end_session(session, true);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::path::Path::new(&stdout_path).exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "SessionEnd should remove the session's monitor log directory"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    assert!(
+        std::path::Path::new(&stdout_path).exists(),
+        "SessionEnd must keep monitor logs so callers can collect them after the session ends"
+    );
 }
 
 #[test]

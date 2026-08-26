@@ -39,8 +39,9 @@ stdout/stderr into a directory as they arrive:
 ```
 
 `peek` and the exit observation keep a short tail in memory (the host tracks
-this regardless of the plugin, so it survives a reload too); the files are
+this regardless of the plugin, so it survives a reload too). The files are
 the source of truth for anything past that tail. On session end the host
-kills the process group and the plugin removes that session's log directory.
+kills the process group. Log files stay so a headless caller can still
+collect stdout, stderr, and meta after the session returns.
 
 The generated [tool reference](/docs/tools/#monitor) and [Lua API](/docs/lua-api/) list every parameter.

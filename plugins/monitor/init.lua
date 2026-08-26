@@ -407,17 +407,3 @@ process. Default wait is 30s, max 10 minutes. timeout_ms 0 is an immediate peek.
     return table.concat(chunks, "\n")
   end,
 })
-
-maki.api.create_autocmd("SessionEnd", {
-  callback = function(ev)
-    local session_id = ev.data and ev.data.session_id
-    if not session_id then
-      return
-    end
-    local root = maki.env.logs_dir()
-    if not root then
-      return
-    end
-    maki.fs.rm(maki.fs.joinpath(root, session_id), { recursive = true, force = true })
-  end,
-})
