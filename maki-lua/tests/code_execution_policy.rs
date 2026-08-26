@@ -2,11 +2,16 @@
 //! gates both `describe` text and the handler's fn-map, so what the model
 //! sees is exactly what the interpreter can call.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use maki_agent::AgentMode;
+use maki_agent::mcp::McpSession;
+use maki_agent::mcp::test_support::stub_session;
 use maki_agent::tools::test_support::stub_ctx;
-use maki_agent::tools::{DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry};
+use maki_agent::tools::{
+    DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry, local_tool,
+};
 use maki_lua::PluginHost;
 
 const CODE_EXECUTION_SRC: &str = include_str!("../../plugins/code_execution/init.lua");
@@ -20,6 +25,22 @@ const WORKFLOW_NOTE_SUBSTR: &str = "Workflow mode: orchestrate subagents";
 const INTERP_ECHO_SIG: &str = "- interp_echo(msg: str, count: int = None, flag: bool = None, items: list = None, raw: any = None) -> str";
 const WF_TASK_SIG: &str = "- wf_task(prompt: str, model_tier: str = None) -> str";
 const SUB_TOOL_SIG: &str = "- sub_tool() -> str";
+const MCP_NOTE_SUBSTR: &str = "callable here too";
+const MCP_TOOL_QUALIFIED: &str = "srv.fetch_issue";
+const MCP_TOOL_WIRE: &str = "srv__fetch_issue";
+const GATED_QUALIFIED: &str = "srv.gated";
+const GATED_WIRE: &str = "srv__gated";
+/// The stub transport fails every request with this, so seeing it proves the
+/// call reached MCP instead of dying at name lookup.
+const MCP_REACHED_ERR: &str = "unknown MCP tool";
+const NAME_ERROR: &str = "NameError";
+const CODE_EXECUTION: &str = "code_execution";
+const TOOLS_MCP_PROBE: &str = "tools_mcp_probe";
+/// Stands in for an ACP client tool: dispatched from the context, not the
+/// registry.
+const CLIENT_TOOL: &str = "client_probe";
+const CLIENT_TOOL_OUT: &str = "client ran";
+const MAIN_ONLY_NAME: &str = "main_only_probe";
 
 fn fixture_plugin() -> String {
     format!(
@@ -63,6 +84,39 @@ maki.api.register_tool({{
     handler = function() return {{ llm_output = "{FAIL_MSG}", is_error = true }} end,
 }})
 maki.api.register_tool({{
+    name = "{GATED_WIRE}",
+    description = "registry tool wearing an MCP wire name",
+    audiences = {{ "main", "interpreter" }},
+    schema = {{ type = "object", properties = {{}}, additionalProperties = false }},
+    handler = function() return "" end,
+}})
+maki.api.register_tool({{
+    name = "{TOOLS_MCP_PROBE}",
+    description = "returns the code_execution description agent.tools built",
+    audiences = {{ "main" }},
+    schema = {{
+        type = "object",
+        required = {{ "mcp" }},
+        properties = {{ mcp = {{ type = "boolean" }} }},
+        additionalProperties = false,
+    }},
+    handler = function(input, ctx)
+        local defs, err = maki.agent.tools(ctx, {{ audience = "main", mcp = input.mcp }})
+        if err then return {{ llm_output = err, is_error = true }} end
+        for _, d in ipairs(defs) do
+            if d.name == "{CODE_EXECUTION}" then return d.description end
+        end
+        return {{ llm_output = "{CODE_EXECUTION} missing", is_error = true }}
+    end,
+}})
+maki.api.register_tool({{
+    name = "{MAIN_ONLY_NAME}",
+    description = "registry tool a client tool may shadow",
+    audiences = {{ "main" }},
+    schema = {{ type = "object", properties = {{}}, additionalProperties = false }},
+    handler = function() return "" end,
+}})
+maki.api.register_tool({{
     name = "sub_tool",
     description = "subagent fixture",
     audiences = {{ "general_sub", "interpreter" }},
@@ -86,8 +140,8 @@ fn setup() -> (Arc<ToolRegistry>, PluginHost) {
     setup_with(Arc::new(ToolRegistry::new()))
 }
 
-/// Uses the global native registry because `interpreter_bridge::dispatch` does.
-/// Safe: nextest runs each test in its own process.
+/// The plugin lists callable tools through `maki.api.get_tools()`, which reads
+/// the global registry. Safe: nextest runs each test in its own process.
 fn setup_native() -> (Arc<ToolRegistry>, PluginHost) {
     setup_with(Arc::clone(ToolRegistry::global_arc()))
 }
@@ -98,31 +152,41 @@ fn describe(
     audience: ToolAudience,
     workflow: bool,
 ) -> String {
-    reg.get("code_execution")
+    reg.get(CODE_EXECUTION)
         .expect("code_execution registered")
         .tool
         .description(&DescriptionContext {
             filter,
             audience,
             workflow,
+            mcp: false,
         })
         .into_owned()
 }
 
-fn exec_code(reg: &ToolRegistry, ctx: &ToolContext, code: &str) -> Result<String, String> {
-    let entry = reg
-        .get("code_execution")
-        .expect("code_execution registered");
-    let inv = entry
-        .tool
-        .parse(&serde_json::json!({ "code": code, "timeout": 10 }))
-        .expect("parse failed");
+fn run_tool(
+    reg: &ToolRegistry,
+    ctx: &ToolContext,
+    name: &str,
+    input: serde_json::Value,
+) -> Result<String, String> {
+    let entry = reg.get(name).unwrap_or_else(|| panic!("{name} registered"));
+    let inv = entry.tool.parse(&input).expect("parse failed");
     smol::block_on(async { inv.execute(ctx).await })
         .output
         .map(|out| match out {
             maki_agent::ToolOutput::Plain(s) => s.text,
             other => panic!("unexpected output: {other:?}"),
         })
+}
+
+fn exec_code(reg: &ToolRegistry, ctx: &ToolContext, code: &str) -> Result<String, String> {
+    run_tool(
+        reg,
+        ctx,
+        CODE_EXECUTION,
+        serde_json::json!({ "code": code, "timeout": 10 }),
+    )
 }
 
 fn run_code_in(code: &str, workflow: bool) -> Result<String, String> {
@@ -243,6 +307,98 @@ fn workflow_tool_callable_when_workflow_true() {
     let out = run_code_in("result = await wf_task(prompt='x')\nprint(result)", true)
         .expect("workflow tool must be callable when workflow=true");
     assert!(out.contains(&format!("{TASK_PREFIX}x")), "got: {out}");
+}
+
+// --- context tools (MCP, client tools) ---
+
+fn run_code_with_mcp(
+    code: &str,
+    mcp: McpSession,
+    audience: ToolAudience,
+) -> Result<String, String> {
+    let (reg, _host) = setup_native();
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.registry = Arc::clone(&reg);
+    ctx.audience = audience;
+    ctx.mcp = Some(mcp);
+    exec_code(&reg, &ctx, code)
+}
+
+/// A caller that drops MCP for a subagent must not hand it a description
+/// promising MCP tools that subagent cannot call.
+#[test_case::test_case(true ; "session_keeps_mcp")]
+#[test_case::test_case(false ; "session_drops_mcp")]
+fn agent_tools_describes_mcp_only_when_the_session_keeps_it(enabled: bool) {
+    let (reg, _host) = setup_native();
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.registry = Arc::clone(&reg);
+    ctx.mcp = Some(stub_session(&[(MCP_TOOL_QUALIFIED, "")]));
+    let desc = run_tool(
+        &reg,
+        &ctx,
+        TOOLS_MCP_PROBE,
+        serde_json::json!({ "mcp": enabled }),
+    )
+    .expect("probe must describe code_execution");
+    assert_eq!(
+        desc.matches(MCP_NOTE_SUBSTR).count(),
+        usize::from(enabled),
+        "got: {desc}"
+    );
+}
+
+/// The stub leaves the tool deferred, so binding it means reading the MCP index
+/// rather than the request's tool array.
+#[test]
+fn deferred_mcp_tool_is_callable_from_the_sandbox() {
+    let err = run_code_with_mcp(
+        &format!("await {MCP_TOOL_WIRE}()"),
+        stub_session(&[(MCP_TOOL_QUALIFIED, "")]),
+        ToolAudience::MAIN,
+    )
+    .expect_err("the stub transport fails every call");
+    assert!(err.contains(MCP_REACHED_ERR), "got: {err}");
+    assert!(!err.contains(NAME_ERROR), "got: {err}");
+}
+
+fn run_code_with_client_tool(code: &str, name: &str) -> Result<String, String> {
+    let (reg, _host) = setup_native();
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.registry = Arc::clone(&reg);
+    ctx.local_tools = Arc::new(HashMap::from([(
+        name.to_owned(),
+        local_tool(|_, _| Box::pin(async { Ok(CLIENT_TOOL_OUT.to_owned()) })),
+    )]));
+    exec_code(&reg, &ctx, code)
+}
+
+/// A nested call resolves names exactly like the model's own, so a client tool
+/// the registry never heard of is callable. One that shadows a registry entry is
+/// not: that entry is `main`-only, and precedence must not launder its audience
+/// into the interpreter.
+#[test]
+fn client_tool_binds_unless_the_registry_holds_the_name() {
+    let out = run_code_with_client_tool(&format!("print(await {CLIENT_TOOL}())"), CLIENT_TOOL)
+        .expect("a client tool must be callable");
+    assert!(out.contains(CLIENT_TOOL_OUT), "got: {out}");
+
+    let err = run_code_with_client_tool(&format!("await {MAIN_ONLY_NAME}()"), MAIN_ONLY_NAME)
+        .expect_err("a shadowed registry name must not be bound at all");
+    assert!(err.contains(NAME_ERROR), "got: {err}");
+}
+
+/// A registry tool wears the same wire name as an MCP tool, and its audience
+/// keeps it out of this sandbox. Binding the name would hand the script the tool
+/// anyway, through MCP's back door.
+#[test]
+fn mcp_name_never_reaches_an_audience_gated_registry_tool() {
+    let err = run_code_with_mcp(
+        &format!("await {GATED_WIRE}()"),
+        stub_session(&[(GATED_QUALIFIED, "")]),
+        ToolAudience::GENERAL_SUB,
+    )
+    .expect_err("a gated name must not be bound at all");
+    assert!(err.contains(NAME_ERROR), "got: {err}");
 }
 
 // --- script rendering ---

@@ -687,6 +687,7 @@ pub fn prompt(
             filter: &ToolFilter::All,
             audience: ToolAudience::MAIN,
             workflow: false,
+            mcp: false,
         };
         let defs = reg.definitions(&vars, &ctx, true);
         if names {

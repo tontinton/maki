@@ -10,16 +10,10 @@ use tracing::{debug, error, warn};
 
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
-use crate::tools::registry::{ToolInvocation, ToolRegistry};
-use crate::tools::{LocalToolFn, ToolContext, truncate_bytes};
+use crate::tools::registry::{RegisteredTool, ToolInvocation};
+use crate::tools::{CallOrigin, LocalToolFn, ToolContext, truncate_bytes};
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::ToolKey;
-
-#[derive(Clone, Copy)]
-pub enum Emit {
-    Notify,
-    Silent,
-}
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
@@ -27,11 +21,9 @@ const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
 
-const SOURCE_NATIVE: &str = "native";
 const SOURCE_LOCAL: &str = "local";
+const SOURCE_MCP: &str = "mcp";
 const SOURCE_UNKNOWN: &str = "unknown";
-/// A name that still carries one means the MCP server behind it is gone.
-const MCP_NAME_SEPARATOR: &str = "__";
 const BASH_TOOL: &str = "bash";
 const BASH_COMMAND_FIELD: &str = "command";
 const GIT_COMMIT: &str = "git commit";
@@ -83,58 +75,116 @@ impl RecentCalls {
 /// Every tool call in maki lands here (native, Lua, MCP, subagents, batch
 /// children), which makes it the one place telemetry has to wrap.
 pub async fn run(
-    registry: &ToolRegistry,
-    mcp: Option<&McpSession>,
     id: String,
     name: &str,
     input: &Value,
     ctx: &ToolContext,
-    emit: Emit,
+    origin: CallOrigin,
 ) -> ToolDoneEvent {
+    let resolved = resolve(ctx, name);
     if !maki_otel::enabled() {
-        return run_inner(registry, mcp, id, name, input, ctx, emit).await;
+        return run_inner(resolved, id, input, ctx, origin).await;
     }
-    let canonical = super::streaming::canonical_tool_name(name);
-    let source = tool_source(registry, ctx, canonical);
+    let name = resolved.name;
+    let source = resolved.route.source();
     let started = Instant::now();
-    let done = run_inner(registry, mcp, id, name, input, ctx, emit).await;
-    report(&done, canonical, &source, input, started.elapsed());
+    let done = run_inner(resolved, id, input, ctx, origin).await;
+    report(&done, name, &source, input, started.elapsed());
     done
+}
+
+/// Where a name goes for one context. Dispatch and telemetry read this one
+/// answer, so a name can never be reported as one thing and run as another.
+enum Route<'a> {
+    Local(&'a LocalToolFn),
+    Native(RegisteredTool),
+    ToolSearch(&'a McpSession),
+    Mcp(&'a McpSession, Arc<str>),
+    Unknown,
+}
+
+impl Route<'_> {
+    /// Registry tools report the plugin behind them, because "native" alone
+    /// tells whoever reads the metric nothing.
+    fn source(&self) -> Cow<'static, str> {
+        match self {
+            Self::Native(entry) => entry.source.as_log_field(),
+            Self::Local(_) => Cow::Borrowed(SOURCE_LOCAL),
+            Self::Mcp(..) => Cow::Borrowed(SOURCE_MCP),
+            Self::ToolSearch(_) => Cow::Borrowed(TOOL_SEARCH_TOOL_NAME),
+            Self::Unknown => Cow::Borrowed(SOURCE_UNKNOWN),
+        }
+    }
+}
+
+/// A canonical name paired with where it goes. Only [`resolve`] builds one, so
+/// no caller can act on a name it forgot to canonicalize.
+struct Resolved<'a> {
+    name: &'a str,
+    route: Route<'a>,
+}
+
+/// Precedence, highest first: client (ACP) tools, the registry, then MCP.
+/// The context is the only input, because resolving against one session and
+/// executing against another is how a tool escapes its audience.
+fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
+    // Names coming back from model JSON (batch children, `call_tool`, the
+    // interpreter bridge) never passed through streaming.rs, so clean up here.
+    let name = super::streaming::canonical_tool_name(name);
+    let route = if let Some(local) = ctx.local_tools.get(name) {
+        Route::Local(local)
+    } else if let Some(entry) = ctx.registry.get(name) {
+        Route::Native(entry)
+    } else if let Some(mcp) = ctx.mcp.as_ref() {
+        match mcp.resolve(name) {
+            Some(qualified) => Route::Mcp(mcp, qualified),
+            None if name == TOOL_SEARCH_TOOL_NAME => Route::ToolSearch(mcp),
+            None => Route::Unknown,
+        }
+    } else {
+        Route::Unknown
+    };
+    Resolved { name, route }
 }
 
 /// Parse errors and unknown tools skip the start event so the UI never
 /// shows a phantom spinner.
 async fn run_inner(
-    registry: &ToolRegistry,
-    mcp: Option<&McpSession>,
+    resolved: Resolved<'_>,
     id: String,
-    name: &str,
     input: &Value,
     ctx: &ToolContext,
-    emit: Emit,
+    origin: CallOrigin,
 ) -> ToolDoneEvent {
-    // Covers names re-entering from model JSON (batch children, `call_tool`,
-    // the interpreter bridge); streamed names are canonicalized in streaming.rs.
-    let name = super::streaming::canonical_tool_name(name);
-    if let Some(local) = ctx.local_tools.get(name) {
-        return run_local_tool(local, id, name, input, ctx, emit).await;
-    }
-    let entry = registry.get(name);
-    // LLM providers send tool names in wire format (server__tool) but our
-    // internal index uses server.tool. Only convert if the name isn't a
-    // native tool — avoids mangling native names that happen to contain __.
-    let mcp_name;
-    let mcp_lookup = if entry.is_none() && name.contains("__") && mcp.is_some() {
-        mcp_name = crate::mcp::internal_tool_name(name);
-        mcp_name.as_str()
-    } else {
-        name
+    let name = resolved.name;
+    let entry = match resolved.route {
+        Route::Local(local) => return run_local_tool(local, id, name, input, ctx, origin).await,
+        Route::ToolSearch(mcp) => return run_tool_search(mcp, id, input, ctx, origin),
+        Route::Mcp(mcp, qualified) => {
+            emit_raw_start(
+                ctx,
+                origin,
+                &id,
+                &qualified,
+                format!("mcp: {qualified}"),
+                input,
+            );
+            return execute_mcp_tool(ctx, mcp, &id, qualified, input, origin).await;
+        }
+        Route::Unknown => {
+            warn!(tool = %name, "unknown tool");
+            return ToolDoneEvent {
+                id,
+                tool: Arc::from(UNKNOWN_MCP),
+                output: ToolOutput::Plain(format!("{UNKNOWN_TOOL_PREFIX}: {name}").into()),
+                is_error: true,
+                annotation: None,
+                written_path: None,
+            };
+        }
+        Route::Native(entry) => entry,
     };
-    let tool_id: Arc<str> = entry
-        .as_ref()
-        .map(|e| Arc::from(e.tool.name()))
-        .or_else(|| mcp.map(|m| m.interned_name(mcp_lookup)))
-        .unwrap_or_else(|| Arc::from(UNKNOWN_MCP));
+    let tool_id: Arc<str> = Arc::from(entry.tool.name());
     let started = Instant::now();
 
     let done_error = |msg: String| ToolDoneEvent {
@@ -146,106 +196,88 @@ async fn run_inner(
         written_path: None,
     };
 
-    if let Some(entry) = entry {
-        let invocation = match entry.tool.parse(input) {
-            Ok(inv) => inv,
-            Err(e) => {
+    let invocation = match entry.tool.parse(input) {
+        Ok(inv) => inv,
+        Err(e) => {
+            warn!(
+                tool = %name,
+                source = %entry.source.as_log_field(),
+                input_preview = %crate::tools::schema::preview(&input.to_string()),
+                error = %e,
+                "tool input parse failed"
+            );
+            return done_error(e.to_string());
+        }
+    };
+
+    if let Some(target) = invocation.mutable_path() {
+        let is_plan_target = ctx.mode.plan_path().is_some_and(|pp| target == pp);
+        if !is_plan_target {
+            if ctx.mode.plan_path().is_some() {
                 warn!(
                     tool = %name,
-                    source = %entry.source.as_log_field(),
-                    input_preview = %crate::tools::schema::preview(&input.to_string()),
-                    error = %e,
-                    "tool input parse failed"
+                    target = %target.display(),
+                    "blocked write in plan mode"
                 );
-                return done_error(e.to_string());
+                return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
             }
-        };
-
-        if let Some(target) = invocation.mutable_path() {
-            let is_plan_target = ctx.mode.plan_path().is_some_and(|pp| target == pp);
-            if !is_plan_target {
-                if ctx.mode.plan_path().is_some() {
-                    warn!(
-                        tool = %name,
-                        target = %target.display(),
-                        "blocked write in plan mode"
-                    );
-                    return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
-                }
-                if let Some(reason) = ctx.permissions.boundary_block_reason(target) {
-                    return done_error(reason);
-                }
+            if let Some(reason) = ctx.permissions.boundary_block_reason(target) {
+                return done_error(reason);
             }
         }
+    }
 
-        let header_result = invocation.start_header().await;
-        let start = ToolStartEvent {
-            id: id.clone(),
-            tool: Arc::clone(&tool_id),
-            summary: header_result.text(),
-            render_header: header_result.snapshot(),
-            annotation: invocation.start_annotation(),
-            input: None,
-            raw_input: Some(input.clone()),
-            output: invocation.start_output(ctx),
-        };
-        if matches!(emit, Emit::Notify) {
-            let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
-        }
+    let header_result = invocation.start_header().await;
+    let start = ToolStartEvent {
+        id: id.clone(),
+        tool: Arc::clone(&tool_id),
+        summary: header_result.text(),
+        render_header: header_result.snapshot(),
+        annotation: invocation.start_annotation(),
+        input: None,
+        raw_input: Some(input.clone()),
+        output: invocation.start_output(ctx),
+    };
+    if origin.is_model() {
+        let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
+    }
 
-        invocation.start(ctx).await;
+    invocation.start(ctx).await;
 
-        if let Err(e) = enforce_permission(invocation.as_ref(), name, ctx, &id).await {
-            return done_error(e);
-        }
+    if let Err(e) = enforce_permission(invocation.as_ref(), name, ctx, &id).await {
+        return done_error(e);
+    }
 
-        let result = invocation.execute(ctx).await;
+    let result = invocation.execute(ctx).await;
 
-        let elapsed = started.elapsed();
-        match result.output {
-            Ok(output) => {
-                debug!(
-                    tool = %name,
-                    source = %entry.source.as_log_field(),
-                    elapsed_ms = elapsed.as_millis() as u64,
-                    "tool ok"
-                );
-                ToolDoneEvent {
-                    id,
-                    tool: tool_id,
-                    output,
-                    is_error: false,
-                    annotation: result.annotation,
-                    written_path: result.written_path,
-                }
-            }
-            Err(message) => {
-                warn!(
-                    tool = %name,
-                    source = %entry.source.as_log_field(),
-                    elapsed_ms = elapsed.as_millis() as u64,
-                    error = %message,
-                    "tool failed"
-                );
-                done_error(message)
+    let elapsed = started.elapsed();
+    match result.output {
+        Ok(output) => {
+            debug!(
+                tool = %name,
+                source = %entry.source.as_log_field(),
+                elapsed_ms = elapsed.as_millis() as u64,
+                "tool ok"
+            );
+            ToolDoneEvent {
+                id,
+                tool: tool_id,
+                output,
+                is_error: false,
+                annotation: result.annotation,
+                written_path: result.written_path,
             }
         }
-    } else if let Some(mcp) = mcp.filter(|_| name == TOOL_SEARCH_TOOL_NAME) {
-        run_tool_search(mcp, id, input, ctx, emit)
-    } else if mcp.is_some_and(|m| m.has_tool(mcp_lookup)) {
-        emit_raw_start(
-            ctx,
-            emit,
-            &id,
-            &tool_id,
-            format!("mcp: {mcp_lookup}"),
-            input,
-        );
-        execute_mcp_tool(ctx, &id, tool_id, mcp_lookup, input).await
-    } else {
-        let msg = format!("{UNKNOWN_TOOL_PREFIX}: {mcp_lookup}");
-        warn!(tool = %mcp_lookup, "unknown tool");
-        done_error(msg)
+        Err(message) => {
+            warn!(
+                tool = %name,
+                source = %entry.source.as_log_field(),
+                elapsed_ms = elapsed.as_millis() as u64,
+                error = %message,
+                "tool failed"
+            );
+            done_error(message)
+        }
     }
 }
 
@@ -253,13 +285,13 @@ async fn run_inner(
 /// so there is no parsed input to show; the UI gets the raw JSON instead.
 fn emit_raw_start(
     ctx: &ToolContext,
-    emit: Emit,
+    origin: CallOrigin,
     id: &str,
     tool: &Arc<str>,
     summary: String,
     input: &Value,
 ) {
-    if !matches!(emit, Emit::Notify) {
+    if !origin.is_model() {
         return;
     }
     let start = ToolStartEvent {
@@ -282,12 +314,12 @@ fn run_tool_search(
     id: String,
     input: &Value,
     ctx: &ToolContext,
-    emit: Emit,
+    origin: CallOrigin,
 ) -> ToolDoneEvent {
     let tool_id: Arc<str> = Arc::from(TOOL_SEARCH_TOOL_NAME);
     let query = input["query"].as_str().unwrap_or_default();
-    emit_raw_start(ctx, emit, &id, &tool_id, query.to_owned(), input);
-    let (output, is_error) = match mcp.search_tools(query) {
+    emit_raw_start(ctx, origin, &id, &tool_id, query.to_owned(), input);
+    let (output, is_error) = match mcp.search_tools(query, origin) {
         Ok(out) => (out, false),
         Err(e) => (e, true),
     };
@@ -307,10 +339,10 @@ async fn run_local_tool(
     name: &str,
     input: &Value,
     ctx: &ToolContext,
-    emit: Emit,
+    origin: CallOrigin,
 ) -> ToolDoneEvent {
     let tool_id: Arc<str> = Arc::from(name);
-    emit_raw_start(ctx, emit, &id, &tool_id, name.to_owned(), input);
+    emit_raw_start(ctx, origin, &id, &tool_id, name.to_owned(), input);
     let tool_ctx = ToolContext {
         tool_use_id: Some(id.clone()),
         ..ctx.clone()
@@ -367,14 +399,15 @@ async fn enforce_permission(
 
 async fn execute_mcp_tool(
     ctx: &ToolContext,
+    mcp: &McpSession,
     id: &str,
-    tool_id: Arc<str>,
-    tool_name: &str,
+    tool: Arc<str>,
     input: &Value,
+    origin: CallOrigin,
 ) -> ToolDoneEvent {
     let done = |output: String, is_error: bool| ToolDoneEvent {
         id: id.to_owned(),
-        tool: Arc::clone(&tool_id),
+        tool: Arc::clone(&tool),
         output: ToolOutput::Plain(output.into()),
         is_error,
         annotation: None,
@@ -385,10 +418,10 @@ async fn execute_mcp_tool(
         return done(MCP_BLOCKED_IN_PLAN.into(), true);
     }
 
-    let perm_tool = match ToolKey::parse(tool_name) {
+    let perm_tool = match ToolKey::parse(&tool) {
         Ok(k) => k,
         Err(e) => {
-            return done(format!("invalid MCP tool key '{tool_name}': {e}"), true);
+            return done(format!("invalid MCP tool key '{tool}': {e}"), true);
         }
     };
     let perm_scope = truncate_bytes(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
@@ -410,14 +443,10 @@ async fn execute_mcp_tool(
         return done(e.to_string(), true);
     }
 
-    let Some(mcp) = &ctx.mcp else {
-        return done(format!("MCP manager not available for {tool_name}"), true);
-    };
-
-    // A permitted call to a deferred tool counts as loading it, so its full
-    // definition joins the next request; a denied call must not load anything.
-    mcp.mark_loaded(tool_name);
-    match mcp.call_tool(tool_name, input).await {
+    // A permitted call counts as loading the tool, so its definition joins the
+    // next request; a denied one must not load anything.
+    mcp.mark_loaded(&tool, origin);
+    match mcp.call_tool(&tool, input).await {
         Ok(text) => done(text, false),
         Err(e) => done(e.to_string(), true),
     }
@@ -427,7 +456,6 @@ async fn execute_mcp_tool(
 pub(super) async fn process_tool_calls(
     response: maki_providers::StreamResponse,
     recent_calls: &mut RecentCalls,
-    mcp: Option<&McpSession>,
     history: &mut super::history::History,
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
@@ -472,18 +500,8 @@ pub(super) async fn process_tool_calls(
             tool_use_id: Some(id.clone()),
             ..ctx.clone()
         };
-        let mcp_owned = mcp.cloned();
         set.spawn(async move {
-            let done = run(
-                &tool_ctx.registry,
-                mcp_owned.as_ref(),
-                id,
-                &name,
-                &input,
-                &tool_ctx,
-                Emit::Notify,
-            )
-            .await;
+            let done = run(id, &name, &input, &tool_ctx, CallOrigin::Model).await;
             event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done.clone())));
             done
         });
@@ -511,17 +529,6 @@ pub(super) async fn process_tool_calls(
     })?;
     history.push(tool_msg);
     Ok(())
-}
-
-fn tool_source(registry: &ToolRegistry, ctx: &ToolContext, name: &str) -> Cow<'static, str> {
-    if ctx.local_tools.contains_key(name) {
-        return Cow::Borrowed(SOURCE_LOCAL);
-    }
-    match registry.get(name) {
-        Some(entry) => entry.source.as_log_field(),
-        None if name.contains(MCP_NAME_SEPARATOR) => Cow::Borrowed(SOURCE_UNKNOWN),
-        None => Cow::Borrowed(SOURCE_NATIVE),
-    }
 }
 
 /// Low-cardinality buckets, because a raw error message would give the
@@ -596,37 +603,43 @@ fn report(done: &ToolDoneEvent, name: &str, source: &str, input: &Value, took: D
     }
 }
 
-/// Test-only entry that skips native lookup, letting plan-mode and MCP tests
-/// exercise the dispatch path without registering a fake native tool.
-#[cfg(test)]
-async fn dispatch_mcp(
-    ctx: &ToolContext,
-    id: &str,
-    tool_name: &str,
-    input: &Value,
-) -> ToolDoneEvent {
-    let tool_id = ctx
-        .mcp
-        .as_ref()
-        .map(|m| m.interned_name(tool_name))
-        .unwrap_or_else(|| Arc::from(UNKNOWN_MCP));
-    execute_mcp_tool(ctx, id, tool_id, tool_name, input).await
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use maki_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
-    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
     use crate::AgentMode;
+    use crate::mcp::test_support::stub_session;
+    use crate::mcp::tool_names;
     use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
-    use crate::tools::registry::ToolSource;
-    use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
+    use crate::tools::interpreter_bridge::context_tools;
+    use crate::tools::registry::{ToolRegistry, ToolSource};
+    use crate::tools::test_support::{
+        GUARDED_TOOL_NAME, GuardedMock, mock_tool, stub_ctx, stub_ctx_with_permissions,
+    };
+    use crate::tools::{
+        BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
+        PermissionScopes, Tool, ToolAudience, ToolExecResult,
+    };
+
+    const TEST_ID: &str = "t1";
+    const PROBE_WIRE: &str = "srv__probe";
+    const PROBE_QUALIFIED: &str = "srv.probe";
+    const OTHER_WIRE: &str = "srv__other";
+    const OTHER_QUALIFIED: &str = "srv.other";
+    const SHADOWED_NAME: &str = "batch";
+    const CLIENT_NAME: &str = "client_probe";
+    const TEST_PLUGIN: &str = "test";
+    const TEST_PLUGIN_SOURCE: &str = "lua:test";
+    const START_PROBE_NAME: &str = "start_probe";
+    /// Allowed by the shared stub permissions; nothing is ever written here.
+    const TEST_ROOT: &str = "/tmp";
+    const PLAN_PATH: &str = "/tmp/plan.md";
 
     fn recent_calls(entries: &[(&str, Value)]) -> RecentCalls {
         let mut rc = RecentCalls::new();
@@ -667,34 +680,84 @@ mod tests {
         ctx
     }
 
+    async fn dispatch(ctx: &ToolContext, name: &str, input: &Value) -> ToolDoneEvent {
+        run(TEST_ID.into(), name, input, ctx, CallOrigin::Model).await
+    }
+
+    async fn dispatch_nested(ctx: &ToolContext, name: &str, input: &Value) -> ToolDoneEvent {
+        run(TEST_ID.into(), name, input, ctx, CallOrigin::Nested).await
+    }
+
+    fn with_mcp(mut ctx: ToolContext, mcp: &McpSession) -> ToolContext {
+        ctx.mcp = Some(mcp.clone());
+        ctx
+    }
+
+    /// Publishes the tools with empty descriptions: search matches on the name.
+    fn stub_mcp(qualified: &[&str]) -> McpSession {
+        let tools: Vec<_> = qualified.iter().map(|name| (*name, "")).collect();
+        stub_session(&tools)
+    }
+
+    fn mcp_ctx(mcp: &McpSession) -> ToolContext {
+        with_mcp(stub_ctx(&AgentMode::Build), mcp)
+    }
+
+    fn registered(tool: Arc<dyn Tool>) -> Arc<ToolRegistry> {
+        let registry = ToolRegistry::new();
+        register(&registry, tool);
+        Arc::new(registry)
+    }
+
+    fn register(registry: &ToolRegistry, tool: Arc<dyn Tool>) {
+        registry
+            .register(
+                tool,
+                ToolSource::Lua {
+                    plugin: TEST_PLUGIN.into(),
+                },
+            )
+            .unwrap();
+    }
+
+    fn registry_with(names: &[&str]) -> Arc<ToolRegistry> {
+        let registry = ToolRegistry::new();
+        for name in names {
+            register(&registry, mock_tool(name, ToolAudience::all()));
+        }
+        Arc::new(registry)
+    }
+
+    fn denying_ctx(tool: ToolKey) -> ToolContext {
+        let config = PermissionsConfig {
+            rules: vec![PermissionRule {
+                tool,
+                scope: None,
+                effect: Effect::Deny,
+            }],
+            ..Default::default()
+        };
+        let permissions = Arc::new(PermissionManager::new(
+            config,
+            PathBuf::from(TEST_ROOT),
+            Arc::default(),
+        ));
+        stub_ctx_with_permissions(&AgentMode::Build, permissions)
+    }
+
     #[test]
     fn local_tool_shadows_registry_and_maps_errors() {
         smol::block_on(async {
-            let ctx = local_ctx("batch", |input| Ok(format!("local:{}", input["path"])));
-            let done = run(
-                ToolRegistry::global(),
-                None,
-                "t1".into(),
-                "batch",
-                &serde_json::json!({"path": "/a"}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
+            let mut ctx = local_ctx(SHADOWED_NAME, |input| {
+                Ok(format!("local:{}", input["path"]))
+            });
+            ctx.registry = registry_with(&[SHADOWED_NAME]);
+            let done = dispatch(&ctx, SHADOWED_NAME, &serde_json::json!({"path": "/a"})).await;
             assert!(!done.is_error);
             assert_eq!(done.output.as_text(), r#"local:"/a""#);
 
             let ctx = local_ctx("boom", |_| Err("nope".into()));
-            let done = run(
-                ToolRegistry::global(),
-                None,
-                "t2".into(),
-                "boom",
-                &serde_json::json!({}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
+            let done = dispatch(&ctx, "boom", &serde_json::json!({})).await;
             assert!(done.is_error);
             assert_eq!(done.output.as_text(), "nope");
         });
@@ -704,16 +767,7 @@ mod tests {
     fn functions_prefixed_name_dispatches_to_canonical_tool() {
         smol::block_on(async {
             let ctx = local_ctx("ok", |_| Ok("ran".into()));
-            let done = run(
-                ToolRegistry::global(),
-                None,
-                "t1".into(),
-                "functions.ok",
-                &serde_json::json!({}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
+            let done = dispatch(&ctx, "functions.ok", &serde_json::json!({})).await;
             assert!(!done.is_error);
             assert_eq!(done.output.as_text(), "ran");
         });
@@ -737,16 +791,7 @@ mod tests {
             ctx.local_tools = Arc::new(map);
 
             let input = serde_json::json!({"path": "/a"});
-            let done = run(
-                ToolRegistry::global(),
-                None,
-                "t1".into(),
-                "local_echo",
-                &input,
-                &ctx,
-                Emit::Notify,
-            )
-            .await;
+            let done = dispatch(&ctx, "local_echo", &input).await;
             assert!(!done.is_error);
 
             let envelope = rx
@@ -764,26 +809,21 @@ mod tests {
     #[test]
     fn tool_search_routes_and_loads_matches() {
         smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
-            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
-            let done = run(
-                ToolRegistry::global(),
-                Some(&mcp),
-                "t1".into(),
+            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
+            let done = dispatch(
+                &mcp_ctx(&mcp),
                 TOOL_SEARCH_TOOL_NAME,
-                &serde_json::json!({"query": "issue"}),
-                &ctx,
-                Emit::Silent,
+                &serde_json::json!({"query": "probe"}),
             )
             .await;
             assert!(!done.is_error, "got: {}", done.output.as_text());
             assert_eq!(done.tool.as_ref(), TOOL_SEARCH_TOOL_NAME);
-            assert!(done.output.as_text().contains("srv__fetch_issue"));
+            assert!(done.output.as_text().contains(PROBE_WIRE));
 
             let mut tools = serde_json::json!([]);
             mcp.extend_tools(&mut tools);
             assert!(
-                crate::mcp::tool_names(&tools).contains(&"srv__fetch_issue"),
+                tool_names(&tools).contains(&PROBE_WIRE),
                 "searched tool must join the next request"
             );
         });
@@ -793,16 +833,10 @@ mod tests {
     #[test_case(serde_json::json!({}) ; "missing_query")]
     fn tool_search_bad_query_is_error_event(input: Value) {
         smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.tool", "")]);
-            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
-            let done = run(
-                ToolRegistry::global(),
-                Some(&mcp),
-                "t1".into(),
+            let done = dispatch(
+                &mcp_ctx(&stub_mcp(&[PROBE_QUALIFIED])),
                 TOOL_SEARCH_TOOL_NAME,
                 &input,
-                &ctx,
-                Emit::Silent,
             )
             .await;
             assert!(done.is_error);
@@ -813,27 +847,37 @@ mod tests {
     #[test]
     fn calling_deferred_mcp_tool_marks_it_loaded() {
         smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "")]);
-            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
-            ctx.mcp = Some(mcp.clone());
-            let done = run(
-                ToolRegistry::global(),
-                Some(&mcp),
-                "t1".into(),
-                "srv__fetch_issue",
-                &serde_json::json!({}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
-            assert_eq!(done.tool.as_ref(), "srv.fetch_issue", "must route to MCP");
+            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
+            let done = dispatch(&mcp_ctx(&mcp), PROBE_WIRE, &serde_json::json!({})).await;
+            assert_eq!(done.tool.as_ref(), PROBE_QUALIFIED, "must route to MCP");
 
             let mut tools = serde_json::json!([]);
             mcp.extend_tools(&mut tools);
             assert_eq!(
-                crate::mcp::tool_names(&tools),
-                vec!["srv__fetch_issue"],
+                tool_names(&tools),
+                vec![PROBE_WIRE],
                 "called tool must join the next request"
+            );
+        });
+    }
+
+    /// `McpSession::new` rebuilds the loaded set from the `ToolUse` blocks in
+    /// history, which hold no nested call, so loading one here would make the
+    /// live tool array differ from the resumed one.
+    #[test_case(PROBE_WIRE, serde_json::json!({}), PROBE_QUALIFIED ; "tool_call")]
+    #[test_case(TOOL_SEARCH_TOOL_NAME, serde_json::json!({"query": "probe"}), TOOL_SEARCH_TOOL_NAME ; "tool_search")]
+    fn nested_call_reaches_mcp_without_loading_anything(name: &str, input: Value, routed: &str) {
+        smol::block_on(async {
+            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
+            let done = dispatch_nested(&mcp_ctx(&mcp), name, &input).await;
+            assert_eq!(done.tool.as_ref(), routed, "must route to MCP");
+
+            let mut tools = serde_json::json!([]);
+            mcp.extend_tools(&mut tools);
+            assert_eq!(
+                tool_names(&tools),
+                vec![TOOL_SEARCH_TOOL_NAME],
+                "a nested call must not change the next request"
             );
         });
     }
@@ -841,36 +885,9 @@ mod tests {
     #[test]
     fn denied_mcp_call_does_not_load_definition() {
         smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "")]);
-            let deny_cfg = PermissionsConfig {
-                rules: vec![PermissionRule {
-                    tool: ToolKey::parse("srv.fetch_issue").unwrap(),
-                    scope: None,
-                    effect: Effect::Deny,
-                }],
-                ..Default::default()
-            };
-            let dir = TempDir::new().unwrap();
-            let permissions = Arc::new(PermissionManager::new(
-                deny_cfg,
-                dir.path().to_path_buf(),
-                Arc::default(),
-            ));
-            let mut ctx = crate::tools::test_support::stub_ctx_with_permissions(
-                &AgentMode::Build,
-                permissions,
-            );
-            ctx.mcp = Some(mcp.clone());
-            let done = run(
-                ToolRegistry::global(),
-                Some(&mcp),
-                "t1".into(),
-                "srv__fetch_issue",
-                &serde_json::json!({}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
+            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
+            let ctx = with_mcp(denying_ctx(ToolKey::parse(PROBE_QUALIFIED).unwrap()), &mcp);
+            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
             assert!(done.is_error);
             assert!(
                 done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
@@ -881,7 +898,7 @@ mod tests {
             let mut tools = serde_json::json!([]);
             mcp.extend_tools(&mut tools);
             assert_eq!(
-                crate::mcp::tool_names(&tools),
+                tool_names(&tools),
                 vec![TOOL_SEARCH_TOOL_NAME],
                 "denied call must not load the definition"
             );
@@ -891,16 +908,15 @@ mod tests {
     #[test]
     fn local_tool_named_tool_search_shadows_mcp_search() {
         smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.tool", "")]);
-            let ctx = local_ctx(TOOL_SEARCH_TOOL_NAME, |_| Ok("local wins".into()));
-            let done = run(
-                ToolRegistry::global(),
-                Some(&mcp),
-                "t1".into(),
-                TOOL_SEARCH_TOOL_NAME,
-                &serde_json::json!({"query": "tool"}),
+            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
+            let ctx = with_mcp(
+                local_ctx(TOOL_SEARCH_TOOL_NAME, |_| Ok("local wins".into())),
+                &mcp,
+            );
+            let done = dispatch(
                 &ctx,
-                Emit::Silent,
+                TOOL_SEARCH_TOOL_NAME,
+                &serde_json::json!({"query": "probe"}),
             )
             .await;
             assert_eq!(done.output.as_text(), "local wins");
@@ -908,101 +924,88 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tool_returns_error_event() {
+    fn telemetry_source_names_the_plugin_for_registry_tools() {
+        let mut ctx = mcp_ctx(&stub_mcp(&[PROBE_QUALIFIED, OTHER_QUALIFIED]));
+        ctx.registry = registry_with(&[PROBE_WIRE]);
+        assert_eq!(resolve(&ctx, PROBE_WIRE).route.source(), TEST_PLUGIN_SOURCE);
+        assert_eq!(resolve(&ctx, OTHER_WIRE).route.source(), SOURCE_MCP);
+    }
+
+    #[test]
+    fn resolve_prefers_local_over_registry_and_registry_over_mcp() {
+        let mcp = stub_mcp(&[PROBE_QUALIFIED]);
+        let mut ctx = with_mcp(local_ctx(PROBE_WIRE, |_| Ok(String::new())), &mcp);
+        ctx.registry = registry_with(&[PROBE_WIRE]);
+
+        assert!(matches!(resolve(&ctx, PROBE_WIRE).route, Route::Local(_)));
+
+        ctx.local_tools = Arc::default();
+        assert!(matches!(resolve(&ctx, PROBE_WIRE).route, Route::Native(_)));
+
+        ctx.registry = Arc::new(ToolRegistry::new());
+        assert!(matches!(resolve(&ctx, PROBE_WIRE).route, Route::Mcp(..)));
+    }
+
+    /// A registry entry is an audience decision about that name, so any name the
+    /// registry holds stays unbound, be it one MCP publishes or one a client
+    /// tool shadows. Deferred MCP tools do bind: hidden from the tool array is
+    /// not the same as uncallable.
+    #[test]
+    fn context_tools_bind_only_names_the_registry_does_not_hold() {
+        let ctx = stub_ctx(&AgentMode::Build);
+        assert!(
+            context_tools(&ctx).is_empty(),
+            "without MCP and client tools there is nothing to bind"
+        );
+
+        let mcp = stub_mcp(&[PROBE_QUALIFIED, OTHER_QUALIFIED]);
+        let mut ctx = with_mcp(local_ctx(CLIENT_NAME, |_| Ok(String::new())), &mcp);
+        assert_eq!(
+            context_tools(&ctx),
+            [CLIENT_NAME, OTHER_WIRE, PROBE_WIRE, TOOL_SEARCH_TOOL_NAME]
+        );
+
+        ctx.registry = registry_with(&[PROBE_WIRE, CLIENT_NAME]);
+        assert_eq!(context_tools(&ctx), [OTHER_WIRE, TOOL_SEARCH_TOOL_NAME]);
+    }
+
+    /// The model only fixes names it recognizes, so it hears back what it sent.
+    #[test_case(None, "nonexistent.tool" ; "without_mcp")]
+    #[test_case(Some(PROBE_QUALIFIED), OTHER_WIRE ; "unpublished_wire_name")]
+    fn unknown_tool_errors_and_echoes_the_name_verbatim(published: Option<&str>, name: &str) {
         smol::block_on(async {
-            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
-            let done = run(
-                &ctx.registry,
-                None,
-                "t1".into(),
-                "nonexistent.tool",
-                &serde_json::json!({}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
+            let mcp = published.map(|tool| stub_mcp(&[tool]));
+            let ctx = match &mcp {
+                Some(mcp) => mcp_ctx(mcp),
+                None => stub_ctx(&AgentMode::Build),
+            };
+            let done = dispatch(&ctx, name, &serde_json::json!({})).await;
             assert!(done.is_error);
             assert_eq!(done.tool.as_ref(), UNKNOWN_MCP);
             let text = done.output.as_text();
-            assert!(text.starts_with(UNKNOWN_TOOL_PREFIX));
-            assert!(text.contains("nonexistent.tool"));
+            assert!(text.starts_with(UNKNOWN_TOOL_PREFIX), "got: {text}");
+            assert!(text.contains(name), "got: {text}");
         });
     }
 
     #[test]
     fn mcp_tool_blocked_in_plan_mode() {
         smol::block_on(async {
-            let result = dispatch_mcp(
-                &crate::tools::test_support::stub_ctx(&AgentMode::Plan(PathBuf::from(
-                    "/tmp/plan.md",
-                ))),
-                "t1",
-                "myserver.mytool",
-                &serde_json::json!({}),
-            )
-            .await;
-            assert!(result.is_error);
-            assert_eq!(result.output.as_text(), MCP_BLOCKED_IN_PLAN);
-        });
-    }
-
-    #[test]
-    fn mcp_tool_errors_without_mcp_manager() {
-        smol::block_on(async {
-            let result = dispatch_mcp(
-                &crate::tools::test_support::stub_ctx(&AgentMode::Build),
-                "t1",
-                "myserver.mytool",
-                &serde_json::json!({}),
-            )
-            .await;
-            assert!(result.is_error);
-            assert!(result.output.as_text().contains("not available"));
+            let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
+            let ctx = with_mcp(stub_ctx(&plan), &stub_mcp(&[PROBE_QUALIFIED]));
+            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), MCP_BLOCKED_IN_PLAN);
         });
     }
 
     #[test]
     fn permission_denial_short_circuits_execute() {
         smol::block_on(async {
-            let deny_cfg = PermissionsConfig {
-                rules: vec![PermissionRule {
-                    tool: ToolKey::native(GUARDED_TOOL_NAME),
-                    scope: None,
-                    effect: Effect::Deny,
-                }],
-                ..Default::default()
-            };
-            let dir = TempDir::new().unwrap();
-            let permissions = Arc::new(PermissionManager::new(
-                deny_cfg,
-                dir.path().to_path_buf(),
-                Arc::default(),
-            ));
-            let ctx = crate::tools::test_support::stub_ctx_with_permissions(
-                &AgentMode::Build,
-                permissions,
-            );
+            let mut ctx = denying_ctx(ToolKey::native(GUARDED_TOOL_NAME));
+            ctx.registry = registered(Arc::new(GuardedMock));
 
-            let registry = ToolRegistry::new();
-            registry
-                .register(
-                    Arc::new(GuardedMock),
-                    ToolSource::Lua {
-                        plugin: "test".into(),
-                    },
-                )
-                .unwrap();
-
-            let done = run(
-                &registry,
-                None,
-                "t1".into(),
-                GUARDED_TOOL_NAME,
-                &serde_json::json!({}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
+            let done = dispatch(&ctx, GUARDED_TOOL_NAME, &serde_json::json!({})).await;
 
             assert!(done.is_error, "permission denial must produce error event");
             assert!(
@@ -1012,15 +1015,6 @@ mod tests {
             );
         });
     }
-
-    const START_PROBE_NAME: &str = "start_probe";
-
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use crate::tools::{
-        BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-        PermissionScopes, Tool, ToolExecResult,
-    };
 
     #[derive(Default)]
     struct StartProbe {
@@ -1076,47 +1070,12 @@ mod tests {
     #[test]
     fn start_runs_before_permission_denial_blocks_execute() {
         smol::block_on(async {
-            let deny_cfg = PermissionsConfig {
-                rules: vec![PermissionRule {
-                    tool: ToolKey::native(START_PROBE_NAME),
-                    scope: None,
-                    effect: Effect::Deny,
-                }],
-                ..Default::default()
-            };
-            let dir = TempDir::new().unwrap();
-            let permissions = Arc::new(PermissionManager::new(
-                deny_cfg,
-                dir.path().to_path_buf(),
-                Arc::default(),
-            ));
-            let ctx = crate::tools::test_support::stub_ctx_with_permissions(
-                &AgentMode::Build,
-                permissions,
-            );
-
+            let mut ctx = denying_ctx(ToolKey::native(START_PROBE_NAME));
             let probe = StartProbe::default();
             let (started, executed) = (Arc::clone(&probe.started), Arc::clone(&probe.executed));
-            let registry = ToolRegistry::new();
-            registry
-                .register(
-                    Arc::new(probe),
-                    ToolSource::Lua {
-                        plugin: "test".into(),
-                    },
-                )
-                .unwrap();
+            ctx.registry = registered(Arc::new(probe));
 
-            let done = run(
-                &registry,
-                None,
-                "t1".into(),
-                START_PROBE_NAME,
-                &serde_json::json!({}),
-                &ctx,
-                Emit::Silent,
-            )
-            .await;
+            let done = dispatch(&ctx, START_PROBE_NAME, &serde_json::json!({})).await;
 
             assert!(done.is_error, "denial must error");
             assert!(

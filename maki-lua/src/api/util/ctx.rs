@@ -5,9 +5,7 @@ use std::time::{Duration, Instant};
 
 use maki_agent::agent::LoadedInstructions;
 use maki_agent::cancel::CancelToken;
-use maki_agent::tools::{
-    Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext, ToolLive,
-};
+use maki_agent::tools::{Deadline, FileReadTracker, ToolAudience, ToolContext, ToolLive};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::SessionRef;
 use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
@@ -42,6 +40,11 @@ fn send_live_buf(lua: &mlua::Lua, buf: &mlua::AnyUserData) -> mlua::Result<()> {
 
 /// Captured snapshot of the parent `ToolContext`. Per-call state (deadline,
 /// instructions, output lines) is reset so child calls start clean.
+///
+/// Routing state is kept verbatim, `local_tools` included: a name a Lua tool
+/// dispatches must land where the same name lands when the model calls it, or
+/// shadowing quietly inverts for nested calls. A child session does not inherit
+/// them anyway, `session()` always sets its own.
 #[derive(Clone)]
 pub(crate) struct AgentContext(ToolContext);
 
@@ -51,7 +54,6 @@ impl From<&ToolContext> for AgentContext {
         c.loaded_instructions = LoadedInstructions::new();
         c.deadline = Deadline::None;
         c.tool_output_lines = ToolOutputLines::default();
-        c.local_tools = LocalTools::default();
         Self(c)
     }
 }
@@ -450,7 +452,10 @@ mod tests {
         );
         assert!(matches!(agent.deadline, Deadline::None));
         assert_eq!(agent.tool_output_lines, ToolOutputLines::default());
-        assert!(agent.local_tools.is_empty());
+        assert!(
+            agent.local_tools.contains_key(LOCAL_TOOL_NAME),
+            "a nested call must route names exactly like the model's own call"
+        );
         assert!(
             !agent
                 .loaded_instructions

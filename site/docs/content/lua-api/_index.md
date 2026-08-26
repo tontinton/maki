@@ -847,6 +847,9 @@ available.
   - `except` (`string[]?`) exclude these tool names.
   - `workflow` (`boolean?`) use workflow-mode descriptions. Default: `false`.
   - `spec` (`string?`) evaluate capability exclusions against this model spec.
+  - `mcp` (`boolean?`) describe tools as if MCP is reachable. Default: `true`.
+    Pass the same value you pass to `maki.agent.session()`, or the
+    descriptions promise MCP tools the session cannot call.
 
 **Returns:** (`table?`, `string?`) Array of tool definition tables, or `(nil, err)` on failure.
 
@@ -859,6 +862,40 @@ local defs, err = maki.agent.tools(ctx, {
 })
 if err then error(err) end
 print(#defs .. " tools available")
+```
+
+---
+
+### `maki.agent.context_tools()` {#maki-agent-context_tools}
+
+```lua
+maki.agent.context_tools({ctx})
+```
+
+List the tool names this context can call that the registry knows nothing
+about: MCP tools (deferred ones included), ACP client tools, and
+`tool_search`. Use it to bind callable names in a sandbox. Registry tools
+come from `maki.api.get_tools()` instead, already filtered by audience.
+
+Any name the registry holds is left out, even one a client tool shadows: the
+registry entry carries an audience, and routing precedence must not hand a
+sandbox what that audience keeps out.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+
+**Returns:** (`table?`, `string?`) Array of `{ name = string, kind = "mcp"|"local"|"tool_search" }`,
+  empty when the session has neither MCP nor client tools, or `(nil, err)` on failure.
+
+**Example:**
+
+```lua
+local extra, err = maki.agent.context_tools(ctx)
+if err then error(err) end
+for _, t in ipairs(extra) do
+  print(t.kind .. ": " .. t.name)
+end
 ```
 
 ---

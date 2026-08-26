@@ -514,49 +514,10 @@ mod tests {
     use crate::template::Vars;
     use test_case::test_case;
 
-    struct MockTool {
-        name: String,
-        audience: ToolAudience,
-    }
-
-    struct MockInvocation;
-
-    impl ToolInvocation for MockInvocation {
-        fn start_header(&self) -> HeaderFuture {
-            HeaderFuture::Ready(HeaderResult::plain("mock".into()))
-        }
-        fn execute<'a>(self: Box<Self>, _ctx: &'a super::ToolContext) -> ExecFuture<'a> {
-            Box::pin(async { Ok(ToolOutput::Plain(String::new().into())).into() })
-        }
-    }
-
-    impl Tool for MockTool {
-        fn name(&self) -> &str {
-            &self.name
-        }
-        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
-            "mock tool".into()
-        }
-        fn schema(&self) -> Value {
-            json!({"type": "object", "properties": {}, "additionalProperties": false})
-        }
-        fn audience(&self) -> ToolAudience {
-            self.audience
-        }
-        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
-            Ok(Box::new(MockInvocation))
-        }
-    }
+    use crate::tools::test_support::mock_tool as mock_scoped;
 
     fn mock(name: &str) -> Arc<dyn Tool> {
         mock_scoped(name, ToolAudience::all())
-    }
-
-    fn mock_scoped(name: &str, audience: ToolAudience) -> Arc<dyn Tool> {
-        Arc::new(MockTool {
-            name: name.to_owned(),
-            audience,
-        })
     }
 
     fn lua_source(plugin: &str) -> ToolSource {
@@ -591,6 +552,7 @@ mod tests {
             filter: &filter,
             audience: ToolAudience::MAIN,
             workflow: false,
+            mcp: false,
         };
         let vars = Vars::new();
         let defs = reg.definitions(&vars, &ctx, false);
@@ -755,6 +717,7 @@ mod tests {
                 filter: &filter,
                 audience,
                 workflow: false,
+                mcp: false,
             };
             reg.definitions(&vars, &ctx, false)
                 .as_array()

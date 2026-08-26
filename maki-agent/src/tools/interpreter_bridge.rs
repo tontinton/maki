@@ -1,24 +1,45 @@
 use serde_json::Value;
 
-use crate::agent::tool_dispatch::{self, Emit};
+use crate::agent::tool_dispatch;
+use crate::mcp::TOOL_SEARCH_TOOL_NAME;
 
-use super::ToolContext;
+use super::{CallOrigin, ToolContext};
 
 pub const IMAGE_NOT_VISIBLE_NOTE: &str =
     "image pixels are not visible from here; call the view_image tool directly";
 
+/// Names this context can dispatch that the registry knows nothing about: ACP
+/// client tools, MCP tools (deferred ones included) and `tool_search`. The
+/// sandbox binds these; registry tools it takes from the registry, already
+/// filtered by audience.
+///
+/// A registry entry is an audience decision about that name, so any name the
+/// registry holds is dropped here, even one a client tool shadows in dispatch.
+/// Otherwise precedence would launder the decision, handing a script an ACP
+/// `question` that the registry's `question` audience keeps out.
+///
+/// Recompute per call: MCP republishes its index whenever a server comes or
+/// goes.
+pub fn context_tools(ctx: &ToolContext) -> Vec<String> {
+    let mut names: Vec<String> = ctx
+        .local_tools
+        .keys()
+        .cloned()
+        .chain(ctx.mcp.iter().flat_map(|mcp| {
+            mcp.wire_names()
+                .into_iter()
+                .chain([TOOL_SEARCH_TOOL_NAME.to_owned()])
+        }))
+        .filter(|name| ctx.registry.get(name).is_none())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 pub async fn dispatch(ctx: &ToolContext, name: &str, input: &Value) -> Result<String, String> {
     ctx.deadline.check()?;
-    let done = tool_dispatch::run(
-        &ctx.registry,
-        ctx.mcp.as_ref(),
-        String::new(),
-        name,
-        input,
-        ctx,
-        Emit::Silent,
-    )
-    .await;
+    let done = tool_dispatch::run(String::new(), name, input, ctx, CallOrigin::Nested).await;
     flatten(&done)
 }
 

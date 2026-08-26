@@ -40,10 +40,31 @@ use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
 use maki_storage::id::SessionRef;
 
+/// Who made a tool call. History keeps only the model's own calls, as `ToolUse`
+/// blocks, so those are also the only calls the UI shows and the only ones
+/// allowed to change what the next request carries. State a resumed session
+/// cannot rebuild must never differ from the live one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CallOrigin {
+    /// Emitted by the model and recorded in history under its own id.
+    Model,
+    /// Made on the model's behalf and invisible to history: batch children,
+    /// `code_execution` scripts, Lua `call_tool`.
+    Nested,
+}
+
+impl CallOrigin {
+    pub fn is_model(self) -> bool {
+        matches!(self, Self::Model)
+    }
+}
+
 pub struct DescriptionContext<'a> {
     pub filter: &'a ToolFilter,
     pub audience: ToolAudience,
     pub workflow: bool,
+    /// Whether the session being described can reach MCP tools.
+    pub mcp: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -486,6 +507,57 @@ pub mod test_support {
     use super::*;
 
     pub const GUARDED_TOOL_NAME: &str = "guarded_mock";
+
+    /// Registry and routing tests care about the name and audience only, never
+    /// about what the tool returns.
+    #[cfg(test)]
+    pub(crate) fn mock_tool(name: &str, audience: ToolAudience) -> Arc<dyn registry::Tool> {
+        Arc::new(MockTool {
+            name: name.to_owned(),
+            audience,
+        })
+    }
+
+    #[cfg(test)]
+    struct MockTool {
+        name: String,
+        audience: ToolAudience,
+    }
+
+    #[cfg(test)]
+    struct MockInvocation;
+
+    #[cfg(test)]
+    impl registry::ToolInvocation for MockInvocation {
+        fn start_header(&self) -> registry::HeaderFuture {
+            registry::HeaderFuture::Ready(registry::HeaderResult::plain("mock".into()))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> registry::ExecFuture<'a> {
+            Box::pin(async { Ok(ToolOutput::Plain(String::new().into())).into() })
+        }
+    }
+
+    #[cfg(test)]
+    impl registry::Tool for MockTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            "mock tool".into()
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+        fn audience(&self) -> ToolAudience {
+            self.audience
+        }
+        fn parse(
+            &self,
+            _input: &Value,
+        ) -> Result<Box<dyn registry::ToolInvocation>, registry::ParseError> {
+            Ok(Box::new(MockInvocation))
+        }
+    }
 
     pub struct GuardedMock;
 

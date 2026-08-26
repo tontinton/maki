@@ -51,6 +51,14 @@ async def gather(*calls):
 local TOOLS_HEADER = "\n\nAvailable tools (called as Python functions with keyword arguments):\n"
 local WORKFLOW_TOOLS_NOTE =
   "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `gather(task(...), task(...))` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
+-- MCP names and schemas already sit in the tool array (or the tool_search
+-- catalog), so point at those instead of repeating them here.
+local MCP_NOTE =
+  "\nMCP tools whose names are valid Python identifiers are callable here too, with the arguments their tool definitions declare.\n"
+local CONTEXT_TOOLS_WARN = "context_tools failed, MCP and client tools are not bound: "
+-- Servers ship hyphenated names like `srv__get-docs`, which Python reads as
+-- subtraction, so binding those would only add dead weight.
+local PY_IDENTIFIER = "^[%a_][%w_]*$"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
 
 local opts = maki.api.register_options(output_limits.extend({
@@ -159,7 +167,8 @@ for line in content.splitlines():
 
 -- Shared predicate for describe and handler so advertised == callable.
 -- The interpreter is a calling convention, not a capability grant: a read-only
--- subagent must not reach edit/write through Python.
+-- subagent must not reach edit/write through Python. Only registry tools carry
+-- an audience, so only they come through here.
 local function interpreter_tools(tools, audience, workflow)
   local out = {}
   for _, t in ipairs(tools) do
@@ -233,6 +242,9 @@ local function describe(dctx)
   if has_workflow_only then
     parts[#parts + 1] = WORKFLOW_TOOLS_NOTE
   end
+  if dctx.mcp then
+    parts[#parts + 1] = MCP_NOTE
+  end
   return table.concat(parts)
 end
 
@@ -289,6 +301,22 @@ local function handler(input, ctx)
     local call_opts = t.workflow_only and {} or { timeout = timeout }
     tools[name] = function(tool_input)
       return maki.agent.call_tool(ctx, name, tool_input, call_opts)
+    end
+  end
+
+  -- MCP tools, ACP client tools and tool_search: dispatchable, but absent from
+  -- the registry, so they hold no audience to check. `context_tools` already
+  -- dropped every name the registry does hold, so nothing collides above.
+  local extra, ctx_err = maki.agent.context_tools(ctx)
+  if ctx_err then
+    maki.log.warn(CONTEXT_TOOLS_WARN .. ctx_err)
+  else
+    for _, name in ipairs(extra) do
+      if name:match(PY_IDENTIFIER) then
+        tools[name] = function(tool_input)
+          return maki.agent.call_tool(ctx, name, tool_input, { timeout = timeout })
+        end
+      end
     end
   end
 

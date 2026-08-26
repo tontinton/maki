@@ -86,6 +86,7 @@ fn dctx_json(ctx: &DescriptionContext) -> Value {
     let mut obj = json!({
         "audience": ctx.audience.name().unwrap_or("main"),
         "workflow": ctx.workflow,
+        "mcp": ctx.mcp,
     });
     match ctx.filter {
         ToolFilter::All => {}
@@ -1710,6 +1711,7 @@ mod tests {
             filter: &ToolFilter::All,
             audience: ToolAudience::MAIN,
             workflow: false,
+            mcp: false,
         };
         assert_eq!(tool.description(&ctx), "test");
     }

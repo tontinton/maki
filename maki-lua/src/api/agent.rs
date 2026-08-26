@@ -8,14 +8,14 @@ use std::time::{Duration, Instant};
 
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
-use maki_agent::agent::tool_dispatch::{self, Emit};
+use maki_agent::agent::tool_dispatch;
 use maki_agent::cancel::{CancelMap, CancelSlot};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
-    Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools, ToolAudience,
-    ToolContext, ToolFilter, ToolLive,
+    CallOrigin, Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools,
+    ToolAudience, ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
@@ -214,6 +214,9 @@ async fn system_prompt(
 ///   `except` (string[]?) - exclude these tool names.
 ///   `workflow` (boolean?) - use workflow-mode descriptions. Default: `false`.
 ///   `spec` (string?) - evaluate capability exclusions against this model spec.
+///   `mcp` (boolean?) - describe tools as if MCP is reachable. Default: `true`.
+///     Pass the same value you pass to `maki.agent.session()`, or the
+///     descriptions promise MCP tools the session cannot call.
 /// @return (table?, string?) Array of tool definition tables, or `(nil, err)` on failure.
 /// @example
 /// local defs, err = maki.agent.tools(ctx, {
@@ -235,6 +238,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
     let except: Option<Vec<String>> = opts.get("except")?;
     let workflow: bool = opts.get::<Option<bool>>("workflow")?.unwrap_or(false);
     let spec_str: Option<String> = opts.get("spec")?;
+    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true);
 
     let parsed = spec_str
         .as_deref()
@@ -261,12 +265,38 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
         filter: &filter,
         audience,
         workflow,
+        mcp: mcp_enabled && agent.mcp.is_some(),
     };
     // Base definitions only: the session injects MCP definitions per
     // request, so baking them into a tools array would freeze the catalog.
     let defs = ToolRegistry::global().definitions(&vars, &ctx_desc, model.supports_tool_examples());
 
     Ok((Some(json_to_lua(&lua, &defs)?), None))
+}
+
+/// List the tool names this context can call that the registry knows nothing
+/// about: MCP tools (deferred ones included), ACP client tools, and
+/// `tool_search`. Use it to bind callable names in a sandbox. Registry tools
+/// come from `maki.api.get_tools()` instead, already filtered by audience.
+///
+/// Any name the registry holds is left out, even one a client tool shadows: the
+/// registry entry carries an audience, and routing precedence must not hand a
+/// sandbox what that audience keeps out.
+///
+/// @param ctx LuaCtx Agent context.
+/// @return (table?, string?) Array of tool names, empty when the session has
+///   neither MCP nor client tools, or `(nil, err)` on failure.
+/// @example
+/// local extra, err = maki.agent.context_tools(ctx)
+/// if err then error(err) end
+/// for _, name in ipairs(extra) do
+///   print(name)
+/// end
+#[lua_fn]
+async fn context_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<Table>> {
+    let agent = try_pair!(dispatch_ctx(&ctx, "context_tools"));
+    let names = interpreter_bridge::context_tools(&agent.to_tool_context());
+    Ok((Some(lua.create_sequence_from(names)?), None))
 }
 
 /// Run a tool by name and wait for the result. This is how you call built-in
@@ -592,7 +622,7 @@ lua_table! {
     /// sess:close()
     /// ```
     "maki.agent" => pub(crate) fn create_agent_table(), DOCS [
-        resolve_model, system_prompt, tools, call_tool, session,
+        resolve_model, system_prompt, tools, context_tools, call_tool, session,
     ]
 }
 
@@ -635,15 +665,7 @@ async fn dispatch_racing_live(
     rx: Option<flume::Receiver<ToolLive>>,
     cbs: &LiveCallbacks<'_>,
 ) -> ToolDoneEvent {
-    let run = tool_dispatch::run(
-        &tctx.registry,
-        tctx.mcp.as_ref(),
-        String::new(),
-        name,
-        input,
-        tctx,
-        Emit::Silent,
-    );
+    let run = tool_dispatch::run(String::new(), name, input, tctx, CallOrigin::Nested);
     let Some(rx) = rx else {
         return run.await;
     };

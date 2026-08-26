@@ -301,6 +301,7 @@ impl AgentLoop {
             filter: &filter,
             audience: ToolAudience::MAIN,
             workflow,
+            mcp: self.mcp.is_some(),
         };
         ToolRegistry::global().definitions(&self.vars, &ctx, examples)
     }
