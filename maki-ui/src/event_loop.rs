@@ -23,6 +23,10 @@ use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
 use maki_config::{ModelPolicy, UiConfig};
+use maki_lua::session_snapshot::{
+    MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
+    SessionSnapshot,
+};
 use maki_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionEndReason,
     SessionRequest, TaskRequest, UiAction, UiAttachment, UiReply,
@@ -202,9 +206,9 @@ impl SessionStatus {
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::Working => "working",
-            Self::NeedsInput => "needs_input",
-            Self::Idle => "idle",
+            Self::Working => STATUS_WORKING,
+            Self::NeedsInput => STATUS_NEEDS_INPUT,
+            Self::Idle => STATUS_IDLE,
         }
     }
 }
@@ -1104,6 +1108,13 @@ impl<'t> EventLoop<'t> {
             SessionRequest::Current => {
                 let _ = reply_tx.send(Ok(json!(self.sessions[self.focused].id())));
             }
+            SessionRequest::Read { id } => {
+                let reply = match self.resolve_session_index(id.as_deref()) {
+                    Ok(idx) => Ok(self.session_snapshot_json(idx)),
+                    Err(e) => Err(e),
+                };
+                let _ = reply_tx.send(reply);
+            }
             SessionRequest::New { prompt, focus } => {
                 let session = self.focused_app().blank_session();
                 let idx = self.push_runtime(self.ctx.spawn_runtime(session));
@@ -1210,6 +1221,45 @@ impl<'t> EventLoop<'t> {
 
     fn position(&self, id: MakiId) -> Option<usize> {
         self.sessions.iter().position(|rt| rt.id() == id)
+    }
+
+    /// No id means the focused session. A plugin holding the id of a tab that
+    /// has since closed gets `session not live` back, so it knows to stop.
+    fn resolve_session_index(&self, id: Option<&str>) -> Result<usize, String> {
+        let Some(id) = id else {
+            return Ok(self.focused);
+        };
+        let parsed = parse_session_id(id)?;
+        self.position(parsed).ok_or_else(|| NOT_LIVE_ERR.into())
+    }
+
+    /// The totals live on the session, so a plugin that reloads mid run keeps
+    /// the accounting it would lose by summing `TurnEnd` payloads itself.
+    fn session_snapshot_json(&self, idx: usize) -> serde_json::Value {
+        let rt = &self.sessions[idx];
+        let app = &rt.app;
+        let snapshot = SessionSnapshot {
+            id: rt.id().to_string(),
+            cwd: app.state.session.cwd.clone(),
+            title: Some(app.state.session.title.clone()),
+            model: app.state.model.spec(),
+            mode: if app.state.mode == crate::app::mode::Mode::Plan {
+                MODE_PLAN
+            } else {
+                MODE_BUILD
+            },
+            status: SessionStatus::of(app).as_str(),
+            focused: idx == self.focused,
+            updated_at: app.state.session.updated_at,
+            queue: Some(SessionQueueSnapshot {
+                count: app.queue.text_messages().len(),
+            }),
+            usage: app.state.token_usage,
+            context_size: app.state.context_size,
+            context_window: app.state.model.context_window,
+            cost: app.state.cost,
+        };
+        json!(snapshot)
     }
 
     /// The single place that removes a runtime: keeps `focused` pointing at
@@ -1663,6 +1713,10 @@ mod tests {
     fn done_event() -> AgentEvent {
         AgentEvent::Done {
             usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
             num_turns: 1,
             reason: DoneReason::EndTurn,
         }

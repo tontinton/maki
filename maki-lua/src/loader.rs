@@ -1035,6 +1035,16 @@ impl EventHandle {
         });
     }
 
+    /// Headless drivers install their own provider so `maki.session.read` has
+    /// something to answer with instead of "no interactive UI attached". The UI
+    /// leaves the slot empty and answers through its event loop, which owns the
+    /// live session runtimes.
+    pub fn install_session_snapshot(&self, provider: crate::api::session::SessionSnapshotFn) {
+        let _ = self
+            .tx
+            .try_send(Request::InstallSessionSnapshot { provider });
+    }
+
     /// Queue the kill of session-owned jobs and the `SessionEnd` dispatch,
     /// then return. Call from every session-end path so a Lua monitor can
     /// stay a plugin. Process exit wants [`Self::end_sessions_blocking`].

@@ -2,11 +2,11 @@ use std::any::Any;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use flume::Sender;
 use maki_config::ToolKey;
-use maki_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
+use maki_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage, add_cost};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
@@ -535,6 +535,9 @@ pub enum DoneReason {
     MaxTokens,
     MaxTurns,
     Cancelled,
+    /// A manual `/compact` ended the run, but no user turn ended with it, so
+    /// a goal loop should not treat this as a turn boundary.
+    Compact,
 }
 
 impl From<Option<StopReason>> for DoneReason {
@@ -603,11 +606,24 @@ pub enum AgentEvent {
     QueueDrained,
     Done {
         usage: TokenUsage,
+        /// Billed cost for the whole run, `None` while nothing was priced.
+        cost: Option<f64>,
+        /// List-price reference cost, for subsidised models.
+        list_cost: Option<f64>,
+        context_size: u32,
+        context_window: u32,
         num_turns: u32,
         reason: DoneReason,
     },
-    AutoCompacting,
-    CompactionDone,
+    AutoCompacting {
+        context_size: u32,
+        context_window: u32,
+    },
+    CompactionDone {
+        context_size_before: u32,
+        context_size_after: u32,
+        context_window: u32,
+    },
     Retry {
         attempt: u32,
         message: String,
@@ -870,11 +886,64 @@ pub struct TurnCompleteEvent {
     pub model: String,
     #[serde(skip)]
     pub cost: Option<f64>,
+    /// Tokens the next request would carry. This is the one context number
+    /// the host reports, so `Done` and the compaction trigger agree with it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_size: Option<u32>,
     /// The model's context window, so consumers can gauge `context_size`
     /// against the ceiling without resolving the model.
     pub context_window: u32,
+}
+
+/// What one run spent, itself and everything it spawned.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunTotals {
+    pub usage: TokenUsage,
+    pub cost: Option<f64>,
+    pub list_cost: Option<f64>,
+}
+
+/// Spend accumulator for one run, chained to the run that spawned it.
+///
+/// A round is added where it was paid for and walks up the chain, so every
+/// ledger holds its own subtree: a subagent reports its own spend, and the
+/// turn that spawned it still gets billed for the whole fan-out. Several
+/// subagents run at once, hence the lock.
+#[derive(Debug, Default)]
+pub struct RunLedger {
+    totals: Mutex<RunTotals>,
+    parent: Option<Arc<RunLedger>>,
+}
+
+impl RunLedger {
+    pub fn child(parent: &Arc<Self>) -> Arc<Self> {
+        Arc::new(Self {
+            totals: Mutex::default(),
+            parent: Some(Arc::clone(parent)),
+        })
+    }
+
+    pub fn add(&self, usage: TokenUsage, cost: Option<f64>, list_cost: Option<f64>) {
+        {
+            let mut totals = self.locked();
+            totals.usage += usage;
+            add_cost(&mut totals.cost, cost);
+            add_cost(&mut totals.list_cost, list_cost);
+        }
+        if let Some(parent) = &self.parent {
+            parent.add(usage, cost, list_cost);
+        }
+    }
+
+    pub fn totals(&self) -> RunTotals {
+        *self.locked()
+    }
+
+    /// A poisoned lock only means another run panicked mid-update. The totals
+    /// are still sound, and dropping a session's accounting over it is worse.
+    fn locked(&self) -> MutexGuard<'_, RunTotals> {
+        self.totals.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1485,5 +1554,60 @@ mod tests {
         let display = output.as_display_text();
         assert!(display.contains("fn main()"), "{EXCLUDES_MSG}");
         assert!(!display.contains("Instructions from:"), "{EXCLUDES_MSG}");
+    }
+
+    const FIRST_COST: f64 = 0.5;
+    const SECOND_COST: f64 = 0.25;
+    const FIRST_INPUT: u32 = 10;
+    const SECOND_INPUT: u32 = 5;
+    const OWN_SUBTREE_MSG: &str = "a child ledger reports only what it spent itself";
+    const ROLLUP_MSG: &str = "a child's spend has to land in the parent's totals";
+
+    fn usage(input: u32) -> TokenUsage {
+        TokenUsage {
+            input,
+            ..Default::default()
+        }
+    }
+
+    #[test_case(Some(FIRST_COST), Some(SECOND_COST), Some(FIRST_COST + SECOND_COST) ; "priced_rounds_add_up")]
+    #[test_case(None, None, None ; "unpriced_rounds_stay_unpriced")]
+    fn ledger_folds_usage_and_cost_across_adds(
+        first: Option<f64>,
+        second: Option<f64>,
+        expected: Option<f64>,
+    ) {
+        let ledger = RunLedger::default();
+        ledger.add(usage(FIRST_INPUT), first, first);
+        ledger.add(usage(SECOND_INPUT), second, second);
+
+        let totals = ledger.totals();
+        assert_eq!(totals.usage.input, FIRST_INPUT + SECOND_INPUT);
+        assert_eq!(totals.cost, expected);
+        assert_eq!(totals.list_cost, expected);
+    }
+
+    #[test]
+    fn ledger_child_spend_rolls_up_into_parent() {
+        let parent = Arc::new(RunLedger::default());
+        parent.add(usage(FIRST_INPUT), Some(FIRST_COST), Some(FIRST_COST));
+        let child = RunLedger::child(&parent);
+        child.add(usage(SECOND_INPUT), Some(SECOND_COST), Some(SECOND_COST));
+
+        let own = child.totals();
+        assert_eq!(own.usage.input, SECOND_INPUT, "{OWN_SUBTREE_MSG}");
+        assert_eq!(own.cost, Some(SECOND_COST), "{OWN_SUBTREE_MSG}");
+
+        let rolled_up = parent.totals();
+        assert_eq!(
+            rolled_up.usage.input,
+            FIRST_INPUT + SECOND_INPUT,
+            "{ROLLUP_MSG}"
+        );
+        assert_eq!(
+            rolled_up.cost,
+            Some(FIRST_COST + SECOND_COST),
+            "{ROLLUP_MSG}"
+        );
     }
 }

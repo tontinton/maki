@@ -11,7 +11,7 @@ use maki_agent::tools::{FileReadTracker, RequestTools, ToolAudience, ToolRegistr
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, History, Instructions,
-    McpCommand, PromptRole, SessionMailbox, SharedMessages, ToolOutputLines,
+    McpCommand, PromptRole, RunLedger, SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -261,6 +261,7 @@ impl AgentLoop {
                 file_tracker: Arc::clone(&self.file_tracker),
                 prompt_slots: Arc::new(prompt_slots),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
+                ledger: Arc::new(RunLedger::default()),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::clone(&self.model_policy),

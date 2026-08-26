@@ -1115,23 +1115,12 @@ impl App {
             return vec![];
         }
 
-        match &envelope.event {
-            AgentEvent::ToolStart(event) => self.fire_session_autocmd(
-                "ToolStart",
-                serde_json::json!({
-                    "tool_id": event.id,
-                    "tool": event.tool,
-                }),
-            ),
-            AgentEvent::ToolDone(event) => self.fire_session_autocmd(
-                "ToolDone",
-                serde_json::json!({
-                    "tool_id": event.id,
-                    "tool": event.tool,
-                }),
-            ),
-            _ => {}
-        }
+        maki_lua::agent_autocmd::dispatch(
+            &self.lua_event_handle,
+            &self.state.session.id,
+            &envelope,
+            envelope.subagent.is_some(),
+        );
 
         let subagent_id = envelope
             .subagent
@@ -1243,7 +1232,6 @@ impl App {
                     self.chat_index.clear();
                     self.subagent_answers.clear();
                     self.status = Status::Idle;
-                    self.fire_session_autocmd("TurnEnd", serde_json::json!({}));
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
                     }
@@ -1256,10 +1244,6 @@ impl App {
                     self.recoverable_queue = self.queue.text_messages();
                     self.queue.clear();
                     self.chat_index.clear();
-                    self.fire_session_autocmd(
-                        "TurnError",
-                        serde_json::json!({ "message": message }),
-                    );
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
                     }

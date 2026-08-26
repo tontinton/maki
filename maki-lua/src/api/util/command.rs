@@ -409,11 +409,31 @@ pub enum SessionRequest {
     List,
     Live,
     Current,
-    New { prompt: Option<String>, focus: bool },
-    Prompt { id: Option<String>, text: String },
-    Focus { id: String },
-    Delete { id: String },
-    SetTitle { id: String, title: String },
+    /// UI-mode fallback for `maki.session.read` when no snapshot slot is
+    /// installed — the UI resolves the id and returns a `session_snapshot_json`
+    /// payload. Headless drivers install a `SessionSnapshotSlot` instead
+    /// so `read` doesn't need a UI.
+    Read {
+        id: Option<String>,
+    },
+    New {
+        prompt: Option<String>,
+        focus: bool,
+    },
+    Prompt {
+        id: Option<String>,
+        text: String,
+    },
+    Focus {
+        id: String,
+    },
+    Delete {
+        id: String,
+    },
+    SetTitle {
+        id: String,
+        title: String,
+    },
 }
 
 pub enum TaskRequest {

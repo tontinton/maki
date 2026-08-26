@@ -23,8 +23,8 @@ use crate::template;
 use crate::tools::{FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolRegistry};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
-    EventSender, ImageSource, McpHandle, McpSession, PermissionsConfig, SessionMailbox, ToolOutput,
-    ToolOutputLines,
+    EventSender, ImageSource, McpHandle, McpSession, PermissionsConfig, RunLedger, SessionMailbox,
+    ToolOutput, ToolOutputLines,
 };
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
@@ -208,6 +208,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
                     subagent_cancels: Arc::new(CancelMap::new()),
+                    ledger: Arc::new(RunLedger::default()),
                     registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
                     model_policy: Arc::clone(&params.model_policy),
@@ -440,6 +441,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
                         subagent_cancels: Arc::new(CancelMap::new()),
+                        ledger: Arc::new(RunLedger::default()),
                         registry: Arc::clone(ToolRegistry::global_arc()),
                         audience: ToolAudience::MAIN,
                         model_policy: Arc::clone(&params.model_policy),

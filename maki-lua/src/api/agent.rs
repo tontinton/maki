@@ -19,7 +19,8 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
-    EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession, SubagentInfo, ToolDoneEvent,
+    EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession, RunLedger, SubagentInfo,
+    ToolDoneEvent,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -598,6 +599,7 @@ async fn session(
             file_tracker: FileReadTracker::fresh(),
             prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
             subagent_cancels: Arc::new(CancelMap::new()),
+            ledger: RunLedger::child(&agent_ctx.ledger),
             registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
             audience,
             model_policy: Arc::clone(&agent_ctx.model_policy),
@@ -1052,6 +1054,10 @@ mod tests {
             },
             AgentEvent::Done {
                 usage: DONE_USAGE,
+                cost: None,
+                list_cost: None,
+                context_size: 0,
+                context_window: 0,
                 num_turns: 2,
                 reason: DoneReason::EndTurn,
             },

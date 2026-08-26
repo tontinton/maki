@@ -305,9 +305,15 @@ local function handler(input, ctx)
   for _, t in ipairs(interpreter_tools(callable, ctx:audience(), ctx:workflow())) do
     local bind, name = t.alias or t.name, t.name
     if bind:match(PY_IDENTIFIER) then
-      local call_opts = t.workflow_only and {} or { timeout = timeout }
       tools[bind] = function(tool_input)
-        return maki.agent.call_tool(ctx, name, tool_input, call_opts)
+        if t.workflow_only then
+          return maki.agent.call_tool(ctx, name, tool_input, {})
+        end
+        -- The script clock stops while a tool call is awaited, so an explicit
+        -- longer timeout on the call has to win over the script budget.
+        local explicit = type(tool_input) == "table" and tonumber(tool_input.timeout) or nil
+        local deadline = math.max(timeout, explicit or 0)
+        return maki.agent.call_tool(ctx, name, tool_input, { timeout = deadline })
       end
     end
   end

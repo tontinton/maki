@@ -23,7 +23,7 @@ use crate::tools::{
 };
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
-    ExtractedCommand, InterruptSource, SessionMailbox, TurnCompleteEvent,
+    ExtractedCommand, InterruptSource, RunLedger, SessionMailbox, TurnCompleteEvent,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
@@ -77,6 +77,8 @@ pub struct AgentParams {
     pub file_tracker: Arc<FileReadTracker>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub subagent_cancels: Arc<CancelMap<String>>,
+    /// Subagents inherit this, so a turn's totals cover everything it spawned.
+    pub ledger: Arc<RunLedger>,
     pub registry: Arc<crate::tools::ToolRegistry>,
     pub audience: ToolAudience,
     pub model_policy: Arc<ModelPolicy>,
@@ -100,7 +102,7 @@ pub struct Agent<'h> {
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     cancel: CancelToken,
-    total_usage: TokenUsage,
+    ledger: Arc<RunLedger>,
     context_size: u32,
     num_turns: u32,
     recent_calls: RecentCalls,
@@ -143,7 +145,7 @@ impl<'h> Agent<'h> {
             user_response_rx: None,
             interrupt_source: None,
             cancel: CancelToken::none(),
-            total_usage: TokenUsage::default(),
+            ledger: params.ledger,
             context_size: 0,
             num_turns: 0,
             recent_calls: RecentCalls::new(),
@@ -359,10 +361,8 @@ impl<'h> Agent<'h> {
             "API response received"
         );
 
+        self.context_size = response.usage.total_input();
         self.emit_turn_complete(&response)?;
-        let usage = response.usage;
-        self.total_usage += usage;
-        self.context_size = usage.total_input();
 
         if has_tools {
             let history_len_before = self.history.len();
@@ -426,29 +426,36 @@ impl<'h> Agent<'h> {
     }
 
     fn emit_turn_complete(&self, response: &StreamResponse) -> Result<(), AgentError> {
+        let fast = self.opts.clamped(&self.model).fast;
+        let cost = self.model.billed_cost(&response.usage, fast);
+        let list_cost = self.model.list_cost(&response.usage, fast);
+        self.ledger.add(response.usage, cost, list_cost);
         self.event_tx
             .send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
                 message: response.message.clone(),
                 usage: response.usage,
                 model: self.model.id.clone(),
-                cost: self
-                    .model
-                    .billed_cost(&response.usage, self.opts.clamped(&self.model).fast),
-                context_size: Some(response.usage.context_tokens()),
+                cost,
+                context_size: Some(self.context_size),
                 context_window: self.model.context_window,
             })))
     }
 
     fn emit_done(&self, reason: DoneReason) -> Result<(), AgentError> {
+        let totals = self.ledger.totals();
         info!(
             self.num_turns,
-            total_input = self.total_usage.input,
-            total_output = self.total_usage.output,
+            total_input = totals.usage.input,
+            total_output = totals.usage.output,
             %reason,
             "agent run completed"
         );
         self.event_tx.send(AgentEvent::Done {
-            usage: self.total_usage,
+            usage: totals.usage,
+            cost: totals.cost,
+            list_cost: totals.list_cost,
+            context_size: self.context_size,
+            context_window: self.model.context_window,
             num_turns: self.num_turns,
             reason,
         })
@@ -507,6 +514,7 @@ impl<'h> Agent<'h> {
             prompt_slots: Arc::clone(&self.prompt_slots),
             opts: self.opts,
             subagent_cancels: Arc::clone(&self.subagent_cancels),
+            ledger: Arc::clone(&self.ledger),
             registry: Arc::clone(&self.registry),
             workflow: self.workflow,
             audience: self.audience,
@@ -530,19 +538,23 @@ impl<'h> Agent<'h> {
             return Ok(false);
         }
         info!(context_size = self.context_size, "auto-compacting");
-        self.event_tx.send(AgentEvent::AutoCompacting)?;
+        self.event_tx.send(AgentEvent::AutoCompacting {
+            context_size: self.context_size,
+            context_window: self.model.context_window,
+        })?;
         self.do_compact().await?;
         Ok(true)
     }
 
     async fn do_compact(&mut self) -> Result<(), AgentError> {
+        let context_size_before = self.context_size;
         let (compact_provider, compact_model) = resolve_compaction_model(
             &self.provider,
             &self.model,
             self.timeouts,
             &self.model_policy,
         );
-        self.total_usage += compaction::compact_history(
+        let compaction_usage = compaction::compact_history(
             &*compact_provider,
             &compact_model,
             self.history,
@@ -551,8 +563,23 @@ impl<'h> Agent<'h> {
             &self.config,
         )
         .await?;
+        // The summariser can be a different model, so price this with
+        // `compact_model` and not `self.model`.
+        let fast = self.opts.clamped(&compact_model).fast;
+        let compact_cost = compact_model.billed_cost(&compaction_usage, fast);
+        let compact_list_cost = compact_model.list_cost(&compaction_usage, fast);
+        self.ledger
+            .add(compaction_usage, compact_cost, compact_list_cost);
+        // The summary the model just wrote is all the next call will see, so
+        // its output count is the new gauge.
+        let context_size_after = compaction_usage.output;
+        self.context_size = context_size_after;
         self.rollback_len = self.history.len();
-        self.event_tx.send(AgentEvent::CompactionDone)?;
+        self.event_tx.send(AgentEvent::CompactionDone {
+            context_size_before,
+            context_size_after,
+            context_window: self.model.context_window,
+        })?;
         self.history
             .push(Message::synthetic(compaction::continue_message(
                 &self.config,
@@ -638,6 +665,8 @@ mod tests {
     use crate::permissions::PermissionManager;
 
     const QUEUED_MESSAGES: [&str; 3] = ["first", "second", "third"];
+    const ONE_GAUGE_MSG: &str =
+        "TurnComplete, Done, and the compaction trigger must read one context gauge";
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -805,6 +834,7 @@ mod tests {
                 file_tracker: FileReadTracker::fresh(),
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                 subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
+                ledger: Arc::new(RunLedger::default()),
                 registry: Arc::new(crate::tools::ToolRegistry::new()),
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::new(ModelPolicy::default()),
@@ -1152,6 +1182,38 @@ mod tests {
         });
     }
 
+    /// `TurnComplete`, `Done` and the auto-compaction trigger all report the
+    /// same context number, so nobody downstream thinks it has spare room.
+    #[test]
+    fn context_size_is_one_gauge_across_turn_complete_and_done() {
+        smol::block_on(async {
+            let mut response = text_response(StopReason::EndTurn);
+            response.usage = TokenUsage {
+                input: 1_000,
+                output: 400,
+                cache_read: 250,
+                cache_creation: 50,
+                ..Default::default()
+            };
+            let expected = response.usage.total_input();
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (mut agent, event_rx) = make_agent(MockProvider::new(vec![response]), &mut history);
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            let events = drain_events(&event_rx);
+            let reported: Vec<u32> = events
+                .iter()
+                .filter_map(|e| match &e.event {
+                    AgentEvent::TurnComplete(tc) => tc.context_size,
+                    AgentEvent::Done { context_size, .. } => Some(*context_size),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(reported, vec![expected, expected], "{ONE_GAUGE_MSG}");
+        });
+    }
+
     #[test_case(true,  170_000, true  ; "enabled_and_over_threshold")]
     #[test_case(true,  150_000, false ; "enabled_but_below_threshold")]
     #[test_case(false, 170_000, false ; "disabled_even_over_threshold")]
@@ -1174,7 +1236,7 @@ mod tests {
             assert_eq!(
                 has_event(&drain_events(&event_rx), |e| matches!(
                     e,
-                    AgentEvent::AutoCompacting
+                    AgentEvent::AutoCompacting { .. }
                 )),
                 expected,
             );

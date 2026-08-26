@@ -8,7 +8,16 @@ use maki_storage::id::MakiId;
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip};
+use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, err_pair};
+
+/// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
+/// optional session id from Lua and returns a serialized
+/// [`crate::SessionSnapshot`].
+pub type SessionSnapshotFn =
+    Box<dyn Fn(Option<&str>) -> Result<serde_json::Value, String> + Send + Sync + 'static>;
+
+pub struct SessionSnapshotSlot(pub SessionSnapshotFn);
 
 const BLANK_NOTIFY_ERR: &str = "text must not be blank";
 const SESSION_REQUIRED_ERR: &str = "session is required";
@@ -46,6 +55,62 @@ async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 #[lua_fn]
 async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Live).await
+}
+
+/// One-call snapshot of a session: queue, usage, context, cost, mode, and
+/// status. Reads the focused session, or the one you name in `session` when
+/// you act on a background tab.
+///
+/// The returned table:
+/// ```
+/// {
+///   id, cwd, model, mode = "build" | "plan",
+///   status = "idle" | "working" | "needs_input",
+///   focused, updated_at,
+///   usage = { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens },
+///   context_size, context_window,
+///   cost,
+///   queue = { count }, -- nil under headless drivers
+///   title,             -- nil under headless drivers
+/// }
+/// ```
+///
+/// `usage` and `cost` include subagent spend. `context_size` is the main
+/// session's own, since a subagent runs its own window. There is no
+/// `list_cost` here because `cost` is re-settled from stored usage when a
+/// session resumes and list price is not stored, so per-turn list price
+/// lives on the `TurnEnd` autocmd instead.
+///
+/// @param opts table? `session` (string?) Session id; defaults to focused.
+/// @return (table|nil, string|nil) Snapshot table, or nil and an error.
+/// @example
+/// local s = maki.session.read()
+/// if s.context_size > s.context_window * 0.8 then
+///   maki.ui.notify("context is nearly full")
+/// end
+#[lua_fn]
+async fn read(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Value>> {
+    let id = match opts {
+        Some(t) => t.get::<Option<String>>("session")?,
+        None => None,
+    };
+    // Headless drivers install a provider, the UI leaves the slot empty and
+    // answers from its event loop, which owns the live session runtimes.
+    if let Some(slot) = lua.app_data_ref::<SessionSnapshotSlot>() {
+        return match (slot.0)(id.as_deref()) {
+            Ok(value) => Ok((Some(json_to_lua(&lua, &value)?), None)),
+            Err(msg) => Ok(err_pair(msg)),
+        };
+    }
+    ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::Session {
+        req: SessionRequest::Read { id },
+        reply_tx,
+    })
+    .await
 }
 
 /// Returns the id of the currently focused session.
@@ -193,7 +258,7 @@ lua_table! {
     /// attached"` without a UI. `notify` instead targets a live agent mailbox
     /// directly, so it also works under ACP and SDK frontends.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), live(tx), current(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_title(tx)]
+    DOCS [list(tx), live(tx), current(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_title(tx)]
 }
 
 #[cfg(test)]

@@ -279,6 +279,9 @@ pub fn map_done_reason(reason: DoneReason) -> StopReason {
         DoneReason::MaxTokens => StopReason::MaxTokens,
         DoneReason::MaxTurns => StopReason::MaxTurnRequests,
         DoneReason::Cancelled => StopReason::Cancelled,
+        // Manual `/compact` isn't a turn boundary; ACP has no dedicated
+        // stop reason for housekeeping, so surface it as EndTurn.
+        DoneReason::Compact => StopReason::EndTurn,
     }
 }
 

@@ -214,6 +214,11 @@ pub enum Request {
     /// Plugins are loaded, so native codegen may start using idle time. Sent
     /// last so it never interleaves with the loads themselves.
     WarmJit,
+    /// Install a `SessionSnapshotSlot` on the Lua thread. Headless drivers send
+    /// one so `maki.session.read` works without a UI to ask.
+    InstallSessionSnapshot {
+        provider: crate::api::session::SessionSnapshotFn,
+    },
     /// Takes the package operations Lua recorded, leaving the queue empty.
     TakePackOps {
         reply: flume::Sender<Vec<crate::api::pack::PackOp>>,
@@ -3114,6 +3119,10 @@ pub fn spawn(
                     match msg {
                         Request::Shutdown => break,
                         Request::WarmJit => codegen_armed = true,
+                        Request::InstallSessionSnapshot { provider } => {
+                            rt.lua
+                                .set_app_data(crate::api::session::SessionSnapshotSlot(provider));
+                        }
                         Request::LoadSource {
                             name,
                             chunks,

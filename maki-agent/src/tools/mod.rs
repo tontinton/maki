@@ -33,7 +33,7 @@ use crate::agent::LoadedInstructions;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
-use crate::{AgentConfig, AgentMode, EventSender, SharedBuf};
+use crate::{AgentConfig, AgentMode, EventSender, RunLedger, SharedBuf};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
@@ -340,6 +340,9 @@ pub struct ToolContext {
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub opts: RequestOptions,
     pub subagent_cancels: Arc<CancelMap<String>>,
+    /// Shared with the run that spawned this tool, so a subagent's spend lands
+    /// in the parent turn's totals.
+    pub ledger: Arc<RunLedger>,
     pub registry: Arc<ToolRegistry>,
     pub workflow: bool,
     pub audience: ToolAudience,
@@ -564,6 +567,7 @@ pub fn interpreter_ctx(
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),
+        ledger: Arc::default(),
         registry,
         workflow: false,
         audience: ToolAudience::MAIN,

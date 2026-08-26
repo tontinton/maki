@@ -48,6 +48,8 @@ const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
 const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
 const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
 const MODEL_CHANGED_EVENT: &str = "ModelChanged";
+const PLAN_READY_EVENT: &str = "PlanReady";
+const PLAN_DRAFT_PATH: &str = "/tmp/plan.md";
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stands in for a size the provider measured, baseline included.
 const MEASURED_CONTEXT: u32 = 100_000;
@@ -207,6 +209,10 @@ fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
 fn done() -> AgentEvent {
     AgentEvent::Done {
         usage: TokenUsage::default(),
+        cost: None,
+        list_cost: None,
+        context_size: 0,
+        context_window: 0,
         num_turns: 1,
         reason: DoneReason::EndTurn,
     }
@@ -394,6 +400,10 @@ fn reset_session_clears_exit_request_source() {
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::Done {
         usage: TokenUsage::default(),
+        cost: None,
+        list_cost: None,
+        context_size: 0,
+        context_window: 0,
         num_turns: 1,
         reason: DoneReason::EndTurn,
     }));
@@ -865,6 +875,41 @@ fn reset_session_clears_drafting_plan_in_build_mode() {
     app.reset_session();
     assert_eq!(app.state.mode, Mode::Build);
     assert_eq!(app.state.plan, PlanState::None);
+}
+
+/// A retried write hits the same transition again, and the plugin still gets
+/// one event with the draft path it needs to open.
+#[test]
+fn plan_ready_fires_once_per_draft() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
+    app.transition_plan(PlanTrigger::WriteDone);
+    app.transition_plan(PlanTrigger::WriteDone);
+
+    let (event, data) = probe.try_recv_autocmd().expect("PlanReady fired");
+    assert_eq!(event, PLAN_READY_EVENT);
+    assert_eq!(data["path"], serde_json::json!(PLAN_DRAFT_PATH));
+    assert!(
+        probe.try_recv_autocmd().is_none(),
+        "second WriteDone must not re-emit"
+    );
+}
+
+#[test]
+fn plan_ready_does_not_fire_outside_plan_mode() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.state.mode = Mode::Build;
+    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
+    app.transition_plan(PlanTrigger::WriteDone);
+
+    assert!(probe.try_recv_autocmd().is_none());
 }
 
 #[test]

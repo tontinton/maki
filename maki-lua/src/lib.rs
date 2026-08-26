@@ -1,3 +1,4 @@
+pub mod agent_autocmd;
 mod api;
 pub mod docs;
 pub mod docs_render;
@@ -7,11 +8,13 @@ mod loader;
 mod pack;
 pub(crate) mod plugin_permissions;
 mod runtime;
+pub mod session_snapshot;
 
 pub use api::keymap::{KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use api::net::set_allowed_private_hosts;
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::pack::{Declared, PackOp};
+pub use api::session::SessionSnapshotFn;
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
     HintReader, HintSnapshot, LuaCommandInfo, LuaCommandReader, ModelRequest, SessionRequest,
@@ -27,6 +30,7 @@ pub use pack::{
 };
 pub use plugin_permissions::{Permission, PluginPermissions, Requested};
 pub use runtime::{KILL_GRACE, MAX_INFLIGHT_TOOLS, RestoreItem, WARM_TOOL_CAP};
+pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 
 pub mod test_support {
     use crate::KeymapReader;

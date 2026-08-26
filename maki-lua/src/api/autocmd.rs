@@ -147,27 +147,50 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `del_autocmd` later to remove the listener.
 ///
 /// Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
-/// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
-/// `"SessionEnd"`, `"SessionFocusChanged"`, `"SessionStatusChanged"`,
-/// `"TaskStatusChanged"`, and `"ModelChanged"`. Plugins can also fire their
-/// own events with `exec_autocmds`.
+/// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
+/// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
+/// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
+/// and `"ModelChanged"`. Plugins can also fire their own events with
+/// `exec_autocmds`.
 ///
-/// Each host event carries `data.session_id`. For `"SessionReset"` and
-/// `"SessionEnd"` that is the session being left behind; the other events
-/// name the session now running or focused. Tool events also carry
-/// `data.tool_id` and `data.tool`. `"SessionFocusChanged"` also carries
-/// `data.previous_session_id` except on initial startup.
-/// `"SessionStatusChanged"` fires whenever a session moves between
-/// `"working"`, `"needs_input"`, and `"idle"`; it carries `data.status`,
-/// `data.title`, and `data.focused` (boolean).
-/// `"TaskStatusChanged"` fires when a subagent starts, or when one moves
-/// between `"working"`, `"done"`, and `"error"`; it carries `data.id` and
-/// `data.name` alongside `data.status`. A task that comes back from disk
-/// already finished stays quiet, so reloading a session does not replay
-/// old tasks. `"ModelChanged"` fires when a session switches model, whoever
-/// asked for it; it carries `data.model` in the shape `maki.model.get`
-/// returns, plus `data.previous_spec`. Picking the model already in use stays
-/// quiet, and so does startup.
+/// Every host event carries `data.session_id`. For `"SessionReset"` and
+/// `"SessionEnd"` that is the session being left behind, the other events
+/// name the session now running or focused. What each event adds:
+///
+/// - `"ToolStart"`, `"ToolDone"`: `data.tool_id` and `data.tool`.
+/// - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
+///   `"max_turns"`, or `"cancelled"`), `data.usage` (four token fields,
+///   cache included), `data.cost`, `data.list_cost`, `data.context_size`,
+///   `data.context_window`, and `data.num_turns` (model round-trips the
+///   turn took). `list_cost` is the un-subsidised list price and `cost` is
+///   the real bill, so a budget plugin charges against whichever one it
+///   wants.
+/// - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
+///   trigger time.
+/// - `"CompactionDone"`: `data.context_size_before`,
+///   `data.context_size_after`, and `data.context_window`.
+/// - `"PlanReady"`: `data.path`, the absolute path of the plan file the
+///   agent just wrote. Fires once per draft.
+/// - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
+///   first focus at startup.
+/// - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
+///   or `"idle"`), `data.title`, and `data.focused` (boolean).
+/// - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
+///   (`"working"`, `"done"`, or `"error"`), when a subagent starts or
+///   changes status. A task that comes back from disk already finished
+///   stays quiet, so reloading a session does not replay old tasks.
+/// - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
+///   plus `data.previous_spec`. Picking the model already in use stays
+///   quiet, and so does startup.
+///
+/// `"TurnEnd"` fires once per turn and only for the main session, so
+/// subagent turns never show up. A manual `/compact` ends its run without
+/// ending a turn, so it stays quiet too.
+///
+/// Drivers are not all caught up. `"TurnStart"` and `"PlanReady"` come from
+/// `maki-ui` only. `maki-acp` runs the agent on its own loop and does not
+/// call the dispatcher yet, so plugins loaded under ACP receive no turn
+/// events. Everything else fires under `maki -p` and sdk mode as well.
 ///
 /// `"SessionEnd"` is the teardown signal: it fires first so handlers can
 /// still inspect or stop the session's jobs, then session-owned jobs are

@@ -138,14 +138,14 @@ impl Chat {
                     self.messages_panel.set_turn_usage_on_last_tool(usage);
                 }
             }
-            AgentEvent::AutoCompacting => {
+            AgentEvent::AutoCompacting { .. } => {
                 self.messages_panel.flush();
                 self.messages_panel.push(DisplayMessage::new(
                     DisplayRole::Assistant,
                     "Auto-compacting conversation...".into(),
                 ));
             }
-            AgentEvent::CompactionDone => {
+            AgentEvent::CompactionDone { .. } => {
                 self.messages_panel.flush();
             }
             AgentEvent::QueueItemConsumed { text, image_count } => {
@@ -1111,7 +1111,13 @@ mod tests {
     fn compaction_done_flushes_streaming_buffers() {
         let mut chat = chat();
 
-        chat.handle_event(AgentEvent::AutoCompacting, None);
+        chat.handle_event(
+            AgentEvent::AutoCompacting {
+                context_size: 0,
+                context_window: 0,
+            },
+            None,
+        );
         assert_eq!(chat.message_count(), 1);
 
         chat.handle_event(
@@ -1129,7 +1135,14 @@ mod tests {
         assert!(!chat.streaming_text_is_empty());
         assert!(!chat.streaming_thinking_is_empty());
 
-        chat.handle_event(AgentEvent::CompactionDone, None);
+        chat.handle_event(
+            AgentEvent::CompactionDone {
+                context_size_before: 0,
+                context_size_after: 0,
+                context_window: 0,
+            },
+            None,
+        );
         assert!(chat.streaming_text_is_empty());
         assert!(chat.streaming_thinking_is_empty());
         assert_eq!(chat.message_count(), 3);
