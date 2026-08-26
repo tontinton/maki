@@ -26,9 +26,9 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
         no_plugins,
         super::BuiltinFailure::Fatal,
         maki_lua::Interaction::None,
-        |host, names, _| {
+        |host, names, warnings| {
             let mut config = host
-                .load_init_files_or_skip(no_plugins, &cwd)
+                .load_init_files_or_skip(no_plugins, &cwd, warnings)
                 .context("load init.lua files")?
                 .unwrap_or_default()
                 .into_config(&names(host)?)

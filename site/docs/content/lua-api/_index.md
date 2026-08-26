@@ -63,6 +63,8 @@ Grants come from a `plugin.toml` next to the Lua file (for
 `~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
 
 ```toml
+min_maki_version = "0.4.12"
+
 [permissions]
 fs_read = true
 fs_write = true
@@ -78,6 +80,10 @@ The rules:
 - `plugin.toml` exists: permissions default to granted; set a key to
   `false` to revoke it. An empty file grants everything.
 - Invalid TOML: everything denied, with a warning in the log.
+- `min_maki_version` is optional and takes a plain semantic version as a lower
+  bound, so ranges do not work. When the field is invalid or the running
+  version is older, Maki skips the Lua in that directory and warns at startup
+  instead of failing. `--no-plugins` still skips every user plugin at once.
 
 ## Overview
 

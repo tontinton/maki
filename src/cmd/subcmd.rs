@@ -548,7 +548,7 @@ pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
         no_plugins,
         super::BuiltinFailure::Fatal,
         maki_lua::Interaction::None,
-        |host, names, _| load_effective_config(host, no_plugins, &cwd, names),
+        |host, names, warnings| load_effective_config(host, no_plugins, &cwd, names, warnings),
     )?;
     super::report_warnings(warnings);
 
@@ -572,9 +572,10 @@ fn load_effective_config(
     no_plugins: bool,
     cwd: &Path,
     names: &super::KnownNames<'_>,
+    warnings: &mut Vec<String>,
 ) -> Result<Config> {
     let raw_config = host
-        .load_init_files_or_skip(no_plugins, cwd)
+        .load_init_files_or_skip(no_plugins, cwd, warnings)
         .context("load init.lua files")?;
     raw_config
         .unwrap_or_default()
@@ -594,8 +595,8 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
         no_plugins,
         super::BuiltinFailure::Fatal,
         maki_lua::Interaction::None,
-        |host, names, _| {
-            let mut config = load_effective_config(host, no_plugins, &cwd, names)?;
+        |host, names, warnings| {
+            let mut config = load_effective_config(host, no_plugins, &cwd, names, warnings)?;
             config.permissions = load_permissions(&cwd);
             Ok(config)
         },
@@ -691,7 +692,7 @@ pub fn prompt(
         no_plugins,
         super::BuiltinFailure::Fatal,
         maki_lua::Interaction::None,
-        |host, names, _| load_effective_config(host, no_plugins, &cwd, names),
+        |host, names, warnings| load_effective_config(host, no_plugins, &cwd, names, warnings),
     )?;
     super::report_warnings(warnings);
 

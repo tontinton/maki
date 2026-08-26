@@ -36,6 +36,8 @@ Grants come from a `plugin.toml` next to the Lua file (for
 `~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
 
 ```toml
+min_maki_version = "0.4.12"
+
 [permissions]
 {KEYS}```
 
@@ -46,6 +48,10 @@ The rules:
 - `plugin.toml` exists: permissions default to granted; set a key to
   `false` to revoke it. An empty file grants everything.
 - Invalid TOML: everything denied, with a warning in the log.
+- `min_maki_version` is optional and takes a plain semantic version as a lower
+  bound, so ranges do not work. When the field is invalid or the running
+  version is older, Maki skips the Lua in that directory and warns at startup
+  instead of failing. `--no-plugins` still skips every user plugin at once.
 "#;
     let keys = Permission::ALL.map(Permission::manifest_key);
     let anchor = if anchored {
@@ -304,7 +310,8 @@ pub fn guide_page() -> String {
         "## Permissions and plugin.toml\n\n\
          Sensitive APIs are gated per plugin file, and a plugin without a\n\
          `plugin.toml` next to it gets nothing. The gates and the file format are\n\
-         in [the reference]({REFERENCE_URL}#{PERMISSIONS_ANCHOR})."
+         in [the reference]({REFERENCE_URL}#{PERMISSIONS_ANCHOR}). Set\n\
+         `min_maki_version` there when a plugin needs a newer Maki Lua API."
     );
     format!(
         "{}\n## Full API reference\n\n\

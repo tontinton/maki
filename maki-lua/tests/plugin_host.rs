@@ -10,7 +10,7 @@ use maki_agent::tools::{
     ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource, timeout_annotation,
 };
 use maki_config::{AlwaysThinking, Effect, PluginsConfig, ToolKey, ToolOutputLines};
-use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
+use maki_lua::{PluginError, PluginHost, SKIPPED_PLUGIN_WARNING, WARM_TOOL_CAP};
 use maki_storage::id::SessionRef;
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
@@ -1050,6 +1050,36 @@ greet.setup()
 
     assert!(reg.has("greet"));
     assert_eq!(reg.names().len(), 1);
+}
+
+/// An incompatible `plugin.toml` must cost that directory its Lua, not the
+/// whole startup: `load_init_files` keeps going and reports a warning.
+#[test]
+fn incompatible_plugin_warns_instead_of_aborting_startup() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let maki_dir = tmp.path().join(".maki");
+    std::fs::create_dir_all(&maki_dir).unwrap();
+    let running = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+    let required = format!("{}.0.0", running.major + 1);
+    std::fs::write(
+        maki_dir.join("plugin.toml"),
+        format!("min_maki_version = {required:?}\n"),
+    )
+    .unwrap();
+    std::fs::write(maki_dir.join("init.lua"), ECHO_PLUGIN).unwrap();
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut warnings = Vec::new();
+    host.load_init_files_or_skip(false, tmp.path(), &mut warnings)
+        .expect("an incompatible plugin must not abort startup");
+
+    assert!(!reg.has("echo_"));
+    let warning = warnings
+        .iter()
+        .find(|w| w.contains(SKIPPED_PLUGIN_WARNING))
+        .unwrap_or_else(|| panic!("no skip warning in {warnings:?}"));
+    assert!(warning.contains(&required), "{warning}");
 }
 
 #[test]

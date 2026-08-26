@@ -3,9 +3,14 @@ use std::io;
 use std::path::Path;
 
 use mlua::{Error as LuaError, Function, IntoLuaMulti, Lua, Result as LuaResult};
+use semver::Version;
 use tracing::warn;
 
+use crate::error::PluginError;
+
 const MANIFEST_FILE: &str = "plugin.toml";
+const MIN_MAKI_VERSION: &str = "min_maki_version";
+const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Permission {
@@ -238,20 +243,41 @@ fn denied_error(perm: Permission) -> LuaError {
 }
 
 pub(crate) fn load_plugin_permissions(plugin_dir: Option<&Path>) -> PluginPermissions {
-    let Some(dir) = plugin_dir else {
-        return PluginPermissions::denied();
+    load_plugin_manifest(plugin_dir)
+        .as_ref()
+        .map_or_else(PluginPermissions::denied, PluginPermissions::from_manifest)
+}
+
+/// Host-side gate, run before any Lua from `plugin_dir` reaches the runtime.
+/// An `Err` means the directory is refused; the startup path turns it into a
+/// warning and skips the plugin, so one bad `min_maki_version` cannot keep
+/// Maki from booting.
+pub(crate) fn check_plugin_compatibility(
+    plugin: &str,
+    plugin_dir: Option<&Path>,
+) -> Result<(), PluginError> {
+    let Some(manifest) = load_plugin_manifest(plugin_dir) else {
+        return Ok(());
     };
+    let Some(required) = manifest.get(MIN_MAKI_VERSION) else {
+        return Ok(());
+    };
+    check_minimum_version(plugin, required, RUNTIME_VERSION)
+}
+
+fn load_plugin_manifest(plugin_dir: Option<&Path>) -> Option<toml::Value> {
+    let dir = plugin_dir?;
     let manifest_path = dir.join(MANIFEST_FILE);
     match std::fs::read_to_string(&manifest_path) {
         Ok(content) => match toml::from_str::<toml::Value>(&content) {
-            Ok(val) => PluginPermissions::from_manifest(&val),
+            Ok(manifest) => Some(manifest),
             Err(e) => {
                 warn!(
                     path = %manifest_path.display(),
                     error = %e,
                     "invalid {MANIFEST_FILE}, denying all permissions"
                 );
-                PluginPermissions::denied()
+                None
             }
         },
         Err(e) => {
@@ -268,14 +294,59 @@ pub(crate) fn load_plugin_permissions(plugin_dir: Option<&Path>) -> PluginPermis
                     "cannot read {MANIFEST_FILE}, denying all permissions"
                 );
             }
-            PluginPermissions::denied()
+            None
         }
     }
 }
 
+fn check_minimum_version(
+    plugin: &str,
+    required: &toml::Value,
+    running: &str,
+) -> Result<(), PluginError> {
+    let required = required
+        .as_str()
+        .ok_or_else(|| PluginError::InvalidMinimumVersionType {
+            plugin: plugin.to_owned(),
+        })?;
+    let required =
+        Version::parse(required).map_err(|source| PluginError::InvalidMinimumVersion {
+            plugin: plugin.to_owned(),
+            version: required.to_owned(),
+            source,
+        })?;
+    let running = Version::parse(running).map_err(|source| PluginError::InvalidRuntimeVersion {
+        version: running.to_owned(),
+        source,
+    })?;
+    if required > running {
+        return Err(PluginError::MakiVersionTooOld {
+            plugin: plugin.to_owned(),
+            required,
+            running,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use test_case::test_case;
+
     use super::*;
+
+    const PLUGIN: &str = "test-plugin";
+
+    fn assert_denied(permissions: &PluginPermissions) {
+        for permission in Permission::ALL {
+            assert!(
+                !permissions.is_allowed(permission),
+                "{permission} should be denied"
+            );
+        }
+    }
 
     #[test]
     fn trusted_allows_everything() {
@@ -288,9 +359,7 @@ mod tests {
     #[test]
     fn denied_blocks_everything() {
         let p = PluginPermissions::denied();
-        for perm in Permission::ALL {
-            assert!(!p.is_allowed(perm), "{perm} should be denied");
-        }
+        assert_denied(&p);
     }
 
     #[test]
@@ -442,5 +511,102 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("permission denied"));
         assert!(msg.contains("fs_read"));
+    }
+
+    #[test_case("1.2.2", "1.2.3", true; "lower")]
+    #[test_case("1.2.3", "1.2.3", true; "equal")]
+    #[test_case("1.2.3-alpha.1", "1.2.3-alpha.2", true; "older_prerelease")]
+    #[test_case("1.2.3-alpha.2", "1.2.3-alpha.1", false; "newer_prerelease")]
+    #[test_case("1.2.4", "1.2.3", false; "higher")]
+    fn minimum_version_uses_semver_precedence(required: &str, running: &str, compatible: bool) {
+        let required = toml::Value::String(required.to_owned());
+        let result = check_minimum_version(PLUGIN, &required, running);
+        assert_eq!(result.is_ok(), compatible);
+        if !compatible {
+            assert!(matches!(result, Err(PluginError::MakiVersionTooOld { .. })));
+        }
+    }
+
+    #[test]
+    fn minimum_version_requires_a_plain_semver_string() {
+        let wrong_type = check_minimum_version(PLUGIN, &toml::Value::Integer(1), RUNTIME_VERSION);
+        assert!(matches!(
+            wrong_type,
+            Err(PluginError::InvalidMinimumVersionType { .. })
+        ));
+
+        for version in ["not-a-version", "v1.2.3"] {
+            let value = toml::Value::String(version.to_owned());
+            assert!(matches!(
+                check_minimum_version(PLUGIN, &value, RUNTIME_VERSION),
+                Err(PluginError::InvalidMinimumVersion { .. })
+            ));
+        }
+
+        let value = toml::Value::String("1.2.3".to_owned());
+        assert!(matches!(
+            check_minimum_version(PLUGIN, &value, "invalid"),
+            Err(PluginError::InvalidRuntimeVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn manifest_rejects_an_invalid_declared_minimum() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(MANIFEST_FILE),
+            format!("{MIN_MAKI_VERSION} = 1\n"),
+        )
+        .unwrap();
+        assert!(matches!(
+            check_plugin_compatibility(PLUGIN, Some(dir.path())),
+            Err(PluginError::InvalidMinimumVersionType { .. })
+        ));
+
+        fs::write(
+            dir.path().join(MANIFEST_FILE),
+            format!("{MIN_MAKI_VERSION} = \"v1.2.3\"\n"),
+        )
+        .unwrap();
+        assert!(matches!(
+            check_plugin_compatibility(PLUGIN, Some(dir.path())),
+            Err(PluginError::InvalidMinimumVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn missing_valid_and_malformed_manifests_keep_existing_defaults() {
+        assert_denied(&load_plugin_permissions(None));
+
+        let dir = tempfile::tempdir().unwrap();
+        assert_denied(&load_plugin_permissions(Some(dir.path())));
+
+        fs::write(dir.path().join(MANIFEST_FILE), "").unwrap();
+        let permissions = load_plugin_permissions(Some(dir.path()));
+        for permission in Permission::ALL {
+            assert!(permissions.is_allowed(permission));
+        }
+
+        fs::write(dir.path().join(MANIFEST_FILE), "not = [valid").unwrap();
+        assert_denied(&load_plugin_permissions(Some(dir.path())));
+        assert!(
+            check_plugin_compatibility(PLUGIN, Some(dir.path())).is_ok(),
+            "an unparseable manifest has no floor to enforce"
+        );
+    }
+
+    #[test]
+    fn one_manifest_provides_compatibility_and_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(MANIFEST_FILE),
+            format!("{MIN_MAKI_VERSION} = {RUNTIME_VERSION:?}\n\n[permissions]\nnet = false\n"),
+        )
+        .unwrap();
+
+        check_plugin_compatibility(PLUGIN, Some(dir.path())).unwrap();
+        let permissions = load_plugin_permissions(Some(dir.path()));
+        assert!(permissions.is_allowed(Permission::FsRead));
+        assert!(!permissions.is_allowed(Permission::Net));
     }
 }

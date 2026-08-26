@@ -2813,6 +2813,7 @@ dependencies = [
  "pin-project-lite",
  "regex",
  "rustix",
+ "semver",
  "serde_json",
  "serde_yaml",
  "smol",

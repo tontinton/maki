@@ -15,13 +15,17 @@ use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
 use crate::error::PluginError;
 use crate::pack::DiscoveredPackage;
-use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
+use crate::plugin_permissions::{
+    PluginPermissions, check_plugin_compatibility, load_plugin_permissions,
+};
 use crate::runtime::{
     self, ClickFallback, ConfigScope, LoadChunk, LuaThread, Request, RestoreItem,
 };
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const USER_PLUGIN: &str = "user";
+pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
 
 struct BundledPlugin {
     name: &'static str,
@@ -253,7 +257,13 @@ impl PluginHost {
         Ok(host)
     }
 
-    pub fn load_init_files(&self, cwd: &Path) -> Result<Option<RawConfig>, PluginError> {
+    /// `warnings` collects non-fatal startup problems (an incompatible
+    /// `plugin.toml` skips that directory's Lua) for the caller to surface.
+    pub fn load_init_files(
+        &self,
+        cwd: &Path,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<RawConfig>, PluginError> {
         let mut merged: Option<RawConfig> = None;
 
         for global_dir in maki_config::global_config_dirs() {
@@ -261,6 +271,7 @@ impl PluginHost {
                 &global_dir.join("init.lua"),
                 ConfigScope::Global,
                 &mut merged,
+                warnings,
             )?;
             if merged.is_some() {
                 break;
@@ -270,6 +281,7 @@ impl PluginHost {
             &cwd.join(".maki/init.lua"),
             ConfigScope::Project,
             &mut merged,
+            warnings,
         )?;
 
         Ok(merged)
@@ -282,11 +294,12 @@ impl PluginHost {
         &self,
         no_plugins: bool,
         cwd: &Path,
+        warnings: &mut Vec<String>,
     ) -> Result<Option<RawConfig>, PluginError> {
         if no_plugins {
             return Ok(None);
         }
-        self.load_init_files(cwd)
+        self.load_init_files(cwd, warnings)
     }
 
     fn run_init_file(
@@ -294,6 +307,7 @@ impl PluginHost {
         path: &Path,
         scope: ConfigScope,
         merged: &mut Option<RawConfig>,
+        warnings: &mut Vec<String>,
     ) -> Result<(), PluginError> {
         if !path.is_file() {
             return Ok(());
@@ -303,6 +317,10 @@ impl PluginHost {
             source: e,
         })?;
         let plugin_dir = path.parent().map(Path::to_path_buf);
+        if let Err(e) = check_plugin_compatibility(scope.label(), plugin_dir.as_deref()) {
+            warnings.push(format!("{SKIPPED_PLUGIN_WARNING}: {e}"));
+            return Ok(());
+        }
         if let Some(raw) = self.send_config_lua(source, scope, plugin_dir)? {
             match merged {
                 Some(existing) => existing.merge(raw),
@@ -502,13 +520,14 @@ impl PluginHost {
             source: e,
         })?;
         let plugin_dir = path.parent().map(Path::to_path_buf);
+        check_plugin_compatibility(USER_PLUGIN, plugin_dir.as_deref())?;
         let permissions = load_plugin_permissions(plugin_dir.as_deref());
         // Test-only path today. Once user plugin dirs exist: derive a real
         // plugin name, since the hardcoded "user" would collide across files,
         // pass the `plugins.<name>` opts through, and teach the
         // unknown-plugin guards about user plugin names.
         self.send_load(
-            Arc::from("user"),
+            Arc::from(USER_PLUGIN),
             vec![LoadChunk::new(path.display().to_string(), source)],
             plugin_dir,
             permissions,
@@ -1219,15 +1238,16 @@ mod tests {
 
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
 
+        let mut warnings = Vec::new();
         let skipped = host
-            .load_init_files_or_skip(true, dir.path())
+            .load_init_files_or_skip(true, dir.path(), &mut warnings)
             .expect("no-plugins skips broken init.lua");
         assert!(
             skipped.is_none(),
             "--no-plugins must skip user init.lua entirely"
         );
 
-        let ran = host.load_init_files_or_skip(false, dir.path());
+        let ran = host.load_init_files_or_skip(false, dir.path(), &mut warnings);
         assert!(
             ran.is_err(),
             "without --no-plugins the broken init.lua must surface as an error"

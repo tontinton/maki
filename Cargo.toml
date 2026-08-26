@@ -130,6 +130,7 @@ fs4 = "1"
 pin-project-lite = "0.2"
 rustix = { version = "1", default-features = false, features = ["process"] }
 humantime = "2"
+semver = "1"
 toml = "0.8"
 toml_edit = "0.22"
 smol = "2"

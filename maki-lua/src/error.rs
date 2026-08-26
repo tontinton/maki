@@ -17,6 +17,31 @@ pub enum PluginError {
         #[source]
         source: io::Error,
     },
+    #[error(
+        "plugin {plugin} has a non-string min_maki_version; use a plain major.minor.patch string"
+    )]
+    InvalidMinimumVersionType { plugin: String },
+    #[error(
+        "plugin {plugin} has invalid min_maki_version {version:?}: {source}; use a semantic version such as \"1.2.3\""
+    )]
+    InvalidMinimumVersion {
+        plugin: String,
+        version: String,
+        #[source]
+        source: semver::Error,
+    },
+    #[error("Maki was built with invalid package version {version:?}: {source}")]
+    InvalidRuntimeVersion {
+        version: String,
+        #[source]
+        source: semver::Error,
+    },
+    #[error("plugin {plugin} requires Maki {required} or newer, but this is Maki {running}")]
+    MakiVersionTooOld {
+        plugin: String,
+        required: semver::Version,
+        running: semver::Version,
+    },
     #[error("no bundled plugin named \"{plugin}\" (enabled via plugins.{plugin})")]
     UnknownPlugin { plugin: String },
     #[error("plugin host is not running")]

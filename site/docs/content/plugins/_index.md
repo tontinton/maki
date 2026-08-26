@@ -74,7 +74,8 @@ settings in a local table, or export a `setup(opts)` function `init.lua` calls.
 
 Sensitive APIs are gated per plugin file, and a plugin without a
 `plugin.toml` next to it gets nothing. The gates and the file format are
-in [the reference](/docs/lua-api/#plugin-permissions).
+in [the reference](/docs/lua-api/#plugin-permissions). Set
+`min_maki_version` there when a plugin needs a newer Maki Lua API.
 
 ## Development loop
 
