@@ -83,6 +83,16 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
 /// pointer to the new one.
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
 
+/// Tool names registered by the bundled `monitor` plugin beyond its config
+/// key. Valid in `--allowed-tools` and friends, but never a `plugins.<name>`
+/// table.
+pub const MONITOR_SUB_TOOLS: &[&str] = &[
+    "monitor_stop",
+    "monitor_list",
+    "monitor_peek",
+    "monitor_wait",
+];
+
 pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines", "insert_lines"];
 
 #[derive(Debug, Clone, Copy)]

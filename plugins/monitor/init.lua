@@ -16,13 +16,13 @@ monitors; `monitor_stop` kills one (safe after exit).
 
 The monitor survives plugin reloads.]]
 
-local function parse_session(input)
+local function parse_session(input, ctx)
   if input.session and input.session ~= "" then
     return input.session
   end
-  local id, err = maki.session.current()
+  local id, err = ctx:session_id()
   if not id then
-    return nil, err or "no interactive session"
+    return nil, err or "no session"
   end
   return id
 end
@@ -165,12 +165,12 @@ maki.api.register_tool({
     buf:line({ { "monitor ", "dim" }, { s } })
     return buf
   end,
-  handler = function(input)
+  handler = function(input, ctx)
     if not input.command or input.command:match("^%s*$") then
       return { llm_output = "error: command is required", is_error = true }
     end
 
-    local session, err = parse_session(input)
+    local session, err = parse_session(input, ctx)
     if not session then
       return { llm_output = "error: " .. (err or "no session"), is_error = true }
     end
@@ -292,8 +292,8 @@ Returns each monitor's id, command, pid, status, and how long it ran.]],
   permission_scopes = function()
     return { scopes = { "monitor_list" }, force_prompt = false }
   end,
-  handler = function(input)
-    local session, err = parse_session(input or {})
+  handler = function(input, ctx)
+    local session, err = parse_session(input or {}, ctx)
     if not session then
       return { llm_output = "error: " .. (err or "no session"), is_error = true }
     end
