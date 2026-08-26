@@ -35,7 +35,7 @@ use serde_json::Value;
 use smol::io::AsyncBufReadExt;
 use tracing::{debug, warn};
 
-use crate::{AcpParams, elicitation, methods, permissions, translate};
+use crate::{AcpParams, SessionEndHook, elicitation, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
 /// ACP has no fast-mode toggle, so a restored total is priced at standard rates.
@@ -75,7 +75,7 @@ struct Server {
     model_policy: Arc<ModelPolicy>,
     client_elicits_form: bool,
     session: Option<SessionState>,
-    on_session_end: Option<Arc<dyn Fn(MakiId) + Send + Sync>>,
+    on_session_end: Option<SessionEndHook>,
 }
 
 impl Server {
@@ -124,12 +124,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     }
 
-    if let Some(session) = server.session.take() {
-        if let Some(cb) = &server.on_session_end {
-            cb(session.handle.session_id.id());
-        }
-        drop(session);
-    }
+    close_session(&mut server).await;
     drop(server);
     writer_task.await;
     reader_task.await.context("read stdin")?;
@@ -498,7 +493,7 @@ async fn close_session(srv: &mut Server) {
         return;
     };
     if let Some(cb) = &srv.on_session_end {
-        cb(state.handle.session_id.id());
+        cb(state.handle.session_id.id()).await;
     }
     // The event pump dies with the session, so the prompt it owed an answer to
     // has to be answered here or the client waits on it forever.
@@ -934,6 +929,24 @@ mod tests {
             }),
         };
         (server, answer_rx, out_rx)
+    }
+
+    #[test]
+    fn close_session_awaits_the_session_end_hook() {
+        let (mut srv, ..) = server_with_ask(AskKind::Permission);
+        let ended = srv.session.as_ref().unwrap().handle.session_id.id();
+        let (ended_tx, ended_rx) = flume::bounded(1);
+        srv.on_session_end = Some(Arc::new(move |id| {
+            let ended_tx = ended_tx.clone();
+            Box::pin(async move {
+                let _ = ended_tx.send(id);
+            })
+        }));
+
+        smol::block_on(close_session(&mut srv));
+
+        assert_eq!(ended_rx.try_recv().ok(), Some(ended));
+        assert!(srv.session.is_none(), "close must take the session");
     }
 
     #[test]

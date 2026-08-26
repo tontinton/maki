@@ -1565,6 +1565,10 @@ impl<'t> EventLoop<'t> {
             elapsed
         };
         let exit = self.sessions[self.focused].app.exit_request;
+        // The loop already stopped draining `UiAction`. Drop the receiver
+        // before the handlers run, or one that touches the UI parks forever
+        // and only the teardown deadline gets us out of it.
+        drop(self.ui_action_rx);
         self.ctx
             .lua_event_handle
             .end_sessions_blocking(self.sessions.iter().map(SessionRuntime::id));

@@ -148,17 +148,18 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///
 /// Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 /// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
-/// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-/// and `"ModelChanged"`. Plugins can also fire their own events with
-/// `exec_autocmds`.
+/// `"SessionEnd"`, `"SessionFocusChanged"`, `"SessionStatusChanged"`,
+/// `"TaskStatusChanged"`, and `"ModelChanged"`. Plugins can also fire their
+/// own events with `exec_autocmds`.
 ///
-/// Each host event carries `data.session_id`. For `"SessionReset"` that
-/// is the session being left behind; the other events name the session now
-/// running or focused. Tool events also carry `data.tool_id` and `data.tool`.
-/// `"SessionFocusChanged"` also carries `data.previous_session_id` except on
-/// initial startup. `"SessionStatusChanged"` fires whenever a session moves
-/// between `"working"`, `"needs_input"`, and `"idle"`; it carries
-/// `data.status`, `data.title`, and `data.focused` (boolean).
+/// Each host event carries `data.session_id`. For `"SessionReset"` and
+/// `"SessionEnd"` that is the session being left behind; the other events
+/// name the session now running or focused. Tool events also carry
+/// `data.tool_id` and `data.tool`. `"SessionFocusChanged"` also carries
+/// `data.previous_session_id` except on initial startup.
+/// `"SessionStatusChanged"` fires whenever a session moves between
+/// `"working"`, `"needs_input"`, and `"idle"`; it carries `data.status`,
+/// `data.title`, and `data.focused` (boolean).
 /// `"TaskStatusChanged"` fires when a subagent starts, or when one moves
 /// between `"working"`, `"done"`, and `"error"`; it carries `data.id` and
 /// `data.name` alongside `data.status`. A task that comes back from disk
@@ -168,9 +169,16 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// returns, plus `data.previous_spec`. Picking the model already in use stays
 /// quiet, and so does startup.
 ///
+/// `"SessionEnd"` is the teardown signal: it fires first so handlers can
+/// still inspect or stop the session's jobs, then session-owned jobs are
+/// reaped. It is sent on TUI `/new`, tab delete, session load, UI shutdown,
+/// ACP session replace/EOF, and headless completion.
+/// `"SessionReset"` stays TUI-only (`/new`).
+///
 /// On the exit paths (UI shutdown, ACP EOF, headless completion) the host is
-/// already tearing down, so handlers get a short grace period and must not
-/// depend on `maki.fn` UI roundtrips; write state out with `maki.fs` instead.
+/// already tearing down, so handlers get a short grace period and the UI is
+/// gone: `maki.fn` roundtrips fail right away. Write state out with
+/// `maki.fs` instead.
 ///
 /// Jobs started inside a callback die with the dispatch unless you await
 /// them there (`jobwait`) or hand them to a session (`owner = "session"`).

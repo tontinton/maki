@@ -2449,8 +2449,8 @@ local seen
 
     host.event_handle().end_sessions_blocking([session]);
 
-    // `wait = true` answers only after handlers dispatched and jobs reaped,
-    // so what the handler saw is settled.
+    // `end_sessions_blocking` only answers once the handlers ran and the jobs
+    // were reaped, so what the handler saw is settled by now.
     let seen = exec_tool(&reg, "probe_order_job", json!({})).unwrap();
     assert!(
         seen.starts_with("running:"),
@@ -5689,52 +5689,50 @@ maki.api.register_tool({{
 fn jobwait_returns_after_session_end_kill() {
     let (reg, host) = builtins_host();
     let session = maki_storage::id::MakiId::generate();
+    let dir = tempfile::tempdir().unwrap();
+    let parked_path = dir.path().join("parked");
     let src = format!(
         r#"
-local job_id
-maki.api.register_tool({{
-    name = "start_long_job",
-    description = "session job that outlives the wait",
-    schema = {MINIMAL_SCHEMA},
-    audiences = {{ "main" }},
-    handler = function()
-        job_id = maki.fn.jobstart("sleep 30", {{
-            owner = "session",
-            session = "{session}",
-        }})
-        return tostring(job_id)
-    end,
-}})
 maki.api.register_tool({{
     name = "wait_long_job",
-    description = "parks in jobwait until killed or timeout",
+    description = "parks in jobwait until the session ends",
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        local ok, res = pcall(maki.fn.jobwait, job_id, 25000)
+        -- jobwait checks the job's output channel out of the store, so only
+        -- a parked jobwait can run this callback. The marker is proof the
+        -- wait is really parked, where a sleep would just be a guess.
+        local id = maki.fn.jobstart("echo parked; exec sleep 30", {{
+            owner = "session",
+            session = "{session}",
+            on_stdout = function() maki.fs.write("{parked}", "parked") end,
+        }})
+        local ok, res = pcall(maki.fn.jobwait, id, 25000)
         if not ok then
             return {{ llm_output = "error: " .. tostring(res), is_error = true }}
         end
         if res == nil then
-            return "timeout"
+            return {{ llm_output = "error: jobwait timed out", is_error = true }}
         end
         return "exit:" .. tostring(res.exit_code)
     end,
 }})
-"#
+"#,
+        parked = parked_path.display(),
     );
     host.load_source("endkill", &src).unwrap();
-    exec_tool(&reg, "start_long_job", json!({})).unwrap();
 
     let reg2 = Arc::clone(&reg);
     let wait_handle =
         std::thread::spawn(move || exec_tool(&reg2, "wait_long_job", json!({})).unwrap());
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    poll_until("jobwait never parked", || {
+        parked_path.exists().then_some(())
+    });
     host.event_handle().end_sessions_blocking([session]);
     let out = wait_handle.join().expect("wait thread must not panic");
     assert!(
-        out.starts_with("exit:") || out == "timeout",
-        "parked jobwait must return after session end, got: {out}"
+        out.starts_with("exit:"),
+        "parked jobwait must collect the exit of the killed job, got: {out}"
     );
 }
 

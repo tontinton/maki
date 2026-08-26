@@ -14,6 +14,9 @@ use maki_config::ModelPolicy;
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_storage::id::MakiId;
+use smol::future::Boxed;
+
+pub type SessionEndHook = Arc<dyn Fn(MakiId) -> Boxed<()> + Send + Sync>;
 
 pub struct AcpParams {
     pub model: Model,
@@ -25,8 +28,10 @@ pub struct AcpParams {
     pub yolo: bool,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
-    /// Called when an ACP session is replaced or the server exits.
-    pub on_session_end: Option<Arc<dyn Fn(MakiId) + Send + Sync>>,
+    /// Called when an ACP session is replaced or the server exits. The hook
+    /// answers with a future so its wait rides the executor instead of
+    /// holding stdin for the whole `SessionEnd` grace period.
+    pub on_session_end: Option<SessionEndHook>,
 }
 
 pub fn run(params: AcpParams) -> color_eyre::Result<()> {

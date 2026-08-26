@@ -70,6 +70,9 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
         yolo,
         model_policy: Arc::new(config.provider.model_policy.clone()),
         plugin_rules: plugin_host.plugin_rules(),
-        on_session_end: Some(Arc::new(move |id| event_handle.end_sessions_blocking([id]))),
+        on_session_end: Some(Arc::new(move |id| {
+            let handle = event_handle.clone();
+            Box::pin(async move { handle.end_session_async(id).await })
+        })),
     })
 }

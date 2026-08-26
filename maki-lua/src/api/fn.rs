@@ -764,8 +764,8 @@ fn jobinfo(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<Pair<Va
 
 /// List jobs this plugin can see, including exited session-owned jobs (so an
 /// id started before a reload stays findable). Rows identify the job; call
-/// `jobinfo` for tails. Pass a session id to restrict session-owned jobs to
-/// that session.
+/// `jobinfo` for tails. Pass a session id to list only session-owned jobs
+/// for that session; plugin and task jobs are omitted.
 ///
 /// @param session string? Session id filter.
 /// @return (table) array of `{ id, command, pid, session, status, exit_code,
@@ -858,8 +858,10 @@ fn jobforget(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 ///
 /// While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 /// callbacks fire as events arrive (like Neovim), so you can stream
-/// output into a buffer while parked here. A job that already exited
-/// answers from its snapshot instead and fires no callbacks.
+/// output into a buffer while parked here. An already-exited
+/// session-owned job answers from its snapshot and fires no callbacks.
+/// Task and plugin jobs leave the store on exit, so waiting after that
+/// is an error.
 ///
 /// @param job_id integer Job id returned by `jobstart`.
 /// @param timeout_ms integer? Maximum wait in milliseconds (default 30000).
@@ -1041,7 +1043,7 @@ lua_table! {
     ///
     /// ```lua
     /// local id = maki.fn.jobstart("git status", {
-    ///   on_exit = function(code) print("done: " .. code) end,
+    ///   on_exit = function(_, code) print("done: " .. code) end,
     /// })
     /// ```
     "maki.fn" => pub(crate) fn create_fn_table(

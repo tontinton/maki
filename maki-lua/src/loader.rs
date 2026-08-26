@@ -986,6 +986,14 @@ impl EventHandle {
         }
     }
 
+    /// [`Self::end_sessions_blocking`] parked on a spare thread. ACP calls
+    /// this from its executor, where blocking would freeze stdin for the
+    /// whole grace period.
+    pub async fn end_session_async(&self, session: MakiId) {
+        let handle = self.clone();
+        smol::unblock(move || handle.end_sessions_blocking([session])).await;
+    }
+
     fn send_end_session(&self, session: MakiId) -> Option<flume::Receiver<()>> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.tx

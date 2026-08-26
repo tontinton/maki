@@ -514,6 +514,10 @@ pub(crate) fn ui_send(
 /// Send an action carrying a reply channel and await the answer. Only
 /// works from a callback: the loop drains `UiAction` between frames, so a
 /// call at config load time would wait forever.
+///
+/// No deadline on purpose: the loop legitimately stops answering for a long
+/// time (`open_editor` holds it for as long as the editor is up). Teardown
+/// drops the receiver instead, which fails the send outright.
 pub(crate) async fn ui_roundtrip<T>(
     tx: Option<&flume::Sender<UiAction>>,
     action: impl FnOnce(flume::Sender<T>) -> UiAction,
@@ -603,6 +607,16 @@ mod tests {
         assert_eq!(reader.load().generation, 1);
         writer.publish(vec![]);
         assert_eq!(reader.load().generation, 2);
+    }
+
+    #[test]
+    fn ui_roundtrip_fails_once_the_loop_drops_its_receiver() {
+        let (tx, rx) = flume::unbounded();
+        drop(rx);
+        let result = smol::block_on(ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView {
+            reply_tx,
+        }));
+        assert_eq!(result.err(), Some(NO_UI_ERR));
     }
 
     #[test_case(Dimension::Abs(42), 200 => 42 ; "abs_ignores_total")]
