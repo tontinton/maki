@@ -8,13 +8,13 @@ use std::time::{Duration, Instant};
 
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
-use maki_agent::agent::tool_dispatch::{self, Emit};
+use maki_agent::agent::tool_dispatch;
 use maki_agent::cancel::{CancelMap, CancelSlot};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
-    Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools, ToolAudience,
+    CallOrigin, Deadline, DescriptionContext, FileReadTracker, LocalTool, LocalTools, ToolAudience,
     ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
@@ -31,6 +31,7 @@ use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as Lua
 use serde_json::Value as JsonValue;
 use tracing::info;
 
+use crate::api::tool::{audiences_to_lua, parse_audience};
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
@@ -214,6 +215,9 @@ async fn system_prompt(
 ///   `except` (string[]?) - exclude these tool names.
 ///   `workflow` (boolean?) - use workflow-mode descriptions. Default: `false`.
 ///   `spec` (string?) - evaluate capability exclusions against this model spec.
+///   `mcp` (boolean?) - describe tools as if MCP is reachable. Default: `true`.
+///     Pass what you pass to `maki.agent.session()`. Otherwise the descriptions
+///     advertise MCP tools that the session has no way to call.
 /// @return (table?, string?) Array of tool definition tables, or `(nil, err)` on failure.
 /// @example
 /// local defs, err = maki.agent.tools(ctx, {
@@ -235,6 +239,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
     let except: Option<Vec<String>> = opts.get("except")?;
     let workflow: bool = opts.get::<Option<bool>>("workflow")?.unwrap_or(false);
     let spec_str: Option<String> = opts.get("spec")?;
+    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true);
 
     let parsed = spec_str
         .as_deref()
@@ -261,12 +266,62 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
         filter: &filter,
         audience,
         workflow,
+        mcp: mcp_enabled && agent.mcp.is_some(),
     };
     // Base definitions only: the session injects MCP definitions per
     // request, so baking them into a tools array would freeze the catalog.
     let defs = ToolRegistry::global().definitions(&vars, &ctx_desc, model.supports_tool_examples());
 
     Ok((Some(json_to_lua(&lua, &defs)?), None))
+}
+
+/// Every tool name this context can dispatch: registry tools, MCP tools
+/// (deferred ones included), host tools (ACP client tools, a subagent's
+/// `structured_output`) and `tool_search`. Reach for it when you expose tools
+/// inside a sandbox and need the names to bind. `maki.api.get_tools()` covers
+/// the registry alone and has no view of the session.
+///
+/// The list already accounts for this session's audience, the config's
+/// `disabled_tools` and the model's capabilities. Read `audiences` to layer
+/// your own policy on top. A sandbox wants `interpreter`.
+///
+/// Each name shows up once, described by the tool a call would really reach, so
+/// a host tool that shadows a registry name reports its own audience rather
+/// than the shadowed one's.
+///
+/// @param ctx LuaCtx Agent context.
+/// @return (table?, string?) Array of `{ name, alias?, source, audiences, schema? }`,
+///   or `(nil, err)` on failure. `source` is one of `"native"`, `"local"`,
+///   `"mcp"`. `alias` is a safe identifier to bind, set only when `name` is not
+///   one (say `srv__get-docs`). Dispatch `name` in every case. `schema` comes
+///   with registry tools only.
+/// @example
+/// local tools, err = maki.agent.callable_tools(ctx)
+/// if err then error(err) end
+/// for _, t in ipairs(tools) do
+///   print(t.source, t.alias or t.name)
+/// end
+#[lua_fn]
+async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<Table>> {
+    let agent = try_pair!(dispatch_ctx(&ctx, "callable_tools"));
+    let out = lua.create_table()?;
+    for (i, tool) in tool_dispatch::callable(&agent.to_tool_context())
+        .into_iter()
+        .enumerate()
+    {
+        let t = lua.create_table()?;
+        t.set("name", tool.name)?;
+        if let Some(alias) = tool.alias {
+            t.set("alias", alias)?;
+        }
+        t.set("source", tool.source)?;
+        t.set("audiences", audiences_to_lua(&lua, tool.audience)?)?;
+        if let Some(schema) = tool.schema {
+            t.set("schema", json_to_lua(&lua, &schema)?)?;
+        }
+        out.set(i + 1, t)?;
+    }
+    Ok((Some(out), None))
 }
 
 /// Run a tool by name and wait for the result. This is how you call built-in
@@ -360,7 +415,9 @@ async fn call_tool(
 ///   `local_tools` (table?) - map of `name -> spec` for Lua-backed tools. Each spec
 ///     requires `description` (string), `input_schema` (table), and
 ///     `handler` (function). The handler receives the input table and must return
-///     `(string)` or `(nil, err)`.
+///     `(string)` or `(nil, err)`. Optional `audiences` (string[]) gates who may
+///     call it, the same way `maki.api.register_tool` does. The default is the
+///     model alone, so a script cannot reach it through `code_execution`.
 ///   `name` (string?) - display name for logs and UI.
 ///   `audience` (string?) - tool audience for capability gating. Default: `"general_sub"`.
 ///   `mcp` (boolean?) - give the session access to MCP tools. Their
@@ -436,7 +493,7 @@ async fn session(
         None => JsonValue::Array(vec![]),
     };
 
-    let mut local_map: HashMap<String, LocalToolFn> = HashMap::new();
+    let mut local_map: HashMap<String, LocalTool> = HashMap::new();
     if let Some(tbl) = local_tools_tbl {
         let defs = tools_json.as_array_mut().expect("checked above");
         for pair in tbl.pairs::<String, Table>() {
@@ -456,10 +513,12 @@ async fn session(
                 "description": description,
                 "input_schema": sanitized_schema,
             }));
+            let audience =
+                parse_audience(spec.get::<Option<Table>>("audiences")?, ToolAudience::MODEL)?;
             let weak = lua.weak();
             local_map.insert(
                 name,
-                maki_agent::tools::local_tool(move |input, _ctx| {
+                maki_agent::tools::local_tool(audience, move |input, _ctx| {
                     let result = call_local_tool(&weak, &handler, &input);
                     Box::pin(async move { result })
                 }),
@@ -592,7 +651,7 @@ lua_table! {
     /// sess:close()
     /// ```
     "maki.agent" => pub(crate) fn create_agent_table(), DOCS [
-        resolve_model, system_prompt, tools, call_tool, session,
+        resolve_model, system_prompt, tools, callable_tools, call_tool, session,
     ]
 }
 
@@ -635,15 +694,7 @@ async fn dispatch_racing_live(
     rx: Option<flume::Receiver<ToolLive>>,
     cbs: &LiveCallbacks<'_>,
 ) -> ToolDoneEvent {
-    let run = tool_dispatch::run(
-        &tctx.registry,
-        tctx.mcp.as_ref(),
-        String::new(),
-        name,
-        input,
-        tctx,
-        Emit::Silent,
-    );
+    let run = tool_dispatch::run(String::new(), name, input, tctx, CallOrigin::Nested);
     let Some(rx) = rx else {
         return run.await;
     };

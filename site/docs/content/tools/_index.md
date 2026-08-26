@@ -142,11 +142,11 @@ Executes multiple independent tool calls concurrently to reduce round-trips.
 
 ### `code_execution` {#code_execution}
 
-Execute Python code in a sandboxed interpreter with tools as callable functions.
+Execute Python in a sandbox where every tool is an async function.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `code` | string | yes |  | Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. Use `await gather(...)` for concurrency. |
+| `code` | string | yes |  | Python code. Tools return strings, not objects, and you MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. |
 | `timeout` | integer | no | 30 | Script execution timeout in seconds |
 
 ### `question` {#question}

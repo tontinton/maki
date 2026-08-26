@@ -102,11 +102,14 @@ struct AgentSetup {
     tools: Value,
 }
 
+/// Takes the handle rather than a second `bool`: two adjacent flags is one
+/// silent swap away from a session that describes tools it cannot call.
 fn setup(
     model: &Model,
     config: &AgentConfig,
     excluded_tools: &[&'static str],
     workflow: bool,
+    mcp: Option<&McpHandle>,
 ) -> AgentSetup {
     let vars = template::env_vars();
     let instructions = agent::load_instructions(&vars.apply("{cwd}"));
@@ -117,6 +120,7 @@ fn setup(
         excluded_tools,
         workflow,
         ToolRegistry::global(),
+        mcp.is_some(),
     );
 
     AgentSetup {
@@ -135,12 +139,14 @@ fn tool_definitions(
     excluded_tools: &[&'static str],
     workflow: bool,
     registry: &ToolRegistry,
+    mcp: bool,
 ) -> Value {
     let filter = ToolFilter::from_config(config, model, excluded_tools);
     let ctx = DescriptionContext {
         filter: &filter,
         audience: ToolAudience::MAIN,
         workflow,
+        mcp,
     };
     registry.definitions(vars, &ctx, model.supports_tool_examples())
 }
@@ -167,6 +173,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         &params.config,
         &params.excluded_tools,
         params.workflow,
+        params.mcp_handle.as_ref(),
     );
 
     let system = agent::build_system_prompt(
@@ -318,6 +325,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         &params.config,
         &params.excluded_tools,
         params.workflow,
+        params.mcp_handle.as_ref(),
     );
 
     let mcp = params
@@ -411,6 +419,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                                 &params.excluded_tools,
                                 params.workflow,
                                 ToolRegistry::global(),
+                                mcp.is_some(),
                             );
                             model = new_model;
                         }
@@ -616,7 +625,8 @@ mod tests {
     #[test]
     fn advertised_names_show_tool_search_not_deferred_tools() {
         let base = serde_json::json!([{"name": "read"}]);
-        let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
+        let mcp =
+            crate::mcp::test_support::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
         let names = advertised_tool_names(&base, Some(&mcp));
         assert_eq!(
             names,

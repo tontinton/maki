@@ -2,11 +2,15 @@
 //! gates both `describe` text and the handler's fn-map, so what the model
 //! sees is exactly what the interpreter can call.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use maki_agent::AgentMode;
+use maki_agent::mcp::test_support::stub_session;
 use maki_agent::tools::test_support::stub_ctx;
-use maki_agent::tools::{DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry};
+use maki_agent::tools::{
+    DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry, local_tool,
+};
 use maki_lua::PluginHost;
 
 const CODE_EXECUTION_SRC: &str = include_str!("../../plugins/code_execution/init.lua");
@@ -20,6 +24,22 @@ const WORKFLOW_NOTE_SUBSTR: &str = "Workflow mode: orchestrate subagents";
 const INTERP_ECHO_SIG: &str = "- interp_echo(msg: str, count: int = None, flag: bool = None, items: list = None, raw: any = None) -> str";
 const WF_TASK_SIG: &str = "- wf_task(prompt: str, model_tier: str = None) -> str";
 const SUB_TOOL_SIG: &str = "- sub_tool() -> str";
+const MCP_NOTE_SUBSTR: &str = "MCP tools are callable too";
+const MCP_TOOL_QUALIFIED: &str = "srv.fetch_issue";
+const MCP_TOOL_WIRE: &str = "srv__fetch_issue";
+/// Servers publish names Python cannot spell; the sandbox binds the alias.
+const HYPHEN_QUALIFIED: &str = "srv.get-docs";
+const HYPHEN_ALIAS: &str = "srv__get_docs";
+/// The stub transport fails every request with this, so seeing it proves the
+/// call reached MCP instead of dying at name lookup.
+const MCP_REACHED_ERR: &str = "unknown MCP tool";
+const NAME_ERROR: &str = "NameError";
+const CODE_EXECUTION: &str = "code_execution";
+const TOOLS_MCP_PROBE: &str = "tools_mcp_probe";
+/// Stands in for an ACP client tool: dispatched from the context, not the
+/// registry.
+const CLIENT_TOOL: &str = "client_probe";
+const CLIENT_TOOL_OUT: &str = "client ran";
 
 fn fixture_plugin() -> String {
     format!(
@@ -63,6 +83,25 @@ maki.api.register_tool({{
     handler = function() return {{ llm_output = "{FAIL_MSG}", is_error = true }} end,
 }})
 maki.api.register_tool({{
+    name = "{TOOLS_MCP_PROBE}",
+    description = "returns the code_execution description agent.tools built",
+    audiences = {{ "main" }},
+    schema = {{
+        type = "object",
+        required = {{ "mcp" }},
+        properties = {{ mcp = {{ type = "boolean" }} }},
+        additionalProperties = false,
+    }},
+    handler = function(input, ctx)
+        local defs, err = maki.agent.tools(ctx, {{ audience = "main", mcp = input.mcp }})
+        if err then return {{ llm_output = err, is_error = true }} end
+        for _, d in ipairs(defs) do
+            if d.name == "{CODE_EXECUTION}" then return d.description end
+        end
+        return {{ llm_output = "{CODE_EXECUTION} missing", is_error = true }}
+    end,
+}})
+maki.api.register_tool({{
     name = "sub_tool",
     description = "subagent fixture",
     audiences = {{ "general_sub", "interpreter" }},
@@ -86,9 +125,9 @@ fn setup() -> (Arc<ToolRegistry>, PluginHost) {
     setup_with(Arc::new(ToolRegistry::new()))
 }
 
-/// Uses the global native registry because `interpreter_bridge::dispatch` does.
-/// Safe: nextest runs each test in its own process.
-fn setup_native() -> (Arc<ToolRegistry>, PluginHost) {
+/// `maki.agent.tools` describes the process-wide registry, so the fixtures have
+/// to land there. Safe: nextest runs each test in its own process.
+fn setup_global() -> (Arc<ToolRegistry>, PluginHost) {
     setup_with(Arc::clone(ToolRegistry::global_arc()))
 }
 
@@ -98,25 +137,26 @@ fn describe(
     audience: ToolAudience,
     workflow: bool,
 ) -> String {
-    reg.get("code_execution")
+    reg.get(CODE_EXECUTION)
         .expect("code_execution registered")
         .tool
         .description(&DescriptionContext {
             filter,
             audience,
             workflow,
+            mcp: false,
         })
         .into_owned()
 }
 
-fn exec_code(reg: &ToolRegistry, ctx: &ToolContext, code: &str) -> Result<String, String> {
-    let entry = reg
-        .get("code_execution")
-        .expect("code_execution registered");
-    let inv = entry
-        .tool
-        .parse(&serde_json::json!({ "code": code, "timeout": 10 }))
-        .expect("parse failed");
+fn run_tool(
+    reg: &ToolRegistry,
+    ctx: &ToolContext,
+    name: &str,
+    input: serde_json::Value,
+) -> Result<String, String> {
+    let entry = reg.get(name).unwrap_or_else(|| panic!("{name} registered"));
+    let inv = entry.tool.parse(&input).expect("parse failed");
     smol::block_on(async { inv.execute(ctx).await })
         .output
         .map(|out| match out {
@@ -125,16 +165,31 @@ fn exec_code(reg: &ToolRegistry, ctx: &ToolContext, code: &str) -> Result<String
         })
 }
 
-fn run_code_in(code: &str, workflow: bool) -> Result<String, String> {
-    let (reg, _host) = setup_native();
+fn exec_code(reg: &ToolRegistry, ctx: &ToolContext, code: &str) -> Result<String, String> {
+    run_tool(
+        reg,
+        ctx,
+        CODE_EXECUTION,
+        serde_json::json!({ "code": code, "timeout": 10 }),
+    )
+}
+
+/// One seam for every scenario: `shape` sets whatever the case is about
+/// (audience, workflow, MCP, host tools) on an otherwise stock context.
+fn shaped_ctx(reg: &Arc<ToolRegistry>, shape: impl FnOnce(&mut ToolContext)) -> ToolContext {
     let mut ctx = stub_ctx(&AgentMode::Build);
-    ctx.registry = Arc::clone(&reg);
-    ctx.workflow = workflow;
-    exec_code(&reg, &ctx, code)
+    ctx.registry = Arc::clone(reg);
+    shape(&mut ctx);
+    ctx
+}
+
+fn run_code_with(code: &str, shape: impl FnOnce(&mut ToolContext)) -> Result<String, String> {
+    let (reg, _host) = setup();
+    exec_code(&reg, &shaped_ctx(&reg, shape), code)
 }
 
 fn run_code(code: &str) -> Result<String, String> {
-    run_code_in(code, false)
+    run_code_with(code, |_| {})
 }
 
 #[test]
@@ -240,9 +295,73 @@ fn workflow_tool_not_callable_when_workflow_false() {
 /// audience/workflow reads, leaving workflow tools uncallable.
 #[test]
 fn workflow_tool_callable_when_workflow_true() {
-    let out = run_code_in("result = await wf_task(prompt='x')\nprint(result)", true)
-        .expect("workflow tool must be callable when workflow=true");
+    let out = run_code_with("result = await wf_task(prompt='x')\nprint(result)", |ctx| {
+        ctx.workflow = true
+    })
+    .expect("workflow tool must be callable when workflow=true");
     assert!(out.contains(&format!("{TASK_PREFIX}x")), "got: {out}");
+}
+
+// --- context tools (MCP, client tools) ---
+
+fn with_mcp(qualified: &'static str) -> impl FnOnce(&mut ToolContext) {
+    move |ctx| ctx.mcp = Some(stub_session(&[(qualified, "")]))
+}
+
+/// A caller that drops MCP for a subagent must not hand it a description
+/// promising MCP tools that subagent cannot call.
+#[test_case::test_case(true ; "session_keeps_mcp")]
+#[test_case::test_case(false ; "session_drops_mcp")]
+fn agent_tools_describes_mcp_only_when_the_session_keeps_it(enabled: bool) {
+    let (reg, _host) = setup_global();
+    let ctx = shaped_ctx(&reg, with_mcp(MCP_TOOL_QUALIFIED));
+    let desc = run_tool(
+        &reg,
+        &ctx,
+        TOOLS_MCP_PROBE,
+        serde_json::json!({ "mcp": enabled }),
+    )
+    .expect("probe must describe code_execution");
+    assert_eq!(desc.contains(MCP_NOTE_SUBSTR), enabled, "got: {desc}");
+}
+
+/// The stub leaves the tool deferred, so binding it means reading the MCP index
+/// rather than the request's tool array.
+#[test_case::test_case(MCP_TOOL_QUALIFIED, MCP_TOOL_WIRE ; "deferred_tool_binds_its_wire_name")]
+#[test_case::test_case(HYPHEN_QUALIFIED, HYPHEN_ALIAS    ; "hyphenated_tool_binds_an_alias")]
+fn mcp_tool_is_callable_from_the_sandbox(qualified: &'static str, bound: &str) {
+    let err = run_code_with(&format!("await {bound}()"), with_mcp(qualified))
+        .expect_err("the stub transport fails every call");
+    assert!(err.contains(MCP_REACHED_ERR), "got: {err}");
+}
+
+fn with_client_tool(audience: ToolAudience) -> impl FnOnce(&mut ToolContext) {
+    let tool = local_tool(audience, |_, _| {
+        Box::pin(async { Ok(CLIENT_TOOL_OUT.to_owned()) })
+    });
+    move |ctx| ctx.local_tools = Arc::new(HashMap::from([(CLIENT_TOOL.to_owned(), tool)]))
+}
+
+#[test]
+fn client_tool_is_callable_when_it_admits_the_interpreter() {
+    let out = run_code_with(
+        &format!("print(await {CLIENT_TOOL}())"),
+        with_client_tool(ToolAudience::MAIN | ToolAudience::INTERPRETER),
+    )
+    .expect("a client tool the interpreter may call must be callable");
+    assert!(out.contains(CLIENT_TOOL_OUT), "got: {out}");
+}
+
+/// `MODEL` is what a host tool gets when nobody opted it in, and a subagent's
+/// `structured_output` rides on that default.
+#[test]
+fn model_only_client_tool_stays_out_of_the_sandbox() {
+    let err = run_code_with(
+        &format!("await {CLIENT_TOOL}()"),
+        with_client_tool(ToolAudience::MODEL),
+    )
+    .expect_err("a model-only host tool must not be bound at all");
+    assert!(err.contains(NAME_ERROR), "got: {err}");
 }
 
 // --- script rendering ---
@@ -339,7 +458,7 @@ fn final_body_text(rx: &flume::Receiver<maki_agent::Envelope>) -> String {
 /// Some call paths skip `start`, so `handler` must render the script itself.
 #[test]
 fn handler_renders_script_when_start_never_ran() {
-    let (reg, _host) = setup_native();
+    let (reg, _host) = setup();
     let inv = parse_code(&reg, "print('hi')");
     let (ctx, rx) = event_ctx(&reg);
     smol::block_on(inv.execute(&ctx))
@@ -366,7 +485,7 @@ fn start_preview_renders_single_line(code: &str) {
 
 #[test]
 fn handler_error_keeps_script_and_drops_waiting_notice() {
-    let (reg, _host) = setup_native();
+    let (reg, _host) = setup();
     let inv = parse_code(&reg, "print(boom_undefined)");
     let (ctx, rx) = event_ctx(&reg);
     let err = smol::block_on(inv.execute(&ctx))

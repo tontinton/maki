@@ -474,7 +474,6 @@ impl<'h> Agent<'h> {
         tool_dispatch::process_tool_calls(
             response,
             &mut self.recent_calls,
-            self.mcp.as_ref(),
             self.history,
             &self.event_tx,
             &ctx,
@@ -972,7 +971,7 @@ mod tests {
             let captured = Arc::clone(&provider.captured_tools);
             let mut history = History::new(Vec::new());
             let (agent, _event_rx) = make_agent(provider, &mut history);
-            let mut agent = agent.with_mcp(Some(crate::mcp::stub_session(&[(
+            let mut agent = agent.with_mcp(Some(crate::mcp::test_support::stub_session(&[(
                 "srv.fetch_issue",
                 "Fetch a GitHub issue",
             )])));

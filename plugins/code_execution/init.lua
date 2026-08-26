@@ -48,9 +48,17 @@ async def gather(*calls):
             results.append('%s' + str(e))
     return results
 ]]):format(ERROR_PREFIX)
-local TOOLS_HEADER = "\n\nAvailable tools (called as Python functions with keyword arguments):\n"
+local TOOLS_HEADER = "\n\nAvailable tools (async Python functions, keyword args only):\n"
 local WORKFLOW_TOOLS_NOTE =
   "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `gather(task(...), task(...))` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
+-- MCP names and schemas already sit in the tool array (or the tool_search
+-- catalog), so point at those instead of repeating them here.
+local MCP_NOTE =
+  "\nMCP tools are callable too, with the arguments their definitions declare. Hyphens become underscores (`srv__get-docs` is `srv__get_docs`).\n"
+local CALLABLE_TOOLS_ERR = "cannot list callable tools: "
+-- `alias` covers hyphens; what is left is a name no substitution can fix, like
+-- a leading digit. Binding it would raise a SyntaxError the model cannot act on.
+local PY_IDENTIFIER = "^[%a_][%w_]*$"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
 
 local opts = maki.api.register_options(output_limits.extend({
@@ -110,7 +118,7 @@ local function build_body(ctx, code)
   return buf, view, highlight
 end
 
-local description = [[Execute Python code in a sandboxed interpreter with tools as callable functions.
+local description = [[Execute Python in a sandbox where every tool is an async function.
 
 Use for chained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** cheaper than sequential tool calls!
 
@@ -130,7 +138,7 @@ local schema = {
   properties = {
     code = {
       type = "string",
-      description = "Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. Use `await gather(...)` for concurrency.",
+      description = "Python code. Tools return strings, not objects, and you MUST await every call: `result = await read(path='/file', offset=1, limit=0)`.",
     },
     timeout = {
       type = "integer",
@@ -167,7 +175,7 @@ local function interpreter_tools(tools, audience, workflow)
     for _, a in ipairs(t.audiences) do
       aud[a] = true
     end
-    if t.enabled and aud[audience] and (aud.interpreter or (workflow and aud.workflow)) then
+    if aud[audience] and (aud.interpreter or (workflow and aud.workflow)) then
       t.workflow_only = not aud.interpreter
       out[#out + 1] = t
     end
@@ -233,6 +241,9 @@ local function describe(dctx)
   if has_workflow_only then
     parts[#parts + 1] = WORKFLOW_TOOLS_NOTE
   end
+  if dctx.mcp then
+    parts[#parts + 1] = MCP_NOTE
+  end
   return table.concat(parts)
 end
 
@@ -246,7 +257,6 @@ local function start(input, ctx)
 end
 
 local function handler(input, ctx)
-  local config = ctx:config()
   local timeout = input.timeout or opts.timeout_secs
 
   local buf, view, highlight = build_body(ctx, input.code)
@@ -283,12 +293,22 @@ local function handler(input, ctx)
     ctx:finish(cut(reason))
   end)
 
+  -- Registry, MCP and host tools in one list, already filtered by
+  -- `disabled_tools`, each entry carrying the audience of the tool a call to
+  -- that name would really reach.
+  local callable, callable_err = maki.agent.callable_tools(ctx)
+  if callable_err then
+    return { llm_output = CALLABLE_TOOLS_ERR .. callable_err, is_error = true }
+  end
+
   local tools = {}
-  for _, t in ipairs(interpreter_tools(maki.api.get_tools({ config = config }), ctx:audience(), ctx:workflow())) do
-    local name = t.name
-    local call_opts = t.workflow_only and {} or { timeout = timeout }
-    tools[name] = function(tool_input)
-      return maki.agent.call_tool(ctx, name, tool_input, call_opts)
+  for _, t in ipairs(interpreter_tools(callable, ctx:audience(), ctx:workflow())) do
+    local bind, name = t.alias or t.name, t.name
+    if bind:match(PY_IDENTIFIER) then
+      local call_opts = t.workflow_only and {} or { timeout = timeout }
+      tools[bind] = function(tool_input)
+        return maki.agent.call_tool(ctx, name, tool_input, call_opts)
+      end
     end
   end
 

@@ -40,10 +40,30 @@ use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
 use maki_storage::id::SessionRef;
 
+/// Who made a tool call. A resumed session rebuilds its state from the `ToolUse`
+/// blocks in history, and those hold the model's own calls only, so a nested
+/// call must never change what the next request carries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CallOrigin {
+    /// Emitted by the model and recorded in history under its own id.
+    Model,
+    /// Made on the model's behalf and invisible to history: batch children,
+    /// `code_execution` scripts, Lua `call_tool`.
+    Nested,
+}
+
+impl CallOrigin {
+    pub fn is_model(self) -> bool {
+        matches!(self, Self::Model)
+    }
+}
+
 pub struct DescriptionContext<'a> {
     pub filter: &'a ToolFilter,
     pub audience: ToolAudience,
     pub workflow: bool,
+    /// Whether the session being described can reach MCP tools.
+    pub mcp: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -187,15 +207,28 @@ pub fn timeout_annotation(secs: u64) -> String {
 
 pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
 pub type LocalToolFn = Arc<dyn Fn(Value, ToolContext) -> LocalToolResult + Send + Sync>;
-pub type LocalTools = Arc<HashMap<String, LocalToolFn>>;
+pub type LocalTools = Arc<HashMap<String, LocalTool>>;
 
-/// Coerces a closure into a [`LocalToolFn`]; the bound gives the boxed
+/// A tool the session's host supplies: an ACP client tool, a subagent's
+/// `structured_output`. Dispatch puts it ahead of the registry, so it carries
+/// its own audience: a host tool must not reach a sandbox by wearing the name
+/// of a registry tool that may.
+#[derive(Clone)]
+pub struct LocalTool {
+    pub handler: LocalToolFn,
+    pub audience: ToolAudience,
+}
+
+/// Coerces a closure into a [`LocalTool`]; the bound gives the boxed
 /// future a coercion target that `Arc::new` alone does not.
-pub fn local_tool<F>(f: F) -> LocalToolFn
+pub fn local_tool<F>(audience: ToolAudience, f: F) -> LocalTool
 where
     F: Fn(Value, ToolContext) -> LocalToolResult + Send + Sync + 'static,
 {
-    Arc::new(f)
+    LocalTool {
+        handler: Arc::new(f),
+        audience,
+    }
 }
 
 #[derive(Clone)]
@@ -486,6 +519,52 @@ pub mod test_support {
     use super::*;
 
     pub const GUARDED_TOOL_NAME: &str = "guarded_mock";
+
+    /// Registry and routing tests care about the name and audience only, never
+    /// about what the tool returns.
+    pub fn mock_tool(name: &str, audience: ToolAudience) -> Arc<dyn registry::Tool> {
+        Arc::new(MockTool {
+            name: name.to_owned(),
+            audience,
+        })
+    }
+
+    struct MockTool {
+        name: String,
+        audience: ToolAudience,
+    }
+
+    struct MockInvocation;
+
+    impl registry::ToolInvocation for MockInvocation {
+        fn start_header(&self) -> registry::HeaderFuture {
+            registry::HeaderFuture::Ready(registry::HeaderResult::plain("mock".into()))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> registry::ExecFuture<'a> {
+            Box::pin(async { Ok(ToolOutput::Plain(String::new().into())).into() })
+        }
+    }
+
+    impl registry::Tool for MockTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            "mock tool".into()
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+        fn audience(&self) -> ToolAudience {
+            self.audience
+        }
+        fn parse(
+            &self,
+            _input: &Value,
+        ) -> Result<Box<dyn registry::ToolInvocation>, registry::ParseError> {
+            Ok(Box::new(MockInvocation))
+        }
+    }
 
     pub struct GuardedMock;
 

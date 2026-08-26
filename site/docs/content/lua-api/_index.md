@@ -847,6 +847,9 @@ available.
   - `except` (`string[]?`) exclude these tool names.
   - `workflow` (`boolean?`) use workflow-mode descriptions. Default: `false`.
   - `spec` (`string?`) evaluate capability exclusions against this model spec.
+  - `mcp` (`boolean?`) describe tools as if MCP is reachable. Default: `true`.
+    Pass what you pass to `maki.agent.session()`. Otherwise the descriptions
+    advertise MCP tools that the session has no way to call.
 
 **Returns:** (`table?`, `string?`) Array of tool definition tables, or `(nil, err)` on failure.
 
@@ -859,6 +862,48 @@ local defs, err = maki.agent.tools(ctx, {
 })
 if err then error(err) end
 print(#defs .. " tools available")
+```
+
+---
+
+### `maki.agent.callable_tools()` {#maki-agent-callable_tools}
+
+```lua
+maki.agent.callable_tools({ctx})
+```
+
+Every tool name this context can dispatch: registry tools, MCP tools
+(deferred ones included), host tools (ACP client tools, a subagent's
+`structured_output`) and `tool_search`. Reach for it when you expose tools
+inside a sandbox and need the names to bind. `maki.api.get_tools()` covers
+the registry alone and has no view of the session.
+
+The list already accounts for this session's audience, the config's
+`disabled_tools` and the model's capabilities. Read `audiences` to layer
+your own policy on top. A sandbox wants `interpreter`.
+
+Each name shows up once, described by the tool a call would really reach, so
+a host tool that shadows a registry name reports its own audience rather
+than the shadowed one's.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+
+**Returns:** (`table?`, `string?`) Array of `{ name, alias?, source, audiences, schema? }`,
+  or `(nil, err)` on failure. `source` is one of `"native"`, `"local"`,
+  `"mcp"`. `alias` is a safe identifier to bind, set only when `name` is not
+  one (say `srv__get-docs`). Dispatch `name` in every case. `schema` comes
+  with registry tools only.
+
+**Example:**
+
+```lua
+local tools, err = maki.agent.callable_tools(ctx)
+if err then error(err) end
+for _, t in ipairs(tools) do
+  print(t.source, t.alias or t.name)
+end
 ```
 
 ---
@@ -927,7 +972,9 @@ and tool set.
   - `local_tools` (`table?`) map of `name -> spec` for Lua-backed tools. Each spec
     requires `description` (string), `input_schema` (table), and
     `handler` (function). The handler receives the input table and must return
-    `(string)` or `(nil, err)`.
+    `(string)` or `(nil, err)`. Optional `audiences` (string[]) gates who may
+    call it, the same way `maki.api.register_tool` does. The default is the
+    model alone, so a script cannot reach it through `code_execution`.
   - `name` (`string?`) display name for logs and UI.
   - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
   - `mcp` (`boolean?`) give the session access to MCP tools. Their

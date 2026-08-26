@@ -21,7 +21,7 @@ use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::PermissionAnswer;
-use maki_agent::tools::{LocalToolFn, LocalTools, QUESTION_TOOL_NAME, local_tool};
+use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
 use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy};
@@ -383,8 +383,10 @@ fn ask_client(
 /// Shadows the Lua `question` tool: sends `elicitation/create` to the client
 /// and blocks the tool call until the form comes back. Serializes on the same
 /// answer channel as permissions, so at most one ask is in flight.
-fn question_tool(out_tx: Sender<Value>, pending: PendingState) -> LocalToolFn {
-    local_tool(move |input, ctx| {
+fn question_tool(out_tx: Sender<Value>, pending: PendingState) -> LocalTool {
+    // The audience the Lua `question` tool carries: shadowing a tool must not
+    // widen who may call it.
+    local_tool(ToolAudience::MAIN, move |input, ctx| {
         let out_tx = out_tx.clone();
         let pending = Arc::clone(&pending);
         Box::pin(async move {

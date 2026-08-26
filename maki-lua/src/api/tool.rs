@@ -86,6 +86,7 @@ fn dctx_json(ctx: &DescriptionContext) -> Value {
     let mut obj = json!({
         "audience": ctx.audience.name().unwrap_or("main"),
         "workflow": ctx.workflow,
+        "mcp": ctx.mcp,
     });
     match ctx.filter {
         ToolFilter::All => {}
@@ -1019,18 +1020,21 @@ pub(crate) fn create_api_table(
     Ok(t)
 }
 
-fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
-    let audience = entry.tool.audience();
-    let audiences = lua.create_table()?;
+pub(crate) fn audiences_to_lua(lua: &Lua, audience: ToolAudience) -> LuaResult<Table> {
+    let out = lua.create_table()?;
     for (flag, name) in maki_agent::tools::registry::AUDIENCE_NAMES {
         if audience.contains(*flag) {
-            audiences.push(*name)?;
+            out.push(*name)?;
         }
     }
+    Ok(out)
+}
+
+fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
     let t = lua.create_table()?;
     t.set("name", entry.name())?;
     t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
-    t.set("audiences", audiences)?;
+    t.set("audiences", audiences_to_lua(lua, entry.tool.audience())?)?;
     if let Some(kind) = entry.tool.tool_kind() {
         t.set("kind", kind)?;
     }
@@ -1150,9 +1154,12 @@ fn is_valid_tool_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn parse_audience(audiences: Option<mlua::Table>) -> LuaResult<ToolAudience> {
+pub(crate) fn parse_audience(
+    audiences: Option<mlua::Table>,
+    default: ToolAudience,
+) -> LuaResult<ToolAudience> {
     let Some(arr) = audiences else {
-        return Ok(ToolAudience::default());
+        return Ok(default);
     };
     let mut flags = ToolAudience::empty();
     let mut count = 0;
@@ -1295,7 +1302,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
         .get::<String>("kind")
         .ok()
         .map(|s| Arc::from(s.as_str()));
-    let audience = parse_audience(audiences)?;
+    let audience = parse_audience(audiences, ToolAudience::default())?;
     let timeout = parse_timeout(spec)?;
     let start_annotation = parse_start_annotation(spec, &schema_val)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
@@ -1710,6 +1717,7 @@ mod tests {
             filter: &ToolFilter::All,
             audience: ToolAudience::MAIN,
             workflow: false,
+            mcp: false,
         };
         assert_eq!(tool.description(&ctx), "test");
     }
