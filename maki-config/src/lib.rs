@@ -163,8 +163,8 @@ pub enum ConfigError {
     )]
     RemovedEditSubTool { tool: &'static str },
     #[error(
-        "invalid config: plugins.{plugin}: no bundled plugin is named \"{plugin}\" \
-         (bundled plugins: {valid})"
+        "invalid config: plugins.{plugin}: no bundled plugin or installed \
+         package is named \"{plugin}\" (available: {valid})"
     )]
     UnknownPlugin { plugin: String, valid: String },
     #[error(
@@ -271,12 +271,19 @@ impl RawConfig {
         self.tools.extend(overlay.tools);
     }
 
-    pub fn into_config(self) -> Result<Config, ConfigError> {
-        self.validate_plugin_tables()?;
+    /// `packages` are the external package names discovery found. They are
+    /// passed in rather than stored, because an installed package is host
+    /// state: it is not written in any config file and must not survive a
+    /// merge between two of them.
+    pub fn into_config(self, packages: &[String]) -> Result<Config, ConfigError> {
+        self.validate_plugin_tables(packages)?;
+        // Only bundled names, because a builtin's name is also its tool name
+        // while a package's is not. Copying a package name here would hide an
+        // unrelated tool that happened to share it.
         let disabled_tools: Vec<String> = self
             .plugins
             .iter()
-            .filter(|(_, cfg)| cfg.enabled == Some(false))
+            .filter(|(name, cfg)| cfg.enabled == Some(false) && !packages.contains(name))
             .map(|(name, _)| name.clone())
             .collect();
         Ok(Config {
@@ -293,13 +300,13 @@ impl RawConfig {
             storage: StorageConfig::from_file(self.storage),
             telemetry: self.telemetry,
             permissions: PermissionsConfig::default(),
-            plugins: PluginsConfig::from_plugins(self.plugins),
+            plugins: PluginsConfig::from_plugins_and_packages(self.plugins, packages),
         })
     }
 
     /// A `plugins.<name>` key that matches no bundled plugin is a typo or an
     /// old config, so fail loudly instead of letting it silently drift.
-    fn validate_plugin_tables(&self) -> Result<(), ConfigError> {
+    fn validate_plugin_tables(&self, packages: &[String]) -> Result<(), ConfigError> {
         if !self.tools.is_empty() {
             return Err(ConfigError::RenamedToolsTable);
         }
@@ -311,13 +318,16 @@ impl RawConfig {
         let mut unknown: Vec<&String> = self
             .plugins
             .keys()
-            .filter(|name| !DEFAULT_BUILTINS.contains(&name.as_str()))
+            .filter(|name| !DEFAULT_BUILTINS.contains(&name.as_str()) && !packages.contains(name))
             .collect();
         unknown.sort();
         if let Some(&plugin) = unknown.first() {
+            let mut valid: Vec<&str> = DEFAULT_BUILTINS.to_vec();
+            valid.extend(packages.iter().map(String::as_str));
+            valid.sort_unstable();
             return Err(ConfigError::UnknownPlugin {
                 plugin: plugin.clone(),
-                valid: DEFAULT_BUILTINS.join(", "),
+                valid: valid.join(", "),
             });
         }
         Ok(())
@@ -1483,7 +1493,12 @@ impl TelemetryConfig {
 #[derive(Debug, Clone, Default)]
 pub struct PluginsConfig {
     pub enabled: bool,
+    /// Enabled bundled plugins. Deliberately does not include packages: the
+    /// host loads the two from different places, and mixing them here made
+    /// `load_builtins` reject every installed package by name.
     pub names: Vec<String>,
+    /// Enabled external packages.
+    pub packages: Vec<String>,
     /// Per-plugin option tables, without `enabled`. Each plugin validates its
     /// own via `maki.api.register_options` at load time.
     pub opts: HashMap<String, JsonMap<String, JsonValue>>,
@@ -1491,16 +1506,37 @@ pub struct PluginsConfig {
 
 impl PluginsConfig {
     pub fn from_plugins(plugins: HashMap<String, PluginFileConfig>) -> Self {
+        Self::from_plugins_and_packages(plugins, &[])
+    }
+
+    /// Installed packages default to enabled like Neovim `start/` packages.
+    pub fn from_plugins_and_packages(
+        plugins: HashMap<String, PluginFileConfig>,
+        packages: &[String],
+    ) -> Self {
+        let enabled = |name: &String| plugins.get(name).and_then(|t| t.enabled).unwrap_or(true);
+
         let mut all: Vec<String> = DEFAULT_BUILTINS
             .iter()
-            .filter(|name| plugins.get(**name).and_then(|t| t.enabled).unwrap_or(true))
-            .map(|s| s.to_string())
+            .map(|s| (*s).to_owned())
+            .filter(|name| enabled(name))
             .collect();
+
+        let mut enabled_packages: Vec<String> = packages
+            .iter()
+            .filter(|name| !DEFAULT_BUILTINS.contains(&name.as_str()))
+            .filter(|name| enabled(name))
+            .cloned()
+            .collect();
+        enabled_packages.sort();
+        enabled_packages.dedup();
 
         let mut extra: Vec<&String> = plugins
             .iter()
             .filter(|(name, cfg)| {
-                !DEFAULT_BUILTINS.contains(&name.as_str()) && cfg.enabled.unwrap_or(false)
+                !DEFAULT_BUILTINS.contains(&name.as_str())
+                    && !packages.contains(name)
+                    && cfg.enabled.unwrap_or(false)
             })
             .map(|(name, _)| name)
             .collect();
@@ -1516,6 +1552,7 @@ impl PluginsConfig {
         Self {
             enabled: true,
             names: all,
+            packages: enabled_packages,
             opts,
         }
     }
@@ -2248,7 +2285,7 @@ mod tests {
 
     #[test]
     fn empty_config_returns_defaults() {
-        let config = RawConfig::default().into_config().unwrap();
+        let config = RawConfig::default().into_config(&[]).unwrap();
         assert!(config.ui.splash_animation);
         assert_eq!(config.ui.notifications, NotificationMethod::Auto);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
@@ -2269,7 +2306,7 @@ mod tests {
     fn notifications_deserialize(value: &str, expected: NotificationMethod) {
         let raw: RawConfig =
             toml::from_str(&format!("[ui]\nnotifications = \"{value}\"\n")).unwrap();
-        assert_eq!(raw.into_config().unwrap().ui.notifications, expected);
+        assert_eq!(raw.into_config(&[]).unwrap().ui.notifications, expected);
     }
 
     #[test]
@@ -2287,7 +2324,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let config = raw.into_config().unwrap();
+        let config = raw.into_config(&[]).unwrap();
         assert_eq!(config.agent.max_output_lines, 5000);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
     }
@@ -2354,7 +2391,7 @@ mod tests {
             ..Default::default()
         });
 
-        let provider = global.into_config().unwrap().provider;
+        let provider = global.into_config(&[]).unwrap().provider;
         assert!(provider.allowed_models.is_empty());
         assert_eq!(provider.excluded_models, ["*/*-preview"]);
         assert!(provider.model_policy.allows("openai/gpt-5"));
@@ -2371,7 +2408,7 @@ mod tests {
             },
             ..Default::default()
         }
-        .into_config()
+        .into_config(&[])
         .unwrap();
         let policy = &config.provider.model_policy;
 
@@ -2387,7 +2424,7 @@ mod tests {
             },
             ..Default::default()
         }
-        .into_config()
+        .into_config(&[])
         .unwrap();
         assert!(exclude_only.provider.model_policy.allows("openai/gpt-5"));
         assert!(
@@ -2407,7 +2444,7 @@ mod tests {
             },
             ..Default::default()
         }
-        .into_config();
+        .into_config(&[]);
 
         assert!(matches!(
             result,
@@ -2442,14 +2479,14 @@ mod tests {
 
     #[test]
     fn always_workflow_resolves_default_and_set() {
-        let defaults = RawConfig::default().into_config().unwrap();
+        let defaults = RawConfig::default().into_config(&[]).unwrap();
         assert!(!defaults.always_workflow, "absent resolves to false");
 
         let raw = RawConfig {
             always_workflow: Some(true),
             ..Default::default()
         };
-        assert!(raw.into_config().unwrap().always_workflow);
+        assert!(raw.into_config(&[]).unwrap().always_workflow);
     }
 
     #[test_case(AlwaysThinking::Toggle(true), StoredThinking::Adaptive ; "toggle_true")]
@@ -2463,14 +2500,14 @@ mod tests {
 
     #[test]
     fn into_config_resolves_always_thinking() {
-        let defaults = RawConfig::default().into_config().unwrap();
+        let defaults = RawConfig::default().into_config(&[]).unwrap();
         assert!(defaults.always_thinking.is_none());
 
         let raw = RawConfig {
             always_thinking: Some(AlwaysThinking::Mode("8192".into())),
             ..Default::default()
         };
-        let config = raw.into_config().unwrap();
+        let config = raw.into_config(&[]).unwrap();
         assert_eq!(
             config.always_thinking,
             Some(StoredThinking::Budget { tokens: 8192 })
@@ -2480,7 +2517,7 @@ mod tests {
             always_thinking: Some(AlwaysThinking::Mode("fast".into())),
             ..Default::default()
         };
-        let err = raw.into_config().err().expect("expected config error");
+        let err = raw.into_config(&[]).err().expect("expected config error");
         assert!(matches!(err, ConfigError::Thinking(_)));
     }
 
@@ -2511,7 +2548,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let config = raw.into_config().unwrap();
+        let config = raw.into_config(&[]).unwrap();
         assert_eq!(config.ui.tool_output_lines.bash, 20);
         assert_eq!(config.ui.tool_output_lines.read, 20);
         assert_eq!(
@@ -2936,14 +2973,14 @@ mod tests {
     #[test]
     fn show_thinking_missing_defaults_true() {
         let raw: RawConfig = toml::from_str("").unwrap();
-        let config = raw.into_config().unwrap();
+        let config = raw.into_config(&[]).unwrap();
         assert!(config.ui.show_thinking);
     }
 
     #[test]
     fn max_input_lines_defaults_and_deserializes() {
         let raw: RawConfig = toml::from_str("").unwrap();
-        let config = raw.into_config().unwrap();
+        let config = raw.into_config(&[]).unwrap();
         assert_eq!(config.ui.max_input_lines, DEFAULT_MAX_INPUT_LINES);
 
         let raw: RawConfig = toml::from_str("[ui]\nmax_input_lines = 5\n").unwrap();
@@ -2989,7 +3026,7 @@ mod tests {
             "[plugins.bash]\ntimeout_secs = 180\n[plugins.websearch]\nenabled = false\n",
         )
         .unwrap();
-        let config = raw.into_config().unwrap();
+        let config = raw.into_config(&[]).unwrap();
         assert!(config.plugins.names.contains(&"bash".to_string()));
         assert!(!config.plugins.names.contains(&"websearch".to_string()));
         assert!(
@@ -3100,7 +3137,7 @@ mod tests {
     fn removed_sub_tool_tables_error() {
         for &tool in EDIT_SUB_TOOLS {
             let raw: RawConfig = toml::from_str(&format!("[plugins.{tool}]\n")).unwrap();
-            let Err(err) = raw.into_config() else {
+            let Err(err) = raw.into_config(&[]) else {
                 panic!("plugins.{tool} should be rejected");
             };
             let msg = err.to_string();
@@ -3116,13 +3153,73 @@ mod tests {
     #[test_case("search_result_limit = 50" ; "opts_only")]
     fn unknown_plugin_name_errors(body: &str) {
         let raw: RawConfig = toml::from_str(&format!("[plugins.gerp]\n{body}\n")).unwrap();
-        let Err(err) = raw.into_config() else {
+        let Err(err) = raw.into_config(&[]) else {
             panic!("plugins.gerp should be rejected");
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("no bundled plugin is named \"gerp\"") && msg.contains("grep"),
-            "error should name the typo and list bundled plugins, got: {msg}"
+            msg.contains("named \"gerp\"") && msg.contains("grep"),
+            "error should name the typo and list what is available, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn known_package_name_is_accepted() {
+        let raw: RawConfig = toml::from_str("[plugins.my_pack]\nenabled = true\n").unwrap();
+        let config = raw
+            .into_config(&["my_pack".to_owned()])
+            .expect("an installed package should be configurable");
+        assert!(config.plugins.packages.contains(&"my_pack".to_owned()));
+    }
+
+    #[test]
+    fn known_package_can_be_disabled() {
+        let raw: RawConfig = toml::from_str("[plugins.my_pack]\nenabled = false\n").unwrap();
+        let config = raw.into_config(&["my_pack".to_owned()]).unwrap();
+        assert!(!config.plugins.packages.contains(&"my_pack".to_owned()));
+    }
+
+    #[test]
+    fn packages_are_not_mixed_into_builtin_names() {
+        let config = RawConfig::default()
+            .into_config(&["my_pack".to_owned()])
+            .unwrap();
+        assert!(!config.plugins.names.contains(&"my_pack".to_owned()));
+        assert!(config.plugins.packages.contains(&"my_pack".to_owned()));
+        assert!(
+            config
+                .plugins
+                .names
+                .iter()
+                .all(|n| DEFAULT_BUILTINS.contains(&n.as_str())),
+            "names must hold only bundled plugins"
+        );
+    }
+
+    #[test]
+    fn disabling_a_package_does_not_disable_a_tool() {
+        let raw: RawConfig = toml::from_str("[plugins.my_pack]\nenabled = false\n").unwrap();
+        let config = raw.into_config(&["my_pack".to_owned()]).unwrap();
+        assert!(!config.agent.disabled_tools.contains(&"my_pack".to_owned()));
+    }
+
+    #[test]
+    fn disabling_a_builtin_still_disables_its_tool() {
+        let raw: RawConfig = toml::from_str("[plugins.grep]\nenabled = false\n").unwrap();
+        let config = raw.into_config(&[]).unwrap();
+        assert!(config.agent.disabled_tools.contains(&"grep".to_owned()));
+    }
+
+    #[test]
+    fn unknown_name_still_rejected_when_packages_exist() {
+        let raw: RawConfig = toml::from_str("[plugins.gerp]\nenabled = true\n").unwrap();
+        let Err(err) = raw.into_config(&["my_pack".to_owned()]) else {
+            panic!("gerp is neither a builtin nor an installed package");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my_pack"),
+            "should list packages too, got: {msg}"
         );
     }
 
@@ -3130,7 +3227,7 @@ mod tests {
     fn disabled_plugin_keeps_opts_but_not_load_entry() {
         let raw: RawConfig =
             toml::from_str("[plugins.bash]\nenabled = false\ntimeout_secs = 180\n").unwrap();
-        let config = raw.into_config().unwrap();
+        let config = raw.into_config(&[]).unwrap();
         assert!(!config.plugins.names.contains(&"bash".to_string()));
         assert_eq!(
             config.plugins.opts["bash"]["timeout_secs"],
@@ -3142,7 +3239,7 @@ mod tests {
     #[test]
     fn renamed_tools_table_errors() {
         let raw: RawConfig = toml::from_str("[tools.bash]\nenabled = true\n").unwrap();
-        let Err(err) = raw.into_config() else {
+        let Err(err) = raw.into_config(&[]) else {
             panic!("old tools table should be rejected");
         };
         assert!(
@@ -3155,7 +3252,7 @@ mod tests {
     fn edit_sub_tool_toggles_flow_as_edit_opts() {
         let raw: RawConfig =
             toml::from_str("[plugins.edit]\nmultiedit = false\nedit_lines = true\n").unwrap();
-        let config = raw.into_config().unwrap();
+        let config = raw.into_config(&[]).unwrap();
         assert_eq!(
             config.plugins.opts["edit"]["multiedit"],
             serde_json::json!(false)

@@ -177,6 +177,29 @@ maki.split("x*y*z", "*", { plain = true }) -- { "x", "y", "z" }
 maki.split("\nhello\nworld\n", "\n", { trimempty = true }) -- { "hello", "world" }
 ```
 
+---
+
+### `maki.packadd()` {#maki-packadd}
+
+```lua
+maki.packadd({name})
+```
+
+Activate an installed `opt/` package, like `:packadd`.
+
+Loading happens after this call returns. The startup package pass reports
+an unknown, disabled, or failed package.
+
+**Parameters:**
+
+- `{name}` (`string`) Package to activate.
+
+**Example:**
+
+```lua
+maki.packadd("maki-goal")
+```
+
 
 ## maki.api {#maki-api}
 

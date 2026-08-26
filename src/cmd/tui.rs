@@ -81,14 +81,19 @@ fn discover_commands(disable: bool) -> Vec<CustomCommand> {
     command::discover_commands(&cwd)
 }
 
-fn load_config(plugin_host: &PluginHost, cli: &Cli, cwd: &Path) -> Result<Config> {
+fn load_config(
+    plugin_host: &PluginHost,
+    cli: &Cli,
+    cwd: &Path,
+    names: &[String],
+) -> Result<Config> {
     let raw_config = plugin_host
         .load_init_files_or_skip(cli.no_plugins, cwd)
         .context("load init.lua files")?;
 
     let mut config = raw_config
         .unwrap_or_default()
-        .into_config()
+        .into_config(names)
         .context("invalid config")?;
     config.permissions = load_permissions(cwd);
 
@@ -137,27 +142,26 @@ fn build_stack(
     storage: &StateDir,
     fallback: Option<(Config, Model)>,
 ) -> Result<(Stack, Vec<String>)> {
-    let mut warnings = Vec::new();
-
     let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
         .context("initialize lua plugin host")?;
 
     let (fallback_config, fallback_model) = fallback.unzip();
-    let reloading = fallback_model.is_some();
-    let config = config_or_fallback(
-        load_config(&plugin_host, cli, cwd),
-        fallback_config,
-        &mut warnings,
-    )?;
-
-    if let Err(e) = plugin_host.load_builtins(&config.plugins) {
-        let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
-        if reloading {
-            warnings.push(format!("{e:#}"));
+    let (config, mut warnings) = super::load_plugins(
+        &mut plugin_host,
+        cli.no_plugins,
+        if fallback_model.is_some() {
+            super::BuiltinFailure::Warn
         } else {
-            return Err(e);
-        }
-    }
+            super::BuiltinFailure::Fatal
+        },
+        |host, names, warnings| {
+            config_or_fallback(
+                load_config(host, cli, cwd, names),
+                fallback_config,
+                warnings,
+            )
+        },
+    )?;
 
     let commands = discover_commands(cli.no_commands);
 
@@ -183,7 +187,7 @@ fn build_stack(
             model,
             needs_login,
         },
-        warnings,
+        super::sanitize_warnings(warnings),
     ))
 }
 
@@ -242,12 +246,22 @@ pub fn run(mut cli: Cli) -> Result<()> {
     load_env_files(&cwd);
     warn_stale_config_toml(&cwd);
 
-    let (mut stack, _) = build_stack(&cli, &cwd, &storage, None)?;
+    let (mut stack, startup_warnings) = build_stack(&cli, &cwd, &storage, None)?;
 
     setup::init_logging(&stack.config.storage);
     setup::init_telemetry(&stack.config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
+
+    // Discovery runs before logging is initialized, so a package problem has
+    // no log to reach either. The TUI shows these in its first generation; a
+    // mode that never opens the UI has to report them here or a broken
+    // package fails in complete silence.
+    if cli.is_sdk_mode() || cli.print {
+        for warning in &startup_warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
 
     if cli.is_sdk_mode() {
         let fast = stack.config.always_fast && stack.model.supports_fast();
@@ -299,7 +313,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         &storage,
     )?];
     let mut focused = 0;
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings = startup_warnings;
     let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
     let mut teardown = Teardown::default();
 
@@ -472,7 +486,9 @@ mod tests {
     }
 
     fn test_config() -> Config {
-        RawConfig::default().into_config().expect("default config")
+        RawConfig::default()
+            .into_config(&[])
+            .expect("default config")
     }
 
     #[test]
@@ -528,7 +544,7 @@ mod tests {
         let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
             .expect("live host boots under --no-plugins");
 
-        let config = load_config(&plugin_host, &cli, dir.path())
+        let config = load_config(&plugin_host, &cli, dir.path(), &[])
             .expect("no-plugins must skip the broken init.lua and still load defaults");
         assert!(
             !config.plugins.names.is_empty(),
@@ -566,7 +582,7 @@ mod tests {
         let mut plugin_host =
             PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
 
-        match load_config(&plugin_host, &cli, dir.path()) {
+        match load_config(&plugin_host, &cli, dir.path(), &[]) {
             Err(_) => {}
             Ok(_) => panic!("broken init.lua must error without --no-plugins"),
         }

@@ -13,6 +13,7 @@ pub(crate) mod log;
 pub(crate) mod model;
 pub(crate) mod net;
 pub(crate) mod options;
+pub(crate) mod pack;
 pub(crate) mod session;
 pub(crate) mod slot;
 pub(crate) mod split;
@@ -95,6 +96,7 @@ pub(crate) fn create_maki_global(
         "keymap",
         keymap::create_keymap_table(lua, Arc::clone(&plugin))?,
     )?;
+    pack::add_packadd(lua, &maki)?;
 
     Ok(maki)
 }

@@ -6,10 +6,72 @@ mod tui;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
+use maki_config::Config;
+use maki_lua::PluginHost;
 use maki_storage::StateDir;
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction};
 use crate::update;
+
+fn sanitize_warning(message: impl std::fmt::Display) -> String {
+    maki_lua::sanitize_message(&message.to_string())
+}
+
+fn sanitize_warnings(warnings: Vec<String>) -> Vec<String> {
+    warnings.into_iter().map(sanitize_warning).collect()
+}
+
+fn report_warnings(warnings: Vec<String>) {
+    for warning in sanitize_warnings(warnings) {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// What a builtin that fails to load means for the run in progress.
+#[derive(Clone, Copy)]
+enum BuiltinFailure {
+    /// Startup has nothing to fall back on.
+    Fatal,
+    /// `/reload` keeps the open UI alive, so the failure is only reported.
+    Warn,
+}
+
+/// The plugin startup every entry point shares. Packages are discovered before
+/// `build_config` runs, so `plugins.<name>` can configure an installed package,
+/// and loaded after the builtins, so a package claiming a builtin tool name is
+/// the side that fails.
+///
+/// Warnings are returned sanitized, leaving the sink to the caller; the extra
+/// `Vec` handed to `build_config` is for warnings raised while building it.
+fn load_plugins(
+    host: &mut PluginHost,
+    no_plugins: bool,
+    on_builtin_failure: BuiltinFailure,
+    build_config: impl FnOnce(&PluginHost, &[String], &mut Vec<String>) -> Result<Config>,
+) -> Result<(Config, Vec<String>)> {
+    let discovery = maki_lua::discover_installed(no_plugins);
+    // Includes the names discovery refused, so a package it could not read does
+    // not become a config error pointing at the user's `plugins.<name>` table.
+    let names = discovery.known_names();
+    let mut warnings: Vec<String> = discovery
+        .problems
+        .into_iter()
+        .map(|problem| format!("skipping package: {problem}"))
+        .collect();
+
+    let config = build_config(host, &names, &mut warnings)?;
+
+    if let Err(e) = host.load_builtins(&config.plugins) {
+        let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
+        match on_builtin_failure {
+            BuiltinFailure::Fatal => return Err(e),
+            BuiltinFailure::Warn => warnings.push(format!("{e:#}")),
+        }
+    }
+    warnings.extend(host.load_packages(&discovery.packages, &config.plugins));
+
+    Ok((config, sanitize_warnings(warnings)))
+}
 
 pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
