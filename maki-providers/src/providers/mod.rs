@@ -7,6 +7,7 @@ use futures_lite::io::AsyncBufRead;
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::http::request::Builder;
 use serde::Deserialize;
+use serde_json::Value;
 use tracing::debug;
 
 use crate::AgentError;
@@ -33,6 +34,7 @@ pub(crate) mod xai;
 pub(crate) mod zai;
 
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
+const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
 
 pub(crate) fn user_agent() -> &'static str {
     concat!(
@@ -121,22 +123,35 @@ pub(crate) struct SseErrorPayload {
 pub(crate) struct SseErrorDetail {
     #[serde(default)]
     pub r#type: String,
+    /// Providers send this as a string, a number or `null`, and rejecting any one of those shapes
+    /// throws away the whole error.
+    #[serde(default)]
+    pub code: Value,
     pub message: String,
+}
+
+/// A streamed error rides inside a plain 200 response, so this tag is the only clue we get about
+/// what went wrong and whether waiting will help.
+pub(crate) fn sse_error_status(tag: &str) -> Option<u16> {
+    Some(match tag {
+        "overloaded_error" | "server_is_overloaded" => 529,
+        "service_unavailable_error" => 503,
+        "api_error" | "server_error" => 500,
+        "rate_limit_error" | "rate_limit_exceeded" | "tokens" => 429,
+        "request_too_large" => 413,
+        "not_found_error" => 404,
+        "permission_error" => 403,
+        "billing_error" | "insufficient_quota" => 402,
+        "authentication_error" | "invalid_api_key" => 401,
+        _ => return None,
+    })
 }
 
 impl SseErrorPayload {
     pub fn into_agent_error(self) -> AgentError {
-        let status = match self.error.r#type.as_str() {
-            "overloaded_error" => 529,
-            "api_error" | "server_error" => 500,
-            "rate_limit_error" | "rate_limit_exceeded" | "tokens" => 429,
-            "request_too_large" => 413,
-            "not_found_error" => 404,
-            "permission_error" => 403,
-            "billing_error" | "insufficient_quota" => 402,
-            "authentication_error" | "invalid_api_key" => 401,
-            _ => 400,
-        };
+        let status = sse_error_status(self.error.code.as_str().unwrap_or_default())
+            .or_else(|| sse_error_status(&self.error.r#type))
+            .unwrap_or(UNMAPPED_SSE_ERROR_STATUS);
         AgentError::Api {
             status,
             message: self.error.message,
@@ -289,6 +304,30 @@ mod tests {
     use super::*;
     use futures_lite::io::AsyncBufReadExt;
     use test_case::test_case;
+
+    const ERROR_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
+    const PARSE_FAILED: &str = "SSE error payload should deserialize";
+
+    // Codex only admits the overload in `code`, and anything we cannot place has to stay a plain
+    // 400 so a user mistake is not retried forever: https://github.com/tontinton/maki/issues/777
+    #[test_case(r#""type":"service_unavailable_error","code":"server_is_overloaded""#, 529, true  ; "code_beats_type")]
+    #[test_case(r#""type":"service_unavailable_error""#,                               503, true  ; "absent_code")]
+    #[test_case(r#""type":"service_unavailable_error","code":null"#,                   503, true  ; "null_code")]
+    #[test_case(r#""type":"rate_limit_error","code":429"#,                             429, true  ; "numeric_code")]
+    #[test_case(r#""type":"invalid_request_error","code":"invalid_value""#,            400, false ; "unknown_tags")]
+    fn sse_error_payload_status(tags: &str, status: u16, retryable: bool) {
+        let payload: SseErrorPayload = serde_json::from_str(&format!(
+            r#"{{"error":{{{tags},"message":"{ERROR_MESSAGE}"}}}}"#
+        ))
+        .expect(PARSE_FAILED);
+        let err = payload.into_agent_error();
+
+        assert_eq!(
+            err.to_string(),
+            format!("API error ({status}): {ERROR_MESSAGE}")
+        );
+        assert_eq!(err.is_retryable(), retryable);
+    }
 
     #[test_case("a b", "a%20b" ; "space")]
     #[test_case("a:b", "a%3Ab" ; "colon")]
