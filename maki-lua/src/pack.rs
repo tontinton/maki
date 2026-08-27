@@ -4,7 +4,7 @@
 //! themselves, laid out the way Neovim lays packages out. Packages that maki
 //! installs are resolved from recorded state instead, and never appear here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -13,6 +13,14 @@ use std::sync::Arc;
 use crate::error::PluginError;
 use crate::loader::is_bundled;
 use crate::plugin_permissions::{Requested, load_requested_permissions};
+
+const REVIEW_REVISION_LEN: usize = 12;
+const UPDATE_REVIEW_DECLINED: &str = "update review was declined";
+const UPDATE_REVIEW_UNAVAILABLE: &str =
+    "update review needs a terminal; pass force = true to skip it";
+const ACTIVE_DELETE_REFUSAL: &str = "package is active and was not removed";
+const OWNER_CONFLICT_FAILURE: &str = "package name conflicts with another owner";
+const DECLARED_DELETE_REFUSAL: &str = "still declared; remove it from maki.pack.add first";
 
 pub fn sanitize_message(message: &str) -> String {
     message
@@ -143,10 +151,12 @@ fn read_approvals_file(path: &Path) -> Option<maki_pack::approvals::Approvals> {
 /// Granting is the caller's decision to make: approving on top of a store that
 /// failed to parse would write back a file missing everyone else's entries.
 fn try_read_approvals() -> Option<maki_pack::approvals::Approvals> {
-    match approvals_path() {
-        Some(path) => read_approvals_file(&path),
-        None => Some(maki_pack::approvals::Approvals::default()),
-    }
+    try_read_approvals_at(approvals_path().as_deref())
+}
+
+fn try_read_approvals_at(path: Option<&Path>) -> Option<maki_pack::approvals::Approvals> {
+    path.map(read_approvals_file)
+        .unwrap_or_else(|| Some(maki_pack::approvals::Approvals::default()))
 }
 
 /// Effective permissions for a package about to load.
@@ -195,8 +205,12 @@ pub enum Interaction {
 }
 
 impl Interaction {
+    fn can_confirm(self) -> bool {
+        self == Self::Tty && io::stdin().is_terminal()
+    }
+
     fn confirm(self, prompt: &str) -> bool {
-        if self != Self::Tty || !io::stdin().is_terminal() {
+        if !self.can_confirm() {
             return false;
         }
         eprint!("{} [y/N] ", sanitize_message(prompt));
@@ -204,6 +218,23 @@ impl Interaction {
         let mut input = String::new();
         io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y")
     }
+
+    fn review(self, prompt: &str) -> ReviewDecision {
+        if !self.can_confirm() {
+            ReviewDecision::Unavailable
+        } else if self.confirm(prompt) {
+            ReviewDecision::Accepted
+        } else {
+            ReviewDecision::Declined
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewDecision {
+    Accepted,
+    Declined,
+    Unavailable,
 }
 
 /// What an install pass produced, and what it could not.
@@ -354,10 +385,8 @@ fn runnable_declarations<'a>(
         .iter()
         .filter(|declared| {
             let name = &declared.spec.name;
-            if is_bundled(name) {
-                report.failures.push(format!(
-                    "{name}: managed package name conflicts with a builtin plugin"
-                ));
+            if let Some(failure) = owner_conflict(name) {
+                report.failures.push(failure);
                 return false;
             }
             if manual_names.iter().any(|manual| manual == name) {
@@ -570,7 +599,7 @@ pub fn install_declared(
 
     // Written once, after the installs, and only when something moved.
     if changed {
-        let recorded = lock_path.is_some_and(|path| write_json(&path, &lock, "pack lockfile"));
+        let recorded = lock_path.is_some_and(|path| write_lockfile(&path, &lock));
         if !recorded {
             // The packages are on disk but nothing records where. The next
             // start reads the old lockfile and would not find them, so they
@@ -585,6 +614,395 @@ pub fn install_declared(
 
     grant_installed(&runnable, &site, &manager, &lock, interaction, &mut report);
     report
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PackReport {
+    pub updated: Vec<(String, String)>,
+    pub removed: Vec<String>,
+    pub failures: Vec<String>,
+}
+
+impl PackReport {
+    pub fn changed(&self) -> bool {
+        !self.updated.is_empty() || !self.removed.is_empty()
+    }
+
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.updated.is_empty() {
+            parts.push(format!("{} updated", self.updated.len()));
+        }
+        if !self.removed.is_empty() {
+            parts.push(format!("{} removed", self.removed.len()));
+        }
+        if parts.is_empty() {
+            "No package changes".to_owned()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
+
+pub fn installed_names() -> Option<Vec<String>> {
+    read_lockfile(lockfile_path().as_deref())
+        .map(|lock| lock.install_order().map(str::to_owned).collect())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackCommand {
+    Update {
+        names: Vec<String>,
+        options: crate::api::pack::UpdateOptions,
+    },
+    Delete {
+        names: Vec<String>,
+        all: bool,
+    },
+}
+
+impl PackCommand {
+    pub fn parse(name: &str, args: &str, bang: bool) -> Result<Self, String> {
+        use crate::api::pack::{UpdateOptions, UpdateTarget};
+
+        let mut names = Vec::new();
+        let mut lockfile = false;
+        let mut all = false;
+        for word in args.split_whitespace() {
+            match word {
+                "++lockfile" => lockfile = true,
+                "++all" => all = true,
+                flag if flag.starts_with('+') || flag.starts_with('-') => {
+                    return Err(format!("{name}: unknown option {flag:?}"));
+                }
+                other => names.push(other.to_owned()),
+            }
+        }
+
+        match name {
+            "/packupdate" => {
+                if all {
+                    return Err("/packupdate: ++all is not an option".to_owned());
+                }
+                if names.len() > 1 {
+                    return Err("/packupdate: name at most one package".to_owned());
+                }
+                Ok(Self::Update {
+                    names,
+                    options: UpdateOptions {
+                        force: bang,
+                        target: if lockfile {
+                            UpdateTarget::Lockfile
+                        } else {
+                            UpdateTarget::Version
+                        },
+                    },
+                })
+            }
+            "/packdel" => {
+                if bang {
+                    return Err("/packdel does not accept !".to_owned());
+                }
+                if lockfile {
+                    return Err("/packdel: ++lockfile applies only to /packupdate".to_owned());
+                }
+                if all != names.is_empty() {
+                    return Err("/packdel: name a package, or pass ++all".to_owned());
+                }
+                Ok(Self::Delete { names, all })
+            }
+            other => Err(format!("{other}: not a package command")),
+        }
+    }
+}
+
+pub fn plan_command(
+    command: &PackCommand,
+    declared: &[crate::api::pack::Declared],
+    installed: &[String],
+) -> Result<Vec<crate::api::pack::PackOp>, String> {
+    use crate::api::pack::PackOp;
+
+    let declared_names: Vec<&str> = declared
+        .iter()
+        .map(|declared| declared.spec.name.as_str())
+        .collect();
+    match command {
+        PackCommand::Update { names, options } => {
+            let names = if names.is_empty() {
+                declared_names
+                    .iter()
+                    .filter(|name| installed.iter().any(|installed| installed == **name))
+                    .map(|name| (*name).to_owned())
+                    .collect::<Vec<_>>()
+            } else {
+                let name = &names[0];
+                if !declared_names.contains(&name.as_str()) {
+                    return Err(format!("{name}: not a package declared with maki.pack.add"));
+                }
+                if !installed.contains(name) {
+                    return Err(format!("{name}: not installed, so it cannot be updated"));
+                }
+                names.clone()
+            };
+            if names.is_empty() {
+                return Err("no declared package is installed; nothing was updated".to_owned());
+            }
+            Ok(names
+                .into_iter()
+                .map(|name| PackOp::Update {
+                    name,
+                    options: *options,
+                })
+                .collect())
+        }
+        PackCommand::Delete { names, all } => {
+            let names = if *all {
+                installed
+                    .iter()
+                    .filter(|name| !declared_names.contains(&name.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                let name = &names[0];
+                if !installed.contains(name) {
+                    return Err(format!("{name}: not an installed package"));
+                }
+                if declared_names.contains(&name.as_str()) {
+                    return Err(format!("{name}: {DECLARED_DELETE_REFUSAL}"));
+                }
+                names.clone()
+            };
+            if names.is_empty() {
+                return Err("no undeclared package matched; nothing was removed".to_owned());
+            }
+            Ok(names
+                .into_iter()
+                .map(|name| PackOp::Delete { name })
+                .collect())
+        }
+    }
+}
+
+pub fn apply_pack_ops(
+    ops: &[crate::api::pack::PackOp],
+    declared: &[crate::api::pack::Declared],
+    active: &BTreeSet<String>,
+    interaction: Interaction,
+) -> PackReport {
+    let mut report = PackReport::default();
+    if ops.is_empty() {
+        return report;
+    }
+    let site = match site_dir() {
+        Ok(site) => site,
+        Err(error) => {
+            report.failures.push(format!(
+                "no data directory, so packages cannot be changed: {error}"
+            ));
+            return report;
+        }
+    };
+    let lock_path = match lockfile_path() {
+        Some(path) => path,
+        None => {
+            report
+                .failures
+                .push("no config directory, so packages cannot be changed".to_owned());
+            return report;
+        }
+    };
+    let approval_path = approvals_path();
+    apply_pack_ops_at(
+        ops,
+        declared,
+        active,
+        &site,
+        &lock_path,
+        approval_path.as_deref(),
+        |prompt| interaction.review(prompt),
+    )
+}
+
+fn apply_pack_ops_at(
+    ops: &[crate::api::pack::PackOp],
+    declared: &[crate::api::pack::Declared],
+    active: &BTreeSet<String>,
+    site: &Path,
+    lock_path: &Path,
+    approval_path: Option<&Path>,
+    review_updates: impl FnOnce(&str) -> ReviewDecision,
+) -> PackReport {
+    use crate::api::pack::{PackOp, UpdateTarget};
+
+    let mut report = PackReport::default();
+    let _guard = match maki_pack::lock::Lock::acquire(&maki_pack::paths::sidecar_lock(lock_path)) {
+        Ok(guard) => guard,
+        Err(error) => {
+            report.failures.push(redact_error(&error));
+            return report;
+        }
+    };
+    let mut lock = match read_lockfile(Some(lock_path)) {
+        Some(lock) => lock,
+        None => {
+            report
+                .failures
+                .push("the pack lockfile is unreadable, so nothing was changed".to_owned());
+            return report;
+        }
+    };
+    let manager = maki_pack::manager::Manager::new(site);
+    let manual_names = discover(site).known_names();
+    let mut prepared = BTreeMap::new();
+    let mut review = Vec::new();
+
+    for (index, op) in ops.iter().enumerate() {
+        let PackOp::Update { name, options } = op else {
+            continue;
+        };
+        if owner_conflict(name).is_some() || manual_names.contains(name) {
+            report
+                .failures
+                .push(format!("{name}: {OWNER_CONFLICT_FAILURE}"));
+            continue;
+        }
+        let Some(spec) = declared
+            .iter()
+            .find(|declared| declared.spec.name == *name)
+            .map(|declared| &declared.spec)
+        else {
+            report.failures.push(format!(
+                "{name}: not declared with maki.pack.add, so it cannot be updated"
+            ));
+            continue;
+        };
+        let proposal = match smol::block_on(manager.prepare_update(
+            spec,
+            &lock,
+            options.target == UpdateTarget::Lockfile,
+        )) {
+            Ok(proposal) => proposal,
+            Err(error) => {
+                report
+                    .failures
+                    .push(format!("{name}: {}", redact_error(&error)));
+                continue;
+            }
+        };
+        if proposal.changed && !options.force {
+            review.push(format!(
+                "{name}: {} -> {}",
+                short_revision(&proposal.old_rev),
+                short_revision(&proposal.new_rev)
+            ));
+        }
+        prepared.insert(index, proposal);
+    }
+
+    let review_decision = if review.is_empty() {
+        ReviewDecision::Accepted
+    } else {
+        review_updates(&format!(
+            "Apply these package updates?\n  {}",
+            review.join("\n  ")
+        ))
+    };
+    for (index, op) in ops.iter().enumerate() {
+        match op {
+            PackOp::Activate { .. } => {}
+            PackOp::Update { name, options } => {
+                let Some(proposal) = prepared.get(&index) else {
+                    continue;
+                };
+                if !proposal.changed {
+                    continue;
+                }
+                if !options.force && review_decision != ReviewDecision::Accepted {
+                    report.failures.push(match review_decision {
+                        ReviewDecision::Declined => format!("{name}: {UPDATE_REVIEW_DECLINED}"),
+                        ReviewDecision::Unavailable => {
+                            format!("{name}: {UPDATE_REVIEW_UNAVAILABLE}")
+                        }
+                        ReviewDecision::Accepted => unreachable!("accepted above"),
+                    });
+                    continue;
+                }
+                match smol::block_on(manager.apply_update(proposal, &mut lock)) {
+                    Ok(installed) => report.updated.push((name.clone(), installed.rev)),
+                    Err(error) => report
+                        .failures
+                        .push(format!("{name}: {}", redact_error(&error))),
+                }
+            }
+            PackOp::Delete { name } => {
+                if declared.iter().any(|declared| declared.spec.name == *name) {
+                    report
+                        .failures
+                        .push(format!("{name}: {DECLARED_DELETE_REFUSAL}"));
+                    continue;
+                }
+                if active.contains(name) {
+                    report
+                        .failures
+                        .push(format!("{name}: {ACTIVE_DELETE_REFUSAL}"));
+                    continue;
+                }
+                if lock.get(name).is_none() {
+                    report
+                        .failures
+                        .push(format!("{name}: not an installed managed package"));
+                    continue;
+                }
+                match manager.remove(name, &mut lock) {
+                    Ok(()) => {
+                        report.removed.push(name.clone());
+                        if !revoke_approval(name, approval_path) {
+                            report.failures.push(format!(
+                                "{name}: removed, but its approval could not be revoked"
+                            ));
+                        }
+                    }
+                    Err(error) => report
+                        .failures
+                        .push(format!("{name}: {}", redact_error(&error))),
+                }
+            }
+        }
+    }
+
+    if report.changed() {
+        if !write_lockfile(lock_path, &lock) {
+            report
+                .failures
+                .push("packages changed but the lockfile could not be written".to_owned());
+        } else {
+            for error in manager.prune(&lock) {
+                report.failures.push(redact_error(&error));
+            }
+        }
+    }
+    report
+}
+
+fn short_revision(revision: &str) -> &str {
+    revision.get(..REVIEW_REVISION_LEN).unwrap_or(revision)
+}
+
+fn revoke_approval(name: &str, path: Option<&Path>) -> bool {
+    let Some(mut approvals) = try_read_approvals_at(path) else {
+        return false;
+    };
+    if !approvals.revoke(name) {
+        return true;
+    }
+    write_approvals_at(path, &approvals)
+}
+
+/// The reason a managed package may not own a name, if something else does.
+fn owner_conflict(name: &str) -> Option<String> {
+    is_bundled(name)
+        .then(|| format!("{name}: managed package name conflicts with a builtin plugin"))
 }
 
 fn redact_error(error: &impl std::fmt::Display) -> String {
@@ -614,8 +1032,16 @@ pub(crate) fn read_lockfile(path: Option<&Path>) -> Option<maki_pack::lockfile::
     }
 }
 
+fn write_lockfile(path: &Path, lock: &maki_pack::lockfile::Lockfile) -> bool {
+    write_json(path, lock, "pack lockfile")
+}
+
 fn write_approvals(approvals: &maki_pack::approvals::Approvals) -> bool {
-    approvals_path().is_some_and(|path| write_json(&path, approvals, "pack approvals"))
+    write_approvals_at(approvals_path().as_deref(), approvals)
+}
+
+fn write_approvals_at(path: Option<&Path>, approvals: &maki_pack::approvals::Approvals) -> bool {
+    path.is_some_and(|path| write_json(path, approvals, "pack approvals"))
 }
 
 /// Replaces a shared JSON file in one step.
@@ -830,6 +1256,7 @@ pub fn discover(site: &Path) -> Discovery {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -837,12 +1264,15 @@ mod tests {
     use crate::plugin_permissions::{Permission, Requested};
 
     use super::{
-        DiscoveredPackage, MANAGED_GROUP, Origin, Problem, discover, granted,
+        ACTIVE_DELETE_REFUSAL, DECLARED_DELETE_REFUSAL, DiscoveredPackage, MANAGED_GROUP,
+        OWNER_CONFLICT_FAILURE, Origin, Problem, REVIEW_REVISION_LEN, ReviewDecision,
+        UPDATE_REVIEW_DECLINED, UPDATE_REVIEW_UNAVAILABLE, apply_pack_ops_at, discover, granted,
         installed_from_declared_source, missing_permissions, read_approvals_file, read_lockfile,
-        resolved_on_disk, sanitize_message,
+        resolved_on_disk, sanitize_message, write_lockfile,
     };
 
     const TEST_REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER_REV: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     #[test]
     fn terminal_messages_keep_layout_but_remove_control_characters() {
@@ -1256,5 +1686,354 @@ mod tests {
         ] {
             assert!(!found.packages[0].requested.is_requested(perm));
         }
+    }
+
+    fn declaration(name: &str) -> crate::api::pack::Declared {
+        crate::api::pack::Declared {
+            spec: maki_pack::Spec::new(format!("https://example.com/{name}")).with_name(name),
+            load: crate::api::pack::LoadMode::Eager,
+            confirm: true,
+            data: None,
+        }
+    }
+
+    struct UpdateFixture {
+        _temp: tempfile::TempDir,
+        site: PathBuf,
+        lock_path: PathBuf,
+        declared: Vec<crate::api::pack::Declared>,
+        old_rev: String,
+        new_rev: String,
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) -> maki_pack::git::GitOutput {
+        smol::block_on(maki_pack::git::run(
+            args.iter().map(|arg| (*arg).to_owned()).collect(),
+            repo.to_path_buf(),
+        ))
+        .unwrap()
+    }
+
+    fn update_fixture() -> UpdateFixture {
+        let temp = tempfile::TempDir::new().unwrap();
+        let origin = temp.path().join("origin");
+        fs::create_dir_all(origin.join("plugin")).unwrap();
+        fs::write(origin.join("plugin").join("init.lua"), "-- first\n").unwrap();
+        run_git(&origin, &["init", "--quiet"]);
+        run_git(&origin, &["config", "user.email", "test@example.com"]);
+        run_git(&origin, &["config", "user.name", "test"]);
+        run_git(&origin, &["add", "."]);
+        run_git(&origin, &["commit", "--quiet", "-m", "first"]);
+
+        let site = temp.path().join("site");
+        let lock_path = temp.path().join("pack-lock.json");
+        let spec = maki_pack::Spec::new(origin.display().to_string()).with_name("demo");
+        let mut lock = maki_pack::lockfile::Lockfile::default();
+        let installed = smol::block_on(
+            maki_pack::manager::Manager::new(&site).ensure_installed(&spec, &mut lock),
+        )
+        .unwrap();
+        assert!(write_lockfile(&lock_path, &lock));
+
+        fs::write(origin.join("plugin").join("later.lua"), "-- later\n").unwrap();
+        run_git(&origin, &["add", "."]);
+        run_git(&origin, &["commit", "--quiet", "-m", "later"]);
+        let new_rev = run_git(&origin, &["rev-parse", "HEAD"])
+            .stdout
+            .trim()
+            .to_owned();
+        let declared = vec![crate::api::pack::Declared {
+            spec,
+            load: crate::api::pack::LoadMode::Eager,
+            confirm: true,
+            data: None,
+        }];
+
+        UpdateFixture {
+            _temp: temp,
+            site,
+            lock_path,
+            declared,
+            old_rev: installed.rev,
+            new_rev,
+        }
+    }
+
+    fn update_operation(force: bool) -> crate::api::pack::PackOp {
+        crate::api::pack::PackOp::Update {
+            name: "demo".to_owned(),
+            options: crate::api::pack::UpdateOptions {
+                force,
+                target: crate::api::pack::UpdateTarget::Version,
+            },
+        }
+    }
+
+    #[test]
+    fn accepted_update_review_applies_the_prepared_revision() {
+        let fixture = update_fixture();
+        let mut prompt = String::new();
+        let report = apply_pack_ops_at(
+            &[update_operation(false)],
+            &fixture.declared,
+            &Default::default(),
+            &fixture.site,
+            &fixture.lock_path,
+            None,
+            |value| {
+                prompt = value.to_owned();
+                ReviewDecision::Accepted
+            },
+        );
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(
+            report.updated,
+            vec![("demo".to_owned(), fixture.new_rev.clone())]
+        );
+        assert!(prompt.contains(&fixture.old_rev[..REVIEW_REVISION_LEN]));
+        assert!(prompt.contains(&fixture.new_rev[..REVIEW_REVISION_LEN]));
+        assert_eq!(
+            read_lockfile(Some(&fixture.lock_path))
+                .unwrap()
+                .get("demo")
+                .unwrap()
+                .rev,
+            fixture.new_rev
+        );
+    }
+
+    #[test]
+    fn declined_update_review_changes_no_managed_state() {
+        let fixture = update_fixture();
+        let report = apply_pack_ops_at(
+            &[update_operation(false)],
+            &fixture.declared,
+            &Default::default(),
+            &fixture.site,
+            &fixture.lock_path,
+            None,
+            |_| ReviewDecision::Declined,
+        );
+
+        assert!(report.updated.is_empty());
+        assert_eq!(
+            report.failures,
+            vec![format!("demo: {UPDATE_REVIEW_DECLINED}")]
+        );
+        assert!(!maki_pack::paths::revision_dir(&fixture.site, "demo", &fixture.new_rev).exists());
+        assert_eq!(
+            read_lockfile(Some(&fixture.lock_path))
+                .unwrap()
+                .get("demo")
+                .unwrap()
+                .rev,
+            fixture.old_rev
+        );
+    }
+
+    #[test]
+    fn forced_update_skips_review_and_applies_the_revision() {
+        let fixture = update_fixture();
+        let report = apply_pack_ops_at(
+            &[update_operation(true)],
+            &fixture.declared,
+            &Default::default(),
+            &fixture.site,
+            &fixture.lock_path,
+            None,
+            |_| panic!("forced updates must not ask for review"),
+        );
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.updated, vec![("demo".to_owned(), fixture.new_rev)]);
+    }
+
+    #[test]
+    fn unavailable_update_review_requires_force_and_changes_nothing() {
+        let fixture = update_fixture();
+        let report = apply_pack_ops_at(
+            &[update_operation(false)],
+            &fixture.declared,
+            &Default::default(),
+            &fixture.site,
+            &fixture.lock_path,
+            None,
+            |_| ReviewDecision::Unavailable,
+        );
+
+        assert!(report.updated.is_empty());
+        assert_eq!(
+            report.failures,
+            vec![format!("demo: {UPDATE_REVIEW_UNAVAILABLE}")]
+        );
+        assert!(!maki_pack::paths::revision_dir(&fixture.site, "demo", &fixture.new_rev).exists());
+        assert_eq!(
+            read_lockfile(Some(&fixture.lock_path))
+                .unwrap()
+                .get("demo")
+                .unwrap()
+                .rev,
+            fixture.old_rev
+        );
+    }
+
+    #[test]
+    fn delete_batch_removes_inactive_packages_and_keeps_active_ones() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let site = temp.path().join("site");
+        let lock_path = temp.path().join("pack-lock.json");
+        let mut lock = maki_pack::lockfile::Lockfile::default();
+        for (name, revision) in [("inactive", TEST_REV), ("active", OTHER_REV)] {
+            lock.record(name, format!("https://example.com/{name}"), revision);
+            fs::create_dir_all(maki_pack::paths::revision_dir(&site, name, revision)).unwrap();
+        }
+        assert!(write_lockfile(&lock_path, &lock));
+        let active = BTreeSet::from(["active".to_owned()]);
+        let operations = [
+            crate::api::pack::PackOp::Delete {
+                name: "inactive".to_owned(),
+            },
+            crate::api::pack::PackOp::Delete {
+                name: "active".to_owned(),
+            },
+        ];
+
+        let report = apply_pack_ops_at(
+            &operations,
+            &[],
+            &active,
+            &site,
+            &lock_path,
+            Some(&temp.path().join("approvals.json")),
+            |_| panic!("deletion does not use update review"),
+        );
+
+        assert_eq!(report.removed, vec!["inactive"]);
+        assert_eq!(
+            report.failures,
+            vec![format!("active: {ACTIVE_DELETE_REFUSAL}")]
+        );
+        assert!(!maki_pack::paths::package_root(&site, "inactive").exists());
+        assert!(maki_pack::paths::package_root(&site, "active").is_dir());
+        let lock = read_lockfile(Some(&lock_path)).unwrap();
+        assert!(lock.get("inactive").is_none());
+        assert!(lock.get("active").is_some());
+    }
+
+    #[test]
+    fn updates_refuse_bundled_and_manual_package_owners() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let site = temp.path().join("site");
+        let lock_path = temp.path().join("pack-lock.json");
+        make_package(&site, "vendor", "start", "manual");
+        assert!(write_lockfile(
+            &lock_path,
+            &maki_pack::lockfile::Lockfile::default()
+        ));
+
+        for name in ["bash", "manual"] {
+            let report = apply_pack_ops_at(
+                &[crate::api::pack::PackOp::Update {
+                    name: name.to_owned(),
+                    options: crate::api::pack::UpdateOptions::default(),
+                }],
+                &[declaration(name)],
+                &Default::default(),
+                &site,
+                &lock_path,
+                None,
+                |_| panic!("owner conflicts do not use update review"),
+            );
+
+            assert_eq!(
+                report.failures,
+                vec![format!("{name}: {OWNER_CONFLICT_FAILURE}")]
+            );
+        }
+    }
+
+    #[test]
+    fn deletion_refuses_a_declared_package_before_removing_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let site = temp.path().join("site");
+        let lock_path = temp.path().join("pack-lock.json");
+        let mut lock = maki_pack::lockfile::Lockfile::default();
+        lock.record("demo", "https://example.com/demo", TEST_REV);
+        fs::create_dir_all(maki_pack::paths::revision_dir(&site, "demo", TEST_REV)).unwrap();
+        assert!(write_lockfile(&lock_path, &lock));
+
+        let report = apply_pack_ops_at(
+            &[crate::api::pack::PackOp::Delete {
+                name: "demo".to_owned(),
+            }],
+            &[declaration("demo")],
+            &Default::default(),
+            &site,
+            &lock_path,
+            None,
+            |_| panic!("deletion does not use update review"),
+        );
+
+        assert_eq!(
+            report.failures,
+            vec![format!("demo: {DECLARED_DELETE_REFUSAL}")]
+        );
+        assert!(maki_pack::paths::package_root(&site, "demo").is_dir());
+        assert!(
+            read_lockfile(Some(&lock_path))
+                .unwrap()
+                .get("demo")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn update_bang_sets_force_and_removed_flags_are_rejected() {
+        let command = super::PackCommand::parse("/packupdate", "++lockfile demo", true).unwrap();
+        assert_eq!(
+            command,
+            super::PackCommand::Update {
+                names: vec!["demo".to_owned()],
+                options: crate::api::pack::UpdateOptions {
+                    force: true,
+                    target: crate::api::pack::UpdateTarget::Lockfile,
+                },
+            }
+        );
+        assert!(super::PackCommand::parse("/packupdate", "++offline", false).is_err());
+        assert!(super::PackCommand::parse("/packdel", "demo", true).is_err());
+    }
+
+    #[test]
+    fn command_plan_keeps_update_and_delete_boundaries() {
+        let declared = vec![declaration("alpha"), declaration("missing")];
+        let installed = vec!["alpha".to_owned(), "orphan".to_owned()];
+        let update = super::PackCommand::parse("/packupdate", "", false).unwrap();
+        assert_eq!(
+            super::plan_command(&update, &declared, &installed).unwrap(),
+            vec![crate::api::pack::PackOp::Update {
+                name: "alpha".to_owned(),
+                options: crate::api::pack::UpdateOptions::default(),
+            }]
+        );
+
+        let undeclared_update = super::PackCommand::parse("/packupdate", "orphan", false).unwrap();
+        assert!(super::plan_command(&undeclared_update, &declared, &installed).is_err());
+        let uninstalled_update =
+            super::PackCommand::parse("/packupdate", "missing", false).unwrap();
+        assert!(super::plan_command(&uninstalled_update, &declared, &installed).is_err());
+
+        let declared_delete = super::PackCommand::parse("/packdel", "alpha", false).unwrap();
+        assert!(super::plan_command(&declared_delete, &declared, &installed).is_err());
+        let missing_delete = super::PackCommand::parse("/packdel", "absent", false).unwrap();
+        assert!(super::plan_command(&missing_delete, &declared, &installed).is_err());
+        let delete_all = super::PackCommand::parse("/packdel", "++all", false).unwrap();
+        assert_eq!(
+            super::plan_command(&delete_all, &declared, &installed).unwrap(),
+            vec![crate::api::pack::PackOp::Delete {
+                name: "orphan".to_owned(),
+            }]
+        );
     }
 }

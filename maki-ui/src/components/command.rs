@@ -109,11 +109,22 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Reload plugins and config",
         max_args: 0,
     },
+    BuiltinCommand {
+        name: "/packupdate",
+        description: "Update packages (++lockfile, ! skips review)",
+        max_args: 2,
+    },
+    BuiltinCommand {
+        name: "/packdel",
+        description: "Remove undeclared packages (++all, or a name)",
+        max_args: 1,
+    },
 ];
 
 pub struct ParsedCommand {
     pub name: String,
     pub args: String,
+    pub bang: bool,
 }
 
 pub enum CommandAction {
@@ -155,6 +166,7 @@ pub struct CommandPalette {
     nucleo: Nucleo<CommandItem>,
     matcher: Matcher,
     current_arg_count: usize,
+    current_bang: bool,
 }
 
 impl CommandPalette {
@@ -185,6 +197,7 @@ impl CommandPalette {
             nucleo,
             matcher: Matcher::new(Config::DEFAULT),
             current_arg_count: 0,
+            current_bang: false,
         }
     }
 
@@ -269,6 +282,11 @@ impl CommandPalette {
             KeyCode::Tab => {
                 if let Some(item) = self.filtered.get(self.selected) {
                     let name = self.item_name(item);
+                    let name = if self.current_bang {
+                        format!("{name}!")
+                    } else {
+                        name
+                    };
                     let text = if self.item_has_args(item) {
                         format!("{name} ")
                     } else {
@@ -301,11 +319,16 @@ impl CommandPalette {
         let Some(stripped) = input.strip_prefix('/') else {
             self.filtered.clear();
             self.current_arg_count = 0;
+            self.current_bang = false;
             return;
         };
 
         let parts: Vec<&str> = stripped.split_whitespace().collect();
-        let cmd_word = parts.first().copied().unwrap_or(stripped);
+        let raw_word = parts.first().copied().unwrap_or(stripped);
+        let (cmd_word, bang) = raw_word
+            .strip_suffix('!')
+            .map_or((raw_word, false), |word| (word, true));
+        self.current_bang = bang;
         let trailing_space = stripped.ends_with(char::is_whitespace);
 
         self.current_arg_count = if trailing_space {
@@ -322,7 +345,17 @@ impl CommandPalette {
             false,
         );
 
+        let exact_name = self.resolve(&format!("/{cmd_word}"));
         self.tick();
+        if let Some(exact_name) = exact_name {
+            self.filtered = self
+                .filtered
+                .iter()
+                .position(|item| self.item_name(item).eq_ignore_ascii_case(&exact_name))
+                .map(|index| vec![self.filtered.remove(index)])
+                .unwrap_or_default();
+            self.selected = 0;
+        }
     }
 
     fn tick(&mut self) {
@@ -351,6 +384,14 @@ impl CommandPalette {
             if self.current_arg_count > cmd_item.max_args {
                 continue;
             }
+            if self.current_bang
+                && !matches!(
+                    cmd_item.command_type,
+                    CommandType::Builtin(command) if command.name == "/packupdate"
+                )
+            {
+                continue;
+            }
 
             let indices = if has_pattern {
                 let mut indices_buf = vec![];
@@ -376,6 +417,7 @@ impl CommandPalette {
     pub fn close(&mut self) {
         self.filtered.clear();
         self.current_arg_count = 0;
+        self.current_bang = false;
     }
 
     pub fn move_up(&mut self) {
@@ -438,6 +480,7 @@ impl CommandPalette {
         Some(ParsedCommand {
             name,
             args: args.to_string(),
+            bang: self.current_bang,
         })
     }
 
@@ -710,7 +753,7 @@ mod tests {
     #[test_case("/CD ~/foo", "/cd", "~/foo"   ; "case_insensitive")]
     #[test_case("/compact", "/compact", ""    ; "other_command")]
     #[test_case("/cmp", "/compact", ""    ; "fuzzy-match-1")]
-    #[test_case("/pct", "/compact", ""    ; "fuzzy-match-2")]
+    #[test_case("/cpt", "/compact", ""    ; "fuzzy-match-2")]
     #[test_case("/btw hello world", "/btw", "hello world" ; "btw_multi_word")]
     fn confirm_parses_args(input: &str, expected_name: &str, expected_args: &str) {
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
@@ -989,6 +1032,20 @@ mod tests {
         let cmd = p.confirm("/memory some-arg").unwrap();
         assert_eq!(cmd.name, "/memory");
         assert_eq!(cmd.args, "some-arg");
+    }
+
+    #[test]
+    fn packupdate_bang_reaches_the_builtin_handler() {
+        let palette = synced("/packupdate! ++lockfile demo");
+        let command = palette.confirm("/packupdate! ++lockfile demo").unwrap();
+        assert_eq!(command.name, "/packupdate");
+        assert_eq!(command.args, "++lockfile demo");
+        assert!(command.bang);
+    }
+
+    #[test]
+    fn delete_bang_is_not_a_supported_command() {
+        assert!(!synced("/packdel! demo").is_active());
     }
 
     #[test]

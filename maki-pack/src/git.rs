@@ -273,6 +273,7 @@ mod tests {
             Path::new("/dest"),
             true
         )));
+        assert!(hooks_flag_present(&fetch_args(&hooks())));
         assert!(hooks_flag_present(&checkout_args(&hooks(), "main")));
         assert!(hooks_flag_present(&rev_parse_args(&hooks(), "HEAD")));
     }

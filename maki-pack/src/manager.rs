@@ -1,4 +1,4 @@
-//! Installing and pruning managed packages.
+//! Installing, updating, pruning, and removing managed packages.
 //!
 //! The lockfile is the single source of truth for which revision of a package
 //! is active. Nothing else records it, so nothing else can disagree with it,
@@ -28,6 +28,12 @@ pub enum ManagerError {
         "package source {src:?} contains HTTP credentials; use a Git credential helper instead"
     )]
     UnsafeSource { src: String },
+    #[error("package {name:?} is not installed")]
+    NotInstalled { name: String },
+    #[error("package {name:?} now declares a different source")]
+    SourceChanged { name: String },
+    #[error("package {name:?} changed while its update was being applied")]
+    ConcurrentChange { name: String },
     #[error("io error on {path}: {source}")]
     Io {
         path: PathBuf,
@@ -49,6 +55,14 @@ pub struct Installed {
 enum Want<'a> {
     Commit(&'a str),
     Ref,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedUpdate {
+    spec: Spec,
+    pub old_rev: String,
+    pub new_rev: String,
+    pub changed: bool,
 }
 
 /// Where a clone keeps the refs that `git fetch` actually moves.
@@ -103,21 +117,21 @@ impl Manager {
         failures
     }
 
-    /// Removes every revision directory of one package except the recorded one.
+    /// Every revision directory of a package, and whatever could not be read.
     ///
-    /// A revision another process is reading keeps its shared lock, and the
-    /// exclusive lock here fails rather than waits, so a live session's
-    /// directory is skipped instead of deleted out from under it.
-    fn prune_package(&self, name: &str, current: &str, failures: &mut Vec<ManagerError>) {
+    /// A missing root yields nothing rather than an error: a package that is
+    /// not installed simply has no revisions to act on.
+    fn revision_dirs(&self, name: &str) -> (Vec<String>, Vec<ManagerError>) {
         let root = paths::package_root(&self.site, name);
         let entries = match fs::read_dir(&root) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(source) => {
-                failures.push(ManagerError::Io { path: root, source });
-                return;
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return (Vec::new(), Vec::new());
             }
+            Err(source) => return (Vec::new(), vec![ManagerError::Io { path: root, source }]),
         };
+        let mut revisions = Vec::new();
+        let mut failures = Vec::new();
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -130,27 +144,38 @@ impl Manager {
                 }
             };
             let revision = entry.file_name().to_string_lossy().into_owned();
-            if revision == current || !revision_is_safe_component(&revision) {
+            // A hand-edited lockfile is input, and an unusable value here
+            // would point a recursive delete outside the site directory.
+            if !revision_is_safe_component(&revision) {
                 continue;
             }
             match entry.file_type() {
-                Ok(file_type) if file_type.is_dir() => {}
-                Ok(_) => continue,
-                Err(source) => {
-                    failures.push(ManagerError::Io {
-                        path: entry.path(),
-                        source,
-                    });
-                    continue;
-                }
+                Ok(file_type) if file_type.is_dir() => revisions.push(revision),
+                Ok(_) => {}
+                Err(source) => failures.push(ManagerError::Io {
+                    path: entry.path(),
+                    source,
+                }),
             }
-            match Lock::acquire(&paths::revision_lock(&self.site, name, &revision)) {
+        }
+        revisions.sort();
+        (revisions, failures)
+    }
+
+    /// Removes every revision directory of one package except the recorded one.
+    ///
+    /// A revision another process is reading keeps its shared lock, and the
+    /// exclusive lock here fails rather than waits, so a live session's
+    /// directory is skipped instead of deleted out from under it.
+    fn prune_package(&self, name: &str, current: &str, failures: &mut Vec<ManagerError>) {
+        let (revisions, errors) = self.revision_dirs(name);
+        failures.extend(errors);
+        for revision in revisions.iter().filter(|revision| *revision != current) {
+            match Lock::acquire(&paths::revision_lock(&self.site, name, revision)) {
                 Ok(_guard) => {
-                    if let Err(source) = fs::remove_dir_all(entry.path()) {
-                        failures.push(ManagerError::Io {
-                            path: entry.path(),
-                            source,
-                        });
+                    let dir = paths::revision_dir(&self.site, name, revision);
+                    if let Err(source) = fs::remove_dir_all(&dir) {
+                        failures.push(ManagerError::Io { path: dir, source });
                     }
                 }
                 Err(LockError::Held { .. }) => {
@@ -237,6 +262,116 @@ impl Manager {
             dir: dest,
             changed: true,
         })
+    }
+
+    /// Resolve an update without changing the lockfile or materializing it.
+    pub async fn prepare_update(
+        &self,
+        spec: &Spec,
+        lock: &Lockfile,
+        restore_lockfile: bool,
+    ) -> Result<PreparedUpdate, ManagerError> {
+        if git::http_source_has_userinfo(&spec.src) {
+            return Err(ManagerError::UnsafeSource {
+                src: git::redact(&spec.src),
+            });
+        }
+        self.check_name(&spec.name, &spec.src)?;
+        let current = lock
+            .get(&spec.name)
+            .ok_or_else(|| ManagerError::NotInstalled {
+                name: spec.name.clone(),
+            })?;
+        if current.src != spec.src {
+            return Err(ManagerError::SourceChanged {
+                name: spec.name.clone(),
+            });
+        }
+        if !revision_is_safe_component(&current.rev) {
+            return Err(ManagerError::UnsafeRevision {
+                rev: current.rev.clone(),
+            });
+        }
+
+        let new_rev = if restore_lockfile {
+            current.rev.clone()
+        } else {
+            let _guard = Lock::acquire(&paths::package_lock(&self.site, &spec.name))?;
+            let hooks = self.hooks_dir()?;
+            let work = self.ensure_work(&hooks, spec, Want::Ref).await?;
+            self.resolve_revision(&hooks, &work, spec).await?
+        };
+        if !revision_is_safe_component(&new_rev) {
+            return Err(ManagerError::UnsafeRevision { rev: new_rev });
+        }
+        Ok(PreparedUpdate {
+            spec: spec.clone(),
+            old_rev: current.rev.clone(),
+            changed: current.rev != new_rev
+                || !paths::revision_dir(&self.site, &spec.name, &new_rev).is_dir(),
+            new_rev,
+        })
+    }
+
+    /// Materialize and record a prepared update.
+    pub async fn apply_update(
+        &self,
+        prepared: &PreparedUpdate,
+        lock: &mut Lockfile,
+    ) -> Result<Installed, ManagerError> {
+        let current =
+            lock.get(&prepared.spec.name)
+                .ok_or_else(|| ManagerError::ConcurrentChange {
+                    name: prepared.spec.name.clone(),
+                })?;
+        if current.src != prepared.spec.src || current.rev != prepared.old_rev {
+            return Err(ManagerError::ConcurrentChange {
+                name: prepared.spec.name.clone(),
+            });
+        }
+
+        let _guard = Lock::acquire(&paths::package_lock(&self.site, &prepared.spec.name))?;
+        let hooks = self.hooks_dir()?;
+        let work = self
+            .ensure_work(&hooks, &prepared.spec, Want::Commit(&prepared.new_rev))
+            .await?;
+        let dest = paths::revision_dir(&self.site, &prepared.spec.name, &prepared.new_rev);
+        let existed = dest.is_dir();
+        if !existed {
+            self.materialize(&hooks, &work, &prepared.new_rev, &dest)
+                .await?;
+        }
+        lock.record(&prepared.spec.name, &prepared.spec.src, &prepared.new_rev);
+        Ok(Installed {
+            rev: prepared.new_rev.clone(),
+            dir: dest,
+            changed: !existed || prepared.old_rev != prepared.new_rev,
+        })
+    }
+
+    /// Removes a package outright, once no process is reading any revision.
+    ///
+    /// Every revision lock is taken before anything is deleted, so a live
+    /// session holding one leaves the package whole rather than half removed.
+    pub fn remove(&self, name: &str, lock: &mut Lockfile) -> Result<(), ManagerError> {
+        self.check_name(name, "")?;
+        let _package_guard = Lock::acquire(&paths::package_lock(&self.site, name))?;
+        let (revisions, failures) = self.revision_dirs(name);
+        if let Some(failure) = failures.into_iter().next() {
+            return Err(failure);
+        }
+        let _revision_guards = revisions
+            .iter()
+            .map(|revision| Lock::acquire(&paths::revision_lock(&self.site, name, revision)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let root = paths::package_root(&self.site, name);
+        match fs::remove_dir_all(&root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(ManagerError::Io { path: root, source }),
+        }
+        lock.remove(name);
+        Ok(())
     }
 
     /// Rejects a name that would not stay inside the package root.
@@ -696,6 +831,17 @@ mod tests {
         repo
     }
 
+    fn commit_later_revision(origin: &Path) {
+        fs::write(origin.join("plugin").join("later.lua"), "-- later\n").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "--quiet", "-m", "later"]] {
+            smol::block_on(git::run(
+                args.into_iter().map(str::to_owned).collect(),
+                origin.to_path_buf(),
+            ))
+            .unwrap();
+        }
+    }
+
     #[test]
     fn installs_a_package_from_a_local_repository() {
         let dir = site();
@@ -1126,5 +1272,214 @@ mod tests {
 
         assert!(manager.prune(&lock).is_empty());
         assert!(recoverable.is_dir());
+    }
+
+    #[test]
+    fn update_is_prepared_before_it_changes_the_lockfile() {
+        let dir = site();
+        let origin = origin_repo(dir.path(), None);
+        let site_dir = dir.path().join("site");
+        let manager = Manager::new(&site_dir);
+        let mut lock = Lockfile::default();
+        let spec = Spec::new(origin.display().to_string()).with_name("demo");
+        let first = smol::block_on(manager.ensure_installed(&spec, &mut lock)).unwrap();
+        let _live =
+            Lock::acquire_shared(&paths::revision_lock(&site_dir, "demo", &first.rev)).unwrap();
+
+        commit_later_revision(&origin);
+
+        let before = lock.clone();
+        let prepared = smol::block_on(manager.prepare_update(&spec, &lock, false)).unwrap();
+        assert!(prepared.changed);
+        assert_ne!(prepared.old_rev, prepared.new_rev);
+        assert_eq!(
+            lock, before,
+            "review preparation must not move the lockfile"
+        );
+        assert!(
+            !paths::revision_dir(&site_dir, "demo", &prepared.new_rev).exists(),
+            "review preparation must not materialize the proposed revision"
+        );
+
+        let updated = smol::block_on(manager.apply_update(&prepared, &mut lock)).unwrap();
+        assert_eq!(updated.rev, prepared.new_rev);
+        assert!(updated.dir.join("plugin").join("later.lua").is_file());
+        assert_eq!(lock.get("demo").unwrap().rev, prepared.new_rev);
+    }
+
+    #[test]
+    fn prepared_update_reports_a_move_when_the_target_revision_exists() {
+        let dir = site();
+        let origin = origin_repo(dir.path(), None);
+        let site_dir = dir.path().join("site");
+        let manager = Manager::new(&site_dir);
+        let mut lock = Lockfile::default();
+        let spec = Spec::new(origin.display().to_string()).with_name("demo");
+        smol::block_on(manager.ensure_installed(&spec, &mut lock)).unwrap();
+
+        commit_later_revision(&origin);
+
+        let first = smol::block_on(manager.prepare_update(&spec, &lock, false)).unwrap();
+        fs::create_dir_all(paths::revision_dir(&site_dir, "demo", &first.new_rev)).unwrap();
+        let second = smol::block_on(manager.prepare_update(&spec, &lock, false)).unwrap();
+
+        assert_ne!(second.old_rev, second.new_rev);
+        assert!(second.changed, "moving the lockfile is still a change");
+    }
+
+    #[test]
+    fn apply_update_rejects_each_lockfile_change_since_review() {
+        let dir = site();
+        let origin = origin_repo(dir.path(), None);
+        let site_dir = dir.path().join("site");
+        let manager = Manager::new(&site_dir);
+        let mut lock = Lockfile::default();
+        let spec = Spec::new(origin.display().to_string()).with_name("demo");
+        smol::block_on(manager.ensure_installed(&spec, &mut lock)).unwrap();
+        let prepared = smol::block_on(manager.prepare_update(&spec, &lock, true)).unwrap();
+
+        let mut changed_source = lock.clone();
+        changed_source.record("demo", "https://example.com/other", &prepared.old_rev);
+        assert!(matches!(
+            smol::block_on(manager.apply_update(&prepared, &mut changed_source)),
+            Err(ManagerError::ConcurrentChange { .. })
+        ));
+
+        let mut changed_revision = lock;
+        changed_revision.record("demo", &spec.src, OTHER_REV);
+        assert!(matches!(
+            smol::block_on(manager.apply_update(&prepared, &mut changed_revision)),
+            Err(ManagerError::ConcurrentChange { .. })
+        ));
+    }
+
+    #[test]
+    fn lockfile_update_restores_the_recorded_revision() {
+        let dir = site();
+        let origin = origin_repo(dir.path(), None);
+        let site_dir = dir.path().join("site");
+        let manager = Manager::new(&site_dir);
+        let mut lock = Lockfile::default();
+        let spec = Spec::new(origin.display().to_string()).with_name("demo");
+        let installed = smol::block_on(manager.ensure_installed(&spec, &mut lock)).unwrap();
+        fs::remove_dir_all(&installed.dir).unwrap();
+
+        let prepared = smol::block_on(manager.prepare_update(&spec, &lock, true)).unwrap();
+        assert!(prepared.changed);
+        assert_eq!(prepared.old_rev, installed.rev);
+        assert_eq!(prepared.new_rev, installed.rev);
+
+        let restored = smol::block_on(manager.apply_update(&prepared, &mut lock)).unwrap();
+        assert!(restored.changed);
+        assert_eq!(restored.rev, installed.rev);
+        assert!(restored.dir.join("plugin").join("init.lua").is_file());
+        assert_eq!(lock.get("demo").unwrap().rev, installed.rev);
+    }
+
+    #[test]
+    fn applying_an_already_materialized_revision_reports_the_lockfile_move() {
+        let dir = site();
+        let origin = origin_repo(dir.path(), None);
+        let site_dir = dir.path().join("site");
+        let manager = Manager::new(&site_dir);
+        let mut lock = Lockfile::default();
+        let spec = Spec::new(origin.display().to_string()).with_name("demo");
+        smol::block_on(manager.ensure_installed(&spec, &mut lock)).unwrap();
+
+        commit_later_revision(&origin);
+        let prepared = smol::block_on(manager.prepare_update(&spec, &lock, false)).unwrap();
+        fs::create_dir_all(paths::revision_dir(&site_dir, "demo", &prepared.new_rev)).unwrap();
+
+        let updated = smol::block_on(manager.apply_update(&prepared, &mut lock)).unwrap();
+        assert!(updated.changed);
+        assert_eq!(lock.get("demo").unwrap().rev, prepared.new_rev);
+    }
+
+    #[test]
+    fn applying_the_current_materialized_revision_reports_no_change() {
+        let dir = site();
+        let origin = origin_repo(dir.path(), None);
+        let site_dir = dir.path().join("site");
+        let manager = Manager::new(&site_dir);
+        let mut lock = Lockfile::default();
+        let spec = Spec::new(origin.display().to_string()).with_name("demo");
+        smol::block_on(manager.ensure_installed(&spec, &mut lock)).unwrap();
+
+        let prepared = smol::block_on(manager.prepare_update(&spec, &lock, true)).unwrap();
+        assert!(!prepared.changed);
+        let unchanged = smol::block_on(manager.apply_update(&prepared, &mut lock)).unwrap();
+        assert!(!unchanged.changed);
+    }
+
+    #[test]
+    fn deletion_removes_a_lock_entry_when_the_package_root_is_missing() {
+        let dir = site();
+        let manager = Manager::new(dir.path());
+        let mut lock = Lockfile::default();
+        lock.record("demo", "https://example.com/demo", TEST_REV);
+
+        manager.remove("demo", &mut lock).unwrap();
+
+        assert!(lock.get("demo").is_none());
+    }
+
+    #[test]
+    fn deletion_keeps_the_lock_entry_when_the_package_root_is_unreadable() {
+        let dir = site();
+        let manager = Manager::new(dir.path());
+        let mut lock = Lockfile::default();
+        lock.record("demo", "https://example.com/demo", TEST_REV);
+        let root = paths::package_root(dir.path(), "demo");
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::write(&root, "not a directory").unwrap();
+
+        assert!(matches!(
+            manager.remove("demo", &mut lock),
+            Err(ManagerError::Io { .. })
+        ));
+        assert!(root.is_file());
+        assert!(lock.get("demo").is_some());
+    }
+
+    #[test]
+    fn deletion_does_not_treat_internal_directories_as_revisions() {
+        let dir = site();
+        let manager = Manager::new(dir.path());
+        let mut lock = Lockfile::default();
+        lock.record("demo", "https://example.com/demo", TEST_REV);
+        fs::create_dir_all(paths::package_root(dir.path(), "demo").join(".work")).unwrap();
+        let _unrelated =
+            Lock::acquire_shared(&paths::revision_lock(dir.path(), "demo", ".work")).unwrap();
+
+        manager.remove("demo", &mut lock).unwrap();
+
+        assert!(!paths::package_root(dir.path(), "demo").exists());
+        assert!(lock.get("demo").is_none());
+    }
+
+    #[test]
+    fn deletion_preflight_leaves_everything_when_one_revision_is_live() {
+        let dir = site();
+        let manager = Manager::new(dir.path());
+        let mut lock = Lockfile::default();
+        lock.record("demo", "https://example.com/demo", TEST_REV);
+        for revision in [TEST_REV, OTHER_REV] {
+            fs::create_dir_all(paths::revision_dir(dir.path(), "demo", revision)).unwrap();
+        }
+        let live =
+            Lock::acquire_shared(&paths::revision_lock(dir.path(), "demo", OTHER_REV)).unwrap();
+
+        assert!(matches!(
+            manager.remove("demo", &mut lock),
+            Err(ManagerError::Lock(LockError::Held { .. }))
+        ));
+        assert!(paths::revision_dir(dir.path(), "demo", TEST_REV).is_dir());
+        assert!(paths::revision_dir(dir.path(), "demo", OTHER_REV).is_dir());
+        assert!(lock.get("demo").is_some());
+
+        drop(live);
+        manager.remove("demo", &mut lock).unwrap();
+        assert!(!paths::package_root(dir.path(), "demo").exists());
+        assert!(lock.get("demo").is_none());
     }
 }

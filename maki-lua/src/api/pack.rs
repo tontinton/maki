@@ -54,7 +54,29 @@ pub struct PackDeclarations {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackOp {
-    Activate { name: String },
+    Activate {
+        name: String,
+    },
+    Update {
+        name: String,
+        options: UpdateOptions,
+    },
+    Delete {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpdateOptions {
+    pub force: bool,
+    pub target: UpdateTarget,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UpdateTarget {
+    #[default]
+    Version,
+    Lockfile,
 }
 
 pub type PackStore = Arc<Mutex<PackDeclarations>>;
@@ -254,8 +276,8 @@ fn parse_options(lua: &Lua, opts: Option<Table>) -> LuaResult<(LoadMode, bool)> 
     Ok((load, confirm))
 }
 
-fn enqueue(lua: &Lua, name: String) -> LuaResult<()> {
-    if !maki_pack::name_is_safe(&name) {
+fn enqueue(lua: &Lua, operation: PackOp, name: &str) -> LuaResult<()> {
+    if !maki_pack::name_is_safe(name) {
         return Err(mlua::Error::runtime(format!(
             "pack: {name:?} is not a usable package name"
         )));
@@ -266,9 +288,13 @@ fn enqueue(lua: &Lua, name: String) -> LuaResult<()> {
         .clone();
     let mut declarations = store.lock().expect("pack declarations");
     if declarations.drained {
-        return Err(mlua::Error::runtime(format!("maki.packadd: {AFTER_LOAD}")));
+        let scope = match &operation {
+            PackOp::Activate { .. } => "maki.packadd",
+            PackOp::Update { .. } => "maki.pack.update",
+            PackOp::Delete { .. } => "maki.pack.del",
+        };
+        return Err(mlua::Error::runtime(format!("{scope}: {AFTER_LOAD}")));
     }
-    let operation = PackOp::Activate { name };
     if !declarations.pending.contains(&operation) {
         declarations.pending.push(operation);
     }
@@ -280,7 +306,7 @@ fn enqueue(lua: &Lua, name: String) -> LuaResult<()> {
 /// @param name string Package name.
 #[lua_fn]
 fn packadd(lua: &Lua, name: String) -> LuaResult<()> {
-    enqueue(lua, name)
+    enqueue(lua, PackOp::Activate { name: name.clone() }, &name)
 }
 
 pub(crate) fn add_packadd(lua: &Lua, maki: &Table) -> LuaResult<()> {
@@ -309,6 +335,96 @@ fn get(lua: &Lua, names: Option<Table>, opts: Option<Table>) -> LuaResult<Table>
         .ok_or_else(|| mlua::Error::runtime("pack.get: pack lockfile is unreadable"))?;
     let site = crate::pack::site_dir().ok();
     package_state_table(lua, requested, &declarations, &lock, site.as_deref())
+}
+
+/// Update managed packages to their declared versions.
+///
+/// The default path shows the old and proposed revisions before it changes
+/// the lockfile. `force = true` skips that review. `target = "lockfile"`
+/// restores the recorded revision without resolving the declared version.
+///
+/// @param names table? Package names. Omit for all declared packages.
+/// @param opts table? `force` (boolean) and `target` (`"version"` or
+///   `"lockfile"`).
+#[lua_fn]
+fn update(lua: &Lua, names: Option<Table>, opts: Option<Table>) -> LuaResult<()> {
+    let options = parse_update_options(opts)?;
+    let names = match names {
+        Some(names) => names
+            .sequence_values::<String>()
+            .collect::<LuaResult<_>>()?,
+        None => declared_names(lua)?,
+    };
+    for name in names {
+        enqueue(
+            lua,
+            PackOp::Update {
+                name: name.clone(),
+                options,
+            },
+            &name,
+        )?;
+    }
+    Ok(())
+}
+
+fn parse_update_options(opts: Option<Table>) -> LuaResult<UpdateOptions> {
+    let Some(opts) = opts else {
+        return Ok(UpdateOptions::default());
+    };
+    reject_unknown_fields(&opts, &["force", "target"], "pack.update")?;
+    let force = match opts.get::<LuaValue>("force")? {
+        LuaValue::Nil => false,
+        LuaValue::Boolean(force) => force,
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "pack.update: 'force' must be a boolean, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    let target = match opts.get::<LuaValue>("target")? {
+        LuaValue::Nil => UpdateTarget::Version,
+        LuaValue::String(target) if target.as_bytes() == b"version" => UpdateTarget::Version,
+        LuaValue::String(target) if target.as_bytes() == b"lockfile" => UpdateTarget::Lockfile,
+        LuaValue::String(_) => {
+            return Err(mlua::Error::runtime(
+                "pack.update: 'target' must be 'version' or 'lockfile'",
+            ));
+        }
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "pack.update: 'target' must be a string, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    Ok(UpdateOptions { force, target })
+}
+
+fn declared_names(lua: &Lua) -> LuaResult<Vec<String>> {
+    let store = lua
+        .app_data_ref::<PackStore>()
+        .ok_or_else(|| mlua::Error::runtime("pack: not available here"))?
+        .clone();
+    let declarations = store.lock().expect("pack declarations");
+    Ok(declarations
+        .specs
+        .iter()
+        .map(|declared| declared.spec.name.clone())
+        .collect())
+}
+
+/// Remove undeclared, inactive managed packages.
+///
+/// @param names table Package names.
+#[lua_fn]
+fn del(lua: &Lua, names: Table) -> LuaResult<()> {
+    for name in names.sequence_values::<String>() {
+        let name = name?;
+        enqueue(lua, PackOp::Delete { name: name.clone() }, &name)?;
+    }
+    Ok(())
 }
 
 fn package_state_table(
@@ -398,14 +514,16 @@ pub(crate) fn spec_to_lua(
 
 pub(crate) fn create_pack_read_table(lua: &Lua) -> LuaResult<Table> {
     let table = lua.create_table()?;
-    table.set(
-        "add",
-        lua.create_function(|_, _: MultiValue| -> LuaResult<()> {
-            Err(mlua::Error::runtime(
-                "maki.pack.add is only available in the global init.lua",
-            ))
-        })?,
-    )?;
+    for method in ["add", "update", "del"] {
+        table.set(
+            method,
+            lua.create_function(move |_, _: MultiValue| -> LuaResult<()> {
+                Err(mlua::Error::runtime(format!(
+                    "maki.pack.{method} is only available in the global init.lua"
+                )))
+            })?,
+        )?;
+    }
     table.set(
         "get",
         lua.create_function(|lua, (names, opts): (Option<Table>, Option<Table>)| {
@@ -416,12 +534,12 @@ pub(crate) fn create_pack_read_table(lua: &Lua) -> LuaResult<Table> {
 }
 
 lua_table! {
-    /// Declare global packages and inspect package state.
+    /// Manage global packages and inspect package state.
     ///
-    /// `add` is available only in the global `init.lua`. `get` is read-only
-    /// and is available in project config and packages.
+    /// `add`, `update`, and `del` are available only in the global
+    /// `init.lua`. `get` is read-only and is available elsewhere.
     "maki.pack" => pub(crate) fn create_pack_table(), DOCS [
-        add, get,
+        add, get, update, del,
     ]
 }
 
@@ -574,6 +692,58 @@ mod tests {
             store.lock().unwrap().pending,
             vec![PackOp::Activate {
                 name: "demo".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn update_records_force_and_lockfile_target() {
+        let (lua, store) = lua_with_store();
+        add_fn(&lua)
+            .call::<()>(
+                lua.create_sequence_from(["https://example.com/demo"])
+                    .unwrap(),
+            )
+            .unwrap();
+        let options = lua.create_table().unwrap();
+        options.set("force", true).unwrap();
+        options.set("target", "lockfile").unwrap();
+        let update: mlua::Function = create_pack_table(&lua).unwrap().get("update").unwrap();
+
+        update.call::<()>((LuaValue::Nil, options)).unwrap();
+
+        assert_eq!(
+            store.lock().unwrap().pending,
+            vec![PackOp::Update {
+                name: "demo".to_owned(),
+                options: UpdateOptions {
+                    force: true,
+                    target: UpdateTarget::Lockfile,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn update_rejects_offline_and_delete_has_no_force_option() {
+        let (lua, store) = lua_with_store();
+        let pack = create_pack_table(&lua).unwrap();
+        let update: mlua::Function = pack.get("update").unwrap();
+        let options = lua.create_table().unwrap();
+        options.set("offline", true).unwrap();
+        assert!(
+            update
+                .call::<()>((lua.create_table().unwrap(), options))
+                .is_err()
+        );
+
+        let delete: mlua::Function = pack.get("del").unwrap();
+        let names = lua.create_sequence_from(["demo"]).unwrap();
+        delete.call::<()>(names).unwrap();
+        assert_eq!(
+            store.lock().unwrap().pending,
+            vec![PackOp::Delete {
+                name: "demo".to_owned(),
             }]
         );
     }

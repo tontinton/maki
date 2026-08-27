@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::c_int;
 use std::future::Future;
 use std::panic::catch_unwind;
@@ -240,6 +240,11 @@ pub enum Request {
     TakePackOps {
         reply: flume::Sender<Vec<crate::api::pack::PackOp>>,
     },
+    /// Takes update and deletion operations while leaving activations queued
+    /// for the package-loading phase.
+    TakePackStateOps {
+        reply: flume::Sender<Vec<crate::api::pack::PackOp>>,
+    },
     /// Closes the queue and hands over whatever is still in it.
     ///
     /// Both halves in one message on purpose: a Lua task can record an
@@ -313,6 +318,9 @@ pub enum Request {
     /// that is when the declared set is complete.
     CollectPackages {
         reply: flume::Sender<Vec<crate::api::pack::Declared>>,
+    },
+    CollectActivePackages {
+        reply: flume::Sender<BTreeSet<String>>,
     },
     RunPackLoader {
         declared: crate::api::pack::Declared,
@@ -729,6 +737,21 @@ fn with_packs<R: Default>(
     };
     let mut declarations = store.lock().expect("pack declarations");
     f(&mut declarations)
+}
+
+/// Takes half the queued operations and leaves the other half for its taker.
+///
+/// Activations load packages and everything else changes them, and the two run
+/// at different points, so neither may consume the other's work.
+fn take_pending(
+    packs: &mut crate::api::pack::PackDeclarations,
+    activations: bool,
+) -> Vec<crate::api::pack::PackOp> {
+    let (taken, remaining) = std::mem::take(&mut packs.pending)
+        .into_iter()
+        .partition(|op| matches!(op, crate::api::pack::PackOp::Activate { .. }) == activations);
+    packs.pending = remaining;
+    taken
 }
 
 fn module_io_error(modname: &str, path: &Path, error: &std::io::Error) -> mlua::Error {
@@ -3364,8 +3387,11 @@ pub fn spawn(
                             .detach();
                         }
                         Request::TakePackOps { reply } => {
-                            let ops =
-                                with_packs(&rt.lua, |packs| std::mem::take(&mut packs.pending));
+                            let ops = with_packs(&rt.lua, |packs| take_pending(packs, true));
+                            let _ = reply.send(ops);
+                        }
+                        Request::TakePackStateOps { reply } => {
+                            let ops = with_packs(&rt.lua, |packs| take_pending(packs, false));
                             let _ = reply.send(ops);
                         }
                         Request::SealPackOps { reply } => {
@@ -3463,6 +3489,16 @@ pub fn spawn(
                         Request::CollectPackages { reply } => {
                             let declared = with_packs(&rt.lua, |packs| packs.specs.clone());
                             let _ = reply.send(declared);
+                        }
+                        Request::CollectActivePackages { reply } => {
+                            let active = rt
+                                .lua
+                                .app_data_ref::<crate::api::pack::PackStore>()
+                                .map(|store| {
+                                    store.lock().expect("pack declarations").active.clone()
+                                })
+                                .unwrap_or_default();
+                            let _ = reply.send(active);
                         }
                         Request::RunPackLoader {
                             declared,

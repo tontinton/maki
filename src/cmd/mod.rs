@@ -97,6 +97,7 @@ fn load_plugins(
     // Installing here rather than inside `maki.pack.add` keeps a clone off the
     // Lua thread, and is the phase Neovim's own `load` default defers to.
     let declared = declared_packages(host)?;
+    apply_pack_changes(host, &declared, interaction, &mut warnings);
     let installed = maki_lua::install_declared(&declared, interaction);
     warnings.extend(installed.failures);
     let available: Vec<DiscoveredPackage> = discovery
@@ -107,6 +108,27 @@ fn load_plugins(
     warnings.extend(host.load_declared_packages(&available, &declared, &config.plugins));
 
     Ok((config, sanitize_warnings(&warnings)))
+}
+
+/// Applies queued updates and deletions before anything is installed, so a
+/// package a run both changes and loads is loaded at its new revision.
+fn apply_pack_changes(
+    host: &PluginHost,
+    declared: &[maki_lua::Declared],
+    interaction: Interaction,
+    warnings: &mut Vec<String>,
+) {
+    match (host.active_packages(), host.take_pack_state_ops()) {
+        (Ok(active), Ok(ops)) => {
+            let report = maki_lua::apply_pack_ops(&ops, declared, &active, interaction);
+            if report.changed() {
+                warnings.push(report.summary());
+            }
+            warnings.extend(report.failures);
+        }
+        (Err(error), _) => warnings.push(format!("could not read active packages: {error}")),
+        (_, Err(error)) => warnings.push(format!("could not read package changes: {error}")),
+    }
 }
 
 fn declared_packages(host: &PluginHost) -> Result<Vec<maki_lua::Declared>> {

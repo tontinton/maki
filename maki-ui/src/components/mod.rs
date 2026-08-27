@@ -210,19 +210,27 @@ pub enum Action {
 
 const ERROR_DISPLAY: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ExitRequest {
     #[default]
     None,
     Success,
     Error,
     Reload,
+    Pack(PackRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackRequest {
+    pub name: String,
+    pub args: String,
+    pub bang: bool,
 }
 
 impl ExitRequest {
     pub fn code(&self) -> i32 {
         match self {
-            Self::None | Self::Success | Self::Reload => 0,
+            Self::None | Self::Success | Self::Reload | Self::Pack(_) => 0,
             Self::Error => 1,
         }
     }

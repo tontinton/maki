@@ -100,7 +100,7 @@ The rules:
 | Module | What it is for |
 | --- | --- |
 | [`maki`](#maki) | The global entry point. |
-| [`maki.pack`](#maki-pack) | Declare global packages and inspect package state. |
+| [`maki.pack`](#maki-pack) | Manage global packages and inspect package state. |
 | [`maki.api`](#maki-api) | Plugin registration. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
@@ -211,10 +211,10 @@ Load an installed package that is not active.
 
 ## maki.pack {#maki-pack}
 
-Declare global packages and inspect package state.
+Manage global packages and inspect package state.
 
-`add` is available only in the global `init.lua`. `get` is read-only
-and is available in project config and packages.
+`add`, `update`, and `del` are available only in the global
+`init.lua`. `get` is read-only and is available elsewhere.
 
 ---
 
@@ -258,6 +258,42 @@ Get package state without changing the installed set.
 - `{opts?}` (`table?`) Reserved. Omit it.
 
 **Returns:** (`table`) Package records with `spec`, `path`, `rev`, and `active`.
+
+---
+
+### `maki.pack.update()` {#maki-pack-update}
+
+```lua
+maki.pack.update({names?}, {opts?})
+```
+
+Update managed packages to their declared versions.
+
+The default path shows the old and proposed revisions before it changes
+the lockfile. `force = true` skips that review. `target = "lockfile"`
+restores the recorded revision without resolving the declared version.
+
+**Parameters:**
+
+- `{names?}` (`table?`) Package names. Omit for all declared packages.
+- `{opts?}` (`table?`) `force` (boolean) and `target` (`"version"` or
+
+  `"lockfile"`).
+
+
+---
+
+### `maki.pack.del()` {#maki-pack-del}
+
+```lua
+maki.pack.del({names})
+```
+
+Remove undeclared, inactive managed packages.
+
+**Parameters:**
+
+- `{names}` (`table`) Package names.
 
 
 ## maki.api {#maki-api}

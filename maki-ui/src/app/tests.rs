@@ -670,6 +670,7 @@ fn cmd(name: &str) -> ParsedCommand {
     ParsedCommand {
         name: name.to_string(),
         args: String::new(),
+        bang: false,
     }
 }
 
@@ -2699,6 +2700,7 @@ fn cd_command_behavior() {
         ParsedCommand {
             name: "/cd".into(),
             args: "/tmp".into(),
+            bang: false,
         },
         0,
     );
@@ -2715,6 +2717,7 @@ fn cd_command_behavior() {
         ParsedCommand {
             name: "/cd".into(),
             args: "/nonexistent_path_12345".into(),
+            bang: false,
         },
         0,
     );
@@ -3255,6 +3258,7 @@ fn btw_empty_flashes_error() {
         ParsedCommand {
             name: "/btw".into(),
             args: String::new(),
+            bang: false,
         },
         0,
     );
@@ -3272,6 +3276,7 @@ fn btw_with_question_returns_action() {
         ParsedCommand {
             name: "/btw".into(),
             args: "what is rust?".into(),
+            bang: false,
         },
         0,
     );
@@ -4035,6 +4040,7 @@ fn thinking_explicit_args() {
         ParsedCommand {
             name: "/thinking".into(),
             args: "8192".into(),
+            bang: false,
         },
         0,
     );
@@ -4044,6 +4050,7 @@ fn thinking_explicit_args() {
         ParsedCommand {
             name: "/thinking".into(),
             args: "high".into(),
+            bang: false,
         },
         0,
     );
@@ -4058,6 +4065,41 @@ fn thinking_unsupported_model_flashes_error() {
     app.execute_command(cmd("/thinking"), 0);
     assert_eq!(app.state.thinking, ThinkingConfig::Off);
     assert_eq!(app.status_bar.flash_text(), Some(THINKING_UNSUPPORTED_MSG));
+}
+
+#[test]
+fn package_commands_are_user_only_and_preserve_update_bang() {
+    let mut app = test_app();
+    app.execute_command(
+        ParsedCommand {
+            name: "/packupdate".into(),
+            args: "demo".into(),
+            bang: true,
+        },
+        1,
+    );
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert_eq!(
+        app.status_bar.flash_text().unwrap(),
+        "/packupdate can only be run by you"
+    );
+
+    app.execute_command(
+        ParsedCommand {
+            name: "/packupdate".into(),
+            args: "demo".into(),
+            bang: true,
+        },
+        0,
+    );
+    assert_eq!(
+        app.exit_request,
+        ExitRequest::Pack(crate::components::PackRequest {
+            name: "/packupdate".to_owned(),
+            args: "demo".to_owned(),
+            bang: true,
+        })
+    );
 }
 
 #[test]

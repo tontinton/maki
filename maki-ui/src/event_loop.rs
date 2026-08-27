@@ -1624,7 +1624,7 @@ impl<'t> EventLoop<'t> {
             phase_start = Instant::now();
             elapsed
         };
-        let exit = self.sessions[self.focused].app.exit_request;
+        let exit = self.sessions[self.focused].app.exit_request.clone();
         // The loop already stopped draining `UiAction`, so say so before the
         // handlers run. Dropping the receiver does not, since the Lua runtime
         // holds one of its own, and a handler touching the UI would then park

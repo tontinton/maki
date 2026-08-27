@@ -1306,6 +1306,7 @@ impl App {
             ParsedCommand {
                 name: resolved,
                 args: args.trim().to_string(),
+                bang: false,
             },
             depth,
         ))
@@ -1405,6 +1406,23 @@ impl App {
             }
             "/exit" => self.quit(),
             "/reload" => self.quit_with(ExitRequest::Reload),
+            name @ ("/packupdate" | "/packdel") => {
+                if depth > 0 {
+                    self.flash(format!("{name} can only be run by you"));
+                    return vec![];
+                }
+                match maki_lua::PackCommand::parse(name, &cmd.args, cmd.bang) {
+                    Ok(_) => self.quit_with(ExitRequest::Pack(crate::components::PackRequest {
+                        name: name.to_owned(),
+                        args: cmd.args,
+                        bang: cmd.bang,
+                    })),
+                    Err(message) => {
+                        self.flash(message);
+                        vec![]
+                    }
+                }
+            }
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)
             }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -597,6 +597,24 @@ impl PluginHost {
         reply_rx.recv().map_err(|_| PluginError::HostDead)
     }
 
+    pub fn active_packages(&self) -> Result<BTreeSet<String>, PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::CollectActivePackages { reply: reply_tx })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
+    pub fn take_pack_state_ops(&self) -> Result<Vec<crate::api::pack::PackOp>, PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::TakePackStateOps { reply: reply_tx })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)
+    }
+
     fn run_pack_loader(
         &self,
         declared: crate::api::pack::Declared,
@@ -844,7 +862,9 @@ impl PluginHost {
             };
             round = Vec::new();
             for op in ops {
-                let crate::api::pack::PackOp::Activate { name } = op;
+                let crate::api::pack::PackOp::Activate { name } = op else {
+                    unreachable!("the runtime returns only activation operations here");
+                };
                 if loaded.contains(&name.as_str()) {
                     continue;
                 }
@@ -871,10 +891,15 @@ impl PluginHost {
         match self.seal_pack_ops() {
             Ok(leftover) => {
                 for op in leftover {
-                    let crate::api::pack::PackOp::Activate { name } = op;
-                    warnings.push(format!(
-                        "packadd {name:?}: arrived after the packages had loaded"
-                    ));
+                    match op {
+                        crate::api::pack::PackOp::Activate { name } => warnings.push(format!(
+                            "packadd {name:?}: arrived after the packages had loaded"
+                        )),
+                        crate::api::pack::PackOp::Update { name, .. }
+                        | crate::api::pack::PackOp::Delete { name } => warnings.push(format!(
+                            "{name}: package change was not processed before package loading"
+                        )),
+                    }
                 }
             }
             Err(e) => {

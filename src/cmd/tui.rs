@@ -73,6 +73,34 @@ impl Drop for Teardown {
     }
 }
 
+fn run_pack_command(stack: &Stack, request: &maki_ui::PackRequest) -> Vec<String> {
+    let command = match maki_lua::PackCommand::parse(&request.name, &request.args, request.bang) {
+        Ok(command) => command,
+        Err(message) => return vec![message],
+    };
+    let declared = match stack.plugin_host.declared_packages() {
+        Ok(declared) => declared,
+        Err(error) => return vec![format!("could not read declared packages: {error}")],
+    };
+    let installed = match maki_lua::installed_names() {
+        Some(installed) => installed,
+        None => return vec!["could not read the package lockfile".to_owned()],
+    };
+    let active = match stack.plugin_host.active_packages() {
+        Ok(active) => active,
+        Err(error) => return vec![format!("could not read active packages: {error}")],
+    };
+    let operations = match maki_lua::plan_command(&command, &declared, &installed) {
+        Ok(operations) => operations,
+        Err(message) => return vec![message],
+    };
+    let report =
+        maki_lua::apply_pack_ops(&operations, &declared, &active, maki_lua::Interaction::Tty);
+    let mut messages = vec![report.summary()];
+    messages.extend(report.failures);
+    messages
+}
+
 fn discover_commands(disable: bool) -> Vec<CustomCommand> {
     if disable {
         return Vec::new();
@@ -401,9 +429,13 @@ pub fn run(mut cli: Cli) -> Result<()> {
             RunOutcome::Reload {
                 tabs: reloaded,
                 focused: f,
+                pack,
             } => {
                 let started = Instant::now();
                 let last_good = (stack.config.clone(), stack.model.clone());
+                let pack_messages = pack
+                    .map(|request| super::sanitize_warnings(&run_pack_command(&stack, &request)))
+                    .unwrap_or_default();
                 // Shut the old host down first so nothing can repopulate
                 // the registry after the clear: its senders disconnect, the
                 // watchdog aborts in-flight callbacks, and only this thread
@@ -422,7 +454,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     tabs.push(session);
                 }
                 stack = new_stack;
-                warnings = new_warnings;
+                warnings = pack_messages;
+                warnings.extend(new_warnings);
                 focused = f.min(tabs.len() - 1);
                 tracing::info!(
                     elapsed_ms = started.elapsed().as_millis() as u64,

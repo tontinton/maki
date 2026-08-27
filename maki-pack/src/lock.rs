@@ -21,6 +21,12 @@ pub struct Lock {
     _file: File,
 }
 
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self._file);
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
     #[error("{path} is locked by another Maki process")]
