@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::model::Model;
-use crate::providers::ResolvedAuth;
+use crate::providers::{ResolvedAuth, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
@@ -16,6 +16,7 @@ use crate::{
 };
 
 const RESPONSES_PATH: &str = "/responses";
+const FAILED_RESPONSE_STATUS: u16 = 500;
 
 pub(crate) fn build_body(
     model: &Model,
@@ -478,18 +479,15 @@ pub(crate) async fn parse_sse(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let resp = &parsed["response"];
-                let error = &resp["error"];
+                let error = &parsed["response"]["error"];
                 let message = error["message"]
                     .as_str()
                     .unwrap_or("response generation failed")
                     .to_string();
-                let code = error["code"].as_str().unwrap_or("server_error");
-                let status = match code {
-                    "rate_limit_exceeded" => 429,
-                    "server_error" => 500,
-                    _ => 500,
-                };
+                let status = error["code"]
+                    .as_str()
+                    .and_then(sse_error_status)
+                    .unwrap_or(FAILED_RESPONSE_STATUS);
                 return Err(AgentError::Api { status, message });
             }
 
@@ -556,8 +554,12 @@ mod tests {
     use super::*;
     use futures_lite::io::Cursor;
     use serde_json::json;
+    use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+    const OVERLOAD_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
+    const BAD_REQUEST_MESSAGE: &str = "Invalid value for 'model'";
+    const RATE_LIMIT_MESSAGE: &str = "Rate limit hit";
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
         let (tx, rx) = flume::unbounded();
@@ -643,41 +645,43 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"ou
         })
     }
 
-    #[test]
-    fn parse_sse_error_event() {
+    // Codex hides an overload in `code` on an otherwise healthy 200 stream, so these tags are what
+    // decide between backing off and giving up: https://github.com/tontinton/maki/issues/777
+    #[test_case("service_unavailable_error", "server_is_overloaded", OVERLOAD_MESSAGE, 529, true ; "codex_overload")]
+    #[test_case("overloaded_error", "", OVERLOAD_MESSAGE, 529, true                              ; "overload_without_code")]
+    #[test_case("invalid_request_error", "invalid_value", BAD_REQUEST_MESSAGE, 400, false        ; "bad_request")]
+    fn parse_sse_error_event(
+        error_type: &str,
+        code: &str,
+        message: &str,
+        status: u16,
+        retryable: bool,
+    ) {
         smol::block_on(async {
-            let sse = "\
-event: error\n\
-data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\"}}\n\
-\n";
+            let data = json!({
+                "type": "error",
+                "error": { "type": error_type, "code": code, "message": message },
+            });
 
-            let (err, _) = run_sse(sse).await;
-            match err.unwrap_err() {
-                AgentError::Api { status, message } => {
-                    assert_eq!(status, 529);
-                    assert_eq!(message, "Server overloaded");
-                }
-                other => panic!("expected Api error, got: {other:?}"),
-            }
+            let (result, _) = run_sse(&format!("event: error\ndata: {data}\n\n")).await;
+            let err = result.unwrap_err();
+            assert_eq!(err.to_string(), format!("API error ({status}): {message}"));
+            assert_eq!(err.is_retryable(), retryable);
         })
     }
 
-    #[test]
-    fn parse_sse_response_failed() {
+    #[test_case("rate_limit_exceeded", RATE_LIMIT_MESSAGE, 429 ; "rate_limit")]
+    #[test_case("server_is_overloaded", OVERLOAD_MESSAGE, 529  ; "overload")]
+    fn parse_sse_response_failed(code: &str, message: &str, status: u16) {
         smol::block_on(async {
-            let sse = "\
-event: response.failed\n\
-data: {\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Rate limit hit\"}}}\n\
-\n";
+            let data = json!({
+                "response": { "error": { "code": code, "message": message } },
+            });
 
-            let (err, _) = run_sse(sse).await;
-            match err.unwrap_err() {
-                AgentError::Api { status, message } => {
-                    assert_eq!(status, 429);
-                    assert_eq!(message, "Rate limit hit");
-                }
-                other => panic!("expected Api error, got: {other:?}"),
-            }
+            let (result, _) = run_sse(&format!("event: response.failed\ndata: {data}\n\n")).await;
+            let err = result.unwrap_err();
+            assert_eq!(err.to_string(), format!("API error ({status}): {message}"));
+            assert!(err.is_retryable());
         })
     }
 
