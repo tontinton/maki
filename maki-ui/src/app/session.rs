@@ -264,12 +264,13 @@ impl App {
         }
     }
 
-    /// Shared by every restore path: `focus_session` picks between resuming in
-    /// place and spawning a fresh runtime by tab state alone, so the same key
-    /// press has to land on the same permissions. The stored value replaces
-    /// whatever the previous session was running with, and a session that
-    /// stored nothing falls back to `--yolo` / `always_yolo`.
-    fn apply_stored_yolo(&self, meta: &SessionMeta) {
+    /// A tab keeps one permission manager while sessions come and go under it,
+    /// so a swap has to state the new session's answer in full, rules and yolo
+    /// both, or the session inherits what the last one was granted. A session
+    /// that stored no yolo falls back to `--yolo` / `always_yolo`.
+    fn apply_stored_permissions(&self, meta: &SessionMeta) {
+        self.permissions
+            .load_session_rules(stored_to_rules(&meta.session_rules));
         self.permissions.set_session_yolo(meta.yolo);
     }
 
@@ -277,9 +278,7 @@ impl App {
     /// history, so no respawn follows and the restored queue must be
     /// flushed here.
     pub(crate) fn restore_resumed_session(&mut self) {
-        self.permissions
-            .load_session_rules(stored_to_rules(&self.state.session.meta.session_rules));
-        self.apply_stored_yolo(&self.state.session.meta);
+        self.apply_stored_permissions(&self.state.session.meta);
         self.restore_display();
         self.flush_restored_queue();
         for w in self.state.warnings.drain(..) {
@@ -299,6 +298,30 @@ impl App {
         }
     }
 
+    /// `/new` swaps a fresh session under this tab, `Ctrl-N` spawns a new tab
+    /// that rebuilds its whole state from this meta, so both gestures keep
+    /// exactly what is listed here. Written out field by field so a new
+    /// `SessionMeta` field has to pick a side: settings that say how the user
+    /// works ride along, anything a finished turn produced stays behind, or the
+    /// new session writes over work it never did.
+    pub(crate) fn blank_session(&self) -> AppSession {
+        let mut session = AppSession::new(&self.state.model.spec(), &self.state.session.cwd);
+        session.meta = SessionMeta {
+            mode: Some(self.state.mode.into()),
+            thinking: Some(self.state.thinking.into()),
+            fast: self.state.fast,
+            workflow: self.state.workflow,
+            plan_path: None,
+            plan_written: false,
+            session_rules: Vec::new(),
+            context_size: 0,
+            input_draft: None,
+            queued_messages: Vec::new(),
+            yolo: None,
+        };
+        session
+    }
+
     pub(super) fn reset_session(&mut self) -> Vec<Action> {
         self.checkpoint_now();
         self.reset_ui_chrome();
@@ -306,7 +329,6 @@ impl App {
         self.state.cost = None;
         self.state.context_size = 0;
         self.state.plan = PlanState::None;
-        self.permissions.set_session_yolo(None);
         if self.state.mode == Mode::Plan {
             self.enter_plan();
         }
@@ -314,10 +336,9 @@ impl App {
         // that just ended needs its id, and the stamp always reads
         // whichever session is current.
         self.fire_session_autocmd("SessionReset", serde_json::json!({}));
-        self.state.session = Arc::new(AppSession::new(
-            &self.state.session.model,
-            &self.state.session.cwd,
-        ));
+        let session = self.blank_session();
+        self.apply_stored_permissions(&session.meta);
+        self.state.session = Arc::new(session);
         maki_otel::emit::session_started(
             maki_otel::emit::START_FRESH,
             Some(&self.state.session.id.to_string()),
@@ -368,9 +389,7 @@ impl App {
         fallback_model: &Model,
     ) -> LoadedSession {
         self.checkpoint_now();
-        self.permissions
-            .load_session_rules(stored_to_rules(&session.meta.session_rules));
-        self.apply_stored_yolo(&session.meta);
+        self.apply_stored_permissions(&session.meta);
         self.state =
             SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
         for w in self.state.warnings.drain(..) {

@@ -1046,11 +1046,7 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(Ok(json!(self.sessions[self.focused].id())));
             }
             SessionRequest::New { prompt, focus } => {
-                let session = {
-                    let slot = self.ctx.model_slot.load();
-                    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-                    AppSession::new(&slot.model.spec(), &cwd.to_string_lossy())
-                };
+                let session = self.focused_app().blank_session();
                 let idx = self.push_runtime(self.ctx.spawn_runtime(session));
                 let id = self.sessions[idx].id();
                 maki_otel::emit::session_started(

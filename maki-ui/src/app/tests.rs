@@ -17,11 +17,11 @@ use maki_agent::{
     DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
     McpSnapshotReader, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
-use maki_config::{PermissionsConfig, UiConfig};
+use maki_config::{Effect, PermissionRule, PermissionsConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
 use maki_providers::{ContentBlock, Effort, Message, Role, THINKING_USAGE, TokenUsage};
-use maki_storage::sessions::{StoredMode, StoredThinking};
+use maki_storage::sessions::{SessionMeta, StoredMode, StoredThinking};
 use ratatui::layout::Rect;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -577,6 +577,14 @@ fn streaming_app_without_queue() -> App {
     app
 }
 
+fn session_rule() -> PermissionRule {
+    PermissionRule {
+        tool: ToolKey::parse("bash").unwrap(),
+        scope: None,
+        effect: Effect::Allow,
+    }
+}
+
 fn queued_msg(text: &str) -> QueuedMessage {
     QueuedMessage {
         text: text.into(),
@@ -701,6 +709,74 @@ fn reset_session_clears_plan() {
     assert!(app.queue.focus().is_none());
     assert!(!app.help_modal.is_open());
     assert!(!app.btw_modal.is_open());
+}
+
+/// A new session inheriting the plan path, the draft or the queue of the one it
+/// started from would take over work it never did, and the checkpoint here is
+/// what puts all of that in the old session's meta. The whole meta is asserted,
+/// so a field that starts riding along cannot slip by.
+#[test]
+fn blank_session_carries_the_settings_that_outlive_a_turn() {
+    let mut app = test_app();
+    app.state.thinking = ThinkingConfig::Effort(Effort::High);
+    app.state.fast = true;
+    app.state.workflow = true;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
+    app.state.context_size = MEASURED_CONTEXT;
+    app.input_box.set_input("half a thought".into());
+    app.queue_and_notify(queued_msg("q"));
+    app.permissions.load_session_rules(vec![session_rule()]);
+    app.permissions.set_session_yolo(Some(true));
+    app.checkpoint();
+
+    let session = app.blank_session();
+
+    assert_eq!(
+        session.meta,
+        SessionMeta {
+            mode: Some(StoredMode::Plan),
+            thinking: Some(StoredThinking::Effort {
+                level: Effort::High
+            }),
+            fast: true,
+            workflow: true,
+            ..Default::default()
+        }
+    );
+    assert!(session.messages().is_empty());
+    assert_eq!(session.model, app.state.model.spec());
+    assert_eq!(session.cwd, app.state.session.cwd);
+}
+
+/// A setting written into the meta but never read back still opens the tab
+/// wrong, so only the round trip through `SessionState` proves `Ctrl-N` works.
+#[test]
+fn a_spawned_tab_opens_on_the_settings_it_was_started_with() {
+    let tmp = TempDir::new().unwrap();
+    let storage = StateDir::from_path(tmp.path().to_path_buf());
+    let mut app = test_app();
+    set_opus_model(&mut app);
+    app.state.thinking = ThinkingConfig::Effort(Effort::High);
+    app.state.fast = true;
+    app.state.workflow = true;
+    app.state.mode = Mode::Plan;
+
+    let spawned = SessionState::from_session(
+        app.blank_session(),
+        &test_model(),
+        &storage,
+        &maki_config::ModelPolicy::default(),
+    );
+
+    assert_eq!(spawned.thinking, app.state.thinking);
+    assert_eq!(spawned.fast, app.state.fast);
+    assert_eq!(spawned.workflow, app.state.workflow);
+    assert_eq!(spawned.mode, app.state.mode);
+    assert!(
+        spawned.plan.path().is_some(),
+        "a plan-mode tab owes itself a plan file"
+    );
 }
 
 #[test]
@@ -2456,18 +2532,23 @@ fn loading_a_session_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (b
 }
 
 /// A tab keeps one permission manager for its whole life, so without an
-/// explicit reset `/new` would inherit the resumed session's answer and then
-/// checkpoint it into a session the user never said anything about.
+/// explicit reset `/new` would inherit both answers the last session got, the
+/// stored bypass and the rules the user allowed during it, and checkpoint them
+/// into a session nobody granted them for.
 #[test_case(false => (false, None) ; "a_fresh_session_drops_a_stored_bypass")]
 #[test_case(true  => (true,  None) ; "a_fresh_session_returns_to_the_flag")]
-fn resetting_the_session_falls_back_to_the_yolo_seed(seed: bool) -> (bool, Option<bool>) {
+fn resetting_the_session_drops_what_the_last_one_was_granted(seed: bool) -> (bool, Option<bool>) {
     let (mut app, session) = app_and_session_with_yolo(seed, Some(!seed));
     app.state.session = Arc::new(session);
     app.restore_resumed_session();
+    app.permissions.load_session_rules(vec![session_rule()]);
     assert_eq!(app.permissions.is_yolo(), !seed);
 
     app.reset_session();
     app.checkpoint();
+
+    assert!(app.permissions.session_rules_snapshot().is_empty());
+    assert!(app.state.session.meta.session_rules.is_empty());
     (app.permissions.is_yolo(), app.state.session.meta.yolo)
 }
 
