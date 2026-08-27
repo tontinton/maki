@@ -60,8 +60,12 @@ impl AgentMode {
 }
 
 pub enum ExtractedCommand {
-    Interrupt(AgentInput, u64),
-    Compact(u64),
+    /// Every message the user queued back to back, so one turn answers them
+    /// all. A source must stop there and hand anything else over on its own,
+    /// since a command like `/compact` rewrites the history the later messages
+    /// land in.
+    Interrupt(Vec<AgentInput>),
+    Compact,
 }
 
 pub trait InterruptSource: Send + Sync {

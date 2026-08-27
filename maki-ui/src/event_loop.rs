@@ -38,7 +38,10 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::AppSession;
-use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
+use crate::agent::{
+    AgentCommand, AgentHandles, ModelSlot,
+    shared_queue::{QueueItem, QueuedInput},
+};
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::tasks::{TaskStatus, diff_task_states};
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
@@ -1323,13 +1326,13 @@ impl<'t> EventLoop<'t> {
                 let mut input = *input;
                 prepend_preamble(&mut input.preamble, rt.app.shell.drain_results());
                 let run_id = rt.app.run_id;
-                rt.handles.queue.push(QueueItem::Message {
+                rt.handles.queue.push(QueueItem::Message(QueuedInput {
                     text: input.message.clone(),
                     image_count: input.images.len(),
                     input,
                     run_id,
                     displayed: true,
-                });
+                }));
             }
             Action::CancelAgent { run_id } => {
                 let rt = &mut self.sessions[idx];

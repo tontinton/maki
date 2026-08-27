@@ -24,7 +24,7 @@ use tracing::error;
 
 use super::ModelSlot;
 use super::cancel_map::RunCancelMap;
-use super::shared_queue::{QueueItem, QueueReceiver};
+use super::shared_queue::{self, QueueReceiver, QueueRun};
 
 pub(super) struct AgentLoop {
     model_slot: Arc<ArcSwap<ModelSlot>>,
@@ -110,12 +110,12 @@ impl AgentLoop {
 
         while let Ok(()) = self.queue.recv_notify().await {
             let mut last_run_id = None;
-            while let Some(entry) = self.queue.pop() {
-                if entry.run_id() < self.min_run_id {
+            while let Some(mut run) = self.queue.pop_run() {
+                let Some(run_id) = run.drop_cancelled(self.min_run_id) else {
                     continue;
-                }
-                last_run_id = Some(entry.run_id());
-                self.process_entry(entry).await;
+                };
+                last_run_id = Some(run_id);
+                self.process_run(run, run_id).await;
             }
             if let Some(run_id) = last_run_id {
                 let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
@@ -125,24 +125,29 @@ impl AgentLoop {
         }
     }
 
-    async fn process_entry(&mut self, entry: QueueItem) {
-        let run_id = entry.run_id();
+    async fn process_run(&mut self, run: QueueRun, run_id: u64) {
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
 
-        let result = match entry {
-            QueueItem::Message {
-                text,
-                image_count,
-                input,
-                displayed,
-                ..
-            } => {
-                if !displayed {
-                    let _ = event_tx.send(AgentEvent::QueueItemConsumed { text, image_count });
-                }
+        let result = match run {
+            QueueRun::Compact { .. } => self.do_compact(&event_tx).await,
+            QueueRun::Messages(messages) => {
+                let inputs = messages
+                    .into_iter()
+                    .map(|queued| {
+                        if !queued.displayed {
+                            let _ = event_tx.send(AgentEvent::QueueItemConsumed {
+                                text: queued.text,
+                                image_count: queued.image_count,
+                            });
+                        }
+                        queued.input
+                    })
+                    .collect();
+                let Some(input) = shared_queue::merge_inputs(inputs) else {
+                    return;
+                };
                 self.do_agent_run(input, event_tx, run_id).await
             }
-            QueueItem::Compact { .. } => self.do_compact(&event_tx).await,
         };
 
         if let Err(e) = result {

@@ -37,6 +37,8 @@ const RECENT_TOOL_WINDOW: usize = 5;
 /// turn, and a model resuming its own cut-off text can wedge the session
 /// (seen with llama.cpp stuck on an unterminated tool call).
 const CANCELLED_TEXT_NOTE: &str = "[Response cut off by user cancel]";
+const INTERRUPT_NOTE: &str =
+    "The user sent a new message while you were working. Address it and continue.";
 
 pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
@@ -563,20 +565,27 @@ impl<'h> Agent<'h> {
             return Ok(false);
         };
         match cmd {
-            ExtractedCommand::Interrupt(mut input, _) => {
-                self.event_tx.send(AgentEvent::QueueItemConsumed {
-                    text: input.message.clone(),
-                    image_count: input.images.len(),
-                })?;
-                self.push_input_context(std::mem::take(&mut input.preamble));
-                self.mode = input.mode.clone();
-                let display = input.message.clone();
-                let wrapped = format!(
-                    "<user-interrupt>\nThe user sent a new message while you were working. Address it and continue.\n\n{display}\n</user-interrupt>"
-                );
-                self.history.push(Message::user_display(wrapped, display));
+            // The burst lands as consecutive user messages, so one request
+            // carries all of it.
+            ExtractedCommand::Interrupt(inputs) => {
+                for input in inputs {
+                    self.event_tx.send(AgentEvent::QueueItemConsumed {
+                        text: input.message.clone(),
+                        image_count: input.images.len(),
+                    })?;
+                    self.push_input_context(input.preamble);
+                    self.mode = input.mode;
+                    let wrapped = format!(
+                        "<user-interrupt>\n{INTERRUPT_NOTE}\n\n{}\n</user-interrupt>",
+                        input.message
+                    );
+                    self.history.push(Message {
+                        display_text: Some(input.message),
+                        ..Message::user_with_images(wrapped, input.images)
+                    });
+                }
             }
-            ExtractedCommand::Compact(_) => {
+            ExtractedCommand::Compact => {
                 self.do_compact().await?;
             }
         }
@@ -624,6 +633,8 @@ mod tests {
     use crate::Envelope;
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
+
+    const QUEUED_MESSAGES: [&str; 3] = ["first", "second", "third"];
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -850,7 +861,7 @@ mod tests {
             SessionMailbox::notify(id, "mailbox".into(), false).unwrap();
             let mut input = default_input();
             input.preamble = vec![Message::observation("preamble".into())];
-            let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(input, 0)]);
+            let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(vec![input])]);
             let mut history = History::new(Vec::new());
             let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
             agent.mailbox = Some(mailbox);
@@ -1030,8 +1041,7 @@ mod tests {
         smol::block_on(async {
             let source = if queued.is_some() {
                 Some(MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
-                    default_input(),
-                    0,
+                    vec![default_input()],
                 )]))
             } else {
                 None
@@ -1072,9 +1082,51 @@ mod tests {
         });
     }
 
+    /// Two responses are the whole budget: the opening turn, then the one turn
+    /// that answers all three queued messages. Answering them one by one would
+    /// ask the mock for a response it does not have.
+    #[test]
+    fn queued_messages_are_delivered_in_one_turn() {
+        smol::block_on(async {
+            let inputs = Vec::from(QUEUED_MESSAGES.map(|text| AgentInput {
+                message: text.into(),
+                ..default_input()
+            }));
+            let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(inputs)]);
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(
+                MockProvider::new(vec![
+                    text_response(StopReason::EndTurn),
+                    text_response(StopReason::EndTurn),
+                ]),
+                &mut history,
+            );
+
+            let mut agent = agent.with_interrupt_source(source);
+            agent.run(default_input()).await.unwrap();
+            let events = drain_events(&event_rx);
+            drop(agent);
+
+            let user_texts: Vec<_> = history
+                .as_slice()
+                .iter()
+                .filter(|m| matches!(m.role, Role::User))
+                .filter_map(Message::user_text)
+                .collect();
+            assert_eq!(user_texts[1..], QUEUED_MESSAGES);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e.event, AgentEvent::QueueItemConsumed { .. }))
+                    .count(),
+                QUEUED_MESSAGES.len()
+            );
+        });
+    }
+
     #[test_case(
         (0..10).map(|i| Message::user(format!("msg {i}"))).collect(),
-        vec![ExtractedCommand::Compact(0)],
+        vec![ExtractedCommand::Compact],
         vec![tool_call_response("glob", "t1"), text_response(StopReason::EndTurn), text_response(StopReason::EndTurn)]
         ; "compaction_via_interrupt_source"
     )]

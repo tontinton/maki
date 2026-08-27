@@ -4,7 +4,7 @@ use maki_agent::AgentInput;
 
 use super::{Action, App, Status, format_with_images};
 
-use crate::agent::shared_queue::{QueueItem, QueueSender};
+use crate::agent::shared_queue::{QueueItem, QueueSender, QueuedInput};
 use crate::components::queue_panel::QueueEntry;
 
 pub(crate) use crate::agent::shared_queue::QueuedMessage;
@@ -156,13 +156,13 @@ impl App {
             return false;
         };
         let input = self.build_agent_input(&msg);
-        shared.push(QueueItem::Message {
+        shared.push(QueueItem::Message(QueuedInput {
             text: msg.text,
             image_count: msg.images.len(),
             input,
             run_id: self.run_id,
             displayed: false,
-        });
+        }));
         true
     }
 
