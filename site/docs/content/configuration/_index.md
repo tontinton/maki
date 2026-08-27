@@ -137,6 +137,24 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `max_log_files` | u32 | `10` | 1 | Max number of log files to keep |
 | `input_history_size` | usize | `100` | 10 | Number of input history entries to retain |
 
+### `net`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `allowed_private_hosts` | string[] | `[]` | Hosts allowed to resolve to a private or loopback address, as `host`, `host:port`, or a CIDR range. Plain `http://` is kept for them instead of being upgraded to `https://` |
+
+`maki.net` refuses private, loopback and metadata addresses, because the model picks the URLs. List a host here to let it through:
+
+```lua
+maki.setup({
+    net = {
+        allowed_private_hosts = { "localhost:8080", "nas.lan", "10.0.0.0/8" },
+    },
+})
+```
+
+An entry with no port covers every port. A name you list is allowed whatever it resolves to. A name you did not list stays blocked when DNS lands it on a private address, unless that address falls in a range you allowed, so keep ranges as small as the service needs. Every redirect hop is checked against the same list. [Permissions](/docs/permissions/#network-addresses) covers what the guard protects.
+
 ### `telemetry`
 
 | Field | Type | Default | Env | Description |

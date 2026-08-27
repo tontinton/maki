@@ -199,6 +199,12 @@ Brace groups `{ ... }` and control flow (`if`, `for`, …) are segmented when po
 
 Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to the Lua file controls which gated `maki.*` APIs it may call. No manifest means every gated call is denied, including for your own `init.lua`. The [Lua API reference](/lua-api/#plugin-permissions) documents the manifest and lists every permission.
 
+## Network Addresses
+
+`webfetch`, `websearch` and every plugin that calls `maki.net` go through one guard. A request to a private, loopback or link-local address is refused, and so is a redirect that lands on one. The model picks these URLs, so a page it reads could otherwise talk it into fetching `http://169.254.169.254/` or an admin panel on your LAN.
+
+To reach a service on your own machine or network, list it in [`net.allowed_private_hosts`](/docs/configuration/#net). An allowed host also keeps plain `http://` instead of being upgraded to `https://`, since a service on your LAN rarely has a certificate.
+
 ## Session Persistence
 
 When you save a session, its permission rules are saved too. Loading the session restores them.

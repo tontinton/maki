@@ -37,6 +37,7 @@ futures-lite = { workspace = true }
 pin-project-lite = { workspace = true }
 tree-sitter = { workspace = true }
 unicode-width = { workspace = true }
+url = { workspace = true }
 regex = { workspace = true }
 include_dir = { workspace = true }
 maki-storage = { workspace = true }

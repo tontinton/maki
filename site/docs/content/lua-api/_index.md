@@ -2837,8 +2837,9 @@ maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
 
 HTTP client for fetching web content. All traffic goes over HTTPS
 (plain HTTP is upgraded). Private and metadata IP addresses are
-blocked to prevent SSRF. Failed requests (5xx) are retried
-automatically.
+blocked to prevent SSRF, including after a redirect. Hosts listed in
+the `net.allowed_private_hosts` config option are exempt.
+Failed requests (5xx) are retried automatically.
 
 ```lua
 local res, err = maki.net.request("https://example.com")
@@ -2855,7 +2856,8 @@ maki.net.request({url}, {opts?})
 
 Make an HTTP request and return the response body. Plain `http://`
 URLs are automatically upgraded to `https://`. Requests to private
-or metadata IP addresses are blocked for safety.
+or metadata IP addresses are blocked for safety, unless the host is
+listed in `net.allowed_private_hosts`.
 
 {opts} fields:
   `method` (string) HTTP verb (default `"GET"`).

@@ -82,6 +82,10 @@ fn load_plugins(
         &mut warnings,
     )?;
 
+    // Before any plugin can call `maki.net`, so the first request already sees
+    // the hosts the user exempted from the private-address block.
+    maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+
     if let Err(e) = host.load_builtins(&config.plugins) {
         let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
         match on_builtin_failure {

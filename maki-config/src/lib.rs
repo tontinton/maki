@@ -239,6 +239,7 @@ pub struct RawConfig {
     pub agent: AgentFileConfig,
     pub provider: ProviderFileConfig,
     pub storage: StorageFileConfig,
+    pub net: NetFileConfig,
     pub telemetry: TelemetryConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
     /// Renamed to `plugins`; kept so old configs fail with a pointer to the
@@ -260,6 +261,7 @@ impl RawConfig {
         self.agent.merge(overlay.agent);
         self.provider.merge(overlay.provider);
         self.storage.merge(overlay.storage);
+        self.net.merge(overlay.net);
         self.telemetry.merge(overlay.telemetry);
         for (name, plugin) in overlay.plugins {
             let entry = self.plugins.entry(name).or_default();
@@ -298,6 +300,7 @@ impl RawConfig {
             agent: AgentConfig::from_file(self.agent, disabled_tools),
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
+            net: NetConfig::from_file(self.net),
             telemetry: self.telemetry,
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_plugins_and_packages(self.plugins, packages),
@@ -547,6 +550,18 @@ impl ProviderFileConfig {
             low_speed_timeout_secs,
             stream_timeout_secs
         );
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetFileConfig {
+    pub allowed_private_hosts: Option<Vec<String>>,
+}
+
+impl NetFileConfig {
+    fn merge(&mut self, overlay: NetFileConfig) {
+        merge_option!(self, overlay, allowed_private_hosts);
     }
 }
 
@@ -851,6 +866,7 @@ pub struct Config {
     pub agent: AgentConfig,
     pub provider: ProviderConfig,
     pub storage: StorageConfig,
+    pub net: NetConfig,
     pub telemetry: TelemetryConfig,
     pub permissions: PermissionsConfig,
     pub plugins: PluginsConfig,
@@ -1287,6 +1303,29 @@ impl StorageConfig {
             max_log_bytes: f.max_log_bytes_mb.unwrap_or(DEFAULT_MAX_LOG_BYTES_MB) * 1024 * 1024,
             max_log_files: f.max_log_files.unwrap_or(DEFAULT_MAX_LOG_FILES),
             input_history_size: f.input_history_size.unwrap_or(DEFAULT_INPUT_HISTORY_SIZE),
+        }
+    }
+}
+
+/// Escape hatches for the SSRF guard in `maki.net`, which every HTTP tool
+/// goes through. The model picks the URL, so private and metadata addresses
+/// are refused unless the user named the host here.
+#[derive(Debug, Clone, ConfigSection)]
+#[config(section = "net")]
+pub struct NetConfig {
+    #[config(
+        ty = "string[]",
+        default = "Vec::new()",
+        default_doc = "[]",
+        desc = "Hosts allowed to resolve to a private or loopback address, as `host`, `host:port`, or a CIDR range. Plain `http://` is kept for them instead of being upgraded to `https://`"
+    )]
+    pub allowed_private_hosts: Vec<String>,
+}
+
+impl NetConfig {
+    fn from_file(f: NetFileConfig) -> Self {
+        Self {
+            allowed_private_hosts: f.allowed_private_hosts.unwrap_or_default(),
         }
     }
 }
@@ -2231,6 +2270,9 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
+    const GLOBAL_ALLOWED_HOST: &str = "ollama.lan";
+    const PROJECT_ALLOWED_HOST: &str = "searx.lan:8888";
+
     fn plugin_enabled(enabled: bool) -> PluginFileConfig {
         PluginFileConfig {
             enabled: Some(enabled),
@@ -2370,6 +2412,24 @@ mod tests {
             "overlay wins"
         );
         assert_eq!(base.ui.flash_duration_ms, Some(2000), "base preserved");
+    }
+
+    #[test]
+    fn net_allowlist_is_empty_by_default_and_project_replaces_global() {
+        let raw_with = |host: &str| RawConfig {
+            net: NetFileConfig {
+                allowed_private_hosts: Some(vec![host.into()]),
+            },
+            ..Default::default()
+        };
+        let defaults = RawConfig::default().into_config(&[]).unwrap();
+        assert!(defaults.net.allowed_private_hosts.is_empty());
+
+        let mut global = raw_with(GLOBAL_ALLOWED_HOST);
+        global.merge(raw_with(PROJECT_ALLOWED_HOST));
+
+        let net = global.into_config(&[]).unwrap().net;
+        assert_eq!(net.allowed_private_hosts, [PROJECT_ALLOWED_HOST]);
     }
 
     #[test]
@@ -2572,6 +2632,7 @@ mod tests {
             agent: AgentConfig::default(),
             provider: ProviderConfig::default(),
             storage: StorageConfig::default(),
+            net: NetConfig::default(),
             telemetry: TelemetryConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::default(),
