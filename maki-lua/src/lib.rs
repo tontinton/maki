@@ -19,7 +19,7 @@ pub use api::util::command::{
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
-pub use loader::{EventHandle, PluginHost, SKIPPED_PLUGIN_WARNING};
+pub use loader::{EventHandle, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING};
 pub use pack::{
     DiscoveredPackage, Discovery, InstallReport, Interaction, MANAGED_GROUP, Origin, discover,
     discover_installed, install_declared, lockfile_path, sanitize_message, site_dir,

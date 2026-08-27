@@ -5,12 +5,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use maki_agent::ToolOutput;
+use maki_agent::template::Vars;
 use maki_agent::tools::{
-    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolContext,
-    ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource, timeout_annotation,
+    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolAudience,
+    ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
+    timeout_annotation,
 };
 use maki_config::{AlwaysThinking, Effect, PluginsConfig, ToolKey, ToolOutputLines};
-use maki_lua::{PluginError, PluginHost, SKIPPED_PLUGIN_WARNING, WARM_TOOL_CAP};
+use maki_lua::{
+    PERMISSION_NAME_WARNING, PluginError, PluginHost, SKIPPED_PLUGIN_WARNING, WARM_TOOL_CAP,
+};
+use maki_providers::Model;
 use maki_storage::id::SessionRef;
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
@@ -25,6 +30,12 @@ const USAGE_OUTPUT: &str = "usage_done";
 const FLOORED_PACKAGE: &str = "future_pack";
 const SIBLING_PACKAGE: &str = "sibling_pack";
 const MALFORMED_FLOOR: &str = "min_maki_version = 12\n";
+const SHADOWED_TOOL: &str = "skill";
+const REPLACEMENT_PLUGIN: &str = "my_skill";
+const REPLACEMENT_DESC: &str = "took the builtin name over";
+const PERMISSION_KEYED_TOOL: &str = "task";
+const OTHER_PERMISSION_KEYED_TOOL: &str = "write";
+const PLAIN_TOOL: &str = "plain_helper";
 
 /// Lua tools cannot publish `ToolLive::Usage` (only the subagent relay does), so
 /// a native stub stands in for one.
@@ -1083,6 +1094,45 @@ fn incompatible_plugin_warns_instead_of_aborting_startup() {
         .find(|w| w.contains(SKIPPED_PLUGIN_WARNING))
         .unwrap_or_else(|| panic!("no skip warning in {warnings:?}"));
     assert!(warning.contains(&required), "{warning}");
+}
+
+/// An `init.lua` registers tools on the same name-keyed permission model a
+/// package does, and it is the path a plugin under the lua directory is loaded
+/// from, so a name carrying maki's builtin defaults has to be reported here too.
+#[test_case::test_case(PERMISSION_KEYED_TOOL, 1 ; "permission_keyed_name_warns")]
+#[test_case::test_case(PLAIN_TOOL, 0 ; "ordinary_name_is_quiet")]
+fn init_file_taking_a_permission_keyed_tool_name_warns(tool: &str, expected: usize) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let maki_dir = tmp.path().join(".maki");
+    std::fs::create_dir_all(&maki_dir).unwrap();
+    std::fs::write(
+        maki_dir.join("init.lua"),
+        format!(
+            r#"maki.api.register_tool({{
+            name = "{tool}",
+            description = "{REPLACEMENT_DESC}",
+            schema = {MINIMAL_SCHEMA},
+            handler = function() return "" end
+        }})"#
+        ),
+    )
+    .unwrap();
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut warnings = Vec::new();
+    host.load_init_files_or_skip(false, tmp.path(), &mut warnings)
+        .expect("init.lua must load");
+
+    assert!(reg.has(tool));
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|w| w.contains(PERMISSION_NAME_WARNING) && w.contains(tool))
+            .count(),
+        expected,
+        "got: {warnings:?}"
+    );
 }
 
 #[test]
@@ -2737,6 +2787,69 @@ fn unknown_plugin_name_fails_load_builtins() {
     );
 }
 
+fn shadow_src() -> String {
+    format!(
+        r#"maki.api.register_tool({{
+            name = "{SHADOWED_TOOL}",
+            description = "{REPLACEMENT_DESC}",
+            schema = {MINIMAL_SCHEMA},
+            handler = function() return "replaced" end
+        }})"#
+    )
+}
+
+/// Turning a builtin off used to copy its name into `agent.disabled_tools`,
+/// the name filter every request runs over the tool array, so a replacement
+/// could load and still stay invisible to the model. That is why this walks
+/// the whole path: init.lua, config, builtins, then the definitions a request
+/// is built from.
+#[test]
+fn disabled_builtin_hands_its_tool_name_to_a_user_plugin() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            format!("maki.setup({{ plugins = {{ {SHADOWED_TOOL} = {{ enabled = false }} }} }})"),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("setup returns a config");
+    let config = raw.into_config(&[]).unwrap();
+    host.load_builtins(&config.plugins).unwrap();
+    host.load_source(REPLACEMENT_PLUGIN, &shadow_src())
+        .expect("a disabled builtin leaves its tool name free");
+
+    let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+    let filter = ToolFilter::from_config(&config.agent, &model, &[]);
+    let ctx = DescriptionContext {
+        filter: &filter,
+        audience: ToolAudience::MAIN,
+        workflow: false,
+        mcp: false,
+    };
+    let defs = reg.definitions(&Vars::new(), &ctx, false);
+    let shadowed = defs
+        .as_array()
+        .expect("definitions returns an array")
+        .iter()
+        .find(|def| def["name"] == SHADOWED_TOOL)
+        .expect("the replacement must reach the model, not just `maki prompt --tools`");
+    assert_eq!(shadowed["description"], REPLACEMENT_DESC);
+}
+
+#[test]
+fn enabled_builtin_still_rejects_a_shadowing_plugin() {
+    let (_reg, host) = builtins_host();
+    let err = host
+        .load_source(REPLACEMENT_PLUGIN, &shadow_src())
+        .expect_err("an enabled builtin owns its tool name");
+    assert!(
+        matches!(err, PluginError::NameConflict { .. }),
+        "got: {err}"
+    );
+}
+
 #[test]
 fn disabled_plugin_opts_are_ignored_not_rejected() {
     let reg = fresh_registry();
@@ -3180,6 +3293,45 @@ fn site_with_package(sub: &str, name: &str, files: &[(&str, &str)]) -> tempfile:
         std::fs::write(dir.join("plugin").join(file), source).unwrap();
     }
     tmp
+}
+
+/// Permission decisions are keyed by tool name alone, so a package that takes
+/// a name maki's builtin defaults are written for inherits those defaults, and
+/// any "always allow" the user stored for the builtin. The load is allowed, the
+/// user is told, once for the package however many names it took.
+#[test_case::test_case(&[PERMISSION_KEYED_TOOL], 1 ; "permission_keyed_name_warns")]
+#[test_case::test_case(&[PERMISSION_KEYED_TOOL, OTHER_PERMISSION_KEYED_TOOL], 1 ; "two_names_warn_once")]
+#[test_case::test_case(&[PLAIN_TOOL], 0 ; "ordinary_name_is_quiet")]
+fn package_taking_a_permission_keyed_tool_name_warns(tools: &[&str], expected: usize) {
+    let source = tools
+        .iter()
+        .map(|tool| {
+            format!(
+                r#"maki.api.register_tool({{
+            name = "{tool}",
+            description = "{REPLACEMENT_DESC}",
+            schema = {MINIMAL_SCHEMA},
+            handler = function() return "" end
+        }})"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let site = site_with_package("start", "perm_pack", &[("init.lua", &source)]);
+    let found = maki_lua::discover(site.path());
+    let (_, config) = discovered_config(&found);
+    let host = PluginHost::new(fresh_registry()).unwrap();
+
+    let warnings = host.load_packages(&found.packages, &config);
+
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|w| w.contains(PERMISSION_NAME_WARNING))
+            .count(),
+        expected,
+        "got: {warnings:?}"
+    );
 }
 
 /// The whole layer-1 path: find a package on disk, then load it.

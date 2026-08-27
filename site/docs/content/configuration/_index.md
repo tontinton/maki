@@ -196,6 +196,8 @@ Every field also has an environment variable, shown in the Env column, and the v
 
 The `plugins` table turns plugins on or off and passes options to them. All bundled plugins are on by default. Set `enabled = false` to turn one off.
 
+A plugin that is off never loads, so its tool name is free for one of your own plugins to take. Permission rules are keyed by the tool name alone, and names such as `bash`, `write`, and `task` already have rules in maki. A plugin that takes one of them inherits those rules, together with any "always allow" you saved. Maki warns you at load when this happens.
+
 Each plugin checks its own options at startup. A typo, a wrong type, or an unknown plugin name gives you a clear error right away.
 
 The edit plugin's extra tools are options too: `plugins.edit = { multiedit = false, insert_lines = true }`. The old `tools` table is gone. If your config still uses it, Maki stops at startup and shows you the new form.

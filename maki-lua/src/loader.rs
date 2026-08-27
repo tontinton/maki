@@ -6,8 +6,8 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use include_dir::{Dir, include_dir};
-use maki_agent::permissions::PluginRuleStore;
-use maki_agent::tools::ToolRegistry;
+use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
+use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{PluginsConfig, RawConfig};
 
 use crate::api::keymap::KeymapReader;
@@ -26,6 +26,9 @@ use maki_agent::prompt::ResolvedSlots;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const USER_PLUGIN: &str = "user";
 pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
+/// Tests assert on this exact text, so a wording tweak here updates them too.
+pub const PERMISSION_NAME_WARNING: &str = "inherits maki's permission rules for the builtin \
+     tool of the same name, together with any \"always allow\" you saved";
 
 struct BundledPlugin {
     name: &'static str,
@@ -188,6 +191,7 @@ fn package_entrypoints(root: &Path) -> Result<Vec<PathBuf>, PluginError> {
 pub struct PluginHost {
     inner: LuaThread,
     plugin_rules: Arc<PluginRuleStore>,
+    registry: Arc<ToolRegistry>,
 }
 
 impl Drop for PluginHost {
@@ -220,10 +224,16 @@ impl PluginHost {
     /// every chunk gets it, init.lua files included.
     pub fn with_jit(registry: Arc<ToolRegistry>, jit: bool) -> Result<Self, PluginError> {
         let plugin_rules = Arc::new(PluginRuleStore::default());
-        let lua = runtime::spawn(registry, *BUNDLED_DIRS, jit, Arc::clone(&plugin_rules))?;
+        let lua = runtime::spawn(
+            Arc::clone(&registry),
+            *BUNDLED_DIRS,
+            jit,
+            Arc::clone(&plugin_rules),
+        )?;
         Ok(Self {
             inner: lua,
             plugin_rules,
+            registry,
         })
     }
 
@@ -321,12 +331,14 @@ impl PluginHost {
             warnings.push(format!("{SKIPPED_PLUGIN_WARNING}: {e}"));
             return Ok(());
         }
+        let owner = scope.label().to_owned();
         if let Some(raw) = self.send_config_lua(source, scope, plugin_dir)? {
             match merged {
                 Some(existing) => existing.merge(raw),
                 None => *merged = Some(raw),
             }
         }
+        warnings.extend(self.permission_name_warning(&owner));
         Ok(())
     }
 
@@ -688,6 +700,28 @@ impl PluginHost {
         self.load_declared_packages(packages, &[], config)
     }
 
+    /// The names the plugin registered that maki's own permission defaults are
+    /// keyed on. Taking such a name is allowed, and a drop-in replacement may
+    /// want the builtin's rules, but the user has to be told which rules the
+    /// plugin just inherited. One warning lists them all, because the TUI
+    /// flashes a single warning and a per-tool one would drop the rest.
+    fn permission_name_warning(&self, plugin: &str) -> Option<String> {
+        let snapshot = self.registry.iter();
+        let names: Vec<String> = snapshot
+            .iter()
+            .filter(|t| matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin))
+            .filter(|t| carries_builtin_defaults(t.name()))
+            .map(|t| format!("`{}`", t.name()))
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{plugin}: registered {}, so it {PERMISSION_NAME_WARNING}",
+            names.join(", ")
+        ))
+    }
+
     /// As `load_packages`, with the declarations that may carry a custom
     /// loader. A package with no matching declaration loads its `plugin/*.lua`.
     pub fn load_declared_packages(
@@ -696,7 +730,7 @@ impl PluginHost {
         declared: &[crate::api::pack::Declared],
         config: &PluginsConfig,
     ) -> Vec<String> {
-        let mut failures = Vec::new();
+        let mut warnings = Vec::new();
         let mut loaded: Vec<&str> = Vec::new();
         let mut round: Vec<&DiscoveredPackage> = packages
             .iter()
@@ -739,31 +773,33 @@ impl PluginHost {
                         pkg.revision_guard.clone(),
                     ),
                 };
-                if let Err(e) = result {
-                    if e.is_version_floor() {
+                match result {
+                    Ok(()) => warnings.extend(self.permission_name_warning(&pkg.name)),
+                    Err(e) if e.is_version_floor() => {
                         tracing::warn!(
                             package = %pkg.name,
                             path = %pkg.dir.display(),
                             error = %e,
                             "{SKIPPED_PLUGIN_WARNING}"
                         );
-                        failures.push(format!("{SKIPPED_PLUGIN_WARNING}: {e}"));
-                        continue;
+                        warnings.push(format!("{SKIPPED_PLUGIN_WARNING}: {e}"));
                     }
-                    tracing::error!(
-                        package = %pkg.name,
-                        path = %pkg.dir.display(),
-                        error = %e,
-                        "failed to load package"
-                    );
-                    failures.push(format!("{}: failed to load: {e}", pkg.name));
+                    Err(e) => {
+                        tracing::error!(
+                            package = %pkg.name,
+                            path = %pkg.dir.display(),
+                            error = %e,
+                            "failed to load package"
+                        );
+                        warnings.push(format!("{}: failed to load: {e}", pkg.name));
+                    }
                 }
             }
 
             let ops = match self.take_pending_pack_ops() {
                 Ok(ops) => ops,
                 Err(e) => {
-                    failures.push(format!("could not read package activations: {e}"));
+                    warnings.push(format!("could not read package activations: {e}"));
                     break;
                 }
             };
@@ -780,7 +816,7 @@ impl PluginHost {
                     .find(|pkg| pkg.name == name && config.packages.iter().any(|n| n == &pkg.name));
                 match found {
                     Some(pkg) => round.push(pkg),
-                    None => failures.push(format!(
+                    None => warnings.push(format!(
                         "packadd {name:?}: no package with that name is installed"
                     )),
                 }
@@ -797,7 +833,7 @@ impl PluginHost {
             Ok(leftover) => {
                 for op in leftover {
                     let crate::api::pack::PackOp::Activate { name } = op;
-                    failures.push(format!(
+                    warnings.push(format!(
                         "packadd {name:?}: arrived after the packages had loaded"
                     ));
                 }
@@ -806,7 +842,7 @@ impl PluginHost {
                 tracing::warn!(error = %e, "could not close the package activation queue");
             }
         }
-        failures
+        warnings
     }
 
     pub fn event_handle(&self) -> EventHandle {

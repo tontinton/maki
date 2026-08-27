@@ -279,15 +279,6 @@ impl RawConfig {
     /// merge between two of them.
     pub fn into_config(self, packages: &[String]) -> Result<Config, ConfigError> {
         self.validate_plugin_tables(packages)?;
-        // Only bundled names, because a builtin's name is also its tool name
-        // while a package's is not. Copying a package name here would hide an
-        // unrelated tool that happened to share it.
-        let disabled_tools: Vec<String> = self
-            .plugins
-            .iter()
-            .filter(|(name, cfg)| cfg.enabled == Some(false) && !packages.contains(name))
-            .map(|(name, _)| name.clone())
-            .collect();
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             always_fast: self.always_fast.unwrap_or(false),
@@ -297,7 +288,7 @@ impl RawConfig {
                 .map(AlwaysThinking::resolve)
                 .transpose()?,
             ui: UiConfig::from_file(self.ui),
-            agent: AgentConfig::from_file(self.agent, disabled_tools),
+            agent: AgentConfig::from_file(self.agent),
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
             net: NetConfig::from_file(self.net),
@@ -1108,12 +1099,14 @@ pub struct AgentConfig {
     #[config(skip, default = "Vec::new()")]
     pub allowed_tools: Vec<String>,
 
+    /// Only from the CLI's `--disallowed-tools`. A disabled plugin never
+    /// registers its tool, so its name stays free for another plugin to claim.
     #[config(skip, default = "Vec::new()")]
     pub disabled_tools: Vec<String>,
 }
 
 impl AgentConfig {
-    fn from_file(file: AgentFileConfig, disabled_tools: Vec<String>) -> Self {
+    fn from_file(file: AgentFileConfig) -> Self {
         Self {
             max_output_bytes: file.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
             max_output_lines: file.max_output_lines.unwrap_or(DEFAULT_MAX_OUTPUT_LINES),
@@ -1127,7 +1120,7 @@ impl AgentConfig {
             rtk: file.rtk.unwrap_or(true),
             max_turns: None,
             allowed_tools: Vec::new(),
-            disabled_tools,
+            disabled_tools: Vec::new(),
         }
     }
 }
@@ -3257,18 +3250,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn disabling_a_package_does_not_disable_a_tool() {
-        let raw: RawConfig = toml::from_str("[plugins.my_pack]\nenabled = false\n").unwrap();
-        let config = raw.into_config(&["my_pack".to_owned()]).unwrap();
-        assert!(!config.agent.disabled_tools.contains(&"my_pack".to_owned()));
-    }
-
-    #[test]
-    fn disabling_a_builtin_still_disables_its_tool() {
-        let raw: RawConfig = toml::from_str("[plugins.grep]\nenabled = false\n").unwrap();
-        let config = raw.into_config(&[]).unwrap();
-        assert!(config.agent.disabled_tools.contains(&"grep".to_owned()));
+    #[test_case("grep", &[] ; "builtin")]
+    #[test_case("my_pack", &["my_pack".to_owned()] ; "package")]
+    fn disabling_a_plugin_leaves_its_tool_name_free(name: &str, packages: &[String]) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[plugins.{name}]\nenabled = false\n")).unwrap();
+        let config = raw.into_config(packages).unwrap();
+        assert!(
+            config.agent.disabled_tools.is_empty(),
+            "a disabled plugin never registers, so nothing may filter its name away"
+        );
     }
 
     #[test]
