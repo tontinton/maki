@@ -257,6 +257,7 @@ impl From<CodexUsage> for ProviderUsage {
         Self {
             plan: usage.plan_type,
             limits,
+            by_model_today: vec![],
         }
     }
 }

@@ -27,7 +27,7 @@ pub use providers::openai::auth as openai_auth;
 pub use providers::xai::auth as xai_auth;
 pub use types::{
     ContentBlock, EMPTY_RESPONSE_MARKER, Effort, EffortDialect, IMAGE_OMITTED_NOTE, ImageMediaType,
-    ImageSource, Message, MessageKind, ProviderEvent, ProviderUsage, RequestOptions, Role,
-    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, UsageLimit, adapt_images_for_model,
-    dialect,
+    ImageSource, Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions,
+    Role, StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, UsageLimit,
+    adapt_images_for_model, dialect,
 };

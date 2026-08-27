@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use maki_config::ClockFormat;
-use maki_providers::{Model, ProviderUsage, TokenUsage, format_tokens, model_cost};
+use maki_providers::{Model, ModelUsageRow, ProviderUsage, TokenUsage, format_tokens, model_cost};
 use maki_storage::sessions::StoredTokenUsage;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -169,6 +169,20 @@ fn build_lines(
             theme.keybind_section,
         )));
         lines.extend(quota_lines(state, theme, ctx.clock_format));
+        if let Some(ready) = provider_usage(state)
+            && !ready.by_model_today.is_empty()
+        {
+            let model_w = model_col_width(ready.by_model_today.iter().map(|row| &row.model));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                format!("{PREFIX}By model (provider, today)"),
+                theme.keybind_section,
+            )));
+            lines.push(Line::from(provider_by_model_header(model_w, theme)));
+            for row in &ready.by_model_today {
+                lines.push(Line::from(provider_by_model_row(row, model_w, fg)));
+            }
+        }
     }
 
     if ctx.by_model.is_empty() {
@@ -178,12 +192,7 @@ fn build_lines(
     let mut entries: Vec<(&String, &StoredTokenUsage)> = ctx.by_model.iter().collect();
     entries.sort_by_key(|(_, u)| Reverse(u.total()));
 
-    let model_w = entries
-        .iter()
-        .map(|(id, _)| id.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(MODEL_COL_MIN);
+    let model_w = model_col_width(entries.iter().map(|(id, _)| id));
 
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
@@ -232,6 +241,15 @@ fn totals_row(
     spans
 }
 
+fn model_col_width(names: impl IntoIterator<Item = impl AsRef<str>>) -> usize {
+    names
+        .into_iter()
+        .map(|name| name.as_ref().chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(MODEL_COL_MIN)
+}
+
 fn header_row(model_w: usize, theme: &crate::theme::Theme) -> Vec<Span<'static>> {
     let h = |label: &str| Span::styled(format!("{label:>NUM_COL$}"), theme.status_dim);
     let gap = || Span::raw(" ".repeat(COL_GAP));
@@ -251,6 +269,52 @@ fn header_row(model_w: usize, theme: &crate::theme::Theme) -> Vec<Span<'static>>
         h("total"),
         gap(),
         Span::styled(format!("{:>6}", "cost"), theme.status_dim),
+    ]
+}
+
+fn provider_usage(state: &UsageFetchState) -> Option<&ProviderUsage> {
+    if let UsageFetchState::Ready(usage) = state {
+        Some(usage)
+    } else {
+        None
+    }
+}
+
+fn provider_by_model_header(model_w: usize, theme: &crate::theme::Theme) -> Vec<Span<'static>> {
+    let h = |label: &str| Span::styled(format!("{label:>NUM_COL$}"), theme.status_dim);
+    let gap = || Span::raw(" ".repeat(COL_GAP));
+    vec![
+        Span::raw(PREFIX),
+        Span::styled(
+            format!("{:width$}", "model", width = model_w),
+            theme.status_dim,
+        ),
+        gap(),
+        h("in"),
+        gap(),
+        h("out"),
+        gap(),
+        h("total"),
+        gap(),
+        Span::styled(format!("{:>7}", "spend"), theme.status_dim),
+    ]
+}
+
+fn provider_by_model_row(row: &ModelUsageRow, model_w: usize, fg: Style) -> Vec<Span<'static>> {
+    let num = |v: u64| Span::styled(format!("{:>NUM_COL$}", format_tokens(v)), fg);
+    let gap = || Span::raw(" ".repeat(COL_GAP));
+    let dollars = row.spend_microdollars as f64 / 1_000_000.0;
+    vec![
+        Span::raw(PREFIX),
+        Span::styled(format!("{:<width$}", row.model, width = model_w), fg),
+        gap(),
+        num(row.input_tokens),
+        gap(),
+        num(row.output_tokens),
+        gap(),
+        num(row.total_tokens),
+        gap(),
+        Span::styled(format!("{dollars:>7.4}"), fg),
     ]
 }
 
@@ -458,6 +522,7 @@ mod tests {
                     detail: Some("$2.33 spent".into()),
                 },
             ],
+            by_model_today: vec![],
         };
         let lines = quota_lines(&UsageFetchState::Ready(usage), &theme, ClockFormat::Hour24);
         assert_eq!(lines.len(), 3);

@@ -648,11 +648,12 @@ impl TokenUsage {
     }
 }
 
-pub fn format_tokens(tokens: u32) -> String {
+pub fn format_tokens(tokens: impl Into<u64>) -> String {
+    let tokens = tokens.into();
     match tokens {
         0..1_000 => tokens.to_string(),
-        1_000..1_000_000 => format!("{:.1}k", f64::from(tokens) / 1_000.0),
-        _ => format!("{:.1}m", f64::from(tokens) / 1_000_000.0),
+        1_000..1_000_000 => format!("{:.1}k", tokens as f64 / 1_000.0),
+        _ => format!("{:.1}m", tokens as f64 / 1_000_000.0),
     }
 }
 

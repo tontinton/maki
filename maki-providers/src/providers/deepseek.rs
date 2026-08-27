@@ -129,7 +129,11 @@ impl From<BalanceResponse> for ProviderUsage {
                 }
             })
             .collect();
-        ProviderUsage { plan: None, limits }
+        ProviderUsage {
+            plan: None,
+            limits,
+            by_model_today: vec![],
+        }
     }
 }
 

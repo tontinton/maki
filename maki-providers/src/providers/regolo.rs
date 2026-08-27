@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -8,7 +9,7 @@ use serde_json::Value;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::types::{ProviderUsage, UsageLimit};
+use crate::types::{ModelUsageRow, ProviderUsage, UsageLimit};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -98,6 +99,51 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
 }
 
 #[derive(Deserialize)]
+struct SpendLogsResponse {
+    data: Vec<SpendLogEntry>,
+}
+
+#[derive(Deserialize)]
+struct SpendLogEntry {
+    model_group: String,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    /// USD; rendered as micro-dollars at the boundary to keep `ProviderUsage`
+    /// in `Eq` land.
+    spend: f64,
+}
+
+impl SpendLogsResponse {
+    fn into_rows(self) -> Vec<ModelUsageRow> {
+        let mut by_model: BTreeMap<String, SpendLogEntry> = BTreeMap::new();
+        for entry in self.data {
+            by_model
+                .entry(entry.model_group.clone())
+                .and_modify(|acc| {
+                    acc.prompt_tokens += entry.prompt_tokens;
+                    acc.completion_tokens += entry.completion_tokens;
+                    acc.total_tokens += entry.total_tokens;
+                    acc.spend += entry.spend;
+                })
+                .or_insert(entry);
+        }
+        let mut rows: Vec<ModelUsageRow> = by_model
+            .into_values()
+            .map(|e| ModelUsageRow {
+                model: e.model_group,
+                input_tokens: e.prompt_tokens,
+                output_tokens: e.completion_tokens,
+                total_tokens: e.total_tokens,
+                spend_microdollars: (e.spend * PER_MILLION).round() as u64,
+            })
+            .collect();
+        rows.sort_by_key(|row| Reverse(row.spend_microdollars));
+        rows
+    }
+}
+
+#[derive(Deserialize)]
 struct KeyInfoResponse {
     info: KeyInfo,
 }
@@ -142,6 +188,12 @@ struct ActivityResponse {
 /// `/global/activity` is key-scoped despite its name and answers per UTC day.
 fn activity_url(root: &str, day: jiff::civil::Date) -> String {
     format!("{root}{ACTIVITY_PATH}?start_date={day}&end_date={day}")
+}
+
+/// `/spend/logs/v2` accepts YYYY-MM-DD, end-inclusive. One hour = one row per
+/// model, so callers must sum across rows to get per-model daily totals.
+fn spend_logs_url(root: &str, day: jiff::civil::Date) -> String {
+    format!("{root}{SPEND_LOGS_PATH}?start_date={day}&end_date={day}")
 }
 
 fn next_utc_midnight(now: jiff::Timestamp) -> Option<u64> {
@@ -236,6 +288,7 @@ pub struct Regolo {
 
 const KEY_INFO_PATH: &str = "/key/info";
 const ACTIVITY_PATH: &str = "/global/activity";
+const SPEND_LOGS_PATH: &str = "/spend/logs/v2";
 const MODEL_GROUP_INFO_PATH: &str = "/model_group/info";
 
 /// Regolo's management endpoints live at the host root, outside `/v1`, so
@@ -355,7 +408,19 @@ impl Provider for Regolo {
             {
                 limits.push(activity.into());
             }
-            Ok(Some(ProviderUsage { plan: None, limits }))
+            let by_model_today = self
+                .compat
+                .get_text(&auth, &spend_logs_url(&root, today))
+                .await
+                .ok()
+                .and_then(|body| serde_json::from_str::<SpendLogsResponse>(&body).ok())
+                .map(SpendLogsResponse::into_rows)
+                .unwrap_or_default();
+            Ok(Some(ProviderUsage {
+                plan: None,
+                limits,
+                by_model_today,
+            }))
         })
     }
 
@@ -497,5 +562,51 @@ mod tests {
         let infos = join_fixture(&["Qwen3-Embedding-8B", "glm5.2", "brand-new-model"]);
         let ids: Vec<&str> = infos.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, ["glm5.2"]);
+    }
+
+    const SPEND_LOGS_FIXTURE: &str = r#"{
+      "data": [
+        {
+          "request_id": "h1", "api_key": "k",
+          "model_group": "qwen3-coder-next", "key_alias": "a",
+          "startTime": "2026-08-25T09:00:00+00:00", "endTime": "2026-08-25T10:00:00+00:00",
+          "completionStartTime": null,
+          "api_requests": 4, "total_tokens": 20000,
+          "prompt_tokens": 15000, "completion_tokens": 5000,
+          "spend": 0.010000, "request_duration_ms": 3600000
+        },
+        {
+          "request_id": "h2", "api_key": "k",
+          "model_group": "qwen3-coder-next", "key_alias": "a",
+          "startTime": "2026-08-25T10:00:00+00:00", "endTime": "2026-08-25T11:00:00+00:00",
+          "completionStartTime": null,
+          "api_requests": 3, "total_tokens": 8000,
+          "prompt_tokens": 5000, "completion_tokens": 3000,
+          "spend": 0.004200, "request_duration_ms": 3600000
+        },
+        {
+          "request_id": "h3", "api_key": "k",
+          "model_group": "glm5.2", "key_alias": "a",
+          "startTime": "2026-08-25T09:00:00+00:00", "endTime": "2026-08-25T10:00:00+00:00",
+          "completionStartTime": null,
+          "api_requests": 2, "total_tokens": 360,
+          "prompt_tokens": 200, "completion_tokens": 160,
+          "spend": 0.000900, "request_duration_ms": 3600000
+        }
+      ]
+    }"#;
+
+    #[test]
+    fn spend_logs_aggregate_by_model_and_rank_by_spend() {
+        let resp: SpendLogsResponse = serde_json::from_str(SPEND_LOGS_FIXTURE).unwrap();
+        let rows = resp.into_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].model, "qwen3-coder-next");
+        assert_eq!(rows[0].input_tokens, 20_000);
+        assert_eq!(rows[0].output_tokens, 8_000);
+        assert_eq!(rows[0].total_tokens, 28_000);
+        assert_eq!(rows[0].spend_microdollars, 14_200);
+        assert_eq!(rows[1].model, "glm5.2");
+        assert_eq!(rows[1].spend_microdollars, 900);
     }
 }

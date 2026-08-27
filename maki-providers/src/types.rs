@@ -812,6 +812,26 @@ pub struct ProviderUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
     pub limits: Vec<UsageLimit>,
+    /// Per-model breakdown of the current UTC day, when the provider exposes
+    /// one. The window is part of the contract: the modal labels these rows as
+    /// today's, so a provider reporting a month or a lifetime needs its own
+    /// field rather than this one. Sorted by the provider (typically spend
+    /// desc).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_model_today: Vec<ModelUsageRow>,
+}
+
+/// One row of a provider-reported per-model usage table. Money is kept as
+/// integer micro-dollars to keep `ProviderUsage` in `Eq` territory for tests;
+/// callers format at the UI layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelUsageRow {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    /// Spend in micro-dollars (1_000_000 = $1.00).
+    pub spend_microdollars: u64,
 }
 
 /// A single quota window (e.g. a 5-hour or weekly token quota).

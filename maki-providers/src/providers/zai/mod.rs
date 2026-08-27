@@ -75,6 +75,7 @@ impl From<QuotaResponse> for ProviderUsage {
                     detail: None,
                 })
                 .collect(),
+            by_model_today: vec![],
         }
     }
 }

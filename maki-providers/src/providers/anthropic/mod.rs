@@ -203,7 +203,11 @@ impl From<OauthUsage> for ProviderUsage {
             }));
         }
         limits.extend(credits_limit(&u));
-        ProviderUsage { plan: None, limits }
+        ProviderUsage {
+            plan: None,
+            limits,
+            by_model_today: vec![],
+        }
     }
 }
 
