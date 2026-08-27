@@ -165,7 +165,6 @@ impl RunNotificationState {
         attention: Option<Notification>,
         status: SessionStatus,
         queue_empty: bool,
-        terminal_focused: bool,
     ) -> Option<Notification> {
         let settled = attention.is_none() && status == SessionStatus::Idle && queue_empty;
         let prompt = (attention != self.last_attention)
@@ -182,7 +181,7 @@ impl RunNotificationState {
                 None
             }
         };
-        (!terminal_focused).then(|| prompt.or(completion)).flatten()
+        prompt.or(completion)
     }
 }
 
@@ -228,32 +227,78 @@ fn select_notification(
     }
 }
 
-#[cfg(not(windows))]
-fn terminal_focus_event(event: &Event) -> Option<bool> {
-    match event {
-        Event::FocusGained => Some(true),
-        Event::FocusLost => Some(false),
-        _ => None,
+/// Maki never turns focus reporting on under Windows, so anything that looks
+/// like a focus record there is a guess rather than a report.
+const TRUSTS_FOCUS_EVENTS: bool = !cfg!(windows);
+
+/// How long input keeps an unproven terminal counting as watched. Short on
+/// purpose: suppressing wrongly hides a finished turn, notifying wrongly only
+/// costs a bell.
+const INPUT_IMPLIES_WATCHING: Duration = Duration::from_secs(30);
+
+/// Whether the user is watching this terminal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Focus {
+    /// No focus report has arrived yet. Terminals that never send one (GNU
+    /// screen, tmux without `focus-events on`) stay here for good, and one
+    /// never arrives while the user simply keeps the window focused, so
+    /// recent input is the only evidence available.
+    Unproven {
+        last_input: Option<Instant>,
+    },
+    Focused,
+    Unfocused,
+}
+
+impl Default for Focus {
+    fn default() -> Self {
+        Self::Unproven { last_input: None }
     }
 }
 
-#[cfg(windows)]
-fn terminal_focus_event(_event: &Event) -> Option<bool> {
-    None
-}
-
-#[cfg(not(windows))]
-fn terminal_input_proves_focus(event: &Event) -> bool {
-    match event {
-        Event::Key(key) => key.kind == KeyEventKind::Press,
-        Event::Paste(_) | Event::Mouse(_) => true,
-        _ => false,
+impl Focus {
+    /// A prompt parks the agent on the user, so it rings even while they
+    /// watch. A finished turn they can already see is just noise.
+    fn allows(self, notification: &Notification) -> bool {
+        notification.is_urgent() || !self.is_watched()
     }
-}
 
-#[cfg(windows)]
-fn terminal_input_proves_focus(_event: &Event) -> bool {
-    false
+    fn is_watched(self) -> bool {
+        match self {
+            Self::Focused => true,
+            Self::Unfocused => false,
+            Self::Unproven { last_input } => {
+                last_input.is_some_and(|at| at.elapsed() < INPUT_IMPLIES_WATCHING)
+            }
+        }
+    }
+
+    fn report(&mut self, reported: Self) {
+        if TRUSTS_FOCUS_EVENTS {
+            *self = reported;
+        }
+    }
+
+    /// Typing proves the user was here just now. It never latches: without a
+    /// report to clear it, a terminal that cannot send `FocusLost` would go
+    /// quiet for good, so the evidence expires on its own.
+    fn note_input(&mut self) {
+        match self {
+            Self::Unfocused => *self = Self::Focused,
+            Self::Unproven { last_input } => *last_input = Some(Instant::now()),
+            Self::Focused => {}
+        }
+    }
+
+    /// An editor, a shell or a suspend eats the focus reports we would have
+    /// seen, so assume the user may have walked away.
+    fn on_resume(&mut self) {
+        match self {
+            Self::Focused => *self = Self::Unfocused,
+            Self::Unproven { last_input } => *last_input = None,
+            Self::Unfocused => {}
+        }
+    }
 }
 
 fn parse_session_id(id: &str) -> Result<MakiId, String> {
@@ -377,7 +422,7 @@ pub(crate) struct EventLoop<'t> {
     sessions: Vec<SessionRuntime>,
     focused: usize,
     last_focused: Option<MakiId>,
-    terminal_focused: bool,
+    focus: Focus,
     notifier: Option<terminal::TerminalNotifier>,
     ctx: SpawnCtx,
     input: InputReader,
@@ -583,7 +628,7 @@ impl<'t> EventLoop<'t> {
             sessions: runtimes,
             focused,
             last_focused: None,
-            terminal_focused: false,
+            focus: Focus::default(),
             notifier,
             ctx,
             input: InputReader::spawn(),
@@ -872,7 +917,7 @@ impl<'t> EventLoop<'t> {
             let _pause = self.input.pause();
             terminal::open_in_editor(path, self.terminal)
         };
-        self.terminal_focused = false;
+        self.focus.on_resume();
         match result {
             Ok(code) => code,
             Err(e) => {
@@ -932,11 +977,10 @@ impl<'t> EventLoop<'t> {
                 rt.app.attention(),
                 rt.last_status,
                 rt.handles.queue.is_empty(),
-                self.terminal_focused,
             );
             selected = select_notification(selected, candidate);
         }
-        if let Some(notification) = selected
+        if let Some(notification) = selected.filter(|n| self.focus.allows(n))
             && let Err(error) = notifier.notify(&notification.message())
         {
             warn!(notifier = ?notifier.notifier(), %error, "terminal notifications disabled after write failure");
@@ -1207,24 +1251,28 @@ impl<'t> EventLoop<'t> {
     }
 
     fn translate(&mut self, raw: Event) -> (Option<Msg>, Option<Event>) {
-        let supports_focus_reporting = self
-            .notifier
-            .as_ref()
-            .is_some_and(terminal::TerminalNotifier::supports_focus_reporting);
-        if let Some(focused) = terminal_focus_event(&raw) {
-            if supports_focus_reporting {
-                self.terminal_focused = focused;
-            }
-            return (None, None);
-        }
-        if supports_focus_reporting && terminal_input_proves_focus(&raw) {
-            self.terminal_focused = true;
-        }
         match raw {
-            Event::Key(key) if key.kind == KeyEventKind::Press => (Some(Msg::Key(key)), None),
+            Event::FocusGained => {
+                self.focus.report(Focus::Focused);
+                (None, None)
+            }
+            Event::FocusLost => {
+                self.focus.report(Focus::Unfocused);
+                (None, None)
+            }
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                self.focus.note_input();
+                (Some(Msg::Key(key)), None)
+            }
             Event::Key(_) => (None, None),
-            Event::Paste(text) => (Some(Msg::Paste(text)), None),
-            Event::Mouse(mouse) => self.translate_mouse(mouse),
+            Event::Paste(text) => {
+                self.focus.note_input();
+                (Some(Msg::Paste(text)), None)
+            }
+            Event::Mouse(mouse) => {
+                self.focus.note_input();
+                self.translate_mouse(mouse)
+            }
             _ => (None, None),
         }
     }
@@ -1410,7 +1458,7 @@ impl<'t> EventLoop<'t> {
                     let _pause = self.input.pause();
                     terminal::edit_temp_content(&current_text, self.terminal)
                 };
-                self.terminal_focused = false;
+                self.focus.on_resume();
                 match result {
                     Ok(edited) => self.sessions[idx].app.input_box.set_input(edited),
                     Err(e) => self.sessions[idx].app.flash(e),
@@ -1427,7 +1475,7 @@ impl<'t> EventLoop<'t> {
             Action::Suspend => {
                 let _pause = self.input.pause();
                 terminal::suspend(self.terminal);
-                self.terminal_focused = false;
+                self.focus.on_resume();
             }
             Action::RefreshModels => self.refresh_models(),
             Action::RefreshUsage => self.refresh_usage(),
@@ -1605,39 +1653,31 @@ mod tests {
 
         state.on_done(&done_event());
         assert!(state.waiting_for_drain());
-        assert_eq!(
-            state.reconcile(None, SessionStatus::Idle, true, false),
-            None
-        );
+        assert_eq!(state.reconcile(None, SessionStatus::Idle, true), None);
 
         state.on_drain();
         assert!(!state.waiting_for_drain());
         assert_eq!(
-            state.reconcile(None, SessionStatus::Idle, true, false),
+            state.reconcile(None, SessionStatus::Idle, true),
             Some(Notification::TurnComplete {
                 response: Some("done".into())
             })
         );
     }
 
-    #[test_case(SessionStatus::Idle, true, false, true ; "fires_when_settled_and_unfocused")]
-    #[test_case(SessionStatus::Idle, true, true, false ; "focused_terminal_swallows")]
-    #[test_case(SessionStatus::Idle, false, false, false ; "queued_message_swallows")]
-    #[test_case(SessionStatus::Working, true, false, false ; "busy_session_swallows")]
+    #[test_case(SessionStatus::Idle, true, true ; "fires_when_settled")]
+    #[test_case(SessionStatus::Idle, false, false ; "queued_message_swallows")]
+    #[test_case(SessionStatus::Working, true, false ; "busy_session_swallows")]
     fn due_completion_is_decided_on_first_reconcile(
         status: SessionStatus,
         queue_empty: bool,
-        terminal_focused: bool,
         fires: bool,
     ) {
         let mut state = due_completion();
 
-        let first = state.reconcile(None, status, queue_empty, terminal_focused);
+        let first = state.reconcile(None, status, queue_empty);
         assert_eq!(first.is_some(), fires);
-        assert_eq!(
-            state.reconcile(None, SessionStatus::Idle, true, false),
-            None
-        );
+        assert_eq!(state.reconcile(None, SessionStatus::Idle, true), None);
     }
 
     #[test]
@@ -1646,17 +1686,65 @@ mod tests {
         let mut state = due_completion();
 
         assert_eq!(
-            state.reconcile(Some(prompt.clone()), SessionStatus::Idle, true, false),
+            state.reconcile(Some(prompt.clone()), SessionStatus::Idle, true),
             Some(prompt.clone())
         );
         assert_eq!(
-            state.reconcile(Some(prompt), SessionStatus::NeedsInput, true, false),
+            state.reconcile(Some(prompt), SessionStatus::NeedsInput, true),
             None
         );
-        assert_eq!(
-            state.reconcile(None, SessionStatus::Idle, true, false),
-            None
-        );
+        assert_eq!(state.reconcile(None, SessionStatus::Idle, true), None);
+    }
+
+    #[test_case(Focus::Focused, false ; "watching_user_already_saw_the_turn_end")]
+    #[test_case(Focus::Unfocused, true ; "away_from_the_terminal")]
+    #[test_case(Focus::default(), true ; "unproven_terminal_without_input_notifies")]
+    #[test_case(stale_input(), true ; "unproven_terminal_left_alone_notifies")]
+    #[test_case(fresh_input(), false ; "unproven_terminal_typed_into_just_now")]
+    fn focus_suppresses_only_turn_completions(focus: Focus, completion_fires: bool) {
+        let completion = Notification::TurnComplete { response: None };
+
+        assert_eq!(focus.allows(&completion), completion_fires);
+        assert!(focus.allows(&Notification::QuestionRequested));
+    }
+
+    fn stale_input() -> Focus {
+        Focus::Unproven {
+            last_input: Instant::now().checked_sub(INPUT_IMPLIES_WATCHING),
+        }
+    }
+
+    fn fresh_input() -> Focus {
+        let mut focus = Focus::default();
+        focus.note_input();
+        focus
+    }
+
+    #[test]
+    fn input_never_latches_on_an_unproven_terminal() {
+        let mut focus = fresh_input();
+
+        focus.on_resume();
+
+        assert_eq!(focus, Focus::default());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_focus_report_makes_input_and_resume_meaningful() {
+        let mut focus = Focus::default();
+
+        focus.report(Focus::Focused);
+        assert_eq!(focus, Focus::Focused);
+
+        focus.on_resume();
+        assert_eq!(focus, Focus::Unfocused);
+
+        focus.note_input();
+        assert_eq!(focus, Focus::Focused);
+
+        focus.report(Focus::Unfocused);
+        assert_eq!(focus, Focus::Unfocused);
     }
 
     #[test]
@@ -1670,32 +1758,6 @@ mod tests {
         let selected = select_notification(selected, Some(second_prompt));
 
         assert_eq!(selected, Some(first_prompt));
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn focus_events_map_to_terminal_focus_state() {
-        assert_eq!(terminal_focus_event(&Event::FocusGained), Some(true));
-        assert_eq!(terminal_focus_event(&Event::FocusLost), Some(false));
-        assert_eq!(terminal_focus_event(&Event::Resize(80, 24)), None);
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn interactive_input_proves_terminal_focus() {
-        let release = crossterm::event::KeyEvent {
-            code: crossterm::event::KeyCode::Enter,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-            kind: KeyEventKind::Release,
-            state: crossterm::event::KeyEventState::NONE,
-        };
-
-        assert!(terminal_input_proves_focus(&Event::Key(
-            crate::components::key(crossterm::event::KeyCode::Enter)
-        )));
-        assert!(terminal_input_proves_focus(&Event::Paste("text".into())));
-        assert!(!terminal_input_proves_focus(&Event::Key(release)));
-        assert!(!terminal_input_proves_focus(&Event::Resize(80, 24)));
     }
 
     #[test]

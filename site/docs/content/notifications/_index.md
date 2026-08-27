@@ -10,8 +10,10 @@ group = "Reference"
 Maki can tell you when a session finishes or needs your input. This is useful
 when you move to another terminal while Maki works.
 
-Notifications are enabled by default. Maki does not notify while it knows
-that its terminal has focus.
+Notifications are enabled by default. A prompt that waits on you always
+notifies, because the agent stays parked until you answer. `Agent turn
+complete` is skipped only when Maki can tell you are watching: the terminal
+reported focus, or you typed in the last 30 seconds.
 
 Maki uses these messages:
 
@@ -55,16 +57,25 @@ OSC 9 work when an SSH connection does not preserve `TERM_PROGRAM`.
 
 ## tmux
 
-tmux needs both of these settings:
+OSC 9 needs passthrough:
 
 ```tmux
-set -g focus-events on
 set -g allow-passthrough all
 ```
 
 Use `allow-passthrough all`, not `allow-passthrough on`. The `on` value permits
 passthrough only while the Maki pane is visible. tmux drops the notification
 after you change to another tmux window.
+
+Focus events are a separate setting:
+
+```tmux
+set -g focus-events on
+```
+
+This lets Maki suppress a turn completion you are already watching. Without it
+Maki falls back to your last keypress and notifies for anything slower than 30
+seconds.
 
 Add the settings to `~/.tmux.conf`, then reload the file or restart tmux.
 
