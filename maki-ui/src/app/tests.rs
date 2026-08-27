@@ -132,6 +132,7 @@ fn build_app_with_session(
         lua_commands,
         KeymapReader::empty(),
         HintReader::empty(),
+        maki_lua::CompleterReader::empty(),
         writer,
         UiConfig::default(),
         100,
@@ -196,6 +197,66 @@ fn app_with_hints() -> (App, HintWriterHandle) {
     app.hints = Watch::seeded(reader.load_full());
     app.hint_reader = reader;
     (app, writer)
+}
+
+/// Hands back the probe answering completer queries, standing in for the
+/// Lua thread like `app_with_hints` does for hints.
+fn app_with_completer() -> (App, maki_lua::test_support::RequestProbe) {
+    let (writer, reader) = maki_lua::test_support::completer_writer_pair();
+    writer.publish(vec![maki_lua::CompleterInfo {
+        trigger: '@',
+        plugin: Arc::from("mention"),
+        name: Arc::from("files"),
+    }]);
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let mut app = test_app();
+    app.completion = crate::components::completion::CompletionPopup::new(reader, handle);
+    (app, probe)
+}
+
+#[test]
+fn typing_a_trigger_completes_into_the_input() {
+    let (mut app, probe) = app_with_completer();
+    for c in "see @ma".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    // Typing while a query is out does not start one call per keystroke:
+    // exactly one is in flight, and the newest query goes out once it lands.
+    let answer = || {
+        probe.answer_completer_query(Some(vec![maki_lua::CompletionItem {
+            label: "src/main.rs".into(),
+            insert: "src/main.rs".into(),
+            detail: None,
+            indices: Vec::new(),
+        }]))
+    };
+    let (_, _, opening) = answer().expect("typing `@` queried the source");
+    assert_eq!(opening, "", "the popup opens on the empty query");
+    assert!(answer().is_none(), "`m` and `a` did not each start a call");
+
+    assert!(app.tick().take());
+    let (_, _, latest) = answer().expect("the reply released the newest query");
+    assert_eq!(latest, "ma");
+    assert!(app.tick().take());
+    assert!(app.completion.is_open());
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.input_box.buffer.value(), "see src/main.rs");
+    assert!(!app.completion.is_open());
+}
+
+#[test]
+fn enter_submits_when_no_completion_is_open() {
+    let (mut app, _probe) = app_with_completer();
+    for c in "plain text".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    assert!(!app.completion.is_open());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(
+        app.input_box.buffer.value().is_empty(),
+        "submit consumed the input"
+    );
 }
 
 fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {

@@ -268,6 +268,13 @@ maki.setup({
 | `insert_lines` | boolean | `false` | - | Provide the opt-in `insert_lines` tool. |
 | `multiedit` | boolean | `true` | - | Provide the `multiedit` tool. |
 
+### `plugins.file_mention`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `cache_ms` | integer | `2000` | 0 | How long the project file list is reused across keystrokes, in milliseconds. |
+| `result_limit` | integer | `10` | 1 | Max files shown in the completion popup. |
+
 ### `plugins.glob`
 
 | Field | Type | Default | Min | Description |

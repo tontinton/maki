@@ -93,6 +93,19 @@ impl TextBuffer {
         }
     }
 
+    /// Replace `[start_x, end_x)` (char indices) on line `y` with `text`,
+    /// leaving the cursor right after the inserted text.
+    pub fn replace_range(&mut self, y: usize, start_x: usize, end_x: usize, text: &str) {
+        let Some(line) = self.lines.get_mut(y) else {
+            return;
+        };
+        let start = Self::char_to_byte(line, start_x);
+        let end = Self::char_to_byte(line, end_x.max(start_x));
+        line.replace_range(start..end, text);
+        self.cursor_y = y;
+        self.raw_x = start_x + text.chars().count();
+    }
+
     pub fn add_line(&mut self) {
         let bx = self.byte_x();
         let (left, right) = self.lines[self.cursor_y].split_at(bx);

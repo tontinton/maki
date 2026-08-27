@@ -30,9 +30,9 @@ use maki_lua::session_snapshot::{
     SessionSnapshot,
 };
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, PackCommand,
-    PackPreparation, SessionEndReason, SessionRequest, TaskRequest, UiAction, UiAttachment,
-    UiReply,
+    CompleterReader, EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest,
+    PackCommand, PackPreparation, SessionEndReason, SessionRequest, TaskRequest, UiAction,
+    UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -101,6 +101,7 @@ pub struct EventLoopParams {
     pub lua_command_reader: LuaCommandReader,
     pub keymap_reader: KeymapReader,
     pub hint_reader: HintReader,
+    pub completer_reader: CompleterReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub ui_attachment: UiAttachment,
     pub lua_event_handle: EventHandle,
@@ -383,6 +384,7 @@ struct SpawnCtx {
     lua_command_reader: LuaCommandReader,
     keymap_reader: KeymapReader,
     hint_reader: HintReader,
+    completer_reader: CompleterReader,
     lua_event_handle: EventHandle,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
@@ -421,6 +423,7 @@ impl SpawnCtx {
             self.lua_command_reader.clone(),
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
+            self.completer_reader.clone(),
             Arc::clone(&self.storage_writer),
             self.ui_config.clone(),
             self.input_history_size,
@@ -583,6 +586,7 @@ impl<'t> EventLoop<'t> {
             lua_command_reader,
             keymap_reader,
             hint_reader,
+            completer_reader,
             ui_action_rx,
             ui_attachment,
             lua_event_handle,
@@ -642,6 +646,7 @@ impl<'t> EventLoop<'t> {
             lua_command_reader,
             keymap_reader,
             hint_reader,
+            completer_reader,
             lua_event_handle,
             mcp_handle,
             mcp_config_errors,
@@ -926,6 +931,9 @@ impl<'t> EventLoop<'t> {
         match action {
             UiAction::Flash(msg) => {
                 self.focused_app().flash(msg);
+            }
+            UiAction::InsertInput(text) => {
+                self.focused_app().insert_input(&text);
             }
             UiAction::SetWindowTitle(title) => {
                 if let Err(error) = terminal::set_window_title(&title) {
