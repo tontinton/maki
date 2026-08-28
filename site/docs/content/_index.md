@@ -41,7 +41,6 @@ The docs are sorted by what you came here to do:
   <div class="card-grid">
     <a class="card" href="/docs/token-economy/"><span class="card-title">Token Economy</span><span class="card-desc">Where tokens go in an agent loop, and every trick Maki uses to spend fewer of them.</span></a>
     <a class="card" href="/docs/context/"><span class="card-title">Context</span><span class="card-desc">What enters the model's context and when, and where to put project knowledge.</span></a>
-    <a class="card" href="/docs/monitor/"><span class="card-title">Long-running commands</span><span class="card-desc">monitor for tests and builds that outlive a tool call. Exit notify, wait, split logs.</span></a>
   </div>
 </div>
 

@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 26 built-in tools in this reference (25 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 21 built-in tools in this reference (20 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -160,58 +160,6 @@ Use this tool when you need to ask the user questions during execution. This all
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `questions` | array | yes | List of questions to ask the user |
-
-## Process Supervision
-
-### `monitor` {#monitor}
-
-Spawn a long-running command you own (a test suite, build, or server).
-The command keeps running after this tool returns. You will be notified in this
-session when it exits, including on success. A new turn starts when the session
-is idle unless you set `wake = false`.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `command` | string | yes |  | The bash command to supervise (runs detached, outlives this call) |
-| `cwd` | string | no | cwd | Working directory |
-| `description` | string | no |  | Short description (3-5 words) of what the command does |
-| `notify_on_success` | boolean | no | true | Notify on every exit, including success. Set false to hear only about failures. |
-| `session` | string | no |  | Session id to notify on exit. Defaults to the current session. |
-| `tail` | integer | no | 20, 0 disables | Trailing lines per stream to keep for peek/notify |
-| `wake` | boolean | no | true | Start a session turn when the process exits and the session is idle. TUI only. |
-
-### `monitor_stop` {#monitor_stop}
-
-Kill a running monitor and its process group.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | integer | yes | Monitor id returned by `monitor` |
-
-### `monitor_list` {#monitor_list}
-
-List this session's live and recently-exited monitors.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `session` | string | no | Session id to list. Defaults to the current session. |
-
-### `monitor_peek` {#monitor_peek}
-
-Read a monitor's recent stdout and stderr without waiting for it to exit.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | integer | yes | Monitor id returned by `monitor` |
-
-### `monitor_wait` {#monitor_wait}
-
-Wait for a monitor to finish, or return a snapshot when the timeout elapses.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `id` | integer | yes |  | Monitor id returned by `monitor` |
-| `timeout_ms` | integer | no | 30000, max 600000 | Maximum wait in milliseconds. 0 returns immediately. |
 
 ## Agent & Knowledge
 
