@@ -140,7 +140,7 @@ impl OpenAiCompatProvider {
     /// Effective base URL: an auth-supplied value (dynamic/custom providers)
     /// wins, then the construction-time env / `providers.toml` override, then
     /// the static compat default.
-    fn base_url(&self, auth: &ResolvedAuth) -> String {
+    pub(crate) fn base_url(&self, auth: &ResolvedAuth) -> String {
         if let Some(explicit) = auth.base_url.as_deref() {
             return explicit.to_string();
         }

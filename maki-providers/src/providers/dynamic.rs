@@ -32,6 +32,7 @@ use super::mistral::Mistral;
 use super::openai::OpenAi;
 use super::opencode::Opencode;
 use super::openrouter::OpenRouter;
+use super::regolo::Regolo;
 use super::synthetic::Synthetic;
 use super::tensorx::TensorX;
 use super::xai::Xai;
@@ -566,6 +567,10 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
         ),
         ProviderKind::Synthetic => Box::new(
             Synthetic::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
+        ProviderKind::Regolo => Box::new(
+            Regolo::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::DeepSeek => Box::new(

@@ -2,7 +2,7 @@ use crate::model::{ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::providers::{
     anthropic, aperture, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama,
-    openai, openrouter, synthetic, tensorx, xai, zai,
+    openai, openrouter, regolo, synthetic, tensorx, xai, zai,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -140,6 +140,18 @@ const OPENROUTER: ProviderManifest = ProviderManifest {
     pricing_schedule: None,
 };
 
+const REGOLO: ProviderManifest = ProviderManifest {
+    slug: "regolo",
+    display_name: "Regolo",
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: false,
+    fallback_max_output: Some(120_000),
+    fallback_context_window: 120_000,
+    models: regolo::models(),
+    pricing_schedule: None,
+};
+
 const SYNTHETIC: ProviderManifest = ProviderManifest {
     slug: "synthetic",
     display_name: "Synthetic",
@@ -223,6 +235,7 @@ const BUILTINS: &[ProviderManifest] = &[
     ZAI,
     DEEPSEEK,
     OPENROUTER,
+    REGOLO,
     SYNTHETIC,
     TENSORX,
     OPENCODE,

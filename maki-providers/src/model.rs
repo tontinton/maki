@@ -54,7 +54,7 @@ pub struct ModelPricing {
 
 /// Metadata discovered at runtime from a provider's `/models` endpoint.
 /// All fields optional -- most providers only return an ID.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ModelInfo {
     pub id: String,
     pub context_window: Option<u32>,
