@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use crate::error::PluginError;
 use crate::loader::is_bundled;
-use crate::plugin_permissions::{Requested, load_requested_permissions};
+use crate::plugin_permissions::{
+    Permission, Requested, load_requested_permissions, requested_permissions_from_text,
+};
 
 const REVIEW_REVISION_LEN: usize = 12;
 const UPDATE_REVIEW_DECLINED: &str = "update review was declined";
@@ -21,6 +23,7 @@ const UPDATE_REVIEW_UNAVAILABLE: &str =
 const ACTIVE_DELETE_REFUSAL: &str = "package is active and was not removed";
 const OWNER_CONFLICT_FAILURE: &str = "package name conflicts with another owner";
 const DECLARED_DELETE_REFUSAL: &str = "still declared; remove it from maki.pack.add first";
+const PLUGIN_MANIFEST: &str = "plugin.toml";
 
 pub fn sanitize_message(message: &str) -> String {
     message
@@ -890,9 +893,18 @@ fn apply_pack_ops_at(
                 continue;
             }
         };
+        let permission_diff = match update_permission_diff(name, &proposal) {
+            Ok(diff) => diff,
+            Err(error) => {
+                report
+                    .failures
+                    .push(format!("{name}: {}", redact_error(&error)));
+                continue;
+            }
+        };
         if proposal.changed && !options.force {
             review.push(format!(
-                "{name}: {} -> {}",
+                "{name}: {} -> {}\n  permissions: {permission_diff}",
                 short_revision(&proposal.old_rev),
                 short_revision(&proposal.new_rev)
             ));
@@ -987,6 +999,31 @@ fn apply_pack_ops_at(
 
 fn short_revision(revision: &str) -> &str {
     revision.get(..REVIEW_REVISION_LEN).unwrap_or(revision)
+}
+
+fn update_permission_diff(
+    name: &str,
+    update: &maki_pack::manager::PreparedUpdate,
+) -> Result<String, PluginError> {
+    let old_path = PathBuf::from(format!("{name}@{}", update.old_rev)).join(PLUGIN_MANIFEST);
+    let new_path = PathBuf::from(format!("{name}@{}", update.new_rev)).join(PLUGIN_MANIFEST);
+    let old = requested_permissions_from_text(update.old_manifest.as_deref(), &old_path)?;
+    let new = requested_permissions_from_text(update.new_manifest.as_deref(), &new_path)?;
+    let mut additions = Vec::new();
+    let mut removals = Vec::new();
+    for &permission in Permission::ALL {
+        match (old.is_requested(permission), new.is_requested(permission)) {
+            (false, true) => additions.push(format!("+{permission}")),
+            (true, false) => removals.push(format!("-{permission}")),
+            _ => {}
+        }
+    }
+    additions.extend(removals);
+    if additions.is_empty() {
+        Ok("unchanged".to_owned())
+    } else {
+        Ok(additions.join(", "))
+    }
 }
 
 fn revoke_approval(name: &str, path: Option<&Path>) -> bool {
@@ -1262,13 +1299,14 @@ mod tests {
 
     use crate::error::PluginError;
     use crate::plugin_permissions::{Permission, Requested};
+    use test_case::test_case;
 
     use super::{
         ACTIVE_DELETE_REFUSAL, DECLARED_DELETE_REFUSAL, DiscoveredPackage, MANAGED_GROUP,
-        OWNER_CONFLICT_FAILURE, Origin, Problem, REVIEW_REVISION_LEN, ReviewDecision,
-        UPDATE_REVIEW_DECLINED, UPDATE_REVIEW_UNAVAILABLE, apply_pack_ops_at, discover, granted,
-        installed_from_declared_source, missing_permissions, read_approvals_file, read_lockfile,
-        resolved_on_disk, sanitize_message, write_lockfile,
+        OWNER_CONFLICT_FAILURE, Origin, PLUGIN_MANIFEST, Problem, REVIEW_REVISION_LEN,
+        ReviewDecision, UPDATE_REVIEW_DECLINED, UPDATE_REVIEW_UNAVAILABLE, apply_pack_ops_at,
+        discover, granted, installed_from_declared_source, missing_permissions,
+        read_approvals_file, read_lockfile, resolved_on_disk, sanitize_message, write_lockfile,
     };
 
     const TEST_REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1715,10 +1753,20 @@ mod tests {
     }
 
     fn update_fixture() -> UpdateFixture {
+        update_fixture_with_manifests(None, None)
+    }
+
+    fn update_fixture_with_manifests(
+        old_manifest: Option<&str>,
+        new_manifest: Option<&str>,
+    ) -> UpdateFixture {
         let temp = tempfile::TempDir::new().unwrap();
         let origin = temp.path().join("origin");
         fs::create_dir_all(origin.join("plugin")).unwrap();
         fs::write(origin.join("plugin").join("init.lua"), "-- first\n").unwrap();
+        if let Some(manifest) = old_manifest {
+            fs::write(origin.join(PLUGIN_MANIFEST), manifest).unwrap();
+        }
         run_git(&origin, &["init", "--quiet"]);
         run_git(&origin, &["config", "user.email", "test@example.com"]);
         run_git(&origin, &["config", "user.name", "test"]);
@@ -1736,6 +1784,13 @@ mod tests {
         assert!(write_lockfile(&lock_path, &lock));
 
         fs::write(origin.join("plugin").join("later.lua"), "-- later\n").unwrap();
+        match new_manifest {
+            Some(manifest) => fs::write(origin.join(PLUGIN_MANIFEST), manifest).unwrap(),
+            None if old_manifest.is_some() => {
+                fs::remove_file(origin.join(PLUGIN_MANIFEST)).unwrap()
+            }
+            None => {}
+        }
         run_git(&origin, &["add", "."]);
         run_git(&origin, &["commit", "--quiet", "-m", "later"]);
         let new_rev = run_git(&origin, &["rev-parse", "HEAD"])
@@ -1793,6 +1848,7 @@ mod tests {
         );
         assert!(prompt.contains(&fixture.old_rev[..REVIEW_REVISION_LEN]));
         assert!(prompt.contains(&fixture.new_rev[..REVIEW_REVISION_LEN]));
+        assert!(prompt.contains("permissions: unchanged"));
         assert_eq!(
             read_lockfile(Some(&fixture.lock_path))
                 .unwrap()
@@ -1801,6 +1857,82 @@ mod tests {
                 .rev,
             fixture.new_rev
         );
+    }
+
+    #[test_case(
+        None,
+        Some("[permissions]\nnet = true\n"),
+        "+net";
+        "added_permission"
+    )]
+    #[test_case(
+        Some("[permissions]\nfs_write = true\n"),
+        Some("[permissions]\nnet = true\n"),
+        "+net, -fs_write";
+        "added_and_removed_permissions"
+    )]
+    #[test_case(
+        Some("[permissions]\nrun = true\n"),
+        None,
+        "-run";
+        "removed_permission"
+    )]
+    fn update_review_shows_permission_changes(
+        old_manifest: Option<&str>,
+        new_manifest: Option<&str>,
+        expected: &str,
+    ) {
+        let fixture = update_fixture_with_manifests(old_manifest, new_manifest);
+        let mut prompt = String::new();
+
+        let report = apply_pack_ops_at(
+            &[update_operation(false)],
+            &fixture.declared,
+            &Default::default(),
+            &fixture.site,
+            &fixture.lock_path,
+            None,
+            |value| {
+                prompt = value.to_owned();
+                ReviewDecision::Accepted
+            },
+        );
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(prompt.contains(&format!("permissions: {expected}")));
+    }
+
+    #[test_case(Some("permissions = ["), None, false; "invalid_current_manifest")]
+    #[test_case(None, Some("permissions = ["), true; "invalid_proposed_manifest_with_force")]
+    fn invalid_update_manifest_prevents_apply(
+        old_manifest: Option<&str>,
+        new_manifest: Option<&str>,
+        force: bool,
+    ) {
+        let fixture = update_fixture_with_manifests(old_manifest, new_manifest);
+
+        let report = apply_pack_ops_at(
+            &[update_operation(force)],
+            &fixture.declared,
+            &Default::default(),
+            &fixture.site,
+            &fixture.lock_path,
+            None,
+            |_| panic!("an invalid manifest must not reach review"),
+        );
+
+        assert!(report.updated.is_empty());
+        assert_eq!(report.failures.len(), 1);
+        assert!(report.failures[0].contains("is not valid toml"));
+        assert_eq!(
+            read_lockfile(Some(&fixture.lock_path))
+                .unwrap()
+                .get("demo")
+                .unwrap()
+                .rev,
+            fixture.old_rev
+        );
+        assert!(!maki_pack::paths::revision_dir(&fixture.site, "demo", &fixture.new_rev).exists());
     }
 
     #[test]
@@ -1835,18 +1967,23 @@ mod tests {
     #[test]
     fn forced_update_skips_review_and_applies_the_revision() {
         let fixture = update_fixture();
+        let approvals = fixture.lock_path.with_file_name("pack-approvals.json");
         let report = apply_pack_ops_at(
             &[update_operation(true)],
             &fixture.declared,
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
-            None,
+            Some(&approvals),
             |_| panic!("forced updates must not ask for review"),
         );
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert_eq!(report.updated, vec![("demo".to_owned(), fixture.new_rev)]);
+        assert!(
+            !approvals.exists(),
+            "force must not write permission approval"
+        );
     }
 
     #[test]

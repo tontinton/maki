@@ -105,9 +105,11 @@ still declares. Pass one package name to update only that package:
 /packupdate maki-review
 ```
 
-Maki fetches the source and shows the old and proposed commits before it
-changes `pack-lock.json`. Declining the review changes no installed revision.
-Use `/packupdate!` to skip the review.
+Maki fetches the source and shows the old and proposed commits with requested
+permission additions and removals before it changes `pack-lock.json`.
+Declining the review changes no installed revision. Use `/packupdate!` to skip
+the update review. It does not approve new permissions. Maki asks for that
+approval separately when it loads the updated package.
 
 Pass `++lockfile` to restore the commit already recorded in the lockfile
 instead of resolving the declared version:

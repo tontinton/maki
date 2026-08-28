@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 /// Peels whatever a ref names down to a commit.
 const COMMIT_PEEL: &str = "^{commit}";
+const PLUGIN_MANIFEST: &str = "plugin.toml";
 
 /// `ext::` hands its argument to a shell, and it is what a hostile
 /// `url.<base>.insteadOf` reaches for. Git already refuses it by default, but
@@ -121,6 +122,24 @@ pub fn checkout_args(empty_hooks_dir: &Path, rev: &str) -> Vec<String> {
 pub fn rev_parse_args(empty_hooks_dir: &Path, rev: &str) -> Vec<String> {
     let mut args = hardening_args(empty_hooks_dir);
     args.extend(["rev-parse".to_owned(), format!("{rev}{COMMIT_PEEL}")]);
+    args
+}
+
+pub(crate) fn manifest_exists_args(empty_hooks_dir: &Path, rev: &str) -> Vec<String> {
+    let mut args = hardening_args(empty_hooks_dir);
+    args.extend([
+        "ls-tree".to_owned(),
+        "--name-only".to_owned(),
+        rev.to_owned(),
+        "--".to_owned(),
+        PLUGIN_MANIFEST.to_owned(),
+    ]);
+    args
+}
+
+pub(crate) fn read_manifest_args(empty_hooks_dir: &Path, rev: &str) -> Vec<String> {
+    let mut args = hardening_args(empty_hooks_dir);
+    args.extend(["show".to_owned(), format!("{rev}:{PLUGIN_MANIFEST}")]);
     args
 }
 
@@ -276,6 +295,11 @@ mod tests {
         assert!(hooks_flag_present(&fetch_args(&hooks())));
         assert!(hooks_flag_present(&checkout_args(&hooks(), "main")));
         assert!(hooks_flag_present(&rev_parse_args(&hooks(), "HEAD")));
+        assert!(hooks_flag_present(&manifest_exists_args(
+            &hooks(),
+            "abc123"
+        )));
+        assert!(hooks_flag_present(&read_manifest_args(&hooks(), "abc123")));
     }
 
     /// The flags have to come before the subcommand, or git treats them as
@@ -301,6 +325,16 @@ mod tests {
         let args = checkout_args(&hooks(), "abc123");
         assert!(args.iter().any(|a| a == "--detach"));
         assert_eq!(args.last().unwrap(), "abc123");
+    }
+
+    #[test]
+    fn manifest_lookup_uses_a_fixed_path_after_the_option_terminator() {
+        let args = manifest_exists_args(&hooks(), "abc123");
+        assert_eq!(&args[args.len() - 3..], ["abc123", "--", PLUGIN_MANIFEST]);
+        assert_eq!(
+            read_manifest_args(&hooks(), "abc123").last().unwrap(),
+            "abc123:plugin.toml"
+        );
     }
 
     /// A source is a positional argument, so it must sit after `--`. Without

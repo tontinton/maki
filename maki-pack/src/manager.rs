@@ -62,6 +62,8 @@ pub struct PreparedUpdate {
     spec: Spec,
     pub old_rev: String,
     pub new_rev: String,
+    pub old_manifest: Option<String>,
+    pub new_manifest: Option<String>,
     pub changed: bool,
 }
 
@@ -293,20 +295,35 @@ impl Manager {
             });
         }
 
+        let _guard = Lock::acquire(&paths::package_lock(&self.site, &spec.name))?;
+        let hooks = self.hooks_dir()?;
+        // Restoring already knows the commit it wants, so a clone that still has
+        // it can skip the fetch. Resolving `version` always needs fresh refs.
+        let want = if restore_lockfile {
+            Want::Commit(&current.rev)
+        } else {
+            Want::Ref
+        };
+        let work = self.ensure_work(&hooks, spec, want).await?;
         let new_rev = if restore_lockfile {
             current.rev.clone()
         } else {
-            let _guard = Lock::acquire(&paths::package_lock(&self.site, &spec.name))?;
-            let hooks = self.hooks_dir()?;
-            let work = self.ensure_work(&hooks, spec, Want::Ref).await?;
             self.resolve_revision(&hooks, &work, spec).await?
         };
         if !revision_is_safe_component(&new_rev) {
             return Err(ManagerError::UnsafeRevision { rev: new_rev });
         }
+        let old_manifest = Self::read_manifest(&hooks, &work, &current.rev).await?;
+        let new_manifest = if current.rev == new_rev {
+            old_manifest.clone()
+        } else {
+            Self::read_manifest(&hooks, &work, &new_rev).await?
+        };
         Ok(PreparedUpdate {
             spec: spec.clone(),
             old_rev: current.rev.clone(),
+            old_manifest,
+            new_manifest,
             changed: current.rev != new_rev
                 || !paths::revision_dir(&self.site, &spec.name, &new_rev).is_dir(),
             new_rev,
@@ -540,6 +557,25 @@ impl Manager {
             }
         }
         Err(last.expect("at least one candidate is always tried").into())
+    }
+
+    async fn read_manifest(
+        hooks: &Path,
+        work: &Path,
+        revision: &str,
+    ) -> Result<Option<String>, ManagerError> {
+        let found = git::run(
+            git::manifest_exists_args(hooks, revision),
+            work.to_path_buf(),
+        )
+        .await?;
+        if found.stdout.trim().is_empty() {
+            return Ok(None);
+        }
+        git::run(git::read_manifest_args(hooks, revision), work.to_path_buf())
+            .await
+            .map(|output| Some(output.stdout))
+            .map_err(Into::into)
     }
 
     /// Builds the revision directory. It is written under a temporary name and
@@ -833,12 +869,13 @@ mod tests {
 
     fn commit_later_revision(origin: &Path) {
         fs::write(origin.join("plugin").join("later.lua"), "-- later\n").unwrap();
-        for args in [vec!["add", "."], vec!["commit", "--quiet", "-m", "later"]] {
-            smol::block_on(git::run(
-                args.into_iter().map(str::to_owned).collect(),
-                origin.to_path_buf(),
-            ))
-            .unwrap();
+        commit_changes(origin, "later");
+    }
+
+    fn commit_changes(origin: &Path, message: &str) {
+        for args in [vec!["add", "."], vec!["commit", "--quiet", "-m", message]] {
+            let args = args.into_iter().map(str::to_owned).collect();
+            smol::block_on(git::run(args, origin.to_path_buf())).unwrap();
         }
     }
 
@@ -1286,12 +1323,18 @@ mod tests {
         let _live =
             Lock::acquire_shared(&paths::revision_lock(&site_dir, "demo", &first.rev)).unwrap();
 
+        fs::write(origin.join("plugin.toml"), "[permissions]\nnet = true\n").unwrap();
         commit_later_revision(&origin);
 
         let before = lock.clone();
         let prepared = smol::block_on(manager.prepare_update(&spec, &lock, false)).unwrap();
         assert!(prepared.changed);
         assert_ne!(prepared.old_rev, prepared.new_rev);
+        assert!(prepared.old_manifest.is_none());
+        assert_eq!(
+            prepared.new_manifest.as_deref(),
+            Some("[permissions]\nnet = true\n")
+        );
         assert_eq!(
             lock, before,
             "review preparation must not move the lockfile"
@@ -1305,6 +1348,49 @@ mod tests {
         assert_eq!(updated.rev, prepared.new_rev);
         assert!(updated.dir.join("plugin").join("later.lua").is_file());
         assert_eq!(lock.get("demo").unwrap().rev, prepared.new_rev);
+    }
+
+    #[test]
+    fn lockfile_restore_reads_the_manifest_from_a_new_work_clone() {
+        let dir = site();
+        let origin = origin_repo(dir.path(), None);
+        let manifest = "[permissions]\nrun = true\n";
+        fs::write(origin.join("plugin.toml"), manifest).unwrap();
+        commit_changes(&origin, "manifest");
+
+        let site_dir = dir.path().join("site");
+        let manager = Manager::new(&site_dir);
+        let mut lock = Lockfile::default();
+        let spec = Spec::new(origin.display().to_string()).with_name("demo");
+        let installed = smol::block_on(manager.ensure_installed(&spec, &mut lock)).unwrap();
+        fs::remove_dir_all(&installed.dir).unwrap();
+        fs::remove_dir_all(paths::package_root(&site_dir, "demo").join(".work")).unwrap();
+        let before = lock.clone();
+
+        let prepared = smol::block_on(manager.prepare_update(&spec, &lock, true)).unwrap();
+
+        assert_eq!(prepared.old_manifest.as_deref(), Some(manifest));
+        assert_eq!(prepared.new_manifest.as_deref(), Some(manifest));
+        assert_eq!(lock, before);
+        assert!(!installed.dir.exists());
+    }
+
+    #[test]
+    fn lockfile_restore_rejects_a_missing_commit_object() {
+        let dir = site();
+        let origin = origin_repo(dir.path(), None);
+        let site_dir = dir.path().join("site");
+        let manager = Manager::new(&site_dir);
+        let spec = Spec::new(origin.display().to_string()).with_name("demo");
+        let mut lock = Lockfile::default();
+        lock.record("demo", &spec.src, TEST_REV);
+        let before = lock.clone();
+
+        let result = smol::block_on(manager.prepare_update(&spec, &lock, true));
+
+        assert!(matches!(result, Err(ManagerError::Git(_))));
+        assert_eq!(lock, before);
+        assert!(!paths::revision_dir(&site_dir, "demo", TEST_REV).exists());
     }
 
     #[test]
