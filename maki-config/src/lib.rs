@@ -2457,6 +2457,38 @@ pub fn save_sandbox_profiles(cwd: &Path, names: &[String]) -> Result<(), String>
     Ok(())
 }
 
+/// Persist the extra host directories bind-mounted into the sandbox workspace
+/// under `agent.sandbox_extra_dirs`.
+pub fn save_sandbox_extra_dirs(cwd: &Path, dirs: &[String]) -> Result<(), String> {
+    let maki_dir = cwd.join(PROJECT_DIR);
+    let path = maki_dir.join("config.toml");
+    let content = if path.exists() {
+        std::fs::read_to_string(&path).map_err(|e| format!("cannot read .maki/config.toml: {e}"))?
+    } else {
+        String::new()
+    };
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| format!("failed to parse .maki/config.toml: {e}"))?;
+
+    let agent = doc
+        .entry("agent")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let agent_table = agent
+        .as_table_mut()
+        .ok_or_else(|| "agent section is not a table".to_string())?;
+    let mut dirs_array = toml_edit::Array::new();
+    for d in dirs {
+        dirs_array.push(d.as_str());
+    }
+    agent_table.insert("sandbox_extra_dirs", toml_edit::value(dirs_array));
+
+    std::fs::create_dir_all(&maki_dir).map_err(|e| format!("cannot create .maki dir: {e}"))?;
+    maki_storage::atomic_write(&path, doc.to_string().as_bytes())
+        .map_err(|e| format!("cannot write .maki/config.toml: {e}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2550,6 +2582,28 @@ mod tests {
     fn notifications_reject_unknown_value() {
         let result: Result<RawConfig, _> = toml::from_str("[ui]\nnotifications = \"desktop\"\n");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn save_sandbox_extra_dirs_writes_and_replaces() {
+        const FIRST: &str = "/home/user/src/something/whatever";
+        const SECOND: &str = "/home/user/data";
+
+        let dir = TempDir::new().unwrap();
+        save_sandbox_extra_dirs(dir.path(), &[FIRST.into(), SECOND.into()]).unwrap();
+        let raw: RawConfig =
+            toml::from_str(&fs::read_to_string(dir.path().join(".maki/config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(
+            raw.agent.sandbox_extra_dirs,
+            Some(vec![FIRST.into(), SECOND.into()])
+        );
+
+        save_sandbox_extra_dirs(dir.path(), &[SECOND.into()]).unwrap();
+        let raw: RawConfig =
+            toml::from_str(&fs::read_to_string(dir.path().join(".maki/config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(raw.agent.sandbox_extra_dirs, Some(vec![SECOND.into()]));
     }
 
     #[test]

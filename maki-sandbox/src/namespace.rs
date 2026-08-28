@@ -599,10 +599,7 @@ fn setup_mounts_impl(config: &NamespaceConfig, has_mount_ns: bool) -> Result<(),
     bind_mount_rw(&config.workspace_dir, &ws_target)?;
 
     for (host_path, name) in &config.extra_workspace_dirs {
-        let target = format!(
-            "{staging}/home/maki/workspace/{}/{}",
-            config.workspace_name, name
-        );
+        let target = format!("{staging}/home/maki/workspace/{name}");
         bind_mount_rw(host_path, &target)?;
     }
 

@@ -60,6 +60,8 @@ pub(crate) enum SandboxModalEvent {
         command: String,
         result: Result<(String, bool), String>,
     },
+    /// Child respawn for a config change finished.
+    ReinitDone,
     /// Child respawn or setup failed.
     Failed(String),
 }
@@ -71,6 +73,7 @@ enum PendingJob {
     Browser,
     Navigate,
     Shell,
+    Reinit,
 }
 
 /// Snapshot of sandbox configuration for display.
@@ -186,6 +189,15 @@ fn parent_dir(path: &str) -> Option<String> {
         Some("/".into())
     } else {
         Some(result)
+    }
+}
+
+fn expand_home(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    match path {
+        "~" => home,
+        _ if path.starts_with("~/") => format!("{home}{}", &path[1..]),
+        _ => path.to_string(),
     }
 }
 
@@ -433,6 +445,85 @@ impl SandboxModal {
             .filter(|(_, enabled)| *enabled)
             .map(|(p, _)| p.name.clone())
             .collect()
+    }
+
+    /// Host paths of the currently configured extra workspace directories.
+    pub fn host_extra_dirs(&self) -> Vec<String> {
+        self.info
+            .extra_workspace_dirs
+            .iter()
+            .map(|(host, _)| host.clone())
+            .collect()
+    }
+
+    /// Add a host directory to bind-mount into the sandbox workspace at
+    /// `workspace/<leaf>`. Expands `~`, requires an existing directory, and
+    /// rejects mounts that would shadow the workspace or collide with another
+    /// host at the same target. Returns the in-sandbox directory name.
+    pub fn add_extra_dir(&mut self, host_path: &str) -> Result<String, String> {
+        let expanded = expand_home(host_path);
+        let path = PathBuf::from(&expanded);
+        if !path.is_dir() {
+            return Err(format!("not a directory: {expanded}"));
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve {expanded}: {e}"))?;
+        let canonical_str = canonical.to_string_lossy().into_owned();
+        let dir_name = canonical
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or_else(|| format!("cannot take directory name from {canonical_str}"))?;
+
+        if self
+            .info
+            .extra_workspace_dirs
+            .iter()
+            .any(|(host, _)| host == &canonical_str)
+        {
+            return Ok(dir_name);
+        }
+        if dir_name == self.info.workspace_name {
+            return Err(format!(
+                "{dir_name} would shadow the sandbox workspace directory"
+            ));
+        }
+        if let Some((existing, _)) = self
+            .info
+            .extra_workspace_dirs
+            .iter()
+            .find(|(_, name)| name == &dir_name)
+        {
+            return Err(format!(
+                "a directory is already mounted at workspace/{dir_name} from {existing}"
+            ));
+        }
+        self.info
+            .extra_workspace_dirs
+            .push((canonical_str, dir_name.clone()));
+        Ok(dir_name)
+    }
+
+    /// Respawn the sandbox child with the current config on a blocking thread
+    /// so an extra workspace directory takes effect immediately.
+    pub fn reinit_sandbox(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        let (Some(tx), Some(sandbox)) = (self.event_tx.clone(), self.sandbox.clone()) else {
+            return;
+        };
+        let config = self.build_spawn_config();
+        self.pending = Some(PendingJob::Reinit);
+        smol::unblock(move || {
+            if let Err(e) = sandbox.reinit(config) {
+                tracing::error!(error = %e, "failed to reinit sandbox");
+                let _ = tx.send(SandboxModalEvent::Failed(e.to_string()));
+            } else {
+                let _ = tx.send(SandboxModalEvent::ReinitDone);
+            }
+        })
+        .detach();
     }
 
     /// Whether the sandbox is currently enabled.
@@ -755,6 +846,11 @@ impl SandboxModal {
                 self.pending = None;
                 self.shell = Some(SandboxShellState::new(pwd));
                 self.spawn_error = None;
+            }
+            SandboxModalEvent::ReinitDone => {
+                if self.pending == Some(PendingJob::Reinit) {
+                    self.pending = None;
+                }
             }
             SandboxModalEvent::Failed(error) => {
                 self.pending = None;
@@ -1116,8 +1212,7 @@ impl SandboxModal {
                 t.keybind_section,
             )));
             for (host, name) in &info.extra_workspace_dirs {
-                let ws = &info.workspace_name;
-                let label = format!("    /home/maki/workspace/{ws}/{name}  ←  {host}");
+                let label = format!("    /home/maki/workspace/{name}  ←  {host}");
                 lines.push(Line::from(Span::styled(label, Style::default())));
             }
         }
@@ -1440,6 +1535,71 @@ mod tests {
             profiles: vec![],
             extra_workspace_dirs: vec![],
         }
+    }
+
+    #[test]
+    fn add_extra_dir_mounts_leaf_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("src").join("project").join("whatever");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut modal = SandboxModal::new(test_info(), None);
+        let name = modal.add_extra_dir(&project.to_string_lossy()).unwrap();
+        assert_eq!(name, "whatever");
+        assert_eq!(modal.host_extra_dirs(), vec![project.to_string_lossy()]);
+        assert_eq!(modal.info.extra_workspace_dirs[0].1, "whatever");
+    }
+
+    #[test]
+    fn add_extra_dir_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut modal = SandboxModal::new(test_info(), None);
+        modal.add_extra_dir(&tmp.path().to_string_lossy()).unwrap();
+        modal.add_extra_dir(&tmp.path().to_string_lossy()).unwrap();
+        assert_eq!(modal.host_extra_dirs().len(), 1);
+    }
+
+    #[test]
+    fn add_extra_dir_rejects_missing_path() {
+        let mut modal = SandboxModal::new(test_info(), None);
+        let err = modal
+            .add_extra_dir("/definitely/not/a/real/dir")
+            .unwrap_err();
+        assert!(err.contains("not a directory"), "got: {err}");
+    }
+
+    #[test]
+    fn add_extra_dir_rejects_colliding_leaf() {
+        let a = tempfile::TempDir::new().unwrap();
+        let b = tempfile::TempDir::new().unwrap();
+        let dir_a = a.path().join("shared");
+        let dir_b = b.path().join("shared");
+        std::fs::create_dir(&dir_a).unwrap();
+        std::fs::create_dir(&dir_b).unwrap();
+        let mut modal = SandboxModal::new(test_info(), None);
+        modal.add_extra_dir(&dir_a.to_string_lossy()).unwrap();
+        let err = modal.add_extra_dir(&dir_b.to_string_lossy()).unwrap_err();
+        assert!(
+            err.contains("already mounted at workspace/shared"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn add_extra_dir_rejects_shadowing_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shadow = tmp.path().join("tmp");
+        std::fs::create_dir(&shadow).unwrap();
+        let mut modal = SandboxModal::new(test_info(), None);
+        let err = modal.add_extra_dir(&shadow.to_string_lossy()).unwrap_err();
+        assert!(err.contains("would shadow"), "got: {err}");
+    }
+
+    #[test]
+    fn reinit_done_clears_pending() {
+        let mut modal = SandboxModal::new(test_info(), None);
+        modal.pending = Some(PendingJob::Reinit);
+        modal.apply(SandboxModalEvent::ReinitDone);
+        assert_eq!(modal.pending, None);
     }
 
     #[test_case(key_ev(KeyCode::Esc) ; "esc_closes")]

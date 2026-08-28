@@ -1508,6 +1508,8 @@ impl App {
                 self.sandbox_modal.toggle();
                 vec![]
             }
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            "/add-dir" => self.cmd_add_dir(&cmd.args),
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)
             }
@@ -1648,6 +1650,36 @@ impl App {
                 self.flash(format!("cd {}", path.display()))
             }
             Err(e) => self.flash(format!("cd: {e}")),
+        }
+        vec![]
+    }
+
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    fn cmd_add_dir(&mut self, args: &str) -> Vec<Action> {
+        let path = args.trim();
+        if path.is_empty() {
+            self.flash("Usage: /add-dir <host-directory>".into());
+            return vec![];
+        }
+        match self.sandbox_modal.add_extra_dir(path) {
+            Ok(name) => {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let dirs = self.sandbox_modal.host_extra_dirs();
+                if let Err(e) = maki_config::save_sandbox_extra_dirs(&cwd, &dirs) {
+                    self.status_bar
+                        .flash(format!("failed to save sandbox extra dirs: {e}"));
+                }
+                let msg = if self.sandbox_modal.is_enabled() {
+                    self.sandbox_modal.reinit_sandbox();
+                    format!("mounted {path} at /home/maki/workspace/{name}")
+                } else {
+                    format!(
+                        "saved {path}: mounts at /home/maki/workspace/{name} once the sandbox is enabled"
+                    )
+                };
+                self.flash(msg);
+            }
+            Err(e) => self.flash(e),
         }
         vec![]
     }
