@@ -709,7 +709,7 @@ impl PackCommand {
                 if lockfile {
                     return Err("/packdel: ++lockfile applies only to /packupdate".to_owned());
                 }
-                if all != names.is_empty() {
+                if (all && !names.is_empty()) || (!all && names.len() != 1) {
                     return Err("/packdel: name a package, or pass ++all".to_owned());
                 }
                 Ok(Self::Delete { names, all })
@@ -732,6 +732,9 @@ pub fn plan_command(
         .collect();
     match command {
         PackCommand::Update { names, options } => {
+            if names.len() > 1 {
+                return Err("/packupdate: name at most one package".to_owned());
+            }
             let names = if names.is_empty() {
                 declared_names
                     .iter()
@@ -739,7 +742,9 @@ pub fn plan_command(
                     .map(|name| (*name).to_owned())
                     .collect::<Vec<_>>()
             } else {
-                let name = &names[0];
+                let Some(name) = names.first() else {
+                    return Err("/packupdate: name a package".to_owned());
+                };
                 if !declared_names.contains(&name.as_str()) {
                     return Err(format!("{name}: not a package declared with maki.pack.add"));
                 }
@@ -761,13 +766,21 @@ pub fn plan_command(
         }
         PackCommand::Delete { names, all } => {
             let names = if *all {
+                if !names.is_empty() {
+                    return Err("/packdel: name a package, or pass ++all".to_owned());
+                }
                 installed
                     .iter()
                     .filter(|name| !declared_names.contains(&name.as_str()))
                     .cloned()
                     .collect::<Vec<_>>()
             } else {
-                let name = &names[0];
+                let Some(name) = names.first() else {
+                    return Err("/packdel: name a package, or pass ++all".to_owned());
+                };
+                if names.len() != 1 {
+                    return Err("/packdel: name one package".to_owned());
+                }
                 if !installed.contains(name) {
                     return Err(format!("{name}: not an installed package"));
                 }
@@ -815,14 +828,13 @@ pub fn apply_pack_ops(
             return report;
         }
     };
-    let approval_path = approvals_path();
     apply_pack_ops_at(
         ops,
         declared,
         active,
         &site,
         &lock_path,
-        approval_path.as_deref(),
+        interaction.can_confirm(),
         |prompt| interaction.review(prompt),
     )
 }
@@ -833,7 +845,7 @@ fn apply_pack_ops_at(
     active: &BTreeSet<String>,
     site: &Path,
     lock_path: &Path,
-    approval_path: Option<&Path>,
+    review_available: bool,
     review_updates: impl FnOnce(&str) -> ReviewDecision,
 ) -> PackReport {
     use crate::api::pack::{PackOp, UpdateTarget};
@@ -856,9 +868,11 @@ fn apply_pack_ops_at(
         }
     };
     let manager = maki_pack::manager::Manager::new(site);
+    let approval_path = site.join("pack-approvals.json");
     let manual_names = discover(site).known_names();
     let mut prepared = BTreeMap::new();
     let mut review = Vec::new();
+    let mut approvals = None;
 
     for (index, op) in ops.iter().enumerate() {
         let PackOp::Update { name, options } = op else {
@@ -880,6 +894,30 @@ fn apply_pack_ops_at(
             ));
             continue;
         };
+        let approved = if options.force {
+            None
+        } else {
+            if !review_available {
+                report
+                    .failures
+                    .push(format!("{name}: {UPDATE_REVIEW_UNAVAILABLE}"));
+                continue;
+            }
+            let store =
+                approvals.get_or_insert_with(|| try_read_approvals_at(Some(&approval_path)));
+            let Some(store) = store else {
+                report.failures.push(format!(
+                    "{name}: the pack approval store is unreadable, so the update cannot be reviewed"
+                ));
+                continue;
+            };
+            Some(
+                store
+                    .get(&maki_pack::approvals::ApprovalKey::new(name, &spec.src))
+                    .unwrap_or(&[])
+                    .to_vec(),
+            )
+        };
         let proposal = match smol::block_on(manager.prepare_update(
             spec,
             &lock,
@@ -893,8 +931,8 @@ fn apply_pack_ops_at(
                 continue;
             }
         };
-        let permission_diff = match update_permission_diff(name, &proposal) {
-            Ok(diff) => diff,
+        let requested = match proposed_permissions(name, &proposal) {
+            Ok(requested) => requested,
             Err(error) => {
                 report
                     .failures
@@ -903,8 +941,23 @@ fn apply_pack_ops_at(
             }
         };
         if proposal.changed && !options.force {
+            let Some(approved) = approved.as_deref() else {
+                report
+                    .failures
+                    .push(format!("{name}: the update review baseline is unavailable"));
+                continue;
+            };
+            let permission_diff = update_permission_diff(&requested, approved);
+            let previous = if matches!(
+                proposal.old_manifest,
+                maki_pack::manager::PreviousManifest::Unavailable
+            ) {
+                "\n  previous manifest unavailable"
+            } else {
+                ""
+            };
             review.push(format!(
-                "{name}: {} -> {}\n  permissions: {permission_diff}",
+                "{name}: {} -> {}\n  permissions: {permission_diff}{previous}",
                 short_revision(&proposal.old_rev),
                 short_revision(&proposal.new_rev)
             ));
@@ -969,7 +1022,7 @@ fn apply_pack_ops_at(
                 match manager.remove(name, &mut lock) {
                     Ok(()) => {
                         report.removed.push(name.clone());
-                        if !revoke_approval(name, approval_path) {
+                        if !revoke_approval(name, Some(&approval_path)) {
                             report.failures.push(format!(
                                 "{name}: removed, but its approval could not be revoked"
                             ));
@@ -1001,18 +1054,25 @@ fn short_revision(revision: &str) -> &str {
     revision.get(..REVIEW_REVISION_LEN).unwrap_or(revision)
 }
 
-fn update_permission_diff(
+fn proposed_permissions(
     name: &str,
     update: &maki_pack::manager::PreparedUpdate,
-) -> Result<String, PluginError> {
-    let old_path = PathBuf::from(format!("{name}@{}", update.old_rev)).join(PLUGIN_MANIFEST);
+) -> Result<crate::plugin_permissions::Requested, PluginError> {
     let new_path = PathBuf::from(format!("{name}@{}", update.new_rev)).join(PLUGIN_MANIFEST);
-    let old = requested_permissions_from_text(update.old_manifest.as_deref(), &old_path)?;
-    let new = requested_permissions_from_text(update.new_manifest.as_deref(), &new_path)?;
+    requested_permissions_from_text(update.new_manifest.as_deref(), &new_path)
+}
+
+fn update_permission_diff(
+    requested: &crate::plugin_permissions::Requested,
+    approved: &[String],
+) -> String {
     let mut additions = Vec::new();
     let mut removals = Vec::new();
-    for &permission in Permission::ALL {
-        match (old.is_requested(permission), new.is_requested(permission)) {
+    for permission in Permission::ALL {
+        let approved = approved
+            .iter()
+            .any(|name| name == permission.manifest_key());
+        match (approved, requested.is_requested(*permission)) {
             (false, true) => additions.push(format!("+{permission}")),
             (true, false) => removals.push(format!("-{permission}")),
             _ => {}
@@ -1020,9 +1080,9 @@ fn update_permission_diff(
     }
     additions.extend(removals);
     if additions.is_empty() {
-        Ok("unchanged".to_owned())
+        "unchanged".to_owned()
     } else {
-        Ok(additions.join(", "))
+        additions.join(", ")
     }
 }
 
@@ -1306,7 +1366,8 @@ mod tests {
         OWNER_CONFLICT_FAILURE, Origin, PLUGIN_MANIFEST, Problem, REVIEW_REVISION_LEN,
         ReviewDecision, UPDATE_REVIEW_DECLINED, UPDATE_REVIEW_UNAVAILABLE, apply_pack_ops_at,
         discover, granted, installed_from_declared_source, missing_permissions,
-        read_approvals_file, read_lockfile, resolved_on_disk, sanitize_message, write_lockfile,
+        read_approvals_file, read_lockfile, resolved_on_disk, sanitize_message, write_approvals_at,
+        write_lockfile,
     };
 
     const TEST_REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1824,6 +1885,16 @@ mod tests {
         }
     }
 
+    fn approve(fixture: &UpdateFixture, names: &[&str]) {
+        let path = fixture.site.join("pack-approvals.json");
+        let mut approvals = maki_pack::approvals::Approvals::default();
+        approvals.approve(
+            &maki_pack::approvals::ApprovalKey::new("demo", &fixture.declared[0].spec.src),
+            names.iter().map(|name| (*name).to_owned()).collect(),
+        );
+        assert!(write_approvals_at(Some(&path), &approvals));
+    }
+
     #[test]
     fn accepted_update_review_applies_the_prepared_revision() {
         let fixture = update_fixture();
@@ -1834,7 +1905,7 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
-            None,
+            true,
             |value| {
                 prompt = value.to_owned();
                 ReviewDecision::Accepted
@@ -1860,29 +1931,48 @@ mod tests {
     }
 
     #[test_case(
+        &[],
         None,
         Some("[permissions]\nnet = true\n"),
         "+net";
         "added_permission"
     )]
     #[test_case(
+        &["fs_write"],
         Some("[permissions]\nfs_write = true\n"),
         Some("[permissions]\nnet = true\n"),
         "+net, -fs_write";
         "added_and_removed_permissions"
     )]
     #[test_case(
+        &["run"],
         Some("[permissions]\nrun = true\n"),
         None,
         "-run";
         "removed_permission"
     )]
+    #[test_case(
+        &["net", "run"],
+        Some("[permissions]\nnet = true\n"),
+        Some("[permissions]\nnet = true\nrun = true\n"),
+        "unchanged";
+        "new_request_was_already_approved"
+    )]
+    #[test_case(
+        &["net"],
+        Some("[permissions]\nnet = true\nrun = true\n"),
+        Some("[permissions]\nnet = true\nrun = true\n"),
+        "+run";
+        "unchanged_manifest_still_needs_missing_approval"
+    )]
     fn update_review_shows_permission_changes(
+        approved: &[&str],
         old_manifest: Option<&str>,
         new_manifest: Option<&str>,
         expected: &str,
     ) {
         let fixture = update_fixture_with_manifests(old_manifest, new_manifest);
+        approve(&fixture, approved);
         let mut prompt = String::new();
 
         let report = apply_pack_ops_at(
@@ -1891,7 +1981,7 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
-            None,
+            true,
             |value| {
                 prompt = value.to_owned();
                 ReviewDecision::Accepted
@@ -1902,22 +1992,17 @@ mod tests {
         assert!(prompt.contains(&format!("permissions: {expected}")));
     }
 
-    #[test_case(Some("permissions = ["), None, false; "invalid_current_manifest")]
-    #[test_case(None, Some("permissions = ["), true; "invalid_proposed_manifest_with_force")]
-    fn invalid_update_manifest_prevents_apply(
-        old_manifest: Option<&str>,
-        new_manifest: Option<&str>,
-        force: bool,
-    ) {
-        let fixture = update_fixture_with_manifests(old_manifest, new_manifest);
+    #[test]
+    fn invalid_proposed_manifest_prevents_forced_apply() {
+        let fixture = update_fixture_with_manifests(None, Some("permissions = ["));
 
         let report = apply_pack_ops_at(
-            &[update_operation(force)],
+            &[update_operation(true)],
             &fixture.declared,
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
-            None,
+            true,
             |_| panic!("an invalid manifest must not reach review"),
         );
 
@@ -1936,6 +2021,60 @@ mod tests {
     }
 
     #[test]
+    fn invalid_previous_manifest_is_display_only() {
+        let fixture = update_fixture_with_manifests(
+            Some("permissions = ["),
+            Some("[permissions]\nnet = true\n"),
+        );
+        let mut prompt = String::new();
+
+        let report = apply_pack_ops_at(
+            &[update_operation(false)],
+            &fixture.declared,
+            &Default::default(),
+            &fixture.site,
+            &fixture.lock_path,
+            true,
+            |value| {
+                prompt = value.to_owned();
+                ReviewDecision::Accepted
+            },
+        );
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(prompt.contains("permissions: +net"));
+    }
+
+    #[test]
+    fn unavailable_previous_manifest_is_reported_in_review() {
+        let fixture = update_fixture_with_manifests(
+            Some("[permissions]\nrun = true\n"),
+            Some("[permissions]\nnet = true\n"),
+        );
+        let mut lock = read_lockfile(Some(&fixture.lock_path)).unwrap();
+        lock.record("demo", &fixture.declared[0].spec.src, TEST_REV);
+        assert!(write_lockfile(&fixture.lock_path, &lock));
+        let mut prompt = String::new();
+
+        let report = apply_pack_ops_at(
+            &[update_operation(false)],
+            &fixture.declared,
+            &Default::default(),
+            &fixture.site,
+            &fixture.lock_path,
+            true,
+            |value| {
+                prompt = value.to_owned();
+                ReviewDecision::Accepted
+            },
+        );
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(prompt.contains("previous manifest unavailable"));
+        assert!(prompt.contains("permissions: +net"));
+    }
+
+    #[test]
     fn declined_update_review_changes_no_managed_state() {
         let fixture = update_fixture();
         let report = apply_pack_ops_at(
@@ -1944,7 +2083,7 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
-            None,
+            true,
             |_| ReviewDecision::Declined,
         );
 
@@ -1967,14 +2106,14 @@ mod tests {
     #[test]
     fn forced_update_skips_review_and_applies_the_revision() {
         let fixture = update_fixture();
-        let approvals = fixture.lock_path.with_file_name("pack-approvals.json");
+        let approvals = fixture.site.join("pack-approvals.json");
         let report = apply_pack_ops_at(
             &[update_operation(true)],
             &fixture.declared,
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
-            Some(&approvals),
+            true,
             |_| panic!("forced updates must not ask for review"),
         );
 
@@ -1987,16 +2126,21 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_update_review_requires_force_and_changes_nothing() {
+    fn unavailable_update_review_stops_before_git_and_changes_nothing() {
         let fixture = update_fixture();
+        let work = maki_pack::paths::package_root(&fixture.site, "demo").join(".work");
+        let before = run_git(&work, &["rev-parse", "refs/remotes/origin/HEAD"])
+            .stdout
+            .trim()
+            .to_owned();
         let report = apply_pack_ops_at(
             &[update_operation(false)],
             &fixture.declared,
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
-            None,
-            |_| ReviewDecision::Unavailable,
+            false,
+            |_| panic!("an unavailable review must be rejected before preparation"),
         );
 
         assert!(report.updated.is_empty());
@@ -2013,6 +2157,43 @@ mod tests {
                 .rev,
             fixture.old_rev
         );
+        let after = run_git(&work, &["rev-parse", "refs/remotes/origin/HEAD"])
+            .stdout
+            .trim()
+            .to_owned();
+        assert_eq!(before, after, "the work clone must not fetch");
+    }
+
+    #[test]
+    fn unreadable_approval_store_stops_before_git() {
+        let fixture = update_fixture();
+        let approval_path = fixture.site.join("pack-approvals.json");
+        fs::create_dir_all(&fixture.site).unwrap();
+        fs::write(&approval_path, "not json").unwrap();
+        let work = maki_pack::paths::package_root(&fixture.site, "demo").join(".work");
+        let before = run_git(&work, &["rev-parse", "refs/remotes/origin/HEAD"])
+            .stdout
+            .trim()
+            .to_owned();
+
+        let report = apply_pack_ops_at(
+            &[update_operation(false)],
+            &fixture.declared,
+            &Default::default(),
+            &fixture.site,
+            &fixture.lock_path,
+            true,
+            |_| panic!("an unreadable approval store cannot reach review"),
+        );
+
+        assert!(report.updated.is_empty());
+        assert_eq!(report.failures.len(), 1);
+        assert!(report.failures[0].contains("approval store is unreadable"));
+        let after = run_git(&work, &["rev-parse", "refs/remotes/origin/HEAD"])
+            .stdout
+            .trim()
+            .to_owned();
+        assert_eq!(before, after, "the work clone must not fetch");
     }
 
     #[test]
@@ -2036,15 +2217,9 @@ mod tests {
             },
         ];
 
-        let report = apply_pack_ops_at(
-            &operations,
-            &[],
-            &active,
-            &site,
-            &lock_path,
-            Some(&temp.path().join("approvals.json")),
-            |_| panic!("deletion does not use update review"),
-        );
+        let report = apply_pack_ops_at(&operations, &[], &active, &site, &lock_path, true, |_| {
+            panic!("deletion does not use update review")
+        });
 
         assert_eq!(report.removed, vec!["inactive"]);
         assert_eq!(
@@ -2079,7 +2254,7 @@ mod tests {
                 &Default::default(),
                 &site,
                 &lock_path,
-                None,
+                true,
                 |_| panic!("owner conflicts do not use update review"),
             );
 
@@ -2108,7 +2283,7 @@ mod tests {
             &Default::default(),
             &site,
             &lock_path,
-            None,
+            true,
             |_| panic!("deletion does not use update review"),
         );
 
@@ -2140,6 +2315,7 @@ mod tests {
         );
         assert!(super::PackCommand::parse("/packupdate", "++offline", false).is_err());
         assert!(super::PackCommand::parse("/packdel", "demo", true).is_err());
+        assert!(super::PackCommand::parse("/packdel", "one two", false).is_err());
     }
 
     #[test]
@@ -2172,5 +2348,26 @@ mod tests {
                 name: "orphan".to_owned(),
             }]
         );
+
+        for invalid in [
+            super::PackCommand::Delete {
+                names: vec![],
+                all: false,
+            },
+            super::PackCommand::Delete {
+                names: vec!["orphan".to_owned(), "other".to_owned()],
+                all: false,
+            },
+            super::PackCommand::Delete {
+                names: vec!["orphan".to_owned()],
+                all: true,
+            },
+            super::PackCommand::Update {
+                names: vec!["alpha".to_owned(), "missing".to_owned()],
+                options: crate::api::pack::UpdateOptions::default(),
+            },
+        ] {
+            assert!(super::plan_command(&invalid, &declared, &installed).is_err());
+        }
     }
 }

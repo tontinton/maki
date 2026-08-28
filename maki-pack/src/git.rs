@@ -137,10 +137,17 @@ pub(crate) fn manifest_exists_args(empty_hooks_dir: &Path, rev: &str) -> Vec<Str
     args
 }
 
-pub(crate) fn read_manifest_args(empty_hooks_dir: &Path, rev: &str) -> Vec<String> {
+pub(crate) fn read_manifest_args(empty_hooks_dir: &Path, rev: &str) -> Option<Vec<String>> {
+    if !revision_is_safe(rev) {
+        return None;
+    }
     let mut args = hardening_args(empty_hooks_dir);
-    args.extend(["show".to_owned(), format!("{rev}:{PLUGIN_MANIFEST}")]);
-    args
+    args.extend([
+        "show".to_owned(),
+        format!("{rev}:{PLUGIN_MANIFEST}"),
+        "--".to_owned(),
+    ]);
+    Some(args)
 }
 
 /// Environment every invocation runs with. Disabling the terminal prompt makes
@@ -299,7 +306,9 @@ mod tests {
             &hooks(),
             "abc123"
         )));
-        assert!(hooks_flag_present(&read_manifest_args(&hooks(), "abc123")));
+        assert!(hooks_flag_present(
+            &read_manifest_args(&hooks(), "abc123").unwrap()
+        ));
     }
 
     /// The flags have to come before the subcommand, or git treats them as
@@ -331,10 +340,9 @@ mod tests {
     fn manifest_lookup_uses_a_fixed_path_after_the_option_terminator() {
         let args = manifest_exists_args(&hooks(), "abc123");
         assert_eq!(&args[args.len() - 3..], ["abc123", "--", PLUGIN_MANIFEST]);
-        assert_eq!(
-            read_manifest_args(&hooks(), "abc123").last().unwrap(),
-            "abc123:plugin.toml"
-        );
+        let read = read_manifest_args(&hooks(), "abc123").unwrap();
+        assert_eq!(&read[read.len() - 2..], ["abc123:plugin.toml", "--"]);
+        assert!(read_manifest_args(&hooks(), "--format=evil").is_none());
     }
 
     /// A source is a positional argument, so it must sit after `--`. Without

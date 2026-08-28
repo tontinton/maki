@@ -36,11 +36,14 @@ pub fn package_lock(site: &Path, name: &str) -> PathBuf {
 
 /// Stable sidecar lock for one immutable revision directory.
 pub fn revision_lock(site: &Path, name: &str, revision: &str) -> PathBuf {
+    revision_lock_dir(site, name).join(format!("{revision}.lock"))
+}
+
+pub fn revision_lock_dir(site: &Path, name: &str) -> PathBuf {
     site.join("pack")
         .join(MANAGED_GROUP)
         .join(".locks")
         .join(name)
-        .join(format!("{revision}.lock"))
 }
 
 /// Sidecar lock for a shared file, held across its whole read-modify-write.

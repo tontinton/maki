@@ -105,11 +105,11 @@ still declares. Pass one package name to update only that package:
 /packupdate maki-review
 ```
 
-Maki fetches the source and shows the old and proposed commits with requested
-permission additions and removals before it changes `pack-lock.json`.
-Declining the review changes no installed revision. Use `/packupdate!` to skip
-the update review. It does not approve new permissions. Maki asks for that
-approval separately when it loads the updated package.
+Maki fetches the source and shows the old and proposed commits. It compares the
+proposed permission request with the permissions already approved for that
+package and source. Declining the review changes no installed revision. Use
+`/packupdate!` to skip the update review. It does not approve new permissions.
+Maki asks for that approval separately when it loads the updated package.
 
 Pass `++lockfile` to restore the commit already recorded in the lockfile
 instead of resolving the declared version:
@@ -118,18 +118,7 @@ instead of resolving the declared version:
 /packupdate ++lockfile maki-review
 ```
 
-The global `init.lua` can queue the same operations in Lua. Project config and
-packages cannot update global package state.
-
-```lua
-maki.pack.update({ "maki-review" })
-maki.pack.update({ "maki-review" }, {
-  force = true,
-  target = "lockfile",
-})
-```
-
-`force = true` has the same review-bypass behavior as `/packupdate!`.
+Project config and packages cannot update global package state.
 
 ## Remove packages
 
@@ -143,12 +132,6 @@ Then remove the inactive package:
 `/packdel ++all` removes every installed package that is no longer declared.
 Maki refuses a package that is active in this process or another Maki process.
 It removes the package approval only after the package files can be removed.
-
-The global `init.lua` can also queue deletion:
-
-```lua
-maki.pack.del({ "maki-review" })
-```
 
 There is no force option for deletion.
 
