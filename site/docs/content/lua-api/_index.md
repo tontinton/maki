@@ -670,7 +670,8 @@ gone: `maki.fn` roundtrips fail right away. Write state out with
 `maki.fs` instead.
 
 Jobs started inside a callback die with the dispatch unless you await
-them there (`jobwait`) or hand them to a session (`owner = "session"`).
+them there (`jobwait`) or hand them to a session
+(`scope = { session = ... }`).
 
 **Parameters:**
 
@@ -1599,15 +1600,10 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `on_stdout` (`function?`) called with `(job_id, line)` for each stdout line.
   - `on_stderr` (`function?`) called with `(job_id, line)` for each stderr line.
   - `on_exit` (`function?`) called with `(job_id, code)` when the process finishes.
-  - `owner` (`string?`) job lifetime. `"task"` (default) ends the job with
-    the current call. `"plugin"` keeps it alive until the plugin unloads
-    or reloads. `"session"` keeps it alive until that session ends, and
-    survives plugin reload; requires `session`.
-  - `session` (`string?`) session id. Required when `owner = "session"`.
-  - `notify` (`boolean|table?`) when the process exits, post a mailbox
-    observation to `session`. `true` uses `{ wake = true, on_success = true }`.
-    A table accepts `wake` (boolean, default true) and `on_success`
-    (boolean, default true). Only valid with `owner = "session"`.
+  - `scope` (`string|table?`) job lifetime. `"task"` (default) ends the job
+    with the current call. `"plugin"` keeps it alive until the plugin
+    unloads or reloads. `{ session = "<id>" }` keeps it alive until that
+    session ends, and survives plugin reload.
   - `tail` (`integer?`) trailing lines per stream kept for `jobinfo`
     (default 20, 0 disables, max 1024).
 

@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use maki_agent::SessionMailbox;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
@@ -24,6 +23,11 @@ const MAX_COMPLETED_SESSION_JOBS: usize = 256;
 const DEFAULT_WAIT_MS: u64 = 30_000;
 
 const READER_BUF_SIZE: usize = 8 * 1024;
+
+const NO_TASK_SCOPE_ERR: &str =
+    "jobstart: no active task; use scope = \"plugin\" or { session = ... }";
+const TABLE_SCOPE_ERR: &str = "jobstart: table scope must be { session = <id> }";
+const SCOPE_TYPE_ERR: &str = "jobstart: scope must be \"task\", \"plugin\", or { session = <id> }";
 
 #[derive(Clone)]
 pub(crate) enum JobEvent {
@@ -44,13 +48,6 @@ pub(crate) enum JobOwner {
     },
 }
 
-#[derive(Clone)]
-struct JobNotify {
-    session: MakiId,
-    wake: bool,
-    on_success: bool,
-}
-
 struct JobMeta {
     owner: JobOwner,
     command: String,
@@ -63,7 +60,6 @@ struct JobMeta {
     stdout_tail: VecDeque<String>,
     stderr_tail: VecDeque<String>,
     tail_cap: usize,
-    notify: Option<JobNotify>,
     exit_code: Option<i32>,
     /// Recorded at exit so elapsed time stops counting once the process is gone.
     elapsed_secs: Option<u64>,
@@ -223,7 +219,6 @@ impl JobStore {
                 stdout_tail: VecDeque::new(),
                 stderr_tail: VecDeque::new(),
                 tail_cap: DEFAULT_TAIL,
-                notify: None,
                 exit_code: None,
                 elapsed_secs: None,
             },
@@ -232,14 +227,12 @@ impl JobStore {
         Ok(id)
     }
 
-    fn configure(&mut self, id: u32, notify: Option<JobNotify>, tail: Option<usize>) {
-        let Some(job) = self.jobs.get_mut(&id) else {
-            return;
-        };
-        if let Some(cap) = tail {
+    fn set_tail(&mut self, id: u32, tail: Option<usize>) {
+        if let Some(job) = self.jobs.get_mut(&id)
+            && let Some(cap) = tail
+        {
             job.tail_cap = cap.min(MAX_TAIL_LINES);
         }
-        job.notify = notify;
     }
 
     pub fn is_empty(&self, owner: &JobOwner) -> bool {
@@ -332,14 +325,6 @@ impl JobStore {
             job.elapsed_secs = Some(job.started.elapsed().as_secs());
         }
         job.exit_code = Some(code);
-        if let Some(notify) = job.notify.clone()
-            && (code != 0 || notify.on_success)
-        {
-            let message = format!("[job {job_id}] \"{}\" exited with code {code}", job.command);
-            if let Err(e) = SessionMailbox::notify(notify.session, message, notify.wake) {
-                tracing::warn!(error = %e, job_id, "session job notify failed");
-            }
-        }
         if matches!(job.owner, JobOwner::Session { .. }) {
             drop_callbacks(lua, job);
             self.completed_order.push_back(job_id);
@@ -610,15 +595,10 @@ fn kill_job(meta: &mut JobMeta) {
 ///   `on_stdout` (function?) called with `(job_id, line)` for each stdout line.
 ///   `on_stderr` (function?) called with `(job_id, line)` for each stderr line.
 ///   `on_exit` (function?) called with `(job_id, code)` when the process finishes.
-///   `owner` (string?) job lifetime. `"task"` (default) ends the job with
-///     the current call. `"plugin"` keeps it alive until the plugin unloads
-///     or reloads. `"session"` keeps it alive until that session ends, and
-///     survives plugin reload; requires `session`.
-///   `session` (string?) session id. Required when `owner = "session"`.
-///   `notify` (boolean|table?) when the process exits, post a mailbox
-///     observation to `session`. `true` uses `{ wake = true, on_success = true }`.
-///     A table accepts `wake` (boolean, default true) and `on_success`
-///     (boolean, default true). Only valid with `owner = "session"`.
+///   `scope` (string|table?) job lifetime. `"task"` (default) ends the job
+///     with the current call. `"plugin"` keeps it alive until the plugin
+///     unloads or reloads. `{ session = "<id>" }` keeps it alive until that
+///     session ends, and survives plugin reload.
 ///   `tail` (integer?) trailing lines per stream kept for `jobinfo`
 ///     (default 20, 0 disables, max 1024).
 /// @return (integer) Job id.
@@ -635,41 +615,14 @@ fn jobstart(
     cmd: String,
     opts: Option<Table>,
 ) -> LuaResult<u32> {
-    let owner_name: Option<String> = opts
+    let scope = opts
         .as_ref()
-        .map(|opts| opts.get("owner"))
+        .map(|opts| opts.get::<Value>("scope"))
         .transpose()?
-        .flatten();
-    let session = opts
-        .as_ref()
-        .and_then(|opts| opts.get::<Option<String>>("session").ok().flatten());
-    let owner = match owner_name.as_deref() {
-        None | Some("task") => job_task_id(lua).map(JobOwner::Task).ok_or_else(|| {
-            mlua::Error::runtime("jobstart: no active task; use owner = \"plugin\" or \"session\"")
-        })?,
-        Some("plugin") => JobOwner::Plugin(Arc::clone(&plugin)),
-        Some("session") => {
-            let raw = session.as_deref().ok_or_else(|| {
-                mlua::Error::runtime("jobstart: owner = \"session\" requires session")
-            })?;
-            let session: MakiId =
-                raw.parse()
-                    .map_err(|e: maki_storage::id::MakiIdParseError| {
-                        mlua::Error::runtime(e.to_string())
-                    })?;
-            JobOwner::Session {
-                session,
-                plugin: Arc::clone(&plugin),
-            }
-        }
-        Some(other) => {
-            return Err(mlua::Error::runtime(format!(
-                "jobstart: unknown owner {other:?}; expected \"task\", \"plugin\", or \"session\""
-            )));
-        }
-    };
+        .unwrap_or(Value::Nil);
+    let owner = parse_scope(lua, &plugin, scope)?;
 
-    let (cwd, env, on_stdout, on_stderr, on_exit, notify, tail) = match opts {
+    let (cwd, env, on_stdout, on_stderr, on_exit, tail) = match opts {
         Some(ref opts) => {
             let cwd: Option<String> = opts.get("cwd").ok();
             let env: Option<HashMap<String, String>> = opts
@@ -691,7 +644,6 @@ fn jobstart(
                 .ok()
                 .map(|f| lua.create_registry_value(f))
                 .transpose()?;
-            let notify = parse_notify(opts, &owner)?;
             let tail: Option<usize> = opts.get("tail").ok();
             if let Some(n) = tail
                 && n > MAX_TAIL_LINES
@@ -700,47 +652,50 @@ fn jobstart(
                     "jobstart: tail must be in 0..={MAX_TAIL_LINES}"
                 )));
             }
-            (cwd, env, on_stdout, on_stderr, on_exit, notify, tail)
+            (cwd, env, on_stdout, on_stderr, on_exit, tail)
         }
-        None => (None, None, None, None, None, None, None),
+        None => (None, None, None, None, None, None),
     };
 
     with_jobs(lua, |store| {
         let id = store.start(owner, &cmd, cwd, env, on_stdout, on_stderr, on_exit)?;
-        store.configure(id, notify, tail);
+        store.set_tail(id, tail);
         Ok::<u32, String>(id)
     })
     .map_err(mlua::Error::runtime)
 }
 
-fn parse_notify(opts: &Table, owner: &JobOwner) -> LuaResult<Option<JobNotify>> {
-    let session = match owner {
-        JobOwner::Session { session, .. } => *session,
-        _ => {
-            if opts.contains_key("notify")? {
-                return Err(mlua::Error::runtime(
-                    "jobstart: notify requires owner = \"session\"",
-                ));
-            }
-            return Ok(None);
-        }
+fn parse_scope(lua: &Lua, plugin: &Arc<str>, scope: Value) -> LuaResult<JobOwner> {
+    let task_scope = || {
+        job_task_id(lua)
+            .map(JobOwner::Task)
+            .ok_or_else(|| mlua::Error::runtime(NO_TASK_SCOPE_ERR))
     };
-    match opts.get::<Value>("notify")? {
-        Value::Nil => Ok(None),
-        Value::Boolean(false) => Ok(None),
-        Value::Boolean(true) => Ok(Some(JobNotify {
-            session,
-            wake: true,
-            on_success: true,
-        })),
-        Value::Table(t) => Ok(Some(JobNotify {
-            session,
-            wake: t.get("wake").unwrap_or(true),
-            on_success: t.get("on_success").unwrap_or(true),
-        })),
-        _ => Err(mlua::Error::runtime(
-            "jobstart: notify must be a boolean or table",
-        )),
+    match scope {
+        Value::Nil => task_scope(),
+        Value::String(name) => match &*name.to_str()? {
+            "task" => task_scope(),
+            "plugin" => Ok(JobOwner::Plugin(Arc::clone(plugin))),
+            other => Err(mlua::Error::runtime(format!(
+                "jobstart: unknown scope {other:?}; expected \"task\", \"plugin\", or {{ session = ... }}"
+            ))),
+        },
+        Value::Table(scope) => {
+            let Value::String(raw) = scope.get::<Value>("session")? else {
+                return Err(mlua::Error::runtime(TABLE_SCOPE_ERR));
+            };
+            let session: MakiId =
+                raw.to_str()?
+                    .parse()
+                    .map_err(|e: maki_storage::id::MakiIdParseError| {
+                        mlua::Error::runtime(e.to_string())
+                    })?;
+            Ok(JobOwner::Session {
+                session,
+                plugin: Arc::clone(plugin),
+            })
+        }
+        _ => Err(mlua::Error::runtime(SCOPE_TYPE_ERR)),
     }
 }
 
@@ -1120,7 +1075,6 @@ mod tests {
             stdout_tail: VecDeque::new(),
             stderr_tail: VecDeque::new(),
             tail_cap: DEFAULT_TAIL,
-            notify: None,
             exit_code: None,
             elapsed_secs: None,
         }
@@ -1498,7 +1452,7 @@ mod tests {
     fn tail_cap_drops_oldest_lines() {
         let mut store = make_store();
         let id = start_echo(&mut store);
-        store.configure(id, None, Some(2));
+        store.set_tail(id, Some(2));
         store.record_event(id, &JobEvent::Stdout("a".into()));
         store.record_event(id, &JobEvent::Stdout("b".into()));
         store.record_event(id, &JobEvent::Stdout("c".into()));
@@ -1546,7 +1500,6 @@ mod tests {
     fn session_job_survives_plugin_detach_and_answers_after_exit() {
         let lua = Lua::new();
         let session = MakiId::generate();
-        let mailbox = SessionMailbox::register(session);
         let owner = JobOwner::Session {
             session,
             plugin: Arc::from(TEST_PLUGIN),
@@ -1563,15 +1516,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        store.configure(
-            id,
-            Some(JobNotify {
-                session,
-                wake: false,
-                on_success: true,
-            }),
-            Some(5),
-        );
+        store.set_tail(id, Some(5));
 
         store.detach_plugin_callbacks(&lua, TEST_PLUGIN);
         assert!(store.jobs.contains_key(&id), "detach must keep the job");
@@ -1594,13 +1539,6 @@ mod tests {
             snap.stderr_lines.iter().any(|l| l.contains("err")),
             "stderr tail: {:?}",
             snap.stderr_lines
-        );
-        let notes = mailbox.drain();
-        assert!(
-            notes.iter().any(|m| m
-                .user_text()
-                .is_some_and(|t| t.contains("exited with code 3"))),
-            "expected exit notify"
         );
 
         store.kill_session(&lua, session);

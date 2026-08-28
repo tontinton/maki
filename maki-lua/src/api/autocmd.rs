@@ -181,7 +181,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `maki.fs` instead.
 ///
 /// Jobs started inside a callback die with the dispatch unless you await
-/// them there (`jobwait`) or hand them to a session (`owner = "session"`).
+/// them there (`jobwait`) or hand them to a session
+/// (`scope = { session = ... }`).
 ///
 /// @param event string|string[] Event name or list of names.
 /// @param opts table Options:

@@ -2131,7 +2131,7 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function()
         local id = maki.fn.jobstart("sleep 0.1; printf plugin-output; exit 7", {{
-            owner = "plugin",
+            scope = "plugin",
             on_stdout = function(_, line) output = line end,
             on_exit = function(_, code) exit_code = tostring(code) end,
         }})
@@ -2177,7 +2177,7 @@ fn unloading_plugin_kills_its_jobs() {
     let pid_path = dir.path().join("job.pid");
     let src = format!(
         r#"maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{
-            owner = "plugin",
+            scope = "plugin",
         }})"#,
         pid_path.display()
     );
@@ -2228,7 +2228,7 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function()
         job_id = maki.fn.jobstart("printf 'hello-tail\n'; exec sleep 30", {{
-            owner = "plugin",
+            scope = "plugin",
             tail = 8,
         }})
         return tostring(job_id)
@@ -2308,8 +2308,7 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function()
         local id = maki.fn.jobstart("printf %s $$ > '{pid}'; exec sleep 30", {{
-            owner = "session",
-            session = "{sid}",
+            scope = {{ session = "{sid}" }},
         }})
         return tostring(id)
     end,
@@ -2396,8 +2395,7 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function()
         job_id = maki.fn.jobstart("printf %s $$ > '{pid}'; exec sleep 30", {{
-            owner = "session",
-            session = "{sid}",
+            scope = {{ session = "{sid}" }},
         }})
         return tostring(job_id)
     end,
@@ -2584,8 +2582,7 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function()
         job_id = maki.fn.jobstart("sleep 2", {{
-            owner = "session",
-            session = "{session}",
+            scope = {{ session = "{session}" }},
             on_exit = function(_, code)
                 local ok, res = pcall(maki.fs.atomic_write, "{}", tostring(code))
                 exit_cb_result = ok and "ok" or "{EXIT_CB_FAILED}:" .. tostring(res)
@@ -5634,8 +5631,7 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function()
         job_id = maki.fn.jobstart("sleep 1", {{
-            owner = "session",
-            session = "{session}",
+            scope = {{ session = "{session}" }},
             on_exit = function(id, code)
                 local ok, res = pcall(maki.fn.jobwait, id, 2000)
                 if not ok then
@@ -5703,8 +5699,7 @@ maki.api.register_tool({{
         -- a parked jobwait can run this callback. The marker is proof the
         -- wait is really parked, where a sleep would just be a guess.
         local id = maki.fn.jobstart("echo parked; exec sleep 30", {{
-            owner = "session",
-            session = "{session}",
+            scope = {{ session = "{session}" }},
             on_stdout = function() maki.fs.write("{parked}", "parked") end,
         }})
         local ok, res = pcall(maki.fn.jobwait, id, 25000)
@@ -5750,8 +5745,7 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function()
         job_id = maki.fn.jobstart("echo one; echo two; echo three", {{
-            owner = "session",
-            session = "{session}",
+            scope = {{ session = "{session}" }},
             on_stdout = function(_, line)
                 if line == "two" then
                     error("boom on stdout")
