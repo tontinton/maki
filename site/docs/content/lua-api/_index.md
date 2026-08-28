@@ -1790,6 +1790,45 @@ local jobs = maki.fn.joblist(maki.session.current())
 
 ---
 
+### `maki.fn.jobattach()` {#maki-fn-jobattach}
+
+```lua
+maki.fn.jobattach({job_id}, {opts})
+```
+
+Attach (or replace) callbacks on a job this plugin can see. This is how a
+plugin picks its jobs back up after a reload: unloading drops the Lua
+callbacks of its session-owned jobs, but the processes keep running.
+
+Keys absent from {opts} leave the current callback alone; pass `false` to
+clear one. Attaching `on_exit` to a job that already exited still fires it
+once, with the recorded exit code, so a reload racing the exit cannot lose
+it.
+
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{job_id}` (`integer`) Job id, e.g. from `joblist`.
+- `{opts}` (`table`) Callbacks to set: `on_stdout`, `on_stderr`, `on_exit`,
+
+  each a function or `false`.
+
+
+**Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+
+**Example:**
+
+```lua
+-- After a reload, re-arm the session job this plugin started.
+maki.fn.jobattach(id, {
+  on_stdout = function(_, line) maki.session.notify(line, { session = sid }) end,
+  on_exit = function(_, code) maki.session.notify("exit " .. code, { session = sid }) end,
+})
+```
+
+---
+
 ### `maki.fn.executable()` {#maki-fn-executable}
 
 ```lua
