@@ -745,30 +745,7 @@ impl App {
         #[cfg(all(feature = "sandbox", target_os = "linux"))]
         if self.sandbox_modal.is_open() {
             self.sandbox_modal.handle_key(key);
-            if self.sandbox_modal.take_enabled_changed() {
-                let enabled = self.sandbox_modal.is_enabled();
-                let cwd = std::env::current_dir().unwrap_or_else(|_| "..".into());
-                if let Err(e) = maki_config::save_sandbox_enabled(&cwd, enabled) {
-                    self.status_bar
-                        .flash(format!("failed to save sandbox setting: {e}"));
-                }
-            }
-            if self.sandbox_modal.take_profiles_changed() {
-                let names = self.sandbox_modal.enabled_profile_names();
-                let cwd = std::env::current_dir().unwrap_or_else(|_| "..".into());
-                if let Err(e) = maki_config::save_sandbox_profiles(&cwd, &names) {
-                    self.status_bar
-                        .flash(format!("failed to save sandbox profiles: {e}"));
-                }
-            }
-            if self.sandbox_modal.take_yolo_changed() {
-                let enabled = self.permissions.toggle_yolo();
-                self.flash(if enabled {
-                    "YOLO mode enabled".into()
-                } else {
-                    "YOLO mode disabled".into()
-                });
-            }
+            self.apply_sandbox_changes();
             return Some(vec![]);
         }
 
@@ -1682,6 +1659,35 @@ impl App {
             Err(e) => self.flash(e),
         }
         vec![]
+    }
+
+    /// Persist any sandbox modal toggles (enabled/profiles/YOLO) to config.
+    /// Called after key handling and after background modal events, so a
+    /// spawn completing on the event loop survives a restart too.
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    pub(crate) fn apply_sandbox_changes(&mut self) {
+        let changes = self.sandbox_modal.take_changes();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| "..".into());
+        if let Some(enabled) = changes.enabled
+            && let Err(e) = maki_config::save_sandbox_enabled(&cwd, enabled)
+        {
+            self.status_bar
+                .flash(format!("failed to save sandbox setting: {e}"));
+        }
+        if let Some(profiles) = &changes.profiles
+            && let Err(e) = maki_config::save_sandbox_profiles(&cwd, profiles)
+        {
+            self.status_bar
+                .flash(format!("failed to save sandbox profiles: {e}"));
+        }
+        if let Some(yolo) = changes.yolo {
+            self.permissions.set_session_yolo(Some(yolo));
+            self.flash(if yolo {
+                "YOLO mode enabled".into()
+            } else {
+                "YOLO mode disabled".into()
+            });
+        }
     }
 
     const OVERLAY_COUNT: usize = if cfg!(all(feature = "sandbox", target_os = "linux")) {

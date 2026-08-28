@@ -835,7 +835,11 @@ impl<'t> EventLoop<'t> {
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             #[cfg(all(feature = "sandbox", target_os = "linux"))]
-            Wake::Sandbox(i, event) => self.sessions[i].app.sandbox_modal.apply(event),
+            Wake::Sandbox(i, event) => {
+                let app = &mut self.sessions[i].app;
+                app.sandbox_modal.apply(event);
+                app.apply_sandbox_changes();
+            }
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Pack(preparation) => self.finish_pack(*preparation),
         }

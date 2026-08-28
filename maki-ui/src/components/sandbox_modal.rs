@@ -24,6 +24,7 @@ use ratatui::widgets::Paragraph;
 const TITLE: &str = " Sandbox ";
 const WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 85;
+const SANDBOX_LABEL: &str = "Run code execution in a sandbox";
 const YOLO_LABEL: &str = "Skip permission prompts for all tools";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -33,10 +34,12 @@ enum Mode {
     Shell,
 }
 
-/// Focus position in the info tab options list: the YOLO checkbox (only
-/// present while the sandbox is enabled), then each profile in order.
+/// Focus position in the info tab options list. The sandbox enable/disable
+/// checkbox is always first; the YOLO checkbox and profiles are only present
+/// while the sandbox is enabled.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum InfoFocus {
+    Sandbox,
     Yolo,
     Profile(usize),
 }
@@ -62,6 +65,8 @@ pub(crate) enum SandboxModalEvent {
     },
     /// Child respawn for a config change finished.
     ReinitDone,
+    /// Enable (checkbox) started a fresh sandbox child.
+    Spawned(Arc<Sandbox>),
     /// Child respawn or setup failed.
     Failed(String),
 }
@@ -73,7 +78,18 @@ enum PendingJob {
     Browser,
     Navigate,
     Shell,
+    Sandbox,
     Reinit,
+}
+
+/// Pending info-tab changes, reported so the app can persist them to config,
+/// sync YOLO permissions, and flash. Each field is `Some` only when that
+/// setting changed since the last `take_changes`.
+#[derive(Debug, Default)]
+pub struct SandboxModalChanges {
+    pub enabled: Option<bool>,
+    pub profiles: Option<Vec<String>>,
+    pub yolo: Option<bool>,
 }
 
 /// Snapshot of sandbox configuration for display.
@@ -542,40 +558,55 @@ impl SandboxModal {
         std::mem::take(&mut self.yolo_changed)
     }
 
+    /// Consume and report every pending info-tab change at once.
+    pub fn take_changes(&mut self) -> SandboxModalChanges {
+        let mut changes = SandboxModalChanges::default();
+        if self.take_enabled_changed() {
+            changes.enabled = Some(self.is_enabled());
+        }
+        if self.take_profiles_changed() {
+            changes.profiles = Some(self.enabled_profile_names());
+        }
+        if self.take_yolo_changed() {
+            changes.yolo = Some(self.yolo);
+        }
+        changes
+    }
+
     fn toggle_yolo(&mut self) {
         self.yolo = !self.yolo;
         self.yolo_changed = true;
     }
 
-    fn first_focus(info: &SandboxInfo) -> Option<InfoFocus> {
-        if info.enabled {
-            Some(InfoFocus::Yolo)
-        } else if info.profiles.is_empty() {
-            None
-        } else {
-            Some(InfoFocus::Profile(0))
-        }
+    fn first_focus(_info: &SandboxInfo) -> Option<InfoFocus> {
+        Some(InfoFocus::Sandbox)
     }
 
     fn focus_count(info: &SandboxInfo) -> usize {
-        info.profiles.len() + usize::from(info.enabled)
+        if info.enabled {
+            info.profiles.len() + 2
+        } else {
+            1
+        }
     }
 
     fn focus_index(info: &SandboxInfo, focus: &InfoFocus) -> usize {
         match focus {
-            InfoFocus::Yolo => 0,
-            InfoFocus::Profile(i) => usize::from(info.enabled) + i,
+            InfoFocus::Sandbox => 0,
+            InfoFocus::Yolo => usize::from(info.enabled),
+            InfoFocus::Profile(i) => usize::from(info.enabled) + 1 + i,
         }
     }
 
     fn focus_at(info: &SandboxInfo, idx: usize) -> Option<InfoFocus> {
-        let base = usize::from(info.enabled);
-        if idx < base {
-            Some(InfoFocus::Yolo)
-        } else if idx < base + info.profiles.len() {
-            Some(InfoFocus::Profile(idx - base))
-        } else {
-            None
+        if !info.enabled {
+            return (idx == 0).then_some(InfoFocus::Sandbox);
+        }
+        match idx {
+            0 => Some(InfoFocus::Sandbox),
+            1 => Some(InfoFocus::Yolo),
+            i if i <= info.profiles.len() + 1 => Some(InfoFocus::Profile(i - 2)),
+            _ => None,
         }
     }
 
@@ -596,6 +627,7 @@ impl SandboxModal {
             return;
         };
         match focus {
+            InfoFocus::Sandbox => self.toggle_sandbox_enabled(),
             InfoFocus::Yolo => self.toggle_yolo(),
             InfoFocus::Profile(i) => {
                 if let Some((_, enabled)) = self.info.profiles.get_mut(i) {
@@ -608,16 +640,18 @@ impl SandboxModal {
     }
 
     /// Re-homes the focus when the options list no longer contains it
-    /// (sandbox toggled off with the YOLO checkbox focused, or a profile
-    /// removed).
+    /// (sandbox toggled with the YOLO or a profile focused).
     fn clamp_focus(&mut self) {
         let Some(focus) = self.info_focus else {
             return;
         };
         let info = &self.info;
-        let gone = matches!(focus, InfoFocus::Yolo) && !info.enabled;
+        let mismatched = match focus {
+            InfoFocus::Sandbox => false,
+            InfoFocus::Yolo | InfoFocus::Profile(_) => !info.enabled,
+        };
         let out_of_range = Self::focus_index(info, &focus) >= Self::focus_count(info);
-        if gone || out_of_range {
+        if mismatched || out_of_range {
             self.info_focus = Self::first_focus(info);
         }
     }
@@ -691,17 +725,53 @@ impl SandboxModal {
     }
 
     fn toggle_sandbox_enabled(&mut self) {
-        if !self.info.enabled {
-            // Validate kernel support before enabling.
-            if let Err(e) = maki_sandbox::namespace::probe() {
-                self.spawn_error = Some(e.to_string());
-                return;
-            }
+        if self.info.enabled {
+            self.info.enabled = false;
+            self.enabled_changed = true;
+            self.spawn_error = None;
+            return;
         }
-        self.info.enabled = !self.info.enabled;
+        // Enabling: validate kernel support first, surfacing the same
+        // preflight result the `--sandbox` startup path reports.
+        if let Err(e) = maki_sandbox::namespace::probe() {
+            self.spawn_error = Some(format!("sandbox preflight check failed: {e}"));
+            return;
+        }
+        if self.sandbox.is_none() {
+            // This session started without a sandbox child; spawn one so the
+            // dialog reflects a real sandbox rather than a saved-but-inert
+            // configuration. The checkbox flips once the child is up.
+            self.spawn_sandbox();
+            return;
+        }
+        self.info.enabled = true;
         self.enabled_changed = true;
         self.spawn_error = None;
-        self.clamp_focus();
+    }
+
+    /// Create a fresh sandbox child (enable in a session that started
+    /// without one) on a blocking thread, then deliver it to the UI thread.
+    fn spawn_sandbox(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        let Some(tx) = self.event_tx.clone() else {
+            self.spawn_error = Some("sandbox event channel unavailable".into());
+            return;
+        };
+        let config = self.build_spawn_config();
+        self.pending = Some(PendingJob::Sandbox);
+        smol::unblock(move || {
+            let event = match maki_sandbox::Sandbox::new(config) {
+                Ok(sandbox) => SandboxModalEvent::Spawned(sandbox),
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to spawn sandbox for modal");
+                    SandboxModalEvent::Failed(e.to_string())
+                }
+            };
+            let _ = tx.send(event);
+        })
+        .detach();
     }
 
     fn spawn_browser(&mut self) {
@@ -852,6 +922,16 @@ impl SandboxModal {
                     self.pending = None;
                 }
             }
+            SandboxModalEvent::Spawned(sandbox) => {
+                if self.pending != Some(PendingJob::Sandbox) {
+                    return;
+                }
+                self.pending = None;
+                self.sandbox = Some(sandbox);
+                self.info.enabled = true;
+                self.enabled_changed = true;
+                self.spawn_error = None;
+            }
             SandboxModalEvent::Failed(error) => {
                 self.pending = None;
                 self.spawn_error = Some(error);
@@ -940,10 +1020,6 @@ impl SandboxModal {
             _ if self.mode == Mode::Browse => self.handle_browse_key(key_event),
             _ if self.mode == Mode::Shell => self.handle_shell_key(key_event),
             _ if self.mode == Mode::Info && self.info_focus.is_some() => match key_event.code {
-                KeyCode::Char('s') => {
-                    self.toggle_sandbox_enabled();
-                    true
-                }
                 KeyCode::Up => {
                     self.move_focus(-1);
                     true
@@ -1085,26 +1161,21 @@ impl SandboxModal {
         self.clamp_focus();
         let info = &self.info;
 
-        // Status
+        // Options — the sandbox enable/disable checkbox, then (while the
+        // sandbox is on) the YOLO checkbox and profiles. One list, navigable
+        // with ↑/↓.
         lines.push(Line::from(Span::styled(
-            "  Status (press s to toggle)",
+            "  Options (navigate with ↑/↓, toggle with Enter/Space)",
             t.keybind_section,
         )));
-        let status_text = if info.enabled { "enabled" } else { "disabled" };
-        lines.push(Line::from(format!("    {status_text}")));
-
-        // Options — YOLO checkbox (only while the sandbox is enabled),
-        // then profiles. One list, navigable with ↑/↓.
-        if info.enabled || !info.profiles.is_empty() {
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "  Options (navigate with ↑/↓, toggle with Enter/Space)",
-                t.keybind_section,
-            )));
-            if info.enabled {
-                let selected = self.info_focus == Some(InfoFocus::Yolo);
-                lines.push(self.option_line(selected, self.yolo, YOLO_LABEL));
-            }
+        let sandbox_selected = self.info_focus == Some(InfoFocus::Sandbox);
+        lines.push(self.option_line(sandbox_selected, info.enabled, SANDBOX_LABEL));
+        if self.pending == Some(PendingJob::Sandbox) {
+            lines.push(Line::from(Span::styled("  starting sandbox…", t.tool_dim)));
+        }
+        if info.enabled {
+            let selected = self.info_focus == Some(InfoFocus::Yolo);
+            lines.push(self.option_line(selected, self.yolo, YOLO_LABEL));
             for (i, (profile, enabled)) in info.profiles.iter().enumerate() {
                 let selected = self.info_focus == Some(InfoFocus::Profile(i));
                 lines.push(self.option_line(selected, *enabled, &profile.name));
@@ -1121,6 +1192,25 @@ impl SandboxModal {
                     )));
                 }
             }
+        }
+
+        // A failed enable (preflight probe) must be visible, not swallowed.
+        // Probes report multi-line diagnostics, so render each row as its own
+        // line rather than a single clipped Line.
+        if let Some(err) = &self.spawn_error {
+            lines.push(Line::default());
+            for line in err.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  ! {line}"),
+                    t.tool_error,
+                )));
+            }
+            lines.push(Line::default());
+        }
+
+        // Nothing else is meaningful while the sandbox is off.
+        if !info.enabled {
+            return;
         }
 
         // Filesystem layout
@@ -1367,7 +1457,7 @@ impl SandboxModal {
                 let tab_hint = if self.info.enabled {
                     "Tab: Browse files"
                 } else {
-                    "Tab: Browse (enable sandbox_enabled in config first)"
+                    "Enable the sandbox above to browse files and run commands"
                 };
                 lines.push(Line::from(Span::styled(tab_hint, t.keybind_desc)));
             }
@@ -1677,9 +1767,11 @@ mod tests {
     }
 
     #[test]
-    fn updown_navigates_yolo_and_profiles() {
+    fn updown_navigates_sandbox_yolo_and_profiles() {
         let mut modal = SandboxModal::new(info_with(true, 2), None);
         modal.toggle();
+        assert_eq!(modal.info_focus, Some(InfoFocus::Sandbox));
+        modal.handle_key(key_ev(KeyCode::Down));
         assert_eq!(modal.info_focus, Some(InfoFocus::Yolo));
         modal.handle_key(key_ev(KeyCode::Down));
         assert_eq!(modal.info_focus, Some(InfoFocus::Profile(0)));
@@ -1695,20 +1787,39 @@ mod tests {
         modal.handle_key(key_ev(KeyCode::Up));
         assert_eq!(modal.info_focus, Some(InfoFocus::Yolo));
         modal.handle_key(key_ev(KeyCode::Up));
+        assert_eq!(modal.info_focus, Some(InfoFocus::Sandbox));
+        modal.handle_key(key_ev(KeyCode::Up));
         assert_eq!(
             modal.info_focus,
-            Some(InfoFocus::Yolo),
+            Some(InfoFocus::Sandbox),
             "should not wrap past the first option"
         );
     }
 
     #[test]
-    fn updown_navigates_profiles_only_when_disabled() {
+    fn updown_keeps_sandbox_checkbox_only_when_disabled() {
         let mut modal = SandboxModal::new(info_with(false, 2), None);
         modal.toggle();
-        assert_eq!(modal.info_focus, Some(InfoFocus::Profile(0)));
+        assert_eq!(modal.info_focus, Some(InfoFocus::Sandbox));
         modal.handle_key(key_ev(KeyCode::Down));
-        assert_eq!(modal.info_focus, Some(InfoFocus::Profile(1)));
+        assert_eq!(
+            modal.info_focus,
+            Some(InfoFocus::Sandbox),
+            "no other options are shown while the sandbox is disabled"
+        );
+    }
+
+    fn lines_text(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -1735,11 +1846,7 @@ mod tests {
         );
         let mut lines = Vec::new();
         modal.render_info(&mut lines);
-        let text: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = lines_text(&lines);
         assert!(
             text.contains("/etc/alternatives/cc  →  /etc/alternatives/cc"),
             "symlink should render as absolute sandbox path, got:\n{text}"
@@ -1749,12 +1856,91 @@ mod tests {
             "symlink must not be treated as a home-relative path"
         );
         assert!(text.contains("/home/maki/.cargo  ←  "));
+        let label = format!("[x] {SANDBOX_LABEL}");
+        assert!(text.contains(label.as_str()), "got:\n{text}");
+    }
+
+    #[test]
+    fn info_disabled_renders_only_enable_checkbox() {
+        let mut modal = SandboxModal::new(info_with(false, 1), None);
+        let mut lines = Vec::new();
+        modal.render_info(&mut lines);
+        let text = lines_text(&lines);
+        assert!(text.contains(SANDBOX_LABEL), "got:\n{text}");
+        assert!(
+            !text.contains("Disable sandbox"),
+            "the label is stable, not action-flipped, got:\n{text}"
+        );
+        assert!(
+            !text.contains("Filesystem layout"),
+            "layout is hidden while the sandbox is off, got:\n{text}"
+        );
+        assert!(
+            !text.contains("Environment variables"),
+            "env allow list is hidden while the sandbox is off, got:\n{text}"
+        );
+        assert!(
+            !text.contains("Skip permission prompts"),
+            "YOLO checkbox is hidden while the sandbox is off, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn info_disabled_renders_failed_enable() {
+        let mut modal = SandboxModal::new(info_with(false, 0), None);
+        modal.spawn_error = Some(
+            "sandbox preflight check failed: boom\n\nWithout namespaces it cannot isolate.\nTry:\n - enable it".into(),
+        );
+        let mut lines = Vec::new();
+        modal.render_info(&mut lines);
+        let text = lines_text(&lines);
+        assert!(
+            text.contains("sandbox preflight check failed: boom"),
+            "the preflight failure is visible in the dialog"
+        );
+        assert!(
+            text.contains("Without namespaces it cannot isolate") && text.contains(" - enable it"),
+            "every row of the multi-line diagnostic is rendered, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn info_disabled_pending_shows_starting() {
+        let mut modal = SandboxModal::new(info_with(false, 0), None);
+        modal.pending = Some(PendingJob::Sandbox);
+        let mut lines = Vec::new();
+        modal.render_info(&mut lines);
+        assert!(
+            lines_text(&lines).contains("starting sandbox"),
+            "a spawn in flight is surfaced, not silent"
+        );
+    }
+
+    #[test]
+    fn spawn_sandbox_without_event_channel_reports_error() {
+        let mut modal = SandboxModal::new(info_with(false, 0), None);
+        modal.spawn_sandbox();
+        assert_eq!(modal.pending, None, "no channel, no job scheduled");
+        assert_eq!(
+            modal.spawn_error.as_deref(),
+            Some("sandbox event channel unavailable")
+        );
+    }
+
+    #[test]
+    fn spawn_sandbox_skips_when_job_pending() {
+        let mut modal = SandboxModal::new(info_with(false, 0), None);
+        modal.pending = Some(PendingJob::Navigate);
+        modal.spawn_sandbox();
+        assert_eq!(modal.pending, Some(PendingJob::Navigate));
+        assert_eq!(modal.spawn_error, None, "no duplicate spawn while busy");
     }
 
     #[test]
     fn enter_toggles_focused_option() {
         let mut modal = SandboxModal::new(info_with(true, 1), None);
         modal.toggle();
+        modal.handle_key(key_ev(KeyCode::Down));
         modal.handle_key(key_ev(KeyCode::Enter));
         assert!(modal.yolo, "Enter should toggle the YOLO checkbox");
         assert!(modal.take_yolo_changed());
@@ -1764,12 +1950,18 @@ mod tests {
     }
 
     #[test]
-    fn s_toggling_sandbox_off_rehomes_yolo_focus() {
-        let mut modal = SandboxModal::new(info_with(true, 0), None);
+    fn entering_sandbox_checkbox_disables_without_probe() {
+        let mut modal = SandboxModal::new(info_with(true, 1), None);
         modal.toggle();
-        assert_eq!(modal.info_focus, Some(InfoFocus::Yolo));
-        modal.handle_key(key_ev(KeyCode::Char('s')));
-        assert_eq!(modal.info_focus, None);
+        assert_eq!(modal.info_focus, Some(InfoFocus::Sandbox));
+        modal.handle_key(key_ev(KeyCode::Enter));
+        assert!(!modal.info.enabled, "Enter toggles the sandbox checkbox");
+        assert!(modal.take_enabled_changed());
+        assert_eq!(
+            modal.info_focus,
+            Some(InfoFocus::Sandbox),
+            "focus stays on the sandbox checkbox"
+        );
     }
 
     #[test]
