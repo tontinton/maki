@@ -33,7 +33,7 @@ use mlua::{Lua, Result as LuaResult, Table};
 use crate::api::options::PluginOpts;
 use crate::api::tool::{PendingRules, PendingTools};
 use crate::api::util::command::UiAction;
-use crate::plugin_permissions::PluginPermissions;
+use crate::plugin_permissions::{Permission, PluginPermissions};
 
 pub(crate) fn create_maki_global(
     lua: &Lua,
@@ -84,7 +84,13 @@ pub(crate) fn create_maki_global(
     )?;
     maki.set(
         "fn",
-        r#fn::create_fn_table(lua, Arc::clone(&plugin), permissions, ui_action_tx)?,
+        r#fn::create_fn_table(
+            lua,
+            Arc::clone(&plugin),
+            permissions,
+            permissions.is_allowed(Permission::FsWrite),
+            ui_action_tx,
+        )?,
     )?;
     split::split__register(&maki, lua)?;
     maki.set("async", r#async::create_async_table(lua)?)?;

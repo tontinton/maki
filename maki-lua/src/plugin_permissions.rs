@@ -191,7 +191,7 @@ pub(crate) fn load_requested_permissions(
         })
 }
 
-fn denied_error(perm: Permission) -> LuaError {
+pub(crate) fn denied_error(perm: Permission) -> LuaError {
     let msg = format!(
         "permission denied: '{perm}' not granted for this plugin (grant it in {MANIFEST_FILE} next to the plugin file)"
     );

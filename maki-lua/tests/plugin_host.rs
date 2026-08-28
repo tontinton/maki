@@ -2725,6 +2725,92 @@ maki.api.register_tool({{
 
 #[cfg(unix)]
 #[test]
+fn argv_jobs_and_stream_redirects() {
+    const LITERAL_ARG: &str = "a; echo pwned";
+    const REDIRECT_ERR: &str = "mutually exclusive";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("job.log");
+    let src = format!(
+        r#"
+maki.api.register_tool({{
+    name = "argv_and_redirect",
+    description = "argv spawning plus stdout redirect",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local seen = {{}}
+        local argv = maki.fn.jobstart({{ "echo", "{LITERAL_ARG}" }}, {{
+            scope = "plugin",
+            on_stdout = function(_, line) seen[#seen + 1] = line end,
+        }})
+        maki.fn.jobwait(argv, 5000)
+
+        local redirected = maki.fn.jobstart({{ "echo", "to-file" }}, {{
+            scope = "plugin",
+            stdout = "{log}",
+        }})
+        local redirected_result = maki.fn.jobwait(redirected, 5000)
+
+        local quiet = maki.fn.jobstart("echo dropped", {{ scope = "plugin", stdout = false }})
+        local quiet_result = maki.fn.jobwait(quiet, 5000)
+
+        local _, err = pcall(maki.fn.jobstart, "echo both", {{
+            scope = "plugin",
+            stdout = "{log}",
+            on_stdout = function() end,
+        }})
+
+        return table.concat({{
+            table.concat(seen, ","),
+            redirected_result.stdout,
+            quiet_result.stdout,
+            tostring(err),
+        }}, "|")
+    end,
+}})
+"#,
+        log = log.display(),
+    );
+    host.load_source("argv_jobs", &src).unwrap();
+
+    let out = exec_tool(&reg, "argv_and_redirect", json!({})).unwrap();
+    let [printed, redirected, discarded, conflict] = out.split('|').collect::<Vec<_>>()[..] else {
+        panic!("handler must return four fields, got {out}");
+    };
+    assert_eq!(
+        printed, LITERAL_ARG,
+        "argv must reach the program without a shell in between"
+    );
+    assert_eq!(redirected, "", "a redirected stream is not also captured");
+    assert_eq!(discarded, "", "a discarded stream produces no events");
+    assert!(
+        conflict.contains(REDIRECT_ERR),
+        "redirect plus on_stdout must be refused, got {conflict}"
+    );
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "to-file\n");
+}
+
+#[test]
+fn stream_redirect_to_a_path_needs_fs_write() {
+    const REDIRECT_TOOL: &str = "redirect_deny";
+    let mut perms = maki_lua::PluginPermissions::denied();
+    perms.set(maki_lua::Permission::Run, true);
+    let src = perm_tool_src(
+        REDIRECT_TOOL,
+        r#"local ok, err = pcall(maki.fn.jobstart, "echo hi", { scope = "plugin", stdout = "/tmp/maki_redirect_test.log" })
+                return tostring(err)"#,
+    );
+
+    let result = exec_tool_with_perms(perms, &src, REDIRECT_TOOL, json!({})).unwrap();
+
+    assert!(result.contains(PERMISSION_DENIED_MSG), "got: {result}");
+    assert!(result.contains("fs_write"), "got: {result}");
+}
+
+#[cfg(unix)]
+#[test]
 fn job_names_are_unique_per_plugin_and_outlive_a_reload() {
     const JOB_NAME: &str = "log-tail";
     const DUPLICATE_ERR: &str = "already held by live job";

@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
+use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::mem;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -15,7 +16,7 @@ use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
-use crate::plugin_permissions::PluginPermissions;
+use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
 use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
 
 const DEFAULT_TAIL: usize = 20;
@@ -31,6 +32,8 @@ const TABLE_SCOPE_ERR: &str = "jobstart: table scope must be { session = <id> }"
 const SCOPE_TYPE_ERR: &str = "jobstart: scope must be \"task\", \"plugin\", or { session = <id> }";
 const JOB_NOT_FOUND_ERR: &str = "job: not found";
 const BLANK_NAME_ERR: &str = "jobstart: name must be non-blank";
+const EMPTY_ARGV_ERR: &str = "jobstart: argv table must not be empty";
+const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv table";
 
 #[derive(Clone)]
 pub(crate) enum JobEvent {
@@ -51,14 +54,73 @@ pub(crate) enum JobOwner {
     },
 }
 
+/// How the process is spawned: through a shell, or straight from an argv the
+/// plugin built itself (no quoting rules to get wrong).
+pub(crate) enum JobCommand {
+    Shell(String),
+    Argv(Vec<String>),
+}
+
+impl JobCommand {
+    fn build(&self) -> Command {
+        match self {
+            Self::Shell(cmd) => shell_command(cmd),
+            Self::Argv(argv) => {
+                let mut command = Command::new(&argv[0]);
+                command.args(&argv[1..]);
+                command
+            }
+        }
+    }
+
+    /// Printable form for `jobinfo` / `joblist` rows.
+    fn display(&self) -> String {
+        match self {
+            Self::Shell(cmd) => cmd.clone(),
+            Self::Argv(argv) => argv
+                .iter()
+                .map(|arg| shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+}
+
+impl Redirect {
+    fn stdio(&self) -> Result<Stdio, String> {
+        match self {
+            Self::Capture => Ok(Stdio::piped()),
+            Self::Discard => Ok(Stdio::null()),
+            Self::File(path) => File::options()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map(Stdio::from)
+                .map_err(|e| format!("cannot open {}: {e}", path.display())),
+        }
+    }
+}
+
+/// Where one of the job's streams goes.
+pub(crate) enum Redirect {
+    /// Piped to a reader thread, so callbacks and tails see the lines.
+    Capture,
+    Discard,
+    /// Appended to a file by the child itself: no reader thread, no events,
+    /// no tail. Durability instead of reaction.
+    File(PathBuf),
+}
+
 /// Everything [`JobStore::start`] needs to spawn one job. A struct because
 /// the options a plugin may pass keep growing.
 pub(crate) struct JobSpec {
     pub owner: JobOwner,
-    pub cmd: String,
+    pub cmd: JobCommand,
     pub name: Option<Arc<str>>,
     pub cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
+    pub stdout: Redirect,
+    pub stderr: Redirect,
     pub on_stdout: Option<RegistryKey>,
     pub on_stderr: Option<RegistryKey>,
     pub on_exit: Option<RegistryKey>,
@@ -68,10 +130,12 @@ impl JobSpec {
     pub(crate) fn new(owner: JobOwner, cmd: impl Into<String>) -> Self {
         Self {
             owner,
-            cmd: cmd.into(),
+            cmd: JobCommand::Shell(cmd.into()),
             name: None,
             cwd: None,
             env: None,
+            stdout: Redirect::Capture,
+            stderr: Redirect::Capture,
             on_stdout: None,
             on_stderr: None,
             on_exit: None,
@@ -178,14 +242,16 @@ impl JobStore {
             name,
             cwd,
             env,
+            stdout,
+            stderr,
             on_stdout,
             on_stderr,
             on_exit,
         } = spec;
-        let mut command = shell_command(&cmd);
+        let mut command = cmd.build();
         command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(stdout.stdio()?)
+            .stderr(stderr.stdio()?)
             .stdin(Stdio::null());
 
         #[cfg(unix)]
@@ -217,8 +283,6 @@ impl JobStore {
         let id = self.next_id;
         self.next_id += 1;
 
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
         let (event_tx, event_rx) = flume::unbounded();
 
         macro_rules! spawn_reader {
@@ -245,8 +309,8 @@ impl JobStore {
                 }
             };
         }
-        let stdout_handle = spawn_reader!(stdout, "job-stdout", Stdout);
-        let stderr_handle = spawn_reader!(stderr, "job-stderr", Stderr);
+        let stdout_handle = spawn_reader!(child.stdout.take(), "job-stdout", Stdout);
+        let stderr_handle = spawn_reader!(child.stderr.take(), "job-stderr", Stderr);
 
         thread::Builder::new()
             .name("job-wait".into())
@@ -266,7 +330,7 @@ impl JobStore {
             id,
             JobMeta {
                 owner,
-                command: cmd,
+                command: cmd.display(),
                 name,
                 pid,
                 started: Instant::now(),
@@ -666,6 +730,20 @@ fn apply_update(lua: &Lua, slot: &mut Option<RegistryKey>, update: CallbackUpdat
     }
 }
 
+/// Single-quote {arg} unless it is plainly safe, so an argv job's `command`
+/// row reads back as the shell line that would have produced it. Display
+/// only: nothing re-parses this.
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@,+".contains(c))
+    {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
 fn shell_command(cmd: &str) -> Command {
     #[cfg(unix)]
     {
@@ -710,17 +788,30 @@ fn kill_job(meta: &mut JobMeta) {
     }
 }
 
-/// Run a shell command in the background. The command runs through
-/// `bash -c` on Unix or `cmd /C` on Windows. You get back a job id
-/// that you can pass to `jobstop` or `jobwait` to control the process.
+/// Run a command in the background. A string runs through `bash -c` on Unix
+/// or `cmd /C` on Windows; a table is spawned as argv, with no shell in
+/// between (nothing in it can be read as a redirect, a pipe, or `$(...)`).
+/// You get back a job id that you can pass to `jobstop` or `jobwait` to
+/// control the process.
 ///
-/// @param cmd string Shell command to run.
+/// `stdout` and `stderr` route a stream to a file instead of into maki. A
+/// path is opened for append and handed to the child, so nothing is buffered
+/// here: no callback, no tail, no events for that stream. That makes the two
+/// mutually exclusive with `on_stdout` / `on_stderr` for the same stream, and
+/// a path additionally needs the `fs_write` permission. To both persist and
+/// react, run one job writing the file and a second one tailing it.
+///
+/// @param cmd string|table Shell command, or an argv table like
+///   `{ "tail", "-F", path }`.
 /// @param opts table? Optional settings:
 ///   `cwd` (string?) working directory (tilde is expanded).
 ///   `env` (table?) extra environment variables, `{ VAR = "value" }`.
 ///   `on_stdout` (function?) called with `(job_id, line)` for each stdout line.
 ///   `on_stderr` (function?) called with `(job_id, line)` for each stderr line.
 ///   `on_exit` (function?) called with `(job_id, code)` when the process finishes.
+///   `stdout` (string|false?) append stdout to this path, or `false` to
+///     discard it.
+///   `stderr` (string|false?) same for stderr; both may name one path.
 ///   `scope` (string|table?) job lifetime. `"task"` (default) ends the job
 ///     with the current call. `"plugin"` keeps it alive until the plugin
 ///     unloads or reloads. `{ session = "<id>" }` keeps it alive until that
@@ -731,8 +822,7 @@ fn kill_job(meta: &mut JobMeta) {
 ///     plugin can see. Starting a second job under a live name is an error.
 /// @return (integer) Job id.
 /// @example
-/// local id = maki.fn.jobstart("ls -la", {
-///   cwd = "~/projects",
+/// local id = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
 ///   on_stdout = function(_, line) print(line) end,
 ///   on_exit = function(_, code) print("exit: " .. code) end,
 /// })
@@ -740,7 +830,8 @@ fn kill_job(meta: &mut JobMeta) {
 fn jobstart(
     lua: &Lua,
     #[ctx] plugin: Arc<str>,
-    cmd: String,
+    #[ctx] fs_write: bool,
+    cmd: Value,
     opts: Option<Table>,
 ) -> LuaResult<u32> {
     let scope = opts
@@ -748,7 +839,8 @@ fn jobstart(
         .map(|opts| opts.get::<Value>("scope"))
         .transpose()?
         .unwrap_or(Value::Nil);
-    let mut spec = JobSpec::new(parse_scope(lua, &plugin, scope)?, cmd);
+    let mut spec = JobSpec::new(parse_scope(lua, &plugin, scope)?, "");
+    spec.cmd = parse_command(cmd)?;
     let mut tail = None;
 
     if let Some(ref opts) = opts {
@@ -761,6 +853,8 @@ fn jobstart(
         spec.on_stdout = callback_key(lua, opts, "on_stdout")?;
         spec.on_stderr = callback_key(lua, opts, "on_stderr")?;
         spec.on_exit = callback_key(lua, opts, "on_exit")?;
+        spec.stdout = parse_redirect(opts, "stdout", spec.on_stdout.is_some(), fs_write)?;
+        spec.stderr = parse_redirect(opts, "stderr", spec.on_stderr.is_some(), fs_write)?;
         tail = opts.get("tail").ok();
         if let Some(n) = tail
             && n > MAX_TAIL_LINES
@@ -785,6 +879,49 @@ fn jobstart(
         Ok::<u32, String>(id)
     })
     .map_err(mlua::Error::runtime)
+}
+
+fn parse_command(cmd: Value) -> LuaResult<JobCommand> {
+    match cmd {
+        Value::String(cmd) => Ok(JobCommand::Shell(cmd.to_str()?.to_string())),
+        Value::Table(argv) => {
+            let argv: Vec<String> = argv.sequence_values().collect::<LuaResult<_>>()?;
+            if argv.is_empty() {
+                return Err(mlua::Error::runtime(EMPTY_ARGV_ERR));
+            }
+            Ok(JobCommand::Argv(argv))
+        }
+        _ => Err(mlua::Error::runtime(CMD_TYPE_ERR)),
+    }
+}
+
+fn parse_redirect(
+    opts: &Table,
+    key: &str,
+    has_callback: bool,
+    fs_write: bool,
+) -> LuaResult<Redirect> {
+    let redirect = match opts.get::<Value>(key)? {
+        Value::Nil => return Ok(Redirect::Capture),
+        Value::Boolean(false) => Redirect::Discard,
+        Value::String(path) => {
+            if !fs_write {
+                return Err(denied_error(Permission::FsWrite));
+            }
+            Redirect::File(expand_tilde(&path.to_str()?))
+        }
+        _ => {
+            return Err(mlua::Error::runtime(format!(
+                "jobstart: {key} must be a path string or false"
+            )));
+        }
+    };
+    if has_callback {
+        return Err(mlua::Error::runtime(format!(
+            "jobstart: {key} and on_{key} are mutually exclusive; tail the file from a second job to get both"
+        )));
+    }
+    Ok(redirect)
 }
 
 fn callback_key(lua: &Lua, opts: &Table, key: &str) -> LuaResult<Option<RegistryKey>> {
@@ -892,10 +1029,16 @@ fn jobinfo(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<Pair<Va
 ///   each a function or `false`.
 /// @return (boolean|nil, string|nil) true on success, or nil and an error.
 /// @example
-/// -- After a reload, re-arm the session job this plugin started.
+/// -- A monitor that survives /reload: adopt the live job or start one.
+/// local sid = maki.session.current()
+/// local id = maki.fn.jobfind("log-tail")
+///   or maki.fn.jobstart({ "tail", "-F", path }, {
+///     name = "log-tail",
+///     scope = { session = sid },
+///   })
 /// maki.fn.jobattach(id, {
 ///   on_stdout = function(_, line) maki.session.notify(line, { session = sid }) end,
-///   on_exit = function(_, code) maki.session.notify("exit " .. code, { session = sid }) end,
+///   on_exit = function(_, code) maki.session.notify("tail died: " .. code, { session = sid }) end,
 /// })
 #[lua_fn(guard = Run)]
 fn jobattach(
@@ -1222,9 +1365,10 @@ lua_table! {
     "maki.fn" => pub(crate) fn create_fn_table(
         plugin: Arc<str>,
         perms: &PluginPermissions,
+        fs_write: bool,
         tx: Option<flume::Sender<UiAction>>,
     ), DOCS [
-        jobstart(perms, plugin), jobstop(perms, plugin), jobforget(perms, plugin),
+        jobstart(perms, plugin, fs_write), jobstop(perms, plugin), jobforget(perms, plugin),
         jobwait(perms, plugin), jobinfo(perms, plugin), joblist(perms, plugin),
         jobattach(perms, plugin), jobfind(perms, plugin),
         executable(perms),
@@ -1835,6 +1979,73 @@ mod tests {
         );
         store.record_event(1, &JobEvent::Exit(code));
         store.complete(lua, 1, code);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_argv_job_takes_shell_metacharacters_literally() {
+        const LITERAL: &str = "a; echo pwned $(id)";
+        let mut store = make_store();
+        let id = store
+            .start(JobSpec {
+                cmd: JobCommand::Argv(vec!["echo".into(), LITERAL.into()]),
+                ..JobSpec::new(task_owner(1), "")
+            })
+            .unwrap();
+
+        let printed: Vec<String> = collect_until_exit(id, || store.next_event(&task_owner(1)))
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                JobEvent::Stdout(line) => Some(line),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(printed, [LITERAL]);
+        assert_eq!(
+            store.snapshot(id, Some(1), TEST_PLUGIN).unwrap().command,
+            format!("echo '{LITERAL}'"),
+            "argv rows must stay printable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redirected_streams_append_to_the_file_and_keep_no_tail() {
+        const EXISTING: &str = "older\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.log");
+        std::fs::write(&path, EXISTING).unwrap();
+        let mut store = make_store();
+        let id = store
+            .start(JobSpec {
+                stdout: Redirect::File(path.clone()),
+                stderr: Redirect::Discard,
+                ..JobSpec::new(task_owner(1), "echo hi; echo err >&2")
+            })
+            .unwrap();
+
+        for (_, event) in collect_until_exit(id, || store.next_event(&task_owner(1))) {
+            store.record_event(id, &event);
+        }
+
+        let snap = store.snapshot(id, Some(1), TEST_PLUGIN).unwrap();
+        assert!(
+            snap.stdout_lines.is_empty() && snap.stderr_lines.is_empty(),
+            "a redirected stream must not be buffered here"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{EXISTING}hi\n")
+        );
+    }
+
+    #[test_case::test_case("plain", "plain" ; "safe_argument_is_bare")]
+    #[test_case::test_case("a b", "'a b'" ; "space_is_quoted")]
+    #[test_case::test_case("it's", r"'it'\''s'" ; "quote_is_escaped")]
+    #[test_case::test_case("", "''" ; "empty_argument_stays_visible")]
+    fn shell_quote_renders_argv_rows(arg: &str, expected: &str) {
+        assert_eq!(shell_quote(arg), expected);
     }
 
     #[test]

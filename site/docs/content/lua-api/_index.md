@@ -1612,21 +1612,36 @@ local id = maki.fn.jobstart("git status", {
 maki.fn.jobstart({cmd}, {opts?})
 ```
 
-Run a shell command in the background. The command runs through
-`bash -c` on Unix or `cmd /C` on Windows. You get back a job id
-that you can pass to `jobstop` or `jobwait` to control the process.
+Run a command in the background. A string runs through `bash -c` on Unix
+or `cmd /C` on Windows; a table is spawned as argv, with no shell in
+between (nothing in it can be read as a redirect, a pipe, or `$(...)`).
+You get back a job id that you can pass to `jobstop` or `jobwait` to
+control the process.
+
+`stdout` and `stderr` route a stream to a file instead of into maki. A
+path is opened for append and handed to the child, so nothing is buffered
+here: no callback, no tail, no events for that stream. That makes the two
+mutually exclusive with `on_stdout` / `on_stderr` for the same stream, and
+a path additionally needs the `fs_write` permission. To both persist and
+react, run one job writing the file and a second one tailing it.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
-- `{cmd}` (`string`) Shell command to run.
+- `{cmd}` (`string|table`) Shell command, or an argv table like
+
+  `{ "tail", "-F", path }`.
+
 - `{opts?}` (`table?`) Optional settings:
   - `cwd` (`string?`) working directory (tilde is expanded).
   - `env` (`table?`) extra environment variables, `{ VAR = "value" }`.
   - `on_stdout` (`function?`) called with `(job_id, line)` for each stdout line.
   - `on_stderr` (`function?`) called with `(job_id, line)` for each stderr line.
   - `on_exit` (`function?`) called with `(job_id, code)` when the process finishes.
+  - `stdout` (`string|false?`) append stdout to this path, or `false` to
+    discard it.
+  - `stderr` (`string|false?`) same for stderr; both may name one path.
   - `scope` (`string|table?`) job lifetime. `"task"` (default) ends the job
     with the current call. `"plugin"` keeps it alive until the plugin
     unloads or reloads. `{ session = "<id>" }` keeps it alive until that
@@ -1641,8 +1656,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
-local id = maki.fn.jobstart("ls -la", {
-  cwd = "~/projects",
+local id = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
   on_stdout = function(_, line) print(line) end,
   on_exit = function(_, code) print("exit: " .. code) end,
 })
@@ -1823,10 +1837,16 @@ Requires the `run` [plugin permission](#plugin-permissions).
 **Example:**
 
 ```lua
--- After a reload, re-arm the session job this plugin started.
+-- A monitor that survives /reload: adopt the live job or start one.
+local sid = maki.session.current()
+local id = maki.fn.jobfind("log-tail")
+  or maki.fn.jobstart({ "tail", "-F", path }, {
+    name = "log-tail",
+    scope = { session = sid },
+  })
 maki.fn.jobattach(id, {
   on_stdout = function(_, line) maki.session.notify(line, { session = sid }) end,
-  on_exit = function(_, code) maki.session.notify("exit " .. code, { session = sid }) end,
+  on_exit = function(_, code) maki.session.notify("tail died: " .. code, { session = sid }) end,
 })
 ```
 
