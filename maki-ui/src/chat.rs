@@ -279,7 +279,7 @@ impl Chat {
         self.messages_panel.project_row(pos)
     }
 
-    pub fn segment_search_texts(&self) -> Vec<&str> {
+    pub fn segment_search_texts(&self) -> Vec<String> {
         self.messages_panel.segment_search_texts()
     }
 
