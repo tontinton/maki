@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod id;
 pub mod input_history;
+pub mod intern;
 pub mod log;
 pub mod model;
 pub mod paths;

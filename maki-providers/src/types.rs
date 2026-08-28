@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use maki_storage::intern;
 pub use maki_storage::sessions::Effort;
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, TitleSource};
 use serde::{Deserialize, Serialize};
@@ -63,10 +64,27 @@ impl<'de> Deserialize<'de> for ImageMediaType {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ImageSource {
     pub media_type: ImageMediaType,
     pub data: Arc<str>,
+}
+
+impl<'de> Deserialize<'de> for ImageSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            media_type: ImageMediaType,
+            data: String,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            media_type: wire.media_type,
+            // Base64 image payloads are the largest strings a session holds,
+            // and a load decodes each one once per record that carries it.
+            data: intern::shared_str(wire.data),
+        })
+    }
 }
 
 impl Serialize for ImageSource {
@@ -859,6 +877,9 @@ mod tests {
     use crate::model::ThinkingSupport as Support;
     use test_case::test_case;
 
+    const INTERNED_DATA: &str = "aW50ZXJuZWQtcGF5bG9hZA==";
+    const OTHER_DATA: &str = "b3RoZXItcGF5bG9hZA==";
+
     #[test_case("end_turn", StopReason::EndTurn   ; "end_turn")]
     #[test_case("tool_use", StopReason::ToolUse   ; "tool_use")]
     #[test_case("max_tokens", StopReason::MaxTokens ; "max_tokens")]
@@ -989,6 +1010,25 @@ mod tests {
         let deserialized: ImageSource = serde_json::from_value(json).unwrap();
         assert_eq!(deserialized.media_type, ImageMediaType::Png);
         assert_eq!(&*deserialized.data, "abc123");
+    }
+
+    /// The payloads a session repeats across records collapse to one
+    /// allocation, and only while a load is in flight.
+    #[test]
+    fn image_source_deserialize_shares_identical_payloads_within_a_load() {
+        let wire = |data: &str| json!({"media_type": "image/png", "data": data}).to_string();
+        let read = |data: &str| serde_json::from_str::<ImageSource>(&wire(data)).unwrap();
+
+        let (first, other) = {
+            let _scope = intern::Scope::enter();
+            let first = read(INTERNED_DATA);
+            assert!(Arc::ptr_eq(&first.data, &read(INTERNED_DATA).data));
+            (first, read(OTHER_DATA))
+        };
+
+        assert!(!Arc::ptr_eq(&first.data, &other.data));
+        assert_eq!(&*first.data, INTERNED_DATA);
+        assert!(!Arc::ptr_eq(&first.data, &read(INTERNED_DATA).data));
     }
 
     use Effort::{High, Low, Max, Minimal, XHigh};
