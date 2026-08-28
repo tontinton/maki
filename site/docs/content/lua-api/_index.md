@@ -1633,6 +1633,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
     session ends, and survives plugin reload.
   - `tail` (`integer?`) trailing lines per stream kept for `jobinfo`
     (default 20, 0 disables, max 1024).
+  - `name` (`string?`) handle for `jobfind`, unique among the live jobs this
+    plugin can see. Starting a second job under a live name is an error.
 
 **Returns:** (`integer`) Job id.
 
@@ -1750,7 +1752,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 
 - `{job_id}` (`integer`) Job id returned by `jobstart`.
 
-**Returns:** (`table|nil`, `string|nil`) `{ id, command, pid, session, status,
+**Returns:** (`table|nil`, `string|nil`) `{ id, command, name, pid, session, status,
   exit_code, elapsed_secs, stdout_lines, stderr_lines }`, or nil and
   an error. `status` is `"running"` or `"exited"`.
 
@@ -1770,8 +1772,9 @@ maki.fn.joblist({session?})
 
 List jobs this plugin can see, including exited session-owned jobs (so an
 id started before a reload stays findable). Rows identify the job; call
-`jobinfo` for tails. Pass a session id to list only session-owned jobs
-for that session; plugin and task jobs are omitted.
+`jobinfo` for tails. Passing a session id keeps the rows whose `session`
+field equals it, so only session-scoped jobs can match: plugin and task
+jobs carry no session.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -1779,8 +1782,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
 
 - `{session?}` (`string?`) Session id filter.
 
-**Returns:** (`table`) array of `{ id, command, pid, session, status, exit_code,
-  elapsed_secs }`.
+**Returns:** (`table`) array of `{ id, command, name, pid, session, status,
+  exit_code, elapsed_secs }`.
 
 **Example:**
 
@@ -1825,6 +1828,37 @@ maki.fn.jobattach(id, {
   on_stdout = function(_, line) maki.session.notify(line, { session = sid }) end,
   on_exit = function(_, code) maki.session.notify("exit " .. code, { session = sid }) end,
 })
+```
+
+---
+
+### `maki.fn.jobfind()` {#maki-fn-jobfind}
+
+```lua
+maki.fn.jobfind({name})
+```
+
+Find the **live** job of this plugin registered under {name} by
+`jobstart`. Exited jobs never answer, so adopting by name restarts a job
+that died instead of latching onto a corpse; their `name` is still on the
+`joblist` row that explains why they died.
+
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{name}` (`string`) Name passed to `jobstart`.
+
+**Returns:** (`integer|nil`, `string|nil`) Job id, or nil and an error when no live
+  job holds the name.
+
+**Example:**
+
+```lua
+local id = maki.fn.jobfind("log-tail")
+if not id then
+  id = maki.fn.jobstart("tail -F /tmp/log", { name = "log-tail", scope = "plugin" })
+end
 ```
 
 ---

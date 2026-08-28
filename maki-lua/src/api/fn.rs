@@ -30,6 +30,7 @@ const NO_TASK_SCOPE_ERR: &str =
 const TABLE_SCOPE_ERR: &str = "jobstart: table scope must be { session = <id> }";
 const SCOPE_TYPE_ERR: &str = "jobstart: scope must be \"task\", \"plugin\", or { session = <id> }";
 const JOB_NOT_FOUND_ERR: &str = "job: not found";
+const BLANK_NAME_ERR: &str = "jobstart: name must be non-blank";
 
 #[derive(Clone)]
 pub(crate) enum JobEvent {
@@ -50,9 +51,40 @@ pub(crate) enum JobOwner {
     },
 }
 
+/// Everything [`JobStore::start`] needs to spawn one job. A struct because
+/// the options a plugin may pass keep growing.
+pub(crate) struct JobSpec {
+    pub owner: JobOwner,
+    pub cmd: String,
+    pub name: Option<Arc<str>>,
+    pub cwd: Option<String>,
+    pub env: Option<HashMap<String, String>>,
+    pub on_stdout: Option<RegistryKey>,
+    pub on_stderr: Option<RegistryKey>,
+    pub on_exit: Option<RegistryKey>,
+}
+
+impl JobSpec {
+    pub(crate) fn new(owner: JobOwner, cmd: impl Into<String>) -> Self {
+        Self {
+            owner,
+            cmd: cmd.into(),
+            name: None,
+            cwd: None,
+            env: None,
+            on_stdout: None,
+            on_stderr: None,
+            on_exit: None,
+        }
+    }
+}
+
 struct JobMeta {
     owner: JobOwner,
     command: String,
+    /// Per-plugin handle, so a reloaded plugin can find this job again
+    /// without matching on the command string. Only live jobs hold it.
+    name: Option<Arc<str>>,
     pid: u32,
     started: Instant,
     on_stdout: Option<RegistryKey>,
@@ -139,18 +171,18 @@ impl JobStore {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn start(
-        &mut self,
-        owner: JobOwner,
-        cmd: &str,
-        cwd: Option<String>,
-        env: Option<HashMap<String, String>>,
-        on_stdout: Option<RegistryKey>,
-        on_stderr: Option<RegistryKey>,
-        on_exit: Option<RegistryKey>,
-    ) -> Result<u32, String> {
-        let mut command = shell_command(cmd);
+    pub fn start(&mut self, spec: JobSpec) -> Result<u32, String> {
+        let JobSpec {
+            owner,
+            cmd,
+            name,
+            cwd,
+            env,
+            on_stdout,
+            on_stderr,
+            on_exit,
+        } = spec;
+        let mut command = shell_command(&cmd);
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -234,7 +266,8 @@ impl JobStore {
             id,
             JobMeta {
                 owner,
-                command: cmd.to_string(),
+                command: cmd,
+                name,
                 pid,
                 started: Instant::now(),
                 on_stdout,
@@ -444,6 +477,20 @@ impl JobStore {
             .then(|| JobSnapshot::from_job(job_id, job, true))
     }
 
+    /// Id of the **live** job this plugin can see holding {name}. Exited jobs
+    /// keep their name for display but stop answering here, so a plugin that
+    /// adopts by name restarts a dead job instead of adopting a corpse.
+    pub fn find_named(&self, name: &str, task_id: Option<u64>, plugin: &str) -> Option<u32> {
+        self.jobs
+            .iter()
+            .find(|(_, job)| {
+                job.exit_code.is_none()
+                    && job.name.as_deref() == Some(name)
+                    && job.can_access(task_id, plugin)
+            })
+            .map(|(&id, _)| id)
+    }
+
     /// List jobs this plugin can see. Task and plugin jobs leave the map on
     /// exit; session-owned jobs stay so exited ids stay findable. Tails live
     /// on `snapshot` / `jobinfo`.
@@ -551,6 +598,7 @@ impl Drop for CheckedOutReceiver {
 pub(crate) struct JobSnapshot {
     pub id: u32,
     pub command: String,
+    pub name: Option<Arc<str>>,
     pub session: Option<MakiId>,
     pub pid: u32,
     pub elapsed_secs: u64,
@@ -564,6 +612,7 @@ impl JobSnapshot {
         Self {
             id,
             command: job.command.clone(),
+            name: job.name.clone(),
             session: job.session(),
             pid: job.pid,
             elapsed_secs: job
@@ -678,6 +727,8 @@ fn kill_job(meta: &mut JobMeta) {
 ///     session ends, and survives plugin reload.
 ///   `tail` (integer?) trailing lines per stream kept for `jobinfo`
 ///     (default 20, 0 disables, max 1024).
+///   `name` (string?) handle for `jobfind`, unique among the live jobs this
+///     plugin can see. Starting a second job under a live name is an error.
 /// @return (integer) Job id.
 /// @example
 /// local id = maki.fn.jobstart("ls -la", {
@@ -697,49 +748,82 @@ fn jobstart(
         .map(|opts| opts.get::<Value>("scope"))
         .transpose()?
         .unwrap_or(Value::Nil);
-    let owner = parse_scope(lua, &plugin, scope)?;
+    let mut spec = JobSpec::new(parse_scope(lua, &plugin, scope)?, cmd);
+    let mut tail = None;
 
-    let (cwd, env, on_stdout, on_stderr, on_exit, tail) = match opts {
-        Some(ref opts) => {
-            let cwd: Option<String> = opts.get("cwd").ok();
-            let env: Option<HashMap<String, String>> = opts
-                .get::<Table>("env")
-                .ok()
-                .map(|t| t.pairs::<String, String>().filter_map(Result::ok).collect());
-            let on_stdout = opts
-                .get::<Function>("on_stdout")
-                .ok()
-                .map(|f| lua.create_registry_value(f))
-                .transpose()?;
-            let on_stderr = opts
-                .get::<Function>("on_stderr")
-                .ok()
-                .map(|f| lua.create_registry_value(f))
-                .transpose()?;
-            let on_exit = opts
-                .get::<Function>("on_exit")
-                .ok()
-                .map(|f| lua.create_registry_value(f))
-                .transpose()?;
-            let tail: Option<usize> = opts.get("tail").ok();
-            if let Some(n) = tail
-                && n > MAX_TAIL_LINES
-            {
-                return Err(mlua::Error::runtime(format!(
-                    "jobstart: tail must be in 0..={MAX_TAIL_LINES}"
-                )));
-            }
-            (cwd, env, on_stdout, on_stderr, on_exit, tail)
+    if let Some(ref opts) = opts {
+        spec.cwd = opts.get("cwd").ok();
+        spec.env = opts
+            .get::<Table>("env")
+            .ok()
+            .map(|t| t.pairs::<String, String>().filter_map(Result::ok).collect());
+        spec.name = job_name(opts)?;
+        spec.on_stdout = callback_key(lua, opts, "on_stdout")?;
+        spec.on_stderr = callback_key(lua, opts, "on_stderr")?;
+        spec.on_exit = callback_key(lua, opts, "on_exit")?;
+        tail = opts.get("tail").ok();
+        if let Some(n) = tail
+            && n > MAX_TAIL_LINES
+        {
+            return Err(mlua::Error::runtime(format!(
+                "jobstart: tail must be in 0..={MAX_TAIL_LINES}"
+            )));
         }
-        None => (None, None, None, None, None, None),
-    };
+    }
 
+    let task_id = active_task_id(lua);
     with_jobs(lua, |store| {
-        let id = store.start(owner, &cmd, cwd, env, on_stdout, on_stderr, on_exit)?;
+        if let Some(ref name) = spec.name
+            && let Some(held) = store.find_named(name, task_id, &plugin)
+        {
+            return Err(format!(
+                "jobstart: name {name:?} is already held by live job {held}"
+            ));
+        }
+        let id = store.start(spec)?;
         store.set_tail(id, tail);
         Ok::<u32, String>(id)
     })
     .map_err(mlua::Error::runtime)
+}
+
+fn callback_key(lua: &Lua, opts: &Table, key: &str) -> LuaResult<Option<RegistryKey>> {
+    opts.get::<Function>(key)
+        .ok()
+        .map(|f| lua.create_registry_value(f))
+        .transpose()
+}
+
+fn job_name(opts: &Table) -> LuaResult<Option<Arc<str>>> {
+    let Some(name) = opts.get::<Option<String>>("name")? else {
+        return Ok(None);
+    };
+    if name.trim().is_empty() {
+        return Err(mlua::Error::runtime(BLANK_NAME_ERR));
+    }
+    Ok(Some(Arc::from(name)))
+}
+
+/// Find the **live** job of this plugin registered under {name} by
+/// `jobstart`. Exited jobs never answer, so adopting by name restarts a job
+/// that died instead of latching onto a corpse; their `name` is still on the
+/// `joblist` row that explains why they died.
+///
+/// @param name string Name passed to `jobstart`.
+/// @return (integer|nil, string|nil) Job id, or nil and an error when no live
+///   job holds the name.
+/// @example
+/// local id = maki.fn.jobfind("log-tail")
+/// if not id then
+///   id = maki.fn.jobstart("tail -F /tmp/log", { name = "log-tail", scope = "plugin" })
+/// end
+#[lua_fn(guard = Run)]
+fn jobfind(lua: &Lua, #[ctx] plugin: Arc<str>, name: String) -> LuaResult<Pair<u32>> {
+    let task_id = active_task_id(lua);
+    match with_jobs(lua, |store| store.find_named(&name, task_id, &plugin)) {
+        Some(id) => Ok((Some(id), None)),
+        None => Ok(err_pair(JOB_NOT_FOUND_ERR)),
+    }
 }
 
 fn parse_scope(lua: &Lua, plugin: &Arc<str>, scope: Value) -> LuaResult<JobOwner> {
@@ -780,7 +864,7 @@ fn parse_scope(lua: &Lua, plugin: &Arc<str>, scope: Value) -> LuaResult<JobOwner
 /// so far; session-owned jobs still answer after they exit.
 ///
 /// @param job_id integer Job id returned by `jobstart`.
-/// @return (table|nil, string|nil) `{ id, command, pid, session, status,
+/// @return (table|nil, string|nil) `{ id, command, name, pid, session, status,
 ///   exit_code, elapsed_secs, stdout_lines, stderr_lines }`, or nil and
 ///   an error. `status` is `"running"` or `"exited"`.
 /// @example
@@ -849,12 +933,13 @@ fn callback_update(lua: &Lua, opts: &Table, key: &str) -> LuaResult<CallbackUpda
 
 /// List jobs this plugin can see, including exited session-owned jobs (so an
 /// id started before a reload stays findable). Rows identify the job; call
-/// `jobinfo` for tails. Pass a session id to list only session-owned jobs
-/// for that session; plugin and task jobs are omitted.
+/// `jobinfo` for tails. Passing a session id keeps the rows whose `session`
+/// field equals it, so only session-scoped jobs can match: plugin and task
+/// jobs carry no session.
 ///
 /// @param session string? Session id filter.
-/// @return (table) array of `{ id, command, pid, session, status, exit_code,
-///   elapsed_secs }`.
+/// @return (table) array of `{ id, command, name, pid, session, status,
+///   exit_code, elapsed_secs }`.
 /// @example
 /// local jobs = maki.fn.joblist(maki.session.current())
 #[lua_fn(guard = Run)]
@@ -879,6 +964,7 @@ fn snapshot_table(lua: &Lua, snap: &JobSnapshot, tails: bool) -> LuaResult<Table
     let row = lua.create_table()?;
     row.set("id", snap.id)?;
     row.set("command", snap.command.as_str())?;
+    row.set("name", snap.name.as_deref())?;
     row.set("pid", snap.pid)?;
     row.set("session", snap.session.map(|s| s.to_string()))?;
     row.set("elapsed_secs", snap.elapsed_secs)?;
@@ -1140,7 +1226,7 @@ lua_table! {
     ), DOCS [
         jobstart(perms, plugin), jobstop(perms, plugin), jobforget(perms, plugin),
         jobwait(perms, plugin), jobinfo(perms, plugin), joblist(perms, plugin),
-        jobattach(perms, plugin),
+        jobattach(perms, plugin), jobfind(perms, plugin),
         executable(perms),
         winsaveview(tx), winrestview(tx),
     ]
@@ -1191,6 +1277,13 @@ mod tests {
         JobOwner::Plugin(Arc::from(TEST_PLUGIN))
     }
 
+    fn session_owner(session: MakiId) -> JobOwner {
+        JobOwner::Session {
+            session,
+            plugin: Arc::from(TEST_PLUGIN),
+        }
+    }
+
     fn stub_job(
         owner: JobOwner,
         on_stdout: Option<RegistryKey>,
@@ -1199,6 +1292,7 @@ mod tests {
         JobMeta {
             owner,
             command: String::new(),
+            name: None,
             pid: 0,
             started: Instant::now(),
             on_stdout,
@@ -1217,7 +1311,7 @@ mod tests {
 
     fn start_echo(store: &mut JobStore) -> u32 {
         store
-            .start(task_owner(1), "echo hello", None, None, None, None, None)
+            .start(JobSpec::new(task_owner(1), "echo hello"))
             .unwrap()
     }
 
@@ -1243,7 +1337,7 @@ mod tests {
     fn dropping_the_store_kills_its_jobs() {
         let mut store = make_store();
         let id = store
-            .start(task_owner(1), "sleep 30", None, None, None, None, None)
+            .start(JobSpec::new(task_owner(1), "sleep 30"))
             .expect("job started");
         let pid = store.jobs[&id].pid;
         assert!(group_alive(pid), "job should be running before the drop");
@@ -1259,15 +1353,10 @@ mod tests {
     #[test]
     fn start_invalid_cwd_returns_error() {
         let mut store = make_store();
-        let result = store.start(
-            task_owner(1),
-            "echo hello",
-            Some("/nonexistent_dir_abc_xyz_123".into()),
-            None,
-            None,
-            None,
-            None,
-        );
+        let result = store.start(JobSpec {
+            cwd: Some("/nonexistent_dir_abc_xyz_123".into()),
+            ..JobSpec::new(task_owner(1), "echo hello")
+        });
         assert!(result.is_err());
     }
 
@@ -1319,7 +1408,7 @@ mod tests {
     fn plugin_owner_can_be_accessed_only_by_its_plugin() {
         let mut store = make_store();
         let id = store
-            .start(plugin_owner(), "echo hello", None, None, None, None, None)
+            .start(JobSpec::new(plugin_owner(), "echo hello"))
             .unwrap();
 
         assert!(store.take_receiver(id, Some(1), "other-plugin").is_none());
@@ -1332,7 +1421,7 @@ mod tests {
         let lua = Lua::new();
         let mut store = make_store();
         let id = store
-            .start(task_owner(1), "sleep 30", None, None, None, None, None)
+            .start(JobSpec::new(task_owner(1), "sleep 30"))
             .unwrap();
         let pid = store.jobs[&id].pid;
 
@@ -1351,11 +1440,9 @@ mod tests {
         let mut store = make_store();
         let task = task_owner(1);
         let plugin = plugin_owner();
-        let task_id = store
-            .start(task.clone(), "sleep 30", None, None, None, None, None)
-            .unwrap();
+        let task_id = store.start(JobSpec::new(task.clone(), "sleep 30")).unwrap();
         let plugin_id = store
-            .start(plugin.clone(), "sleep 30", None, None, None, None, None)
+            .start(JobSpec::new(plugin.clone(), "sleep 30"))
             .unwrap();
         let task_pid = store.jobs[&task_id].pid;
         let plugin_pid = store.jobs[&plugin_id].pid;
@@ -1414,7 +1501,7 @@ mod tests {
         let mut store = make_store();
         let id = start_echo(&mut store);
         let plugin_id = store
-            .start(plugin_owner(), "echo plugin", None, None, None, None, None)
+            .start(JobSpec::new(plugin_owner(), "echo plugin"))
             .unwrap();
 
         let task_events = collect_until_exit(id, || store.next_event(&task_owner(1)));
@@ -1601,7 +1688,7 @@ mod tests {
         let mut store = make_store();
         let task = start_echo(&mut store);
         let plugin = store
-            .start(plugin_owner(), "echo plugin", None, None, None, None, None)
+            .start(JobSpec::new(plugin_owner(), "echo plugin"))
             .unwrap();
 
         let from_task: Vec<u32> = store
@@ -1641,15 +1728,7 @@ mod tests {
         };
         let mut store = make_store();
         let id = store
-            .start(
-                owner.clone(),
-                "echo hi; echo err >&2; exit 3",
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .start(JobSpec::new(owner.clone(), "echo hi; echo err >&2; exit 3"))
             .unwrap();
         store.set_tail(id, Some(5));
 
@@ -1688,32 +1767,10 @@ mod tests {
         let b = MakiId::generate();
         let mut store = make_store();
         let first = store
-            .start(
-                JobOwner::Session {
-                    session: a,
-                    plugin: Arc::from(TEST_PLUGIN),
-                },
-                "sleep 30",
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .start(JobSpec::new(session_owner(a), "sleep 30"))
             .unwrap();
         let second = store
-            .start(
-                JobOwner::Session {
-                    session: b,
-                    plugin: Arc::from(TEST_PLUGIN),
-                },
-                "sleep 30",
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .start(JobSpec::new(session_owner(b), "sleep 30"))
             .unwrap();
         store.kill_session(&lua, a);
         assert!(store.snapshot(first, None, TEST_PLUGIN).is_none());
@@ -1778,6 +1835,38 @@ mod tests {
         );
         store.record_event(1, &JobEvent::Exit(code));
         store.complete(lua, 1, code);
+    }
+
+    #[test]
+    fn a_name_is_held_by_the_live_job_only() {
+        const NAME: &str = "log-tail";
+        let lua = Lua::new();
+        let mut store = make_store();
+        let mut job = stub_job(session_owner(MakiId::generate()), None, None);
+        job.name = Some(Arc::from(NAME));
+        store.jobs.insert(1, job);
+
+        assert_eq!(store.find_named(NAME, None, TEST_PLUGIN), Some(1));
+        assert_eq!(store.find_named(NAME, None, "other-plugin"), None);
+        assert_eq!(store.find_named("absent", None, TEST_PLUGIN), None);
+
+        store.record_event(1, &JobEvent::Exit(0));
+        store.complete(&lua, 1, 0);
+
+        assert_eq!(
+            store.find_named(NAME, None, TEST_PLUGIN),
+            None,
+            "an exited job must release its name so the next start is not blocked"
+        );
+        assert_eq!(
+            store
+                .snapshot(1, None, TEST_PLUGIN)
+                .unwrap()
+                .name
+                .as_deref(),
+            Some(NAME),
+            "the name stays on the row that explains the exit"
+        );
     }
 
     #[test]
@@ -1950,18 +2039,7 @@ mod tests {
         let session = MakiId::generate();
         let mut store = make_store();
         let id = store
-            .start(
-                JobOwner::Session {
-                    session,
-                    plugin: Arc::from(TEST_PLUGIN),
-                },
-                "sleep 0.1",
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .start(JobSpec::new(session_owner(session), "sleep 0.1"))
             .unwrap();
         for (_, event) in collect_until_exit(id, || store.next_plugin_event()) {
             store.record_event(id, &event);

@@ -2725,6 +2725,84 @@ maki.api.register_tool({{
 
 #[cfg(unix)]
 #[test]
+fn job_names_are_unique_per_plugin_and_outlive_a_reload() {
+    const JOB_NAME: &str = "log-tail";
+    const DUPLICATE_ERR: &str = "already held by live job";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = maki_storage::id::MakiId::generate();
+    let _mailbox = maki_agent::SessionMailbox::register(session);
+    let sid = session.to_string();
+    let src = format!(
+        r#"
+maki.api.register_tool({{
+    name = "start_named",
+    description = "starts a named session job twice",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local opts = {{ scope = {{ session = "{sid}" }}, name = "{JOB_NAME}" }}
+        local id = maki.fn.jobstart("exec sleep 30", opts)
+        local ok, err = pcall(maki.fn.jobstart, "exec sleep 30", opts)
+        return tostring(id) .. "|" .. tostring(err)
+    end,
+}})
+"#
+    );
+    host.load_source("named", &src).unwrap();
+    let started = exec_tool(&reg, "start_named", json!({})).unwrap();
+    let (id, dup_err) = started.split_once('|').expect("id and duplicate error");
+    assert!(
+        dup_err.contains(DUPLICATE_ERR),
+        "a second live job under the same name must be refused, got {dup_err}"
+    );
+
+    let rediscover = format!(
+        r#"
+maki.api.register_tool({{
+    name = "find_named",
+    description = "finds the surviving job by name",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local found = maki.fn.jobfind("{JOB_NAME}")
+        local listed = "none"
+        for _, row in ipairs(maki.fn.joblist("{sid}")) do
+            if row.id == {id} then listed = tostring(row.name) .. ":" .. row.status end
+        end
+        return tostring(found) .. "|" .. listed
+    end,
+}})
+maki.api.register_tool({{
+    name = "stop_named",
+    description = "stops the named job",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        maki.fn.jobstop({id})
+        return "stopped"
+    end,
+}})
+"#
+    );
+    host.load_source("named", &rediscover).unwrap();
+    assert_eq!(
+        exec_tool(&reg, "find_named", json!({})).unwrap(),
+        format!("{id}|{JOB_NAME}:running"),
+        "a name must survive the reload that dropped the callbacks"
+    );
+
+    exec_tool(&reg, "stop_named", json!({})).unwrap();
+    let exited = format!("nil|{JOB_NAME}:exited");
+    poll_until("the stopped job kept holding its name", || {
+        (exec_tool(&reg, "find_named", json!({})).unwrap() == exited).then_some(())
+    });
+
+    host.event_handle().end_sessions_blocking([session]);
+}
+
+#[cfg(unix)]
+#[test]
 fn session_end_handler_sees_jobs_before_they_are_reaped() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();

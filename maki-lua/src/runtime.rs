@@ -3362,6 +3362,7 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::r#fn::JobSpec;
     use crate::api::tool::ToolCallReply;
     use futures_lite::future::poll_once;
     use maki_agent::cancel::CancelTrigger;
@@ -3454,10 +3455,10 @@ mod tests {
         let plugin_owner = JobOwner::Plugin(Arc::from("test-plugin"));
         with_jobs(&lua, |store| {
             store
-                .start(task_owner.clone(), "exit 0", None, None, None, None, None)
+                .start(JobSpec::new(task_owner.clone(), "exit 0"))
                 .unwrap();
             store
-                .start(plugin_owner.clone(), "exit 0", None, None, None, None, None)
+                .start(JobSpec::new(plugin_owner.clone(), "exit 0"))
                 .unwrap();
         });
 
@@ -4355,7 +4356,7 @@ mod tests {
             let scope = TaskScope::new(&lua, cell);
             let owner = JobOwner::Task(lock_cell(scope.handle()).id);
             with_jobs(&lua, |store| {
-                store.start(owner, DISPATCH_TEST_JOB, None, None, None, None, None)
+                store.start(JobSpec::new(owner, DISPATCH_TEST_JOB))
             })
             .unwrap();
             let (finish_tx, finish_rx) = flume::bounded(1);
