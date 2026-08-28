@@ -300,7 +300,7 @@ impl App {
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
-            btw_modal: BtwModal::new(typewriter),
+            btw_modal: BtwModal::new(typewriter, ui_config.show_thinking),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),

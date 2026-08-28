@@ -14,7 +14,7 @@ use self::segment::{Segment, SegmentCache};
 use super::tool_display::{
     RenderCtx, ToolLines, append_annotation, append_right_info, assistant_style,
     build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
-    thinking_style, truncate_to_header, user_style,
+    thinking_indicator, thinking_style, truncate_to_header, user_style,
 };
 use super::{DisplayMessage, DisplayRole, ToolRole, ToolStatus, code_view::SectionFlags};
 use crate::animation::spinner_str;
@@ -48,7 +48,6 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use tracing::warn;
 
-const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
 /// Spacer plus instruction segment, inserted as a pair.
 const INSTRUCTION_SEGMENTS: usize = 2;
@@ -1216,11 +1215,11 @@ impl MessagesPanel {
     }
 
     fn build_streaming_collapsed_lines(&self) -> Vec<Line<'static>> {
-        thinking_indicator(self.streaming_thinking.line_count())
+        thinking_indicator(self.streaming_thinking.line_count(), true)
     }
 
     fn build_cached_thinking_indicator(&self, text: &str) -> Vec<Line<'static>> {
-        thinking_indicator(logical_line_count(text))
+        thinking_indicator(logical_line_count(text), true)
     }
 
     /// `pos` is past the cached segments, so it names a tail part: the click
@@ -1510,20 +1509,6 @@ impl MessagesPanel {
         seg.set_lines(lines);
         seg.search_text = search_text;
     }
-}
-
-/// Two-line thinking indicator: a header (`thinking> ...`) followed by a
-/// `(N lines) (click to expand)` footer. Shared by the streaming and cached
-/// views when `show_thinking` is off.
-fn thinking_indicator(line_count: usize) -> Vec<Line<'static>> {
-    let theme = theme::current();
-    vec![
-        Line::from(Span::styled(THINKING_HIDDEN_HEADER, theme.thinking)),
-        Line::from(vec![
-            Span::styled(format!("({line_count} lines) "), theme.tool_dim),
-            Span::styled("(click to expand)", theme.thinking),
-        ]),
-    ]
 }
 
 fn logical_line_count(text: &str) -> usize {

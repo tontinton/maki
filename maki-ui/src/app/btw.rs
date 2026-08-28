@@ -88,11 +88,12 @@ async fn run_btw(
 
     let forward_fut = async {
         while let Ok(event) = event_rx.recv_async().await {
-            let delta = match event {
-                ProviderEvent::TextDelta { text } | ProviderEvent::ThinkingDelta { text } => text,
+            let event = match event {
+                ProviderEvent::TextDelta { text } => BtwEvent::TextDelta(text),
+                ProviderEvent::ThinkingDelta { text } => BtwEvent::ThinkingDelta(text),
                 _ => continue,
             };
-            if btw_tx.send(BtwEvent::TextDelta(delta)).is_err() {
+            if btw_tx.send(event).is_err() {
                 return;
             }
         }

@@ -38,6 +38,8 @@ pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
 const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
+const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
+const THINKING_EXPAND_HINT: &str = " (click to expand)";
 
 pub struct RoleStyle {
     pub prefix: &'static str,
@@ -75,6 +77,24 @@ pub fn thinking_style() -> RoleStyle {
         use_markdown: true,
         max_line_bytes: None,
     }
+}
+
+/// The stand-in for thinking the reader chose not to see. The transcript and
+/// the `/btw` modal both draw it, so it lives here to keep them in step, but
+/// only the transcript rows can be clicked, hence `expandable`.
+pub(crate) fn thinking_indicator(line_count: usize, expandable: bool) -> Vec<Line<'static>> {
+    let theme = theme::current();
+    let mut footer = vec![Span::styled(
+        format!("({line_count} lines)"),
+        theme.tool_dim,
+    )];
+    if expandable {
+        footer.push(Span::styled(THINKING_EXPAND_HINT, theme.thinking));
+    }
+    vec![
+        Line::from(Span::styled(THINKING_HIDDEN_HEADER, theme.thinking)),
+        Line::from(footer),
+    ]
 }
 
 pub fn error_style() -> RoleStyle {
