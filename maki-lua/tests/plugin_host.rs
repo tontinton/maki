@@ -16,7 +16,8 @@ use maki_config::{
     ToolOutputLines,
 };
 use maki_lua::{
-    PERMISSION_NAME_WARNING, PluginError, PluginHost, SKIPPED_PLUGIN_WARNING, WARM_TOOL_CAP,
+    PERMISSION_NAME_WARNING, PluginError, PluginHost, SKIPPED_PLUGIN_WARNING, SessionEndReason,
+    WARM_TOOL_CAP,
 };
 use maki_providers::Model;
 use maki_storage::id::SessionRef;
@@ -2542,7 +2543,8 @@ maki.api.register_tool({{
         "reloaded plugin should see the live session job, got {state}"
     );
 
-    host.event_handle().end_sessions_blocking([session]);
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while test_kill_process_group(pid).is_ok() {
         assert!(
@@ -2635,7 +2637,8 @@ maki.api.register_tool({{
         "error: job: not found"
     );
 
-    host.event_handle().end_sessions_blocking([session]);
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
 }
 
 #[cfg(unix)]
@@ -2720,7 +2723,8 @@ maki.api.register_tool({{
         );
     }
 
-    host.event_handle().end_sessions_blocking([session]);
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
 }
 
 #[cfg(unix)]
@@ -2884,7 +2888,8 @@ maki.api.register_tool({{
         (exec_tool(&reg, "find_named", json!({})).unwrap() == exited).then_some(())
     });
 
-    host.event_handle().end_sessions_blocking([session]);
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
 }
 
 #[cfg(unix)]
@@ -2956,7 +2961,8 @@ local seen
     let pid = Pid::from_raw(pid).unwrap();
     assert!(test_kill_process_group(pid).is_ok());
 
-    host.event_handle().end_sessions_blocking([session]);
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
 
     // `end_sessions_blocking` only answers once the handlers ran and the jobs
     // were reaped, so what the handler saw is settled by now.
@@ -6388,7 +6394,8 @@ maki.api.register_tool({{
     poll_until("jobwait never parked", || {
         parked_path.exists().then_some(())
     });
-    host.event_handle().end_sessions_blocking([session]);
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
     let out = wait_handle.join().expect("wait thread must not panic");
     assert!(
         out.starts_with("exit:"),

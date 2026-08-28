@@ -682,14 +682,20 @@ quiet, and so does startup.
 
 `"SessionEnd"` is the teardown signal: it fires first so handlers can
 still inspect or stop the session's jobs, then session-owned jobs are
-reaped. It is sent on TUI `/new`, tab delete, session load, UI shutdown,
-ACP session replace/EOF, and headless completion.
-`"SessionReset"` stays TUI-only (`/new`).
+reaped. It carries `data.reason`, one of `"reset"` (TUI `/new`),
+`"load"`, `"delete"` (tab closed), `"shutdown"`, `"replaced"` (an ACP
+client took the session's place), or `"completed"` (a headless run
+finished).
 
-On the exit paths (UI shutdown, ACP EOF, headless completion) the host is
-already tearing down, so handlers get a short grace period and the UI is
-gone: `maki.fn` roundtrips fail right away. Write state out with
-`maki.fs` instead.
+The last three are exit paths: the host is already tearing down, so the
+UI is gone (`maki.fn` roundtrips fail right away) and every handler
+shares one grace period. `data.deadline_ms` says how much of it is left
+at dispatch; write state out with `maki.fs` and do not park. On the
+other paths nothing waits and `data.deadline_ms` is nil.
+
+`"SessionReset"` stays TUI-only (`/new`) and is expected to be removed in
+a future release in favour of `"SessionEnd"` with `reason = "reset"`,
+which fires on the same path with the same session id.
 
 Jobs started inside a callback die with the dispatch unless you await
 them there (`jobwait`) or hand them to a session

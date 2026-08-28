@@ -20,6 +20,7 @@ pub use api::util::command::{
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
 pub use loader::{EventHandle, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING};
+pub use maki_agent::SessionEndReason;
 pub use pack::{
     DiscoveredPackage, Discovery, InstallReport, Interaction, MANAGED_GROUP, Origin, discover,
     discover_installed, install_declared, lockfile_path, sanitize_message, site_dir,
@@ -29,6 +30,7 @@ pub use runtime::{KILL_GRACE, RestoreItem, WARM_TOOL_CAP};
 
 pub mod test_support {
     use crate::KeymapReader;
+    use crate::SessionEndReason;
     use crate::api::keymap::{KeymapEntry, KeymapWriter};
     use crate::api::util::command::{
         HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
@@ -110,12 +112,12 @@ pub mod test_support {
             None
         }
 
-        /// Next `SessionEnd` request as the session being left behind.
-        pub fn try_recv_end_session(&self) -> Option<MakiId> {
+        /// Next `SessionEnd` request as the session being left behind and why.
+        pub fn try_recv_end_session(&self) -> Option<(MakiId, SessionEndReason)> {
             use crate::runtime::Request;
             while let Ok(req) = self.0.try_recv() {
-                if let Request::EndSession { session, .. } = req {
-                    return Some(session);
+                if let Request::EndSession(end) = req {
+                    return Some((end.session, end.reason));
                 }
             }
             None

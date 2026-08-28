@@ -6,6 +6,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use include_dir::{Dir, File, include_dir};
+use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{PluginsConfig, RawConfig};
@@ -20,7 +21,8 @@ use crate::plugin_permissions::{
     load_plugin_permissions,
 };
 use crate::runtime::{
-    self, ClickFallback, ConfigScope, LoadChunk, LoadContext, LuaThread, Request, RestoreItem,
+    self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, Request,
+    RestoreItem,
 };
 use maki_agent::prompt::ResolvedSlots;
 use maki_storage::id::MakiId;
@@ -1028,11 +1030,15 @@ impl EventHandle {
     /// Queue the kill of session-owned jobs and the `SessionEnd` dispatch,
     /// then return. Call from every session-end path so a Lua monitor can
     /// stay a plugin. Process exit wants [`Self::end_sessions_blocking`].
-    pub fn end_session(&self, session: MakiId) {
-        let _ = self.tx.try_send(Request::EndSession {
+    ///
+    /// Nothing waits here, so handlers get no deadline and the UI is still
+    /// there to answer them.
+    pub fn end_session(&self, session: MakiId, reason: SessionEndReason) {
+        let _ = self.tx.try_send(Request::EndSession(EndSession {
             session,
-            reply: None,
-        });
+            reason,
+            wait: None,
+        }));
     }
 
     /// [`Self::end_session`] for process exit: block until the handlers ran
@@ -1041,12 +1047,18 @@ impl EventHandle {
     ///
     /// Every session is queued first and the deadline is shared, so quitting
     /// with many tabs open costs one `SHUTDOWN_TIMEOUT`, not one per tab.
-    pub fn end_sessions_blocking(&self, sessions: impl IntoIterator<Item = MakiId>) {
+    pub fn end_sessions_blocking(
+        &self,
+        sessions: impl IntoIterator<Item = MakiId>,
+        reason: SessionEndReason,
+    ) {
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         let waits: Vec<_> = sessions
             .into_iter()
-            .filter_map(|session| Some((session, self.send_end_session(session)?)))
+            .filter_map(|session| {
+                Some((session, self.send_end_session(session, reason, deadline)?))
+            })
             .collect();
-        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         for (session, reply_rx) in waits {
             let left = deadline.saturating_duration_since(Instant::now());
             if reply_rx.recv_timeout(left).is_err() {
@@ -1061,18 +1073,24 @@ impl EventHandle {
     /// [`Self::end_sessions_blocking`] parked on a spare thread. ACP calls
     /// this from its executor, where blocking would freeze stdin for the
     /// whole grace period.
-    pub async fn end_session_async(&self, session: MakiId) {
+    pub async fn end_session_async(&self, session: MakiId, reason: SessionEndReason) {
         let handle = self.clone();
-        smol::unblock(move || handle.end_sessions_blocking([session])).await;
+        smol::unblock(move || handle.end_sessions_blocking([session], reason)).await;
     }
 
-    fn send_end_session(&self, session: MakiId) -> Option<flume::Receiver<()>> {
+    fn send_end_session(
+        &self,
+        session: MakiId,
+        reason: SessionEndReason,
+        deadline: Instant,
+    ) -> Option<flume::Receiver<()>> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.tx
-            .send(Request::EndSession {
+            .send(Request::EndSession(EndSession {
                 session,
-                reply: Some(reply_tx),
-            })
+                reason,
+                wait: Some((deadline, reply_tx)),
+            }))
             .ok()?;
         Some(reply_rx)
     }

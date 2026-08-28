@@ -548,6 +548,26 @@ impl From<Option<StopReason>> for DoneReason {
     }
 }
 
+/// Why a session ended, as `SessionEnd` handlers see it in `data.reason`.
+/// `Shutdown`, `Replaced`, and `Completed` are exit paths: no UI is left to
+/// talk to and every handler shares one grace period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+#[strum(serialize_all = "snake_case")]
+pub enum SessionEndReason {
+    /// `/reset` cleared the transcript.
+    Reset,
+    /// Another session was loaded into this tab.
+    Load,
+    /// The tab was closed.
+    Delete,
+    /// The process is exiting.
+    Shutdown,
+    /// An ACP client started or loaded a session over this one.
+    Replaced,
+    /// A headless run finished.
+    Completed,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {

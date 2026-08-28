@@ -7,6 +7,7 @@ use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{Action, LoadedSession};
 use maki_agent::agent::estimate_message_tokens;
+use maki_lua::SessionEndReason;
 use maki_providers::{Model, TokenUsage};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionMeta, StoredSubagent};
@@ -336,7 +337,8 @@ impl App {
         // that just ended needs its id, and the stamp always reads
         // whichever session is current.
         self.fire_session_autocmd("SessionReset", serde_json::json!({}));
-        self.lua_event_handle.end_session(self.state.session.id);
+        self.lua_event_handle
+            .end_session(self.state.session.id, SessionEndReason::Reset);
         let session = self.blank_session();
         self.apply_stored_permissions(&session.meta);
         self.state.session = Arc::new(session);
@@ -395,7 +397,8 @@ impl App {
         self.state =
             SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
         if previous != self.state.session.id {
-            self.lua_event_handle.end_session(previous);
+            self.lua_event_handle
+                .end_session(previous, SessionEndReason::Load);
         }
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);

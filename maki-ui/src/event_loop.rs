@@ -24,8 +24,8 @@ use maki_agent::{
 };
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionRequest,
-    TaskRequest, UiAction, UiReply,
+    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionEndReason,
+    SessionRequest, TaskRequest, UiAction, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -1061,7 +1061,9 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                     let rt = self.remove_runtime(i);
-                    self.ctx.lua_event_handle.end_session(rt.id());
+                    self.ctx
+                        .lua_event_handle
+                        .end_session(rt.id(), SessionEndReason::Delete);
                     rt.handles.cancel();
                 }
                 self.ctx.storage_writer.delete(id, move |res| {
@@ -1569,9 +1571,10 @@ impl<'t> EventLoop<'t> {
         // before the handlers run, or one that touches the UI parks forever
         // and only the teardown deadline gets us out of it.
         drop(self.ui_action_rx);
-        self.ctx
-            .lua_event_handle
-            .end_sessions_blocking(self.sessions.iter().map(SessionRuntime::id));
+        self.ctx.lua_event_handle.end_sessions_blocking(
+            self.sessions.iter().map(SessionRuntime::id),
+            SessionEndReason::Shutdown,
+        );
         let session_end_ms = lap();
         if let Some(ref h) = self.ctx.mcp_handle {
             mcp::kill_process_groups(&h.reader().load().pids);

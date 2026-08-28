@@ -21,7 +21,9 @@ use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
-use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
+use maki_agent::{
+    BufferSnapshot, SessionEndReason, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
+};
 use mlua::{Chunk, ChunkMode, Compiler, Function, Lua, RegistryKey, Table, Value as LuaValue, ffi};
 use serde_json::Value;
 
@@ -295,11 +297,7 @@ pub enum Request {
         event: String,
         data: Value,
     },
-    /// Reap session-owned jobs and fire `SessionEnd`.
-    EndSession {
-        session: MakiId,
-        reply: Option<flume::Sender<()>>,
-    },
+    EndSession(EndSession),
     ClickTool {
         tool_use_id: String,
         /// 1-based line in the tool's live buffer; 0 means the click landed
@@ -337,14 +335,17 @@ pub enum Request {
 /// from serving anything else, including the priority lane. One consumer
 /// keeps them in the order the host fired them.
 enum HostHook {
-    Autocmd {
-        event: String,
-        data: Value,
-    },
-    EndSession {
-        session: MakiId,
-        reply: Option<flume::Sender<()>>,
-    },
+    Autocmd { event: String, data: Value },
+    EndSession(EndSession),
+}
+
+/// Reap session-owned jobs and fire `SessionEnd`.
+pub struct EndSession {
+    pub session: MakiId,
+    pub reason: SessionEndReason,
+    /// Set on the paths that block on the dispatch: the instant the caller
+    /// stops waiting, and where to answer it. Absent on the queued paths.
+    pub wait: Option<(Instant, flume::Sender<()>)>,
 }
 
 pub struct RestoreItem {
@@ -1113,18 +1114,28 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
                 lua.gc_collect().ok();
             }
         }
-        HostHook::EndSession { session, reply } => {
+        HostHook::EndSession(end) => {
+            // Measured at dispatch, not when the request was queued, so a
+            // handler is told what is left rather than what was promised.
+            let deadline_ms = end
+                .wait
+                .as_ref()
+                .map(|(at, _)| at.saturating_duration_since(Instant::now()).as_millis() as u64);
             // Handlers may still inspect or stop the jobs, so the event fires
             // before the reap.
             let data = json_to_lua(
                 lua,
-                &serde_json::json!({ "session_id": session.to_string() }),
+                &serde_json::json!({
+                    "session_id": end.session.to_string(),
+                    "reason": end.reason.to_string(),
+                    "deadline_ms": deadline_ms,
+                }),
             )
             .unwrap_or(LuaValue::Nil);
             crate::api::autocmd::dispatch(lua.clone(), SESSION_END_EVENT.to_owned(), None, data)
                 .await;
-            with_jobs(lua, |store| store.kill_session(lua, session));
-            if let Some(reply) = reply {
+            with_jobs(lua, |store| store.kill_session(lua, end.session));
+            if let Some((_, reply)) = end.wait {
                 let _ = reply.send(());
             }
         }
@@ -3272,8 +3283,8 @@ pub fn spawn(
                         Request::FireAutocmd { event, data } => {
                             let _ = hook_tx.send(HostHook::Autocmd { event, data });
                         }
-                        Request::EndSession { session, reply } => {
-                            let _ = hook_tx.send(HostHook::EndSession { session, reply });
+                        Request::EndSession(end) => {
+                            let _ = hook_tx.send(HostHook::EndSession(end));
                         }
                         Request::Describe {
                             plugin,

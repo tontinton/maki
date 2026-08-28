@@ -23,7 +23,7 @@ use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::PermissionAnswer;
 use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
 use maki_agent::types::AgentEvent;
-use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
+use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, SessionEndReason};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
@@ -124,7 +124,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     }
 
-    close_session(&mut server).await;
+    close_session(&mut server, SessionEndReason::Shutdown).await;
     drop(server);
     writer_task.await;
     reader_task.await.context("read stdin")?;
@@ -257,7 +257,7 @@ async fn new_session(
     params: &AcpParams,
 ) -> Result<AgentResponse, AcpError> {
     let req: NewSessionRequest = parse_params(raw)?;
-    close_session(srv).await;
+    close_session(srv, SessionEndReason::Replaced).await;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
     let cwd = req.cwd.clone();
     let (handle, pending) = spawn_session(srv, params, req.cwd, None, Vec::new(), mcp.clone());
@@ -284,7 +284,7 @@ async fn load_session(
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
     let mut restored = load_history(session_ref.id())?;
-    close_session(srv).await;
+    close_session(srv, SessionEndReason::Replaced).await;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
@@ -488,12 +488,12 @@ async fn start_mcp(cwd: &Path, servers: &[McpServer]) -> Option<McpHandle> {
 
 /// Stop the old session before the next one starts, so two generations of the
 /// same MCP servers never fight over a port or a lock file.
-async fn close_session(srv: &mut Server) {
+async fn close_session(srv: &mut Server, reason: SessionEndReason) {
     let Some(state) = srv.session.take() else {
         return;
     };
     if let Some(cb) = &srv.on_session_end {
-        cb(state.handle.session_id.id()).await;
+        cb(state.handle.session_id.id(), reason).await;
     }
     // The event pump dies with the session, so the prompt it owed an answer to
     // has to be answered here or the client waits on it forever.
@@ -936,16 +936,19 @@ mod tests {
         let (mut srv, ..) = server_with_ask(AskKind::Permission);
         let ended = srv.session.as_ref().unwrap().handle.session_id.id();
         let (ended_tx, ended_rx) = flume::bounded(1);
-        srv.on_session_end = Some(Arc::new(move |id| {
+        srv.on_session_end = Some(Arc::new(move |id, reason| {
             let ended_tx = ended_tx.clone();
             Box::pin(async move {
-                let _ = ended_tx.send(id);
+                let _ = ended_tx.send((id, reason));
             })
         }));
 
-        smol::block_on(close_session(&mut srv));
+        smol::block_on(close_session(&mut srv, SessionEndReason::Replaced));
 
-        assert_eq!(ended_rx.try_recv().ok(), Some(ended));
+        assert_eq!(
+            ended_rx.try_recv().ok(),
+            Some((ended, SessionEndReason::Replaced))
+        );
         assert!(srv.session.is_none(), "close must take the session");
     }
 

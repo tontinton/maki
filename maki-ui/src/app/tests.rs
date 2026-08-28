@@ -19,7 +19,9 @@ use maki_agent::{
 };
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
-use maki_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
+use maki_lua::{
+    BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader, SessionEndReason,
+};
 use maki_providers::{ContentBlock, Effort, Message, Role, THINKING_USAGE, TokenUsage};
 use maki_storage::sessions::{SessionMeta, StoredMode, StoredThinking};
 use ratatui::layout::Rect;
@@ -675,8 +677,9 @@ fn session_reset_names_the_session_that_ended() {
     let (event, data) = probe.try_recv_autocmd().expect("SessionReset fired");
     assert_eq!(event, "SessionReset");
     assert_eq!(data["session_id"], serde_json::json!(ended));
-    let ended_id = probe.try_recv_end_session().expect("SessionEnd queued");
+    let (ended_id, reason) = probe.try_recv_end_session().expect("SessionEnd queued");
     assert_eq!(ended_id.to_string(), ended);
+    assert_eq!(reason, SessionEndReason::Reset);
     assert_ne!(
         app.state.session.id.to_string(),
         ended,

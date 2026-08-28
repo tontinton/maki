@@ -1,9 +1,12 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use maki_agent::tools::ToolRegistry;
-use maki_lua::PluginHost;
+use maki_lua::{PluginHost, SessionEndReason};
 
 const PROBE_SCHEMA: &str = r#"{ type = "object", properties = {}, additionalProperties = false }"#;
+const DISPATCH_TIMEOUT: Duration = Duration::from_secs(5);
+const DISPATCH_POLL: Duration = Duration::from_millis(10);
 
 fn host() -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
@@ -247,11 +250,57 @@ end }})
     );
     load(&host, "listener", &listener);
     let session = maki_storage::id::MakiId::generate();
-    host.event_handle().end_sessions_blocking([session]);
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
     assert_eq!(
         exec_tool(&reg, "probe_session_end"),
         format!("SessionEnd|{session}")
     );
+}
+
+/// Every reason reaches the handler, and only the blocking paths advertise a
+/// deadline: on the queued ones nothing is waiting for the handler at all.
+#[test_case::test_case(SessionEndReason::Reset, false ; "reset_is_queued")]
+#[test_case::test_case(SessionEndReason::Load, false ; "load_is_queued")]
+#[test_case::test_case(SessionEndReason::Delete, false ; "delete_is_queued")]
+#[test_case::test_case(SessionEndReason::Shutdown, true ; "shutdown_blocks")]
+#[test_case::test_case(SessionEndReason::Replaced, true ; "replaced_blocks")]
+#[test_case::test_case(SessionEndReason::Completed, true ; "completed_blocks")]
+fn session_end_carries_its_reason_and_deadline(reason: SessionEndReason, blocking: bool) {
+    let (reg, host) = host();
+    let listener = format!(
+        r#"
+local seen = "none"
+maki.api.create_autocmd("SessionEnd", {{ callback = function(ev)
+    seen = string.format("%s|%s", ev.data.reason, type(ev.data.deadline_ms))
+end }})
+{}
+"#,
+        probe_tool("probe_reason", "return seen")
+    );
+    load(&host, "listener", &listener);
+    let session = maki_storage::id::MakiId::generate();
+
+    if blocking {
+        host.event_handle().end_sessions_blocking([session], reason);
+    } else {
+        host.event_handle().end_session(session, reason);
+    }
+
+    // The queued paths answer before the handler runs, so poll for it.
+    let expected = format!("{reason}|{}", if blocking { "number" } else { "nil" });
+    let deadline = Instant::now() + DISPATCH_TIMEOUT;
+    loop {
+        let seen = exec_tool(&reg, "probe_reason");
+        if seen == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "SessionEnd handler saw {seen}, expected {expected}"
+        );
+        std::thread::sleep(DISPATCH_POLL);
+    }
 }
 
 #[test]

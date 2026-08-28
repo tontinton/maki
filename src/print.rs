@@ -20,7 +20,7 @@ use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig};
 use maki_config::ModelPolicy;
-use maki_lua::EventHandle;
+use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::model::Model;
 use maki_providers::{TokenUsage, add_cost};
 use maki_storage::id::SessionRef;
@@ -325,7 +325,7 @@ pub fn run(
         })
         .await;
     });
-    lua_handle.end_sessions_blocking([session_id.id()]);
+    lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
 
     let duration_ms = start.elapsed().as_millis();
     // Zero on an unpriced model, which is what its turns reported too.
