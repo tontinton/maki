@@ -113,6 +113,8 @@ fn turn_end_reason(reason: DoneReason) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use maki_agent::{ToolDoneEvent, ToolOutput, ToolStartEvent};
     use maki_providers::TokenUsage;
     use test_case::test_case;
@@ -152,7 +154,7 @@ mod tests {
             AgentEvent::ToolDone(Box::new(ToolDoneEvent {
                 id: "t1".into(),
                 tool: "bash".into(),
-                output: ToolOutput::Plain("ok".into()),
+                output: Arc::new(ToolOutput::Plain("ok".into())),
                 is_error: false,
                 annotation: None,
                 written_path: None,

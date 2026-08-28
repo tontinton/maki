@@ -17,7 +17,7 @@ pub async fn dispatch(ctx: &ToolContext, name: &str, input: &Value) -> Result<St
 /// Both the interpreter and `maki.agent.call_tool` come through here,
 /// so the two can never drift apart.
 pub fn flatten(done: &crate::ToolDoneEvent) -> Result<String, String> {
-    let text = match &done.output {
+    let text = match done.output.as_ref() {
         // The pixels are dropped here; say so instead of implying they were seen.
         crate::ToolOutput::Image { text, .. } if !done.is_error => {
             format!("{text} ({IMAGE_NOT_VISIBLE_NOTE})")

@@ -493,7 +493,7 @@ pub fn history_to_display(
                                     (s, Some(&**text))
                                 })
                                 .unwrap_or((ToolStatus::Success, None));
-                            let stored = tool_outputs.get(id.as_str()).map(Arc::as_ref);
+                            let stored = tool_outputs.get(id.as_str());
                             let (text, truncated_lines, tool_output, mut annotation) =
                                 build_loaded_tool(
                                     static_name,
@@ -597,14 +597,14 @@ pub(crate) fn restore_item_for(
 fn build_loaded_tool(
     tool: &str,
     summary: &str,
-    reconstructed: Option<ToolOutput>,
+    reconstructed: Option<Arc<ToolOutput>>,
     result_text: Option<&str>,
     tool_output_lines: &ToolOutputLines,
 ) -> (String, usize, Option<Arc<ToolOutput>>, Option<String>) {
     match reconstructed {
         Some(output) => {
             let annotation = output.annotation();
-            (summary.to_owned(), 0, Some(Arc::new(output)), annotation)
+            (summary.to_owned(), 0, Some(output), annotation)
         }
         None => {
             let result = result_text.unwrap_or("");
@@ -681,7 +681,7 @@ mod tests {
         AgentEvent::ToolDone(Box::new(ToolDoneEvent {
             id: id.into(),
             tool: tool.into(),
-            output,
+            output: Arc::new(output),
             is_error: false,
             annotation: None,
             written_path,

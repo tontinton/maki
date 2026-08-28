@@ -48,7 +48,7 @@ fn done(id: &str) -> ToolDoneEvent {
     ToolDoneEvent {
         id: id.into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("output".into()),
+         output: Arc::new(ToolOutput::Plain("output".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -82,7 +82,7 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "bash".into(),
-        output: ToolOutput::Plain("output".into()),
+         output: Arc::new(ToolOutput::Plain("output".into())),
         is_error,
         annotation: None,
         written_path: None,
@@ -111,7 +111,7 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: tool.into(),
-        output,
+         output: Arc::new(output),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -129,7 +129,7 @@ fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain(output.into()),
+         output: Arc::new(ToolOutput::Plain(output.into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -155,7 +155,7 @@ fn tool_done_grep_shows_matches() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: GREP_TOOL_NAME.into(),
-        output: grep_output(2),
+         output: Arc::new(grep_output(2)),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -257,7 +257,7 @@ fn unknown_tool_id_is_noop() {
     panel.tool_done(ToolDoneEvent {
         id: "orphan".into(),
         tool: "bash".into(),
-        output: ToolOutput::Plain("output".into()),
+         output: Arc::new(ToolOutput::Plain("output".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -286,7 +286,7 @@ fn in_progress_tracking() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "bash".into(),
-        output: ToolOutput::Plain("ok".into()),
+         output: Arc::new(ToolOutput::Plain("ok".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -296,7 +296,7 @@ fn in_progress_tracking() {
     panel.tool_done(ToolDoneEvent {
         id: "t2".into(),
         tool: "read".into(),
-        output: ToolOutput::Plain("ok".into()),
+         output: Arc::new(ToolOutput::Plain("ok".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -363,7 +363,7 @@ fn events_before_cache_built_render_correctly() {
     panel.tool_done(ToolDoneEvent {
         id: "t2".into(),
         tool: "bash".into(),
-        output: ToolOutput::Plain("result".into()),
+         output: Arc::new(ToolOutput::Plain("result".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -402,7 +402,7 @@ fn bash_live_output_with_code_input() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("done".into()),
+         output: Arc::new(ToolOutput::Plain("done".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -419,7 +419,7 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "bash".into(),
-        output: ToolOutput::Plain("ok".into()),
+         output: Arc::new(ToolOutput::Plain("ok".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -509,13 +509,13 @@ fn tick_drains_the_highlight_worker() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "read".into(),
-        output: ToolOutput::ReadCode {
-            path: "file.rs".into(),
-            start_line: 1,
-            lines: vec![HIGHLIGHTED_CODE.into()],
-            total_lines: 1,
-            instructions: None,
-        },
+         output: Arc::new(ToolOutput::ReadCode {
+             path: "file.rs".into(),
+             start_line: 1,
+             lines: vec![HIGHLIGHTED_CODE.into()],
+             total_lines: 1,
+             instructions: None,
+         }),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -559,7 +559,7 @@ fn tool_done_after_cancel_in_progress_does_not_underflow() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "bash".into(),
-        output: ToolOutput::Plain("late".into()),
+         output: Arc::new(ToolOutput::Plain("late".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -605,7 +605,7 @@ fn search_text_grep_result_includes_structured_output() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "grep".into(),
-        output: grep_output(2),
+         output: Arc::new(grep_output(2)),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -622,12 +622,12 @@ fn search_text_diff_output_includes_hunks() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "edit".into(),
-        output: ToolOutput::Diff {
-            path: "src/main.rs".into(),
-            before: "old\n".into(),
-            after: "new\n".into(),
-            summary: "1 edit".into(),
-        },
+         output: Arc::new(ToolOutput::Diff {
+             path: "src/main.rs".into(),
+             before: "old\n".into(),
+             after: "new\n".into(),
+             summary: "1 edit".into(),
+         }),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -644,7 +644,7 @@ fn search_text_bash_with_code_input() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("hello".into()),
+         output: Arc::new(ToolOutput::Plain("hello".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1041,7 +1041,7 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain(body.into()),
+         output: Arc::new(ToolOutput::Plain(body.into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1135,7 +1135,7 @@ fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: GREP_TOOL_NAME.into(),
-        output: ToolOutput::GrepResult { entries },
+         output: Arc::new(ToolOutput::GrepResult { entries }),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1206,7 +1206,7 @@ fn search_text_includes_truncated_bash_output() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain(full_output.clone().into()),
+         output: Arc::new(ToolOutput::Plain(full_output.clone().into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1241,7 +1241,7 @@ fn done_with_instructions(id: &str) -> ToolDoneEvent {
     ToolDoneEvent {
         id: id.into(),
         tool: "read".into(),
-        output: read_code_with_instructions(instruction_blocks()),
+         output: Arc::new(read_code_with_instructions(instruction_blocks())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1318,7 +1318,7 @@ fn instruction_segment_has_spacer_before_it() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "read".into(),
-        output: read_code_with_instructions(instruction_blocks()),
+         output: Arc::new(read_code_with_instructions(instruction_blocks())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1351,7 +1351,7 @@ fn toggle_instruction_segment_expands_and_collapses() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "read".into(),
-        output: read_code_with_instructions(blocks),
+         output: Arc::new(read_code_with_instructions(blocks)),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1383,7 +1383,7 @@ fn handle_click_on_done_tool_records_click_row() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("output".into()),
+         output: Arc::new(ToolOutput::Plain("output".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1444,7 +1444,7 @@ fn tool_done_removes_live_buf_and_snapshots_dirty() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("output".into()),
+         output: Arc::new(ToolOutput::Plain("output".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1729,7 +1729,7 @@ fn tool_done_without_live_buf_preserves_existing_snapshot() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("output".into()),
+         output: Arc::new(ToolOutput::Plain("output".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1752,7 +1752,7 @@ fn tool_done_clean_live_buf_does_not_snapshot() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("output".into()),
+         output: Arc::new(ToolOutput::Plain("output".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1778,7 +1778,7 @@ fn bash_tool_with_snapshot(id: &str) -> MessagesPanel {
     panel.tool_done(ToolDoneEvent {
         id: id.into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("output".into()),
+         output: Arc::new(ToolOutput::Plain("output".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -2342,7 +2342,7 @@ fn resize_reflows_tool_segment_and_keeps_instruction_segment() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "read".into(),
-        output: read_code_with_instructions(instruction_blocks()),
+        output: Arc::new(read_code_with_instructions(instruction_blocks())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -2523,13 +2523,13 @@ fn theme_switch_repaints_highlighted_code() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "read".into(),
-        output: ToolOutput::ReadCode {
-            path: "file.rs".into(),
-            start_line: 1,
-            lines: vec![THEME_CODE.into()],
-            total_lines: 1,
-            instructions: None,
-        },
+         output: Arc::new(ToolOutput::ReadCode {
+             path: "file.rs".into(),
+             start_line: 1,
+             lines: vec![THEME_CODE.into()],
+             total_lines: 1,
+             instructions: None,
+         }),
         is_error: false,
         annotation: None,
         written_path: None,

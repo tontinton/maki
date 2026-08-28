@@ -281,7 +281,7 @@ impl MessagesPanel {
             append_annotation(&mut msg.annotation, suffix);
         }
 
-        match &event.output {
+        match event.output.as_ref() {
             ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)
                 if msg.render_snapshot.is_none() =>
             {
@@ -306,7 +306,7 @@ impl MessagesPanel {
             }
             _ => {}
         }
-        msg.tool_output = Some(Arc::new(event.output));
+        msg.tool_output = Some(event.output);
         msg.live_output = None;
         self.rebuild_tool_segment(&event.id);
     }
@@ -420,7 +420,7 @@ impl MessagesPanel {
             self.tool_done(ToolDoneEvent {
                 id,
                 tool,
-                output: ToolOutput::Plain(message.clone().into()),
+                output: Arc::new(ToolOutput::Plain(message.clone().into())),
                 is_error: true,
                 annotation: None,
                 written_path: None,

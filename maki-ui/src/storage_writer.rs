@@ -295,7 +295,7 @@ mod tests {
         session.push_message(maki_providers::Message::user(RESUMED_MSG.into()));
         session.insert_tool_output(
             TOOL_ID.into(),
-            maki_agent::ToolOutput::Plain(TOOL_TEXT.to_string().into()),
+            Arc::new(maki_agent::ToolOutput::Plain(TOOL_TEXT.to_string().into())),
         );
         session.set_title(TITLE.into());
 

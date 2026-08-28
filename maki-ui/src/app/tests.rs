@@ -475,7 +475,7 @@ fn tool_done_transitions_plan_to_ready(
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
         tool: "write".into(),
-        output,
+         output: Arc::new(output),
         is_error: false,
         annotation: None,
         written_path,
@@ -962,7 +962,7 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "tool-1".into(),
         tool: "bash".into(),
-        output: ToolOutput::Plain("done".into()),
+         output: Arc::new(ToolOutput::Plain("done".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1387,7 +1387,7 @@ pub(crate) fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: id.into(),
         tool: "task".into(),
-        output: ToolOutput::Plain("result".into()),
+         output: Arc::new(ToolOutput::Plain("result".into())),
         is_error,
         annotation: None,
         written_path: None,
@@ -2950,7 +2950,7 @@ fn build_rewind_app() -> App {
     ]);
     app.state
         .session_mut()
-        .insert_tool_output("tool-1".into(), ToolOutput::Plain("output".into()));
+        .insert_tool_output("tool-1".into(), Arc::new(ToolOutput::Plain("output".into())));
     app
 }
 
@@ -3698,7 +3698,7 @@ fn plan_app() -> App {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
         tool: "write".into(),
-        output: ToolOutput::Plain("wrote 42 bytes to test-plan.md".into()),
+         output: Arc::new(ToolOutput::Plain("wrote 42 bytes to test-plan.md".into())),
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
@@ -3717,7 +3717,7 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
         tool: "write".into(),
-        output: ToolOutput::Plain("wrote 42 bytes to /tmp/plans/test.md".into()),
+         output: Arc::new(ToolOutput::Plain("wrote 42 bytes to /tmp/plans/test.md".into())),
         is_error: false,
         annotation: None,
         written_path: Some("/tmp/plans/test.md".into()),
@@ -3749,7 +3749,7 @@ fn re_edit_keeps_plan_form_visible() {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t2".into(),
         tool: "write".into(),
-        output: ToolOutput::Plain("wrote 50 bytes to test-plan.md".into()),
+         output: Arc::new(ToolOutput::Plain("wrote 50 bytes to test-plan.md".into())),
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
@@ -3817,7 +3817,7 @@ fn rewrite_plan(app: &mut App) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t2".into(),
         tool: "write".into(),
-        output: ToolOutput::Plain("wrote 99 bytes to test-plan.md".into()),
+         output: Arc::new(ToolOutput::Plain("wrote 99 bytes to test-plan.md".into())),
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
@@ -5212,7 +5212,7 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
         app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
             id: tool_id.into(),
             tool: "bash".into(),
-            output: ToolOutput::Plain(tool_text(tool_id).into()),
+             output: Arc::new(ToolOutput::Plain(tool_text(tool_id).into())),
             is_error: false,
             annotation: None,
             written_path: None,
