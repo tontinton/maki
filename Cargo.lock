@@ -2726,6 +2726,7 @@ dependencies = [
  "maki-storage",
  "serde",
  "serde_json",
+ "strum 0.27.2",
  "tempfile",
  "test-case",
  "thiserror 2.0.18",

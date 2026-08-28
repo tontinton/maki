@@ -50,6 +50,7 @@ pub(crate) fn create_maki_global(
         lua,
         pending,
         pending_rules,
+        permissions.clone(),
         Arc::clone(&plugin),
         opts,
         ui_action_tx.clone(),

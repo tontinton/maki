@@ -7,6 +7,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flume::Sender;
+use maki_agent::permissions::is_universal_scope;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::tools::Tool;
 use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
@@ -37,6 +38,7 @@ use crate::api::util::command::{
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, try_pair};
+use crate::plugin_permissions::{Permission, PluginPermissions};
 use crate::runtime::{
     HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request, command_depth,
 };
@@ -114,10 +116,35 @@ pub(crate) enum PermissionScopeSpec {
 }
 
 impl PermissionScopeSpec {
-    pub(crate) fn kind(&self) -> PermissionScopeKind {
+    fn kind(&self) -> PermissionScopeKind {
         match self {
             Self::Field(f) => PermissionScopeKind::Field(Arc::clone(f)),
             Self::Callback(_) => PermissionScopeKind::Callback,
+        }
+    }
+
+    pub(crate) fn callback_key(self) -> Option<RegistryKey> {
+        match self {
+            Self::Callback(key) => Some(key),
+            Self::Field(_) => None,
+        }
+    }
+}
+
+/// What a tool exposes to the model: the capability, plus the scopes every
+/// call is checked against. One field rather than two, because a capability
+/// without scopes is never checked and scopes without a capability cannot be
+/// delegated, so neither half can exist alone.
+pub(crate) struct ToolPermission<S> {
+    pub(crate) permission: Permission,
+    pub(crate) scopes: S,
+}
+
+impl ToolPermission<PermissionScopeSpec> {
+    pub(crate) fn kind(&self) -> ToolPermission<PermissionScopeKind> {
+        ToolPermission {
+            permission: self.permission,
+            scopes: self.scopes.kind(),
         }
     }
 }
@@ -132,7 +159,7 @@ pub(crate) struct PendingTool {
     pub(crate) header_key: Option<RegistryKey>,
     pub(crate) restore_key: Option<RegistryKey>,
     pub(crate) start_key: Option<RegistryKey>,
-    pub(crate) permission_scopes: Option<PermissionScopeSpec>,
+    pub(crate) permission: Option<ToolPermission<PermissionScopeSpec>>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
@@ -140,9 +167,35 @@ pub(crate) struct PendingTool {
     pub(crate) describe_key: Option<RegistryKey>,
 }
 
+impl PendingTool {
+    /// Every lua registry key the tool holds, so a rollback frees one list
+    /// instead of one key per call site.
+    pub(crate) fn registry_keys(self) -> impl Iterator<Item = RegistryKey> {
+        [
+            Some(self.handler_key),
+            self.header_key,
+            self.restore_key,
+            self.start_key,
+            self.describe_key,
+            self.permission.and_then(|p| p.scopes.callback_key()),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
 
-pub(crate) type PendingRules = Arc<Mutex<Vec<PermissionRule>>>;
+/// A rule as declared, before it is checked against the tool it names. Native
+/// and scoped by construction. [`resolve_rules`] turns it into the effective
+/// [`PermissionRule`].
+pub(crate) struct PendingRule {
+    tool: Arc<str>,
+    scope: String,
+    effect: Effect,
+}
+
+pub(crate) type PendingRules = Arc<Mutex<Vec<PendingRule>>>;
 
 pub(crate) struct LuaTool {
     pub(crate) name: Arc<str>,
@@ -154,7 +207,7 @@ pub(crate) struct LuaTool {
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
     pub(crate) has_start_fn: bool,
-    pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
+    pub(crate) permission: Option<ToolPermission<PermissionScopeKind>>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
@@ -218,9 +271,13 @@ impl Tool for LuaTool {
         self.examples.clone()
     }
 
+    fn required_permission(&self) -> Option<Permission> {
+        Some(self.permission.as_ref()?.permission)
+    }
+
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
         let validated = validate(self.schema, input.clone())?;
-        let permission_state = match &self.permission_scope_kind {
+        let permission_state = match self.permission.as_ref().map(|p| &p.scopes) {
             Some(PermissionScopeKind::Field(field)) => {
                 let scope = validated.get(field.as_ref()).and_then(|v| v.as_str());
                 PermissionState::Ready(Some(match scope {
@@ -625,7 +682,8 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   start           (function) Optional. Called when the tool call starts, before the handler runs.
 ///   describe        (function) Optional. Returns a custom description string for the current context.
 ///   examples        (table)    Optional. Array of example input objects for documentation.
-///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission.
+///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
+///   permission      (string)   Required with `permission_scopes`. The capability the tool exposes to the model: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves this tool.
 ///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 /// @return
@@ -648,8 +706,13 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   end,
 /// })
 #[lua_fn]
-fn register_tool(lua: &Lua, #[ctx] pending: PendingTools, spec: Table) -> LuaResult<()> {
-    register_tool_from_lua(lua, &spec, pending)
+fn register_tool(
+    lua: &Lua,
+    #[ctx] pending: PendingTools,
+    #[ctx] permissions: PluginPermissions,
+    spec: Table,
+) -> LuaResult<()> {
+    register_tool_from_lua(lua, &spec, pending, &permissions)
 }
 
 /// Declare an agent permission rule for a native tool. Use it to pre-allow
@@ -660,11 +723,24 @@ fn register_tool(lua: &Lua, #[ctx] pending: PendingTools, spec: Table) -> LuaRes
 /// reload that registers none clears the old ones. User config and session
 /// deny rules always win over a plugin allow.
 ///
+/// An allow is delegation, not escalation: it needs the `permission` the
+/// target tool declares, so a plugin can only pre-approve what it could
+/// already do itself. A deny needs no permission.
+///
+/// Allows are checked once the plugin finishes loading, so a plugin may
+/// pre-approve a tool it registers itself. One that does not hold up (no such
+/// tool, a tool with no `permission_scopes` that is never checked, or a
+/// permission the plugin lacks) is dropped with a warning in the log while the
+/// rest of the plugin loads. Without the rule the call simply prompts.
+///
 /// @param spec table Rule specification:
 ///   tool   (string) Required. Native tool name (e.g. "edit", "write").
 ///                   MCP tools and the "*" wildcard are not allowed.
 ///   scope  (string) Required. Scope pattern the rule applies to, e.g.
-///                   "/abs/dir/**" for a directory subtree.
+///                   "/abs/dir/**" for a directory subtree. An allow whose
+///                   pattern matches every scope ("*", "**", "/*", "/**") is
+///                   refused: name the paths or commands it covers. A deny may
+///                   cover everything.
 ///   effect (string) Optional. "allow" (default) or "deny".
 /// @return
 /// @example
@@ -693,7 +769,7 @@ fn register_permission_rule(
         mlua::Error::runtime("register_permission_rule: 'tool' must be a native tool name string")
     })?;
     let tool = match ToolKey::parse(&tool) {
-        Ok(key @ ToolKey::Native(_)) => key,
+        Ok(ToolKey::Native(name)) => name,
         Ok(_) => {
             return Err(mlua::Error::runtime(
                 "register_permission_rule: only native tools are allowed (no wildcard or MCP)",
@@ -714,7 +790,6 @@ fn register_permission_rule(
             "register_permission_rule: 'scope' must be non-empty",
         ));
     }
-
     let effect = spec
         .get::<Option<String>>("effect")
         .map_err(|_| mlua::Error::runtime("register_permission_rule: 'effect' must be a string"))?;
@@ -727,16 +802,76 @@ fn register_permission_rule(
             )));
         }
     };
+    // A deny that covers everything is the safest rule a plugin can write, so
+    // only an allow is refused.
+    if effect == Effect::Allow && is_universal_scope(&scope) {
+        return Err(mlua::Error::runtime(format!(
+            "register_permission_rule: '{scope}' matches every scope; name the paths or commands the rule covers"
+        )));
+    }
 
     pending_rules
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push(PermissionRule {
+        .push(PendingRule {
             tool,
-            scope: Some(scope),
+            scope,
             effect,
         });
     Ok(())
+}
+
+/// Turns the rules a load declared into the rules that take effect. Runs once,
+/// at the commit point of that load, so the answer never depends on which
+/// plugin happened to run first and the plugin's own tools already exist.
+///
+/// A rule that does not survive is dropped with a warning rather than failing
+/// the load: losing an allow only puts the call back in front of the user,
+/// which is no reason to take the plugin's tools and commands down with it.
+pub(crate) fn resolve_rules(
+    registry: &ToolRegistry,
+    plugin: &str,
+    permissions: &PluginPermissions,
+    rules: Vec<PendingRule>,
+) -> Vec<PermissionRule> {
+    rules
+        .into_iter()
+        .filter(|rule| {
+            rule.effect != Effect::Allow || allow_is_delegated(registry, plugin, permissions, rule)
+        })
+        .map(|rule| PermissionRule {
+            tool: ToolKey::Native(rule.tool),
+            scope: Some(rule.scope),
+            effect: rule.effect,
+        })
+        .collect()
+}
+
+/// An allow has to name a tool that exists, is permission checked at all, and
+/// exposes no more than the plugin already holds.
+fn allow_is_delegated(
+    registry: &ToolRegistry,
+    plugin: &str,
+    permissions: &PluginPermissions,
+    rule: &PendingRule,
+) -> bool {
+    let dropped = |reason: &str| {
+        tracing::warn!(plugin, tool = %rule.tool, reason, "permission rule dropped");
+        false
+    };
+    let Some(registered) = registry.get(&rule.tool) else {
+        // Disabled by config, or owned by a plugin nobody loaded.
+        return dropped("no such tool is registered");
+    };
+    let Some(required) = registered.tool.required_permission() else {
+        return dropped(
+            "the tool declares no permission_scopes, so it is never permission checked",
+        );
+    };
+    permissions.is_allowed(required)
+        || dropped(&format!(
+            "allowing it exposes '{required}', which this plugin was not granted"
+        ))
 }
 
 /// Register a slash-command that appears in the user input bar.
@@ -998,8 +1133,8 @@ lua_table! {
     /// maki.api.register_tool({ name = "greet", ... })
     /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
-    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, plugin: Arc<str>, opts: PluginOpts), DOCS [
-        register_tool(pending), register_permission_rule(pending_rules), register_command(plugin),
+    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, permissions: PluginPermissions, plugin: Arc<str>, opts: PluginOpts), DOCS [
+        register_tool(pending, permissions), register_permission_rule(pending_rules), register_command(plugin),
         register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
         get_tools, get_tool,
         manual run_command,
@@ -1010,12 +1145,13 @@ pub(crate) fn create_api_table(
     lua: &Lua,
     pending: PendingTools,
     pending_rules: PendingRules,
+    permissions: PluginPermissions,
     plugin: Arc<str>,
     opts: PluginOpts,
     ui_action_tx: Option<flume::Sender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
-    add_tool_fns(&t, lua, pending, pending_rules, plugin, opts)?;
+    add_tool_fns(&t, lua, pending, pending_rules, permissions, plugin, opts)?;
     run_command__register(&t, lua, ui_action_tx)?;
     Ok(t)
 }
@@ -1247,7 +1383,74 @@ fn parse_start_annotation(spec: &Table, schema: &Value) -> LuaResult<Option<Star
     }
 }
 
-fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> LuaResult<()> {
+/// Reads both keys together, so the pair enters the runtime whole and only
+/// when the plugin holds what the tool would expose.
+fn parse_tool_permission(
+    lua: &Lua,
+    spec: &Table,
+    tool: &str,
+    schema: &Value,
+    permissions: &PluginPermissions,
+) -> LuaResult<Option<ToolPermission<PermissionScopeSpec>>> {
+    let declared = spec
+        .get::<Option<String>>("permission")?
+        .map(|key| {
+            Permission::from_key(&key).ok_or_else(|| {
+                mlua::Error::runtime(format!(
+                    "register_tool: unknown permission '{key}' (valid: {})",
+                    Permission::ALL
+                        .iter()
+                        .map(|p| p.manifest_key())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })
+        })
+        .transpose()?;
+    let scopes = spec.get::<LuaValue>("permission_scopes")?;
+
+    let permission = match (declared, scopes.is_nil()) {
+        (None, true) => return Ok(None),
+        (Some(permission), false) => permission,
+        (None, false) => {
+            return Err(mlua::Error::runtime(
+                "register_tool: a tool with 'permission_scopes' must declare 'permission', the capability it exposes to the model",
+            ));
+        }
+        (Some(_), true) => {
+            return Err(mlua::Error::runtime(
+                "register_tool: 'permission' needs 'permission_scopes', without scopes the tool is never permission checked",
+            ));
+        }
+    };
+    if !permissions.is_allowed(permission) {
+        return Err(mlua::Error::runtime(format!(
+            "register_tool: '{tool}' exposes '{permission}' to the model, which this plugin was not granted"
+        )));
+    }
+
+    let scopes = match scopes {
+        LuaValue::String(s) => {
+            let field = s.to_str()?.to_owned();
+            check_schema_field(schema, "permission_scopes", &field, "string")?;
+            PermissionScopeSpec::Field(Arc::from(field.as_str()))
+        }
+        LuaValue::Function(f) => PermissionScopeSpec::Callback(lua.create_registry_value(f)?),
+        _ => {
+            return Err(mlua::Error::runtime(
+                "register_tool: 'permission_scopes' must be a string field name or a function",
+            ));
+        }
+    };
+    Ok(Some(ToolPermission { permission, scopes }))
+}
+
+fn register_tool_from_lua(
+    lua: &Lua,
+    spec: &Table,
+    pending: PendingTools,
+    permissions: &PluginPermissions,
+) -> LuaResult<()> {
     let name: String = spec
         .get("name")
         .map_err(|_| mlua::Error::runtime("register_tool: missing 'name'"))?;
@@ -1279,21 +1482,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
         ));
     }
     let mutable_path_field = require_schema_field(spec, "mutable_path", &schema_val)?;
-
-    let permission_scopes = match spec.get::<LuaValue>("permission_scopes")? {
-        LuaValue::Nil => None,
-        LuaValue::String(s) => {
-            let field = s.to_str()?.to_owned();
-            check_schema_field(&schema_val, "permission_scopes", &field, "string")?;
-            Some(PermissionScopeSpec::Field(Arc::from(field.as_str())))
-        }
-        LuaValue::Function(f) => Some(PermissionScopeSpec::Callback(lua.create_registry_value(f)?)),
-        _ => {
-            return Err(mlua::Error::runtime(
-                "register_tool: 'permission_scopes' must be a string field name or a function",
-            ));
-        }
-    };
+    let permission = parse_tool_permission(lua, spec, &name, &schema_val, permissions)?;
 
     let header_fn: Option<Function> = spec.get("header").ok();
     let restore_fn: Option<Function> = spec.get("restore").ok();
@@ -1340,7 +1529,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             header_key,
             restore_key,
             start_key,
-            permission_scopes,
+            permission,
             mutable_path_field,
             timeout,
             start_annotation,
@@ -1722,7 +1911,7 @@ mod tests {
         assert_eq!(tool.description(&ctx), "test");
     }
 
-    fn make_lua_tool(permission_scope_kind: Option<PermissionScopeKind>) -> LuaTool {
+    fn make_lua_tool(scopes: Option<PermissionScopeKind>) -> LuaTool {
         let schema = try_from_json(&serde_json::json!({
             "type": "object",
             "properties": {
@@ -1743,7 +1932,10 @@ mod tests {
             tx,
             plugin: Arc::from("test"),
             has_header_fn: false,
-            permission_scope_kind,
+            permission: scopes.map(|scopes| ToolPermission {
+                permission: Permission::FsWrite,
+                scopes,
+            }),
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
             start_annotation: None,

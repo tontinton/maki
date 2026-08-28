@@ -1,0 +1,3 @@
+[permissions]
+fs_read = true
+run = true

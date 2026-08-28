@@ -9,7 +9,7 @@ use crate::plugin_permissions::PluginPermissions;
 /// @example
 /// local cwd = maki.uv.cwd()
 /// if cwd then print("working in: " .. cwd) end
-#[lua_fn(guard = Env)]
+#[lua_fn(guard = FsRead)]
 fn cwd(_lua: &Lua) -> LuaResult<Option<String>> {
     Ok(std::env::current_dir()
         .ok()
@@ -21,7 +21,7 @@ fn cwd(_lua: &Lua) -> LuaResult<Option<String>> {
 /// @return (string?) Home directory path, or nil if it cannot be determined.
 /// @example
 /// local home = maki.uv.os_homedir() -- e.g. "/home/user"
-#[lua_fn(guard = Env)]
+#[lua_fn(guard = FsRead)]
 fn os_homedir(_lua: &Lua) -> LuaResult<Option<String>> {
     Ok(maki_storage::paths::home().and_then(|p| p.to_str().map(String::from)))
 }
@@ -43,6 +43,10 @@ lua_table! {
     ///
     /// Provides access to the working directory, home directory, and environment
     /// variables. None of these functions throw.
+    ///
+    /// Filesystem location queries (`cwd`, `os_homedir`) need `fs_read`, while
+    /// `os_getenv` reads the process environment, where secrets live, so it needs
+    /// `env`.
     ///
     /// ```lua
     /// local home = maki.uv.os_homedir()

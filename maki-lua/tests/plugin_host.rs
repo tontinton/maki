@@ -11,7 +11,10 @@ use maki_agent::tools::{
     ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
     timeout_annotation,
 };
-use maki_config::{AlwaysThinking, Effect, PluginsConfig, ToolKey, ToolOutputLines};
+use maki_config::{
+    AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission, PluginsConfig, ToolKey,
+    ToolOutputLines,
+};
 use maki_lua::{
     PERMISSION_NAME_WARNING, PluginError, PluginHost, SKIPPED_PLUGIN_WARNING, WARM_TOOL_CAP,
 };
@@ -36,6 +39,9 @@ const REPLACEMENT_DESC: &str = "took the builtin name over";
 const PERMISSION_KEYED_TOOL: &str = "task";
 const OTHER_PERMISSION_KEYED_TOOL: &str = "write";
 const PLAIN_TOOL: &str = "plain_helper";
+const FILE_WRITE_TOOLS_DRIFT: &str = "fs_write tool declarations drifted from FILE_WRITE_TOOLS, update the const or the \
+     register_tool declaration";
+const MEMORY_RULES_DROPPED: &str = "memory pre-approved tools nobody had registered yet, so it must load after the plugins owning them";
 
 /// Lua tools cannot publish `ToolLive::Usage` (only the subagent relay does), so
 /// a native stub stands in for one.
@@ -79,10 +85,13 @@ fn fresh_registry() -> Arc<ToolRegistry> {
 }
 
 fn builtins_host() -> (Arc<ToolRegistry>, PluginHost) {
+    builtins_host_with(&PluginsConfig::from_plugins(HashMap::new()))
+}
+
+fn builtins_host_with(config: &PluginsConfig) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = fresh_registry();
     let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
-        .unwrap();
+    host.load_builtins(config).unwrap();
     (reg, host)
 }
 
@@ -160,14 +169,17 @@ const UNKNOWN_AUD_SRC: &str =
     r#"name = "bad_aud", description = "test", audiences = { "wurkflow" }"#;
 const STRING_EXAMPLES_SRC: &str = r#"name = "ex_bad", description = "test", examples = "[]""#;
 const TIMEOUT_FIELD_NOT_IN_SCHEMA_SRC: &str = r#"name = "to_bad", description = "test", start_annotation = { field = "timeout", kind = "timeout" }"#;
-const SCOPE_MISSING_FIELD_SRC: &str =
-    r#"name = "bad_scope", description = "test", permission_scopes = "nonexistent""#;
-const SCOPE_NON_STRING_FIELD_SRC: &str =
-    r#"name = "bad_scope", description = "test", permission_scopes = "count""#;
+const SCOPE_MISSING_FIELD_SRC: &str = r#"name = "bad_scope", description = "test", permission = "fs_write", permission_scopes = "nonexistent""#;
+const SCOPE_NON_STRING_FIELD_SRC: &str = r#"name = "bad_scope", description = "test", permission = "fs_write", permission_scopes = "count""#;
 const OLD_SCOPE_KEY_SRC: &str =
     r#"name = "old_key", description = "test", permission_scope = "url""#;
 const WRONG_TYPE_SCOPES_SRC: &str =
-    r#"name = "num_scope", description = "test", permission_scopes = 42"#;
+    r#"name = "num_scope", description = "test", permission = "fs_write", permission_scopes = 42"#;
+const SCOPES_WITHOUT_PERMISSION_SRC: &str =
+    r#"name = "no_perm", description = "test", permission_scopes = "url""#;
+const PERMISSION_WITHOUT_SCOPES_SRC: &str =
+    r#"name = "no_scopes", description = "test", permission = "fs_write""#;
+const UNKNOWN_PERMISSION_SRC: &str = r#"name = "bad_perm", description = "test", permission = "filesystem", permission_scopes = "url""#;
 const NON_STRING_FIELD_SCHEMA: &str = r#"{
     type = "object",
     properties = { count = { type = "integer" } },
@@ -341,12 +353,23 @@ fn unload_round_trip() {
 const PERMISSION_RULE_SRC: &str =
     r#"maki.api.register_permission_rule({ tool = "edit", scope = "/tmp/x/**" })"#;
 const NO_RULE_SRC: &str = "local _ = 1";
+/// A rule can only name a registered tool, and it reads the permission it needs
+/// off that tool, so the rule tests have to provide one.
+const EDIT_TOOL_SRC: &str = r#"maki.api.register_tool({
+    name = "edit",
+    description = "test edit tool",
+    schema = { type = "object", properties = { path = { type = "string" } }, required = { "path" } },
+    permission = "fs_write",
+    permission_scopes = "path",
+    handler = function() return "" end,
+})"#;
 
 #[test]
 fn permission_rule_lands_in_store_and_unload_clears() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
+    host.load_source("tool_owner", EDIT_TOOL_SRC).unwrap();
     host.load_source("perm_plugin", PERMISSION_RULE_SRC)
         .unwrap();
     let rules = host.plugin_rules().snapshot();
@@ -364,6 +387,7 @@ fn permission_rule_failed_load_leaves_store_empty() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
+    host.load_source("tool_owner", EDIT_TOOL_SRC).unwrap();
     let src = format!("{PERMISSION_RULE_SRC}\nerror('boom after rule')");
     let err = host
         .load_source("perm_broken", &src)
@@ -377,6 +401,7 @@ fn reload_clears_stale_rules_of_that_plugin_only() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
+    host.load_source("tool_owner", EDIT_TOOL_SRC).unwrap();
     host.load_source("perm_a", PERMISSION_RULE_SRC).unwrap();
     host.load_source(
         "perm_b",
@@ -393,6 +418,100 @@ fn reload_clears_stale_rules_of_that_plugin_only() {
     assert_eq!(rules[0].effect, Effect::Deny);
 }
 
+const TOOL_PERMISSION_NOT_GRANTED: &str = "which this plugin was not granted";
+/// No `permission_scopes`, so the permission manager never consults it and a
+/// rule naming it could only ever do nothing.
+const UNCHECKED_EDIT_TOOL_SRC: &str = r#"maki.api.register_tool({
+    name = "edit",
+    description = "unchecked",
+    schema = { type = "object", properties = {} },
+    handler = function() return "" end,
+})"#;
+
+/// A package is the only entry point that runs lua under a permission set the
+/// plugin did not pick for itself.
+fn load_package_with(
+    host: &PluginHost,
+    src: &str,
+    permissions: maki_lua::PluginPermissions,
+) -> Result<(), PluginError> {
+    let pkg = package_dir(&[("plugin.lua", src)]);
+    host.load_package("pack", pkg.path(), permissions, Default::default())
+}
+
+/// An allow is delegation, so it survives only when the plugin holds the
+/// permission the named tool exposes and that tool is one the permission
+/// manager would ever consult. When it does not survive it costs the rule and
+/// not the plugin: the call simply prompts as it would have without it.
+#[test_case::test_case(EDIT_TOOL_SRC, true => 1 ; "granted_plugin_pre_approves_a_checked_tool")]
+#[test_case::test_case(EDIT_TOOL_SRC, false => 0 ; "plugin_granted_nothing_pre_approves_nothing")]
+#[test_case::test_case(NO_RULE_SRC, true => 0 ; "no_such_tool_is_registered")]
+#[test_case::test_case(UNCHECKED_EDIT_TOOL_SRC, true => 0 ; "tool_is_never_permission_checked")]
+fn allow_rule_survives_only_when_delegated(owner_src: &str, granted: bool) -> usize {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("tool_owner", owner_src).unwrap();
+
+    let permissions = if granted {
+        maki_lua::PluginPermissions::trusted()
+    } else {
+        maki_lua::PluginPermissions::denied()
+    };
+    load_package_with(&host, PERMISSION_RULE_SRC, permissions)
+        .expect("a rule that does not hold up must not fail the load");
+    host.plugin_rules().snapshot().len()
+}
+
+/// A deny only ever takes authority away, so nothing about it is checked: not
+/// the permission, not the blanket scope, not even whether the tool exists.
+#[test]
+fn deny_rule_is_never_filtered() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    load_package_with(
+        &host,
+        r#"maki.api.register_permission_rule({ tool = "edit", scope = "*", effect = "deny" })"#,
+        maki_lua::PluginPermissions::denied(),
+    )
+    .unwrap();
+
+    let rules = host.plugin_rules().snapshot();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].effect, Effect::Deny);
+}
+
+/// The delegation rule from the other side: shipping a tool is itself a use of
+/// the permission that tool exposes.
+#[test]
+fn register_tool_cannot_expose_a_permission_it_lacks() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    let err = load_package_with(&host, EDIT_TOOL_SRC, maki_lua::PluginPermissions::denied())
+        .expect_err("a package granted nothing must not ship an fs_write tool");
+    assert!(
+        err.to_string().contains(TOOL_PERMISSION_NOT_GRANTED),
+        "got: {err}"
+    );
+}
+
+/// Rules resolve when the load commits, not while the chunks run, so a plugin
+/// can pre-approve a tool it ships itself whichever line comes first.
+#[test]
+fn permission_rule_can_name_a_tool_the_same_plugin_registers() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    host.load_source(
+        "self_owner",
+        &format!("{PERMISSION_RULE_SRC}\n{EDIT_TOOL_SRC}"),
+    )
+    .unwrap();
+
+    assert_eq!(host.plugin_rules().snapshot().len(), 1);
+}
+
 #[test_case::test_case(r#"{ tool = "srv.tool", scope = "/x/**" }"#, "only native tools are allowed" ; "mcp_tool")]
 #[test_case::test_case(r#"{ tool = "mcp:srv", scope = "/x/**" }"#, "invalid tool name" ; "invalid_tool_chars")]
 #[test_case::test_case(r#"{ tool = "*", scope = "/x/**" }"#, "only native tools are allowed" ; "wildcard_tool")]
@@ -401,6 +520,10 @@ fn reload_clears_stale_rules_of_that_plugin_only() {
 #[test_case::test_case(r#"{ tool = "edit", scope = "" }"#, "'scope' must be non-empty" ; "empty_scope")]
 #[test_case::test_case(r#"{ tool = "edit", scope = "/x/**", effect = "maybe" }"#, "invalid effect 'maybe'" ; "bad_effect")]
 #[test_case::test_case(r#"{ tool = "edit", scope = "/x/**", bogus = 1 }"#, "unknown key 'bogus'" ; "unknown_key")]
+#[test_case::test_case(r#"{ tool = "edit", scope = "*" }"#, "matches every scope" ; "star_scope")]
+#[test_case::test_case(r#"{ tool = "edit", scope = "**" }"#, "matches every scope" ; "double_star_scope")]
+#[test_case::test_case(r#"{ tool = "edit", scope = "/*" }"#, "matches every scope" ; "root_star_scope")]
+#[test_case::test_case(r#"{ tool = "edit", scope = "/**" }"#, "matches every scope" ; "root_double_star_scope")]
 fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -424,6 +547,9 @@ fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
 #[test_case::test_case(SCOPE_NON_STRING_FIELD_SRC, NON_STRING_FIELD_SCHEMA, INVALID_PERMISSION_SCOPE_ERR ; "permission_scopes_non_string_field")]
 #[test_case::test_case(OLD_SCOPE_KEY_SRC, MINIMAL_SCHEMA, "'permission_scope' was removed" ; "old_permission_scope_key")]
 #[test_case::test_case(WRONG_TYPE_SCOPES_SRC, MINIMAL_SCHEMA, "'permission_scopes' must be a string field name or a function" ; "permission_scopes_wrong_type")]
+#[test_case::test_case(SCOPES_WITHOUT_PERMISSION_SRC, STRING_FIELD_SCHEMA, "must declare 'permission'" ; "scopes_without_permission")]
+#[test_case::test_case(PERMISSION_WITHOUT_SCOPES_SRC, STRING_FIELD_SCHEMA, "needs 'permission_scopes'" ; "permission_without_scopes")]
+#[test_case::test_case(UNKNOWN_PERMISSION_SRC, STRING_FIELD_SCHEMA, "unknown permission 'filesystem'" ; "unknown_permission")]
 fn registration_validation_rejects(fields: &str, schema: &str, expected_err: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -451,6 +577,7 @@ fn permission_scopes_valid_string_field_accepted() {
             name = "ok_scope",
             description = "test",
             schema = {STRING_FIELD_SCHEMA},
+            permission = "net",
             permission_scopes = "url",
             handler = function() return "" end
         }})"#,
@@ -3145,6 +3272,64 @@ fn edit_sub_tools_follow_edit_opts(opts: serde_json::Value, on: &[&str], off: &[
     }
 }
 
+/// Every bundled plugin with the edit sub-tools switched on, so the tool set
+/// matches what a user who enabled everything would see.
+fn whole_bundle() -> (Arc<ToolRegistry>, PluginHost) {
+    let mut config = PluginsConfig::from_plugins(HashMap::new());
+    config.opts.insert(
+        "edit".to_owned(),
+        EDIT_SUB_TOOLS
+            .iter()
+            .map(|name| (name.to_string(), serde_json::Value::Bool(true)))
+            .collect(),
+    );
+    builtins_host_with(&config)
+}
+
+/// Pins `FILE_WRITE_TOOLS` to the actual `permission = "fs_write"`
+/// declarations, so a new fs_write tool cannot quietly slip past the file
+/// write policies keyed off that list (plan mode, cwd allow rules).
+#[test]
+fn fs_write_tools_match_file_write_tools() {
+    let (reg, _host) = whole_bundle();
+
+    let snapshot = reg.iter();
+    let mut declared: Vec<&str> = snapshot
+        .iter()
+        .filter(|t| t.tool.required_permission() == Some(Permission::FsWrite))
+        .map(|t| t.name())
+        .collect();
+    declared.sort_unstable();
+    let mut expected: Vec<&str> = FILE_WRITE_TOOLS.to_vec();
+    expected.sort_unstable();
+
+    assert_eq!(declared, expected, "{FILE_WRITE_TOOLS_DRIFT}");
+}
+
+/// `memory` pre-approves the file-write tools for the notes directory it owns,
+/// and a rule can only name a registered tool. That turns `BUNDLED_PLUGINS`
+/// order into load order: put `memory` above the plugins owning those tools
+/// and its rules vanish with only a log line to show for it.
+#[test]
+fn builtins_load_in_an_order_that_keeps_every_plugin_rule() {
+    let (_reg, host) = whole_bundle();
+
+    let rules = host.plugin_rules().snapshot();
+    let allowed: Vec<&str> = rules
+        .iter()
+        .filter(|rule| rule.effect == Effect::Allow)
+        .filter_map(|rule| match &rule.tool {
+            ToolKey::Native(name) => Some(name.as_ref()),
+            _ => None,
+        })
+        .collect();
+    let dropped: Vec<&&str> = FILE_WRITE_TOOLS
+        .iter()
+        .filter(|tool| !allowed.contains(tool))
+        .collect();
+    assert!(dropped.is_empty(), "{MEMORY_RULES_DROPPED}: {dropped:?}");
+}
+
 #[test]
 fn undeclared_opts_fail_the_load() {
     let reg = fresh_registry();
@@ -4253,7 +4438,7 @@ maki.api.register_command({
 }
 
 /// The manifest is what a manual install is granted, so a package that asks
-/// for `env` gets it without any further approval.
+/// for `fs_read` gets it without any further approval.
 #[test]
 fn manual_package_is_granted_what_its_manifest_requests() {
     let site = site_with_package(
@@ -4276,7 +4461,11 @@ maki.api.register_command({
         .join("vendor")
         .join("start")
         .join("asking_pack");
-    std::fs::write(pkg_dir.join("plugin.toml"), "[permissions]\nenv = true\n").unwrap();
+    std::fs::write(
+        pkg_dir.join("plugin.toml"),
+        "[permissions]\nfs_read = true\n",
+    )
+    .unwrap();
 
     let found = maki_lua::discover(site.path());
     let names: Vec<String> = found.packages.iter().map(|p| p.name.clone()).collect();
@@ -4773,46 +4962,36 @@ fn user_plugin_with_fs_read_can_read_but_not_write() {
     assert!(result.contains("write=false"), "got: {result}");
 }
 
-#[test]
-fn builtin_plugin_has_all_permissions() {
+/// Locating maki's own directories, or a program on `$PATH`, answers where a
+/// file lives and never what the environment holds. `fs_read` is what these
+/// cost, and it is also what they need, so `env` stays the key to the process
+/// environment alone.
+#[test_case::test_case("maki.env.state_dir()" ; "state_dir")]
+#[test_case::test_case(r#"maki.fn.executable("ls")"# ; "executable")]
+fn location_queries_cost_fs_read(call: &str) {
+    const TOOL: &str = "location_test";
     let src = perm_tool_src(
-        "trusted_test",
-        r#"local cwd_ok = pcall(function() maki.uv.cwd() end)
-                local env_ok = pcall(function() maki.env.state_dir() end)
-                return "cwd=" .. tostring(cwd_ok) .. ",env=" .. tostring(env_ok)"#,
+        TOOL,
+        &format!(
+            r#"local ok, err = pcall(function() {call} end)
+                return tostring(ok) .. ":" .. tostring(err)"#
+        ),
     );
-    let result = exec_tool_with_perms(
-        maki_lua::PluginPermissions::trusted(),
-        &src,
-        "trusted_test",
-        serde_json::json!({}),
-    )
-    .unwrap();
-    assert!(result.contains("cwd=true"), "got: {result}");
-    assert!(result.contains("env=true"), "got: {result}");
-}
 
-#[test]
-fn env_permission_guards_uv_and_env() {
-    let src = perm_tool_src(
-        "env_guard_test",
-        r#"local cwd_ok = pcall(function() maki.uv.cwd() end)
-                local home_ok = pcall(function() maki.uv.os_homedir() end)
-                local env_ok = pcall(function() maki.env.state_dir() end)
-                local exec_ok = pcall(function() maki.fn.executable("ls") end)
-                return "cwd=" .. tostring(cwd_ok) .. ",home=" .. tostring(home_ok) .. ",env=" .. tostring(env_ok) .. ",exec=" .. tostring(exec_ok)"#,
-    );
-    let result = exec_tool_with_perms(
+    let mut fs_read = maki_lua::PluginPermissions::denied();
+    fs_read.set(maki_lua::Permission::FsRead, true);
+    let granted = exec_tool_with_perms(fs_read, &src, TOOL, serde_json::json!({})).unwrap();
+    assert!(granted.starts_with("true"), "got: {granted}");
+
+    let refused = exec_tool_with_perms(
         maki_lua::PluginPermissions::denied(),
         &src,
-        "env_guard_test",
+        TOOL,
         serde_json::json!({}),
     )
     .unwrap();
-    assert!(result.contains("cwd=false"), "got: {result}");
-    assert!(result.contains("home=false"), "got: {result}");
-    assert!(result.contains("env=false"), "got: {result}");
-    assert!(result.contains("exec=false"), "got: {result}");
+    assert!(refused.contains(PERMISSION_DENIED_MSG), "got: {refused}");
+    assert!(refused.contains("fs_read"), "got: {refused}");
 }
 
 const PATH_FIELD_SCHEMA: &str = r#"{

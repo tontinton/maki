@@ -9,6 +9,7 @@ use maki_storage::paths;
 use maki_storage::sessions::{StoredThinking, ThinkingParseError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use strum::VariantArray;
 use thiserror::Error;
 use tracing::warn;
 
@@ -83,6 +84,73 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
 
 pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines", "insert_lines"];
+
+/// A capability a lua plugin can hold. Declared in `plugin.toml`, recorded in
+/// the package approval store, and named on every guarded `maki.*` function.
+///
+/// It lives here rather than in `maki-lua` so the tool layer can name the
+/// permission a tool exposes without pulling in the lua runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, VariantArray)]
+pub enum Permission {
+    FsRead,
+    FsWrite,
+    Net,
+    Run,
+    Env,
+}
+
+impl Permission {
+    /// Derived from the enum, because reading a manifest, rendering the docs
+    /// and sizing a permission set all walk this, and a hand-written list is
+    /// the one place a new variant gets forgotten.
+    pub const ALL: &'static [Permission] = <Permission as VariantArray>::VARIANTS;
+
+    /// A permission set is an array this long, indexed by `Permission as
+    /// usize`, which is the position in [`Permission::ALL`] since both follow
+    /// declaration order.
+    pub const COUNT: usize = Permission::ALL.len();
+
+    /// Parses the name used in `plugin.toml` and in the approval store.
+    ///
+    /// Both use one spelling on purpose. If an approval were recorded under a
+    /// different name from the request, `intersect` would silently never
+    /// match, and every managed package would run with nothing granted.
+    pub fn from_key(key: &str) -> Option<Self> {
+        Permission::ALL
+            .iter()
+            .copied()
+            .find(|p| p.manifest_key() == key)
+    }
+
+    pub const fn manifest_key(self) -> &'static str {
+        match self {
+            Permission::FsRead => "fs_read",
+            Permission::FsWrite => "fs_write",
+            Permission::Net => "net",
+            Permission::Run => "run",
+            Permission::Env => "env",
+        }
+    }
+
+    /// What the permission covers, in the words the reference renders. The
+    /// boundaries live here so there is one answer to "which guard does this
+    /// function belong under".
+    pub const fn describes(self) -> &'static str {
+        match self {
+            Permission::FsRead => "reading files, and locating the directories maki keeps them in",
+            Permission::FsWrite => "creating, changing, and removing files",
+            Permission::Net => "outbound network requests",
+            Permission::Run => "starting processes",
+            Permission::Env => "reading the process environment, where secrets live",
+        }
+    }
+}
+
+impl std::fmt::Display for Permission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.manifest_key())
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigValue {

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use include_dir::{Dir, include_dir};
+use include_dir::{Dir, File, include_dir};
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{PluginsConfig, RawConfig};
@@ -16,7 +16,8 @@ use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
 use crate::error::PluginError;
 use crate::pack::DiscoveredPackage;
 use crate::plugin_permissions::{
-    PluginPermissions, check_plugin_compatibility, load_plugin_permissions,
+    MANIFEST_FILE, PluginPermissions, Requested, check_plugin_compatibility,
+    load_plugin_permissions,
 };
 use crate::runtime::{
     self, ClickFallback, ConfigScope, LoadChunk, LoadContext, LuaThread, Request, RestoreItem,
@@ -76,10 +77,6 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/skill"),
     },
     BundledPlugin {
-        name: "memory",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
-    },
-    BundledPlugin {
         name: "question",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/question"),
     },
@@ -98,6 +95,12 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "edit",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/edit"),
+    },
+    // Below the tools it pre-approves: `memory` allows writes into its own
+    // state dir, and a rule can only name a registered tool.
+    BundledPlugin {
+        name: "memory",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
     },
     BundledPlugin {
         name: "task",
@@ -126,6 +129,25 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
 /// down the other's registrations.
 pub(crate) fn is_bundled(name: &str) -> bool {
     BUNDLED_PLUGINS.iter().any(|p| p.name == name)
+}
+
+/// A bundled plugin declares its permissions the same way an external one
+/// does. Shipping inside the binary buys no implicit grant, so an unreadable
+/// manifest fails the load rather than quietly widening anything, and a newly
+/// guarded function stays denied until the plugin asks for it.
+fn bundled_permissions(plugin: &BundledPlugin) -> Result<PluginPermissions, PluginError> {
+    let fail = |message: String| PluginError::BundledManifest {
+        plugin: plugin.name.to_owned(),
+        message,
+    };
+    let source = plugin
+        .dir
+        .get_file(MANIFEST_FILE)
+        .and_then(File::contents_utf8)
+        .ok_or_else(|| fail(format!("no {MANIFEST_FILE} next to init.lua")))?;
+    toml::from_str::<toml::Value>(source)
+        .map(|manifest| Requested::from_manifest(&manifest).granted())
+        .map_err(|e| fail(e.to_string()))
 }
 
 pub(crate) fn lib_dir() -> &'static Dir<'static> {
@@ -373,15 +395,24 @@ impl PluginHost {
                 plugin
             );
         }
-        for builtin in &config.names {
-            let dir = match BUNDLED_PLUGINS.iter().find(|p| p.name == builtin.as_str()) {
-                Some(p) => &p.dir,
-                None => {
-                    return Err(PluginError::UnknownPlugin {
-                        plugin: builtin.clone(),
-                    });
-                }
+        if let Some(unknown) = config
+            .names
+            .iter()
+            .find(|name| !BUNDLED_PLUGINS.iter().any(|p| p.name == name.as_str()))
+        {
+            return Err(PluginError::UnknownPlugin {
+                plugin: unknown.clone(),
+            });
+        }
+        // `BUNDLED_PLUGINS` order, not `config.names` order, because a rule can
+        // only name a registered tool, so whoever owns a tool loads before
+        // whoever pre-approves it. `DEFAULT_BUILTINS` stays alphabetical for
+        // the config surface.
+        for bundled in BUNDLED_PLUGINS {
+            let Some(builtin) = config.names.iter().find(|n| n.as_str() == bundled.name) else {
+                continue;
             };
+            let dir = &bundled.dir;
             let init = dir
                 .get_file("init.lua")
                 .and_then(|f| f.contents_utf8())
@@ -389,6 +420,7 @@ impl PluginHost {
                     plugin: builtin.clone(),
                     source: mlua::Error::runtime("bundled plugin missing init.lua"),
                 })?;
+            let permissions = bundled_permissions(bundled)?;
             let name: Arc<str> = Arc::from(builtin.as_str());
             let opts = config
                 .opts
@@ -401,7 +433,7 @@ impl PluginHost {
                 vec![LoadChunk::new(name.as_ref(), init)],
                 LoadContext {
                     opts,
-                    ..LoadContext::plain(None, PluginPermissions::trusted())
+                    ..LoadContext::plain(None, permissions)
                 },
             )?;
         }
@@ -494,6 +526,10 @@ impl PluginHost {
         Ok(())
     }
 
+    /// Runs a source with every permission granted, for tests and embedders.
+    /// Lua arriving from disk must not: it goes through
+    /// [`PluginHost::load_builtins`], [`PluginHost::load_packages`] or the
+    /// `init.lua` path, each of which derives its grant from a manifest.
     pub fn load_source(&self, name: &str, source: &str) -> Result<(), PluginError> {
         self.load_source_with_opts(name, source, serde_json::Map::new())
     }
@@ -1739,5 +1775,173 @@ mod tests {
             contents(&slots, PromptId::System, Slot::Identity),
             ["Dyn identity"]
         );
+    }
+}
+
+/// Holds every bundled `plugin.toml` to what its plugin actually does: the
+/// guarded `maki.*` calls in its lua, and the permissions its tools expose to
+/// the model. The guard map is read out of the `lua_fn` attributes the docs
+/// already record, so moving a function under a different guard shows up here
+/// without anyone editing a table.
+#[cfg(test)]
+mod bundled_manifests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use include_dir::{Dir, DirEntry, File};
+    use maki_agent::tools::{ToolRegistry, ToolSource};
+    use maki_config::{DEFAULT_BUILTINS, PluginsConfig};
+
+    use super::{Arc, BUNDLED_PLUGINS, HashMap, PluginHost, bundled_permissions, lib_dir};
+    use crate::docs::{DocKind, api_docs};
+    use crate::plugin_permissions::Permission;
+
+    const TEST_DIR: &str = "tests";
+    const LUA_EXT: &str = "lua";
+    const REQUIRE_CALL: &str = "require(";
+
+    /// Every guarded `maki.*` function under the dotted name lua calls it by.
+    fn guarded_calls() -> Vec<(String, Permission)> {
+        api_docs()
+            .into_iter()
+            .filter(|module| module.kind == DocKind::Table)
+            .flat_map(|module| {
+                module.fns.iter().filter_map(move |func| {
+                    let permission = Permission::from_key(func.guard?)?;
+                    Some((format!("{}.{}", module.name, func.name), permission))
+                })
+            })
+            .collect()
+    }
+
+    /// Read off a real load rather than off the source text, because
+    /// `register_tool` refuses a permission the plugin lacks, which makes
+    /// shipping the tool itself a use of it.
+    fn tool_permissions() -> BTreeMap<String, BTreeSet<Permission>> {
+        let registry = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::new(Arc::clone(&registry)).expect("host starts");
+        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+            .expect("every bundled plugin loads");
+
+        let mut out: BTreeMap<String, BTreeSet<Permission>> = BTreeMap::new();
+        for tool in registry.iter().iter() {
+            let (ToolSource::Lua { plugin }, Some(permission)) =
+                (&tool.source, tool.tool.required_permission())
+            else {
+                continue;
+            };
+            out.entry(plugin.to_string())
+                .or_default()
+                .insert(permission);
+        }
+        out
+    }
+
+    /// Specs, not runtime code. What a test calls must not buy the plugin a
+    /// permission its handlers never use.
+    fn runtime_lua(file: &'static File<'static>) -> Option<&'static str> {
+        let path = file.path();
+        if path.extension()? != LUA_EXT || path.components().any(|p| p.as_os_str() == TEST_DIR) {
+            return None;
+        }
+        file.contents_utf8()
+    }
+
+    fn collect_runtime_lua(dir: &'static Dir<'static>, out: &mut Vec<&'static str>) {
+        for entry in dir.entries() {
+            match entry {
+                DirEntry::Dir(sub) => collect_runtime_lua(sub, out),
+                DirEntry::File(file) => out.extend(runtime_lua(file)),
+            }
+        }
+    }
+
+    fn required_module_names(source: &'static str) -> impl Iterator<Item = &'static str> {
+        source.match_indices(REQUIRE_CALL).filter_map(|(start, _)| {
+            let rest = &source[start + REQUIRE_CALL.len()..];
+            let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let name = &rest[quote.len_utf8()..];
+            name.find(quote).map(|end| &name[..end])
+        })
+    }
+
+    /// A guard resolves against the calling plugin, so a `lib` helper spends
+    /// the caller's permissions and counts as the caller's usage. `lib` is the
+    /// only plugin another one reaches into: anything else a `require` names is
+    /// the plugin's own file, already collected, or a virtual module such as
+    /// `plugin_dev`. A plugin's own directory is taken whole rather than walked
+    /// from its entrypoint, because `index` builds its language module names at
+    /// runtime.
+    fn runtime_sources(dir: &'static Dir<'static>) -> Vec<&'static str> {
+        let mut sources = Vec::new();
+        collect_runtime_lua(dir, &mut sources);
+        let mut seen = BTreeSet::new();
+        let mut next = 0;
+        while let Some(source) = sources.get(next).copied() {
+            next += 1;
+            let reached: Vec<&'static str> = required_module_names(source)
+                .filter(|modname| seen.insert(*modname))
+                .filter_map(|modname| {
+                    lib_dir().get_file(format!("{}.{LUA_EXT}", modname.replace('.', "/")))
+                })
+                .filter_map(runtime_lua)
+                .collect();
+            sources.extend(reached);
+        }
+        sources
+    }
+
+    /// Whole-word only, so `maki.fs.read` is not reported for every
+    /// `maki.fs.read_bytes`.
+    fn calls(source: &str, name: &str) -> bool {
+        source.match_indices(name).any(|(at, _)| {
+            !source[at + name.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    }
+
+    #[test]
+    fn bundled_manifests_match_the_permissions_their_plugin_uses() {
+        let tools = tool_permissions();
+        let guarded = guarded_calls();
+        let mut drift = Vec::new();
+        // `lib` is the one bundled directory that never loads on its own, so it
+        // ships no manifest and its modules answer to whoever requires them.
+        for plugin in BUNDLED_PLUGINS
+            .iter()
+            .filter(|p| DEFAULT_BUILTINS.contains(&p.name))
+        {
+            let declared = bundled_permissions(plugin).expect("every builtin ships a plugin.toml");
+            // Each permission paired with the usage demanding it, so a failure
+            // points at something to go look at.
+            let mut needed: BTreeMap<Permission, String> = tools
+                .get(plugin.name)
+                .into_iter()
+                .flatten()
+                .map(|permission| (*permission, format!("a tool exposing '{permission}'")))
+                .collect();
+            for source in runtime_sources(&plugin.dir) {
+                for (name, permission) in &guarded {
+                    if calls(source, name) {
+                        needed.entry(*permission).or_insert_with(|| name.clone());
+                    }
+                }
+            }
+
+            let manifest = format!("plugins/{}/plugin.toml", plugin.name);
+            for &permission in Permission::ALL {
+                match (declared.is_allowed(permission), needed.get(&permission)) {
+                    (false, Some(usage)) => drift.push(format!(
+                        "{manifest}: {usage} needs '{permission}', grant it or drop the usage"
+                    )),
+                    (true, None) => drift.push(format!(
+                        "{manifest}: declares '{permission}' but nothing its runtime lua reaches needs it, remove it"
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        assert!(drift.is_empty(), "plugin.toml drift:\n{}", drift.join("\n"));
     }
 }

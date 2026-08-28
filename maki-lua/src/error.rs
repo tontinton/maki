@@ -46,6 +46,8 @@ pub enum PluginError {
     UnknownPlugin { plugin: String },
     #[error("plugin host is not running")]
     HostDead,
+    #[error("bundled plugin {plugin} has an unusable plugin.toml: {message}")]
+    BundledManifest { plugin: String, message: String },
     #[error("package {name} at {path} has no plugin/*.lua entrypoint")]
     PackageEmpty { name: String, path: PathBuf },
     #[error("package file {path} resolves outside its package directory")]

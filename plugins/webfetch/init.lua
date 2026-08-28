@@ -95,6 +95,7 @@ maki.api.register_tool({
       timeout = { type = "integer", description = "Timeout in seconds (default 30, max 120)" },
     },
   },
+  permission = "net",
   permission_scopes = "url",
 
   header = function(input)

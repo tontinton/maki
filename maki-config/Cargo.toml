@@ -15,6 +15,7 @@ tracing = { workspace = true }
 dotenvy = { workspace = true }
 inventory = { workspace = true }
 globset = { workspace = true }
+strum = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

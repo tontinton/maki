@@ -38,6 +38,7 @@ maki.api.register_tool({
       num_results = { type = "integer", description = "Number of results to return (default 8)" },
     },
   },
+  permission = "net",
   permission_scopes = "query",
   -- research/general included so subagents keep web search now that the
   -- interpreter only exposes tools the host audience could see itself.

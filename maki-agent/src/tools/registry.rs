@@ -10,6 +10,7 @@ use std::task::{Context, Poll};
 
 use arc_swap::ArcSwap;
 use bitflags::bitflags;
+use maki_config::Permission;
 use serde_json::{Value, json};
 
 use crate::template::Vars;
@@ -228,6 +229,12 @@ pub trait Tool: Send + Sync + 'static {
         ToolAudience::default()
     }
     fn tool_kind(&self) -> Option<&str> {
+        None
+    }
+    /// The plugin permission a rule pre-approving this tool requires. `None`
+    /// means the tool is never permission checked, so a rule naming it would
+    /// never be consulted.
+    fn required_permission(&self) -> Option<Permission> {
         None
     }
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError>;

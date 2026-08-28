@@ -54,10 +54,15 @@ a string belongs.
 
 ## Permissions and plugin.toml {#plugin-permissions}
 
-Sensitive APIs are gated per plugin file; every gated function's entry in
-this reference names the permission it needs. The permissions are: `fs_read`, `fs_write`, `net`, `run`, `env`.
-A gated call without its permission raises
-`permission denied: '<name>' not granted for this plugin`.
+Sensitive APIs are gated per plugin file, and every gated function's entry in
+this reference names the permission it needs. A gated call without its
+permission raises `permission denied: '<name>' not granted for this plugin`.
+
+- `fs_read`: reading files, and locating the directories maki keeps them in
+- `fs_write`: creating, changing, and removing files
+- `net`: outbound network requests
+- `run`: starting processes
+- `env`: reading the process environment, where secrets live
 
 Grants come from a `plugin.toml` next to the Lua file (for
 `~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
@@ -80,6 +85,9 @@ The rules:
 - `plugin.toml` exists: permissions default to granted; set a key to
   `false` to revoke it. An empty file grants everything.
 - Invalid TOML: everything denied, with a warning in the log.
+- A package, or a plugin maki ships, is read the other way round: a key it
+  does not name is not requested, so its `plugin.toml` lists everything it
+  uses. Only a `plugin.toml` you wrote yourself defaults to granted.
 - `min_maki_version` is optional and takes a plain semantic version as a lower
   bound, so ranges do not work. When the field is invalid or the running
   version is older, Maki skips the Lua in that directory and warns at startup
@@ -312,7 +320,8 @@ string or a table with richer output fields.
   - `start` (`function`) Optional. Called when the tool call starts, before the handler runs.
   - `describe` (`function`) Optional. Returns a custom description string for the current context.
   - `examples` (`table`) Optional. Array of example input objects for documentation.
-  - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission.
+  - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
+  - `permission` (`string`) Required with `permission_scopes`. The capability the tool exposes to the model: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves this tool.
   - `mutable_path` (`string`) Schema field name (type: string) for the primary path the tool writes.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 
@@ -354,13 +363,26 @@ Rules live as long as the plugin is loaded: a reload replaces them, and a
 reload that registers none clears the old ones. User config and session
 deny rules always win over a plugin allow.
 
+An allow is delegation, not escalation: it needs the `permission` the
+target tool declares, so a plugin can only pre-approve what it could
+already do itself. A deny needs no permission.
+
+Allows are checked once the plugin finishes loading, so a plugin may
+pre-approve a tool it registers itself. One that does not hold up (no such
+tool, a tool with no `permission_scopes` that is never checked, or a
+permission the plugin lacks) is dropped with a warning in the log while the
+rest of the plugin loads. Without the rule the call simply prompts.
+
 **Parameters:**
 
 - `{spec}` (`table`) Rule specification:
   - `tool` (`string`) Required. Native tool name (e.g. "edit", "write").
     MCP tools and the "*" wildcard are not allowed.
   - `scope` (`string`) Required. Scope pattern the rule applies to, e.g.
-    "/abs/dir/**" for a directory subtree.
+    "/abs/dir/**" for a directory subtree. An allow whose
+    pattern matches every scope ("*", "**", "/*", "/**") is
+    refused: name the paths or commands it covers. A deny may
+    cover everything.
   - `effect` (`string`) Optional. "allow" (default) or "deny".
 
 **Example:**
@@ -1482,6 +1504,11 @@ Paths to maki's own directories (config, state, logs, legacy).
 
 Use these to locate config files or persistent state without hard-coding paths.
 
+These answer where maki keeps its files, so they need `fs_read`, which a
+plugin needs to read anything there anyway. Asking for a path must not
+cost a plugin `env`, which covers the process environment alone
+(`maki.uv.os_getenv`), where secrets live.
+
 ```lua
 local cfg = maki.env.config_dir()
 ```
@@ -1497,7 +1524,7 @@ maki.env.state_dir()
 Return the directory where maki stores runtime state (sessions, auth tokens, etc.).
 Typically something like `~/.local/state/maki`.
 
-Requires the `env` [plugin permission](#plugin-permissions).
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Returns:** (`string?`) State directory path, or nil if it cannot be determined.
 
@@ -1518,7 +1545,7 @@ maki.env.config_dir()
 Return the directory where maki looks for user configuration files.
 Typically something like `~/.config/maki`.
 
-Requires the `env` [plugin permission](#plugin-permissions).
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Returns:** (`string?`) Config directory path, or nil if it cannot be determined.
 
@@ -1539,7 +1566,7 @@ maki.env.logs_dir()
 Return the directory where maki writes its log files (`maki.log`).
 Typically something like `~/.local/logs/maki`.
 
-Requires the `env` [plugin permission](#plugin-permissions).
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Returns:** (`string?`) Logs directory path, or nil if it cannot be determined.
 
@@ -1560,7 +1587,7 @@ maki.env.legacy_dir()
 Return the legacy config path (`~/.maki`), if it exists on disk.
 Useful for migration logic. Returns nil when there is no legacy directory.
 
-Requires the `env` [plugin permission](#plugin-permissions).
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Returns:** (`string?`) Legacy directory path, or nil if not present.
 
@@ -1773,7 +1800,7 @@ Check whether {name} can be found on `$PATH` or is an absolute path
 to a file. Returns 1 when found, 0 otherwise (matches Neovim's
 `vim.fn.executable`).
 
-Requires the `env` [plugin permission](#plugin-permissions).
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -5302,6 +5329,10 @@ System and environment utilities, modelled after `vim.uv`.
 Provides access to the working directory, home directory, and environment
 variables. None of these functions throw.
 
+Filesystem location queries (`cwd`, `os_homedir`) need `fs_read`, while
+`os_getenv` reads the process environment, where secrets live, so it needs
+`env`.
+
 ```lua
 local home = maki.uv.os_homedir()
 ```
@@ -5316,7 +5347,7 @@ maki.uv.cwd()
 
 Return the current working directory as an absolute path. Like `vim.uv.cwd`.
 
-Requires the `env` [plugin permission](#plugin-permissions).
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Returns:** (`string?`) Current working directory, or nil if it cannot be determined.
 
@@ -5337,7 +5368,7 @@ maki.uv.os_homedir()
 
 Return the current user's home directory. Like `vim.uv.os_homedir`.
 
-Requires the `env` [plugin permission](#plugin-permissions).
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Returns:** (`string?`) Home directory path, or nil if it cannot be determined.
 

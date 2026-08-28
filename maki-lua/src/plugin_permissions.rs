@@ -1,4 +1,3 @@
-use std::fmt;
 use std::io;
 use std::path::Path;
 
@@ -8,69 +7,27 @@ use tracing::warn;
 
 use crate::error::PluginError;
 
-const MANIFEST_FILE: &str = "plugin.toml";
+pub use maki_config::Permission;
+
+pub(crate) const MANIFEST_FILE: &str = "plugin.toml";
 const MIN_MAKI_VERSION: &str = "min_maki_version";
 const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Permission {
-    FsRead,
-    FsWrite,
-    Net,
-    Run,
-    Env,
-}
-
-impl Permission {
-    pub(crate) const ALL: [Permission; 5] = [
-        Permission::FsRead,
-        Permission::FsWrite,
-        Permission::Net,
-        Permission::Run,
-        Permission::Env,
-    ];
-
-    /// Parses the name used in `plugin.toml` and in the approval store.
-    ///
-    /// Both use one spelling on purpose. If an approval were recorded under a
-    /// different name from the request, `intersect` would silently never
-    /// match, and every managed package would run with nothing granted.
-    pub fn from_key(key: &str) -> Option<Self> {
-        Permission::ALL
-            .into_iter()
-            .find(|p| p.manifest_key() == key)
-    }
-
-    pub(crate) const fn manifest_key(self) -> &'static str {
-        match self {
-            Permission::FsRead => "fs_read",
-            Permission::FsWrite => "fs_write",
-            Permission::Net => "net",
-            Permission::Run => "run",
-            Permission::Env => "env",
-        }
-    }
-}
-
-impl fmt::Display for Permission {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.manifest_key())
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct PluginPermissions {
-    allowed: [bool; 5],
+    allowed: [bool; Permission::COUNT],
 }
 
 impl PluginPermissions {
     pub fn trusted() -> Self {
-        Self { allowed: [true; 5] }
+        Self {
+            allowed: [true; Permission::COUNT],
+        }
     }
 
     pub fn denied() -> Self {
         Self {
-            allowed: [false; 5],
+            allowed: [false; Permission::COUNT],
         }
     }
 
@@ -95,8 +52,8 @@ impl PluginPermissions {
 
     pub fn from_manifest(manifest: &toml::Value) -> Self {
         let perms = manifest.get("permissions");
-        let mut allowed = [true; 5];
-        for perm in Permission::ALL {
+        let mut allowed = [true; Permission::COUNT];
+        for &perm in Permission::ALL {
             allowed[perm as usize] = perms
                 .and_then(|p| p.get(perm.manifest_key()))
                 .and_then(toml::Value::as_bool)
@@ -166,8 +123,8 @@ impl Requested {
 
     pub fn from_manifest(manifest: &toml::Value) -> Self {
         let perms = manifest.get("permissions");
-        let mut allowed = [false; 5];
-        for perm in Permission::ALL {
+        let mut allowed = [false; Permission::COUNT];
+        for &perm in Permission::ALL {
             allowed[perm as usize] = perms
                 .and_then(|p| p.get(perm.manifest_key()))
                 .and_then(toml::Value::as_bool)
@@ -182,16 +139,16 @@ impl Requested {
 
     pub fn names(&self) -> Vec<String> {
         Permission::ALL
-            .into_iter()
-            .filter(|permission| self.is_requested(*permission))
+            .iter()
+            .filter(|permission| self.is_requested(**permission))
             .map(|permission| permission.to_string())
             .collect()
     }
 
-    /// A package the user installed by hand gets what it asks for. They placed
-    /// the files, which is the same trust already given to a local `init.lua`.
-    /// Only a package maki fetched has to be intersected with an approval.
-    pub fn granted_for_manual_install(self) -> PluginPermissions {
+    /// Code whose files nobody fetched gets what it asks for: a package the
+    /// user installed by hand, or a plugin bundled into the binary. Only a
+    /// package maki downloaded has to be intersected with an approval.
+    pub fn granted(self) -> PluginPermissions {
         self.0
     }
 
@@ -199,7 +156,7 @@ impl Requested {
     /// approval must agree.
     pub fn intersect(&self, approved: &PluginPermissions) -> PluginPermissions {
         let mut out = PluginPermissions::denied();
-        for perm in Permission::ALL {
+        for &perm in Permission::ALL {
             out.set(perm, self.0.is_allowed(perm) && approved.is_allowed(perm));
         }
         out
@@ -340,7 +297,7 @@ mod tests {
     const PLUGIN: &str = "test-plugin";
 
     fn assert_denied(permissions: &PluginPermissions) {
-        for permission in Permission::ALL {
+        for &permission in Permission::ALL {
             assert!(
                 !permissions.is_allowed(permission),
                 "{permission} should be denied"
@@ -351,7 +308,7 @@ mod tests {
     #[test]
     fn trusted_allows_everything() {
         let p = PluginPermissions::trusted();
-        for perm in Permission::ALL {
+        for &perm in Permission::ALL {
             assert!(p.is_allowed(perm), "{perm} should be allowed");
         }
     }
@@ -384,7 +341,7 @@ mod tests {
     fn from_manifest_missing_section() {
         let val: toml::Value = toml::from_str("[package]\nname = \"test\"").unwrap();
         let p = PluginPermissions::from_manifest(&val);
-        for perm in Permission::ALL {
+        for &perm in Permission::ALL {
             assert!(p.is_allowed(perm), "{perm} should default to allowed");
         }
     }
@@ -423,7 +380,7 @@ mod tests {
         .unwrap();
         let req = Requested::from_manifest(&val);
         assert!(req.is_requested(Permission::Net));
-        for perm in Permission::ALL {
+        for &perm in Permission::ALL {
             if perm != Permission::Net {
                 assert!(!req.is_requested(perm), "{perm} must not be requested");
             }
@@ -454,7 +411,7 @@ mod tests {
         let val: toml::Value = toml::from_str("[package]\nname = \"p\"").unwrap();
         let legacy = PluginPermissions::from_manifest(&val);
         let requested = Requested::from_manifest(&val);
-        for perm in Permission::ALL {
+        for &perm in Permission::ALL {
             assert!(legacy.is_allowed(perm), "legacy stays permissive");
             assert!(!requested.is_requested(perm), "package requests nothing");
         }
@@ -495,7 +452,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let granted = Requested::from_manifest(&val).granted_for_manual_install();
+        let granted = Requested::from_manifest(&val).granted();
         assert!(granted.is_allowed(Permission::FsRead));
         assert!(!granted.is_allowed(Permission::Net));
     }
@@ -583,7 +540,7 @@ mod tests {
 
         fs::write(dir.path().join(MANIFEST_FILE), "").unwrap();
         let permissions = load_plugin_permissions(Some(dir.path()));
-        for permission in Permission::ALL {
+        for &permission in Permission::ALL {
             assert!(permissions.is_allowed(permission));
         }
 

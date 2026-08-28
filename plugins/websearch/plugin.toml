@@ -1,0 +1,3 @@
+[permissions]
+net = true
+env = true

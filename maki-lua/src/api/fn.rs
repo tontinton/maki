@@ -930,7 +930,9 @@ pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) 
 /// if maki.fn.executable("rg") == 1 then
 ///   -- use ripgrep
 /// end
-#[lua_fn(guard = Env)]
+// A file probe over `$PATH`: it answers whether a file exists, never what the
+// environment holds, so `fs_read` covers it.
+#[lua_fn(guard = FsRead)]
 fn executable(_lua: &Lua, name: String) -> LuaResult<i32> {
     let found = env::var_os("PATH")
         .map(|paths| env::split_paths(&paths).any(|dir| dir.join(&name).is_file()))
