@@ -38,7 +38,7 @@ use crate::api::util::command::{
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, try_pair};
-use crate::plugin_permissions::{Permission, PluginPermissions};
+use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions};
 use crate::runtime::{
     HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request, command_depth,
 };
@@ -1389,6 +1389,14 @@ fn parse_start_annotation(spec: &Table, schema: &Value) -> LuaResult<Option<Star
     }
 }
 
+fn permission_keys() -> String {
+    Permission::ALL
+        .iter()
+        .map(|p| p.manifest_key())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Reads both keys together, so the pair enters the runtime whole and only
 /// when the plugin holds what the tool would expose.
 fn parse_tool_permission(
@@ -1403,12 +1411,8 @@ fn parse_tool_permission(
         .map(|key| {
             Permission::from_key(&key).ok_or_else(|| {
                 mlua::Error::runtime(format!(
-                    "register_tool: unknown permission '{key}' (valid: {})",
-                    Permission::ALL
-                        .iter()
-                        .map(|p| p.manifest_key())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "register_tool: '{tool}' declares unknown permission '{key}' (valid: {})",
+                    permission_keys()
                 ))
             })
         })
@@ -1419,19 +1423,23 @@ fn parse_tool_permission(
         (None, true) => return Ok(None),
         (Some(permission), false) => permission,
         (None, false) => {
-            return Err(mlua::Error::runtime(
-                "register_tool: a tool with 'permission_scopes' must declare 'permission', the capability it exposes to the model",
-            ));
+            return Err(mlua::Error::runtime(format!(
+                "register_tool: '{tool}' has 'permission_scopes', so it must declare 'permission', the capability it exposes to the model. \
+                 Add it next to 'permission_scopes' in the register_tool spec, one of: {}",
+                permission_keys()
+            )));
         }
-        (Some(_), true) => {
-            return Err(mlua::Error::runtime(
-                "register_tool: 'permission' needs 'permission_scopes', without scopes the tool is never permission checked",
-            ));
+        (Some(permission), true) => {
+            return Err(mlua::Error::runtime(format!(
+                "register_tool: '{tool}' declares permission '{permission}' but needs 'permission_scopes' too, without scopes the tool is never permission checked. \
+                 Add 'permission_scopes' next to it, either the name of the schema field holding the path or a function(input) returning the scopes"
+            )));
         }
     };
     if !permissions.is_allowed(permission) {
         return Err(mlua::Error::runtime(format!(
-            "register_tool: '{tool}' exposes '{permission}' to the model, which this plugin was not granted"
+            "register_tool: '{tool}' exposes '{permission}' to the model, which this plugin was not granted. \
+             Add `{permission} = true` under `[permissions]` in the {MANIFEST_FILE} next to the plugin file"
         )));
     }
 
