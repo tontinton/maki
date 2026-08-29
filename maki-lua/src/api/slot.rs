@@ -1,11 +1,21 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::mem;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwap;
+use maki_agent::tools::HookStage;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 
-use crate::api::util::dispatch::{DepthGuard, call_isolated};
+use crate::api::util::dispatch::{DepthGuard, Reentry, call_swallowing};
+
+/// Slot names the host fires itself. A plugin declaring one would shadow a
+/// point whose firing order dispatch guarantees, so the namespace is closed.
+pub(crate) const HOST_PREFIX: &str = "tool.";
+
+const SEAM: &str = "slot";
 
 #[derive(Clone)]
 pub(crate) struct SlotLayer {
@@ -22,12 +32,21 @@ pub(crate) struct SlotEntry {
     pub layers: Vec<SlotLayer>,
 }
 
-#[derive(Default)]
 pub(crate) struct SlotStore {
     pub slots: HashMap<String, SlotEntry>,
+    /// The published view of `slots`, for the one reader that cannot take the
+    /// Lua state: a tool call on the agent's thread.
+    layered: Arc<LayeredTools>,
 }
 
 impl SlotStore {
+    pub fn new(layered: Arc<LayeredTools>) -> Self {
+        Self {
+            slots: HashMap::new(),
+            layered,
+        }
+    }
+
     pub fn clear_plugin(&mut self, plugin: &str) {
         for entry in self.slots.values_mut() {
             entry.layers.retain(|l| l.plugin.as_ref() != plugin);
@@ -38,6 +57,40 @@ impl SlotStore {
         }
         self.slots
             .retain(|_, e| e.owner.is_some() || !e.layers.is_empty());
+        self.publish();
+    }
+
+    /// Rebuilds the published index from `slots`, which stays the only thing
+    /// anyone writes. Every mutation ends here, so a tool call never reads a
+    /// layer a reload took away, or misses one it just added.
+    fn publish(&self) {
+        let mut stages = StageSets::default();
+        for (name, entry) in &self.slots {
+            if entry.layers.is_empty() {
+                continue;
+            }
+            if let Some((tool, stage)) = host_slot_target(name) {
+                stages[stage as usize].insert(Arc::from(tool));
+            }
+        }
+        self.layered.0.store(Arc::new(stages));
+    }
+}
+
+type StageSets = [HashSet<Arc<str>>; HookStage::ALL.len()];
+
+/// Which tools have a layer on which stage, keyed by tool rather than by slot
+/// name so the check every tool call makes costs one atomic load and one
+/// lookup, with nothing formatted and nothing allocated.
+///
+/// Owned by the runtime that created the [`SlotStore`], so two plugin hosts in
+/// one process each answer for their own layers.
+#[derive(Default)]
+pub struct LayeredTools(ArcSwap<StageSets>);
+
+impl LayeredTools {
+    pub fn wraps(&self, tool: &str, stage: HookStage) -> bool {
+        self.0.load()[stage as usize].contains(tool)
     }
 }
 
@@ -66,37 +119,50 @@ fn slot_store_mut(lua: &Lua) -> LuaResult<mlua::AppDataRefMut<'_, SlotStore>> {
         .ok_or_else(|| mlua::Error::runtime("slot store not initialized"))
 }
 
-fn make_prev(
-    lua: &Lua,
-    name: &str,
-    default: &Function,
-    layers: &Arc<[SlotLayer]>,
-    rest: usize,
-    state: &PrevCell,
-) -> LuaResult<Function> {
-    let name = name.to_owned();
-    let default = default.clone();
-    let layers = Arc::clone(layers);
+/// The innermost call of a host-fired chain: no plugin owns those slots, so
+/// the arguments fall through unchanged when every layer defers.
+fn identity_default(lua: &Lua) -> LuaResult<Function> {
+    lua.create_function(|_, args: MultiValue| Ok(args))
+}
+
+/// Everything a chain needs except its position in it. Bundled because
+/// `create_async_function` wants an owned copy per call, and the alternative is
+/// cloning four captures by hand at every hop.
+#[derive(Clone)]
+struct Chain {
+    lua: Lua,
+    name: Arc<str>,
+    default: Function,
+    layers: Arc<[SlotLayer]>,
+}
+
+fn make_prev(chain: &Chain, rest: usize, state: &PrevCell) -> LuaResult<Function> {
+    let owned = chain.clone();
     let state = Arc::clone(state);
-    lua.create_function(
-        move |lua, args: MultiValue| match take_state(&state, PrevState::Running) {
-            PrevState::Armed => {
-                let r = invoke_chain(lua, &name, &default, &layers, rest, args);
-                set_state(&state, PrevState::Done(r.clone()));
-                r
+    chain.lua.create_async_function(move |_, args: MultiValue| {
+        let chain = owned.clone();
+        let state = Arc::clone(&state);
+        async move {
+            match take_state(&state, PrevState::Running) {
+                PrevState::Armed => {
+                    let r = invoke_chain(chain, rest, args).await;
+                    set_state(&state, PrevState::Done(r.clone()));
+                    r
+                }
+                prior => {
+                    let what = match prior {
+                        PrevState::Expired => "expired",
+                        _ => "already consumed",
+                    };
+                    set_state(&state, prior);
+                    Err(mlua::Error::runtime(format!(
+                        "prev for slot '{}' {what}",
+                        chain.name
+                    )))
+                }
             }
-            prior => {
-                let what = match prior {
-                    PrevState::Expired => "expired",
-                    _ => "already consumed",
-                };
-                set_state(&state, prior);
-                Err(mlua::Error::runtime(format!(
-                    "prev for slot '{name}' {what}"
-                )))
-            }
-        },
-    )
+        }
+    })
 }
 
 /// Runs the chain so everything below a layer executes exactly once.
@@ -105,6 +171,10 @@ fn make_prev(
 /// single-shot `prev` that continues the chain. The `(default, layers)`
 /// snapshot cannot race an unload: all Lua runs on the runtime thread and
 /// unloads arrive through the request channel.
+///
+/// Layers may park, which is what lets one shell out or read a file before it
+/// decides. They run in the caller's task ([`call_swallowing`]), so the
+/// caller's cancellation and deadline reach the layers producing its answer.
 ///
 /// When a layer errors, its `prev` state tells us how far it got:
 /// - never called `prev`: skip the broken layer, run the rest with the
@@ -115,51 +185,118 @@ fn make_prev(
 /// Errors from the default propagate unwrapped: the default is the owner's
 /// own function, same as any local call.
 fn invoke_chain(
-    lua: &Lua,
-    name: &str,
-    default: &Function,
-    layers: &Arc<[SlotLayer]>,
+    chain: Chain,
     idx: usize,
     args: MultiValue,
+) -> Pin<Box<dyn Future<Output = LuaResult<MultiValue>> + Send>> {
+    Box::pin(async move {
+        let Some(layer) = idx.checked_sub(1).map(|i| chain.layers[i].clone()) else {
+            return chain.default.call_async(args).await;
+        };
+        let state: PrevCell = Arc::new(Mutex::new(PrevState::Armed));
+        let prev = make_prev(&chain, idx - 1, &state)?;
+        let mut layer_args = args.clone();
+        layer_args.push_front(Value::Function(prev));
+        let result =
+            call_swallowing::<MultiValue>(&layer.func, layer_args, &chain.name, &layer.plugin)
+                .await;
+        match (result, take_state(&state, PrevState::Expired)) {
+            (Some(r), _) => Ok(r),
+            (None, PrevState::Done(r)) => r,
+            (None, PrevState::Armed) => invoke_chain(chain, idx - 1, args).await,
+            (None, PrevState::Running | PrevState::Expired) => Err(mlua::Error::runtime(format!(
+                "prev for slot '{}' left in inconsistent state",
+                chain.name
+            ))),
+        }
+    })
+}
+
+fn snapshot(lua: &Lua, name: &str) -> Option<(Option<Function>, Arc<[SlotLayer]>)> {
+    let store = lua.app_data_ref::<SlotStore>()?;
+    let entry = store.slots.get(name)?;
+    Some((entry.default.clone(), entry.layers.as_slice().into()))
+}
+
+/// The one way into [`invoke_chain`], so no caller can start a chain without
+/// the depth bound that stops a layer from re-entering its own seam forever.
+async fn run_chain(
+    lua: &Lua,
+    name: Arc<str>,
+    default: Function,
+    layers: Arc<[SlotLayer]>,
+    args: MultiValue,
 ) -> LuaResult<MultiValue> {
-    let Some(layer) = idx.checked_sub(1).map(|i| &layers[i]) else {
-        return default.call(args);
+    let _guard = DepthGuard::enter(lua, SEAM, &name, Reentry::Task).map_err(|_| {
+        mlua::Error::runtime(format!(
+            "slot '{name}' exceeded max depth (recursive filler? call prev instead)"
+        ))
+    })?;
+    let depth = layers.len();
+    let chain = Chain {
+        lua: lua.clone(),
+        name,
+        default,
+        layers,
     };
-    let state: PrevCell = Arc::new(Mutex::new(PrevState::Armed));
-    let prev = make_prev(lua, name, default, layers, idx - 1, &state)?;
-    let mut layer_args = args.clone();
-    layer_args.push_front(Value::Function(prev));
-    let result = call_isolated::<MultiValue>(lua, &layer.func, layer_args, name, &layer.plugin);
-    match (result, take_state(&state, PrevState::Expired)) {
-        (Some(r), _) => Ok(r),
-        (None, PrevState::Done(r)) => r,
-        (None, PrevState::Armed) => invoke_chain(lua, name, default, layers, idx - 1, args),
-        (None, PrevState::Running | PrevState::Expired) => Err(mlua::Error::runtime(format!(
-            "prev for slot '{name}' left in inconsistent state"
-        ))),
+    invoke_chain(chain, depth, args).await
+}
+
+/// The slot a stage of a tool call fires: `("bash", Input)` -> `tool.bash.input`.
+pub(crate) fn host_slot_name(tool: &str, stage: HookStage) -> String {
+    format!("{HOST_PREFIX}{tool}.{}", stage.as_str())
+}
+
+/// The inverse of [`host_slot_name`]. `None` for any other name, including a
+/// `tool.` name whose suffix names no stage.
+pub(crate) fn host_slot_target(slot: &str) -> Option<(&str, HookStage)> {
+    let (tool, suffix) = slot.strip_prefix(HOST_PREFIX)?.rsplit_once('.')?;
+    let stage = HookStage::ALL.into_iter().find(|s| s.as_str() == suffix)?;
+    Some((tool, stage))
+}
+
+/// Fires a host-owned slot: same layer contract as a declared one, with an
+/// identity default nobody can replace. `allow_layer` says which plugins'
+/// layers may see it, and living in the caller keeps slots ignorant of tools
+/// and permissions.
+///
+/// `None` means nothing ran, which the identity default handing back `args`
+/// would not say: the caller has to leave the value alone rather than report a
+/// rewrite.
+pub(crate) async fn run_host_chain(
+    lua: &Lua,
+    name: &str,
+    args: MultiValue,
+    allow_layer: &dyn Fn(&str) -> bool,
+) -> LuaResult<Option<MultiValue>> {
+    let Some((_, layers)) = snapshot(lua, name) else {
+        return Ok(None);
+    };
+    let layers: Arc<[SlotLayer]> = layers
+        .iter()
+        .filter(|layer| allow_layer(&layer.plugin))
+        .cloned()
+        .collect();
+    if layers.is_empty() {
+        return Ok(None);
     }
+    run_chain(lua, Arc::from(name), identity_default(lua)?, layers, args)
+        .await
+        .map(Some)
 }
 
 /// The callable closes over `name` only and reads the store on every call,
 /// so a handle given out before a reload keeps working after it.
 fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
-    lua.create_function(move |lua, args: MultiValue| {
-        let _guard = DepthGuard::enter(lua, "slot", &name).map_err(|_| {
-            mlua::Error::runtime(format!(
-                "slot '{name}' exceeded max depth (recursive filler? call prev instead)"
-            ))
-        })?;
-        let (default, layers): (Function, Arc<[SlotLayer]>) = {
-            let store = lua
-                .app_data_ref::<SlotStore>()
-                .ok_or_else(|| mlua::Error::runtime("slot store not initialized"))?;
-            store
-                .slots
-                .get(&name)
-                .and_then(|e| Some((e.default.clone()?, e.layers.as_slice().into())))
-                .ok_or_else(|| mlua::Error::runtime(format!("slot '{name}' is not declared")))?
-        };
-        invoke_chain(lua, &name, &default, &layers, layers.len(), args)
+    let name: Arc<str> = Arc::from(name.as_str());
+    lua.create_async_function(move |lua, args: MultiValue| {
+        let name = Arc::clone(&name);
+        async move {
+            let (default, layers) = snapshot(&lua, &name)
+                .and_then(|(default, layers)| Some((default?, layers)))
+                .ok_or_else(|| mlua::Error::runtime(format!("slot '{name}' is not declared")))?;
+            run_chain(&lua, name, default, layers, args).await
+        }
     })
 }
 
@@ -168,14 +305,15 @@ fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
 /// `set_slot`. The returned callable runs the full chain: outermost
 /// layer first, then inward, ending at {default}.
 ///
-/// Throws if another plugin already owns a slot with the same {name}.
+/// Throws if another plugin already owns a slot with the same {name}, or
+/// if {name} starts with `"tool."`, which the host fires itself.
 ///
-/// The chain runs synchronously, so neither the default nor a layer may
-/// call a suspending API (`maki.fs.*`, `maki.fn.jobwait`,
-/// `maki.api.exec_autocmds`, ...). Parking raises "attempt to yield
-/// across metamethod/C-call boundary": from the default that error
-/// reaches your caller, from a layer it only drops that layer. Do the
-/// waiting outside the chain and pass the result in.
+/// The chain is async: the default and every layer may park (`maki.fs.*`,
+/// `maki.fn.jobwait`, `maki.agent.call_tool`, ...), and so does the
+/// returned callable. Call it from a tool handler, a command, or an
+/// autocmd, rather than from a `header` or `restore` function, which
+/// cannot wait. The chain runs in your task, so cancelling the caller
+/// cancels the layers it is waiting on.
 ///
 /// @param name string Unique slot name, e.g. `"myplugin.render"`.
 /// @param default function Default implementation, called when no layers wrap it.
@@ -192,6 +330,12 @@ fn declare_slot(
     name: String,
     default: Function,
 ) -> LuaResult<Function> {
+    if name.starts_with(HOST_PREFIX) {
+        return Err(mlua::Error::runtime(format!(
+            "slot '{name}' is host owned: '{HOST_PREFIX}' names are fired by maki itself, \
+             use set_slot to wrap one"
+        )));
+    }
     {
         let mut store = slot_store_mut(lua)?;
         let entry = store.slots.entry(name.clone()).or_default();
@@ -214,8 +358,20 @@ fn declare_slot(
 /// You can call this before the owner runs `declare_slot`. The layer
 /// is queued and attached when the slot is declared.
 ///
-/// Layers run synchronously, so one that calls a suspending API is
-/// dropped and the chain continues without it, see `declare_slot`.
+/// A layer may park, and one that throws is skipped: the chain continues
+/// as if it had returned `prev(...)` untouched, so a broken layer never
+/// takes the seam down with it.
+///
+/// Layers wrap in registration order, so the last one registered runs
+/// first and sees the value before the others do.
+///
+/// Maki fires two slots per tool itself: `tool.<name>.input` before
+/// permissions look at the call, and `tool.<name>.output` on the text it
+/// produced. Both take `function(prev, value, ctx)` and answer with a
+/// table to replace the value, nothing to leave it alone, or
+/// `nil, reason` to stop the call. Wrapping one costs the capability the
+/// tool declares, and a tool declaring none costs every permission. See
+/// [Hooks](/docs/hooks/).
 ///
 /// @param name string Slot name to wrap.
 /// @param wrapper function Layer: `function(prev, ...)`. Call `prev(...)` to continue.
@@ -226,15 +382,12 @@ fn declare_slot(
 /// end)
 #[lua_fn]
 fn set_slot(lua: &Lua, #[ctx] plugin: Arc<str>, name: String, wrapper: Function) -> LuaResult<()> {
-    slot_store_mut(lua)?
-        .slots
-        .entry(name)
-        .or_default()
-        .layers
-        .push(SlotLayer {
-            plugin: Arc::clone(&plugin),
-            func: wrapper,
-        });
+    let mut store = slot_store_mut(lua)?;
+    store.slots.entry(name).or_default().layers.push(SlotLayer {
+        plugin: Arc::clone(&plugin),
+        func: wrapper,
+    });
+    store.publish();
     Ok(())
 }
 
@@ -274,6 +427,8 @@ lua_table! {
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
 
     fn noop(lua: &Lua) -> Function {
@@ -294,10 +449,30 @@ mod tests {
         }
     }
 
+    #[test_case("tool.bash.input", Some(("bash", HookStage::Input)); "input")]
+    #[test_case("tool.bash.output", Some(("bash", HookStage::Output)); "output")]
+    #[test_case("tool.mcp__srv__do.input", Some(("mcp__srv__do", HookStage::Input)); "underscored_name")]
+    #[test_case("tool.srv.do.input", Some(("srv.do", HookStage::Input)); "dotted_name")]
+    #[test_case("tool.bash.header", None; "unknown_suffix")]
+    #[test_case("tool.bash", None; "no_suffix")]
+    #[test_case("myplugin.render", None; "not_host_owned")]
+    fn host_slot_target_reads_the_wrapped_tool(slot: &str, target: Option<(&str, HookStage)>) {
+        assert_eq!(host_slot_target(slot), target);
+    }
+
+    /// The two directions have to stay each other's inverse, since dispatch
+    /// builds the name it fires and `publish` parses the names it was given.
+    #[test_case("bash", HookStage::Input ; "input")]
+    #[test_case("srv.do", HookStage::Output ; "dotted_output")]
+    fn host_slot_names_round_trip(tool: &str, stage: HookStage) {
+        let name = host_slot_name(tool, stage);
+        assert_eq!(host_slot_target(&name), Some((tool, stage)));
+    }
+
     #[test]
     fn clear_plugin_semantics() {
         let lua = Lua::new();
-        let mut store = SlotStore::default();
+        let mut store = SlotStore::new(Arc::default());
         store
             .slots
             .insert("s".into(), entry(&lua, "owner", &["a", "b"]));
@@ -320,6 +495,32 @@ mod tests {
         assert!(
             !store.slots.contains_key("solo"),
             "fully-cleared entry is dropped"
+        );
+    }
+
+    /// The published index is derived, never written to directly, so an unload
+    /// can only narrow it.
+    #[test]
+    fn publishing_follows_the_layers() {
+        let lua = Lua::new();
+        let layered: Arc<LayeredTools> = Arc::default();
+        let mut store = SlotStore::new(Arc::clone(&layered));
+        store.slots.insert(
+            host_slot_name("bash", HookStage::Input),
+            entry(&lua, "owner", &["a"]),
+        );
+        store
+            .slots
+            .insert("myplugin.render".into(), entry(&lua, "owner", &["a"]));
+        store.publish();
+        assert!(layered.wraps("bash", HookStage::Input));
+        assert!(!layered.wraps("bash", HookStage::Output));
+        assert!(!layered.wraps("myplugin.render", HookStage::Input));
+
+        store.clear_plugin("a");
+        assert!(
+            !layered.wraps("bash", HookStage::Input),
+            "the index drops with the plugin that registered the layer"
         );
     }
 }

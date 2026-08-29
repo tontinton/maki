@@ -50,6 +50,12 @@ impl PluginPermissions {
         self.allowed[perm as usize]
     }
 
+    /// Layering a call whose reach nobody declared takes full trust, since no
+    /// narrower price would be honest.
+    pub fn holds_all(&self) -> bool {
+        self.allowed.iter().all(|&allowed| allowed)
+    }
+
     pub fn from_manifest(manifest: &toml::Value) -> Self {
         let perms = manifest.get("permissions");
         let mut allowed = [true; Permission::COUNT];

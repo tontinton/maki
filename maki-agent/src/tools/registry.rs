@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bitflags::bitflags;
 use maki_config::Permission;
 use serde_json::{Value, json};
@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use crate::template::Vars;
 use crate::{BufferSnapshot, ToolOutput};
 
+use super::hook::ToolHook;
 use super::{DescriptionContext, ToolContext};
 
 bitflags! {
@@ -260,7 +261,15 @@ impl RegisteredTool {
 /// Lock-free reads via `ArcSwap`, writes swap in a new snapshot atomically.
 pub struct ToolRegistry {
     tools: ArcSwap<Vec<RegisteredTool>>,
+    /// Whoever may rewrite or stop a call before and after it runs. One per
+    /// registry rather than one per tool, so a tool arriving from a new place
+    /// is hookable the day it lands.
+    hook: ArcSwapOption<Box<dyn ToolHook>>,
 }
+
+/// `ArcSwapOption` needs a sized payload, hence the `Box`. Auto-deref hides
+/// it at every call site.
+pub type InstalledHook = Arc<Box<dyn ToolHook>>;
 
 impl Default for ToolRegistry {
     fn default() -> Self {
@@ -278,7 +287,20 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: ArcSwap::from_pointee(Vec::new()),
+            hook: ArcSwapOption::empty(),
         }
+    }
+
+    /// Installed by the plugin host once its Lua thread is up. Last writer
+    /// wins, so a registry outliving the host that hooked it points at the
+    /// host that replaced it, never at the dead one.
+    pub fn set_hook(&self, hook: impl ToolHook) {
+        let boxed: Box<dyn ToolHook> = Box::new(hook);
+        self.hook.store(Some(Arc::new(boxed)));
+    }
+
+    pub fn hook(&self) -> Option<InstalledHook> {
+        self.hook.load_full()
     }
 
     /// The process-wide registry. Every tool in it comes from a Lua plugin

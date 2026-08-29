@@ -7,11 +7,13 @@
 
 mod file_tracker;
 pub mod grep;
+pub mod hook;
 pub mod interpreter_bridge;
 pub mod registry;
 pub mod schema;
 
 pub use file_tracker::FileReadTracker;
+pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
     RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation,
@@ -57,6 +59,13 @@ pub enum CallOrigin {
 impl CallOrigin {
     pub fn is_model(self) -> bool {
         matches!(self, Self::Model)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Nested => "nested",
+        }
     }
 }
 

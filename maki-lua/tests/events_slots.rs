@@ -1,12 +1,18 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use maki_agent::tools::ToolRegistry;
-use maki_lua::{PluginHost, SessionEndReason};
+use maki_agent::cancel::CancelToken;
+use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
+use maki_agent::tools::{CallOrigin, ToolRegistry};
+use maki_lua::{Permission, PluginHost, PluginPermissions, SessionEndReason};
 use maki_storage::id::MakiId;
+use test_case::test_case;
 
 const PROBE_SCHEMA: &str = r#"{ type = "object", properties = {}, additionalProperties = false }"#;
-const DISPATCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Generous on purpose. A bound a slow machine can trip is a bound that fails
+/// for the wrong reason, and this one is only reached when something is stuck.
+const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 const DISPATCH_POLL: Duration = Duration::from_millis(10);
 
 fn host() -> (Arc<ToolRegistry>, PluginHost) {
@@ -318,6 +324,750 @@ maki.api.create_autocmd("Shared", {{ callback = function() n = n + 1 end }})
     assert_eq!(exec_tool(&reg, "probe_keep"), "1");
 }
 
+// ------------------------------------------------------ host tool slots
+
+const SLOT_TOOL: &str = "slotted";
+const COMMAND_FIELD: &str = "command";
+const ARGV_FIELD: &str = "argv";
+const TOOL_ID: &str = "t1";
+const GUARDED_TOOL: &str = "guarded";
+const LAYER_PLUGIN: &str = "policy_layer";
+const HIJACKED: &str = "hijacked";
+const COMMAND: &str = "ls";
+const PASS_THROUGH: (Option<String>, Option<String>) = (None, None);
+const NEVER_ANSWERED: &str = "the chain never answered";
+const INNER_LAYER: &str = "inner_layer";
+const OUTER_LAYER: &str = "outer_layer";
+const INNER_MARK: &str = ":inner";
+const OUTER_MARK: &str = ":outer";
+/// Far longer than [`HOOK_WINDOW`], so a layer parked on it can only answer
+/// because the window let it, never because the job came back in time.
+const PARKED_FOR: Duration = Duration::from_secs(5);
+/// What a call with no deadline of its own would hand a chain, scaled down:
+/// long enough that no healthy layer is rushed, short enough to prove a parked
+/// one ends on it.
+const HOOK_WINDOW: Duration = Duration::from_millis(200);
+
+/// One string field in the schema, so a layer has something to rewrite.
+fn slotted_tool(host: &PluginHost) {
+    load(
+        host,
+        "slotted_owner",
+        r#"
+maki.api.register_tool({
+    name = "slotted",
+    description = "probe",
+    schema = { type = "object", properties = { command = { type = "string" } } },
+    audiences = { "main" },
+    handler = function(input) return "ran " .. tostring(input.command) end,
+})
+"#,
+    );
+}
+
+/// The call every firing here filters, so a test only names the field it is
+/// about.
+fn call_of<'a>(
+    tool: &'a str,
+    authority: Authority,
+    origin: CallOrigin,
+    cancel: &'a CancelToken,
+) -> HookCall<'a> {
+    HookCall {
+        tool,
+        tool_id: TOOL_ID,
+        session_id: None,
+        origin,
+        authority,
+        cancel,
+        deadline: Instant::now() + DISPATCH_TIMEOUT,
+    }
+}
+
+fn fire_call(
+    reg: &ToolRegistry,
+    call: &HookCall<'_>,
+    stage: HookStage,
+    value: serde_json::Value,
+) -> Verdict {
+    let hook = reg.hook().expect("the plugin host installs one at boot");
+    if !hook.wraps(call.tool, stage) {
+        return Verdict::Unchanged;
+    }
+    within(hook.run(stage, value, call))
+}
+
+/// Bounded, so a seam that stops answering fails the test instead of hanging
+/// the suite.
+fn within<T>(work: impl Future<Output = T>) -> T {
+    smol::block_on(async {
+        let work = async { Some(work.await) };
+        let give_up = async {
+            smol::Timer::after(DISPATCH_TIMEOUT).await;
+            None
+        };
+        smol::future::or(work, give_up).await.expect(NEVER_ANSWERED)
+    })
+}
+
+/// Fires one stage the way `tool_dispatch::run` does, with the authority the
+/// registered tool lends: its own capability, or everything when it declares
+/// none, the way an MCP or client tool is priced.
+fn fire(
+    reg: &ToolRegistry,
+    tool: &str,
+    origin: CallOrigin,
+    stage: HookStage,
+    value: serde_json::Value,
+) -> Verdict {
+    let entry = reg.get(tool).expect("tool registered");
+    let authority = entry
+        .tool
+        .required_permission()
+        .map_or(Authority::Unbounded, Authority::Capability);
+    fire_call(
+        reg,
+        &call_of(tool, authority, origin, &CancelToken::none()),
+        stage,
+        value,
+    )
+}
+
+/// `(replacement, denial reason)`, so a test names the one it means.
+fn input(reg: &ToolRegistry, tool: &str, command: &str) -> (Option<String>, Option<String>) {
+    input_from(reg, tool, CallOrigin::Model, command)
+}
+
+fn input_from(
+    reg: &ToolRegistry,
+    tool: &str,
+    origin: CallOrigin,
+    command: &str,
+) -> (Option<String>, Option<String>) {
+    match fire(
+        reg,
+        tool,
+        origin,
+        HookStage::Input,
+        serde_json::json!({ COMMAND_FIELD: command }),
+    ) {
+        Verdict::Unchanged => (None, None),
+        Verdict::Replaced(v) => (Some(v[COMMAND_FIELD].as_str().unwrap().to_owned()), None),
+        Verdict::Denied(reason) => (None, Some(reason)),
+    }
+}
+
+fn output(reg: &ToolRegistry, tool: &str, text: &str, is_error: bool) -> Option<(String, bool)> {
+    let value = serde_json::json!({ hook::OUTPUT_TEXT: text, hook::OUTPUT_IS_ERROR: is_error });
+    match fire(reg, tool, CallOrigin::Model, HookStage::Output, value) {
+        Verdict::Unchanged => None,
+        Verdict::Denied(reason) => Some((reason, true)),
+        Verdict::Replaced(v) => Some((
+            v[hook::OUTPUT_TEXT].as_str().unwrap().to_owned(),
+            v[hook::OUTPUT_IS_ERROR].as_bool().unwrap_or(is_error),
+        )),
+    }
+}
+
+#[test]
+fn tool_input_slot_rewrites_denies_and_passes_through() {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        "policy",
+        r#"
+maki.api.set_slot("tool.slotted.input", function(prev, input, ctx)
+    assert(ctx.tool == "slotted", ctx.tool)
+    assert(ctx.origin == "model", ctx.origin)
+    if input.command == "denied" then
+        return nil, "use rg"
+    end
+    if input.command == "grep -r x ." then
+        input.command = "rg x"
+        return prev(input, ctx)
+    end
+end)
+"#,
+    );
+
+    assert_eq!(
+        input(&reg, SLOT_TOOL, "grep -r x ."),
+        (Some("rg x".to_owned()), None)
+    );
+    assert_eq!(
+        input(&reg, SLOT_TOOL, "denied"),
+        (None, Some("use rg".to_owned()))
+    );
+    assert_eq!(
+        input(&reg, SLOT_TOOL, "ls"),
+        (None, None),
+        "a layer that returns nothing leaves the call alone"
+    );
+}
+
+/// Same shape as `bash`: permission checked, so layering it hands the layer
+/// that tool's authority.
+fn guarded_tool(host: &PluginHost) {
+    load(
+        host,
+        "guarded_owner",
+        r#"
+maki.api.register_tool({
+    name = "guarded",
+    description = "probe",
+    schema = { type = "object", properties = { command = { type = "string" } } },
+    audiences = { "main" },
+    permission = "run",
+    permission_scopes = function(input)
+        return { scopes = { input.command }, force_prompt = false }
+    end,
+    handler = function(input) return "ran " .. tostring(input.command) end,
+})
+"#,
+    );
+}
+
+fn load_granted(host: &PluginHost, plugin: &str, source: &str, granted: PluginPermissions) {
+    host.load_source_with_permissions(plugin, source, granted)
+        .expect("layer plugin loads whatever it is granted");
+}
+
+fn only_run() -> PluginPermissions {
+    let mut permissions = PluginPermissions::denied();
+    permissions.set(Permission::Run, true);
+    permissions
+}
+
+/// Everything but one, because the point is that "almost all" is not all.
+fn all_but_run() -> PluginPermissions {
+    let mut permissions = PluginPermissions::trusted();
+    permissions.set(Permission::Run, false);
+    permissions
+}
+
+/// A layer on one host slot whose body is the whole contract under test.
+fn layer(tool: &str, stage: HookStage, body: &str) -> String {
+    format!(
+        r#"maki.api.set_slot("tool.{tool}.{}", function(prev, value, ctx) {body} end)"#,
+        stage.as_str()
+    )
+}
+
+/// Rewrites, so `Replaced` means the layer ran and `Unchanged` means it was
+/// skipped. That is the answer every entitlement test reads.
+fn hijack_layer(tool: &str) -> String {
+    layer(
+        tool,
+        HookStage::Input,
+        &format!(r#"value.{COMMAND_FIELD} = "{HIJACKED}"; return prev(value, ctx)"#),
+    )
+}
+
+/// Appends {mark}, so the order two of them ran in survives into the answer.
+fn marking_layer(tool: &str, mark: &str) -> String {
+    layer(
+        tool,
+        HookStage::Input,
+        &format!(
+            r#"value.{COMMAND_FIELD} = value.{COMMAND_FIELD} .. "{mark}"; return prev(value, ctx)"#
+        ),
+    )
+}
+
+/// The price list. A tool that declares a capability sells its layers exactly
+/// that one. A tool declaring none, like an MCP server's tool, has said nothing
+/// about how far it reaches, so layering it costs every capability.
+///
+/// The layer is registered before its target exists, because nobody guarantees
+/// load order between a layer and the tool it wraps.
+#[test_case(GUARDED_TOOL, only_run,                   true  ; "the_declared_capability_is_enough")]
+#[test_case(SLOT_TOOL,    only_run,                   false ; "an_undeclared_reach_takes_more_than_one")]
+#[test_case(SLOT_TOOL,    all_but_run,                false ; "almost_every_capability_is_not_every_one")]
+#[test_case(SLOT_TOOL,    PluginPermissions::trusted, true  ; "full_trust_layers_anything")]
+fn a_layer_pays_the_authority_of_the_call_it_filters(
+    tool: &str,
+    granted: fn() -> PluginPermissions,
+    runs: bool,
+) {
+    let (reg, host) = host();
+    load_granted(&host, LAYER_PLUGIN, &hijack_layer(tool), granted());
+    slotted_tool(&host);
+    guarded_tool(&host);
+
+    let expected = runs.then(|| HIJACKED.to_owned());
+    assert_eq!(input(&reg, tool, COMMAND), (expected, None));
+}
+
+#[test]
+fn tool_slot_with_no_layers_never_reaches_lua() {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    assert_eq!(input(&reg, SLOT_TOOL, COMMAND), PASS_THROUGH);
+    assert_eq!(output(&reg, SLOT_TOOL, "out", false), None);
+}
+
+/// The chain owns a task, which is what delivers job events to a layer waiting
+/// on one.
+#[test]
+fn tool_input_layer_may_run_a_job() {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        "job_policy",
+        r#"
+maki.api.set_slot("tool.slotted.input", function(prev, input, ctx)
+    local result = maki.fn.jobwait(maki.fn.jobstart({ "echo", "from-job" }))
+    input.command = result.stdout
+    return prev(input, ctx)
+end)
+"#,
+    );
+
+    assert_eq!(
+        input(&reg, SLOT_TOOL, "ls"),
+        (Some("from-job".to_owned()), None)
+    );
+}
+
+#[test]
+fn tool_output_slot_rewrites_text_and_error_flag() {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        "trimmer",
+        r#"
+maki.api.set_slot("tool.slotted.output", function(prev, out, ctx)
+    out.text = out.text:sub(1, 3)
+    out.is_error = true
+    return prev(out, ctx)
+end)
+"#,
+    );
+
+    assert_eq!(
+        output(&reg, SLOT_TOOL, "0123456789", false),
+        Some(("012".to_owned(), true))
+    );
+}
+
+#[test]
+fn unloading_the_layer_owner_restores_the_fast_path() {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(&host, "temporary", &hijack_layer(SLOT_TOOL));
+    assert_eq!(
+        input(&reg, SLOT_TOOL, COMMAND),
+        (Some(HIJACKED.to_owned()), None)
+    );
+
+    host.unload("temporary").unwrap();
+    assert_eq!(
+        input(&reg, SLOT_TOOL, COMMAND),
+        PASS_THROUGH,
+        "the layer index drops with the plugin that registered it"
+    );
+}
+
+/// Chains overlap whenever tools run in parallel, and each one still has to
+/// run its layer. A reentrancy bound that read overlap as nesting would drop
+/// layers exactly when a `batch` is widest.
+#[test]
+fn overlapping_chains_all_run() {
+    const CONCURRENT: usize = maki_lua::test_support::MAX_HOOK_DEPTH as usize * 2;
+    let (reg, host) = host();
+    slotted_tool(&host);
+    // Parks first, then marks: a pass-through is reported as untouched, so the
+    // rewrite is what says this chain's own layer ran.
+    load(
+        &host,
+        "parking_policy",
+        &format!(
+            r#"
+maki.api.set_slot("tool.slotted.input", function(prev, input, ctx)
+    maki.fs.read("/nope")
+    input.{COMMAND_FIELD} = input.{COMMAND_FIELD} .. "{INNER_MARK}"
+    return prev(input, ctx)
+end)
+"#
+        ),
+    );
+    let hook = reg.hook().expect("the plugin host installs one at boot");
+    let cancel = CancelToken::none();
+    let call = call_of(SLOT_TOOL, Authority::Unbounded, CallOrigin::Model, &cancel);
+
+    // Joined, so the chains are genuinely in flight at once. Awaiting them one
+    // at a time would never overlap and never notice.
+    let verdicts = within(futures::future::join_all((0..CONCURRENT).map(|i| {
+        let value = serde_json::json!({ COMMAND_FIELD: i.to_string() });
+        hook.run(HookStage::Input, value, &call)
+    })));
+    let ran = verdicts
+        .iter()
+        .filter(|v| matches!(v, Verdict::Replaced(_)))
+        .count();
+    assert_eq!(ran, CONCURRENT, "every overlapping chain ran its layer");
+}
+
+/// The documented layer shape returns `prev(...)`, and the identity default
+/// hands back what it was given, so a layer that changed nothing still answers
+/// with a table. Reporting that as a rewrite would swap the input the caller
+/// holds for a re-encode of it, and a JSON null is a Lua nil, which is an
+/// absent key, so the re-encode would quietly lose fields on the way.
+#[test_case(serde_json::json!({ COMMAND_FIELD: COMMAND }) ; "a_value_the_layer_could_have_touched")]
+#[test_case(serde_json::json!({ COMMAND_FIELD: null, ARGV_FIELD: [COMMAND, null] }) ; "nulls_no_layer_ever_sees")]
+fn a_pass_through_layer_leaves_the_input_untouched(value: serde_json::Value) {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        LAYER_PLUGIN,
+        &layer(SLOT_TOOL, HookStage::Input, "return prev(value, ctx)"),
+    );
+
+    let verdict = fire(&reg, SLOT_TOOL, CallOrigin::Model, HookStage::Input, value);
+
+    assert!(
+        matches!(verdict, Verdict::Unchanged),
+        "a layer that only deferred is not a rewrite"
+    );
+}
+
+/// The chain runs on the Lua thread, so the agent side giving up on the reply
+/// is not the same as the chain ending: without the call's own token the
+/// watchdog has nothing to interrupt this layer with, and it spins forever.
+#[test]
+fn cancelling_the_call_kills_the_chain() {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        LAYER_PLUGIN,
+        &layer(
+            SLOT_TOOL,
+            HookStage::Input,
+            &format!(
+                r#"local n = 0
+                while true do n = n + 1 end
+                value.{COMMAND_FIELD} = "{HIJACKED}"
+                return prev(value, ctx)"#
+            ),
+        ),
+    );
+
+    let (trigger, cancel) = CancelToken::new();
+    trigger.cancel();
+    let call = call_of(SLOT_TOOL, Authority::Unbounded, CallOrigin::Model, &cancel);
+    let value = serde_json::json!({ COMMAND_FIELD: COMMAND });
+
+    let verdict = fire_call(&reg, &call, HookStage::Input, value);
+
+    assert!(
+        matches!(verdict, Verdict::Unchanged),
+        "the killed layer never reached its rewrite"
+    );
+}
+
+/// The watchdog only interrupts Lua that runs, and a layer parked in an await
+/// runs none: it renews its grace at every yield and would sit there as long as
+/// whatever it waits on. Only the window dispatch hands the chain ends this
+/// one, well before the job it is parked on comes back.
+#[test]
+fn a_parked_layer_ends_at_the_window_it_was_given() {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        LAYER_PLUGIN,
+        &layer(
+            SLOT_TOOL,
+            HookStage::Input,
+            &format!(
+                r#"maki.fn.jobwait(maki.fn.jobstart({{ "sleep", "{}" }}), {})
+                value.{COMMAND_FIELD} = "{HIJACKED}"
+                return prev(value, ctx)"#,
+                PARKED_FOR.as_secs(),
+                PARKED_FOR.as_millis()
+            ),
+        ),
+    );
+
+    let cancel = CancelToken::none();
+    let mut call = call_of(SLOT_TOOL, Authority::Unbounded, CallOrigin::Model, &cancel);
+    call.deadline = Instant::now() + HOOK_WINDOW;
+    let value = serde_json::json!({ COMMAND_FIELD: COMMAND });
+
+    let verdict = fire_call(&reg, &call, HookStage::Input, value);
+
+    assert!(
+        matches!(verdict, Verdict::Unchanged),
+        "the abandoned layer never reached its rewrite"
+    );
+}
+
+#[test]
+fn host_slot_names_are_reserved() {
+    let (_reg, host) = host();
+    let err = host
+        .load_source(
+            "squatter",
+            r#"maki.api.declare_slot("tool.bash.input", function(i) return i end)"#,
+        )
+        .expect_err("declaring a host slot must fail");
+    assert!(format!("{err}").contains("host owned"), "{err}");
+}
+
+/// A layer answering off contract costs what no layer costs: dispatch keeps the
+/// call it already had rather than hand the tool a shape nobody promised. One
+/// case is a table conversion that genuinely fails, the only way to reach the
+/// "not json" arm.
+#[test_case(r#"return "nope""# ; "string")]
+#[test_case("return 42" ; "number")]
+#[test_case("return true" ; "boolean")]
+#[test_case("return nil, 42" ; "non_string_reason")]
+#[test_case(r#"return { "\255\254" }"# ; "table_that_is_not_json")]
+fn a_malformed_layer_answer_leaves_the_call_alone(answer: &str) {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        LAYER_PLUGIN,
+        &layer(SLOT_TOOL, HookStage::Input, answer),
+    );
+
+    assert_eq!(input(&reg, SLOT_TOOL, COMMAND), PASS_THROUGH);
+}
+
+/// The reason is what the model reads instead of the output, so it has to
+/// arrive verbatim rather than as a replacement value.
+#[test]
+fn an_output_layer_stops_the_call_with_its_reason() {
+    const REASON: &str = "redacted";
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        LAYER_PLUGIN,
+        &layer(
+            SLOT_TOOL,
+            HookStage::Output,
+            &format!(r#"return nil, "{REASON}""#),
+        ),
+    );
+
+    assert_eq!(
+        output(&reg, SLOT_TOOL, "secret", false),
+        Some((REASON.to_owned(), true))
+    );
+}
+
+/// One plugin's broken layer must not take the seam down or swallow the layers
+/// another plugin registered underneath it.
+#[test]
+fn a_broken_layer_is_skipped_and_the_chain_still_answers() {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(&host, INNER_LAYER, &hijack_layer(SLOT_TOOL));
+    load(
+        &host,
+        OUTER_LAYER,
+        &layer(SLOT_TOOL, HookStage::Input, r#"error("boom")"#),
+    );
+
+    assert_eq!(
+        input(&reg, SLOT_TOOL, COMMAND),
+        (Some(HIJACKED.to_owned()), None)
+    );
+}
+
+/// Layers wrap in registration order across plugins too, so the last one
+/// registered sees the call first. Otherwise two plugins that both rewrite
+/// would compose differently depending on a load order nobody can see.
+#[test]
+fn layers_compose_with_the_last_registered_outermost() {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(&host, INNER_LAYER, &marking_layer(SLOT_TOOL, INNER_MARK));
+    load(&host, OUTER_LAYER, &marking_layer(SLOT_TOOL, OUTER_MARK));
+
+    assert_eq!(
+        input(&reg, SLOT_TOOL, COMMAND),
+        (Some(format!("{COMMAND}{OUTER_MARK}{INNER_MARK}")), None)
+    );
+}
+
+/// Entitlement is per layer, not per slot. The plugin holding the tool's
+/// capability keeps its rewrite, the one without it is dropped from the chain,
+/// and being dropped is not a denial.
+#[test]
+fn only_the_entitled_layer_of_two_runs() {
+    let (reg, host) = host();
+    guarded_tool(&host);
+    let denied = PluginPermissions::denied();
+    load_granted(
+        &host,
+        INNER_LAYER,
+        &marking_layer(GUARDED_TOOL, INNER_MARK),
+        denied,
+    );
+    load_granted(
+        &host,
+        OUTER_LAYER,
+        &marking_layer(GUARDED_TOOL, OUTER_MARK),
+        only_run(),
+    );
+
+    assert_eq!(
+        input(&reg, GUARDED_TOOL, COMMAND),
+        (Some(format!("{COMMAND}{OUTER_MARK}")), None),
+        "the denied layer is skipped, not consulted and not a denial"
+    );
+}
+
+/// A layer owns the decision it makes: answering without calling `prev` is how
+/// it stops the layers below from seeing the call at all.
+#[test]
+fn a_layer_that_never_calls_prev_short_circuits() {
+    const PROBE: &str = "probe_inner_ran";
+    const SHORT: &str = "short";
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        LAYER_PLUGIN,
+        &format!(
+            r#"
+local inner_ran = false
+{}
+{}
+{}
+"#,
+            layer(
+                SLOT_TOOL,
+                HookStage::Input,
+                "inner_ran = true; return prev(value, ctx)"
+            ),
+            layer(
+                SLOT_TOOL,
+                HookStage::Input,
+                &format!(r#"return {{ {COMMAND_FIELD} = "{SHORT}" }}"#)
+            ),
+            probe_tool(PROBE, "return tostring(inner_ran)")
+        ),
+    );
+
+    assert_eq!(
+        input(&reg, SLOT_TOOL, COMMAND),
+        (Some(SHORT.to_owned()), None)
+    );
+    assert_eq!(
+        exec_tool(&reg, PROBE),
+        "false",
+        "the layer below the one that answered must never have run"
+    );
+}
+
+/// The grant is read when the chain fires, so narrowing it costs one reload
+/// rather than a restart.
+#[test]
+fn a_reload_that_narrows_permissions_applies_to_the_next_call() {
+    let (reg, host) = host();
+    guarded_tool(&host);
+    load_granted(&host, LAYER_PLUGIN, &hijack_layer(GUARDED_TOOL), only_run());
+    assert_eq!(
+        input(&reg, GUARDED_TOOL, COMMAND),
+        (Some(HIJACKED.to_owned()), None)
+    );
+
+    let source = hijack_layer(GUARDED_TOOL);
+    load_granted(&host, LAYER_PLUGIN, &source, PluginPermissions::denied());
+    assert_eq!(
+        input(&reg, GUARDED_TOOL, COMMAND),
+        PASS_THROUGH,
+        "the reloaded plugin is weighed by what this load granted it"
+    );
+}
+
+/// The hook outlives the runtime that installed it, and a call in flight at
+/// shutdown still has to be answered. The only honest answer left is the one
+/// no layer would have changed.
+#[test]
+fn a_dropped_host_leaves_the_call_unchanged() {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(&host, LAYER_PLUGIN, &hijack_layer(SLOT_TOOL));
+    let hook = reg.hook().expect("the plugin host installs one at boot");
+    assert!(hook.wraps(SLOT_TOOL, HookStage::Input));
+
+    drop(host);
+
+    let cancel = CancelToken::none();
+    let call = call_of(SLOT_TOOL, Authority::Unbounded, CallOrigin::Model, &cancel);
+    let value = serde_json::json!({ COMMAND_FIELD: COMMAND });
+    let verdict = within(hook.run(HookStage::Input, value, &call));
+
+    assert!(
+        matches!(verdict, Verdict::Unchanged),
+        "a runtime that is gone is not a denial"
+    );
+}
+
+/// `tool.` is the host's namespace, but only two names in it mean anything. A
+/// third is accepted and inert rather than rejected, and above all it must not
+/// enrol the tool into a stage it never named.
+#[test]
+fn a_tool_slot_that_names_no_stage_never_fires() {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        LAYER_PLUGIN,
+        &format!(
+            r#"maki.api.set_slot("tool.{SLOT_TOOL}.header", function(prev, value, ctx)
+                value.{COMMAND_FIELD} = "{HIJACKED}"
+                return prev(value, ctx)
+            end)"#
+        ),
+    );
+
+    let hook = reg.hook().expect("the plugin host installs one at boot");
+    for stage in HookStage::ALL {
+        assert!(
+            !hook.wraps(SLOT_TOOL, stage),
+            "a name that is not a stage must not wrap {stage:?}"
+        );
+    }
+    assert_eq!(input(&reg, SLOT_TOOL, COMMAND), PASS_THROUGH);
+}
+
+/// What a layer is told about the call it filters. `origin` is the one field it
+/// cannot get anywhere else, and it says whether the model asked for this call
+/// or another tool did.
+#[test_case(CallOrigin::Model, "model" ; "model")]
+#[test_case(CallOrigin::Nested, "nested" ; "nested")]
+fn the_ctx_table_names_the_call(origin: CallOrigin, expected_origin: &str) {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        LAYER_PLUGIN,
+        &layer(
+            SLOT_TOOL,
+            HookStage::Input,
+            &format!(
+                r#"value.{COMMAND_FIELD} = ctx.tool_id .. "|" .. ctx.origin; return prev(value, ctx)"#
+            ),
+        ),
+    );
+
+    assert_eq!(
+        input_from(&reg, SLOT_TOOL, origin, COMMAND),
+        (Some(format!("{TOOL_ID}|{expected_origin}")), None)
+    );
+}
+
 // ---------------------------------------------------------------- slots
 
 #[test]
@@ -375,25 +1125,28 @@ assert(runs == 1, "rest of chain ran exactly once: " .. runs)
     );
 }
 
-/// Slot dispatch is a plain synchronous call, so `maki.fs.read` parks on the
-/// C-call boundary long before it reaches the filesystem. From the default
-/// that error travels to the caller, from a layer it costs only the layer and
-/// the chain still answers.
+/// Chains are async all the way down, so a layer can wait for the answer it
+/// needs before deciding. Without that, wrapping a seam would only pay off for
+/// decisions that need nothing but the argument.
 #[test]
-fn slot_chain_must_not_suspend() {
+fn slot_chain_may_suspend() {
     let (_reg, host) = host();
     load(
         &host,
         "slot_suspends",
         r#"
-local d = maki.api.declare_slot("sd", function() return maki.fs.read("/nope") end)
-local ok, err = pcall(d)
-assert(not ok, "a suspending default must fail the call")
-assert(tostring(err):find("yield"), tostring(err))
+local d = maki.api.declare_slot("sd", function()
+    local _, err = maki.fs.read("/nope")
+    return err ~= nil
+end)
+assert(d() == true, "a parking default reaches the filesystem and comes back")
 
-local l = maki.api.declare_slot("sl", function() return "base" end)
-maki.api.set_slot("sl", function(prev) return maki.fs.read("/nope") end)
-assert(l() == "base", "a suspending layer is skipped, chain keeps working")
+local l = maki.api.declare_slot("sl", function(x) return x end)
+maki.api.set_slot("sl", function(prev, x)
+    local _, err = maki.fs.read("/nope")
+    return prev(x .. tostring(err ~= nil))
+end)
+assert(l("v") == "vtrue", l("v"))
 "#,
     );
 }

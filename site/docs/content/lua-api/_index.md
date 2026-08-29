@@ -754,9 +754,7 @@ maki.api.exec_autocmds({event}, {opts?})
 Fire one or more events manually. Every matching autocmd callback
 runs to completion before this function returns.
 
-A handler may suspend, so this call may too. That rules it out inside
-a slot chain, which runs synchronously (see `declare_slot`). Fire the
-event from the code that calls the slot instead.
+A handler may suspend, so this call may too.
 
 **Parameters:**
 
@@ -787,14 +785,15 @@ Create a named extension point owned by your plugin. You provide a
 `set_slot`. The returned callable runs the full chain: outermost
 layer first, then inward, ending at {default}.
 
-Throws if another plugin already owns a slot with the same {name}.
+Throws if another plugin already owns a slot with the same {name}, or
+if {name} starts with `"tool."`, which the host fires itself.
 
-The chain runs synchronously, so neither the default nor a layer may
-call a suspending API (`maki.fs.*`, `maki.fn.jobwait`,
-`maki.api.exec_autocmds`, ...). Parking raises "attempt to yield
-across metamethod/C-call boundary": from the default that error
-reaches your caller, from a layer it only drops that layer. Do the
-waiting outside the chain and pass the result in.
+The chain is async: the default and every layer may park (`maki.fs.*`,
+`maki.fn.jobwait`, `maki.agent.call_tool`, ...), and so does the
+returned callable. Call it from a tool handler, a command, or an
+autocmd, rather than from a `header` or `restore` function, which
+cannot wait. The chain runs in your task, so cancelling the caller
+cancels the layers it is waiting on.
 
 **Parameters:**
 
@@ -828,8 +827,20 @@ Calling `prev` more than once throws.
 You can call this before the owner runs `declare_slot`. The layer
 is queued and attached when the slot is declared.
 
-Layers run synchronously, so one that calls a suspending API is
-dropped and the chain continues without it, see `declare_slot`.
+A layer may park, and one that throws is skipped: the chain continues
+as if it had returned `prev(...)` untouched, so a broken layer never
+takes the seam down with it.
+
+Layers wrap in registration order, so the last one registered runs
+first and sees the value before the others do.
+
+Maki fires two slots per tool itself: `tool.<name>.input` before
+permissions look at the call, and `tool.<name>.output` on the text it
+produced. Both take `function(prev, value, ctx)` and answer with a
+table to replace the value, nothing to leave it alone, or
+`nil, reason` to stop the call. Wrapping one costs the capability the
+tool declares, and a tool declaring none costs every permission. See
+[Hooks](/docs/hooks/).
 
 **Parameters:**
 
@@ -1751,11 +1762,6 @@ output into a buffer while parked here. An already-exited
 session-owned job answers from its snapshot and fires no callbacks.
 Task and plugin jobs leave the store on exit, so waiting after that
 is an error.
-
-Waiting parks the caller, so a slot chain cannot call it. From a
-slot, start the job with an `on_exit` that stashes the result in
-your plugin state and pick it back up with `jobfind` next time.
-`maki.api.declare_slot` explains the restriction.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 

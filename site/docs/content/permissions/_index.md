@@ -18,6 +18,10 @@ Rules come from four layers, combined for resolution:
 
 Any matching deny blocks the tool. No exceptions, so a config deny always beats a plugin allow.
 
+A [`tool.<name>.input` hook](/docs/hooks/) runs before any of this. Rules are
+resolved against the call as the hook left it, so what the prompt shows you is
+what runs.
+
 ## Check Flow
 
 For every tool call, each scope resolves like this:

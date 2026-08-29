@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 
-use crate::api::util::dispatch::DepthGuard;
+use crate::api::util::dispatch::{DepthGuard, Reentry};
 use crate::runtime::{run_detached, strip_traceback};
 
 static NEXT_AUTOCMD_ID: AtomicU64 = AtomicU64::new(1);
@@ -71,7 +71,7 @@ fn pattern_matches(patterns: Option<&[String]>, fired: Option<&str>) -> bool {
 /// gets its own `ev` table, so one plugin's mutation cannot leak into the
 /// next.
 pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, data: Value) {
-    let Ok(_guard) = DepthGuard::enter(&lua, "autocmd", &event) else {
+    let Ok(_guard) = DepthGuard::enter(&lua, "autocmd", &event, Reentry::Vm) else {
         tracing::warn!(event, "autocmd dispatch exceeded max depth, skipping");
         return;
     };
@@ -249,9 +249,7 @@ fn del_autocmd(lua: &Lua, id: u64) -> LuaResult<()> {
 /// Fire one or more events manually. Every matching autocmd callback
 /// runs to completion before this function returns.
 ///
-/// A handler may suspend, so this call may too. That rules it out inside
-/// a slot chain, which runs synchronously (see `declare_slot`). Fire the
-/// event from the code that calls the slot instead.
+/// A handler may suspend, so this call may too.
 ///
 /// @param event string|string[] Event name or list of names to fire.
 /// @param opts table? Options:

@@ -58,6 +58,7 @@ The docs are sorted by what you came here to do:
     <a class="card" href="/docs/commands/"><span class="card-title">Commands</span><span class="card-desc">The / palette, sessions, toggles, custom commands.</span></a>
     <a class="card" href="/docs/keybindings/"><span class="card-title">Keybindings</span><span class="card-desc">Defaults, precedence, rebinding from Lua.</span></a>
     <a class="card" href="/docs/lua-api/"><span class="card-title">Lua API</span><span class="card-desc">The plugin surface, mirrored from Neovim.</span></a>
+    <a class="card" href="/docs/hooks/"><span class="card-title">Hooks</span><span class="card-desc">Rewrite, block, or trim a tool call from Lua.</span></a>
     <a class="card" href="/docs/packages/"><span class="card-title">Lua Packages</span><span class="card-desc">Load external Lua plugins from Neovim-style package directories.</span></a>
     <a class="card" href="/docs/cli/"><span class="card-title">CLI</span><span class="card-desc">Flags and subcommands (auth, models, acp, prompt, ...).</span></a>
     <a class="card" href="/docs/telemetry/"><span class="card-title">Telemetry</span><span class="card-desc">Opt-in OpenTelemetry metrics and events, to a collector you run.</span></a>

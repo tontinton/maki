@@ -1199,11 +1199,6 @@ fn jobforget(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 /// Task and plugin jobs leave the store on exit, so waiting after that
 /// is an error.
 ///
-/// Waiting parks the caller, so a slot chain cannot call it. From a
-/// slot, start the job with an `on_exit` that stashes the result in
-/// your plugin state and pick it back up with `jobfind` next time.
-/// `maki.api.declare_slot` explains the restriction.
-///
 /// @param job_id integer Job id returned by `jobstart`.
 /// @param timeout_ms integer? Maximum wait in milliseconds (default 30000).
 /// @return (table?) `{ stdout, stderr, exit_code, truncated }`, or nil on timeout.

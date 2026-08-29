@@ -2,6 +2,7 @@ mod api;
 pub mod docs;
 pub mod docs_render;
 mod error;
+mod hook;
 pub mod language;
 mod loader;
 mod pack;
@@ -35,6 +36,7 @@ pub mod test_support {
     use crate::api::util::command::{
         HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
     };
+    pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
     use maki_storage::id::MakiId;
 
     pub struct LuaCommandWriterHandle(LuaCommandWriter);
