@@ -49,14 +49,14 @@ impl Sandbox {
             inner: Mutex::new(None),
             handler: Arc::new(Mutex::new(None)),
         });
-        let inner = Self::spawn_inner(&sandbox, &config)?;
+        let inner = Self::spawn_inner(&sandbox, config)?;
         *lock_or_poisoned(&sandbox.inner)? = Some(inner);
         Ok(sandbox)
     }
 
     fn spawn_inner(
         sandbox: &Self,
-        config: &NamespaceConfig,
+        config: NamespaceConfig,
     ) -> Result<Arc<SandboxInner>, SandboxError> {
         let (pid, sock) = crate::spawn_child(config)?;
         debug!(pid = %pid.as_raw(), "sandbox: child spawned");
@@ -92,7 +92,7 @@ impl Sandbox {
     pub fn reinit(&self, config: NamespaceConfig) -> Result<(), SandboxError> {
         let old = lock_or_poisoned(&self.inner)?.take();
         drop(old);
-        *lock_or_poisoned(&self.inner)? = Some(Self::spawn_inner(self, &config)?);
+        *lock_or_poisoned(&self.inner)? = Some(Self::spawn_inner(self, config)?);
         debug!("sandbox: reinit complete");
         Ok(())
     }

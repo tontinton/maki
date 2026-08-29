@@ -53,7 +53,7 @@ pub use workload::{child_workload, register_child_workload};
 /// After this returns, the child is in its persistent IO loop and accepts
 /// [`ParentMsg`](crate::ipc::ParentMsg) requests (runs, tool calls, queries)
 /// over the socket.
-pub fn spawn_child(config: &NamespaceConfig) -> Result<(Pid, UnixStream), SandboxError> {
+pub fn spawn_child(config: NamespaceConfig) -> Result<(Pid, UnixStream), SandboxError> {
     let (mut parent_sock, child_sock) =
         UnixStream::pair().map_err(|e| SandboxError::Ipc(format!("socketpair: {e}")))?;
 

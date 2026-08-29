@@ -178,8 +178,8 @@ impl SandboxChild {
 /// so the inner instance starts with a clean process state inside the
 /// isolated filesystem. When mount namespace is unavailable, it calls the
 /// inner loop directly (no isolation, no exec).
-pub fn child_main(sock: UnixStream, ns_config: &NamespaceConfig) -> ! {
-    SandboxChild::new(sock, ns_config.clone()).run()
+pub fn child_main(sock: UnixStream, ns_config: NamespaceConfig) -> ! {
+    SandboxChild::new(sock, ns_config).run()
 }
 
 /// Second invocation (post-exec) entry point.
