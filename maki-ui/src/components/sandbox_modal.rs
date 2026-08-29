@@ -328,7 +328,7 @@ pub struct SandboxModal {
 
 impl SandboxModal {
     pub fn new(info: SandboxInfo, sandbox: Option<Arc<Sandbox>>) -> Self {
-        let info_focus = Self::first_focus(&info);
+        let info_focus = Self::first_focus();
         Self {
             open: false,
             mode: Mode::Info,
@@ -433,7 +433,7 @@ impl SandboxModal {
             self.enabled_changed = false;
             self.profiles_changed = false;
             self.yolo_changed = false;
-            self.info_focus = Self::first_focus(&self.info);
+            self.info_focus = Self::first_focus();
         } else {
             self.close_browser();
             self.close_shell();
@@ -578,7 +578,7 @@ impl SandboxModal {
         self.yolo_changed = true;
     }
 
-    fn first_focus(_info: &SandboxInfo) -> Option<InfoFocus> {
+    fn first_focus() -> Option<InfoFocus> {
         Some(InfoFocus::Sandbox)
     }
 
@@ -652,7 +652,7 @@ impl SandboxModal {
         };
         let out_of_range = Self::focus_index(info, &focus) >= Self::focus_count(info);
         if mismatched || out_of_range {
-            self.info_focus = Self::first_focus(info);
+            self.info_focus = Self::first_focus();
         }
     }
 
