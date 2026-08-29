@@ -4,7 +4,7 @@ use maki_sandbox::namespace::NamespaceConfig;
 use std::path::PathBuf;
 
 /// Test that a sandbox browser can be spawned, list files, and navigate
-/// directories. This requires user namespace support (CLONE_NEWUSER).
+/// directories. This requires user namespace support (`CLONE_NEWUSER`).
 ///
 /// Needs `/proc/sys/kernel/unprivileged_userns_clone=1` on most distros,
 /// or `kernel.apparmor_restrict_unprivileged_userns=0` on Ubuntu.

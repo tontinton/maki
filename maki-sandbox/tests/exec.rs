@@ -6,7 +6,7 @@ use std::path::PathBuf;
 const EXEC_FAILED: &str = "exec failed";
 
 /// Test that a sandbox browser can execute shell commands via Exec IPC.
-/// This requires user namespace support (CLONE_NEWUSER).
+/// This requires user namespace support (`CLONE_NEWUSER`).
 #[test]
 fn sandbox_shell_exec() {
     let dir = tempfile::TempDir::new().expect("temp dir");

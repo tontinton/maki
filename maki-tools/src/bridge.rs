@@ -67,12 +67,17 @@ fn forward_host_ui(lua: &Lua, name: &str, args: &[Value]) -> Result<String, Stri
 
 /// Run `code` inside the sandbox child, exposing the given Lua functions as
 /// trusted tools.
-pub async fn run_sandbox_with(
+///
+/// # Errors
+///
+/// Returns a `LuaError` if the sandbox runtime fails to start; tool-level
+/// failures are reported as the `Err(String)` in the inner `Result`.
+pub async fn run_sandbox_with<S: std::hash::BuildHasher + Send + Sync + 'static>(
     sandbox: &Arc<Sandbox>,
     lua: Lua,
     code: String,
     timeout: Duration,
-    fns: HashMap<String, Function>,
+    fns: HashMap<String, Function, S>,
     config_json: String,
 ) -> Result<Result<InterpreterResult, String>, LuaError> {
     // Trusted tool calls arrive on the sandbox IO thread while the run is

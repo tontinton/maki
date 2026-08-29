@@ -54,7 +54,7 @@ impl ChildLuaRuntime {
     fn build(plugin_dir: &Path, forward: Option<HostForward>) -> Result<Self, LuaError> {
         let lua = Lua::new();
         create_maki_api(&lua, forward)?;
-        setup_require(&lua, plugin_dir.to_path_buf())?;
+        setup_require(&lua, plugin_dir)?;
         load_plugins(&lua, plugin_dir)?;
         Ok(Self {
             lua,
@@ -357,8 +357,8 @@ fn create_maki_api(lua: &Lua, forward: Option<HostForward>) -> Result<(), LuaErr
 //  require() resolution
 // ──────────────────────────────────────────────
 
-fn setup_require(lua: &Lua, plugin_dir: PathBuf) -> Result<(), LuaError> {
-    let global_require = create_require_fn(lua, &plugin_dir, None)?;
+fn setup_require(lua: &Lua, plugin_dir: &Path) -> Result<(), LuaError> {
+    let global_require = create_require_fn(lua, plugin_dir, None)?;
     lua.globals().set("require", global_require)?;
     Ok(())
 }
@@ -747,9 +747,8 @@ fn collect_glob_matches(dir: &Path, pattern: &str, out: &mut Vec<String>, limit:
         if out.len() >= limit {
             break;
         }
-        let rd = match std::fs::read_dir(&current) {
-            Ok(rd) => rd,
-            Err(_) => continue,
+        let Ok(rd) = std::fs::read_dir(&current) else {
+            continue;
         };
         for entry in rd.flatten() {
             if out.len() >= limit {
@@ -780,21 +779,21 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 fn glob_match_inner(pattern: &[char], text: &[char]) -> bool {
     let mut pi = 0;
     let mut ti = 0;
-    let mut star_pi = usize::MAX;
-    let mut star_ti = 0;
+    let mut star_pattern_i = usize::MAX;
+    let mut star_text_i = 0;
 
     while ti < text.len() {
         if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == text[ti]) {
             pi += 1;
             ti += 1;
         } else if pi < pattern.len() && pattern[pi] == '*' {
-            star_pi = pi;
-            star_ti = ti;
+            star_pattern_i = pi;
+            star_text_i = ti;
             pi += 1;
-        } else if star_pi != usize::MAX {
-            pi = star_pi + 1;
-            star_ti += 1;
-            ti = star_ti;
+        } else if star_pattern_i != usize::MAX {
+            pi = star_pattern_i + 1;
+            star_text_i += 1;
+            ti = star_text_i;
         } else {
             return false;
         }
@@ -1046,8 +1045,8 @@ fn json_encode(lua: &Lua, value: LuaValue) -> LuaResult<String> {
 }
 
 fn json_decode(lua: &Lua, text: String) -> LuaResult<LuaValue> {
-    let json_val: Value = serde_json::from_str(&text)
-        .map_err(|e| LuaError::runtime(format!("json decode: {e}")))?;
+    let json_val: Value =
+        serde_json::from_str(&text).map_err(|e| LuaError::runtime(format!("json decode: {e}")))?;
     json_to_lua(lua, &json_val)
 }
 

@@ -33,18 +33,15 @@ fn sandbox_run_code_prints() {
         eprintln!("{SKIP_NO_NS}");
         return;
     };
-    let result = match sandbox.run_code(
+    let Ok(result) = sandbox.run_code(
         "print('sandbox-ok')".into(),
         30,
         0,
         "{}".into(),
         |name, _, _| Err(format!("no tools in test: {name}")),
-    ) {
-        Ok(r) => r,
-        Err(_) => {
-            eprintln!("{SKIP_NO_NS}");
-            return;
-        }
+    ) else {
+        eprintln!("{SKIP_NO_NS}");
+        return;
     };
     assert!(
         result.error.is_none(),

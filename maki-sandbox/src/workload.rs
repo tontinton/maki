@@ -68,6 +68,11 @@ impl ChildCtx {
     }
 
     /// Run a trusted tool in the parent process (network, UI, agent state).
+    ///
+    /// # Errors
+    ///
+    /// Returns the tool's error message, or an error string if the forward
+    /// times out or the IO thread is gone.
     pub fn forward_trusted(
         &self,
         name: &str,
@@ -111,6 +116,10 @@ impl ChildCtx {
     }
 
     /// Execute a shell command inside the isolated filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SandboxError::Exec`] if the fork, exec, or wait fails.
     pub fn exec(
         &self,
         command: &str,
@@ -124,6 +133,11 @@ impl ChildCtx {
 pub trait ChildWorkload: Send + Sync {
     /// Build the session. Called once per child process, before any IPC
     /// traffic is served; an Err fails the child with a fatal report.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fatal error report sent to the parent if the session
+    /// cannot be initialized.
     fn init(&self, ctx: ChildCtx) -> Result<Box<dyn ChildSession>, String>;
 }
 
@@ -134,6 +148,10 @@ pub trait ChildSession: Send {
 
     /// Answer a parent-initiated tool call meant for local execution.
     /// Returns the textual tool output, or Err for a tool-level error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the tool-level error message when the tool fails.
     fn handle_tool_call(
         &mut self,
         name: &str,

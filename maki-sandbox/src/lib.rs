@@ -32,6 +32,10 @@ const IO_POLL_TIMEOUT_MS: u16 = 100;
 const SHUTDOWN_MSG: &str = "sandbox shutting down";
 
 /// Acquire a mutex lock, converting poison to [`SandboxError`].
+///
+/// # Errors
+///
+/// Returns [`SandboxError::MutexPoisoned`] if the mutex is poisoned.
 pub fn lock_or_poisoned<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, SandboxError> {
     mutex
         .lock()
@@ -53,6 +57,11 @@ pub use workload::{child_workload, register_child_workload};
 /// After this returns, the child is in its persistent IO loop and accepts
 /// [`ParentMsg`](crate::ipc::ParentMsg) requests (runs, tool calls, queries)
 /// over the socket.
+///
+/// # Errors
+///
+/// Returns a [`SandboxError`] if the fork fails, the handshake or sync
+/// protocol fails, or the uid/gid map cannot be written.
 pub fn spawn_child(config: NamespaceConfig) -> Result<(Pid, UnixStream), SandboxError> {
     let (mut parent_sock, child_sock) =
         UnixStream::pair().map_err(|e| SandboxError::Ipc(format!("socketpair: {e}")))?;
@@ -88,6 +97,11 @@ pub fn spawn_child(config: NamespaceConfig) -> Result<(Pid, UnixStream), Sandbox
 }
 
 /// Wait for the child process to exit and collect its status.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Ipc`] if the child exits with a non-zero code, is
+/// killed by a signal, or [`waitpid`] itself fails.
 pub fn wait_child(pid: Pid) -> Result<(), SandboxError> {
     match waitpid(pid, None) {
         Ok(WaitStatus::Exited(_, 0)) => Ok(()),
@@ -336,14 +350,15 @@ impl ParentIo {
     /// calls that already timed out are dropped without disturbing the loop.
     fn deliver(&self, call_id: u32, response: Result<SandboxResponse, String>) {
         match self.pending.lock() {
-            Ok(mut pending) => match pending.remove(&call_id) {
-                Some(tx) => {
+            Ok(mut pending) => {
+                if let Some(tx) = pending.remove(&call_id) {
                     if tx.send(response).is_err() {
                         debug!(call_id, "sandbox parent io: waiter gone");
                     }
+                } else {
+                    debug!(call_id, "sandbox parent io: no pending waiter");
                 }
-                None => debug!(call_id, "sandbox parent io: no pending waiter"),
-            },
+            }
             Err(e) => warn!("sandbox parent io: pending mutex poisoned: {e}"),
         }
     }

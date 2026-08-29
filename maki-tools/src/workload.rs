@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use maki_agent::agent::UNKNOWN_TOOL_PREFIX;
 use maki_interpreter::runner::{self, ToolFn};
-use maki_sandbox::{ChildIoResult, register_child_workload};
 use maki_sandbox::workload::{ChildCtx, ChildSession, ChildWorkload, RunSpec};
+use maki_sandbox::{ChildIoResult, register_child_workload};
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -65,9 +65,8 @@ impl ChildWorkload for MakiChildWorkload {
         let plugin_dir = discover_plugin_dir(SANDBOX_CONFIG_DIRS);
         let lua_runtime = {
             let ctx = ctx.clone();
-let forward: HostForward = Arc::new(move |name, args, kwargs| {
-            ctx.forward_trusted(name, args, kwargs)
-        });
+            let forward: HostForward =
+                Arc::new(move |name, args, kwargs| ctx.forward_trusted(name, args, kwargs));
             match ChildLuaRuntime::with_forwarder(&plugin_dir, forward) {
                 Ok(rt) => Some(Arc::new(rt)),
                 Err(e) => {
@@ -92,7 +91,7 @@ let forward: HostForward = Arc::new(move |name, args, kwargs| {
         let mut tools: HashMap<String, ToolFn> = HashMap::new();
         tools.insert("bash".into(), build_bash_tool(&ctx));
         if let Some(ref rt) = lua_runtime {
-            extend_lua_tools(&mut tools, Arc::clone(rt))?;
+            extend_lua_tools(&mut tools, rt)?;
         }
         extend_trusted_tools(&mut tools, &ctx);
 
@@ -185,7 +184,7 @@ fn build_bash_tool(ctx: &ChildCtx) -> ToolFn {
 /// [`ChildLuaRuntime`]; only child-local names are exposed.
 fn extend_lua_tools(
     tools: &mut HashMap<String, ToolFn>,
-    runtime: Arc<ChildLuaRuntime>,
+    runtime: &Arc<ChildLuaRuntime>,
 ) -> Result<(), String> {
     let names = runtime
         .registered_tool_names()
@@ -195,7 +194,7 @@ fn extend_lua_tools(
             debug!(tool = %name, "extend_lua_tools: not child-local, skipping");
             continue;
         }
-        let rt = Arc::clone(&runtime);
+        let rt = Arc::clone(runtime);
         let tool_name = name.clone();
         tools.insert(
             name,

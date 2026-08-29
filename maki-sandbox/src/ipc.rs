@@ -19,6 +19,11 @@ pub struct Handshake {
     pub version: u32,
 }
 
+/// Send a JSON-encoded [`Handshake`] over the socket.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Ipc`] if serialization or the socket write fails.
 pub fn send_handshake(sock: &mut UnixStream, name: &str) -> Result<(), SandboxError> {
     let msg = Handshake {
         name: name.to_string(),
@@ -29,6 +34,12 @@ pub fn send_handshake(sock: &mut UnixStream, name: &str) -> Result<(), SandboxEr
     write_message(sock, &data)
 }
 
+/// Receive and validate a [`Handshake`] from the socket.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Ipc`] if the message cannot be read or
+/// deserialized, or its version does not match [`HANDSHAKE_VERSION`].
 pub fn recv_handshake(sock: &mut UnixStream) -> Result<String, SandboxError> {
     let data = read_message(sock)?;
     let hs: Handshake = serde_json::from_slice(&data)
@@ -45,11 +56,22 @@ pub fn recv_handshake(sock: &mut UnixStream) -> Result<String, SandboxError> {
 pub const SYNC_READY: &[u8] = b"ready";
 pub const SYNC_GO: &[u8] = b"go";
 
+/// Send a raw sync message (see [`SYNC_READY`] / [`SYNC_GO`]).
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Ipc`] if the socket write fails.
 pub fn send_sync(sock: &mut UnixStream, msg: &[u8]) -> Result<(), SandboxError> {
     sock.write_all(msg)
         .map_err(|e| SandboxError::Ipc(format!("sync send: {e}")))
 }
 
+/// Receive a raw sync message, expecting `expected`.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Ipc`] if the read fails or the received bytes
+/// differ from `expected`.
 pub fn recv_sync(sock: &mut UnixStream, expected: &[u8]) -> Result<(), SandboxError> {
     let mut buf = vec![0u8; expected.len()];
     sock.read_exact(&mut buf)
@@ -196,6 +218,10 @@ fn read_message(sock: &mut UnixStream) -> Result<Vec<u8>, SandboxError> {
 }
 
 /// Send a [`ChildMsg`] to the parent process over the IPC socket.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Ipc`] if serialization or the socket write fails.
 pub fn send_child_msg(sock: &mut UnixStream, msg: &ChildMsg) -> Result<(), SandboxError> {
     let label = child_msg_label(msg);
     let data = serde_json::to_vec(msg)
@@ -211,6 +237,11 @@ pub fn send_child_msg(sock: &mut UnixStream, msg: &ChildMsg) -> Result<(), Sandb
 }
 
 /// Receive a [`ChildMsg`] from the parent process over the IPC socket.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Ipc`] if the message cannot be read or
+/// deserialized.
 pub fn recv_child_msg(sock: &mut UnixStream) -> Result<ChildMsg, SandboxError> {
     let data = read_message(sock)?;
     let msg: ChildMsg = serde_json::from_slice(&data)
@@ -220,6 +251,10 @@ pub fn recv_child_msg(sock: &mut UnixStream) -> Result<ChildMsg, SandboxError> {
 }
 
 /// Send a [`ParentMsg`] to the child process over the IPC socket.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Ipc`] if serialization or the socket write fails.
 pub fn send_parent_msg(sock: &mut UnixStream, msg: &ParentMsg) -> Result<(), SandboxError> {
     let label = parent_msg_label(msg);
     let data = serde_json::to_vec(msg)
@@ -230,11 +265,20 @@ pub fn send_parent_msg(sock: &mut UnixStream, msg: &ParentMsg) -> Result<(), San
 }
 
 /// Send an exit signal to the child process.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Ipc`] if the socket write fails.
 pub fn send_exit(sock: &mut UnixStream) -> Result<(), SandboxError> {
     send_parent_msg(sock, &ParentMsg::Exit)
 }
 
 /// Receive a [`ParentMsg`] from the child process over the IPC socket.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Ipc`] if the message cannot be read or
+/// deserialized.
 pub fn recv_parent_msg(sock: &mut UnixStream) -> Result<ParentMsg, SandboxError> {
     let data = read_message(sock)?;
     let msg: ParentMsg = serde_json::from_slice(&data)
@@ -299,7 +343,7 @@ mod tests {
     #[test]
     fn read_message_rejects_oversized() {
         let (mut tx, mut rx) = pair();
-        let len = (MAX_MSG_LEN as u32 + 1).to_be_bytes();
+        let len = (u32::try_from(MAX_MSG_LEN).unwrap() + 1).to_be_bytes();
         tx.write_all(&len).unwrap();
         let err = read_message(&mut rx).unwrap_err();
         assert!(err.to_string().contains("message too large"));
@@ -662,14 +706,14 @@ mod tests {
         assert_eq!(
             child_msg_label(&ChildMsg::Stdout {
                 call_id: 0,
-                text: "".into()
+                text: String::new()
             }),
             "stdout"
         );
         assert_eq!(
             child_msg_label(&ChildMsg::ToolCall {
                 call_id: 0,
-                name: "".into(),
+                name: String::new(),
                 args: vec![],
                 kwargs: vec![]
             }),
@@ -679,7 +723,7 @@ mod tests {
             child_msg_label(&ChildMsg::Done {
                 call_id: 0,
                 output: None,
-                stdout: "".into(),
+                stdout: String::new(),
                 error: None
             }),
             "done"
@@ -694,7 +738,7 @@ mod tests {
         assert_eq!(
             child_msg_label(&ChildMsg::PwdResult {
                 call_id: 0,
-                path: "".into()
+                path: String::new()
             }),
             "pwd_result"
         );
@@ -705,7 +749,7 @@ mod tests {
         assert_eq!(
             child_msg_label(&ChildMsg::ExecResult {
                 call_id: 0,
-                output: "".into(),
+                output: String::new(),
                 is_error: false
             }),
             "exec_result"
@@ -727,17 +771,17 @@ mod tests {
         assert_eq!(
             parent_msg_label(&ParentMsg::Run {
                 call_id: 0,
-                code: "".into(),
+                code: String::new(),
                 timeout_secs: 0,
                 max_memory: 0,
-                config: "".into()
+                config: String::new()
             }),
             "run"
         );
         assert_eq!(
             parent_msg_label(&ParentMsg::ToolCall {
                 call_id: 0,
-                name: "".into(),
+                name: String::new(),
                 args: vec![],
                 kwargs: vec![]
             }),
@@ -758,7 +802,7 @@ mod tests {
         assert_eq!(
             parent_msg_label(&ParentMsg::Ls {
                 call_id: 0,
-                path: "".into()
+                path: String::new()
             }),
             "ls"
         );
@@ -766,14 +810,14 @@ mod tests {
         assert_eq!(
             parent_msg_label(&ParentMsg::Cd {
                 call_id: 0,
-                path: "".into()
+                path: String::new()
             }),
             "cd"
         );
         assert_eq!(
             parent_msg_label(&ParentMsg::Exec {
                 call_id: 0,
-                command: "".into()
+                command: String::new()
             }),
             "exec"
         );

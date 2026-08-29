@@ -267,7 +267,7 @@ impl InnerChild {
 
         if let Err(e) = std::thread::Builder::new()
             .name("sandbox-io".into())
-            .spawn(move || IoHandler::run(io_sock, outgoing_rx, dispatch, work_tx))
+            .spawn(move || IoHandler::run(io_sock, &outgoing_rx, &dispatch, &work_tx))
         {
             error!("sandbox child: io thread spawn failed: {e}");
             let _ = ipc::send_child_msg(
@@ -282,7 +282,7 @@ impl InnerChild {
             std::process::exit(1);
         }
 
-        Self::worker_loop(work_rx, outgoing_tx, session);
+        Self::worker_loop(&work_rx, &outgoing_tx, session);
         std::process::exit(0);
     }
 
@@ -302,8 +302,8 @@ impl InnerChild {
     }
 
     fn worker_loop(
-        work_rx: Receiver<Work>,
-        outgoing_tx: Sender<IoCommand>,
+        work_rx: &Receiver<Work>,
+        outgoing_tx: &Sender<IoCommand>,
         mut session: Box<dyn ChildSession>,
     ) {
         while let Ok(work) = work_rx.recv() {
@@ -364,12 +364,12 @@ struct IoHandler;
 impl IoHandler {
     fn run(
         mut sock: UnixStream,
-        outgoing_rx: Receiver<IoCommand>,
-        dispatch: Arc<RemoteDispatch>,
-        work_tx: Sender<Work>,
+        outgoing_rx: &Receiver<IoCommand>,
+        dispatch: &Arc<RemoteDispatch>,
+        work_tx: &Sender<Work>,
     ) {
         loop {
-            if !Self::drain_outgoing(&outgoing_rx, &mut sock) {
+            if !Self::drain_outgoing(outgoing_rx, &mut sock) {
                 break;
             }
 
@@ -395,13 +395,13 @@ impl IoHandler {
                     break;
                 }
             };
-            if !Self::handle_parent_msg(&mut sock, msg, &dispatch, &work_tx) {
+            if !Self::handle_parent_msg(&mut sock, msg, dispatch, work_tx) {
                 break;
             }
         }
         // Whatever ended the loop, forwarded-trusted callers must not wait
         // forever for replies that can no longer arrive.
-        Self::cancel_pending(&dispatch);
+        Self::cancel_pending(dispatch);
     }
 
     fn drain_outgoing(outgoing_rx: &Receiver<IoCommand>, sock: &mut UnixStream) -> bool {
@@ -600,7 +600,7 @@ pub(crate) fn sandbox_exec(
         match nix_read(pipe_r, &mut buf) {
             Ok(0) => break,
             Ok(n) => output.push_str(&String::from_utf8_lossy(&buf[..n])),
-            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EINTR) => {}
             Err(_) => break,
         }
     }

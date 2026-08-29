@@ -44,6 +44,11 @@ impl Sandbox {
     ///
     /// Trusted tools forwarded by the child fail unless the active
     /// [`run_code`](Sandbox::run_code) call provides a handler for them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError`] if the child cannot be spawned or its IO
+    /// thread cannot be started.
     pub fn new(config: NamespaceConfig) -> Result<Arc<Self>, SandboxError> {
         let sandbox = Arc::new(Self {
             inner: Mutex::new(None),
@@ -89,6 +94,11 @@ impl Sandbox {
     ///
     /// The old child is sent [`Exit`](crate::ipc::ParentMsg::Exit) and waited
     /// on before the new child is started.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError`] if the sandbox mutex is poisoned or the new
+    /// child cannot be spawned.
     pub fn reinit(&self, config: NamespaceConfig) -> Result<(), SandboxError> {
         let old = lock_or_poisoned(&self.inner)?.take();
         drop(old);
@@ -109,12 +119,22 @@ impl Sandbox {
     }
 
     /// Wait for the child process to exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError`] if no child is running or the child exited
+    /// unsuccessfully.
     pub fn wait(&self) -> Result<(), SandboxError> {
         let inner = self.inner()?;
         crate::wait_child(inner.pid)
     }
 
     /// Send an exit signal to the child.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError`] if no child is running or the IO thread has
+    /// disconnected.
     pub fn exit(&self) -> Result<(), SandboxError> {
         let inner = self.inner()?;
         inner
@@ -129,6 +149,11 @@ impl Sandbox {
     /// runtime before the run starts. Trusted tools the child forwards while
     /// this run is active are answered by `handler`; calls arriving outside
     /// a run fail with "no sandbox run is active".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError`] if no child is running, the run times out, or
+    /// the child reports an I/O failure.
     pub fn run_code(
         &self,
         code: String,
@@ -177,6 +202,11 @@ impl Sandbox {
     /// Filesystem and bash tools run in the child; trusted tools are
     /// forwarded to the handler of the active
     /// [`run_code`](Sandbox::run_code) call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError`] if no child is running, the call times out, or
+    /// the child reports an I/O failure.
     pub fn call_tool(
         &self,
         name: &str,
@@ -204,6 +234,10 @@ impl Sandbox {
     }
 
     /// List directory entries in the sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError`] if no child is running or the query times out.
     pub fn ls(&self, path: &str) -> Result<Vec<DirEntry>, SandboxError> {
         let inner = self.inner()?;
         let call_id = inner.next_id.fetch_add(1, Ordering::SeqCst);
@@ -224,6 +258,10 @@ impl Sandbox {
     }
 
     /// Query the sandbox's current working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError`] if no child is running or the query times out.
     pub fn pwd(&self) -> Result<String, SandboxError> {
         let inner = self.inner()?;
         let call_id = inner.next_id.fetch_add(1, Ordering::SeqCst);
@@ -237,6 +275,11 @@ impl Sandbox {
     }
 
     /// Change the sandbox's working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError`] if no child is running, the query times out,
+    /// or the directory does not exist inside the sandbox.
     pub fn cd(&self, path: &str) -> Result<(), SandboxError> {
         let inner = self.inner()?;
         let call_id = inner.next_id.fetch_add(1, Ordering::SeqCst);
@@ -258,6 +301,11 @@ impl Sandbox {
     }
 
     /// Execute a shell command in the sandbox. Returns `(output, is_error)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError`] if no child is running, the exec times out, or
+    /// the child reports an I/O failure.
     pub fn exec(&self, command: &str) -> Result<(String, bool), SandboxError> {
         let inner = self.inner()?;
         let call_id = inner.next_id.fetch_add(1, Ordering::SeqCst);
@@ -388,12 +436,9 @@ mod tests {
             eprintln!("{SKIP_NO_NS}");
             return;
         };
-        let pwd = match sandbox.pwd() {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("{SKIP_NO_NS}");
-                return;
-            }
+        let Ok(pwd) = sandbox.pwd() else {
+            eprintln!("{SKIP_NO_NS}");
+            return;
         };
         assert!(!pwd.is_empty());
     }
@@ -404,12 +449,9 @@ mod tests {
             eprintln!("{SKIP_NO_NS}");
             return;
         };
-        let (output, is_error) = match sandbox.exec("echo hello") {
-            Ok(r) => r,
-            Err(_) => {
-                eprintln!("{SKIP_NO_NS}");
-                return;
-            }
+        let Ok((output, is_error)) = sandbox.exec("echo hello") else {
+            eprintln!("{SKIP_NO_NS}");
+            return;
         };
         assert!(!is_error);
         assert_eq!(output.trim(), "hello");
@@ -430,19 +472,13 @@ mod tests {
             vec![],
             vec![],
         );
-        let sandbox = match Sandbox::new(config) {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("{SKIP_NO_NS}");
-                return;
-            }
+        let Ok(sandbox) = Sandbox::new(config) else {
+            eprintln!("{SKIP_NO_NS}");
+            return;
         };
-        let entries = match sandbox.ls(".") {
-            Ok(e) => e,
-            Err(_) => {
-                eprintln!("{SKIP_NO_NS}");
-                return;
-            }
+        let Ok(entries) = sandbox.ls(".") else {
+            eprintln!("{SKIP_NO_NS}");
+            return;
         };
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"file.txt"));

@@ -180,6 +180,12 @@ impl NamespaceConfig {
         compute_env_entries(&self.allowed_env, &self.env_vars, &self.path_dirs)
     }
 
+    /// Replace the child's environment with the filtered allow-listed set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Env`] if an env key or value contains a null
+    /// byte.
     pub fn filter_env(&self) -> Result<(), SandboxError> {
         let mut keep: Vec<(String, String)> = Vec::new();
         for (key, val) in std::env::vars() {
@@ -242,6 +248,11 @@ impl NamespaceConfig {
     }
 
     /// Set up bind mounts and `pivot_root` for filesystem isolation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Mount`] if any mount or `pivot_root` step
+    /// fails.
     pub fn setup_mounts(&self, has_mount_ns: bool) -> Result<(), SandboxError> {
         setup_mounts_impl(self, has_mount_ns)
     }
@@ -362,6 +373,13 @@ impl NamespaceConfig {
     }
 }
 
+/// Isolate the calling process into a new user namespace, synchronizing with
+/// the parent over `sock`.
+///
+/// # Errors
+///
+/// Returns a [`SandboxError`] if `unshare(CLONE_NEWUSER)` fails or the sync
+/// protocol with the parent breaks.
 pub fn isolate_user_ns(sock: &mut UnixStream) -> Result<(), SandboxError> {
     unshare(CloneFlags::CLONE_NEWUSER)
         .map_err(|e| SandboxError::Namespace(format!("unshare(CLONE_NEWUSER): {e}")))?;
@@ -370,6 +388,12 @@ pub fn isolate_user_ns(sock: &mut UnixStream) -> Result<(), SandboxError> {
     Ok(())
 }
 
+/// Isolate the calling process into a new mount namespace. Returns whether
+/// the namespace was created (falls back to no fs isolation when unsupported).
+///
+/// # Errors
+///
+/// Returns a [`SandboxError`] if `unshare(CLONE_NEWNS)` fails unexpectedly.
 pub fn isolate_mount_ns() -> Result<bool, SandboxError> {
     match unshare(CloneFlags::CLONE_NEWNS) {
         Ok(()) => {
@@ -420,11 +444,12 @@ fn prepare_device_stage() -> Result<String, SandboxError> {
 /// Remove the staging trees left behind by an exited child. Its mounts died
 /// with its mount namespace; only plain directories remain on /tmp.
 pub(crate) fn cleanup_staging(pid: Pid) {
-    let pid = pid.as_raw() as u32;
+    let pid = pid.as_raw().unsigned_abs();
     let _ = std::fs::remove_dir_all(staging_dir(pid));
     let _ = std::fs::remove_dir_all(device_stage_dir(pid));
 }
 
+#[allow(clippy::too_many_lines)]
 fn setup_mounts_impl(config: &NamespaceConfig, has_mount_ns: bool) -> Result<(), SandboxError> {
     if !has_mount_ns {
         warn!("sandbox: no mount namespace, cd to workspace (no fs isolation)");
@@ -667,6 +692,13 @@ fn setup_mounts_impl(config: &NamespaceConfig, has_mount_ns: bool) -> Result<(),
     Ok(())
 }
 
+/// Probe whether user and mount namespaces are available in a throwaway
+/// fork, without disturbing the calling process.
+///
+/// # Errors
+///
+/// Returns a [`SandboxError`] if the probe socket cannot be created, the
+/// fork fails, or the child reports it could not create a namespace.
 pub fn probe() -> Result<(), SandboxError> {
     let (mut sync_rx, mut sync_tx) =
         UnixStream::pair().map_err(|e| SandboxError::Ipc(format!("probe socketpair: {e}")))?;
@@ -824,8 +856,7 @@ fn pivot_root(new_root: &str, put_old: &str) -> Result<(), SandboxError> {
         CString::new(new_root).map_err(|_| SandboxError::Mount("pivot_root new_root".into()))?;
     let old =
         CString::new(put_old).map_err(|_| SandboxError::Mount("pivot_root put_old".into()))?;
-    let ret =
-        unsafe { libc::syscall(libc::SYS_pivot_root, new.as_ptr(), old.as_ptr()) as libc::c_int };
+    let ret = unsafe { libc::syscall(libc::SYS_pivot_root, new.as_ptr(), old.as_ptr()) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
         return Err(SandboxError::Mount(format!("pivot_root: {err}")));
@@ -915,6 +946,13 @@ fn bind_mount_device(source: &Path, target: &str) -> Result<(), SandboxError> {
     Ok(())
 }
 
+/// Write the uid/gid mapping for a user-namespace child so its root maps to
+/// the given host uid/gid.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Namespace`] if writing `setgroups`, `uid_map`, or
+/// `gid_map` fails.
 pub fn write_uid_map(child_pid: Pid, uid: u32, gid: u32) -> Result<(), SandboxError> {
     let uid_map_path = format!("/proc/{child_pid}/uid_map");
     let gid_map_path = format!("/proc/{child_pid}/gid_map");
