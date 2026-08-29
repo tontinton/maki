@@ -24,6 +24,10 @@ const NO_ASKPASS: (&str, &str) = ("GIT_ASKPASS", "");
 /// maki's environment was put there by someone else. Zero pairs reads the same
 /// as none, and unlike `GIT_CONFIG_NOSYSTEM` the user's own config is untouched.
 const NO_INJECTED_CONFIG: (&str, &str) = ("GIT_CONFIG_COUNT", "0");
+/// Bytes per second below which a transfer counts as stalled.
+const LOW_SPEED_LIMIT: u32 = 1;
+/// Seconds a transfer may stay under `LOW_SPEED_LIMIT` before git gives up.
+const LOW_SPEED_TIME: u32 = 30;
 
 /// Flags every invocation carries, whatever it is doing.
 ///
@@ -32,12 +36,20 @@ const NO_INJECTED_CONFIG: (&str, &str) = ("GIT_CONFIG_COUNT", "0");
 /// import hooks from a remote, so this is defence in depth for the case that
 /// matters more: a checkout directory on this machine whose `.git/hooks`
 /// something else has written.
+///
+/// Nothing here can cancel a running git, so the speed limits are what turn a
+/// remote that connects and then goes quiet into a failure instead of a wait
+/// with no end.
 pub fn hardening_args(empty_hooks_dir: &Path) -> Vec<String> {
     vec![
         "-c".to_owned(),
         format!("core.hooksPath={}", empty_hooks_dir.display()),
         "-c".to_owned(),
         EXT_TRANSPORT_DENIED.to_owned(),
+        "-c".to_owned(),
+        format!("http.lowSpeedLimit={LOW_SPEED_LIMIT}"),
+        "-c".to_owned(),
+        format!("http.lowSpeedTime={LOW_SPEED_TIME}"),
     ]
 }
 
@@ -125,7 +137,13 @@ pub fn rev_parse_args(empty_hooks_dir: &Path, rev: &str) -> Vec<String> {
     args
 }
 
-pub(crate) fn manifest_exists_args(empty_hooks_dir: &Path, rev: &str) -> Vec<String> {
+/// The revision sits before `--`, where git still reads a leading dash as an
+/// option, so an unsafe revision gets no arguments at all. Same rule as
+/// [`read_manifest_args`].
+pub(crate) fn manifest_exists_args(empty_hooks_dir: &Path, rev: &str) -> Option<Vec<String>> {
+    if !revision_is_safe(rev) {
+        return None;
+    }
     let mut args = hardening_args(empty_hooks_dir);
     args.extend([
         "ls-tree".to_owned(),
@@ -134,7 +152,7 @@ pub(crate) fn manifest_exists_args(empty_hooks_dir: &Path, rev: &str) -> Vec<Str
         "--".to_owned(),
         PLUGIN_MANIFEST.to_owned(),
     ]);
-    args
+    Some(args)
 }
 
 pub(crate) fn read_manifest_args(empty_hooks_dir: &Path, rev: &str) -> Option<Vec<String>> {
@@ -302,13 +320,25 @@ mod tests {
         assert!(hooks_flag_present(&fetch_args(&hooks())));
         assert!(hooks_flag_present(&checkout_args(&hooks(), "main")));
         assert!(hooks_flag_present(&rev_parse_args(&hooks(), "HEAD")));
-        assert!(hooks_flag_present(&manifest_exists_args(
-            &hooks(),
-            "abc123"
-        )));
+        assert!(hooks_flag_present(
+            &manifest_exists_args(&hooks(), "abc123").unwrap()
+        ));
         assert!(hooks_flag_present(
             &read_manifest_args(&hooks(), "abc123").unwrap()
         ));
+    }
+
+    #[test]
+    fn a_stalled_transfer_cannot_wait_forever() {
+        let args = fetch_args(&hooks());
+        assert!(
+            args.contains(&format!("http.lowSpeedLimit={LOW_SPEED_LIMIT}")),
+            "{args:?}"
+        );
+        assert!(
+            args.contains(&format!("http.lowSpeedTime={LOW_SPEED_TIME}")),
+            "{args:?}"
+        );
     }
 
     /// The flags have to come before the subcommand, or git treats them as
@@ -337,11 +367,15 @@ mod tests {
     }
 
     #[test]
-    fn manifest_lookup_uses_a_fixed_path_after_the_option_terminator() {
-        let args = manifest_exists_args(&hooks(), "abc123");
+    fn manifest_lookup_pins_the_path_and_refuses_an_unsafe_revision() {
+        let args = manifest_exists_args(&hooks(), "abc123").unwrap();
         assert_eq!(&args[args.len() - 3..], ["abc123", "--", PLUGIN_MANIFEST]);
         let read = read_manifest_args(&hooks(), "abc123").unwrap();
-        assert_eq!(&read[read.len() - 2..], ["abc123:plugin.toml", "--"]);
+        assert_eq!(
+            &read[read.len() - 2..],
+            [format!("abc123:{PLUGIN_MANIFEST}"), "--".to_owned()]
+        );
+        assert!(manifest_exists_args(&hooks(), "--format=evil").is_none());
         assert!(read_manifest_args(&hooks(), "--format=evil").is_none());
     }
 

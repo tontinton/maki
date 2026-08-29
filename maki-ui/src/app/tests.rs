@@ -20,7 +20,8 @@ use maki_agent::{
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{
-    BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader, SessionEndReason,
+    BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader, PackCommand,
+    PackPlan, PackPreparation, PackReport, SessionEndReason,
 };
 use maki_providers::{ContentBlock, Effort, Message, Role, THINKING_USAGE, TokenUsage};
 use maki_storage::sessions::{SessionMeta, StoredMode, StoredThinking};
@@ -33,6 +34,11 @@ use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const TASK_ID: &str = "task1";
+const PACKUPDATE: &str = "/packupdate";
+const PACK_NAME: &str = "demo";
+const PACKDEL_USAGE: &str = "/packdel: name a package, or pass ++all";
+const PACK_FAILURES: &str = "first; second";
+const PACK_REVIEW_PROMPT: &str = "Apply these package changes?";
 pub(crate) const RESEARCH_NAME: &str = "research";
 const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
@@ -4070,36 +4076,88 @@ fn thinking_unsupported_model_flashes_error() {
 #[test]
 fn package_commands_are_user_only_and_preserve_update_bang() {
     let mut app = test_app();
-    app.execute_command(
-        ParsedCommand {
-            name: "/packupdate".into(),
-            args: "demo".into(),
-            bang: true,
-        },
-        1,
-    );
+    let typed = || ParsedCommand {
+        name: PACKUPDATE.into(),
+        args: PACK_NAME.into(),
+        bang: true,
+    };
+
+    app.execute_command(typed(), 1);
     assert_eq!(app.exit_request, ExitRequest::None);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        "/packupdate can only be run by you"
+        format!("{PACKUPDATE}{PACK_USER_ONLY_SUFFIX}")
     );
 
-    app.execute_command(
+    let actions = app.execute_command(typed(), 0);
+    assert_eq!(app.exit_request, ExitRequest::None);
+    let [Action::PreparePack(PackCommand::Update { name, options })] = actions.as_slice() else {
+        panic!("expected one package preparation action");
+    };
+    assert_eq!(name.as_deref(), Some(PACK_NAME));
+    assert!(options.force);
+}
+
+#[test]
+fn invalid_package_command_stays_in_the_current_tui() {
+    let mut app = test_app();
+
+    let actions = app.execute_command(
         ParsedCommand {
-            name: "/packupdate".into(),
-            args: "demo".into(),
-            bang: true,
+            name: "/packdel".into(),
+            args: "one two".into(),
+            bang: false,
         },
         0,
     );
-    assert_eq!(
-        app.exit_request,
-        ExitRequest::Pack(crate::components::PackRequest {
-            name: "/packupdate".to_owned(),
-            args: "demo".to_owned(),
-            bang: true,
-        })
+
+    assert!(actions.is_empty());
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert_eq!(app.status_bar.flash_text(), Some(PACKDEL_USAGE));
+}
+
+#[test]
+fn completed_package_preparation_reports_all_failures_without_exit() {
+    let mut app = test_app();
+    let report = PackReport {
+        failures: vec!["first".into(), "second".into()],
+        ..PackReport::default()
+    };
+
+    let actions = app.handle_pack_preparation(PackPreparation::Complete(report));
+
+    assert!(actions.is_empty());
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert_eq!(app.status_bar.flash_text(), Some(PACK_FAILURES));
+}
+
+/// Preparation runs off the event loop, so an agent can raise a permission
+/// prompt while the review is already up. The prompt has a tool waiting on it
+/// and owns the bottom panel, so it answers first even though it opened last.
+#[test]
+fn a_pending_permission_prompt_answers_before_the_package_review() {
+    let mut app = test_app();
+    app.handle_pack_preparation(PackPreparation::Review {
+        prompt: PACK_REVIEW_PROMPT.into(),
+        plan: PackPlan::default(),
+    });
+    app.permission_prompt.open(
+        "id".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
     );
+
+    app.update(Msg::Key(KeyEvent::from(KeyCode::Char('y'))));
+
+    assert!(!app.permission_prompt.is_open());
+    assert!(app.pack_review.is_open(), "the review waits its turn");
+    assert_eq!(app.exit_request, ExitRequest::None);
+
+    app.update(Msg::Key(KeyEvent::from(KeyCode::Char('y'))));
+
+    assert!(!app.pack_review.is_open());
+    assert!(matches!(app.exit_request, ExitRequest::Pack(_)));
 }
 
 #[test]

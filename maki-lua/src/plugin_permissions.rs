@@ -189,16 +189,13 @@ pub(crate) fn load_requested_permissions(
             });
         }
     };
-    requested_permissions_from_text(Some(&content), &manifest_path)
+    requested_permissions_from_text(&content, &manifest_path)
 }
 
 pub(crate) fn requested_permissions_from_text(
-    content: Option<&str>,
+    content: &str,
     manifest_path: &Path,
 ) -> Result<Requested, PluginError> {
-    let Some(content) = content else {
-        return Ok(Requested::none());
-    };
     toml::from_str::<toml::Value>(content)
         .map(|value| Requested::from_manifest(&value))
         .map_err(|error| PluginError::PackageManifest {

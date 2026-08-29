@@ -13,6 +13,7 @@ pub(crate) mod mcp_picker;
 pub mod messages;
 pub(crate) mod modal;
 pub(crate) mod model_picker;
+pub(crate) mod pack_review;
 pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
@@ -33,6 +34,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
 use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
+use maki_lua::{PackCommand, PackPlan};
 use maki_providers::{Message, ModelTier};
 use ratatui::text::{Line, Span};
 
@@ -205,6 +207,7 @@ pub enum Action {
     OpenEditor(PathBuf),
     EditInputInEditor,
     Btw(String),
+    PreparePack(PackCommand),
     Suspend,
 }
 
@@ -217,14 +220,7 @@ pub enum ExitRequest {
     Success,
     Error,
     Reload,
-    Pack(PackRequest),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PackRequest {
-    pub name: String,
-    pub args: String,
-    pub bang: bool,
+    Pack(PackPlan),
 }
 
 impl ExitRequest {

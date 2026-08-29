@@ -107,9 +107,12 @@ still declares. Pass one package name to update only that package:
 
 Maki fetches the source and shows the old and proposed commits. It compares the
 proposed permission request with the permissions already approved for that
-package and source. Declining the review changes no installed revision. Use
-`/packupdate!` to skip the update review. It does not approve new permissions.
-Maki asks for that approval separately when it loads the updated package.
+package and source. Accepting the review applies the revision and approves the
+permissions it showed. Declining leaves the installed revision alone.
+
+Use `/packupdate!` to skip the update review. The bang does not cover
+permissions, so Maki still asks about a new one when it loads the updated
+package.
 
 Pass `++lockfile` to restore the commit already recorded in the lockfile
 instead of resolving the declared version:
@@ -130,10 +133,11 @@ Then remove the inactive package:
 ```
 
 `/packdel ++all` removes every installed package that is no longer declared.
-Maki refuses a package that is active in this process or another Maki process.
-It removes the package approval only after the package files can be removed.
+Maki shows what it is about to remove and waits for you to accept. A package
+that is still active, here or in another Maki process, is refused. The package
+approval goes away once its files are gone.
 
-There is no force option for deletion.
+Use `/packdel!` to skip that review. The refusals still apply.
 
 ## Package permissions
 

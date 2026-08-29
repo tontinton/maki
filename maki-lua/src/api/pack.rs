@@ -54,29 +54,7 @@ pub struct PackDeclarations {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackOp {
-    Activate {
-        name: String,
-    },
-    Update {
-        name: String,
-        options: UpdateOptions,
-    },
-    Delete {
-        name: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct UpdateOptions {
-    pub force: bool,
-    pub target: UpdateTarget,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum UpdateTarget {
-    #[default]
-    Version,
-    Lockfile,
+    Activate { name: String },
 }
 
 pub type PackStore = Arc<Mutex<PackDeclarations>>;
@@ -276,8 +254,8 @@ fn parse_options(lua: &Lua, opts: Option<Table>) -> LuaResult<(LoadMode, bool)> 
     Ok((load, confirm))
 }
 
-fn enqueue(lua: &Lua, operation: PackOp, name: &str) -> LuaResult<()> {
-    if !maki_pack::name_is_safe(name) {
+fn enqueue(lua: &Lua, name: String) -> LuaResult<()> {
+    if !maki_pack::name_is_safe(&name) {
         return Err(mlua::Error::runtime(format!(
             "pack: {name:?} is not a usable package name"
         )));
@@ -288,13 +266,9 @@ fn enqueue(lua: &Lua, operation: PackOp, name: &str) -> LuaResult<()> {
         .clone();
     let mut declarations = store.lock().expect("pack declarations");
     if declarations.drained {
-        let scope = match &operation {
-            PackOp::Activate { .. } => "maki.packadd",
-            PackOp::Update { .. } => "maki.pack.update",
-            PackOp::Delete { .. } => "maki.pack.del",
-        };
-        return Err(mlua::Error::runtime(format!("{scope}: {AFTER_LOAD}")));
+        return Err(mlua::Error::runtime(format!("maki.packadd: {AFTER_LOAD}")));
     }
+    let operation = PackOp::Activate { name };
     if !declarations.pending.contains(&operation) {
         declarations.pending.push(operation);
     }
@@ -306,7 +280,7 @@ fn enqueue(lua: &Lua, operation: PackOp, name: &str) -> LuaResult<()> {
 /// @param name string Package name.
 #[lua_fn]
 fn packadd(lua: &Lua, name: String) -> LuaResult<()> {
-    enqueue(lua, PackOp::Activate { name: name.clone() }, &name)
+    enqueue(lua, name)
 }
 
 pub(crate) fn add_packadd(lua: &Lua, maki: &Table) -> LuaResult<()> {
@@ -442,10 +416,10 @@ pub(crate) fn create_pack_read_table(lua: &Lua) -> LuaResult<Table> {
 }
 
 lua_table! {
-    /// Manage global packages and inspect package state.
+    /// Declare global packages and inspect package state.
     ///
     /// `add` is available only in the global `init.lua`. `get` is read-only
-    /// and is available elsewhere.
+    /// and is available in project config and packages.
     "maki.pack" => pub(crate) fn create_pack_table(), DOCS [
         add, get,
     ]

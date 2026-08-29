@@ -73,34 +73,6 @@ impl Drop for Teardown {
     }
 }
 
-fn run_pack_command(stack: &Stack, request: &maki_ui::PackRequest) -> Vec<String> {
-    let command = match maki_lua::PackCommand::parse(&request.name, &request.args, request.bang) {
-        Ok(command) => command,
-        Err(message) => return vec![message],
-    };
-    let declared = match stack.plugin_host.declared_packages() {
-        Ok(declared) => declared,
-        Err(error) => return vec![format!("could not read declared packages: {error}")],
-    };
-    let installed = match maki_lua::installed_names() {
-        Some(installed) => installed,
-        None => return vec!["could not read the package lockfile".to_owned()],
-    };
-    let active = match stack.plugin_host.active_packages() {
-        Ok(active) => active,
-        Err(error) => return vec![format!("could not read active packages: {error}")],
-    };
-    let operations = match maki_lua::plan_command(&command, &declared, &installed) {
-        Ok(operations) => operations,
-        Err(message) => return vec![message],
-    };
-    let report =
-        maki_lua::apply_pack_ops(&operations, &declared, &active, maki_lua::Interaction::Tty);
-    let mut messages = vec![report.summary()];
-    messages.extend(report.failures);
-    messages
-}
-
 fn discover_commands(disable: bool) -> Vec<CustomCommand> {
     if disable {
         return Vec::new();
@@ -349,6 +321,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     )?];
     let mut focused = 0;
     let mut warnings = startup_warnings;
+    let mut notice = None;
     let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
     let mut teardown = Teardown::default();
 
@@ -383,6 +356,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 sessions: std::mem::take(&mut tabs),
                 focused,
                 startup_warnings: std::mem::take(&mut warnings),
+                startup_notice: notice.take(),
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
@@ -433,18 +407,22 @@ pub fn run(mut cli: Cli) -> Result<()> {
             } => {
                 let started = Instant::now();
                 let last_good = (stack.config.clone(), stack.model.clone());
-                let pack_messages = pack
-                    .map(|request| super::sanitize_warnings(&run_pack_command(&stack, &request)))
-                    .unwrap_or_default();
-                // Shut the old host down first so nothing can repopulate
-                // the registry after the clear: its senders disconnect, the
-                // watchdog aborts in-flight callbacks, and only this thread
-                // issues loads. The old VM then shares nothing with the new
-                // stack, so its slow join (up to 2s) can run on a
-                // background thread.
+                // Shut the old host down first so nothing can repopulate the
+                // registry after the clear: its senders disconnect, the watchdog
+                // aborts in-flight callbacks, and only this thread issues loads.
+                // A package plan then has to wait for the old revision leases to
+                // close, while an ordinary reload can drop the stack in the
+                // background.
                 stack.plugin_host.begin_shutdown();
                 ToolRegistry::global().clear_lua();
-                teardown.defer(move || drop(stack));
+                let pack_report = if let Some(plan) = pack {
+                    teardown.join();
+                    drop(stack);
+                    Some(maki_lua::apply_pack_plan(plan))
+                } else {
+                    teardown.defer(move || drop(stack));
+                    None
+                };
                 let (new_stack, new_warnings) =
                     build_stack(&cli, &cwd, &storage, interaction, Some(last_good))?;
                 tabs = reloaded;
@@ -454,7 +432,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     tabs.push(session);
                 }
                 stack = new_stack;
-                warnings = pack_messages;
+                if let Some(report) = pack_report {
+                    notice = report.changed().then(|| report.summary());
+                    warnings = super::sanitize_warnings(&report.failures);
+                }
                 warnings.extend(new_warnings);
                 focused = f.min(tabs.len() - 1);
                 tracing::info!(

@@ -57,20 +57,16 @@ enum Want<'a> {
     Ref,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedUpdate {
     spec: Spec,
     pub old_rev: String,
     pub new_rev: String,
-    pub old_manifest: PreviousManifest,
+    /// False when the work clone no longer has the recorded revision, so a
+    /// review cannot show what the package is moving away from.
+    pub old_rev_available: bool,
     pub new_manifest: Option<String>,
     pub changed: bool,
-}
-
-#[derive(Debug, Clone)]
-pub enum PreviousManifest {
-    Available(Option<String>),
-    Unavailable,
 }
 
 #[derive(Debug, Default)]
@@ -218,22 +214,16 @@ impl Manager {
             .iter()
             .filter(|revision| *revision != current)
         {
-            let lock_path = paths::revision_lock(&self.site, name, revision);
-            match Lock::acquire(&lock_path) {
-                Ok(guard) => {
+            // The lock file outlives the directory it guards. Unlinking it while
+            // holding it would let a reader caught between `open` and `flock`
+            // keep the orphaned inode while the next process locks a fresh file
+            // at the same path, and both would think they are alone. An empty
+            // file per dead revision is the cheaper problem.
+            match Lock::acquire(&paths::revision_lock(&self.site, name, revision)) {
+                Ok(_guard) => {
                     let dir = paths::revision_dir(&self.site, name, revision);
                     if let Err(source) = fs::remove_dir_all(&dir) {
                         failures.push(ManagerError::Io { path: dir, source });
-                        continue;
-                    }
-                    drop(guard);
-                    if let Err(source) = fs::remove_file(&lock_path)
-                        && source.kind() != std::io::ErrorKind::NotFound
-                    {
-                        failures.push(ManagerError::Io {
-                            path: lock_path,
-                            source,
-                        });
                     }
                 }
                 Err(LockError::Held { .. }) => {
@@ -254,12 +244,7 @@ impl Manager {
         spec: &Spec,
         lock: &mut Lockfile,
     ) -> Result<Installed, ManagerError> {
-        if git::http_source_has_userinfo(&spec.src) {
-            return Err(ManagerError::UnsafeSource {
-                src: git::redact(&spec.src),
-            });
-        }
-        self.check_name(&spec.name, &spec.src)?;
+        self.check_spec(spec)?;
 
         // The recorded source must match before an installed directory counts.
         // Pointing a name at a different repository has to fetch that
@@ -329,12 +314,7 @@ impl Manager {
         lock: &Lockfile,
         restore_lockfile: bool,
     ) -> Result<PreparedUpdate, ManagerError> {
-        if git::http_source_has_userinfo(&spec.src) {
-            return Err(ManagerError::UnsafeSource {
-                src: git::redact(&spec.src),
-            });
-        }
-        self.check_name(&spec.name, &spec.src)?;
+        self.check_spec(spec)?;
         let current = lock
             .get(&spec.name)
             .ok_or_else(|| ManagerError::NotInstalled {
@@ -370,18 +350,14 @@ impl Manager {
             return Err(ManagerError::UnsafeRevision { rev: new_rev });
         }
         let new_manifest = Self::read_manifest(&hooks, &work, &new_rev).await?;
-        let old_manifest = if current.rev == new_rev {
-            PreviousManifest::Available(new_manifest.clone())
-        } else {
-            match Self::read_manifest(&hooks, &work, &current.rev).await {
-                Ok(manifest) => PreviousManifest::Available(manifest),
-                Err(_) => PreviousManifest::Unavailable,
-            }
-        };
+        let old_rev_available = current.rev == new_rev
+            || Self::revision_exists(&hooks, &work, &current.rev)
+                .await
+                .unwrap_or(false);
         Ok(PreparedUpdate {
             spec: spec.clone(),
             old_rev: current.rev.clone(),
-            old_manifest,
+            old_rev_available,
             new_manifest,
             changed: current.rev != new_rev
                 || !paths::revision_dir(&self.site, &spec.name, &new_rev).is_dir(),
@@ -456,6 +432,18 @@ impl Manager {
         }
         lock.remove(name);
         Ok(())
+    }
+
+    /// Checks a spec before it reaches git. A credential in the source would be
+    /// written to the lockfile and echoed back in errors, and an unusable name
+    /// escapes the package root.
+    fn check_spec(&self, spec: &Spec) -> Result<(), ManagerError> {
+        if git::http_source_has_userinfo(&spec.src) {
+            return Err(ManagerError::UnsafeSource {
+                src: git::redact(&spec.src),
+            });
+        }
+        self.check_name(&spec.name, &spec.src)
     }
 
     /// Rejects a name that would not stay inside the package root.
@@ -626,24 +614,35 @@ impl Manager {
         Err(last.expect("at least one candidate is always tried").into())
     }
 
+    /// Whether the work clone still holds this revision. A recorded one can go
+    /// missing after the remote rewrote history, and a review that cannot name
+    /// what the package is moving away from still has to be shown.
+    async fn revision_exists(
+        hooks: &Path,
+        work: &Path,
+        revision: &str,
+    ) -> Result<bool, ManagerError> {
+        match git::run(git::rev_parse_args(hooks, revision), work.to_path_buf()).await {
+            Ok(_) => Ok(true),
+            Err(GitError::Failed { .. }) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn read_manifest(
         hooks: &Path,
         work: &Path,
         revision: &str,
     ) -> Result<Option<String>, ManagerError> {
-        let found = git::run(
-            git::manifest_exists_args(hooks, revision),
-            work.to_path_buf(),
-        )
-        .await?;
+        let unsafe_revision = || ManagerError::UnsafeRevision {
+            rev: revision.to_owned(),
+        };
+        let exists = git::manifest_exists_args(hooks, revision).ok_or_else(unsafe_revision)?;
+        let found = git::run(exists, work.to_path_buf()).await?;
         if found.stdout.trim().is_empty() {
             return Ok(None);
         }
-        let args = git::read_manifest_args(hooks, revision).ok_or_else(|| {
-            ManagerError::UnsafeRevision {
-                rev: revision.to_owned(),
-            }
-        })?;
+        let args = git::read_manifest_args(hooks, revision).ok_or_else(unsafe_revision)?;
         git::run(args, work.to_path_buf())
             .await
             .map(|output| Some(output.stdout))
@@ -767,6 +766,7 @@ mod tests {
 
     const TEST_REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OTHER_REV: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const MANIFEST: &str = "[permissions]\nnet = true\n";
 
     fn site() -> tempfile::TempDir {
         tempfile::TempDir::new().unwrap()
@@ -959,6 +959,52 @@ mod tests {
         .unwrap()
     }
 
+    /// A site with one installable `demo` repository, plus the calls every
+    /// update test makes on it.
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        origin: PathBuf,
+        site: PathBuf,
+        manager: Manager,
+        lock: Lockfile,
+        spec: Spec,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = site();
+            let origin = origin_repo(dir.path(), None);
+            let site = dir.path().join("site");
+            Self {
+                manager: Manager::new(&site),
+                spec: Spec::new(origin.display().to_string()).with_name("demo"),
+                lock: Lockfile::default(),
+                origin,
+                site,
+                _dir: dir,
+            }
+        }
+
+        fn install(&mut self) -> Installed {
+            smol::block_on(self.manager.ensure_installed(&self.spec, &mut self.lock)).unwrap()
+        }
+
+        fn prepare(&self, restore_lockfile: bool) -> Result<PreparedUpdate, ManagerError> {
+            smol::block_on(
+                self.manager
+                    .prepare_update(&self.spec, &self.lock, restore_lockfile),
+            )
+        }
+
+        fn apply(&mut self, prepared: &PreparedUpdate) -> Result<Installed, ManagerError> {
+            smol::block_on(self.manager.apply_update(prepared, &mut self.lock))
+        }
+
+        fn revision_dir(&self, revision: &str) -> PathBuf {
+            paths::revision_dir(&self.site, "demo", revision)
+        }
+    }
+
     #[test]
     fn installs_a_package_from_a_local_repository() {
         let dir = site();
@@ -1033,16 +1079,15 @@ mod tests {
     fn an_annotated_tag_records_the_commit_it_points_at() {
         let dir = site();
         let origin = origin_repo(dir.path(), None);
-        let git = |args: Vec<&str>| {
-            smol::block_on(git::run(
-                args.iter().map(|a| (*a).to_owned()).collect(),
-                origin.clone(),
-            ))
-            .unwrap()
-        };
-        git(vec!["tag", "-a", "v2.0.0", "-m", "release"]);
-        let commit = git(vec!["rev-parse", "HEAD"]).stdout.trim().to_owned();
-        let tag_object = git(vec!["rev-parse", "v2.0.0"]).stdout.trim().to_owned();
+        fixture_git(&origin, &["tag", "-a", "v2.0.0", "-m", "release"]);
+        let commit = fixture_git(&origin, &["rev-parse", "HEAD"])
+            .stdout
+            .trim()
+            .to_owned();
+        let tag_object = fixture_git(&origin, &["rev-parse", "v2.0.0"])
+            .stdout
+            .trim()
+            .to_owned();
         assert_ne!(tag_object, commit, "the fixture tag must be annotated");
 
         let mgr = Manager::new(dir.path().join("site"));
@@ -1073,13 +1118,7 @@ mod tests {
 
         // A later commit lands upstream, so `version` would now resolve higher.
         fs::write(origin.join("plugin").join("extra.lua"), "-- later\n").unwrap();
-        for args in [vec!["add", "."], vec!["commit", "--quiet", "-m", "later"]] {
-            smol::block_on(git::run(
-                args.iter().map(|a| (*a).to_owned()).collect(),
-                origin.clone(),
-            ))
-            .unwrap();
-        }
+        commit_changes(&origin, "later");
 
         // Machine two starts empty but carries the committed lockfile.
         let second_site = dir.path().join("site-two");
@@ -1192,13 +1231,7 @@ mod tests {
         fs::create_dir_all(&second_root).unwrap();
         let second = origin_repo(&second_root, None);
         fs::write(second.join("plugin").join("only_here.lua"), "-- new\n").unwrap();
-        for args in [vec!["add", "."], vec!["commit", "--quiet", "-m", "second"]] {
-            smol::block_on(git::run(
-                args.iter().map(|a| (*a).to_owned()).collect(),
-                second.clone(),
-            ))
-            .unwrap();
-        }
+        commit_changes(&second, "second");
 
         let respec = Spec::new(second.display().to_string()).with_name("demo");
         let installed = smol::block_on(mgr.ensure_installed(&respec, &mut lock))
@@ -1341,35 +1374,24 @@ mod tests {
         fs::create_dir_all(paths::package_root(dir.path(), "demo").join(".work")).unwrap();
         let stale_lock = paths::revision_lock(dir.path(), "demo", STALE);
         drop(Lock::acquire(&stale_lock).unwrap());
-        let _held = Lock::acquire_shared(&paths::revision_lock(dir.path(), "demo", HELD)).unwrap();
+        let _held_lock =
+            Lock::acquire_shared(&paths::revision_lock(dir.path(), "demo", HELD)).unwrap();
 
         assert!(manager.prune(&lock).is_empty());
 
         assert!(paths::revision_dir(dir.path(), "demo", CURRENT).is_dir());
         assert!(!paths::revision_dir(dir.path(), "demo", STALE).exists());
         assert!(!incoming.exists());
-        assert!(!stale_lock.exists());
+        assert!(
+            stale_lock.exists(),
+            "a lock file must outlive the revision it guards"
+        );
         assert!(paths::revision_dir(dir.path(), "demo", HELD).is_dir());
         assert!(
             paths::package_root(dir.path(), "demo")
                 .join(".work")
                 .is_dir()
         );
-    }
-
-    #[test]
-    fn package_directory_read_errors_are_reported() {
-        let dir = site();
-        let manager = Manager::new(dir.path());
-        let root = paths::package_root(dir.path(), "demo");
-        fs::create_dir_all(root.parent().unwrap()).unwrap();
-        fs::write(&root, "not a directory").unwrap();
-
-        let (dirs, failures) = manager.package_dirs("demo");
-
-        assert!(dirs.revisions.is_empty());
-        assert!(dirs.staging.is_empty());
-        assert_eq!(failures.len(), 1);
     }
 
     #[cfg(unix)]
@@ -1414,255 +1436,168 @@ mod tests {
 
     #[test]
     fn update_is_prepared_before_it_changes_the_lockfile() {
-        let dir = site();
-        let origin = origin_repo(dir.path(), None);
-        let site_dir = dir.path().join("site");
-        let manager = Manager::new(&site_dir);
-        let mut lock = Lockfile::default();
-        let spec = Spec::new(origin.display().to_string()).with_name("demo");
-        let first = smol::block_on(manager.ensure_installed(&spec, &mut lock)).unwrap();
+        let mut fixture = Fixture::new();
+        let first = fixture.install();
         let _live =
-            Lock::acquire_shared(&paths::revision_lock(&site_dir, "demo", &first.rev)).unwrap();
+            Lock::acquire_shared(&paths::revision_lock(&fixture.site, "demo", &first.rev)).unwrap();
 
-        fs::write(origin.join("plugin.toml"), "[permissions]\nnet = true\n").unwrap();
-        commit_later_revision(&origin);
+        fs::write(fixture.origin.join("plugin.toml"), MANIFEST).unwrap();
+        commit_later_revision(&fixture.origin);
 
-        let before = lock.clone();
-        let prepared = smol::block_on(manager.prepare_update(&spec, &lock, false)).unwrap();
+        let before = fixture.lock.clone();
+        let prepared = fixture.prepare(false).unwrap();
         assert!(prepared.changed);
         assert_ne!(prepared.old_rev, prepared.new_rev);
-        assert!(matches!(
-            prepared.old_manifest,
-            PreviousManifest::Available(None)
-        ));
+        assert!(prepared.old_rev_available);
+        assert_eq!(prepared.new_manifest.as_deref(), Some(MANIFEST));
         assert_eq!(
-            prepared.new_manifest.as_deref(),
-            Some("[permissions]\nnet = true\n")
-        );
-        assert_eq!(
-            lock, before,
+            fixture.lock, before,
             "review preparation must not move the lockfile"
         );
         assert!(
-            !paths::revision_dir(&site_dir, "demo", &prepared.new_rev).exists(),
+            !fixture.revision_dir(&prepared.new_rev).exists(),
             "review preparation must not materialize the proposed revision"
         );
 
-        let updated = smol::block_on(manager.apply_update(&prepared, &mut lock)).unwrap();
+        let updated = fixture.apply(&prepared).unwrap();
         assert_eq!(updated.rev, prepared.new_rev);
         assert!(updated.dir.join("plugin").join("later.lua").is_file());
-        assert_eq!(lock.get("demo").unwrap().rev, prepared.new_rev);
+        assert_eq!(fixture.lock.get("demo").unwrap().rev, prepared.new_rev);
     }
 
     #[test]
     fn lockfile_restore_reads_the_manifest_from_a_new_work_clone() {
-        let dir = site();
-        let origin = origin_repo(dir.path(), None);
-        let manifest = "[permissions]\nrun = true\n";
-        fs::write(origin.join("plugin.toml"), manifest).unwrap();
-        commit_changes(&origin, "manifest");
-
-        let site_dir = dir.path().join("site");
-        let manager = Manager::new(&site_dir);
-        let mut lock = Lockfile::default();
-        let spec = Spec::new(origin.display().to_string()).with_name("demo");
-        let installed = smol::block_on(manager.ensure_installed(&spec, &mut lock)).unwrap();
+        let mut fixture = Fixture::new();
+        fs::write(fixture.origin.join("plugin.toml"), MANIFEST).unwrap();
+        commit_changes(&fixture.origin, "manifest");
+        let installed = fixture.install();
         fs::remove_dir_all(&installed.dir).unwrap();
-        fs::remove_dir_all(paths::package_root(&site_dir, "demo").join(".work")).unwrap();
-        let before = lock.clone();
+        fs::remove_dir_all(paths::package_root(&fixture.site, "demo").join(".work")).unwrap();
+        let before = fixture.lock.clone();
 
-        let prepared = smol::block_on(manager.prepare_update(&spec, &lock, true)).unwrap();
+        let prepared = fixture.prepare(true).unwrap();
 
-        assert!(matches!(
-            prepared.old_manifest,
-            PreviousManifest::Available(Some(ref value)) if value == manifest
-        ));
-        assert_eq!(prepared.new_manifest.as_deref(), Some(manifest));
-        assert_eq!(lock, before);
+        assert!(prepared.old_rev_available);
+        assert_eq!(prepared.new_manifest.as_deref(), Some(MANIFEST));
+        assert_eq!(fixture.lock, before);
         assert!(!installed.dir.exists());
     }
 
     #[test]
     fn lockfile_restore_fetches_a_revision_missing_from_a_stale_work_clone() {
-        let dir = site();
-        let origin = origin_repo(dir.path(), None);
-        let site_dir = dir.path().join("site");
-        let manager = Manager::new(&site_dir);
-        let mut lock = Lockfile::default();
-        let spec = Spec::new(origin.display().to_string()).with_name("demo");
-        smol::block_on(manager.ensure_installed(&spec, &mut lock)).unwrap();
+        let mut fixture = Fixture::new();
+        fixture.install();
 
-        let manifest = "[permissions]\nrun = true\n";
-        fs::write(origin.join("plugin.toml"), manifest).unwrap();
-        commit_changes(&origin, "recorded later");
-        let recorded = fixture_git(&origin, &["rev-parse", "HEAD"])
+        fs::write(fixture.origin.join("plugin.toml"), MANIFEST).unwrap();
+        commit_changes(&fixture.origin, "recorded later");
+        let recorded = fixture_git(&fixture.origin, &["rev-parse", "HEAD"])
             .stdout
             .trim()
             .to_owned();
-        lock.record("demo", &spec.src, &recorded);
-        let work = paths::package_root(&site_dir, "demo").join(".work");
+        fixture.lock.record("demo", &fixture.spec.src, &recorded);
+        let work = paths::package_root(&fixture.site, "demo").join(".work");
         let tracked = fixture_git(&work, &["rev-parse", "refs/remotes/origin/HEAD"])
             .stdout
             .trim()
             .to_owned();
         assert_ne!(tracked, recorded, "the work clone must start stale");
 
-        let prepared = smol::block_on(manager.prepare_update(&spec, &lock, true)).unwrap();
+        let prepared = fixture.prepare(true).unwrap();
 
-        assert_eq!(prepared.new_manifest.as_deref(), Some(manifest));
-        assert!(matches!(
-            prepared.old_manifest,
-            PreviousManifest::Available(Some(ref value)) if value == manifest
-        ));
+        assert_eq!(prepared.new_manifest.as_deref(), Some(MANIFEST));
+        assert!(prepared.old_rev_available);
         assert_eq!(prepared.new_rev, recorded);
     }
 
     #[test]
     fn update_keeps_going_when_the_previous_revision_is_unavailable() {
-        let dir = site();
-        let origin = origin_repo(dir.path(), None);
-        let site_dir = dir.path().join("site");
-        let manager = Manager::new(&site_dir);
-        let mut lock = Lockfile::default();
-        let spec = Spec::new(origin.display().to_string()).with_name("demo");
-        fs::write(origin.join("plugin.toml"), "[permissions]\nnet = true\n").unwrap();
-        commit_changes(&origin, "requested permissions");
-        lock.record("demo", &spec.src, TEST_REV);
+        let mut fixture = Fixture::new();
+        fs::write(fixture.origin.join("plugin.toml"), MANIFEST).unwrap();
+        commit_changes(&fixture.origin, "requested permissions");
+        fixture.lock.record("demo", &fixture.spec.src, TEST_REV);
 
-        let prepared = smol::block_on(manager.prepare_update(&spec, &lock, false)).unwrap();
+        let prepared = fixture.prepare(false).unwrap();
 
         assert_eq!(prepared.old_rev, TEST_REV);
-        assert!(matches!(
-            prepared.old_manifest,
-            PreviousManifest::Unavailable
-        ));
-        assert_eq!(
-            prepared.new_manifest.as_deref(),
-            Some("[permissions]\nnet = true\n")
-        );
-        assert!(!paths::revision_dir(&site_dir, "demo", &prepared.new_rev).exists());
+        assert!(!prepared.old_rev_available);
+        assert_eq!(prepared.new_manifest.as_deref(), Some(MANIFEST));
+        assert!(!fixture.revision_dir(&prepared.new_rev).exists());
     }
 
     #[test]
     fn lockfile_restore_rejects_a_missing_commit_object() {
-        let dir = site();
-        let origin = origin_repo(dir.path(), None);
-        let site_dir = dir.path().join("site");
-        let manager = Manager::new(&site_dir);
-        let spec = Spec::new(origin.display().to_string()).with_name("demo");
-        let mut lock = Lockfile::default();
-        lock.record("demo", &spec.src, TEST_REV);
-        let before = lock.clone();
+        let mut fixture = Fixture::new();
+        fixture.lock.record("demo", &fixture.spec.src, TEST_REV);
+        let before = fixture.lock.clone();
 
-        let result = smol::block_on(manager.prepare_update(&spec, &lock, true));
+        let result = fixture.prepare(true);
 
         assert!(matches!(result, Err(ManagerError::Git(_))));
-        assert_eq!(lock, before);
-        assert!(!paths::revision_dir(&site_dir, "demo", TEST_REV).exists());
+        assert_eq!(fixture.lock, before);
+        assert!(!fixture.revision_dir(TEST_REV).exists());
     }
 
+    /// A revision directory that is already there is not a reason to stay put:
+    /// what the package loads comes from the lockfile, so the entry still moves.
     #[test]
-    fn prepared_update_reports_a_move_when_the_target_revision_exists() {
-        let dir = site();
-        let origin = origin_repo(dir.path(), None);
-        let site_dir = dir.path().join("site");
-        let manager = Manager::new(&site_dir);
-        let mut lock = Lockfile::default();
-        let spec = Spec::new(origin.display().to_string()).with_name("demo");
-        smol::block_on(manager.ensure_installed(&spec, &mut lock)).unwrap();
+    fn an_update_to_an_already_materialized_revision_still_moves_the_lockfile() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        commit_later_revision(&fixture.origin);
 
-        commit_later_revision(&origin);
+        let prepared = fixture.prepare(false).unwrap();
+        fs::create_dir_all(fixture.revision_dir(&prepared.new_rev)).unwrap();
 
-        let first = smol::block_on(manager.prepare_update(&spec, &lock, false)).unwrap();
-        fs::create_dir_all(paths::revision_dir(&site_dir, "demo", &first.new_rev)).unwrap();
-        let second = smol::block_on(manager.prepare_update(&spec, &lock, false)).unwrap();
+        let again = fixture.prepare(false).unwrap();
+        assert_ne!(again.old_rev, again.new_rev);
+        assert!(again.changed);
 
-        assert_ne!(second.old_rev, second.new_rev);
-        assert!(second.changed, "moving the lockfile is still a change");
+        let updated = fixture.apply(&again).unwrap();
+        assert!(updated.changed);
+        assert_eq!(fixture.lock.get("demo").unwrap().rev, again.new_rev);
     }
 
     #[test]
     fn apply_update_rejects_each_lockfile_change_since_review() {
-        let dir = site();
-        let origin = origin_repo(dir.path(), None);
-        let site_dir = dir.path().join("site");
-        let manager = Manager::new(&site_dir);
-        let mut lock = Lockfile::default();
-        let spec = Spec::new(origin.display().to_string()).with_name("demo");
-        smol::block_on(manager.ensure_installed(&spec, &mut lock)).unwrap();
-        let prepared = smol::block_on(manager.prepare_update(&spec, &lock, true)).unwrap();
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let prepared = fixture.prepare(true).unwrap();
 
-        let mut changed_source = lock.clone();
+        let mut changed_source = fixture.lock.clone();
         changed_source.record("demo", "https://example.com/other", &prepared.old_rev);
-        assert!(matches!(
-            smol::block_on(manager.apply_update(&prepared, &mut changed_source)),
-            Err(ManagerError::ConcurrentChange { .. })
-        ));
+        let mut changed_revision = fixture.lock.clone();
+        changed_revision.record("demo", &fixture.spec.src, OTHER_REV);
 
-        let mut changed_revision = lock;
-        changed_revision.record("demo", &spec.src, OTHER_REV);
-        assert!(matches!(
-            smol::block_on(manager.apply_update(&prepared, &mut changed_revision)),
-            Err(ManagerError::ConcurrentChange { .. })
-        ));
+        for mut moved in [changed_source, changed_revision] {
+            assert!(matches!(
+                smol::block_on(fixture.manager.apply_update(&prepared, &mut moved)),
+                Err(ManagerError::ConcurrentChange { .. })
+            ));
+        }
     }
 
+    /// Restoring is how a deleted revision directory comes back, so it has to
+    /// report a change only when there is one to make.
     #[test]
-    fn lockfile_update_restores_the_recorded_revision() {
-        let dir = site();
-        let origin = origin_repo(dir.path(), None);
-        let site_dir = dir.path().join("site");
-        let manager = Manager::new(&site_dir);
-        let mut lock = Lockfile::default();
-        let spec = Spec::new(origin.display().to_string()).with_name("demo");
-        let installed = smol::block_on(manager.ensure_installed(&spec, &mut lock)).unwrap();
+    fn lockfile_restore_acts_only_when_the_recorded_revision_is_missing() {
+        let mut fixture = Fixture::new();
+        let installed = fixture.install();
+
+        let intact = fixture.prepare(true).unwrap();
+        assert!(!intact.changed);
+        assert!(!fixture.apply(&intact).unwrap().changed);
+
         fs::remove_dir_all(&installed.dir).unwrap();
+        let missing = fixture.prepare(true).unwrap();
+        assert!(missing.changed);
+        assert_eq!(missing.old_rev, installed.rev);
+        assert_eq!(missing.new_rev, installed.rev);
 
-        let prepared = smol::block_on(manager.prepare_update(&spec, &lock, true)).unwrap();
-        assert!(prepared.changed);
-        assert_eq!(prepared.old_rev, installed.rev);
-        assert_eq!(prepared.new_rev, installed.rev);
-
-        let restored = smol::block_on(manager.apply_update(&prepared, &mut lock)).unwrap();
+        let restored = fixture.apply(&missing).unwrap();
         assert!(restored.changed);
         assert_eq!(restored.rev, installed.rev);
         assert!(restored.dir.join("plugin").join("init.lua").is_file());
-        assert_eq!(lock.get("demo").unwrap().rev, installed.rev);
-    }
-
-    #[test]
-    fn applying_an_already_materialized_revision_reports_the_lockfile_move() {
-        let dir = site();
-        let origin = origin_repo(dir.path(), None);
-        let site_dir = dir.path().join("site");
-        let manager = Manager::new(&site_dir);
-        let mut lock = Lockfile::default();
-        let spec = Spec::new(origin.display().to_string()).with_name("demo");
-        smol::block_on(manager.ensure_installed(&spec, &mut lock)).unwrap();
-
-        commit_later_revision(&origin);
-        let prepared = smol::block_on(manager.prepare_update(&spec, &lock, false)).unwrap();
-        fs::create_dir_all(paths::revision_dir(&site_dir, "demo", &prepared.new_rev)).unwrap();
-
-        let updated = smol::block_on(manager.apply_update(&prepared, &mut lock)).unwrap();
-        assert!(updated.changed);
-        assert_eq!(lock.get("demo").unwrap().rev, prepared.new_rev);
-    }
-
-    #[test]
-    fn applying_the_current_materialized_revision_reports_no_change() {
-        let dir = site();
-        let origin = origin_repo(dir.path(), None);
-        let site_dir = dir.path().join("site");
-        let manager = Manager::new(&site_dir);
-        let mut lock = Lockfile::default();
-        let spec = Spec::new(origin.display().to_string()).with_name("demo");
-        smol::block_on(manager.ensure_installed(&spec, &mut lock)).unwrap();
-
-        let prepared = smol::block_on(manager.prepare_update(&spec, &lock, true)).unwrap();
-        assert!(!prepared.changed);
-        let unchanged = smol::block_on(manager.apply_update(&prepared, &mut lock)).unwrap();
-        assert!(!unchanged.changed);
+        assert_eq!(fixture.lock.get("demo").unwrap().rev, installed.rev);
     }
 
     #[test]

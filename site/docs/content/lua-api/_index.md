@@ -100,7 +100,7 @@ The rules:
 | Module | What it is for |
 | --- | --- |
 | [`maki`](#maki) | The global entry point. |
-| [`maki.pack`](#maki-pack) | Manage global packages and inspect package state. |
+| [`maki.pack`](#maki-pack) | Declare global packages and inspect package state. |
 | [`maki.api`](#maki-api) | Plugin registration. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
@@ -211,10 +211,10 @@ Load an installed package that is not active.
 
 ## maki.pack {#maki-pack}
 
-Manage global packages and inspect package state.
+Declare global packages and inspect package state.
 
 `add` is available only in the global `init.lua`. `get` is read-only
-and is available elsewhere.
+and is available in project config and packages.
 
 ---
 

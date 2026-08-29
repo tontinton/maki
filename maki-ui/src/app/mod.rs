@@ -38,6 +38,7 @@ use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
+use crate::components::pack_review::{PackReview, PackReviewAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
@@ -61,7 +62,8 @@ use maki_agent::{
 };
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
+    BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader,
+    PackCommand, PackPreparation, WinView,
 };
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
@@ -95,6 +97,8 @@ const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
+const PACK_CHANGES_DECLINED: &str = "Package changes declined";
+const PACK_USER_ONLY_SUFFIX: &str = " can only be run by you";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
@@ -208,6 +212,7 @@ pub struct App {
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
+    pub(super) pack_review: PackReview,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
@@ -304,6 +309,7 @@ impl App {
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
+            pack_review: PackReview::new(),
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(flash),
@@ -604,6 +610,8 @@ impl App {
     }
 
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        // With both up the permission prompt goes first: a tool is blocked on
+        // it and it owns the bottom panel. The pack review waits on nothing.
         if self.permission_prompt.is_open() {
             if let Some(answer) = self.permission_prompt.handle_key(key) {
                 let subagent_id = self.permission_prompt.subagent_id().map(str::to_owned);
@@ -612,6 +620,17 @@ impl App {
                 self.send_to_agent(subagent_id.as_deref(), encoded);
             }
             return Some(vec![]);
+        }
+
+        if self.pack_review.is_open() {
+            return Some(match self.pack_review.handle_key(key) {
+                Some(PackReviewAction::Accept(plan)) => self.quit_with(ExitRequest::Pack(plan)),
+                Some(PackReviewAction::Decline) => {
+                    self.flash(PACK_CHANGES_DECLINED.to_owned());
+                    Vec::new()
+                }
+                None => Vec::new(),
+            });
         }
 
         // plan_form is non-modal: Passthrough falls through to the rest of dispatch
@@ -1408,15 +1427,11 @@ impl App {
             "/reload" => self.quit_with(ExitRequest::Reload),
             name @ ("/packupdate" | "/packdel") => {
                 if depth > 0 {
-                    self.flash(format!("{name} can only be run by you"));
+                    self.flash(format!("{name}{PACK_USER_ONLY_SUFFIX}"));
                     return vec![];
                 }
-                match maki_lua::PackCommand::parse(name, &cmd.args, cmd.bang) {
-                    Ok(_) => self.quit_with(ExitRequest::Pack(crate::components::PackRequest {
-                        name: name.to_owned(),
-                        args: cmd.args,
-                        bang: cmd.bang,
-                    })),
+                match PackCommand::parse(name, &cmd.args, cmd.bang) {
+                    Ok(command) => vec![Action::PreparePack(command)],
                     Err(message) => {
                         self.flash(message);
                         vec![]
@@ -1447,6 +1462,20 @@ impl App {
             args,
             depth,
         );
+    }
+
+    pub(crate) fn handle_pack_preparation(&mut self, preparation: PackPreparation) -> Vec<Action> {
+        match preparation {
+            PackPreparation::Complete(report) => {
+                self.flash(report.message());
+                Vec::new()
+            }
+            PackPreparation::Ready(plan) => self.quit_with(ExitRequest::Pack(plan)),
+            PackPreparation::Review { prompt, plan } => {
+                self.pack_review.open(prompt, plan);
+                Vec::new()
+            }
+        }
     }
 
     fn execute_mcp_prompt(&mut self, name: &str, args: &str) -> Vec<Action> {
@@ -1553,7 +1582,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 12] {
+    fn overlays(&self) -> [&dyn Overlay; 13] {
         [
             &self.help_modal,
             &self.usage_modal,
@@ -1566,11 +1595,12 @@ impl App {
             &self.model_picker,
             &self.login_picker,
             &self.mcp_picker,
+            &self.pack_review,
             &self.permission_prompt,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 12] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
         [
             &mut self.help_modal,
             &mut self.usage_modal,
@@ -1583,6 +1613,7 @@ impl App {
             &mut self.model_picker,
             &mut self.login_picker,
             &mut self.mcp_picker,
+            &mut self.pack_review,
             &mut self.permission_prompt,
         ]
     }

@@ -37,6 +37,7 @@ use std::time::Instant;
 
 use color_eyre::Result;
 use maki_agent::ToolOutput;
+use maki_lua::PackPlan;
 use maki_providers::Message;
 use maki_providers::TokenUsage;
 use maki_storage::id::MakiId;
@@ -44,7 +45,6 @@ use maki_storage::id::MakiId;
 pub type AppSession = maki_storage::sessions::Session<Message, TokenUsage, ToolOutput>;
 
 pub(crate) use agent::AgentCommand;
-pub use components::PackRequest;
 pub use event_loop::EventLoopParams;
 
 /// How a UI generation ended. On `Reload`, each tab carries its in-memory
@@ -57,7 +57,7 @@ pub enum RunOutcome {
     Reload {
         tabs: Vec<AppSession>,
         focused: usize,
-        pack: Option<PackRequest>,
+        pack: Option<PackPlan>,
     },
 }
 
