@@ -682,20 +682,20 @@ quiet, and so does startup.
 
 `"SessionEnd"` is the teardown signal: it fires first so handlers can
 still inspect or stop the session's jobs, then session-owned jobs are
-reaped. It carries `data.reason`, one of `"reset"` (TUI `/new`),
-`"load"`, `"delete"` (tab closed), `"shutdown"`, `"replaced"` (an ACP
-client took the session's place), or `"completed"` (a headless run
-finished).
+reaped. `data.reason` names the path it came from: `"reset"` (TUI
+`/new`), `"load"`, `"delete"` (tab closed), `"shutdown"`, `"replaced"`
+(an ACP client took the session's place), or `"completed"` (a headless
+run finished).
 
-The last three are exit paths: the host is already tearing down, so the
-UI is gone (`maki.fn` roundtrips fail right away) and every handler
-shares one grace period. `data.deadline_ms` says how much of it is left
-at dispatch; write state out with `maki.fs` and do not park. On the
-other paths nothing waits and `data.deadline_ms` is nil.
+On `"shutdown"`, `"replaced"`, and `"completed"` the host is already
+tearing down, so the UI is gone (`maki.fn` roundtrips fail right away)
+and every handler shares one grace period. `data.deadline_ms` is how
+much of it is left at dispatch, so write state out with `maki.fs` and do
+not park. On the other reasons nothing waits and `data.deadline_ms` is
+nil.
 
-`"SessionReset"` stays TUI-only (`/new`) and is expected to be removed in
-a future release in favour of `"SessionEnd"` with `reason = "reset"`,
-which fires on the same path with the same session id.
+`"SessionReset"` stays TUI-only (`/new`) and fires on the same path as
+`"SessionEnd"` with `reason = "reset"`.
 
 Jobs started inside a callback die with the dispatch unless you await
 them there (`jobwait`) or hand them to a session
@@ -753,6 +753,10 @@ maki.api.exec_autocmds({event}, {opts?})
 Fire one or more events manually. Every matching autocmd callback
 runs to completion before this function returns.
 
+A handler may suspend, so this call may too. That rules it out inside
+a slot chain, which runs synchronously (see `declare_slot`). Fire the
+event from the code that calls the slot instead.
+
 **Parameters:**
 
 - `{event}` (`string|string[]`) Event name or list of names to fire.
@@ -783,6 +787,13 @@ Create a named extension point owned by your plugin. You provide a
 layer first, then inward, ending at {default}.
 
 Throws if another plugin already owns a slot with the same {name}.
+
+The chain runs synchronously, so neither the default nor a layer may
+call a suspending API (`maki.fs.*`, `maki.fn.jobwait`,
+`maki.api.exec_autocmds`, ...). Parking raises "attempt to yield
+across metamethod/C-call boundary": from the default that error
+reaches your caller, from a layer it only drops that layer. Do the
+waiting outside the chain and pass the result in.
 
 **Parameters:**
 
@@ -815,6 +826,9 @@ Calling `prev` more than once throws.
 
 You can call this before the owner runs `declare_slot`. The layer
 is queued and attached when the slot is declared.
+
+Layers run synchronously, so one that calls a suspending API is
+dropped and the chain continues without it, see `declare_slot`.
 
 **Parameters:**
 

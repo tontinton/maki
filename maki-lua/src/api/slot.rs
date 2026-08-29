@@ -170,6 +170,13 @@ fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
 ///
 /// Throws if another plugin already owns a slot with the same {name}.
 ///
+/// The chain runs synchronously, so neither the default nor a layer may
+/// call a suspending API (`maki.fs.*`, `maki.fn.jobwait`,
+/// `maki.api.exec_autocmds`, ...). Parking raises "attempt to yield
+/// across metamethod/C-call boundary": from the default that error
+/// reaches your caller, from a layer it only drops that layer. Do the
+/// waiting outside the chain and pass the result in.
+///
 /// @param name string Unique slot name, e.g. `"myplugin.render"`.
 /// @param default function Default implementation, called when no layers wrap it.
 /// @return (function) Callable that dispatches through all layers.
@@ -206,6 +213,9 @@ fn declare_slot(
 ///
 /// You can call this before the owner runs `declare_slot`. The layer
 /// is queued and attached when the slot is declared.
+///
+/// Layers run synchronously, so one that calls a suspending API is
+/// dropped and the chain continues without it, see `declare_slot`.
 ///
 /// @param name string Slot name to wrap.
 /// @param wrapper function Layer: `function(prev, ...)`. Call `prev(...)` to continue.

@@ -171,20 +171,20 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///
 /// `"SessionEnd"` is the teardown signal: it fires first so handlers can
 /// still inspect or stop the session's jobs, then session-owned jobs are
-/// reaped. It carries `data.reason`, one of `"reset"` (TUI `/new`),
-/// `"load"`, `"delete"` (tab closed), `"shutdown"`, `"replaced"` (an ACP
-/// client took the session's place), or `"completed"` (a headless run
-/// finished).
+/// reaped. `data.reason` names the path it came from: `"reset"` (TUI
+/// `/new`), `"load"`, `"delete"` (tab closed), `"shutdown"`, `"replaced"`
+/// (an ACP client took the session's place), or `"completed"` (a headless
+/// run finished).
 ///
-/// The last three are exit paths: the host is already tearing down, so the
-/// UI is gone (`maki.fn` roundtrips fail right away) and every handler
-/// shares one grace period. `data.deadline_ms` says how much of it is left
-/// at dispatch; write state out with `maki.fs` and do not park. On the
-/// other paths nothing waits and `data.deadline_ms` is nil.
+/// On `"shutdown"`, `"replaced"`, and `"completed"` the host is already
+/// tearing down, so the UI is gone (`maki.fn` roundtrips fail right away)
+/// and every handler shares one grace period. `data.deadline_ms` is how
+/// much of it is left at dispatch, so write state out with `maki.fs` and do
+/// not park. On the other reasons nothing waits and `data.deadline_ms` is
+/// nil.
 ///
-/// `"SessionReset"` stays TUI-only (`/new`) and is expected to be removed in
-/// a future release in favour of `"SessionEnd"` with `reason = "reset"`,
-/// which fires on the same path with the same session id.
+/// `"SessionReset"` stays TUI-only (`/new`) and fires on the same path as
+/// `"SessionEnd"` with `reason = "reset"`.
 ///
 /// Jobs started inside a callback die with the dispatch unless you await
 /// them there (`jobwait`) or hand them to a session
@@ -247,6 +247,10 @@ fn del_autocmd(lua: &Lua, id: u64) -> LuaResult<()> {
 
 /// Fire one or more events manually. Every matching autocmd callback
 /// runs to completion before this function returns.
+///
+/// A handler may suspend, so this call may too. That rules it out inside
+/// a slot chain, which runs synchronously (see `declare_slot`). Fire the
+/// event from the code that calls the slot instead.
 ///
 /// @param event string|string[] Event name or list of names to fire.
 /// @param opts table? Options:
