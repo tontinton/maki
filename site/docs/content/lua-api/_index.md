@@ -1380,20 +1380,21 @@ local results = maki.async.gather({
 ### `maki.async.run()` {#maki-async-run}
 
 ```lua
-maki.async.run({fn}, {on_finish?})
+maki.async.run({fn}, {opts?})
 ```
 
 Fire off a function as a new async task. It runs in the background and
 you do not wait for it. If you need the result, pass an {on_finish}
 callback.
 
-The task must finish within 60 seconds; waiting minutes for a build or a
-subagent inside one dies partway through.
+A spawned task must finish within 60 seconds by default; pass
+{deadline_ms} to change that, or `false` to remove the cap for
+genuinely long work.
 
 **Parameters:**
 
 - `{fn}` (`function`) Zero-argument function to execute.
-- `{on_finish?}` (`function?`) Optional callback `function(err, result)`. Called once {fn} completes.
+- `{opts?}` (`table?`) {on_finish} is `function(err, result)`, called once {fn} completes. {deadline_ms} is integer milliseconds, or `false` for no deadline.
 
 **Example:**
 
@@ -1401,7 +1402,7 @@ subagent inside one dies partway through.
 maki.async.run(function()
   local data = expensive_fetch()
   process(data)
-end)
+end, { deadline_ms = false })
 ```
 
 ---

@@ -136,3 +136,20 @@ maki.async.run(function()
   end
 end)
 ```
+
+## Spawning Lua work
+
+`maki.async.run(fn, opts?)` starts a Lua task on the async executor and returns
+at once, which is how a tool can hand back a receipt and keep working. The task
+inherits the caller's cancellation, and by default it must finish within 60
+seconds. Pass `deadline_ms` to raise the cap, or `false` to remove it for
+genuinely long work:
+
+```lua
+maki.async.run(function()
+  run_suite_and_collect_failures()
+end, { deadline_ms = false })
+```
+
+The task is Lua-owned, so a `/reload` tears it down together with the plugin,
+unlike host jobs. Prefer `jobstart` for work that must survive a reload.
