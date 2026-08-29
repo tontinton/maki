@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use maki_agent::agent::UNKNOWN_TOOL_PREFIX;
 use maki_interpreter::runner::{self, ToolFn};
-use maki_sandbox::ChildIoResult;
+use maki_sandbox::{ChildIoResult, register_child_workload};
 use maki_sandbox::workload::{ChildCtx, ChildSession, ChildWorkload, RunSpec};
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::child_lua::ChildLuaRuntime;
+use crate::child_lua::{ChildLuaRuntime, HostForward};
 
 /// Tools that must run in the parent process (network, UI, agent state).
 /// All other tools are executed by local functions inside the sandbox.
@@ -53,7 +53,7 @@ fn discover_plugin_dir(candidates: &[&str]) -> PathBuf {
 ///
 /// Call once at process startup, before any child is spawned or re-execed.
 pub fn install_child_workload() {
-    if !maki_sandbox::register_child_workload(Arc::new(MakiChildWorkload)) {
+    if !register_child_workload(Arc::new(MakiChildWorkload)) {
         debug!("maki-tools: child workload already registered");
     }
 }
@@ -63,11 +63,17 @@ struct MakiChildWorkload;
 impl ChildWorkload for MakiChildWorkload {
     fn init(&self, ctx: ChildCtx) -> Result<Box<dyn ChildSession>, String> {
         let plugin_dir = discover_plugin_dir(SANDBOX_CONFIG_DIRS);
-        let lua_runtime = match ChildLuaRuntime::new(&plugin_dir) {
-            Ok(rt) => Some(Arc::new(rt)),
-            Err(e) => {
-                warn!(error = %e, "sandbox child: lua runtime init failed, filesystem tools unavailable");
-                None
+        let lua_runtime = {
+            let ctx = ctx.clone();
+let forward: HostForward = Arc::new(move |name, args, kwargs| {
+            ctx.forward_trusted(name, args, kwargs)
+        });
+            match ChildLuaRuntime::with_forwarder(&plugin_dir, forward) {
+                Ok(rt) => Some(Arc::new(rt)),
+                Err(e) => {
+                    warn!(error = %e, "sandbox child: lua runtime init failed, filesystem tools unavailable");
+                    None
+                }
             }
         };
 

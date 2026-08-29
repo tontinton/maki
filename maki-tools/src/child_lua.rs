@@ -18,6 +18,15 @@ static EMBEDDED_PLUGINS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../plugins"
 /// Global name of the serialized `AgentConfig` table, if the parent sent one.
 const CONFIG_GLOBAL: &str = "_config";
 
+/// Wire prefix for host-focused `maki.ui.*` calls the sandbox forwards to the
+/// parent; the parent answers them from its own plugin Lua API.
+pub const HOST_UI_PREFIX: &str = "maki.ui.";
+
+/// Forward a call to a host-answered tool (the parent's plugin API rather
+/// than a registered sandbox tool), mirroring `ChildCtx::forward_trusted`.
+pub type HostForward =
+    Arc<dyn Fn(&str, Vec<Value>, Vec<(String, Value)>) -> Result<String, String> + Send + Sync>;
+
 /// Minimal Lua runtime for the sandbox child.
 ///
 /// Provides a stripped-down `maki.*` API so the existing tool plugins
@@ -31,9 +40,20 @@ pub struct ChildLuaRuntime {
 }
 
 impl ChildLuaRuntime {
+    #[cfg(test)]
     pub fn new(plugin_dir: &Path) -> Result<Self, LuaError> {
+        Self::build(plugin_dir, None)
+    }
+
+    /// Like [`Self::new`], but forwards host-side API calls (e.g. status
+    /// hints) to the parent through `forward`.
+    pub fn with_forwarder(plugin_dir: &Path, forward: HostForward) -> Result<Self, LuaError> {
+        Self::build(plugin_dir, Some(forward))
+    }
+
+    fn build(plugin_dir: &Path, forward: Option<HostForward>) -> Result<Self, LuaError> {
         let lua = Lua::new();
-        create_maki_api(&lua)?;
+        create_maki_api(&lua, forward)?;
         setup_require(&lua, plugin_dir.to_path_buf())?;
         load_plugins(&lua, plugin_dir)?;
         Ok(Self {
@@ -215,7 +235,7 @@ fn build_ctx(
 //  maki.* API surface
 // ──────────────────────────────────────────────
 
-fn create_maki_api(lua: &Lua) -> Result<(), LuaError> {
+fn create_maki_api(lua: &Lua, forward: Option<HostForward>) -> Result<(), LuaError> {
     let maki = lua.create_table()?;
 
     // maki.fs
@@ -248,12 +268,43 @@ fn create_maki_api(lua: &Lua) -> Result<(), LuaError> {
     log.set("error", lua.create_function(log_error)?)?;
     maki.set("log", log)?;
 
-    // maki.ui (stubs — no terminal in sandbox)
+    // maki.ui: local stubs for pure helpers; everything else (anything with
+    // a side effect on the host UI) derives a forwarder via the table
+    // metatable when a forwarder is present.
     let ui = lua.create_table()?;
     ui.set("buf", lua.create_function(ui_buf)?)?;
     ui.set("highlight", lua.create_function(ui_highlight)?)?;
     ui.set("theme_color", lua.create_function(ui_theme_color)?)?;
     ui.set("humantime", lua.create_function(ui_humantime)?)?;
+    if let Some(forward) = forward {
+        let ui_mt = lua.create_table()?;
+        ui_mt.set(
+            "__index",
+            lua.create_function(move |lua, (_, key): (LuaTable, LuaValue)| {
+                let key = match &key {
+                    LuaValue::String(s) => s.to_str()?.to_string(),
+                    _ => {
+                        return Err(LuaError::runtime("maki.ui index must be a string"));
+                    }
+                };
+                let name = format!("{HOST_UI_PREFIX}{key}");
+                let forward = Arc::clone(&forward);
+                Ok(LuaValue::Function(lua.create_function(
+                    move |lua, args: MultiValue| {
+                        let json_args = args
+                            .iter()
+                            .map(|v| lua_to_json(lua, v))
+                            .collect::<LuaResult<Vec<Value>>>()?;
+                        if let Err(e) = forward(&name, json_args, Vec::new()) {
+                            warn!(error = %e, "sandbox: forwarding {name} failed");
+                        }
+                        Ok(())
+                    },
+                )?))
+            })?,
+        )?;
+        ui.set_metatable(Some(ui_mt))?;
+    }
     maki.set("ui", ui)?;
 
     // maki.api
@@ -379,7 +430,7 @@ fn resolve_require(
                 .set_name(&display_path)
                 .set_environment(env)
                 .eval()
-                .map_err(|e| mlua::Error::runtime(format!("require '{modname}': {e}")))?;
+                .map_err(|e| LuaError::runtime(format!("require '{modname}': {e}")))?;
             loaded.set(modname, result.clone())?;
             return Ok(result);
         }
@@ -902,10 +953,10 @@ fn ui_humantime(_: &Lua, secs: u64) -> LuaResult<String> {
 fn api_register_tool(lua: &Lua, spec: LuaTable) -> LuaResult<()> {
     let name: String = spec
         .get("name")
-        .map_err(|_| mlua::Error::runtime("register_tool: missing 'name'"))?;
+        .map_err(|_| LuaError::runtime("register_tool: missing 'name'"))?;
     let handler: LuaFunction = spec
         .get("handler")
-        .map_err(|_| mlua::Error::runtime("register_tool: missing 'handler'"))?;
+        .map_err(|_| LuaError::runtime("register_tool: missing 'handler'"))?;
 
     let tools: LuaTable = lua.globals().get("_registered_tools")?;
     tools.set(name.as_str(), handler)?;
@@ -950,7 +1001,7 @@ fn fn_jobstart(lua: &Lua, (command, opts): (String, Option<LuaTable>)) -> LuaRes
 
     let output = cmd
         .output()
-        .map_err(|e| mlua::Error::runtime(format!("jobstart: {e}")))?;
+        .map_err(|e| LuaError::runtime(format!("jobstart: {e}")))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -991,12 +1042,12 @@ fn ts_get_node_text(lua: &Lua, (_node, _src): (LuaValue, String)) -> LuaResult<L
 
 fn json_encode(lua: &Lua, value: LuaValue) -> LuaResult<String> {
     let json_val = lua_to_json(lua, &value)?;
-    serde_json::to_string(&json_val).map_err(|e| mlua::Error::runtime(e.to_string()))
+    serde_json::to_string(&json_val).map_err(|e| LuaError::runtime(e.to_string()))
 }
 
 fn json_decode(lua: &Lua, text: String) -> LuaResult<LuaValue> {
     let json_val: Value = serde_json::from_str(&text)
-        .map_err(|e| mlua::Error::runtime(format!("json decode: {e}")))?;
+        .map_err(|e| LuaError::runtime(format!("json decode: {e}")))?;
     json_to_lua(lua, &json_val)
 }
 
@@ -1177,6 +1228,80 @@ mod tests {
         let rt = ChildLuaRuntime::new(dir.path()).unwrap();
         let (output, _) = rt.call_tool("spliter", &[], &[]).unwrap();
         assert_eq!(output, "a|b|c");
+    }
+
+    #[test]
+    fn ui_calls_forward_to_the_host() {
+        type ForwardedCall = (String, Vec<Value>, Vec<(String, Value)>);
+        let seen: Arc<std::sync::Mutex<Vec<ForwardedCall>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let forward_seen = Arc::clone(&seen);
+        let forward: HostForward = Arc::new(move |name, args, kwargs| {
+            forward_seen
+                .lock()
+                .unwrap()
+                .push((name.to_string(), args, kwargs));
+            Ok(String::new())
+        });
+        let rt = ChildLuaRuntime::with_forwarder(tmp_plugin_dir().path(), forward).unwrap();
+
+        let maki: LuaTable = rt.lua.globals().get("maki").unwrap();
+        let ui: LuaTable = maki.get("ui").unwrap();
+        let set_status_hint: LuaFunction = ui.get("set_status_hint").unwrap();
+
+        let spans = rt.lua.create_table().unwrap();
+        let row = rt.lua.create_table().unwrap();
+        row.set(1, "q").unwrap();
+        row.set(2, "quit").unwrap();
+        spans.set(1, row).unwrap();
+        set_status_hint
+            .call::<()>(spans)
+            .expect("hint table forwarded");
+
+        set_status_hint
+            .call::<()>(LuaValue::Nil)
+            .expect("nil hint forwarded");
+
+        let flash: LuaFunction = ui.get("flash").unwrap();
+        flash.call::<()>("flash!").expect("ui call forwarded");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].0, "maki.ui.set_status_hint");
+        assert_eq!(seen[0].1, vec![json!([["q", "quit"]])]);
+        assert!(seen[0].2.is_empty());
+        assert_eq!(seen[1].0, "maki.ui.set_status_hint");
+        assert_eq!(seen[1].1, vec![Value::Null]);
+        assert!(seen[1].2.is_empty());
+        assert_eq!(seen[2].0, "maki.ui.flash");
+        assert_eq!(seen[2].1, vec![json!("flash!")]);
+        assert!(seen[2].2.is_empty());
+    }
+
+    #[test]
+    fn ui_stubs_do_not_forward() {
+        let seen: Arc<std::sync::Mutex<u32>> = Arc::new(std::sync::Mutex::new(0));
+        let forward_seen = Arc::clone(&seen);
+        let forward: HostForward = Arc::new(move |_, _, _| {
+            *forward_seen.lock().unwrap() += 1;
+            Ok(String::new())
+        });
+        let rt = ChildLuaRuntime::with_forwarder(tmp_plugin_dir().path(), forward).unwrap();
+
+        let maki: LuaTable = rt.lua.globals().get("maki").unwrap();
+        let ui: LuaTable = maki.get("ui").unwrap();
+        let buf: LuaFunction = ui.get("buf").unwrap();
+        buf.call::<LuaValue>(()).unwrap();
+        assert_eq!(*seen.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn ui_forwarded_calls_are_absent_without_a_forwarder() {
+        let rt = ChildLuaRuntime::new(tmp_plugin_dir().path()).unwrap();
+        let maki: LuaTable = rt.lua.globals().get("maki").unwrap();
+        let ui: LuaTable = maki.get("ui").unwrap();
+        assert!(ui.get::<LuaValue>("set_status_hint").unwrap().is_nil());
+        assert!(ui.get::<LuaValue>("flash").unwrap().is_nil());
     }
 }
 

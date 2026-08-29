@@ -1,6 +1,6 @@
 //! Where each tool runs: host plugin execution vs sandboxed child execution.
 //!
-//! Parent side this crate owns the code_execution bridge; child side it
+//! Parent side this crate owns the `code_execution` bridge; child side it
 //! provides the default [`ChildWorkload`](maki_sandbox::ChildWorkload):
 //! bash plus Lua-plugin filesystem tools inside the sandbox, with trusted
 //! tools forwarded to the parent.
