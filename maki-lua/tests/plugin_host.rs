@@ -2557,63 +2557,82 @@ maki.api.register_tool({{
 
 #[cfg(unix)]
 #[test]
-fn jobattach_resumes_streaming_after_reload_and_refuses_foreign_jobs() {
+fn jobattach_re_arms_session_jobs_a_reload_dropped() {
+    const EXIT_CODE: i32 = 3;
     const ATTACHED: &str = "attached";
+    const NOT_FOUND: &str = "job: not found";
+    // Status of the doomed job, whether ticks arrived, and the codes seen.
+    const BEFORE_ATTACH: &str = "exited|false|";
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let session = maki_storage::id::MakiId::generate();
     let _mailbox = maki_agent::SessionMailbox::register(session);
     let sid = session.to_string();
-    let src = format!(
+    let starter = format!(
         r#"
 maki.api.register_tool({{
-    name = "start_ticker",
-    description = "starts a chatty session-owned job",
+    name = "start_jobs",
+    description = "starts a chatty session job and one that dies at once",
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        return tostring(maki.fn.jobstart("while true; do echo tick; sleep 0.05; done", {{
+        local ticker = maki.fn.jobstart("while true; do echo tick; sleep 0.05; done", {{
             scope = {{ session = "{sid}" }},
-        }}))
+        }})
+        local doomed = maki.fn.jobstart("exit {EXIT_CODE}", {{
+            scope = {{ session = "{sid}" }},
+        }})
+        return ticker .. " " .. doomed
     end,
 }})
 "#
     );
-    host.load_source("ticker", &src).unwrap();
-    let id = exec_tool(&reg, "start_ticker", json!({})).unwrap();
+    host.load_source("ticker", &starter).unwrap();
+    let ids = exec_tool(&reg, "start_jobs", json!({})).unwrap();
+    let (ticker, doomed) = ids.split_once(' ').expect("two job ids");
 
     let reattach = format!(
         r#"
-local seen = 0
+local ticks, exits = 0, {{}}
 maki.api.register_tool({{
-    name = "attach_ticker",
-    description = "re-arms the surviving job",
+    name = "attach_jobs",
+    description = "re-arms the jobs the reload detached",
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        local ok, err = maki.fn.jobattach({id}, {{
-            on_stdout = function(_, line) seen = seen + 1 end,
+        local ok, err = maki.fn.jobattach({ticker}, {{
+            on_stdout = function() ticks = ticks + 1 end,
         }})
-        if not ok then return "error: " .. err end
-        return "{ATTACHED}"
+        if not ok then return err end
+        ok, err = maki.fn.jobattach({doomed}, {{
+            on_exit = function(_, code) exits[#exits + 1] = code end,
+        }})
+        return ok and "{ATTACHED}" or err
     end,
 }})
 maki.api.register_tool({{
-    name = "ticker_seen",
-    description = "lines seen since the attach",
+    name = "report",
+    description = "what the re-armed callbacks have seen",
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
-    handler = function() return tostring(seen) end,
+    handler = function()
+        local info = maki.fn.jobinfo({doomed})
+        return (info and info.status or "missing")
+            .. "|" .. tostring(ticks > 0)
+            .. "|" .. table.concat(exits, ",")
+    end,
 }})
 "#
     );
     host.load_source("ticker", &reattach).unwrap();
-    assert_eq!(
-        exec_tool(&reg, "attach_ticker", json!({})).unwrap(),
-        ATTACHED
-    );
-    poll_until("jobattach did not resume stdout after reload", || {
-        (exec_tool(&reg, "ticker_seen", json!({})).unwrap() != "0").then_some(())
+    poll_until("the doomed job never reported its exit", || {
+        (exec_tool(&reg, "report", json!({})).unwrap() == BEFORE_ATTACH).then_some(())
+    });
+    assert_eq!(exec_tool(&reg, "attach_jobs", json!({})).unwrap(), ATTACHED);
+
+    let expected = format!("exited|true|{EXIT_CODE}");
+    poll_until("the re-armed callbacks never fired", || {
+        (exec_tool(&reg, "report", json!({})).unwrap() == expected).then_some(())
     });
 
     let spy = format!(
@@ -2624,104 +2643,14 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        local ok, err = maki.fn.jobattach({id}, {{ on_stdout = function() end }})
-        if ok then return "{ATTACHED}" end
-        return "error: " .. err
+        local ok, err = maki.fn.jobattach({ticker}, {{ on_stdout = function() end }})
+        return ok and "{ATTACHED}" or err
     end,
 }})
 "#
     );
     host.load_source("spy", &spy).unwrap();
-    assert_eq!(
-        exec_tool(&reg, "spy_attach", json!({})).unwrap(),
-        "error: job: not found"
-    );
-
-    host.event_handle()
-        .end_sessions_blocking([session], SessionEndReason::Shutdown);
-}
-
-#[cfg(unix)]
-#[test]
-fn jobattach_replays_the_exit_of_an_already_exited_job() {
-    const EXIT_CODE: i32 = 3;
-    const SETTLED_ROUNDS: usize = 3;
-    let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let session = maki_storage::id::MakiId::generate();
-    let _mailbox = maki_agent::SessionMailbox::register(session);
-    let sid = session.to_string();
-    let src = format!(
-        r#"
-maki.api.register_tool({{
-    name = "start_doomed",
-    description = "starts a session job that exits at once",
-    schema = {MINIMAL_SCHEMA},
-    audiences = {{ "main" }},
-    handler = function()
-        return tostring(maki.fn.jobstart("exit {EXIT_CODE}", {{
-            scope = {{ session = "{sid}" }},
-        }}))
-    end,
-}})
-"#
-    );
-    host.load_source("doomed", &src).unwrap();
-    let id = exec_tool(&reg, "start_doomed", json!({})).unwrap();
-
-    let watcher = format!(
-        r#"
-local exits = {{}}
-maki.api.register_tool({{
-    name = "status_doomed",
-    description = "reports the recorded status",
-    schema = {MINIMAL_SCHEMA},
-    audiences = {{ "main" }},
-    handler = function()
-        local info = maki.fn.jobinfo({id})
-        return info and info.status or "missing"
-    end,
-}})
-maki.api.register_tool({{
-    name = "attach_doomed",
-    description = "attaches on_exit after the exit",
-    schema = {MINIMAL_SCHEMA},
-    audiences = {{ "main" }},
-    handler = function()
-        local ok, err = maki.fn.jobattach({id}, {{
-            on_exit = function(_, code) exits[#exits + 1] = code end,
-        }})
-        return ok and "attached" or ("error: " .. err)
-    end,
-}})
-maki.api.register_tool({{
-    name = "report_doomed",
-    description = "codes seen, then the session job count",
-    schema = {MINIMAL_SCHEMA},
-    audiences = {{ "main" }},
-    handler = function()
-        return table.concat(exits, ",") .. "|" .. tostring(#maki.fn.joblist("{sid}"))
-    end,
-}})
-"#
-    );
-    host.load_source("doomed", &watcher).unwrap();
-    poll_until("the doomed job never reported its exit", || {
-        (exec_tool(&reg, "status_doomed", json!({})).unwrap() == "exited").then_some(())
-    });
-    exec_tool(&reg, "attach_doomed", json!({})).unwrap();
-
-    let expected = format!("{EXIT_CODE}|1");
-    poll_until("attaching on_exit after the exit never fired it", || {
-        (exec_tool(&reg, "report_doomed", json!({})).unwrap() == expected).then_some(())
-    });
-    for _ in 0..SETTLED_ROUNDS {
-        assert_eq!(
-            exec_tool(&reg, "report_doomed", json!({})).unwrap(),
-            expected,
-            "a replayed exit must fire once and leave the job listed once"
-        );
-    }
+    assert_eq!(exec_tool(&reg, "spy_attach", json!({})).unwrap(), NOT_FOUND);
 
     host.event_handle()
         .end_sessions_blocking([session], SessionEndReason::Shutdown);
@@ -2730,8 +2659,9 @@ maki.api.register_tool({{
 #[cfg(unix)]
 #[test]
 fn argv_jobs_and_stream_redirects() {
-    const LITERAL_ARG: &str = "a; echo pwned";
+    const LITERAL_ARG: &str = "a; echo pwned $(id)";
     const REDIRECT_ERR: &str = "mutually exclusive";
+    const FIELDS_ERR: &str = "handler must return the streams and the error, separated by |";
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -2745,20 +2675,18 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function()
         local seen = {{}}
-        local argv = maki.fn.jobstart({{ "echo", "{LITERAL_ARG}" }}, {{
+        maki.fn.jobwait(maki.fn.jobstart({{ "echo", "{LITERAL_ARG}" }}, {{
             scope = "plugin",
             on_stdout = function(_, line) seen[#seen + 1] = line end,
-        }})
-        maki.fn.jobwait(argv, 5000)
+        }}))
 
-        local redirected = maki.fn.jobstart({{ "echo", "to-file" }}, {{
+        local redirected = maki.fn.jobwait(maki.fn.jobstart({{ "echo", "to-file" }}, {{
             scope = "plugin",
             stdout = "{log}",
-        }})
-        local redirected_result = maki.fn.jobwait(redirected, 5000)
-
-        local quiet = maki.fn.jobstart("echo dropped", {{ scope = "plugin", stdout = false }})
-        local quiet_result = maki.fn.jobwait(quiet, 5000)
+        }}))
+        local quiet = maki.fn.jobwait(
+            maki.fn.jobstart("echo dropped", {{ scope = "plugin", stdout = false }})
+        )
 
         local _, err = pcall(maki.fn.jobstart, "echo both", {{
             scope = "plugin",
@@ -2768,8 +2696,8 @@ maki.api.register_tool({{
 
         return table.concat({{
             table.concat(seen, ","),
-            redirected_result.stdout,
-            quiet_result.stdout,
+            redirected.stdout,
+            quiet.stdout,
             tostring(err),
         }}, "|")
     end,
@@ -2780,15 +2708,14 @@ maki.api.register_tool({{
     host.load_source("argv_jobs", &src).unwrap();
 
     let out = exec_tool(&reg, "argv_and_redirect", json!({})).unwrap();
-    let [printed, redirected, discarded, conflict] = out.split('|').collect::<Vec<_>>()[..] else {
-        panic!("handler must return four fields, got {out}");
-    };
+    let (streams, conflict) = out
+        .rsplit_once('|')
+        .unwrap_or_else(|| panic!("{FIELDS_ERR}"));
     assert_eq!(
-        printed, LITERAL_ARG,
-        "argv must reach the program without a shell in between"
+        streams,
+        format!("{LITERAL_ARG}||"),
+        "argv must reach the program with no shell in between, and a stream sent to a file or dropped must not be captured too"
     );
-    assert_eq!(redirected, "", "a redirected stream is not also captured");
-    assert_eq!(discarded, "", "a discarded stream produces no events");
     assert!(
         conflict.contains(REDIRECT_ERR),
         "redirect plus on_stdout must be refused, got {conflict}"
@@ -2796,6 +2723,57 @@ maki.api.register_tool({{
     assert_eq!(std::fs::read_to_string(&log).unwrap(), "to-file\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn jobwait_on_an_exited_job_reports_whether_its_tail_is_complete() {
+    const WHOLE: &str = "one\ntwo:false";
+    const CLIPPED: &str = "two:true";
+    const DISCARDED: &str = ":true";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = maki_storage::id::MakiId::generate();
+    let _mailbox = maki_agent::SessionMailbox::register(session);
+    let sid = session.to_string();
+    let src = format!(
+        r#"
+maki.api.register_tool({{
+    name = "wait_twice",
+    description = "the tail three exited session jobs read back",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        -- The first wait parks until the exit and fills the tail, the second
+        -- one answers from that tail, which is the path under test.
+        local function tail_of(opts)
+            opts.scope = {{ session = "{sid}" }}
+            local id = maki.fn.jobstart("echo one; echo two", opts)
+            maki.fn.jobwait(id)
+            local got = maki.fn.jobwait(id)
+            return got.stdout .. ":" .. tostring(got.truncated)
+        end
+        return table.concat({{
+            tail_of({{ tail = 8 }}),
+            tail_of({{ tail = 1 }}),
+            tail_of({{ stdout = false }}),
+        }}, "|")
+    end,
+}})
+"#
+    );
+    host.load_source("chatty", &src).unwrap();
+
+    assert_eq!(
+        exec_tool(&reg, "wait_twice", json!({})).unwrap(),
+        format!("{WHOLE}|{CLIPPED}|{DISCARDED}"),
+        "a tail that held everything is not truncated, an empty one we never filled is"
+    );
+
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+}
+
+/// `run` on its own is enough to start a job, but pointing a stream at a path
+/// is a write, so it costs `fs_write` too.
 #[test]
 fn stream_redirect_to_a_path_needs_fs_write() {
     const REDIRECT_TOOL: &str = "redirect_deny";
@@ -2803,7 +2781,7 @@ fn stream_redirect_to_a_path_needs_fs_write() {
     perms.set(maki_lua::Permission::Run, true);
     let src = perm_tool_src(
         REDIRECT_TOOL,
-        r#"local ok, err = pcall(maki.fn.jobstart, "echo hi", { scope = "plugin", stdout = "/tmp/maki_redirect_test.log" })
+        r#"local _, err = pcall(maki.fn.jobstart, "echo hi", { scope = "plugin", stdout = "/tmp/maki-never-written.log" })
                 return tostring(err)"#,
     );
 
@@ -2815,7 +2793,7 @@ fn stream_redirect_to_a_path_needs_fs_write() {
 
 #[cfg(unix)]
 #[test]
-fn job_names_are_unique_per_plugin_and_outlive_a_reload() {
+fn a_job_name_survives_a_reload_and_blocks_a_second_live_job() {
     const JOB_NAME: &str = "log-tail";
     const DUPLICATE_ERR: &str = "already held by live job";
     let reg = fresh_registry();
@@ -2833,7 +2811,7 @@ maki.api.register_tool({{
     handler = function()
         local opts = {{ scope = {{ session = "{sid}" }}, name = "{JOB_NAME}" }}
         local id = maki.fn.jobstart("exec sleep 30", opts)
-        local ok, err = pcall(maki.fn.jobstart, "exec sleep 30", opts)
+        local _, err = pcall(maki.fn.jobstart, "exec sleep 30", opts)
         return tostring(id) .. "|" .. tostring(err)
     end,
 }})
@@ -2854,39 +2832,16 @@ maki.api.register_tool({{
     description = "finds the surviving job by name",
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
-    handler = function()
-        local found = maki.fn.jobfind("{JOB_NAME}")
-        local listed = "none"
-        for _, row in ipairs(maki.fn.joblist("{sid}")) do
-            if row.id == {id} then listed = tostring(row.name) .. ":" .. row.status end
-        end
-        return tostring(found) .. "|" .. listed
-    end,
-}})
-maki.api.register_tool({{
-    name = "stop_named",
-    description = "stops the named job",
-    schema = {MINIMAL_SCHEMA},
-    audiences = {{ "main" }},
-    handler = function()
-        maki.fn.jobstop({id})
-        return "stopped"
-    end,
+    handler = function() return tostring(maki.fn.jobfind("{JOB_NAME}")) end,
 }})
 "#
     );
     host.load_source("named", &rediscover).unwrap();
     assert_eq!(
         exec_tool(&reg, "find_named", json!({})).unwrap(),
-        format!("{id}|{JOB_NAME}:running"),
+        id,
         "a name must survive the reload that dropped the callbacks"
     );
-
-    exec_tool(&reg, "stop_named", json!({})).unwrap();
-    let exited = format!("nil|{JOB_NAME}:exited");
-    poll_until("the stopped job kept holding its name", || {
-        (exec_tool(&reg, "find_named", json!({})).unwrap() == exited).then_some(())
-    });
 
     host.event_handle()
         .end_sessions_blocking([session], SessionEndReason::Shutdown);

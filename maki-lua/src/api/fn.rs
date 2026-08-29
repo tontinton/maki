@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
+use shell_words::join as shell_join;
 
 use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
@@ -55,11 +56,17 @@ pub(crate) enum JobOwner {
     },
 }
 
-/// How the process is spawned: through a shell, or straight from an argv the
-/// plugin built itself (no quoting rules to get wrong).
+/// A shell line, or an argv the plugin built itself so there are no quoting
+/// rules to get wrong.
 pub(crate) enum JobCommand {
     Shell(String),
     Argv(Vec<String>),
+}
+
+impl From<&str> for JobCommand {
+    fn from(cmd: &str) -> Self {
+        Self::Shell(cmd.to_string())
+    }
 }
 
 impl JobCommand {
@@ -74,17 +81,23 @@ impl JobCommand {
         }
     }
 
-    /// Printable form for `jobinfo` / `joblist` rows.
+    /// Only for `jobinfo` / `joblist` rows: an argv job spawns from the vec,
+    /// so nothing ever re-parses this.
     fn display(&self) -> String {
         match self {
             Self::Shell(cmd) => cmd.clone(),
-            Self::Argv(argv) => argv
-                .iter()
-                .map(|arg| shell_quote(arg))
-                .collect::<Vec<_>>()
-                .join(" "),
+            Self::Argv(argv) => shell_join(argv),
         }
     }
+}
+
+pub(crate) enum Redirect {
+    /// Piped to a reader thread, so callbacks and tails see the lines.
+    Capture,
+    Discard,
+    /// The child appends to the file on its own: no reader thread, no events,
+    /// no tail.
+    File(PathBuf),
 }
 
 impl Redirect {
@@ -102,22 +115,10 @@ impl Redirect {
     }
 }
 
-/// Where one of the job's streams goes.
-pub(crate) enum Redirect {
-    /// Piped to a reader thread, so callbacks and tails see the lines.
-    Capture,
-    Discard,
-    /// Appended to a file by the child itself: no reader thread, no events,
-    /// no tail. Durability instead of reaction.
-    File(PathBuf),
-}
-
-/// Everything [`JobStore::start`] needs to spawn one job. A struct because
-/// the options a plugin may pass keep growing.
 pub(crate) struct JobSpec {
     pub owner: JobOwner,
     pub cmd: JobCommand,
-    pub name: Option<Arc<str>>,
+    pub name: Option<String>,
     pub cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
     pub stdout: Redirect,
@@ -128,10 +129,10 @@ pub(crate) struct JobSpec {
 }
 
 impl JobSpec {
-    pub(crate) fn new(owner: JobOwner, cmd: impl Into<String>) -> Self {
+    pub(crate) fn new(owner: JobOwner, cmd: impl Into<JobCommand>) -> Self {
         Self {
             owner,
-            cmd: JobCommand::Shell(cmd.into()),
+            cmd: cmd.into(),
             name: None,
             cwd: None,
             env: None,
@@ -147,9 +148,9 @@ impl JobSpec {
 struct JobMeta {
     owner: JobOwner,
     command: String,
-    /// Per-plugin handle, so a reloaded plugin can find this job again
-    /// without matching on the command string. Only live jobs hold it.
-    name: Option<Arc<str>>,
+    /// A reloaded plugin looks its job up by this instead of matching on the
+    /// command string. See [`JobStore::find_named`].
+    name: Option<String>,
     pid: u32,
     started: Instant,
     on_stdout: Option<RegistryKey>,
@@ -159,20 +160,20 @@ struct JobMeta {
     stdout_tail: VecDeque<String>,
     stderr_tail: VecDeque<String>,
     tail_cap: usize,
-    /// Flipped by the wait thread the moment the process is reaped, so
-    /// [`kill_job`] stops signalling a pid the kernel may have handed out
-    /// again. Narrower than `exit_code`, which is only set once the `Exit`
-    /// event reaches the pump.
+    /// Whether the tails ever lost a line, which is what `truncated` answers.
+    /// True from the start for a stream sent to a file or dropped, since
+    /// nothing ever reaches the tail there and an empty tail is no evidence
+    /// the job stayed quiet.
+    dropped_output: bool,
+    /// Set by the wait thread the moment the child is reaped, which is well
+    /// before `exit_code`. Read by [`kill_job`].
     reaped: Arc<AtomicBool>,
     exit_code: Option<i32>,
     /// Recorded at exit so elapsed time stops counting once the process is gone.
     elapsed_secs: Option<u64>,
-    /// Exit code owed to a callback attached after the process already died,
-    /// served by [`JobStore::next_matching`] as a synthetic event.
+    /// Exit code owed to an `on_exit` attached after the process already died,
+    /// served once by [`JobStore::next_matching`] as a synthetic event.
     replay_exit: Option<i32>,
-    /// Set by the first [`JobStore::complete`], so a replayed exit does not
-    /// run the completion bookkeeping twice.
-    completed: bool,
 }
 
 impl JobMeta {
@@ -183,8 +184,19 @@ impl JobMeta {
         }
     }
 
+    /// Owning plugin of a session job. Other owners drop their job on exit, so
+    /// only these keep a history worth capping.
+    fn session_plugin(&self) -> Option<&Arc<str>> {
+        match &self.owner {
+            JobOwner::Session { plugin, .. } => Some(plugin),
+            _ => None,
+        }
+    }
+
     fn record_line(&mut self, stdout: bool, line: &str) {
-        if self.tail_cap == 0 {
+        let cap = self.tail_cap;
+        if cap == 0 {
+            self.dropped_output = true;
             return;
         }
         let tail = if stdout {
@@ -192,10 +204,12 @@ impl JobMeta {
         } else {
             &mut self.stderr_tail
         };
-        if tail.len() >= self.tail_cap {
+        let evicting = tail.len() >= cap;
+        if evicting {
             tail.pop_front();
         }
         tail.push_back(line.to_string());
+        self.dropped_output |= evicting;
     }
 
     fn has_pending(&self) -> bool {
@@ -210,6 +224,19 @@ enum CallbackUpdate {
     Set(RegistryKey),
 }
 
+impl CallbackUpdate {
+    fn apply(self, lua: &Lua, slot: &mut Option<RegistryKey>) {
+        let replacement = match self {
+            Self::Keep => return,
+            Self::Clear => None,
+            Self::Set(key) => Some(key),
+        };
+        if let Some(old) = mem::replace(slot, replacement) {
+            lua.remove_registry_value(old).ok();
+        }
+    }
+}
+
 pub(crate) struct CallbackUpdates {
     on_stdout: CallbackUpdate,
     on_stderr: CallbackUpdate,
@@ -219,9 +246,6 @@ pub(crate) struct CallbackUpdates {
 pub(crate) struct JobStore {
     jobs: HashMap<u32, JobMeta>,
     next_id: u32,
-    /// Exited session jobs per owning plugin, oldest first. Keyed by plugin
-    /// so a chatty one evicts only its own history.
-    completed_order: HashMap<Arc<str>, VecDeque<u32>>,
     /// Id served by the last [`JobStore::next_matching`], so the next scan
     /// starts past it.
     scan_cursor: u32,
@@ -238,7 +262,6 @@ impl JobStore {
         Self {
             jobs: HashMap::new(),
             next_id: 1,
-            completed_order: HashMap::new(),
             scan_cursor: 0,
         }
     }
@@ -326,7 +349,7 @@ impl JobStore {
             .name("job-wait".into())
             .spawn(move || {
                 let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-                wait_reaped.store(true, Ordering::Release);
+                wait_reaped.store(true, Ordering::Relaxed);
                 if let Some(h) = stdout_handle {
                     let _ = h.join();
                 }
@@ -352,11 +375,14 @@ impl JobStore {
                 stdout_tail: VecDeque::new(),
                 stderr_tail: VecDeque::new(),
                 tail_cap: DEFAULT_TAIL,
+                dropped_output: !matches!(
+                    (&stdout, &stderr),
+                    (Redirect::Capture, Redirect::Capture)
+                ),
                 reaped,
                 exit_code: None,
                 elapsed_secs: None,
                 replay_exit: None,
-                completed: false,
             },
         );
 
@@ -448,11 +474,9 @@ impl JobStore {
         match event {
             JobEvent::Stdout(line) => job.record_line(true, line),
             JobEvent::Stderr(line) => job.record_line(false, line),
-            JobEvent::Exit(code) => {
-                job.exit_code = Some(*code);
-                job.elapsed_secs
-                    .get_or_insert_with(|| job.started.elapsed().as_secs());
-            }
+            // Termination is [`Self::complete`]'s business: it owns
+            // `exit_code` and runs once per job.
+            JobEvent::Exit(_) => {}
         }
     }
 
@@ -462,46 +486,43 @@ impl JobStore {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
-        // A replayed exit reaches here a second time; only the callbacks the
-        // replay just used still need releasing.
-        if job.completed {
+        // A replayed exit reaches here a second time: the job is already
+        // booked, only the callbacks the replay just used need releasing.
+        if job.exit_code.is_some() {
             drop_callbacks(lua, job);
             return;
         }
-        job.completed = true;
-        job.elapsed_secs
-            .get_or_insert_with(|| job.started.elapsed().as_secs());
         job.exit_code = Some(code);
-        let owner_plugin = match &job.owner {
-            JobOwner::Session { plugin, .. } => {
-                let plugin = Arc::clone(plugin);
-                drop_callbacks(lua, job);
-                Some(plugin)
-            }
-            _ => None,
-        };
-        let Some(plugin) = owner_plugin else {
-            self.finish(lua, job_id);
-            return;
-        };
+        job.elapsed_secs = Some(job.started.elapsed().as_secs());
+        let session_plugin = job.session_plugin().cloned();
+        drop_callbacks(lua, job);
+        match session_plugin {
+            Some(plugin) => self.evict_completed(lua, &plugin),
+            None => self.finish(lua, job_id),
+        }
+    }
 
-        let history = self.completed_order.entry(plugin).or_default();
-        history.push_back(job_id);
-        let evicted: Vec<u32> = if history.len() > MAX_COMPLETED_SESSION_JOBS {
-            history
-                .drain(..history.len() - MAX_COMPLETED_SESSION_JOBS)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        for oldest in evicted {
-            if self
-                .jobs
-                .get(&oldest)
-                .is_some_and(|job| job.exit_code.is_some())
-            {
-                self.remove(lua, oldest, false);
-            }
+    /// Cap the exited session jobs {plugin} keeps, dropping the oldest ids
+    /// first, so a chatty plugin only ever evicts its own history. Scanning
+    /// `jobs` beats keeping a second list in sync with it.
+    fn evict_completed(&mut self, lua: &Lua, plugin: &str) {
+        let mut exited: Vec<u32> = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| {
+                job.exit_code.is_some()
+                    && job
+                        .session_plugin()
+                        .is_some_and(|owner| owner.as_ref() == plugin)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        if exited.len() <= MAX_COMPLETED_SESSION_JOBS {
+            return;
+        }
+        exited.sort_unstable();
+        for oldest in &exited[..exited.len() - MAX_COMPLETED_SESSION_JOBS] {
+            self.remove(lua, *oldest, false);
         }
     }
 
@@ -515,12 +536,6 @@ impl JobStore {
         for id in ids {
             self.remove(lua, id, true);
         }
-        let remaining: HashSet<u32> = self.jobs.keys().copied().collect();
-        for history in self.completed_order.values_mut() {
-            history.retain(|id| remaining.contains(id));
-        }
-        self.completed_order
-            .retain(|_, history| !history.is_empty());
     }
 
     /// Drop Lua callbacks for session jobs started by {plugin} without
@@ -556,13 +571,12 @@ impl JobStore {
         if !job.can_access(task_id, plugin) {
             return false;
         }
-        let attaching_exit = matches!(updates.on_exit, CallbackUpdate::Set(_));
-        apply_update(lua, &mut job.on_stdout, updates.on_stdout);
-        apply_update(lua, &mut job.on_stderr, updates.on_stderr);
-        apply_update(lua, &mut job.on_exit, updates.on_exit);
-        if attaching_exit && let Some(code) = job.exit_code {
-            job.replay_exit = Some(code);
+        if matches!(updates.on_exit, CallbackUpdate::Set(_)) {
+            job.replay_exit = job.exit_code;
         }
+        updates.on_stdout.apply(lua, &mut job.on_stdout);
+        updates.on_stderr.apply(lua, &mut job.on_stderr);
+        updates.on_exit.apply(lua, &mut job.on_exit);
         true
     }
 
@@ -572,9 +586,9 @@ impl JobStore {
             .then(|| JobSnapshot::from_job(job_id, job, true))
     }
 
-    /// Id of the **live** job this plugin can see holding {name}. Exited jobs
-    /// keep their name for display but stop answering here, so a plugin that
-    /// adopts by name restarts a dead job instead of adopting a corpse.
+    /// Id of the live job this plugin can see holding `name`. An exited job
+    /// keeps its name on the row but stops answering here, so a plugin that
+    /// adopts by name restarts a job that died instead of taking over its id.
     pub fn find_named(&self, name: &str, task_id: Option<u64>, plugin: &str) -> Option<u32> {
         self.jobs
             .iter()
@@ -612,13 +626,10 @@ impl JobStore {
             return;
         }
         self.remove(lua, job_id, false);
-        if let Some(history) = self.completed_order.get_mut(plugin) {
-            history.retain(|&id| id != job_id);
-        }
     }
 
     pub fn kill(&mut self, job_id: u32, task_id: Option<u64>, plugin: &str) {
-        if let Some(job) = self.jobs.get_mut(&job_id)
+        if let Some(job) = self.jobs.get(&job_id)
             && job.can_access(task_id, plugin)
         {
             kill_job(job);
@@ -642,9 +653,9 @@ impl JobStore {
     }
 
     fn remove(&mut self, lua: &Lua, job_id: u32, kill: bool) {
-        if let Some(mut job) = self.jobs.remove(&job_id) {
+        if let Some(job) = self.jobs.remove(&job_id) {
             if kill {
-                kill_job(&mut job);
+                kill_job(&job);
             }
             for key in [job.on_stdout, job.on_stderr, job.on_exit]
                 .into_iter()
@@ -655,8 +666,8 @@ impl JobStore {
         }
     }
 
-    fn kill_all(&mut self) {
-        for job in self.jobs.values_mut() {
+    fn kill_all(&self) {
+        for job in self.jobs.values() {
             kill_job(job);
         }
     }
@@ -695,13 +706,16 @@ impl Drop for CheckedOutReceiver {
 pub(crate) struct JobSnapshot {
     pub id: u32,
     pub command: String,
-    pub name: Option<Arc<str>>,
+    pub name: Option<String>,
     pub session: Option<MakiId>,
     pub pid: u32,
     pub elapsed_secs: u64,
     pub exit_code: Option<i32>,
     pub stdout_lines: Vec<String>,
     pub stderr_lines: Vec<String>,
+    /// Some output never reached the tails, so what they hold is a window
+    /// onto a longer stream.
+    pub dropped_output: bool,
 }
 
 impl JobSnapshot {
@@ -726,6 +740,7 @@ impl JobSnapshot {
             } else {
                 Vec::new()
             },
+            dropped_output: job.dropped_output,
         }
     }
 }
@@ -752,31 +767,6 @@ fn drop_callbacks(lua: &Lua, job: &mut JobMeta) {
     }
 }
 
-fn apply_update(lua: &Lua, slot: &mut Option<RegistryKey>, update: CallbackUpdate) {
-    let replacement = match update {
-        CallbackUpdate::Keep => return,
-        CallbackUpdate::Clear => None,
-        CallbackUpdate::Set(key) => Some(key),
-    };
-    if let Some(old) = mem::replace(slot, replacement) {
-        lua.remove_registry_value(old).ok();
-    }
-}
-
-/// Single-quote {arg} unless it is plainly safe, so an argv job's `command`
-/// row reads back as the shell line that would have produced it. Display
-/// only: nothing re-parses this.
-fn shell_quote(arg: &str) -> String {
-    if !arg.is_empty()
-        && arg
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@,+".contains(c))
-    {
-        return arg.to_string();
-    }
-    format!("'{}'", arg.replace('\'', r"'\''"))
-}
-
 fn shell_command(cmd: &str) -> Command {
     #[cfg(unix)]
     {
@@ -792,31 +782,28 @@ fn shell_command(cmd: &str) -> Command {
     }
 }
 
-fn kill_job(meta: &mut JobMeta) {
-    // Once the process is reaped its pid can be handed to someone else, and
-    // signalling it would hit a stranger's process group. The flag is set by
-    // the wait thread right after `wait` returns, which narrows that window
-    // to a few instructions but does not close it: only a pidfd would, and a
-    // pidfd cannot express `killpg`.
-    if meta.reaped.load(Ordering::Acquire) {
+/// Signalling a reaped pid would hit whoever the kernel handed it to next, so
+/// skip the jobs the wait thread already reaped. The flag carries no data of
+/// its own, hence `Relaxed`. It narrows the window to the few instructions
+/// after `wait` returns rather than closing it, which would take a pidfd, and
+/// a pidfd cannot express `killpg`.
+fn kill_job(job: &JobMeta) {
+    if job.reaped.load(Ordering::Relaxed) {
         return;
     }
-    let pid = meta.pid;
     #[cfg(unix)]
     {
         use rustix::process::{Pid, Signal, kill_process_group};
-        let raw = match i32::try_from(pid) {
-            Ok(raw) => raw,
-            Err(_) => return,
-        };
-        if let Some(pid) = Pid::from_raw(raw) {
+        if let Ok(raw) = i32::try_from(job.pid)
+            && let Some(pid) = Pid::from_raw(raw)
+        {
             let _ = kill_process_group(pid, Signal::KILL);
         }
     }
     #[cfg(windows)]
     {
         let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .args(["/T", "/F", "/PID", &job.pid.to_string()])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -832,10 +819,11 @@ fn kill_job(meta: &mut JobMeta) {
 ///
 /// `stdout` and `stderr` route a stream to a file instead of into maki. A
 /// path is opened for append and handed to the child, so nothing is buffered
-/// here: no callback, no tail, no events for that stream. That makes the two
-/// mutually exclusive with `on_stdout` / `on_stderr` for the same stream, and
-/// a path additionally needs the `fs_write` permission. To both persist and
-/// react, run one job writing the file and a second one tailing it.
+/// here: no callback, no tail, no events for that stream, and it counts as
+/// truncated everywhere a tail is reported. That makes the two mutually
+/// exclusive with `on_stdout` / `on_stderr` for the same stream, and a path
+/// additionally needs the `fs_write` permission. To both persist and react,
+/// run one job writing the file and a second one tailing it.
 ///
 /// @param cmd string|table Shell command, or an argv table like
 ///   `{ "tail", "-F", path }`.
@@ -875,8 +863,7 @@ fn jobstart(
         .map(|opts| opts.get::<Value>("scope"))
         .transpose()?
         .unwrap_or(Value::Nil);
-    let mut spec = JobSpec::new(parse_scope(lua, &plugin, scope)?, "");
-    spec.cmd = parse_command(cmd)?;
+    let mut spec = JobSpec::new(parse_scope(lua, &plugin, scope)?, parse_command(cmd)?);
     let mut tail = None;
 
     if let Some(ref opts) = opts {
@@ -937,27 +924,27 @@ fn parse_redirect(
     has_callback: bool,
     fs_write: bool,
 ) -> LuaResult<Redirect> {
-    let redirect = match opts.get::<Value>(key)? {
-        Value::Nil => return Ok(Redirect::Capture),
-        Value::Boolean(false) => Redirect::Discard,
-        Value::String(path) => {
-            if !fs_write {
-                return Err(denied_error(Permission::FsWrite));
-            }
-            Redirect::File(expand_tilde(&path.to_str()?))
-        }
-        _ => {
-            return Err(mlua::Error::runtime(format!(
-                "jobstart: {key} must be a path string or false"
-            )));
-        }
-    };
+    let value = opts.get::<Value>(key)?;
+    if value.is_nil() {
+        return Ok(Redirect::Capture);
+    }
     if has_callback {
         return Err(mlua::Error::runtime(format!(
             "jobstart: {key} and on_{key} are mutually exclusive; tail the file from a second job to get both"
         )));
     }
-    Ok(redirect)
+    match value {
+        Value::Boolean(false) => Ok(Redirect::Discard),
+        Value::String(path) => {
+            if !fs_write {
+                return Err(denied_error(Permission::FsWrite));
+            }
+            Ok(Redirect::File(expand_tilde(&path.to_str()?)))
+        }
+        _ => Err(mlua::Error::runtime(format!(
+            "jobstart: {key} must be a path string or false"
+        ))),
+    }
 }
 
 fn callback_key(lua: &Lua, opts: &Table, key: &str) -> LuaResult<Option<RegistryKey>> {
@@ -967,20 +954,18 @@ fn callback_key(lua: &Lua, opts: &Table, key: &str) -> LuaResult<Option<Registry
         .transpose()
 }
 
-fn job_name(opts: &Table) -> LuaResult<Option<Arc<str>>> {
-    let Some(name) = opts.get::<Option<String>>("name")? else {
-        return Ok(None);
-    };
-    if name.trim().is_empty() {
+fn job_name(opts: &Table) -> LuaResult<Option<String>> {
+    let name = opts.get::<Option<String>>("name")?;
+    if name.as_deref().is_some_and(|name| name.trim().is_empty()) {
         return Err(mlua::Error::runtime(BLANK_NAME_ERR));
     }
-    Ok(Some(Arc::from(name)))
+    Ok(name)
 }
 
-/// Find the **live** job of this plugin registered under {name} by
-/// `jobstart`. Exited jobs never answer, so adopting by name restarts a job
-/// that died instead of latching onto a corpse; their `name` is still on the
-/// `joblist` row that explains why they died.
+/// Find the live job of this plugin that `jobstart` registered under {name}.
+/// An exited job never answers, so `jobfind(...) or jobstart(...)` restarts a
+/// job that died instead of adopting its id. The name stays on the `joblist`
+/// row, which is where you go to see why it died.
 ///
 /// @param name string Name passed to `jobstart`.
 /// @return (integer|nil, string|nil) Job id, or nil and an error when no live
@@ -1055,14 +1040,12 @@ fn jobinfo(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<Pair<Va
 /// plugin picks its jobs back up after a reload: unloading drops the Lua
 /// callbacks of its session-owned jobs, but the processes keep running.
 ///
-/// Keys absent from {opts} leave the current callback alone; pass `false` to
-/// clear one. Attaching `on_exit` to a job that already exited still fires it
-/// once, with the recorded exit code, so a reload racing the exit cannot lose
-/// it.
+/// Keys absent from {opts} leave the current callback alone. Attaching
+/// `on_exit` to a job that already exited still fires it once, with the
+/// recorded exit code, so a reload racing the exit cannot lose it.
 ///
 /// @param job_id integer Job id, e.g. from `joblist`.
-/// @param opts table Callbacks to set: `on_stdout`, `on_stderr`, `on_exit`,
-///   each a function or `false`.
+/// @param opts table `on_stdout`, `on_stderr`, `on_exit`: a function, or `false` to clear.
 /// @return (boolean|nil, string|nil) true on success, or nil and an error.
 /// @example
 /// -- A monitor that survives /reload: adopt the live job or start one.
@@ -1112,9 +1095,8 @@ fn callback_update(lua: &Lua, opts: &Table, key: &str) -> LuaResult<CallbackUpda
 
 /// List jobs this plugin can see, including exited session-owned jobs (so an
 /// id started before a reload stays findable). Rows identify the job; call
-/// `jobinfo` for tails. Passing a session id keeps the rows whose `session`
-/// field equals it, so only session-scoped jobs can match: plugin and task
-/// jobs carry no session.
+/// `jobinfo` for tails. Pass a session id to list only that session's jobs.
+/// Plugin and task jobs carry no session, so a filter never matches them.
 ///
 /// @param session string? Session id filter.
 /// @return (table) array of `{ id, command, name, pid, session, status,
@@ -1200,11 +1182,11 @@ fn jobforget(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 }
 
 /// Wait for a job to finish and collect its output. Returns a result
-/// table with `stdout`, `stderr`, `exit_code`, and `truncated`. `truncated`
-/// is false when the collected lines are the full output; a job that already
-/// exited answers from its captured tail, so `truncated` is true and the
-/// output may be missing lines. Returns `nil` if the job does not finish
-/// before the timeout.
+/// table with `stdout`, `stderr`, `exit_code`, and `truncated`. A job that
+/// already exited answers from its captured tail, so `truncated` says
+/// whether that tail ever lost a line (`tail` too small or 0, or the stream
+/// redirected away). Waiting on a live job collects every line and is never
+/// truncated. Returns `nil` if the job does not finish before the timeout.
 ///
 /// While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 /// callbacks fire as events arrive (like Neovim), so you can stream
@@ -1212,6 +1194,11 @@ fn jobforget(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 /// session-owned job answers from its snapshot and fires no callbacks.
 /// Task and plugin jobs leave the store on exit, so waiting after that
 /// is an error.
+///
+/// Waiting parks the caller, so a slot chain cannot call it. From a
+/// slot, start the job with an `on_exit` that stashes the result in
+/// your plugin state and pick it back up with `jobfind` next time.
+/// `maki.api.declare_slot` explains the restriction.
 ///
 /// @param job_id integer Job id returned by `jobstart`.
 /// @param timeout_ms integer? Maximum wait in milliseconds (default 30000).
@@ -1233,12 +1220,13 @@ async fn jobwait(
     if let Some(snap) = with_jobs(&lua, |store| store.snapshot(job_id, task_id, &plugin))
         && let Some(code) = snap.exit_code
     {
-        let result = lua.create_table()?;
-        result.set("stdout", snap.stdout_lines.join("\n"))?;
-        result.set("stderr", snap.stderr_lines.join("\n"))?;
-        result.set("exit_code", code)?;
-        result.set("truncated", true)?;
-        return Ok(mlua::Value::Table(result));
+        return wait_result(
+            &lua,
+            &snap.stdout_lines,
+            &snap.stderr_lines,
+            code,
+            snap.dropped_output,
+        );
     }
     let receiver = with_jobs(&lua, |store| store.take_receiver(job_id, task_id, &plugin))
         .ok_or_else(|| mlua::Error::runtime("unknown job id or already waited"))?;
@@ -1275,12 +1263,24 @@ async fn jobwait(
         }
     };
 
+    wait_result(&lua, &stdout_lines, &stderr_lines, exit_code, false)
+}
+
+/// The single shape `jobwait` answers with, so its two paths cannot drift
+/// apart from the documented keys.
+fn wait_result(
+    lua: &Lua,
+    stdout: &[String],
+    stderr: &[String],
+    exit_code: i32,
+    truncated: bool,
+) -> LuaResult<Value> {
     let result = lua.create_table()?;
-    result.set("stdout", stdout_lines.join("\n"))?;
-    result.set("stderr", stderr_lines.join("\n"))?;
+    result.set("stdout", stdout.join("\n"))?;
+    result.set("stderr", stderr.join("\n"))?;
     result.set("exit_code", exit_code)?;
-    result.set("truncated", false)?;
-    Ok(mlua::Value::Table(result))
+    result.set("truncated", truncated)?;
+    Ok(Value::Table(result))
 }
 
 /// Fire the job's Lua callback for {event} (if any) and mark the job
@@ -1420,6 +1420,9 @@ mod tests {
     const TEST_PLUGIN: &str = "test-plugin";
     const JOB_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
     const JOB_POLL_INTERVAL: Duration = Duration::from_millis(10);
+    #[cfg(unix)]
+    const EXIT_WITHOUT_REAP: &str =
+        "an exit event must mean the child was reaped, or a later kill can signal a recycled pid";
     const NEVER_EXITED: &str = "job never reported its exit";
 
     /// Pull events until {id} reports its exit, so assertions run against a
@@ -1482,11 +1485,11 @@ mod tests {
             stdout_tail: VecDeque::new(),
             stderr_tail: VecDeque::new(),
             tail_cap: DEFAULT_TAIL,
+            dropped_output: false,
             reaped: Arc::new(AtomicBool::new(false)),
             exit_code: None,
             elapsed_secs: None,
             replay_exit: None,
-            completed: false,
         }
     }
 
@@ -1507,10 +1510,14 @@ mod tests {
 
     #[cfg(unix)]
     fn wait_for_group_exit(pid: u32) -> bool {
-        (0..500).any(|_| {
-            thread::sleep(Duration::from_millis(10));
-            !group_alive(pid)
-        })
+        let deadline = Instant::now() + JOB_EXIT_TIMEOUT;
+        while Instant::now() < deadline {
+            if !group_alive(pid) {
+                return true;
+            }
+            thread::sleep(JOB_POLL_INTERVAL);
+        }
+        false
     }
 
     #[cfg(unix)]
@@ -1887,7 +1894,6 @@ mod tests {
             .collect();
         assert!(from_other.is_empty());
 
-        store.record_event(task, &JobEvent::Exit(0));
         store.finish(&lua, task);
         let live: Vec<u32> = store
             .list(None, Some(1), TEST_PLUGIN)
@@ -1962,22 +1968,15 @@ mod tests {
     #[test]
     fn snapshot_elapsed_freezes_at_recorded_exit() {
         const PAST_SECS: u64 = 45;
-        let session = MakiId::generate();
+        let lua = Lua::new();
         let mut store = make_store();
-        let mut job = stub_job(
-            JobOwner::Session {
-                session,
-                plugin: Arc::from(TEST_PLUGIN),
-            },
-            None,
-            None,
-        );
+        let mut job = stub_job(session_owner(MakiId::generate()), None, None);
         job.started = Instant::now()
             .checked_sub(Duration::from_secs(PAST_SECS))
             .expect("clock has enough history");
         store.jobs.insert(1, job);
 
-        store.record_event(1, &JobEvent::Exit(0));
+        store.complete(&lua, 1, 0);
         let at_exit = store.snapshot(1, None, TEST_PLUGIN).unwrap().elapsed_secs;
         assert!(
             at_exit >= PAST_SECS,
@@ -1989,11 +1988,18 @@ mod tests {
         assert_eq!(later, at_exit, "elapsed must freeze once the job exits");
     }
 
-    fn exit_updates(key: RegistryKey) -> CallbackUpdates {
+    fn keep_all() -> CallbackUpdates {
         CallbackUpdates {
             on_stdout: CallbackUpdate::Keep,
             on_stderr: CallbackUpdate::Keep,
-            on_exit: CallbackUpdate::Set(key),
+            on_exit: CallbackUpdate::Keep,
+        }
+    }
+
+    fn exit_updates(lua: &Lua) -> CallbackUpdates {
+        CallbackUpdates {
+            on_exit: CallbackUpdate::Set(noop_key(lua)),
+            ..keep_all()
         }
     }
 
@@ -2002,47 +2008,32 @@ mod tests {
         lua.create_registry_value(noop).unwrap()
     }
 
-    fn exited_session_job(lua: &Lua, store: &mut JobStore, session: MakiId, code: i32) {
-        store.jobs.insert(
-            1,
-            stub_job(
-                JobOwner::Session {
-                    session,
-                    plugin: Arc::from(TEST_PLUGIN),
-                },
-                None,
-                None,
-            ),
-        );
-        store.record_event(1, &JobEvent::Exit(code));
+    /// Which callbacks the stub job (always id 1 here) still holds, as
+    /// (stdout, stderr, exit).
+    fn armed_slots(store: &JobStore) -> (bool, bool, bool) {
+        let held = |event| store.callback_key(1, &event).is_some();
+        (
+            held(JobEvent::Stdout(String::new())),
+            held(JobEvent::Stderr(String::new())),
+            held(JobEvent::Exit(0)),
+        )
+    }
+
+    fn exited_session_job(lua: &Lua, store: &mut JobStore, code: i32) {
+        store
+            .jobs
+            .insert(1, stub_job(session_owner(MakiId::generate()), None, None));
         store.complete(lua, 1, code);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn an_argv_job_takes_shell_metacharacters_literally() {
-        const LITERAL: &str = "a; echo pwned $(id)";
-        let mut store = make_store();
-        let id = store
-            .start(JobSpec {
-                cmd: JobCommand::Argv(vec!["echo".into(), LITERAL.into()]),
-                ..JobSpec::new(task_owner(1), "")
-            })
-            .unwrap();
-
-        let printed: Vec<String> = collect_until_exit(id, || store.next_event(&task_owner(1)))
-            .into_iter()
-            .filter_map(|(_, event)| match event {
-                JobEvent::Stdout(line) => Some(line),
-                _ => None,
-            })
-            .collect();
-
-        assert_eq!(printed, [LITERAL]);
+    fn an_argv_row_reads_back_as_the_same_argv() {
+        const ARGV: [&str; 2] = ["echo", "a; echo pwned"];
+        let row = JobCommand::Argv(ARGV.map(String::from).to_vec()).display();
         assert_eq!(
-            store.snapshot(id, Some(1), TEST_PLUGIN).unwrap().command,
-            format!("echo '{LITERAL}'"),
-            "argv rows must stay printable"
+            shell_words::split(&row).unwrap(),
+            ARGV,
+            "the row a user reads must quote what the shell would have eaten"
         );
     }
 
@@ -2071,18 +2062,14 @@ mod tests {
             snap.stdout_lines.is_empty() && snap.stderr_lines.is_empty(),
             "a redirected stream must not be buffered here"
         );
+        assert!(
+            snap.dropped_output,
+            "an empty tail on a redirected stream must not read as the whole output"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             format!("{EXISTING}hi\n")
         );
-    }
-
-    #[test_case::test_case("plain", "plain" ; "safe_argument_is_bare")]
-    #[test_case::test_case("a b", "'a b'" ; "space_is_quoted")]
-    #[test_case::test_case("it's", r"'it'\''s'" ; "quote_is_escaped")]
-    #[test_case::test_case("", "''" ; "empty_argument_stays_visible")]
-    fn shell_quote_renders_argv_rows(arg: &str, expected: &str) {
-        assert_eq!(shell_quote(arg), expected);
     }
 
     #[test]
@@ -2091,14 +2078,13 @@ mod tests {
         let lua = Lua::new();
         let mut store = make_store();
         let mut job = stub_job(session_owner(MakiId::generate()), None, None);
-        job.name = Some(Arc::from(NAME));
+        job.name = Some(NAME.to_string());
         store.jobs.insert(1, job);
 
         assert_eq!(store.find_named(NAME, None, TEST_PLUGIN), Some(1));
         assert_eq!(store.find_named(NAME, None, "other-plugin"), None);
         assert_eq!(store.find_named("absent", None, TEST_PLUGIN), None);
 
-        store.record_event(1, &JobEvent::Exit(0));
         store.complete(&lua, 1, 0);
 
         assert_eq!(
@@ -2120,12 +2106,13 @@ mod tests {
     #[test]
     fn attaching_on_exit_after_the_exit_replays_it_once() {
         const CODE: i32 = 5;
+        const REWIND: Duration = Duration::from_secs(60);
         let lua = Lua::new();
         let mut store = make_store();
-        exited_session_job(&lua, &mut store, MakiId::generate(), CODE);
-        let elapsed = store.jobs[&1].elapsed_secs;
+        exited_session_job(&lua, &mut store, CODE);
+        let at_exit = store.jobs[&1].elapsed_secs;
 
-        assert!(store.attach(&lua, 1, None, TEST_PLUGIN, exit_updates(noop_key(&lua))));
+        assert!(store.attach(&lua, 1, None, TEST_PLUGIN, exit_updates(&lua)));
 
         let (id, event) = store.next_plugin_event().expect("replayed exit");
         assert_eq!(id, 1);
@@ -2135,17 +2122,18 @@ mod tests {
             "the replay must be served once"
         );
 
-        store.record_event(1, &event);
+        // Rewind the start so a second round of bookkeeping would show up in
+        // the elapsed time instead of hiding in the same second.
+        store.jobs.get_mut(&1).unwrap().started = Instant::now() - REWIND;
         store.complete(&lua, 1, CODE);
         assert_eq!(
-            store.completed_order[TEST_PLUGIN].len(),
-            1,
-            "a replayed exit must not re-push the job onto the completed list"
+            store.jobs[&1].elapsed_secs, at_exit,
+            "a replayed exit must not restate when the job died"
         );
-        assert_eq!(store.jobs[&1].elapsed_secs, elapsed);
-        assert!(
-            store.callback_key(1, &JobEvent::Exit(CODE)).is_none(),
-            "completing again must still release the replayed callback"
+        assert_eq!(
+            armed_slots(&store),
+            (false, false, false),
+            "completing on the replay must release the callback it used"
         );
     }
 
@@ -2153,10 +2141,10 @@ mod tests {
     fn attach_is_refused_for_jobs_this_plugin_cannot_see() {
         let lua = Lua::new();
         let mut store = make_store();
-        exited_session_job(&lua, &mut store, MakiId::generate(), 0);
+        exited_session_job(&lua, &mut store, 0);
 
-        assert!(!store.attach(&lua, 1, None, "other-plugin", exit_updates(noop_key(&lua))));
-        assert!(!store.attach(&lua, 999, None, TEST_PLUGIN, exit_updates(noop_key(&lua))));
+        assert!(!store.attach(&lua, 1, None, "other-plugin", exit_updates(&lua)));
+        assert!(!store.attach(&lua, 999, None, TEST_PLUGIN, exit_updates(&lua)));
         assert!(
             store.next_plugin_event().is_none(),
             "a refused attach must not queue a replay"
@@ -2177,20 +2165,14 @@ mod tests {
             None,
             TEST_PLUGIN,
             CallbackUpdates {
-                on_stdout: CallbackUpdate::Keep,
                 on_stderr: CallbackUpdate::Set(noop_key(&lua)),
-                on_exit: CallbackUpdate::Keep,
+                ..keep_all()
             },
         );
-        assert!(
-            store
-                .callback_key(1, &JobEvent::Stdout(String::new()))
-                .is_some()
-        );
-        assert!(
-            store
-                .callback_key(1, &JobEvent::Stderr(String::new()))
-                .is_some()
+        assert_eq!(
+            armed_slots(&store),
+            (true, true, false),
+            "an absent key must keep the callback it found"
         );
 
         store.attach(
@@ -2200,60 +2182,73 @@ mod tests {
             TEST_PLUGIN,
             CallbackUpdates {
                 on_stdout: CallbackUpdate::Clear,
-                on_stderr: CallbackUpdate::Keep,
-                on_exit: CallbackUpdate::Keep,
+                ..keep_all()
             },
         );
-        assert!(
-            store
-                .callback_key(1, &JobEvent::Stdout(String::new()))
-                .is_none()
+        assert_eq!(
+            armed_slots(&store),
+            (false, true, false),
+            "false must clear that callback and leave the rest"
         );
-        assert!(
+    }
+
+    #[test_case::test_case(3, false ; "tail_holds_every_line")]
+    #[test_case::test_case(2, true ; "tail_evicted_a_line")]
+    #[test_case::test_case(0, true ; "tail_disabled")]
+    fn dropped_says_whether_the_tail_is_the_whole_output(cap: usize, expected: bool) {
+        let mut store = make_store();
+        store.jobs.insert(1, stub_job(task_owner(1), None, None));
+        store.set_tail(1, Some(cap));
+
+        for line in ["a", "b", "c"] {
+            store.record_event(1, &JobEvent::Stdout(line.into()));
+        }
+
+        assert_eq!(
             store
-                .callback_key(1, &JobEvent::Stderr(String::new()))
-                .is_some()
+                .snapshot(1, Some(1), TEST_PLUGIN)
+                .unwrap()
+                .dropped_output,
+            expected
         );
     }
 
     #[test]
     fn completed_history_is_evicted_per_plugin() {
         const QUIET_PLUGIN: &str = "quiet-plugin";
+        const QUIET_JOB: u32 = 1;
+        const OLDEST_CHATTY_JOB: u32 = 2;
         let lua = Lua::new();
         let session = MakiId::generate();
         let mut store = make_store();
-        store.jobs.insert(
-            1,
-            stub_job(
-                JobOwner::Session {
-                    session,
-                    plugin: Arc::from(QUIET_PLUGIN),
-                },
-                None,
-                None,
-            ),
-        );
-        store.complete(&lua, 1, 0);
-
-        let chatty = 2..=(MAX_COMPLETED_SESSION_JOBS as u32 + 2);
-        for id in chatty {
-            store
-                .jobs
-                .insert(id, stub_job(session_owner(session), None, None));
+        let exit_job = |store: &mut JobStore, id: u32, plugin: &str| {
+            let owner = JobOwner::Session {
+                session,
+                plugin: Arc::from(plugin),
+            };
+            store.jobs.insert(id, stub_job(owner, None, None));
             store.complete(&lua, id, 0);
+        };
+
+        exit_job(&mut store, QUIET_JOB, QUIET_PLUGIN);
+        for id in OLDEST_CHATTY_JOB..=(MAX_COMPLETED_SESSION_JOBS as u32 + OLDEST_CHATTY_JOB) {
+            exit_job(&mut store, id, TEST_PLUGIN);
         }
 
         assert!(
-            store.snapshot(1, None, QUIET_PLUGIN).is_some(),
+            store.snapshot(QUIET_JOB, None, QUIET_PLUGIN).is_some(),
             "a chatty plugin must not evict another plugin's history"
         );
         assert!(
-            store.snapshot(2, None, TEST_PLUGIN).is_none(),
-            "the chatty plugin evicts its own oldest job"
+            store
+                .snapshot(OLDEST_CHATTY_JOB, None, TEST_PLUGIN)
+                .is_none(),
+            "the chatty plugin evicts its own oldest job first"
         );
         assert_eq!(
-            store.completed_order[TEST_PLUGIN].len(),
-            MAX_COMPLETED_SESSION_JOBS
+            store.list(None, None, TEST_PLUGIN).len(),
+            MAX_COMPLETED_SESSION_JOBS,
+            "the cap counts only this plugin's exited jobs"
         );
     }
 
@@ -2301,7 +2296,6 @@ mod tests {
             "running job must stay"
         );
 
-        store.record_event(1, &JobEvent::Exit(0));
         store.complete(&lua, 1, 0);
         assert!(
             store
@@ -2333,6 +2327,10 @@ mod tests {
         for (_, event) in collect_until_exit(id, || store.next_plugin_event()) {
             store.record_event(id, &event);
         }
+        assert!(
+            store.jobs[&id].reaped.load(Ordering::Relaxed),
+            "{EXIT_WITHOUT_REAP}"
+        );
         store.complete(&lua, id, 0);
         store.kill(id, None, TEST_PLUGIN);
         let snap = store

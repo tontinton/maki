@@ -1640,10 +1640,11 @@ control the process.
 
 `stdout` and `stderr` route a stream to a file instead of into maki. A
 path is opened for append and handed to the child, so nothing is buffered
-here: no callback, no tail, no events for that stream. That makes the two
-mutually exclusive with `on_stdout` / `on_stderr` for the same stream, and
-a path additionally needs the `fs_write` permission. To both persist and
-react, run one job writing the file and a second one tailing it.
+here: no callback, no tail, no events for that stream, and it counts as
+truncated everywhere a tail is reported. That makes the two mutually
+exclusive with `on_stdout` / `on_stderr` for the same stream, and a path
+additionally needs the `fs_write` permission. To both persist and react,
+run one job writing the file and a second one tailing it.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -1737,11 +1738,11 @@ maki.fn.jobwait({job_id}, {timeout_ms?})
 ```
 
 Wait for a job to finish and collect its output. Returns a result
-table with `stdout`, `stderr`, `exit_code`, and `truncated`. `truncated`
-is false when the collected lines are the full output; a job that already
-exited answers from its captured tail, so `truncated` is true and the
-output may be missing lines. Returns `nil` if the job does not finish
-before the timeout.
+table with `stdout`, `stderr`, `exit_code`, and `truncated`. A job that
+already exited answers from its captured tail, so `truncated` says
+whether that tail ever lost a line (`tail` too small or 0, or the stream
+redirected away). Waiting on a live job collects every line and is never
+truncated. Returns `nil` if the job does not finish before the timeout.
 
 While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 callbacks fire as events arrive (like Neovim), so you can stream
@@ -1749,6 +1750,11 @@ output into a buffer while parked here. An already-exited
 session-owned job answers from its snapshot and fires no callbacks.
 Task and plugin jobs leave the store on exit, so waiting after that
 is an error.
+
+Waiting parks the caller, so a slot chain cannot call it. From a
+slot, start the job with an `on_exit` that stashes the result in
+your plugin state and pick it back up with `jobfind` next time.
+`maki.api.declare_slot` explains the restriction.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -1806,9 +1812,8 @@ maki.fn.joblist({session?})
 
 List jobs this plugin can see, including exited session-owned jobs (so an
 id started before a reload stays findable). Rows identify the job; call
-`jobinfo` for tails. Passing a session id keeps the rows whose `session`
-field equals it, so only session-scoped jobs can match: plugin and task
-jobs carry no session.
+`jobinfo` for tails. Pass a session id to list only that session's jobs.
+Plugin and task jobs carry no session, so a filter never matches them.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -1837,20 +1842,16 @@ Attach (or replace) callbacks on a job this plugin can see. This is how a
 plugin picks its jobs back up after a reload: unloading drops the Lua
 callbacks of its session-owned jobs, but the processes keep running.
 
-Keys absent from {opts} leave the current callback alone; pass `false` to
-clear one. Attaching `on_exit` to a job that already exited still fires it
-once, with the recorded exit code, so a reload racing the exit cannot lose
-it.
+Keys absent from {opts} leave the current callback alone. Attaching
+`on_exit` to a job that already exited still fires it once, with the
+recorded exit code, so a reload racing the exit cannot lose it.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
 - `{job_id}` (`integer`) Job id, e.g. from `joblist`.
-- `{opts}` (`table`) Callbacks to set: `on_stdout`, `on_stderr`, `on_exit`,
-
-  each a function or `false`.
-
+- `{opts}` (`table`) `on_stdout`, `on_stderr`, `on_exit`: a function, or `false` to clear.
 
 **Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
 
@@ -1878,10 +1879,10 @@ maki.fn.jobattach(id, {
 maki.fn.jobfind({name})
 ```
 
-Find the **live** job of this plugin registered under {name} by
-`jobstart`. Exited jobs never answer, so adopting by name restarts a job
-that died instead of latching onto a corpse; their `name` is still on the
-`joblist` row that explains why they died.
+Find the live job of this plugin that `jobstart` registered under {name}.
+An exited job never answers, so `jobfind(...) or jobstart(...)` restarts a
+job that died instead of adopting its id. The name stays on the `joblist`
+row, which is where you go to see why it died.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
