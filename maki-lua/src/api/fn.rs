@@ -219,7 +219,9 @@ pub(crate) struct CallbackUpdates {
 pub(crate) struct JobStore {
     jobs: HashMap<u32, JobMeta>,
     next_id: u32,
-    completed_order: VecDeque<u32>,
+    /// Exited session jobs per owning plugin, oldest first. Keyed by plugin
+    /// so a chatty one evicts only its own history.
+    completed_order: HashMap<Arc<str>, VecDeque<u32>>,
     /// Id served by the last [`JobStore::next_matching`], so the next scan
     /// starts past it.
     scan_cursor: u32,
@@ -236,7 +238,7 @@ impl JobStore {
         Self {
             jobs: HashMap::new(),
             next_id: 1,
-            completed_order: VecDeque::new(),
+            completed_order: HashMap::new(),
             scan_cursor: 0,
         }
     }
@@ -470,22 +472,37 @@ impl JobStore {
         job.elapsed_secs
             .get_or_insert_with(|| job.started.elapsed().as_secs());
         job.exit_code = Some(code);
-        if matches!(job.owner, JobOwner::Session { .. }) {
-            drop_callbacks(lua, job);
-            self.completed_order.push_back(job_id);
-            while self.completed_order.len() > MAX_COMPLETED_SESSION_JOBS {
-                let oldest = self.completed_order.pop_front().unwrap();
-                if self
-                    .jobs
-                    .get(&oldest)
-                    .is_some_and(|j| j.exit_code.is_some())
-                {
-                    self.remove(lua, oldest, false);
-                }
+        let owner_plugin = match &job.owner {
+            JobOwner::Session { plugin, .. } => {
+                let plugin = Arc::clone(plugin);
+                drop_callbacks(lua, job);
+                Some(plugin)
             }
+            _ => None,
+        };
+        let Some(plugin) = owner_plugin else {
+            self.finish(lua, job_id);
             return;
+        };
+
+        let history = self.completed_order.entry(plugin).or_default();
+        history.push_back(job_id);
+        let evicted: Vec<u32> = if history.len() > MAX_COMPLETED_SESSION_JOBS {
+            history
+                .drain(..history.len() - MAX_COMPLETED_SESSION_JOBS)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for oldest in evicted {
+            if self
+                .jobs
+                .get(&oldest)
+                .is_some_and(|job| job.exit_code.is_some())
+            {
+                self.remove(lua, oldest, false);
+            }
         }
-        self.finish(lua, job_id);
     }
 
     pub fn kill_session(&mut self, lua: &Lua, session: MakiId) {
@@ -499,7 +516,11 @@ impl JobStore {
             self.remove(lua, id, true);
         }
         let remaining: HashSet<u32> = self.jobs.keys().copied().collect();
-        self.completed_order.retain(|id| remaining.contains(id));
+        for history in self.completed_order.values_mut() {
+            history.retain(|id| remaining.contains(id));
+        }
+        self.completed_order
+            .retain(|_, history| !history.is_empty());
     }
 
     /// Drop Lua callbacks for session jobs started by {plugin} without
@@ -591,7 +612,9 @@ impl JobStore {
             return;
         }
         self.remove(lua, job_id, false);
-        self.completed_order.retain(|&id| id != job_id);
+        if let Some(history) = self.completed_order.get_mut(plugin) {
+            history.retain(|&id| id != job_id);
+        }
     }
 
     pub fn kill(&mut self, job_id: u32, task_id: Option<u64>, plugin: &str) {
@@ -2115,7 +2138,7 @@ mod tests {
         store.record_event(1, &event);
         store.complete(&lua, 1, CODE);
         assert_eq!(
-            store.completed_order.len(),
+            store.completed_order[TEST_PLUGIN].len(),
             1,
             "a replayed exit must not re-push the job onto the completed list"
         );
@@ -2190,6 +2213,47 @@ mod tests {
             store
                 .callback_key(1, &JobEvent::Stderr(String::new()))
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn completed_history_is_evicted_per_plugin() {
+        const QUIET_PLUGIN: &str = "quiet-plugin";
+        let lua = Lua::new();
+        let session = MakiId::generate();
+        let mut store = make_store();
+        store.jobs.insert(
+            1,
+            stub_job(
+                JobOwner::Session {
+                    session,
+                    plugin: Arc::from(QUIET_PLUGIN),
+                },
+                None,
+                None,
+            ),
+        );
+        store.complete(&lua, 1, 0);
+
+        let chatty = 2..=(MAX_COMPLETED_SESSION_JOBS as u32 + 2);
+        for id in chatty {
+            store
+                .jobs
+                .insert(id, stub_job(session_owner(session), None, None));
+            store.complete(&lua, id, 0);
+        }
+
+        assert!(
+            store.snapshot(1, None, QUIET_PLUGIN).is_some(),
+            "a chatty plugin must not evict another plugin's history"
+        );
+        assert!(
+            store.snapshot(2, None, TEST_PLUGIN).is_none(),
+            "the chatty plugin evicts its own oldest job"
+        );
+        assert_eq!(
+            store.completed_order[TEST_PLUGIN].len(),
+            MAX_COMPLETED_SESSION_JOBS
         );
     }
 
