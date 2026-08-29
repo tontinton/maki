@@ -6,6 +6,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -158,6 +159,11 @@ struct JobMeta {
     stdout_tail: VecDeque<String>,
     stderr_tail: VecDeque<String>,
     tail_cap: usize,
+    /// Flipped by the wait thread the moment the process is reaped, so
+    /// [`kill_job`] stops signalling a pid the kernel may have handed out
+    /// again. Narrower than `exit_code`, which is only set once the `Exit`
+    /// event reaches the pump.
+    reaped: Arc<AtomicBool>,
     exit_code: Option<i32>,
     /// Recorded at exit so elapsed time stops counting once the process is gone.
     elapsed_secs: Option<u64>,
@@ -312,10 +318,13 @@ impl JobStore {
         let stdout_handle = spawn_reader!(child.stdout.take(), "job-stdout", Stdout);
         let stderr_handle = spawn_reader!(child.stderr.take(), "job-stderr", Stderr);
 
+        let reaped = Arc::new(AtomicBool::new(false));
+        let wait_reaped = Arc::clone(&reaped);
         thread::Builder::new()
             .name("job-wait".into())
             .spawn(move || {
                 let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+                wait_reaped.store(true, Ordering::Release);
                 if let Some(h) = stdout_handle {
                     let _ = h.join();
                 }
@@ -341,6 +350,7 @@ impl JobStore {
                 stdout_tail: VecDeque::new(),
                 stderr_tail: VecDeque::new(),
                 tail_cap: DEFAULT_TAIL,
+                reaped,
                 exit_code: None,
                 elapsed_secs: None,
                 replay_exit: None,
@@ -760,9 +770,12 @@ fn shell_command(cmd: &str) -> Command {
 }
 
 fn kill_job(meta: &mut JobMeta) {
-    // The wait thread already reaped the process, so its pid may have been
-    // recycled. Only signal jobs we know are still alive.
-    if meta.exit_code.is_some() {
+    // Once the process is reaped its pid can be handed to someone else, and
+    // signalling it would hit a stranger's process group. The flag is set by
+    // the wait thread right after `wait` returns, which narrows that window
+    // to a few instructions but does not close it: only a pidfd would, and a
+    // pidfd cannot express `killpg`.
+    if meta.reaped.load(Ordering::Acquire) {
         return;
     }
     let pid = meta.pid;
@@ -1446,6 +1459,7 @@ mod tests {
             stdout_tail: VecDeque::new(),
             stderr_tail: VecDeque::new(),
             tail_cap: DEFAULT_TAIL,
+            reaped: Arc::new(AtomicBool::new(false)),
             exit_code: None,
             elapsed_secs: None,
             replay_exit: None,
