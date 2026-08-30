@@ -661,6 +661,10 @@ pub enum AgentEvent {
     SubagentHistory {
         tool_use_id: String,
         messages: Vec<Message>,
+        /// True when the session closed knowing it failed. `false` leaves the
+        /// verdict to the `ToolDone` that follows in the blocking flow.
+        #[serde(default)]
+        failed: bool,
     },
     ToolSnapshot {
         id: String,

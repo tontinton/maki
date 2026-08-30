@@ -796,7 +796,7 @@ struct SessionState {
 }
 
 impl SessionState {
-    fn close(&mut self) {
+    fn close(&mut self, failed: bool) {
         if self.closed {
             return;
         }
@@ -807,6 +807,7 @@ impl SessionState {
         let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
             tool_use_id: self.ui_id.clone(),
             messages,
+            failed,
         });
         info!(
             name = %self.name,
@@ -825,12 +826,12 @@ struct LuaSession {
 impl Drop for LuaSession {
     fn drop(&mut self) {
         match self.inner.try_lock() {
-            Some(mut s) => s.close(),
+            Some(mut s) => s.close(false),
             // Prompt still in flight: close asynchronously so history
             // and cancel entry are never silently leaked.
             None => {
                 let inner = Arc::clone(&self.inner);
-                smol::spawn(async move { inner.lock().await.close() }).detach();
+                smol::spawn(async move { inner.lock().await.close(false) }).detach();
             }
         }
     }
@@ -976,13 +977,18 @@ async fn prompt(
 /// leaves the work to the Lua garbage collector, which may never run while
 /// the VM sits idle, and the subagent's event relay stays alive until it does.
 ///
+/// @param err string? Pass the failure reason when the run failed, so the session's UI item ends as errored even without a following tool result.
 /// @return
 #[lua_fn]
-async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> {
+async fn close(
+    _lua: Lua,
+    this: mlua::UserDataRef<LuaSession>,
+    err: Option<String>,
+) -> LuaResult<()> {
     let inner = Arc::clone(&this.inner);
     drop(this);
     let mut s = inner.lock().await;
-    s.close();
+    s.close(err.is_some());
     Ok(())
 }
 

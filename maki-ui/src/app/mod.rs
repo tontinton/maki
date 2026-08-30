@@ -1136,14 +1136,21 @@ impl App {
         if let AgentEvent::SubagentHistory {
             tool_use_id,
             messages,
+            failed,
         } = envelope.event
         {
             // Workflow sessions use synthetic ids that no ToolDone will match,
-            // so we finish them here on SubagentHistory. This event only knows
-            // that the transcript closed, so say Unknown and leave the verdict
-            // to the ToolDone that follows elsewhere.
+            // so we finish them here on SubagentHistory. Without a verdict it
+            // only knows that the transcript closed, so say Unknown and leave
+            // the outcome to the ToolDone that follows elsewhere; a detached
+            // (background) session closes with its own verdict.
             if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
-                self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
+                let outcome = if failed {
+                    TaskOutcome::Error
+                } else {
+                    TaskOutcome::Unknown
+                };
+                self.chats[sub_idx].mark_finished(outcome, DONE_TEXT);
             }
             self.detached_subagents.remove(&tool_use_id);
             self.state
@@ -1178,15 +1185,18 @@ impl App {
             self.state
                 .session_mut()
                 .insert_tool_output(e.id.clone(), e.output.clone());
-            if let Some(&sub_idx) = self.chat_index.get(&e.id)
-                && !self.detached_subagents.contains(&e.id)
-            {
-                let (outcome, text) = if e.is_error {
-                    (TaskOutcome::Error, ERROR_TEXT)
-                } else {
-                    (TaskOutcome::Done, DONE_TEXT)
-                };
-                self.chats[sub_idx].mark_finished(outcome, text);
+            if let Some(&sub_idx) = self.chat_index.get(&e.id) {
+                if e.annotation.as_deref() == Some(maki_agent::tools::TASK_HANDOFF_ANNOTATION) {
+                    self.chats[sub_idx].mark_detached();
+                    self.detached_subagents.insert(e.id.clone());
+                } else if !self.detached_subagents.contains(&e.id) {
+                    let (outcome, text) = if e.is_error {
+                        (TaskOutcome::Error, ERROR_TEXT)
+                    } else {
+                        (TaskOutcome::Done, DONE_TEXT)
+                    };
+                    self.chats[sub_idx].mark_finished(outcome, text);
+                }
             }
         }
 
@@ -1304,6 +1314,9 @@ impl App {
             self.detached_subagents.insert(id.clone());
         }
         if let Some(&idx) = self.chat_index.get(id.as_str()) {
+            if subagent.detached {
+                self.chats[idx].mark_detached();
+            }
             return idx;
         }
         let idx = self.chats.len();
@@ -1326,6 +1339,9 @@ impl App {
         chat.model_id = subagent.model.clone();
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
+        }
+        if subagent.detached {
+            chat.mark_detached();
         }
         self.chats.push(chat);
         self.sync_subagents();
@@ -1781,7 +1797,7 @@ impl App {
     /// stay in `chat_index` so Esc on them can still cancel.
     fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str) {
         self.chat_index.retain(|id, &mut sub_idx| {
-            if self.detached_subagents.contains(id) {
+            if self.detached_subagents.contains(id) || self.chats[sub_idx].is_detached() {
                 return true;
             }
             if self.chats[sub_idx].is_finished() {
@@ -1792,6 +1808,13 @@ impl App {
             }
         });
         self.sync_subagents();
+    }
+
+    /// Keeps only the detached (background) subagents routable across the turn
+    /// boundary; their items are still live while newer turns already ran.
+    /// Prunes silently: the janitor already synced the persisted set.
+    fn retain_detached_subagents(&mut self) {
+        self.drop_attached_subagents();
     }
 
     pub fn flush_all_chats(&mut self) {
