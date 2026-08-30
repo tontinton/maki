@@ -2763,9 +2763,11 @@ dependencies = [
 name = "maki-highlight"
 version = "0.5.0"
 dependencies = [
+ "flume 0.11.1",
  "serde_json",
  "syntect",
  "test-case",
+ "tracing",
  "two-face",
 ]
 

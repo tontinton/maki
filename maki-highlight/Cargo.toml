@@ -8,8 +8,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+flume = { workspace = true }
 serde_json = { workspace = true }
 syntect = { workspace = true }
+tracing = { workspace = true }
 two-face = { workspace = true }
 
 [dev-dependencies]

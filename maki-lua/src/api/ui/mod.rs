@@ -161,11 +161,13 @@ async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) ->
         .and_then(|t| t.get::<String>("prefix").ok())
         .unwrap_or_default();
     let segments = smol::unblock(move || {
-        if independent {
-            maki_highlight::highlight_lines_independent(&lang, &code)
-        } else {
-            maki_highlight::highlight_code(&lang, &code, &prefix)
-        }
+        maki_highlight::pool::run(move || {
+            if independent {
+                maki_highlight::highlight_lines_independent(&lang, &code)
+            } else {
+                maki_highlight::highlight_code(&lang, &code, &prefix)
+            }
+        })
     })
     .await;
     segments_to_lua_lines(&lua, &segments)
@@ -187,7 +189,10 @@ async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) ->
 /// end
 #[lua_fn]
 async fn markdown(lua: Lua, text: String, width: u16) -> LuaResult<Table> {
-    let lines = smol::unblock(move || maki_markdown::render::render(&text, width)).await;
+    let lines = smol::unblock(move || {
+        maki_highlight::pool::run(move || maki_markdown::render::render(&text, width))
+    })
+    .await;
     markdown_lines_to_lua(&lua, &lines)
 }
 
