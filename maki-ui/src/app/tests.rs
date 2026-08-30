@@ -1583,6 +1583,29 @@ fn handoff_receipt_before_the_first_envelope_still_detaches() {
     assert_eq!(tasks[1]["status"], serde_json::json!("done"));
 }
 
+#[test]
+fn close_verdict_lands_after_the_spawning_run_goes_stale() {
+    let mut app = streaming_app();
+    handoff_subagent(&mut app, TASK_ID);
+    start_subagent(&mut app, TASK_ID, RESEARCH_NAME);
+    end_turn(&mut app);
+
+    // The session closes minutes later, long after newer runs moved the
+    // current run id on; the stale-run gate must not eat the close.
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentHistory {
+            tool_use_id: TASK_ID.into(),
+            messages: vec![],
+            failed: false,
+        },
+        subagent: None,
+        run_id: app.run_id + 7,
+    })));
+    assert!(app.chats[1].is_finished());
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    assert_eq!(tasks[1]["status"], serde_json::json!("done"));
+}
+
 /// Escaping out of a subagent takes the single-chat cancel path instead of the
 /// sweep over the whole turn, and that path has to land the task in `error`
 /// too, or it spins forever.

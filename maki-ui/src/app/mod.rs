@@ -1122,22 +1122,9 @@ impl App {
             }
             return vec![];
         }
-        if envelope.run_id != self.run_id && envelope.run_id != maki_agent::DETACHED_RUN_ID {
-            // A snapshot dropped here degrades the tool body to llm_output.
-            if let AgentEvent::ToolSnapshot { id, .. }
-            | AgentEvent::ToolHeaderSnapshot { id, .. }
-            | AgentEvent::LiveToolBuf { id, .. } = &envelope.event
-            {
-                tracing::debug!(
-                    tool_id = %id,
-                    event_run_id = envelope.run_id,
-                    current_run_id = self.run_id,
-                    "tool render event dropped: stale run_id"
-                );
-            }
-            return vec![];
-        }
 
+        // A backgrounded session closes long after its spawning run ended,
+        // so the close verdict and transcript skip the stale-run gate.
         if let AgentEvent::SubagentHistory {
             tool_use_id,
             messages,
@@ -1163,6 +1150,22 @@ impl App {
             self.state
                 .session_mut()
                 .set_subagent_messages(tool_use_id, messages);
+            return vec![];
+        }
+
+        if envelope.run_id != self.run_id && envelope.run_id != maki_agent::DETACHED_RUN_ID {
+            // A snapshot dropped here degrades the tool body to llm_output.
+            if let AgentEvent::ToolSnapshot { id, .. }
+            | AgentEvent::ToolHeaderSnapshot { id, .. }
+            | AgentEvent::LiveToolBuf { id, .. } = &envelope.event
+            {
+                tracing::debug!(
+                    tool_id = %id,
+                    event_run_id = envelope.run_id,
+                    current_run_id = self.run_id,
+                    "tool render event dropped: stale run_id"
+                );
+            }
             return vec![];
         }
 
