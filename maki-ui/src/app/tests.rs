@@ -1556,6 +1556,33 @@ fn handoff_failure_lands_as_error_at_close() {
     assert_eq!(tasks[1]["status"], serde_json::json!("error"));
 }
 
+#[test]
+fn handoff_receipt_before_the_first_envelope_still_detaches() {
+    let mut app = streaming_app();
+    handoff_subagent(&mut app, TASK_ID);
+
+    start_subagent(&mut app, TASK_ID, RESEARCH_NAME);
+    assert_eq!(app.chats.len(), 2);
+    assert!(
+        app.chats[1].is_detached(),
+        "a chat born after the receipt must inherit the handoff"
+    );
+
+    end_turn(&mut app);
+    assert!(
+        !app.chats[1].is_finished() && app.chat_index.contains_key(TASK_ID),
+        "turn end must spare a chat detached from a parked receipt"
+    );
+
+    app.update(agent_msg(AgentEvent::SubagentHistory {
+        tool_use_id: TASK_ID.into(),
+        messages: vec![],
+        failed: false,
+    }));
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    assert_eq!(tasks[1]["status"], serde_json::json!("done"));
+}
+
 /// Escaping out of a subagent takes the single-chat cancel path instead of the
 /// sweep over the whole turn, and that path has to land the task in `error`
 /// too, or it spins forever.

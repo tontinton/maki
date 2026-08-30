@@ -258,6 +258,10 @@ pub struct App {
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
+    /// Receipts whose annotated ToolDone beat the session's first envelope:
+    /// the chat does not exist yet, so the handoff is parked here until the
+    /// chat is born.
+    detached_receipts: HashSet<String>,
 }
 
 impl App {
@@ -354,6 +358,7 @@ impl App {
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
+            detached_receipts: HashSet::new(),
         };
         app.model_picker.set_recents(
             maki_storage::model::read_recents(&app.storage)
@@ -1147,6 +1152,8 @@ impl App {
             if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
                 let outcome = if failed {
                     TaskOutcome::Error
+                } else if self.chats[sub_idx].is_detached() {
+                    TaskOutcome::Done
                 } else {
                     TaskOutcome::Unknown
                 };
@@ -1185,18 +1192,25 @@ impl App {
             self.state
                 .session_mut()
                 .insert_tool_output(e.id.clone(), e.output.clone());
-            if let Some(&sub_idx) = self.chat_index.get(&e.id) {
-                if e.annotation.as_deref() == Some(maki_agent::tools::TASK_HANDOFF_ANNOTATION) {
-                    self.chats[sub_idx].mark_detached();
-                    self.detached_subagents.insert(e.id.clone());
-                } else if !self.detached_subagents.contains(&e.id) {
-                    let (outcome, text) = if e.is_error {
-                        (TaskOutcome::Error, ERROR_TEXT)
-                    } else {
-                        (TaskOutcome::Done, DONE_TEXT)
-                    };
-                    self.chats[sub_idx].mark_finished(outcome, text);
+            if e.annotation.as_deref() == Some(maki_agent::tools::TASK_HANDOFF_ANNOTATION) {
+                match self.chat_index.get(&e.id) {
+                    Some(&sub_idx) => {
+                        self.chats[sub_idx].mark_detached();
+                        self.detached_subagents.insert(e.id.clone());
+                    }
+                    None => {
+                        self.detached_receipts.insert(e.id.clone());
+                    }
                 }
+            } else if let Some(&sub_idx) = self.chat_index.get(&e.id)
+                && !self.detached_subagents.contains(&e.id)
+            {
+                let (outcome, text) = if e.is_error {
+                    (TaskOutcome::Error, ERROR_TEXT)
+                } else {
+                    (TaskOutcome::Done, DONE_TEXT)
+                };
+                self.chats[sub_idx].mark_finished(outcome, text);
             }
         }
 
@@ -1340,8 +1354,9 @@ impl App {
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
         }
-        if subagent.detached {
+        if subagent.detached || self.detached_receipts.remove(id) {
             chat.mark_detached();
+            self.detached_subagents.insert(id.clone());
         }
         self.chats.push(chat);
         self.sync_subagents();
@@ -1784,12 +1799,10 @@ impl App {
     fn terminalize_turn(&mut self, message: &str) {
         self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
         self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
-        let detached = self.detached_chat_indices();
-        for (i, chat) in self.chats.iter_mut().enumerate().skip(1) {
-            if detached.contains(&i) {
-                continue;
+        for chat in self.chats.iter_mut().skip(1) {
+            if !chat.is_detached() {
+                chat.fail_in_progress_with_message(message.into());
             }
-            chat.fail_in_progress_with_message(message.into());
         }
     }
 
