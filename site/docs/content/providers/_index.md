@@ -80,7 +80,7 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 
 ### OpenAI
 
-- **Env var**: `OPENAI_API_KEY` (also supports OAuth device flow)
+- **Env var**: `OPENAI_API_KEY` (also supports OAuth via `maki auth login openai`)
 - **API**: `https://api.openai.com/v1`
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
@@ -104,6 +104,8 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Strong | gpt-5.1-codex | $1.25 / $10.00 | 400K ctx / 128K out |
 
 Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), gpt-5.6-sol (strong)
+
+`maki auth login openai` offers device-code login by default. Select browser login to use PKCE and a callback on `localhost:1455`. Tokens refresh automatically.
 
 ### Google
 
