@@ -4742,7 +4742,10 @@ your plugin's colors consistent with the rest of the UI.
 
 - `{name}` (`string`) Semantic color name, e.g. "accent" or "background".
 
-**Returns:** (`string|nil`) "#rrggbb" hex color, or nil if the name is unknown.
+**Returns:** (`string|nil`) "#rrggbb" for a truecolor theme, a palette index as a
+  string like "4" when the theme names an ANSI color, or "default" for the
+  terminal's own color. Nil only when the name is unknown. Every form can be
+  passed straight to a span's `fg`/`bg`.
 
 **Example:**
 
@@ -4764,6 +4767,11 @@ maki.ui.highlight({code}, {lang}, {opts?})
 Syntax-highlights a chunk of source code. Returns a table of styled
 lines that you can feed into a buffer. Each line is a list of
 `{text, style}` spans where style is a `{fg, bold?, italic?, underline?}` table.
+
+`fg` is "#rrggbb" for a truecolor theme, a palette index as a string like
+"4" when the theme names an ANSI color, or "default" for the terminal's own
+color. Pass the span straight to `buf:line` and it resolves correctly in
+every case.
 
 **Parameters:**
 
@@ -5310,8 +5318,11 @@ Buf:line({line})
 Appends a single line to the end of the buffer. You can pass a
 plain string for unstyled text, or a table of `{text, style?}` spans
 for rich content. Style can be a named string like "bold" or
-"keyword", or an inline table `{fg?, bg?, bold?, italic?, underline?, dim?, strikethrough?, reversed?}`
-with "#rrggbb" color strings.
+"keyword", or an inline table `{fg?, bg?, bold?, italic?, underline?, dim?, strikethrough?, reversed?}`.
+Colors accept "#rrggbb", a terminal color name like "blue" or "light-gray",
+or a palette index as a string like "4". Names must be spelled exactly,
+hyphens included. Named and indexed colors are left for the terminal to
+resolve, so they follow the user's palette.
 
 **Parameters:**
 
@@ -5665,10 +5676,10 @@ shown as full source, larger ones as their public interface.
 local M = {}
 
 function M.lerp(from, to, t)
-  local fr, fg, fb = from:match("#(%x%x)(%x%x)(%x%x)")
-  local tr, tg, tb = to:match("#(%x%x)(%x%x)(%x%x)")
+  local fr, fg, fb = from:match("^#(%x%x)(%x%x)(%x%x)$")
+  local tr, tg, tb = to:match("^#(%x%x)(%x%x)(%x%x)$")
   if not fr or not tr then
-    return from
+    return nil
   end
   fr, fg, fb = tonumber(fr, 16), tonumber(fg, 16), tonumber(fb, 16)
   tr, tg, tb = tonumber(tr, 16), tonumber(tg, 16), tonumber(tb, 16)
@@ -5679,8 +5690,8 @@ function M.lerp(from, to, t)
 end
 
 function M.dim(color, factor)
-  local bg = maki.ui.theme_color("background") or "#000000"
-  return M.lerp(color, bg, factor)
+  local bg = maki.ui.theme_color("background")
+  return bg and M.lerp(color, bg, factor)
 end
 
 return M

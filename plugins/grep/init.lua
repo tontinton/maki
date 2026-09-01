@@ -71,11 +71,10 @@ local function dim_spans(spans)
   local result = {}
   for _, span in ipairs(spans) do
     local style = span[2]
-    if type(style) == "table" and style.fg then
-      result[#result + 1] = { span[1], { fg = color.dim(style.fg, DIM_FACTOR) } }
-    else
-      result[#result + 1] = { span[1], "dim" }
-    end
+    local fg = type(style) == "table" and style.fg or nil
+    local faded = fg and color.dim(fg, DIM_FACTOR)
+    -- A palette color has no value to blend, so the terminal dims it instead.
+    result[#result + 1] = faded and { span[1], { fg = faded } } or { span[1], { fg = fg, dim = true } }
   end
   return result
 end

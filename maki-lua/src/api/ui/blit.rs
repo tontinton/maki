@@ -1,4 +1,4 @@
-use maki_agent::types::InlineStyle;
+use maki_agent::types::{InlineStyle, SpanColor};
 use maki_agent::{SnapshotLine, SnapshotSpan, SpanStyle};
 use thiserror::Error;
 use unicode_width::UnicodeWidthStr;
@@ -130,8 +130,8 @@ fn run_span((fg, bg, count): Run, cell: &str) -> SnapshotSpan {
     SnapshotSpan {
         text: cell.repeat(count),
         style: SpanStyle::Inline(InlineStyle {
-            fg: Some(fg),
-            bg,
+            fg: Some(SpanColor::Rgb(fg)),
+            bg: bg.map(SpanColor::Rgb),
             ..InlineStyle::default()
         }),
     }
@@ -147,6 +147,13 @@ mod tests {
     const BLUE: (u8, u8, u8) = (0, 0, 255);
     const WHITE: (u8, u8, u8) = (255, 255, 255);
 
+    fn unwrap_rgb(c: SpanColor) -> Rgb {
+        match c {
+            SpanColor::Rgb(rgb) => rgb,
+            other => panic!("expected rgb, got {other:?}"),
+        }
+    }
+
     fn assert_structure(lines: &[SnapshotLine], w: usize, h: usize) {
         assert_eq!(lines.len(), h.div_ceil(2));
         for line in lines {
@@ -161,7 +168,7 @@ mod tests {
 
     fn style(span: &SnapshotSpan) -> (Option<Rgb>, Option<Rgb>) {
         match &span.style {
-            SpanStyle::Inline(i) => (i.fg, i.bg),
+            SpanStyle::Inline(i) => (i.fg.map(unwrap_rgb), i.bg.map(unwrap_rgb)),
             other => panic!("expected inline style, got {other:?}"),
         }
     }

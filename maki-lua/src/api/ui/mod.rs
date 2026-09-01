@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use humantime::format_duration;
+use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
 use strum::VariantNames;
@@ -93,7 +94,10 @@ fn buf(lua: &Lua) -> LuaResult<buf::BufHandle> {
 /// your plugin's colors consistent with the rest of the UI.
 ///
 /// @param name string Semantic color name, e.g. "accent" or "background".
-/// @return (string|nil) "#rrggbb" hex color, or nil if the name is unknown.
+/// @return (string|nil) "#rrggbb" for a truecolor theme, a palette index as a
+///   string like "4" when the theme names an ANSI color, or "default" for the
+///   terminal's own color. Nil only when the name is unknown. Every form can be
+///   passed straight to a span's `fg`/`bg`.
 /// @example
 /// local accent = maki.ui.theme_color("accent")
 /// if accent then
@@ -101,17 +105,22 @@ fn buf(lua: &Lua) -> LuaResult<buf::BufHandle> {
 /// end
 #[lua_fn]
 fn theme_color(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
-    let Some((r, g, b)) = maki_highlight::theme_color(&name) else {
+    let Some(color) = maki_highlight::theme_color(&name) else {
         return Ok(mlua::Value::Nil);
     };
     Ok(mlua::Value::String(
-        lua.create_string(format!("#{r:02x}{g:02x}{b:02x}"))?,
+        lua.create_string(segment_color_to_lua(color))?,
     ))
 }
 
 /// Syntax-highlights a chunk of source code. Returns a table of styled
 /// lines that you can feed into a buffer. Each line is a list of
 /// `{text, style}` spans where style is a `{fg, bold?, italic?, underline?}` table.
+///
+/// `fg` is "#rrggbb" for a truecolor theme, a palette index as a string like
+/// "4" when the theme names an ANSI color, or "default" for the terminal's own
+/// color. Pass the span straight to `buf:line` and it resolves correctly in
+/// every case.
 ///
 /// @param code string Source text to highlight.
 /// @param lang string Language identifier, e.g. "rust", "python".
@@ -580,6 +589,17 @@ fn parse_title_pos(tbl: &Table) -> TitlePos {
         .unwrap_or_default()
 }
 
+/// Palette colors stay symbolic (`"4"`, `"12"`, `"default"`) so the terminal
+/// picks the actual shade; only true RGB is written as hex. Every spelling
+/// here round-trips back through a span's `fg`/`bg`.
+fn segment_color_to_lua(c: SegmentColor) -> String {
+    match c {
+        SegmentColor::Rgb((r, g, b)) => format!("#{r:02x}{g:02x}{b:02x}"),
+        SegmentColor::Ansi(i) => i.to_string(),
+        SegmentColor::Default => DEFAULT_COLOR_NAME.to_owned(),
+    }
+}
+
 fn segments_to_lua_lines(
     lua: &Lua,
     lines: &[Vec<maki_highlight::StyledSegment>],
@@ -591,8 +611,7 @@ fn segments_to_lua_lines(
             let span = lua.create_table_with_capacity(2, 0)?;
             span.raw_set(1, seg.text.as_str())?;
             let style = lua.create_table_with_capacity(0, 4)?;
-            let (r, g, b) = seg.fg;
-            style.raw_set("fg", format!("#{r:02x}{g:02x}{b:02x}"))?;
+            style.raw_set("fg", segment_color_to_lua(seg.fg))?;
             if seg.bold {
                 style.raw_set("bold", true)?;
             }
@@ -631,7 +650,7 @@ fn span_style_to_lua(lua: &Lua, span: &maki_markdown::render::Span) -> LuaResult
             underline,
         } => {
             let tbl = lua.create_table()?;
-            tbl.set("fg", format!("#{:02x}{:02x}{:02x}", fg.0, fg.1, fg.2))?;
+            tbl.set("fg", segment_color_to_lua(*fg))?;
             if *bold {
                 tbl.set("bold", true)?;
             }
@@ -875,7 +894,7 @@ mod tests {
     fn seg(text: &str, bold: bool) -> StyledSegment {
         StyledSegment {
             text: text.into(),
-            fg: (255, 128, 0),
+            fg: SegmentColor::Rgb((255, 128, 0)),
             bold,
             italic: false,
             underline: false,
@@ -1133,7 +1152,7 @@ mod tests {
     fn seg_full(text: &str, bold: bool, italic: bool, underline: bool) -> StyledSegment {
         StyledSegment {
             text: text.into(),
-            fg: (255, 128, 0),
+            fg: SegmentColor::Rgb((255, 128, 0)),
             bold,
             italic,
             underline,
@@ -1258,7 +1277,7 @@ mod tests {
             let span = maki_markdown::render::Span {
                 text: "tok".into(),
                 style: maki_markdown::render::StyleToken::Highlight {
-                    fg: (255, 128, 0),
+                    fg: SegmentColor::Rgb((255, 128, 0)),
                     bold,
                     italic,
                     underline,

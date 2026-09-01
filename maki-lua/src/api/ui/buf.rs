@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use maki_agent::types::InlineStyle;
+use maki_agent::types::{DefaultColor, InlineStyle, SpanColor};
 use maki_agent::{SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
+use maki_highlight::SegmentColor;
 use maki_lua_macro::{lua_class, lua_fn};
 use mlua::{Function, Lua, Result as LuaResult, Table, Value as LuaValue};
 
-use super::blit;
+use super::{blit, segment_color_to_lua};
 use crate::runtime::{TaskHandle, lock_cell};
 
 /// `live_buf` tracks the first buffer a handler creates, the one
@@ -149,8 +150,11 @@ pub(crate) fn buf_from_reply(val: &LuaValue) -> Option<Arc<SharedBuf>> {
 /// Appends a single line to the end of the buffer. You can pass a
 /// plain string for unstyled text, or a table of `{text, style?}` spans
 /// for rich content. Style can be a named string like "bold" or
-/// "keyword", or an inline table `{fg?, bg?, bold?, italic?, underline?, dim?, strikethrough?, reversed?}`
-/// with "#rrggbb" color strings.
+/// "keyword", or an inline table `{fg?, bg?, bold?, italic?, underline?, dim?, strikethrough?, reversed?}`.
+/// Colors accept "#rrggbb", a terminal color name like "blue" or "light-gray",
+/// or a palette index as a string like "4". Names must be spelled exactly,
+/// hyphens included. Named and indexed colors are left for the terminal to
+/// resolve, so they follow the user's palette.
 ///
 /// @param line string|table Plain string, or a sequence of spans: `{ {text, style?}, ... }`.
 /// @return
@@ -425,10 +429,10 @@ fn parse_style(val: &LuaValue) -> LuaResult<SpanStyle> {
         LuaValue::Table(t) => {
             let mut inline = InlineStyle::default();
             if let Ok(LuaValue::String(s)) = t.raw_get::<LuaValue>("fg") {
-                inline.fg = parse_hex_color(&s.to_str().map_err(mlua::Error::external)?);
+                inline.fg = parse_span_color(&s.to_str().map_err(mlua::Error::external)?);
             }
             if let Ok(LuaValue::String(s)) = t.raw_get::<LuaValue>("bg") {
-                inline.bg = parse_hex_color(&s.to_str().map_err(mlua::Error::external)?);
+                inline.bg = parse_span_color(&s.to_str().map_err(mlua::Error::external)?);
             }
             inline.bold = t.raw_get::<bool>("bold").unwrap_or(false);
             inline.italic = t.raw_get::<bool>("italic").unwrap_or(false);
@@ -465,11 +469,11 @@ fn span_to_lua(lua: &Lua, span: &SnapshotSpan) -> LuaResult<Table> {
 
 fn inline_to_lua(lua: &Lua, inline: &InlineStyle) -> LuaResult<Table> {
     let tbl = lua.create_table()?;
-    if let Some(rgb) = inline.fg {
-        tbl.raw_set("fg", hex_color(rgb))?;
+    if let Some(c) = inline.fg {
+        tbl.raw_set("fg", segment_color_to_lua(segment_color_from_span(c)))?;
     }
-    if let Some(rgb) = inline.bg {
-        tbl.raw_set("bg", hex_color(rgb))?;
+    if let Some(c) = inline.bg {
+        tbl.raw_set("bg", segment_color_to_lua(segment_color_from_span(c)))?;
     }
     for (key, on) in [
         ("bold", inline.bold),
@@ -486,19 +490,23 @@ fn inline_to_lua(lua: &Lua, inline: &InlineStyle) -> LuaResult<Table> {
     Ok(tbl)
 }
 
-fn hex_color((r, g, b): (u8, u8, u8)) -> String {
-    format!("#{r:02x}{g:02x}{b:02x}")
+/// Plugins speak the same `#rrggbb | index | name | default` grammar as
+/// themes, so both directions go through [`SegmentColor`] and cannot drift.
+/// The orphan rule rules out `From`, both types are foreign here.
+fn parse_span_color(s: &str) -> Option<SpanColor> {
+    Some(match SegmentColor::parse(s)? {
+        SegmentColor::Rgb(rgb) => SpanColor::Rgb(rgb),
+        SegmentColor::Ansi(i) => SpanColor::Ansi(i),
+        SegmentColor::Default => SpanColor::Default(DefaultColor::Default),
+    })
 }
 
-fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
-    let s = s.strip_prefix('#')?;
-    if s.len() != 6 {
-        return None;
+fn segment_color_from_span(c: SpanColor) -> SegmentColor {
+    match c {
+        SpanColor::Rgb(rgb) => SegmentColor::Rgb(rgb),
+        SpanColor::Ansi(i) => SegmentColor::Ansi(i),
+        SpanColor::Default(_) => SegmentColor::Default,
     }
-    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-    Some((r, g, b))
 }
 
 #[cfg(test)]
@@ -570,7 +578,7 @@ mod tests {
     #[test_case("#ff000000", None               ; "too_long_8_digits")]
     #[test_case("",        None                 ; "empty_string")]
     fn hex_color_parsing(input: &str, expected: Option<(u8, u8, u8)>) {
-        assert_eq!(parse_hex_color(input), expected);
+        assert_eq!(parse_span_color(input), expected.map(SpanColor::Rgb));
     }
 
     fn test_lua() -> mlua::Lua {
@@ -645,7 +653,7 @@ mod tests {
         let style = parse_style(&LuaValue::Table(t)).unwrap();
         match style {
             SpanStyle::Inline(ref i) => {
-                assert_eq!(i.fg, Some((255, 128, 0)));
+                assert_eq!(i.fg, Some(SpanColor::Rgb((255, 128, 0))));
                 assert!(i.bold);
                 assert!(i.dim);
                 assert!(!i.italic);
@@ -744,7 +752,7 @@ mod tests {
         assert_eq!(snap.lines[0].spans[0].text, "ERROR");
         match &snap.lines[0].spans[0].style {
             SpanStyle::Inline(i) => {
-                assert_eq!(i.fg, Some((255, 0, 0)));
+                assert_eq!(i.fg, Some(SpanColor::Rgb((255, 0, 0))));
                 assert!(i.bold);
             }
             other => panic!("expected inline style, got {other:?}"),
@@ -845,8 +853,8 @@ mod tests {
         assert_eq!(
             lines[2].spans[0].style,
             SpanStyle::Inline(InlineStyle {
-                fg: Some((255, 128, 0)),
-                bg: Some((0, 17, 34)),
+                fg: Some(SpanColor::Rgb((255, 128, 0))),
+                bg: Some(SpanColor::Rgb((0, 17, 34))),
                 bold: true,
                 dim: true,
                 ..InlineStyle::default()
@@ -1051,5 +1059,35 @@ mod tests {
         // line + 2x lines + set_lines = 4; the recursive append was dropped.
         let changes: i64 = lua.globals().get("changes").unwrap();
         assert_eq!(changes, 4);
+    }
+}
+
+#[cfg(test)]
+mod palette_roundtrip {
+    use super::*;
+    use test_case::test_case;
+
+    #[test_case("light-blue", SpanColor::Ansi(12); "name")]
+    #[test_case("4", SpanColor::Ansi(4); "index")]
+    #[test_case("default", SpanColor::Default(DefaultColor::Default); "terminal default")]
+    #[test_case("#6fb3d2", SpanColor::Rgb((0x6f, 0xb3, 0xd2)); "hex")]
+    fn accepted_color_spellings(input: &str, expected: SpanColor) {
+        assert_eq!(parse_span_color(input), Some(expected));
+    }
+
+    #[test_case("lightgray"; "missing separator")]
+    #[test_case("LIGHT-GRAY"; "uppercase")]
+    #[test_case("+4"; "signed index")]
+    #[test_case("256"; "index out of range")]
+    fn rejected_color_spellings(name: &str) {
+        assert_eq!(parse_span_color(name), None);
+    }
+
+    #[test_case(SpanColor::Ansi(4); "palette index")]
+    #[test_case(SpanColor::Default(DefaultColor::Default); "terminal default")]
+    #[test_case(SpanColor::Rgb((0x6f, 0xb3, 0xd2)); "rgb")]
+    fn colors_survive_the_lua_round_trip(color: SpanColor) {
+        let text = segment_color_to_lua(segment_color_from_span(color));
+        assert_eq!(parse_span_color(&text), Some(color));
     }
 }
