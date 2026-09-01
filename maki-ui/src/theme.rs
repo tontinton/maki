@@ -665,7 +665,7 @@ fn build_syntax_theme(
 }
 
 impl Theme {
-    fn from_toml(toml_str: &str) -> Result<Self, String> {
+    pub(crate) fn from_toml(toml_str: &str) -> Result<Self, String> {
         let full_table: toml::Table = toml::from_str(toml_str).map_err(|e| e.to_string())?;
 
         let raw_palette: HashMap<String, String> = full_table
