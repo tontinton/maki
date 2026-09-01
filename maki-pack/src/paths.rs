@@ -16,6 +16,19 @@ pub fn package_root(site: &Path, name: &str) -> PathBuf {
     site.join("pack").join(MANAGED_GROUP).join(name)
 }
 
+/// `<site>/pack/core/.<name>.removing`, where a package root is parked before it
+/// is deleted.
+///
+/// A package name can never start with a dot, so a delete that dies half way
+/// leaves something unreachable instead of a gutted package the next session
+/// would load. The suffix keeps it clear of `.locks`, which a package named
+/// `locks` would otherwise land on.
+pub fn package_trash(site: &Path, name: &str) -> PathBuf {
+    site.join("pack")
+        .join(MANAGED_GROUP)
+        .join(format!(".{name}.removing"))
+}
+
 /// `<site>/pack/core/<name>/<sha>`, the directory a session actually loads.
 pub fn revision_dir(site: &Path, name: &str, sha: &str) -> PathBuf {
     package_root(site, name).join(sha)
@@ -91,6 +104,18 @@ mod tests {
         assert!(
             !lock.starts_with(package_root(&site(), name)),
             "a lock inside the directory it guards would be removed with it"
+        );
+    }
+
+    #[test]
+    fn package_trash_can_never_be_mistaken_for_a_package_or_the_lock_dir() {
+        let trash = package_trash(&site(), "demo");
+        assert_eq!(trash.parent(), package_root(&site(), "demo").parent());
+        let name = trash.file_name().unwrap().to_str().unwrap();
+        assert!(!crate::spec::name_is_safe(name));
+        assert_ne!(
+            package_trash(&site(), "locks"),
+            revision_lock_dir(&site(), "locks").parent().unwrap()
         );
     }
 

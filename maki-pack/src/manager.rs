@@ -405,6 +405,11 @@ impl Manager {
     ///
     /// Every revision lock is taken before anything is deleted, so a live
     /// session holding one leaves the package whole rather than half removed.
+    ///
+    /// The root is parked aside before it is emptied. A recursive delete can
+    /// die half way through, and the rename is the only step that is all or
+    /// nothing, so it is what keeps the lockfile from ever pointing at a gutted
+    /// directory.
     pub fn remove(&self, name: &str, lock: &mut Lockfile) -> Result<(), ManagerError> {
         self.check_name(name, "")?;
         let _package_guard = Lock::acquire(&paths::package_lock(&self.site, name))?;
@@ -418,18 +423,21 @@ impl Manager {
             .map(|revision| Lock::acquire(&paths::revision_lock(&self.site, name, revision)))
             .collect::<Result<Vec<_>, _>>()?;
         let root = paths::package_root(&self.site, name);
-        match fs::remove_dir_all(&root) {
+        let trash = paths::package_trash(&self.site, name);
+        // An earlier delete may have died holding this name, and a rename onto a
+        // non-empty directory fails.
+        let _ = fs::remove_dir_all(&trash);
+        match fs::rename(&root, &trash) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => return Err(ManagerError::Io { path: root, source }),
         }
+        discard(&trash, "package files");
         drop(revision_guards);
-        let lock_dir = paths::revision_lock_dir(&self.site, name);
-        if let Err(source) = fs::remove_dir_all(&lock_dir)
-            && source.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(path = %lock_dir.display(), %source, "could not remove package revision locks");
-        }
+        discard(
+            &paths::revision_lock_dir(&self.site, name),
+            "package revision locks",
+        );
         lock.remove(name);
         Ok(())
     }
@@ -679,6 +687,17 @@ fn remote_branch_ref(rev: &str) -> Option<String> {
         return Some(format!("{REMOTE_PREFIX}{name}"));
     }
     (!rev.starts_with("refs/") && rev != "HEAD").then(|| format!("{REMOTE_PREFIX}{rev}"))
+}
+
+/// Drops bytes nothing points at any more. Callers reach here once the package
+/// is gone for every reader, so leftovers are worth a line in the log but not
+/// worth failing a removal that already succeeded.
+fn discard(path: &Path, what: &str) {
+    if let Err(source) = fs::remove_dir_all(path)
+        && source.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %path.display(), %source, "could not remove {what}");
+    }
 }
 
 /// A revision directory name. Revisions are recorded from `git rev-parse`, so a
@@ -1610,6 +1629,26 @@ mod tests {
         manager.remove("demo", &mut lock).unwrap();
 
         assert!(lock.get("demo").is_none());
+    }
+
+    /// A delete that died half way leaves a parked root behind, and the next
+    /// removal needs that same name to rename onto.
+    #[test]
+    fn deletion_clears_a_leftover_from_an_earlier_failed_delete() {
+        let dir = site();
+        let manager = Manager::new(dir.path());
+        let mut lock = Lockfile::default();
+        lock.record("demo", "https://example.com/demo", TEST_REV);
+        let revision = paths::revision_dir(dir.path(), "demo", TEST_REV);
+        fs::create_dir_all(&revision).unwrap();
+        fs::write(revision.join("init.lua"), "return {}").unwrap();
+        let leftover = paths::package_trash(dir.path(), "demo");
+        fs::create_dir_all(leftover.join("stale")).unwrap();
+
+        manager.remove("demo", &mut lock).unwrap();
+
+        assert!(!paths::package_root(dir.path(), "demo").exists());
+        assert!(!leftover.exists());
     }
 
     #[test]
