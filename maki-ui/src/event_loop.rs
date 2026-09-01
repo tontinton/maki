@@ -29,8 +29,9 @@ use maki_lua::session_snapshot::{
     SessionSnapshot,
 };
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionEndReason,
-    SessionRequest, TaskRequest, UiAction, UiAttachment, UiReply,
+    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, PackCommand,
+    PackPreparation, SessionEndReason, SessionRequest, TaskRequest, UiAction, UiAttachment,
+    UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -444,19 +445,14 @@ pub(crate) struct EventLoop<'t> {
     warn_tx: flume::Sender<String>,
     ui_action_rx: flume::Receiver<UiAction>,
     ui_attachment: UiAttachment,
-    pack_tx: flume::Sender<PackOutcome>,
-    pack_rx: flume::Receiver<PackOutcome>,
+    pack_tx: flume::Sender<Box<PackPreparation>>,
+    pack_rx: flume::Receiver<Box<PackPreparation>>,
     /// One package command at a time. The work runs on its own thread, so
     /// without this a second `/packupdate` would race the first over the same
     /// clones and locks.
     pack_running: bool,
     _model_fetch_task: smol::Task<()>,
 }
-
-/// Which session asked, and what preparing its command produced. Named rather
-/// than indexed: preparation outlives a `remove_runtime` that shifts every
-/// index after it, and a misrouted plan is a plan nobody applies.
-type PackOutcome = (MakiId, Box<maki_lua::PackPreparation>);
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
 /// means the wait timed out (animation/idle tick).
@@ -467,7 +463,7 @@ enum Wake {
     Agent(usize, Box<maki_agent::Envelope>),
     Shell(usize, ShellEvent),
     Warn(String),
-    Pack(PackOutcome),
+    Pack(Box<PackPreparation>),
 }
 
 struct BackgroundModels {
@@ -781,7 +777,7 @@ impl<'t> EventLoop<'t> {
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
-            Wake::Pack((id, preparation)) => self.finish_pack(id, *preparation),
+            Wake::Pack(preparation) => self.finish_pack(*preparation),
         }
         Ok(())
     }
@@ -1599,14 +1595,13 @@ impl<'t> EventLoop<'t> {
     /// Preparation fetches over the network through a git child process nothing
     /// here can cancel. Inline it would freeze drawing and input for as long as
     /// the slowest remote takes, so the answer comes back as an event instead.
-    fn start_pack(&mut self, idx: usize, command: maki_lua::PackCommand) {
+    fn start_pack(&mut self, idx: usize, command: PackCommand) {
         if self.pack_running {
             self.sessions[idx].app.flash(PACK_BUSY_ERR.to_owned());
             return;
         }
         self.pack_running = true;
         self.sessions[idx].app.flash(PACK_PREPARING.to_owned());
-        let id = self.sessions[idx].id();
         let handle = self.ctx.lua_event_handle.clone();
         let tx = self.pack_tx.clone();
         std::thread::spawn(move || {
@@ -1615,22 +1610,20 @@ impl<'t> EventLoop<'t> {
             // later package command reports "already running".
             let preparation = catch_unwind(AssertUnwindSafe(|| match handle.package_context() {
                 Ok(context) => maki_lua::prepare_pack_command(&command, &context),
-                Err(error) => maki_lua::PackPreparation::failed(error),
+                Err(error) => PackPreparation::failed(error),
             }))
-            .unwrap_or_else(|_| maki_lua::PackPreparation::failed(PACK_PANIC_ERR.to_owned()));
-            let _ = tx.send((id, Box::new(preparation)));
+            .unwrap_or_else(|_| PackPreparation::failed(PACK_PANIC_ERR.to_owned()));
+            let _ = tx.send(Box::new(preparation));
         });
     }
 
-    /// A session closed while its command ran drops the result: the plan is
-    /// only ever applied by leaving the TUI, and there is no TUI left to leave.
-    fn finish_pack(&mut self, id: MakiId, preparation: maki_lua::PackPreparation) {
+    /// The answer lands on the focused session, not on the one that asked: a
+    /// package command reloads the whole Lua host, and only the focused session
+    /// is read for an exit request or seen by whoever answers the review.
+    fn finish_pack(&mut self, preparation: PackPreparation) {
         self.pack_running = false;
-        let Some(idx) = self.position(id) else {
-            return;
-        };
-        let actions = self.sessions[idx].app.handle_pack_preparation(preparation);
-        self.dispatch(idx, actions);
+        let actions = self.focused_app().handle_pack_preparation(preparation);
+        self.dispatch(self.focused, actions);
     }
 
     fn refresh_models(&self) {
