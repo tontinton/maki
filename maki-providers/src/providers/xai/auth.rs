@@ -1,22 +1,18 @@
-use std::io::{self, Write};
-use std::net::TcpListener;
+use std::io;
 use std::path::PathBuf;
 use std::str;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use isahc::ReadResponseExt;
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, now_millis, save_tokens};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tracing::{debug, error, warn};
 
 use crate::AgentError;
+use crate::providers::oauth_loopback::{self, LoginMethod, Loopback};
 use crate::providers::{KeyPool, ResolvedAuth, refreshed_tokens, urlenc};
 
 use super::catalog;
@@ -25,12 +21,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_TIMEOUT: Duration = Duration::from_secs(300);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
-const ACCEPT_POLL: Duration = Duration::from_millis(100);
 const DEFAULT_EXPIRES_SECS: u64 = 3600;
 const GROK_CLI_DEFAULT_TTL_MS: u64 = 6 * 60 * 60 * 1000;
 const MS_THRESHOLD: f64 = 10_000_000_000.0;
 
 pub(crate) const PROVIDER: &str = "xai";
+const DISPLAY_NAME: &str = "xAI";
 pub(crate) const API_KEY_ENV: &str = "XAI_API_KEY";
 pub(crate) const TOKEN_AUTH: &str = "xai-grok-cli";
 pub(crate) const AUTHENTICATE_RESPONSE: &str = "authenticate-response";
@@ -62,9 +58,6 @@ const NOT_AUTHENTICATED: &str = "not authenticated, run `maki auth login xai` or
 const DEVICE_TIMEOUT: &str = "xAI device authorization timed out";
 const DEVICE_DENIED: &str = "xAI device authorization was denied";
 const DEVICE_EXPIRED: &str = "xAI device authorization expired; run `maki auth login xai` again";
-const CALLBACK_TIMEOUT_MSG: &str = "timed out waiting for xAI OAuth callback";
-const STATE_MISMATCH: &str = "xAI authorization failed: state mismatch";
-const RAW_CODE_MSG: &str = "raw xAI authorization codes are not accepted; paste the complete redirect URL containing both code and state";
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -245,7 +238,7 @@ pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
 pub fn login(dir: &StateDir) -> Result<(), AgentError> {
     if let Some(existing) = grok_cli_credentials() {
         println!("Found official Grok CLI credentials in ~/.grok/auth.json.");
-        let answer = prompt("Use them instead of a new xAI OAuth login? [Y/n] ")?;
+        let answer = oauth_loopback::prompt("Use them instead of a new xAI OAuth login? [Y/n] ")?;
         if answer.is_empty() || answer.to_ascii_lowercase().starts_with('y') {
             match ensure_fresh(existing) {
                 Ok(tokens) => return finish_login(dir, tokens),
@@ -259,7 +252,7 @@ pub fn login(dir: &StateDir) -> Result<(), AgentError> {
         }
     }
 
-    let method = select_login_method()?;
+    let method = oauth_loopback::select_login_method(DISPLAY_NAME)?;
     let tokens = match method {
         LoginMethod::Device => device_login()?,
         LoginMethod::Browser => browser_login()?,
@@ -301,60 +294,6 @@ fn ensure_fresh(tokens: OAuthTokens) -> Result<OAuthTokens, AgentError> {
         return Ok(tokens);
     }
     refresh_tokens(&tokens)
-}
-
-enum LoginMethod {
-    Browser,
-    Device,
-}
-
-fn prefer_device() -> bool {
-    env::var_os("SSH_CONNECTION").is_some()
-        || env::var_os("SSH_CLIENT").is_some()
-        || env::var_os("SSH_TTY").is_some()
-        || env::var_os("WSL_DISTRO_NAME").is_some()
-        || env::var_os("WSL_INTEROP").is_some()
-        || env::var_os("container").is_some()
-        || env::var_os("KUBERNETES_SERVICE_HOST").is_some()
-        || env::var_os("CODESPACES").is_some()
-        || env::var_os("REMOTE_CONTAINERS").is_some()
-        || env::var_os("DEVCONTAINER").is_some()
-        || !io::IsTerminal::is_terminal(&io::stdin())
-}
-
-fn select_login_method() -> Result<LoginMethod, AgentError> {
-    let default_device = prefer_device();
-    println!("xAI login method:");
-    if default_device {
-        println!("  1. Browser login");
-        println!("  2. Device code login (recommended for this session)");
-    } else {
-        println!("  1. Browser login (default)");
-        println!("  2. Device code login (remote/headless)");
-    }
-    let answer = prompt("Select [1-2]: ")?;
-    match answer.as_str() {
-        "" if default_device => Ok(LoginMethod::Device),
-        "" | "1" | "browser" => Ok(LoginMethod::Browser),
-        "2" | "device" => Ok(LoginMethod::Device),
-        _ => Err(AgentError::Config {
-            message: "invalid xAI login method".into(),
-        }),
-    }
-}
-
-fn prompt(message: &str) -> Result<String, AgentError> {
-    print!("{message}");
-    io::stdout().flush().map_err(|e| AgentError::Config {
-        message: format!("prompt: {e}"),
-    })?;
-    let mut line = String::new();
-    io::stdin()
-        .read_line(&mut line)
-        .map_err(|e| AgentError::Config {
-            message: format!("prompt: {e}"),
-        })?;
-    Ok(line.trim().to_string())
 }
 
 fn device_login() -> Result<OAuthTokens, AgentError> {
@@ -518,12 +457,18 @@ fn poll_device_token(device: &DeviceCodeResponse) -> Result<OAuthTokens, AgentEr
 }
 
 fn browser_login() -> Result<OAuthTokens, AgentError> {
-    let (verifier, challenge) = pkce_pair()?;
-    let state = random_token()?;
-    let nonce = random_token()?;
-    let listener = bind_callback()?;
-    let port = listener.local_addr()?.port();
-    let redirect_uri = format!("http://{REDIRECT_HOST}:{port}{REDIRECT_PATH}");
+    let (verifier, challenge) = oauth_loopback::pkce_pair()?;
+    let state = oauth_loopback::random_token()?;
+    let nonce = oauth_loopback::random_token()?;
+    let server = Loopback {
+        port: REDIRECT_PORT,
+        fallback_to_ephemeral: true,
+        path: REDIRECT_PATH,
+        timeout: CALLBACK_TIMEOUT,
+        paste_fallback: true,
+    }
+    .bind()?;
+    let redirect_uri = format!("http://{REDIRECT_HOST}:{}{REDIRECT_PATH}", server.port());
 
     let authorize_url = format!(
         "{AUTHORIZE_URL}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}&nonce={}",
@@ -542,7 +487,7 @@ fn browser_login() -> Result<OAuthTokens, AgentError> {
     println!("Waiting for xAI OAuth callback on {redirect_uri}...");
     println!("If the redirect cannot reach this process, paste the complete redirect URL below.");
 
-    let callback = wait_for_callback(listener, &state)?;
+    let callback = server.wait(&state)?;
     if let Some(error) = callback.error {
         return Err(AgentError::Config {
             message: format!("xAI authorization failed: {error}"),
@@ -567,215 +512,6 @@ fn browser_login() -> Result<OAuthTokens, AgentError> {
     }
     let token_resp: TokenResponse = serde_json::from_str(&body_text)?;
     into_oauth_tokens(token_resp, None)
-}
-
-#[derive(Debug)]
-struct CallbackResult {
-    code: Option<String>,
-    error: Option<String>,
-}
-
-fn bind_callback() -> Result<TcpListener, AgentError> {
-    TcpListener::bind((REDIRECT_HOST, REDIRECT_PORT))
-        .or_else(|_| TcpListener::bind((REDIRECT_HOST, 0)))
-        .and_then(|listener| {
-            listener.set_nonblocking(true)?;
-            Ok(listener)
-        })
-        .map_err(|e| AgentError::Config {
-            message: format!("xAI OAuth callback server: {e}"),
-        })
-}
-
-fn wait_for_callback(
-    listener: TcpListener,
-    expected_state: &str,
-) -> Result<CallbackResult, AgentError> {
-    let deadline = Instant::now() + CALLBACK_TIMEOUT;
-    let paste_rx = spawn_paste_reader();
-    loop {
-        if Instant::now() >= deadline {
-            return Err(AgentError::Config {
-                message: CALLBACK_TIMEOUT_MSG.into(),
-            });
-        }
-        if let Ok(pasted) = paste_rx.try_recv() {
-            return parse_callback_input(&pasted, expected_state);
-        }
-
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let mut buf = [0u8; 4096];
-                stream.set_nonblocking(false).ok();
-                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]);
-                let Some(target) = request.split_whitespace().nth(1) else {
-                    continue;
-                };
-                if !target.starts_with(REDIRECT_PATH) {
-                    let _ = write_http(&mut stream, 404, "text/plain; charset=utf-8", "Not found");
-                    continue;
-                }
-                match parse_callback_target(target, expected_state) {
-                    Ok(result) => {
-                        let html = if result.error.is_some() {
-                            "<html><body><h1>xAI authorization failed.</h1>You can close this tab.</body></html>"
-                        } else {
-                            "<html><body><h1>xAI authorization received.</h1>You can close this tab.</body></html>"
-                        };
-                        let _ = write_http(&mut stream, 200, "text/html; charset=utf-8", html);
-                        return Ok(result);
-                    }
-                    Err(_) => {
-                        let _ = write_http(
-                            &mut stream,
-                            400,
-                            "text/html; charset=utf-8",
-                            "<html><body><h1>xAI authorization state mismatch.</h1>Please return to maki and try again.</body></html>",
-                        );
-                    }
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(ACCEPT_POLL);
-            }
-            Err(e) => {
-                return Err(AgentError::Config {
-                    message: format!("xAI OAuth callback: {e}"),
-                });
-            }
-        }
-    }
-}
-
-fn spawn_paste_reader() -> mpsc::Receiver<String> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        loop {
-            let mut line = String::new();
-            match io::stdin().read_line(&mut line) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {
-                    let pasted = line.trim().to_string();
-                    if !pasted.is_empty() && tx.send(pasted).is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-    });
-    rx
-}
-
-fn write_http(
-    stream: &mut impl Write,
-    status: u16,
-    content_type: &str,
-    body: &str,
-) -> io::Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        if status == 200 {
-            "OK"
-        } else if status == 404 {
-            "Not Found"
-        } else {
-            "Bad Request"
-        },
-        body.len(),
-    )
-}
-
-fn parse_callback_target(target: &str, expected_state: &str) -> Result<CallbackResult, AgentError> {
-    let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
-    parse_callback_query(query, expected_state)
-}
-
-fn parse_callback_input(input: &str, expected_state: &str) -> Result<CallbackResult, AgentError> {
-    let value = input.trim();
-    if value.is_empty() {
-        return Err(AgentError::Config {
-            message: "empty xAI OAuth callback".into(),
-        });
-    }
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        && value.len() >= 20
-    {
-        return Err(AgentError::Config {
-            message: RAW_CODE_MSG.into(),
-        });
-    }
-    let query = if let Some(idx) = value.find('?') {
-        &value[idx + 1..]
-    } else if value.contains('=') {
-        value
-    } else {
-        return Err(AgentError::Config {
-            message: "ignored pasted xAI OAuth input because it was not a complete redirect URL"
-                .into(),
-        });
-    };
-    parse_callback_query(query, expected_state)
-}
-
-fn parse_callback_query(query: &str, expected_state: &str) -> Result<CallbackResult, AgentError> {
-    let mut code = None;
-    let mut state = None;
-    let mut error = None;
-    for pair in query.split('&') {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        let decoded = percent_decode(value);
-        match key {
-            "code" => code = Some(decoded),
-            "state" => state = Some(decoded),
-            "error" => error = Some(decoded),
-            _ => {}
-        }
-    }
-    if state.as_deref() != Some(expected_state) {
-        return Err(AgentError::Config {
-            message: STATE_MISMATCH.into(),
-        });
-    }
-    Ok(CallbackResult { code, error })
-}
-
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && let Some(hex) = bytes.get(i + 1..i + 3).and_then(|b| str::from_utf8(b).ok())
-            && let Ok(value) = u8::from_str_radix(hex, 16)
-        {
-            out.push(value);
-            i += 3;
-            continue;
-        }
-        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn pkce_pair() -> Result<(String, String), AgentError> {
-    let verifier = random_token()?;
-    let digest = Sha256::digest(verifier.as_bytes());
-    let challenge = URL_SAFE_NO_PAD.encode(digest);
-    Ok((verifier, challenge))
-}
-
-fn random_token() -> Result<String, AgentError> {
-    let mut buf = [0u8; 32];
-    getrandom::fill(&mut buf).map_err(|e| AgentError::Config {
-        message: format!("CSPRNG unavailable: {e}"),
-    })?;
-    Ok(URL_SAFE_NO_PAD.encode(buf))
 }
 
 pub(crate) fn grok_cli_credentials() -> Option<OAuthTokens> {
@@ -925,33 +661,6 @@ mod tests {
     #[test_case("https://auth.x.ai/device?code=secret-code", "secret-code", false)]
     fn verification_uri_validation(uri: &str, secret: &str, expected: bool) {
         assert_eq!(valid_verification_uri(uri, secret), expected);
-    }
-
-    #[test]
-    fn callback_query_requires_matching_state() {
-        let err = parse_callback_query("code=abc&state=other", "expected").unwrap_err();
-        assert_eq!(err.to_string(), STATE_MISMATCH);
-    }
-
-    #[test]
-    fn callback_query_accepts_code_and_state() {
-        let result = parse_callback_query("code=abc%2Fdef&state=expected", "expected").unwrap();
-        assert_eq!(result.code.as_deref(), Some("abc/def"));
-        assert!(result.error.is_none());
-    }
-
-    #[test_case("a%20b", "a b" ; "decodes_percent_escape")]
-    #[test_case("%41", "A" ; "decodes_escape_at_end")]
-    #[test_case("%\u{20ac}", "%\u{20ac}" ; "keeps_multibyte_after_percent")]
-    #[test_case("a+b", "a b" ; "decodes_plus_as_space")]
-    fn percent_decode_handles_edge_cases(input: &str, expected: &str) {
-        assert_eq!(percent_decode(input), expected);
-    }
-
-    #[test]
-    fn raw_authorization_codes_are_rejected() {
-        let err = parse_callback_input("Abcdefghijklmnopqrstuvwxyz0123", "state").unwrap_err();
-        assert_eq!(err.to_string(), RAW_CODE_MSG);
     }
 
     #[test]

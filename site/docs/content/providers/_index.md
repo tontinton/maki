@@ -80,7 +80,7 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 
 ### OpenAI
 
-- **Env var**: `OPENAI_API_KEY` (also supports OAuth device flow)
+- **Env var**: `OPENAI_API_KEY` (also supports OAuth via `maki auth login openai`)
 - **API**: `https://api.openai.com/v1`
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
@@ -106,7 +106,9 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 
 Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), gpt-5.6-sol (strong)
 
-With ChatGPT OAuth (`maki auth login openai`) the model list comes from the Codex backend's own `/models` endpoint, so a model your plan gains shows up without a Maki update, with the context window and reasoning levels the backend declares for it. The table above is the offline fallback. The endpoint hides models newer than the Codex CLI version Maki reports, so a brand new release can lag until that version is bumped.
+`maki auth login openai` offers browser login (PKCE, callback on `localhost:1455`) and device code login. Browser is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically.
+
+With ChatGPT OAuth the model list comes from the Codex backend's own `/models` endpoint, so a model your plan gains shows up without a Maki update, with the context window and reasoning levels the backend declares for it. The table above is the offline fallback. The endpoint hides models newer than the Codex CLI version Maki reports, so a brand new release can lag until that version is bumped.
 
 ### Google
 

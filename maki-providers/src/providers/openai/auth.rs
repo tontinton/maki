@@ -1,6 +1,8 @@
 use std::time::Duration;
 use std::{env, thread};
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use isahc::ReadResponseExt;
 use isahc::config::{Configurable, VersionNegotiation};
 use maki_storage::StateDir;
@@ -9,18 +11,26 @@ use serde::Deserialize;
 use tracing::{debug, error, warn};
 
 use crate::AgentError;
+use crate::providers::oauth_loopback::{self, LoginMethod, Loopback};
 use crate::providers::{ResolvedAuth, refreshed_tokens, urlenc};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const PROVIDER: &str = "openai";
+const DISPLAY_NAME: &str = "OpenAI";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const DEVICE_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
 const DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
-const REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+// Registered on the OpenAI client, so the port is not ours to choose.
+const REDIRECT_PORT: u16 = 1455;
+const REDIRECT_PATH: &str = "/auth/callback";
+const SCOPE: &str = "openid profile email offline_access";
 const POLL_SAFETY_MARGIN: Duration = Duration::from_secs(3);
 const TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Deserialize)]
@@ -62,8 +72,6 @@ fn extract_account_id(token: &str) -> Option<String> {
     if parts.len() != 3 {
         return None;
     }
-    use base64::Engine;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let payload = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
 
@@ -167,7 +175,11 @@ fn poll_device_token(device: &DeviceCodeResponse) -> Result<DeviceTokenResponse,
     }
 }
 
-fn exchange_device_token(device_token: &DeviceTokenResponse) -> Result<TokenResponse, AgentError> {
+fn exchange_authorization_code(
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<TokenResponse, AgentError> {
     let client = http_client(TOKEN_EXCHANGE_TIMEOUT)?;
 
     let form_body = format!(
@@ -176,10 +188,10 @@ fn exchange_device_token(device_token: &DeviceTokenResponse) -> Result<TokenResp
          &redirect_uri={}\
          &client_id={}\
          &code_verifier={}",
-        urlenc(&device_token.authorization_code),
-        urlenc(REDIRECT_URI),
+        urlenc(code),
+        urlenc(redirect_uri),
         urlenc(CLIENT_ID),
-        urlenc(&device_token.code_verifier),
+        urlenc(verifier),
     );
 
     let request = isahc::Request::builder()
@@ -201,6 +213,21 @@ fn exchange_device_token(device_token: &DeviceTokenResponse) -> Result<TokenResp
 
     let body_text = resp.text()?;
     serde_json::from_str(&body_text).map_err(Into::into)
+}
+
+fn redirect_uri() -> String {
+    format!("http://localhost:{REDIRECT_PORT}{REDIRECT_PATH}")
+}
+
+fn authorization_url(redirect_uri: &str, challenge: &str, state: &str) -> String {
+    format!(
+        "{AUTHORIZE_URL}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=maki",
+        urlenc(CLIENT_ID),
+        urlenc(redirect_uri),
+        urlenc(SCOPE),
+        urlenc(challenge),
+        urlenc(state),
+    )
 }
 
 fn into_oauth_tokens(resp: TokenResponse) -> OAuthTokens {
@@ -299,26 +326,69 @@ pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
 }
 
 pub fn login(dir: &StateDir) -> Result<(), AgentError> {
-    let device = request_device_code()?;
+    let token_response = match oauth_loopback::select_login_method(DISPLAY_NAME)? {
+        LoginMethod::Browser => browser_login()?,
+        LoginMethod::Device => device_login()?,
+    };
+    let tokens = into_oauth_tokens(token_response);
+    save_tokens(dir, PROVIDER, &tokens)?;
+    println!("Authenticated successfully.");
+    Ok(())
+}
 
+fn device_login() -> Result<TokenResponse, AgentError> {
+    let device = request_device_code()?;
     println!("Open this URL in your browser:\n\n  {DEVICE_AUTH_URL}\n");
     println!("Enter code: {}\n", device.user_code);
     println!("Waiting for authorization...");
-
     let device_token = poll_device_token(&device).map_err(|e| {
         error!(error = %e, "OpenAI device authorization failed");
         e
     })?;
+    exchange_authorization_code(
+        &device_token.authorization_code,
+        &device_token.code_verifier,
+        DEVICE_REDIRECT_URI,
+    )
+}
 
-    let token_resp = exchange_device_token(&device_token).map_err(|e| {
-        error!(error = %e, "OpenAI token exchange failed");
+fn browser_login() -> Result<TokenResponse, AgentError> {
+    let (verifier, challenge) = oauth_loopback::pkce_pair()?;
+    let state = oauth_loopback::random_token()?;
+    let server = Loopback {
+        port: REDIRECT_PORT,
+        fallback_to_ephemeral: false,
+        path: REDIRECT_PATH,
+        timeout: CALLBACK_TIMEOUT,
+        paste_fallback: false,
+    }
+    .bind()?;
+
+    let redirect_uri = redirect_uri();
+    let authorize_url = authorization_url(&redirect_uri, &challenge, &state);
+    println!("Open this URL in your browser:\n\n  {authorize_url}\n");
+    if let Err(e) = open::that(&authorize_url) {
+        warn!(error = %e, "failed to open browser");
+    }
+    println!("Waiting for OpenAI OAuth callback on {redirect_uri}...");
+
+    let callback = server.wait(&state).map_err(|e| {
+        error!(error = %e, "OpenAI browser authorization failed");
         e
     })?;
+    if let Some(error) = callback.error {
+        return Err(AgentError::Config {
+            message: format!("OpenAI authorization failed: {error}"),
+        });
+    }
+    let code = callback.code.ok_or_else(|| AgentError::Config {
+        message: "OpenAI authorization failed: no authorization code returned".into(),
+    })?;
 
-    let tokens = into_oauth_tokens(token_resp);
-    save_tokens(dir, PROVIDER, &tokens)?;
-    println!("Authenticated successfully.");
-    Ok(())
+    exchange_authorization_code(&code, &verifier, &redirect_uri).map_err(|e| {
+        error!(error = %e, "OpenAI token exchange failed");
+        e
+    })
 }
 
 pub fn logout(dir: &StateDir) -> Result<(), AgentError> {
@@ -336,9 +406,6 @@ mod tests {
 
     #[test]
     fn extract_account_id_from_jwt() {
-        use base64::Engine;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
         let header = URL_SAFE_NO_PAD.encode(b"{}");
         let payload = URL_SAFE_NO_PAD.encode(
             serde_json::json!({"chatgpt_account_id": "acct_123"})
@@ -350,5 +417,15 @@ mod tests {
 
         assert_eq!(extract_account_id("not.a.jwt"), None);
         assert_eq!(extract_account_id("invalid"), None);
+    }
+
+    #[test]
+    fn authorization_uses_the_registered_loopback_redirect() {
+        let url = authorization_url(&redirect_uri(), "challenge", "state");
+        assert!(url.starts_with(AUTHORIZE_URL));
+        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
+        assert!(url.contains("code_challenge=challenge&code_challenge_method=S256"));
+        assert!(url.contains("state=state"));
+        assert!(!url.contains("device"));
     }
 }

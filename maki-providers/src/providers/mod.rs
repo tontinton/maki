@@ -27,6 +27,7 @@ pub(crate) mod google;
 pub(crate) mod llama_cpp;
 pub(crate) mod local;
 pub(crate) mod mistral;
+pub(crate) mod oauth_loopback;
 pub(crate) mod ollama;
 pub(crate) mod openai;
 pub(crate) mod openai_compat;

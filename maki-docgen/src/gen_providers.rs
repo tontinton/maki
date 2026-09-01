@@ -60,7 +60,9 @@ const XAI_OAUTH_NOTE: &str = r#"OAuth uses the same first-party xAI client as th
 
 If `~/.grok/auth.json` already exists, login offers to reuse it without writing that file."#;
 
-const OPENAI_OAUTH_NOTE: &str = r#"With ChatGPT OAuth (`maki auth login openai`) the model list comes from the Codex backend's own `/models` endpoint, so a model your plan gains shows up without a Maki update, with the context window and reasoning levels the backend declares for it. The table above is the offline fallback. The endpoint hides models newer than the Codex CLI version Maki reports, so a brand new release can lag until that version is bumped."#;
+const OPENAI_OAUTH_NOTE: &str = r#"`maki auth login openai` offers browser login (PKCE, callback on `localhost:1455`) and device code login. Browser is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically.
+
+With ChatGPT OAuth the model list comes from the Codex backend's own `/models` endpoint, so a model your plan gains shows up without a Maki update, with the context window and reasoning levels the backend declares for it. The table above is the offline fallback. The endpoint hides models newer than the Codex CLI version Maki reports, so a brand new release can lag until that version is bumped."#;
 
 const OPENCODE_FREE_MODELS_NOTE: &str = r#"By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/maki/providers.toml`:
 
@@ -389,7 +391,10 @@ fn build_sections() -> Vec<ProviderSection> {
                 sections.push(ProviderSection {
                     kind,
                     name: kind.display_name(),
-                    auth_line: format!("{} (also supports OAuth device flow)", format_auth(kind)),
+                    auth_line: format!(
+                        "{} (also supports OAuth via `maki auth login openai`)",
+                        format_auth(kind)
+                    ),
                     urls: vec![kind.base_url()],
                     features: kind.features(),
                     entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
@@ -550,16 +555,16 @@ fn write_section(out: &mut String, section: &ProviderSection) {
         let _ = writeln!(out, "\n{BEDROCK_NOTE}");
     }
 
+    if section.kind == ProviderKind::OpenAi {
+        let _ = writeln!(out, "\n{OPENAI_OAUTH_NOTE}");
+    }
+
     if section.kind == ProviderKind::Opencode {
         let _ = writeln!(out, "\n{OPENCODE_FREE_MODELS_NOTE}");
     }
 
     if section.kind == ProviderKind::Xai {
         let _ = writeln!(out, "\n{XAI_OAUTH_NOTE}");
-    }
-
-    if section.kind == ProviderKind::OpenAi {
-        let _ = writeln!(out, "\n{OPENAI_OAUTH_NOTE}");
     }
 }
 
