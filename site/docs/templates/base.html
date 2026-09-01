@@ -5,12 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}{{ config.title }}{% endblock %}</title>
   <meta name="description" content="Documentation for maki, an efficient AI coding agent built in Rust.">
-  <meta name="theme-color" content="#f2eee1" media="(prefers-color-scheme: light)">
-  <meta name="theme-color" content="#141624" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f4f0e3" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#101221" media="(prefers-color-scheme: dark)">
   <script>
     (function() {
-      var t = localStorage.getItem('theme');
-      var dark = t === 'dark' || (!t && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      // a stored choice wins, otherwise follow the system, same rule as the landing page
+      var stored = localStorage.getItem('theme');
+      var dark = stored === 'light' || stored === 'dark' ? stored === 'dark'
+        : !matchMedia('(prefers-color-scheme: light)').matches;
       if (dark) {
         document.documentElement.setAttribute('data-theme', 'dark');
         document.documentElement.style.colorScheme = 'dark';
@@ -219,7 +221,7 @@
       transition: opacity 0.15s;
     }
     .topnav-logo:hover { opacity: 0.7; }
-    .topnav-sep { width: 1px; height: 18px; background: var(--sidebar-sep); }
+    .topnav-sep { height: 18px; border-left: 1px solid var(--sidebar-sep); }
     .topnav-section {
       font-family: var(--font-mono);
       font-size: 0.78rem;
@@ -966,21 +968,22 @@
 <script>
   // theme toggle
   const themeToggle = document.getElementById('theme-toggle');
-  function setTheme(dark, animate) {
-    if (animate) {
-      document.documentElement.classList.add('theme-transition');
-      setTimeout(() => document.documentElement.classList.remove('theme-transition'), 350);
-    }
+  function setTheme(dark) {
+    document.documentElement.classList.add('theme-transition');
+    setTimeout(() => document.documentElement.classList.remove('theme-transition'), 350);
     document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
     document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
     document.documentElement.style.background = dark ? 'oklch(19% 0.03 277)' : 'oklch(95.5% 0.018 95)';
-    localStorage.setItem('theme', dark ? 'dark' : 'light');
   }
   themeToggle.addEventListener('click', () => {
-    setTheme(document.documentElement.getAttribute('data-theme') !== 'dark', true);
+    const dark = document.documentElement.getAttribute('data-theme') !== 'dark';
+    setTheme(dark);
+    localStorage.setItem('theme', dark ? 'dark' : 'light');
   });
-  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
-    if (!localStorage.getItem('theme')) setTheme(e.matches, true);
+
+  // following the system only repaints, it must never write the choice to storage
+  matchMedia('(prefers-color-scheme: light)').addEventListener('change', e => {
+    if (!localStorage.getItem('theme')) setTheme(!e.matches);
   });
 
   const contentRoot = document.querySelector('.content-inner');

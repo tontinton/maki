@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>maki</title>
   <meta name="description" content="An efficient AI coding agent. Native Rust TUI. Immediate startup, 60 FPS, low memory. Indexes files instead of reading them, chains tools in a sandbox interpreter. Anthropic, OpenAI, Google, Z.AI, OpenRouter, Synthetic, or any OpenAI / Anthropic compatible API.">
-  <meta name="theme-color" content="#f0ede2">
+  <meta name="theme-color" content="#dbe6ff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1d2040" media="(prefers-color-scheme: dark)">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://maki.sh/">
   <meta property="og:title" content="maki - the efficient coder">
@@ -21,247 +22,388 @@
   <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
   <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link rel="manifest" href="/site.webmanifest">
+  <script>
+    (function() {
+      var root = document.documentElement;
+      // a stored choice wins, otherwise follow the system; runs before first paint so nothing flips
+      var theme = localStorage.getItem('theme');
+      root.setAttribute('data-theme', theme === 'light' || theme === 'dark' ? theme
+        : matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+
+      // the install line is picked here too, so Windows visitors never see the curl command first
+      var os = localStorage.getItem('os');
+      root.setAttribute('data-os', os === 'win' || os === 'unix' ? os
+        : /Windows/i.test(navigator.userAgent) ? 'win' : 'unix');
+
+      // the recording is the slowest thing the hero needs: start it before the body is even
+      // parsed, and hold on to the text so switching speed later never refetches it
+      window.castText = fetch('demo.cast').then(function(r) { return r.text(); });
+    })();
+  </script>
   <link rel="dns-prefetch" href="https://api.github.com">
-  <link rel="preload" href="demo.cast" as="fetch" crossorigin fetchpriority="high">
-  <link rel="preload" href="asciinema-player.min.js" as="script" fetchpriority="high">
-  <link rel="preload" href="asciinema-player.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Nunito:wght@400;700;800&display=swap" media="print" onload="this.media='all'">
+  <link rel="preload" href="/docs/fonts/nunito-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/docs/fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="asciinema-player.min.js" as="script">
+  <!-- the player measures a character cell against these rules on create, so they must be applied
+       before it mounts; 6 KB over the wire is cheaper than a mis-sized terminal -->
+  <link rel="stylesheet" href="asciinema-player.css">
   <noscript>
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Nunito:wght@400;700;800&display=swap">
-    <link rel="stylesheet" href="asciinema-player.css">
+    <style>.reveal, .hero-intro, .hero-preview { opacity: 1; transform: none; animation: none; }</style>
   </noscript>
   <style>
-    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    @font-face {
+      font-family: 'Nunito';
+      font-style: normal;
+      font-weight: 400 800;
+      font-display: swap;
+      src: url('/docs/fonts/nunito-latin.woff2') format('woff2');
+      unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+    }
+    @font-face {
+      font-family: 'JetBrains Mono';
+      font-style: normal;
+      font-weight: 100 800;
+      font-display: swap;
+      src: url('/docs/fonts/jetbrains-mono-latin.woff2') format('woff2');
+      unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+    }
+
+    *,*::before,*::after { box-sizing: border-box; margin: 0; padding: 0; }
+    button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+
+    /* dark is the default so a JS-less or pre-script paint is never light */
+    :root {
+      color-scheme: dark;
+      --font-body: 'Nunito', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace;
+
+      --paper: oklch(19.5% 0.028 295);
+      --hover: oklch(25.5% 0.035 295);
+      --soft: oklch(100% 0 0 / 0.06);
+      --soft-hover: oklch(100% 0 0 / 0.13);
+      --ink: oklch(89% 0.02 80);
+      --ink-2: oklch(74% 0.025 75);
+      --ink-3: oklch(60% 0.03 70);
+      --rule: oklch(30% 0.03 295);
+      --accent: oklch(75% 0.12 45);
+      --accent-hover: oklch(82% 0.12 50);
+      --link-underline: oklch(75% 0.12 45 / 0.35);
+      --chip-bg: oklch(27% 0.035 295);
+      --chip-fg: oklch(86% 0.025 80);
+      --chip-border: oklch(35% 0.035 295);
+      --nav-bg: oklch(19.5% 0.028 295 / 0.96);
+      --nav-sep: oklch(42% 0.03 295);
+      --scroll-thumb: oklch(89% 0.02 80 / 0.2);
+      --scroll-thumb-hover: oklch(89% 0.02 80 / 0.34);
+
+      --sky-1: oklch(26% 0.06 277);
+      --sky-2: oklch(23% 0.055 312);
+      --sky-3: oklch(21% 0.045 340);
+      --cloud: var(--paper);
+      --cloud-deep: oklch(24.5% 0.045 310);
+      --moon-face: oklch(94% 0.06 88);
+      --moon-glow: oklch(85% 0.09 85 / 0.4);
+      --star: oklch(96% 0.035 92);
+      --star-op: 1;
+
+      --pane-bg: #1E1E2E;
+      --pane-head: #191B28;
+      --pane-line: #2C2F42;
+      --pane-label: #878DA9;
+      --t-ink: #DDE0EA;
+      --t-com: #878DA9;
+      --t-kw: #A2B5FA;
+      --t-fn: #F7A87D;
+      --t-ty: #A9D5E3;
+      --t-str: #ABD695;
+      --t-con: #EDA8C2;
+
+      --term-bg: #282A36;
+      --term-line: #3A3D4D;
+      --ctl-bg: #16171F;
+      --ctl-hover: #22242F;
+      --ctl-fg: #B6BCCD;
+      --ctl-track: #33364A;
+      --demo-shadow: 0 14px 34px -14px oklch(0% 0 0 / 0.55);
+
+      --nav-h: 44px;
+      --ease: cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    [data-theme="light"] {
+      color-scheme: light;
+      --paper: oklch(96.5% 0.022 88);
+      --hover: oklch(93% 0.032 80);
+      --soft: oklch(100% 0 0 / 0.5);
+      --soft-hover: oklch(100% 0 0 / 0.8);
+      --ink: oklch(27% 0.042 318);
+      --ink-2: oklch(40% 0.036 315);
+      --ink-3: oklch(53% 0.03 318);
+      --rule: oklch(87% 0.03 72);
+      --accent: oklch(50% 0.13 42);
+      --accent-hover: oklch(43% 0.145 40);
+      --link-underline: oklch(50% 0.13 42 / 0.32);
+      --chip-bg: oklch(93.5% 0.03 82);
+      --chip-fg: oklch(32% 0.045 318);
+      --chip-border: oklch(88.5% 0.03 78);
+      --nav-bg: oklch(96.5% 0.022 88 / 0.96);
+      --nav-sep: oklch(76% 0.03 72);
+      --scroll-thumb: oklch(27% 0.042 318 / 0.22);
+      --scroll-thumb-hover: oklch(27% 0.042 318 / 0.38);
+
+      --demo-shadow: 0 2px 5px oklch(27% 0.042 318 / 0.12), 0 18px 38px -10px oklch(27% 0.042 318 / 0.45);
+
+      --sky-1: oklch(92.5% 0.04 268);
+      --sky-2: oklch(91.5% 0.045 330);
+      --sky-3: oklch(90% 0.06 28);
+      --cloud-deep: oklch(86.5% 0.055 20);
+      --moon-face: oklch(96% 0.09 92);
+      --moon-glow: oklch(92% 0.09 85 / 0.35);
+      --star: oklch(99% 0.055 95);
+      --star-op: 0.9;
+    }
+
     html {
-      scroll-padding-top: 5rem;
+      background: var(--sky-1);
+      scroll-padding-top: calc(var(--nav-h) + 1.5rem);
       scroll-behavior: smooth;
       -webkit-font-smoothing: antialiased;
       -moz-osx-font-smoothing: grayscale;
     }
-    code, pre { font-family: 'JetBrains Mono', monospace; }
-
-    :root {
-      --lavender: oklch(85% 0.06 280);
-      --periwinkle: oklch(78% 0.08 275);
-      --soft-pink: oklch(82% 0.06 350);
-      --salmon: oklch(75% 0.12 40);
-      --cream: oklch(96% 0.02 90);
-      --deep-navy: oklch(25% 0.04 270);
-      --navy-light: oklch(35% 0.04 270);
-      --text-secondary: oklch(50% 0.03 270);
-      --muted: oklch(65% 0.03 270);
-      --surface-glow: oklch(90% 0.05 280);
-      --sky-start: oklch(92% 0.04 275);
-      --sky-end: oklch(88% 0.06 280);
-    }
-
     body {
-      font-family: 'Nunito', sans-serif;
-      color: var(--deep-navy);
-      background: var(--cream);
+      font-family: var(--font-body);
+      font-size: 16px;
       line-height: 1.6;
-      overflow-x: hidden;
+      color: var(--ink);
+      background: var(--paper);
+    }
+    * { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) transparent; }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb {
+      background: var(--scroll-thumb);
+      border-radius: 99px;
+    }
+    ::-webkit-scrollbar-thumb:hover { background: var(--scroll-thumb-hover); }
+    a { color: var(--accent); text-decoration: none; }
+    p a {
+      text-decoration: underline;
+      text-decoration-color: var(--link-underline);
+      text-underline-offset: 2px;
+    }
+    p a:hover { color: var(--accent-hover); text-decoration-color: currentColor; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.85em;
+      background: var(--chip-bg);
+      color: var(--chip-fg);
+      border: 1px solid var(--chip-border);
+      border-radius: 4px;
+      padding: 0.06rem 0.3rem;
+    }
+    a code {
+      background: none;
+      border: 0;
+      padding: 0;
+      color: inherit;
     }
 
-    /* ── NAV ── */
+    /* ── nav ── */
     nav {
       position: fixed;
-      top: 0;
-      left: 0;
-      right: 0;
+      inset: 0 0 auto 0;
       z-index: 100;
-      padding: 0.35rem 1rem;
+      height: var(--nav-h);
       display: flex;
       align-items: center;
       justify-content: space-between;
-      background: oklch(96% 0.02 90 / 0.85);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-      border-bottom: 1px solid oklch(85% 0.04 280 / 0.3);
-      transition: box-shadow 0.3s ease;
+      padding: 0 clamp(1rem, 3vw, 1.75rem);
+      background: transparent;
+      border-bottom: 1px solid transparent;
+      transition: background 0.18s ease, border-color 0.18s ease;
     }
-    nav.scrolled { box-shadow: 0 4px 30px oklch(70% 0.06 280 / 0.1); }
-    .nav-logo {
-      font-weight: 800;
-      font-size: 1.4rem;
-      color: var(--deep-navy);
-      text-decoration: none;
-      letter-spacing: -0.02em;
+    nav.scrolled {
+      background: var(--nav-bg);
+      border-bottom-color: var(--rule);
     }
-    .nav-right { display: flex; gap: 1.5rem; align-items: center; }
-    .nav-right a {
-      font-size: 0.92rem;
-      font-weight: 700;
-      color: var(--text-secondary);
-      text-decoration: none;
-      transition: color 0.2s;
-    }
-    .nav-right a:hover { color: var(--deep-navy); }
-    .nav-discord, .nav-github { display: inline-flex; align-items: center; gap: 0.35rem; }
-    .nav-sep { width: 1px; height: 16px; background: var(--text-secondary); opacity: 0.25; }
-
-    /* ── STAR BADGE ── */
-    .star-badge {
-      display: none;
-      align-items: center;
-      gap: 0.25rem;
-      font-size: 0.78rem;
-      font-weight: 700;
-      font-family: 'JetBrains Mono', monospace;
-      letter-spacing: 0.01em;
-      opacity: 0;
-      transform: scale(0.8) translateY(2px);
-      transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1), transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+    /* watched instead of listening to scroll, so nothing of ours runs on the scroll path */
+    #top-sentinel {
+      position: absolute;
+      top: 24px;
+      width: 1px;
+      height: 1px;
       pointer-events: none;
     }
-    .star-badge.loaded {
+    .nav-left { display: flex; align-items: baseline; gap: 0.5rem; }
+    .nav-crumb {
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      color: var(--ink-3);
+      opacity: 0;
+      transition: opacity 0.16s ease;
+    }
+    .nav-crumb.on { opacity: 1; }
+    .key-hint { display: flex; }
+    .key-hint kbd {
+      font-family: var(--font-mono);
+      font-size: 0.76rem;
+      line-height: 1.4;
+      padding: 0 0.4rem;
+      border: 1px solid var(--rule);
+      border-radius: 4px;
+      box-shadow: 0 2px 0 var(--rule);
+      background: var(--soft);
+      color: var(--ink-2);
+      border-color: var(--nav-sep);
+      transition: color 0.1s, border-color 0.1s;
+    }
+    .key-hint:hover kbd { color: var(--accent); border-color: var(--accent); }
+    .nav-logo {
+      font-weight: 800;
+      font-size: 1.15rem;
+      letter-spacing: -0.03em;
+      color: var(--ink);
+    }
+    .nav-logo:hover { color: var(--accent); }
+    .nav-right { display: flex; align-items: center; gap: 1rem; }
+    .nav-right a {
       display: inline-flex;
-      opacity: 1;
-      transform: scale(1) translateY(0);
+      align-items: center;
+      gap: 0.35rem;
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      color: var(--ink-2);
+      transition: color 0.1s;
     }
-    .star-badge svg {
-      flex-shrink: 0;
-      fill: currentColor;
-      opacity: 0.5;
-      transition: fill 0.2s, opacity 0.2s;
+    .nav-right a:hover { color: var(--ink); }
+    .nav-sep { height: 14px; border-left: 1px solid var(--nav-sep); }
+    /* laid out from the start, only faded in, so arriving star counts never nudge the nav */
+    .star-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.2rem;
+      min-width: 1.9rem;
+      opacity: 0;
+      transition: opacity 0.22s ease;
     }
-    .nav-github .star-badge { margin-left: 0.1rem; }
-    .nav-github:hover .star-badge svg { fill: oklch(74% 0.15 85); opacity: 1; }
+    .star-badge.loaded { opacity: 1; }
+    .star-badge svg { fill: currentColor; opacity: 0.75; transition: fill 0.1s, opacity 0.1s; }
+    .nav-github:hover .star-badge svg { fill: var(--accent); opacity: 1; }
+    .theme-toggle {
+      display: flex;
+      margin-left: 0.65rem;
+      padding: 0.15rem;
+      color: var(--ink-2);
+      transition: color 0.1s;
+    }
+    .theme-toggle:hover { color: var(--ink); }
+    .theme-toggle svg { width: 16px; height: 16px; }
+    .theme-toggle .icon-sun { display: none; }
+    [data-theme="light"] .theme-toggle .icon-sun { display: block; }
+    [data-theme="light"] .theme-toggle .icon-moon { display: none; }
 
-    /* ── HERO ── */
+    /* ── hero ── */
     .hero {
-      min-height: 100vh;
+      position: relative;
+      overflow: hidden;
+      min-height: min(100svh, 47rem);
       display: flex;
       align-items: center;
-      justify-content: center;
-      padding: 6rem clamp(2rem, 4vw, 4rem) 3rem;
-      position: relative;
-      background: linear-gradient(180deg, var(--sky-start) 0%, var(--sky-end) 40%, var(--lavender) 70%, var(--soft-pink) 100%);
-      overflow: hidden;
-    }
-    .hero-grid {
-      display: grid;
-      grid-template-columns: 30% 1fr;
-      align-items: center;
-      gap: 2.5rem;
-      width: 100%;
-      max-width: 1280px;
-      position: relative;
-      z-index: 2;
-    }
-    .hero-intro {
-      position: relative;
+      padding: calc(var(--nav-h) + clamp(2rem, 5vw, 3.5rem)) clamp(2rem, 4vw, 4rem) clamp(4rem, 9vw, 7rem);
+      background: linear-gradient(180deg, var(--sky-1) 0%, var(--sky-2) 58%, var(--sky-3) 100%);
     }
 
-    .hero-clouds {
+    /* ── sky ── */
+    .sky {
       position: absolute;
       inset: 0;
       pointer-events: none;
     }
-
-    .cloud-svg {
+    .sky::after {
+      content: '';
       position: absolute;
-      pointer-events: none;
-    }
-
-    .cloud-bank {
-      position: absolute;
-      pointer-events: none;
-      will-change: transform;
-    }
-    .cloud-bank-1 { bottom: -2%; left: -8%; animation: drift-slow 18s ease-in-out infinite; }
-    .cloud-bank-2 { bottom: 6%; right: -6%; animation: drift-slow 14s ease-in-out infinite reverse; }
-    .cloud-bank-5 { bottom: 18%; left: 30%; animation: drift-slow 16s ease-in-out infinite; transform: scale(0.45); opacity: 0.5; }
-    .cloud-bank-7 { bottom: -4%; left: 20%; animation: drift-slow 21s ease-in-out infinite; transform: scale(0.9); }
-    .cloud-bank-8 { bottom: -6%; right: 15%; animation: drift-slow 18s ease-in-out infinite reverse; transform: scale(0.75); opacity: 0.85; }
-
-    .cloud-floor {
-      position: absolute;
-      bottom: -30px;
-      left: -5%;
-      right: -5%;
-      height: 120px;
-      background: linear-gradient(180deg, transparent 0%, oklch(95% 0.02 280 / 0.4) 40%, oklch(96% 0.02 90 / 0.8) 100%);
-    }
-
-    @keyframes drift-slow {
-      0%, 100% { transform: translateX(0); }
-      50% { transform: translateX(30px); }
-    }
-    @keyframes drift-med {
-      0%, 100% { transform: translateX(0) translateY(0); }
-      33% { transform: translateX(20px) translateY(-5px); }
-      66% { transform: translateX(-10px) translateY(3px); }
-    }
-
-    .stars { position: absolute; inset: 0; pointer-events: none; }
-    .star {
-      position: absolute;
-      background: oklch(98% 0.02 90);
-      clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
-      animation: twinkle 3s ease-in-out infinite;
-    }
-    .star-diamond {
-      position: absolute;
-      background: oklch(98% 0.03 85);
-      clip-path: polygon(50% 0%, 62% 38%, 100% 50%, 62% 62%, 50% 100%, 38% 62%, 0% 50%, 38% 38%);
-      animation: twinkle-bright 4s ease-in-out infinite;
-    }
-    .star:nth-child(1) { top: 15%; left: 20%; width: 8px; height: 8px; }
-    .star:nth-child(2) { top: 25%; right: 25%; width: 6px; height: 6px; animation-delay: 1s; }
-    .star:nth-child(3) { top: 10%; right: 35%; width: 5px; height: 5px; animation-delay: 0.5s; }
-    .star:nth-child(4) { top: 30%; left: 35%; width: 4px; height: 4px; animation-delay: 2s; }
-    .star:nth-child(5) { top: 18%; left: 55%; width: 7px; height: 7px; animation-delay: 1.5s; }
-    .star:nth-child(6) { top: 8%; right: 15%; width: 5px; height: 5px; animation-delay: 0.8s; }
-    .star:nth-child(7) { top: 6%; left: 40%; width: 4px; height: 4px; animation-delay: 2.3s; }
-    .star:nth-child(8) { top: 22%; left: 70%; width: 5px; height: 5px; animation-delay: 0.3s; }
-    .star:nth-child(9) { top: 12%; left: 82%; width: 3px; height: 3px; animation-delay: 1.8s; }
-    .star:nth-child(10) { top: 35%; right: 40%; width: 4px; height: 4px; animation-delay: 2.6s; }
-    .star-diamond:nth-child(11) { top: 12%; left: 30%; width: 14px; height: 14px; animation-delay: 0.7s; }
-    .star-diamond:nth-child(12) { top: 20%; right: 18%; width: 11px; height: 11px; animation-delay: 1.4s; }
-    .star-diamond:nth-child(13) { top: 7%; left: 60%; width: 10px; height: 10px; animation-delay: 2.1s; }
-    .star-diamond:nth-child(14) { top: 32%; left: 48%; width: 8px; height: 8px; animation-delay: 0.2s; }
-    .star-diamond:nth-child(15) { top: 16%; right: 38%; width: 9px; height: 9px; animation-delay: 1.9s; }
-
-    @keyframes twinkle {
-      0%, 100% { opacity: 0.3; transform: scale(1); }
-      50% { opacity: 1; transform: scale(1.3); }
-    }
-    @keyframes twinkle-bright {
-      0%, 100% { opacity: 0.15; transform: scale(0.8) rotate(0deg); }
-      50% { opacity: 0.9; transform: scale(1.2) rotate(15deg); }
-    }
-
-    .moon-group {
-      position: absolute;
-      top: 10%;
-      right: 10%;
-      pointer-events: none;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: clamp(90px, 12vw, 160px);
+      background: linear-gradient(180deg, transparent, var(--paper) 88%);
     }
     .moon {
-      position: relative;
-      width: 42px;
-      height: 42px;
+      position: absolute;
+      pointer-events: auto;
+      transition: transform 0.18s var(--ease);
+      top: 4rem;
+      right: clamp(1.5rem, 4vw, 3rem);
+      width: 34px;
+      height: 34px;
       border-radius: 50%;
-      background: oklch(95% 0.03 85);
-      box-shadow:
-        0 0 20px oklch(92% 0.04 85 / 0.5),
-        0 0 60px oklch(92% 0.04 85 / 0.2),
-        0 0 100px oklch(92% 0.04 85 / 0.1);
+      background: var(--moon-face);
+      box-shadow: 0 0 18px 2px var(--moon-glow), 0 0 55px 18px var(--moon-glow);
     }
     .moon::after {
       content: '';
       position: absolute;
-      width: 34px;
-      height: 34px;
+      top: -5px;
+      left: 8px;
+      width: 30px;
+      height: 30px;
       border-radius: 50%;
-      background: linear-gradient(135deg, var(--sky-start), var(--sky-end));
-      top: -4px;
-      left: 7px;
+      background: color-mix(in oklab, var(--sky-1) 80%, var(--sky-2));
+    }
+    .moon:hover { transform: scale(1.12); }
+    .star {
+      position: absolute;
+      background: var(--star);
+      opacity: var(--star-op);
+      clip-path: polygon(50% 0%, 62% 38%, 100% 50%, 62% 62%, 50% 100%, 38% 62%, 0% 50%, 38% 38%);
+      animation: twinkle 6s ease-in-out infinite;
+    }
+    .star-1 { top: 14%; left: 12%; width: 11px; height: 11px; }
+    .star-2 { top: 26%; left: 30%; width: 7px; height: 7px; animation-delay: 2.4s; }
+    .star-3 { top: 9%;  left: 47%; width: 9px;  height: 9px;  animation-delay: 1.2s; }
+    .star-4 { top: 30%; right: 22%; width: 8px; height: 8px; animation-delay: 3.6s; }
+    .star-5 { top: 18%; right: 7%;  width: 6px;  height: 6px;  animation-delay: 4.8s; }
+    @keyframes twinkle {
+      0%, 100% { opacity: calc(var(--star-op) * 0.35); }
+      50% { opacity: var(--star-op); }
+    }
+    .clouds {
+      position: absolute;
+      left: -3%;
+      right: -3%;
+      bottom: -1px;
+      height: clamp(70px, 9vw, 130px);
+    }
+    .cloud {
+      position: absolute;
+      bottom: -1px;
+      display: block;
+      fill: var(--cloud);
+    }
+    .cloud-a { left: -2%;  width: clamp(300px, 34vw, 480px); animation: drift 38s ease-in-out infinite; }
+    .cloud-b { right: -3%; width: clamp(260px, 30vw, 430px); animation: drift 52s ease-in-out infinite reverse; }
+    .cloud-c { left: 40%;  width: clamp(170px, 20vw, 280px); opacity: 0.8; }
+    @keyframes drift {
+      0%, 100% { transform: translateX(0); }
+      50% { transform: translateX(28px); }
     }
 
+    .hero-grid {
+      position: relative;
+      z-index: 1;
+      width: 100%;
+      min-width: 0;
+      max-width: 1280px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: minmax(0, 30%) minmax(0, 1fr);
+      gap: 2.5rem;
+      align-items: center;
+    }
+    /* the install command is typeset from this width, so the column has to be a query container */
+    .hero-intro { container-type: inline-size; }
     .hero h1 {
       font-weight: 800;
       font-size: clamp(2.5rem, 5vw, 3.5rem);
@@ -270,222 +412,118 @@
       margin-bottom: 0.3rem;
     }
     .hero-tagline {
-      font-size: clamp(1.05rem, 2.2vw, 1.3rem);
       font-weight: 700;
-      color: var(--navy-light);
-      margin-bottom: 1.25rem;
+      font-size: clamp(1.05rem, 2.2vw, 1.3rem);
+      color: var(--ink-3);
     }
     .hero-sub {
-      font-size: 1rem;
-      color: var(--navy-light);
-      max-width: 42ch;
-      margin-bottom: 1.5rem;
+      max-width: 44ch;
+      margin-top: 1.35rem;
+      font-size: 1.1rem;
+      color: var(--ink-2);
+      text-wrap: pretty;
     }
-    .hero-preview {
-      position: relative;
-      z-index: 2;
-      align-self: center;
-      min-width: 0;
-    }
+    .hero-sub + .hero-sub { margin-top: 0.6rem; }
 
-    /* ── DIVIDER ── */
-    .divider {
-      height: 1px;
-      background: linear-gradient(90deg, transparent, oklch(80% 0.06 280 / 0.4), transparent);
-      margin-bottom: clamp(3rem, 6vw, 5rem);
-    }
-    .divider.visible { transform: scaleX(1); }
-
-    .install-line code {
-      display: inline-block;
-      padding: 0.35rem 0.9rem;
-      background: #1e1e2e;
-      color: #cdd6f4;
-      border: 1px solid #313244;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.92rem;
-      border-radius: 8px;
-      letter-spacing: 0.02em;
-      user-select: none;
-    }
-    .install-line .sh-cmd { color: #89b4fa; }
-    .install-line .sh-flag { color: #a6adc8; }
-    .install-line .sh-url { color: #a6e3a1; }
-    .install-line .sh-pipe { color: #f38ba8; font-weight: 700; }
-
-    /* ── MAIN CONTENT ── */
-    .content {
-      max-width: 1060px;
-      margin: 0 auto;
-      padding: clamp(4rem, 8vw, 6rem) clamp(1.5rem, 5vw, 3rem) 0rem;
-      content-visibility: auto;
-      contain-intrinsic-size: auto 800px;
-    }
-
-    .pitch {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 3rem;
-      margin-bottom: clamp(3rem, 6vw, 5rem);
-    }
-    .pitch-col h2 {
-      font-weight: 800;
-      font-size: clamp(1.35rem, 2.5vw, 1.7rem);
-      letter-spacing: -0.02em;
-      line-height: 1.2;
-      margin-bottom: 1.25rem;
-    }
-    .pitch-col h2 span {
+    /* the fill hugs the command instead of the column: the box is as wide as the command's
+       longest unbreakable run, and the type is sized from the column so that run always fits */
+    .install {
       display: block;
-      font-size: 0.78rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.14em;
-      color: var(--muted);
-      margin-bottom: 0.4rem;
-    }
-
-    .pitch-item:last-child { margin-bottom: 0; }
-
-    .pip {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      margin-top: 0.55rem;
-      justify-self: center;
-    }
-    .pip-lavender { background: var(--periwinkle); }
-    .pip-salmon { background: var(--salmon); }
-    .pip-pink { background: var(--soft-pink); }
-    .pip-gold { background: oklch(78% 0.12 85); }
-
-    .pitch-item strong {
-      font-weight: 800;
-      font-size: 1rem;
-    }
-    .pitch-item strong a {
-      color: inherit;
-      text-decoration: underline;
-      text-decoration-color: var(--lavender);
-      text-underline-offset: 2px;
-      text-decoration-thickness: 2px;
-      transition: text-decoration-color 0.2s;
-    }
-    .pitch-item strong a:hover {
-      text-decoration-color: var(--salmon);
-    }
-    .pitch-item p {
-      font-size: 0.92rem;
-      color: var(--text-secondary);
+      width: min-content;
+      max-width: 100%;
+      margin-top: 1.75rem;
+      padding: 0.7rem 0.9rem;
+      border-radius: 8px;
+      background: var(--soft);
+      transition: background 0.1s;
+      font-family: var(--font-mono);
+      font-size: min(1.02rem, calc((100cqw - 1.8rem) / var(--install-run)));
       line-height: 1.55;
-      margin-top: 0.2rem;
+      color: var(--ink);
+      text-align: left;
     }
-    .pitch-item code {
-      font-size: 0.88rem;
-      background: oklch(90% 0.03 270 / 0.5);
-      padding: 0.1rem 0.35rem;
-      border-radius: 4px;
+    /* mono advance is 0.6em, so a run of N characters needs N * 0.6 of them. the url onwards
+       is one run for curl, and the whole line is one run for the shorter powershell command */
+    .install .nb, .install .for-win { white-space: nowrap; }
+    [data-os="unix"] .install { --install-run: 18.6; }
+    [data-os="win"] .install { --install-run: 23.4; }
+    [data-os="win"] .for-unix, [data-os="unix"] .for-win { display: none; }
+    .install .sh-p { color: var(--accent); }
+    .install .sh-dim { color: var(--ink-3); }
+    .install:hover { background: var(--soft-hover); }
+    .install-note {
+      margin-top: 0.45rem;
+      font-family: var(--font-mono);
+      font-size: 0.84rem;
+      color: var(--ink-3);
     }
-    .pitch-badge {
-      display: inline-block;
-      font-size: 0.78rem;
-      font-weight: 700;
-      color: oklch(50% 0.1 280);
-      background: oklch(92% 0.06 280 / 0.5);
-      padding: 0.2rem 0.6rem;
-      border-radius: 20px;
-      margin-left: 0.4rem;
-      vertical-align: middle;
+    .os-swap {
+      color: var(--ink-3);
+      text-decoration: underline;
+      text-decoration-color: var(--rule);
+      text-underline-offset: 3px;
     }
+    .os-swap:hover { color: var(--accent); }
 
-    /* faithful TUI recreation */
+    /* ── terminal frame ── */
+    .hero-preview { min-width: 0; }
+    .tui-scale-wrap { min-width: 0; overflow: hidden; }
+    .tui-scale-wrap > .tui { width: fit-content; }
+    .tui-scale-wrap, .doom-demo .tui { border-radius: 10px; box-shadow: var(--demo-shadow); }
     .tui {
+      display: block;
+      background: var(--term-bg);
       border-radius: 10px;
       overflow: hidden;
-      box-shadow: 0 24px 80px oklch(20% 0.04 270 / 0.3), 0 0 0 1px oklch(30% 0.02 270 / 0.3);
-      font-family: 'JetBrains Mono', monospace;
+      font-family: var(--font-mono);
       font-size: 0.72rem;
       line-height: 1.5;
-      background: #282a36;
-      color: oklch(78% 0.02 270);
-      display: inline-block;
-      transform-origin: top left;
     }
-    .tui-titlebar {
-      display: flex;
-      align-items: center;
-      gap: 7px;
-      padding: 8px 16px;
-      background: oklch(16% 0.015 270);
-    }
-    .tui-dot { width: 11px; height: 11px; border-radius: 50%; }
-    .tui-dot-r { background: oklch(62% 0.2 25); }
-    .tui-dot-y { background: oklch(78% 0.15 85); }
-    .tui-dot-g { background: oklch(68% 0.15 150); }
-    .tui-titlebar-text {
-      margin-left: 0.5rem;
-      font-size: 0.72rem;
-      color: oklch(55% 0.02 270);
-    }
-
     .tui-body {
       display: flex;
       flex-direction: column;
-      background: #282a36;
       position: relative;
-      min-height: 330px;
-      min-width: 774px;
+      background: var(--term-bg);
     }
-    @media (hover: hover) {
-      .tui-body:hover .player-controls {
-        opacity: 1;
-        transform: translateY(0);
-        pointer-events: auto;
-      }
-    }
-    .tui-body .player-controls:focus-within,
-    .tui-body .player-controls.force-visible {
-      opacity: 1;
-      transform: translateY(0);
-      pointer-events: auto;
-    }
+    /* holds the cast's size before the player exists, then gets out of its way */
+    .tui-scale-wrap > .tui:not(.booted) .tui-body { min-height: 330px; min-width: 774px; }
     .tui-loader {
       position: absolute;
       inset: 0;
       display: flex;
       align-items: center;
       justify-content: center;
-      background: #282a36;
+      background: var(--term-bg);
       z-index: 5;
-      transition: opacity 0.3s ease;
+      transition: opacity 0.18s ease;
     }
-    .tui-loader.hidden {
-      opacity: 0;
-      pointer-events: none;
-    }
+    .tui-loader.hidden { opacity: 0; pointer-events: none; }
+    /* a speed change mounts a second player: both share one cell so the swap never blinks */
+    #demo-player { display: grid; }
+    #demo-player > * { grid-area: 1 / 1; }
     .tui-spinner {
-      width: 24px;
-      height: 24px;
-      border: 2px solid oklch(50% 0.02 270);
-      border-top-color: oklch(80% 0.06 280);
+      width: 20px;
+      height: 20px;
+      border: 2px solid var(--term-line);
+      border-top-color: var(--t-fn);
       border-radius: 50%;
-      animation: spin 0.8s linear infinite;
+      animation: spin 0.55s linear infinite;
     }
-    @keyframes spin {
-      to { transform: rotate(360deg); }
-    }
+    @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* asciinema player overrides */
     .tui-body .ap-wrapper {
-      background: #282a36 !important;
+      background: var(--term-bg) !important;
       border-radius: 0 !important;
       box-shadow: none !important;
       padding: 0 !important;
       margin: 0 !important;
       justify-content: start !important;
     }
+    /* the cast is re-laid out at this size rather than transform-scaled to fit, so every glyph
+       is rasterized at the size it is shown at and the terminal stays crisp */
     .tui-body .ap-player {
-      background: #282a36 !important;
+      font-size: var(--cast-font, 18px) !important;
+      background: var(--term-bg) !important;
       padding: 0 !important;
       border-radius: 0 !important;
       margin: 0 !important;
@@ -496,67 +534,66 @@
       border-width: 0 !important;
       box-sizing: border-box !important;
     }
-    .tui-body .ap-control-bar {
-      display: none !important;
-    }
-    .tui-body .ap-overlay-start {
-      display: none !important;
-    }
+    .tui-body .ap-control-bar, .tui-body .ap-overlay-start { display: none !important; }
 
-    /* ── PLAYER CONTROLS ── */
+    /* ── player controls ── */
     .player-controls {
       position: absolute;
       left: 0;
       right: 0;
       bottom: 0;
+      z-index: 6;
       display: flex;
       align-items: center;
-      gap: 0.75rem;
-      padding: 0.5rem 0.75rem;
-      background: #000;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.75rem;
+      gap: 0.7rem;
+      padding: 0.45rem 0.6rem;
+      background: var(--ctl-bg);
+      border-top: 1px solid var(--term-line);
+      /* chrome, not terminal output: the body font stays legible once the frame is scaled
+         down, and Nunito's digits are tabular so the clock never jitters */
+      font-family: var(--font-body);
+      font-size: 0.82rem;
+      font-variant-numeric: tabular-nums;
       opacity: 0;
       transform: translateY(6px);
       pointer-events: none;
-      transition: opacity 0.2s ease, transform 0.2s ease;
-      z-index: 6;
+      transition: opacity 0.13s ease, transform 0.13s ease;
     }
+    @media (hover: hover) {
+      .tui-body:hover .player-controls {
+        opacity: 1;
+        transform: translateY(0);
+        pointer-events: auto;
+      }
+    }
+    .tui-body .player-controls:focus-within {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+    .player-btn, .speed-toggle, .speed-option {
+      color: var(--ctl-fg);
+      transition: background 0.1s, color 0.1s;
+    }
+    .player-btn:hover, .speed-toggle:hover, .speed-option:hover { background: var(--ctl-hover); color: #fff; }
     .player-btn {
+      flex-shrink: 0;
       display: flex;
       align-items: center;
       justify-content: center;
-      width: 28px;
-      height: 28px;
-      padding: 0;
-      background: transparent;
-      border: 1px solid oklch(30% 0.02 270);
-      border-radius: 6px;
-      color: oklch(70% 0.02 270);
-      cursor: pointer;
-      transition: all 0.15s ease;
-      flex-shrink: 0;
+      width: 24px;
+      height: 24px;
+      border: 1px solid var(--term-line);
     }
-    .player-btn:hover {
-      background: oklch(25% 0.02 270);
-      color: oklch(90% 0.02 270);
-      border-color: oklch(40% 0.03 270);
-    }
-    .player-btn:active {
-      transform: scale(0.95);
-    }
-    .player-btn svg {
-      width: 14px;
-      height: 14px;
-      fill: currentColor;
-    }
+    .player-btn svg { width: 12px; height: 12px; fill: currentColor; }
+    .player-btn .icon-pause, .player-btn.playing .icon-play { display: none; }
+    .player-btn.playing .icon-pause { display: block; }
     .player-progress {
-      flex: 1;
-      height: 6px;
-      background: oklch(25% 0.02 270);
-      border-radius: 3px;
-      cursor: pointer;
       position: relative;
+      flex: 1;
+      height: 3px;
+      background: var(--ctl-track);
+      cursor: pointer;
     }
     .player-progress::before {
       content: '';
@@ -566,127 +603,229 @@
       top: -10px;
       bottom: -10px;
     }
+    /* scaled rather than resized: the fill is repainted every frame while playing */
     .player-progress-bar {
+      width: 100%;
       height: 100%;
-      background: oklch(60% 0.08 280);
-      border-radius: 3px;
-      width: 0%;
-      transition: width 0.1s linear;
+      background: var(--t-fn);
+      transform: scaleX(0);
+      transform-origin: left;
     }
     .player-time {
-      color: oklch(98% 0 0);
-      font-size: 0.82rem;
-      font-weight: 700;
-      min-width: 85px;
-      text-align: right;
       flex-shrink: 0;
+      min-width: 68px;
+      text-align: right;
+      color: var(--ctl-fg);
     }
-    .player-speed {
-      position: relative;
-      margin-left: 0.25rem;
-    }
+    .player-speed { position: relative; }
     .speed-toggle {
-      padding: 0.2rem 0.55rem;
-      background: transparent;
-      border: 1px solid oklch(40% 0.02 270);
-      border-radius: 4px;
-      color: oklch(98% 0 0);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.75rem;
-      font-weight: 700;
-      cursor: pointer;
-      transition: all 0.15s ease;
-      min-width: 36px;
-    }
-    .speed-toggle:hover {
-      background: oklch(25% 0.02 270);
-      color: oklch(90% 0.02 270);
-      border-color: oklch(40% 0.03 270);
+      min-width: 34px;
+      padding: 0.15rem 0.4rem;
+      border: 1px solid var(--term-line);
     }
     .speed-menu {
       position: absolute;
-      bottom: calc(100% + 6px);
       right: 0;
-      background: oklch(18% 0.02 270);
-      border: 1px solid oklch(30% 0.02 270);
-      border-radius: 6px;
-      padding: 0.25rem 0;
-      min-width: 72px;
-      box-shadow: 0 8px 24px oklch(0% 0 0 / 0.4);
+      bottom: calc(100% + 6px);
+      min-width: 70px;
+      padding: 0.2rem 0;
+      background: var(--ctl-bg);
+      border: 1px solid var(--term-line);
       opacity: 0;
       transform: translateY(4px);
       pointer-events: none;
-      transition: opacity 0.15s ease, transform 0.15s ease;
+      transition: opacity 0.1s ease, transform 0.1s ease;
       z-index: 10;
     }
-    .speed-menu.open {
-      opacity: 1;
-      transform: translateY(0);
-      pointer-events: auto;
-    }
+    .speed-menu.open { opacity: 1; transform: translateY(0); pointer-events: auto; }
     .speed-option {
+      position: relative;
       display: block;
       width: 100%;
-      padding: 0.35rem 0.9rem 0.35rem 1.6rem;
-      background: transparent;
-      border: none;
-      color: oklch(95% 0.01 270);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.78rem;
-      font-weight: 700;
+      padding: 0.3rem 0.8rem 0.3rem 1.5rem;
       text-align: left;
-      cursor: pointer;
-      position: relative;
-      transition: background 0.12s ease, color 0.12s ease;
     }
-    .speed-option:hover {
-      background: oklch(25% 0.02 270);
-      color: oklch(95% 0.02 270);
-    }
-    .speed-option.active {
-      color: oklch(75% 0.1 280);
-    }
-    .speed-option.active::before {
-      content: '✓';
-      position: absolute;
-      left: 0.55rem;
-      color: oklch(75% 0.1 280);
-    }
+    .speed-option.active { color: var(--t-fn); }
+    .speed-option.active::before { content: '>'; position: absolute; left: 0.55rem; }
     .player-hint {
-      margin-top: 0.6rem;
+      margin-top: 0.85rem;
+      font-family: var(--font-mono);
+      font-size: 0.9rem;
+      color: var(--ink-3);
       text-align: center;
-      font-size: 0.85rem;
-      color: var(--text-secondary);
     }
     .player-hint button {
-      background: none;
-      border: none;
-      padding: 0;
-      font: inherit;
-      font-weight: 700;
-      color: var(--navy-light);
+      -webkit-user-select: text;
+      user-select: text;
+      color: var(--accent);
       text-decoration: underline;
+      text-decoration-color: var(--link-underline);
       text-underline-offset: 3px;
       cursor: pointer;
     }
-    .player-hint button:hover {
-      color: var(--deep-navy);
+    .player-hint button:hover { color: var(--accent-hover); text-decoration-color: currentColor; }
+
+    /* ── sections ── */
+    .content {
+      max-width: 1332px;
+      margin: 0 auto;
+      padding: 0 clamp(1.25rem, 7vw, 6rem);
+    }
+    .block {
+      border-top: 1px solid var(--rule);
+      padding: clamp(2.75rem, 5.5vw, 4rem) 0;
+    }
+    h2 {
+      font-weight: 700;
+      font-size: clamp(1.55rem, 2.8vw, 2rem);
+      letter-spacing: -0.025em;
+      line-height: 1.2;
+      text-wrap: balance;
+    }
+    .sec-head { margin-bottom: 1.75rem; }
+    .sec-head p + p { margin-top: 0.55rem; }
+    .sec-head p {
+      max-width: 58ch;
+      margin-top: 0.85rem;
+      font-size: 1.1rem;
+      color: var(--ink-2);
+      text-wrap: pretty;
     }
 
-    /* ── DOOM DEMO ── */
+    /* ── features ── */
+    .features {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.7rem clamp(2rem, 4vw, 3.5rem);
+      align-items: start;
+    }
+    .feature { max-width: 54ch; }
+    .feature strong {
+      display: block;
+      font-family: var(--font-mono);
+      font-weight: 700;
+      font-size: 1.05rem;
+      letter-spacing: -0.01em;
+      margin-bottom: 0.6rem;
+    }
+    .feature p + p { margin-top: 0.5rem; }
+    .feature p, .feature-rest {
+      font-size: 1.06rem;
+      line-height: 1.62;
+      color: var(--ink-2);
+      text-wrap: pretty;
+    }
+    .feature strong a { color: inherit; }
+    .feature strong a::after {
+      content: '↓';
+      margin-left: 0.35em;
+      font-weight: 400;
+      opacity: 0.5;
+    }
+    .feature strong a[href^="/docs"]::after, .feature strong a[href^="http"]::after { content: '↗'; }
+    .feature strong a:hover { color: var(--accent); }
+    .feature code { white-space: nowrap; }
+    .feature-rest {
+      grid-column: 1 / -1;
+      max-width: 74ch;
+      margin-top: 0.6rem;
+      color: var(--ink-3);
+    }
+
+    /* ── dark panes ── */
+    .pane-split {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1px;
+      background: var(--pane-line);
+      border: 1px solid var(--pane-line);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .pane {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      background: var(--pane-bg);
+    }
+    .pane-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.45rem 0.95rem;
+      background: var(--pane-head);
+      border-bottom: 1px solid var(--pane-line);
+      font-family: var(--font-mono);
+      font-size: 0.86rem;
+      color: var(--pane-label);
+    }
+    .pane-label b { font-weight: 400; color: #C3C9DA; }
+    .pane-hint { display: none; opacity: 0; transition: opacity 0.18s ease; }
+    @media (hover: hover) { .pane-hint { display: block; } }
+    .dissolved .pane-hint { opacity: 1; }
+    .dissolved .pane-src:hover .pane-hint { opacity: 0; }
+    .pane pre {
+      flex: 1;
+      margin: 0;
+      --scroll-thumb: oklch(100% 0 0 / 0.14);
+      --scroll-thumb-hover: oklch(100% 0 0 / 0.26);
+      padding: 0.95rem 1rem;
+      overflow-x: auto;
+      font-family: var(--font-mono);
+      font-size: 0.88rem;
+      line-height: 1.62;
+      color: var(--t-ink);
+    }
+    .pane .kw { color: var(--t-kw); }
+    .pane .ty { color: var(--t-ty); }
+    .pane .fn { color: var(--t-fn); }
+    .pane .at, .pane .sec { color: var(--t-con); }
+    .pane .cm, .pane .rng { color: var(--t-com); }
+    .pane .st, .pane .out { color: var(--t-str); }
+
+    /* the source file dissolves into what index keeps */
+    .pane .l { display: block; }
+    .src .l:not(.keep) { transition: opacity 0.35s ease 0.25s; }
+    .dissolved .src .l:not(.keep) { opacity: 0.34; }
+    .dissolved .pane-src:hover .l:not(.keep) { opacity: 1; transition-delay: 0s; }
+
+    .stat {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      margin-top: 1.1rem;
+      font-family: var(--font-mono);
+      font-size: 0.94rem;
+      color: var(--ink-3);
+    }
+    .stat-num { color: var(--ink); font-weight: 700; }
+    .stat-arrow { color: var(--ink-3); }
+    .stat-result { color: var(--accent); }
+    .stat-result::before { content: '·'; margin-right: 0.45rem; color: var(--ink-3); }
+
+    .pane-split.wide-left { grid-template-columns: 1.4fr 1fr; }
+    .pane-duo {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+    }
+    .pane-solo { border: 1px solid var(--pane-line); border-radius: 10px; overflow: hidden; }
+
+    /* ── doom ── */
     .doom-demo {
-      max-width: 820px;
-      margin: 3rem auto 0;
+      max-width: 900px;
+      margin: clamp(2.5rem, 5vw, 3.5rem) auto 0;
     }
     .doom-line {
+      font-family: var(--font-mono);
+      font-size: 1.05rem;
+      color: var(--ink-2);
       text-align: center;
-      font-size: 1.15rem;
-      font-weight: 800;
-      color: var(--deep-navy);
-      margin-bottom: 1rem;
+      margin-bottom: 0.85rem;
     }
-    .doom-demo .tui { display: block; }
-    .doom-demo .tui-body { min-width: 0; min-height: 0; }
     .doom-video {
       display: block;
       width: 100%;
@@ -696,454 +835,138 @@
       cursor: pointer;
     }
 
-
-    /* ── PROVIDERS ── */
-    .providers-section {
-      text-align: center;
-      margin-bottom: 0;
-      position: relative;
-      z-index: 2;
-      max-width: 1060px;
-      margin: 0 auto;
-    }
-    .providers-section h2 {
-      font-weight: 800;
-      font-size: clamp(1.65rem, 3.2vw, 2.2rem);
-      letter-spacing: -0.02em;
-      margin-bottom: 0.5rem;
-    }
-    .providers-section > p {
-      font-size: 1rem;
-      color: var(--text-secondary);
-      max-width: 50ch;
-      margin: 0 auto 2rem;
-    }
-    .provider-grid {
-      display: flex;
-      justify-content: center;
-      gap: 1.25rem;
-      flex-wrap: wrap;
-      margin-bottom: 1.25rem;
-    }
-    .provider-chip {
-      display: inline-block;
-      padding: 0.8rem 1.6rem;
-      background: linear-gradient(135deg, oklch(96% 0.02 280 / 0.6), oklch(94% 0.03 280 / 0.3));
-      border: 1px solid oklch(88% 0.04 280 / 0.4);
-      border-radius: 12px;
-      font-weight: 700;
-      font-size: 1.05rem;
-      color: var(--deep-navy);
-      text-decoration: none;
-    }
-    .provider-chip:hover {
-      transform: translateY(-3px) scale(1.04);
-      box-shadow: 0 8px 24px oklch(70% 0.06 280 / 0.15);
-      background: linear-gradient(135deg, oklch(94% 0.04 280 / 0.7), oklch(90% 0.06 280 / 0.4));
-      border-color: oklch(78% 0.08 280 / 0.5);
-    }
-    .provider-plus {
-      font-size: 0.92rem;
-      color: var(--text-secondary);
-    }
-    .provider-plus a {
-      color: oklch(48% 0.1 280);
-      text-decoration: underline;
-      text-underline-offset: 3px;
-    }
-
-
-    /* ── TOOL SHOWCASES ── */
-    .showcase {
-      margin-bottom: clamp(4rem, 8vw, 6rem);
-    }
-    .showcase-header {
-      margin-bottom: 2rem;
-    }
-    .showcase-header span {
-      display: block;
-      font-size: 0.78rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.14em;
-      color: var(--muted);
-      margin-bottom: 0.4rem;
-    }
-    .showcase-header h2 {
-      font-weight: 800;
-      font-size: clamp(1.35rem, 2.5vw, 1.7rem);
-      letter-spacing: -0.02em;
-      line-height: 1.2;
-      margin-bottom: 0.5rem;
-    }
-    .showcase-header p {
-      font-size: 0.92rem;
-      color: var(--text-secondary);
-      max-width: 55ch;
-      line-height: 1.55;
-    }
-    .showcase-header code {
-      font-size: 0.88rem;
-      background: oklch(90% 0.03 270 / 0.5);
-      padding: 0.1rem 0.35rem;
-      border-radius: 4px;
-    }
-
-    /* index tool split view */
-    .index-split {
-      display: grid;
-      grid-template-columns: 1fr auto 1fr;
-      gap: 0;
-      border-radius: 10px;
-      overflow: hidden;
-      box-shadow: 0 8px 32px oklch(20% 0.04 270 / 0.15), 0 0 0 1px oklch(30% 0.02 270 / 0.2);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.82rem;
-      line-height: 1.6;
-      background: #1e1e2e;
-    }
-    .index-pane {
-      overflow: hidden;
-      position: relative;
-    }
-    .index-pane-label {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      padding: 0.3rem 1rem;
-      font-size: 0.92rem;
-      font-weight: 700;
-      color: oklch(55% 0.02 270);
-      background: oklch(18% 0.02 270);
-    }
-    .index-pane pre {
-      margin: 0;
-      padding: 0.8rem 1rem;
-      overflow-x: auto;
-      color: #cdd6f4;
-    }
-    .index-divider {
-      width: 1px;
-      background: oklch(32% 0.04 270);
-    }
-    .index-pane .ln  { color: oklch(40% 0.015 270); user-select: none; }
-    .index-pane .kw  { color: #cba6f7; }
-    .index-pane .ty  { color: #f9e2af; }
-    .index-pane .fn  { color: #89b4fa; }
-    .index-pane .st  { color: #a6e3a1; }
-    .index-pane .cm  { color: oklch(50% 0.02 270); font-style: italic; }
-    .index-pane .at  { color: #f38ba8; }
-    .index-pane .op  { color: #89dceb; }
-    .index-pane .sec { color: #f9e2af; font-weight: 700; }
-    .index-pane .dim { color: oklch(50% 0.015 270); }
-    .index-pane .rng { color: oklch(55% 0.06 280); }
-
-    .showcase-stat {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      flex-wrap: wrap;
-      gap: 0.4rem 0.6rem;
-      margin-top: 1.5rem;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.88rem;
-      color: var(--text-secondary);
-    }
-    .stat-num {
-      font-weight: 800;
-      color: var(--deep-navy);
-    }
-    .stat-arrow {
-      color: oklch(45% 0.03 270);
-      font-family: 'JetBrains Mono', monospace;
-    }
-    .stat-result {
-      padding: 0.3rem 0.75rem;
-      border-radius: 20px;
-      font-size: 0.82rem;
-      font-weight: 800;
-      background: oklch(92% 0.06 150 / 0.5);
-      color: oklch(38% 0.12 150);
-    }
-
-    /* code_execution showcase */
-    .exec-demo {
-      border-radius: 10px;
-      overflow: hidden;
-      box-shadow: 0 8px 32px oklch(20% 0.04 270 / 0.15), 0 0 0 1px oklch(30% 0.02 270 / 0.2);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.82rem;
-      line-height: 1.6;
-      background: #1e1e2e;
-    }
-    .exec-body {
-      display: grid;
-      grid-template-columns: 1fr auto 1fr;
-    }
-    .exec-pane {
-      overflow: hidden;
-    }
-    .exec-pane-label {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      padding: 0.3rem 1rem;
-      font-size: 0.92rem;
-      font-weight: 700;
-      color: oklch(55% 0.02 270);
-      background: oklch(18% 0.02 270);
-    }
-    .exec-pane pre {
-      margin: 0;
-      padding: 0.8rem 1rem;
-      overflow-x: auto;
-      color: #cdd6f4;
-    }
-    .exec-divider {
-      width: 1px;
-      background: oklch(32% 0.04 270);
-    }
-    .exec-duo {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1.5rem;
-    }
-    .exec-duo .exec-demo {
-      display: flex;
-      flex-direction: column;
-    }
-    .exec-duo .exec-pane {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-    }
-    .exec-duo .exec-pane pre { flex: 1; }
-    .exec-pane .kw  { color: #cba6f7; }
-    .exec-pane .fn  { color: #89b4fa; }
-    .exec-pane .st  { color: #a6e3a1; }
-    .exec-pane .cm  { color: oklch(50% 0.02 270); font-style: italic; }
-    .exec-pane .op  { color: #89dceb; }
-    .exec-pane .nb  { color: #fab387; }
-    .exec-pane .dim { color: oklch(50% 0.015 270); }
-    .exec-pane .out { color: oklch(70% 0.08 150); }
-    .exec-pane .err { color: #f38ba8; }
-
-
-
-    @media (max-width: 768px) {
-      .index-split { grid-template-columns: 1fr; }
-      .index-divider { width: auto; height: 1px; }
-      .exec-body { grid-template-columns: 1fr; }
-      .exec-divider { width: auto; height: 1px; }
-      .exec-duo { grid-template-columns: 1fr; }
-    }
-
-    /* ── BOTTOM SKY ── */
+    /* ── bottom sky ── */
     .bottom-sky {
       position: relative;
       overflow: hidden;
-      margin-top: -1px;
-      content-visibility: auto;
-      contain-intrinsic-size: auto 500px;
+      background: linear-gradient(180deg, var(--paper) 0%, var(--sky-3) 55%, var(--sky-2) 78%, var(--sky-1) 100%);
     }
-    .bottom-sky-bg {
-      min-height: clamp(18rem, 28vw, 28rem);
-      background: linear-gradient(180deg, var(--cream) 0%, var(--sky-start) 15%, var(--sky-end) 35%, var(--lavender) 60%, var(--soft-pink) 100%);
-      position: relative;
-      padding: clamp(3rem, 6vw, 5rem) clamp(1.5rem, 5vw, 3rem) clamp(10rem, 14vw, 16rem);
+    .bottom-sky .block { border-top: 0; }
+    .bottom-sky .clouds { --cloud: var(--cloud-deep); }
+    .bottom-sky > .content, .bottom-sky > footer { position: relative; z-index: 1; }
+
+    /* ── providers ── */
+    .provider-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.55rem;
+      margin-bottom: 1.5rem;
     }
-    .bottom-stars {
-      position: absolute;
+    .provider-chip {
+      padding: 0.62rem 0.95rem;
+      border-radius: 8px;
+      background: var(--soft);
+      font-family: var(--font-mono);
+      font-size: 0.96rem;
+      color: var(--ink-2);
+      transition: background 0.1s, color 0.1s;
+    }
+    .provider-chip:hover { background: var(--soft-hover); color: var(--accent); }
+    .provider-plus {
+      max-width: 58ch;
+      font-size: 1.06rem;
+      color: var(--ink-2);
+    }
+    .provider-plus p + p { margin-top: 0.5rem; }
+
+    /* ── footer ── */
+    footer {
+      padding: clamp(4rem, 9vw, 7rem) 1.5rem clamp(1.5rem, 3vw, 2rem);
+      text-align: center;
+      font-family: var(--font-mono);
+      font-size: 0.88rem;
+      color: var(--ink-3);
+    }
+    footer a { color: var(--ink-2); }
+    footer a:hover { color: var(--accent); }
+
+    /* ── keys card ── */
+    .overlay {
+      position: fixed;
       inset: 0;
-      pointer-events: none;
+      z-index: 200;
+      display: flex;
+      justify-content: center;
+      padding-top: 16vh;
+      background: oklch(25% 0.03 300 / 0.35);
     }
-    .bottom-star {
-      position: absolute;
-      background: oklch(98% 0.02 90);
-      clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
-      animation: twinkle 3s ease-in-out infinite;
+    .overlay[hidden] { display: none; }
+    .overlay-card {
+      width: min(520px, 92vw);
+      height: fit-content;
+      background: var(--pane-bg);
+      border: 1px solid var(--pane-line);
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 24px 60px oklch(20% 0.04 300 / 0.35);
+      font-family: var(--font-mono);
     }
-    .bottom-star:nth-child(1) { bottom: 45%; left: 12%; width: 5px; height: 5px; animation-delay: 0.5s; }
-    .bottom-star:nth-child(2) { bottom: 55%; left: 30%; width: 4px; height: 4px; animation-delay: 1.2s; }
-    .bottom-star:nth-child(3) { bottom: 60%; right: 22%; width: 5px; height: 5px; animation-delay: 0.8s; }
-    .bottom-star:nth-child(4) { bottom: 50%; right: 38%; width: 3px; height: 3px; animation-delay: 2s; }
-    .bottom-star:nth-child(5) { bottom: 65%; left: 52%; width: 4px; height: 4px; animation-delay: 1.5s; }
-    .bottom-star:nth-child(6) { bottom: 48%; right: 10%; width: 4px; height: 4px; animation-delay: 0.3s; }
-    .bottom-star-diamond {
-      position: absolute;
-      background: oklch(98% 0.03 85);
-      clip-path: polygon(50% 0%, 62% 38%, 100% 50%, 62% 62%, 50% 100%, 38% 62%, 0% 50%, 38% 38%);
-      animation: twinkle-bright 4s ease-in-out infinite;
+    .overlay-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.7rem 0.9rem;
+      border-bottom: 1px solid var(--pane-line);
     }
-    .bottom-star-diamond:nth-child(7) { bottom: 52%; left: 22%; width: 10px; height: 10px; animation-delay: 1.8s; }
-    .bottom-star-diamond:nth-child(8) { bottom: 58%; right: 28%; width: 8px; height: 8px; animation-delay: 0.6s; }
-
-    .bottom-cloud-layer {
-      position: absolute;
-      bottom: 0;
-      left: -5%;
-      right: -5%;
-      pointer-events: none;
+    .overlay-mark { color: var(--t-fn); }
+    .keys-title { color: var(--t-com); font-size: 0.94rem; }
+    .keys-list { list-style: none; padding: 0.35rem 0; }
+    .keys-list li {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.4rem 0.9rem;
+      font-size: 0.9rem;
+      color: var(--t-com);
     }
-    .bottom-cloud-row {
-      position: absolute;
-      left: 0;
-      right: 0;
-    }
-    .bottom-cloud-row .cloud-svg {
-    }
-    .bottom-cloud-back {
-      bottom: 60px;
-      height: 90px;
-    }
-    .bottom-cloud-back .cloud-svg { fill: oklch(90% 0.05 300 / 0.5); }
-    .bottom-cloud-mid {
-      bottom: 25px;
-      height: 80px;
-    }
-    .bottom-cloud-mid .cloud-svg { fill: oklch(88% 0.04 290 / 0.6); }
-    .bottom-cloud-front {
-      bottom: -8px;
-      height: 70px;
-    }
-    .bottom-cloud-front .cloud-svg { fill: oklch(92% 0.03 280 / 0.8); }
-
-    .bottom-moon {
-      position: absolute;
-      top: 18%;
-      right: 10%;
-      width: 28px;
-      height: 28px;
-      border-radius: 50%;
-      background: oklch(95% 0.03 85);
-      box-shadow:
-        0 0 16px oklch(92% 0.04 85 / 0.4),
-        0 0 50px oklch(92% 0.04 85 / 0.15);
-    }
-    .bottom-moon::after {
-      content: '';
-      position: absolute;
-      width: 22px;
-      height: 22px;
-      border-radius: 50%;
-      background: linear-gradient(135deg, oklch(90% 0.05 280), oklch(85% 0.06 290));
-      top: -3px;
-      left: 5px;
+    .keys-list span { margin-left: 0.5rem; }
+    .keys-list kbd {
+      min-width: 1.5rem;
+      padding: 0 0.35rem;
+      border: 1px solid var(--pane-line);
+      border-radius: 4px;
+      box-shadow: 0 2px 0 var(--pane-line);
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      text-align: center;
+      color: var(--t-ink);
     }
 
-    /* ── ANIMATIONS ── */
+    /* the sandbox prints its result when you reach it */
+    .exec-out .l {
+      opacity: 0;
+      transform: translateY(3px);
+      transition: opacity 0.18s ease, transform 0.18s ease;
+    }
+    .exec-out .l:nth-child(2) { transition-delay: 0.12s; }
+    .exec-out .l:nth-child(3) { transition-delay: 0.24s; }
+    .ran .exec-out .l { opacity: 1; transform: none; }
+    .run-caret {
+      display: inline-block;
+      width: 0.55em;
+      height: 1em;
+      vertical-align: text-bottom;
+      background: var(--t-fn);
+      animation: blink 1.15s steps(1) infinite;
+    }
+    .ran .run-caret { display: none; }
+    @keyframes blink { 0%, 55% { opacity: 1; } 56%, 100% { opacity: 0; } }
+
+    /* the hero borrows the same entrance, but from CSS: it starts on the first paint instead of
+       waiting for the parser to reach the script at the end of the body */
+    .hero-intro, .hero-preview { animation: rise 0.32s var(--ease) both; }
+    .hero-preview { animation-delay: 0.06s; }
+    @keyframes rise { from { opacity: 0; transform: translateY(14px); } }
+
+    /* ── reveal ── */
     .reveal {
       opacity: 0;
-      transform: translateY(20px);
-      transition: opacity 0.6s cubic-bezier(0.16, 1, 0.3, 1), transform 0.6s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-    .reveal.visible { opacity: 1; transform: translateY(0); }
-    .reveal-d1 { transition-delay: 0.1s; }
-    .reveal-d2 { transition-delay: 0.2s; }
-    .reveal-d3 { transition-delay: 0.3s; }
-    .reveal-d4 { transition-delay: 0.4s; }
-    .reveal-d5 { transition-delay: 0.5s; }
-    .reveal-d6 { transition-delay: 0.6s; }
-    .reveal-d7 { transition-delay: 0.7s; }
-
-    /* hero entrance choreography — .hero-anim added by JS */
-    .hero-anim .hero-intro > * {
-      opacity: 0;
-      transform: translateY(18px);
-      transition: opacity 0.4s cubic-bezier(0.16, 1, 0.3, 1), transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-    .hero-anim .hero-intro.entered > * { opacity: 1; transform: translateY(0); }
-    .hero-anim .hero-intro > :nth-child(1) { transition-delay: 0.05s; }
-    .hero-anim .hero-intro > :nth-child(2) { transition-delay: 0.12s; }
-    .hero-anim .hero-intro > :nth-child(3) { transition-delay: 0.19s; }
-    .hero-anim .hero-intro > :nth-child(4) { transition-delay: 0.26s; }
-    .hero-anim .hero-intro > :nth-child(5) { transition-delay: 0.33s; }
-    .hero-anim .hero-intro > :nth-child(6) { transition-delay: 0.40s; }
-
-    /* hero preview (TUI) entrance */
-    .hero-anim .hero-preview {
-      opacity: 0;
-      transform: translateX(40px);
-      transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.15s, transform 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.15s;
-    }
-    .hero-anim .hero-preview.entered {
-      opacity: 1;
-      transform: translateX(0);
-    }
-
-    /* pitch item stagger — each item animates individually */
-    .pitch-item {
-      display: grid;
-      grid-template-columns: 24px 1fr;
-      gap: 0.75rem;
-      align-items: baseline;
-      margin-bottom: 1.1rem;
-      opacity: 0;
-      transform: translateY(16px);
-      transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1), transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-    .pitch-item.visible { opacity: 1; transform: translateY(0); }
-
-    /* provider chip stagger */
-    .provider-chip {
-      opacity: 0;
       transform: translateY(14px);
-      transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s ease, opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1), background 0.25s ease, border-color 0.25s ease;
+      transition: opacity 0.32s var(--ease), transform 0.32s var(--ease);
     }
-    .provider-chip.visible {
-      opacity: 1;
-      transform: translateY(0);
-    }
+    .reveal.visible { opacity: 1; transform: none; }
+    .hero-preview.reveal { transition-delay: 0.06s; }
 
-    /* install line copy feedback */
-    .install-line {
-      margin-top: 1.25rem;
-      position: relative;
-      display: inline-flex;
-      align-items: center;
-    }
-    .install-line code {
-      cursor: pointer;
-      transition: background 0.2s ease, transform 0.15s ease;
-    }
-    .install-line code:hover {
-      background: #313244;
-    }
-    .install-line code:active {
-      transform: scale(0.97);
-    }
-    .copy-toast {
-      position: absolute;
-      top: 50%;
-      left: calc(100% + 0.35rem);
-      transform: translateY(-50%) translateX(-4px);
-      font-size: 0.78rem;
-      font-weight: 700;
-      color: oklch(50% 0.12 145);
-      opacity: 0;
-      transition: opacity 0.25s ease, transform 0.25s ease;
-      pointer-events: none;
-      white-space: nowrap;
-    }
-    .copy-toast.show {
-      opacity: 1;
-      transform: translateY(-50%) translateX(0);
-    }
-
-    /* nav logo hover */
-    .nav-logo {
-      transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-    .nav-logo:hover {
-      transform: scale(1.05);
-    }
-
-    /* provider chip active */
-    .provider-chip:active {
-      transform: translateY(0) scale(0.97) !important;
-    }
-
-    /* ── REDUCED MOTION ── */
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
         animation-duration: 0.01ms !important;
@@ -1151,265 +974,169 @@
         transition-duration: 0.01ms !important;
         scroll-behavior: auto !important;
       }
-      .hero-anim .hero-intro > * { opacity: 1; transform: none; }
-      .hero-anim .hero-preview { opacity: 1; transform: none; }
       .reveal { opacity: 1; transform: none; }
-      .pitch-item { opacity: 1; transform: none; }
-      .provider-chip { opacity: 1; transform: none; }
-      .star-badge { opacity: 1; transform: none; }
     }
 
-    /* ── RESPONSIVE ── */
+    /* ── responsive ── */
+    /* the two Lua samples need 1098px of band between them, so they stack first */
+    @media (max-width: 1340px) {
+      .pane-duo { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 1220px) {
+      .pane-split, .pane-split.wide-left { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 1000px) {
+      .hero { min-height: 0; }
+      .hero-grid { grid-template-columns: minmax(0, 1fr); }
+      .features { grid-template-columns: 1fr; gap: 1.55rem; }
+      .feature { max-width: 68ch; }
+    }
     @media (max-width: 768px) {
-      .nav-right a:not(.nav-github):not(.nav-discord):not([href="/docs/"]) { display: none; }
-      .nav-label { display: none; }
-      .hero { padding-inline: 1rem; }
-      .hero-grid { grid-template-columns: 1fr; text-align: center; }
-      .hero-intro { display: flex; flex-direction: column; align-items: center; }
-      .hero-preview { text-align: left; width: 100%; }
-      .pitch { grid-template-columns: 1fr; }
-
-      .provider-grid { gap: 0.75rem; }
-      .provider-chip { padding: 0.65rem 1.25rem; font-size: 0.88rem; }
-
-      /* always show player controls below the player on mobile */
-      .tui-body { min-width: 0; }
-      .tui-body .player-controls {
+      .nav-label, .nav-crumb { display: none; }
+      .nav-right { gap: 0.85rem; }
+      .hero-preview > .player-controls, .doom-demo .player-controls {
         position: static;
         opacity: 1;
         transform: none;
         pointer-events: auto;
-        background: oklch(16% 0.015 270);
-        border-top: 1px solid oklch(22% 0.02 270);
       }
     }
   </style>
 </head>
 <body>
 
+<div id="top-sentinel" aria-hidden="true"></div>
+
 <nav id="nav">
-  <a href="#" class="nav-logo">maki</a>
+  <div class="nav-left">
+    <a href="#" class="nav-logo">maki</a>
+    <span class="nav-crumb" id="nav-crumb" aria-hidden="true"></span>
+  </div>
   <div class="nav-right">
+    <button class="key-hint" id="keys-open" aria-label="Keyboard shortcuts"><kbd>?</kbd></button>
+    <span class="nav-sep"></span>
     <a href="/docs/">Docs</a>
     <span class="nav-sep"></span>
     <a href="https://discord.gg/dEBhANTbX" target="_blank" rel="noopener" class="nav-discord" aria-label="Discord"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.369a19.79 19.79 0 00-4.885-1.515.074.074 0 00-.079.037c-.21.375-.444.864-.608 1.249a18.27 18.27 0 00-5.487 0 12.64 12.64 0 00-.617-1.25.077.077 0 00-.079-.036A19.736 19.736 0 003.677 4.37a.07.07 0 00-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 00.031.057 19.9 19.9 0 005.993 3.03.078.078 0 00.084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 00-.041-.106 13.107 13.107 0 01-1.872-.892.077.077 0 01-.008-.128c.126-.094.252-.192.372-.291a.074.074 0 01.077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 01.078.009c.12.099.246.198.373.292a.077.077 0 01-.006.127c-.598.35-1.22.644-1.873.891a.077.077 0 00-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 00.084.028 19.839 19.839 0 006.002-3.03.077.077 0 00.032-.056c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 00-.031-.028zM8.02 15.331c-1.182 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg><span class="nav-label">Discord</span></a>
     <span class="nav-sep"></span>
     <a href="https://github.com/tontinton/maki" target="_blank" rel="noopener" class="nav-github" aria-label="GitHub"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg><span class="nav-label">GitHub</span><span class="star-badge" data-stars><svg width="10" height="10" viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg><span data-star-count></span></span></a>
+    <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark mode">
+      <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+      <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    </button>
   </div>
 </nav>
 
-<section class="hero">
-  <div class="hero-clouds">
-    <div class="cloud-bank cloud-bank-1">
-      <svg class="cloud-svg" style="width:380px;bottom:0;left:0" viewBox="0 0 380 120" fill="oklch(96% 0.02 280 / 0.6)"><path d="M10 120 Q10 95 35 90 Q20 60 55 50 Q60 20 100 18 Q130 0 165 15 Q195 5 220 20 Q250 8 275 25 Q310 10 340 30 Q365 20 370 50 Q390 65 370 85 Q380 110 360 120Z"/></svg>
-    </div>
-    <div class="cloud-bank cloud-bank-2">
-      <svg class="cloud-svg" style="width:300px;bottom:0;right:0" viewBox="0 0 300 110" fill="oklch(96% 0.02 280 / 0.55)"><path d="M5 110 Q0 85 25 75 Q15 50 50 40 Q55 15 90 12 Q120 -5 155 10 Q180 0 210 15 Q240 5 260 25 Q285 15 290 45 Q310 60 290 80 Q300 105 280 110Z"/></svg>
-    </div>
-    <div class="cloud-bank cloud-bank-5">
-      <svg class="cloud-svg" style="width:160px;bottom:0;left:0" viewBox="0 0 160 65" fill="oklch(96% 0.02 280 / 0.4)"><path d="M5 65 Q0 48 16 42 Q8 26 30 20 Q38 4 58 6 Q75 -4 95 8 Q112 0 128 15 Q148 8 152 30 Q166 40 150 52 Q158 63 142 65Z"/></svg>
-    </div>
-    <div class="cloud-bank cloud-bank-7">
-      <svg class="cloud-svg" style="width:400px;bottom:0;left:0" viewBox="0 0 400 130" fill="oklch(97% 0.02 280 / 0.65)"><path d="M8 130 Q5 100 30 92 Q15 60 55 48 Q62 18 105 15 Q140 -5 175 12 Q205 0 235 18 Q265 5 295 22 Q325 8 355 30 Q380 18 385 55 Q405 72 385 92 Q395 125 375 130Z"/></svg>
-    </div>
-    <div class="cloud-bank cloud-bank-8">
-      <svg class="cloud-svg" style="width:320px;bottom:0;left:0" viewBox="0 0 320 115" fill="oklch(97% 0.02 280 / 0.6)"><path d="M8 115 Q3 88 28 80 Q15 55 48 42 Q55 15 92 12 Q122 -4 155 10 Q182 0 208 16 Q235 5 258 22 Q282 12 300 35 Q318 22 312 55 Q330 68 312 85 Q320 110 302 115Z"/></svg>
-    </div>
-    <div class="cloud-floor"></div>
+<header class="hero" data-section="intro">
+  <div class="sky">
+    <span class="star star-1"></span>
+    <span class="star star-2"></span>
+    <span class="star star-3"></span>
+    <span class="star star-4"></span>
+    <span class="star star-5"></span>
+    <button class="moon" id="moon" aria-label="Toggle dark mode"></button>
   </div>
-  <div class="stars">
-    <div class="star"></div><div class="star"></div><div class="star"></div><div class="star"></div><div class="star"></div>
-    <div class="star"></div><div class="star"></div><div class="star"></div><div class="star"></div><div class="star"></div>
-    <div class="star-diamond"></div><div class="star-diamond"></div><div class="star-diamond"></div><div class="star-diamond"></div><div class="star-diamond"></div>
+  <div class="clouds" aria-hidden="true">
+    <svg class="cloud cloud-a" viewBox="0 0 380 120"><path d="M10 120 Q10 95 35 90 Q20 60 55 50 Q60 20 100 18 Q130 0 165 15 Q195 5 220 20 Q250 8 275 25 Q310 10 340 30 Q365 20 370 50 Q390 65 370 85 Q380 110 360 120Z"/></svg>
+    <svg class="cloud cloud-b" viewBox="0 0 300 110"><path d="M5 110 Q0 85 25 75 Q15 50 50 40 Q55 15 90 12 Q120 -5 155 10 Q180 0 210 15 Q240 5 260 25 Q285 15 290 45 Q310 60 290 80 Q300 105 280 110Z"/></svg>
+    <svg class="cloud cloud-c" viewBox="0 0 160 65"><path d="M5 65 Q0 48 16 42 Q8 26 30 20 Q38 4 58 6 Q75 -4 95 8 Q112 0 128 15 Q148 8 152 30 Q166 40 150 52 Q158 63 142 65Z"/></svg>
   </div>
-  <div class="moon-group">
-    <div class="moon"></div>
-  </div>
-
   <div class="hero-grid">
-  <div class="hero-intro">
-    <h1>maki</h1>
-    <p class="hero-tagline">the efficient coder</p>
-    <p class="hero-sub">I got frustrated with existing coding agents and hitting hourly/weekly token limits.<br>So I built Maki, a lightweight Rust TUI with some novel context token reduction techniques.<br>In benchmarks, it reduces cost by 2x and finishes them 2x faster too.</p>
-    <div class="install-line">
-      <code onclick="navigator.clipboard.writeText('curl -fsSL https://maki.sh/install.sh | sh');showCopyToast(this)"><span class="sh-cmd">curl</span> <span class="sh-flag">-fsSL</span> <span class="sh-url">https://maki.sh/install.sh</span> <span class="sh-pipe">|</span> <span class="sh-cmd">sh</span></code>
-      <span class="copy-toast">copied!</span>
+    <div class="hero-intro">
+      <h1>maki</h1>
+      <p class="hero-tagline">the efficient coder</p>
+      <p class="hero-sub">I got frustrated with existing coding agents and hitting hourly/weekly token limits.</p>
+      <p class="hero-sub">So I built Maki, a lightweight Rust TUI with some novel context token reduction techniques.</p>
+      <p class="hero-sub">In benchmarks, it reduces cost by 2x and finishes them 2x faster too.</p>
+      <button class="install" id="install" aria-keyshortcuts="c"><span class="for-unix"><span class="sh-p">$</span> curl <span class="sh-dim">-fsSL</span> <span class="nb">https://maki.sh/install.sh <span class="sh-dim">|</span> sh</span></span><span class="for-win"><span class="sh-p">&gt;</span> <span class="nb">irm https://maki.sh/install.ps1 <span class="sh-dim">|</span> iex</span></span></button>
+      <p class="install-note"><button class="os-swap" id="os-swap"><span class="for-unix">on Windows?</span><span class="for-win">on macOS or Linux?</span></button><span id="install-hint"></span></p>
     </div>
-  </div>
 
-  <div class="hero-preview">
-    <div class="tui-scale-wrap">
-    <div class="tui">
-      <div class="tui-titlebar">
-        <div class="tui-dot tui-dot-r"></div>
-        <div class="tui-dot tui-dot-y"></div>
-        <div class="tui-dot tui-dot-g"></div>
-      </div>
-
-      <div class="tui-body">
-        <div class="tui-loader" id="demo-loader"><div class="tui-spinner"></div></div>
-        <div id="demo-player"></div>
-        <div class="player-controls">
-          <button class="player-btn" id="play-btn" aria-label="Play/Pause">
-            <svg viewBox="0 0 24 24" id="play-icon"><path d="M8 5v14l11-7z"/></svg>
-            <svg viewBox="0 0 24 24" id="pause-icon" style="display:none"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
-          </button>
-          <div class="player-progress" id="progress-bar">
-            <div class="player-progress-bar" id="progress-fill"></div>
-          </div>
-          <span class="player-time" id="time-display">0:00 / 0:00</span>
-          <div class="player-speed">
-            <button class="speed-toggle" id="speed-toggle" aria-haspopup="true" aria-expanded="false">2.0x</button>
-            <div class="speed-menu" id="speed-menu" role="menu">
-              <button class="speed-option" data-speed="0.5" role="menuitem">0.5x</button>
-              <button class="speed-option" data-speed="1" role="menuitem">1.0x</button>
-              <button class="speed-option" data-speed="1.5" role="menuitem">1.5x</button>
-              <button class="speed-option active" data-speed="2" role="menuitem">2.0x</button>
-              <button class="speed-option" data-speed="3" role="menuitem">3.0x</button>
+    <div class="hero-preview">
+      <div class="tui-scale-wrap">
+        <div class="tui">
+          <div class="tui-body">
+            <div class="tui-loader" id="demo-loader"><div class="tui-spinner"></div></div>
+            <div id="demo-player"></div>
+            <div class="player-controls">
+              <button class="player-btn" id="play-btn" aria-label="Play/Pause">
+                <svg viewBox="0 0 24 24" class="icon-play"><path d="M8 5v14l11-7z"/></svg>
+                <svg viewBox="0 0 24 24" class="icon-pause"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+              </button>
+              <div class="player-progress" id="progress-bar">
+                <div class="player-progress-bar" id="progress-fill"></div>
+              </div>
+              <span class="player-time" id="time-display">0:00 / 0:00</span>
+              <div class="player-speed">
+                <button class="speed-toggle" id="speed-toggle" aria-haspopup="true" aria-expanded="false">2.0x</button>
+                <div class="speed-menu" id="speed-menu" role="menu">
+                  <button class="speed-option" data-speed="0.5" role="menuitem">0.5x</button>
+                  <button class="speed-option" data-speed="1" role="menuitem">1.0x</button>
+                  <button class="speed-option" data-speed="1.5" role="menuitem">1.5x</button>
+                  <button class="speed-option active" data-speed="2" role="menuitem">2.0x</button>
+                  <button class="speed-option" data-speed="3" role="menuitem">3.0x</button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
       </div>
-    </div>
-    </div>
-    <p class="player-hint"><button type="button" id="skip-hint-btn">Skip to 1:07</button> to see the snake game Opus 4.6 created</p>
-  </div>
-  </div>
-</section>
-
-<div class="content" id="features">
-
-  <div class="pitch reveal">
-    <div class="pitch-col">
-      <h2><span>Context efficiency</span>Where tokens go</h2>
-
-      <div class="pitch-item">
-        <div class="pip pip-lavender"></div>
-        <div>
-          <strong><a href="#index">index</a></strong>
-          <p>Parses 15 languages into skeletons: imports, type defs, function signatures with their line ranges. Adds 59 tok/turn but saves 224 tok/turn on reads, netting 165 tok/turn saved. My usage indicated reads are ~65% of all tokens, so this optimization is big.</p>
-        </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-salmon"></div>
-        <div>
-          <strong><a href="#exec">code_execution</a></strong>
-          <p>A sandboxed Python interpreter with memory and time limits. All tools are exposed as <code>async</code> functions, so the model can <code>asyncio.gather()</code> a bunch of reads, grep the results, and only return what matters. Intermediate data never reaches your context.</p>
-        </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-pink"></div>
-        <div>
-          <strong>task</strong>
-          <p>The model picks weak, medium, or strong for each subagent. Haiku-tier for grep-heavy research, opus-tier for architecture. Subagents can be read-only or have full tool access.</p>
-        </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-gold"></div>
-        <div>
-          <strong>Lean system prompt</strong>
-          <p>The system prompt, tool descriptions, and examples are short. When context gets too long, maki compacts history automatically: strips images, thinking blocks, and summarizes older turns.</p>
-        </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-salmon"></div>
-        <div>
-          <strong><a href="/docs/mcp/#tool-search" target="_blank" rel="noopener">MCP tool_search</a></strong>
-          <p>Datadog's MCP server exposes over 100 tools with all toolsets on, and each definition sits in your context on every request, used or not. Maki hides them behind a single <code>tool_search</code> tool, so the model looks up what it needs and the rest never loads.</p>
-        </div>
-      </div>
-    </div>
-
-    <div class="pitch-col">
-      <h2><span>User experience</span>What you get</h2>
-
-      <div class="pitch-item">
-        <div class="pip pip-salmon"></div>
-        <div>
-          <strong>Rust TUI, 60 FPS</strong>
-          <p>Native binary. No javascript runtime, no react. Even the splash screen animation uses SIMD. Syntax highlighting runs on a background thread pool so it never blocks your input. Fits well on small laptop screens.</p>
-        </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-lavender"></div>
-        <div>
-          <strong>Full visibility</strong>
-          <p>Philosophy: don't hide anything. Token count, cost, and model are always in the status bar. Each subagent gets its own chat window you can flip through with <code>/tasks</code> (Ctrl-X). Ctrl-F for fuzzy search. <code>/btw</code> runs a side query without touching the current session. <code>!</code> runs shell commands, <code>!!</code> runs them silently.</p>
-        </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-gold"></div>
-        <div>
-          <strong>Sensible permissions</strong>
-          <p>Bash commands are parsed with tree-sitter so maki knows what's actually being run. <code>git diff && rm -rf /</code> correctly flags both <code>git</code> and <code>rm</code>. Most agents only see <code>git</code>. Handles subshells, command substitution, pipes. Per-tool allow/deny rules, or <code>--yolo</code> to skip it all. SSRF protection on webfetch.</p>
-        </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-pink"></div>
-        <div>
-          <strong>Sessions, memory, MCP, ACP</strong>
-          <p>Sessions run in parallel: switch away and the agent keeps working, <code>/sessions</code> to jump back when it flashes done. Long-term memory that persists across sessions. Tell maki to remember something, sometimes it picks things up on its own. Double-Escape to rewind. Plan mode restricts the agent to read-only. MCP servers over stdio or HTTP. Skills. Opt-in <a href="/docs/telemetry/">OpenTelemetry</a> export. 26 themes. Paste images. <code>--print</code> for headless (output is Claude Code-compatible). <code>maki acp</code> runs an <a href="/docs/acp/">ACP</a> server for editors like <a href="https://zed.dev" target="_blank" rel="noopener">Zed</a>.</p>
-        </div>
-      </div>
-      <div class="pitch-item">
-        <div class="pip pip-salmon"></div>
-        <div>
-          <strong><a href="#lua">Lua plugins</a></strong>
-          <p>Extend maki in Lua with a Neovim-style plugin API. Every built-in tool is a Lua plugin, so anything maki does out of the box, your plugins can do too: add tools, slash commands, keymaps, and UI.</p>
-        </div>
-      </div>
+      <p class="player-hint"><button type="button" id="skip-hint-btn" data-seek="67">Skip to 1:07</button> to see the snake game Opus 4.6 created</p>
     </div>
   </div>
+</header>
 
-  <div class="divider reveal"></div>
+<main class="content">
 
-  <!-- INDEX TOOL SHOWCASE -->
-  <div class="showcase reveal" id="index">
-    <div class="showcase-header">
-      <span>See it in action</span>
+  <section class="block" id="tokens" data-section="tokens">
+    <div class="sec-head">
+      <h2>Where tokens go</h2>
+    </div>
+
+    <div class="features">
+      <div class="feature">
+        <strong><a href="#index">index</a></strong>
+        <p>Parses 15 languages into skeletons: imports, type defs, function signatures with their line ranges.</p>
+        <p>Costs 59 tok/turn, saves 224 on reads. Reads were ~65% of my tokens, so this one is big.</p>
+      </div>
+      <div class="feature">
+        <strong><a href="#exec">code_execution</a></strong>
+        <p>A sandboxed Python interpreter where every tool is an <code>async</code> function.</p>
+        <p>The model gathers 50 reads, greps them, prints the 3 lines that matter. The rest never touches your context.</p>
+      </div>
+      <div class="feature">
+        <strong><a href="/docs/mcp/#tool-search" target="_blank" rel="noopener">tool_search</a></strong>
+        <p>Datadog's MCP server has over 100 tools. Every definition sits in your context on every request, used or not.</p>
+        <p>Maki hides them behind one search tool and loads what the model asks for.</p>
+      </div>
+      <div class="feature">
+        <strong>task</strong>
+        <p>The model picks weak, medium, or strong for each subagent. Haiku-tier for grep-heavy research, opus-tier for architecture.</p>
+        <p>You get a summary, not the transcript.</p>
+      </div>
+      <div class="feature">
+        <strong>compaction</strong>
+        <p>Long sessions get compacted: images and thinking blocks go first, then old turns get summarized.</p>
+        <p>The system prompt and tool descriptions are short too.</p>
+      </div>
+    </div>
+
+  </section>
+
+  <section class="block reveal" id="index" data-section="index">
+    <div class="sec-head">
       <h2>index: read less, know more</h2>
-      <p>Instead of reading full files, <code>index</code> parses with tree-sitter and returns a compact skeleton. The model sees the structure, then reads only the lines it needs.</p>
+      <p>Instead of reading full files, <code>index</code> parses with tree-sitter and returns a compact skeleton.</p>
+      <p>The model sees the structure, then reads only the lines it needs.</p>
     </div>
 
-    <div class="index-split">
-      <div class="index-pane">
-        <div class="index-pane-label">main.rs</div>
-        <pre><span class="kw">use</span> std::fs;
-<span class="kw">use</span> clap::<span class="ty">Parser</span>;
-<span class="kw">use</span> color_eyre::<span class="ty">Result</span>;
-
-<span class="at">#[derive(Parser)]</span>
-<span class="kw">struct</span> <span class="ty">Args</span> {
-    paths: <span class="ty">Vec</span>&lt;<span class="ty">PathBuf</span>&gt;,
-    <span class="at">#[arg(short, long)]</span>
-    lines: <span class="kw">bool</span>,
-}
-
-<span class="kw">fn</span> <span class="fn">count_words</span>(text: &amp;<span class="ty">str</span>) -&gt; <span class="ty">usize</span> {
-    text.<span class="fn">split_whitespace</span>().<span class="fn">count</span>()
-}
-
-<span class="kw">fn</span> <span class="fn">count_lines</span>(text: &amp;<span class="ty">str</span>) -&gt; <span class="ty">usize</span> {
-    text.<span class="fn">lines</span>().<span class="fn">count</span>()
-}
-
-<span class="kw">fn</span> <span class="fn">main</span>() -&gt; <span class="ty">Result</span>&lt;()&gt; {
-    <span class="kw">let</span> args = <span class="ty">Args</span>::<span class="fn">parse</span>();
-    <span class="kw">for</span> path <span class="kw">in</span> &amp;args.paths {
-        <span class="kw">let</span> text = fs::<span class="fn">read_to_string</span>(path)?;
-        <span class="kw">let</span> n = <span class="kw">if</span> args.lines {
-            <span class="fn">count_lines</span>(&amp;text)
-        } <span class="kw">else</span> {
-            <span class="fn">count_words</span>(&amp;text)
-        };
-        <span class="fn">println!</span>(<span class="st">"{}: {n}"</span>, path.<span class="fn">display</span>());
-    }
-    <span class="ty">Ok</span>(())
-}</pre>
+    <div class="pane-split" id="index-demo">
+      <div class="pane pane-src">
+        <div class="pane-label"><b>main.rs</b><span class="pane-hint">hover to restore</span></div>
+        <pre class="src"><span class="l keep"><span class="kw">use</span> std::fs;</span><span class="l keep"><span class="kw">use</span> clap::<span class="ty">Parser</span>;</span><span class="l keep"><span class="kw">use</span> color_eyre::<span class="ty">Result</span>;</span><span class="l"> </span><span class="l keep"><span class="at">#[derive(Parser)]</span></span><span class="l keep"><span class="kw">struct</span> <span class="ty">Args</span> {</span><span class="l keep">    paths: <span class="ty">Vec</span>&lt;<span class="ty">PathBuf</span>&gt;,</span><span class="l">    <span class="at">#[arg(short, long)]</span></span><span class="l keep">    lines: <span class="kw">bool</span>,</span><span class="l keep">}</span><span class="l"> </span><span class="l keep"><span class="kw">fn</span> <span class="fn">count_words</span>(text: &amp;<span class="ty">str</span>) -&gt; <span class="ty">usize</span> {</span><span class="l">    text.<span class="fn">split_whitespace</span>().<span class="fn">count</span>()</span><span class="l">}</span><span class="l"> </span><span class="l keep"><span class="kw">fn</span> <span class="fn">count_lines</span>(text: &amp;<span class="ty">str</span>) -&gt; <span class="ty">usize</span> {</span><span class="l">    text.<span class="fn">lines</span>().<span class="fn">count</span>()</span><span class="l">}</span><span class="l"> </span><span class="l keep"><span class="kw">fn</span> <span class="fn">main</span>() -&gt; <span class="ty">Result</span>&lt;()&gt; {</span><span class="l">    <span class="kw">let</span> args = <span class="ty">Args</span>::<span class="fn">parse</span>();</span><span class="l">    <span class="kw">for</span> path <span class="kw">in</span> &amp;args.paths {</span><span class="l">        <span class="kw">let</span> text = fs::<span class="fn">read_to_string</span>(path)?;</span><span class="l">        <span class="kw">let</span> n = <span class="kw">if</span> args.lines {</span><span class="l">            <span class="fn">count_lines</span>(&amp;text)</span><span class="l">        } <span class="kw">else</span> {</span><span class="l">            <span class="fn">count_words</span>(&amp;text)</span><span class="l">        };</span><span class="l">        <span class="fn">println!</span>(<span class="st">"{}: {n}"</span>, path.<span class="fn">display</span>());</span><span class="l">    }</span><span class="l">    <span class="ty">Ok</span>(())</span><span class="l">}</span></pre>
       </div>
-      <div class="index-divider"></div>
-      <div class="index-pane">
-        <div class="index-pane-label">maki index main.rs</div>
+      <div class="pane">
+        <div class="pane-label"><b>maki index main.rs</b><span>skeleton</span></div>
         <pre><span class="sec">imports:</span> <span class="rng">[1-3]</span>
   clap::<span class="ty">Parser</span>, color_eyre::<span class="ty">Result</span>, std::fs
 
@@ -1426,27 +1153,23 @@
       </div>
     </div>
 
-    <div class="showcase-stat">
+    <div class="stat">
       <span><span class="stat-num">29</span> lines</span> <span class="stat-arrow">&rarr;</span> <span><span class="stat-num">13</span> lines</span>
       <span class="stat-result">55% smaller</span>
     </div>
-  </div>
+  </section>
 
-  <div class="divider reveal"></div>
-
-  <!-- CODE_EXECUTION SHOWCASE -->
-  <div class="showcase reveal" id="exec">
-    <div class="showcase-header">
-      <span>See it in action</span>
+  <section class="block reveal" id="exec" data-section="code_execution">
+    <div class="sec-head">
       <h2>code_execution: think inside the sandbox</h2>
-      <p>Tools are exposed as <code>async</code> Python functions. The model writes a script, runs it sandboxed, and only the <code>print()</code> output enters your context.</p>
+      <p>Tools are exposed as <code>async</code> Python functions.</p>
+      <p>The model writes a script, runs it sandboxed, and only the <code>print()</code> output enters your context.</p>
     </div>
 
-    <div class="exec-demo">
-      <div class="exec-body">
-        <div class="exec-pane">
-          <div class="exec-pane-label">script</div>
-          <pre><span class="cm"># find dead exports in a TS repo</span>
+    <div class="pane-split wide-left">
+      <div class="pane">
+        <div class="pane-label"><b>script</b><span>python</span></div>
+        <pre><span class="cm"># find dead exports in a TS repo</span>
 files = <span class="kw">await</span> <span class="fn">glob</span>(pattern=<span class="st">'src/**/*.ts'</span>)
 srcs = <span class="kw">await</span> asyncio.<span class="fn">gather</span>(
     *[<span class="fn">read</span>(path=f) <span class="kw">for</span> f <span class="kw">in</span> files]
@@ -1463,38 +1186,64 @@ imports = <span class="fn">set</span>()
 <span class="kw">for</span> name, f <span class="kw">in</span> exports.<span class="fn">items</span>():
     <span class="kw">if</span> name <span class="kw">not in</span> imports:
         <span class="fn">print</span>(<span class="st">f'{f}  {name}'</span>)</pre>
-        </div>
-        <div class="exec-divider"></div>
-        <div class="exec-pane">
-          <div class="exec-pane-label">output</div>
-          <pre><span class="out">src/lib/csv.ts       parseCsvLegacy</span>
-<span class="out">src/auth/jwt.ts      signV1</span>
-<span class="out">src/utils/phone.ts   formatE164</span></pre>
-        </div>
+      </div>
+      <div class="pane">
+        <div class="pane-label"><b>output</b><span>3 lines</span></div>
+        <pre class="exec-out"><span class="l out">src/lib/csv.ts       parseCsvLegacy</span><span class="l out">src/auth/jwt.ts      signV1</span><span class="l out">src/utils/phone.ts   formatE164</span><span class="run-caret"></span></pre>
       </div>
     </div>
 
-    <div class="showcase-stat">
+    <div class="stat">
       <span><span class="stat-num">~40k</span> tokens</span> <span class="stat-arrow">&rarr;</span> <span><span class="stat-num">~30</span> tokens</span>
       <span class="stat-result">1300x reduction</span>
     </div>
-  </div>
+  </section>
 
-  <div class="divider reveal"></div>
-
-  <!-- LUA PLUGINS SHOWCASE -->
-  <div class="showcase reveal" id="lua">
-    <div class="showcase-header">
-      <span>See it in action</span>
-      <h2>Lua plugins: hackable all the way down</h2>
-      <p>Every built-in tool, <code>read</code>, <code>bash</code>, <code>edit</code>, even <code>batch</code>, is itself a Lua plugin. Read them in <a href="https://github.com/tontinton/maki/tree/main/plugins" target="_blank" rel="noopener"><code>./plugins</code></a>. The <a href="/docs/lua-api/">API</a> mirrors Neovim (<code>maki.fs</code>, <code>maki.uv</code>, <code>maki.keymap</code>, <code>maki.treesitter</code>), so it feels familiar. Drop a file in <code>~/.config/maki/plugins/</code> to add tools, slash commands, keymaps, or UI.</p>
+  <section class="block reveal" id="usage" data-section="usage">
+    <div class="sec-head">
+      <h2>What you get</h2>
     </div>
 
-    <div class="exec-duo">
-      <div class="exec-demo">
-        <div class="exec-pane">
-          <div class="exec-pane-label">add a ci_status tool: the model checks CI itself</div>
-          <pre><span class="fn">maki.api.register_tool</span>({
+    <div class="features">
+    <div class="feature">
+      <strong><a href="#lua">Lua plugins</a></strong>
+      <p>Extend maki in Lua with a Neovim-style plugin API: add tools, slash commands, keymaps, and UI.</p>
+      <p>Anything maki does out of the box, your plugins can do too.</p>
+    </div>
+    <div class="feature">
+      <strong>Rust TUI, 60 FPS</strong>
+      <p>Native binary. No javascript runtime, no react. Even the splash screen animation uses SIMD.</p>
+      <p>Syntax highlighting runs on a background thread pool so it never blocks your input.</p>
+    </div>
+    <div class="feature">
+      <strong>Full visibility</strong>
+      <p>Philosophy: don't hide anything. Token count, cost, and model are always in the status bar.</p>
+      <p>Each subagent gets its own chat window you can flip through with <code>/tasks</code> (Ctrl-X). Ctrl-F for fuzzy search.</p>
+      <p><code>/btw</code> runs a side query without touching the current session. <code>!</code> runs shell commands, <code>!!</code> runs them silently.</p>
+    </div>
+    <div class="feature">
+      <strong>Sensible permissions</strong>
+      <p>Bash commands are parsed with tree-sitter so maki knows what's actually being run.</p>
+      <p><code>git diff &amp;&amp; rm -rf /</code> correctly flags both <code>git</code> and <code>rm</code>. Most agents only see <code>git</code>. Handles subshells, command substitution, pipes.</p>
+      <p>Per-tool allow/deny rules, or <code>--yolo</code> to skip it all.</p>
+    </div>
+
+    <p class="feature-rest">Also in there: parallel sessions you can switch away from, long-term memory, double-Escape to rewind, plan mode, MCP over stdio or HTTP, skills, ACP, opt-in <a href="/docs/telemetry/">OpenTelemetry</a>, 26 themes, image paste, and <code>--print</code> for headless.</p>
+    </div>
+  </section>
+
+  <section class="block reveal" id="lua" data-section="lua">
+    <div class="sec-head">
+      <h2>Lua plugins: hackable all the way down</h2>
+      <p>Every built-in tool, <code>read</code>, <code>bash</code>, <code>edit</code>, even <code>batch</code>, is itself a Lua plugin. Read them in <a href="https://github.com/tontinton/maki/tree/main/plugins" target="_blank" rel="noopener"><code>./plugins</code></a>.</p>
+      <p>The <a href="/docs/lua-api/">API</a> mirrors Neovim (<code>maki.fs</code>, <code>maki.uv</code>, <code>maki.keymap</code>, <code>maki.treesitter</code>), so it feels familiar.</p>
+      <p>Drop a file in <code>~/.config/maki/plugins/</code> to add tools, slash commands, keymaps, or UI.</p>
+    </div>
+
+    <div class="pane-duo">
+      <div class="pane pane-solo">
+        <div class="pane-label"><b>add a ci_status tool: the model checks CI itself</b></div>
+        <pre><span class="fn">maki.api.register_tool</span>({
   name = <span class="st">"ci_status"</span>,
   description = <span class="st">"Latest CI run for this branch"</span>,
   schema = { type = <span class="st">"object"</span>, properties = {} },
@@ -1509,12 +1258,10 @@ imports = <span class="fn">set</span>()
     <span class="kw">return</span> { llm_output = res.body, body = buf }
   <span class="kw">end</span>,
 })</pre>
-        </div>
       </div>
-      <div class="exec-demo">
-        <div class="exec-pane">
-          <div class="exec-pane-label">add /standup: show yesterday's commits</div>
-          <pre><span class="fn">maki.api.register_command</span>({
+      <div class="pane pane-solo">
+        <div class="pane-label"><b>add /standup: show yesterday's commits</b></div>
+        <pre><span class="fn">maki.api.register_command</span>({
   name = <span class="st">"/standup"</span>,
   description = <span class="st">"Yesterday's commits"</span>,
   handler = <span class="kw">function</span>()
@@ -1530,27 +1277,21 @@ imports = <span class="fn">set</span>()
     <span class="fn">win:close</span>()
   <span class="kw">end</span>,
 })</pre>
-        </div>
       </div>
     </div>
 
-    <div class="doom-demo reveal">
+    <div class="doom-demo">
       <p class="doom-line">And yes... it can even run DOOM!</p>
       <div class="tui">
-        <div class="tui-titlebar">
-          <div class="tui-dot tui-dot-r"></div>
-          <div class="tui-dot tui-dot-y"></div>
-          <div class="tui-dot tui-dot-g"></div>
-        </div>
         <div class="tui-body">
-          <video class="doom-video" width="1920" height="970" muted loop playsinline preload="none" aria-label="maki running DOOM through a Lua plugin">
+          <video class="doom-video" width="1920" height="970" muted loop playsinline preload="none" data-poster="doom-poster.webp" aria-label="maki running DOOM through a Lua plugin">
             <source src="doom-av1.mp4" type="video/mp4; codecs=av01.0.04M.08">
             <source src="doom.mp4" type="video/mp4">
           </video>
           <div class="player-controls">
             <button class="player-btn doom-play-btn" aria-label="Play/Pause">
-              <svg viewBox="0 0 24 24" class="doom-play-icon"><path d="M8 5v14l11-7z"/></svg>
-              <svg viewBox="0 0 24 24" class="doom-pause-icon" style="display:none"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+              <svg viewBox="0 0 24 24" class="icon-play"><path d="M8 5v14l11-7z"/></svg>
+              <svg viewBox="0 0 24 24" class="icon-pause"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
             </button>
             <div class="player-progress doom-progress">
               <div class="player-progress-bar doom-progress-fill"></div>
@@ -1560,242 +1301,281 @@ imports = <span class="fn">set</span>()
         </div>
       </div>
     </div>
-  </div>
+  </section>
 
-  <div class="divider reveal"></div>
 
-</div>
+</main>
 
 <div class="bottom-sky">
-  <div class="bottom-sky-bg">
-    <div class="bottom-stars">
-      <div class="bottom-star"></div><div class="bottom-star"></div><div class="bottom-star"></div>
-      <div class="bottom-star"></div><div class="bottom-star"></div><div class="bottom-star"></div>
-      <div class="bottom-star-diamond"></div><div class="bottom-star-diamond"></div>
+  <div class="content">
+  <section class="block reveal" id="providers" data-section="providers">
+    <div class="sec-head">
+      <h2>Providers</h2>
+      <p>Set an API key env var, or use <code>maki auth login openai</code> for OAuth.</p>
     </div>
-    <div class="bottom-moon"></div>
-
-    <div class="providers-section">
-      <h2 class="reveal">Providers</h2>
-      <p class="reveal reveal-d1">Set an API key env var, or use <code>maki auth login openai</code> for OAuth.</p>
-      <div class="provider-grid">
-        <a href="/docs/providers/#anthropic" class="provider-chip">Anthropic</a>
-        <a href="/docs/providers/#openai" class="provider-chip">OpenAI</a>
-        <a href="/docs/providers/#xai" class="provider-chip">xAI</a>
-        <a href="/docs/providers/#google" class="provider-chip">Google</a>
-        <a href="/docs/providers/#copilot" class="provider-chip">Copilot</a>
-        <a href="/docs/providers/#ollama" class="provider-chip">Ollama</a>
-        <a href="/docs/providers/#llamacpp" class="provider-chip">llama.cpp</a>
-        <a href="/docs/providers/#mistral" class="provider-chip">Mistral</a>
-        <a href="/docs/providers/#z-ai" class="provider-chip">Z.AI</a>
-        <a href="/docs/providers/#deepseek" class="provider-chip">DeepSeek</a>
-        <a href="/docs/providers/#openrouter" class="provider-chip">OpenRouter</a>
-        <a href="/docs/providers/#synthetic" class="provider-chip">Synthetic</a>
-        <a href="/docs/providers/#regolo" class="provider-chip">Regolo</a>
-        <a href="/docs/providers/#tensorx" class="provider-chip">TensorX</a>
-        <a href="/docs/providers/#opencode-zen" class="provider-chip">OpenCode Zen</a>
-        <a href="/docs/providers/#opencode-go" class="provider-chip">OpenCode Go</a>
-        <a href="/docs/providers/#aperture" class="provider-chip">Aperture</a>
-      </div>
-      <p class="provider-plus reveal reveal-d3">Anything that speaks the OpenAI or Anthropic API works too. Write a short <a href="https://github.com/tontinton/maki/tree/main/scripts/providers" target="_blank" rel="noopener">provider script</a>. OpenAI oauth example included.</p>
+    <div class="provider-grid">
+      <a href="/docs/providers/#anthropic" class="provider-chip">Anthropic</a>
+      <a href="/docs/providers/#openai" class="provider-chip">OpenAI</a>
+      <a href="/docs/providers/#xai" class="provider-chip">xAI</a>
+      <a href="/docs/providers/#google" class="provider-chip">Google</a>
+      <a href="/docs/providers/#copilot" class="provider-chip">Copilot</a>
+      <a href="/docs/providers/#ollama" class="provider-chip">Ollama</a>
+      <a href="/docs/providers/#llamacpp" class="provider-chip">llama.cpp</a>
+      <a href="/docs/providers/#mistral" class="provider-chip">Mistral</a>
+      <a href="/docs/providers/#z-ai" class="provider-chip">Z.AI</a>
+      <a href="/docs/providers/#deepseek" class="provider-chip">DeepSeek</a>
+      <a href="/docs/providers/#openrouter" class="provider-chip">OpenRouter</a>
+      <a href="/docs/providers/#synthetic" class="provider-chip">Synthetic</a>
+      <a href="/docs/providers/#regolo" class="provider-chip">Regolo</a>
+      <a href="/docs/providers/#tensorx" class="provider-chip">TensorX</a>
+      <a href="/docs/providers/#opencode-zen" class="provider-chip">OpenCode Zen</a>
+      <a href="/docs/providers/#opencode-go" class="provider-chip">OpenCode Go</a>
+      <a href="/docs/providers/#aperture" class="provider-chip">Aperture</a>
     </div>
-
-    <div class="bottom-cloud-layer">
-      <div class="bottom-cloud-row bottom-cloud-back">
-        <svg class="cloud-svg" style="width:360px;bottom:0;left:2%" viewBox="0 0 360 100"><path d="M8 100 Q5 78 28 70 Q15 48 48 38 Q55 12 92 10 Q125 -5 158 10 Q185 0 212 15 Q238 5 262 22 Q288 12 310 32 Q335 20 340 52 Q358 65 340 82 Q350 98 330 100Z"/></svg>
-        <svg class="cloud-svg" style="width:300px;bottom:0;left:30%" viewBox="0 0 300 90"><path d="M5 90 Q0 70 22 62 Q12 42 42 34 Q48 10 80 8 Q108 -4 135 8 Q158 0 180 14 Q205 4 225 20 Q248 10 262 30 Q282 18 285 48 Q302 58 285 72 Q295 88 278 90Z"/></svg>
-        <svg class="cloud-svg" style="width:340px;bottom:0;right:2%" viewBox="0 0 340 95"><path d="M8 95 Q2 75 25 66 Q14 45 45 36 Q52 10 88 8 Q118 -4 150 8 Q178 -2 205 14 Q232 4 255 22 Q280 10 300 30 Q322 18 325 50 Q342 62 325 78 Q335 93 315 95Z"/></svg>
-      </div>
-      <div class="bottom-cloud-row bottom-cloud-mid">
-        <svg class="cloud-svg" style="width:400px;bottom:0;left:-1%" viewBox="0 0 400 95"><path d="M5 95 Q0 72 28 64 Q14 42 50 32 Q58 8 98 6 Q132 -6 168 8 Q198 -2 228 14 Q258 2 288 20 Q318 8 345 28 Q372 16 378 50 Q398 62 378 78 Q390 93 368 95Z"/></svg>
-        <svg class="cloud-svg" style="width:380px;bottom:0;left:25%" viewBox="0 0 380 90"><path d="M5 90 Q0 68 25 60 Q12 40 45 30 Q52 6 90 5 Q122 -5 155 8 Q182 -2 210 12 Q238 2 265 18 Q292 6 318 25 Q345 14 352 46 Q370 58 352 72 Q362 88 342 90Z"/></svg>
-        <svg class="cloud-svg" style="width:360px;bottom:0;right:-1%" viewBox="0 0 360 92"><path d="M5 92 Q0 70 24 62 Q12 42 44 32 Q50 8 85 6 Q115 -4 148 8 Q175 -2 202 14 Q230 2 255 20 Q282 8 305 28 Q330 16 335 48 Q355 60 335 76 Q345 90 325 92Z"/></svg>
-      </div>
-      <div class="bottom-cloud-row bottom-cloud-front">
-        <svg class="cloud-svg" style="width:440px;bottom:0;left:-2%" viewBox="0 0 440 100"><path d="M5 100 Q0 76 30 68 Q15 45 55 35 Q62 8 105 5 Q142 -8 180 8 Q212 -4 245 14 Q278 2 312 20 Q345 6 378 28 Q408 14 415 50 Q435 65 415 82 Q428 98 405 100Z"/></svg>
-        <svg class="cloud-svg" style="width:420px;bottom:0;left:22%" viewBox="0 0 420 95"><path d="M5 95 Q0 72 28 64 Q14 42 52 32 Q58 6 98 4 Q135 -6 170 8 Q200 -2 232 14 Q262 2 295 18 Q325 6 355 26 Q385 14 392 48 Q412 60 392 76 Q405 93 385 95Z"/></svg>
-        <svg class="cloud-svg" style="width:400px;bottom:0;right:-2%" viewBox="0 0 400 98"><path d="M5 98 Q0 75 26 66 Q14 44 48 34 Q55 8 92 5 Q128 -6 162 8 Q192 -2 222 14 Q252 2 282 20 Q312 8 342 28 Q370 16 375 50 Q395 62 375 78 Q388 96 365 98Z"/></svg>
-      </div>
+    <div class="provider-plus">
+      <p>Anything that speaks the OpenAI or Anthropic API works too.</p>
+      <p>Write a short <a href="https://github.com/tontinton/maki/tree/main/scripts/providers" target="_blank" rel="noopener">provider script</a>. OpenAI oauth example included.</p>
     </div>
+  </section>
+  </div>
 
-    <footer style="position:absolute;bottom:1rem;left:50%;transform:translateX(-50%);font-size:0.75rem;color:var(--text-secondary);">
-      Created by <a href="https://tontinton.com" target="_blank" rel="noopener" style="color:var(--deep-navy);text-decoration:underline;text-underline-offset:2px;">tontinton</a>.
-    </footer>
+  <footer>
+    Created by <a href="https://tontinton.com" target="_blank" rel="noopener">tontinton</a>.
+  </footer>
+
+  <div class="clouds" aria-hidden="true">
+    <svg class="cloud cloud-a" viewBox="0 0 380 120"><path d="M10 120 Q10 95 35 90 Q20 60 55 50 Q60 20 100 18 Q130 0 165 15 Q195 5 220 20 Q250 8 275 25 Q310 10 340 30 Q365 20 370 50 Q390 65 370 85 Q380 110 360 120Z"/></svg>
+    <svg class="cloud cloud-b" viewBox="0 0 300 110"><path d="M5 110 Q0 85 25 75 Q15 50 50 40 Q55 15 90 12 Q120 -5 155 10 Q180 0 210 15 Q240 5 260 25 Q285 15 290 45 Q310 60 290 80 Q300 105 280 110Z"/></svg>
+    <svg class="cloud cloud-c" viewBox="0 0 160 65"><path d="M5 65 Q0 48 16 42 Q8 26 30 20 Q38 4 58 6 Q75 -4 95 8 Q112 0 128 15 Q148 8 152 30 Q166 40 150 52 Q158 63 142 65Z"/></svg>
+  </div>
+</div>
+
+
+<div class="overlay" id="keys" hidden>
+  <div class="overlay-card" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+    <div class="overlay-row"><span class="overlay-mark">?</span><span class="keys-title">keys</span></div>
+    <ul class="keys-list">
+      <li><kbd>j</kbd><kbd>k</kbd><span>next / previous section</span></li>
+      <li><kbd>g</kbd><kbd>G</kbd><span>top / bottom</span></li>
+      <li><kbd>t</kbd><span>light or dark</span></li>
+      <li><kbd>c</kbd><span>copy the install command</span></li>
+      <li><kbd>esc</kbd><span>close</span></li>
+    </ul>
   </div>
 </div>
 
 <script>
+  const COPY_HINT_MS = 1500;
+  const COPIED_HINT = ' \u00b7 copied';
+  const DOOM = 'doom';
+  const INSTALL_CMD = {
+    unix: 'curl -fsSL https://maki.sh/install.sh | sh',
+    win: 'irm https://maki.sh/install.ps1 | iex',
+  };
+
+  const root = document.documentElement;
   const nav = document.getElementById('nav');
-  let navScrolled = false;
-  let navScrollRaf = 0;
-  window.addEventListener('scroll', () => {
-    if (navScrollRaf) return;
-    navScrollRaf = requestAnimationFrame(() => {
-      navScrollRaf = 0;
-      const shouldScroll = window.scrollY > 40;
-      if (shouldScroll !== navScrolled) {
-        navScrolled = shouldScroll;
-        nav.classList.toggle('scrolled', shouldScroll);
-      }
-    });
-  }, { passive: true });
+  const navCrumb = document.getElementById('nav-crumb');
 
-  // hero entrance — add hidden state via JS, then animate in
-  // this prevents flicker on Firefox refresh (content visible by default in CSS)
-  const hero = document.querySelector('.hero');
-  hero.classList.add('hero-anim');
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
-      document.querySelector('.hero-intro').classList.add('entered');
-      document.querySelector('.hero-preview').classList.add('entered');
-    });
+  const navObs = new IntersectionObserver(([entry]) => {
+    nav.classList.toggle('scrolled', !entry.isIntersecting);
   });
+  navObs.observe(document.getElementById('top-sentinel'));
 
-  // scroll reveal for .reveal elements
-  const revealObs = new IntersectionObserver((entries) => {
+  const sections = [...document.querySelectorAll('[data-section]')];
+  let sectionAt = 0;
+  const sectionObs = new IntersectionObserver(entries => {
     entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        entry.target.classList.add('visible');
-        revealObs.unobserve(entry.target);
-      }
+      if (!entry.isIntersecting) return;
+      sectionAt = sections.indexOf(entry.target);
+      const name = entry.target.dataset.section;
+      navCrumb.textContent = name === 'intro' ? '' : '/ ' + name;
+      navCrumb.classList.toggle('on', name !== 'intro');
     });
-  }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
-  document.querySelectorAll('.reveal').forEach(el => revealObs.observe(el));
+  }, { rootMargin: '-45% 0px -45% 0px' });
+  sections.forEach(el => sectionObs.observe(el));
 
-  // pitch items stagger on scroll
-  const pitchObs = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        const col = entry.target;
-        col.querySelectorAll('.pitch-item').forEach((item, i) => {
-          setTimeout(() => item.classList.add('visible'), i * 120);
-        });
-        pitchObs.unobserve(col);
-      }
-    });
-  }, { threshold: 0.15, rootMargin: '0px 0px -60px 0px' });
-  document.querySelectorAll('.pitch-col').forEach(col => pitchObs.observe(col));
-
-  // provider chips stagger
-  const chipObs = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        entry.target.querySelectorAll('.provider-chip').forEach((chip, i) => {
-          setTimeout(() => chip.classList.add('visible'), i * 100);
-        });
-        chipObs.unobserve(entry.target);
-      }
-    });
-  }, { threshold: 0.2 });
-  document.querySelectorAll('.provider-grid').forEach(g => chipObs.observe(g));
-
-  // copy toast
-  function showCopyToast(el) {
-    const toast = el.parentElement.querySelector('.copy-toast');
-    toast.classList.add('show');
-    setTimeout(() => toast.classList.remove('show'), 1200);
+  function gotoSection(step) {
+    const next = Math.min(sections.length - 1, Math.max(0, sectionAt + step));
+    sections[next].scrollIntoView({ behavior: 'smooth' });
   }
 
-  // fetch github stars
-  fetch('https://api.github.com/repos/tontinton/maki', { headers: { Accept: 'application/vnd.github.v3+json' } })
-    .then(r => r.json())
-    .then(data => {
-      if (!data.stargazers_count) return;
-      const count = data.stargazers_count >= 1000
-        ? (data.stargazers_count / 1000).toFixed(1).replace(/\.0$/, '') + 'k'
-        : String(data.stargazers_count);
-      document.querySelectorAll('[data-star-count]').forEach(el => el.textContent = count);
-      const badges = document.querySelectorAll('[data-stars]');
-      badges.forEach(el => el.style.display = 'inline-flex');
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          badges.forEach(el => el.classList.add('loaded'));
-        });
-      });
-    })
-    .catch(() => {});
+  function toggleTheme() {
+    const next = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('theme', next);
+  }
+  document.getElementById('theme-toggle').addEventListener('click', toggleTheme);
+  document.getElementById('moon').addEventListener('click', toggleTheme);
+
+  matchMedia('(prefers-color-scheme: light)').addEventListener('change', e => {
+    if (localStorage.getItem('theme')) return;
+    document.documentElement.setAttribute('data-theme', e.matches ? 'light' : 'dark');
+  });
+
+  // sets a class the first time an element is scrolled into view, then stops watching it
+  function onceVisible(el, cls, options) {
+    new IntersectionObserver(([entry], obs) => {
+      if (!entry.isIntersecting) return;
+      el.classList.add(cls);
+      obs.disconnect();
+    }, options).observe(el);
+  }
+
+  document.querySelectorAll('.reveal').forEach(el =>
+    onceVisible(el, 'visible', { threshold: 0.08, rootMargin: '0px 0px -40px 0px' }));
+
+  // the file fades down to what index actually keeps, and the sandbox prints its result
+  onceVisible(document.getElementById('index-demo'), 'dissolved', { threshold: 0.3 });
+  onceVisible(document.getElementById('exec'), 'ran', { threshold: 0.3 });
+
+  // on phones the terminal is scaled down to fit, so the transport moves out of it
+  if (matchMedia('(max-width: 768px)').matches) {
+    const preview = document.querySelector('.hero-preview');
+    preview.insertBefore(preview.querySelector('.player-controls'), preview.querySelector('.player-hint'));
+  }
+
+  // both install lines ship in the markup and CSS picks one off data-os, which the head
+  // script already set, so the right command is in the very first paint
+  const installHint = document.getElementById('install-hint');
+  let copyTimer = 0;
+
+  document.getElementById('os-swap').addEventListener('click', () => {
+    root.dataset.os = root.dataset.os === 'win' ? 'unix' : 'win';
+    localStorage.setItem('os', root.dataset.os);
+  });
+
+  function copyInstall() {
+    navigator.clipboard.writeText(INSTALL_CMD[root.dataset.os] ?? INSTALL_CMD.unix);
+    installHint.textContent = COPIED_HINT;
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => { installHint.textContent = ''; }, COPY_HINT_MS);
+  }
+  document.getElementById('install').addEventListener('click', copyInstall);
+
+  // the whole page answers to the keyboard, the way the TUI does
+  const keys = document.getElementById('keys');
+  keys.addEventListener('click', e => { if (e.target === keys) keys.hidden = true; });
+  document.getElementById('keys-open').addEventListener('click', () => { keys.hidden = false; });
+
+  let typed = '';
+  document.addEventListener('keydown', e => {
+    if (/^(INPUT|TEXTAREA)$/.test(e.target.tagName) || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'Escape') { keys.hidden = true; return; }
+
+    // typing the magic word takes you where you want to go
+    typed = (typed + e.key.toLowerCase()).slice(-DOOM.length);
+    if (typed === DOOM) {
+      document.querySelector('.doom-demo').scrollIntoView({ behavior: 'smooth' });
+      document.querySelector('.doom-video').play().catch(() => {});
+      return;
+    }
+
+    if (e.key === '?') { e.preventDefault(); keys.hidden = !keys.hidden; }
+    else if (e.key === 'j') { e.preventDefault(); gotoSection(1); }
+    else if (e.key === 'k') { e.preventDefault(); gotoSection(-1); }
+    else if (e.key === 'g') { e.preventDefault(); window.scrollTo({ top: 0, behavior: 'smooth' }); }
+    else if (e.key === 'G') { e.preventDefault(); window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }); }
+    else if (e.key === 't') { e.preventDefault(); toggleTheme(); }
+    else if (e.key === 'c') { e.preventDefault(); copyInstall(); }
+  });
+
+  const starBadge = document.querySelector('[data-stars]');
+  const starCount = starBadge.querySelector('[data-star-count]');
+
+  function showStars(count) {
+    starCount.textContent = count;
+    starBadge.classList.add('loaded');
+  }
+
+  // paint the last known count instantly, then refresh once the page is idle
+  const cachedStars = localStorage.getItem('stars');
+  if (cachedStars) showStars(cachedStars);
+
+  const idle = window.requestIdleCallback || (fn => setTimeout(fn, 200));
+  idle(() => {
+    fetch('https://api.github.com/repos/tontinton/maki', { headers: { Accept: 'application/vnd.github.v3+json' } })
+      .then(r => r.json())
+      .then(data => {
+        if (!data.stargazers_count) return;
+        const count = data.stargazers_count >= 1000
+          ? (data.stargazers_count / 1000).toFixed(1).replace(/\.0$/, '') + 'k'
+          : String(data.stargazers_count);
+        if (count === cachedStars) return;
+        localStorage.setItem('stars', count);
+        showStars(count);
+      })
+      .catch(() => {});
+  });
 </script>
 <script src="asciinema-player.min.js"></script>
 <script>
-  let player = AsciinemaPlayer.create('demo.cast', document.getElementById('demo-player'), {
+  const LOADER_FADE_MS = 300;
+  const FONT_WAIT_MS = 1200;
+  const SWAP_SETTLE_MS = 150;
+  const TUI_MIN_WIDTH = 774;
+  const CAST_FONT_PX = 18;
+  const TERMINAL_FONT = "'JetBrains Mono'";
+  const PLAYER_OPTS = {
     autoPlay: true,
     preload: true,
     loop: true,
-    speed: 2.0,
     idleTimeLimit: 2,
     fit: false,
     terminalFontSize: 'medium',
     controls: false,
-    terminalFontFamily: "'JetBrains Mono', monospace",
+    terminalFontFamily: `${TERMINAL_FONT}, monospace`,
     theme: 'dracula',
-  });
-  let scaleTuiRaf = 0;
-  function scaleTui() {
-    if (scaleTuiRaf) return;
-    scaleTuiRaf = requestAnimationFrame(() => {
-      scaleTuiRaf = 0;
-      const tui = document.querySelector('.hero-preview .tui');
-      if (!tui) return;
-      const container = tui.parentElement;
-      const prevTransform = tui.style.transform;
-      tui.style.transform = 'none';
-      const naturalWidth = tui.offsetWidth;
-      const naturalHeight = tui.offsetHeight;
-      tui.style.transform = prevTransform;
-      const available = container.clientWidth;
-      if (naturalWidth > available) {
-        const s = available / naturalWidth;
-        tui.style.transform = `scale(${s})`;
-        container.style.height = (naturalHeight * s) + 'px';
-      } else {
-        tui.style.transform = '';
-        container.style.height = '';
-      }
-    });
-  }
-  window.addEventListener('resize', scaleTui, { passive: true });
-  new ResizeObserver(scaleTui).observe(document.querySelector('.hero-preview'));
+  };
 
-  player.addEventListener('play', () => {
-    const loader = document.getElementById('demo-loader');
-    if (loader) {
-      loader.classList.add('hidden');
-      setTimeout(() => loader.remove(), 300);
-    }
-    scaleTui();
-  });
-
-  // Player controls
   const playBtn = document.getElementById('play-btn');
-  const playIcon = document.getElementById('play-icon');
-  const pauseIcon = document.getElementById('pause-icon');
   const progressBar = document.getElementById('progress-bar');
   const progressFill = document.getElementById('progress-fill');
   const timeDisplay = document.getElementById('time-display');
-  let isPlaying = true;
-  let progressRaf = null;
-  let currentSpeed = 2.0;
-  let playerContainer = document.getElementById('demo-player');
+  const playerContainer = document.getElementById('demo-player');
+  const speedToggle = document.getElementById('speed-toggle');
+  const speedMenu = document.getElementById('speed-menu');
+  const speedOptions = [...speedMenu.querySelectorAll('.speed-option')];
+  const scaleWrap = document.querySelector('.tui-scale-wrap');
+  const heroTui = scaleWrap.firstElementChild;
 
-  function createPlayer(speed, autoPlay = true, startTime = 0) {
-    const container = playerContainer;
-    container.innerHTML = '';
-    const newPlayer = AsciinemaPlayer.create('demo.cast', container, {
-      autoPlay: autoPlay,
-      preload: true,
-      loop: true,
-      speed: speed,
-      idleTimeLimit: 2,
-      fit: false,
-      terminalFontSize: 'medium',
-      controls: false,
-      terminalFontFamily: "'JetBrains Mono', monospace",
-      theme: 'dracula',
-    });
-    if (startTime > 0) {
-      newPlayer.seek(startTime);
-    }
-    return newPlayer;
+  let player = null;
+  let castText = '';
+  let booted = false;
+  let isPlaying = false;
+  let userPaused = false;
+  let offScreen = false;
+  let progressRaf = 0;
+  let shownTime = '';
+  let tuiWidth = TUI_MIN_WIDTH;
+  let wrapWidth = -1;
+
+  // the cast has a fixed column count, so it is re-laid out at the font size its column can
+  // take. the terminal's own size is cached, so a resize is pure writes and never a reflow
+  function applyScale() {
+    if (scaleWrap.clientWidth === wrapWidth) return;
+    wrapWidth = scaleWrap.clientWidth;
+    const scale = Math.min(1, wrapWidth / tuiWidth);
+    heroTui.style.setProperty('--cast-font', CAST_FONT_PX * scale + 'px');
+  }
+
+  function measureTui() {
+    heroTui.classList.add('booted');
+    heroTui.style.removeProperty('--cast-font');
+    tuiWidth = heroTui.offsetWidth || TUI_MIN_WIDTH;
+    wrapWidth = -1;
+    applyScale();
+  }
+
+  // scaled from the CSS floor before the player exists, so the frame never jumps once it does
+  applyScale();
+  new ResizeObserver(applyScale).observe(document.querySelector('.hero-preview'));
+
+  function hideLoader() {
+    const loader = document.getElementById('demo-loader');
+    if (!loader) return;
+    loader.classList.add('hidden');
+    setTimeout(() => loader.remove(), LOADER_FADE_MS);
   }
 
   function formatTime(seconds) {
@@ -1805,169 +1585,170 @@ imports = <span class="fn">set</span>()
   }
 
   function updateProgress() {
-    if (!player) return;
-    const current = player.getCurrentTime();
+    progressRaf = isPlaying ? requestAnimationFrame(updateProgress) : 0;
     const duration = player.getDuration();
-    if (duration > 0) {
-      const pct = (current / duration) * 100;
-      progressFill.style.width = pct + '%';
-      timeDisplay.textContent = `${formatTime(current)} / ${formatTime(duration)}`;
-    }
-    if (isPlaying) {
-      progressRaf = requestAnimationFrame(updateProgress);
-    }
+    if (!duration) return;
+    const current = player.getCurrentTime();
+    progressFill.style.transform = `scaleX(${current / duration})`;
+    const text = `${formatTime(current)} / ${formatTime(duration)}`;
+    if (text === shownTime) return;
+    shownTime = text;
+    timeDisplay.textContent = text;
   }
 
-  playBtn.addEventListener('click', () => {
-    if (isPlaying) {
-      player.pause();
-    } else {
-      player.play();
-    }
-  });
-
-  player.addEventListener('play', () => {
-    isPlaying = true;
-    playIcon.style.display = 'none';
-    pauseIcon.style.display = 'block';
+  function setPlaying(playing) {
+    isPlaying = playing;
+    playBtn.classList.toggle('playing', playing);
+    cancelAnimationFrame(progressRaf);
+    progressRaf = 0;
+    if (!playing) return;
+    hideLoader();
+    measureTui();
     progressRaf = requestAnimationFrame(updateProgress);
+  }
+
+  // the recording is fetched once and replayed from memory, so switching speed costs nothing
+  function createPlayer(speed, startTime) {
+    const host = document.createElement('div');
+    playerContainer.appendChild(host);
+    const src = castText ? { driver: 'recording', data: () => castText } : 'demo.cast';
+    const created = AsciinemaPlayer.create(src, host, { ...PLAYER_OPTS, speed });
+    created.host = host;
+    created.addEventListener('play', () => {
+      if (player !== created) return;
+      // the player rejects play/pause/seek until it has parsed the recording, so nothing
+      // touches it before its first frame
+      booted = true;
+      setPlaying(true);
+      syncPlayback();
+    });
+    created.addEventListener('pause', () => { if (player === created) setPlaying(false); });
+    if (startTime) created.seek(startTime);
+    return created;
+  }
+
+  function syncPlayback() {
+    if (!booted) return;
+    if (offScreen) { if (isPlaying) player.pause(); }
+    else if (!userPaused && !isPlaying) player.play();
+  }
+
+  // the player measures a character cell when it mounts, so it waits for the real mono font;
+  // otherwise the whole grid stays sized to whatever fallback happened to be up
+  const fontReady = document.fonts
+    ? Promise.race([
+        document.fonts.load(`400 15px ${TERMINAL_FONT}`),
+        new Promise(resolve => setTimeout(resolve, FONT_WAIT_MS)),
+      ])
+    : Promise.resolve();
+
+  Promise.all([window.castText.catch(() => ''), fontReady.catch(() => {})]).then(([text]) => {
+    castText = text;
+    player = createPlayer(parseFloat(speedMenu.querySelector('.active').dataset.speed), 0);
   });
 
-  player.addEventListener('pause', () => {
-    isPlaying = false;
-    playIcon.style.display = 'block';
-    pauseIcon.style.display = 'none';
-    if (progressRaf) cancelAnimationFrame(progressRaf);
-  });
+  // a player nobody can see still diffs a full terminal every frame, so it stops off screen
+  new IntersectionObserver(([entry]) => {
+    offScreen = !entry.isIntersecting;
+    syncPlayback();
+  }).observe(scaleWrap);
 
-  progressBar.addEventListener('click', (e) => {
+  function togglePlayback() {
+    if (!booted) return;
+    userPaused = isPlaying;
+    if (isPlaying) player.pause();
+    else player.play();
+  }
+  playBtn.addEventListener('click', togglePlayback);
+  playerContainer.addEventListener('click', togglePlayback);
+
+  progressBar.addEventListener('click', e => {
+    if (!booted) return;
     const rect = progressBar.getBoundingClientRect();
-    const pct = (e.clientX - rect.left) / rect.width;
-    const duration = player.getDuration();
-    player.seek(duration * pct);
+    player.seek(player.getDuration() * ((e.clientX - rect.left) / rect.width));
   });
 
-  // Speed controls (YouTube-style popup)
-  const speedToggle = document.getElementById('speed-toggle');
-  const speedMenu = document.getElementById('speed-menu');
-  const speedOptions = document.querySelectorAll('.speed-option');
+  const skipBtn = document.getElementById('skip-hint-btn');
+  skipBtn.addEventListener('click', () => {
+    if (!booted) return;
+    userPaused = false;
+    player.seek(Number(skipBtn.dataset.seek));
+    player.play();
+  });
 
   function closeSpeedMenu() {
     speedMenu.classList.remove('open');
     speedToggle.setAttribute('aria-expanded', 'false');
   }
-
-  speedToggle.addEventListener('click', (e) => {
+  speedToggle.addEventListener('click', e => {
     e.stopPropagation();
-    const open = speedMenu.classList.toggle('open');
-    speedToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    speedToggle.setAttribute('aria-expanded', speedMenu.classList.toggle('open'));
   });
-
-  document.addEventListener('click', (e) => {
-    if (!speedMenu.contains(e.target) && e.target !== speedToggle) {
-      closeSpeedMenu();
-    }
+  document.addEventListener('click', e => {
+    if (!speedMenu.contains(e.target) && e.target !== speedToggle) closeSpeedMenu();
   });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSpeedMenu(); });
 
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeSpeedMenu();
-  });
+  // speed is fixed per player, so the new one is mounted over the old one in the same
+  // grid cell and the old one is only torn down once the swap has painted
+  speedOptions.forEach(opt => opt.addEventListener('click', () => {
+    speedOptions.forEach(other => other.classList.toggle('active', other === opt));
+    speedToggle.textContent = opt.textContent;
+    closeSpeedMenu();
+    if (!booted) return;
+    const previous = player;
+    booted = false;
+    player = createPlayer(parseFloat(opt.dataset.speed), previous.getCurrentTime());
+    setTimeout(() => { previous.dispose(); previous.host.remove(); }, SWAP_SETTLE_MS);
+  }));
 
-  speedOptions.forEach(opt => {
-    opt.addEventListener('click', () => {
-      const speed = parseFloat(opt.dataset.speed);
-      const currentTime = player.getCurrentTime();
-      player.dispose();
-      currentSpeed = speed;
-      player = createPlayer(speed, true, currentTime);
-      speedOptions.forEach(o => o.classList.remove('active'));
-      opt.classList.add('active');
-      speedToggle.textContent = opt.textContent;
-      closeSpeedMenu();
-      player.addEventListener('play', () => {
-        isPlaying = true;
-        playIcon.style.display = 'none';
-        pauseIcon.style.display = 'block';
-        progressRaf = requestAnimationFrame(updateProgress);
-      });
-      player.addEventListener('pause', () => {
-        isPlaying = false;
-        playIcon.style.display = 'block';
-        pauseIcon.style.display = 'none';
-        if (progressRaf) cancelAnimationFrame(progressRaf);
-      });
-    });
-  });
-
-  document.getElementById('skip-hint-btn').addEventListener('click', () => {
-    player.seek(67);
-    player.play();
-  });
-
-  // Start progress updates
-  progressRaf = requestAnimationFrame(updateProgress);
-
-  // DOOM demo player
+  // the DOOM capture is a plain <video> behind the same transport
   (() => {
     const demo = document.querySelector('.doom-demo');
-    if (!demo) return;
     const video = demo.querySelector('.doom-video');
-    const dPlayIcon = demo.querySelector('.doom-play-icon');
-    const dPauseIcon = demo.querySelector('.doom-pause-icon');
-    const dProgress = demo.querySelector('.doom-progress');
-    const dFill = demo.querySelector('.doom-progress-fill');
-    const dTime = demo.querySelector('.doom-time');
-    let userPaused = false;
+    const btn = demo.querySelector('.doom-play-btn');
+    const progress = demo.querySelector('.doom-progress');
+    const fill = demo.querySelector('.doom-progress-fill');
+    const time = demo.querySelector('.doom-time');
+    let pausedByUser = false;
 
     function render() {
-      const d = video.duration || 0;
-      dFill.style.width = d ? (video.currentTime / d * 100) + '%' : '0%';
-      dTime.textContent = `${formatTime(video.currentTime)} / ${formatTime(d)}`;
+      const duration = video.duration || 0;
+      fill.style.transform = `scaleX(${duration ? video.currentTime / duration : 0})`;
+      time.textContent = `${formatTime(video.currentTime)} / ${formatTime(duration)}`;
+      btn.classList.toggle('playing', !video.paused);
     }
-    video.addEventListener('timeupdate', render);
-    video.addEventListener('loadedmetadata', render);
-    video.addEventListener('play', () => {
-      dPlayIcon.style.display = 'none';
-      dPauseIcon.style.display = 'block';
-    });
-    video.addEventListener('pause', () => {
-      dPlayIcon.style.display = 'block';
-      dPauseIcon.style.display = 'none';
-    });
+    ['timeupdate', 'loadedmetadata', 'play', 'pause'].forEach(ev => video.addEventListener(ev, render));
 
-    function toggle() {
-      if (video.paused) {
-        userPaused = false;
-        video.play();
-      } else {
-        userPaused = true;
-        video.pause();
-      }
+    function toggleVideo() {
+      pausedByUser = !video.paused;
+      if (video.paused) video.play();
+      else video.pause();
     }
-    demo.querySelector('.doom-play-btn').addEventListener('click', toggle);
-    video.addEventListener('click', toggle);
+    btn.addEventListener('click', toggleVideo);
+    video.addEventListener('click', toggleVideo);
 
-    dProgress.addEventListener('click', (e) => {
-      const rect = dProgress.getBoundingClientRect();
-      const pct = (e.clientX - rect.left) / rect.width;
-      video.currentTime = pct * (video.duration || 0);
+    progress.addEventListener('click', e => {
+      const rect = progress.getBoundingClientRect();
+      video.currentTime = ((e.clientX - rect.left) / rect.width) * (video.duration || 0);
       render();
     });
 
+    // it plays while on screen, unless you paused it yourself
     new IntersectionObserver(([entry]) => {
-      if (entry.isIntersecting) {
-        if (!userPaused) video.play().catch(() => {});
-      } else if (!video.paused) {
-        video.pause();
-      }
+      if (!entry.isIntersecting) video.pause();
+      else if (!pausedByUser) video.play().catch(() => {});
     }, { threshold: 0.35 }).observe(video);
 
-    window.addEventListener('load', () => {
-      if (video.readyState === 0 && video.paused) {
-        video.preload = 'auto';
-        video.load();
-      }
-    }, { once: true });
+    // neither the poster nor the 3 MB capture is worth taking bandwidth from the hero for the
+    // majority who never get here, so both start a screen out and have landed on arrival
+    new IntersectionObserver(([entry], obs) => {
+      if (!entry.isIntersecting) return;
+      obs.disconnect();
+      video.poster = video.dataset.poster;
+      video.preload = 'auto';
+      video.load();
+    }, { rootMargin: '1500px 0px' }).observe(video);
   })();
 </script>
 

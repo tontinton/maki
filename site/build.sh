@@ -21,11 +21,13 @@ mkdir -p "$OUT"
 
 # 1. Copy static landing page files
 cp index.html "$OUT/"
+cp _headers "$OUT/"
 cp asciinema-player.css "$OUT/"
 cp asciinema-player.min.js "$OUT/"
 cp demo.cast "$OUT/"
 cp doom.mp4 "$OUT/"
 cp doom-av1.mp4 "$OUT/"
+cp doom-poster.webp "$OUT/"
 cp ../install.sh "$OUT/"
 cp ../install.ps1 "$OUT/"
 cp favicon.ico "$OUT/"
