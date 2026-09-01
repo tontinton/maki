@@ -690,7 +690,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   examples        (table)    Optional. Array of example input objects for documentation.
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
 ///   permission      (string)   Required with `permission_scopes`. The capability the tool exposes to the model: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves this tool.
-///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes.
+///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 /// @return
 /// @example
@@ -1497,6 +1497,18 @@ fn register_tool_from_lua(
     }
     let mutable_path_field = require_schema_field(spec, "mutable_path", &schema_val)?;
     let permission = parse_tool_permission(lua, spec, &name, &schema_val, permissions)?;
+    if mutable_path_field.is_none()
+        && permission
+            .as_ref()
+            .is_some_and(|p| p.permission == Permission::FsWrite)
+    {
+        return Err(mlua::Error::runtime(format!(
+            "register_tool: '{name}' declares permission 'fs_write' but no 'mutable_path', \
+             so write serialization, the stale-read check, the plan-mode block and the \
+             boundary check would all be silently skipped. Add 'mutable_path' naming the \
+             schema field that holds the path it writes"
+        )));
+    }
 
     let header_fn: Option<Function> = spec.get("header").ok();
     let restore_fn: Option<Function> = spec.get("restore").ok();

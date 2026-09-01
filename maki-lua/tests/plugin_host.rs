@@ -181,6 +181,7 @@ const SCOPES_WITHOUT_PERMISSION_SRC: &str =
 const PERMISSION_WITHOUT_SCOPES_SRC: &str =
     r#"name = "no_scopes", description = "test", permission = "fs_write""#;
 const UNKNOWN_PERMISSION_SRC: &str = r#"name = "bad_perm", description = "test", permission = "filesystem", permission_scopes = "url""#;
+const FS_WRITE_WITHOUT_MUTABLE_PATH_SRC: &str = r#"name = "no_mpath", description = "test", permission = "fs_write", permission_scopes = "url""#;
 const NON_STRING_FIELD_SCHEMA: &str = r#"{
     type = "object",
     properties = { count = { type = "integer" } },
@@ -362,6 +363,7 @@ const EDIT_TOOL_SRC: &str = r#"maki.api.register_tool({
     schema = { type = "object", properties = { path = { type = "string" } }, required = { "path" } },
     permission = "fs_write",
     permission_scopes = "path",
+    mutable_path = "path",
     handler = function() return "" end,
 })"#;
 
@@ -551,6 +553,7 @@ fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
 #[test_case::test_case(SCOPES_WITHOUT_PERMISSION_SRC, STRING_FIELD_SCHEMA, "must declare 'permission'" ; "scopes_without_permission")]
 #[test_case::test_case(PERMISSION_WITHOUT_SCOPES_SRC, STRING_FIELD_SCHEMA, "needs 'permission_scopes'" ; "permission_without_scopes")]
 #[test_case::test_case(UNKNOWN_PERMISSION_SRC, STRING_FIELD_SCHEMA, "unknown permission 'filesystem'" ; "unknown_permission")]
+#[test_case::test_case(FS_WRITE_WITHOUT_MUTABLE_PATH_SRC, STRING_FIELD_SCHEMA, "no 'mutable_path'" ; "fs_write_without_mutable_path")]
 fn registration_validation_rejects(fields: &str, schema: &str, expected_err: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -3628,6 +3631,11 @@ fn whole_bundle() -> (Arc<ToolRegistry>, PluginHost) {
 /// Pins `FILE_WRITE_TOOLS` to the actual `permission = "fs_write"`
 /// declarations, so a new fs_write tool cannot quietly slip past the file
 /// write policies keyed off that list (plan mode, cwd allow rules).
+///
+/// The other half of that guard is a registration rule: `permission =
+/// "fs_write"` requires `mutable_path` (see `fs_write_without_mutable_path`),
+/// which is what makes the dispatcher serialize the write and check for a
+/// stale read.
 #[test]
 fn fs_write_tools_match_file_write_tools() {
     let (reg, _host) = whole_bundle();

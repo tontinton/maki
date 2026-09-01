@@ -18,9 +18,7 @@ use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
-use crate::tools::{
-    Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext,
-};
+use crate::tools::{Deadline, FileAccess, LocalTools, RequestTools, ToolAudience, ToolContext};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
     ExtractedCommand, InterruptSource, RunLedger, SessionMailbox, TurnCompleteEvent,
@@ -74,7 +72,7 @@ pub struct AgentParams {
     pub session_id: Option<SessionRef>,
     pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
-    pub file_tracker: Arc<FileReadTracker>,
+    pub file_access: Arc<FileAccess>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub subagent_cancels: Arc<CancelMap<String>>,
     /// Subagents inherit this, so a turn's totals cover everything it spawned.
@@ -118,7 +116,7 @@ pub struct Agent<'h> {
     session_id: Option<SessionRef>,
     mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
-    file_tracker: Arc<FileReadTracker>,
+    file_access: Arc<FileAccess>,
     prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     subagent_cancels: Arc<crate::cancel::CancelMap<String>>,
     registry: Arc<crate::tools::ToolRegistry>,
@@ -157,7 +155,7 @@ impl<'h> Agent<'h> {
             opts: RequestOptions::default(),
             session_id: params.session_id,
             mailbox: params.mailbox,
-            file_tracker: params.file_tracker,
+            file_access: params.file_access,
             prompt_slots: params.prompt_slots,
             subagent_cancels: params.subagent_cancels,
             registry: params.registry,
@@ -510,7 +508,7 @@ impl<'h> Agent<'h> {
             tool_output_lines: self.tool_output_lines,
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
-            file_tracker: Arc::clone(&self.file_tracker),
+            file_access: Arc::clone(&self.file_access),
             prompt_slots: Arc::clone(&self.prompt_slots),
             opts: self.opts,
             subagent_cancels: Arc::clone(&self.subagent_cancels),
@@ -831,7 +829,7 @@ mod tests {
                 session_id: None,
                 mailbox: None,
                 timeouts: maki_providers::Timeouts::default(),
-                file_tracker: FileReadTracker::fresh(),
+                file_access: FileAccess::fresh(),
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                 subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
                 ledger: Arc::new(RunLedger::default()),

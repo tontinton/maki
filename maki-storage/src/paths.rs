@@ -116,6 +116,28 @@ pub fn incremental_canonicalize(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Resolve a leading `~`. The one answer to what a tilde means, because a
+/// spelling one layer expands and another does not is two names for one file.
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    match (path.strip_prefix("~"), home()) {
+        (Ok(rest), Some(home)) => home.join(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// The identity of a file, independent of how a path was spelled: relative or
+/// absolute, with `..` or not, through a symlink or not, under `~` or spelled
+/// out, existing or not yet.
+///
+/// Over-resolving is safe here; under-resolving is the bug, because two keys
+/// for one file mean two locks for one file, or a staleness check that looks
+/// up an entry nobody wrote.
+pub fn canonical_key(path: &Path) -> PathBuf {
+    let expanded = expand_tilde(path);
+    let abs = std::path::absolute(&expanded).unwrap_or(expanded);
+    incremental_canonicalize(&abs).unwrap_or_else(|| normalize_path(&abs))
+}
+
 /// Strip the `\\?\` prefix that Windows `canonicalize` adds, using the
 /// Rust `Prefix` enum for correct WTF-8 handling (no `.to_str()` lossy
 /// conversion).
@@ -286,7 +308,62 @@ pub fn user_config_dirs(
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
+
+    const KEYED_FILE: &str = "f.rs";
+    const SUBDIR: &str = "sub";
+
+    #[test_case(|_rel, abs| abs.join(KEYED_FILE); "absolute")]
+    #[test_case(|rel, _abs| rel.join(KEYED_FILE); "relative")]
+    #[test_case(|rel, _abs| rel.join(SUBDIR).join("..").join(KEYED_FILE); "parent_component")]
+    fn every_spelling_of_one_file_is_one_key(spell: fn(&Path, &Path) -> PathBuf) {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::TempDir::new_in(&cwd).unwrap();
+        let abs = dir.path();
+        let rel = PathBuf::from(abs.file_name().unwrap());
+        fs::create_dir(abs.join(SUBDIR)).unwrap();
+
+        let expected = canonical_key(&abs.join(KEYED_FILE));
+        assert_eq!(
+            canonical_key(&spell(&rel, abs)),
+            expected,
+            "before the file exists"
+        );
+
+        fs::write(abs.join(KEYED_FILE), "content").unwrap();
+        assert_eq!(
+            canonical_key(&spell(&rel, abs)),
+            expected,
+            "once the file exists"
+        );
+    }
+
+    #[test]
+    fn tilde_spelling_is_one_key() {
+        let home = home().expect("no home dir");
+        assert_eq!(
+            canonical_key(Path::new("~").join(KEYED_FILE).as_path()),
+            canonical_key(&home.join(KEYED_FILE))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_spelling_is_one_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join(SUBDIR);
+        let link = dir.path().join("link");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join(KEYED_FILE), "content").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            canonical_key(&link.join(KEYED_FILE)),
+            canonical_key(&real.join(KEYED_FILE))
+        );
+    }
 
     #[test]
     fn normalize_path_resolves_parent() {

@@ -20,7 +20,7 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::template;
-use crate::tools::{FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolRegistry};
+use crate::tools::{FileAccess, LocalTools, RequestTools, ToolAudience, ToolRegistry};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
     EventSender, ImageSource, McpHandle, McpSession, PermissionsConfig, RunLedger, SessionMailbox,
@@ -205,7 +205,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     session_id: Some(session_ref_clone.clone()),
                     mailbox: Some(mailbox.clone()),
                     timeouts: params.timeouts,
-                    file_tracker: FileReadTracker::fresh(),
+                    file_access: FileAccess::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
                     subagent_cancels: Arc::new(CancelMap::new()),
                     ledger: Arc::new(RunLedger::default()),
@@ -337,7 +337,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     ));
 
     let answer_rx = Arc::new(Mutex::new(answer_rx));
-    let file_tracker = FileReadTracker::fresh();
+    let file_access = FileAccess::fresh();
 
     let session_ref_clone = session_ref.clone();
     let task = smol::spawn({
@@ -438,7 +438,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         session_id: Some(session_ref_clone.clone()),
                         mailbox: Some(mailbox.clone()),
                         timeouts: params.timeouts,
-                        file_tracker: Arc::clone(&file_tracker),
+                        file_access: Arc::clone(&file_access),
                         prompt_slots: Arc::clone(&params.prompt_slots),
                         subagent_cancels: Arc::new(CancelMap::new()),
                         ledger: Arc::new(RunLedger::default()),

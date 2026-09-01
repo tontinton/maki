@@ -709,15 +709,11 @@ fn rule_matches_scope(rule: &PermissionRule, scope: &str) -> bool {
     }
 }
 
-/// Absolutize first, then resolve symlinks in the leading components that
-/// exist and append the rest as written. The order matters: a relative rule
-/// like `dist/**` has to match before the dir exists, and
-/// `incremental_canonicalize` leaves a relative path relative when the leading
-/// component is missing.
+/// A rule and the path it is matched against have to agree on what file they
+/// name, including for a relative rule like `dist/**` written before the dir
+/// exists — both are `canonical_key`'s job.
 fn normalize_scope_prefix(path: &str) -> PathBuf {
-    let abs = std::path::absolute(path).unwrap_or_else(|_| PathBuf::from(path));
-    maki_storage::paths::incremental_canonicalize(&abs)
-        .unwrap_or_else(|| maki_storage::paths::normalize_path(&abs))
+    maki_storage::paths::canonical_key(Path::new(path))
 }
 
 /// A pattern with nothing left once its trailing glob is taken off covers

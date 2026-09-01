@@ -14,8 +14,8 @@ use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
-    CallOrigin, Deadline, DescriptionContext, FileReadTracker, LocalTool, LocalTools, RequestTools,
-    ToolAudience, ToolContext, ToolFilter, ToolLive,
+    CallOrigin, Deadline, DescriptionContext, LocalTool, LocalTools, RequestTools, ToolAudience,
+    ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
@@ -596,7 +596,11 @@ async fn session(
             session_id: agent_ctx.session_id.clone(),
             mailbox: None,
             timeouts: agent_ctx.timeouts,
-            file_tracker: FileReadTracker::fresh(),
+            // Shared with the parent, not fresh: a lock that a subagent does
+            // not take is no lock at all once two of them edit one file, and a
+            // subagent starting with an empty read history would overwrite
+            // whatever its parent read without ever being told it was stale.
+            file_access: Arc::clone(&agent_ctx.file_access),
             prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
             subagent_cancels: Arc::new(CancelMap::new()),
             ledger: RunLedger::child(&agent_ctx.ledger),
