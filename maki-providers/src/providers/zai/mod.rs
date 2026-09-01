@@ -28,6 +28,10 @@ static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
 
 const QUOTA_LIMIT_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
 
+/// First GLM that takes thinking parameters at all. A floor instead of a prefix
+/// allowlist, so the next GLM gets thinking without us shipping a release.
+const THINKING_SINCE: (u32, u32) = (5, 2);
+
 #[derive(Deserialize)]
 struct QuotaResponse {
     data: QuotaData,
@@ -128,6 +132,38 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(131072),
             context_window: 200_000,
+        },
+        ModelEntry {
+            prefixes: &["glm-5.3"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Glm,
+            vision: false,
+            default: false,
+            pricing: ModelPricing {
+                input: 1.40,
+                output: 4.40,
+                cache_write: 0.00,
+                cache_read: 0.26,
+                fast: None,
+            },
+            max_output_tokens: Some(131072),
+            context_window: 1_000_000,
+        },
+        ModelEntry {
+            prefixes: &["glm-5.3-flash"],
+            tier: ModelTier::Weak,
+            family: ModelFamily::Glm,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.15,
+                output: 0.50,
+                cache_write: 0.00,
+                cache_read: 0.03,
+                fast: None,
+            },
+            max_output_tokens: Some(131072),
+            context_window: 1_000_000,
         },
         ModelEntry {
             prefixes: &["glm-5.2"],
@@ -354,8 +390,20 @@ impl Provider for Zai {
     }
 }
 
+/// `glm-5.3` -> `(5, 3)`, `glm-5.3-flash` -> `(5, 3)`, `glm-5-code` -> `(5, 0)`.
+/// Same trick as `claude_version`.
+fn glm_version(model_id: &str) -> Option<(u32, u32)> {
+    let mut parts = model_id.strip_prefix("glm-")?.split(['-', '.']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor))
+}
+
 fn adjust_model(model: &mut Model) {
-    if model.id.starts_with("glm-5.2") {
+    let Some(version) = glm_version(&model.id) else {
+        return;
+    };
+    if version >= THINKING_SINCE {
         model.thinking_override = Some(ThinkingSupport::Yes);
     }
 }
@@ -371,13 +419,37 @@ mod tests {
         {"type":"TIME_LIMIT","unit":5,"percentage":0,"nextResetTime":1780336384978}
     ],"level":"lite"}}"#;
 
-    #[test_case("zai/glm-5.2", true ; "glm_5_2_supports_thinking")]
-    #[test_case("zai/glm-5.1", false ; "glm_5_1_no_thinking")]
-    #[test_case("zai/glm-4.7", false ; "glm_4_7_no_thinking")]
-    fn adjust_model_sets_thinking_support(spec: &str, expected: bool) {
+    const LONG_CONTEXT: u32 = 1_000_000;
+    const GLM_5_CONTEXT: u32 = 200_000;
+
+    #[test_case("zai/glm-5.3", Some(ThinkingSupport::Yes) ; "glm_5_3_supports_thinking")]
+    #[test_case("zai/glm-5.3-flash", Some(ThinkingSupport::Yes) ; "glm_5_3_flash_supports_thinking")]
+    #[test_case("zai/glm-5.4", Some(ThinkingSupport::Yes) ; "future_glm_stays_above_the_floor")]
+    #[test_case("zai/glm-5.2", Some(ThinkingSupport::Yes) ; "glm_5_2_supports_thinking")]
+    #[test_case("zai/glm-5.1", None ; "glm_5_1_no_thinking")]
+    #[test_case("zai/glm-5-code", None ; "glm_5_code_reads_as_5_0")]
+    #[test_case("zai/glm-4.7", None ; "glm_4_7_no_thinking")]
+    fn adjust_model_sets_thinking_support(spec: &str, expected: Option<ThinkingSupport>) {
         let mut model = Model::from_spec(spec).unwrap();
         adjust_model(&mut model);
-        assert_eq!(model.supports_thinking(), expected);
+        assert_eq!(model.thinking_override, expected);
+    }
+
+    #[test_case("zai/glm-5.3", LONG_CONTEXT ; "glm_5_3_1m_context")]
+    #[test_case("zai/glm-5.3-flash", LONG_CONTEXT ; "glm_5_3_flash_1m_context")]
+    #[test_case("zai/glm-5.1", GLM_5_CONTEXT ; "glm_5_1_keeps_200k")]
+    #[test_case("zai/glm-5.4", GLM_5_CONTEXT ; "unknown_glm_5_x_falls_back_to_glm_5_entry")]
+    fn model_entry_context_window(spec: &str, expected: u32) {
+        assert_eq!(Model::from_spec(spec).unwrap().context_window, expected);
+    }
+
+    /// The longest prefix wins, so without its own entry the cheap flash model
+    /// would answer as the strong `glm-5.3` and get billed like it.
+    #[test]
+    fn glm_5_3_flash_does_not_ride_the_glm_5_3_entry() {
+        let flash = Model::from_spec("zai/glm-5.3-flash").unwrap();
+        assert_eq!(flash.tier, ModelTier::Weak);
+        assert!(flash.supports_vision());
     }
 
     #[test]

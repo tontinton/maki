@@ -192,12 +192,14 @@ Defaults: mistral-medium-latest (strong), mistral-small-latest (medium), ministr
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
+| Weak | glm-5.3-flash | $0.15 / $0.50 | 1000K ctx / 131K out |
 | Weak | **glm-4.7-flash** (default) | $0.00 / $0.00 | 200K ctx / 131K out |
 | Weak | glm-4.5-flash | $0.00 / $0.00 | 131K ctx / 98K out |
 | Weak | glm-4.5-air | $0.20 / $1.10 | 131K ctx / 98K out |
 | Medium | **glm-4.7, glm-4.6** (default) | $0.60 / $2.20 | 200K ctx / 131K out |
 | Medium | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
 | Strong | **glm-5-code** (default) | $1.20 / $5.00 | 200K ctx / 131K out |
+| Strong | glm-5.3 | $1.40 / $4.40 | 1000K ctx / 131K out |
 | Strong | glm-5.2 | $1.00 / $3.20 | 1000K ctx / 131K out |
 | Strong | glm-5.1, glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
 
