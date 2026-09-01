@@ -258,7 +258,7 @@ pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
     let result = futures_lite::future::or(
         async { lines.next().await.transpose().map_err(AgentError::from) },
         async {
-            smol::Timer::after(remaining).await;
+            futures_timer::Delay::new(remaining).await;
             Err(AgentError::Timeout {
                 secs: stream_timeout.as_secs(),
             })
