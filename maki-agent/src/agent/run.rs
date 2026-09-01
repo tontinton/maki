@@ -327,6 +327,7 @@ impl<'h> Agent<'h> {
             Err(StreamError::Cancelled { streamed }) => {
                 let streamed = streamed.trim_end();
                 if !streamed.is_empty() {
+                    self.recent_calls.record_interrupted(streamed);
                     self.history.push(Message {
                         role: Role::Assistant,
                         content: vec![ContentBlock::Text {

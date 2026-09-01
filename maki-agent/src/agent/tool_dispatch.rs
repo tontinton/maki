@@ -1,7 +1,5 @@
 use std::borrow::Cow;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,7 +18,8 @@ use maki_config::ToolKey;
 use maki_storage::id::SessionRef;
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
-const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
+const DOOM_LOOP_SIMILARITY: f32 = 0.95;
+const DOOM_LOOP_MESSAGE: &str = "You have called this tool with the same (or nearly identical) input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
 
@@ -50,36 +49,89 @@ const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 /// gives up".
 const HOOK_CHAIN_MAX: Duration = Duration::from_secs(60);
 
-pub(super) struct RecentCalls(VecDeque<(String, u64)>);
+pub(super) struct RecentCalls(VecDeque<(String, String)>);
 
 impl RecentCalls {
     pub(super) fn new() -> Self {
         Self(VecDeque::new())
     }
 
-    fn hash_input(input: &Value) -> u64 {
-        let mut h = DefaultHasher::new();
-        input.to_string().hash(&mut h);
-        h.finish()
+    /// Similarity in [0, 1]; exact matches short-circuit to 1.0. Near-duplicates
+    /// (whitespace, minor flag churn) also count so a model oscillating among
+    /// tiny rewordings of the same call cannot dodge the guard.
+    fn similarity(a: &str, b: &str) -> f32 {
+        if a == b {
+            return 1.0;
+        }
+        similar::TextDiff::from_chars(a, b).ratio()
     }
 
-    fn is_doom_loop(&self, name: &str, input: &Value) -> bool {
-        let hash = Self::hash_input(input);
+    fn is_similar(&self, name: &str, input: &Value) -> bool {
+        let input_str = input.to_string();
         self.0.len() >= DOOM_LOOP_THRESHOLD - 1
             && self
                 .0
                 .iter()
                 .rev()
                 .take(DOOM_LOOP_THRESHOLD - 1)
-                .all(|(n, h)| n == name && *h == hash)
+                .all(|(n, i)| n == name && Self::similarity(i, &input_str) >= DOOM_LOOP_SIMILARITY)
     }
 
-    fn record(&mut self, name: String, input: &Value) {
-        self.0.push_back((name, Self::hash_input(input)));
+    fn record_string(&mut self, name: String, input: String) {
+        self.0.push_back((name, input));
         if self.0.len() > DOOM_LOOP_THRESHOLD {
             self.0.pop_front();
         }
     }
+
+    fn record(&mut self, name: String, input: &Value) {
+        self.record_string(name, input.to_string());
+    }
+
+    /// Feeds a cancelled/streamed response into the counter so interrupted
+    /// turns accumulate repeats. A model that keeps re-announcing the same
+    /// command across cut-off responses would otherwise never trip the guard.
+    pub(super) fn record_interrupted(&mut self, streamed: &str) {
+        if let Some((name, input)) = extract_tool_call(streamed) {
+            self.record_string(name, input)
+        }
+    }
+}
+
+/// Best-effort pull of a fully-formed tool call out of a streamed (possibly
+/// truncated) response. Only complete `{"name":...,"input":{...}}` objects are
+/// recovered; anything half-serialized is ignored rather than guessed at.
+fn extract_tool_call(streamed: &str) -> Option<(String, String)> {
+    let mut depth = 0i32;
+    let mut start = None;
+    let bytes = streamed.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        match b {
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth != 0 {
+                    continue;
+                }
+                let Some(s) = start else {
+                    continue;
+                };
+                if let Ok(value) = serde_json::from_str::<Value>(&streamed[s..=i]) {
+                    let name = value.get("name")?.as_str()?.to_owned();
+                    let input = value.get("input")?;
+                    return Some((name, input.to_string()));
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Every tool call in maki lands here (native, Lua, MCP, subagents, batch
@@ -770,7 +822,7 @@ pub(super) async fn process_tool_calls(
             input_preview = %crate::tools::schema::preview(&input.to_string()),
             "parsing tool call"
         );
-        if recent_calls.is_doom_loop(&name, &input) {
+        if recent_calls.is_similar(&name, &input) {
             warn!(tool = %name, "doom loop detected, skipping execution");
             immediate_errors.push(ToolDoneEvent::error(id.clone(), DOOM_LOOP_MESSAGE));
         } else {
@@ -969,13 +1021,60 @@ mod tests {
     #[test_case("read", &[("read", "/a"), ("read", "/b")], false ; "different_input_breaks_chain")]
     #[test_case("grep", &[("glob", "/a"), ("glob", "/a")], false ; "different_tool_name")]
     #[test_case("bash", &[("bash", "/a"), ("bash", "/b"), ("bash", "/a")], false ; "interrupted_chain")]
+    #[test_case("bash", &[("bash", "/a"), ("bash", "/a ")], true  ; "near_duplicate_whitespace_triggers")]
     fn doom_loop_detection(name: &str, history: &[(&str, &str)], expected: bool) {
         let entries: Vec<_> = history
             .iter()
             .map(|(n, p)| (*n, serde_json::json!({"path": p})))
             .collect();
         let input = serde_json::json!({"path": "/a"});
-        assert_eq!(recent_calls(&entries).is_doom_loop(name, &input), expected);
+        assert_eq!(recent_calls(&entries).is_similar(name, &input), expected);
+    }
+
+    /// Near-duplicate commands (trailing space, reordering of args) must trip
+    /// the guard even though no two are byte-identical.
+    #[test]
+    fn near_duplicate_command_triggers() {
+        let mut rc = RecentCalls::new();
+        let cmd = |c: &str| serde_json::json!({"command": c});
+        rc.record(
+            "bash".into(),
+            &cmd("grep -rn \"TNS_BIND_\" src/main/kotlin"),
+        );
+        rc.record(
+            "bash".into(),
+            &cmd("grep -rn \"TNS_BIND_\" src/main/kotlin "),
+        );
+        assert!(rc.is_similar("bash", &cmd("grep -rn \"TNS_BIND_\" src/main/kotlin")));
+    }
+
+    #[test]
+    fn near_duplicate_dissimilar_input_does_not_trigger() {
+        let mut rc = RecentCalls::new();
+        let cmd = |c: &str| serde_json::json!({"command": c});
+        rc.record("bash".into(), &cmd("grep -rn A one"));
+        rc.record("bash".into(), &cmd("touch totally/unrelated/file"));
+        assert!(!rc.is_similar("bash", &cmd("grep -rn A one")));
+    }
+
+    /// Interrupted turns (partial streamed responses) feed the same counter, so
+    /// a model that re-announces a command across cut-offs cannot evade the guard.
+    #[test]
+    fn interrupted_calls_feed_loop_counter() {
+        let mut rc = RecentCalls::new();
+        let cmd = |c: &str| serde_json::json!({"command": c});
+        let streamed =
+            r#"I'll grep now. {"name":"bash","input":{"command":"grep -rn X src"}} cut off"#;
+        rc.record_interrupted(streamed);
+        rc.record_interrupted(r#"{"name":"bash","input":{"command":"grep -rn X src"}}"#);
+        assert!(rc.is_similar("bash", &cmd("grep -rn X src")));
+    }
+
+    #[test]
+    fn interrupted_no_recoverable_tool_call_is_ignored() {
+        let mut rc = RecentCalls::new();
+        rc.record_interrupted("just some prose, no tool json here");
+        assert!(!rc.is_similar("bash", &serde_json::json!({"command": "ls"})));
     }
 
     fn local_ctx(
