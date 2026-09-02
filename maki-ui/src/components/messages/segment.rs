@@ -6,6 +6,7 @@ use super::super::code_view::SectionFlags;
 use super::super::tool_display::{HighlightRequest, ToolLines};
 use ratatui::text::{Line, Span};
 use std::cell::Cell;
+use std::ops::Range;
 
 const INST_SUFFIX: &str = "__inst";
 
@@ -133,14 +134,19 @@ impl Segment {
 
     /// Maps a display row (after wrapping) back to the source line index.
     pub fn source_line_at(&self, rel_row: u16, width: u16) -> Option<usize> {
-        let mut acc = 0u16;
-        for (i, line) in self.lines.iter().enumerate() {
-            acc = acc.saturating_add(wrap::line_rows(line, width));
-            if rel_row < acc {
-                return Some(i);
-            }
-        }
-        None
+        self.rows_from(rel_row, width).line()
+    }
+
+    /// A cursor parked on the source line that covers display row `start_row`.
+    pub fn rows_from(&self, start_row: u16, width: u16) -> RowWalk<'_> {
+        let mut walk = RowWalk {
+            lines: &self.lines,
+            measure: wrap::Measure::new(width),
+            next_line: 0,
+            row: 0,
+        };
+        walk.seek(start_row);
+        walk
     }
 
     /// Maps a source line to a 1-based row in the tool's live buffer, or 0
@@ -260,6 +266,57 @@ impl Segment {
         }
         if let Some(base) = &mut self.snapshot_base {
             shift(base);
+        }
+    }
+}
+
+/// Cursor over a segment's display rows. It only moves forward and measures
+/// each source line once, so re-rendering a tall segment in pieces costs one
+/// measure of it, not one per piece.
+pub struct RowWalk<'a> {
+    lines: &'a [Line<'static>],
+    measure: wrap::Measure,
+    next_line: usize,
+    /// Display row the line at `next_line` starts on.
+    row: u16,
+}
+
+impl<'a> RowWalk<'a> {
+    /// The source line the cursor sits on, or `None` past the last row.
+    pub fn line(&self) -> Option<usize> {
+        (self.next_line < self.lines.len()).then_some(self.next_line)
+    }
+
+    /// The next source lines, covering `max_rows` display rows or the single
+    /// line that overshoots them, and the rows they cover. Wrapping is per
+    /// source line, so drawing this slice at `rows.start` draws exactly what
+    /// the whole segment would draw there.
+    ///
+    /// While a line is left one is always taken, so a loop over this moves and
+    /// ends even at `max_rows` of zero.
+    pub fn next_chunk(&mut self, max_rows: u16) -> Option<(&'a [Line<'static>], Range<u16>)> {
+        let (start, top) = (self.next_line, self.row);
+        while let Some(line) = self.lines.get(self.next_line) {
+            self.next_line += 1;
+            self.row = self.row.saturating_add(self.measure.rows(line));
+            // Rows are u16 everywhere above this, so nothing past the
+            // saturation point can be addressed, selected or copied anyway.
+            if self.row == u16::MAX || self.row - top >= max_rows {
+                break;
+            }
+        }
+        (self.next_line > start).then(|| (&self.lines[start..self.next_line], top..self.row))
+    }
+
+    /// Backs up to the start of the line covering `target`, or off the end.
+    fn seek(&mut self, target: u16) {
+        while let Some(line) = self.lines.get(self.next_line) {
+            let end = self.row.saturating_add(self.measure.rows(line));
+            if end > target {
+                break;
+            }
+            self.next_line += 1;
+            self.row = end;
         }
     }
 }
