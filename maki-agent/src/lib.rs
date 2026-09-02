@@ -65,7 +65,9 @@ pub enum ExtractedCommand {
     /// since a command like `/compact` rewrites the history the later messages
     /// land in.
     Interrupt(Vec<AgentInput>),
-    Compact,
+    /// Carries the guidance typed as `/compact <instructions>`, for this one
+    /// summary.
+    Compact(Option<String>),
 }
 
 pub trait InterruptSource: Send + Sync {

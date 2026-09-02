@@ -47,7 +47,7 @@ use tracing::{info, warn};
 use crate::AppSession;
 use crate::agent::{
     AgentCommand, AgentHandles, ModelSlot,
-    shared_queue::{QueueItem, QueuedInput},
+    shared_queue::{Compaction, QueueItem, QueuedInput},
 };
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::tasks::{TaskStatus, diff_task_states};
@@ -1529,11 +1529,14 @@ impl<'t> EventLoop<'t> {
             Action::UnassignTier(spec, tier) => {
                 maki_providers::model_registry::unset_and_persist(&spec, tier, &self.ctx.storage);
             }
-            Action::Compact => {
+            Action::Compact(instructions) => {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();
                 let run_id = rt.app.run_id;
-                rt.handles.queue.push(QueueItem::Compact { run_id });
+                rt.handles.queue.push(QueueItem::Compact(Compaction {
+                    run_id,
+                    instructions,
+                }));
             }
             Action::ToggleMcp(server_name, enabled) => {
                 self.sessions[idx].handles.send_mcp(McpCommand::Toggle {

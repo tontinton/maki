@@ -4,7 +4,7 @@ use maki_agent::AgentInput;
 
 use super::{Action, App, Status, format_with_images};
 
-use crate::agent::shared_queue::{QueueItem, QueueSender, QueuedInput};
+use crate::agent::shared_queue::{Compaction, QueueItem, QueueSender, QueuedInput};
 use crate::components::queue_panel::QueueEntry;
 
 pub(crate) use crate::agent::shared_queue::QueuedMessage;
@@ -183,13 +183,14 @@ impl App {
         }
     }
 
-    pub(super) fn queue_compact(&mut self) {
+    pub(super) fn queue_compact(&mut self, instructions: Option<String>) {
         let Some(ref shared) = self.queue.shared else {
             return;
         };
-        shared.push(QueueItem::Compact {
+        shared.push(QueueItem::Compact(Compaction {
             run_id: self.run_id,
-        });
+            instructions,
+        }));
     }
 
     /// Agent reached a deferred message: time to draw the bubble. Restored

@@ -1336,12 +1336,13 @@ impl App {
     fn execute_command(&mut self, cmd: ParsedCommand, depth: u8) -> Vec<Action> {
         match cmd.name.as_str() {
             "/compact" => {
+                let instructions = (!cmd.args.is_empty()).then(|| cmd.args.clone());
                 if self.status == Status::Streaming {
-                    self.queue_compact();
+                    self.queue_compact(instructions);
                     return vec![];
                 }
                 self.status = Status::Streaming;
-                vec![Action::Compact]
+                vec![Action::Compact(instructions)]
             }
             "/help" => {
                 self.help_modal.toggle();
