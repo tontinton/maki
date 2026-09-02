@@ -273,6 +273,14 @@ local function handler(input, ctx)
     name = input.description,
   }
 
+  -- A backgrounded subagent must outlive this call and the turn that made
+  -- it, so it cannot be a child of this call's cancel token. Only possible
+  -- with a real session to tie it to; without one (headless/one-shot) it
+  -- falls back to the call-scoped default.
+  if input.background and sid then
+    session_opts.scope = { session = sid }
+  end
+
   if not input.background then
     local permit = semaphore:acquire()
     local ok, out = pcall(function()

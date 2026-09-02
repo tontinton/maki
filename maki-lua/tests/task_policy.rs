@@ -9,6 +9,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::{AgentMode, ToolOutput};
 use maki_lua::PluginHost;
+use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
@@ -238,11 +239,21 @@ fn load_task_host_with_opts(
 }
 
 fn exec_tool(reg: &ToolRegistry, name: &str, input: Value) -> Result<String, String> {
+    exec_tool_with_session(reg, name, input, None)
+}
+
+fn exec_tool_with_session(
+    reg: &ToolRegistry,
+    name: &str,
+    input: Value,
+    session: Option<SessionRef>,
+) -> Result<String, String> {
     let entry = reg
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
-    let ctx = stub_ctx(&AgentMode::Build);
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.session_id = session;
     smol::block_on(async { inv.execute(&ctx).await })
         .output
         .map(|out| match out {
@@ -591,6 +602,40 @@ fn background_returns_receipt_and_delivers_by_notify() {
 
     let out =
         exec_tool(&reg, TASK_TOOL_RESULT, json!({ "task_id": id })).expect("task_result failed");
+    assert_eq!(out, PLAIN_TEXT);
+}
+
+/// A background subagent must not be a child of the call that spawned it, or
+/// it dies the moment that call's turn ends instead of outliving it. With a
+/// real session id this now spawns `scope = { session = sid }`; confirm that
+/// still reaches a receipt instead of tripping the scope validation.
+#[test]
+fn background_with_a_real_session_detaches_and_still_delivers() {
+    let (reg, host) = load_task_host();
+    let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
+        .parse()
+        .expect("valid session id");
+    let receipt = exec_tool_with_session(
+        &reg,
+        TASK_TOOL,
+        bg_input(SCENARIO_PLAIN),
+        Some(session.clone()),
+    )
+    .expect("background task failed");
+    let id = bg_task_id(&receipt);
+
+    assert!(
+        matches!(wait_flash(&host), maki_lua::UiAction::Flash(msg) if msg == BG_FLASH),
+        "flash must carry the completion marker"
+    );
+
+    let out = exec_tool_with_session(
+        &reg,
+        TASK_TOOL_RESULT,
+        json!({ "task_id": id }),
+        Some(session),
+    )
+    .expect("task_result failed");
     assert_eq!(out, PLAIN_TEXT);
 }
 
