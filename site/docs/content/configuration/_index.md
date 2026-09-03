@@ -177,7 +177,7 @@ An entry with no port covers every port. A name you list is allowed whatever it 
 | `name` | String | `none` | Instance name shown on the anchor dashboard. Defaults to the machine hostname |
 | `token` | String | `none` | Registration token issued by `maki-anchor tokens add <name>` |
 
-When all three fields are set, `/rc` dials the anchor instead of          binding its own listener: the anchor URL replaces the local one, and          the instance needs no inbound port. Tokens come from `maki-anchor tokens add <name>`; one token per instance.
+When all three fields are set, `/rc` dials the anchor instead of binding its own listener: the anchor URL replaces the local one, and the instance needs no inbound port. Tokens come from `maki-anchor tokens add <name>`; one token per instance.
 
 ### `telemetry`
 

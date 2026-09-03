@@ -208,7 +208,9 @@ fn write_anchor_section(out: &mut String) {
     write_section(out, "[anchor]", AnchorConfig::FIELDS);
     writeln!(
         out,
-        "When all three fields are set, `/rc` dials the anchor instead of          binding its own listener: the anchor URL replaces the local one, and          the instance needs no inbound port. Tokens come from \
+        "When all three fields are set, `/rc` dials the anchor instead of \
+         binding its own listener: the anchor URL replaces the local one, and \
+         the instance needs no inbound port. Tokens come from \
          `maki-anchor tokens add <name>`; one token per instance.
 "
     )

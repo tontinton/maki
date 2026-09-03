@@ -2,9 +2,17 @@
 //! over the WebSocket; this side answers it with the same dispatch logic the
 //! standalone server uses, so both modes are identical from the user's view.
 
-use std::sync::mpsc::{self, Receiver};
+use std::{
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver},
+    },
+    thread,
+};
 
-use tungstenite::{Message as WsMessage, client::IntoClientRequest};
+use tungstenite::{
+    Message as WsMessage, client::IntoClientRequest, protocol::WebSocket, stream::MaybeTlsStream,
+};
 
 use crate::{RemoteRequest, dispatch::Route};
 
@@ -15,8 +23,27 @@ pub enum TunnelError {
         url: String,
         source: tungstenite::Error,
     },
+    #[error("io: {source}")]
+    Io { source: std::io::Error },
     #[error("tunnel closed")]
     Closed,
+}
+
+/// A reply frame heading back to the anchor over the tunnel.
+#[derive(Debug)]
+pub enum TunnelReplyWire {
+    Response {
+        conn_id: u64,
+        status: u16,
+        body: Vec<u8>,
+        final_chunk: bool,
+    },
+}
+
+/// The anchor's handshake frame: the share link minted for this tunnel.
+#[derive(Debug, serde::Deserialize)]
+struct LinkFrame {
+    link: String,
 }
 
 /// Browser traffic forwarded by the anchor: one HTTP-shaped request.
@@ -26,7 +53,7 @@ pub struct ForwardedRequest {
     method: String,
     path: String,
     #[serde(default)]
-    body: String,
+    body: Vec<u8>,
 }
 
 /// One streamed SSE chunk heading back through the tunnel.
@@ -75,11 +102,13 @@ impl TunnelClient {
 }
 
 /// Runs the outbound tunnel until the anchor drops it or the process exits.
+/// Returns the share URL the anchor minted for this tunnel, via `link_out`.
 /// Blocking; belongs on a dedicated thread.
 pub fn run_tunnel(
     anchor_url: &str,
     registration_token: &str,
     client: crate::tunnel::TunnelClient,
+    link_out: flume::Sender<String>,
 ) -> Result<(), TunnelError> {
     let ws_url = format!("{}/ws", anchor_url.trim_end_matches('/'));
     let mut request =
@@ -98,6 +127,11 @@ pub fn run_tunnel(
             url: ws_url.clone(),
             source,
         })?;
+    let write_stream = match socket.get_mut() {
+        MaybeTlsStream::Plain(stream) => stream.try_clone(),
+        _ => Err(std::io::Error::other("tls tunnels unsupported")),
+    }
+    .map_err(|source| TunnelError::Io { source })?;
     let hello = serde_json::json!({
         "instance_name": client.instance_name,
         "registration_token": registration_token,
@@ -106,160 +140,138 @@ pub fn run_tunnel(
     if socket.send(WsMessage::text(hello)).is_err() {
         return Err(TunnelError::Closed);
     }
-    // SSE replies outlive one request: their frames are pushed from producer
-    // threads into this channel and the tunnel loop forwards them as they
-    // arrive, interleaved with answering new requests.
-    let (stream_tx, stream_rx): (_, Receiver<StreamChunk>) = mpsc::channel();
+    // First anchor frame hands back the freshly minted control link.
+    let first = match socket.read() {
+        Ok(WsMessage::Text(text)) => text,
+        _ => return Err(TunnelError::Closed),
+    };
+    let Ok(link_frame) = serde_json::from_str::<LinkFrame>(&first) else {
+        return Err(TunnelError::Closed);
+    };
+    let _ = link_out.send(link_frame.link);
+    // Split handles: the reader blocks on anchor frames, the writer thread
+    // ships replies and SSE chunks as producers finish them. TCP is full
+    // duplex, so the two tungstenite handles never contend.
+    let (reply_tx, reply_rx): (_, Receiver<TunnelReplyWire>) = mpsc::channel();
+    let writer_stream = write_stream;
+    let writer = Arc::new(Mutex::new(WebSocket::from_raw_socket(
+        writer_stream,
+        tungstenite::protocol::Role::Client,
+        None,
+    )));
+    let writer_handle = Arc::clone(&writer);
+    thread::spawn(move || {
+        while let Ok(reply) = reply_rx.recv() {
+            let TunnelReplyWire::Response {
+                conn_id,
+                status,
+                body,
+                final_chunk,
+            } = reply;
+            let wire = serde_json::json!({"conn_id": conn_id, "status": status, "body": body, "final": final_chunk});
+            if writer_handle
+                .lock()
+                .unwrap()
+                .send(WsMessage::text(wire.to_string()))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     loop {
         let message = match socket.read() {
             Ok(WsMessage::Text(text)) => text,
-            Ok(WsMessage::Ping(payload)) => {
-                let _ = socket.send(WsMessage::Pong(payload));
-                continue;
-            }
             Ok(WsMessage::Close(_)) | Err(_) => break,
             Ok(_) => continue,
         };
         let Ok(parsed) = serde_json::from_str::<ForwardedRequest>(&message) else {
             continue;
         };
-        match handle_forwarded(&client, parsed, stream_tx.clone()) {
-            TunnelReply::Single(reply) => {
-                let serialized = reply.to_string();
-                if socket.send(WsMessage::text(serialized)).is_err() {
-                    break;
-                }
-            }
-            TunnelReply::StreamStart {
-                conn_id,
-                status,
-                body,
-            } => {
-                let start = serde_json::json!({
-                    "conn_id": conn_id, "status": status, "body": body, "final": false,
-                })
-                .to_string();
-                if socket.send(WsMessage::text(start)).is_err() {
-                    break;
-                }
-                // Pump stream frames as they are produced; blocks until the
-                // SSE ends (client disconnect, shutdown), which is correct:
-                // one browser tab holds the tunnel while it watches.
-                while let Ok(chunk) = stream_rx.recv() {
-                    let wire = serde_json::json!({
-                        "conn_id": chunk.conn_id,
-                        "status": 200,
-                        "body": chunk.body,
-                        "final": chunk.final_chunk,
-                    })
-                    .to_string();
-                    if socket.send(WsMessage::text(wire)).is_err() {
-                        break;
-                    }
-                    if chunk.final_chunk {
-                        break;
-                    }
-                }
-            }
-        }
+        handle_forwarded(&client, parsed, reply_tx.clone());
     }
     Ok(())
-}
-
-struct StreamChunk {
-    conn_id: u64,
-    body: Vec<u8>,
-    final_chunk: bool,
 }
 
 fn http_header_value(value: &str) -> tungstenite::http::HeaderValue {
     tungstenite::http::HeaderValue::from_str(value).expect("registration token is ascii")
 }
 
+/// Answers one forwarded request on the reply channel. Non-SSE routes reply
+/// inline; SSE spawns a producer that streams frames until the stream ends.
 fn handle_forwarded(
     client: &TunnelClient,
     request: ForwardedRequest,
-    stream_tx: mpsc::Sender<StreamChunk>,
-) -> TunnelReply {
-    let token_hex = client.token_hex.as_str();
-    let Some(path) = request.path.strip_prefix('/') else {
-        return TunnelReply::Single(response_frame(
-            request.conn_id,
-            404,
-            b"not found".to_vec(),
-            true,
-        ));
+    reply_tx: mpsc::Sender<TunnelReplyWire>,
+) {
+    // The anchor forwards the bare tail (it owns the link token); accept the
+    // token-prefixed shape too so the dispatcher stays testable standalone.
+    let path = request.path.strip_prefix('/').unwrap_or(&request.path);
+    let tail = if path.len() > client.token_hex.len()
+        && path[..client.token_hex.len()] == client.token_hex
+    {
+        &path[client.token_hex.len()..]
+    } else {
+        path
     };
-    let Some(rest) = path.strip_prefix(token_hex) else {
-        return TunnelReply::Single(response_frame(
-            request.conn_id,
-            404,
-            b"invalid link".to_vec(),
-            true,
-        ));
-    };
-    let tail = rest.strip_prefix('/').unwrap_or(rest);
+    let tail = tail.trim_start_matches('/');
     let route = Route::from_tail(tail, &request.method);
-    let outcome = client.dispatcher().dispatch(route, &request.body);
+    let body = String::from_utf8_lossy(&request.body).into_owned();
+    let outcome = client.dispatcher().dispatch(route, &body);
+    let conn_id = request.conn_id;
+    let send = |status: u16, body: Vec<u8>, final_chunk: bool| {
+        tracing::info!(conn_id, status, final_chunk, "tunnel: shipping reply");
+        let _ = reply_tx.send(TunnelReplyWire::Response {
+            conn_id,
+            status,
+            body,
+            final_chunk,
+        });
+    };
     match outcome {
-        crate::dispatch::DispatchOutcome::NotFound => TunnelReply::Single(response_frame(
-            request.conn_id,
-            404,
-            b"not found".to_vec(),
-            true,
-        )),
-        crate::dispatch::DispatchOutcome::Index => TunnelReply::Single(response_frame(
-            request.conn_id,
-            200,
-            crate::server::INDEX_HTML.as_bytes().to_vec(),
-            true,
-        )),
-        crate::dispatch::DispatchOutcome::Posted(status) => {
-            TunnelReply::Single(response_frame(request.conn_id, status, Vec::new(), true))
+        crate::dispatch::DispatchOutcome::NotFound => send(404, b"not found".to_vec(), true),
+        crate::dispatch::DispatchOutcome::Index => {
+            send(200, crate::server::INDEX_HTML.as_bytes().to_vec(), true)
         }
-        // SSE: the producer thread blocks on the fan-out channel and ships
-        // frames; the tunnel loop forwards them until the stream ends. The
-        // anchor serializes requests per connection, so the browser tab's
-        // SSE owns the tunnel while other posts queue briefly.
+        crate::dispatch::DispatchOutcome::Posted(status) => send(status, Vec::new(), true),
+        // SSE: the producer blocks on the fan-out channel and ships frames;
+        // the writer thread forwards them until the stream ends.
         crate::dispatch::DispatchOutcome::Events { mut source } => {
-            let conn_id = request.conn_id;
-            let tx = stream_tx.clone();
+            if reply_tx
+                .send(TunnelReplyWire::Response {
+                    conn_id,
+                    status: 200,
+                    body: Vec::new(),
+                    final_chunk: false,
+                })
+                .is_err()
+            {
+                return;
+            }
             std::thread::Builder::new()
                 .name("remote-tunnel-sse".into())
                 .spawn(move || {
                     while let Some(frame) = source.next_frame() {
-                        if tx
-                            .send(StreamChunk {
+                        if reply_tx
+                            .send(TunnelReplyWire::Response {
                                 conn_id,
+                                status: 200,
                                 body: frame,
                                 final_chunk: false,
                             })
                             .is_err()
                         {
-                            break;
+                            return;
                         }
                     }
-                    let _ = tx.send(StreamChunk {
+                    let _ = reply_tx.send(TunnelReplyWire::Response {
                         conn_id,
+                        status: 200,
                         body: Vec::new(),
                         final_chunk: true,
                     });
                 })
                 .expect("spawn tunnel SSE thread");
-            TunnelReply::StreamStart {
-                conn_id,
-                status: 200,
-                body: Vec::new(),
-            }
         }
     }
-}
-
-fn response_frame(
-    conn_id: u64,
-    status: u16,
-    body: Vec<u8>,
-    final_chunk: bool,
-) -> serde_json::Value {
-    serde_json::json!({"conn_id": conn_id, "status": status, "body": body, "final": final_chunk})
 }

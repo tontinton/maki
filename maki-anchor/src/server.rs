@@ -1,7 +1,12 @@
 use std::{
+    io::Write,
     net::TcpListener,
-    sync::{Arc, Mutex, mpsc::channel},
+    sync::{
+        Arc, Mutex,
+        mpsc::{Receiver, channel},
+    },
     thread,
+    time::Duration,
 };
 
 use tiny_http::{Header, Response, Server};
@@ -9,8 +14,73 @@ use tungstenite::{Message as WsMessage, protocol::WebSocket};
 
 use crate::{
     hub::{self, Hub, TunnelCommand, TunnelPush},
-    store::{SessionRow, Store},
+    store::{self, Role, SessionRow, Store},
 };
+
+const TUNNEL_LINK_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Mints a share link, returning the raw token.
+pub fn mint_link(
+    store: &Store,
+    instance_id: i64,
+    session_id: Option<&str>,
+    rights: Role,
+    ttl: Duration,
+) -> String {
+    let token = new_link_token();
+    store
+        .create_link(
+            &store::hash_token(&token),
+            instance_id,
+            session_id,
+            rights.as_str(),
+            ttl,
+        )
+        .expect("create link");
+    token
+}
+
+fn request_path_session(tail: &str) -> Option<String> {
+    let rest = tail.strip_prefix("s/")?;
+    Some(rest.split('/').next().unwrap_or(rest).to_owned())
+}
+
+fn buffered(
+    (status, content_type, body): (u16, String, Vec<u8>),
+    request: tiny_http::Request,
+) -> RouteOutcome {
+    RouteOutcome::Buffered(Box::new(BufferedResponse {
+        status,
+        content_type,
+        body,
+        request,
+    }))
+}
+
+fn new_link_token() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("rng failed");
+    hex(&bytes)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Outcome of routing one browser request.
+enum RouteOutcome {
+    /// Write this response to the request.
+    Buffered(Box<BufferedResponse>),
+    /// The response was already written (SSE stream); nothing to do.
+    Streamed,
+}
+
+struct BufferedResponse {
+    status: u16,
+    content_type: String,
+    body: Vec<u8>,
+    request: tiny_http::Request,
+}
 
 const MAX_BODY: usize = 10 * 1024 * 1024;
 
@@ -50,7 +120,11 @@ fn split_token_path(path: &str) -> Option<(&str, &str)> {
     Some((token, tail))
 }
 
-pub fn serve(addr: &str, store: Arc<Store>) -> Result<(), ServerError> {
+pub fn serve(
+    addr: &str,
+    store: Arc<Store>,
+    oidc: Option<crate::oidc::OidcConfig>,
+) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).map_err(|source| ServerError::Bind {
         addr: addr.to_string(),
         source,
@@ -70,6 +144,7 @@ pub fn serve(addr: &str, store: Arc<Store>) -> Result<(), ServerError> {
         addr: ws_addr.clone(),
         source,
     })?;
+    let auth = Arc::new(crate::auth::Auth::new(Arc::clone(&store), oidc));
     let ws_store = Arc::clone(&store);
     let ws_hub = Arc::clone(&hub);
     thread::spawn(move || {
@@ -101,13 +176,19 @@ pub fn serve(addr: &str, store: Arc<Store>) -> Result<(), ServerError> {
         };
         let hub = Arc::clone(&hub);
         let store = Arc::clone(&store);
+        let auth = Arc::clone(&auth);
         thread::spawn(move || {
-            handle_request(request, hub, store);
+            handle_request(request, hub, store, auth);
         });
     }
 }
 
-fn handle_request(request: tiny_http::Request, hub: Arc<Hub>, store: Arc<Store>) {
+fn handle_request(
+    request: tiny_http::Request,
+    hub: Arc<Hub>,
+    store: Arc<Store>,
+    auth: Arc<crate::auth::Auth>,
+) {
     let method = request.method().to_string();
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("");
@@ -121,47 +202,209 @@ fn handle_request(request: tiny_http::Request, hub: Arc<Hub>, store: Arc<Store>)
         return;
     }
 
-    let mut request = request;
-    let (status, content_type, body) = route(path, &mut request, &hub, &store);
-    let response = Response::from_data(body)
-        .with_status_code(status)
-        .with_header(Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()).unwrap());
-    let _ = request.respond(response);
-    tracing::debug!(method, path, status, "request");
+    let outcome = route(path, request, &hub, &store, &auth);
+    match outcome {
+        RouteOutcome::Buffered(buffered) => {
+            let response = Response::from_data(buffered.body)
+                .with_status_code(buffered.status)
+                .with_header(
+                    Header::from_bytes(&b"Content-Type"[..], buffered.content_type.as_bytes())
+                        .unwrap(),
+                );
+            let _ = buffered.request.respond(response);
+            tracing::debug!(method, path, status = buffered.status, "request");
+        }
+        RouteOutcome::Streamed => {}
+    }
 }
 
 fn route(
     path: &str,
-    request: &mut tiny_http::Request,
+    request: tiny_http::Request,
     hub: &Hub,
     store: &Arc<Store>,
-) -> (u16, String, Vec<u8>) {
+    auth: &crate::auth::Auth,
+) -> RouteOutcome {
     if let Some((token, tail)) = split_token_path(path) {
-        return proxy_remote(token, tail, request, hub, store);
+        let user = auth.user_from_cookie(cookie_header(&request));
+        return proxy_remote(token, tail, request, hub, store, user.as_ref());
     }
-    if path == "/instances" {
-        return json_list_instances(store);
+    // Auth endpoints work without a session; everything user-facing below
+    // needs one when OIDC is on.
+    if path == "/login" {
+        return start_login(request, auth);
     }
-    if path == "/sessions" {
-        return json_list_sessions(store);
+    if path == "/callback" {
+        return finish_login(request, auth);
     }
-    if let Some(rest) = path.strip_prefix("/sessions/") {
-        let Ok(instance_id) = rest.parse::<i64>() else {
-            return (400, "text/plain".to_string(), b"bad instance id".to_vec());
-        };
-        return match store.sessions_for_instance(instance_id) {
-            Ok(rows) => {
-                let body = serde_json::to_vec(&rows).unwrap_or_default();
-                (200, "application/json".to_string(), body)
-            }
-            Err(err) => (
-                500,
+    if path == "/logout" {
+        let cookie_header = cookie_header(&request);
+        auth.logout(cookie_header);
+        let response = Response::empty(302)
+            .with_header(Header::from_bytes("Location", "/").unwrap())
+            .with_header(
+                Header::from_bytes("Set-Cookie", crate::auth::Auth::clear_cookie()).unwrap(),
+            );
+        let _ = request.respond(response);
+        return RouteOutcome::Streamed;
+    }
+    let user = auth.user_from_cookie(cookie_header(&request));
+    if auth.enabled() && user.is_none() {
+        return redirect_to_login(request);
+    }
+    route_authorized(path, request, hub, store, user)
+}
+
+fn cookie_header(request: &tiny_http::Request) -> Option<&str> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str() == "Cookie")
+        .map(|h| h.value.as_str())
+}
+
+fn start_login(request: tiny_http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
+    match auth.begin_login() {
+        Ok(url) => {
+            let response = Response::empty(302)
+                .with_header(Header::from_bytes("Location", url.as_bytes()).unwrap());
+            let _ = request.respond(response);
+            RouteOutcome::Streamed
+        }
+        Err(err) => buffered(
+            (
+                502,
                 "text/plain".to_string(),
-                format!("store error: {err}").into_bytes(),
+                format!("login: {err}").into_bytes(),
             ),
-        };
+            request,
+        ),
     }
-    (404, "text/plain".to_string(), b"not found".to_vec())
+}
+
+fn finish_login(request: tiny_http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
+    let query = request.url().split('?').nth(1).unwrap_or("");
+    let params = |key: &str| {
+        query.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k == key).then(|| v.to_owned())
+        })
+    };
+    let Some(code) = params("code") else {
+        return buffered(
+            (400, "text/plain".to_string(), b"missing code".to_vec()),
+            request,
+        );
+    };
+    let Some(state) = params("state") else {
+        return buffered(
+            (400, "text/plain".to_string(), b"missing state".to_vec()),
+            request,
+        );
+    };
+    match auth.finish_login(&code, &state) {
+        Ok(cookie_value) => {
+            let response = Response::empty(302)
+                .with_header(Header::from_bytes("Location", "/".as_bytes()).unwrap())
+                .with_header(
+                    Header::from_bytes(
+                        "Set-Cookie",
+                        crate::auth::Auth::session_set_cookie(&cookie_value).as_bytes(),
+                    )
+                    .unwrap(),
+                );
+            let _ = request.respond(response);
+            RouteOutcome::Streamed
+        }
+        Err(err) => buffered(
+            (
+                401,
+                "text/plain".to_string(),
+                format!("login failed: {err}").into_bytes(),
+            ),
+            request,
+        ),
+    }
+}
+
+/// GET /links?instance=&session=&rights=&hours=: mint and display a link.
+fn render_link(
+    request: tiny_http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    let query = request.url().split('?').nth(1).unwrap_or("");
+    let params = |key: &str| {
+        query.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k == key).then(|| v.replace("%3A", ":").replace('+', " "))
+        })
+    };
+    let Some(instance) = params("instance") else {
+        return buffered(
+            (400, "text/plain".to_string(), b"missing instance".to_vec()),
+            request,
+        );
+    };
+    let hours = params("hours")
+        .and_then(|h| h.parse::<u64>().ok())
+        .unwrap_or(2);
+    let outcome = crate::dashboard::render_link(
+        store,
+        user,
+        &instance,
+        params("session").as_deref(),
+        params("rights").as_deref().unwrap_or("view"),
+        hours,
+    );
+    buffered(outcome, request)
+}
+
+fn redirect_to_login(request: tiny_http::Request) -> RouteOutcome {
+    let response = Response::empty(302)
+        .with_header(Header::from_bytes("Location", "/login".as_bytes()).unwrap());
+    let _ = request.respond(response);
+    RouteOutcome::Streamed
+}
+
+/// User-facing routes: dashboard and JSON endpoints. The user row (None in
+/// LAN-trust mode) is available for future per-instance filtering.
+fn route_authorized(
+    path: &str,
+    request: tiny_http::Request,
+    _hub: &Hub,
+    store: &Arc<Store>,
+    user: Option<crate::store::UserRow>,
+) -> RouteOutcome {
+    if path == "/" {
+        return buffered(crate::dashboard::render(store, user.as_ref()), request);
+    }
+    if path == "/links" {
+        return render_link(request, store, user.as_ref());
+    }
+    let outcome = if path == "/instances" {
+        json_list_instances(store)
+    } else if path == "/sessions" {
+        json_list_sessions(store)
+    } else if let Some(rest) = path.strip_prefix("/sessions/") {
+        match rest.parse::<i64>() {
+            Ok(instance_id) => match store.sessions_for_instance(instance_id) {
+                Ok(rows) => {
+                    let body = serde_json::to_vec(&rows).unwrap_or_default();
+                    (200, "application/json".to_string(), body)
+                }
+                Err(err) => (
+                    500,
+                    "text/plain".to_string(),
+                    format!("store error: {err}").into_bytes(),
+                ),
+            },
+            Err(_) => (400, "text/plain".to_string(), b"bad instance id".to_vec()),
+        }
+    } else {
+        (404, "text/plain".to_string(), b"not found".to_vec())
+    };
+    buffered(outcome, request)
 }
 
 fn json_list_instances(store: &Arc<Store>) -> (u16, String, Vec<u8>) {
@@ -222,56 +465,85 @@ fn handle_push(store: &Arc<Store>, push: TunnelPush) {
     }
 }
 
-/// `/{token}/{tail}` -> the session id when `tail` is `/s/{session_id}` shaped,
-/// used for session-scoped links.
-fn request_path_session(tail: &str) -> Option<String> {
-    let rest = tail.strip_prefix("s/")?;
-    Some(rest.split('/').next().unwrap_or(rest).to_owned())
-}
-
 fn proxy_remote(
     token: &str,
     tail: &str,
-    request: &mut tiny_http::Request,
+    mut request: tiny_http::Request,
     hub: &Hub,
     store: &Arc<Store>,
-) -> (u16, String, Vec<u8>) {
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
     let link = match store.link_by_token(token) {
         Ok(link) => link,
         Err(_) => {
-            return (
-                404,
-                "text/plain".to_string(),
-                b"invalid or expired link".to_vec(),
+            return buffered(
+                (
+                    404,
+                    "text/plain".to_string(),
+                    b"invalid or expired link".to_vec(),
+                ),
+                request,
             );
         }
     };
     if !hub.is_online(link.instance_id) {
-        return (503, "text/plain".to_string(), b"instance offline".to_vec());
+        return buffered(
+            (503, "text/plain".to_string(), b"instance offline".to_vec()),
+            request,
+        );
     }
 
-    // A session-scoped link only opens that session; others 404 at the
-    // instance (which re-checks the path against its own token anyway).
+    // A session-scoped link only opens that session's view.
     if let Some(session_id) = link.external_session_id.as_deref() {
         let requested = request_path_session(tail);
         if requested.is_none_or(|id| id != session_id) {
-            return (
-                404,
-                "text/plain".to_string(),
-                b"link is scoped to another session".to_vec(),
+            return buffered(
+                (
+                    404,
+                    "text/plain".to_string(),
+                    b"link is scoped to another session".to_vec(),
+                ),
+                request,
             );
         }
     }
 
     let method = request.method().as_str().to_string();
+    let write = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+    // Grants raise the floor, never lower it: a controller grant upgrades a
+    // view link for the logged-in user.
+    let rights = if write
+        && link.rights == Role::Viewer.as_str()
+        && user.is_some_and(|u| {
+            store
+                .grant_for(u.id, link.instance_id)
+                .ok()
+                .flatten()
+                .is_some_and(|r| r == Role::Controller)
+        }) {
+        Role::Controller.as_str()
+    } else {
+        link.rights.as_str()
+    };
+    if write && rights != Role::Controller.as_str() {
+        return buffered(
+            (403, "text/plain".to_string(), b"link is view-only".to_vec()),
+            request,
+        );
+    }
     let mut body = Vec::new();
     if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
-        return (413, "text/plain".to_string(), b"body too large".to_vec());
+        return buffered(
+            (413, "text/plain".to_string(), b"body too large".to_vec()),
+            request,
+        );
     }
 
+    // The anchor owns the link token: the instance sees the bare tail, so its
+    // own token check (standalone mode) stays independent of anchor links.
     let forwarded = serde_json::json!({
         "method": method,
-        "path": format!("/{token}/{tail}"),
+        "path": format!("/{tail}"),
         "headers": {},
         "body": body,
     })
@@ -280,44 +552,70 @@ fn proxy_remote(
     let (_conn_id, rx) = match hub.request(link.instance_id, forwarded) {
         Ok(pair) => pair,
         Err(err) => {
-            return (
-                502,
-                "text/plain".to_string(),
-                format!("tunnel: {err}").into_bytes(),
+            return buffered(
+                (
+                    502,
+                    "text/plain".to_string(),
+                    format!("tunnel: {err}").into_bytes(),
+                ),
+                request,
             );
         }
     };
     let first = match hub.wait_first(&rx) {
         Ok(first) => first,
         Err(err) => {
-            return (
-                502,
-                "text/plain".to_string(),
-                format!("tunnel: {err}").into_bytes(),
+            return buffered(
+                (
+                    502,
+                    "text/plain".to_string(),
+                    format!("tunnel: {err}").into_bytes(),
+                ),
+                request,
             );
         }
     };
     let status = first.status;
+    // SSE streams chunk as they are produced; everything else buffers.
+    if tail == "events" && status == 200 {
+        return stream_to_browser(request, hub, rx, status);
+    }
     let mut acc = first.body;
     if !first.final_chunk {
-        loop {
-            let chunk = match hub.wait_first(&rx) {
-                Ok(chunk) => chunk,
-                Err(err) => {
-                    return (
-                        502,
-                        "text/plain".to_string(),
-                        format!("tunnel: {err}").into_bytes(),
-                    );
-                }
-            };
+        while let Ok(chunk) = hub.wait_chunk(&rx) {
             acc.extend_from_slice(&chunk.body);
             if chunk.final_chunk {
                 break;
             }
         }
     }
-    (status, "application/json".to_string(), acc)
+    buffered((status, "application/json".to_string(), acc), request)
+}
+
+/// Streams tunnel SSE chunks to the browser with tiny_http bypassed: its
+/// chunked encoder buffers, and SSE frames must flush as they arrive.
+fn stream_to_browser(
+    request: tiny_http::Request,
+    hub: &Hub,
+    rx: Receiver<hub::TunnelResponse>,
+    status: u16,
+) -> RouteOutcome {
+    let mut writer = request.into_writer();
+    let head = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n"
+    );
+    if writer.write_all(head.as_bytes()).is_err() || writer.flush().is_err() {
+        return RouteOutcome::Streamed;
+    }
+    while let Ok(chunk) = hub.wait_chunk(&rx) {
+        if writer.write_all(&chunk.body).is_err() || writer.flush().is_err() {
+            break;
+        }
+        if chunk.final_chunk {
+            break;
+        }
+    }
+    RouteOutcome::Streamed
 }
 
 fn drive_tunnel(mut websocket: WebSocket<std::net::TcpStream>, hub: Arc<Hub>, store: Arc<Store>) {
@@ -336,6 +634,18 @@ fn drive_tunnel(mut websocket: WebSocket<std::net::TcpStream>, hub: Arc<Hub>, st
         }
     };
     store.touch_instance(instance.id).ok();
+    // Every tunnel gets a fresh control link valid while the tunnel lives
+    // (plus a grace window); the URL goes back to the instance to display.
+    let control_link = mint_link(
+        store.as_ref(),
+        instance.id,
+        None,
+        Role::Controller,
+        TUNNEL_LINK_TTL,
+    );
+    let _ = websocket.send(WsMessage::text(
+        serde_json::json!({"link": control_link}).to_string(),
+    ));
     let (cmd_tx, cmd_rx) = channel::<TunnelCommand>();
     hub.attach(instance.id, cmd_tx);
 

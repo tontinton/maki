@@ -15,6 +15,8 @@ pub enum HubError {
     Offline,
     #[error("request timed out")]
     Timeout,
+    #[error("instance dropped the tunnel")]
+    Disconnected,
 }
 
 /// One HTTP request/response exchange routed through an instance tunnel.
@@ -83,12 +85,18 @@ impl Pending {
         (conn_id, rx)
     }
 
-    /// Deliver to the waiting request; the sender is consumed either way so a
-    /// late frame after timeout cannot resurrect a dead slot.
+    /// Deliver to the waiting request. Non-final chunks keep the slot alive
+    /// (an SSE stream sends many); a final chunk or slot eviction consumes the
+    /// sender, so a late frame after timeout cannot resurrect a dead slot.
     fn deliver(&self, conn_id: u64, response: TunnelResponse) {
-        let sender = self.responses.lock().unwrap().remove(&conn_id);
+        let mut responses = self.responses.lock().unwrap();
+        let sender = responses.remove(&conn_id);
         if let Some(sender) = sender {
-            let _ = sender.send(response);
+            let final_chunk = response.final_chunk;
+            let delivered = sender.send(response).is_ok();
+            if delivered && !final_chunk {
+                responses.insert(conn_id, sender);
+            }
         }
     }
 
@@ -152,6 +160,15 @@ impl Hub {
             Ok(response) => Ok(response),
             Err(RecvTimeoutError::Timeout) => Err(HubError::Timeout),
             Err(RecvTimeoutError::Disconnected) => Err(HubError::Timeout),
+        }
+    }
+
+    /// Blocks until the next chunk. A chunk with `final_chunk` ends the stream.
+    pub fn wait_chunk(&self, rx: &Receiver<TunnelResponse>) -> Result<TunnelResponse, HubError> {
+        match rx.recv_timeout(REQ_TIMEOUT) {
+            Ok(response) => Ok(response),
+            Err(RecvTimeoutError::Timeout) => Err(HubError::Timeout),
+            Err(RecvTimeoutError::Disconnected) => Err(HubError::Disconnected),
         }
     }
 }

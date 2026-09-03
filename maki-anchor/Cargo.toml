@@ -23,6 +23,13 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 getrandom = { workspace = true }
 clap = { workspace = true }
+base64 = { workspace = true }
+num-bigint = "0.4"
+ureq = { workspace = true }
+url = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+flume = { workspace = true }
+maki-remote = { workspace = true }

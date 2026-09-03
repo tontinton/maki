@@ -1,17 +1,51 @@
 use std::{path::PathBuf, time::Duration};
 
 use clap::{Parser, Subcommand};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::oidc::OidcConfig;
+
+mod auth;
+mod dashboard;
 mod hub;
+mod oidc;
 mod server;
 mod store;
 
-use store::Store;
+use store::{Role, Store};
 
 const DEFAULT_DB_PATH: &str = "maki-anchor.sqlite3";
+const DEFAULT_CONFIG_PATH: &str = "maki-anchor.toml";
 const DEFAULT_BIND: &str = "0.0.0.0:8688";
 const DEFAULT_LINK_TTL_HOURS: u64 = 2;
+
+/// Anchor's own config file: OIDC settings live here, not in maki's config.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct AnchorConfig {
+    oidc: Option<OidcFileConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct OidcFileConfig {
+    issuer: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    origin: Option<String>,
+}
+
+impl OidcFileConfig {
+    fn complete(&self) -> Option<OidcConfig> {
+        Some(OidcConfig {
+            issuer: self.issuer.clone()?,
+            client_id: self.client_id.clone()?,
+            client_secret: self.client_secret.clone()?,
+            origin: self.origin.clone()?,
+        })
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "maki-anchor", about = "Anchor server for maki remote control")]
@@ -28,6 +62,8 @@ enum Command {
         bind: String,
         #[arg(long, default_value = DEFAULT_DB_PATH)]
         db: PathBuf,
+        #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
     },
     /// Manage instances: registration tokens and share links
     #[clap(name = "tokens")]
@@ -37,6 +73,30 @@ enum Command {
         #[arg(long, default_value = DEFAULT_DB_PATH, global = true)]
         db: PathBuf,
     },
+    /// Manage per-user access grants
+    Grants {
+        #[command(subcommand)]
+        sub: GrantCommand,
+        #[arg(long, default_value = DEFAULT_DB_PATH, global = true)]
+        db: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum GrantCommand {
+    /// Grant a user rights on an instance
+    Set {
+        user_id: i64,
+        instance: String,
+        #[arg(default_value = "view")]
+        rights: String,
+    },
+    /// Remove a grant
+    Revoke { user_id: i64, instance: String },
+    /// List grants
+    List,
+    /// Look up a user id by OIDC subject (for writing grants)
+    Lookup { oidc_sub: String },
 }
 
 #[derive(Subcommand)]
@@ -63,12 +123,27 @@ fn main() {
             tracing_subscriber::EnvFilter::try_from_env("MAKI_LOG")
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("maki_anchor=info")),
         )
+        .with_writer(std::io::stderr)
         .try_init();
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { bind, db } => {
+        Command::Serve { bind, db, config } => {
             let store = Store::open(&db).expect("open anchor db");
-            if let Err(err) = server::serve(&bind, store) {
+            let anchor_config = match std::fs::read_to_string(&config) {
+                Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
+                    eprintln!("config {config:?}: {e}");
+                    std::process::exit(1);
+                }),
+                Err(_) => AnchorConfig::default(),
+            };
+            let oidc = anchor_config
+                .oidc
+                .as_ref()
+                .and_then(OidcFileConfig::complete)
+                .inspect(|_| {
+                    tracing::info!("OIDC login enabled");
+                });
+            if let Err(err) = server::serve(&bind, store, oidc) {
                 eprintln!("fatal: {err}");
                 std::process::exit(1);
             }
@@ -89,14 +164,11 @@ fn main() {
                     ttl_hours,
                     session,
                 } => {
-                    let rights = match rights.as_str() {
-                        "view" | "viewer" => "viewer",
-                        "control" => "controller",
-                        _other => {
-                            eprintln!("rights must be `view` or `control`, got `{rights}`");
-                            std::process::exit(1);
-                        }
+                    let Some(rights) = Role::parse(&rights) else {
+                        eprintln!("rights must be `view` or `control`, got `{rights}`");
+                        std::process::exit(1);
                     };
+                    let rights = rights.as_str();
                     let instance_id = store
                         .instance_by_name(&instance)
                         .expect("unknown instance; add it with `tokens add` first")
@@ -126,7 +198,55 @@ fn main() {
                 }
             }
         }
+        Command::Grants { sub, db } => {
+            let store = Store::open(&db).expect("open anchor db");
+            match sub {
+                GrantCommand::Set {
+                    user_id,
+                    instance,
+                    rights,
+                } => {
+                    let Some(rights) = Role::parse(&rights) else {
+                        eprintln!("rights must be `view` or `control`");
+                        std::process::exit(1);
+                    };
+                    let instance_id = instance_id_by_name(&store, &instance);
+                    store
+                        .set_grant(user_id, instance_id, rights)
+                        .expect("set grant");
+                    println!("{rights:?} granted to {user_id} on {instance}");
+                }
+                GrantCommand::Revoke { user_id, instance } => {
+                    let instance_id = instance_id_by_name(&store, &instance);
+                    if store
+                        .delete_grant(user_id, instance_id)
+                        .expect("delete grant")
+                    {
+                        println!("revoked");
+                    } else {
+                        eprintln!("no such grant");
+                        std::process::exit(1);
+                    }
+                }
+                GrantCommand::List => {
+                    for (user, instance, rights) in store.list_grants().expect("list grants") {
+                        println!("{user} {instance} {rights}");
+                    }
+                }
+                GrantCommand::Lookup { oidc_sub } => {
+                    let user = store.user_by_sub(&oidc_sub).expect("no such user");
+                    println!("{} {}", user.id, user.oidc_sub);
+                }
+            }
+        }
     }
+}
+
+fn instance_id_by_name(store: &Store, name: &str) -> i64 {
+    store
+        .instance_by_name(name)
+        .expect("unknown instance; add it with `tokens add` first")
+        .id
 }
 
 fn new_token() -> String {

@@ -84,19 +84,25 @@ fn http(port: u16, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
 }
 
 /// Drive a fake instance: WS dial + answer one forwarded GET /{token}/.
-fn fake_instance(port: u16, name: &str, token: &str, link: &str) -> Vec<u8> {
+fn fake_instance(port: u16, name: &str, token: &str) -> Vec<u8> {
     let mut socket = tungstenite::connect(format!("ws://127.0.0.1:{port}/ws"))
         .unwrap()
         .0;
     let hello = serde_json::json!({"instance_name": name, "registration_token": token}).to_string();
     socket.send(WsMessage::text(hello)).unwrap();
+    let link_frame = socket.read().unwrap();
+    let WsMessage::Text(link_text) = link_frame else {
+        panic!("expected link frame, got {link_frame:?}");
+    };
+    let minted: serde_json::Value = serde_json::from_str(&link_text).unwrap();
+    assert_eq!(minted["link"].as_str().map(str::len), Some(32));
     let message = socket.read().unwrap();
     let WsMessage::Text(text) = message else {
         panic!("expected forwarded request, got {message:?}");
     };
     let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(parsed["method"], "GET");
-    assert_eq!(parsed["path"], format!("/{link}/"));
+    assert_eq!(parsed["path"], "/");
     let body = format!("hello from {name}").into_bytes();
     let reply = serde_json::json!({"conn_id": parsed["conn_id"], "status": 200, "body": body, "final": true});
     socket.send(WsMessage::text(reply.to_string())).unwrap();
@@ -129,10 +135,9 @@ fn tunnel_carries_browser_requests() {
     let link = String::from_utf8_lossy(&out.stdout).trim().to_string();
 
     let ws_port = anchor.port + 1;
-    let link_for_thread = link.clone();
     // The instance's tunnel stays open (the anchor writer thread holds the
     // command channel), so the dial thread is never joined.
-    thread::spawn(move || fake_instance(ws_port, "host-x", &reg_token, &link_for_thread));
+    thread::spawn(move || fake_instance(ws_port, "host-x", &reg_token));
 
     thread::sleep(Duration::from_millis(300));
     let (status, body) = http(anchor.port, "GET", &format!("/{link}/"), &[]);

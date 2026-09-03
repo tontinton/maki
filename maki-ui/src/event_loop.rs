@@ -890,6 +890,7 @@ impl<'t> EventLoop<'t> {
         // Remote control POSTs are answered here, before the wake loop: the
         // HTTP handler parks up to its timeout, so it must never wait on the
         // next real event.
+        self.flash_tunnel_link_if_ready();
         if self.remote.is_running() {
             let actions = self
                 .remote
@@ -1718,6 +1719,24 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Err(e) => self.focused_app().flash(format!("{e}")),
+        }
+    }
+
+    /// Swaps the tunnel's placeholder flash for the anchor-minted link as soon
+    /// as the handshake hands it back; also copies it to the clipboard.
+    fn flash_tunnel_link_if_ready(&mut self) {
+        let Some(url) = self.remote.tunnel_link() else {
+            return;
+        };
+        let copy = self.focused_app().clipboard.copy_text(&url);
+        let app = self.focused_app();
+        app.main_chat().push(DisplayMessage::new(
+            DisplayRole::Done,
+            format!("{REMOTE_URL_MSG}{url}"),
+        ));
+        app.flash(url);
+        if let Err(e) = copy {
+            app.flash(format!("{REMOTE_COPY_ERR}: {e}"));
         }
     }
 

@@ -7,6 +7,30 @@ use std::{
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
+/// Rights attached to a share link or a user grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Viewer,
+    Controller,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+            Self::Controller => "controller",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "view" | "viewer" => Some(Self::Viewer),
+            "control" | "controller" => Some(Self::Controller),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("sqlite: {0}")]
@@ -51,6 +75,15 @@ pub struct InstanceRow {
     pub id: i64,
     pub name: String,
     pub last_seen: i64,
+}
+
+#[derive(Debug)]
+pub struct UserRow {
+    pub id: i64,
+    pub oidc_sub: String,
+    pub email: Option<String>,
+    pub name: Option<String>,
+    pub is_admin: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -108,6 +141,24 @@ impl Store {
                  rights TEXT NOT NULL,
                  expires_at INTEGER NOT NULL,
                  revoked_at INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS users (
+                 id INTEGER PRIMARY KEY,
+                 oidc_sub TEXT NOT NULL UNIQUE,
+                 email TEXT,
+                 name TEXT,
+                 is_admin INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS oidc_sessions (
+                 cookie TEXT PRIMARY KEY,
+                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                 expires_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS grants (
+                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                 instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+                 rights TEXT NOT NULL,
+                 PRIMARY KEY (user_id, instance_id)
              );",
         )?;
         Ok(Arc::new(Self {
@@ -306,6 +357,169 @@ impl Store {
         Err(StoreError::NotFound)
     }
 
+    /// Upsert a user after OIDC login. The first user to log in becomes admin
+    /// when no admin exists yet, so a fresh deployment bootstraps itself.
+    pub fn upsert_user(
+        &self,
+        oidc_sub: &str,
+        email: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<UserRow, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let admins = conn.query_row("SELECT COUNT(*) FROM users WHERE is_admin = 1", [], |r| {
+            r.get::<_, i64>(0)
+        })?;
+        conn.execute(
+            "INSERT INTO users (oidc_sub, email, name, is_admin) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(oidc_sub) DO UPDATE SET email = excluded.email, name = excluded.name",
+            rusqlite::params![oidc_sub, email, name, i64::from(admins == 0)],
+        )?;
+        let id = conn.query_row(
+            "SELECT id FROM users WHERE oidc_sub = ?1",
+            [oidc_sub],
+            |r| r.get(0),
+        )?;
+        Ok(UserRow {
+            id,
+            oidc_sub: oidc_sub.to_owned(),
+            email: email.map(str::to_owned),
+            name: name.map(str::to_owned),
+            is_admin: admins == 0,
+        })
+    }
+
+    pub fn user_by_sub(&self, oidc_sub: &str) -> Result<UserRow, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, oidc_sub, email, name, is_admin FROM users WHERE oidc_sub = ?1",
+            [oidc_sub],
+            |row| {
+                Ok(UserRow {
+                    id: row.get(0)?,
+                    oidc_sub: row.get(1)?,
+                    email: row.get(2)?,
+                    name: row.get(3)?,
+                    is_admin: row.get::<_, i64>(4)? != 0,
+                })
+            },
+        )
+        .map_err(StoreError::from)
+    }
+
+    pub fn user_by_id(&self, id: i64) -> Result<UserRow, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, oidc_sub, email, name, is_admin FROM users WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(UserRow {
+                    id: row.get(0)?,
+                    oidc_sub: row.get(1)?,
+                    email: row.get(2)?,
+                    name: row.get(3)?,
+                    is_admin: row.get::<_, i64>(4)? != 0,
+                })
+            },
+        )
+        .map_err(StoreError::from)
+    }
+
+    /// Create an OIDC browser session; the cookie value is the primary key.
+    pub fn create_oidc_session(
+        &self,
+        cookie: &str,
+        user_id: i64,
+        ttl: Duration,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO oidc_sessions (cookie, user_id, expires_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![cookie, user_id, now_unix() + ttl.as_secs() as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Resolve a cookie to its user, ignoring expired sessions.
+    pub fn user_by_cookie(&self, cookie: &str) -> Result<UserRow, StoreError> {
+        let user_id = {
+            let conn = self.conn.lock().unwrap();
+            let (user_id, expires_at) = conn
+                .query_row(
+                    "SELECT user_id, expires_at FROM oidc_sessions WHERE cookie = ?1",
+                    [cookie],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .map_err(StoreError::from)?;
+            if expires_at <= now_unix() {
+                conn.execute("DELETE FROM oidc_sessions WHERE cookie = ?1", [cookie])?;
+                return Err(StoreError::NotFound);
+            }
+            user_id
+        };
+        self.user_by_id(user_id)
+    }
+
+    pub fn delete_oidc_session(&self, cookie: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM oidc_sessions WHERE cookie = ?1", [cookie])?;
+        Ok(())
+    }
+
+    pub fn set_grant(
+        &self,
+        user_id: i64,
+        instance_id: i64,
+        rights: Role,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO grants (user_id, instance_id, rights) VALUES (?1, ?2, ?3)
+             ON CONFLICT(user_id, instance_id) DO UPDATE SET rights = excluded.rights",
+            rusqlite::params![user_id, instance_id, rights.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_grant(&self, user_id: i64, instance_id: i64) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "DELETE FROM grants WHERE user_id = ?1 AND instance_id = ?2",
+            rusqlite::params![user_id, instance_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// The user's rights on an instance: the grant if one exists.
+    pub fn grant_for(&self, user_id: i64, instance_id: i64) -> Result<Option<Role>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let rights: Option<String> = conn
+            .query_row(
+                "SELECT rights FROM grants WHERE user_id = ?1 AND instance_id = ?2",
+                rusqlite::params![user_id, instance_id],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        Ok(rights.as_deref().and_then(Role::parse))
+    }
+
+    pub fn list_grants(&self) -> Result<Vec<(i64, String, String)>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT u.id, i.name, g.rights FROM grants g
+             JOIN users u ON u.id = g.user_id
+             JOIN instances i ON i.id = g.instance_id
+             ORDER BY u.id, i.name",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn revoke_link(&self, token_hash: &str) -> Result<bool, StoreError> {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
@@ -348,6 +562,63 @@ mod tests {
         assert_eq!(row.id, id);
         assert_eq!(row.name, "host-a");
         assert!(store.instance_by_registration_token("wrong").is_err());
+    }
+
+    #[test]
+    fn user_sessions_and_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        // First user bootstraps to admin.
+        let user = store
+            .upsert_user("sub-1", Some("a@x"), Some("Alice"))
+            .unwrap();
+        assert!(user.is_admin);
+        let second = store.upsert_user("sub-2", None, None).unwrap();
+        assert!(!second.is_admin);
+
+        // Cookie sessions round-trip and expire.
+        store
+            .create_oidc_session("cookie-1", user.id, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(store.user_by_cookie("cookie-1").unwrap().id, user.id);
+        store
+            .create_oidc_session("cookie-2", user.id, Duration::ZERO)
+            .unwrap();
+        assert!(store.user_by_cookie("cookie-2").is_err());
+        store.delete_oidc_session("cookie-1").unwrap();
+        assert!(store.user_by_cookie("cookie-1").is_err());
+
+        // Grants: set, read, upgrade, revoke.
+        let instance = store
+            .register_instance("g-host", &hash_token("reg"))
+            .unwrap();
+        assert_eq!(store.grant_for(user.id, instance).unwrap(), None);
+        store.set_grant(user.id, instance, Role::Viewer).unwrap();
+        assert_eq!(
+            store.grant_for(user.id, instance).unwrap(),
+            Some(Role::Viewer)
+        );
+        store
+            .set_grant(user.id, instance, Role::Controller)
+            .unwrap();
+        assert_eq!(
+            store.grant_for(user.id, instance).unwrap(),
+            Some(Role::Controller)
+        );
+        store.set_grant(second.id, instance, Role::Viewer).unwrap();
+        assert_eq!(store.list_grants().unwrap().len(), 2);
+        assert!(store.delete_grant(user.id, instance).unwrap());
+        assert_eq!(store.grant_for(user.id, instance).unwrap(), None);
+    }
+
+    #[test]
+    fn user_by_sub_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        store.upsert_user("sub-x", Some("x@x"), None).unwrap();
+        let found = store.user_by_sub("sub-x").unwrap();
+        assert_eq!(found.email.as_deref(), Some("x@x"));
+        assert!(store.user_by_sub("missing").is_err());
     }
 
     #[test]

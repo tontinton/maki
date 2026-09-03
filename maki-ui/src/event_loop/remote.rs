@@ -16,10 +16,16 @@ use crate::components::Action;
 
 /// Remote requests handled per drain, so a flood cannot starve rendering.
 const REQUEST_BUDGET: usize = 64;
+const REMOTE_TUNNEL_STARTING: &str = "connecting to anchor...";
 
 pub(crate) enum RemoteControl {
-    Standalone { server: Arc<RemoteServer> },
-    Tunnel { state: maki_remote::RemoteState },
+    Standalone {
+        server: Arc<RemoteServer>,
+    },
+    Tunnel {
+        state: maki_remote::RemoteState,
+        link_rx: Option<flume::Receiver<String>>,
+    },
 }
 
 impl RemoteControl {
@@ -41,11 +47,14 @@ impl RemoteControl {
             let client_state = maki_remote::RemoteState::new();
             let client = TunnelClient::new(requests, token.clone(), name.clone());
             let anchor_url = url.clone();
-            let link_token = token.to_lowercase();
+            // The anchor mints the real share link during the handshake; it
+            // lands on this channel and the loop flashes it as soon as it
+            // arrives. Until then, tell the user the tunnel is coming up.
+            let (link_tx, link_rx) = flume::bounded::<String>(1);
             std::thread::Builder::new()
                 .name("remote-tunnel".into())
                 .spawn(move || {
-                    if let Err(e) = run_tunnel(&anchor_url, &token, client) {
+                    if let Err(e) = run_tunnel(&anchor_url, &token, client, link_tx) {
                         tracing::warn!(error = %e, "anchor tunnel ended");
                     }
                 })
@@ -53,8 +62,9 @@ impl RemoteControl {
             Ok((
                 Self::Tunnel {
                     state: client_state,
+                    link_rx: Some(link_rx),
                 },
-                format!("{url}/{name}/{link_token}"),
+                REMOTE_TUNNEL_STARTING.to_owned(),
             ))
         } else {
             let (server, url) = RemoteServer::bind(config, requests)?;
@@ -72,6 +82,19 @@ impl RemoteControl {
     fn stop(&self) {
         if let Self::Standalone { server } = self {
             server.shutdown();
+        }
+    }
+
+    /// The anchor-minted link once the tunnel handshake completes.
+    fn tunnel_link(&mut self) -> Option<String> {
+        if let Self::Tunnel { link_rx, .. } = self {
+            let link = link_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+            if link.is_some() {
+                *link_rx = None;
+            }
+            link
+        } else {
+            None
         }
     }
 }
@@ -133,8 +156,13 @@ impl RemoteSlot {
     pub(crate) fn state(&self) -> Option<maki_remote::RemoteState> {
         self.control.as_ref().map(|c| match c {
             RemoteControl::Standalone { server } => server.state().clone(),
-            RemoteControl::Tunnel { state } => state.clone(),
+            RemoteControl::Tunnel { state, .. } => state.clone(),
         })
+    }
+
+    /// The anchor-minted share link, once the tunnel handshake completes.
+    pub(crate) fn tunnel_link(&mut self) -> Option<String> {
+        self.control.as_mut().and_then(RemoteControl::tunnel_link)
     }
 
     /// Services pending requests from remote clients, returning the actions
