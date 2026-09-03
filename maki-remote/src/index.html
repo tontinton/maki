@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>maki remote</title>
+<style>
+  :root {
+    --bg: #16181d;
+    --panel: #1d2026;
+    --border: #2c313a;
+    --text: #d6dbe3;
+    --muted: #8b93a1;
+    --accent: #7aa2f7;
+    --user: #9ece6a;
+    --error: #f7768e;
+    --tool: #bb9af7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
+  }
+  header {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    flex-wrap: wrap;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  header h1 { font-size: 14px; margin: 0; }
+  #title { color: var(--text); }
+  #cwd, #model { color: var(--muted); font-size: 12px; }
+  #status { color: var(--muted); }
+  #status[data-status="working"] { color: var(--accent); }
+  #stats { color: var(--muted); font-size: 12px; margin-left: auto; }
+  #conn { color: var(--muted); font-size: 12px; }
+  #conn[data-conn="live"] { color: var(--user); }
+  #conn[data-conn="down"] { color: var(--error); }
+  main {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px 14px;
+  }
+  .msg { margin: 6px 0; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { color: var(--user); }
+  .msg.user::before { content: "you> "; color: var(--muted); }
+  .msg.assistant { color: var(--text); }
+  .msg.thinking { color: var(--muted); font-style: italic; }
+  .msg.error { color: var(--error); }
+  .msg.system { color: var(--muted); }
+  .tool { margin: 6px 0; border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; background: var(--panel); }
+  .tool summary { color: var(--tool); cursor: pointer; user-select: none; }
+  .tool .out { white-space: pre-wrap; word-break: break-word; color: var(--muted); margin-top: 4px; max-height: 300px; overflow-y: auto; }
+  .tool.running summary::after { content: " …"; color: var(--accent); }
+  .tool.is-error { border-color: var(--error); }
+  #perm {
+    display: none;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    background: var(--panel);
+    padding: 10px 14px;
+    margin: 8px 14px;
+  }
+  #perm .toolname { color: var(--accent); }
+  #perm .scopes { color: var(--muted); margin: 4px 0 8px; }
+  #perm .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  #perm textarea {
+    width: 100%;
+    min-height: 60px;
+    margin-top: 8px;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font: inherit;
+    display: none;
+  }
+  button {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 14px;
+    font: inherit;
+    cursor: pointer;
+  }
+  button.primary { border-color: var(--user); color: var(--user); }
+  button.danger { border-color: var(--error); color: var(--error); }
+  #stoprow { padding: 4px 14px; }
+  #stoprow button { display: none; }
+  #inputrow {
+    display: flex;
+    gap: 8px;
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  #prompt {
+    flex: 1;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    font: inherit;
+    resize: none;
+    height: 44px;
+    max-height: 200px;
+  }
+  #prompt:focus { outline: none; border-color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>maki</h1>
+  <span id="title"></span>
+  <span id="cwd"></span>
+  <span id="model"></span>
+  <span id="status" data-status="idle">idle</span>
+  <span id="stats"></span>
+  <span id="conn" data-conn="down">connecting</span>
+</header>
+<main id="log"></main>
+<div id="perm">
+  <div>Permission needed: <span class="toolname" id="perm-tool"></span></div>
+  <div class="scopes" id="perm-scopes"></div>
+  <div class="row">
+    <button class="primary" data-answer="allow">Allow</button>
+    <button data-answer="allow_session">Allow session</button>
+    <button data-answer="allow_always_local">Always (repo)</button>
+    <button data-answer="allow_always_global">Always (global)</button>
+    <button class="danger" id="deny-btn" data-answer="deny">Deny</button>
+  </div>
+  <textarea id="deny-guidance" placeholder="Guidance for the agent (optional; submit with the deny button)"></textarea>
+</div>
+<div id="stoprow"><button class="danger" id="stop">Stop run (Esc)</button></div>
+<div id="inputrow">
+  <textarea id="prompt" placeholder="Message maki… (Enter to send, Shift+Enter for newline)"></textarea>
+  <button id="send" class="primary">Send</button>
+</div>
+<script>
+(() => {
+  const log = document.getElementById("log");
+  const connEl = document.getElementById("conn");
+  const statusEl = document.getElementById("status");
+  const statsEl = document.getElementById("stats");
+  const titleEl = document.getElementById("title");
+  const cwdEl = document.getElementById("cwd");
+  const modelEl = document.getElementById("model");
+  const permEl = document.getElementById("perm");
+  const promptEl = document.getElementById("prompt");
+  const stopBtn = document.getElementById("stop");
+  const denyGuidance = document.getElementById("deny-guidance");
+  let pendingPermission = null;
+
+  const el = (cls, text) => {
+    const node = document.createElement("div");
+    node.className = cls;
+    node.textContent = text ?? "";
+    return node;
+  };
+
+  const scrollDown = () => { log.scrollTop = log.scrollHeight; };
+
+  const fmtTokens = (n) =>
+    n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
+
+  const setStats = (stats) => {
+    if (!stats) return;
+    const parts = [];
+    if (typeof stats.context_size === "number" && stats.context_window) {
+      const pct = Math.round(stats.context_size / stats.context_window * 100);
+      parts.push(`${fmtTokens(stats.context_size)}/${fmtTokens(stats.context_window)} (${pct}%)`);
+    }
+    if (typeof stats.cost === "number") parts.push(`$${stats.cost.toFixed(3)}`);
+    const usage = stats.token_usage || {};
+    const inTok = (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0);
+    if (inTok || usage.output_tokens) parts.push(`in ${fmtTokens(inTok)} out ${fmtTokens(usage.output_tokens || 0)}`);
+    statsEl.textContent = parts.join(" · ");
+  };
+
+  const setHeader = (snap) => {
+    if (snap.title) titleEl.textContent = snap.title;
+    if (snap.cwd) cwdEl.textContent = snap.cwd;
+    if (snap.model) modelEl.textContent = snap.model;
+    setStats(snap);
+    if (snap.status) setStatus(snap.status);
+  };
+
+  const toolCard = (event) => {
+    const details = document.createElement("details");
+    details.className = "tool running";
+    details.dataset.id = event.id;
+    const summary = document.createElement("summary");
+    let label = event.tool || "";
+    if (event.summary) label += ` — ${event.summary}`;
+    else if (event.input) {
+      const bits = [];
+      for (const key of ["command", "path", "file_path", "pattern", "query", "url"]) {
+        if (event.input[key]) bits.push(String(event.input[key]).slice(0, 80));
+      }
+      if (bits.length) label += ` — ${bits.join(" ")}`;
+    }
+    summary.textContent = label;
+    const out = document.createElement("div");
+    out.className = "out";
+    details.appendChild(summary);
+    details.appendChild(out);
+    log.appendChild(details);
+    return details;
+  };
+
+  const toolById = (id) => log.querySelector(`.tool[data-id="${CSS.escape(id)}"]`);
+
+  const renderEvent = (event) => {
+    switch (event.type) {
+      case "text_delta": {
+        const last = log.lastElementChild;
+        if (last && last.dataset.kind === "assistant") {
+          last.textContent += event.text;
+        } else {
+          const node = el("msg assistant", event.text);
+          node.dataset.kind = "assistant";
+          log.appendChild(node);
+        }
+        break;
+      }
+      case "thinking_delta": {
+        const last = log.lastElementChild;
+        if (last && last.dataset.kind === "thinking") {
+          last.textContent += event.text;
+        } else {
+          const node = el("msg thinking", event.text);
+          node.dataset.kind = "thinking";
+          log.appendChild(node);
+        }
+        break;
+      }
+      case "tool_start": toolCard(event); break;
+      case "tool_output": {
+        const details = toolById(event.id);
+        if (details) details.querySelector(".out").textContent = event.content;
+        break;
+      }
+      case "tool_done": {
+        const details = toolById(event.id);
+        if (details) {
+          details.classList.remove("running");
+          const out = details.querySelector(".out");
+          const text = typeof event.output === "string"
+            ? event.output
+            : (event.output && event.output.Plain && event.output.Plain.text) || JSON.stringify(event.output);
+          out.textContent = event.is_error ? `[error] ${text}` : text;
+        }
+        break;
+      }
+      case "error": log.appendChild(el("msg error", event.message)); break;
+      case "done": {
+        log.appendChild(el("msg system", `— done (${event.num_turns ?? "?"} turns)`));
+        setStats({ context_size: event.context_size, context_window: event.context_window, cost: event.cost });
+        break;
+      }
+      case "turn_complete": {
+        if (event.usage) setStats({ token_usage: event.usage, cost: event.cost });
+        break;
+      }
+      case "permission_request": {
+        pendingPermission = event;
+        document.getElementById("perm-tool").textContent = event.tool;
+        document.getElementById("perm-scopes").textContent = (event.scopes || []).join(", ");
+        denyGuidance.value = "";
+        denyGuidance.style.display = "none";
+        permEl.style.display = "block";
+        break;
+      }
+      case "permission_resolved": {
+        if (pendingPermission && pendingPermission.id === event.id) {
+          pendingPermission = null;
+          permEl.style.display = "none";
+        }
+        break;
+      }
+      case "user_message": log.appendChild(el("msg user", event.text)); break;
+      case "assistant_text": {
+        const node = el("msg assistant", event.text);
+        node.dataset.kind = "assistant";
+        log.appendChild(node);
+        break;
+      }
+    }
+    scrollDown();
+  };
+
+  // One pass over the snapshot's message list: the same shapes live events
+  // use, so rendering is the same code path.
+  const renderSnapshot = (snap) => {
+    log.replaceChildren();
+    for (const event of snap.messages || []) renderEvent(event);
+    // Snapshot tool cards arrive as start+result pairs; close them.
+    for (const details of log.querySelectorAll(".tool.running")) {
+      details.classList.remove("running");
+    }
+    if (snap.pending_permission) {
+      renderEvent({ type: "permission_request", id: snap.pending_permission.id, tool: "resuming" });
+    }
+    setHeader(snap);
+    if (Array.isArray(snap.queue) && snap.queue.length) {
+      log.appendChild(el("msg system", `— ${snap.queue.length} queued prompt(s)`));
+    }
+    scrollDown();
+  };
+
+  const setStatus = (status) => {
+    statusEl.dataset.status = status;
+    statusEl.textContent = status;
+    stopBtn.style.display = status === "working" ? "inline-block" : "none";
+  };
+
+  const connect = () => {
+    const es = new EventSource("events");
+    es.onopen = () => { connEl.dataset.conn = "live"; connEl.textContent = "live"; };
+    es.onerror = () => {
+      connEl.dataset.conn = "down";
+      connEl.textContent = "reconnecting";
+      es.close();
+      setTimeout(connect, 2000);
+    };
+    for (const kind of ["snapshot", "event", "status", "permission", "permission_resolved"]) {
+      es.addEventListener(kind, (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          if (kind === "snapshot") renderSnapshot(data);
+          else if (kind === "event") renderEvent(data);
+          else if (kind === "status") setStatus(data);
+          else if (kind === "permission") renderEvent({ type: "permission_request", ...data });
+          else if (kind === "permission_resolved") renderEvent({ type: "permission_resolved", ...data });
+        } catch {}
+      });
+    }
+  };
+
+  const submit = async (path, body) => {
+    try {
+      const res = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return res.ok;
+    } catch { return false; }
+  };
+
+  const sendPrompt = async () => {
+    const text = promptEl.value.trim();
+    if (!text) return;
+    promptEl.value = "";
+    if (await submit("prompt", { text })) {
+      renderEvent({ type: "user_message", text });
+    }
+  };
+
+  const answerPermission = async (answer) => {
+    if (!pendingPermission) return;
+    if (answer === "deny" && denyGuidance.value.trim()) {
+      answer = "deny:" + denyGuidance.value.trim();
+    }
+    const requestId = pendingPermission.id;
+    pendingPermission = null;
+    permEl.style.display = "none";
+    await submit("answer", { request_id: requestId, answer });
+  };
+
+  document.getElementById("send").onclick = sendPrompt;
+  promptEl.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      sendPrompt();
+    }
+  });
+  stopBtn.onclick = () => submit("stop", {});
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && statusEl.dataset.status === "working") submit("stop", {});
+  });
+  permEl.addEventListener("click", (ev) => {
+    const answer = ev.target?.dataset?.answer;
+    if (!answer) return;
+    if (answer === "deny") {
+      denyGuidance.style.display = denyGuidance.style.display === "none" ? "block" : "none";
+      if (!denyGuidance.value.trim()) return;
+    }
+    answerPermission(answer);
+  });
+
+  connect();
+  promptEl.focus();
+})();
+</script>
+</body>
+</html>

@@ -7,6 +7,8 @@
 //! waits on every event source at once and wakes the moment a plugin action,
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
+mod remote;
+
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,7 +25,7 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
-use maki_config::{ModelPolicy, UiConfig};
+use maki_config::{ModelPolicy, RemoteControlConfig, UiConfig};
 use maki_lua::session_snapshot::{
     MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
     SessionSnapshot,
@@ -55,7 +57,7 @@ use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_resp
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
-use crate::components::{Action, ExitRequest, Status};
+use crate::components::{Action, DisplayMessage, DisplayRole, ExitRequest, Status};
 use crate::input::InputReader;
 use crate::repaint::{Dirty, IDLE_POLL};
 
@@ -73,6 +75,10 @@ const NOT_LIVE_ERR: &str = "session not live";
 const PACK_PREPARING: &str = "Checking packages...";
 const PACK_BUSY_ERR: &str = "a package command is already running";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
+const REMOTE_NO_DOMAIN_MSG: &str =
+    "remote control needs a domain: set remote_control.domain in the config, or run /rc <domain>";
+const REMOTE_URL_MSG: &str = "Remote control: ";
+const REMOTE_COPY_ERR: &str = "clipboard copy failed";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -93,6 +99,7 @@ pub struct EventLoopParams {
     pub storage: StateDir,
     pub config: AgentConfig,
     pub ui_config: UiConfig,
+    pub remote_control: RemoteControlConfig,
     pub input_history_size: usize,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: Timeouts,
@@ -362,6 +369,7 @@ struct SpawnCtx {
     storage: StateDir,
     config: AgentConfig,
     ui_config: UiConfig,
+    remote_control: RemoteControlConfig,
     input_history_size: usize,
     /// Prototype only: every runtime forks its own manager so session rules
     /// stay per-session. `App::new` then restates the fork from the session's
@@ -452,6 +460,7 @@ pub(crate) struct EventLoop<'t> {
     /// without this a second `/packupdate` would race the first over the same
     /// clones and locks.
     pack_running: bool,
+    remote: remote::RemoteSlot,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -558,6 +567,7 @@ impl<'t> EventLoop<'t> {
             storage,
             config,
             ui_config,
+            remote_control,
             input_history_size,
             permissions,
             timeouts,
@@ -615,6 +625,7 @@ impl<'t> EventLoop<'t> {
             storage,
             config,
             ui_config,
+            remote_control,
             input_history_size,
             permissions,
             timeouts,
@@ -672,6 +683,7 @@ impl<'t> EventLoop<'t> {
             pack_tx,
             pack_rx,
             pack_running: false,
+            remote: remote::RemoteSlot::new(),
             _model_fetch_task: bg.task,
         })
     }
@@ -832,6 +844,20 @@ impl<'t> EventLoop<'t> {
     fn handle_agent(&mut self, idx: usize, envelope: Box<maki_agent::Envelope>) {
         let rt = &mut self.sessions[idx];
         let current = is_current_top_level(rt.app.run_id, &envelope);
+        if let Some(state) = self.remote.state() {
+            state.send_envelope(&rt.id().to_string(), &envelope);
+            if let maki_agent::AgentEvent::PermissionRequest { id, tool, scopes } = &envelope.event
+            {
+                state.send_permission(
+                    &rt.id().to_string(),
+                    maki_remote::PermissionFrame {
+                        id: id.clone(),
+                        tool: tool.to_string(),
+                        scopes: scopes.clone(),
+                    },
+                );
+            }
+        }
         match &envelope.event {
             AgentEvent::QueueDrained => {
                 if current {
@@ -857,6 +883,15 @@ impl<'t> EventLoop<'t> {
 
     fn drain_channels(&mut self) -> Result<Dirty> {
         let mut dirty = Dirty::NO;
+        // Remote control POSTs are answered here, before the wake loop: the
+        // HTTP handler parks up to its timeout, so it must never wait on the
+        // next real event.
+        if self.remote.is_running() {
+            let actions = self
+                .remote
+                .drain_requests(&mut self.sessions[self.focused].app);
+            self.dispatch(self.focused, actions);
+        }
         // Leftovers beyond the budget are picked up right after the next draw.
         for _ in 0..DRAIN_BUDGET {
             match self.next_wake(Duration::ZERO) {
@@ -995,6 +1030,9 @@ impl<'t> EventLoop<'t> {
                 continue;
             }
             rt.last_status = status;
+            if let Some(state) = self.remote.state() {
+                state.send_status(&rt.id().to_string(), status.as_str());
+            }
             handle.fire_autocmd(
                 "SessionStatusChanged",
                 json!({
@@ -1582,6 +1620,7 @@ impl<'t> EventLoop<'t> {
                 );
             }
             Action::PreparePack(command) => self.start_pack(idx, command),
+            Action::RemoteControl(domain) => self.handle_remote_control(domain),
             Action::Suspend => {
                 let _pause = self.input.pause();
                 terminal::suspend(self.terminal);
@@ -1646,6 +1685,36 @@ impl<'t> EventLoop<'t> {
         self.pack_running = false;
         let actions = self.focused_app().handle_pack_preparation(preparation);
         self.dispatch(self.focused, actions);
+    }
+
+    /// `/rc` (optionally with a domain override). With no domain and no
+    /// config default, tells the user what to set; `/rc` while running
+    /// restarts the server (fresh token). The URL goes to the clipboard and
+    /// the transcript, since the status bar flash is too narrow to hold one.
+    fn handle_remote_control(&mut self, domain: Option<String>) {
+        let Some(domain) = domain.or_else(|| self.ctx.remote_control.domain.clone()) else {
+            self.focused_app().flash(REMOTE_NO_DOMAIN_MSG.into());
+            return;
+        };
+        let config = RemoteControlConfig {
+            domain: Some(domain),
+            ..self.ctx.remote_control.clone()
+        };
+        match self.remote.start(&config) {
+            Ok(url) => {
+                let copy = self.focused_app().clipboard.copy_text(&url);
+                let app = self.focused_app();
+                app.main_chat().push(DisplayMessage::new(
+                    DisplayRole::Done,
+                    format!("{REMOTE_URL_MSG}{url}"),
+                ));
+                app.flash(url);
+                if let Err(e) = copy {
+                    app.flash(format!("{REMOTE_COPY_ERR}: {e}"));
+                }
+            }
+            Err(e) => self.focused_app().flash(format!("{e}")),
+        }
     }
 
     fn refresh_models(&self) {
@@ -1713,6 +1782,7 @@ impl<'t> EventLoop<'t> {
         // until the shared deadline, taking every later tab's `SessionEnd`
         // down with it.
         self.ui_attachment.detach();
+        self.remote.stop();
         // `/reload` hands these same sessions to the next generation, so
         // their handlers must not hear that the process is quitting.
         let reason = match exit {

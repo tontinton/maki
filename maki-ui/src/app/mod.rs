@@ -55,7 +55,7 @@ use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
-use maki_agent::permissions::PermissionManager;
+use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
     SharedMessages, SubagentInfo,
@@ -65,10 +65,11 @@ use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader,
     PackCommand, PackPreparation, WinView,
 };
-use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
+use maki_providers::{ContentBlock, Message, MessageKind, Model, Role, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
+use serde_json::json;
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::Position;
@@ -531,6 +532,157 @@ impl App {
         } else {
             self.send_answer(answer);
         }
+    }
+
+    /// Remote control submitted a prompt. Same path as the Lua session API:
+    /// started or queued exactly like a typed one, minus the input box.
+    pub(crate) fn submit_remote_prompt(&mut self, text: String) -> Result<Vec<Action>, String> {
+        match self.submit_prompt(QueuedMessage {
+            text,
+            images: Vec::new(),
+        }) {
+            SubmitOutcome::Started(actions) => Ok(actions),
+            SubmitOutcome::Queued => Ok(vec![]),
+            SubmitOutcome::Rejected(e) => Err(e.into()),
+        }
+    }
+
+    /// Remote control answered the pending permission prompt. The request id
+    /// must still match, so a stale answer cannot hit a newer prompt.
+    pub(crate) fn answer_remote_permission(
+        &mut self,
+        request_id: &str,
+        answer: &str,
+    ) -> Result<(), String> {
+        let Some((pending_id, subagent_id)) = self.pending_permission_ids() else {
+            return Err("no permission prompt is pending".into());
+        };
+        if pending_id != request_id {
+            return Err("that permission prompt is no longer pending".into());
+        }
+        let decoded =
+            PermissionAnswer::decode(answer).ok_or_else(|| format!("invalid answer {answer:?}"))?;
+        self.send_to_agent(subagent_id.as_deref(), decoded.encode());
+        self.permission_prompt.close();
+        Ok(())
+    }
+
+    /// The pending permission request's id and its owning subagent, if any.
+    pub(crate) fn pending_permission_ids(&self) -> Option<(String, Option<String>)> {
+        match &self.permission_prompt {
+            PermissionPrompt::Open {
+                id, subagent_id, ..
+            } => Some((id.clone(), subagent_id.clone())),
+            PermissionPrompt::Closed => None,
+        }
+    }
+
+    /// Remote control asked to stop the run; identical to double-esc cancel.
+    /// The cancel's `Action`s come back to the caller to dispatch.
+    pub(crate) fn stop_remote_run(&mut self) -> Result<Vec<Action>, String> {
+        if self.status != Status::Streaming {
+            return Err("no run is active".into());
+        }
+        Ok(self.handle_cancel())
+    }
+
+    /// Everything a freshly connected web client needs to catch up to what
+    /// the TUI shows: transcript, stats, mode, status, pending permission.
+    /// Mirrors what the TUI renders, not the raw LLM history.
+    pub(crate) fn remote_snapshot(&self) -> serde_json::Value {
+        let mut messages = Vec::new();
+        // The live mirror while a run exists; the session's own list otherwise
+        // (e.g. before the first spawn applies the mirror).
+        let history: std::sync::Arc<Vec<Message>> = match &self.shared_history {
+            Some(shared) => shared.load().messages.clone(),
+            None => self.state.session.messages().to_vec().into(),
+        };
+        for message in history.iter() {
+            // Observation messages are host bookkeeping the TUI hides.
+            if message.kind == MessageKind::Observation {
+                continue;
+            }
+            match message.role {
+                Role::User => {
+                    // Empty display text marks host bookkeeping (synthetic
+                    // prompts, cancel markers on result-only messages); the
+                    // tool results themselves still render.
+                    let has_results = message
+                        .content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+                    if message.display_text.as_deref().is_some_and(str::is_empty) && !has_results {
+                        continue;
+                    }
+                    if let Some(text) = message.user_text() {
+                        messages.push(json!({
+                            "type": "user_message",
+                            "text": text,
+                        }));
+                    }
+                    for block in &message.content {
+                        if let ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } = block
+                        {
+                            messages.push(json!({
+                                "type": "tool_result",
+                                "id": tool_use_id,
+                                "content": content,
+                                "is_error": is_error,
+                            }));
+                        }
+                    }
+                }
+                Role::Assistant => {
+                    for block in &message.content {
+                        match block {
+                            ContentBlock::Text { text } if !text.is_empty() => {
+                                messages.push(json!({
+                                    "type": "assistant_text",
+                                    "text": text,
+                                }));
+                            }
+                            ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                                messages.push(json!({
+                                    "type": "thinking",
+                                    "text": thinking,
+                                }));
+                            }
+                            ContentBlock::ToolUse {
+                                id, name, input, ..
+                            } => {
+                                messages.push(json!({
+                                    "type": "tool_start",
+                                    "id": id,
+                                    "tool": name,
+                                    "input": input,
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        let session = &self.state.session;
+        json!({
+            "messages": messages,
+            "session_id": session.id.to_string(),
+            "title": session.title,
+            "cwd": session.cwd,
+            "model": self.state.model.spec(),
+            "status": if self.status == Status::Streaming { "working" } else { "idle" },
+            "context_size": self.state.context_size,
+            "context_window": self.state.model.context_window,
+            "cost": self.state.cost,
+            "token_usage": self.state.token_usage,
+            "queue": self.queue.text_messages(),
+            "pending_permission": self.pending_permission_ids()
+                .map(|(id, _)| json!({ "id": id })),
+        })
     }
 
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
@@ -1422,6 +1574,12 @@ impl App {
                     .into(),
                 );
                 vec![]
+            }
+            "/remote-control" | "/rc" => {
+                let domain = cmd.args.trim();
+                vec![Action::RemoteControl(
+                    (!domain.is_empty()).then(|| domain.to_owned()),
+                )]
             }
             "/exit" => self.quit(),
             "/reload" => self.quit_with(ExitRequest::Reload),

@@ -52,6 +52,9 @@ pub const MIN_TOOL_OUTPUT_LINES: usize = 1;
 pub const MIN_MAX_LOG_BYTES_MB: u64 = 1;
 pub const MIN_MAX_LOG_FILES: u32 = 1;
 pub const MIN_INPUT_HISTORY_SIZE: usize = 10;
+pub const DEFAULT_REMOTE_CONTROL_PORT: u16 = 8687;
+const DEFAULT_REMOTE_CONTROL_BIND: &str = "0.0.0.0";
+const MIN_PORT: u16 = 1;
 pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
 pub const MIN_LOW_SPEED_TIMEOUT_SECS: u64 = 1;
 pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
@@ -338,6 +341,7 @@ pub struct RawConfig {
     pub provider: ProviderFileConfig,
     pub storage: StorageFileConfig,
     pub net: NetFileConfig,
+    pub remote_control: RemoteControlFileConfig,
     pub telemetry: TelemetryConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
     /// Renamed to `plugins`; kept so old configs fail with a pointer to the
@@ -360,6 +364,7 @@ impl RawConfig {
         self.provider.merge(overlay.provider);
         self.storage.merge(overlay.storage);
         self.net.merge(overlay.net);
+        self.remote_control.merge(overlay.remote_control);
         self.telemetry.merge(overlay.telemetry);
         for (name, plugin) in overlay.plugins {
             let entry = self.plugins.entry(name).or_default();
@@ -390,6 +395,7 @@ impl RawConfig {
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
             net: NetConfig::from_file(self.net),
+            remote_control: RemoteControlConfig::from_file(self.remote_control),
             telemetry: self.telemetry,
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_plugins_and_packages(self.plugins, packages),
@@ -651,6 +657,20 @@ pub struct NetFileConfig {
 impl NetFileConfig {
     fn merge(&mut self, overlay: NetFileConfig) {
         merge_option!(self, overlay, allowed_private_hosts);
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct RemoteControlFileConfig {
+    pub domain: Option<String>,
+    pub port: Option<u16>,
+    pub bind: Option<String>,
+}
+
+impl RemoteControlFileConfig {
+    fn merge(&mut self, overlay: RemoteControlFileConfig) {
+        merge_option!(self, overlay, domain, port, bind);
     }
 }
 
@@ -945,7 +965,7 @@ pub struct PermissionsConfig {
     pub yolo: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Config {
     pub always_yolo: bool,
     pub always_fast: bool,
@@ -956,6 +976,7 @@ pub struct Config {
     pub provider: ProviderConfig,
     pub storage: StorageConfig,
     pub net: NetConfig,
+    pub remote_control: RemoteControlConfig,
     pub telemetry: TelemetryConfig,
     pub permissions: PermissionsConfig,
     pub plugins: PluginsConfig,
@@ -1421,6 +1442,38 @@ impl NetConfig {
     }
 }
 
+/// Settings for the `/remote-control` (`/rc`) web endpoint. TLS and DNS stay
+/// on the user's reverse proxy; maki only binds a plain HTTP listener and
+/// hands out `https://{domain}/{token}` links under it.
+#[derive(Debug, Clone, ConfigSection)]
+#[config(section = "remote_control")]
+pub struct RemoteControlConfig {
+    #[config(
+        ty = "String",
+        default = "None",
+        desc = "Public domain the reverse proxy serves; the `/rc` link is `https://{domain}/{token}`. Required before `/rc` starts"
+    )]
+    pub domain: Option<String>,
+
+    #[config(default = DEFAULT_REMOTE_CONTROL_PORT, min = MIN_PORT, desc = "TCP port the control server listens on")]
+    pub port: u16,
+
+    #[config(default = DEFAULT_REMOTE_CONTROL_BIND.to_owned(), desc = "Address to bind the control server to: `0.0.0.0` when the proxy runs on another machine, `127.0.0.1` to keep it local")]
+    pub bind: String,
+}
+
+impl RemoteControlConfig {
+    fn from_file(f: RemoteControlFileConfig) -> Self {
+        Self {
+            domain: f.domain,
+            port: f.port.unwrap_or(DEFAULT_REMOTE_CONTROL_PORT),
+            bind: f
+                .bind
+                .unwrap_or_else(|| DEFAULT_REMOTE_CONTROL_BIND.to_owned()),
+        }
+    }
+}
+
 /// OpenTelemetry export settings. Every field also has an `OTEL_*` (or
 /// `MAKI_*`) environment variable, which wins over what is set here.
 ///
@@ -1694,6 +1747,7 @@ impl Config {
         self.agent.validate()?;
         self.provider.validate()?;
         self.storage.validate()?;
+        self.remote_control.validate()?;
         Ok(())
     }
 }
@@ -2523,6 +2577,83 @@ mod tests {
         assert_eq!(net.allowed_private_hosts, [PROJECT_ALLOWED_HOST]);
     }
 
+    const RC_GLOBAL_DOMAIN: &str = "rc.example.com";
+    const RC_PROJECT_DOMAIN: &str = "tunnel.example.org";
+    const RC_CUSTOM_PORT: u16 = 9000;
+    const RC_CUSTOM_BIND: &str = "127.0.0.1";
+
+    #[test]
+    fn remote_control_defaults_and_overlay_wins() {
+        let defaults = RawConfig::default().into_config(&[]).unwrap();
+        assert_eq!(defaults.remote_control.domain, None);
+        assert_eq!(defaults.remote_control.port, DEFAULT_REMOTE_CONTROL_PORT);
+        assert_eq!(defaults.remote_control.bind, DEFAULT_REMOTE_CONTROL_BIND);
+
+        let raw_with = |domain: &str| RawConfig {
+            remote_control: RemoteControlFileConfig {
+                domain: Some(domain.into()),
+                port: Some(RC_CUSTOM_PORT),
+                bind: Some(RC_CUSTOM_BIND.into()),
+            },
+            ..Default::default()
+        };
+
+        let mut global = raw_with(RC_GLOBAL_DOMAIN);
+        global.merge(raw_with(RC_PROJECT_DOMAIN));
+
+        let rc = global.into_config(&[]).unwrap().remote_control;
+        assert_eq!(rc.domain.as_deref(), Some(RC_PROJECT_DOMAIN));
+        assert_eq!(rc.port, RC_CUSTOM_PORT);
+        assert_eq!(rc.bind, RC_CUSTOM_BIND);
+    }
+
+    #[test]
+    fn remote_control_parses_from_toml() {
+        let raw: RawConfig = toml::from_str(
+            "[remote_control]\ndomain = \"rc.example.com\"\nport = 9443\nbind = \"127.0.0.1\"\n",
+        )
+        .unwrap();
+        let rc = raw.into_config(&[]).unwrap().remote_control;
+        assert_eq!(rc.domain.as_deref(), Some(RC_GLOBAL_DOMAIN));
+        assert_eq!(rc.port, 9443);
+        assert_eq!(rc.bind, RC_CUSTOM_BIND);
+    }
+
+    #[test]
+    fn remote_control_rejects_unknown_fields() {
+        let result: Result<RawConfig, _> = toml::from_str("[remote_control]\nnonsense = 1\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn remote_control_port_below_minimum_fails_validate() {
+        let config = Config {
+            always_yolo: false,
+            always_fast: false,
+            always_workflow: false,
+            always_thinking: None,
+            ui: UiConfig::default(),
+            agent: AgentConfig::default(),
+            provider: ProviderConfig::default(),
+            storage: StorageConfig::default(),
+            net: NetConfig::default(),
+            remote_control: RemoteControlConfig {
+                domain: None,
+                port: 0,
+                bind: DEFAULT_REMOTE_CONTROL_BIND.to_owned(),
+            },
+            telemetry: TelemetryConfig::default(),
+            permissions: PermissionsConfig::default(),
+            plugins: PluginsConfig::default(),
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::BelowMinimum { section: s, field: f, .. }
+                if s == "remote_control" && f == "port"
+        ));
+    }
+
     #[test]
     fn provider_model_lists_inherit_replace_and_clear() {
         let mut global = RawConfig {
@@ -2724,6 +2855,7 @@ mod tests {
             provider: ProviderConfig::default(),
             storage: StorageConfig::default(),
             net: NetConfig::default(),
+            remote_control: RemoteControlConfig::default(),
             telemetry: TelemetryConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::default(),

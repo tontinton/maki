@@ -1,0 +1,18 @@
+[package]
+name = "maki-remote"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+maki-agent = { workspace = true }
+maki-config = { workspace = true }
+arc-swap = { workspace = true }
+flume = { workspace = true }
+getrandom = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tiny_http = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }

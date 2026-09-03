@@ -11,6 +11,7 @@ maki-highlight = { workspace = true }
 maki-markdown = { workspace = true }
 maki-providers = { workspace = true }
 maki-lua = { workspace = true }
+maki-remote = { workspace = true }
 maki-storage = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }

@@ -118,8 +118,20 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         bang: false,
     },
     BuiltinCommand {
+        name: "/remote-control",
+        description: "Start remote control; prints a tokenized web URL",
+        max_args: 1,
+        bang: false,
+    },
+    BuiltinCommand {
+        name: "/rc",
+        description: "Alias of /remote-control",
+        max_args: 1,
+        bang: false,
+    },
+    BuiltinCommand {
         name: "/exit",
-        description: "Exit the application",
+        description: "Exit maki",
         max_args: 0,
         bang: false,
     },

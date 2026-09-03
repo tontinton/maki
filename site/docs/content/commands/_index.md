@@ -28,7 +28,9 @@ Type `/` in the input box to open the command palette.
 | `/thinking` | Toggle extended thinking (off, adaptive, effort level, or budget) |
 | `/fast` | Toggle Anthropic fast mode (Opus only) |
 | `/workflow` | Toggle workflow mode (task callable inside code_execution) |
-| `/exit` | Exit the application |
+| `/remote-control` | Start remote control; prints a tokenized web URL |
+| `/rc` | Alias of /remote-control |
+| `/exit` | Exit maki |
 | `/reload` | Reload plugins and config |
 | `/packupdate` | Update packages (++lockfile, ! skips review) |
 | `/packdel` | Remove undeclared packages (++all, or a name) |
