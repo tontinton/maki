@@ -169,6 +169,16 @@ An entry with no port covers every port. A name you list is allowed whatever it 
 
 `/remote-control` (`/rc`) serves the live session over HTTP behind your own reverse proxy, which owns TLS and DNS. The command prints a `https://{domain}/{token}` link; the token is unique per start and is the only gate, so keep the proxy pointed at the control port whole and out of reach of anything you do not trust.
 
+### `anchor`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | String | `none` | Anchor base URL, e.g. `https://maki.example.com`. Required before `/rc` dials out |
+| `name` | String | `none` | Instance name shown on the anchor dashboard. Defaults to the machine hostname |
+| `token` | String | `none` | Registration token issued by `maki-anchor tokens add <name>` |
+
+When all three fields are set, `/rc` dials the anchor instead of          binding its own listener: the anchor URL replaces the local one, and          the instance needs no inbound port. Tokens come from `maki-anchor tokens add <name>`; one token per instance.
+
 ### `telemetry`
 
 | Field | Type | Default | Env | Description |

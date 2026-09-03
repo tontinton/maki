@@ -5,11 +5,15 @@
 //! status frames, and every mutating endpoint lands on the same channel the
 //! TUI already services, so remote actions behave like local ones.
 
+mod dispatch;
 mod server;
 mod state;
+pub mod tunnel;
 
+pub use dispatch::Route;
 pub use server::{RemoteRequest, RemoteServer};
 pub use state::{PermissionFrame, RemoteState, RemoteUpdate};
+pub use tunnel::{TunnelClient, TunnelError, run_tunnel};
 
 use thiserror::Error;
 

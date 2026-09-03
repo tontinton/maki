@@ -100,6 +100,7 @@ pub struct EventLoopParams {
     pub config: AgentConfig,
     pub ui_config: UiConfig,
     pub remote_control: RemoteControlConfig,
+    pub anchor: Option<maki_config::AnchorConfig>,
     pub input_history_size: usize,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: Timeouts,
@@ -370,6 +371,7 @@ struct SpawnCtx {
     config: AgentConfig,
     ui_config: UiConfig,
     remote_control: RemoteControlConfig,
+    anchor: Option<maki_config::AnchorConfig>,
     input_history_size: usize,
     /// Prototype only: every runtime forks its own manager so session rules
     /// stay per-session. `App::new` then restates the fork from the session's
@@ -568,6 +570,7 @@ impl<'t> EventLoop<'t> {
             config,
             ui_config,
             remote_control,
+            ref anchor,
             input_history_size,
             permissions,
             timeouts,
@@ -626,6 +629,7 @@ impl<'t> EventLoop<'t> {
             config,
             ui_config,
             remote_control,
+            anchor: anchor.clone(),
             input_history_size,
             permissions,
             timeouts,
@@ -1700,7 +1704,7 @@ impl<'t> EventLoop<'t> {
             domain: Some(domain),
             ..self.ctx.remote_control.clone()
         };
-        match self.remote.start(&config) {
+        match self.remote.start(&config, self.ctx.anchor.as_ref()) {
             Ok(url) => {
                 let copy = self.focused_app().clipboard.copy_text(&url);
                 let app = self.focused_app();

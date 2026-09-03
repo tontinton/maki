@@ -1,20 +1,15 @@
-use std::io::Read;
 use std::sync::Arc;
-use std::time::Duration;
 
 use flume::Sender;
 use maki_config::RemoteControlConfig;
-use serde_json::json;
-use tiny_http::{Header, Method, Response, Server};
+use tiny_http::{Method, Response, Server};
 
-use crate::state::{PermissionFrame, RemoteState, RemoteUpdate};
+use crate::state::RemoteState;
 
-const INDEX_HTML: &str = include_str!("index.html");
+pub(crate) const INDEX_HTML: &str = include_str!("index.html");
 
-const SSE_PING_SECS: u64 = 15;
 /// How long a POST waits for the event loop to confirm it handled the
 /// request. The loop only flips state or forwards, so this is generous.
-const REQUEST_REPLY_TIMEOUT_SECS: u64 = 5;
 const MAX_BODY_BYTES: usize = 1 << 20;
 const TOKEN_BYTES: usize = 16;
 /// `2 * TOKEN_BYTES` hex chars: 128 bits of entropy, the only gate.
@@ -43,19 +38,9 @@ pub enum RemoteRequest {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Route {
-    Index,
-    Events,
-    Prompt,
-    Answer,
-    Stop,
-}
-
 pub struct RemoteServer {
     server: Server,
-    state: RemoteState,
-    requests: Sender<RemoteRequest>,
+    dispatcher: crate::dispatch::Dispatcher,
     token: [u8; TOKEN_LEN],
     bound_port: u16,
 }
@@ -92,8 +77,10 @@ impl RemoteServer {
         let url = format!("https://{domain}/{}", String::from_utf8_lossy(&token));
         let server = Self {
             server,
-            state: RemoteState::new(),
-            requests,
+            dispatcher: crate::dispatch::Dispatcher {
+                state: RemoteState::new(),
+                requests,
+            },
             token,
             bound_port,
         };
@@ -122,13 +109,13 @@ impl RemoteServer {
     /// Ends every SSE stream and unblocks the serving thread, so `serve`
     /// returns and the listener closes. Idempotent.
     pub fn shutdown(&self) {
-        self.state.send_shutdown();
+        self.dispatcher.state.send_shutdown();
         self.server.unblock();
     }
 
     /// The live fan-out hub the event loop mirrors session state into.
     pub fn state(&self) -> &RemoteState {
-        &self.state
+        &self.dispatcher.state
     }
 
     /// The port actually bound. Differs from the config when the caller
@@ -137,7 +124,7 @@ impl RemoteServer {
         self.bound_port
     }
 
-    fn route(&self, path: &str, method: &Method) -> Option<Route> {
+    fn route(&self, path: &str, method: &Method) -> Option<crate::dispatch::Route> {
         let rest = path.strip_prefix('/')?;
         let (token, tail) = match rest.split_once('/') {
             Some((token, tail)) => (token, tail),
@@ -146,23 +133,34 @@ impl RemoteServer {
         if !constant_time_eq(token.as_bytes(), &self.token) {
             return None;
         }
-        match (tail, method) {
-            ("", &Method::Get) => Some(Route::Index),
-            ("events", &Method::Get) => Some(Route::Events),
-            ("prompt", &Method::Post) => Some(Route::Prompt),
-            ("answer", &Method::Post) => Some(Route::Answer),
-            ("stop", &Method::Post) => Some(Route::Stop),
-            _ => None,
-        }
+        crate::dispatch::Route::from_tail(tail, method.as_str())
     }
 
     fn handle(&self, mut request: tiny_http::Request) {
-        let Some(route) = self.route(request.url(), request.method()) else {
-            let _ = request.respond(Response::empty(404));
-            return;
+        let route = self.route(request.url(), request.method());
+        let body = if matches!(
+            route,
+            Some(
+                crate::dispatch::Route::Prompt
+                    | crate::dispatch::Route::Answer
+                    | crate::dispatch::Route::Stop
+            )
+        ) {
+            match read_body(&mut request) {
+                Ok(body) => body,
+                Err(_) => {
+                    let _ = request.respond(Response::empty(413));
+                    return;
+                }
+            }
+        } else {
+            String::new()
         };
-        match route {
-            Route::Index => {
+        match self.dispatcher.dispatch(route, &body) {
+            crate::dispatch::DispatchOutcome::NotFound => {
+                let _ = request.respond(Response::empty(404));
+            }
+            crate::dispatch::DispatchOutcome::Index => {
                 let response = Response::from_string(INDEX_HTML)
                     .with_header(content_type("text/html; charset=utf-8"));
                 let _ = request.respond(response);
@@ -172,92 +170,20 @@ impl RemoteServer {
             // subscriber. The snapshot is fetched here so it strictly
             // precedes any event fanned out to this subscriber. Everything
             // else is handled inline.
-            Route::Events => {
-                let subscription = self.state.subscribe();
-                let snapshot = self.snapshot_json();
+            crate::dispatch::DispatchOutcome::Events { mut source, .. } => {
                 std::thread::Builder::new()
                     .name("remote-control-sse".into())
-                    .spawn(move || serve_events(request, subscription, snapshot))
+                    .spawn(move || serve_events(request, &mut source))
                     .expect("spawn SSE thread");
             }
-            Route::Prompt | Route::Answer | Route::Stop => {
-                let body = match read_body(&mut request) {
-                    Ok(body) => body,
-                    Err(_) => {
-                        let _ = request.respond(Response::empty(413));
-                        return;
-                    }
-                };
-                let status = match self.dispatch_post(route, body) {
-                    Some(()) => 200,
-                    None => 400,
-                };
+            crate::dispatch::DispatchOutcome::Posted(status) => {
                 let _ = request.respond(Response::empty(status));
             }
         }
     }
-
-    /// Asks the event loop for the current session snapshot. Empty object if
-    /// the loop is wedged; the stream still opens with live events.
-    fn snapshot_json(&self) -> serde_json::Value {
-        let (tx, rx) = flume::bounded(1);
-        if self
-            .requests
-            .try_send(RemoteRequest::Snapshot { reply: tx })
-            .is_err()
-        {
-            return json!({});
-        }
-        rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS))
-            .unwrap_or_else(|_| json!({}))
-    }
-
-    fn dispatch_post(&self, route: Route, body: String) -> Option<()> {
-        let (request, reply_rx) = match route {
-            Route::Prompt => {
-                let text = parse_json_field(&body, "text")?;
-                let (tx, rx) = flume::unbounded();
-                (RemoteRequest::Prompt { text, reply: tx }, rx)
-            }
-            Route::Answer => {
-                let value: serde_json::Value = serde_json::from_str(&body).ok()?;
-                let request_id = value.get("request_id")?.as_str()?.to_owned();
-                let answer = value.get("answer")?.as_str()?.to_owned();
-                let (tx, rx) = flume::unbounded();
-                (
-                    RemoteRequest::Answer {
-                        request_id,
-                        answer,
-                        reply: tx,
-                    },
-                    rx,
-                )
-            }
-            Route::Stop => {
-                let (tx, rx) = flume::unbounded();
-                (RemoteRequest::Stop { reply: tx }, rx)
-            }
-            Route::Index | Route::Events => return None,
-        };
-        self.requests.try_send(request).ok()?;
-        // The loop answers fast (it only flips state or forwards); still,
-        // bound the wait so a wedged UI thread cannot leak connections.
-        match reply_rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS)) {
-            Ok(Ok(())) => Some(()),
-            Ok(Err(reason)) => {
-                tracing::debug!(%reason, "remote control: request rejected");
-                None
-            }
-            Err(_) => None,
-        }
-    }
 }
 
-fn serve_events(
-    request: tiny_http::Request,
-    subscription: crate::state::Subscription,
-    snapshot: serde_json::Value,
-) {
+fn serve_events(request: tiny_http::Request, source: &mut crate::dispatch::SseSource) {
     // Handled by hand instead of `respond`: tiny_http's chunked encoder
     // buffers 8 KiB before sending, which would sit on small SSE frames
     // forever. The raw writer lets each frame flush as it is produced.
@@ -267,21 +193,8 @@ fn serve_events(
         let mut writer = request.into_writer();
         writer.write_all(head.as_bytes())?;
         writer.flush()?;
-        let mut body = SseBody {
-            subscription,
-            idle_deadline: None,
-            buf: Vec::new(),
-        };
-        // The snapshot precedes everything fanned out from here on, so a
-        // fresh tab renders history first and live events after.
-        write_frame(&mut body.buf, "snapshot", &snapshot);
-        loop {
-            let mut frame = [0u8; 4096];
-            let n = body.read(&mut frame)?;
-            if n == 0 {
-                break;
-            }
-            writer.write_all(&frame[..n])?;
+        while let Some(frame) = source.next_frame() {
+            writer.write_all(&frame)?;
             writer.flush()?;
         }
         Ok(())
@@ -291,115 +204,19 @@ fn serve_events(
     }
 }
 
-/// Reads the fan-out channel and yields SSE frames. Never returns `Ok(0)`:
-/// a zero read would end the stream, so the reader sleeps on the channel
-/// instead and emits pings on long idles.
-struct SseBody {
-    subscription: crate::state::Subscription,
-    idle_deadline: Option<std::time::Instant>,
-    buf: Vec<u8>,
-}
-
-impl Read for SseBody {
-    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        if self.buf.is_empty() {
-            let updates = &self.subscription.updates;
-            let update = match self.idle_deadline {
-                Some(deadline) => match updates.recv_deadline(deadline) {
-                    Ok(update) => Some(update),
-                    Err(flume::RecvTimeoutError::Timeout) => {
-                        self.idle_deadline = None;
-                        self.buf.extend_from_slice(b": ping\n\n");
-                        None
-                    }
-                    Err(_) => return Ok(0),
-                },
-                None => match updates.recv() {
-                    Ok(update) => Some(update),
-                    Err(_) => return Ok(0),
-                },
-            };
-            if let Some(update) = update {
-                self.idle_deadline =
-                    Some(std::time::Instant::now() + Duration::from_secs(SSE_PING_SECS));
-                match update {
-                    RemoteUpdate::Envelope { event, .. } => {
-                        write_frame(&mut self.buf, "event", &event);
-                    }
-                    RemoteUpdate::Status { status, .. } => {
-                        write_frame(&mut self.buf, "status", &json!(status));
-                    }
-                    RemoteUpdate::Permission { frame, .. } => {
-                        write_frame(&mut self.buf, "permission", &frame_json(&frame));
-                    }
-                    RemoteUpdate::PermissionResolved { request_id, .. } => {
-                        write_frame(
-                            &mut self.buf,
-                            "permission_resolved",
-                            &json!({ "id": request_id }),
-                        );
-                    }
-                    RemoteUpdate::Shutdown => return Ok(0),
-                }
-            }
-        }
-        self.drain_into(out)
-    }
-}
-
-impl SseBody {
-    fn drain_into(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.buf.len().min(out.len());
-        if n == 0 {
-            // An out slice too small for even one buffered byte would spin;
-            // SSE frames are tens of bytes, so this cannot happen in
-            // practice, but refuse rather than loop forever.
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "sse buffer larger than read slice",
-            ));
-        }
-        out[..n].copy_from_slice(&self.buf[..n]);
-        self.buf.drain(..n);
-        Ok(n)
-    }
-}
-
-fn write_frame(buf: &mut Vec<u8>, event: &str, payload: &serde_json::Value) {
-    use std::io::Write;
-    let _ = write!(buf, "event: {event}\ndata: {payload}\n\n");
-}
-
-fn frame_json(frame: &PermissionFrame) -> serde_json::Value {
-    json!({
-        "id": frame.id,
-        "tool": frame.tool,
-        "scopes": frame.scopes,
-    })
-}
-
-fn content_type(value: &str) -> Header {
-    header("Content-Type", value)
-}
-
-fn header(name: &str, value: &str) -> Header {
-    Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("valid header")
+fn content_type(value: &str) -> tiny_http::Header {
+    tiny_http::Header::from_bytes("Content-Type", value).expect("static content type")
 }
 
 fn read_body(request: &mut tiny_http::Request) -> Result<String, ()> {
-    const LIMIT: u64 = MAX_BODY_BYTES as u64;
-    let mut buf = Vec::new();
-    let mut reader = request.as_reader().take(LIMIT + 1);
-    reader.read_to_end(&mut buf).map_err(|_| ())?;
-    if buf.len() as u64 > LIMIT {
+    use std::io::Read;
+    let mut body = Vec::new();
+    let mut reader = request.as_reader().take(MAX_BODY_BYTES as u64 + 1);
+    reader.read_to_end(&mut body).map_err(|_| ())?;
+    if body.len() > MAX_BODY_BYTES {
         return Err(());
     }
-    String::from_utf8(buf).map_err(|_| ())
-}
-
-fn parse_json_field(body: &str, field: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    value.get(field)?.as_str().map(str::to_owned)
+    String::from_utf8(body).map_err(|_| ())
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -434,8 +251,10 @@ mod tests {
         let server = Server::http("127.0.0.1:0").unwrap();
         RemoteServer {
             server,
-            state: RemoteState::new(),
-            requests: tx,
+            dispatcher: crate::dispatch::Dispatcher {
+                state: RemoteState::new(),
+                requests: tx,
+            },
             token,
             bound_port: 0,
         }
@@ -460,19 +279,19 @@ mod tests {
         let post = &Method::Post;
         assert!(matches!(
             server.route("/abcdef0123456789abcdef0123456789/", get),
-            Some(Route::Index)
+            Some(crate::dispatch::Route::Index)
         ));
         assert!(matches!(
             server.route("/abcdef0123456789abcdef0123456789", get),
-            Some(Route::Index)
+            Some(crate::dispatch::Route::Index)
         ));
         assert!(matches!(
             server.route("/abcdef0123456789abcdef0123456789/events", get),
-            Some(Route::Events)
+            Some(crate::dispatch::Route::Events)
         ));
         assert!(matches!(
             server.route("/abcdef0123456789abcdef0123456789/prompt", post),
-            Some(Route::Prompt)
+            Some(crate::dispatch::Route::Prompt)
         ));
         assert!(server.route("/wrongtoken/events", get).is_none());
         assert!(
@@ -491,11 +310,14 @@ mod tests {
     #[test]
     fn prompt_body_parses_text_field() {
         assert_eq!(
-            parse_json_field(r#"{"text":"hi"}"#, "text"),
+            crate::dispatch::parse_json_field(r#"{"text":"hi"}"#, "text"),
             Some("hi".into())
         );
-        assert_eq!(parse_json_field(r#"{"text":42}"#, "text"), None);
-        assert_eq!(parse_json_field("not json", "text"), None);
+        assert_eq!(
+            crate::dispatch::parse_json_field(r#"{"text":42}"#, "text"),
+            None
+        );
+        assert_eq!(crate::dispatch::parse_json_field("not json", "text"), None);
     }
 
     #[test]

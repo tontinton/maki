@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use flume::Sender;
 use maki_config::RemoteControlConfig;
+use maki_remote::tunnel::{TunnelClient, run_tunnel};
 use maki_remote::{RemoteRequest, RemoteServer};
 
 use crate::app::App;
@@ -16,30 +17,70 @@ use crate::components::Action;
 /// Remote requests handled per drain, so a flood cannot starve rendering.
 const REQUEST_BUDGET: usize = 64;
 
-pub(crate) struct RemoteControl {
-    server: Arc<RemoteServer>,
+pub(crate) enum RemoteControl {
+    Standalone { server: Arc<RemoteServer> },
+    Tunnel { state: maki_remote::RemoteState },
 }
 
 impl RemoteControl {
-    /// Binds the listener and spawns the serving thread.
+    /// Binds the listener and spawns the serving thread, or dials the anchor
+    /// and runs the tunnel thread. `anchor` wins when configured.
     fn start(
         config: &RemoteControlConfig,
+        anchor: Option<&maki_config::AnchorConfig>,
         requests: Sender<RemoteRequest>,
     ) -> color_eyre::Result<(Self, String)> {
-        let (server, url) = RemoteServer::bind(config, requests)?;
-        let thread_server = Arc::clone(&server);
-        std::thread::Builder::new()
-            .name("remote-control".into())
-            .spawn(move || thread_server.serve())
-            .map_err(|e| color_eyre::eyre::eyre!("remote control thread: {e}"))?;
-        Ok((Self { server }, url))
+        if let Some(anchor) = anchor {
+            let Some((url, name, token)) = anchor
+                .complete()
+                .map(|(u, n, t)| (u.to_owned(), n.to_owned(), t.to_owned()))
+            else {
+                color_eyre::eyre::bail!("anchor config needs url, name and token together");
+            };
+            validate_token_hex(&token)?;
+            let client_state = maki_remote::RemoteState::new();
+            let client = TunnelClient::new(requests, token.clone(), name.clone());
+            let anchor_url = url.clone();
+            let link_token = token.to_lowercase();
+            std::thread::Builder::new()
+                .name("remote-tunnel".into())
+                .spawn(move || {
+                    if let Err(e) = run_tunnel(&anchor_url, &token, client) {
+                        tracing::warn!(error = %e, "anchor tunnel ended");
+                    }
+                })
+                .map_err(|e| color_eyre::eyre::eyre!("remote tunnel thread: {e}"))?;
+            Ok((
+                Self::Tunnel {
+                    state: client_state,
+                },
+                format!("{url}/{name}/{link_token}"),
+            ))
+        } else {
+            let (server, url) = RemoteServer::bind(config, requests)?;
+            let thread_server = Arc::clone(&server);
+            std::thread::Builder::new()
+                .name("remote-control".into())
+                .spawn(move || thread_server.serve())
+                .map_err(|e| color_eyre::eyre::eyre!("remote control thread: {e}"))?;
+            Ok((Self::Standalone { server }, url))
+        }
     }
 
     /// Unblocks the serving thread and closes SSE streams; the listener
     /// closes when the last `Arc<RemoteServer>` drops.
     fn stop(&self) {
-        self.server.shutdown();
+        if let Self::Standalone { server } = self {
+            server.shutdown();
+        }
     }
+}
+
+fn validate_token_hex(token: &str) -> color_eyre::Result<()> {
+    if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        color_eyre::eyre::bail!("anchor.token must be 32 hex chars from `maki-anchor tokens add`");
+    }
+    Ok(())
 }
 
 /// The event loop's per-generation remote control state. The server is `None`
@@ -66,11 +107,15 @@ impl RemoteSlot {
 
     /// Starts (or restarts) the server. Returns the public URL to flash.
     /// A fresh token is minted every start.
-    pub(crate) fn start(&mut self, config: &RemoteControlConfig) -> color_eyre::Result<String> {
+    pub(crate) fn start(
+        &mut self,
+        config: &RemoteControlConfig,
+        anchor: Option<&maki_config::AnchorConfig>,
+    ) -> color_eyre::Result<String> {
         if let Some(old) = self.control.take() {
             old.stop();
         }
-        let (control, url) = RemoteControl::start(config, self.requests_tx.clone())?;
+        let (control, url) = RemoteControl::start(config, anchor, self.requests_tx.clone())?;
         self.control = Some(control);
         Ok(url)
     }
@@ -86,7 +131,10 @@ impl RemoteSlot {
 
     /// The live fan-out hub, or nothing while remote control is off.
     pub(crate) fn state(&self) -> Option<maki_remote::RemoteState> {
-        self.control.as_ref().map(|c| c.server.state().clone())
+        self.control.as_ref().map(|c| match c {
+            RemoteControl::Standalone { server } => server.state().clone(),
+            RemoteControl::Tunnel { state } => state.clone(),
+        })
     }
 
     /// Services pending requests from remote clients, returning the actions

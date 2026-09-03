@@ -342,6 +342,7 @@ pub struct RawConfig {
     pub storage: StorageFileConfig,
     pub net: NetFileConfig,
     pub remote_control: RemoteControlFileConfig,
+    pub anchor: AnchorFileConfig,
     pub telemetry: TelemetryConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
     /// Renamed to `plugins`; kept so old configs fail with a pointer to the
@@ -365,6 +366,7 @@ impl RawConfig {
         self.storage.merge(overlay.storage);
         self.net.merge(overlay.net);
         self.remote_control.merge(overlay.remote_control);
+        self.anchor.merge(overlay.anchor);
         self.telemetry.merge(overlay.telemetry);
         for (name, plugin) in overlay.plugins {
             let entry = self.plugins.entry(name).or_default();
@@ -396,6 +398,7 @@ impl RawConfig {
             storage: StorageConfig::from_file(self.storage),
             net: NetConfig::from_file(self.net),
             remote_control: RemoteControlConfig::from_file(self.remote_control),
+            anchor: AnchorConfig::from_file(self.anchor),
             telemetry: self.telemetry,
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_plugins_and_packages(self.plugins, packages),
@@ -671,6 +674,22 @@ pub struct RemoteControlFileConfig {
 impl RemoteControlFileConfig {
     fn merge(&mut self, overlay: RemoteControlFileConfig) {
         merge_option!(self, overlay, domain, port, bind);
+    }
+}
+
+/// Anchor-server connection: when set, `/rc` dials the anchor instead of
+/// binding its own listener, and the anchor URL replaces the local one.
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct AnchorFileConfig {
+    pub url: Option<String>,
+    pub name: Option<String>,
+    pub token: Option<String>,
+}
+
+impl AnchorFileConfig {
+    fn merge(&mut self, overlay: AnchorFileConfig) {
+        merge_option!(self, overlay, url, name, token);
     }
 }
 
@@ -977,6 +996,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub net: NetConfig,
     pub remote_control: RemoteControlConfig,
+    pub anchor: AnchorConfig,
     pub telemetry: TelemetryConfig,
     pub permissions: PermissionsConfig,
     pub plugins: PluginsConfig,
@@ -1471,6 +1491,52 @@ impl RemoteControlConfig {
                 .bind
                 .unwrap_or_else(|| DEFAULT_REMOTE_CONTROL_BIND.to_owned()),
         }
+    }
+}
+
+/// Anchor-server settings. All three fields must be set together for `/rc`
+/// to use the anchor; a partial section is a config error.
+#[derive(Debug, Clone, ConfigSection)]
+#[config(section = "anchor")]
+pub struct AnchorConfig {
+    #[config(
+        ty = "String",
+        default = "None",
+        desc = "Anchor base URL, e.g. `https://maki.example.com`. Required before `/rc` dials out"
+    )]
+    pub url: Option<String>,
+
+    #[config(
+        ty = "String",
+        default = "None",
+        desc = "Instance name shown on the anchor dashboard. Defaults to the machine hostname"
+    )]
+    pub name: Option<String>,
+
+    #[config(
+        ty = "String",
+        default = "None",
+        desc = "Registration token issued by `maki-anchor tokens add <name>`"
+    )]
+    pub token: Option<String>,
+}
+
+impl AnchorConfig {
+    fn from_file(f: AnchorFileConfig) -> Self {
+        Self {
+            url: f.url,
+            name: f.name,
+            token: f.token,
+        }
+    }
+
+    /// All three fields together make the anchor usable.
+    pub fn complete(&self) -> Option<(&str, &str, &str)> {
+        Some((
+            self.url.as_deref()?,
+            self.name.as_deref()?,
+            self.token.as_deref()?,
+        ))
     }
 }
 
@@ -2637,6 +2703,7 @@ mod tests {
             provider: ProviderConfig::default(),
             storage: StorageConfig::default(),
             net: NetConfig::default(),
+            anchor: AnchorConfig::default(),
             remote_control: RemoteControlConfig {
                 domain: None,
                 port: 0,
@@ -2856,6 +2923,7 @@ mod tests {
             storage: StorageConfig::default(),
             net: NetConfig::default(),
             remote_control: RemoteControlConfig::default(),
+            anchor: AnchorConfig::default(),
             telemetry: TelemetryConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::default(),
