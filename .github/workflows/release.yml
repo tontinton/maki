@@ -73,7 +73,7 @@ jobs:
               git config --global --add safe.directory /workspace
               curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.target }}
               source "$HOME/.cargo/env"
-              cargo build --release --target ${{ matrix.target }}
+              cargo build --release --target ${{ matrix.target }} --package maki --package maki-anchor
             '
           sudo chown -R $(id -u):$(id -g) target/
 
@@ -116,7 +116,7 @@ jobs:
           key: ${{ matrix.target }}-${{ github.ref_name }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --package maki --package maki-anchor
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
