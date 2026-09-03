@@ -352,16 +352,19 @@ fn build_meta(
         None => Vec::new(),
     };
 
-    // Only the llama.cpp request path reads these, so anywhere else they would
-    // vanish without a trace.
-    if !matches!(base, ProviderKind::LlamaCpp)
-        && let Some(model) = models.iter().find(|m| m.thinking_fields.is_some())
+    // Only the local (llama-cpp / ollama) and openai-compat request paths
+    // merge thinking_fields into the body, so anywhere else they would vanish
+    // without a trace.
+    if !matches!(
+        base,
+        ProviderKind::LlamaCpp | ProviderKind::Ollama | ProviderKind::OpenAi
+    ) && let Some(model) = models.iter().find(|m| m.thinking_fields.is_some())
     {
         warn!(
             slug,
             base = %info.base,
             model = model.id,
-            "thinking_fields only applies to llama-cpp models, ignoring"
+            "thinking_fields only applies to llama-cpp, ollama, and openai providers, ignoring"
         );
     }
 
@@ -943,6 +946,25 @@ mod tests {
         let ids: Vec<&str> = meta.models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["typo", "good"]);
         assert!(meta.models[0].thinking_fields.is_none());
+    }
+
+    #[test]
+    fn openai_base_script_keeps_thinking_fields() {
+        let described = ScriptDescription {
+            modified_ns: 0,
+            size: 0,
+            info: r#"{"display_name": "T", "base": "openai", "has_auth": false}"#.into(),
+            models: Some(
+                r#"[{"id": "thinking", "thinking_fields": {"high": {"reasoning_effort": "xhigh"}}}]"#
+                    .into(),
+            ),
+        };
+        let meta = build_meta("t".into(), PathBuf::new(), &described).unwrap();
+        assert_eq!(meta.models.len(), 1);
+        assert!(
+            meta.models[0].thinking_fields.is_some(),
+            "openai-base scripts may declare thinking_fields"
+        );
     }
 
     #[cfg(unix)]

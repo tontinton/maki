@@ -335,8 +335,12 @@ impl Provider for OpenAi {
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking
-                .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
+            if model.thinking_fields.is_some() {
+                opts.thinking.apply_local_thinking(&mut body, model);
+            } else {
+                opts.thinking
+                    .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
+            }
             self.with_oauth_retry(|| async {
                 let auth = self.current_auth();
                 self.compat
