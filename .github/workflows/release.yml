@@ -10,11 +10,19 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.5.0-rc.1)"
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
+  # Tag to release: from a `v*` push ref, or the workflow_dispatch input.
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   GH_TOKEN: ${{ github.token }}
   GH_REPO: ${{ github.repository }}
 
@@ -27,11 +35,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Create draft release
         run: |
           .github/scripts/retry.sh bash -c \
-            'gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes'
+            'gh release view "$RELEASE_TAG" >/dev/null 2>&1 || gh release create "$RELEASE_TAG" --draft --title "$RELEASE_TAG" --generate-notes'
 
   build-linux:
     name: Build (${{ matrix.target }})
@@ -48,6 +58,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Build in Alpine container
         run: |
@@ -67,14 +79,14 @@ jobs:
 
       - name: Package
         run: |
-          tag="$GITHUB_REF_NAME"
+          tag="$RELEASE_TAG"
           archive="maki-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/maki" "target/${{ matrix.target }}/release/maki-anchor" .
           tar czf "${archive}" maki maki-anchor
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
+        run: .github/scripts/retry.sh gh release upload "$RELEASE_TAG" "$ARCHIVE" --clobber
 
   build-other:
     name: Build (${{ matrix.target }})
@@ -93,6 +105,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust toolchain
         run: rustup target add ${{ matrix.target }}
@@ -107,7 +121,7 @@ jobs:
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          tag="$GITHUB_REF_NAME"
+          tag="$RELEASE_TAG"
           archive="maki-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/maki" "target/${{ matrix.target }}/release/maki-anchor" .
           tar czf "${archive}" maki maki-anchor
@@ -117,7 +131,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          tag="$GITHUB_REF_NAME"
+          tag="$RELEASE_TAG"
           archive="maki-${tag}-${{ matrix.target }}.zip"
           cp "target/${{ matrix.target }}/release/maki.exe" "target/${{ matrix.target }}/release/maki-anchor.exe" .
           7z a "${archive}" maki.exe maki-anchor.exe
@@ -125,7 +139,7 @@ jobs:
 
       - name: Upload artifact
         shell: bash
-        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
+        run: .github/scripts/retry.sh gh release upload "$RELEASE_TAG" "$ARCHIVE" --clobber
 
   publish:
     name: Publish Release
@@ -133,9 +147,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Download artifacts
-        run: .github/scripts/retry.sh gh release download "$GITHUB_REF_NAME" --dir artifacts
+        run: .github/scripts/retry.sh gh release download "$RELEASE_TAG" --dir artifacts
 
       - name: Generate checksums
         run: |
@@ -144,7 +160,7 @@ jobs:
           cat ../sha256sums.txt
 
       - name: Upload checksums
-        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" sha256sums.txt --clobber
+        run: .github/scripts/retry.sh gh release upload "$RELEASE_TAG" sha256sums.txt --clobber
 
       - name: Mark release as published
-        run: .github/scripts/retry.sh gh release edit "$GITHUB_REF_NAME" --draft=false
+        run: .github/scripts/retry.sh gh release edit "$RELEASE_TAG" --draft=false

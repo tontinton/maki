@@ -59,3 +59,7 @@ jobs:
           git tag -a "$tag" -m "Release $tag" "${{ github.sha }}"
           git push origin "$tag"
           echo "tagged $tag"
+          # GITHUB_TOKEN tag pushes do not trigger workflows, so start the
+          # release explicitly.
+          gh workflow run release.yml --ref main -f tag="$tag"
+          echo "dispatched release for $tag"
