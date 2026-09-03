@@ -29,8 +29,8 @@ pub struct BuiltinCommand {
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "/compact",
-        description: "Summarize and compact conversation history",
-        max_args: 0,
+        description: "Summarize and compact conversation history (optional guidance)",
+        max_args: usize::MAX,
         bang: false,
     },
     BuiltinCommand {
@@ -157,6 +157,8 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
 
 pub struct ParsedCommand {
     pub name: String,
+    /// Already trimmed, so empty means no args and handlers never re-check
+    /// whitespace.
     pub args: String,
     pub bang: bool,
 }
@@ -760,8 +762,8 @@ mod tests {
         assert_eq!(name, "/cd");
     }
 
-    #[test_case("/compact ", false ; "zero_arg_cmd_with_space")]
     #[test_case("/help ", false     ; "zero_arg_help_with_space")]
+    #[test_case("/compact ", true   ; "compact_stays_active_with_space")]
     #[test_case("/cd ", true        ; "one_arg_cmd_with_space")]
     #[test_case("/cd ~/foo", true   ; "one_arg_cmd_mid_arg")]
     #[test_case("/cd  ~/foo", true  ; "one_arg_cmd_double_space")]
@@ -787,7 +789,7 @@ mod tests {
     #[test_case("/cd", "/cd", ""              ; "no_args")]
     #[test_case("/cd ~/foo", "/cd", "~/foo"   ; "with_args")]
     #[test_case("/CD ~/foo", "/cd", "~/foo"   ; "case_insensitive")]
-    #[test_case("/compact", "/compact", ""    ; "other_command")]
+    #[test_case("/compact ", "/compact", ""   ; "whitespace_only_args_are_empty")]
     #[test_case("/cmp", "/compact", ""    ; "fuzzy-match-1")]
     #[test_case("/cpt", "/compact", ""    ; "fuzzy-match-2")]
     #[test_case("/btw hello world", "/btw", "hello world" ; "btw_multi_word")]

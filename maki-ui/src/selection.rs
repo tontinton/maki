@@ -28,6 +28,7 @@
 //! swallowed space, then `append_rows` calls `needs_space()`.
 
 use std::cmp::Ordering;
+use std::ops::Range;
 use std::time::Instant;
 
 use ratatui::buffer::Buffer;
@@ -356,18 +357,21 @@ impl LineBreaks {
         let mut word_wraps = Vec::new();
         let mut row: u16 = 0;
         for line in lines {
-            if is_code_wrap_continuation(line) {
-                row += 1;
-                continue;
+            // Continuation rows belong to the line above, so they set no bits
+            // of their own. They are still walked at their real height: a stale
+            // segment holds code wrapped for a wider terminal, and counting one
+            // row each slides every later bit off its row.
+            let starts_line = !is_code_wrap_continuation(line);
+            if starts_line {
+                set_bit(&mut line_starts, row);
             }
-            set_bit(&mut line_starts, row);
             wrap::breaks(line, width, |kind| {
-                row += 1;
-                if kind == Break::Word {
+                row = row.saturating_add(1);
+                if starts_line && kind == Break::Word {
                     set_bit(&mut word_wraps, row);
                 }
             });
-            row += 1;
+            row = row.saturating_add(1);
         }
         Self::Bitmap {
             line_starts,
@@ -492,16 +496,26 @@ pub(crate) fn strip_code_bar_prefix(
     prefix_len
 }
 
+/// What [`append_rows`] hands to itself when one block of text is copied in
+/// several passes: whether anything was emitted yet, so a later pass does not
+/// mistake its first row for the start of the text, and the blank lines still
+/// held back in case content follows.
+#[derive(Default)]
+pub(crate) struct RowCarry {
+    started: bool,
+    pending_newlines: u16,
+}
+
 /// Trailing whitespace is trimmed per line. Consecutive blank lines are
 /// collapsed so we don't emit a wall of empty newlines.
 pub(crate) fn append_rows(
     buf: &Buffer,
     area: Rect,
     ss: &ScreenSelection,
-    from: u16,
-    to: u16,
+    rows: Range<u16>,
     out: &mut String,
     breaks: &LineBreaks,
+    carry: &mut RowCarry,
 ) {
     let top = area.y;
     let area = clip(buf, area);
@@ -509,10 +523,8 @@ pub(crate) fn append_rows(
         return;
     }
     let right = area.right().saturating_sub(1);
-    let row_start = from.max(area.y);
-    let row_end = to.min(area.bottom());
-    let mut pending_newlines = 0u16;
-    let anchor = out.len();
+    let row_start = rows.start.max(area.y);
+    let row_end = rows.end.min(area.bottom());
     for row in row_start..row_end {
         let rel_row = row - top;
         let is_new_line = breaks.is_line_start(rel_row);
@@ -547,16 +559,17 @@ pub(crate) fn append_rows(
         let trimmed_len = out[line_start..].trim_end().len() + line_start;
         out.truncate(trimmed_len);
         let has_content = out.len() > line_start;
-        let is_first_row = line_start == anchor;
+        let is_first_row = !carry.started;
+        carry.started |= has_content;
 
         if is_new_line {
             if !has_content && !is_first_row {
-                pending_newlines += 1;
+                carry.pending_newlines += 1;
             } else if !is_first_row {
-                for _ in 0..pending_newlines {
+                for _ in 0..carry.pending_newlines {
                     out.insert(line_start, '\n');
                 }
-                pending_newlines = 0;
+                carry.pending_newlines = 0;
                 out.insert(line_start, '\n');
             }
         } else if has_content && !is_first_row && stripped == 0 && breaks.needs_space(rel_row) {
@@ -599,10 +612,10 @@ pub fn extract_selected_text(
                 buf,
                 region.area,
                 ss,
-                row,
-                chunk_end,
+                row..chunk_end,
                 &mut out,
                 &region.line_breaks,
+                &mut RowCarry::default(),
             );
         }
         row = region_end;
@@ -614,6 +627,7 @@ pub fn extract_selected_text(
 mod tests {
     use super::*;
     use ratatui::style::Style;
+    use ratatui::text::Span;
     use test_case::test_case;
 
     fn doc(row: u16, col: u16) -> DocPos {
@@ -1092,17 +1106,24 @@ mod tests {
         assert!(lb.needs_space(1), "word-boundary continuation needs space");
     }
 
-    #[test]
-    fn from_lines_code_wrap_continuation_skipped() {
-        let wrap_line = Line::from(vec![ratatui::text::Span::raw(CODE_BAR_WRAP)]);
-        let lines = vec![Line::from("first"), wrap_line, Line::from("second")];
-        let lb = LineBreaks::from_lines(&lines, 80);
-        assert!(lb.is_line_start(0));
-        assert!(
-            !lb.is_line_start(1),
-            "code wrap continuation is not a line start"
-        );
-        assert!(lb.is_line_start(2));
+    /// A code block wrapped for a wider terminal leaves continuation rows
+    /// behind. They belong to the line above, so they start no line of their
+    /// own, but they still have to be walked at their real height: assume one
+    /// row each and every later start bit slides off its row, which splices
+    /// newlines into the middle of copied prose.
+    #[test_case("" => vec![0, 2] ; "continuation_fits_one_row")]
+    #[test_case("abcdefghij" => vec![0, 3] ; "continuation_wraps_again")]
+    fn from_lines_skips_every_row_a_code_continuation_takes(tail: &str) -> Vec<u16> {
+        const WIDTH: u16 = 6;
+        let lines = vec![
+            Line::from("first"),
+            Line::from(vec![Span::raw(CODE_BAR_WRAP), Span::raw(tail)]),
+            Line::from("second"),
+        ];
+        let lb = LineBreaks::from_lines(&lines, WIDTH);
+        (0..wrap::total_rows(&lines, WIDTH))
+            .filter(|&row| lb.is_line_start(row))
+            .collect()
     }
 
     #[test]
@@ -1139,7 +1160,15 @@ mod tests {
     ) {
         let buf = Buffer::empty(buf_area);
         let mut out = String::new();
-        append_rows(&buf, area, &sel, from, to, &mut out, &LineBreaks::EveryRow);
+        append_rows(
+            &buf,
+            area,
+            &sel,
+            from..to,
+            &mut out,
+            &LineBreaks::EveryRow,
+            &mut RowCarry::default(),
+        );
         assert!(out.is_empty());
     }
 
@@ -1163,7 +1192,6 @@ mod tests {
         assert!(!lb.is_line_start(5));
         assert!(lb.needs_space(5));
     }
-
     #[test]
     fn wrap_extract_two_lines_first_wraps_second_doesnt() {
         use ratatui::widgets::{Paragraph, Widget, Wrap};
@@ -1200,10 +1228,10 @@ mod tests {
             &buf,
             area,
             &ss(0, 1, 0, 3),
-            0,
-            1,
+            0..1,
             &mut out,
             &LineBreaks::EveryRow,
+            &mut RowCarry::default(),
         );
         assert_eq!(out, "好");
     }

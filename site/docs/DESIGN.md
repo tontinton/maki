@@ -20,7 +20,7 @@
 
 ## Color
 
-"Warm surfaces, cool ink." Two neutrals + one accent, oklch, defined once in `base.html` `:root` / `[data-theme="dark"]`; components only use vars.
+"Warm surfaces, cool ink." Two neutrals + one accent, oklch, defined once in `base.html` `:root` / `[data-theme="dark"]`; components only use vars. A stored choice wins, otherwise `prefers-color-scheme` decides; the head script resolves both before the first paint. The landing page runs the identical rule on the same `localStorage.theme` key, so the two never disagree.
 
 | | Light | Dark |
 |---|---|---|
@@ -66,4 +66,6 @@ Rotation display serifs (Fraunces, Instrument Serif, Space Grotesk...), rounded 
 
 ## Verifying
 
-`cd site && ./build.sh` (full: search.json + token spans) or `zola build` in `site/docs` (fast). Check both themes, 390px and 1600px. Screenshot previews can lie about color; pixel-sample PNGs. Landing page not yet migrated.
+`cd site && ./build.sh` (full: search.json + token spans) or `zola build` here (fast). Check both themes, 390px and 1600px. Screenshot previews can lie about color; pixel-sample PNGs.
+
+The landing page has its own system: see `../DESIGN.md`. The banned list above is docs-scoped and does not apply to it.

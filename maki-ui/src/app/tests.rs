@@ -678,10 +678,15 @@ pub(crate) fn error_app(app: &mut App) {
     }));
 }
 
-fn cmd(name: &str) -> ParsedCommand {
+/// Splits the line the way the palette does, so a test can write what the
+/// user types.
+fn cmd(cmdline: &str) -> ParsedCommand {
+    let (name, args) = cmdline
+        .split_once(char::is_whitespace)
+        .unwrap_or((cmdline, ""));
     ParsedCommand {
         name: name.to_string(),
-        args: String::new(),
+        args: args.trim().to_string(),
         bang: false,
     }
 }
@@ -1547,24 +1552,31 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
     );
 }
 
-#[test]
-fn compact_command_sets_streaming() {
+const COMPACT_GUIDANCE: &str = "keep the failing test names";
+const COMPACT_WITH_GUIDANCE: &str = "/compact keep the failing test names";
+
+#[test_case("/compact", None ; "no_guidance")]
+#[test_case(COMPACT_WITH_GUIDANCE, Some(COMPACT_GUIDANCE) ; "guidance_forwarded")]
+fn compact_command_sets_streaming(cmdline: &str, expected: Option<&str>) {
     let mut app = test_app();
-    let actions = app.execute_command(cmd("/compact"), 0);
-    assert!(matches!(&actions[0], Action::Compact));
+    let actions = app.execute_command(cmd(cmdline), 0);
+    assert!(
+        matches!(&actions[0], Action::Compact(instructions) if instructions.as_deref() == expected)
+    );
     assert_eq!(app.status, Status::Streaming);
 }
 
-#[test]
-fn compact_during_streaming_queues_item() {
+#[test_case("/compact" ; "bare")]
+#[test_case(COMPACT_WITH_GUIDANCE ; "guidance_shown_in_panel")]
+fn compact_during_streaming_queues_item(cmdline: &str) {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
 
-    let actions = app.execute_command(cmd("/compact"), 0);
+    let actions = app.execute_command(cmd(cmdline), 0);
     assert!(actions.is_empty());
     assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.queue.panel_entries()[0].text, "/compact");
+    assert_eq!(app.queue.panel_entries()[0].text, cmdline);
 }
 
 #[test]

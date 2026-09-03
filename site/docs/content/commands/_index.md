@@ -13,7 +13,7 @@ Type `/` in the input box to open the command palette.
 
 | Command | Description |
 |---------|-------------|
-| `/compact` | Summarize and compact conversation history |
+| `/compact` | Summarize and compact conversation history (optional guidance) |
 | `/new` | Start a new session |
 | `/help` | Show keybindings |
 | `/usage` | Show token usage breakdown |
