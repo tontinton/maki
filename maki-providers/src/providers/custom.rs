@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use serde_json::Value;
+use tracing::warn;
 
 use maki_config::providers::{
     Protocol, ProviderDef, ProvidersConfig, resolve_api_key_env, resolve_base_url, resolve_protocol,
@@ -15,8 +16,8 @@ use crate::manifest::ManifestRegistry;
 use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
-use crate::types::ThinkingConfig;
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::types::ThinkingFields;
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     // Custom providers resolve their own base URL (including any override) from
@@ -127,6 +128,15 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
             .or_else(|| ManifestRegistry::get(&kind.to_string()).map(|m| m.supports_thinking)),
         declared.and_then(|m| m.requires_thinking).unwrap_or(false),
     );
+    let thinking_fields = declared
+        .and_then(|m| m.thinking_fields.as_ref())
+        .and_then(|v| match serde_json::from_value::<ThinkingFields>(v.clone()) {
+            Ok(fields) => Some(Box::new(fields)),
+            Err(error) => {
+                warn!(slug, %error, "invalid thinking_fields, dropping them");
+                None
+            }
+        });
     let supports_vision_override = declared.and_then(|m| m.supports_vision);
     let pricing = declared
         .filter(|m| m.has_pricing())
@@ -155,7 +165,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         discovered_free: false,
         max_output_tokens,
         context_window,
-        thinking_fields: None,
+        thinking_fields,
     }
 }
 
@@ -298,8 +308,10 @@ impl Provider for CustomOpenAiProvider {
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
-            if matches!(opts.thinking, ThinkingConfig::Off) {
-                body["thinking"] = serde_json::json!({"type": "disabled"});
+            if model.thinking_fields.is_some() {
+                opts.thinking.apply_local_thinking(&mut body, model);
+            } else if model.supports_thinking() {
+                opts.thinking.apply_reasoning_effort(&mut body, &dialect::OLLAMA, model);
             }
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
