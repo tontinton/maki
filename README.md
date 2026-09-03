@@ -1,5 +1,54 @@
 <img src="./banner.png">
 
+## About this fork
+
+This fork adds remote control over the web, built for running maki on many
+hosts with one shared entry point:
+
+* **`/rc` standalone** - run `/rc` in the TUI and it prints a tokenized web URL
+  (behind your own reverse proxy for TLS). The web view mirrors the live
+  session: full transcript, thinking, tool calls with results, model, context
+  and cost stats. You can prompt, answer permission requests, and stop runs
+  from the browser.
+* **`maki-anchor`** - a central server for many instances. Instances dial out
+  over a WebSocket, so they need no inbound ports. One domain, one dashboard,
+  one login:
+  * OIDC single sign-on (Authelia, Authentik, Keycloak, Pocket ID, ...), first
+    login becomes admin.
+  * Per-user, per-instance grants: `viewer` (read) or `controller` (prompt and
+    approve).
+  * Share links with rights and expiry: `view` / `control`, default 2 hours.
+  * Fleet dashboard: all instances, their sessions, costs, and status.
+  * Transcripts are fetched live from the owning instance; the anchor stores
+    metadata only.
+
+Quick start for the anchor:
+
+```sh
+# On the server (reverse proxy handles TLS, forwards WebSocket upgrades).
+maki-anchor serve --bind 0.0.0.0:8688
+maki-anchor tokens add work-laptop
+```
+
+```lua
+-- In ~/.config/maki/init.lua on the instance host.
+maki.setup {
+  anchor = {
+    url = "https://maki.example.com",
+    name = "work-laptop",
+    token = "<token from tokens add>",
+  },
+}
+```
+
+Now `/rc` prints an anchor link instead of binding a local port. See the
+[anchor docs](https://maki.sh/docs/anchor/) for SSO setup, grants, and share
+links.
+
+Everything below is upstream's README.
+
+---
+
 An AI coding agent optimized for minimal use of context tokens, while providing a great user experience.
 
 ## Features
