@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::model::{Model, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::catalog::{
-    CatalogMeta, CatalogTransport, EndpointType, FreeTier, ProviderQuirks, config_error,
+    CatalogMeta, CatalogTransport, EndpointType, FreeTier, ProviderQuirks,
     init_shared_catalog_if_needed,
 };
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
@@ -95,12 +95,9 @@ impl Opencode {
             let auth = match override_auth {
                 Some(auth) => auth,
                 None => provider_data
-                    .resolve_auth(&guard.state_dir)?
-                    .ok_or_else(|| {
-                        config_error(format!(
-                            "authentication required for provider '{sub_provider}', run `maki auth login {sub_provider}`"
-                        ))
-                    })?,
+                    .catalog_auth(&guard.state_dir, provider_data.free_models_enabled())?
+                    .unlocked(&sub_provider)?
+                    .clone(),
             };
             let auth = provider_data.request_auth(auth, session_id.as_ref());
             Ok((meta.clone(), provider_data.api_format, auth))

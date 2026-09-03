@@ -203,6 +203,24 @@ impl ProviderData {
         })
     }
 
+    pub(crate) fn catalog_auth(
+        &self,
+        state_dir: &StateDir,
+        allow_free_fallback: bool,
+    ) -> Result<CatalogAuth, AgentError> {
+        Ok(match self.build_auth(state_dir)? {
+            Authentication::KeyBased(auth) => CatalogAuth::Keyed(auth),
+            Authentication::FreeKey(auth, _) if allow_free_fallback => CatalogAuth::FreeOnly(auth),
+            Authentication::FreeKey(_, tier) => CatalogAuth::Gated(tier),
+            Authentication::NoAuth => {
+                let slug = &self.slug;
+                return Err(config_error(format!(
+                    "no API key configured for provider '{slug}'; run `maki auth login {slug}`"
+                )));
+            }
+        })
+    }
+
     pub fn available_models(
         &self,
         state_dir: &StateDir,
@@ -479,9 +497,14 @@ pub fn catalog_provider(provider_id: &str) -> Option<ProviderData> {
 /// Non-blocking variant of [`catalog_provider`]: returns the `ProviderData` only
 /// if the catalog has already been downloaded. Never triggers a fetch.
 pub fn catalog_provider_if_available(provider_id: &str) -> Option<ProviderData> {
-    let catalog = SHARED_CATALOG.get()?;
-    let guard = catalog.lock().ok()?;
-    guard.providers.get(provider_id).cloned()
+    with_provider_if_available(provider_id, ProviderData::clone)
+}
+
+/// Borrows under the lock instead of cloning: the picker calls this once per
+/// row through `Model::is_free`, and a `ProviderData` carries its whole models map.
+fn with_provider_if_available<T>(slug: &str, f: impl FnOnce(&ProviderData) -> T) -> Option<T> {
+    let guard = SHARED_CATALOG.get()?.lock().ok()?;
+    guard.providers.get(slug).map(f)
 }
 
 /// Non-blocking availability check for catalog-backed providers: true only when
@@ -719,10 +742,22 @@ pub struct CatalogProvider {
 /// unlocks nothing. `Gated` holds no credentials at all, so it can never send
 /// the public token by accident: discovery lists nothing, and only an actual
 /// attempt to stream tells the user to log in or opt in.
-enum CatalogAuth {
+pub(crate) enum CatalogAuth {
     Keyed(ResolvedAuth),
     FreeOnly(ResolvedAuth),
     Gated(FreeTier),
+}
+
+impl CatalogAuth {
+    pub(crate) fn unlocked(&self, slug: &str) -> Result<&ResolvedAuth, AgentError> {
+        match self {
+            Self::Keyed(auth) | Self::FreeOnly(auth) => Ok(auth),
+            Self::Gated(tier) => Err(config_error(format!(
+                "provider '{slug}' has no API key; run `maki auth login {slug}` or set providers.{}.enable_free_models = true to use its free models",
+                tier.config_slug
+            ))),
+        }
+    }
 }
 
 impl CatalogProvider {
@@ -732,22 +767,9 @@ impl CatalogProvider {
         timeouts: Timeouts,
         allow_free_fallback: bool,
     ) -> Result<Self, AgentError> {
-        let auth = match data.build_auth(state_dir)? {
-            Authentication::KeyBased(auth) => CatalogAuth::Keyed(auth),
-            Authentication::FreeKey(auth, _) if allow_free_fallback => CatalogAuth::FreeOnly(auth),
-            Authentication::FreeKey(_, tier) => CatalogAuth::Gated(tier),
-            Authentication::NoAuth => {
-                return Err(AgentError::Config {
-                    message: format!(
-                        "no API key configured for provider '{}'; run `maki auth login {}`",
-                        data.slug, data.slug
-                    ),
-                });
-            }
-        };
         Ok(Self {
+            auth: data.catalog_auth(state_dir, allow_free_fallback)?,
             data,
-            auth,
             transport: CatalogTransport::new(timeouts),
         })
     }
@@ -765,20 +787,8 @@ impl Provider for CatalogProvider {
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let auth = match &self.auth {
-                CatalogAuth::Keyed(auth) | CatalogAuth::FreeOnly(auth) => {
-                    self.data.request_auth(auth.clone(), session_id)
-                }
-                CatalogAuth::Gated(tier) => {
-                    let slug = &self.data.slug;
-                    return Err(AgentError::Config {
-                        message: format!(
-                            "provider '{slug}' has no API key; run `maki auth login {slug}` or set providers.{}.enable_free_models = true to use its free models",
-                            tier.config_slug
-                        ),
-                    });
-                }
-            };
+            let auth = self.auth.unlocked(&self.data.slug)?.clone();
+            let auth = self.data.request_auth(auth, session_id);
             let meta = self
                 .data
                 .models
@@ -925,27 +935,29 @@ pub fn try_create(slug: &str, timeouts: Timeouts) -> Option<Result<Box<dyn Provi
 /// (e.g. `Model::from_spec`) must tolerate `None` and fall through, since
 /// the catalog may still be warming in the background.
 pub fn model_meta_if_available(slug: &str, model_id: &str) -> Option<CatalogMetaView> {
-    let data = catalog_provider_if_available(slug)?;
-    let meta = data.models.get(model_id)?;
-    Some(CatalogMetaView {
-        context: meta.context,
-        output: meta.output,
-        input_price: meta.input_price,
-        output_price: meta.output_price,
-        cache_read: meta.cache_read,
-        cache_write: meta.cache_write,
-        supports_thinking: meta.supports_thinking,
-        supports_vision: meta.supports_vision,
+    with_provider_if_available(slug, |data| {
+        data.models.get(model_id).map(|meta| CatalogMetaView {
+            context: meta.context,
+            output: meta.output,
+            input_price: meta.input_price,
+            output_price: meta.output_price,
+            cache_read: meta.cache_read,
+            cache_write: meta.cache_write,
+            supports_thinking: meta.supports_thinking,
+            supports_vision: meta.supports_vision,
+        })
     })
+    .flatten()
 }
 
 /// True when the model belongs to a provider with a [`FreeTier`] and is free
 /// by the same [`is_free_model`] definition gating `enable_free_models` (zero
 /// input and output price). Never triggers a fetch.
 pub(crate) fn free_model_if_available(slug: &str, model_id: &str) -> bool {
-    catalog_provider_if_available(slug).is_some_and(|data| {
+    with_provider_if_available(slug, |data| {
         data.quirks.free_tier.is_some() && data.models.get(model_id).is_some_and(is_free_model)
     })
+    .unwrap_or(false)
 }
 
 /// Metadata shape `Model::from_spec` consumes when a spec resolves to a catalog
