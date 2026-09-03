@@ -81,8 +81,9 @@ jobs:
         run: |
           tag="$RELEASE_TAG"
           archive="maki-${tag}-${{ matrix.target }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/maki" "target/${{ matrix.target }}/release/maki-anchor" .
-          tar czf "${archive}" maki maki-anchor
+          mkdir stage
+          cp "target/${{ matrix.target }}/release/maki" "target/${{ matrix.target }}/release/maki-anchor" stage/
+          tar czf "${archive}" -C stage maki maki-anchor
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
@@ -123,8 +124,9 @@ jobs:
         run: |
           tag="$RELEASE_TAG"
           archive="maki-${tag}-${{ matrix.target }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/maki" "target/${{ matrix.target }}/release/maki-anchor" .
-          tar czf "${archive}" maki maki-anchor
+          mkdir -p stage
+          cp "target/${{ matrix.target }}/release/maki" "target/${{ matrix.target }}/release/maki-anchor" stage/
+          tar czf "${archive}" -C stage maki maki-anchor
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Package (Windows)
@@ -133,8 +135,9 @@ jobs:
         run: |
           tag="$RELEASE_TAG"
           archive="maki-${tag}-${{ matrix.target }}.zip"
-          cp "target/${{ matrix.target }}/release/maki.exe" "target/${{ matrix.target }}/release/maki-anchor.exe" .
-          7z a "${archive}" maki.exe maki-anchor.exe
+          mkdir -p stage
+          cp "target/${{ matrix.target }}/release/maki.exe" "target/${{ matrix.target }}/release/maki-anchor.exe" stage/
+          7z a "${archive}" ./stage/maki.exe ./stage/maki-anchor.exe
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
