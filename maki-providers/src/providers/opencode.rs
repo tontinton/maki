@@ -147,9 +147,11 @@ impl Opencode {
         &self,
         sub_provider: &str,
         actual_id: &str,
+        session_id: Option<&SessionRef>,
     ) -> Result<(CatalogMeta, EndpointType, ResolvedAuth), AgentError> {
         let sub_provider = sub_provider.to_string();
         let actual_id = actual_id.to_string();
+        let session_id = session_id.cloned();
         let auth_override = self.auth.clone();
         smol::unblock(move || {
             let guard = init_shared_catalog_if_needed().lock().unwrap();
@@ -162,6 +164,7 @@ impl Opencode {
                         "authentication required for provider '{sub_provider}', run `maki auth login {sub_provider}`"
                     ))
                 })?;
+            let auth = provider_data.request_auth(auth, session_id.as_ref());
             Ok((meta.clone(), provider_data.api_format, auth))
         })
         .await
@@ -177,7 +180,7 @@ impl Provider for Opencode {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let model_for_stream = model.clone();
@@ -186,7 +189,7 @@ impl Provider for Opencode {
             let (sub_provider, actual_id) =
                 model_id.split_once('/').unwrap_or(("opencode", model_id));
 
-            let (meta, api_format, auth) = self.lookup(sub_provider, actual_id).await?;
+            let (meta, api_format, auth) = self.lookup(sub_provider, actual_id, session_id).await?;
 
             let mut buf = String::new();
             let system = with_prefix(&self.system_prefix, system, &mut buf);

@@ -37,6 +37,7 @@ const MESSAGES_PATH: &str = "/messages";
 const BLOCKED_PROVIDER_IN_CATALOG: &[&str] = &["zai", "zai-coding-plan", "github-copilot"];
 
 pub(crate) const OPENCODE_FAMILY_SLUGS: &[&str] = &["opencode", "opencode-go"];
+const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 
 const CATALOG_URL: &str = "https://models.dev/api.json";
 const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
@@ -117,6 +118,26 @@ impl ProviderData {
             .map(|s| s.as_str())
     }
 
+    fn is_opencode_family(&self) -> bool {
+        OPENCODE_FAMILY_SLUGS.contains(&self.slug.as_str())
+    }
+
+    /// OpenCode asked clients to send one stable ID per conversation here and
+    /// warned that requests without it may start failing:
+    /// https://github.com/tontinton/maki/issues/935
+    pub(crate) fn request_auth(
+        &self,
+        mut auth: ResolvedAuth,
+        session_id: Option<&SessionRef>,
+    ) -> ResolvedAuth {
+        if self.is_opencode_family()
+            && let Some(sid) = session_id
+        {
+            auth.set_header(OPENCODE_SESSION_HEADER, sid.to_string());
+        }
+        auth
+    }
+
     fn auth_headers(&self, api_key: &str) -> Vec<(String, String)> {
         match self.npm.as_str() {
             "@ai-sdk/anthropic" => vec![("x-api-key".into(), api_key.into())],
@@ -132,7 +153,7 @@ impl ProviderData {
     pub fn build_auth(&self, state_dir: &StateDir) -> Result<Authentication, AgentError> {
         let api_key = match self.resolve_api_key(state_dir) {
             Some(key) => key,
-            None if OPENCODE_FAMILY_SLUGS.contains(&self.slug.as_str()) => {
+            None if self.is_opencode_family() => {
                 return Ok(Authentication::OpenCodeFreeKey(self.auth_for("public")?));
             }
             None => return Ok(Authentication::NoAuth),
@@ -153,7 +174,7 @@ impl ProviderData {
         override_auth: Option<&Arc<Mutex<ResolvedAuth>>>,
         state_dir: &StateDir,
     ) -> Result<Option<ResolvedAuth>, AgentError> {
-        if OPENCODE_FAMILY_SLUGS.contains(&self.slug.as_str())
+        if self.is_opencode_family()
             && let Some(auth) = override_auth
         {
             return Ok(Some(auth.lock().unwrap().clone()));
@@ -683,11 +704,13 @@ impl Provider for CatalogProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = match &self.auth {
-                CatalogAuth::Keyed(auth) | CatalogAuth::FreeOnly(auth) => auth,
+                CatalogAuth::Keyed(auth) | CatalogAuth::FreeOnly(auth) => {
+                    self.data.request_auth(auth.clone(), session_id)
+                }
                 CatalogAuth::Gated => {
                     let slug = &self.data.slug;
                     return Err(AgentError::Config {
@@ -725,7 +748,7 @@ impl Provider for CatalogProvider {
                         &stream_model,
                     );
                     self.chat_compat
-                        .do_stream(&stream_model, &[], &body, event_tx, auth)
+                        .do_stream(&stream_model, &[], &body, event_tx, &auth)
                         .await
                 }
                 EndpointType::Messages => {
@@ -949,12 +972,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        Authentication, CatalogData, CatalogMeta, EndpointType, FREE_MODELS_OPT_IN, ProviderData,
-        StateDir, available_if_warm, determine_catalog_format,
+        Authentication, CatalogData, CatalogMeta, EndpointType, FREE_MODELS_OPT_IN,
+        OPENCODE_SESSION_HEADER, ProviderData, SessionRef, StateDir, available_if_warm,
+        determine_catalog_format,
     };
     use crate::model::{Model, ModelPricing};
     use crate::provider::Provider;
-    use crate::providers::Timeouts;
+    use crate::providers::{ResolvedAuth, Timeouts};
     use crate::{AgentError, ModelFamily, ModelTier, RequestOptions};
     use test_case::test_case;
 
@@ -972,6 +996,28 @@ mod tests {
         };
         let result = super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true);
         assert!(matches!(result, Err(AgentError::Config { .. })));
+    }
+
+    #[test_case("opencode",    true,  true  ; "zen_with_session")]
+    #[test_case("opencode-go", true,  true  ; "go_with_session")]
+    #[test_case("opencode-go", false, false ; "go_without_session")]
+    #[test_case("anthropic",   true,  false ; "other_provider_never")]
+    fn request_auth_sets_opencode_session_header(slug: &str, with_session: bool, expected: bool) {
+        let data = ProviderData {
+            slug: slug.into(),
+            ..opencode_go_provider_data("UNUSED")
+        };
+        let session = SessionRef::generate();
+        let auth = data.request_auth(
+            ResolvedAuth::for_test(None, Vec::new()),
+            with_session.then_some(&session),
+        );
+        let header = auth
+            .headers
+            .iter()
+            .find(|(key, _)| key == OPENCODE_SESSION_HEADER)
+            .map(|(_, value)| value.as_str());
+        assert_eq!(header, expected.then(|| session.to_string()).as_deref());
     }
 
     fn opencode_go_provider_data(env_key: &str) -> ProviderData {
