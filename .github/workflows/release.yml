@@ -1,6 +1,9 @@
 # To release:
-#   git tag vX.Y.Z
-#   git push origin vX.Y.Z
+#   bump [workspace.package] version to X.Y.Z-rc.N in Cargo.toml, push to main.
+#   The release-bot workflow tags vX.Y.Z-rc.N, which triggers this workflow.
+#
+# Archives contain both binaries: maki (the agent) and maki-anchor (the
+# central server for remote control).
 name: Release
 
 on:
@@ -12,7 +15,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
-  BINARY_NAME: maki
   GH_TOKEN: ${{ github.token }}
   GH_REPO: ${{ github.repository }}
 
@@ -66,9 +68,9 @@ jobs:
       - name: Package
         run: |
           tag="$GITHUB_REF_NAME"
-          archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}"
+          archive="maki-${tag}-${{ matrix.target }}.tar.gz"
+          cp "target/${{ matrix.target }}/release/maki" "target/${{ matrix.target }}/release/maki-anchor" .
+          tar czf "${archive}" maki maki-anchor
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
@@ -106,9 +108,9 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           tag="$GITHUB_REF_NAME"
-          archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}"
+          archive="maki-${tag}-${{ matrix.target }}.tar.gz"
+          cp "target/${{ matrix.target }}/release/maki" "target/${{ matrix.target }}/release/maki-anchor" .
+          tar czf "${archive}" maki maki-anchor
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Package (Windows)
@@ -116,9 +118,9 @@ jobs:
         shell: bash
         run: |
           tag="$GITHUB_REF_NAME"
-          archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.zip"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}.exe" "${BINARY_NAME}.exe"
-          7z a "${archive}" "${BINARY_NAME}.exe"
+          archive="maki-${tag}-${{ matrix.target }}.zip"
+          cp "target/${{ matrix.target }}/release/maki.exe" "target/${{ matrix.target }}/release/maki-anchor.exe" .
+          7z a "${archive}" maki.exe maki-anchor.exe
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
