@@ -48,10 +48,7 @@ fn spawn_anchor(db: &std::path::Path) -> AnchorProcess {
             db.to_str().unwrap(),
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::from(
-            std::fs::File::create("/tmp/opencode/anchor-e2e.log").unwrap(),
-        ))
-        .env("MAKI_LOG", "trace")
+        .stderr(Stdio::null())
         .spawn()
         .expect("spawn maki-anchor");
     AnchorProcess {
