@@ -80,7 +80,16 @@ pub fn enabled() -> bool {
 /// Returns without doing anything when telemetry is off or has nowhere to
 /// send. Call after logging is set up so export errors are recorded.
 pub fn init(config: &TelemetryConfig) -> Result<(), InitError> {
-    let Some(settings) = settings::resolve(config, |key| std::env::var(key).ok())? else {
+    init_with_env(config, |key| std::env::var(key).ok())
+}
+
+/// [`init`] with an injected environment, so integration tests are immune to
+/// whatever `OTEL_*` the developer's shell exports.
+pub fn init_with_env<F: Fn(&str) -> Option<String>>(
+    config: &TelemetryConfig,
+    env: F,
+) -> Result<(), InitError> {
+    let Some(settings) = settings::resolve(config, env)? else {
         return Ok(());
     };
     let exports_metrics = !settings.metrics_exporters.is_empty();

@@ -51,7 +51,7 @@ fn prompt_text_and_tool_input_stay_home_by_default() {
         logs_interval_ms: Some(NEVER_MS),
         ..TelemetryConfig::default()
     };
-    maki_otel::init(&config).expect("telemetry should start");
+    maki_otel::init_with_env(&config, support::no_env).expect("telemetry should start");
     assert!(
         !maki_otel::logs_tool_details(),
         "tool details must be opt-in"
