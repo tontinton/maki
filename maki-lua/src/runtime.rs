@@ -2466,6 +2466,10 @@ impl LuaRuntime {
                     plugin: name.to_string(),
                     tool: n,
                 },
+                RegistryError::ReservedName { name: n } => PluginError::ReservedToolName {
+                    plugin: name.to_string(),
+                    tool: n,
+                },
             });
         }
 

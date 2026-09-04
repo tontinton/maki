@@ -23,7 +23,6 @@ const DECLARED_DELETE_REFUSAL: &str = "still declared; remove it from maki.pack.
 const UPDATE_USAGE: &str = "/packupdate: name at most one package";
 const DELETE_USAGE: &str = "/packdel: name a package, or pass ++all";
 const PLUGIN_MANIFEST: &str = "plugin.toml";
-const APPROVALS_FILE: &str = "pack-approvals.json";
 const REVIEW_PROMPT_HEADER: &str = "Apply these package changes?";
 const REVIEW_DELETE_LINE: &str = "remove";
 const UNAVAILABLE_OLD_REVISION: &str = "\n  previous revision unavailable";
@@ -54,7 +53,7 @@ pub use maki_pack::paths::MANAGED_GROUP;
 
 /// `<data>/site`, the root Neovim would call a package path.
 pub fn site_dir() -> Result<PathBuf, std::io::Error> {
-    maki_storage::paths::data_dir().map(|d| d.join("site"))
+    maki_storage::paths::data_dir().map(|d| d.join(maki_storage::paths::SITE_DIR))
 }
 
 /// How a package reached the disk, which is what decides whose word grants its
@@ -107,14 +106,68 @@ pub fn lockfile_path() -> Option<PathBuf> {
         .map(|dir| dir.join("pack-lock.json"))
 }
 
-/// `pack-approvals.json`, in the state directory beside the checkouts.
+/// `pack-approvals.json`, in the state directory.
 ///
 /// Deliberately not beside the lockfile. A lockfile is meant to be committed,
 /// so a package set reproduces on another machine. An approval is the opposite
 /// kind of fact: one person's decision to trust one repository on one machine,
 /// which must not travel with a repository into someone else's checkout.
+///
+/// Not beside the checkouts either, which is where an older release kept it.
+/// This file decides whether a package may run Lua on the next start, so it is
+/// Maki's own state, while a checkout is the one subtree of the data dir a
+/// file tool can read at all.
+///
+/// Resolving the path also performs the one-time move, for the same reason
+/// `state_dir` creates the directory it answers with: a read and the write
+/// that follows it have to land on one file.
 pub fn approvals_path() -> Option<PathBuf> {
-    site_dir().ok().map(|dir| dir.join(APPROVALS_FILE))
+    let current = maki_storage::paths::state_dir()
+        .ok()?
+        .join(maki_storage::paths::APPROVALS_FILE);
+    adopt_superseded_store(site_dir().ok().as_deref(), &current);
+    Some(current)
+}
+
+/// Moves the approval store out of the package checkouts, once, on the first
+/// start after the upgrade that moved it.
+///
+/// A store that is not found reads as "nothing approved", which is right for a
+/// machine that never approved anything and wrong for one that did: every
+/// package is asked about again, and on a run with nobody to ask, which is
+/// every headless and ACP run, it is dropped with a failure instead.
+///
+/// Moving rather than reading both places forever, because two locations mean
+/// every caller has to agree on which one it is looking at, and whichever one
+/// gets written leaves the other stale. A failure here costs the approvals and
+/// says so. It cannot corrupt the new store, which is only ever written from a
+/// store that was read.
+///
+/// Takes the directories rather than resolving them, so a test can hand it
+/// tempdirs instead of rummaging through the real ones.
+fn adopt_superseded_store(site: Option<&Path>, current: &Path) {
+    if current.exists() {
+        return;
+    }
+    let Some(superseded) = site
+        .map(|dir| dir.join(maki_storage::paths::APPROVALS_FILE))
+        .filter(|p| p.exists())
+    else {
+        return;
+    };
+    match fs::rename(&superseded, current).or_else(|_| fs::copy(&superseded, current).map(|_| ())) {
+        Ok(()) => tracing::info!(
+            from = %superseded.display(),
+            to = %current.display(),
+            "moved the pack approval store out of the package checkouts"
+        ),
+        Err(error) => tracing::warn!(
+            from = %superseded.display(),
+            to = %current.display(),
+            %error,
+            "pack approval store could not be moved; packages will ask for their permissions again"
+        ),
+    }
 }
 
 /// Reads the approval store.
@@ -856,6 +909,10 @@ pub struct PackPlan {
     operations: Vec<PreparedPackOp>,
     site: PathBuf,
     lock_path: PathBuf,
+    /// Carried rather than worked out again where it is written, because the
+    /// store this reads and the store that decides whether a package may run
+    /// have to be one file.
+    approvals: PathBuf,
     report: PackReport,
 }
 
@@ -899,12 +956,18 @@ pub fn prepare_pack_command(command: &PackCommand, context: &PackContext) -> Pac
             "no config directory, so packages cannot be changed".to_owned(),
         );
     };
+    let Some(approvals) = approvals_path() else {
+        return PackPreparation::failed(
+            "no state directory, so an approval cannot be recorded".to_owned(),
+        );
+    };
     prepare_pack_ops_at(
         &operations,
         &context.declared,
         &context.active,
         &site,
         &lock_path,
+        &approvals,
     )
 }
 
@@ -914,6 +977,7 @@ fn prepare_pack_ops_at(
     active: &BTreeSet<String>,
     site: &Path,
     lock_path: &Path,
+    approval_path: &Path,
 ) -> PackPreparation {
     let mut report = PackReport::default();
     let guard = match maki_pack::lock::Lock::acquire(&maki_pack::paths::sidecar_lock(lock_path)) {
@@ -938,7 +1002,6 @@ fn prepare_pack_ops_at(
     // before it writes anything.
     drop(guard);
     let manager = maki_pack::manager::Manager::new(site);
-    let approval_path = site.join(APPROVALS_FILE);
     let manual_names = discover(site).known_names();
     let mut prepared = Vec::new();
     let mut review = Vec::new();
@@ -968,8 +1031,7 @@ fn prepare_pack_ops_at(
                 let approved = if options.force {
                     None
                 } else {
-                    let store =
-                        approvals.get_or_insert_with(|| read_approvals_file(&approval_path));
+                    let store = approvals.get_or_insert_with(|| read_approvals_file(approval_path));
                     let Some(store) = store else {
                         report.failures.push(format!(
                             "{name}: the pack approval store is unreadable, so the update cannot be reviewed"
@@ -1066,6 +1128,7 @@ fn prepare_pack_ops_at(
         operations: prepared,
         site: site.to_path_buf(),
         lock_path: lock_path.to_path_buf(),
+        approvals: approval_path.to_path_buf(),
         report,
     };
     if review.is_empty() {
@@ -1083,6 +1146,7 @@ pub fn apply_pack_plan(plan: PackPlan) -> PackReport {
         operations,
         site,
         lock_path,
+        approvals: approval_path,
         mut report,
     } = plan;
     let _guard = match maki_pack::lock::Lock::acquire(&maki_pack::paths::sidecar_lock(&lock_path)) {
@@ -1102,7 +1166,6 @@ pub fn apply_pack_plan(plan: PackPlan) -> PackReport {
         }
     };
     let manager = maki_pack::manager::Manager::new(&site);
-    let approval_path = site.join(APPROVALS_FILE);
     let mut approvals = None;
     // Failures that only count if the single write below fails. The list is
     // also the dirty flag: nothing in it, nothing to write.
@@ -1487,19 +1550,34 @@ mod tests {
 
     use crate::error::PluginError;
     use crate::plugin_permissions::{Permission, Requested};
+    use maki_storage::paths::{APPROVALS_FILE, Access, Guard, Layout, Refusal, SITE_DIR};
     use test_case::test_case;
 
     use super::{
-        ACTIVE_DELETE_REFUSAL, APPROVALS_FILE, DECLARED_DELETE_REFUSAL, DiscoveredPackage,
-        MANAGED_GROUP, OWNER_CONFLICT_FAILURE, Origin, PLUGIN_MANIFEST, PackPreparation, PlannedOp,
-        Problem, REVIEW_DELETE_LINE, REVIEW_PROMPT_HEADER, REVIEW_REVISION_LEN,
-        UNAVAILABLE_OLD_REVISION, UpdateOptions, UpdateTarget, apply_pack_plan, discover, granted,
+        ACTIVE_DELETE_REFUSAL, DECLARED_DELETE_REFUSAL, DiscoveredPackage, MANAGED_GROUP,
+        OWNER_CONFLICT_FAILURE, Origin, PLUGIN_MANIFEST, PackPreparation, PlannedOp, Problem,
+        REVIEW_DELETE_LINE, REVIEW_PROMPT_HEADER, REVIEW_REVISION_LEN, UNAVAILABLE_OLD_REVISION,
+        UpdateOptions, UpdateTarget, adopt_superseded_store, apply_pack_plan, discover, granted,
         installed_from_declared_source, missing_permissions, prepare_pack_ops_at,
         read_approvals_file, read_lockfile, resolved_on_disk, sanitize_message, write_approvals_at,
         write_lockfile,
     };
 
     const NET_MANIFEST: &str = "[permissions]\nnet = true\n";
+    const NET_PERMISSION: &str = "net";
+    const PACKAGE_NAME: &str = "demo";
+    const PACKAGE_SRC: &str = "https://example.com/demo";
+    const SITE_ROLE: &str = "site";
+    const STATE_ROLE: &str = "state";
+    const ADOPTED: &str = "an approval an older release recorded must survive the move";
+    const OUT_OF_REACH: &str =
+        "an agent that can edit the approval store grants its own packages permissions";
+    const CHECKOUTS_WERE_READABLE: &str =
+        "the superseded location is agent-readable, which is why the store had to move";
+    const ONE_COPY: &str =
+        "a copy left behind goes stale, and an empty one blocks a later adoption";
+    const NO_EMPTY_STORE: &str =
+        "an empty store here reads as nothing approved and blocks a later adoption";
     const TEST_REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OTHER_REV: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -1930,6 +2008,7 @@ mod tests {
         _temp: tempfile::TempDir,
         site: PathBuf,
         lock_path: PathBuf,
+        approvals: PathBuf,
         declared: Vec<crate::api::pack::Declared>,
         old_rev: String,
         new_rev: String,
@@ -1966,6 +2045,7 @@ mod tests {
 
         let site = temp.path().join("site");
         let lock_path = temp.path().join("pack-lock.json");
+        let approvals = temp.path().join(APPROVALS_FILE);
         let spec = maki_pack::Spec::new(origin.display().to_string()).with_name("demo");
         let mut lock = maki_pack::lockfile::Lockfile::default();
         let installed = smol::block_on(
@@ -1996,6 +2076,7 @@ mod tests {
         }];
 
         UpdateFixture {
+            approvals,
             _temp: temp,
             site,
             lock_path,
@@ -2009,6 +2090,7 @@ mod tests {
         _temp: tempfile::TempDir,
         site: PathBuf,
         lock_path: PathBuf,
+        approvals: PathBuf,
     }
 
     /// A site holding the given `(name, revision)` packages, recorded in the
@@ -2017,6 +2099,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let site = temp.path().join("site");
         let lock_path = temp.path().join("pack-lock.json");
+        let approvals = temp.path().join(APPROVALS_FILE);
         let mut lock = maki_pack::lockfile::Lockfile::default();
         for (name, revision) in packages {
             lock.record(*name, format!("https://example.com/{name}"), *revision);
@@ -2027,6 +2110,7 @@ mod tests {
             _temp: temp,
             site,
             lock_path,
+            approvals,
         }
     }
 
@@ -2056,13 +2140,143 @@ mod tests {
     }
 
     fn approve(fixture: &UpdateFixture, names: &[&str]) {
-        let path = fixture.site.join(APPROVALS_FILE);
+        let path = fixture.approvals.clone();
         let mut approvals = maki_pack::approvals::Approvals::default();
         approvals.approve(
             &maki_pack::approvals::ApprovalKey::new("demo", &fixture.declared[0].spec.src),
             names.iter().map(|name| (*name).to_owned()).collect(),
         );
         assert!(write_approvals_at(&path, &approvals));
+    }
+
+    fn approval_key() -> maki_pack::approvals::ApprovalKey {
+        maki_pack::approvals::ApprovalKey::new(PACKAGE_NAME, PACKAGE_SRC)
+    }
+
+    /// One approved package, which is all any of the moving tests needs.
+    fn record_approval(store: &Path) {
+        let mut approvals = maki_pack::approvals::Approvals::default();
+        approvals.approve(&approval_key(), vec![NET_PERMISSION.to_owned()]);
+        assert!(write_approvals_at(store, &approvals));
+    }
+
+    fn approved_permissions(store: &Path) -> Vec<String> {
+        read_approvals_file(store)
+            .expect("the store stays readable")
+            .get(&approval_key())
+            .unwrap_or(&[])
+            .to_vec()
+    }
+
+    /// Losing the store is not neutral: every package is asked about again,
+    /// and on a run with nobody to ask it is dropped with a failure instead.
+    /// So the approval survives either way, in the new place once the move
+    /// lands and in the old one while it cannot. Without a destination
+    /// directory both the rename and the copy fall through, which is the
+    /// failure the second case reproduces.
+    #[test_case(true; "the_move_lands")]
+    #[test_case(false; "the_move_cannot_happen")]
+    fn adoption_never_loses_the_approval(state_dir_exists: bool) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let site = temp.path().join(SITE_ROLE);
+        let superseded = site.join(APPROVALS_FILE);
+        let current = temp.path().join(STATE_ROLE).join(APPROVALS_FILE);
+        fs::create_dir_all(&site).unwrap();
+        if state_dir_exists {
+            fs::create_dir_all(current.parent().unwrap()).unwrap();
+        }
+        record_approval(&superseded);
+
+        adopt_superseded_store(Some(&site), &current);
+
+        let (kept, gone) = match state_dir_exists {
+            true => (&current, &superseded),
+            false => (&superseded, &current),
+        };
+        assert_eq!(approved_permissions(kept), [NET_PERMISSION], "{ADOPTED}");
+        assert!(!gone.exists(), "{ONE_COPY}");
+    }
+
+    /// The move is the upgrade's one chance and nothing else, so a store that
+    /// is already in place decides on its own. Overwriting it would undo every
+    /// decision made since the upgrade.
+    #[test]
+    fn adoption_leaves_a_store_that_is_already_there_alone() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let site = temp.path().join(SITE_ROLE);
+        let current = temp.path().join(APPROVALS_FILE);
+        fs::create_dir_all(&site).unwrap();
+        record_approval(&site.join(APPROVALS_FILE));
+        assert!(write_approvals_at(
+            &current,
+            &maki_pack::approvals::Approvals::default()
+        ));
+
+        adopt_superseded_store(Some(&site), &current);
+
+        let kept = read_approvals_file(&current).expect("the store in place stays readable");
+        assert!(kept.is_empty(), "the store in place is the one that counts");
+    }
+
+    /// The point of the move, and a guard against `APPROVALS_FILE` being put
+    /// back under a checkout or opened by an approval later: this file decides
+    /// whether a package may run Lua with granted permissions on the next
+    /// start, so the agent must not be able to write it anywhere it lives.
+    ///
+    /// The rule naming it says so in its own words, rather than inheriting the
+    /// blanket state rule, because that one can be lifted by a user approval
+    /// and this file is not something to hand over by answering a prompt.
+    #[test]
+    fn the_approval_store_is_out_of_the_agents_reach() {
+        let state = tempfile::TempDir::new().unwrap();
+        let data = tempfile::TempDir::new().unwrap();
+        let guard = Guard::for_layout(&Layout {
+            state: Some(state.path()),
+            data: Some(data.path()),
+            cache: None,
+            logs: None,
+            config_dirs: &[],
+            home: None,
+        });
+        let current = state.path().join(APPROVALS_FILE);
+        let superseded = data.path().join(SITE_DIR).join(APPROVALS_FILE);
+
+        for access in [Access::Read, Access::Write] {
+            assert_eq!(
+                guard.refusal(&current, access),
+                Some(Refusal::ApprovalStore),
+                "{OUT_OF_REACH}"
+            );
+        }
+        assert_eq!(
+            guard.refusal(&superseded, Access::Write),
+            Some(Refusal::PackageCode),
+            "{OUT_OF_REACH}"
+        );
+        assert_eq!(
+            guard.refusal(&superseded, Access::Read),
+            None,
+            "{CHECKOUTS_WERE_READABLE}"
+        );
+    }
+
+    /// Nothing to adopt is not the same as an empty store: a file created here
+    /// reads as "nothing approved" forever and makes `adopt_superseded_store`
+    /// return early on the start that would have had something to move.
+    #[test_case(None; "no_data_dir_to_look_in")]
+    #[test_case(Some(SITE_ROLE); "checkouts_without_a_store")]
+    fn adoption_without_a_superseded_store_writes_nothing(site: Option<&str>) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let site = site.map(|name| {
+            let dir = temp.path().join(name);
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        });
+        let current = temp.path().join(APPROVALS_FILE);
+
+        adopt_superseded_store(site.as_deref(), &current);
+
+        assert!(!current.exists(), "{NO_EMPTY_STORE}");
     }
 
     #[test]
@@ -2074,6 +2288,7 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
+            &fixture.approvals,
         ));
         let prompt = prompt.expect("a normal update needs review");
 
@@ -2144,6 +2359,7 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
+            &fixture.approvals,
         ));
         let prompt = prompt.expect("a normal update needs review");
 
@@ -2161,6 +2377,7 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
+            &fixture.approvals,
         ));
 
         assert!(prompt.is_none());
@@ -2187,6 +2404,7 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
+            &fixture.approvals,
         ));
         let prompt = prompt.expect("a normal update needs review");
 
@@ -2207,6 +2425,7 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
+            &fixture.approvals,
         ));
         let prompt = prompt.expect("a normal update needs review");
 
@@ -2224,6 +2443,7 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
+            &fixture.approvals,
         );
         let PackPreparation::Review { plan, .. } = preparation else {
             panic!("a normal update needs review");
@@ -2243,20 +2463,20 @@ mod tests {
     #[test]
     fn forced_update_skips_review_and_applies_the_revision() {
         let fixture = update_fixture();
-        let approvals = fixture.site.join(APPROVALS_FILE);
         let (report, prompt) = finish_preparation(prepare_pack_ops_at(
             &[update_operation(true)],
             &fixture.declared,
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
+            &fixture.approvals,
         ));
 
         assert!(prompt.is_none());
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert_eq!(report.updated, vec![("demo".to_owned(), fixture.new_rev)]);
         assert!(
-            !approvals.exists(),
+            !fixture.approvals.exists(),
             "force must not write permission approval"
         );
     }
@@ -2271,11 +2491,12 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
+            &fixture.approvals,
         ));
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
-        let approvals = read_approvals_file(&fixture.site.join(APPROVALS_FILE))
-            .expect("the approval store stays readable");
+        let approvals =
+            read_approvals_file(&fixture.approvals).expect("the approval store stays readable");
         let key = maki_pack::approvals::ApprovalKey::new("demo", &fixture.declared[0].spec.src);
         assert_eq!(approvals.get(&key).unwrap_or(&[]), expected);
     }
@@ -2283,7 +2504,7 @@ mod tests {
     #[test]
     fn unreadable_approval_store_stops_before_git() {
         let fixture = update_fixture();
-        let approval_path = fixture.site.join(APPROVALS_FILE);
+        let approval_path = fixture.approvals.clone();
         fs::create_dir_all(&fixture.site).unwrap();
         fs::write(&approval_path, "not json").unwrap();
         let work = maki_pack::paths::package_root(&fixture.site, "demo").join(".work");
@@ -2298,6 +2519,7 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
+            &fixture.approvals,
         ));
 
         assert!(prompt.is_none());
@@ -2326,6 +2548,7 @@ mod tests {
             &active,
             &fixture.site,
             &fixture.lock_path,
+            &fixture.approvals,
         ));
 
         assert_eq!(
@@ -2358,6 +2581,7 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
+            &fixture.approvals,
         );
 
         let PackPreparation::Review { prompt, .. } = preparation else {
@@ -2380,6 +2604,7 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
+            &fixture.approvals,
         ));
 
         assert!(prompt.is_none());
@@ -2403,6 +2628,7 @@ mod tests {
                 &Default::default(),
                 &fixture.site,
                 &fixture.lock_path,
+                &fixture.approvals,
             ));
 
             assert!(prompt.is_none());
@@ -2423,6 +2649,7 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
+            &fixture.approvals,
         ));
 
         assert!(prompt.is_none());

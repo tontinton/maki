@@ -9,7 +9,7 @@ use maki_config::{GatedFile, ProjectConfig, expand_env, is_valid_server_name};
 use serde::Deserialize;
 use toml_edit::DocumentMut;
 
-const MCP_CONFIG_FILE: &str = "mcp.toml";
+use maki_storage::paths::MCP_FILE as MCP_CONFIG_FILE;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
 

@@ -3,7 +3,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use maki_storage::StateDir;
-use maki_storage::paths::{canonicalize_clean, home};
+use maki_storage::paths::{self, canonicalize_clean, home};
 use maki_storage::trusted_folders::{CanonicalFolder, TrustDecision, TrustedFolders};
 use strum::VariantArray;
 use tracing::{info, warn};
@@ -55,10 +55,10 @@ impl GatedFile {
     /// compared against would silently never match.
     pub const fn file_name(self) -> &'static str {
         match self {
-            GatedFile::Env => ".env",
-            GatedFile::Permissions => "permissions.toml",
+            GatedFile::Env => paths::ENV_FILE,
+            GatedFile::Permissions => paths::PERMISSIONS_FILE,
             GatedFile::InitLua => "init.lua",
-            GatedFile::Mcp => "mcp.toml",
+            GatedFile::Mcp => paths::MCP_FILE,
         }
     }
 

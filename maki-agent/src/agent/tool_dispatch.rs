@@ -17,7 +17,7 @@ use crate::tools::{
     truncate_bytes,
 };
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
-use maki_config::ToolKey;
+use maki_config::{Permission, ToolKey};
 use maki_storage::id::SessionRef;
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
@@ -561,7 +561,14 @@ async fn run_native_tool(
 
     invocation.start(ctx).await;
 
-    if let Err(e) = enforce_permission(invocation.as_ref(), name, ctx, &id).await {
+    // The tool's own declaration of what it exposes, turned into what that
+    // means to the guard over Maki's own files. In hand here, so no lookup has
+    // to be plumbed into the permission manager.
+    let access = entry
+        .tool
+        .required_permission()
+        .and_then(Permission::access);
+    if let Err(e) = enforce_permission(invocation.as_ref(), name, ctx, &id, access).await {
         return done_error(e);
     }
 
@@ -720,6 +727,7 @@ async fn enforce_permission(
     name: &str,
     ctx: &ToolContext,
     id: &str,
+    access: Option<maki_storage::paths::Access>,
 ) -> Result<(), String> {
     if name.contains('.') {
         return Err(format!(
@@ -737,6 +745,7 @@ async fn enforce_permission(
                 id,
                 &ctx.cancel,
                 ctx.mode.plan_path(),
+                access,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -781,6 +790,9 @@ async fn execute_mcp_tool(
             id,
             &ctx.cancel,
             ctx.mode.plan_path(),
+            // An MCP scope is a JSON blob, not a path, so there is nothing here
+            // an override could name.
+            None,
         )
         .await
     {

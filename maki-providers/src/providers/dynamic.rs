@@ -401,14 +401,24 @@ fn write_cache(cache: &ScriptCache) {
 }
 
 fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
+    let cache = read_cache();
+    let (result, next) = describe_scripts_in(dir, &cache);
+    if next != cache {
+        write_cache(&next);
+    }
+    result
+}
+
+/// Pure half of `discover_in`: the cache comes in and the next one goes out,
+/// so discovery does no I/O on Maki's state dir and a test can drive it.
+fn describe_scripts_in(dir: &Path, cache: &ScriptCache) -> (Vec<DynamicProviderMeta>, ScriptCache) {
+    let mut next = ScriptCache::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), next),
     };
 
     let builtins = builtin_slugs();
-    let cache = read_cache();
-    let mut next = ScriptCache::new();
     let mut result = Vec::new();
 
     for entry in entries.flatten() {
@@ -471,10 +481,7 @@ fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
         next.insert(slug, described);
     }
 
-    if next != cache {
-        write_cache(&next);
-    }
-    result
+    (result, next)
 }
 
 static DISCOVERED: OnceLock<Vec<DynamicProviderMeta>> = OnceLock::new();
@@ -975,6 +982,13 @@ mod tests {
         assert!(meta.models[0].thinking_fields.is_none());
     }
 
+    /// Discovery with an empty cache and nowhere to write one, so the test run
+    /// leaves Maki's real state dir alone.
+    #[cfg(unix)]
+    fn discovered_in(dir: &Path) -> Vec<DynamicProviderMeta> {
+        describe_scripts_in(dir, &ScriptCache::new()).0
+    }
+
     #[cfg(unix)]
     fn write_script(dir: &Path, name: &str, info_json: &str) -> PathBuf {
         let path = dir.join(name);
@@ -998,7 +1012,7 @@ mod tests {
             "test-provider",
             r#"{"display_name": "Test", "base": "anthropic", "has_auth": true}"#,
         );
-        let providers = discover_in(tmp.path());
+        let providers = discovered_in(tmp.path());
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].slug, "test-provider");
         assert_eq!(providers[0].display_name, "Test");
@@ -1014,7 +1028,7 @@ mod tests {
     fn discover_skips_invalid(name: &str, info_json: &str) {
         let tmp = TempDir::new().unwrap();
         write_script(tmp.path(), name, info_json);
-        assert!(discover_in(tmp.path()).is_empty());
+        assert!(discovered_in(tmp.path()).is_empty());
     }
 
     #[cfg(unix)]
@@ -1035,7 +1049,7 @@ esac
         file.sync_all().unwrap();
         drop(file);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        let providers = discover_in(tmp.path());
+        let providers = discovered_in(tmp.path());
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].models.len(), 1);
         assert_eq!(providers[0].models[0].id, "custom-v1");
@@ -1151,8 +1165,67 @@ esac
         let tmp = TempDir::new().unwrap();
         let info = format!(r#"{{"display_name": "Test", "base": "{base}", "has_auth": false}}"#);
         write_script(tmp.path(), "custom-test", &info);
-        let providers = discover_in(tmp.path());
+        let providers = discovered_in(tmp.path());
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].base, expected);
+    }
+
+    /// Startup must stop writing to Maki's state dir once nothing changed:
+    /// `discover_in` only saves when `next != cache`, which is worth nothing if
+    /// a second run over an untouched directory builds a different cache. The
+    /// providers have to survive the cache-hit path too, since the description
+    /// it replays is what picks each provider's base and models.
+    #[cfg(unix)]
+    #[test]
+    fn second_run_over_unchanged_dir_reuses_the_cache() {
+        const DISPLAY_NAME: &str = "Test";
+        let tmp = TempDir::new().unwrap();
+        write_script(
+            tmp.path(),
+            TEST_SLUG,
+            &format!(
+                r#"{{"display_name": "{DISPLAY_NAME}", "base": "anthropic", "has_auth": true}}"#
+            ),
+        );
+
+        let (first, cache) = describe_scripts_in(tmp.path(), &ScriptCache::new());
+        let (second, next) = describe_scripts_in(tmp.path(), &cache);
+
+        assert!(next == cache, "unchanged scripts rewrote the cache file");
+        assert_eq!(second.len(), first.len());
+        assert_eq!(second[0].slug, TEST_SLUG);
+        assert_eq!(second[0].display_name, DISPLAY_NAME);
+        assert_eq!(second[0].base, first[0].base);
+        assert_eq!(second[0].models.len(), first[0].models.len());
+    }
+
+    /// The cache must never resurrect a provider whose script the user deleted:
+    /// `next` is built from the directory, so an entry with no file behind it
+    /// is dropped instead of carried forward forever.
+    #[cfg(unix)]
+    #[test]
+    fn deleted_script_is_dropped_from_cache_and_providers() {
+        const DELETED_SLUG: &str = "deleted-provider";
+        let tmp = TempDir::new().unwrap();
+        write_script(
+            tmp.path(),
+            TEST_SLUG,
+            r#"{"display_name": "Test", "base": "anthropic", "has_auth": true}"#,
+        );
+
+        let (_, mut cache) = describe_scripts_in(tmp.path(), &ScriptCache::new());
+        let surviving = cache.get(TEST_SLUG).unwrap().clone();
+        cache.insert(DELETED_SLUG.to_string(), surviving);
+
+        let (providers, next) = describe_scripts_in(tmp.path(), &cache);
+
+        assert_eq!(next.keys().collect::<Vec<_>>(), [TEST_SLUG]);
+        assert_eq!(
+            providers
+                .iter()
+                .map(|p| p.slug.as_str())
+                .collect::<Vec<_>>(),
+            [TEST_SLUG]
+        );
     }
 }
