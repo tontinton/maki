@@ -13,7 +13,7 @@ mod oidc;
 mod server;
 mod store;
 
-use store::{Role, Store};
+use store::{MintTokens, Role, Store};
 
 const DEFAULT_DB_PATH: &str = "maki-anchor.sqlite3";
 const DEFAULT_CONFIG_PATH: &str = "maki-anchor.toml";
@@ -33,8 +33,10 @@ struct AnchorConfig {
 struct AuthFileConfig {
     /// Allow username/password local users in addition to OIDC. Default true.
     allow_local_users: Option<bool>,
-    /// If true, only authenticated users (OIDC or local) can mint instance tokens via the UI/API.
-    /// Default: true when OIDC is configured, false otherwise. Override with MAKI_ANCHOR_REQUIRE_AUTH_FOR_TOKENS env.
+    /// Who can mint instance tokens: any (anonymous), user (any logged-in), admin (admins only). Default: admin if OIDC, user otherwise.
+    /// Env MAKI_ANCHOR_MINT_TOKENS overrides.
+    mint_tokens: Option<MintTokens>,
+    /// Deprecated: use mint_tokens. If true, maps to user, if false to any.
     require_auth_for_tokens: Option<bool>,
 }
 
@@ -133,6 +135,14 @@ enum UserCommand {
     List,
     /// Set password for a local user
     SetPassword { username: String },
+    /// Toggle admin flag for a user
+    SetAdmin {
+        username: String,
+        #[arg(long, default_value_t = true)]
+        admin: bool,
+    },
+    /// Delete a user (and their grants/sessions)
+    Delete { username: String },
 }
 
 #[derive(Subcommand)]
@@ -184,19 +194,32 @@ fn main() {
                 .as_ref()
                 .and_then(|a| a.allow_local_users)
                 .unwrap_or(true);
-            let require_auth_for_tokens = anchor_config
-                .auth
-                .as_ref()
-                .and_then(|a| a.require_auth_for_tokens)
-                .or_else(|| {
-                    std::env::var("MAKI_ANCHOR_REQUIRE_AUTH_FOR_TOKENS")
-                        .ok()
-                        .map(|v| v != "0" && v.to_lowercase() != "false")
-                })
-                .unwrap_or_else(|| oidc.is_some());
-            if let Err(err) =
-                server::serve(&bind, store, oidc, allow_local, require_auth_for_tokens)
-            {
+            let mint_tokens = {
+                if let Some(v) = std::env::var("MAKI_ANCHOR_MINT_TOKENS")
+                    .ok()
+                    .and_then(|s| MintTokens::parse(&s))
+                {
+                    v
+                } else if let Some(v) = anchor_config.auth.as_ref().and_then(|a| a.mint_tokens) {
+                    v
+                } else if let Some(v) = anchor_config
+                    .auth
+                    .as_ref()
+                    .and_then(|a| a.require_auth_for_tokens)
+                {
+                    if v { MintTokens::User } else { MintTokens::Any }
+                } else if let Some(v) = std::env::var("MAKI_ANCHOR_REQUIRE_AUTH_FOR_TOKENS")
+                    .ok()
+                    .map(|s| s != "0" && s.to_lowercase() != "false")
+                {
+                    if v { MintTokens::User } else { MintTokens::Any }
+                } else if oidc.is_some() {
+                    MintTokens::Admin
+                } else {
+                    MintTokens::Any
+                }
+            };
+            if let Err(err) = server::serve(&bind, store, oidc, allow_local, mint_tokens) {
                 eprintln!("fatal: {err}");
                 std::process::exit(1);
             }
@@ -358,6 +381,28 @@ fn main() {
                         )
                         .expect("set password");
                     println!("password updated for {username}");
+                }
+                UserCommand::SetAdmin { username, admin } => {
+                    let user = store
+                        .local_user_by_username(&username)
+                        .or_else(|_| store.user_by_sub(&format!("local:{username}")))
+                        .or_else(|_| store.user_by_sub(&username))
+                        .expect("no such user");
+                    store.set_user_admin(user.id, admin).expect("set admin");
+                    println!("user {} admin={}", username, admin);
+                }
+                UserCommand::Delete { username } => {
+                    let user = store
+                        .local_user_by_username(&username)
+                        .or_else(|_| store.user_by_sub(&format!("local:{username}")))
+                        .or_else(|_| store.user_by_sub(&username))
+                        .expect("no such user");
+                    if store.delete_user(user.id).expect("delete") {
+                        println!("deleted user {} id {}", username, user.id);
+                    } else {
+                        eprintln!("delete failed");
+                        std::process::exit(1);
+                    }
                 }
             }
         }

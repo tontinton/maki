@@ -31,6 +31,33 @@ impl Role {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MintTokens {
+    Any,
+    #[default]
+    User,
+    Admin,
+}
+
+impl MintTokens {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "any" | "anonymous" => Some(Self::Any),
+            "user" | "users" | "authenticated" => Some(Self::User),
+            "admin" | "admins" => Some(Self::Admin),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::User => "user",
+            Self::Admin => "admin",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("sqlite: {0}")]
@@ -134,14 +161,18 @@ impl Store {
                  updated_at INTEGER NOT NULL,
                  PRIMARY KEY (instance_id, external_id)
              );
-             CREATE TABLE IF NOT EXISTS links (
-                 token_hash TEXT PRIMARY KEY,
-                 instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
-                 external_session_id TEXT,
-                 rights TEXT NOT NULL,
-                 expires_at INTEGER NOT NULL,
-                 revoked_at INTEGER
-             );
+              CREATE TABLE IF NOT EXISTS links (
+                  token_hash TEXT PRIMARY KEY,
+                  instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+                  external_session_id TEXT,
+                  rights TEXT NOT NULL,
+                  expires_at INTEGER NOT NULL,
+                  revoked_at INTEGER
+              );
+              CREATE TABLE IF NOT EXISTS settings (
+                  key TEXT PRIMARY KEY,
+                  value TEXT NOT NULL
+              );
               CREATE TABLE IF NOT EXISTS users (
                   id INTEGER PRIMARY KEY,
                   oidc_sub TEXT NOT NULL UNIQUE,
@@ -551,6 +582,87 @@ impl Store {
                     email: row.get(2)?,
                     name: row.get(3)?,
                     is_admin: row.get::<_, i64>(4)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let res: Result<String, _> =
+            conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+                r.get(0)
+            });
+        match res {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_user(&self, user_id: i64) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute("DELETE FROM users WHERE id = ?1", [user_id])?;
+        Ok(changed > 0)
+    }
+
+    pub fn set_user_admin(&self, user_id: i64, is_admin: bool) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE users SET is_admin = ?1 WHERE id = ?2",
+            rusqlite::params![i64::from(is_admin), user_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn sessions_for_user(
+        &self,
+        user_id: i64,
+        is_admin: bool,
+    ) -> Result<Vec<SessionRow>, StoreError> {
+        if is_admin {
+            return self.list_sessions();
+        }
+        let conn = self.conn.lock().unwrap();
+        // Sessions visible where user has a grant on the instance
+        let mut stmt = conn.prepare(
+            "SELECT s.instance_id, s.external_id, s.title, s.model, s.cwd, s.status, s.cost_cents, s.tokens_in, s.tokens_out, s.context_window, s.updated_at
+             FROM sessions s JOIN grants g ON g.instance_id = s.instance_id WHERE g.user_id = ?1 ORDER BY s.updated_at DESC LIMIT 500",
+        )?;
+        let rows = stmt
+            .query_map([user_id], map_session)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn instances_for_user(
+        &self,
+        user_id: i64,
+        is_admin: bool,
+    ) -> Result<Vec<InstanceRow>, StoreError> {
+        if is_admin {
+            return self.list_instances();
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT i.id, i.name, i.last_seen FROM instances i JOIN grants g ON g.instance_id = i.id WHERE g.user_id = ?1 ORDER BY i.name",
+        )?;
+        let rows = stmt
+            .query_map([user_id], |row| {
+                Ok(InstanceRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    last_seen: row.get(2)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

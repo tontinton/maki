@@ -22,7 +22,7 @@ pub struct Auth {
     pub oidc: Option<OidcConfig>,
     pub store: Arc<Store>,
     pub allow_local: bool,
-    pub require_auth_for_tokens: bool,
+    pub mint_tokens: store::MintTokens,
     /// Login state -> timestamp, so /callback can verify the state parameter.
     /// Bounded by pruning on insert.
     pending: std::sync::Mutex<std::collections::HashMap<String, i64>>,
@@ -36,14 +36,31 @@ impl Auth {
         store: Arc<Store>,
         oidc: Option<OidcConfig>,
         allow_local: bool,
-        require_auth_for_tokens: bool,
+        mint_tokens: store::MintTokens,
     ) -> Self {
         Self {
             oidc,
             store,
             allow_local,
-            require_auth_for_tokens,
+            mint_tokens,
             pending: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub fn effective_mint_tokens(&self) -> store::MintTokens {
+        if let Ok(Some(v)) = self.store.get_setting("mint_tokens")
+            && let Some(m) = store::MintTokens::parse(&v)
+        {
+            return m;
+        }
+        self.mint_tokens
+    }
+
+    pub fn can_mint_tokens(&self, user: Option<&store::UserRow>) -> bool {
+        match self.effective_mint_tokens() {
+            store::MintTokens::Any => true,
+            store::MintTokens::User => user.is_some(),
+            store::MintTokens::Admin => user.is_some_and(|u| u.is_admin),
         }
     }
 

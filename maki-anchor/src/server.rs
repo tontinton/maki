@@ -127,7 +127,7 @@ pub fn serve(
     store: Arc<Store>,
     oidc: Option<crate::oidc::OidcConfig>,
     allow_local: bool,
-    require_auth_for_tokens: bool,
+    mint_tokens: store::MintTokens,
 ) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).map_err(|source| ServerError::Bind {
         addr: addr.to_string(),
@@ -152,7 +152,7 @@ pub fn serve(
         Arc::clone(&store),
         oidc,
         allow_local,
-        require_auth_for_tokens,
+        mint_tokens,
     ));
     let ws_store = Arc::clone(&store);
     let ws_hub = Arc::clone(&hub);
@@ -321,7 +321,8 @@ fn route(
     if auth.enabled() && user.is_none() {
         return redirect_to_login(request);
     }
-    if auth.allow_local && auth.require_auth_for_tokens && user.is_none() {
+    if auth.allow_local && auth.effective_mint_tokens() != store::MintTokens::Any && user.is_none()
+    {
         // Only require auth for dashboard if there is at least one user (otherwise bootstrapping)
         let has_users = store.list_users().map(|u| !u.is_empty()).unwrap_or(false);
         if has_users {
@@ -628,12 +629,22 @@ fn handle_api_create_instance(
             request,
         );
     }
-    if auth.require_auth_for_tokens && user.is_none() {
+    if !auth.can_mint_tokens(user) {
+        let msg = match auth.effective_mint_tokens() {
+            store::MintTokens::Admin => "admin required to mint tokens",
+            store::MintTokens::User => "authentication required",
+            store::MintTokens::Any => "authentication required",
+        };
+        let status = if auth.effective_mint_tokens() == store::MintTokens::Admin {
+            403
+        } else {
+            401
+        };
         return buffered(
             (
-                401,
+                status,
                 "application/json".to_string(),
-                br#"{"error":"authentication required"}"#.to_vec(),
+                serde_json::json!({"error": msg}).to_string().into_bytes(),
             ),
             request,
         );
@@ -1036,7 +1047,7 @@ fn handle_api_create_user(
         }
     } else if user.is_none() {
         let has_users = store.list_users().map(|u| !u.is_empty()).unwrap_or(false);
-        if has_users && auth.require_auth_for_tokens {
+        if has_users && auth.effective_mint_tokens() != store::MintTokens::Any {
             return buffered(
                 (
                     401,
@@ -1155,6 +1166,327 @@ fn handle_api_create_user(
     }
 }
 
+fn handle_api_set_admin(
+    mut request: tiny_http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method().as_str() != "POST" {
+        return buffered(
+            (
+                405,
+                "application/json".to_string(),
+                br#"{"error":"method not allowed"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    if let Some(u) = user
+        && !u.is_admin
+    {
+        return buffered(
+            (
+                403,
+                "application/json".to_string(),
+                br#"{"error":"admin required"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    let mut body = Vec::new();
+    if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
+        return buffered(
+            (
+                413,
+                "application/json".to_string(),
+                br#"{"error":"body too large"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return buffered(
+                (
+                    400,
+                    "application/json".to_string(),
+                    br#"{"error":"invalid json"}"#.to_vec(),
+                ),
+                request,
+            );
+        }
+    };
+    let username = value
+        .get("username")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    let is_admin = value
+        .get("is_admin")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if username.is_empty() {
+        return buffered(
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"missing username"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    let user_row = match store
+        .local_user_by_username(&username)
+        .or_else(|_| store.user_by_sub(&format!("local:{username}")))
+    {
+        Ok(u) => u,
+        Err(_) => {
+            return buffered(
+                (
+                    404,
+                    "application/json".to_string(),
+                    br#"{"error":"unknown user"}"#.to_vec(),
+                ),
+                request,
+            );
+        }
+    };
+    if let Err(e) = store.set_user_admin(user_row.id, is_admin) {
+        return buffered(
+            (
+                500,
+                "application/json".to_string(),
+                serde_json::json!({"error": format!("store error: {e}")})
+                    .to_string()
+                    .into_bytes(),
+            ),
+            request,
+        );
+    }
+    let body = serde_json::json!({"ok": true, "is_admin": is_admin})
+        .to_string()
+        .into_bytes();
+    buffered((200, "application/json".to_string(), body), request)
+}
+
+fn handle_api_delete_user(
+    mut request: tiny_http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method().as_str() != "POST" {
+        return buffered(
+            (
+                405,
+                "application/json".to_string(),
+                br#"{"error":"method not allowed"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    if let Some(u) = user
+        && !u.is_admin
+    {
+        return buffered(
+            (
+                403,
+                "application/json".to_string(),
+                br#"{"error":"admin required"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    let mut body = Vec::new();
+    if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
+        return buffered(
+            (
+                413,
+                "application/json".to_string(),
+                br#"{"error":"body too large"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return buffered(
+                (
+                    400,
+                    "application/json".to_string(),
+                    br#"{"error":"invalid json"}"#.to_vec(),
+                ),
+                request,
+            );
+        }
+    };
+    let username = value
+        .get("username")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    if username.is_empty() {
+        return buffered(
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"missing username"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    let user_row = match store
+        .local_user_by_username(&username)
+        .or_else(|_| store.user_by_sub(&format!("local:{username}")))
+    {
+        Ok(u) => u,
+        Err(_) => {
+            return buffered(
+                (
+                    404,
+                    "application/json".to_string(),
+                    br#"{"error":"unknown user"}"#.to_vec(),
+                ),
+                request,
+            );
+        }
+    };
+    // Prevent deleting self if admin
+    if let Some(cur) = user
+        && cur.id == user_row.id
+    {
+        return buffered(
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"cannot delete self"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    match store.delete_user(user_row.id) {
+        Ok(true) => buffered(
+            (
+                200,
+                "application/json".to_string(),
+                br#"{"ok":true}"#.to_vec(),
+            ),
+            request,
+        ),
+        Ok(false) => buffered(
+            (
+                404,
+                "application/json".to_string(),
+                br#"{"error":"not found"}"#.to_vec(),
+            ),
+            request,
+        ),
+        Err(e) => buffered(
+            (
+                500,
+                "application/json".to_string(),
+                serde_json::json!({"error": format!("store error: {e}")})
+                    .to_string()
+                    .into_bytes(),
+            ),
+            request,
+        ),
+    }
+}
+
+fn handle_api_set_mint_tokens(
+    mut request: tiny_http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+    auth: &crate::auth::Auth,
+) -> RouteOutcome {
+    if request.method().as_str() != "POST" {
+        return buffered(
+            (
+                405,
+                "application/json".to_string(),
+                br#"{"error":"method not allowed"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    let is_admin = user.as_ref().is_some_and(|u| u.is_admin);
+    if !is_admin {
+        let has_users = store.list_users().map(|u| !u.is_empty()).unwrap_or(false);
+        if has_users {
+            return buffered(
+                (
+                    403,
+                    "application/json".to_string(),
+                    br#"{"error":"admin required"}"#.to_vec(),
+                ),
+                request,
+            );
+        }
+    }
+    let mut body = Vec::new();
+    if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
+        return buffered(
+            (
+                413,
+                "application/json".to_string(),
+                br#"{"error":"body too large"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return buffered(
+                (
+                    400,
+                    "application/json".to_string(),
+                    br#"{"error":"invalid json"}"#.to_vec(),
+                ),
+                request,
+            );
+        }
+    };
+    let mint = value
+        .get("mint_tokens")
+        .or_else(|| value.get("mint"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let parsed = crate::store::MintTokens::parse(mint);
+    let Some(parsed) = parsed else {
+        return buffered(
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"mint_tokens must be any, user, or admin"}"#.to_vec(),
+            ),
+            request,
+        );
+    };
+    if let Err(e) = store.set_setting("mint_tokens", parsed.as_str()) {
+        return buffered(
+            (
+                500,
+                "application/json".to_string(),
+                serde_json::json!({"error": format!("store error: {e}")})
+                    .to_string()
+                    .into_bytes(),
+            ),
+            request,
+        );
+    }
+    // Also update in-memory auth for this process (next request will read from DB anyway)
+    let _ = auth;
+    let body = serde_json::json!({"mint_tokens": parsed.as_str()})
+        .to_string()
+        .into_bytes();
+    buffered((200, "application/json".to_string(), body), request)
+}
+
 /// User-facing routes: dashboard and JSON endpoints. The user row (None in
 /// LAN-trust mode) is available for future per-instance filtering.
 fn route_authorized(
@@ -1191,6 +1523,12 @@ fn route_authorized(
             ),
         };
     }
+    if path == "/api/users/set-admin" {
+        return handle_api_set_admin(request, store, user.as_ref());
+    }
+    if path == "/api/users/delete" {
+        return handle_api_delete_user(request, store, user.as_ref());
+    }
     if path == "/api/grants" {
         return match request.method().as_str() {
             "GET" => buffered(json_list_grants(store), request),
@@ -1208,24 +1546,87 @@ fn route_authorized(
     if path == "/api/grants/revoke" {
         return handle_api_revoke_grant(request, store, user.as_ref());
     }
+    if path == "/admin" {
+        match &user {
+            Some(u) if u.is_admin => {
+                return buffered(
+                    crate::dashboard::render_admin(store, user.as_ref(), auth),
+                    request,
+                );
+            }
+            Some(_) => {
+                return buffered(
+                    (
+                        403,
+                        "text/html".to_string(),
+                        b"<html><body>admin only <a href=\"/\">back</a></body></html>".to_vec(),
+                    ),
+                    request,
+                );
+            }
+            None => return redirect_to_login(request),
+        }
+    }
+    if path == "/api/config/mint_tokens" {
+        return match request.method().as_str() {
+            "GET" => {
+                let v = auth.effective_mint_tokens().as_str().to_owned();
+                let body = serde_json::json!({"mint_tokens": v})
+                    .to_string()
+                    .into_bytes();
+                buffered((200, "application/json".to_string(), body), request)
+            }
+            "POST" => handle_api_set_mint_tokens(request, store, user.as_ref(), auth),
+            _ => buffered(
+                (
+                    405,
+                    "application/json".to_string(),
+                    br#"{"error":"method not allowed"}"#.to_vec(),
+                ),
+                request,
+            ),
+        };
+    }
     let outcome = if path == "/instances" {
-        json_list_instances(store)
+        json_list_instances_for(store, user.as_ref())
     } else if path == "/sessions" {
-        json_list_sessions(store)
+        json_list_sessions_for(store, user.as_ref())
     } else if let Some(rest) = path.strip_prefix("/sessions/") {
         match rest.parse::<i64>() {
-            Ok(instance_id) => match store.sessions_for_instance(instance_id) {
-                Ok(rows) => {
-                    let body = serde_json::to_vec(&rows).unwrap_or_default();
-                    (200, "application/json".to_string(), body)
+            Ok(instance_id) => {
+                if let Some(u) = &user
+                    && !u.is_admin
+                    && let Ok(visible) = store.instances_for_user(u.id, u.is_admin)
+                    && !visible.iter().any(|i| i.id == instance_id)
+                {
+                    return buffered(
+                        (
+                            403,
+                            "application/json".to_string(),
+                            br#"{"error":"forbidden"}"#.to_vec(),
+                        ),
+                        request,
+                    );
                 }
-                Err(err) => (
-                    500,
-                    "text/plain".to_string(),
-                    format!("store error: {err}").into_bytes(),
-                ),
-            },
-            Err(_) => (400, "text/plain".to_string(), b"bad instance id".to_vec()),
+                match store.sessions_for_instance(instance_id) {
+                    Ok(rows) => {
+                        let body = serde_json::to_vec(&rows).unwrap_or_default();
+                        (200, "application/json".to_string(), body)
+                    }
+                    Err(err) => (
+                        500,
+                        "application/json".to_string(),
+                        serde_json::json!({"error": format!("store error: {err}")})
+                            .to_string()
+                            .into_bytes(),
+                    ),
+                }
+            }
+            Err(_) => (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"bad instance id"}"#.to_vec(),
+            ),
         }
     } else {
         (404, "text/plain".to_string(), b"not found".to_vec())
@@ -1233,6 +1634,7 @@ fn route_authorized(
     buffered(outcome, request)
 }
 
+#[allow(dead_code)]
 fn json_list_instances(store: &Arc<Store>) -> (u16, String, Vec<u8>) {
     match store.list_instances() {
         Ok(rows) => {
@@ -1241,12 +1643,38 @@ fn json_list_instances(store: &Arc<Store>) -> (u16, String, Vec<u8>) {
         }
         Err(err) => (
             500,
-            "text/plain".to_string(),
-            format!("store error: {err}").into_bytes(),
+            "application/json".to_string(),
+            serde_json::json!({"error": format!("store error: {err}")})
+                .to_string()
+                .into_bytes(),
         ),
     }
 }
 
+fn json_list_instances_for(
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> (u16, String, Vec<u8>) {
+    let res = match user {
+        Some(u) => store.instances_for_user(u.id, u.is_admin),
+        None => store.list_instances(),
+    };
+    match res {
+        Ok(rows) => {
+            let body = serde_json::to_vec(&rows).unwrap_or_default();
+            (200, "application/json".to_string(), body)
+        }
+        Err(err) => (
+            500,
+            "application/json".to_string(),
+            serde_json::json!({"error": format!("store error: {err}")})
+                .to_string()
+                .into_bytes(),
+        ),
+    }
+}
+
+#[allow(dead_code)]
 fn json_list_sessions(store: &Arc<Store>) -> (u16, String, Vec<u8>) {
     match store.list_sessions() {
         Ok(rows) => {
@@ -1255,8 +1683,33 @@ fn json_list_sessions(store: &Arc<Store>) -> (u16, String, Vec<u8>) {
         }
         Err(err) => (
             500,
-            "text/plain".to_string(),
-            format!("store error: {err}").into_bytes(),
+            "application/json".to_string(),
+            serde_json::json!({"error": format!("store error: {err}")})
+                .to_string()
+                .into_bytes(),
+        ),
+    }
+}
+
+fn json_list_sessions_for(
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> (u16, String, Vec<u8>) {
+    let res = match user {
+        Some(u) => store.sessions_for_user(u.id, u.is_admin),
+        None => store.list_sessions(),
+    };
+    match res {
+        Ok(rows) => {
+            let body = serde_json::to_vec(&rows).unwrap_or_default();
+            (200, "application/json".to_string(), body)
+        }
+        Err(err) => (
+            500,
+            "application/json".to_string(),
+            serde_json::json!({"error": format!("store error: {err}")})
+                .to_string()
+                .into_bytes(),
         ),
     }
 }
