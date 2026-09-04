@@ -114,7 +114,7 @@ pub fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn auth_path(dir: &StateDir, filename: &str) -> PathBuf {
+pub(crate) fn auth_path(dir: &StateDir, filename: &str) -> PathBuf {
     dir.path().join(AUTH_DIR).join(format!("{filename}.json"))
 }
 

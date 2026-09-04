@@ -41,6 +41,7 @@ use maki_providers::Model;
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
 use maki_storage::id::SessionRef;
+use maki_storage::paths::{Guard, Protection};
 
 pub(crate) const TOOL_NAME_FIELD: &str = "name";
 
@@ -431,8 +432,43 @@ pub fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder, String
     walk_builder_opts(root, patterns, true)
 }
 
-/// `.git` is always excluded, even when `gitignore` is false.
+/// The key for a walk entry, without a `canonicalize` per path component.
+///
+/// `ignore` does not follow symlinks, so every entry it yields is the walk root
+/// plus a chain of real directory names, never `.`, never `..`, and never a
+/// step through a link. Canonicalizing the root once and pasting that chain
+/// back on therefore gives the same answer as resolving the entry component by
+/// component, for one join and no syscall. Walks run over hundreds of
+/// thousands of entries, and full resolution costs a `realpath` per component
+/// on each of them.
+///
+/// A symlink entry is the one case where that does not hold, since the link
+/// name says nothing about where it points, so those get resolved properly.
+/// There are few of them and the walk stops at each one anyway.
+fn walk_entry_key(root: &Path, root_key: &Path, entry: &ignore::DirEntry) -> PathBuf {
+    let is_link = entry.file_type().is_none_or(|kind| kind.is_symlink());
+    match entry.path().strip_prefix(root) {
+        Ok(rest) if !is_link => root_key.join(rest),
+        _ => maki_storage::paths::canonical_key(entry.path()),
+    }
+}
+
+/// `.git` is always excluded, even when `gitignore` is false. So are the paths
+/// `maki_storage::paths` marks unreachable: pruned mid-walk, so a credential
+/// file is never opened at all. Careful, `ignore` keeps one filter predicate
+/// per builder, so a caller that sets its own `filter_entry` drops this one.
 pub fn walk_builder_opts(
+    root: &str,
+    patterns: &[&str],
+    gitignore: bool,
+) -> Result<WalkBuilder, String> {
+    walk_builder_guarded(maki_storage::paths::guard(), root, patterns, gitignore)
+}
+
+/// The same walk against a rule set the caller names, so a test can aim one at
+/// a layout it owns instead of at the developer's real state dir.
+fn walk_builder_guarded(
+    guard: &'static Guard,
     root: &str,
     patterns: &[&str],
     gitignore: bool,
@@ -449,8 +485,19 @@ pub fn walk_builder_opts(
         .build()
         .map_err(|e| format!("invalid glob pattern: {e}"))?;
 
+    let root_path = PathBuf::from(root);
+    let root_key = maki_storage::paths::canonical_key(&root_path);
+
     let mut wb = WalkBuilder::new(root);
-    wb.hidden(false).overrides(overrides);
+    // Already the default, and spelled out because `walk_entry_key` may only
+    // skip the per-component resolution for as long as it holds.
+    wb.follow_links(false)
+        .hidden(false)
+        .overrides(overrides)
+        .filter_entry(move |entry| {
+            let key = walk_entry_key(&root_path, &root_key, entry);
+            guard.protected_key(&key) != Some(Protection::NoAccess)
+        });
     if !gitignore {
         wb.ignore(false)
             .git_ignore(false)
@@ -770,6 +817,7 @@ pub mod test_support {
 mod tests {
     use std::fs::{self, File};
 
+    use maki_storage::paths::Layout;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -777,6 +825,12 @@ mod tests {
 
     const LINE_LIMIT: usize = 500;
     const TEST_MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
+    const ORDINARY_FILE: &str = "note.md";
+    const CLOSED_STATE_FILE: &str = "sessions.json";
+    const NESTED_DIR: &str = "nested";
+    const OPEN_STATE_SUBTREE: &str = maki_storage::paths::OPEN_STATE_SUBTREES[0];
+    #[cfg(unix)]
+    const STATE_LINK: &str = "link";
 
     /// The array a host hands in is the whole answer, but only where names can
     /// be read out of it. Something unreadable must not quietly come out as
@@ -1047,6 +1101,141 @@ mod tests {
         assert!(rs_only.contains(&"lib.rs".into()));
         assert!(!rs_only.contains(&"main.py".into()), "glob must filter");
         assert!(!rs_only.iter().any(|p| p.starts_with(".git")));
+    }
+
+    fn walk_key_tree() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join(NESTED_DIR).join(NESTED_DIR);
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join(ORDINARY_FILE), "").unwrap();
+        fs::write(tmp.path().join(ORDINARY_FILE), "").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&nested, tmp.path().join(STATE_LINK)).unwrap();
+        tmp
+    }
+
+    /// The cheap key the filter uses has to agree with resolving the entry one
+    /// component at a time, since that agreement is the whole reason the walk
+    /// may skip the expensive resolution.
+    ///
+    /// The root has to be spelled in a way that still needs resolving, or both
+    /// sides of the comparison reduce to the same expression and the test
+    /// passes without asking anything. A `TempDir` path on its own is already
+    /// canonical, which is exactly that case.
+    fn assert_walk_keys_agree(root: &Path) {
+        let root_path = root.to_path_buf();
+        let root_key = maki_storage::paths::canonical_key(&root_path);
+        assert_ne!(
+            root_path, root_key,
+            "the root must not already be canonical"
+        );
+
+        let entries: Vec<_> = walk_builder(&root.to_string_lossy(), &[])
+            .unwrap()
+            .build()
+            .flatten()
+            .collect();
+        assert!(entries.len() > 3, "the walk produced nothing to compare");
+        for entry in entries {
+            assert_eq!(
+                walk_entry_key(&root_path, &root_key, &entry),
+                maki_storage::paths::canonical_key(entry.path()),
+                "{}",
+                entry.path().display()
+            );
+        }
+    }
+
+    #[test]
+    fn walk_entry_key_agrees_from_a_root_with_a_parent_component() {
+        let tmp = walk_key_tree();
+        assert_walk_keys_agree(&tmp.path().join(NESTED_DIR).join(".."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_entry_key_agrees_from_a_root_reached_through_a_symlink() {
+        let tmp = walk_key_tree();
+        let elsewhere = TempDir::new().unwrap();
+        let link = elsewhere.path().join(STATE_LINK);
+        std::os::unix::fs::symlink(tmp.path(), &link).unwrap();
+
+        assert_walk_keys_agree(&link);
+    }
+
+    /// A state dir this test owns, with one closed file and one in an open
+    /// subtree, plus a guard that treats it as Maki's own.
+    ///
+    /// The guard is leaked because `ignore` wants the filter to outlive the
+    /// walk, which the real one does for free. The real layout is not used
+    /// here on purpose: it depends on whether the machine has a `~/.maki`, and
+    /// the walk would go rummaging through the developer's own credentials to
+    /// find that out.
+    fn state_fixture() -> (TempDir, &'static Guard, PathBuf) {
+        let state = TempDir::new().unwrap();
+        let open = state.path().join(OPEN_STATE_SUBTREE);
+        fs::create_dir_all(&open).unwrap();
+        fs::write(open.join(ORDINARY_FILE), "").unwrap();
+        fs::write(state.path().join(CLOSED_STATE_FILE), "").unwrap();
+
+        let guard: &'static Guard = Box::leak(Box::new(Guard::for_layout(&Layout {
+            state: Some(state.path()),
+            ..Default::default()
+        })));
+        let path = state.path().to_path_buf();
+        (state, guard, path)
+    }
+
+    fn walk_paths(guard: &'static Guard, root: &Path) -> Vec<PathBuf> {
+        walk_builder_guarded(guard, &root.to_string_lossy(), &[], true)
+            .unwrap()
+            .max_depth(Some(1))
+            .build()
+            .flatten()
+            .map(|entry| entry.path().to_path_buf())
+            .collect()
+    }
+
+    /// The walk starts at the state dir, so the root itself is never filtered.
+    /// Everything below it must be gone except the open subtrees.
+    #[test]
+    fn walk_returns_nothing_closed_from_makis_state() {
+        let (_state, guard, state) = state_fixture();
+        let open = state.join(OPEN_STATE_SUBTREE);
+
+        let reached: Vec<PathBuf> = walk_paths(guard, &state)
+            .into_iter()
+            .filter(|path| *path != state && !path.starts_with(&open))
+            .collect();
+
+        assert!(
+            reached.is_empty(),
+            "the walk reached Maki's state: {reached:?}"
+        );
+    }
+
+    /// A link is how a walk reaches the state dir without being pointed at it,
+    /// so the filter has to resolve the entry rather than trust its name.
+    #[cfg(unix)]
+    #[test]
+    fn walk_prunes_a_link_into_makis_state() {
+        let (_state, guard, state) = state_fixture();
+        let dir = TempDir::new().unwrap();
+        let link = dir.path().join(STATE_LINK);
+        std::os::unix::fs::symlink(&state, &link).unwrap();
+        let ordinary = dir.path().join(ORDINARY_FILE);
+        fs::write(&ordinary, "").unwrap();
+
+        let entries = walk_paths(guard, dir.path());
+
+        assert!(
+            entries.contains(&ordinary),
+            "an ordinary entry must still come back"
+        );
+        assert!(
+            !entries.contains(&link),
+            "the walk must not reach the state"
+        );
     }
 
     #[test]
