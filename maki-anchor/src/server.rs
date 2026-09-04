@@ -2009,3 +2009,38 @@ fn drive_tunnel(mut websocket: WebSocket<std::net::TcpStream>, hub: Arc<Hub>, st
     hub.detach(instance.id);
     store.touch_instance(instance.id).ok();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_token_path_rejects_api_paths() {
+        assert_eq!(split_token_path("/api/instances"), None);
+        assert_eq!(split_token_path("/api/users"), None);
+        assert_eq!(split_token_path("/api/sso"), None);
+        assert_eq!(split_token_path("/install.sh"), None);
+        assert_eq!(split_token_path("/login"), None);
+    }
+
+    #[test]
+    fn split_token_path_accepts_valid_token() {
+        let token = "a".repeat(32);
+        assert_eq!(
+            split_token_path(&format!("/{token}/events")),
+            Some((token.as_str(), "events"))
+        );
+        assert_eq!(
+            split_token_path(&format!("/{token}/prompt")),
+            Some((token.as_str(), "prompt"))
+        );
+        // Non-hex or wrong length rejected
+        assert_eq!(split_token_path("/short/events"), None);
+        assert_eq!(
+            split_token_path("/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz/events"),
+            None
+        );
+        assert_eq!(split_token_path("//events"), None);
+        assert_eq!(split_token_path("/api"), None);
+    }
+}

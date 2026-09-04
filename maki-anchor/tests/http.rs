@@ -158,3 +158,39 @@ fn anchor_serves_instances_and_sessions() {
     let (status, _) = http(anchor.port, "GET", "/nope", &[]);
     assert_eq!(status, 404);
 }
+
+#[test]
+fn api_instances_is_not_treated_as_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db.sqlite3");
+    let anchor = spawn_anchor(&db);
+    thread::sleep(Duration::from_millis(300));
+    // POST /api/instances should be JSON API, not proxy 404 "invalid or expired link"
+    let (status, body) = http(anchor.port, "POST", "/api/instances", br#"{"name":"test"}"#);
+    // Should be 200 (any) or 401/403 JSON, never 404 text/plain "invalid or expired link"
+    assert_ne!(status, 404);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.starts_with("invalid or expired"),
+        "API was mistaken for token path: {text}"
+    );
+    // Body must be JSON
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&body).is_ok(),
+        "API must return JSON, got: {text}"
+    );
+}
+
+#[test]
+fn api_users_and_grants_require_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db.sqlite3");
+    let anchor = spawn_anchor(&db);
+    thread::sleep(Duration::from_millis(300));
+    let (status, body) = http(anchor.port, "GET", "/api/users", &[]);
+    assert_eq!(status, 200);
+    assert!(serde_json::from_slice::<serde_json::Value>(&body).is_ok());
+    let (status, body) = http(anchor.port, "GET", "/api/grants", &[]);
+    assert_eq!(status, 200);
+    assert!(serde_json::from_slice::<serde_json::Value>(&body).is_ok());
+}
