@@ -11,6 +11,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::debug;
 
+use maki_storage::StateDir;
+use maki_storage::auth::{OAuthTokens, load_tokens, lock_tokens, save_tokens};
+
 use crate::AgentError;
 
 pub(crate) mod anthropic;
@@ -37,6 +40,7 @@ pub(crate) mod zai;
 
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
+const UNAUTHORIZED_STATUS: u16 = 401;
 const AUTHORIZATION_HEADER: &str = "authorization";
 
 fn bearer_value(api_key: &str) -> String {
@@ -67,6 +71,28 @@ impl Default for Timeouts {
             low_speed: Duration::from_secs(30),
         }
     }
+}
+
+/// Reading, refreshing and writing tokens has to happen as one turn. Whoever
+/// queued behind a peer here is holding a copy the peer already spent, and
+/// replaying a rotated refresh token gets the whole family revoked, so the
+/// tokens are loaded again once the lock is in hand.
+pub(crate) fn refreshed_tokens(
+    dir: &StateDir,
+    provider: &str,
+    refresh: impl FnOnce(&OAuthTokens) -> Result<OAuthTokens, AgentError>,
+) -> Result<OAuthTokens, AgentError> {
+    let _lock = lock_tokens(dir, provider);
+    let current = load_tokens(dir, provider).ok_or_else(|| AgentError::Api {
+        status: UNAUTHORIZED_STATUS,
+        message: format!("{provider} OAuth tokens not found on disk"),
+    })?;
+    if !current.is_expired() {
+        return Ok(current);
+    }
+    let fresh = refresh(&current)?;
+    save_tokens(dir, provider, &fresh)?;
+    Ok(fresh)
 }
 
 #[derive(Clone)]

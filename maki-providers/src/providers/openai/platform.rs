@@ -16,8 +16,8 @@ use crate::{
 };
 
 use super::auth;
-use crate::providers::ResolvedAuth;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::providers::{ResolvedAuth, refreshed_tokens};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "openai",
@@ -150,18 +150,8 @@ impl OpenAi {
             message: "OAuth refresh not available for externally-managed auth".into(),
         })?;
         let resolved = smol::unblock(move || {
-            let tokens =
-                maki_storage::auth::load_tokens(&storage, auth::PROVIDER).ok_or_else(|| {
-                    AgentError::Api {
-                        status: 401,
-                        message: "OpenAI OAuth tokens not found on disk".into(),
-                    }
-                })?;
-            match auth::refresh_tokens(&tokens) {
-                Ok(fresh) => {
-                    maki_storage::auth::save_tokens(&storage, auth::PROVIDER, &fresh)?;
-                    auth::build_oauth_resolved(&fresh)
-                }
+            match refreshed_tokens(&storage, auth::PROVIDER, auth::refresh_tokens) {
+                Ok(fresh) => auth::build_oauth_resolved(&fresh),
                 Err(e) => {
                     warn!(error = %e, "OpenAI OAuth refresh failed, clearing stale tokens");
                     let _ = maki_storage::auth::delete_tokens(&storage, auth::PROVIDER);

@@ -1,6 +1,7 @@
-use std::fs;
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::sleep;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,9 @@ use crate::{StateDir, StorageError, atomic_write_permissions};
 const AUTH_DIR: &str = "auth";
 const AUTH_FILE_MODE: u32 = 0o600;
 const REFRESH_BUFFER_SECS: u64 = 60;
+const LOCK_SUFFIX: &str = ".lock";
+const LOCK_WAIT: Duration = Duration::from_secs(30);
+const LOCK_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OAuthTokens {
@@ -47,7 +51,7 @@ pub struct McpAuthData {
     pub token_endpoint: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ProviderCredentials {
     pub api_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,6 +70,41 @@ impl ProviderCredentials {
             "****".to_string()
         }
     }
+}
+
+/// Refresh tokens rotate and a rotated one is single use, so two processes
+/// refreshing at once leave the loser replaying a spent token, which providers
+/// answer by revoking the whole family instead of failing the one call. Waiting
+/// forever would be worse than the race though, since this runs on the ui
+/// thread too, so a lock that does not arrive in time is given up and the
+/// caller carries on as before.
+pub fn lock_exclusive(path: &Path) -> Option<File> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => {
+            fs::create_dir_all(path.parent()?).ok()?;
+            OpenOptions::new()
+                .write(true)
+                .truncate(false)
+                .create(true)
+                .open(path)
+                .ok()?
+        }
+    };
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => sleep(LOCK_POLL),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Every write replaces the token file, so the lock sits beside it under a name
+/// no loader reads.
+pub fn lock_tokens(dir: &StateDir, provider: &str) -> Option<File> {
+    lock_exclusive(&auth_path(dir, &format!("{provider}{LOCK_SUFFIX}")))
 }
 
 pub fn now_millis() -> u64 {

@@ -9,7 +9,7 @@ use serde::Deserialize;
 use tracing::{debug, error, warn};
 
 use crate::AgentError;
-use crate::providers::{ResolvedAuth, urlenc};
+use crate::providers::{ResolvedAuth, refreshed_tokens, urlenc};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const PROVIDER: &str = "openai";
@@ -271,9 +271,8 @@ pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
             debug!("using OpenAI OAuth authentication");
             return build_oauth_resolved(&tokens);
         }
-        match refresh_tokens(&tokens) {
+        match refreshed_tokens(dir, PROVIDER, refresh_tokens) {
             Ok(fresh) => {
-                save_tokens(dir, PROVIDER, &fresh)?;
                 debug!("using OpenAI OAuth authentication (refreshed)");
                 return build_oauth_resolved(&fresh);
             }

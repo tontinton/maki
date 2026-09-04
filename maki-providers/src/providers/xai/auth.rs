@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, error, warn};
 
 use crate::AgentError;
-use crate::providers::{KeyPool, ResolvedAuth, urlenc};
+use crate::providers::{KeyPool, ResolvedAuth, refreshed_tokens, urlenc};
 
 use super::catalog;
 
@@ -219,9 +219,8 @@ pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
             debug!("using xAI OAuth authentication");
             return build_oauth_resolved(&tokens);
         }
-        match refresh_tokens(&tokens) {
+        match refreshed_tokens(dir, PROVIDER, refresh_tokens) {
             Ok(fresh) => {
-                save_tokens(dir, PROVIDER, &fresh)?;
                 debug!("using xAI OAuth authentication (refreshed)");
                 return build_oauth_resolved(&fresh);
             }

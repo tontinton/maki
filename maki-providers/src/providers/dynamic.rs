@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 
 use flume::Sender;
 use maki_config::providers::ProvidersConfig;
 use maki_storage::StateDir;
+use maki_storage::auth::lock_exclusive;
 use maki_storage::id::SessionRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -43,6 +43,7 @@ const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const PROVIDERS_DIR: &str = "providers";
 const SCRIPT_CACHE_FILE: &str = "provider-scripts.json";
 const THINKING_FIELDS_KEY: &str = "thinking_fields";
+const RELOAD_SUBCOMMAND: &str = "reload";
 
 struct DynamicProviderMeta {
     slug: String,
@@ -52,6 +53,7 @@ struct DynamicProviderMeta {
     has_auth: bool,
     script_path: PathBuf,
     models: Vec<ScriptModel>,
+    refresh_gate: RefreshGate,
 }
 
 #[derive(Deserialize)]
@@ -204,7 +206,12 @@ fn run_script(path: &Path, subcommand: &str, timeout: Duration) -> Result<String
     })
 }
 
+/// Login writes a brand new token family, so it has to wait for an in flight
+/// refresh instead of racing it: the loser of that race would put the old
+/// family back on top of the new one, and the user would see the same auth
+/// error right after logging in.
 fn run_script_interactive(path: &Path, subcommand: &str) -> Result<(), AgentError> {
+    let _lock = lock_exclusive(path);
     let status = Command::new(path)
         .arg(subcommand)
         .stdin(std::process::Stdio::inherit())
@@ -224,6 +231,9 @@ fn run_script_interactive(path: &Path, subcommand: &str) -> Result<(), AgentErro
 }
 
 fn resolve_auth(meta: &DynamicProviderMeta) -> Result<ResolvedAuth, AgentError> {
+    // A script may refresh under `resolve` when the token is near expiry, and
+    // this runs on every `create`, so it takes the lock too.
+    let _lock = lock_exclusive(&meta.script_path);
     let stdout = run_script(&meta.script_path, "resolve", SCRIPT_TIMEOUT)?;
     let parsed: ScriptResolvedAuth =
         serde_json::from_str(&stdout).map_err(|e| AgentError::Config {
@@ -373,6 +383,7 @@ fn build_meta(
         has_auth: info.has_auth,
         script_path,
         models,
+        refresh_gate: RefreshGate::default(),
     })
 }
 
@@ -602,7 +613,7 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
         inner,
         auth,
         models: &meta.models,
-        refresh_gate: RefreshGate::default(),
+        refresh_gate: &meta.refresh_gate,
     }))
 }
 
@@ -661,20 +672,28 @@ struct DynamicProvider {
     inner: Box<dyn Provider>,
     auth: Arc<Mutex<ResolvedAuth>>,
     models: &'static [ScriptModel],
-    refresh_gate: RefreshGate,
+    refresh_gate: &'static RefreshGate,
 }
 
-/// Gate around the auth script's `refresh`. Parallel 401s, say from sub-agents
-/// sharing one provider, would each spend the script's rotating refresh token,
-/// so callers queue on the lock and whoever arrives late reuses what the winner
-/// fetched. A refresh may hand back byte-identical credentials, so the
-/// generation counter, not the auth bytes, is what tells a parked caller that a
-/// peer already did the work. The lock orders that bump against the load, which
-/// is why `Relaxed` is enough.
+/// Gate around the auth script's `refresh`. Every `create` mints a fresh
+/// `DynamicProvider`, so sub-agents running their own model would each spend
+/// the script's rotating refresh token, and a spent one taken twice costs the
+/// whole token family. They queue here instead, and the late arrival takes the
+/// credentials the winner brought back. That is why the gate hangs off the
+/// `'static` per-slug metadata rather than the provider.
 #[derive(Default)]
 struct RefreshGate {
     lock: smol::lock::Mutex<()>,
-    generation: AtomicU64,
+    winner: Mutex<Winner>,
+}
+
+/// A refresh can hand back byte-identical credentials, so the count, not the
+/// bytes, is what tells a parked caller the work is already done. Both live
+/// under one lock so they cannot be read apart.
+#[derive(Default, Clone)]
+struct Winner {
+    refreshes: u64,
+    auth: Option<ResolvedAuth>,
 }
 
 impl RefreshGate {
@@ -684,14 +703,21 @@ impl RefreshGate {
         script_path: &Path,
         auth: &Arc<Mutex<ResolvedAuth>>,
     ) -> Result<(), AgentError> {
-        let before = self.generation.load(Ordering::Relaxed);
+        let before = self.winner.lock().unwrap().refreshes;
         let _guard = self.lock.lock().await;
-        if self.generation.load(Ordering::Relaxed) != before {
+        let winner = self.winner.lock().unwrap().clone();
+        if winner.refreshes != before {
             debug!("peer refreshed while we waited, skipping script run");
+            if let Some(fresh) = winner.auth {
+                *auth.lock().unwrap() = fresh;
+            }
             return Ok(());
         }
         run_auth_script(slug, script_path, auth, "refresh").await?;
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        *self.winner.lock().unwrap() = Winner {
+            refreshes: before + 1,
+            auth: Some(auth.lock().unwrap().clone()),
+        };
         Ok(())
     }
 }
@@ -706,6 +732,9 @@ async fn run_auth_script(
     let auth = auth.clone();
     let slug = slug.to_string();
     smol::unblock(move || {
+        // `reload` only re-reads what a login wrote, so it spends no token and
+        // must not park the ui behind someone else's refresh.
+        let _lock = (subcommand != RELOAD_SUBCOMMAND).then(|| lock_exclusive(&script_path));
         let stdout = run_script(&script_path, subcommand, SCRIPT_TIMEOUT)?;
         let parsed: ScriptResolvedAuth =
             serde_json::from_str(&stdout).map_err(|e| AgentError::Config {
@@ -824,7 +853,7 @@ impl Provider for DynamicProvider {
             self.slug,
             self.script_path,
             &self.auth,
-            "reload",
+            RELOAD_SUBCOMMAND,
         ))
     }
 
@@ -1042,6 +1071,10 @@ esac
         fs::read_to_string(counter).unwrap().trim().parse().unwrap()
     }
 
+    /// Two auth slots, because sub-agents on one slug each build their own
+    /// provider and only the gate is shared. Both have to come out holding the
+    /// winner's token, since a second run would spend the rotating refresh
+    /// token again.
     #[cfg(unix)]
     #[test_case(true, "Bearer refreshed-2" ; "rotating_token")]
     #[test_case(false, CONSTANT_TOKEN ; "unchanged_token")]
@@ -1049,31 +1082,36 @@ esac
         let tmp = TempDir::new().unwrap();
         let counter = tmp.path().join("count");
         let script = write_counting_refresh_script(tmp.path(), &counter, rotating);
-        let auth = Arc::new(Mutex::new(ResolvedAuth::for_test(
-            None,
-            vec![("authorization".into(), STALE_TOKEN.into())],
-        )));
+        let stale = || {
+            Arc::new(Mutex::new(ResolvedAuth::for_test(
+                None,
+                vec![("authorization".into(), STALE_TOKEN.into())],
+            )))
+        };
+        let (first, second) = (stale(), stale());
         let gate = RefreshGate::default();
 
         smol::block_on(async {
-            let (first, second) = futures_lite::future::zip(
-                gate.refresh(TEST_SLUG, &script, &auth),
-                gate.refresh(TEST_SLUG, &script, &auth),
+            let (a, b) = futures_lite::future::zip(
+                gate.refresh(TEST_SLUG, &script, &first),
+                gate.refresh(TEST_SLUG, &script, &second),
             )
             .await;
-            first.unwrap();
-            second.unwrap();
+            a.unwrap();
+            b.unwrap();
 
             assert_eq!(
                 script_runs(&counter),
                 1,
                 "concurrent 401s share one script run"
             );
-            assert_ne!(auth.lock().unwrap().headers[0].1, STALE_TOKEN);
+            let winner = first.lock().unwrap().headers[0].1.clone();
+            assert_ne!(winner, STALE_TOKEN);
+            assert_eq!(second.lock().unwrap().headers[0].1, winner);
 
-            // The late caller snapshots the bumped generation before locking, so
-            // a refresh that doesn't overlap anyone still runs the script.
-            gate.refresh(TEST_SLUG, &script, &auth).await.unwrap();
+            // The late caller snapshots the count before locking, so a refresh
+            // that overlaps nobody still runs the script.
+            gate.refresh(TEST_SLUG, &script, &first).await.unwrap();
         });
 
         assert_eq!(
@@ -1081,7 +1119,7 @@ esac
             2,
             "a refresh that overlaps nobody runs the script again"
         );
-        assert_eq!(auth.lock().unwrap().headers[0].1, final_token);
+        assert_eq!(first.lock().unwrap().headers[0].1, final_token);
     }
 
     #[cfg(unix)]
