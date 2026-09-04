@@ -18,6 +18,9 @@ env:
 
 permissions:
   contents: write
+  # The bot dispatches release.yml explicitly, because a GITHUB_TOKEN tag push
+  # would not trigger workflows.
+  actions: write
 
 jobs:
   tag-release:
