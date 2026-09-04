@@ -153,6 +153,7 @@ impl Store {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;
              CREATE TABLE IF NOT EXISTS instances (
                  id INTEGER PRIMARY KEY,
                  name TEXT NOT NULL UNIQUE,
