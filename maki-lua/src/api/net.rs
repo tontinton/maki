@@ -1,4 +1,5 @@
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation
 use isahc::{AsyncBody, HttpClient, Request, Response};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
+use smol::{Timer, unblock};
 use url::Url;
 
 use crate::api::util::pair::{Pair, try_pair};
@@ -27,6 +29,8 @@ const HTTP_SCHEME: &str = "http://";
 const HTTPS_SCHEME: &str = "https://";
 const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
+const DNS_ATTEMPTS: u32 = 3;
+const DNS_RETRY_DELAY: Duration = Duration::from_millis(150);
 const ALLOWLIST_HINT: &str = "add it to `net.allowed_private_hosts` in your init.lua to allow it";
 /// Reserved IPv4 ranges the standard library has no predicate for. Carrier
 /// grade NAT is the one that bites: Alibaba Cloud parks its instance metadata
@@ -227,7 +231,7 @@ struct ResponseData {
 /// end
 #[lua_fn(guard = Net)]
 async fn request(lua: Lua, url: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
-    let params = try_pair!(extract_request_params(&url, opts.as_ref()));
+    let params = try_pair!(extract_request_params(&url, opts.as_ref()).await);
     let resp = try_pair!(do_request(params).await);
     let tbl = lua.create_table()?;
     tbl.set("body", resp.body)?;
@@ -252,10 +256,10 @@ lua_table! {
     ]
 }
 
-fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<RequestParams, String> {
+async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<RequestParams, String> {
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
     let url = validate_and_upgrade_url(url, &allowed)?;
-    let pin = check_ssrf(&url, &allowed)?;
+    let pin = check_ssrf(&url, &allowed).await?;
 
     let method = opts
         .and_then(|o| o.get::<String>("method").ok())
@@ -429,7 +433,9 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
         let Some(location) = redirect_location(&response) else {
             break;
         };
-        params.follow_redirect(response.status().as_u16(), &location, &allowed)?;
+        params
+            .follow_redirect(response.status().as_u16(), &location, &allowed)
+            .await?;
         response = send_with_retries(&build_client(&params)?, &params).await?;
     }
     if redirect_location(&response).is_some() {
@@ -478,7 +484,7 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
 impl RequestParams {
     /// Points the request at a redirect target after putting it through the
     /// same scheme and SSRF rules as the URL the caller asked for.
-    fn follow_redirect(
+    async fn follow_redirect(
         &mut self,
         status: u16,
         location: &str,
@@ -489,7 +495,7 @@ impl RequestParams {
             .join(location)
             .map_err(|e| format!("invalid redirect to {location}: {e}"))?;
         let target = validate_and_upgrade_url(target.as_str(), allowed)?;
-        let pin = check_ssrf(&target, allowed)?;
+        let pin = check_ssrf(&target, allowed).await?;
 
         let landed =
             Url::parse(&target).map_err(|e| format!("invalid redirect to {location}: {e}"))?;
@@ -537,9 +543,29 @@ fn extract_host_port(url: &str) -> Option<(&str, u16)> {
     Some((host, port.unwrap_or(default_port)))
 }
 
+/// getaddrinfo blocks, so it runs on the blocking pool rather than on the
+/// executor thread every other plugin future shares. A resolver saying "try
+/// again" (a cold cache, a link that just came back) has not answered yet, so a
+/// couple of retries go out before the lookup counts as a failure.
+async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    let mut attempt = 1;
+    loop {
+        let target = (host.to_string(), port);
+        match unblock(move || target.to_socket_addrs()).await {
+            Ok(addrs) => return Ok(addrs.collect()),
+            Err(e) if attempt == DNS_ATTEMPTS => return Err(e),
+            Err(e) => {
+                tracing::debug!(host, port, attempt, error = %e, "name lookup failed, retrying")
+            }
+        }
+        attempt += 1;
+        Timer::after(DNS_RETRY_DELAY).await;
+    }
+}
+
 /// Runs the guard and, when it had to resolve a name to reach its verdict,
 /// hands back the address the request must then be pinned to.
-fn check_ssrf(url: &str, allowed: &HostAllowlist) -> Result<Option<DnsPin>, String> {
+async fn check_ssrf(url: &str, allowed: &HostAllowlist) -> Result<Option<DnsPin>, String> {
     let (host, port) = extract_host_port(url).ok_or("cannot extract host from URL")?;
     // A name on the allowlist is trusted whatever it resolves to, and a URL
     // carrying a literal address leaves curl nothing to resolve. Neither
@@ -558,10 +584,11 @@ fn check_ssrf(url: &str, allowed: &HostAllowlist) -> Result<Option<DnsPin>, Stri
     }
 
     // A host we cannot resolve is a host we cannot vouch for, and that covers
-    // being offline: the answer the guard would have judged never arrives.
-    let addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("blocked: cannot resolve {host}: {e} ({ALLOWLIST_HINT})"))?;
+    // being offline: the answer the guard would have judged never arrives. The
+    // failure is the network's and not a verdict, so it is not worded as one.
+    let addrs = resolve(host, port)
+        .await
+        .map_err(|e| format!("cannot resolve {host}: {e}"))?;
     let mut vetted = None;
     for sa in addrs {
         if is_private_ip(&sa.ip()) && !allowed.allows_ip(sa.ip(), port) {
@@ -675,6 +702,8 @@ mod tests {
     const OTHER_PUBLIC_URL: &str = "https://1.1.1.1/";
     const PUBLIC_URL_OTHER_PORT: &str = "https://8.8.8.8:8443/";
     const BLOCKED_PREFIX: &str = "blocked:";
+    /// Reserved by RFC 6761, so every resolver answers NXDOMAIN for it.
+    const UNRESOLVABLE_HOST: &str = "maki.invalid";
     const PAYLOAD: &str = "payload";
     const AUTH_HEADER: &str = "Authorization";
     const AUTH_VALUE: &str = "Bearer tok";
@@ -683,6 +712,25 @@ mod tests {
 
     fn allowlist(entries: &[&str]) -> HostAllowlist {
         HostAllowlist::parse(&entries.iter().map(|e| (*e).to_string()).collect::<Vec<_>>())
+    }
+
+    /// The guard went async when the name lookup moved off the executor thread.
+    /// Driving it to completion here keeps the tests below about the verdict.
+    fn ssrf(url: &str, allowed: &HostAllowlist) -> Result<Option<DnsPin>, String> {
+        smol::block_on(check_ssrf(url, allowed))
+    }
+
+    fn redirect(
+        params: &mut RequestParams,
+        status: u16,
+        location: &str,
+        allowed: &HostAllowlist,
+    ) -> Result<(), String> {
+        smol::block_on(params.follow_redirect(status, location, allowed))
+    }
+
+    fn request_params(url: &str, opts: Option<&Table>) -> Result<RequestParams, String> {
+        smol::block_on(extract_request_params(url, opts))
     }
 
     #[test_case(&[], "https://example.com/", "https://example.com/" ; "https_passthrough")]
@@ -722,7 +770,7 @@ mod tests {
     #[test_case(&[PRIVATE_CIDR_ENTRY], OUT_OF_CIDR_URL, false ; "outside_cidr_still_blocked")]
     #[test_case(&[PRIVATE_CIDR_ENTRY], METADATA_URL, false ; "metadata_never_allowed_by_a_range")]
     fn check_ssrf_cases(entries: &[&str], url: &str, allowed: bool) {
-        let result = check_ssrf(url, &allowlist(entries));
+        let result = ssrf(url, &allowlist(entries));
         assert_eq!(
             result.is_ok(),
             allowed,
@@ -738,15 +786,25 @@ mod tests {
     #[test_case("https://[fe80::1%25eth0]/" ; "percent_encoded_zone_id")]
     fn normalised_bypass_is_refused(url: &str) {
         let allowed = HostAllowlist::default();
-        let result = validate_and_upgrade_url(url, &allowed).and_then(|u| check_ssrf(&u, &allowed));
+        let result = validate_and_upgrade_url(url, &allowed).and_then(|u| ssrf(&u, &allowed));
         assert!(result.is_err(), "{url}");
     }
 
     #[test_case(LOOPBACK_URL ; "private_address")]
     fn blocked_message_points_at_the_config_option(url: &str) {
-        let err = check_ssrf(url, &HostAllowlist::default()).unwrap_err();
+        let err = ssrf(url, &HostAllowlist::default()).unwrap_err();
         assert!(err.starts_with(BLOCKED_PREFIX), "{err}");
         assert!(err.contains(ALLOWLIST_HINT), "{err}");
+    }
+
+    /// A resolver with no answer has reached no verdict, so pointing at the
+    /// allowlist would send the caller after the wrong problem.
+    #[test]
+    fn an_unresolvable_host_reads_as_a_network_failure() {
+        let url = format!("https://{UNRESOLVABLE_HOST}/");
+        let err = ssrf(&url, &HostAllowlist::default()).expect_err(UNRESOLVABLE_HOST);
+        assert!(!err.starts_with(BLOCKED_PREFIX), "{err}");
+        assert!(err.contains(UNRESOLVABLE_HOST), "{err}");
     }
 
     fn redirect_params(url: &str) -> RequestParams {
@@ -767,7 +825,7 @@ mod tests {
     #[test]
     fn a_resolved_host_is_pinned_to_the_address_the_guard_vetted() {
         let allowed = allowlist(&[LOOPBACK_CIDR_ENTRY, IPV6_LOOPBACK_ENTRY]);
-        let pin = check_ssrf(LOCALHOST_URL, &allowed)
+        let pin = ssrf(LOCALHOST_URL, &allowed)
             .unwrap()
             .expect("a resolved host must be pinned");
         assert_eq!(pin.host, LOCALHOST_ENTRY);
@@ -778,7 +836,7 @@ mod tests {
     #[test_case(PUBLIC_URL ; "literal_address_needs_no_lookup")]
     #[test_case(LOCALHOST_URL ; "allowlisted_name_is_trusted_however_it_resolves")]
     fn hosts_the_guard_never_resolved_are_not_pinned(url: &str) {
-        let pin = check_ssrf(url, &allowlist(&[LOCALHOST_ENTRY])).unwrap();
+        let pin = ssrf(url, &allowlist(&[LOCALHOST_ENTRY])).unwrap();
         assert!(pin.is_none(), "{pin:?}");
     }
 
@@ -793,18 +851,26 @@ mod tests {
             port: ALLOWED_PORT,
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
         });
-        params
-            .follow_redirect(302, LOOPBACK_PORT_URL, &allowlist(&[LOOPBACK_PORT_ENTRY]))
-            .unwrap();
+        redirect(
+            &mut params,
+            302,
+            LOOPBACK_PORT_URL,
+            &allowlist(&[LOOPBACK_PORT_ENTRY]),
+        )
+        .unwrap();
         assert!(params.pin.is_none(), "{:?}", params.pin);
     }
 
     #[test]
     fn redirect_hop_into_a_private_address_is_refused() {
         let mut params = redirect_params(LOOPBACK_PORT_URL);
-        let err = params
-            .follow_redirect(302, METADATA_URL, &allowlist(&[LOOPBACK_PORT_ENTRY]))
-            .unwrap_err();
+        let err = redirect(
+            &mut params,
+            302,
+            METADATA_URL,
+            &allowlist(&[LOOPBACK_PORT_ENTRY]),
+        )
+        .unwrap_err();
         assert!(err.starts_with(BLOCKED_PREFIX), "{err}");
         assert_eq!(
             params.url, LOOPBACK_PORT_URL,
@@ -815,9 +881,13 @@ mod tests {
     #[test]
     fn relative_redirect_on_an_allowlisted_host_is_followed() {
         let mut params = redirect_params(LOOPBACK_PORT_URL);
-        params
-            .follow_redirect(302, "/results", &allowlist(&[LOOPBACK_PORT_ENTRY]))
-            .unwrap();
+        redirect(
+            &mut params,
+            302,
+            "/results",
+            &allowlist(&[LOOPBACK_PORT_ENTRY]),
+        )
+        .unwrap();
         assert_eq!(params.url, "http://127.0.0.1:8888/results");
     }
 
@@ -831,9 +901,7 @@ mod tests {
             (AUTH_HEADER.to_string(), AUTH_VALUE.to_string()),
             (ACCEPT_HEADER.to_string(), ACCEPT_VALUE.to_string()),
         ];
-        params
-            .follow_redirect(302, location, &HostAllowlist::default())
-            .unwrap();
+        redirect(&mut params, 302, location, &HostAllowlist::default()).unwrap();
         assert_eq!(
             params.headers.iter().any(|(k, _)| k == AUTH_HEADER),
             kept,
@@ -849,9 +917,7 @@ mod tests {
         let mut params = redirect_params(PUBLIC_URL);
         params.method = "POST".to_string();
         params.body = PAYLOAD.into();
-        params
-            .follow_redirect(status, PUBLIC_URL, &HostAllowlist::default())
-            .unwrap();
+        redirect(&mut params, status, PUBLIC_URL, &HostAllowlist::default()).unwrap();
         assert_eq!(params.method, method);
         assert_eq!(params.body, body.as_bytes());
     }
@@ -980,7 +1046,7 @@ mod tests {
 
     #[test]
     fn extract_params_defaults_no_opts() {
-        let params = extract_request_params(PUBLIC_URL, None).unwrap();
+        let params = request_params(PUBLIC_URL, None).unwrap();
         assert_eq!(params.url, PUBLIC_URL);
         assert_eq!(params.method, "GET");
         assert!(params.headers.is_empty());
@@ -995,7 +1061,7 @@ mod tests {
         let lua = Lua::new();
         let opts = lua.create_table().unwrap();
         opts.set("timeout", MAX_TIMEOUT_SECS + 100).unwrap();
-        let params = extract_request_params(PUBLIC_URL, Some(&opts)).unwrap();
+        let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
         assert_eq!(params.timeout, Duration::from_secs(MAX_TIMEOUT_SECS));
     }
 
@@ -1005,14 +1071,14 @@ mod tests {
         let opts = lua.create_table().unwrap();
         opts.set("method", "POST").unwrap();
         opts.set("body", r#"{"key":"val"}"#).unwrap();
-        let params = extract_request_params(PUBLIC_URL, Some(&opts)).unwrap();
+        let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
         assert_eq!(params.method, "POST");
         assert_eq!(params.body, br#"{"key":"val"}"#);
     }
 
     #[test]
     fn extract_params_http_upgraded_to_https() {
-        let params = extract_request_params(PUBLIC_HTTP_URL, None).unwrap();
+        let params = request_params(PUBLIC_HTTP_URL, None).unwrap();
         assert_eq!(params.url, PUBLIC_URL);
     }
 
@@ -1024,7 +1090,7 @@ mod tests {
         headers.set(ACCEPT_HEADER, ACCEPT_VALUE).unwrap();
         let opts = lua.create_table().unwrap();
         opts.set("headers", headers).unwrap();
-        let params = extract_request_params(PUBLIC_URL, Some(&opts)).unwrap();
+        let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
         assert_eq!(params.headers.len(), 2);
         assert!(
             params
