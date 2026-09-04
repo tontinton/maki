@@ -2150,11 +2150,14 @@ fn drive_tunnel(
         }
     };
     let link_hash = store::hash_token(&control_link);
+    // Attach first, then hand the link to the instance: a client that holds
+    // the link must find the tunnel already online, or a request fired the
+    // instant the link arrives races a 503 against the hub insert.
+    let (cmd_tx, cmd_rx) = channel::<TunnelCommand>();
+    let epoch = hub.attach(instance.id, cmd_tx, link_hash.clone());
     let _ = writer.lock().unwrap().send(WsMessage::text(
         serde_json::json!({"link": control_link}).to_string(),
     ));
-    let (cmd_tx, cmd_rx) = channel::<TunnelCommand>();
-    let epoch = hub.attach(instance.id, cmd_tx, link_hash.clone());
 
     // Only the writer thread touches the write side; this thread keeps reading.
     let writer_hub = Arc::clone(&hub);
