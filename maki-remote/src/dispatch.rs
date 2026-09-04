@@ -55,7 +55,10 @@ pub enum DispatchOutcome {
         source: SseSource,
     },
     Posted(u16),
-    Json { status: u16, body: Vec<u8> },
+    Json {
+        status: u16,
+        body: Vec<u8>,
+    },
     NotFound,
 }
 
@@ -136,14 +139,20 @@ impl Dispatcher {
 
     fn dispatch_sessions(&self) -> Option<serde_json::Value> {
         let (tx, rx) = flume::bounded(1);
-        self.requests.try_send(crate::RemoteRequest::Sessions { reply: tx }).ok()?;
-        rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS)).ok()
+        self.requests
+            .try_send(crate::RemoteRequest::Sessions { reply: tx })
+            .ok()?;
+        rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS))
+            .ok()
     }
 
     fn dispatch_model_get(&self) -> Option<serde_json::Value> {
         let (tx, rx) = flume::bounded(1);
-        self.requests.try_send(crate::RemoteRequest::ModelGet { reply: tx }).ok()?;
-        rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS)).ok()
+        self.requests
+            .try_send(crate::RemoteRequest::ModelGet { reply: tx })
+            .ok()?;
+        rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS))
+            .ok()
     }
 
     fn dispatch_model_set(&self, body: &str) -> Option<Result<serde_json::Value, String>> {
@@ -151,8 +160,14 @@ impl Dispatcher {
             Ok(v) => v,
             Err(_) => return Some(Err("invalid json".into())),
         };
-        let spec = value.get("spec").and_then(|v| v.as_str()).map(str::to_owned);
-        let thinking = value.get("thinking").and_then(|v| v.as_str()).map(str::to_owned);
+        let spec = value
+            .get("spec")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let thinking = value
+            .get("thinking")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
         let fast = value.get("fast").and_then(|v| v.as_bool());
         if spec.is_none() && thinking.is_none() && fast.is_none() {
             return Some(Err("no model fields: need spec, thinking or fast".into()));
@@ -166,7 +181,8 @@ impl Dispatcher {
                 reply: tx,
             })
             .ok()?;
-        rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS)).ok()
+        rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS))
+            .ok()
     }
 
     fn dispatch_post(&self, route: Route, body: &str) -> Option<()> {
@@ -203,15 +219,11 @@ impl Dispatcher {
                     .and_then(|v| v.as_str())
                     .map(str::to_owned)?;
                 let (tx, rx) = flume::unbounded();
-                (
-                    crate::RemoteRequest::Command {
-                        cmdline,
-                        reply: tx,
-                    },
-                    rx,
-                )
+                (crate::RemoteRequest::Command { cmdline, reply: tx }, rx)
             }
-            Route::Index | Route::Events | Route::Sessions | Route::ModelGet | Route::ModelPost => return None,
+            Route::Index | Route::Events | Route::Sessions | Route::ModelGet | Route::ModelPost => {
+                return None;
+            }
         };
         self.requests.try_send(request).ok()?;
         // The loop answers fast (it only flips state or forwards); still,

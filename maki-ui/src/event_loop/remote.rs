@@ -233,11 +233,7 @@ impl RemoteSlot {
                     fast,
                     reply,
                 } => {
-                    let outcome = app.remote_model_set(
-                        spec.as_deref(),
-                        thinking.as_deref(),
-                        fast,
-                    );
+                    let outcome = app.remote_model_set(spec.as_deref(), thinking.as_deref(), fast);
                     let _ = reply.send(outcome.clone().map_err(|e| e.clone()));
                     match outcome {
                         Ok(_) => Ok(vec![]),

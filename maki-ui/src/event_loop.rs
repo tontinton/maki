@@ -914,10 +914,11 @@ impl<'t> EventLoop<'t> {
                 serde_json::json!({ "sessions": list, "focused": focused_id })
             };
             let sessions_json_clone = sessions_json.clone();
-            let actions = self.remote.drain_requests_with(
-                &mut self.sessions[focused].app,
-                move || sessions_json_clone.clone(),
-            );
+            let actions = self
+                .remote
+                .drain_requests_with(&mut self.sessions[focused].app, move || {
+                    sessions_json_clone.clone()
+                });
             self.dispatch(focused, actions);
         }
         // Leftovers beyond the budget are picked up right after the next draw.

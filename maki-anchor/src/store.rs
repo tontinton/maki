@@ -531,9 +531,8 @@ impl Store {
 
     pub fn list_users(&self) -> Result<Vec<UserRow>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, oidc_sub, email, name, is_admin FROM users ORDER BY id",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, oidc_sub, email, name, is_admin FROM users ORDER BY id")?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(UserRow {

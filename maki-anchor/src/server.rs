@@ -258,7 +258,9 @@ fn route(
             .to_string()
             .into_bytes()
         } else {
-            serde_json::json!({"enabled": false}).to_string().into_bytes()
+            serde_json::json!({"enabled": false})
+                .to_string()
+                .into_bytes()
         };
         return buffered((200, "application/json".to_string(), body), request);
     }
@@ -411,7 +413,11 @@ fn handle_api_create_instance(
 ) -> RouteOutcome {
     if request.method().as_str() != "POST" {
         return buffered(
-            (405, "text/plain".to_string(), b"method not allowed".to_vec()),
+            (
+                405,
+                "text/plain".to_string(),
+                b"method not allowed".to_vec(),
+            ),
             request,
         );
     }
@@ -428,7 +434,7 @@ fn handle_api_create_instance(
             return buffered(
                 (400, "text/plain".to_string(), b"invalid json".to_vec()),
                 request,
-            )
+            );
         }
     };
     let name = value
@@ -439,7 +445,11 @@ fn handle_api_create_instance(
         .to_owned();
     if name.is_empty() {
         return buffered(
-            (400, "application/json".to_string(), br#"{"error":"missing name"}"#.to_vec()),
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"missing name"}"#.to_vec(),
+            ),
             request,
         );
     }
@@ -510,7 +520,11 @@ fn handle_api_set_grant(
 ) -> RouteOutcome {
     if request.method().as_str() != "POST" {
         return buffered(
-            (405, "text/plain".to_string(), b"method not allowed".to_vec()),
+            (
+                405,
+                "text/plain".to_string(),
+                b"method not allowed".to_vec(),
+            ),
             request,
         );
     }
@@ -518,7 +532,11 @@ fn handle_api_set_grant(
         && !u.is_admin
     {
         return buffered(
-            (403, "application/json".to_string(), br#"{"error":"admin required"}"#.to_vec()),
+            (
+                403,
+                "application/json".to_string(),
+                br#"{"error":"admin required"}"#.to_vec(),
+            ),
             request,
         );
     }
@@ -535,27 +553,48 @@ fn handle_api_set_grant(
             return buffered(
                 (400, "text/plain".to_string(), b"invalid json".to_vec()),
                 request,
-            )
+            );
         }
     };
     let user_id = value.get("user_id").and_then(|v| v.as_i64());
-    let instance = value.get("instance").and_then(|v| v.as_str()).unwrap_or("").trim().to_owned();
-    let rights = value.get("rights").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    let instance = value
+        .get("instance")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    let rights = value
+        .get("rights")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
     let Some(user_id) = user_id else {
         return buffered(
-            (400, "application/json".to_string(), br#"{"error":"missing user_id"}"#.to_vec()),
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"missing user_id"}"#.to_vec(),
+            ),
             request,
         );
     };
     if instance.is_empty() {
         return buffered(
-            (400, "application/json".to_string(), br#"{"error":"missing instance"}"#.to_vec()),
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"missing instance"}"#.to_vec(),
+            ),
             request,
         );
     }
     let Some(role) = Role::parse(&rights) else {
         return buffered(
-            (400, "application/json".to_string(), br#"{"error":"rights must be view or control"}"#.to_vec()),
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"rights must be view or control"}"#.to_vec(),
+            ),
             request,
         );
     };
@@ -563,25 +602,41 @@ fn handle_api_set_grant(
         Ok(r) => r,
         Err(_) => {
             return buffered(
-                (404, "application/json".to_string(), br#"{"error":"unknown instance"}"#.to_vec()),
+                (
+                    404,
+                    "application/json".to_string(),
+                    br#"{"error":"unknown instance"}"#.to_vec(),
+                ),
                 request,
-            )
+            );
         }
     };
     if store.user_by_id(user_id).is_err() {
         return buffered(
-            (404, "application/json".to_string(), br#"{"error":"unknown user"}"#.to_vec()),
+            (
+                404,
+                "application/json".to_string(),
+                br#"{"error":"unknown user"}"#.to_vec(),
+            ),
             request,
         );
     }
     if let Err(e) = store.set_grant(user_id, instance_row.id, role) {
         return buffered(
-            (500, "text/plain".to_string(), format!("store error: {e}").into_bytes()),
+            (
+                500,
+                "text/plain".to_string(),
+                format!("store error: {e}").into_bytes(),
+            ),
             request,
         );
     }
     buffered(
-        (200, "application/json".to_string(), br#"{"ok":true}"#.to_vec()),
+        (
+            200,
+            "application/json".to_string(),
+            br#"{"ok":true}"#.to_vec(),
+        ),
         request,
     )
 }
@@ -593,7 +648,11 @@ fn handle_api_revoke_grant(
 ) -> RouteOutcome {
     if request.method().as_str() != "POST" {
         return buffered(
-            (405, "text/plain".to_string(), b"method not allowed".to_vec()),
+            (
+                405,
+                "text/plain".to_string(),
+                b"method not allowed".to_vec(),
+            ),
             request,
         );
     }
@@ -601,7 +660,11 @@ fn handle_api_revoke_grant(
         && !u.is_admin
     {
         return buffered(
-            (403, "application/json".to_string(), br#"{"error":"admin required"}"#.to_vec()),
+            (
+                403,
+                "application/json".to_string(),
+                br#"{"error":"admin required"}"#.to_vec(),
+            ),
             request,
         );
     }
@@ -618,20 +681,33 @@ fn handle_api_revoke_grant(
             return buffered(
                 (400, "text/plain".to_string(), b"invalid json".to_vec()),
                 request,
-            )
+            );
         }
     };
     let user_id = value.get("user_id").and_then(|v| v.as_i64());
-    let instance = value.get("instance").and_then(|v| v.as_str()).unwrap_or("").trim().to_owned();
+    let instance = value
+        .get("instance")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
     let Some(user_id) = user_id else {
         return buffered(
-            (400, "application/json".to_string(), br#"{"error":"missing user_id"}"#.to_vec()),
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"missing user_id"}"#.to_vec(),
+            ),
             request,
         );
     };
     if instance.is_empty() {
         return buffered(
-            (400, "application/json".to_string(), br#"{"error":"missing instance"}"#.to_vec()),
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"missing instance"}"#.to_vec(),
+            ),
             request,
         );
     }
@@ -639,22 +715,38 @@ fn handle_api_revoke_grant(
         Ok(r) => r,
         Err(_) => {
             return buffered(
-                (404, "application/json".to_string(), br#"{"error":"unknown instance"}"#.to_vec()),
+                (
+                    404,
+                    "application/json".to_string(),
+                    br#"{"error":"unknown instance"}"#.to_vec(),
+                ),
                 request,
-            )
+            );
         }
     };
     match store.delete_grant(user_id, instance_row.id) {
         Ok(true) => buffered(
-            (200, "application/json".to_string(), br#"{"ok":true}"#.to_vec()),
+            (
+                200,
+                "application/json".to_string(),
+                br#"{"ok":true}"#.to_vec(),
+            ),
             request,
         ),
         Ok(false) => buffered(
-            (404, "application/json".to_string(), br#"{"error":"grant not found"}"#.to_vec()),
+            (
+                404,
+                "application/json".to_string(),
+                br#"{"error":"grant not found"}"#.to_vec(),
+            ),
             request,
         ),
         Err(e) => buffered(
-            (500, "text/plain".to_string(), format!("store error: {e}").into_bytes()),
+            (
+                500,
+                "text/plain".to_string(),
+                format!("store error: {e}").into_bytes(),
+            ),
             request,
         ),
     }
@@ -681,7 +773,11 @@ fn route_authorized(
     if path == "/api/users" {
         if request.method().as_str() != "GET" {
             return buffered(
-                (405, "text/plain".to_string(), b"method not allowed".to_vec()),
+                (
+                    405,
+                    "text/plain".to_string(),
+                    b"method not allowed".to_vec(),
+                ),
                 request,
             );
         }
@@ -692,7 +788,11 @@ fn route_authorized(
             "GET" => buffered(json_list_grants(store), request),
             "POST" => handle_api_set_grant(request, store, user.as_ref()),
             _ => buffered(
-                (405, "text/plain".to_string(), b"method not allowed".to_vec()),
+                (
+                    405,
+                    "text/plain".to_string(),
+                    b"method not allowed".to_vec(),
+                ),
                 request,
             ),
         };
