@@ -17,7 +17,7 @@ use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
 use crate::providers::aperture::Aperture;
 use crate::providers::catalog::{
-    OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
+    CATALOG_BACKED_BUILTINS, available_if_warm, catalog_providers, catalog_providers_if_available,
 };
 use crate::providers::copilot::Copilot;
 use crate::providers::deepseek::DeepSeek;
@@ -254,7 +254,7 @@ impl ProviderKind {
             Self::Synthetic => Ok(Box::new(Synthetic::new(timeouts)?)),
             Self::Regolo => Ok(Box::new(Regolo::new(timeouts)?)),
             Self::TensorX => Ok(Box::new(TensorX::new(timeouts)?)),
-            Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
+            Self::Opencode => Ok(Box::new(Opencode::new(timeouts))),
             Self::Xai => Ok(Box::new(Xai::new(timeouts)?)),
             Self::Aperture => Ok(Box::new(Aperture::new(timeouts)?)),
         }
@@ -441,7 +441,7 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
             if ProviderKind::from_str(&cat.slug).is_ok()
                 || dynamic::base_for_slug(&cat.slug).is_some()
                 || crate::providers::custom::base_kind(&cat.slug).is_some()
-                || OPENCODE_FAMILY_SLUGS.contains(&cat.slug.as_str())
+                || CATALOG_BACKED_BUILTINS.contains(&cat.slug.as_str())
             {
                 continue;
             }
@@ -552,7 +552,7 @@ pub async fn fetch_all_models(
         for cat in catalog {
             if ProviderKind::from_str(&cat.slug).is_ok()
                 || dynamic::base_for_slug(&cat.slug).is_some()
-                || OPENCODE_FAMILY_SLUGS.contains(&cat.slug.as_str())
+                || CATALOG_BACKED_BUILTINS.contains(&cat.slug.as_str())
             {
                 continue;
             }

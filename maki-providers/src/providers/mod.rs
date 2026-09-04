@@ -146,7 +146,7 @@ impl ResolvedAuth {
     /// Replace a same-name header (case-insensitive) instead of appending a
     /// second one: `Builder::header` appends, so a configured `Authorization`
     /// next to the built-in bearer would send two credentials.
-    fn set_header(&mut self, name: &str, value: String) {
+    pub(crate) fn set_header(&mut self, name: &str, value: String) {
         match self
             .headers
             .iter_mut()
