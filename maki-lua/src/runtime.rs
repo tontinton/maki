@@ -63,6 +63,7 @@ use crate::api::util::command::{
 use crate::api::util::convert::{json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::setup::ConfigStore;
+use crate::api::uv::{UvEvent, UvStore, close_plugin_handles, deliver_uv_event, with_uv};
 use crate::docs_render;
 use crate::error::PluginError;
 use crate::key_lint::KeyLint;
@@ -1358,6 +1359,24 @@ async fn deliver_pending(
     }
 }
 
+/// Same drain for uv handle events: tcp reads, connect and write completions,
+/// timer ticks. Callback failures are logged, never propagated.
+async fn deliver_uv_pending(
+    lua: &Lua,
+    budget: usize,
+    mut next: impl FnMut() -> Option<(u32, UvEvent)>,
+) {
+    for _ in 0..budget {
+        let Some((handle_id, event)) = next() else {
+            return;
+        };
+        if let Err(e) = deliver_uv_event(lua, handle_id, event).await {
+            tracing::warn!(handle_id, error = %strip_traceback(&e), "uv callback failed");
+        }
+        smol::future::yield_now().await;
+    }
+}
+
 impl Drop for TaskScope {
     fn drop(&mut self) {
         let task_id = {
@@ -2177,6 +2196,7 @@ impl LuaRuntime {
 
         lua.set_app_data(CommandHandlerMap::new());
         lua.set_app_data(JobStore::new());
+        lua.set_app_data(UvStore::new());
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
         lua.set_app_data(crate::api::top::NotifyHandler::default());
@@ -2271,6 +2291,7 @@ impl LuaRuntime {
             store.kill_owner(&self.lua, &JobOwner::Plugin(Arc::from(name)));
             store.detach_plugin_callbacks(&self.lua, name);
         });
+        close_plugin_handles(&self.lua, name);
         if let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>() {
             store.remove(name);
         }
@@ -3775,6 +3796,16 @@ pub fn spawn(
                                     first
                                         .take()
                                         .or_else(|| with_jobs(&lua, |s| s.next_plugin_event()))
+                                }))
+                                .await;
+                            drop(scope);
+                        }
+                        if let Some(first) = with_uv(&lua, |store| store.next_event()) {
+                            let mut first = Some(first);
+                            let scope = TaskScope::delivery(&lua);
+                            scope
+                                .scope_future(deliver_uv_pending(&lua, usize::MAX, || {
+                                    first.take().or_else(|| with_uv(&lua, |s| s.next_event()))
                                 }))
                                 .await;
                             drop(scope);
