@@ -116,9 +116,13 @@ pub enum ServerError {
 }
 
 /// Strip the leading `/{token}` path component used by the standalone remote UI.
+/// Tokens are 32 hex chars (128-bit), so `/api/*` etc. are not mistaken for a token.
 fn split_token_path(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_prefix('/')?;
     let (token, tail) = rest.split_once('/')?;
+    if token.len() != 32 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
     Some((token, tail))
 }
 
