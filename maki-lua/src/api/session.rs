@@ -62,7 +62,7 @@ async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 /// you act on a background tab.
 ///
 /// The returned table:
-/// ```
+/// ```ignore
 /// {
 ///   id, cwd, model, mode = "build" | "plan",
 ///   status = "idle" | "working" | "needs_input",
