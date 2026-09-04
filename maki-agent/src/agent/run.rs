@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -27,6 +28,17 @@ use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
+/// Safety net for a run that never reaches a stop reason: without a caller-set
+/// budget a degenerate agent could otherwise loop forever. Generous enough to
+/// never cut a legitimate long task short.
+const DEFAULT_MAX_TURNS: u32 = 200;
+/// An agent stuck narrating without progress gets a bounded number of explicit
+/// "break the loop" nudges before the run just ends. High similarity so only
+/// near-identical repetition (not legitimately similar progress updates) trips.
+const TEXT_LOOP_THRESHOLD: usize = 4;
+const TEXT_LOOP_SIMILARITY: f32 = 0.9;
+const MAX_TEXT_LOOP_NUDGES: u32 = 2;
+const TEXT_LOOP_MESSAGE: &str = "Your last several replies said essentially the same thing without making progress. You appear stuck in a loop. Stop repeating yourself and take a concrete next action towards the task.";
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
 /// A model that stalls once often stalls again on the retry, so it gets
 /// plenty of chances before the turn ends empty handed.
@@ -60,6 +72,13 @@ pub fn resolve_compaction_model(
 enum TurnOutcome {
     Continue,
     Done(DoneReason),
+}
+
+fn text_similar(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    similar::TextDiff::from_chars(a, b).ratio() >= TEXT_LOOP_SIMILARITY
 }
 
 #[derive(Clone)]
@@ -104,6 +123,8 @@ pub struct Agent<'h> {
     context_size: u32,
     num_turns: u32,
     recent_calls: RecentCalls,
+    recent_text: VecDeque<String>,
+    text_loop_nudges: u32,
     auto_compact: bool,
     loaded_instructions: LoadedInstructions,
     rollback_len: usize,
@@ -147,6 +168,8 @@ impl<'h> Agent<'h> {
             context_size: 0,
             num_turns: 0,
             recent_calls: RecentCalls::new(),
+            recent_text: VecDeque::new(),
+            text_loop_nudges: 0,
             auto_compact: compaction::auto_compact_enabled(),
             loaded_instructions: LoadedInstructions::new(),
             rollback_len: 0,
@@ -274,7 +297,7 @@ impl<'h> Agent<'h> {
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
         loop {
-            if let Some(max) = self.config.max_turns
+            if let Some(max) = self.config.max_turns.or(Some(DEFAULT_MAX_TURNS))
                 && self.num_turns >= max
             {
                 return Ok(DoneReason::MaxTurns);
@@ -325,6 +348,7 @@ impl<'h> Agent<'h> {
             Err(StreamError::Cancelled { streamed }) => {
                 let streamed = streamed.trim_end();
                 if !streamed.is_empty() {
+                    self.recent_calls.record_interrupted(streamed);
                     self.history.push(Message {
                         role: Role::Assistant,
                         content: vec![ContentBlock::Text {
@@ -362,16 +386,23 @@ impl<'h> Agent<'h> {
         self.context_size = response.usage.total_input();
         self.emit_turn_complete(&response)?;
 
+        let text_loop = match response.message.first_text_content() {
+            Some(text) if stop_reason != Some(StopReason::MaxTokens) => {
+                self.record_text_turn(text)?
+            }
+            _ => false,
+        };
+
         if has_tools {
             let history_len_before = self.history.len();
             self.process_tool_calls(response).await?;
             self.context_size +=
                 estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
         } else {
-            if response.message.first_text_content().is_some() {
-                self.history.push(response.message);
-            } else if self.recover_stalled_turn()? {
-                return Ok(TurnOutcome::Continue);
+            match response.message.first_text_content() {
+                Some(_) => self.history.push(response.message),
+                None if self.recover_stalled_turn()? => return Ok(TurnOutcome::Continue),
+                None => {}
             }
 
             if stop_reason == Some(StopReason::MaxTokens)
@@ -383,6 +414,10 @@ impl<'h> Agent<'h> {
                 );
                 return Ok(TurnOutcome::Continue);
             }
+        }
+
+        if text_loop {
+            return Ok(TurnOutcome::Continue);
         }
 
         if self.try_auto_compact().await? || self.handle_queued_command().await? {
@@ -476,6 +511,32 @@ impl<'h> Agent<'h> {
         self.event_tx.send(AgentEvent::Nudge)?;
         self.history.push(Message::synthetic(NUDGE_PROMPT.into()));
         Ok(true)
+    }
+
+    /// Records the assistant's latest plain-text reply and, once the recent
+    /// text turns are all near-identical, nudges the model to break out.
+    /// Returns true when a nudge was injected (the caller must continue).
+    fn record_text_turn(&mut self, text: &str) -> Result<bool, AgentError> {
+        let normalized = text.trim().to_owned();
+        self.recent_text.push_back(normalized.clone());
+        if self.recent_text.len() > TEXT_LOOP_THRESHOLD {
+            self.recent_text.pop_front();
+        }
+        if self.recent_text.len() >= TEXT_LOOP_THRESHOLD
+            && self.text_loop_nudges < MAX_TEXT_LOOP_NUDGES
+            && self
+                .recent_text
+                .iter()
+                .all(|t| text_similar(t, &normalized))
+        {
+            self.text_loop_nudges += 1;
+            warn!("detected repetitive assistant text, nudging model to break the loop");
+            self.event_tx.send(AgentEvent::Nudge)?;
+            self.history
+                .push(Message::synthetic(TEXT_LOOP_MESSAGE.into()));
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
@@ -781,6 +842,33 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(stop_reason),
+        }
+    }
+
+    fn text_blob(text: &str) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text { text: text.into() }],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::EndTurn),
+        }
+    }
+
+    fn text_and_tool(text: &str, tool: &str, tool_id: &str, input: Value) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text { text: text.into() },
+                    ContentBlock::tool_use(tool_id, tool, input),
+                ],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::ToolUse),
         }
     }
 
@@ -1482,6 +1570,66 @@ mod tests {
                 .filter(|e| matches!(e.event, AgentEvent::Nudge))
                 .count();
             assert_eq!(nudges, MAX_NUDGES as usize + 1);
+        });
+    }
+
+    /// A model that narrates the same text while its tool calls keep the run
+    /// alive gets a "break the loop" nudge instead of spinning forever, but a
+    /// dissimilar reply clears the streak and ends the run normally.
+    #[test]
+    fn repetitive_text_turns_trigger_loop_nudge() {
+        smol::block_on(async {
+            const T: &str = "Invoking bash now. I'll grep.";
+            let input = |i: u32| serde_json::json!({"command": format!("grep -rn X f{i}")});
+            // Varying tool inputs avoid the tool doom-loop so the repeated
+            // narration alone drives the text-loop nudge on the 4th turn.
+            let responses = vec![
+                text_and_tool(T, "bash", "t1", input(1)),
+                text_and_tool(T, "bash", "t2", input(2)),
+                text_and_tool(T, "bash", "t3", input(3)),
+                text_and_tool(T, "bash", "t4", input(4)), // 4th identical text -> nudge
+                text_blob("done"),
+            ];
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let _ = agent.run(default_input()).await;
+            drop(agent);
+            let events = drain_events(&event_rx);
+
+            assert!(has_event(&events, |e| matches!(e, AgentEvent::Nudge)));
+            assert!(has_event(&events, |e| matches!(e, AgentEvent::Done { .. })));
+            assert!(
+                history.as_slice().iter().any(|m| m.content.iter().any(|b| {
+                    matches!(b, ContentBlock::Text { text } if text.contains("stuck in a loop"))
+                })),
+                "history must contain the loop-break nudge"
+            );
+        });
+    }
+
+    /// The run hard-stops at the default turn budget even when the caller never
+    /// set `max_turns` and the model keeps producing tool calls that would
+    /// otherwise loop forever.
+    #[test]
+    fn default_turn_budget_hard_stops_infinite_run() {
+        smol::block_on(async {
+            let responses = (0..DEFAULT_MAX_TURNS)
+                .map(|i| tool_call_response("bash", &format!("t{i}")))
+                .collect();
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let reason = agent.run(default_input()).await.unwrap();
+            drop(agent);
+            assert_eq!(reason, DoneReason::MaxTurns);
+            let events = drain_events(&event_rx);
+            let done = events
+                .iter()
+                .find_map(|e| match &e.event {
+                    AgentEvent::Done { num_turns, .. } => Some(*num_turns),
+                    _ => None,
+                })
+                .expect("expected Done event");
+            assert_eq!(done, DEFAULT_MAX_TURNS);
         });
     }
 
