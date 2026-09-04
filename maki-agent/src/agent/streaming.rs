@@ -7,10 +7,12 @@ use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::warn;
 
+use super::run::estimate_prompt_tokens;
 use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender};
 
 const FUNCTIONS_PREFIX: &str = "functions.";
+const MIN_OUTPUT_TOKENS: u32 = 1024;
 
 /// GPT models sometimes emit `functions.<name>`, a Codex training habit.
 /// Stripped here at the provider boundary so no raw name enters the agent;
@@ -85,6 +87,15 @@ impl From<StreamError> for AgentError {
     }
 }
 
+/// Servers like vLLM reject `prompt + max_tokens > window` even when the
+/// prompt alone fits. Returns the reduced cap, or `None` when the model's own
+/// cap already fits.
+fn clamped_output_tokens(model: &Model, prompt_tokens: u32) -> Option<u32> {
+    let max_output = model.max_output_tokens?;
+    let remaining = model.context_window.saturating_sub(prompt_tokens);
+    (max_output > remaining).then(|| remaining.max(MIN_OUTPUT_TOKENS))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream_with_retry(
     provider: &dyn Provider,
@@ -98,6 +109,25 @@ pub(crate) async fn stream_with_retry(
     session_id: Option<&SessionRef>,
 ) -> Result<StreamResponse, StreamError> {
     let opts = opts.clamped(model);
+    let prompt_tokens = estimate_prompt_tokens(messages, system, tools);
+    let clamped;
+    let model = match clamped_output_tokens(model, prompt_tokens) {
+        Some(max_output) => {
+            warn!(
+                model = %model.id,
+                prompt_tokens,
+                context_window = model.context_window,
+                max_output_tokens = max_output,
+                "clamped max output tokens to fit the context window"
+            );
+            clamped = Model {
+                max_output_tokens: Some(max_output),
+                ..model.clone()
+            };
+            &clamped
+        }
+        None => model,
+    };
     let messages = maki_providers::adapt_images_for_model(model, messages);
     let messages = &*messages;
     let mut retry = RetryState::new();
@@ -213,10 +243,35 @@ fn error_description(error: &AgentError) -> String {
 mod tests {
     use maki_providers::Role;
     use serde_json::json;
+    use test_case::test_case;
 
     use super::*;
 
     const SECRET_BODY: &str = "messages.0.content: \"my private prompt\", key sk-abc";
+    const WINDOW: u32 = 262_144;
+    const BIG_PROMPT: u32 = 162_145;
+    const BIG_MAX_OUTPUT: u32 = 100_000;
+
+    fn model_with(context_window: u32, max_output_tokens: Option<u32>) -> Model {
+        let mut model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        model.context_window = context_window;
+        model.max_output_tokens = max_output_tokens;
+        model
+    }
+
+    #[test_case(WINDOW, Some(BIG_MAX_OUTPUT), 1_000, None; "cap_fits_inside_remaining_window")]
+    #[test_case(WINDOW, Some(BIG_MAX_OUTPUT), BIG_PROMPT, Some(WINDOW - BIG_PROMPT); "cap_exceeds_remaining_window")]
+    #[test_case(WINDOW, Some(BIG_MAX_OUTPUT), WINDOW + 1, Some(MIN_OUTPUT_TOKENS); "prompt_larger_than_window_floors_at_minimum")]
+    #[test_case(WINDOW, None, BIG_PROMPT, None; "provider_chosen_cap_is_left_alone")]
+    fn clamps_output_tokens_to_the_remaining_window(
+        context_window: u32,
+        max_output_tokens: Option<u32>,
+        prompt_tokens: u32,
+        expected: Option<u32>,
+    ) {
+        let model = model_with(context_window, max_output_tokens);
+        assert_eq!(clamped_output_tokens(&model, prompt_tokens), expected);
+    }
 
     #[test]
     fn tool_use_names_canonicalized() {

@@ -645,6 +645,14 @@ pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
     (total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN) as u32
 }
 
+/// Adds what [`estimate_message_tokens`] leaves out: the system prompt and the
+/// serialized tool schemas, which a server enforcing `prompt + max_tokens <=
+/// context_window` counts against the same budget.
+pub fn estimate_prompt_tokens(messages: &[Message], system: &str, tools: &Value) -> u32 {
+    let overhead = (system.len() + tools.to_string().len()) / CHARS_PER_TOKEN;
+    estimate_message_tokens(messages).saturating_add(overhead as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -1027,6 +1035,19 @@ mod tests {
             assert!(!first.contains(&"srv__fetch_issue"));
             assert!(tool_names(&captured[1]).contains(&"srv__fetch_issue"));
         });
+    }
+
+    const SYSTEM_PROMPT: &str = "You are a coding agent with a full tool set.";
+    const SHORT_USER_MESSAGE: &str = "hi";
+
+    #[test]
+    fn prompt_estimate_counts_system_prompt_and_tool_schemas() {
+        let messages = [Message::user(SHORT_USER_MESSAGE.into())];
+        let tools = serde_json::json!([{ "name": "read", "description": SYSTEM_PROMPT }]);
+        assert!(
+            estimate_prompt_tokens(&messages, SYSTEM_PROMPT, &tools)
+                > estimate_message_tokens(&messages)
+        );
     }
 
     fn small_context_model(context_window: u32, max_output_tokens: u32) -> Model {
