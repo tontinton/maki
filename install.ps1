@@ -3,7 +3,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$Repo = "tontinton/maki"
+# The anchor/remote-control features configured via -Anchor only exist in this
+# fork's release line, so default to the fork. Override for upstream/mirror.
+$Repo = if ($env:MAKI_INSTALL_REPO) { $env:MAKI_INSTALL_REPO } else { "wmantly/maki" }
 $Binary = "maki"
 $InstallDir = if ($env:MAKI_INSTALL_DIR) {
     $env:MAKI_INSTALL_DIR

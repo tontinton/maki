@@ -1,7 +1,10 @@
 #!/bin/sh
 set -eu
 
-REPO="tontinton/maki"
+# The anchor/remote-control features this script configures (via --anchor)
+# only exist in this fork's release line, so the installer must fetch from the
+# fork by default. Override for the upstream or another mirror.
+REPO="${MAKI_INSTALL_REPO:-wmantly/maki}"
 BINARY="maki"
 
 github_curl() {
