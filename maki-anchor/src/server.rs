@@ -18,6 +18,8 @@ use crate::{
 };
 
 const TUNNEL_LINK_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+const INSTALL_SH: &str = include_str!("../../install.sh");
+const INSTALL_PS1: &str = include_str!("../../install.ps1");
 
 /// Mints a share link, returning the raw token.
 pub fn mint_link(
@@ -225,6 +227,41 @@ fn route(
     store: &Arc<Store>,
     auth: &crate::auth::Auth,
 ) -> RouteOutcome {
+    if path == "/install.sh" {
+        return buffered(
+            (
+                200,
+                "text/x-shellscript".to_string(),
+                INSTALL_SH.as_bytes().to_vec(),
+            ),
+            request,
+        );
+    }
+    if path == "/install.ps1" {
+        return buffered(
+            (
+                200,
+                "text/x-powershell".to_string(),
+                INSTALL_PS1.as_bytes().to_vec(),
+            ),
+            request,
+        );
+    }
+    if path == "/api/sso" {
+        let body = if let Some(oidc) = &auth.oidc {
+            serde_json::json!({
+                "enabled": true,
+                "issuer": oidc.issuer,
+                "origin": oidc.origin,
+                "client_id": oidc.client_id,
+            })
+            .to_string()
+            .into_bytes()
+        } else {
+            serde_json::json!({"enabled": false}).to_string().into_bytes()
+        };
+        return buffered((200, "application/json".to_string(), body), request);
+    }
     if let Some((token, tail)) = split_token_path(path) {
         let user = auth.user_from_cookie(cookie_header(&request));
         return proxy_remote(token, tail, request, hub, store, user.as_ref());
@@ -367,6 +404,262 @@ fn redirect_to_login(request: tiny_http::Request) -> RouteOutcome {
     RouteOutcome::Streamed
 }
 
+fn handle_api_create_instance(
+    mut request: tiny_http::Request,
+    store: &Arc<Store>,
+    _user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method().as_str() != "POST" {
+        return buffered(
+            (405, "text/plain".to_string(), b"method not allowed".to_vec()),
+            request,
+        );
+    }
+    let mut body = Vec::new();
+    if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
+        return buffered(
+            (413, "text/plain".to_string(), b"body too large".to_vec()),
+            request,
+        );
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return buffered(
+                (400, "text/plain".to_string(), b"invalid json".to_vec()),
+                request,
+            )
+        }
+    };
+    let name = value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    if name.is_empty() {
+        return buffered(
+            (400, "application/json".to_string(), br#"{"error":"missing name"}"#.to_vec()),
+            request,
+        );
+    }
+    if name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return buffered(
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"name must be 1-64 chars: alphanumeric, -, _, ."}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    let token = new_link_token();
+    let hash = store::hash_token(&token);
+    if let Err(e) = store.register_instance(&name, &hash) {
+        return buffered(
+            (
+                500,
+                "text/plain".to_string(),
+                format!("store error: {e}").into_bytes(),
+            ),
+            request,
+        );
+    }
+    let body = serde_json::json!({"name": name, "token": token})
+        .to_string()
+        .into_bytes();
+    buffered((200, "application/json".to_string(), body), request)
+}
+
+fn json_list_users(store: &Arc<Store>) -> (u16, String, Vec<u8>) {
+    match store.list_users() {
+        Ok(rows) => {
+            let body = serde_json::to_vec(&rows).unwrap_or_default();
+            (200, "application/json".to_string(), body)
+        }
+        Err(err) => (
+            500,
+            "text/plain".to_string(),
+            format!("store error: {err}").into_bytes(),
+        ),
+    }
+}
+
+fn json_list_grants(store: &Arc<Store>) -> (u16, String, Vec<u8>) {
+    match store.list_grants() {
+        Ok(rows) => {
+            let body = serde_json::to_vec(&rows).unwrap_or_default();
+            (200, "application/json".to_string(), body)
+        }
+        Err(err) => (
+            500,
+            "text/plain".to_string(),
+            format!("store error: {err}").into_bytes(),
+        ),
+    }
+}
+
+fn handle_api_set_grant(
+    mut request: tiny_http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method().as_str() != "POST" {
+        return buffered(
+            (405, "text/plain".to_string(), b"method not allowed".to_vec()),
+            request,
+        );
+    }
+    if let Some(u) = user
+        && !u.is_admin
+    {
+        return buffered(
+            (403, "application/json".to_string(), br#"{"error":"admin required"}"#.to_vec()),
+            request,
+        );
+    }
+    let mut body = Vec::new();
+    if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
+        return buffered(
+            (413, "text/plain".to_string(), b"body too large".to_vec()),
+            request,
+        );
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return buffered(
+                (400, "text/plain".to_string(), b"invalid json".to_vec()),
+                request,
+            )
+        }
+    };
+    let user_id = value.get("user_id").and_then(|v| v.as_i64());
+    let instance = value.get("instance").and_then(|v| v.as_str()).unwrap_or("").trim().to_owned();
+    let rights = value.get("rights").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    let Some(user_id) = user_id else {
+        return buffered(
+            (400, "application/json".to_string(), br#"{"error":"missing user_id"}"#.to_vec()),
+            request,
+        );
+    };
+    if instance.is_empty() {
+        return buffered(
+            (400, "application/json".to_string(), br#"{"error":"missing instance"}"#.to_vec()),
+            request,
+        );
+    }
+    let Some(role) = Role::parse(&rights) else {
+        return buffered(
+            (400, "application/json".to_string(), br#"{"error":"rights must be view or control"}"#.to_vec()),
+            request,
+        );
+    };
+    let instance_row = match store.instance_by_name(&instance) {
+        Ok(r) => r,
+        Err(_) => {
+            return buffered(
+                (404, "application/json".to_string(), br#"{"error":"unknown instance"}"#.to_vec()),
+                request,
+            )
+        }
+    };
+    if store.user_by_id(user_id).is_err() {
+        return buffered(
+            (404, "application/json".to_string(), br#"{"error":"unknown user"}"#.to_vec()),
+            request,
+        );
+    }
+    if let Err(e) = store.set_grant(user_id, instance_row.id, role) {
+        return buffered(
+            (500, "text/plain".to_string(), format!("store error: {e}").into_bytes()),
+            request,
+        );
+    }
+    buffered(
+        (200, "application/json".to_string(), br#"{"ok":true}"#.to_vec()),
+        request,
+    )
+}
+
+fn handle_api_revoke_grant(
+    mut request: tiny_http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method().as_str() != "POST" {
+        return buffered(
+            (405, "text/plain".to_string(), b"method not allowed".to_vec()),
+            request,
+        );
+    }
+    if let Some(u) = user
+        && !u.is_admin
+    {
+        return buffered(
+            (403, "application/json".to_string(), br#"{"error":"admin required"}"#.to_vec()),
+            request,
+        );
+    }
+    let mut body = Vec::new();
+    if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
+        return buffered(
+            (413, "text/plain".to_string(), b"body too large".to_vec()),
+            request,
+        );
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return buffered(
+                (400, "text/plain".to_string(), b"invalid json".to_vec()),
+                request,
+            )
+        }
+    };
+    let user_id = value.get("user_id").and_then(|v| v.as_i64());
+    let instance = value.get("instance").and_then(|v| v.as_str()).unwrap_or("").trim().to_owned();
+    let Some(user_id) = user_id else {
+        return buffered(
+            (400, "application/json".to_string(), br#"{"error":"missing user_id"}"#.to_vec()),
+            request,
+        );
+    };
+    if instance.is_empty() {
+        return buffered(
+            (400, "application/json".to_string(), br#"{"error":"missing instance"}"#.to_vec()),
+            request,
+        );
+    }
+    let instance_row = match store.instance_by_name(&instance) {
+        Ok(r) => r,
+        Err(_) => {
+            return buffered(
+                (404, "application/json".to_string(), br#"{"error":"unknown instance"}"#.to_vec()),
+                request,
+            )
+        }
+    };
+    match store.delete_grant(user_id, instance_row.id) {
+        Ok(true) => buffered(
+            (200, "application/json".to_string(), br#"{"ok":true}"#.to_vec()),
+            request,
+        ),
+        Ok(false) => buffered(
+            (404, "application/json".to_string(), br#"{"error":"grant not found"}"#.to_vec()),
+            request,
+        ),
+        Err(e) => buffered(
+            (500, "text/plain".to_string(), format!("store error: {e}").into_bytes()),
+            request,
+        ),
+    }
+}
+
 /// User-facing routes: dashboard and JSON endpoints. The user row (None in
 /// LAN-trust mode) is available for future per-instance filtering.
 fn route_authorized(
@@ -381,6 +674,31 @@ fn route_authorized(
     }
     if path == "/links" {
         return render_link(request, store, user.as_ref());
+    }
+    if path == "/api/instances" {
+        return handle_api_create_instance(request, store, user.as_ref());
+    }
+    if path == "/api/users" {
+        if request.method().as_str() != "GET" {
+            return buffered(
+                (405, "text/plain".to_string(), b"method not allowed".to_vec()),
+                request,
+            );
+        }
+        return buffered(json_list_users(store), request);
+    }
+    if path == "/api/grants" {
+        return match request.method().as_str() {
+            "GET" => buffered(json_list_grants(store), request),
+            "POST" => handle_api_set_grant(request, store, user.as_ref()),
+            _ => buffered(
+                (405, "text/plain".to_string(), b"method not allowed".to_vec()),
+                request,
+            ),
+        };
+    }
+    if path == "/api/grants/revoke" {
+        return handle_api_revoke_grant(request, store, user.as_ref());
     }
     let outcome = if path == "/instances" {
         json_list_instances(store)

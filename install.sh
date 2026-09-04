@@ -94,7 +94,65 @@ Write-Host \"added \$dir to user PATH (restart terminal if maki is not found)\"
 " || true
 }
 
+configure_anchor() {
+    [ -n "${ANCHOR_URL:-}" ] || return 0
+    anchor_name="${ANCHOR_NAME:-$(hostname 2>/dev/null || echo maki)}"
+    config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/maki"
+    init_lua="$config_dir/init.lua"
+    mkdir -p "$config_dir"
+    token_val="${ANCHOR_TOKEN:-YOUR_TOKEN_HERE}"
+    if [ ! -f "$init_lua" ]; then
+        cat > "$init_lua" <<EOF
+maki.setup {
+  anchor = {
+    url = "$ANCHOR_URL",
+    name = "$anchor_name",
+    token = "$token_val",
+  },
+}
+EOF
+        echo "created $init_lua with anchor $ANCHOR_URL (name $anchor_name)"
+    else
+        if grep -q "anchor" "$init_lua" 2>/dev/null; then
+            echo "note: $init_lua already contains anchor config; not modifying"
+            echo "  set url = \"$ANCHOR_URL\", name = \"$anchor_name\", token = \"$token_val\" manually if needed"
+        else
+            cat >> "$init_lua" <<EOF
+
+-- added by maki install --anchor
+maki.setup {
+  anchor = {
+    url = "$ANCHOR_URL",
+    name = "$anchor_name",
+    token = "$token_val",
+  },
+}
+EOF
+            echo "appended anchor config to $init_lua (name $anchor_name)"
+        fi
+    fi
+    if [ "$token_val" = "YOUR_TOKEN_HERE" ]; then
+        echo "next: create a token on the anchor dashboard and set token in $init_lua"
+    fi
+}
+
 main() {
+    ANCHOR_URL=""
+    ANCHOR_NAME=""
+    ANCHOR_TOKEN=""
+    TAG=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --anchor) ANCHOR_URL="$2"; shift 2 ;;
+            --name) ANCHOR_NAME="$2"; shift 2 ;;
+            --token) ANCHOR_TOKEN="$2"; shift 2 ;;
+            --help|-h) echo "usage: $0 [--anchor URL] [--name NAME] [--token TOKEN] [tag]"; exit 0 ;;
+            --) shift; break ;;
+            -*) err "unknown option $1" ;;
+            *) if [ -z "$TAG" ]; then TAG="$1"; else err "too many positional args: $1"; fi; shift ;;
+        esac
+    done
+
     need_cmd curl
 
     if is_windows; then
@@ -123,22 +181,36 @@ main() {
 
     INSTALL_DIR="${MAKI_INSTALL_DIR:-$(default_install_dir)}"
 
-    tag="${1:-$(latest_tag)}"
+    tag="${TAG:-$(latest_tag)}"
     [ -n "${tag}" ] || err "failed to determine latest release tag"
 
-    url="https://github.com/${REPO}/releases/download/${tag}/${BINARY}-${tag}-${target}.${archive_ext}"
+    if is_windows; then
+        raw_url="https://github.com/${REPO}/releases/download/${tag}/${BINARY}-${tag}-${target}-signed.exe"
+        archive_url="https://github.com/${REPO}/releases/download/${tag}/${BINARY}-${tag}-${target}.zip"
+    else
+        raw_url="https://github.com/${REPO}/releases/download/${tag}/${BINARY}-${tag}-${target}"
+        archive_url="https://github.com/${REPO}/releases/download/${tag}/${BINARY}-${tag}-${target}.tar.gz"
+    fi
     tmp="$(mktemp -d)"
     trap 'rm -rf "${tmp}"' EXIT
 
     echo "downloading ${BINARY} ${tag} for ${target}..."
-    if [ "${archive_ext}" = "zip" ]; then
-        github_curl "${url}" -o "${tmp}/maki.zip"
-        unzip -qo "${tmp}/maki.zip" -d "${tmp}"
+    # Try raw binary (new releases); fallback to archive for old releases
+    if ! github_curl "${raw_url}" -o "${tmp}/${bin_name}" 2>/dev/null || [ ! -s "${tmp}/${bin_name}" ]; then
+        rm -f "${tmp}/${bin_name}"
+        echo "raw binary not found at $raw_url, trying archive $archive_url..."
+        url="$archive_url"
+        if [ "${archive_ext}" = "zip" ]; then
+            github_curl "${url}" -o "${tmp}/maki.zip"
+            unzip -qo "${tmp}/maki.zip" -d "${tmp}"
+        else
+            github_curl "${url}" | tar xz -C "${tmp}"
+        fi
     else
-        github_curl "${url}" | tar xz -C "${tmp}"
+        echo "downloaded raw binary $raw_url"
     fi
 
-    [ -f "${tmp}/${bin_name}" ] || err "archive did not contain ${bin_name}"
+    [ -f "${tmp}/${bin_name}" ] || err "download failed: ${bin_name} not found in ${tmp}"
 
     dest="${INSTALL_DIR}/${bin_name}"
 
@@ -166,6 +238,7 @@ main() {
         warn_shadowed "${dest}"
     fi
     echo ""
+    configure_anchor
 }
 
 need_cmd() {

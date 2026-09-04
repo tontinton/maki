@@ -94,6 +94,51 @@
   }
   button.primary { border-color: var(--user); color: var(--user); }
   button.danger { border-color: var(--error); color: var(--error); }
+  button.mini { padding: 2px 8px; font-size: 12px; }
+  #toolbar {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    align-items: center;
+    padding: 6px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  #toolbar input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font: inherit;
+    font-size: 12px;
+  }
+  #toolbar #model-input { width: 220px; }
+  #toolbar #cmd-input { flex: 1; min-width: 160px; }
+  #sessions-bar {
+    display: none;
+    gap: 6px;
+    padding: 6px 14px;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  #sessions-bar span { color: var(--muted); font-size: 12px; }
+  #sessions-bar .sess { cursor: pointer; padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border); }
+  #sessions-bar .sess.focused { border-color: var(--accent); color: var(--accent); }
+  #toast {
+    position: fixed;
+    bottom: 80px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 14px;
+    border-radius: 6px;
+    display: none;
+    max-width: 80vw;
+  }
   #stoprow { padding: 4px 14px; }
   #stoprow button { display: none; }
   #inputrow {
@@ -128,7 +173,20 @@
   <span id="stats"></span>
   <span id="conn" data-conn="down">connecting</span>
 </header>
+<div id="toolbar">
+  <input id="cmd-input" placeholder="/command  (e.g. /yolo, /compact, /model)  Enter to run">
+  <button class="mini" id="cmd-run">Run</button>
+  <input id="model-input" placeholder="model spec (provider/model)">
+  <button class="mini" id="model-set">Set model</button>
+  <button class="mini" id="btn-yolo">/yolo</button>
+  <button class="mini" id="btn-fast">/fast</button>
+  <button class="mini" id="btn-thinking">/thinking</button>
+  <button class="mini" id="btn-new">/new</button>
+  <button class="mini" id="btn-compact">/compact</button>
+</div>
+<div id="sessions-bar"></div>
 <main id="log"></main>
+<div id="toast"></div>
 <div id="perm">
   <div>Permission needed: <span class="toolname" id="perm-tool"></span></div>
   <div class="scopes" id="perm-scopes"></div>
@@ -159,6 +217,10 @@
   const promptEl = document.getElementById("prompt");
   const stopBtn = document.getElementById("stop");
   const denyGuidance = document.getElementById("deny-guidance");
+  const cmdInput = document.getElementById("cmd-input");
+  const modelInput = document.getElementById("model-input");
+  const sessionsBar = document.getElementById("sessions-bar");
+  const toastEl = document.getElementById("toast");
   let pendingPermission = null;
 
   const el = (cls, text) => {
@@ -190,9 +252,19 @@
   const setHeader = (snap) => {
     if (snap.title) titleEl.textContent = snap.title;
     if (snap.cwd) cwdEl.textContent = snap.cwd;
-    if (snap.model) modelEl.textContent = snap.model;
+    if (snap.model) {
+      modelEl.textContent = snap.model;
+      if (modelInput && !modelInput.dataset.touched) modelInput.value = snap.model;
+    }
     setStats(snap);
     if (snap.status) setStatus(snap.status);
+  };
+
+  const toast = (msg, ms = 2500) => {
+    toastEl.textContent = msg;
+    toastEl.style.display = "block";
+    clearTimeout(toastEl._t);
+    toastEl._t = setTimeout(() => toastEl.style.display = "none", ms);
   };
 
   const toolCard = (event) => {
@@ -354,8 +426,15 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
+      if (!res.ok) {
+        try { const j = await res.json(); if (j.error) toast(j.error); } catch {}
+      }
       return res.ok;
     } catch { return false; }
+  };
+
+  const fetchJson = async (path) => {
+    try { const r = await fetch(path); if (!r.ok) return null; return await r.json(); } catch { return null; }
   };
 
   const sendPrompt = async () => {
@@ -378,10 +457,63 @@
     await submit("answer", { request_id: requestId, answer });
   };
 
+  const runCommand = async () => {
+    const cmdline = cmdInput.value.trim();
+    if (!cmdline) return;
+    const ok = await submit("command", { cmdline });
+    if (ok) { toast(`ran ${cmdline}`); cmdInput.value = ""; setTimeout(() => { refreshModel(); refreshSessions(); }, 600); }
+  };
+  const setModel = async () => {
+    const spec = modelInput.value.trim();
+    if (!spec) return;
+    try {
+      const res = await fetch("model", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ spec }) });
+      const j = await res.json().catch(() => ({}));
+      if (res.ok) { toast(`model → ${j.spec || spec}`); modelEl.textContent = j.spec || spec; }
+      else toast(j.error || "model change failed");
+    } catch { toast("model change failed"); }
+  };
+  const refreshSessions = async () => {
+    const data = await fetchJson("sessions");
+    if (!data || !Array.isArray(data.sessions)) return;
+    sessionsBar.replaceChildren();
+    const label = document.createElement("span");
+    label.textContent = "sessions:";
+    sessionsBar.appendChild(label);
+    for (const s of data.sessions) {
+      const b = document.createElement("button");
+      b.className = "sess mini" + (s.focused ? " focused" : "");
+      b.textContent = `${s.title || s.id.slice(0,8)} · ${s.model || ""}`;
+      b.title = s.id;
+      sessionsBar.appendChild(b);
+    }
+    sessionsBar.style.display = data.sessions.length ? "flex" : "none";
+  };
+  const refreshModel = async () => {
+    const m = await fetchJson("model");
+    if (m && m.spec) { modelEl.textContent = m.spec; if (!modelInput.dataset.touched) modelInput.value = m.spec; }
+  };
+
   document.getElementById("send").onclick = sendPrompt;
+  document.getElementById("cmd-run").onclick = runCommand;
+  document.getElementById("model-set").onclick = setModel;
+  document.getElementById("btn-yolo").onclick = () => submit("command", { cmdline: "/yolo" }).then(ok => ok && toast("toggled /yolo"));
+  document.getElementById("btn-fast").onclick = () => submit("command", { cmdline: "/fast" }).then(ok => ok && toast("toggled /fast"));
+  document.getElementById("btn-thinking").onclick = () => {
+    const v = prompt("thinking: off / adaptive / high / low (blank toggles)", "");
+    if (v !== null) submit("command", { cmdline: "/thinking " + v }).then(ok => ok && toast("thinking updated"));
+  };
+  document.getElementById("btn-new").onclick = () => submit("command", { cmdline: "/new" }).then(ok => ok && toast("new session"));
+  document.getElementById("btn-compact").onclick = () => submit("command", { cmdline: "/compact" }).then(ok => ok && toast("compact queued"));
+  cmdInput.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); runCommand(); } });
+  modelInput.addEventListener("input", () => modelInput.dataset.touched = "1");
+  modelInput.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); setModel(); } });
   promptEl.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && !ev.shiftKey) {
       ev.preventDefault();
+      // slash at start → route to command endpoint so autocomplete, model, etc. work from the main box too
+      const t = promptEl.value.trim();
+      if (t.startsWith("/")) { cmdInput.value = t; promptEl.value = ""; runCommand(); return; }
       sendPrompt();
     }
   });
@@ -400,6 +532,9 @@
   });
 
   connect();
+  refreshModel();
+  refreshSessions();
+  setInterval(refreshSessions, 8000);
   promptEl.focus();
 })();
 </script>

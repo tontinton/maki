@@ -586,6 +586,42 @@ impl App {
         Ok(self.handle_cancel())
     }
 
+    pub(crate) fn run_remote_command(&mut self, cmdline: &str) -> Result<Vec<Action>, String> {
+        self.run_cmdline(cmdline, 0)
+    }
+
+    pub(crate) fn remote_model_get(&self) -> serde_json::Value {
+        self.model_state()
+    }
+
+    pub(crate) fn remote_model_set(
+        &mut self,
+        spec: Option<&str>,
+        thinking: Option<&str>,
+        fast: Option<bool>,
+    ) -> Result<serde_json::Value, String> {
+        if let Some(spec) = spec {
+            self.change_model_via_remote(spec)?;
+        }
+        if let Some(thinking) = thinking {
+            self.set_thinking(thinking)?;
+        }
+        if let Some(fast) = fast {
+            self.set_fast(fast)?;
+        }
+        Ok(self.model_state())
+    }
+
+    fn change_model_via_remote(&mut self, spec: &str) -> Result<(), String> {
+        let model = maki_providers::model::Model::from_spec(spec).map_err(|e| e.to_string())?;
+        if !self.model_policy.allows(&model.spec()) {
+            return Err("Model is not allowed by policy".into());
+        }
+        self.update_model(&model);
+        self.record_recent_model(spec);
+        Ok(())
+    }
+
     /// Everything a freshly connected web client needs to catch up to what
     /// the TUI shows: transcript, stats, mode, status, pending permission.
     /// Mirrors what the TUI renders, not the raw LLM history.

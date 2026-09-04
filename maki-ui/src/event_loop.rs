@@ -892,10 +892,33 @@ impl<'t> EventLoop<'t> {
         // next real event.
         self.flash_tunnel_link_if_ready();
         if self.remote.is_running() {
-            let actions = self
-                .remote
-                .drain_requests(&mut self.sessions[self.focused].app);
-            self.dispatch(self.focused, actions);
+            let focused = self.focused;
+            let sessions_json = {
+                let sessions = &self.sessions;
+                let focused_id = sessions[focused].id().to_string();
+                let list: Vec<serde_json::Value> = sessions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, rt)| {
+                        serde_json::json!({
+                            "id": rt.id().to_string(),
+                            "title": rt.app.state.session.title,
+                            "cwd": rt.app.state.session.cwd,
+                            "model": rt.app.state.model.spec(),
+                            "status": SessionStatus::of(&rt.app).as_str(),
+                            "focused": i == focused,
+                            "updated_at": rt.app.state.session.updated_at,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({ "sessions": list, "focused": focused_id })
+            };
+            let sessions_json_clone = sessions_json.clone();
+            let actions = self.remote.drain_requests_with(
+                &mut self.sessions[focused].app,
+                move || sessions_json_clone.clone(),
+            );
+            self.dispatch(focused, actions);
         }
         // Leftovers beyond the budget are picked up right after the next draw.
         for _ in 0..DRAIN_BUDGET {

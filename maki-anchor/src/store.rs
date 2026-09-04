@@ -77,7 +77,7 @@ pub struct InstanceRow {
     pub last_seen: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, Clone)]
 pub struct UserRow {
     pub id: i64,
     pub oidc_sub: String,
@@ -527,6 +527,25 @@ impl Store {
             rusqlite::params![now_unix(), token_hash],
         )?;
         Ok(changed > 0)
+    }
+
+    pub fn list_users(&self) -> Result<Vec<UserRow>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, oidc_sub, email, name, is_admin FROM users ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(UserRow {
+                    id: row.get(0)?,
+                    oidc_sub: row.get(1)?,
+                    email: row.get(2)?,
+                    name: row.get(3)?,
+                    is_admin: row.get::<_, i64>(4)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 }
 

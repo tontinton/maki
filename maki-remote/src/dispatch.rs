@@ -18,6 +18,10 @@ pub enum Route {
     Prompt,
     Answer,
     Stop,
+    Command,
+    Sessions,
+    ModelGet,
+    ModelPost,
 }
 
 impl Route {
@@ -28,6 +32,10 @@ impl Route {
             ("prompt", "POST") => Some(Route::Prompt),
             ("answer", "POST") => Some(Route::Answer),
             ("stop", "POST") => Some(Route::Stop),
+            ("command", "POST") => Some(Route::Command),
+            ("sessions", "GET") => Some(Route::Sessions),
+            ("model", "GET") => Some(Route::ModelGet),
+            ("model", "POST") => Some(Route::ModelPost),
             _ => None,
         }
     }
@@ -47,6 +55,7 @@ pub enum DispatchOutcome {
         source: SseSource,
     },
     Posted(u16),
+    Json { status: u16, body: Vec<u8> },
     NotFound,
 }
 
@@ -66,7 +75,41 @@ impl Dispatcher {
                     source: SseSource::new(subscription, &snapshot),
                 }
             }
-            Route::Prompt | Route::Answer | Route::Stop => {
+            Route::Sessions => match self.dispatch_sessions() {
+                Some(value) => DispatchOutcome::Json {
+                    status: 200,
+                    body: serde_json::to_vec(&value).unwrap_or_default(),
+                },
+                None => DispatchOutcome::Json {
+                    status: 503,
+                    body: br#"{"error":"event loop wedged"}"#.to_vec(),
+                },
+            },
+            Route::ModelGet => match self.dispatch_model_get() {
+                Some(value) => DispatchOutcome::Json {
+                    status: 200,
+                    body: serde_json::to_vec(&value).unwrap_or_default(),
+                },
+                None => DispatchOutcome::Json {
+                    status: 503,
+                    body: br#"{"error":"event loop wedged"}"#.to_vec(),
+                },
+            },
+            Route::ModelPost => match self.dispatch_model_set(body) {
+                Some(Ok(value)) => DispatchOutcome::Json {
+                    status: 200,
+                    body: serde_json::to_vec(&value).unwrap_or_default(),
+                },
+                Some(Err(msg)) => DispatchOutcome::Json {
+                    status: 400,
+                    body: serde_json::to_vec(&json!({"error": msg})).unwrap_or_default(),
+                },
+                None => DispatchOutcome::Json {
+                    status: 503,
+                    body: br#"{"error":"event loop wedged"}"#.to_vec(),
+                },
+            },
+            Route::Prompt | Route::Answer | Route::Stop | Route::Command => {
                 let status = match self.dispatch_post(route, body) {
                     Some(()) => 200,
                     None => 400,
@@ -89,6 +132,41 @@ impl Dispatcher {
         }
         rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS))
             .unwrap_or_else(|_| json!({}))
+    }
+
+    fn dispatch_sessions(&self) -> Option<serde_json::Value> {
+        let (tx, rx) = flume::bounded(1);
+        self.requests.try_send(crate::RemoteRequest::Sessions { reply: tx }).ok()?;
+        rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS)).ok()
+    }
+
+    fn dispatch_model_get(&self) -> Option<serde_json::Value> {
+        let (tx, rx) = flume::bounded(1);
+        self.requests.try_send(crate::RemoteRequest::ModelGet { reply: tx }).ok()?;
+        rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS)).ok()
+    }
+
+    fn dispatch_model_set(&self, body: &str) -> Option<Result<serde_json::Value, String>> {
+        let value: serde_json::Value = match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(_) => return Some(Err("invalid json".into())),
+        };
+        let spec = value.get("spec").and_then(|v| v.as_str()).map(str::to_owned);
+        let thinking = value.get("thinking").and_then(|v| v.as_str()).map(str::to_owned);
+        let fast = value.get("fast").and_then(|v| v.as_bool());
+        if spec.is_none() && thinking.is_none() && fast.is_none() {
+            return Some(Err("no model fields: need spec, thinking or fast".into()));
+        }
+        let (tx, rx) = flume::bounded(1);
+        self.requests
+            .try_send(crate::RemoteRequest::ModelSet {
+                spec,
+                thinking,
+                fast,
+                reply: tx,
+            })
+            .ok()?;
+        rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS)).ok()
     }
 
     fn dispatch_post(&self, route: Route, body: &str) -> Option<()> {
@@ -116,7 +194,24 @@ impl Dispatcher {
                 let (tx, rx) = flume::unbounded();
                 (crate::RemoteRequest::Stop { reply: tx }, rx)
             }
-            Route::Index | Route::Events => return None,
+            Route::Command => {
+                let value: serde_json::Value = serde_json::from_str(body).ok()?;
+                let cmdline = value
+                    .get("cmdline")
+                    .or_else(|| value.get("command"))
+                    .or_else(|| value.get("text"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)?;
+                let (tx, rx) = flume::unbounded();
+                (
+                    crate::RemoteRequest::Command {
+                        cmdline,
+                        reply: tx,
+                    },
+                    rx,
+                )
+            }
+            Route::Index | Route::Events | Route::Sessions | Route::ModelGet | Route::ModelPost => return None,
         };
         self.requests.try_send(request).ok()?;
         // The loop answers fast (it only flips state or forwards); still,

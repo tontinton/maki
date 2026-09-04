@@ -234,6 +234,7 @@ fn handle_forwarded(
             send(200, crate::server::INDEX_HTML.as_bytes().to_vec(), true)
         }
         crate::dispatch::DispatchOutcome::Posted(status) => send(status, Vec::new(), true),
+        crate::dispatch::DispatchOutcome::Json { status, body } => send(status, body, true),
         // SSE: the producer blocks on the fan-out channel and ships frames;
         // the writer thread forwards them until the stream ends.
         crate::dispatch::DispatchOutcome::Events { mut source } => {

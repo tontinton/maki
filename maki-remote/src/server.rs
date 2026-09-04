@@ -30,6 +30,22 @@ pub enum RemoteRequest {
     Stop {
         reply: Sender<Result<(), String>>,
     },
+    Command {
+        cmdline: String,
+        reply: Sender<Result<(), String>>,
+    },
+    Sessions {
+        reply: Sender<serde_json::Value>,
+    },
+    ModelGet {
+        reply: Sender<serde_json::Value>,
+    },
+    ModelSet {
+        spec: Option<String>,
+        thinking: Option<String>,
+        fast: Option<bool>,
+        reply: Sender<Result<serde_json::Value, String>>,
+    },
     /// A web client connected and needs the current session state: history,
     /// stats, status. The loop answers with the JSON payload to emit as the
     /// first SSE frame, so a fresh tab opens on the TUI's world.
@@ -144,6 +160,8 @@ impl RemoteServer {
                 crate::dispatch::Route::Prompt
                     | crate::dispatch::Route::Answer
                     | crate::dispatch::Route::Stop
+                    | crate::dispatch::Route::Command
+                    | crate::dispatch::Route::ModelPost
             )
         ) {
             match read_body(&mut request) {
@@ -178,6 +196,12 @@ impl RemoteServer {
             }
             crate::dispatch::DispatchOutcome::Posted(status) => {
                 let _ = request.respond(Response::empty(status));
+            }
+            crate::dispatch::DispatchOutcome::Json { status, body } => {
+                let response = Response::from_data(body)
+                    .with_status_code(status)
+                    .with_header(content_type("application/json"));
+                let _ = request.respond(response);
             }
         }
     }
@@ -292,6 +316,22 @@ mod tests {
         assert!(matches!(
             server.route("/abcdef0123456789abcdef0123456789/prompt", post),
             Some(crate::dispatch::Route::Prompt)
+        ));
+        assert!(matches!(
+            server.route("/abcdef0123456789abcdef0123456789/command", post),
+            Some(crate::dispatch::Route::Command)
+        ));
+        assert!(matches!(
+            server.route("/abcdef0123456789abcdef0123456789/sessions", get),
+            Some(crate::dispatch::Route::Sessions)
+        ));
+        assert!(matches!(
+            server.route("/abcdef0123456789abcdef0123456789/model", get),
+            Some(crate::dispatch::Route::ModelGet)
+        ));
+        assert!(matches!(
+            server.route("/abcdef0123456789abcdef0123456789/model", post),
+            Some(crate::dispatch::Route::ModelPost)
         ));
         assert!(server.route("/wrongtoken/events", get).is_none());
         assert!(

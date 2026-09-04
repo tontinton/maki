@@ -2,8 +2,9 @@
 #   bump [workspace.package] version to X.Y.Z-rc.N in Cargo.toml, push to main.
 #   The release-bot workflow tags vX.Y.Z-rc.N, which triggers this workflow.
 #
-# Archives contain both binaries: maki (the agent) and maki-anchor (the
-# central server for remote control).
+# Raw binaries are uploaded per target (no archives): maki and maki-anchor.
+# Windows binaries are Trusted Signed via `az` and carry a -signed suffix:
+#   maki-vX.Y.Z-x86_64-pc-windows-msvc-signed.exe
 name: Release
 
 on:
@@ -28,6 +29,7 @@ env:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   create-release:
@@ -77,17 +79,16 @@ jobs:
             '
           sudo chown -R $(id -u):$(id -g) target/
 
-      - name: Package
+      - name: Upload raw binaries
         run: |
           tag="$RELEASE_TAG"
-          archive="maki-${tag}-${{ matrix.target }}.tar.gz"
-          mkdir stage
-          cp "target/${{ matrix.target }}/release/maki" "target/${{ matrix.target }}/release/maki-anchor" stage/
-          tar czf "${archive}" -C stage maki maki-anchor
-          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
-
-      - name: Upload artifact
-        run: .github/scripts/retry.sh gh release upload "$RELEASE_TAG" "$ARCHIVE" --clobber
+          for bin in maki maki-anchor; do
+            src="target/${{ matrix.target }}/release/$bin"
+            dest="${bin}-${tag}-${{ matrix.target }}"
+            cp "$src" "$dest"
+            echo "Uploading $dest"
+            .github/scripts/retry.sh gh release upload "$RELEASE_TAG" "$dest" --clobber
+          done
 
   build-other:
     name: Build (${{ matrix.target }})
@@ -119,30 +120,69 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} --package maki --package maki-anchor
 
-      - name: Package (Unix)
+      - name: Azure login (Windows Trusted Signing via az)
+        if: runner.os == 'Windows' && secrets.AZURE_CLIENT_ID != ''
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows binaries (az Trusted Signing)
+        if: runner.os == 'Windows' && secrets.AZURE_CLIENT_ID != ''
+        shell: pwsh
+        env:
+          AZURE_TRUSTED_SIGNING_ACCOUNT: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT }}
+          AZURE_TRUSTED_SIGNING_PROFILE: ${{ secrets.AZURE_TRUSTED_SIGNING_PROFILE }}
+          AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+        run: |
+          az --version
+          az account show
+          if (-not $env:AZURE_TRUSTED_SIGNING_ACCOUNT) { Write-Error "AZURE_TRUSTED_SIGNING_ACCOUNT secret not set"; exit 1 }
+          if (-not $env:AZURE_TRUSTED_SIGNING_PROFILE) { Write-Error "AZURE_TRUSTED_SIGNING_PROFILE secret not set"; exit 1 }
+          if (-not $env:AZURE_TRUSTED_SIGNING_ENDPOINT) { $env:AZURE_TRUSTED_SIGNING_ENDPOINT = "https://eus.codesigning.azure.net" }
+          Write-Host "Installing AzureSignTool..."
+          dotnet tool install --global AzureSignTool --version 6.0.0 2>$null
+          if ($LASTEXITCODE -ne 0) { dotnet tool update --global AzureSignTool }
+          $files = @("target/${{ matrix.target }}/release/maki.exe", "target/${{ matrix.target }}/release/maki-anchor.exe")
+          foreach ($f in $files) { if (-not (Test-Path $f)) { Write-Error "missing $f"; exit 1 } }
+          Write-Host "Signing with az Trusted Signing: $env:AZURE_TRUSTED_SIGNING_ACCOUNT / $env:AZURE_TRUSTED_SIGNING_PROFILE @ $env:AZURE_TRUSTED_SIGNING_ENDPOINT"
+          AzureSignTool sign `
+            --azure-trusted-signing-account $env:AZURE_TRUSTED_SIGNING_ACCOUNT `
+            --azure-trusted-signing-certificate-profile $env:AZURE_TRUSTED_SIGNING_PROFILE `
+            --azure-trusted-signing-endpoint $env:AZURE_TRUSTED_SIGNING_ENDPOINT `
+            --timestamp-rfc3161 http://timestamp.acs.microsoft.com `
+            --timestamp-digest SHA256 `
+            --file-digest SHA256 `
+            --verbose `
+            $files
+          Write-Host "Verifying signatures..."
+          foreach ($f in $files) { & signtool verify /pa $f; if ($LASTEXITCODE -ne 0) { Write-Error "verify failed for $f"; exit 1 } }
+
+      - name: Upload raw binaries (Unix)
         if: runner.os != 'Windows'
         run: |
           tag="$RELEASE_TAG"
-          archive="maki-${tag}-${{ matrix.target }}.tar.gz"
-          mkdir -p stage
-          cp "target/${{ matrix.target }}/release/maki" "target/${{ matrix.target }}/release/maki-anchor" stage/
-          tar czf "${archive}" -C stage maki maki-anchor
-          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
+          for bin in maki maki-anchor; do
+            src="target/${{ matrix.target }}/release/$bin"
+            dest="${bin}-${tag}-${{ matrix.target }}"
+            cp "$src" "$dest"
+            echo "Uploading $dest"
+            .github/scripts/retry.sh gh release upload "$RELEASE_TAG" "$dest" --clobber
+          done
 
-      - name: Package (Windows)
+      - name: Upload raw binaries (Windows, signed)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           tag="$RELEASE_TAG"
-          archive="maki-${tag}-${{ matrix.target }}.zip"
-          mkdir -p stage
-          cp "target/${{ matrix.target }}/release/maki.exe" "target/${{ matrix.target }}/release/maki-anchor.exe" stage/
-          7z a "${archive}" ./stage/maki.exe ./stage/maki-anchor.exe
-          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
-
-      - name: Upload artifact
-        shell: bash
-        run: .github/scripts/retry.sh gh release upload "$RELEASE_TAG" "$ARCHIVE" --clobber
+          for bin in maki maki-anchor; do
+            src="target/${{ matrix.target }}/release/${bin}.exe"
+            dest="${bin}-${tag}-${{ matrix.target }}-signed.exe"
+            cp "$src" "$dest"
+            echo "Uploading $dest (signed)"
+            .github/scripts/retry.sh gh release upload "$RELEASE_TAG" "$dest" --clobber
+          done
 
   publish:
     name: Publish Release

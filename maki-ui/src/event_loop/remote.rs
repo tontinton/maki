@@ -168,7 +168,26 @@ impl RemoteSlot {
     /// Services pending requests from remote clients, returning the actions
     /// the focused app owes the loop. Called every loop iteration, right
     /// after draining agent events.
+    #[allow(dead_code)]
     pub(crate) fn drain_requests(&self, app: &mut App) -> Vec<Action> {
+        let snap = serde_json::json!({
+            "sessions": [{
+                "id": app.state.session.id.to_string(),
+                "title": app.state.session.title.clone(),
+                "cwd": app.state.session.cwd.clone(),
+                "model": app.state.model.spec(),
+                "status": if app.status == crate::components::Status::Streaming { "working" } else { "idle" },
+                "focused": true,
+            }],
+            "focused": app.state.session.id.to_string(),
+        });
+        self.drain_requests_with(app, move || snap.clone())
+    }
+
+    pub(crate) fn drain_requests_with<F>(&self, app: &mut App, sessions_fn: F) -> Vec<Action>
+    where
+        F: Fn() -> serde_json::Value,
+    {
         let mut actions = Vec::new();
         for _ in 0..REQUEST_BUDGET {
             let Ok(request) = self.requests_rx.try_recv() else {
@@ -193,6 +212,37 @@ impl RemoteSlot {
                     let outcome = app.stop_remote_run();
                     let _ = reply.send(outcome.as_ref().map(|_| ()).map_err(Clone::clone));
                     outcome
+                }
+                RemoteRequest::Command { cmdline, reply } => {
+                    let outcome = app.run_remote_command(&cmdline);
+                    let _ = reply.send(outcome.as_ref().map(|_| ()).map_err(Clone::clone));
+                    outcome
+                }
+                RemoteRequest::Sessions { reply } => {
+                    let value = sessions_fn();
+                    let _ = reply.send(value);
+                    continue;
+                }
+                RemoteRequest::ModelGet { reply } => {
+                    let _ = reply.send(app.remote_model_get());
+                    continue;
+                }
+                RemoteRequest::ModelSet {
+                    spec,
+                    thinking,
+                    fast,
+                    reply,
+                } => {
+                    let outcome = app.remote_model_set(
+                        spec.as_deref(),
+                        thinking.as_deref(),
+                        fast,
+                    );
+                    let _ = reply.send(outcome.clone().map_err(|e| e.clone()));
+                    match outcome {
+                        Ok(_) => Ok(vec![]),
+                        Err(e) => Err(e),
+                    }
                 }
                 RemoteRequest::Snapshot { reply } => {
                     let _ = reply.send(app.remote_snapshot());
