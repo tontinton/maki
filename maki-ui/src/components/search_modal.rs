@@ -147,7 +147,9 @@ impl SearchModal {
         }
     }
 
-    pub fn update_matches(&mut self, segment_texts: &[&str]) {
+    /// `corpus` is called only once there is something to match, so an empty
+    /// query never pays to materialize the transcript.
+    pub fn update_matches(&mut self, corpus: impl FnOnce() -> Vec<String>) {
         let query = self.search.value();
         self.matches.clear();
         self.selected = 0;
@@ -167,7 +169,7 @@ impl SearchModal {
 
         let mut buf = Vec::new();
         let mut indices = Vec::new();
-        for (idx, text) in segment_texts.iter().enumerate() {
+        for (idx, text) in corpus().iter().enumerate() {
             if text.is_empty() {
                 continue;
             }
@@ -368,7 +370,7 @@ mod tests {
         let mut modal = SearchModal::new();
         modal.open(ScrollPos::default(), true);
         modal.search = TextBuffer::new(query.into());
-        modal.update_matches(texts);
+        modal.update_matches(|| texts.iter().map(|t| (*t).to_owned()).collect());
         modal
     }
 

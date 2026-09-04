@@ -1341,6 +1341,9 @@ where
     T: DeserializeOwned,
 {
     let data = fs::read(path).map_err(StorageError::from)?;
+    // Held across both formats: either one decodes the same image payload once
+    // per record that mentions it.
+    let _intern = crate::intern::Scope::enter();
     let mut session: Session<M, U, T> = if path.extension().is_some_and(|e| e == "jsonl") {
         load_jsonl(&data, &path.display().to_string())?
     } else {
@@ -1504,8 +1507,8 @@ where
 
     /// A change under an existing id is not expressible as an append, so it
     /// voids the cursors; a new id is a pure append.
-    pub fn insert_tool_output(&mut self, id: String, output: T) {
-        if self.tool_outputs.insert(id, Arc::new(output)).is_some() {
+    pub fn insert_tool_output(&mut self, id: String, output: Arc<T>) {
+        if self.tool_outputs.insert(id, output).is_some() {
             self.rewrite();
         } else {
             self.touch();
@@ -1818,7 +1821,7 @@ mod tests {
             .insert("task-stale".into(), Arc::new(vec!["stale-sub-tool".into()]));
         session.set_subagents(vec![subagent("task-live"), subagent("task-stale")]);
         for id in ["task-live", "sub-tool", "stale-sub-tool", "orphan"] {
-            session.insert_tool_output(id.into(), Value::Null);
+            session.insert_tool_output(id.into(), Arc::new(Value::Null));
         }
 
         session.prune_orphans(ids);
@@ -3269,7 +3272,7 @@ mod tests {
                 session.push_message(tool_message(&slot));
                 session.push_message(assistant_message("reply"));
             }
-            2 => session.insert_tool_output(slot, Value::from(format!("out-{step}"))),
+            2 => session.insert_tool_output(slot, Arc::new(Value::from(format!("out-{step}")))),
             3 => {
                 let len = rng.below(4) as usize;
                 let msgs = (0..len)
@@ -3469,7 +3472,7 @@ mod tests {
         let held = Arc::clone(&session);
         let live = Arc::make_mut(&mut session);
         live.push_message(assistant_message("b"));
-        live.insert_tool_output("t1".into(), Value::from("out"));
+        live.insert_tool_output("t1".into(), Arc::new(Value::from("out")));
         live.set_subagent_messages("s1".into(), vec![user_message("sub")]);
 
         log.append(&session).unwrap();

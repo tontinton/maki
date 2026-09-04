@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use super::error::McpError;
 use crate::tools::is_builtin_tool;
-use maki_config::{expand_env, global_config_dir, is_valid_server_name};
+use maki_config::{expand_env, is_valid_server_name};
 use serde::Deserialize;
 use toml_edit::DocumentMut;
 
@@ -368,8 +368,7 @@ pub fn load_config(cwd: &Path) -> (McpConfig, McpConfigErrors) {
     let mut merged = McpConfig::default();
     let mut errors = McpConfigErrors::new(cwd.to_path_buf());
 
-    if let Some(global_dir) = global_config_dir() {
-        let global_path = global_dir.join(MCP_CONFIG_FILE);
+    if let Some(global_path) = maki_storage::paths::find_config_path(MCP_CONFIG_FILE) {
         merge_config(&mut merged, &mut errors, &global_path);
     }
     let project_path = cwd.join(".maki").join(MCP_CONFIG_FILE);

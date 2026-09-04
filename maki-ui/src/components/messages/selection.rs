@@ -110,7 +110,7 @@ mod tests {
     fn copy_whole_segment(lines: Vec<Line<'static>>, width: u16) -> String {
         let area = Rect::new(0, 0, width, 24);
         let mut cache = SegmentCache::new();
-        cache.push(Segment::with_lines(lines, String::new(), None));
+        cache.push(Segment::with_lines(lines, None));
         let last_row = cache
             .get(0)
             .expect("segment")

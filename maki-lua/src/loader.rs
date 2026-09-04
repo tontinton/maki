@@ -302,7 +302,7 @@ impl PluginHost {
     ) -> Result<Option<RawConfig>, PluginError> {
         let mut merged: Option<RawConfig> = None;
 
-        for global_dir in maki_config::global_config_dirs() {
+        for global_dir in maki_storage::paths::config_search_dirs() {
             self.run_init_file(
                 &global_dir.join("init.lua"),
                 ConfigScope::Global,

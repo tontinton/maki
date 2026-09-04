@@ -271,10 +271,14 @@ impl ProvidersConfig {
     }
 }
 
+/// The `providers.toml` we already read, or where a fresh one goes. Both share
+/// this path so `save` cannot leave a second copy behind in the other dir.
 fn providers_file_path() -> PathBuf {
-    paths::config_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(PROVIDERS_FILE)
+    paths::find_config_path(PROVIDERS_FILE).unwrap_or_else(|| {
+        paths::config_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(PROVIDERS_FILE)
+    })
 }
 
 pub fn builtin_provider(slug: &str) -> Option<&'static BuiltInProvider> {

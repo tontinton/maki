@@ -23,6 +23,7 @@ const INSTRUCTION_FILES: &[&str] = &[
 ];
 
 const LOCAL_INSTRUCTION_FILE: &str = "AGENTS.local.md";
+const GLOBAL_INSTRUCTION_FILE: &str = "AGENTS.md";
 
 #[derive(Clone, Default)]
 pub struct LoadedInstructions(Arc<Mutex<HashSet<PathBuf>>>);
@@ -120,7 +121,8 @@ fn collect_instruction_files(
         }
     }
 
-    for path in maki_storage::paths::user_config_dirs(home, xdg_config, "AGENTS.md") {
+    for dir in maki_storage::paths::config_search_dirs_from(home, xdg_config) {
+        let path = dir.join(GLOBAL_INSTRUCTION_FILE);
         if let Some((canonical, content)) = read_instruction(&path, loaded) {
             let label = format!("Global instructions ({})", canonical.display());
             out.push((label, content));
@@ -135,7 +137,7 @@ pub fn load_instruction_text(cwd: &str) -> String {
     load_instruction_text_with_home(
         cwd,
         maki_storage::paths::home().as_deref(),
-        maki_storage::paths::config_dir().ok().as_deref(),
+        maki_storage::paths::xdg_config_dir().ok().as_deref(),
     )
 }
 
@@ -158,7 +160,7 @@ pub fn load_instructions(cwd: &str) -> Instructions {
     load_instructions_with_home(
         cwd,
         maki_storage::paths::home().as_deref(),
-        maki_storage::paths::config_dir().ok().as_deref(),
+        maki_storage::paths::xdg_config_dir().ok().as_deref(),
     )
 }
 
@@ -220,6 +222,8 @@ mod tests {
     use super::*;
 
     const PLAN_PATH: &str = ".maki/plans/123.md";
+    const LEGACY_RULES: &str = "legacy global rules";
+    const XDG_RULES: &str = "xdg global rules";
 
     #[test_case(&AgentMode::Build, false ; "build_excludes_plan")]
     #[test_case(&AgentMode::Plan(PathBuf::from(PLAN_PATH)), true ; "plan_includes_plan")]
@@ -331,6 +335,29 @@ mod tests {
         let text =
             load_instructions_with_home(cwd.path().to_str().unwrap(), Some(home.path()), None).text;
         assert!(text.contains("global rules"));
+    }
+
+    #[test_case(false, XDG_RULES, LEGACY_RULES ; "xdg_is_searched_even_though_legacy_dir_exists")]
+    #[test_case(true, LEGACY_RULES, XDG_RULES ; "legacy_wins_when_both_have_a_file")]
+    fn load_instructions_global_search_order(write_legacy: bool, wanted: &str, unwanted: &str) {
+        let cwd = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let legacy = home.path().join(".maki");
+        fs::create_dir(&legacy).unwrap();
+        if write_legacy {
+            fs::write(legacy.join(GLOBAL_INSTRUCTION_FILE), LEGACY_RULES).unwrap();
+        }
+        fs::write(xdg.path().join(GLOBAL_INSTRUCTION_FILE), XDG_RULES).unwrap();
+
+        let text = load_instructions_with_home(
+            cwd.path().to_str().unwrap(),
+            Some(home.path()),
+            Some(xdg.path()),
+        )
+        .text;
+        assert!(text.contains(wanted), "got {text}");
+        assert!(!text.contains(unwanted), "got {text}");
     }
 
     #[test]

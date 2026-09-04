@@ -15,6 +15,7 @@ use tracing::warn;
 
 const PROJECT_DIR: &str = ".maki";
 const PERMISSIONS_FILE: &str = "permissions.toml";
+const ENV_FILE: &str = ".env";
 
 pub mod providers;
 
@@ -2125,29 +2126,16 @@ fn build_permissions(
     }
 }
 
-fn global_dir() -> Option<PathBuf> {
-    paths::config_dir().ok()
+pub fn load_env_files(cwd: &Path) {
+    load_env_files_with_global(cwd, paths::find_config_path(ENV_FILE).as_deref());
 }
 
-fn config_search_dirs(global: Option<&Path>) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(d) = global {
-        dirs.push(d.to_path_buf());
-    }
-    if let Ok(xdg) = paths::xdg_config_dir()
-        && dirs.first() != Some(&xdg)
-    {
-        dirs.push(xdg);
-    }
-    dirs
-}
-
-fn load_env_files_with_global(cwd: &Path, global: Option<&Path>) {
+fn load_env_files_with_global(cwd: &Path, global_env: Option<&Path>) {
     let mut vars = HashMap::new();
-    if let Some(path) = global {
-        collect_env_vars(&path.join(".env"), &mut vars);
+    if let Some(path) = global_env {
+        collect_env_vars(path, &mut vars);
     }
-    collect_env_vars(&cwd.join(PROJECT_DIR).join(".env"), &mut vars);
+    collect_env_vars(&cwd.join(PROJECT_DIR).join(ENV_FILE), &mut vars);
 
     for (key, value) in vars {
         if std::env::var_os(&key).is_none() {
@@ -2166,13 +2154,8 @@ fn collect_env_vars(path: &Path, vars: &mut HashMap<String, String>) {
     }
 }
 
-pub fn load_env_files(cwd: &Path) {
-    load_env_files_with_global(cwd, global_dir().as_deref());
-}
-
 pub fn load_permissions(cwd: &Path) -> PermissionsConfig {
-    let global_dirs = config_search_dirs(global_dir().as_deref());
-    load_permissions_inner(cwd, &global_dirs)
+    load_permissions_inner(cwd, &paths::config_search_dirs())
 }
 
 fn load_permissions_inner(cwd: &Path, global_dirs: &[PathBuf]) -> PermissionsConfig {
@@ -2357,11 +2340,7 @@ fn read_permissions_file(path: &Path) -> Option<PermissionsFileConfig> {
 }
 
 pub fn global_config_dir() -> Option<PathBuf> {
-    global_dir()
-}
-
-pub fn global_config_dirs() -> Vec<PathBuf> {
-    config_search_dirs(global_dir().as_deref())
+    paths::config_dir().ok()
 }
 
 pub fn append_permission_rule(
@@ -2370,9 +2349,7 @@ pub fn append_permission_rule(
     effect: Effect,
     target: &PermissionTarget,
 ) -> Result<(), String> {
-    let dir = config_search_dirs(global_dir().as_deref())
-        .into_iter()
-        .last();
+    let dir = paths::config_search_dirs().into_iter().last();
     append_permission_rule_with_global(tool, scope, effect, target, dir)
 }
 
@@ -3248,7 +3225,7 @@ mod tests {
             std::env::set_var(PROCESS_WINS, "process");
         }
 
-        load_env_files_with_global(dir.path(), Some(&global));
+        load_env_files_with_global(dir.path(), Some(&global.join(ENV_FILE)));
 
         assert_eq!(std::env::var(GLOBAL_ONLY).unwrap(), "global");
         assert_eq!(std::env::var(PROJECT_SHADOWS).unwrap(), "project");

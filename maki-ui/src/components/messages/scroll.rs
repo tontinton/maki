@@ -145,7 +145,7 @@ mod tests {
         let mut cache = SegmentCache::new();
         for &h in heights {
             let lines = (0..h).map(|i| Line::raw(format!("l{i}"))).collect();
-            cache.push(Segment::with_lines(lines, String::new(), None));
+            cache.push(Segment::with_lines(lines, None));
         }
         cache
     }

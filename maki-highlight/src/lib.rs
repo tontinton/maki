@@ -11,6 +11,8 @@ use syntect::highlighting::{
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
+pub mod pool;
+
 const TOKEN_ALIASES: &[(&str, &str)] = &[("jsx", "js")];
 pub const TAB_SPACES: &str = "  ";
 const BLOCK_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;

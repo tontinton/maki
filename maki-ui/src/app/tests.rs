@@ -476,7 +476,7 @@ fn tool_done_transitions_plan_to_ready(
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
         tool: "write".into(),
-        output,
+        output: Arc::new(output),
         is_error: false,
         annotation: None,
         written_path,
@@ -963,7 +963,7 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "tool-1".into(),
         tool: "bash".into(),
-        output: ToolOutput::Plain("done".into()),
+        output: Arc::new(ToolOutput::Plain("done".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1388,7 +1388,7 @@ pub(crate) fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: id.into(),
         tool: "task".into(),
-        output: ToolOutput::Plain("result".into()),
+        output: Arc::new(ToolOutput::Plain("result".into())),
         is_error,
         annotation: None,
         written_path: None,
@@ -2949,9 +2949,10 @@ fn build_rewind_app() -> App {
         },
         Message::user("third prompt".into()),
     ]);
-    app.state
-        .session_mut()
-        .insert_tool_output("tool-1".into(), ToolOutput::Plain("output".into()));
+    app.state.session_mut().insert_tool_output(
+        "tool-1".into(),
+        Arc::new(ToolOutput::Plain("output".into())),
+    );
     app
 }
 
@@ -3204,6 +3205,66 @@ fn send_to_agent_unknown_subagent_falls_back_to_main() {
 
     assert_eq!(main_rx.try_recv().unwrap(), "");
     assert_eq!(app.pending_input, PendingInput::None);
+}
+
+/// Output that mutates a segment already on screen, rather than appending a
+/// new one, still has to be searchable. A `!` shell command does exactly this
+/// and never sets `Status::Streaming`, so the status is no guide to staleness.
+#[test]
+fn search_reaches_output_that_lands_in_an_existing_segment() {
+    const LATE_TEXT: &str = "zzarrived";
+
+    let mut app = test_app();
+    app.run_id = 1;
+    app.update(agent_msg(tool_start("tool-1", "bash")));
+    rendered(&mut app);
+    app.update(Msg::Key(kb::SEARCH.to_key_event()));
+
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: "tool-1".into(),
+        tool: "bash".into(),
+        output: Arc::new(ToolOutput::Plain(LATE_TEXT.into())),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    }))));
+    rendered(&mut app);
+    for c in LATE_TEXT.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+
+    assert!(
+        app.search_modal.current_segment_index().is_some(),
+        "search must see output that landed in a segment opened before it"
+    );
+}
+
+/// The messages that close a turn out land after the status has already left
+/// `Streaming`, so both statuses have to reach a freshly appended segment.
+#[test_case(Status::Streaming ; "mid_turn")]
+#[test_case(Status::Idle      ; "after_the_turn_ended")]
+fn search_reaches_output_that_lands_while_the_modal_is_open(status: Status) {
+    // Nothing else in the transcript holds this string, so a hit can only come
+    // from a corpus rebuilt after the modal opened.
+    const LATE_TEXT: &str = "zzarrived";
+
+    let mut app = test_app();
+    app.status = status;
+    app.update(Msg::Key(kb::SEARCH.to_key_event()));
+
+    app.active_chat().push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        LATE_TEXT.into(),
+    ));
+    rendered(&mut app);
+    for c in LATE_TEXT.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+
+    assert!(
+        app.search_modal.current_segment_index().is_some(),
+        "search must see the message that arrived after the modal opened"
+    );
 }
 
 #[test_case(ScrollPos { seg: 4, row: 2 }, false ; "restores_scroll_position")]
@@ -3699,7 +3760,7 @@ fn plan_app() -> App {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
         tool: "write".into(),
-        output: ToolOutput::Plain("wrote 42 bytes to test-plan.md".into()),
+        output: Arc::new(ToolOutput::Plain("wrote 42 bytes to test-plan.md".into())),
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
@@ -3718,7 +3779,9 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
         tool: "write".into(),
-        output: ToolOutput::Plain("wrote 42 bytes to /tmp/plans/test.md".into()),
+        output: Arc::new(ToolOutput::Plain(
+            "wrote 42 bytes to /tmp/plans/test.md".into(),
+        )),
         is_error: false,
         annotation: None,
         written_path: Some("/tmp/plans/test.md".into()),
@@ -3750,7 +3813,7 @@ fn re_edit_keeps_plan_form_visible() {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t2".into(),
         tool: "write".into(),
-        output: ToolOutput::Plain("wrote 50 bytes to test-plan.md".into()),
+        output: Arc::new(ToolOutput::Plain("wrote 50 bytes to test-plan.md".into())),
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
@@ -3818,7 +3881,7 @@ fn rewrite_plan(app: &mut App) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t2".into(),
         tool: "write".into(),
-        output: ToolOutput::Plain("wrote 99 bytes to test-plan.md".into()),
+        output: Arc::new(ToolOutput::Plain("wrote 99 bytes to test-plan.md".into())),
         is_error: false,
         annotation: None,
         written_path: Some("test-plan.md".into()),
@@ -5213,7 +5276,7 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
         app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
             id: tool_id.into(),
             tool: "bash".into(),
-            output: ToolOutput::Plain(tool_text(tool_id).into()),
+            output: Arc::new(ToolOutput::Plain(tool_text(tool_id).into())),
             is_error: false,
             annotation: None,
             written_path: None,

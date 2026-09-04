@@ -17,7 +17,7 @@ reference is at the end of this document.
 Plugins live in the maki config dir. There are two of them, same layout:
 
 - `~/.config/maki/` - global, every project (if `~/.maki/` exists, maki reads
-  that one instead)
+  that one first)
 - `<project>/.maki/` - this project only
 
 ```

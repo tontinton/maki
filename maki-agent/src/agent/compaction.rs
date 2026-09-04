@@ -14,6 +14,12 @@ use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const IMAGE_PLACEHOLDER: &str = "[image]";
+const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
+/// How much of the newest tool output survives a compaction verbatim. This
+/// used to be a count, which kept three huge results and threw away thirty
+/// cheap ones, so one giant MCP dump could sit in the protected tail and blow
+/// the window on every retry.
+const RECENT_TOOL_RESULT_BUDGET: usize = 64 * 1024;
 
 fn normalize(text: Option<&str>) -> Option<&str> {
     text.map(str::trim).filter(|t| !t.is_empty())
@@ -43,6 +49,14 @@ pub(super) fn continue_message(config: &AgentConfig) -> String {
     }
 }
 
+/// Replaces `history` with a summary of itself, retrying on overflow by
+/// pruning what it sends.
+///
+/// The last `carry_len` messages are held out of the summary and re-appended
+/// after it, so input no turn has answered yet survives verbatim without ever
+/// leaving `history`. Anything less and the mirror would publish a transcript
+/// missing that input for the length of the summary request.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn compact_history(
     provider: &dyn maki_providers::provider::Provider,
     model: &Model,
@@ -51,13 +65,15 @@ pub(super) async fn compact_history(
     cancel: &CancelToken,
     config: &AgentConfig,
     instructions: Option<&str>,
+    carry_len: usize,
 ) -> Result<TokenUsage, AgentError> {
     let compact_start = std::time::Instant::now();
-    let mut compaction_history: Vec<Message> = history.as_slice().to_vec();
+    let summarized = history.len().saturating_sub(carry_len);
+    let mut compaction_history: Vec<Message> = history.as_slice()[..summarized].to_vec();
     remove_orphaned_tool_results(&mut compaction_history);
     strip_images(&mut compaction_history);
     strip_thinking(&mut compaction_history);
-    strip_old_tool_results(&mut compaction_history);
+    collapse_tool_results(&mut compaction_history, RECENT_TOOL_RESULT_BUDGET);
     compaction_history.push(Message::user(summary_prompt(config, instructions)));
 
     let empty_tools = serde_json::json!([]);
@@ -80,16 +96,26 @@ pub(super) async fn compact_history(
         {
             Ok(response) => {
                 if attempt > 0 {
-                    info!(
-                        attempt,
-                        "compaction succeeded after truncating oldest rounds"
-                    );
+                    info!(attempt, "compaction succeeded after pruning history");
                 }
-                return finish_compact(response, history, event_tx, compact_start, model);
+                return finish_compact(
+                    response,
+                    history,
+                    summarized,
+                    event_tx,
+                    compact_start,
+                    model,
+                );
             }
             Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
                 last_error = Some(e);
-                truncate_oldest_round(&mut compaction_history);
+                // Truncation eats from the front, so it can never shrink an
+                // oversized result sitting in the protected tail. Collapse that
+                // first, and once there is nothing left to collapse, drop the
+                // oldest round rather than resend the same request.
+                if !collapse_tool_results(&mut compaction_history, 0) {
+                    truncate_oldest_round(&mut compaction_history);
+                }
             }
             Err(e) => return Err(e.into()),
         }
@@ -101,6 +127,7 @@ pub(super) async fn compact_history(
 fn finish_compact(
     response: StreamResponse,
     history: &mut History,
+    summarized: usize,
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
@@ -120,10 +147,11 @@ fn finish_compact(
         return Err(AgentError::EmptySummary);
     }
 
-    let new_history = vec![
+    let mut new_history = vec![
         Message::user("What did we do so far?".into()),
         response.message,
     ];
+    new_history.extend_from_slice(&history.as_slice()[summarized..]);
     history.replace(new_history);
     info!(
         model = %model.id,
@@ -151,6 +179,7 @@ pub async fn compact(
         &cancel,
         config,
         instructions,
+        0,
     )
     .await?;
     if let Some(post) = normalize(config.post_compaction_instructions.as_deref()) {
@@ -208,27 +237,30 @@ fn strip_thinking(messages: &mut [Message]) {
     }
 }
 
-const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
-const KEEP_LAST_TOOL_RESULTS: usize = 3;
-
-fn strip_old_tool_results(messages: &mut [Message]) {
-    let total: usize = messages
-        .iter()
-        .flat_map(|m| &m.content)
-        .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
-        .count();
-
-    let mut seen = 0;
-    for msg in messages {
-        for block in &mut msg.content {
-            if let ContentBlock::ToolResult { content, .. } = block {
-                if seen < total.saturating_sub(KEEP_LAST_TOOL_RESULTS) {
+/// Walks newest first and collapses every tool result that does not fit in
+/// what is left of `budget`. One oversized result is collapsed on its own and
+/// leaves the budget to the older ones, which is the whole point: charging it
+/// would spend the tail on a block that is no longer there. Returns whether
+/// anything actually shrank, so a caller retrying on overflow can tell
+/// progress from a no-op.
+fn collapse_tool_results(messages: &mut [Message], mut budget: usize) -> bool {
+    let mut collapsed = false;
+    for block in messages
+        .iter_mut()
+        .rev()
+        .flat_map(|m| m.content.iter_mut().rev())
+    {
+        if let ContentBlock::ToolResult { content, .. } = block {
+            match budget.checked_sub(content.len()) {
+                Some(rest) => budget = rest,
+                None => {
+                    collapsed |= content != TOOL_RESULT_PLACEHOLDER;
                     *content = TOOL_RESULT_PLACEHOLDER.into();
                 }
-                seen += 1;
             }
         }
     }
+    collapsed
 }
 
 fn truncate_oldest_round(messages: &mut Vec<Message>) {
@@ -284,6 +316,13 @@ mod tests {
     const CONFIG_EXTRA: &str = "Record anything that belongs in plan.md";
     const REQUEST_EXTRA: &str = "Keep the failing test names";
     const POST: &str = "Re-read plan.md and agent.md";
+    const OVERFLOW_MESSAGE: &str = "prompt is too long";
+    const OVERFLOW_STATUS: u16 = 413;
+    /// Shorter than [`NEW_RESULT`], so the budget-burn case below is the only
+    /// reason it collapses.
+    const OLD_RESULT: &str = "old";
+    const NEW_RESULT: &str = "new result";
+    const KEPT_TEXT: &str = "keep me";
 
     struct MockProvider {
         responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
@@ -331,6 +370,13 @@ mod tests {
         let mut model = default_model();
         model.context_window = context_window;
         model
+    }
+
+    fn overflow_error() -> AgentError {
+        AgentError::Api {
+            status: OVERFLOW_STATUS,
+            message: OVERFLOW_MESSAGE.into(),
+        }
     }
 
     fn text_response(stop_reason: StopReason) -> StreamResponse {
@@ -518,6 +564,7 @@ mod tests {
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
+                0,
             )
             .await
             .unwrap();
@@ -623,61 +670,38 @@ mod tests {
         assert!(matches!(&messages[0].content[0], ContentBlock::Text { text } if text == "hello"));
     }
 
-    #[test]
-    fn strip_old_tool_results_keeps_newest() {
+    #[test_case(OLD_RESULT.len() + NEW_RESULT.len(), &[OLD_RESULT, NEW_RESULT] ; "whole_tail_fits")]
+    #[test_case(NEW_RESULT.len(), &[TOOL_RESULT_PLACEHOLDER, NEW_RESULT] ; "only_newest_fits")]
+    #[test_case(NEW_RESULT.len() - 1, &[OLD_RESULT, TOOL_RESULT_PLACEHOLDER] ; "oversized_newest_spares_the_older_ones")]
+    fn collapse_tool_results_budgets_the_tail(budget: usize, expected: &[&str]) {
         let mut messages = vec![Message {
             role: Role::User,
             content: vec![
                 ContentBlock::ToolResult {
                     tool_use_id: "t1".into(),
-                    content: "old result 1".into(),
+                    content: OLD_RESULT.into(),
                     is_error: false,
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: "t2".into(),
-                    content: "old result 2".into(),
-                    is_error: false,
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "t3".into(),
-                    content: "keep 1".into(),
-                    is_error: false,
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "t4".into(),
-                    content: "keep 2".into(),
-                    is_error: false,
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "t5".into(),
-                    content: "keep 3".into(),
+                    content: NEW_RESULT.into(),
                     is_error: false,
                 },
                 ContentBlock::Text {
-                    text: "keep me".into(),
+                    text: KEPT_TEXT.into(),
                 },
             ],
             ..Default::default()
         }];
-        strip_old_tool_results(&mut messages);
-        assert_eq!(messages[0].content.len(), 6);
+        collapse_tool_results(&mut messages, budget);
+
+        for (block, expected) in messages[0].content.iter().zip(expected) {
+            assert!(
+                matches!(block, ContentBlock::ToolResult { content, .. } if content == expected)
+            );
+        }
         assert!(
-            matches!(&messages[0].content[0], ContentBlock::ToolResult { content, tool_use_id, .. } if content == TOOL_RESULT_PLACEHOLDER && tool_use_id == "t1")
-        );
-        assert!(
-            matches!(&messages[0].content[1], ContentBlock::ToolResult { content, tool_use_id, .. } if content == TOOL_RESULT_PLACEHOLDER && tool_use_id == "t2")
-        );
-        assert!(
-            matches!(&messages[0].content[2], ContentBlock::ToolResult { content, tool_use_id, .. } if content == "keep 1" && tool_use_id == "t3")
-        );
-        assert!(
-            matches!(&messages[0].content[3], ContentBlock::ToolResult { content, tool_use_id, .. } if content == "keep 2" && tool_use_id == "t4")
-        );
-        assert!(
-            matches!(&messages[0].content[4], ContentBlock::ToolResult { content, tool_use_id, .. } if content == "keep 3" && tool_use_id == "t5")
-        );
-        assert!(
-            matches!(&messages[0].content[5], ContentBlock::Text { text } if text == "keep me")
+            matches!(&messages[0].content[2], ContentBlock::Text { text } if text == KEPT_TEXT)
         );
     }
 
@@ -721,10 +745,8 @@ mod tests {
             const TOOL_USE_ID: &str = "call_dMZDTpEfz2JxMvFbqFHua1Zy";
 
             let provider = MockProvider::new(vec![
-                Err(AgentError::Api {
-                    status: 413,
-                    message: "prompt is too long".into(),
-                }),
+                Err(overflow_error()),
+                Err(overflow_error()),
                 Ok(text_response(StopReason::EndTurn)),
             ]);
             let mut history = History::new(vec![
@@ -747,22 +769,103 @@ mod tests {
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
+                0,
             )
             .await
             .unwrap();
 
             let requests = provider.requests.lock().unwrap();
-            assert_eq!(requests.len(), 2);
+            assert_eq!(requests.len(), 3);
             assert!(requests[0]
                 .iter()
                 .flat_map(|message| &message.content)
                 .any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == TOOL_USE_ID)));
+            // Attempt 1 only collapses the result, attempt 2 drops the round.
+            assert!(requests[1]
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(block, ContentBlock::ToolResult { content, .. } if content == TOOL_RESULT_PLACEHOLDER)));
             assert!(
-                !requests[1]
+                !requests[2]
                     .iter()
                     .flat_map(|message| &message.content)
                     .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
             );
+        });
+    }
+
+    const NO_COLLAPSE_MSG: &str =
+        "with no tool result to collapse the retry must prune instead of resending";
+
+    #[test]
+    fn compact_history_prunes_when_there_is_nothing_to_collapse() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![
+                Err(overflow_error()),
+                Ok(text_response(StopReason::EndTurn)),
+            ]);
+            let mut history = History::new(vec![
+                Message::user("first".into()),
+                Message::user("second".into()),
+            ]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact_history(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
+                &AgentConfig::default(),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+
+            let requests = provider.requests.lock().unwrap();
+            assert!(requests[1].len() < requests[0].len(), "{NO_COLLAPSE_MSG}");
+        });
+    }
+
+    const CARRIED: &str = "answer this next";
+    const CARRY_UNSENT_MSG: &str = "carried input is not the summariser's to read";
+    const CARRY_KEPT_MSG: &str = "carried input must outlive the summary verbatim";
+
+    #[test]
+    fn compact_history_carries_the_tail_past_the_summary() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![
+                Message::user("first".into()),
+                Message::user(CARRIED.into()),
+            ]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact_history(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
+                &AgentConfig::default(),
+                None,
+                1,
+            )
+            .await
+            .unwrap();
+
+            let carried = |messages: &[Message]| {
+                messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|block| matches!(block, ContentBlock::Text { text } if text == CARRIED))
+            };
+            assert!(
+                !carried(&provider.requests.lock().unwrap()[0]),
+                "{CARRY_UNSENT_MSG}"
+            );
+            assert!(carried(history.as_slice()), "{CARRY_KEPT_MSG}");
         });
     }
 
@@ -790,6 +893,7 @@ mod tests {
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
+                0,
             )
             .await
             .unwrap();

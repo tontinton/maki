@@ -1288,6 +1288,18 @@ mod tests {
         }
     }
 
+    /// A scope is one string and a chain is still one scope, so it is tempting
+    /// to teach the matcher that `rm *` should not claim `rm ...; sudo ...`.
+    /// Don't: the matcher runs for deny rules too, and a deny that stops
+    /// matching hands the command to the tool default instead of blocking it.
+    /// Chains get split by the bash plugin, before they ever reach here.
+    #[test]
+    fn deny_rule_matches_a_chain_it_starts() {
+        let mgr = mgr_with(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
+        let check = mgr.check(&ToolKey::native("bash"), "rm -rf /tmp; sudo x", None);
+        assert!(matches!(check, PermissionCheck::Denied), "got {check:?}");
+    }
+
     #[test]
     fn apply_decision_multi_scope_generalizes_all() {
         let mgr = default_mgr();

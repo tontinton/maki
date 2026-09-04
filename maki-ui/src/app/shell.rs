@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::process::Command as StdCommand;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -150,7 +151,7 @@ impl App {
                 self.main_chat().shell_tool_done(ToolDoneEvent {
                     id: id.clone(),
                     tool: "bash".into(),
-                    output: ToolOutput::Plain(output.into()),
+                    output: Arc::new(ToolOutput::Plain(output.into())),
                     is_error,
                     annotation: None,
                     written_path: None,

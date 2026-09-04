@@ -607,7 +607,7 @@ impl<'t> EventLoop<'t> {
 
         static PROCESS_WARMUP: std::sync::Once = std::sync::Once::new();
         PROCESS_WARMUP.call_once(|| {
-            std::thread::spawn(crate::highlight::warmup);
+            maki_highlight::pool::spawn(crate::highlight::warmup);
             crate::update::spawn_check();
         });
 

@@ -853,12 +853,7 @@ impl App {
 
         if self.search_modal.is_open() {
             match self.search_modal.handle_key(key) {
-                SearchAction::Consumed => {
-                    let chat = &mut self.chats[self.active_chat];
-                    let texts = chat.segment_search_texts();
-                    self.search_modal.update_matches(&texts);
-                    sync_search_highlight(&self.search_modal, chat);
-                }
+                SearchAction::Consumed => self.refresh_search_matches(),
                 SearchAction::Navigate => {
                     sync_search_highlight(&self.search_modal, &mut self.chats[self.active_chat]);
                 }
@@ -993,9 +988,9 @@ impl App {
                 self.file_picker.open(&self.state.session.cwd);
             }
             BuiltinAction::Search => {
-                let pos = self.chats[self.active_chat].scroll_pos();
-                let auto = self.chats[self.active_chat].auto_scroll();
-                self.search_modal.open(pos, auto);
+                let chat = &self.chats[self.active_chat];
+                self.search_modal
+                    .open(chat.scroll_pos(), chat.auto_scroll());
             }
             BuiltinAction::Help => self.help_modal.toggle(),
             BuiltinAction::PlanToggle => {
@@ -1853,6 +1848,17 @@ impl App {
         self.overlays().iter().any(|o| o.is_open() && o.is_modal())
     }
 
+    /// Derived fresh every time rather than snapshotted on open: output can
+    /// land behind the modal, and a `!` shell command streams into a segment
+    /// that already existed without ever setting [`Status::Streaming`]. The
+    /// copy is cheaper than the match pass that follows it over the same bytes.
+    fn refresh_search_matches(&mut self) {
+        let chat = &mut self.chats[self.active_chat];
+        self.search_modal
+            .update_matches(|| chat.segment_search_texts());
+        sync_search_highlight(&self.search_modal, chat);
+    }
+
     pub fn close_all_overlays(&mut self) {
         self.overlays_mut().iter_mut().for_each(|o| o.close());
     }
@@ -1950,10 +1956,7 @@ impl App {
         }
         if self.search_modal.is_open() {
             self.search_modal.handle_paste(text);
-            let chat = &mut self.chats[self.active_chat];
-            let texts = chat.segment_search_texts();
-            self.search_modal.update_matches(&texts);
-            sync_search_highlight(&self.search_modal, chat);
+            self.refresh_search_matches();
             return;
         }
         macro_rules! try_picker {

@@ -49,7 +49,6 @@ impl HighlightKey {
 #[derive(Default)]
 pub(super) struct Segment {
     lines: Vec<Line<'static>>,
-    pub search_text: String,
     pub tool_id: Option<String>,
     /// Backlink to `self.messages`, set only by `with_lines`. A click on a
     /// collapsed thinking indicator has no tool_id to route by, so this is
@@ -91,14 +90,9 @@ impl Segment {
         }
     }
 
-    pub fn with_lines(
-        lines: Vec<Line<'static>>,
-        search_text: String,
-        msg_index: Option<usize>,
-    ) -> Self {
+    pub fn with_lines(lines: Vec<Line<'static>>, msg_index: Option<usize>) -> Self {
         Self {
             lines,
-            search_text,
             msg_index,
             ..Self::default()
         }
@@ -397,13 +391,6 @@ impl SegmentCache {
         if !self.segments.is_empty() {
             self.segments.push(Segment::spacer());
         }
-    }
-
-    pub fn search_texts(&self) -> Vec<&str> {
-        self.segments
-            .iter()
-            .map(|s| s.search_text.as_str())
-            .collect()
     }
 
     pub fn mark_all_stale(&mut self) {

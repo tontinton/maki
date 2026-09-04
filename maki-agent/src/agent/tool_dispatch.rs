@@ -114,7 +114,7 @@ pub async fn run(
             return ToolDoneEvent {
                 id,
                 tool: Arc::from(name),
-                output: ToolOutput::Plain(reason.into()),
+                output: Arc::new(ToolOutput::Plain(reason.into())),
                 is_error: true,
                 annotation: None,
                 written_path: None,
@@ -173,7 +173,16 @@ impl<'a> Hook<'a> {
             return;
         }
         let was_error = done.is_error;
-        let Some(text) = done.output.filterable_text_mut() else {
+        // The output has not reached the session or the UI yet, so `make_mut`
+        // takes the allocation instead of cloning it. Publishing the event any
+        // earlier would still be correct, only silently back to deep copies.
+        debug_assert_eq!(
+            Arc::strong_count(&done.output),
+            1,
+            "a tool output hook ran on an already-published output: whoever \
+             published it before this point turned every hook into a deep copy"
+        );
+        let Some(text) = Arc::make_mut(&mut done.output).filterable_text_mut() else {
             debug!(
                 tool = %self.tool,
                 "output hook skipped: this output renders from fields, not prose"
@@ -463,7 +472,9 @@ async fn run_inner(
             ToolDoneEvent {
                 id,
                 tool: Arc::from(UNKNOWN_MCP),
-                output: ToolOutput::Plain(format!("{UNKNOWN_TOOL_PREFIX}: {name}").into()),
+                output: Arc::new(ToolOutput::Plain(
+                    format!("{UNKNOWN_TOOL_PREFIX}: {name}").into(),
+                )),
                 is_error: true,
                 annotation: None,
                 written_path: None,
@@ -487,7 +498,7 @@ async fn run_native_tool(
     let done_error = |msg: String| ToolDoneEvent {
         id: id.clone(),
         tool: Arc::clone(&tool_id),
-        output: ToolOutput::Plain(msg.into()),
+        output: Arc::new(ToolOutput::Plain(msg.into())),
         is_error: true,
         annotation: None,
         written_path: None,
@@ -598,7 +609,7 @@ async fn run_native_tool(
             ToolDoneEvent {
                 id,
                 tool: tool_id,
-                output,
+                output: Arc::new(output),
                 is_error: false,
                 annotation: result.annotation,
                 written_path: result.written_path,
@@ -662,7 +673,7 @@ fn run_tool_search(
     ToolDoneEvent {
         id,
         tool: tool_id,
-        output: ToolOutput::Markdown(output.into()),
+        output: Arc::new(ToolOutput::Markdown(output.into())),
         is_error,
         annotation: None,
         written_path: None,
@@ -693,7 +704,7 @@ async fn run_local_tool(
     ToolDoneEvent {
         id,
         tool: tool_id,
-        output: ToolOutput::Plain(output.into()),
+        output: Arc::new(ToolOutput::Plain(output.into())),
         is_error,
         annotation: None,
         written_path: None,
@@ -745,7 +756,7 @@ async fn execute_mcp_tool(
     let done = |output: String, is_error: bool| ToolDoneEvent {
         id: id.to_owned(),
         tool: Arc::clone(&tool),
-        output: ToolOutput::Plain(output.into()),
+        output: Arc::new(ToolOutput::Plain(output.into())),
         is_error,
         annotation: None,
         written_path: None,
@@ -927,7 +938,7 @@ fn report(done: &ToolDoneEvent, name: &str, source: &str, input: &Value, took: D
         error_type: error_text.as_deref().map(classify_error),
         tool_input: tool_input.as_deref(),
     });
-    if let ToolOutput::Diff { before, after, .. } = &done.output {
+    if let ToolOutput::Diff { before, after, .. } = done.output.as_ref() {
         let (added, removed) = changed_lines(before, after);
         maki_otel::emit::lines_of_code(added, removed);
     }
