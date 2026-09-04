@@ -73,6 +73,11 @@ enum Command {
     Serve {
         #[arg(long, default_value = DEFAULT_BIND)]
         bind: String,
+        /// Host (or host:port) for the instance tunnel listener. Defaults to
+        /// the `--bind` host on HTTP port + 1. Use `--ws-bind 127.0.0.1` to
+        /// keep the tunnel loopback-only and front it with your reverse proxy.
+        #[arg(long)]
+        ws_bind: Option<String>,
         #[arg(long, default_value = DEFAULT_DB_PATH)]
         db: PathBuf,
         #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
@@ -173,7 +178,12 @@ fn main() {
         .try_init();
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { bind, db, config } => {
+        Command::Serve {
+            bind,
+            ws_bind,
+            db,
+            config,
+        } => {
             let store = Store::open(&db).expect("open anchor db");
             let anchor_config = match std::fs::read_to_string(&config) {
                 Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
@@ -219,7 +229,7 @@ fn main() {
                     MintTokens::Any
                 }
             };
-            if let Err(err) = server::serve(&bind, store, oidc, allow_local, mint_tokens) {
+            if let Err(err) = server::serve(&bind, ws_bind.as_deref(), store, oidc, allow_local, mint_tokens) {
                 eprintln!("fatal: {err}");
                 std::process::exit(1);
             }

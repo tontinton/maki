@@ -34,6 +34,19 @@ This serves the web UI on port 8688 and the instance tunnel on 8689. Put your
 reverse proxy in front for TLS, and point the tunnel port at the same host.
 The proxy must forward WebSocket upgrades to the tunnel port.
 
+The tunnel is a second listener because `tiny_http` owns the HTTP port's
+accept loop, and a tunnel is a long-lived full-duplex socket, not a
+request/response. It does not have to be public. With `--ws-bind 127.0.0.1`
+the tunnel binds to loopback only and your reverse proxy fronts both behind
+one origin, forwarding `/ws` to `127.0.0.1:8689`:
+
+```
+maki-anchor serve --bind 0.0.0.0:8688 --ws-bind 127.0.0.1
+```
+
+Only the HTTP port then needs a firewall/TLS path. Use `--ws-bind host:port`
+to pin the tunnel to an explicit port as well.
+
 The anchor writes its database next to the working directory as
 `maki-anchor.sqlite3`, and reads optional OIDC settings from
 `maki-anchor.toml`.

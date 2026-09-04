@@ -143,8 +143,26 @@ fn split_token_path(path: &str) -> Option<(&str, &str)> {
     Some((token, tail))
 }
 
+/// Tunnel listen address: an explicit `ws_bind` host (with `:port`) wins,
+/// otherwise the HTTP host with `http_port + 1`. Keeps the default behavior
+/// while letting operators bind the tunnel to loopback only.
+fn resolve_ws_addr(ws_bind: Option<&str>, addr: &str, http_port: u16) -> String {
+    match ws_bind {
+        None => format!(
+            "{}:{}",
+            addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr),
+            http_port + 1
+        ),
+        Some(bind) => match bind.rsplit_once(':') {
+            Some((_host, port)) if port.parse::<u16>().is_ok() => bind.to_owned(),
+            _ => format!("{bind}:{}", http_port + 1),
+        },
+    }
+}
+
 pub fn serve(
     addr: &str,
+    ws_bind: Option<&str>,
     store: Arc<Store>,
     oidc: Option<crate::oidc::OidcConfig>,
     allow_local: bool,
@@ -160,11 +178,9 @@ pub fn serve(
 
     // The instance tunnel lives on its own listener: browser traffic goes
     // through tiny_http, tunnels through a plain socket we drive directly.
-    let ws_addr = format!(
-        "{}:{}",
-        addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr),
-        port + 1
-    );
+    // `ws_bind` overrides the host (and optionally the port) so operators
+    // fronting one public origin can pin the tunnel to loopback.
+    let ws_addr = resolve_ws_addr(ws_bind, addr, port);
     let ws_listener = TcpListener::bind(&ws_addr).map_err(|source| ServerError::Bind {
         addr: ws_addr.clone(),
         source,
@@ -2159,8 +2175,7 @@ mod tests {
     }
 
     #[test]
-    fn split_token_path_accepts_valid_token() {
-        let token = "a".repeat(32);
+    fn split_token_path_accepts_valid_token() {        let token = "a".repeat(32);
         assert_eq!(
             split_token_path(&format!("/{token}/events")),
             Some((token.as_str(), "events"))
@@ -2227,5 +2242,25 @@ mod tests {
         // A stray percent stays literal instead of eating following chars.
         assert_eq!(url_decode("100%"), "100%");
         assert_eq!(url_decode("bad%zz"), "bad%zz");
+    }
+
+    #[test]
+    fn ws_addr_defaults_to_http_host_plus_one() {
+        assert_eq!(resolve_ws_addr(None, "0.0.0.0:8688", 8688), "0.0.0.0:8689");
+        assert_eq!(resolve_ws_addr(None, "127.0.0.1:0", 4321), "127.0.0.1:4322");
+    }
+
+    #[test]
+    fn ws_addr_honors_host_only_or_full_bind() {
+        // Host only -> reuse http port + 1 on that host.
+        assert_eq!(
+            resolve_ws_addr(Some("127.0.0.1"), "0.0.0.0:8688", 8688),
+            "127.0.0.1:8689"
+        );
+        // Explicit port wins.
+        assert_eq!(
+            resolve_ws_addr(Some("127.0.0.1:9000"), "0.0.0.0:8688", 8688),
+            "127.0.0.1:9000"
+        );
     }
 }
