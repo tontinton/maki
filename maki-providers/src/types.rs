@@ -815,6 +815,24 @@ impl ThinkingConfig {
         }
     }
 
+    /// Declared fragments win over the dialect; otherwise the dialect sends
+    /// effort only for thinking-capable models, so plain gateways stay quiet.
+    /// Fragments are the only openai-compat spelling: when no fragment spells
+    /// this mode there is nothing truthful to send, so unlike the local path
+    /// there is no budget-field fallback (that field is llama.cpp-only).
+    pub fn apply_openai_thinking(self, body: &mut Value, model: &Model, dialect: &EffortDialect) {
+        if let Some(fields) = &model.thinking_fields {
+            let max = model.max_thinking_budget();
+            if let Some((fragment, _)) = fields.fragment(self, max)
+                && let Some(object) = body.as_object_mut()
+            {
+                merge_body(object, fragment);
+            }
+        } else if model.supports_thinking() {
+            self.apply_reasoning_effort(body, dialect, model);
+        }
+    }
+
     /// `max` is Google's own documented ceiling on thinking, which is a
     /// capability and so part of resolving the level, not a trim.
     pub fn apply_google_thinking(self, body: &mut Value, model: &Model, max: u32) {
@@ -1257,7 +1275,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&first.data, &read(INTERNED_DATA).data));
     }
 
-    use Effort::{High, Low, Max, Medium, Minimal, XHigh};
+    use Effort::{High, Low, Max, Minimal, XHigh};
 
     /// `max_output_tokens: 8192`, so `max_thinking_budget()` is 4096.
     fn thinking_model(id: &str) -> crate::model::Model {
@@ -1388,9 +1406,6 @@ mod tests {
     #[test_case(&dialect::OLLAMA, ThinkingConfig::Off,             Some("none")   ; "ollama_off_explicit_none")]
     #[test_case(&dialect::OLLAMA, ThinkingConfig::Adaptive,        Some("medium") ; "ollama_adaptive")]
     #[test_case(&dialect::OLLAMA, ThinkingConfig::Effort(Minimal), Some("low")    ; "ollama_minimal_snaps_up")]
-    #[test_case(&dialect::OLLAMA, ThinkingConfig::Effort(Low),     Some("low")    ; "ollama_low_passthrough")]
-    #[test_case(&dialect::OLLAMA, ThinkingConfig::Effort(Medium),  Some("medium") ; "ollama_medium_passthrough")]
-    #[test_case(&dialect::OLLAMA, ThinkingConfig::Effort(High),    Some("high")   ; "ollama_high_passthrough")]
     #[test_case(&dialect::OLLAMA, ThinkingConfig::Effort(XHigh),   Some("high")   ; "ollama_xhigh_snaps_down")]
     #[test_case(&dialect::OLLAMA, ThinkingConfig::Effort(Max),     Some("max")    ; "ollama_max_passthrough")]
     fn thinking_apply_reasoning_effort(
@@ -1404,6 +1419,22 @@ mod tests {
             Some(e) => assert_eq!(body["reasoning_effort"], e),
             None => assert!(body.get("reasoning_effort").is_none()),
         }
+    }
+
+    #[test]
+    fn openai_thinking_prefers_declared_fields_over_dialect() {
+        let model = native_effort_model();
+        let mut body = json!({"model": "test"});
+        ThinkingConfig::Effort(XHigh).apply_openai_thinking(&mut body, &model, &dialect::OLLAMA);
+        assert_eq!(body["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn openai_thinking_sends_nothing_without_a_matching_fragment() {
+        let model = native_thinking_model("fields-model", json!({"high": {"reasoning_effort": "xhigh"}}));
+        let mut body = json!({"model": "test"});
+        ThinkingConfig::Off.apply_openai_thinking(&mut body, &model, &dialect::OLLAMA);
+        assert_eq!(body, json!({"model": "test"}));
     }
 
     /// The badge reads as whatever the session is set to, and stays quiet when
