@@ -135,6 +135,8 @@ The rules:
 | [`maki.ui.Win`](#maki-ui-Win) | Handle to a floating or split window. |
 | [`maki.ui.Buf`](#maki-ui-Buf) | A content buffer that holds styled lines of text. |
 | [`maki.uv`](#maki-uv) | System and environment utilities, modelled after `vim.uv`. |
+| [`maki.uv.Tcp`](#maki-uv-Tcp) | An outbound TCP client handle, mirroring libuv's `uv_tcp_t`. |
+| [`maki.uv.Timer`](#maki-uv-Timer) | A timer handle, mirroring libuv's `uv_timer_t`. |
 | [`maki.yaml`](#maki-yaml) | YAML encoding and decoding. |
 
 ## maki {#maki}
@@ -5711,12 +5713,19 @@ buf:blit(fb32, 160, 100, { format = "bgra", char = "█" })
 
 System and environment utilities, modelled after `vim.uv`.
 
-Provides access to the working directory, home directory, and environment
-variables. None of these functions throw.
+Beyond the location queries, this namespace carries libuv-style tcp and
+timer handles: `new_tcp` and `new_timer` return handles whose methods
+(`:connect`, `:read_start`, `:write`, `:start`, ...) keep `vim.uv`
+signatures, so plugin code can be copy-pasted between Neovim and maki.
+Handle operations return `0` on success and `(nil, err, name)` on
+failure, and their callbacks receive errors err-first, exactly like
+`vim.uv`. Connecting is guarded like `maki.net.request`: the plugin
+needs `net`, and loopback or private targets additionally need an entry
+in `net.allowed_private_hosts`.
 
 Filesystem location queries (`cwd`, `os_homedir`) need `fs_read`, while
-`os_getenv` reads the process environment, where secrets live, so it needs
-`env`.
+`os_getenv` reads the process environment, where secrets live, so it
+needs `env`.
 
 ```lua
 local home = maki.uv.os_homedir()
@@ -5787,6 +5796,391 @@ Requires the `env` [plugin permission](#plugin-permissions).
 ```lua
 local editor = maki.uv.os_getenv("EDITOR") or "vi"
 ```
+
+---
+
+### `maki.uv.new_tcp()` {#maki-uv-new_tcp}
+
+```lua
+maki.uv.new_tcp({flags?})
+```
+
+Create a new TCP handle. Like `vim.uv.new_tcp`. The optional {flags}
+restrict the handle to an address family; a wrong value throws, as a
+programmer error.
+
+**Parameters:**
+
+- `{flags?}` (`string|integer?`) `"inet"`, `"inet6"`, or one of the `AF_*` integers (`0`, `2`, `10`).
+
+**Returns:** ([`maki.uv.Tcp`](#maki-uv-Tcp)) The new handle.
+
+**Example:**
+
+```lua
+local tcp = maki.uv.new_tcp()
+tcp:connect("127.0.0.1", 8080, function(err)
+  if err then print("connect failed: " .. err) end
+end)
+```
+
+---
+
+### `maki.uv.new_timer()` {#maki-uv-new_timer}
+
+```lua
+maki.uv.new_timer()
+```
+
+Create a new timer handle. Like `vim.uv.new_timer`.
+
+**Returns:** ([`maki.uv.Timer`](#maki-uv-Timer)) The new handle.
+
+**Example:**
+
+```lua
+local timer = maki.uv.new_timer()
+timer:start(1000, 0, function() print("one second later") end)
+```
+
+
+## maki.uv.Tcp {#maki-uv-Tcp}
+
+An outbound TCP client handle, mirroring libuv's `uv_tcp_t`. Created by
+`maki.uv.new_tcp()`, connected with `:connect()`, read with
+`:read_start()`, written with `:write()`, released with `:close()`.
+
+---
+
+### `Tcp:connect()` {#Tcp-connect}
+
+```lua
+Tcp:connect({host}, {port}, {callback})
+```
+
+Connect the handle to `host:port`. Like `vim.uv.tcp_connect`. `host` may
+be an IP address or a name: names resolve on the blocking pool through the
+same guard as `maki.net.request`, and their verdict reaches `callback`.
+Literal addresses and immediate failures report at the call site: the
+plugin's `net` permission, the `net.allowed_private_hosts` allowlist for
+private targets, a closed handle, or one already connecting or connected.
+
+**Parameters:**
+
+- `{host}` (`string`) Host or IP to connect to.
+- `{port}` (`integer`) Port to connect to.
+- `{callback}` (`function`) Called with `err` (nil on success).
+
+**Returns:** (`0|nil`, `string?`, `string?`) `0` on success, or luv's `(nil, err, name)` fail triple for immediate failures (closed handle, already connecting or connected, guard refusal).
+
+**Example:**
+
+```lua
+tcp:connect("127.0.0.1", 8080, function(err)
+  if not err then tcp:read_start(function(err, chunk)
+    if chunk then print(chunk) end
+  end) end
+end)
+```
+
+---
+
+### `Tcp:read_start()` {#Tcp-read_start}
+
+```lua
+Tcp:read_start({callback})
+```
+
+Start reading chunks as they arrive. Like `vim.uv.read_start`, except
+chunks are raw and arbitrary: unlike `maki.fn.jobstart` there is no line
+buffering. Reading may be armed before `:connect` finishes; it then starts
+as soon as the socket is up. End-of-file and errors end the stream; the
+callback still runs once with `data` nil, and re-arming after the stream
+ended delivers that end once more.
+
+**Parameters:**
+
+- `{callback}` (`function`) Called err-first as `function(err, data)`. `data` is nil at end-of-file or on error.
+
+**Returns:** (`0|nil`, `string?`, `string?`) `0` on success, or the fail triple.
+
+**Example:**
+
+```lua
+tcp:read_start(function(err, data)
+  if err then print("read error: " .. err)
+  elseif data then print("got " .. #data .. " bytes")
+  else print("closed by peer") end
+end)
+```
+
+---
+
+### `Tcp:read_stop()` {#Tcp-read_stop}
+
+```lua
+Tcp:read_stop()
+```
+
+Stop delivering chunks to the read callback. Like `vim.uv.read_stop`.
+Idempotent, and safe on a stopped or closed stream. The socket keeps being
+read: chunks that arrive while stopped buffer on the handle and replay in
+order on the next `read_start`.
+
+**Returns:** (`0|nil`, `string?`, `string?`) `0` on success, or the fail triple.
+
+**Example:**
+
+```lua
+tcp:read_stop()
+```
+
+---
+
+### `Tcp:write()` {#Tcp-write}
+
+```lua
+Tcp:write({data}, {callback?})
+```
+
+Write `data` to the stream. Like `vim.uv.write`. `data` may be a string or
+a table of strings, sent in order. Writes queue up and go out one writer
+task at a time, so pipelined writes reach the wire in call order and each
+callback reports its own write, like libuv's write queue. Writing before
+the socket is up fails with `ENOTCONN` where libuv would queue it.
+Writing after `:shutdown` fails with `EPIPE`.
+
+**Parameters:**
+
+- `{data}` (`string|table`) Bytes to write.
+- `{callback?}` (`function?`) Called with `err` (nil on success) once the bytes have been handed to the socket.
+
+**Returns:** (`0|nil`, `string?`, `string?`) `0` on success, or the fail triple.
+
+**Example:**
+
+```lua
+tcp:write("hello\n")
+tcp:write({"line1\n", "line2\n"}, function(err)
+  if err then print("write failed: " .. err) end
+end)
+```
+
+---
+
+### `Tcp:shutdown()` {#Tcp-shutdown}
+
+```lua
+Tcp:shutdown({callback?})
+```
+
+Half-close the stream: send FIN while the read side stays open. Like
+`vim.uv.shutdown`, queued writes are flushed before the FIN goes out.
+Once shut down, further writes fail with `EPIPE` and further shutdowns
+with `ENOTCONN`, like libuv's.
+
+**Parameters:**
+
+- `{callback?}` (`function?`) Called with `err` (nil on success) once the shutdown completed.
+
+**Returns:** (`0|nil`, `string?`, `string?`) `0` on success, or the fail triple.
+
+**Example:**
+
+```lua
+tcp:write("bye\n")
+tcp:shutdown(function(err)
+  if not err then print("peer may still reply") end
+end)
+```
+
+---
+
+### `Tcp:close()` {#Tcp-close}
+
+```lua
+Tcp:close({callback?})
+```
+
+Close the handle and release its resources. Like `vim.uv.close`. Must be
+called on every handle; in-flight operations go quiet instead of delivering
+an `ECANCELED` callback.
+
+**Parameters:**
+
+- `{callback?}` (`function?`) Called with no arguments once the handle is closed.
+
+**Example:**
+
+```lua
+tcp:close(function() print("closed") end)
+```
+
+---
+
+### `Tcp:is_active()` {#Tcp-is_active}
+
+```lua
+Tcp:is_active()
+```
+
+Whether the handle is busy: connecting, reading, or writing. Like
+`vim.uv.is_active`.
+
+**Returns:** (`boolean`)
+
+**Example:**
+
+```lua
+if not tcp:is_active() then tcp:read_stop() end
+```
+
+---
+
+### `Tcp:is_closing()` {#Tcp-is_closing}
+
+```lua
+Tcp:is_closing()
+```
+
+Whether the handle is closing or closed. Like `vim.uv.is_closing`.
+
+**Returns:** (`boolean`)
+
+**Example:**
+
+```lua
+if not tcp:is_closing() then tcp:close() end
+```
+
+---
+
+### `Tcp:nodelay()` {#Tcp-nodelay}
+
+```lua
+Tcp:nodelay({enable})
+```
+
+Enable or disable Nagle's algorithm. Like `vim.uv.tcp_nodelay`. Allowed
+before `:connect`; the setting is applied as soon as the socket exists.
+
+**Parameters:**
+
+- `{enable}` (`boolean`) True to send chunks without waiting to coalesce them.
+
+**Returns:** (`0|nil`, `string?`, `string?`) `0` on success, or the fail triple.
+
+**Example:**
+
+```lua
+tcp:nodelay(true)
+```
+
+
+## maki.uv.Timer {#maki-uv-Timer}
+
+A timer handle, mirroring libuv's `uv_timer_t`. Created by
+`maki.uv.new_timer()`, armed with `:start(timeout, repeat, cb)`,
+silenced with `:stop()`, released with `:close()`.
+
+---
+
+### `Timer:start()` {#Timer-start}
+
+```lua
+Timer:start({timeout}, {repeat}, {callback})
+```
+
+Arm the timer. Like `vim.uv.timer_start`. Fires `callback` after `timeout`
+milliseconds, then, when `repeat` is non-zero, again every `repeat`
+milliseconds. A `timeout` of zero fires on the next pump pass. Starting an
+already active timer rearms it; pending ticks of the previous run are
+dropped.
+
+**Parameters:**
+
+- `{timeout}` (`integer`) Milliseconds until the first tick.
+- `{repeat}` (`integer`) Milliseconds between ticks; `0` for a one-shot.
+- `{callback}` (`function`) Called with no arguments on every tick.
+
+**Returns:** (`0|nil`, `string?`, `string?`) `0` on success, or the fail triple.
+
+**Example:**
+
+```lua
+local timer = maki.uv.new_timer()
+timer:start(500, 500, function() print("tick") end)
+```
+
+---
+
+### `Timer:stop()` {#Timer-stop}
+
+```lua
+Timer:stop()
+```
+
+Stop the timer; the callback will not fire again. Like `vim.uv.timer_stop`.
+Idempotent, and safe on a stopped or closed timer.
+
+**Returns:** (`0|nil`, `string?`, `string?`) `0` on success, or the fail triple.
+
+**Example:**
+
+```lua
+timer:stop()
+```
+
+---
+
+### `Timer:close()` {#Timer-close}
+
+```lua
+Timer:close({callback?})
+```
+
+Close the timer and release its resources. Like `vim.uv.close`. Must be
+called on every timer; timers of an unloaded plugin are closed for it.
+
+**Parameters:**
+
+- `{callback?}` (`function?`) Called with no arguments once the timer is closed.
+
+**Example:**
+
+```lua
+timer:close()
+```
+
+---
+
+### `Timer:is_active()` {#Timer-is_active}
+
+```lua
+Timer:is_active()
+```
+
+Whether the timer is armed. Like `vim.uv.is_active`.
+
+**Returns:** (`boolean`)
+
+**Example:**
+
+```lua
+if timer:is_active() then timer:stop() end
+```
+
+---
+
+### `Timer:is_closing()` {#Timer-is_closing}
+
+```lua
+Timer:is_closing()
+```
+
+Whether the timer is closing or closed. Like `vim.uv.is_closing`.
+
+**Returns:** (`boolean`)
 
 
 ## maki.yaml {#maki-yaml}

@@ -11,6 +11,7 @@ Our goal is to let plugin authors have as much freedom as possible, that's why d
 Fallible runtime operations return the pair (value, err) and never throw.
 Throwing is reserved for programmer errors, like passing a number where a string belongs.
 `util/pair.rs` is the single home for that shape: use `Pair<T>`, `err_pair`, `pair`, and `try_pair!` instead of writing a new helper.
+Exception: `maki.uv` handles follow luv instead, returning `0` on success and `(nil, err, name)` on failure with err-first callbacks, so `vim.uv` plugin code works unmodified.
 A call with nothing to return still answers `(true, nil)` on success, so `if not ok` always means failure.
 
 Tool handlers fail with `{ llm_output = msg, is_error = true }`; a plain string is always success (only `is_error` flags the result as an error to the provider).
