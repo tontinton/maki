@@ -1,12 +1,19 @@
 //! Runs syntect on one dedicated thread to bound its regex cache memory.
 //!
-//! syntect has no thread-local state of its own: the memory is regex-automata's
-//! `Pool<Cache>`, one owner value plus 8 sharded stacks per compiled `Regex`, and a
-//! `SyntaxSet` holds thousands of them. That is ~10 MB per thread, 65-84% of peak
-//! heap in long sessions. The pool never contracts and thread exit does not reclaim
-//! it: 48 threads spawned sequentially, only ever one alive, still ended at +113 MB.
-//! So the previous idle-timeout render pool, respawning workers every 5s, bought a
-//! fresh cache set each time even with nothing running in parallel.
+//! The cache is not syntect's own, it is regex-automata's `Pool<Cache>`. When a
+//! thread wants to highlight while another already holds the cache, it gets a
+//! fresh set of its own, one per compiled `Regex` in the syntax, and that memory
+//! is never given back, not even when the thread exits. It is charged per
+//! language too: against a warmed `SyntaxSet` every extra concurrent thread
+//! retains about 2.7 MB for `rust` and 1.7 MB for `markdown`, so a session
+//! touching several syntaxes pays the bill several times. The pool shards 8 ways
+//! per regex, so the first handful of threads do most of the damage, `rust`
+//! alone saturating near 37 MB. That is how the old render pool, which let
+//! workers idle out and respawn every 5s, ended a session at +113 MB after 48
+//! threads had come and gone one at a time.
+//!
+//! Compiling a syntax's regexes the first time costs a further ~10 MB, but that
+//! one is global and paid once, so no amount of single-threading wins it back.
 
 use std::any::Any;
 use std::cell::Cell;
