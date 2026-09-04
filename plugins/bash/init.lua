@@ -192,43 +192,61 @@ local function is_complex(node)
   return false
 end
 
-local LEAF_COMMAND_TYPES = {
-  command = true,
-  redirected_statement = true,
-  negated_command = true,
-  subshell = true,
-  compound_statement = true,
-  if_statement = true,
-  while_statement = true,
-  for_statement = true,
-  case_statement = true,
-  function_definition = true,
-  c_style_for_statement = true,
+local REDIRECT_TYPES = {
+  file_redirect = true,
+  heredoc_redirect = true,
+  herestring_redirect = true,
 }
 
+-- Nodes we walk through instead of turning into a scope. `redirected_statement`
+-- has to be one of them: tree-sitter hangs a trailing `2>&1` off the entire
+-- `cd x && cargo test` chain rather than off `cargo test`, so treating it as a
+-- leaf turns the whole chain into a single scope starting with `cd `, and a
+-- `cd *` allow rule then quietly covers whatever runs after the `&&`.
+local WALK_THROUGH_TYPES = {
+  program = true,
+  list = true,
+  pipeline = true,
+  redirected_statement = true,
+}
+
+local function node_text(node, source)
+  return maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
+end
+
+-- Anything we don't walk through becomes one scope, its own text. That covers
+-- plain commands and the block forms (`if`, `while`, subshells) we deliberately
+-- keep whole, plus any node type we never thought of, which is what we want:
+-- an unknown node has to end up in front of the user, not get dropped.
 local function collect_commands(node, source)
-  local out = {}
-  local kind = node:type()
-  if kind == "program" or kind == "list" then
-    for child in node:iter_children() do
-      local nested = collect_commands(child, source)
-      for _, cmd in ipairs(nested) do
-        out[#out + 1] = cmd
-      end
-    end
-  elseif kind == "pipeline" then
-    for child in node:iter_children() do
-      if child:named() then
-        local text = maki.treesitter.get_node_text(child, source):match("^%s*(.-)%s*$")
-        if text ~= "" then
-          out[#out + 1] = text
+  if not WALK_THROUGH_TYPES[node:type()] then
+    local text = node_text(node, source)
+    return text ~= "" and { text } or {}
+  end
+
+  local out, redirects = {}, {}
+  for child in node:iter_children() do
+    local kind = child:type()
+    if child:named() and kind ~= "comment" then
+      if REDIRECT_TYPES[kind] then
+        redirects[#redirects + 1] = node_text(child, source)
+      else
+        for _, cmd in ipairs(collect_commands(child, source)) do
+          out[#out + 1] = cmd
         end
       end
     end
-  elseif LEAF_COMMAND_TYPES[kind] then
-    local text = maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
-    if text ~= "" then
-      out[#out + 1] = text
+  end
+
+  -- The redirect belongs to the last command of the chain, the one bash would
+  -- actually apply it to. A bodiless `> log` has no such command and still
+  -- truncates the file, so it becomes a scope of its own instead of vanishing.
+  if #redirects > 0 then
+    local text = table.concat(redirects, " ")
+    if #out > 0 then
+      out[#out] = out[#out] .. " " .. text
+    else
+      out[1] = text
     end
   end
   return out
