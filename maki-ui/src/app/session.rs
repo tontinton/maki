@@ -196,9 +196,11 @@ impl App {
         );
         self.main_chat().load_messages(display_msgs);
         let cost = self.state.cost;
+        let list_cost = self.state.list_cost;
         let context_size = self.state.context_size;
         let main = self.main_chat();
         main.cost = cost;
+        main.list_cost = list_cost;
         main.context_size = context_size;
         if let Some(draft) = self.state.session.meta.input_draft.clone() {
             self.input_box.set_input(draft);
@@ -329,6 +331,7 @@ impl App {
         self.reset_ui_chrome();
         self.state.token_usage = TokenUsage::default();
         self.state.cost = None;
+        self.state.list_cost = None;
         self.state.context_size = 0;
         self.state.plan = PlanState::None;
         if self.state.mode == Mode::Plan {

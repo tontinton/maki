@@ -269,6 +269,7 @@ impl App {
             let ctx = UsageModalContext {
                 total: &self.state.token_usage,
                 total_cost: self.state.cost,
+                total_list_cost: self.state.list_cost,
                 by_model: self.state.session.usage_by_model(),
                 model: &self.state.model,
                 fast: self.state.fast,
@@ -302,6 +303,8 @@ impl App {
                 global_cost: self.state.cost,
                 context_size: chat.context_size,
                 cost: chat.cost,
+                list_cost: chat.list_cost,
+                subsidy_source: self.state.model.subsidy_source().map(std::sync::Arc::from),
                 context_window: self.state.model.context_window,
                 show_global: self.chats.len() > 1,
             },

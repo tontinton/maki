@@ -147,24 +147,27 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `del_autocmd` later to remove the listener.
 ///
 /// Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
-/// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
-/// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
-/// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-/// and `"ModelChanged"`. Plugins can also fire their own events with
-/// `exec_autocmds`.
+/// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"ToolReviewed"`,
+/// `"AutoCompacting"`, `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`,
+/// `"SessionEnd"`, `"SessionFocusChanged"`, `"SessionStatusChanged"`,
+/// `"TaskStatusChanged"`, and `"ModelChanged"`. Plugins can also fire their
+/// own events with `exec_autocmds`.
 ///
 /// Every host event carries `data.session_id`. For `"SessionReset"` and
 /// `"SessionEnd"` that is the session being left behind, the other events
 /// name the session now running or focused. What each event adds:
 ///
 /// - `"ToolStart"`, `"ToolDone"`: `data.tool_id` and `data.tool`.
+/// - `"ToolReviewed"`: `data.tool`, `data.reviewer`, `data.model`,
+///   `data.verdict`, `data.reason`, `data.resolution`, `data.cost`, and
+///   `data.list_cost`.
 /// - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
 ///   `"max_turns"`, or `"cancelled"`), `data.usage` (four token fields,
 ///   cache included), `data.cost`, `data.list_cost`, `data.context_size`,
 ///   `data.context_window`, and `data.num_turns` (model round-trips the
-///   turn took). `list_cost` is the un-subsidised list price and `cost` is
-///   the real bill, so a budget plugin charges against whichever one it
-///   wants.
+///   turn took). `cost` is the real bill; `list_cost` is the un-subsidised
+///   reference price and is only set for subsidised models, so a budget
+///   plugin against list price should fall back to `cost` when absent.
 /// - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
 ///   trigger time.
 /// - `"CompactionDone"`: `data.context_size_before`,

@@ -110,6 +110,7 @@ fn finish_compact(
         usage: response.usage,
         model: model.id.clone(),
         cost: model.billed_cost(&response.usage, false),
+        list_cost: model.subsidised_list_cost(&response.usage, false),
         context_size: Some(response.usage.output),
         context_window: model.context_window,
     })));
@@ -173,7 +174,7 @@ pub async fn compact(
     event_tx.send(AgentEvent::Done {
         usage,
         cost: model.billed_cost(&usage, false),
-        list_cost: model.list_cost(&usage, false),
+        list_cost: model.subsidised_list_cost(&usage, false),
         context_size: context_size_after,
         context_window: model.context_window,
         num_turns: 1,

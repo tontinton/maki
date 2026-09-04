@@ -30,11 +30,12 @@ use maki_lua::session_snapshot::{
 };
 use maki_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, PackCommand,
-    PackPreparation, SessionEndReason, SessionRequest, TaskRequest, UiAction, UiAttachment,
-    UiReply,
+    PackPreparation, PlanActionReader, PlanRequest, SessionEndReason, SessionRequest, TaskRequest,
+    UiAction, UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
-use maki_providers::provider::{Provider, fetch_all_models, from_model};
+use maki_providers::models_cache::fetch_all_models_cached;
+use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
@@ -100,6 +101,7 @@ pub struct EventLoopParams {
     pub lua_command_reader: LuaCommandReader,
     pub keymap_reader: KeymapReader,
     pub hint_reader: HintReader,
+    pub plan_action_reader: PlanActionReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub ui_attachment: UiAttachment,
     pub lua_event_handle: EventHandle,
@@ -372,6 +374,7 @@ struct SpawnCtx {
     lua_command_reader: LuaCommandReader,
     keymap_reader: KeymapReader,
     hint_reader: HintReader,
+    plan_action_reader: PlanActionReader,
     lua_event_handle: EventHandle,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
@@ -408,6 +411,7 @@ impl SpawnCtx {
             self.lua_command_reader.clone(),
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
+            self.plan_action_reader.clone(),
             Arc::clone(&self.storage_writer),
             self.ui_config.clone(),
             self.input_history_size,
@@ -527,10 +531,11 @@ fn spawn_model_fetch(
                 provider: Arc::from(provider),
             }));
         });
-        fetch_all_models(
+        fetch_all_models_cached(
             &policy,
             |batch| merge_batch(&bg, batch, &warn_tx),
             Some(done),
+            false,
         )
         .await;
     });
@@ -565,6 +570,7 @@ impl<'t> EventLoop<'t> {
             lua_command_reader,
             keymap_reader,
             hint_reader,
+            plan_action_reader,
             ui_action_rx,
             ui_attachment,
             lua_event_handle,
@@ -622,6 +628,7 @@ impl<'t> EventLoop<'t> {
             lua_command_reader,
             keymap_reader,
             hint_reader,
+            plan_action_reader,
             lua_event_handle,
             mcp_handle,
             mcp_config_errors,
@@ -934,6 +941,9 @@ impl<'t> EventLoop<'t> {
             UiAction::Session { req, reply_tx } => {
                 self.handle_session_request(req, reply_tx);
             }
+            UiAction::Plan { req, reply_tx } => {
+                self.handle_plan_request(req, reply_tx);
+            }
             UiAction::Model { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_model_request(req));
             }
@@ -1211,6 +1221,35 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// Route the four plan-surface requests to the focused session's app.
+    /// `Read` and `SuppressForm` fill their reply channel; `Implement`
+    /// and `OpenEditor` are fire-and-forget and dispatch actions the
+    /// same code path a built-in row would.
+    fn handle_plan_request(&mut self, req: PlanRequest, reply_tx: Option<flume::Sender<UiReply>>) {
+        match req {
+            PlanRequest::Read => {
+                let value = self.focused_app().plan_snapshot();
+                if let Some(tx) = reply_tx {
+                    let _ = tx.send(Ok(value));
+                }
+            }
+            PlanRequest::SuppressForm(hidden) => {
+                let previous = self.focused_app().set_plan_form_suppressed(hidden);
+                if let Some(tx) = reply_tx {
+                    let _ = tx.send(Ok(json!(previous)));
+                }
+            }
+            PlanRequest::Implement { clear_context } => {
+                let actions = self.focused_app().implement_plan_from_lua(clear_context);
+                self.dispatch(self.focused, actions);
+            }
+            PlanRequest::OpenEditor => {
+                let actions = self.focused_app().open_plan_editor_action();
+                self.dispatch(self.focused, actions);
+            }
+        }
+    }
+
     /// Lua acts on the focused session, the same target the model picker and
     /// `/thinking` write to.
     fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
@@ -1238,6 +1277,10 @@ impl<'t> EventLoop<'t> {
                     app.set_fast(fast)?;
                 }
                 Ok(app.model_state())
+            }
+            ModelRequest::Refresh { live } => {
+                self.refresh_models(live);
+                Ok(json!(true))
             }
         }
     }
@@ -1590,7 +1633,8 @@ impl<'t> EventLoop<'t> {
                 terminal::suspend(self.terminal);
                 self.focus.on_resume();
             }
-            Action::RefreshModels => self.refresh_models(),
+            Action::RefreshModels => self.refresh_models(false),
+            Action::RefreshModelsLive => self.refresh_models(true),
             Action::RefreshUsage => self.refresh_usage(),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
@@ -1651,16 +1695,20 @@ impl<'t> EventLoop<'t> {
         self.dispatch(self.focused, actions);
     }
 
-    fn refresh_models(&self) {
+    /// `live` skips the on-disk discovery cache replay (R in the picker,
+    /// provider auth changes). Without it the last discovery replays
+    /// instantly and live re-discovery still refreshes in the background.
+    fn refresh_models(&self, live: bool) {
         let available = Arc::clone(&self.ctx.available_models);
         let warn_tx = self.warn_tx.clone();
         let policy = Arc::clone(&self.ctx.model_policy);
         available.store(None);
         smol::spawn(async move {
-            fetch_all_models(
+            fetch_all_models_cached(
                 &policy,
                 |batch| merge_batch(&available, batch, &warn_tx),
                 None,
+                live,
             )
             .await;
         })

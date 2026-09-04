@@ -14,6 +14,7 @@ pub(crate) mod model;
 pub(crate) mod net;
 pub(crate) mod options;
 pub(crate) mod pack;
+pub(crate) mod plan;
 pub(crate) mod session;
 pub(crate) mod slot;
 pub(crate) mod split;
@@ -35,11 +36,14 @@ use crate::api::options::PluginOpts;
 use crate::api::tool::{PendingRules, PendingTools};
 use crate::api::util::command::UiAction;
 use crate::plugin_permissions::{Permission, PluginPermissions};
+use maki_agent::permissions::PluginRuleStore;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_maki_global(
     lua: &Lua,
     pending: PendingTools,
     pending_rules: PendingRules,
+    rule_store: Arc<PluginRuleStore>,
     plugin: Arc<str>,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     permissions: &PluginPermissions,
@@ -52,12 +56,18 @@ pub(crate) fn create_maki_global(
         pending,
         pending_rules,
         permissions.clone(),
+        tool::ReviewerRegistry {
+            store: rule_store,
+            plugin: Arc::clone(&plugin),
+            allowed: permissions.is_allowed(Permission::Reviewers),
+        },
         Arc::clone(&plugin),
         opts,
         ui_action_tx.clone(),
     )?;
     autocmd::add_autocmd_methods(&api, lua, Arc::clone(&plugin))?;
-    slot::add_slot_methods(&api, lua, Arc::clone(&plugin))?;
+    plan::add_plan_action_methods(&api, lua, Arc::clone(&plugin))?;
+    slot::add_slot_methods(&api, lua, Arc::clone(&plugin), permissions.clone())?;
     maki.set("api", api)?;
     maki.set("env", env::create_env_table(lua, permissions)?)?;
     maki.set("fs", fs::create_fs_table(lua, permissions)?)?;
@@ -70,6 +80,7 @@ pub(crate) fn create_maki_global(
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
     maki.set("net", net::create_net_table(lua, permissions)?)?;
     maki.set("text", text::create_text_table(lua)?)?;
+    maki.set("plan", plan::create_plan_table(lua, ui_action_tx.clone())?)?;
     maki.set(
         "session",
         session::create_session_table(lua, ui_action_tx.clone())?,

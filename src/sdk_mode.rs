@@ -973,6 +973,7 @@ impl EventPump {
             .map(|s| s.parent_tool_use_id.clone());
 
         match &envelope.event {
+            AgentEvent::ReviewerVerdict(_) => {}
             AgentEvent::TextDelta { text } => {
                 if self.include_partial_messages {
                     let model = self.model_id();

@@ -40,6 +40,9 @@ use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
+use crate::api::plan::{
+    PlanActionHandlerMap, PlanActionReader, PlanActionWriter, publish_plan_action_snapshot,
+};
 use crate::api::slot::{LayeredTools, SlotStore, run_host_chain};
 use crate::api::tool::{
     LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission, resolve_rules,
@@ -285,6 +288,15 @@ pub enum Request {
         run: HookRun,
         reply: flume::Sender<Verdict>,
     },
+    CallReviewHandler {
+        plugin: Arc<str>,
+        name: Arc<str>,
+        request: Value,
+        /// Fires when the caller's timeout/cancel wins the outer race, so the
+        /// detached Lua handler can drop its RegistryKey and skip the reply.
+        cancel: CancelToken,
+        reply: flume::Sender<Option<(String, Option<String>)>>,
+    },
     ClearPlugin {
         plugin: Arc<str>,
         reply: flume::Sender<()>,
@@ -302,6 +314,19 @@ pub enum Request {
         /// How many `maki.api.run_command` hops led here; seeds the handler's
         /// [`TaskCell::command_depth`] so an alias cycle terminates.
         depth: u8,
+    },
+    /// Fires when the user picks a plugin-registered row on the plan form.
+    /// Fire-and-forget; the handler drives outcomes by calling
+    /// `maki.plan.implement` / `maki.plan.open_editor`.
+    RunPlanAction {
+        plugin: Arc<str>,
+        name: Arc<str>,
+        /// Absolute plan path.
+        path: String,
+        /// Value of the form's "parallel" checkbox when the user selected the row.
+        parallel: bool,
+        /// Row index in the merged menu; rarely useful, but exposed.
+        selected: usize,
     },
     CollectPromptSlots {
         reply: flume::Sender<ResolvedSlots>,
@@ -1949,6 +1974,7 @@ impl LuaRuntime {
         command_writer: LuaCommandWriter,
         keymap_writer: KeymapWriter,
         hint_writer: HintWriter,
+        plan_action_writer: PlanActionWriter,
         jit: bool,
         plugin_rules: Arc<PluginRuleStore>,
     ) -> Result<Self, PluginError> {
@@ -1979,11 +2005,15 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(CommandHandlerMap::new());
+        lua.set_app_data(PlanActionHandlerMap::new());
+        lua.set_app_data(crate::api::tool::ReviewHandlerMap::default());
+        lua.set_app_data(crate::api::tool::ReviewerRequestTx(tx.clone()));
         lua.set_app_data(JobStore::new());
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
         lua.set_app_data(crate::api::top::NotifyHandler::default());
         lua.set_app_data(command_writer);
+        lua.set_app_data(plan_action_writer);
         lua.set_app_data(PromptHintCallbacks::default());
         lua.set_app_data(PluginOptionSpecs::default());
         lua.set_app_data(crate::api::pack::PackStore::default());
@@ -2105,6 +2135,17 @@ impl LuaRuntime {
                 }
             }
         }
+        if let Some(mut review_map) = self
+            .lua
+            .app_data_mut::<crate::api::tool::ReviewHandlerMap>()
+            && let Some(handlers) = review_map.0.remove(name)
+        {
+            for (_, key) in handlers {
+                if let Err(e) = self.lua.remove_registry_value(key) {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop review handler key");
+                }
+            }
+        }
         if let Some(mut cmd_map) = self.lua.app_data_mut::<CommandHandlerMap>()
             && let Some(cmds) = cmd_map.remove(name)
         {
@@ -2119,6 +2160,22 @@ impl LuaRuntime {
                 self.lua.app_data_ref::<LuaCommandWriter>(),
             ) {
                 publish_command_snapshot(&map, &writer);
+            }
+        }
+        if let Some(mut plan_map) = self.lua.app_data_mut::<PlanActionHandlerMap>()
+            && let Some(actions) = plan_map.remove(name)
+        {
+            for (_, entry) in actions {
+                if let Err(e) = self.lua.remove_registry_value(entry.handler) {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop plan action handler key");
+                }
+            }
+            drop(plan_map);
+            if let (Some(map), Some(writer)) = (
+                self.lua.app_data_ref::<PlanActionHandlerMap>(),
+                self.lua.app_data_ref::<PlanActionWriter>(),
+            ) {
+                publish_plan_action_snapshot(&map, &writer);
             }
         }
         if let Some(mut hints) = self.lua.app_data_mut::<PromptHintCallbacks>()
@@ -2341,6 +2398,7 @@ impl LuaRuntime {
             &self.lua,
             Arc::clone(&self.pending),
             Arc::clone(&pending_rules),
+            Arc::clone(&self.plugin_rules),
             Arc::clone(&name),
             self.ui_action_tx.clone(),
             &permissions,
@@ -3263,6 +3321,7 @@ pub(crate) struct LuaThread {
     pub command_reader: LuaCommandReader,
     pub keymap_reader: KeymapReader,
     pub hint_reader: crate::api::util::command::HintReader,
+    pub plan_action_reader: PlanActionReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub ui_attachment: UiAttachment,
 }
@@ -3287,6 +3346,7 @@ pub fn spawn(
     let (command_writer, command_reader) = LuaCommandWriter::new();
     let (keymap_writer, keymap_reader) = KeymapWriter::new();
     let (hint_writer, hint_reader) = HintWriter::new();
+    let (plan_action_writer, plan_action_reader) = PlanActionWriter::new();
 
     let handle = thread::Builder::new()
         .name("maki-lua".to_owned())
@@ -3301,6 +3361,7 @@ pub fn spawn(
                 command_writer,
                 keymap_writer,
                 hint_writer,
+                plan_action_writer,
                 jit,
                 plugin_rules,
             ) {
@@ -3548,6 +3609,38 @@ pub fn spawn(
                                 .detach();
                             }
                         }
+                        Request::RunPlanAction {
+                            plugin,
+                            name,
+                            path,
+                            parallel,
+                            selected,
+                        } => {
+                            let handler_fn = rt
+                                .lua
+                                .app_data_ref::<PlanActionHandlerMap>()
+                                .and_then(|m| {
+                                    let entry = m.get(&plugin)?.get(&name)?;
+                                    rt.lua.registry_value::<Function>(&entry.handler).ok()
+                                });
+                            if let Some(func) = handler_fn {
+                                let lua = rt.lua.clone();
+                                ex.spawn(async move {
+                                    let run = async {
+                                        let opts = lua.create_table()?;
+                                        opts.set("path", path)?;
+                                        opts.set("parallel", parallel)?;
+                                        opts.set("selected", selected)?;
+                                        let thread = lua.create_thread(func)?;
+                                        thread.into_async::<()>(opts)?.await
+                                    };
+                                    if let Err(e) = run_command_scoped(&lua, 0, run).await {
+                                        tracing::warn!(plugin = %plugin, action = %name, error = %e, "plan action handler failed");
+                                    }
+                                })
+                                .detach();
+                            }
+                        }
                         Request::ComputeHeader {
                             plugin,
                             tool,
@@ -3577,6 +3670,63 @@ pub fn spawn(
                             ex.spawn(async move {
                                 let verdict = run_hook(&lua, &plugins, &gate, run).await;
                                 let _ = reply.send(verdict);
+                            })
+                            .detach();
+                        }
+                        Request::CallReviewHandler {
+                            plugin,
+                            name,
+                            request,
+                            cancel,
+                            reply,
+                        } => {
+                            let func = rt
+                                .lua
+                                .app_data_ref::<crate::api::tool::ReviewHandlerMap>()
+                                .and_then(|m| {
+                                    let key = m.0.get(&plugin)?.get(&name)?;
+                                    rt.lua.registry_value::<Function>(key).ok()
+                                });
+                            let Some(func) = func else {
+                                let _ = reply.send(None);
+                                continue;
+                            };
+                            // Deliberately not gate-tracked: a handler may
+                            // park on a human prompt, and reload must not
+                            // wait for it. Cancellation is what ends a
+                            // handler whose caller has walked away, so the
+                            // detached task cannot outlive the outer race.
+                            let lua = rt.lua.clone();
+                            ex.spawn(async move {
+                                let run = run_detached(&lua, async {
+                                    let arg =
+                                        crate::api::util::convert::json_to_lua(&lua, &request)?;
+                                    let thread = lua.create_thread(func)?;
+                                    thread
+                                        .into_async::<(Option<String>, Option<String>)>(arg)?
+                                        .await
+                                });
+                                let raced = cancel.race(run).await;
+                                match raced {
+                                    Err(_) => {
+                                        tracing::info!(
+                                            plugin = %plugin,
+                                            reviewer = %name,
+                                            "review handler dropped after caller cancel"
+                                        );
+                                    }
+                                    Ok(result) => {
+                                        let out = match result {
+                                            Ok((Some(verdict), reason)) => Some((verdict, reason)),
+                                            Ok((None, _)) => None,
+                                            Err(e) => {
+                                                tracing::warn!(plugin = %plugin, reviewer = %name, error = %e, "review handler failed");
+                                                None
+                                            }
+                                        };
+                                        let _ = reply.send(out);
+                                    }
+                                }
                             })
                             .detach();
                         }
@@ -3813,6 +3963,7 @@ pub fn spawn(
         command_reader,
         keymap_reader,
         hint_reader,
+        plan_action_reader,
         ui_action_rx,
         ui_attachment,
     })

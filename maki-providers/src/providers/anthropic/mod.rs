@@ -368,14 +368,7 @@ impl Anthropic {
             let body_text = response.text().await?;
             let page: ModelsPage = serde_json::from_str(&body_text)?;
             for m in page.data {
-                if m.max_input_tokens >= shared::LONG_CONTEXT_WINDOW {
-                    models.push(crate::model::ModelInfo::id_only(format!(
-                        "{}{}",
-                        m.id,
-                        shared::LONG_CONTEXT_SUFFIX
-                    )));
-                }
-                models.push(crate::model::ModelInfo::id_only(m.id));
+                models.extend(discovered_model_infos(m));
             }
 
             if !page.has_more {
@@ -490,6 +483,34 @@ struct ApiModelInfo {
     id: String,
     #[serde(default)]
     max_input_tokens: u32,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+}
+
+/// Discovery entries for one /v1/models item: a synthesised `-1m` variant
+/// (when the reported input window reaches 1M) followed by the base model.
+/// The variant pins `context_window` to [`shared::LONG_CONTEXT_WINDOW`] --
+/// that is what the suffix asserts -- while the base keeps whatever
+/// discovery reported; zero-valued fields are treated as unreported.
+fn discovered_model_infos(m: ApiModelInfo) -> Vec<crate::model::ModelInfo> {
+    let mut models = Vec::new();
+    let context_window = (m.max_input_tokens > 0).then_some(m.max_input_tokens);
+    let max_output_tokens = m.max_tokens.filter(|&v| v > 0);
+    if m.max_input_tokens >= shared::LONG_CONTEXT_WINDOW {
+        models.push(crate::model::ModelInfo {
+            id: format!("{}{}", m.id, shared::LONG_CONTEXT_SUFFIX),
+            context_window: Some(shared::LONG_CONTEXT_WINDOW),
+            max_output_tokens,
+            ..Default::default()
+        });
+    }
+    models.push(crate::model::ModelInfo {
+        id: m.id,
+        context_window,
+        max_output_tokens,
+        ..Default::default()
+    });
+    models
 }
 
 #[derive(Deserialize)]
@@ -1182,5 +1203,61 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
                 matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hi")
             );
         })
+    }
+
+    #[test]
+    fn api_model_info_deserializes_discovery_metadata() {
+        let m: ApiModelInfo = serde_json::from_value(json!({
+            "id": "claude-x",
+            "max_input_tokens": 200_000,
+            "max_tokens": 64_000,
+        }))
+        .unwrap();
+        assert_eq!(m.max_input_tokens, 200_000);
+        assert_eq!(m.max_tokens, Some(64_000));
+
+        // Fields absent from the response must not fail deserialization.
+        let m: ApiModelInfo = serde_json::from_value(json!({ "id": "claude-x" })).unwrap();
+        assert_eq!(m.max_input_tokens, 0);
+        assert_eq!(m.max_tokens, None);
+    }
+
+    #[test]
+    fn discovered_metadata_flows_into_model_info() {
+        let infos = discovered_model_infos(ApiModelInfo {
+            id: "claude-x".into(),
+            max_input_tokens: 200_000,
+            max_tokens: Some(64_000),
+        });
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].context_window, Some(200_000));
+        assert_eq!(infos[0].max_output_tokens, Some(64_000));
+
+        // Zero means the API did not report the field.
+        let infos = discovered_model_infos(ApiModelInfo {
+            id: "claude-x".into(),
+            max_input_tokens: 0,
+            max_tokens: Some(0),
+        });
+        assert_eq!(infos[0].context_window, None);
+        assert_eq!(infos[0].max_output_tokens, None);
+    }
+
+    #[test]
+    fn long_context_model_gets_pinned_1m_variant() {
+        let infos = discovered_model_infos(ApiModelInfo {
+            id: "claude-x".into(),
+            max_input_tokens: shared::LONG_CONTEXT_WINDOW,
+            max_tokens: Some(64_000),
+        });
+        assert_eq!(infos.len(), 2);
+        assert_eq!(
+            infos[0].id,
+            format!("claude-x{}", shared::LONG_CONTEXT_SUFFIX)
+        );
+        assert_eq!(infos[0].context_window, Some(shared::LONG_CONTEXT_WINDOW));
+        assert_eq!(infos[0].max_output_tokens, Some(64_000));
+        assert_eq!(infos[1].id, "claude-x");
+        assert_eq!(infos[1].context_window, Some(shared::LONG_CONTEXT_WINDOW));
     }
 }

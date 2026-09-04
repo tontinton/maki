@@ -370,12 +370,13 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
                 },
                 context_window: ov.context_window,
                 max_output_tokens: ov.max_output_tokens,
-                pricing: m["pricing"].as_object().map(|p| ModelPricing {
-                    input: price_per_m(p.get("input")),
-                    output: price_per_m(p.get("output")),
-                    cache_read: price_per_m(p.get("input_cache_read")),
-                    cache_write: 0.0,
-                    fast: None,
+                pricing: m["pricing"].as_object().map(|p| {
+                    ModelPricing::per_token(
+                        price_per_m(p.get("input")),
+                        price_per_m(p.get("output")),
+                        0.0,
+                        price_per_m(p.get("input_cache_read")),
+                    )
                 }),
                 supports_thinking: ov
                     .supports_thinking

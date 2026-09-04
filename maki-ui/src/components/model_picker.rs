@@ -34,6 +34,8 @@ fn footer_line() -> Line<'static> {
         Span::styled(" weak", t.tool_dim),
         Span::styled("  $", t.keybind_key),
         Span::styled(" compaction", t.tool_dim),
+        Span::styled("  R", t.keybind_key),
+        Span::styled(" refresh", t.tool_dim),
     ])
 }
 
@@ -62,6 +64,7 @@ pub enum ModelPickerAction {
     Select(String),
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
+    Refresh,
     Close,
 }
 
@@ -231,6 +234,15 @@ impl ModelPicker {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> ModelPickerAction {
+        // R re-runs live model discovery, bypassing the on-disk cache.
+        // Deliberately shift-only: plain letters belong to the fuzzy filter.
+        if matches!(key.code, KeyCode::Char('R'))
+            || (matches!(key.code, KeyCode::Char('r'))
+                && key.modifiers.contains(KeyModifiers::SHIFT))
+        {
+            self.needs_rebuild = true;
+            return ModelPickerAction::Refresh;
+        }
         if let Some(tier) = tier_for_shortcut(key)
             && let Some(entry) = self.picker.selected_item()
         {
@@ -643,13 +655,7 @@ mod tests {
 
     const OX_SPEC: &str = "openrouter/stealth/ox-alpha";
     const PAID_ID: &str = "vendor/paid-model";
-    const PAID_PRICING: ModelPricing = ModelPricing {
-        input: 3.0,
-        output: 15.0,
-        cache_write: 0.0,
-        cache_read: 0.0,
-        fast: None,
-    };
+    const PAID_PRICING: ModelPricing = ModelPricing::per_token(3.0, 15.0, 0.0, 0.0);
 
     fn register_openrouter_models() {
         model_registry::set_known_models(

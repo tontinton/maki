@@ -58,12 +58,12 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SharedMessages, SubagentInfo,
+    ReviewerVerdictEvent, SharedMessages, SubagentInfo,
 };
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader,
-    PackCommand, PackPreparation, WinView,
+    PackCommand, PackPreparation, PlanActionReader, WinView,
 };
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
@@ -251,6 +251,10 @@ pub struct App {
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     hints: Watch<HintSnapshot>,
+    pub(super) plan_action_reader: PlanActionReader,
+    /// Last snapshot generation applied to `plan_form`; skips a rebuild
+    /// when no plugin actions have changed.
+    plan_actions_generation: u64,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
@@ -268,6 +272,7 @@ impl App {
         lua_command_reader: LuaCommandReader,
         keymap_reader: KeymapReader,
         hint_reader: HintReader,
+        plan_action_reader: PlanActionReader,
         storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
@@ -344,6 +349,8 @@ impl App {
             hints: Watch::seeded(hint_reader.load_full()),
             keymap_reader,
             hint_reader,
+            plan_action_reader,
+            plan_actions_generation: 0,
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
@@ -439,6 +446,22 @@ impl App {
 
     pub(crate) fn flash(&mut self, msg: String) {
         self.status_bar.flash(msg);
+    }
+
+    // Accounting only; the `ToolReviewed` autocmd fires from
+    // `agent_autocmd::dispatch` so `-p` and sdk mode see it too.
+    fn handle_reviewer_verdict(&mut self, event: &ReviewerVerdictEvent) {
+        self.state.token_usage += event.usage;
+        add_cost(&mut self.state.cost, event.billed_cost);
+        add_cost(&mut self.state.list_cost, event.list_cost);
+        if !event.model.is_empty() {
+            self.state.session_mut().add_model_usage(
+                &event.model,
+                event
+                    .usage
+                    .billed_with_list_cost(event.billed_cost, event.list_cost),
+            );
+        }
     }
 
     pub(crate) fn fire_session_autocmd(&self, event: &str, mut data: serde_json::Value) {
@@ -755,6 +778,7 @@ impl App {
                 ModelPickerAction::UnassignTier(spec, tier) => {
                     vec![Action::UnassignTier(spec, tier)]
                 }
+                ModelPickerAction::Refresh => vec![Action::RefreshModelsLive],
                 ModelPickerAction::Close => vec![],
             });
         }
@@ -764,10 +788,10 @@ impl App {
                 LoginPickerAction::Consumed => vec![],
                 LoginPickerAction::Close => vec![],
                 LoginPickerAction::Authenticated { model_spec } => {
-                    vec![Action::ChangeModel(model_spec), Action::RefreshModels]
+                    vec![Action::ChangeModel(model_spec), Action::RefreshModelsLive]
                 }
                 LoginPickerAction::Configured { slug } => {
-                    vec![Action::RefreshProvider { slug }, Action::RefreshModels]
+                    vec![Action::RefreshProvider { slug }, Action::RefreshModelsLive]
                 }
             });
         }
@@ -1140,6 +1164,9 @@ impl App {
             &envelope,
             envelope.subagent.is_some(),
         );
+        if let AgentEvent::ReviewerVerdict(event) = &envelope.event {
+            self.handle_reviewer_verdict(event);
+        }
 
         let subagent_id = envelope
             .subagent
@@ -1193,9 +1220,12 @@ impl App {
             self.state.token_usage += tc.usage;
             add_cost(&mut self.state.cost, tc.cost);
             add_cost(&mut self.chats[chat_idx].cost, tc.cost);
-            self.state
-                .session_mut()
-                .add_model_usage(&tc.model, tc.usage.billed(tc.cost));
+            add_cost(&mut self.state.list_cost, tc.list_cost);
+            add_cost(&mut self.chats[chat_idx].list_cost, tc.list_cost);
+            self.state.session_mut().add_model_usage(
+                &tc.model,
+                tc.usage.billed_with_list_cost(tc.cost, tc.list_cost),
+            );
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
@@ -1678,8 +1708,32 @@ impl App {
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
             | self.hints.poll(self.hint_reader.load_full())
+            | self.tick_plan_actions()
             | self.tick_file_picker()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
+    }
+
+    /// Mirror the plan-action snapshot into the plan form when a plugin
+    /// (un)registered since the last tick.
+    fn tick_plan_actions(&mut self) -> Dirty {
+        let snapshot = self.plan_action_reader.load();
+        if snapshot.generation == self.plan_actions_generation {
+            return Dirty::NO;
+        }
+        let rows = snapshot
+            .actions
+            .iter()
+            .map(|a| crate::components::plan_form::PluginPlanRow {
+                plugin: a.plugin.clone(),
+                name: a.name.clone(),
+                label: a.label.clone(),
+                desc: a.desc.clone(),
+                order: a.order,
+            })
+            .collect();
+        self.plan_form.set_plugin_rows(rows, snapshot.generation);
+        self.plan_actions_generation = snapshot.generation;
+        Dirty::YES
     }
 
     fn tick_file_picker(&mut self) -> Dirty {
@@ -1790,16 +1844,83 @@ impl App {
                 self.plan_form.hide();
                 vec![]
             }
-            PlanFormAction::OpenEditor => match self.state.plan.path() {
-                Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
-                None => {
-                    self.flash(FLASH_NO_PLAN.into());
-                    vec![]
-                }
-            },
+            PlanFormAction::OpenEditor => self.open_plan_editor_action(),
             PlanFormAction::Implement => self.implement_plan(false),
             PlanFormAction::ClearAndImplement => self.implement_plan(true),
+            PlanFormAction::Plugin { plugin, name } => {
+                // Snapshot the form's parallel + selected before we reset,
+                // since the handler may want them and reset() runs after.
+                let parallel = self.plan_form.parallel();
+                let selected = self.plan_form.selected();
+                let path = self
+                    .state
+                    .plan
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                self.plan_form.reset();
+                self.lua_event_handle
+                    .run_plan_action(plugin, name, path, parallel, selected);
+                vec![]
+            }
         }
+    }
+
+    pub(crate) fn open_plan_editor_action(&mut self) -> Vec<Action> {
+        match self.state.plan.path() {
+            Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
+            None => {
+                self.flash(FLASH_NO_PLAN.into());
+                vec![]
+            }
+        }
+    }
+
+    /// Snapshot of the current plan for `maki.plan.read()`. `content`
+    /// stays `None` when the plan is not ready or the file cannot be
+    /// read, so a caller can tell the two apart from an empty plan.
+    pub(crate) fn plan_snapshot(&self) -> serde_json::Value {
+        let mode = if self.state.mode == Mode::Plan {
+            "plan"
+        } else {
+            "build"
+        };
+        let path = self.state.plan.path().map(|p| p.display().to_string());
+        let ready = self.state.plan.is_ready();
+        let content = if ready {
+            self.state
+                .plan
+                .path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+        } else {
+            None
+        };
+        serde_json::json!({
+            "mode": mode,
+            "path": path,
+            "ready": ready,
+            "content": content,
+        })
+    }
+
+    /// Read the plan-form suppression flag, optionally mutating it first;
+    /// returns the previous value so the Lua caller can restore state.
+    pub(crate) fn set_plan_form_suppressed(&mut self, hidden: Option<bool>) -> bool {
+        match hidden {
+            Some(v) => self.plan_form.set_suppressed(v),
+            None => self.plan_form.is_suppressed(),
+        }
+    }
+
+    /// Fire the same code path a built-in Implement / Clear-and-implement
+    /// row would. Used by `maki.plan.implement` and by plugin plan
+    /// actions that decide the plan is ready to execute. Silently no-op
+    /// when there is no ready plan, matching the built-in Hide branch.
+    pub(crate) fn implement_plan_from_lua(&mut self, clear_context: bool) -> Vec<Action> {
+        if self.state.plan.path().is_none() {
+            return vec![];
+        }
+        self.implement_plan(clear_context)
     }
 
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {

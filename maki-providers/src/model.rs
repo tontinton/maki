@@ -50,6 +50,14 @@ pub struct ModelPricing {
     /// back to standard rates instead of overcharging.
     #[serde(default)]
     pub fast: Option<FastPricing>,
+    /// Set when the model's per-token cost is prepaid via a flat subscription
+    /// (e.g. Claude Max through cliproxy), so the billed cost is always `$0`
+    /// even though the rates above still reflect the provider's published
+    /// list price. Holds the subscription's display name (e.g. `"Max"`),
+    /// shown next to the list-price reference. `Arc<str>` because it is
+    /// cloned into every turn's cost event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subsidised_by: Option<std::sync::Arc<str>>,
 }
 
 /// Metadata discovered at runtime from a provider's `/models` endpoint.
@@ -71,13 +79,7 @@ impl ModelInfo {
     pub fn id_only(id: String) -> Self {
         Self {
             id,
-            context_window: None,
-            max_output_tokens: None,
-            pricing: None,
-            supports_thinking: None,
-            supports_vision: None,
-            tier: None,
-            provider_info: None,
+            ..Self::default()
         }
     }
 }
@@ -92,12 +94,51 @@ pub struct FastPricing {
 }
 
 impl ModelPricing {
+    /// Per-token rates with no fast tier and no subsidy -- the shape of
+    /// every static catalog entry. `const` so provider catalogs can call it;
+    /// it also spares each entry from spelling out fields it never sets.
+    pub const fn per_token(input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
+        Self {
+            input,
+            output,
+            cache_write,
+            cache_read,
+            fast: None,
+            subsidised_by: None,
+        }
+    }
+
+    /// Like [`per_token`](Self::per_token), with a fast-tier price. A flat
+    /// constructor rather than a `with_fast(self)` builder: consuming `self`
+    /// in a `const fn` trips E0493 because `ModelPricing` carries drop glue.
+    pub const fn per_token_with_fast(
+        input: f64,
+        output: f64,
+        cache_write: f64,
+        cache_read: f64,
+        fast_input: f64,
+        fast_output: f64,
+    ) -> Self {
+        Self {
+            input,
+            output,
+            cache_write,
+            cache_read,
+            fast: Some(FastPricing {
+                input: fast_input,
+                output: fast_output,
+            }),
+            subsidised_by: None,
+        }
+    }
+
     pub const ZERO: Self = Self {
         input: 0.0,
         output: 0.0,
         cache_write: 0.0,
         cache_read: 0.0,
         fast: None,
+        subsidised_by: None,
     };
 
     pub fn is_zero(&self) -> bool {
@@ -326,13 +367,12 @@ impl Model {
             supports_tool_examples_override: None,
             thinking_override: ThinkingSupport::from_flags(Some(meta.supports_thinking), false),
             supports_vision_override: Some(meta.supports_vision),
-            pricing: ModelPricing {
-                input: meta.input_price,
-                output: meta.output_price,
-                cache_write: meta.cache_write,
-                cache_read: meta.cache_read,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(
+                meta.input_price,
+                meta.output_price,
+                meta.cache_write,
+                meta.cache_read,
+            ),
             discovered_free: false,
             max_output_tokens: Some(meta.output),
             context_window: meta.context,
@@ -417,6 +457,12 @@ impl Model {
     /// of zero, which is all a free model ever sends, and free has always shown
     /// no cost rather than "$0.000".
     pub fn billed_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
+        if self.pricing.subsidised_by.is_some() {
+            // Prepaid via a flat subscription: the turn ran, but nothing was
+            // billed per-token. Still require a real price table so an
+            // unpriced model does not report a false "$0.000".
+            return self.list_cost(usage, fast).map(|_| 0.0);
+        }
         usage.cost.filter(|bill| *bill > 0.0).or_else(|| {
             let cost = self.list_cost(usage, fast)?;
             let schedule =
@@ -431,6 +477,24 @@ impl Model {
     /// the honest guess.
     pub fn list_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
         (!self.pricing.is_zero()).then(|| usage.estimate(&self.pricing, fast))
+    }
+
+    /// What a subsidised turn *would* have cost at [`list_cost`]
+    /// (Self::list_cost) rates, kept as a reference next to the `$0` it
+    /// actually billed. `None` for every model that is not subsidised, so
+    /// callers do not show a redundant list-price figure next to a real bill.
+    pub fn subsidised_list_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
+        self.pricing
+            .subsidised_by
+            .is_some()
+            .then(|| self.list_cost(usage, fast))
+            .flatten()
+    }
+
+    /// Name of the subscription covering this model's cost (e.g. `"Max"`),
+    /// or `None` when the model is billed per-token as usual.
+    pub fn subsidy_source(&self) -> Option<&str> {
+        self.pricing.subsidised_by.as_deref()
     }
 
     pub fn provider_display_name(&self) -> &'static str {
@@ -597,12 +661,24 @@ impl TokenUsage {
     /// purpose: a caller that forgets the cost quietly loses money from the
     /// session total, so saying it out loud is mandatory.
     pub fn billed(&self, cost: Option<f64>) -> StoredTokenUsage {
+        self.billed_with_list_cost(cost, None)
+    }
+
+    /// Like [`billed`](Self::billed), but also records what a subsidised
+    /// turn would have cost at the provider's list rates. `list_cost` is
+    /// `None` for every non-subsidised turn.
+    pub fn billed_with_list_cost(
+        &self,
+        cost: Option<f64>,
+        list_cost: Option<f64>,
+    ) -> StoredTokenUsage {
         StoredTokenUsage {
             input: self.input,
             output: self.output,
             cache_creation: self.cache_creation,
             cache_read: self.cache_read,
             cost,
+            list_cost,
         }
     }
 
@@ -720,13 +796,7 @@ mod tests {
     const FREE_MEANS_A_KNOWN_ZERO: &str = "only a price discovery reported as zero means free";
     const TABLE_MUST_NOT_AGREE_BY_LUCK: &str =
         "the table has to disagree, or preferring the bill proves nothing";
-    const PAID_PRICING: ModelPricing = ModelPricing {
-        input: 3.0,
-        output: 15.0,
-        cache_write: 0.0,
-        cache_read: 0.0,
-        fast: None,
-    };
+    const PAID_PRICING: ModelPricing = ModelPricing::per_token(3.0, 15.0, 0.0, 0.0);
 
     #[test_case(999, "999"         ; "under_thousand")]
     #[test_case(1_000, "1.0k"      ; "thousand")]
@@ -831,13 +901,7 @@ mod tests {
 
     #[test]
     fn estimate_computes_all_token_types() {
-        let pricing = ModelPricing {
-            input: 3.00,
-            output: 15.00,
-            cache_write: 3.75,
-            cache_read: 0.30,
-            fast: None,
-        };
+        let pricing = ModelPricing::per_token(3.00, 15.00, 3.75, 0.30);
         let usage = TokenUsage {
             input: 1_000_000,
             output: 100_000,
@@ -887,16 +951,7 @@ mod tests {
 
     #[test]
     fn fast_mode_applies_premium_rates() {
-        let pricing = ModelPricing {
-            input: 5.00,
-            output: 25.00,
-            cache_write: 6.25,
-            cache_read: 0.50,
-            fast: Some(FastPricing {
-                input: 30.00,
-                output: 150.00,
-            }),
-        };
+        let pricing = ModelPricing::per_token_with_fast(5.00, 25.00, 6.25, 0.50, 30.00, 150.00);
         let usage = TokenUsage {
             input: 1_000_000,
             output: 1_000_000,
@@ -912,13 +967,7 @@ mod tests {
 
     #[test]
     fn fast_flag_ignored_without_fast_tier() {
-        let pricing = ModelPricing {
-            input: 3.00,
-            output: 15.00,
-            cache_write: 3.75,
-            cache_read: 0.30,
-            fast: None,
-        };
+        let pricing = ModelPricing::per_token(3.00, 15.00, 3.75, 0.30);
         let usage = TokenUsage {
             input: 1_000_000,
             output: 1_000_000,
@@ -1261,8 +1310,46 @@ mod tests {
                 cache_creation: COUNTERS.cache_creation,
                 cache_read: COUNTERS.cache_read,
                 cost: Some(RECORDED_COST),
+                list_cost: None,
             }
         );
         assert_eq!(COUNTERS.billed(None).cost, None);
+    }
+
+    /// A subsidy zeroes the bill while the list price stays visible as a
+    /// reference, so "covered by the subscription" and "free" read apart.
+    #[test]
+    fn subsidised_pricing_bills_zero_and_keeps_the_list_price() {
+        let mut model = Model::from_spec(UNPRICED_DEEPSEEK_SPEC).unwrap();
+        model.pricing = ModelPricing {
+            subsidised_by: Some(Arc::from("Max")),
+            ..PAID_PRICING
+        };
+        let list = model.list_cost(&INPUT_ONLY, false).unwrap();
+        assert!(list > 0.0);
+        assert_eq!(model.billed_cost(&INPUT_ONLY, false), Some(0.0));
+        assert_eq!(model.subsidised_list_cost(&INPUT_ONLY, false), Some(list));
+        assert_eq!(model.subsidy_source(), Some("Max"));
+    }
+
+    /// A subsidy must not turn "no price table" into a false `$0.000`: with
+    /// zero rates there is nothing to reference, so both costs stay `None`.
+    #[test]
+    fn subsidised_but_unpriced_model_stays_unpriced() {
+        let mut model = Model::from_spec(UNPRICED_DEEPSEEK_SPEC).unwrap();
+        assert!(model.pricing.is_zero());
+        model.pricing.subsidised_by = Some(Arc::from("Max"));
+        assert_eq!(model.billed_cost(&INPUT_ONLY, false), None);
+        assert_eq!(model.subsidised_list_cost(&INPUT_ONLY, false), None);
+    }
+
+    /// An ordinary metered model has no list-price reference to show; the
+    /// figure only appears next to a subsidised `$0` bill.
+    #[test]
+    fn metered_model_has_no_subsidised_list_cost() {
+        let model = Model::from_spec(DEEPSEEK_SPEC).unwrap();
+        assert!(model.billed_cost(&INPUT_ONLY, false).is_some());
+        assert_eq!(model.subsidised_list_cost(&INPUT_ONLY, false), None);
+        assert_eq!(model.subsidy_source(), None);
     }
 }

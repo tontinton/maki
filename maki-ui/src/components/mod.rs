@@ -201,6 +201,8 @@ pub enum Action {
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
     RefreshModels,
+    /// Live model re-discovery, bypassing the on-disk cache.
+    RefreshModelsLive,
     RefreshUsage,
     Compact(Option<String>),
     ToggleMcp(String, bool),
@@ -376,13 +378,7 @@ pub(crate) const TEST_CONTEXT_WINDOW: u32 = 200_000;
 
 #[cfg(test)]
 pub(crate) fn test_pricing() -> ModelPricing {
-    ModelPricing {
-        input: 3.0,
-        output: 15.0,
-        cache_write: 3.75,
-        cache_read: 0.30,
-        fast: None,
-    }
+    ModelPricing::per_token(3.0, 15.0, 3.75, 0.30)
 }
 
 #[cfg(test)]

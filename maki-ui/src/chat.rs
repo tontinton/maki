@@ -49,6 +49,9 @@ pub enum ChatEventResult {
 pub struct Chat {
     pub name: String,
     pub cost: Option<f64>,
+    /// This chat's slice of the session's list-price reference cost; mirrors
+    /// `cost`, but only ever set for subsidised models.
+    pub list_cost: Option<f64>,
     pub context_size: u32,
     pub model_id: Option<String>,
     pending_turn_usage: Option<String>,
@@ -66,6 +69,7 @@ impl Chat {
         Self {
             name,
             cost: None,
+            list_cost: None,
             context_size: 0,
             model_id: None,
             pending_turn_usage: None,
@@ -114,6 +118,7 @@ impl Chat {
                 self.messages_panel.text_delta(&text);
             }
             AgentEvent::ToolPending { id, name } => self.messages_panel.tool_pending(id, &name),
+            AgentEvent::ReviewerVerdict(_) => {}
             AgentEvent::ToolStart(e) => self.messages_panel.tool_start(*e),
             AgentEvent::ToolOutput { id, content } => {
                 self.messages_panel.tool_output(&id, &content)

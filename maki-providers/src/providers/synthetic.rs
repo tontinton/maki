@@ -33,20 +33,14 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
 });
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
+    const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["hf:moonshotai/Kimi-K2.5"],
             tier: ModelTier::Strong,
             family: ModelFamily::Synthetic,
             vision: false,
             default: true,
-            pricing: ModelPricing {
-                input: 0.45,
-                output: 3.40,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(0.45, 3.40, 0.00, 0.00),
             max_output_tokens: Some(131072),
             context_window: 200_000,
         },
@@ -56,13 +50,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Synthetic,
             vision: false,
             default: true,
-            pricing: ModelPricing {
-                input: 0.56,
-                output: 1.68,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(0.56, 1.68, 0.00, 0.00),
             max_output_tokens: Some(131072),
             context_window: 200_000,
         },
@@ -72,17 +60,12 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Synthetic,
             vision: false,
             default: true,
-            pricing: ModelPricing {
-                input: 0.10,
-                output: 0.50,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(0.10, 0.50, 0.00, 0.00),
             max_output_tokens: Some(131072),
             context_window: 200_000,
         },
-    ]
+    ];
+    MODELS
 }
 
 pub struct Synthetic {

@@ -105,7 +105,23 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
 
 /// Build a model from an already-loaded provider definition so tier resolution
 /// and id lookup can share one `providers.toml` read instead of loading twice.
+/// The model id to price a subsidised-but-unpriced model from the Anthropic
+/// catalog under, or `None` when the fallback does not apply. Gated on the
+/// provider's protocol: only Anthropic-protocol providers serve Anthropic
+/// models, so any other kind must not get Anthropic catalog rates. `-1m`
+/// context variants price the same as their base model.
+fn catalog_fallback_id<'a>(
+    kind: ProviderKind,
+    pricing: &ModelPricing,
+    subsidised: bool,
+    model_id: &'a str,
+) -> Option<&'a str> {
+    (pricing.is_zero() && subsidised && matches!(kind, ProviderKind::Anthropic))
+        .then(|| model_id.strip_suffix("-1m").unwrap_or(model_id))
+}
+
 fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &str) -> Model {
+    let subsidy_source = def.subsidised_by.as_deref();
     let declared = def.models.iter().find(|m| m.id == model_id);
     let tier = declared
         .map(|m| ModelTier::from(m.tier))
@@ -116,9 +132,14 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         .and_then(|m| m.max_output_tokens)
         .or_else(|| discovered.and_then(|d| d.max_output_tokens))
         .or_else(|| kind.fallback_max_output());
+    // The builtin manifest path (model.rs::from_manifest) applies this so
+    // `<id>-1m` resolves to 1M context regardless of what /v1/models said.
+    // Custom Anthropic slugs (cliproxy on Claude Max) need the same behaviour
+    // or every -1m variant reads back as the 200K protocol default.
     let context_window = declared
         .and_then(|m| m.context_window)
         .or_else(|| discovered.and_then(|d| d.context_window))
+        .or_else(|| super::anthropic::shared::long_context_window(model_id))
         .unwrap_or_else(|| kind.fallback_context_window());
     let supports_tool_examples_override = declared.and_then(|m| m.supports_tool_examples);
     let thinking_override = ThinkingSupport::from_flags(
@@ -141,8 +162,27 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
                     input: d.pricing_fast_input.unwrap_or(0.0),
                     output: d.pricing_fast_output.unwrap_or(0.0),
                 }),
+            subsidised_by: None,
         })
         .unwrap_or_default();
+    // A subsidised provider (Claude Max via cliproxy) rarely quotes its own
+    // rates -- it is free at the point of use -- so fall back to the
+    // published list price purely as the reference shown alongside the $0
+    // bill.
+    let mut pricing = pricing;
+    if let Some(base_id) = catalog_fallback_id(kind, &pricing, subsidy_source.is_some(), model_id)
+        && let Some(meta) = crate::providers::catalog::model_meta_if_available("anthropic", base_id)
+    {
+        pricing = ModelPricing::per_token(
+            meta.input_price,
+            meta.output_price,
+            meta.cache_write,
+            meta.cache_read,
+        );
+    }
+    if let Some(source) = subsidy_source {
+        pricing.subsidised_by = Some(Arc::from(source));
+    }
     Model {
         id: model_id.to_string(),
         provider: Arc::from(slug),
@@ -384,5 +424,80 @@ mod tests {
         overlay_declared_tiers(&def, &mut models);
         assert_eq!(models[0].tier, Some(ModelTier::Strong));
         assert_eq!(models[1].tier, None);
+    }
+
+    use crate::TokenUsage;
+
+    fn subsidised_def(protocol: &str, model_id: &str) -> ProviderDef {
+        serde_json::from_str(&format!(
+            r#"{{"protocol":"{protocol}","subsidised_by":"Max","models":[{{"id":"{model_id}"}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn catalog_fallback_only_for_unpriced_subsidised_anthropic() {
+        let zero = ModelPricing::ZERO;
+        assert_eq!(
+            catalog_fallback_id(ProviderKind::Anthropic, &zero, true, "claude-x"),
+            Some("claude-x")
+        );
+        // `-1m` context variants price the same as their base model.
+        assert_eq!(
+            catalog_fallback_id(ProviderKind::Anthropic, &zero, true, "claude-x-1m"),
+            Some("claude-x")
+        );
+        // Another protocol must never pick up Anthropic catalog rates.
+        assert_eq!(
+            catalog_fallback_id(ProviderKind::OpenAi, &zero, true, "claude-x"),
+            None
+        );
+        // Declared/discovered rates win over the catalog.
+        let priced = ModelPricing::per_token(3.0, 15.0, 0.0, 0.0);
+        assert_eq!(
+            catalog_fallback_id(ProviderKind::Anthropic, &priced, true, "claude-x"),
+            None
+        );
+        // No subsidy, no reference price to backfill.
+        assert_eq!(
+            catalog_fallback_id(ProviderKind::Anthropic, &zero, false, "claude-x"),
+            None
+        );
+    }
+
+    // The subsidy is stamped whichever path supplied the rates, and an
+    // unpriced non-Anthropic model must not report a false $0 bill.
+    #[test]
+    fn subsidised_def_stamps_declared_pricing() {
+        let mut def = subsidised_def("openai", "my-model");
+        def.models[0].pricing_input = Some(3.0);
+        def.models[0].pricing_output = Some(15.0);
+        let model = model_from_def(&def, ProviderKind::OpenAi, "my-proxy", "my-model");
+        assert_eq!(model.subsidy_source(), Some("Max"));
+        assert_eq!(model.pricing.input, 3.0);
+        let usage = TokenUsage {
+            input: 1_000_000,
+            output: 0,
+            cache_creation: 0,
+            cache_read: 0,
+            ..Default::default()
+        };
+        assert_eq!(model.billed_cost(&usage, false), Some(0.0));
+    }
+
+    #[test]
+    fn subsidised_def_without_pricing_stays_unpriced() {
+        let def = subsidised_def("openai", "my-model");
+        let model = model_from_def(&def, ProviderKind::OpenAi, "my-proxy", "my-model");
+        assert_eq!(model.subsidy_source(), Some("Max"));
+        assert!(model.pricing.is_zero());
+        let usage = TokenUsage {
+            input: 1_000_000,
+            output: 0,
+            cache_creation: 0,
+            cache_read: 0,
+            ..Default::default()
+        };
+        assert_eq!(model.billed_cost(&usage, false), None);
     }
 }

@@ -69,6 +69,12 @@ pub fn set_known_models(provider: &str, models: Vec<ModelInfo>) {
     write().set_known_models(provider, models);
 }
 
+/// Everything discovery has stored, cloned out for the on-disk model cache
+/// (crate::models_cache). Owned data, same as every accessor here.
+pub fn all_known_models() -> HashMap<String, Vec<ModelInfo>> {
+    read().known_models.clone()
+}
+
 /// Tiers whose override points at `spec`, in descending tier order.
 pub fn override_tiers(spec: &str) -> Vec<ModelTier> {
     read().override_tiers(spec)

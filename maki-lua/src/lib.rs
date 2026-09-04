@@ -15,11 +15,13 @@ pub use api::keymap::{KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use api::net::set_allowed_private_hosts;
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::pack::{Declared, PackOp};
+pub use api::plan::{PlanActionInfo, PlanActionReader, PlanActionSnapshot};
 pub use api::session::SessionSnapshotFn;
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
-    HintReader, HintSnapshot, LuaCommandInfo, LuaCommandReader, ModelRequest, SessionRequest,
-    Split, TaskRequest, TitlePos, UiAction, UiAttachment, UiReply, WinCommand, WinEvent, WinView,
+    HintReader, HintSnapshot, LuaCommandInfo, LuaCommandReader, ModelRequest, PlanRequest,
+    SessionRequest, Split, TaskRequest, TitlePos, UiAction, UiAttachment, UiReply, WinCommand,
+    WinEvent, WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
@@ -39,11 +41,25 @@ pub mod test_support {
     use crate::KeymapReader;
     use crate::SessionEndReason;
     use crate::api::keymap::{KeymapEntry, KeymapWriter};
+    use crate::api::plan::{PlanActionInfo, PlanActionReader, PlanActionWriter};
     use crate::api::util::command::{
         HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
     };
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
     use maki_storage::id::MakiId;
+
+    pub struct PlanActionWriterHandle(PlanActionWriter);
+
+    impl PlanActionWriterHandle {
+        pub fn publish(&self, actions: Vec<PlanActionInfo>) {
+            self.0.publish(actions);
+        }
+    }
+
+    pub fn plan_action_writer_pair() -> (PlanActionWriterHandle, PlanActionReader) {
+        let (writer, reader) = PlanActionWriter::new();
+        (PlanActionWriterHandle(writer), reader)
+    }
 
     pub struct LuaCommandWriterHandle(LuaCommandWriter);
 

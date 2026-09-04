@@ -212,6 +212,7 @@ impl<'h> Agent<'h> {
             workflow,
             prompt: _,
         } = input;
+        self.permissions.reset_review_turn();
         self.rollback_len = self.history.len();
         self.push_input_context(preamble);
         if !message.trim().is_empty() || !images.is_empty() {
@@ -426,7 +427,10 @@ impl<'h> Agent<'h> {
     fn emit_turn_complete(&self, response: &StreamResponse) -> Result<(), AgentError> {
         let fast = self.opts.clamped(&self.model).fast;
         let cost = self.model.billed_cost(&response.usage, fast);
-        let list_cost = self.model.list_cost(&response.usage, fast);
+        // Ledger and TurnComplete both use the subsidised list price so a
+        // plugin summing per-turn `list_cost` from events lands on the same
+        // total the ledger later hands to `Done`.
+        let list_cost = self.model.subsidised_list_cost(&response.usage, fast);
         self.ledger.add(response.usage, cost, list_cost);
         self.event_tx
             .send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
@@ -434,6 +438,7 @@ impl<'h> Agent<'h> {
                 usage: response.usage,
                 model: self.model.id.clone(),
                 cost,
+                list_cost,
                 context_size: Some(self.context_size),
                 context_window: self.model.context_window,
             })))
@@ -519,6 +524,12 @@ impl<'h> Agent<'h> {
             local_tools: Arc::clone(&self.local_tools),
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
+            recent_user_messages: self
+                .history
+                .recent_user_texts(crate::reviewers::REVIEW_CONTEXT_MESSAGES)
+                .into_iter()
+                .map(Arc::from)
+                .collect(),
         }
     }
 

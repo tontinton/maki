@@ -20,6 +20,10 @@ pub(crate) struct SessionState {
     /// since. Kept running, because re-deriving it from the counters would
     /// re-price history at today's rates. `None` while nothing was priced.
     pub cost: Option<f64>,
+    /// Sum of what subsidised turns in this session would have cost at the
+    /// provider's published list price. `None` until a subsidised turn lands;
+    /// unaffected by ordinary, per-token-billed turns.
+    pub list_cost: Option<f64>,
     pub context_size: u32,
     pub mode: Mode,
     pub plan: PlanState,
@@ -101,6 +105,10 @@ impl SessionState {
             model,
             token_usage,
             cost,
+            // Not settled from storage like `cost`: subsidised sessions are
+            // new enough that resuming one always re-derives it from the
+            // per-turn stream rather than trusting old on-disk totals.
+            list_cost: None,
             context_size,
             mode,
             plan,

@@ -95,6 +95,20 @@ pub fn autocmd_for(
             "TurnError",
             json!({ "session_id": sid(), "message": message }),
         )),
+        AgentEvent::ReviewerVerdict(e) => Some((
+            "ToolReviewed",
+            json!({
+                "session_id": sid(),
+                "tool": e.tool.to_string(),
+                "reviewer": e.reviewer,
+                "model": e.model,
+                "verdict": e.verdict,
+                "reason": e.reason,
+                "resolution": e.resolution,
+                "cost": e.billed_cost,
+                "list_cost": e.list_cost,
+            }),
+        )),
         _ => None,
     }
 }
@@ -113,7 +127,8 @@ fn turn_end_reason(reason: DoneReason) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::{ToolDoneEvent, ToolOutput, ToolStartEvent};
+    use maki_agent::{ReviewerVerdictEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
+    use maki_config::ToolKey;
     use maki_providers::TokenUsage;
     use test_case::test_case;
 
@@ -170,7 +185,41 @@ mod tests {
             AgentEvent::Error {
                 message: "boom".into(),
             },
+            AgentEvent::ReviewerVerdict(Box::new(ReviewerVerdictEvent {
+                tool: ToolKey::native("bash"),
+                reviewer: "guard".into(),
+                model: "claude-sonnet-4".into(),
+                verdict: "ALLOW".into(),
+                reason: Some("safe".into()),
+                resolution: "allowed".into(),
+                usage: TokenUsage::default(),
+                billed_cost: Some(0.01),
+                list_cost: Some(0.05),
+            })),
         ]
+    }
+
+    #[test]
+    fn reviewer_verdict_shape() {
+        let event = AgentEvent::ReviewerVerdict(Box::new(ReviewerVerdictEvent {
+            tool: ToolKey::native("bash"),
+            reviewer: "guard".into(),
+            model: "claude-sonnet-4".into(),
+            verdict: "DENY".into(),
+            reason: Some("nope".into()),
+            resolution: "denied".into(),
+            usage: TokenUsage::default(),
+            billed_cost: Some(0.02),
+            list_cost: Some(0.1),
+        }));
+        let (name, data) = autocmd_for(&event, &SESSION, false).unwrap();
+        assert_eq!(name, "ToolReviewed");
+        assert_eq!(data["tool"], "bash");
+        assert_eq!(data["reviewer"], "guard");
+        assert_eq!(data["verdict"], "DENY");
+        assert_eq!(data["resolution"], "denied");
+        assert_eq!(data["cost"], 0.02);
+        assert_eq!(data["list_cost"], 0.1);
     }
 
     #[test_case(DoneReason::EndTurn, Some("finished") ; "finished")]

@@ -46,6 +46,9 @@ pub struct UsageModalContext<'a> {
     /// What the session billed, from [`maki_providers::session_cost`]. `None`
     /// means nothing here is priced, so the modal shows tokens only.
     pub total_cost: Option<f64>,
+    /// What the session would have billed at the provider's published list
+    /// price, shown next to `total_cost` only when `model` is subsidised.
+    pub total_list_cost: Option<f64>,
     pub by_model: &'a HashMap<String, StoredTokenUsage>,
     pub model: &'a Model,
     pub fast: bool,
@@ -160,7 +163,13 @@ fn build_lines(
         theme.keybind_section,
     )));
 
-    lines.push(Line::from(totals_row(ctx.total, ctx.total_cost, theme)));
+    lines.push(Line::from(totals_row(
+        ctx.total,
+        ctx.total_cost,
+        ctx.total_list_cost,
+        ctx.model.subsidy_source(),
+        theme,
+    )));
 
     if let Some(state) = quota {
         lines.push(Line::default());
@@ -219,6 +228,8 @@ fn build_lines(
 fn totals_row(
     total: &TokenUsage,
     cost: Option<f64>,
+    list_cost: Option<f64>,
+    subsidy_source: Option<&str>,
     theme: &crate::theme::Theme,
 ) -> Vec<Span<'static>> {
     let mut spans = vec![
@@ -235,8 +246,15 @@ fn totals_row(
             Style::new().fg(theme.foreground),
         ),
     ];
-    if let Some(c) = cost {
-        spans.push(Span::styled(format!("  ${c:.3}"), theme.accent));
+    match (cost, list_cost, subsidy_source) {
+        (Some(c), Some(list), Some(source)) if list > 0.0 => {
+            spans.push(Span::styled(
+                format!("  ${c:.3} (~${list:.3} {source})"),
+                theme.accent,
+            ));
+        }
+        (Some(c), _, _) => spans.push(Span::styled(format!("  ${c:.3}"), theme.accent)),
+        (None, _, _) => {}
     }
     spans
 }
@@ -593,6 +611,7 @@ mod tests {
         let ctx = UsageModalContext {
             total,
             total_cost,
+            total_list_cost: None,
             by_model,
             model,
             fast: false,
@@ -670,6 +689,7 @@ mod tests {
         let ctx = UsageModalContext {
             total: &TokenUsage::default(),
             total_cost: None,
+            total_list_cost: None,
             by_model: &HashMap::new(),
             model: &model,
             fast: false,

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use maki_config::{
@@ -10,7 +11,19 @@ use maki_config::{
 use thiserror::Error;
 use tracing::{info, warn};
 
-use crate::{AgentEvent, EventSender};
+use maki_providers::Timeouts;
+use serde_json::Value;
+
+use crate::reviewers::{
+    AttemptRecord, DEFAULT_MAX_REDIRECTS_PER_TURN, FINAL_REDIRECT_GUIDANCE, LinkCx, LinkOutcome,
+    ProviderTransport, REDIRECT_GUIDANCE, ReviewCall, ReviewTransport, ReviewerDef, Verdict,
+    build_user_message,
+};
+use crate::{AgentEvent, EventSender, ReviewerVerdictEvent};
+
+/// Hard cap on registered reviewers naming any one tool pattern; a runaway
+/// plugin loop cannot grow the chain past this and blow the walk budget.
+pub const MAX_REVIEWER_CHAIN: usize = 8;
 
 pub const DEFAULT_DENY_GUIDANCE: &str =
     "Do not retry. Try a different approach or ask the user for guidance.";
@@ -21,6 +34,7 @@ pub const PERMISSION_DENIED_PREFIX: &str = "Permission denied for";
 /// Values for the `source` attribute on `maki.tool_decision` events.
 pub const DECISION_SOURCE_RULE: &str = "rule";
 pub const DECISION_SOURCE_YOLO: &str = "yolo";
+pub const DECISION_SOURCE_REVIEWER: &str = "reviewer";
 pub const DECISION_SOURCE_USER_ONCE: &str = "user_once";
 pub const DECISION_SOURCE_USER_SESSION: &str = "user_session";
 pub const DECISION_SOURCE_USER_ALWAYS: &str = "user_always";
@@ -67,6 +81,57 @@ pub enum PermissionCheck {
         scopes: Vec<String>,
         force_prompt: bool,
     },
+}
+
+#[derive(Clone, Copy)]
+pub struct ReviewSource<'a> {
+    pub input: Option<&'a Value>,
+    /// Oldest first; the last is the most recent.
+    pub recent_user_messages: &'a [Arc<str>],
+    pub timeouts: Timeouts,
+}
+
+impl ReviewSource<'_> {
+    pub fn none() -> Self {
+        ReviewSource {
+            input: None,
+            recent_user_messages: &[],
+            timeouts: Timeouts::default(),
+        }
+    }
+}
+
+enum ReviewDecision {
+    Allow,
+    Deny {
+        reviewer: String,
+        reason: Option<String>,
+    },
+    Undecided,
+    /// Task cancellation preempted the chain; skip ledger and redirect
+    /// bookkeeping so a cancel does not burn a retry slot or a redirect.
+    Cancelled,
+}
+
+fn scope_hash(scopes: &[String]) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    scopes.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[derive(Debug, Error)]
+pub struct ReviewerChainOverflow {
+    pub tool: String,
+}
+
+impl std::fmt::Display for ReviewerChainOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "reviewer chain for tool \"{}\" would exceed MAX_REVIEWER_CHAIN ({})",
+            self.tool, MAX_REVIEWER_CHAIN
+        )
+    }
 }
 
 #[derive(Debug, Error)]
@@ -220,12 +285,22 @@ impl PermissionAnswer {
 /// the Lua runtime (writer, on plugin load/unload) and every
 /// [`PermissionManager`] (reader).
 #[derive(Default)]
-pub struct PluginRuleStore(Mutex<HashMap<Arc<str>, Vec<PermissionRule>>>);
+pub struct PluginRuleStore {
+    rules: Mutex<HashMap<Arc<str>, Vec<PermissionRule>>>,
+    reviewers: Mutex<HashMap<Arc<str>, Vec<ReviewerDef>>>,
+}
 
 impl PluginRuleStore {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Arc<str>, Vec<PermissionRule>>> {
-        self.0.lock().unwrap_or_else(|e| {
+        self.rules.lock().unwrap_or_else(|e| {
             warn!("plugin rule mutex was poisoned, recovering");
+            e.into_inner()
+        })
+    }
+
+    fn lock_reviewers(&self) -> std::sync::MutexGuard<'_, HashMap<Arc<str>, Vec<ReviewerDef>>> {
+        self.reviewers.lock().unwrap_or_else(|e| {
+            warn!("reviewer mutex was poisoned, recovering");
             e.into_inner()
         })
     }
@@ -241,12 +316,105 @@ impl PluginRuleStore {
         }
     }
 
+    /// Same-name registration replaces in place, so reloads never stack
+    /// duplicates. Enforces [`MAX_REVIEWER_CHAIN`] per tool pattern to keep
+    /// a runaway registrar from unbounded chain growth.
+    pub fn add_reviewer(
+        &self,
+        plugin: &str,
+        def: ReviewerDef,
+    ) -> Result<(), ReviewerChainOverflow> {
+        let mut map = self.lock_reviewers();
+        let plugin_key: Arc<str> = Arc::from(plugin);
+        let is_upsert = map
+            .get(&plugin_key)
+            .is_some_and(|defs| defs.iter().any(|existing| existing.name == def.name));
+        if !is_upsert {
+            for pat in &def.tools {
+                let count = map
+                    .values()
+                    .flat_map(|defs| defs.iter())
+                    .filter(|existing| existing.tools.iter().any(|p| p == pat))
+                    .count();
+                if count >= MAX_REVIEWER_CHAIN {
+                    return Err(ReviewerChainOverflow { tool: pat.clone() });
+                }
+            }
+        }
+        let defs = map.entry(plugin_key).or_default();
+        match defs.iter_mut().find(|existing| existing.name == def.name) {
+            Some(slot) => *slot = def,
+            None => defs.push(def),
+        }
+        Ok(())
+    }
+
+    /// Unknown names are a no-op so toggles can call this unconditionally.
+    pub fn remove_reviewer(&self, plugin: &str, name: &str) {
+        let mut map = self.lock_reviewers();
+        let Some(defs) = map.get_mut(plugin) else {
+            return;
+        };
+        defs.retain(|def| def.name.as_ref() != name);
+        if defs.is_empty() {
+            map.remove(plugin);
+        }
+    }
+
+    pub fn replace_reviewers(&self, plugin: &str, defs: Vec<ReviewerDef>) {
+        let mut map = self.lock_reviewers();
+        if defs.is_empty() {
+            map.remove(plugin);
+        } else {
+            map.insert(Arc::from(plugin), defs);
+        }
+    }
+
     pub fn remove(&self, plugin: &str) {
         self.lock().remove(plugin);
+        self.lock_reviewers().remove(plugin);
     }
 
     pub fn snapshot(&self) -> Vec<PermissionRule> {
         self.lock().values().flatten().cloned().collect()
+    }
+
+    /// Matching reviewers ordered by `order`, plugin name, then registration
+    /// order, so the walk is deterministic across plugins.
+    pub fn reviewer_chain(&self, tool: &str) -> Vec<ReviewerDef> {
+        self.reviewer_chain_where(|def| def.tools.iter().any(|pat| scope_matches(pat, tool)))
+    }
+
+    /// Only reviewers that named {tool} with a real pattern; the `"*"`
+    /// default does not opt a reviewer into vetoing permission-free tools.
+    pub fn explicit_reviewer_chain(&self, tool: &str) -> Vec<ReviewerDef> {
+        self.reviewer_chain_where(|def| {
+            def.tools
+                .iter()
+                .any(|pat| pat != "*" && scope_matches(pat, tool))
+        })
+    }
+
+    fn reviewer_chain_where(&self, keep: impl Fn(&ReviewerDef) -> bool) -> Vec<ReviewerDef> {
+        let map = self.lock_reviewers();
+        let mut entries: Vec<(&Arc<str>, usize, &ReviewerDef)> = map
+            .iter()
+            .flat_map(|(plugin, defs)| {
+                defs.iter()
+                    .enumerate()
+                    .map(move |(idx, def)| (plugin, idx, def))
+            })
+            .filter(|(_, _, def)| keep(def))
+            .collect();
+        entries.sort_by(|a, b| (a.2.order, a.0.as_ref(), a.1).cmp(&(b.2.order, b.0.as_ref(), b.1)));
+        entries.into_iter().map(|(_, _, def)| def.clone()).collect()
+    }
+
+    pub fn has_reviewers(&self, tool: &str) -> bool {
+        self.lock_reviewers()
+            .values()
+            .flatten()
+            .any(|def| def.tools.iter().any(|pat| scope_matches(pat, tool)))
     }
 }
 
@@ -265,6 +433,9 @@ pub struct PermissionManager {
     tool_defaults: HashMap<ToolKey, DefaultEffect>,
     cwd: PathBuf,
     plugin_rules: Arc<PluginRuleStore>,
+    review_transport: Arc<dyn ReviewTransport>,
+    review_ledger: Mutex<HashMap<(String, u64), AttemptRecord>>,
+    turn_redirects: AtomicU32,
 }
 
 impl PermissionManager {
@@ -310,7 +481,16 @@ impl PermissionManager {
             tool_defaults: config.tool_defaults,
             cwd,
             plugin_rules,
+            review_transport: Arc::new(ProviderTransport::default()),
+            review_ledger: Mutex::new(HashMap::new()),
+            turn_redirects: AtomicU32::new(0),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_transport(mut self, transport: Arc<dyn ReviewTransport>) -> Self {
+        self.review_transport = transport;
+        self
     }
 
     /// Fresh manager for a new session runtime: shares config and builtin
@@ -328,6 +508,9 @@ impl PermissionManager {
             tool_defaults: self.tool_defaults.clone(),
             cwd: self.cwd.clone(),
             plugin_rules: Arc::clone(&self.plugin_rules),
+            review_transport: Arc::clone(&self.review_transport),
+            review_ledger: Mutex::new(HashMap::new()),
+            turn_redirects: AtomicU32::new(0),
         }
     }
 
@@ -395,7 +578,11 @@ impl PermissionManager {
             // force_prompt: all scopes will be prompted anyway
         }
 
-        if self.yolo.load(Ordering::Relaxed) && gate.accepts(Approval::Standing) {
+        // Yolo must not swallow the NeedsPrompt a registered reviewer intercepts.
+        if self.yolo.load(Ordering::Relaxed)
+            && gate.accepts(Approval::Standing)
+            && !self.plugin_rules.has_reviewers(&tool.to_string())
+        {
             return PermissionCheck::Allowed;
         }
 
@@ -586,6 +773,210 @@ impl PermissionManager {
         }
     }
 
+    pub fn reset_review_turn(&self) {
+        self.turn_redirects.store(0, Ordering::Relaxed);
+        self.review_ledger().clear();
+    }
+
+    fn review_ledger(&self) -> std::sync::MutexGuard<'_, HashMap<(String, u64), AttemptRecord>> {
+        self.review_ledger.lock().unwrap_or_else(|e| {
+            warn!("review ledger mutex was poisoned, recovering");
+            e.into_inner()
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_review_chain(
+        &self,
+        chain: &[ReviewerDef],
+        tool: &ToolKey,
+        scopes: &[String],
+        force_prompt: bool,
+        review: &ReviewSource<'_>,
+        event_tx: &EventSender,
+        cancel: &crate::CancelToken,
+    ) -> ReviewDecision {
+        let tool_string = tool.to_string();
+        let ledger_key = (tool_string.clone(), scope_hash(scopes));
+        let call = ReviewCall {
+            tool: tool_string.clone(),
+            input: review.input.cloned(),
+            scopes: scopes.to_vec(),
+            force_prompt,
+            cwd: self.cwd.display().to_string(),
+            recent_user_messages: review
+                .recent_user_messages
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            attempt: self.review_ledger().get(&ledger_key).cloned(),
+        };
+        let user_message = build_user_message(&call);
+
+        let mut decision = ReviewDecision::Undecided;
+        for def in chain {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let cx = LinkCx {
+                transport: self.review_transport.as_ref(),
+                timeouts: review.timeouts,
+                user_message: &user_message,
+            };
+            let deadline = async {
+                async_io::Timer::after(std::time::Duration::from_millis(def.timeout_ms)).await;
+                LinkOutcome::default()
+            };
+            let raced = futures_lite::future::or(def.link.review(&call, cx), deadline);
+            let outcome = cancel.race(raced).await.unwrap_or_default();
+            let parsed = outcome.verdict;
+            let (verdict, reason) = match &parsed {
+                Some((verdict, reason)) => (verdict.as_str(), reason.clone()),
+                None => ("ASK", None),
+            };
+            let resolution = match parsed {
+                Some((Verdict::Allow, _)) => "allowed",
+                Some((Verdict::Deny, _)) => "denied",
+                _ => "escalated",
+            };
+            info!(
+                tool = %tool_string,
+                reviewer = %def.name,
+                model = %def.link.label(),
+                verdict,
+                resolution,
+                "reviewer verdict"
+            );
+            let _ = event_tx.send(AgentEvent::ReviewerVerdict(Box::new(
+                ReviewerVerdictEvent {
+                    tool: tool.clone(),
+                    reviewer: def.name.to_string(),
+                    model: def.link.label().to_owned(),
+                    verdict: verdict.to_owned(),
+                    reason: reason.clone(),
+                    resolution: resolution.to_owned(),
+                    usage: outcome.usage,
+                    billed_cost: outcome.billed_cost,
+                    list_cost: outcome.list_cost,
+                },
+            )));
+            match parsed {
+                Some((Verdict::Allow, _)) => {
+                    decision = ReviewDecision::Allow;
+                    break;
+                }
+                Some((Verdict::Deny, deny_reason)) => {
+                    decision = ReviewDecision::Deny {
+                        reviewer: def.name.to_string(),
+                        reason: deny_reason,
+                    };
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if cancel.is_cancelled() {
+            return ReviewDecision::Cancelled;
+        }
+
+        let mut ledger = self.review_ledger();
+        let record = ledger.entry(ledger_key).or_insert_with(|| AttemptRecord {
+            attempts: 0,
+            history: Vec::new(),
+        });
+        record.attempts += 1;
+        match &decision {
+            ReviewDecision::Allow => record.record("ALLOW", None),
+            ReviewDecision::Deny { reason, .. } => record.record("DENY", reason.as_deref()),
+            ReviewDecision::Undecided => record.record("ASK", None),
+            ReviewDecision::Cancelled => unreachable!("cancel returns early above"),
+        }
+        decision
+    }
+
+    /// Opt-in review for tools that need no permission: reviewers that
+    /// named {tool} explicitly (not via the `"*"` default) get a chance to
+    /// DENY the call. Anything short of a DENY — allow, timeout, exhausted
+    /// escalation — falls through to normal execution, so an absent or slow
+    /// reviewer can never break a free tool.
+    pub async fn veto_review(
+        &self,
+        tool_name: &str,
+        review: ReviewSource<'_>,
+        event_tx: &EventSender,
+        cancel: &crate::CancelToken,
+    ) -> Result<(), PermissionError> {
+        let chain = self.plugin_rules.explicit_reviewer_chain(tool_name);
+        if chain.is_empty() {
+            return Ok(());
+        }
+        let tool = ToolKey::native(tool_name);
+        match self
+            .run_review_chain(&chain, &tool, &[], false, &review, event_tx, cancel)
+            .await
+        {
+            ReviewDecision::Deny { reviewer, reason } => {
+                maki_otel::emit::tool_decision(
+                    tool_name,
+                    maki_otel::emit::DECISION_REJECT,
+                    DECISION_SOURCE_REVIEWER,
+                );
+                let why = match reason {
+                    Some(r) => format!("denied by reviewer {reviewer}: {r}"),
+                    None => format!("denied by reviewer {reviewer}"),
+                };
+                Err(PermissionError::with_guidance(
+                    tool_name,
+                    "reviewer veto",
+                    why,
+                ))
+            }
+            ReviewDecision::Allow | ReviewDecision::Undecided | ReviewDecision::Cancelled => {
+                maki_otel::emit::tool_decision(
+                    tool_name,
+                    maki_otel::emit::DECISION_ACCEPT,
+                    DECISION_SOURCE_REVIEWER,
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn redirect_denial(
+        &self,
+        tool: &ToolKey,
+        chain: &[ReviewerDef],
+        event_tx: &EventSender,
+    ) -> Option<String> {
+        if !self.is_yolo() {
+            return None;
+        }
+        let redirects = self.turn_redirects.fetch_add(1, Ordering::Relaxed) + 1;
+        let guidance = if redirects >= DEFAULT_MAX_REDIRECTS_PER_TURN {
+            FINAL_REDIRECT_GUIDANCE.to_owned()
+        } else {
+            chain
+                .iter()
+                .find_map(|def| def.redirect_guidance.clone())
+                .unwrap_or_else(|| REDIRECT_GUIDANCE.to_owned())
+        };
+        let _ = event_tx.send(AgentEvent::ReviewerVerdict(Box::new(
+            ReviewerVerdictEvent {
+                tool: tool.clone(),
+                reviewer: String::new(),
+                model: String::new(),
+                verdict: "ASK".to_owned(),
+                reason: None,
+                resolution: "redirected".to_owned(),
+                usage: maki_providers::TokenUsage::default(),
+                billed_cost: None,
+                list_cost: None,
+            },
+        )));
+        Some(guidance)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn enforce(
         &self,
@@ -596,6 +987,7 @@ impl PermissionManager {
         request_id: &str,
         cancel: &crate::CancelToken,
         plan_path: Option<&Path>,
+        review: ReviewSource<'_>,
     ) -> Result<(), PermissionError> {
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
         let tool_string = tool.to_string();
@@ -631,6 +1023,42 @@ impl PermissionManager {
                     force_prompt,
                 } => (tool, scopes, force_prompt),
             };
+
+        let chain = self.plugin_rules.reviewer_chain(&tool_string);
+        if !chain.is_empty() {
+            match self
+                .run_review_chain(&chain, tool, &ps, force_prompt, &review, event_tx, cancel)
+                .await
+            {
+                ReviewDecision::Allow => return allowed(DECISION_SOURCE_REVIEWER),
+                ReviewDecision::Deny { reviewer, reason } => {
+                    let why = match reason {
+                        Some(r) => format!("denied by reviewer {reviewer}: {r}"),
+                        None => format!("denied by reviewer {reviewer}"),
+                    };
+                    return Err(deny(DECISION_SOURCE_REVIEWER, Some(why)));
+                }
+                ReviewDecision::Cancelled => return Err(deny(DECISION_SOURCE_USER_ABORT, None)),
+                ReviewDecision::Undecided => {
+                    if let Some(guidance) = self.redirect_denial(tool, &chain, event_tx) {
+                        return Err(deny(DECISION_SOURCE_REVIEWER, Some(guidance)));
+                    }
+                    let _ = event_tx.send(AgentEvent::ReviewerVerdict(Box::new(
+                        ReviewerVerdictEvent {
+                            tool: tool.clone(),
+                            reviewer: String::new(),
+                            model: String::new(),
+                            verdict: "ASK".to_owned(),
+                            reason: None,
+                            resolution: "prompted".to_owned(),
+                            usage: maki_providers::TokenUsage::default(),
+                            billed_cost: None,
+                            list_cost: None,
+                        },
+                    )));
+                }
+            }
+        }
 
         let Some(rx) = user_response_rx else {
             warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
@@ -877,6 +1305,93 @@ mod tests {
         PermissionsConfig {
             rules,
             ..Default::default()
+        }
+    }
+
+    mod veto {
+        use super::*;
+        use crate::reviewers::{LinkCx, LinkOutcome, ReviewCall, ReviewLink, parse_verdict};
+        use maki_providers::provider::BoxFuture;
+
+        struct FixedLink(&'static str);
+
+        impl ReviewLink for FixedLink {
+            fn label(&self) -> &str {
+                "fixed"
+            }
+
+            fn review<'a>(
+                &'a self,
+                _call: &'a ReviewCall,
+                _cx: LinkCx<'a>,
+            ) -> BoxFuture<'a, LinkOutcome> {
+                Box::pin(async move {
+                    LinkOutcome {
+                        verdict: parse_verdict(self.0),
+                        ..Default::default()
+                    }
+                })
+            }
+        }
+
+        fn manager_with(tools: Vec<&str>, verdict: &'static str) -> PermissionManager {
+            let store = Arc::new(PluginRuleStore::default());
+            store
+                .add_reviewer(
+                    "goal",
+                    ReviewerDef {
+                        name: Arc::from("goal-no-questions"),
+                        link: Arc::new(FixedLink(verdict)),
+                        tools: tools.into_iter().map(str::to_owned).collect(),
+                        timeout_ms: 1_000,
+                        order: 0,
+                        redirect_guidance: None,
+                    },
+                )
+                .expect("chain cap not reached in test");
+            PermissionManager::new(make_config(Vec::new()), "/work".into(), store)
+        }
+
+        fn veto(mgr: &PermissionManager, tool: &str) -> Result<(), PermissionError> {
+            let (tx, _rx) = flume::unbounded();
+            let event_tx = EventSender::new(tx, 0);
+            smol::block_on(mgr.veto_review(
+                tool,
+                ReviewSource::none(),
+                &event_tx,
+                &crate::CancelToken::none(),
+            ))
+        }
+
+        #[test]
+        fn explicit_deny_blocks_a_permission_free_tool() {
+            let mgr = manager_with(vec!["question"], "DENY: goal mode is active");
+            let err = veto(&mgr, "question")
+                .expect_err("deny must block")
+                .to_string();
+            assert!(err.contains("goal-no-questions"), "err: {err}");
+            assert!(err.contains("goal mode is active"), "err: {err}");
+        }
+
+        #[test]
+        fn wildcard_reviewers_are_not_consulted() {
+            let mgr = manager_with(vec!["*"], "DENY: would block everything");
+            assert!(veto(&mgr, "question").is_ok());
+        }
+
+        #[test]
+        fn anything_short_of_deny_lets_the_call_run() {
+            for verdict in ["ALLOW", "ASK", "gibberish"] {
+                let mgr = manager_with(vec!["question"], verdict);
+                assert!(veto(&mgr, "question").is_ok(), "verdict {verdict}");
+            }
+        }
+
+        #[test]
+        fn glob_pattern_counts_as_explicit() {
+            let mgr = manager_with(vec!["quest*"], "DENY");
+            assert!(veto(&mgr, "question").is_err());
+            assert!(veto(&mgr, "bash").is_ok(), "non-matching tool untouched");
         }
     }
 
@@ -1868,5 +2383,406 @@ mod tests {
             ),
             PermissionCheck::NeedsPrompt { .. }
         ));
+    }
+
+    mod reviewer_chain {
+        use super::*;
+        use crate::reviewers::LinkCallResult;
+        use maki_providers::TokenUsage;
+        use maki_providers::provider::BoxFuture;
+        use std::collections::VecDeque;
+
+        const SCOPE: &str = "rm -rf build";
+        const TEST_BILLED: f64 = 0.001;
+
+        struct ScriptedTransport {
+            responses: Mutex<VecDeque<Result<String, String>>>,
+            calls: Mutex<Vec<(String, String)>>,
+        }
+
+        impl ScriptedTransport {
+            fn new(responses: &[Result<&str, &str>]) -> Arc<Self> {
+                Arc::new(Self {
+                    responses: Mutex::new(
+                        responses
+                            .iter()
+                            .map(|r| r.map(str::to_owned).map_err(str::to_owned))
+                            .collect(),
+                    ),
+                    calls: Mutex::new(Vec::new()),
+                })
+            }
+
+            fn calls(&self) -> Vec<(String, String)> {
+                self.calls.lock().unwrap().clone()
+            }
+        }
+
+        impl ReviewTransport for ScriptedTransport {
+            fn call<'a>(
+                &'a self,
+                spec: &'a str,
+                _system: &'a str,
+                user: &'a str,
+                _timeouts: Timeouts,
+            ) -> BoxFuture<'a, LinkCallResult> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((spec.to_owned(), user.to_owned()));
+                let next = self.responses.lock().unwrap().pop_front();
+                Box::pin(async move {
+                    match next {
+                        Some(Ok(text)) => LinkCallResult {
+                            text: Ok(text),
+                            usage: TokenUsage {
+                                input: 10,
+                                output: 2,
+                                ..Default::default()
+                            },
+                            billed_cost: Some(TEST_BILLED),
+                            list_cost: None,
+                        },
+                        Some(Err(e)) => LinkCallResult::failed(e),
+                        None => LinkCallResult::failed("script exhausted".into()),
+                    }
+                })
+            }
+        }
+
+        fn reviewer(name: &str, tools: &[&str]) -> ReviewerDef {
+            ReviewerDef {
+                name: Arc::from(name),
+                link: Arc::new(crate::reviewers::ModelLink {
+                    spec: "test/model".into(),
+                    policy: "policy".into(),
+                }),
+                tools: tools.iter().map(|s| (*s).to_owned()).collect(),
+                timeout_ms: 1_000,
+                order: 0,
+                redirect_guidance: None,
+            }
+        }
+
+        fn manager(
+            config: PermissionsConfig,
+            defs: Vec<ReviewerDef>,
+            transport: Arc<ScriptedTransport>,
+        ) -> PermissionManager {
+            let store = Arc::new(PluginRuleStore::default());
+            store.replace_reviewers("test", defs);
+            PermissionManager::new(config, PathBuf::from("/tmp"), store).with_transport(transport)
+        }
+
+        fn enforce(
+            mgr: &PermissionManager,
+        ) -> (Result<(), PermissionError>, Vec<crate::AgentEvent>) {
+            let (tx, rx) = flume::unbounded();
+            let event_tx = EventSender::new(tx, 0);
+            let scopes = crate::tools::PermissionScopes {
+                scopes: vec![SCOPE.to_owned()],
+                force_prompt: false,
+            };
+            let result = smol::block_on(mgr.enforce(
+                &ToolKey::native("bash"),
+                &scopes,
+                &event_tx,
+                None,
+                "req-1",
+                &crate::CancelToken::none(),
+                None,
+                ReviewSource::none(),
+            ));
+            let events = rx.drain().map(|envelope| envelope.event).collect();
+            (result, events)
+        }
+
+        fn resolutions(events: &[crate::AgentEvent]) -> Vec<String> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    crate::AgentEvent::ReviewerVerdict(v) => Some(v.resolution.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn allow_verdict_allows_and_reports_spend() {
+            let transport = ScriptedTransport::new(&[Ok("ALLOW: read only")]);
+            let mgr = manager(
+                PermissionsConfig::default(),
+                vec![reviewer("cheap", &["*"])],
+                Arc::clone(&transport),
+            );
+            let (result, events) = enforce(&mgr);
+            assert!(result.is_ok());
+            assert_eq!(resolutions(&events), ["allowed"]);
+            let crate::AgentEvent::ReviewerVerdict(v) = &events[0] else {
+                panic!("expected verdict event");
+            };
+            assert_eq!(v.billed_cost, Some(TEST_BILLED));
+            assert_eq!(v.reviewer, "cheap");
+        }
+
+        #[test]
+        fn deny_verdict_hard_denies_and_never_escalates() {
+            let transport = ScriptedTransport::new(&[Ok("DENY: touches prod")]);
+            let mgr = manager(
+                PermissionsConfig::default(),
+                vec![reviewer("cheap", &["*"]), reviewer("strong", &["*"])],
+                Arc::clone(&transport),
+            );
+            let (result, events) = enforce(&mgr);
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("denied by reviewer cheap: touches prod"),
+                "{err}"
+            );
+            assert_eq!(transport.calls().len(), 1, "DENY must not escalate");
+            assert_eq!(resolutions(&events), ["denied"]);
+        }
+
+        #[test]
+        fn ask_garbage_and_errors_escalate_until_prompt() {
+            let transport =
+                ScriptedTransport::new(&[Ok("ASK"), Ok("maybe? sounds fine"), Err("timeout")]);
+            let mgr = manager(
+                PermissionsConfig::default(),
+                vec![
+                    reviewer("a", &["*"]),
+                    reviewer("b", &["*"]),
+                    reviewer("c", &["*"]),
+                ],
+                Arc::clone(&transport),
+            );
+            let (result, events) = enforce(&mgr);
+            assert!(
+                result.is_err(),
+                "no response channel, so the prompt path denies"
+            );
+            assert_eq!(transport.calls().len(), 3);
+            assert_eq!(
+                resolutions(&events),
+                ["escalated", "escalated", "escalated", "prompted"]
+            );
+        }
+
+        #[test]
+        fn yolo_with_matching_reviewer_redirects_instead_of_allowing() {
+            let transport = ScriptedTransport::new(&[Ok("ASK"), Ok("ASK"), Ok("ASK")]);
+            let config = PermissionsConfig {
+                yolo: true,
+                ..Default::default()
+            };
+            let mgr = manager(
+                config,
+                vec![reviewer("cheap", &["*"])],
+                Arc::clone(&transport),
+            );
+
+            let (result, events) = enforce(&mgr);
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains(REDIRECT_GUIDANCE), "{err}");
+            assert_eq!(resolutions(&events), ["escalated", "redirected"]);
+
+            let (result, _) = enforce(&mgr);
+            assert!(result.unwrap_err().to_string().contains(REDIRECT_GUIDANCE));
+            let (result, _) = enforce(&mgr);
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains(FINAL_REDIRECT_GUIDANCE),
+                "third redirect in a turn must harden the guidance: {err}"
+            );
+
+            mgr.reset_review_turn();
+            let transport2 = ScriptedTransport::new(&[Ok("ASK")]);
+            let mgr2 = manager(
+                PermissionsConfig {
+                    yolo: true,
+                    ..Default::default()
+                },
+                vec![reviewer("cheap", &["*"])],
+                transport2,
+            );
+            let (result, _) = enforce(&mgr2);
+            assert!(result.unwrap_err().to_string().contains(REDIRECT_GUIDANCE));
+        }
+
+        #[test]
+        fn yolo_without_matching_reviewer_still_allows_all() {
+            let transport = ScriptedTransport::new(&[]);
+            let config = PermissionsConfig {
+                yolo: true,
+                ..Default::default()
+            };
+            let mgr = manager(
+                config,
+                vec![reviewer("writes", &["write"])],
+                Arc::clone(&transport),
+            );
+            let (result, events) = enforce(&mgr);
+            assert!(result.is_ok());
+            assert!(transport.calls().is_empty());
+            assert!(resolutions(&events).is_empty());
+        }
+
+        #[test]
+        fn static_deny_rule_wins_before_any_review() {
+            let transport = ScriptedTransport::new(&[Ok("ALLOW")]);
+            let config = PermissionsConfig {
+                yolo: true,
+                rules: vec![deny_rule("rm *")],
+                ..Default::default()
+            };
+            let mgr = manager(
+                config,
+                vec![reviewer("cheap", &["*"])],
+                Arc::clone(&transport),
+            );
+            let (result, _) = enforce(&mgr);
+            assert!(result.is_err());
+            assert!(transport.calls().is_empty());
+        }
+
+        #[test]
+        fn static_allow_rule_short_circuits_before_review() {
+            let transport = ScriptedTransport::new(&[Ok("DENY")]);
+            let config = make_config(vec![allow_rule("rm *")]);
+            let mgr = manager(
+                config,
+                vec![reviewer("cheap", &["*"])],
+                Arc::clone(&transport),
+            );
+            let (result, _) = enforce(&mgr);
+            assert!(result.is_ok());
+            assert!(transport.calls().is_empty());
+        }
+
+        #[test]
+        fn tool_filter_scopes_the_chain() {
+            let transport = ScriptedTransport::new(&[Ok("ALLOW")]);
+            let mgr = manager(
+                PermissionsConfig::default(),
+                vec![reviewer("writes", &["write"])],
+                Arc::clone(&transport),
+            );
+            let (result, events) = enforce(&mgr);
+            assert!(result.is_err(), "bash has no reviewer, prompt path denies");
+            assert!(transport.calls().is_empty());
+            assert!(resolutions(&events).is_empty());
+        }
+
+        #[test]
+        fn attempt_history_appears_on_the_second_review() {
+            let transport = ScriptedTransport::new(&[Ok("ASK"), Ok("ASK")]);
+            let mgr = manager(
+                PermissionsConfig::default(),
+                vec![reviewer("cheap", &["*"])],
+                Arc::clone(&transport),
+            );
+            let _ = enforce(&mgr);
+            let _ = enforce(&mgr);
+            let calls = transport.calls();
+            assert!(!calls[0].1.contains("Attempt history"));
+            assert!(calls[1].1.contains("Attempt history"));
+            assert!(calls[1].1.contains("attempt 2"));
+        }
+
+        #[test]
+        fn fork_shares_the_reviewer_store() {
+            let transport = ScriptedTransport::new(&[]);
+            let mgr = manager(
+                PermissionsConfig::default(),
+                vec![reviewer("cheap", &["*"])],
+                transport,
+            );
+            let fork = mgr.fork();
+            assert!(fork.plugin_rules.has_reviewers("bash"));
+            assert!(Arc::ptr_eq(&mgr.plugin_rules, &fork.plugin_rules));
+        }
+
+        #[test]
+        fn chain_orders_by_order_then_plugin_then_index() {
+            let store = PluginRuleStore::default();
+            let mut early = reviewer("early", &["*"]);
+            early.order = -1;
+            store.replace_reviewers("zeta", vec![reviewer("z1", &["*"]), early]);
+            store.replace_reviewers("alpha", vec![reviewer("a1", &["*"])]);
+            let names: Vec<String> = store
+                .reviewer_chain("bash")
+                .into_iter()
+                .map(|def| def.name.to_string())
+                .collect();
+            assert_eq!(names, ["early", "a1", "z1"]);
+        }
+
+        #[test]
+        fn chain_cap_rejects_additions_beyond_the_limit() {
+            let store = PluginRuleStore::default();
+            for i in 0..MAX_REVIEWER_CHAIN {
+                store
+                    .add_reviewer("p", reviewer(&format!("r{i}"), &["bash"]))
+                    .expect("under cap");
+            }
+            let err = store
+                .add_reviewer("p", reviewer("overflow", &["bash"]))
+                .expect_err("cap must reject the ninth registration");
+            assert_eq!(err.tool, "bash");
+            let msg = err.to_string();
+            assert!(msg.contains("MAX_REVIEWER_CHAIN"), "{msg}");
+        }
+
+        #[test]
+        fn chain_cap_allows_upsert_at_the_limit() {
+            let store = PluginRuleStore::default();
+            for i in 0..MAX_REVIEWER_CHAIN {
+                store
+                    .add_reviewer("p", reviewer(&format!("r{i}"), &["bash"]))
+                    .expect("under cap");
+            }
+            store
+                .add_reviewer("p", reviewer("r0", &["bash"]))
+                .expect("same-name replace stays within cap");
+        }
+
+        #[test]
+        fn ledger_resets_between_turns() {
+            let transport = ScriptedTransport::new(&[Ok("ASK"), Ok("ASK")]);
+            let mgr = manager(
+                PermissionsConfig::default(),
+                vec![reviewer("cheap", &["*"])],
+                Arc::clone(&transport),
+            );
+            let _ = enforce(&mgr);
+            mgr.reset_review_turn();
+            let _ = enforce(&mgr);
+            let calls = transport.calls();
+            assert!(
+                !calls[1].1.contains("Attempt history"),
+                "reset must clear the per-turn attempt ledger: {}",
+                calls[1].1
+            );
+        }
+
+        #[test]
+        fn add_reviewer_upserts_by_name() {
+            let store = PluginRuleStore::default();
+            store
+                .add_reviewer("p", reviewer("cheap", &["*"]))
+                .expect("first add fits");
+            let mut replacement = reviewer("cheap", &["write"]);
+            replacement.link = Arc::new(crate::reviewers::ModelLink {
+                spec: "other/model".into(),
+                policy: "policy".into(),
+            });
+            store
+                .add_reviewer("p", replacement)
+                .expect("upsert never overflows");
+            let chain = store.reviewer_chain("write");
+            assert_eq!(chain.len(), 1);
+            assert_eq!(chain[0].link.label(), "other/model");
+            assert!(store.reviewer_chain("bash").is_empty());
+        }
     }
 }

@@ -52,20 +52,14 @@ const PEAK_WINDOWS: &[PricingWindow] = &[PricingWindow::hours(1, 4), PricingWind
 const PEAK_MULTIPLIER: f64 = 2.0;
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
+    const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["deepseek-v4-flash"],
             tier: ModelTier::Medium,
             family: ModelFamily::Generic,
             vision: false,
             default: true,
-            pricing: ModelPricing {
-                input: 0.22,
-                output: 0.66,
-                cache_write: 0.00,
-                cache_read: 0.007,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(0.22, 0.66, 0.00, 0.007),
             max_output_tokens: Some(384_000),
             context_window: 1_000_000,
         },
@@ -75,17 +69,12 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Generic,
             vision: false,
             default: true,
-            pricing: ModelPricing {
-                input: 0.66,
-                output: 1.98,
-                cache_write: 0.00,
-                cache_read: 0.022,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(0.66, 1.98, 0.00, 0.022),
             max_output_tokens: Some(384_000),
             context_window: 1_000_000,
         },
-    ]
+    ];
+    MODELS
 }
 
 #[derive(Deserialize)]

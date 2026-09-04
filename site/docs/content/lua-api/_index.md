@@ -63,6 +63,7 @@ permission raises `permission denied: '<name>' not granted for this plugin`.
 - `net`: outbound network requests
 - `run`: starting processes
 - `env`: reading the process environment, where secrets live
+- `reviewers`: registering reviewers that intercept permission prompts
 
 Grants come from a `plugin.toml` next to the Lua file (for
 `~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
@@ -76,6 +77,7 @@ fs_write = true
 net = true
 run = true
 env = true
+reviewers = true
 ```
 
 The rules:
@@ -120,6 +122,7 @@ The rules:
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
 | [`maki.model`](#maki-model) | The model behind the focused session. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
+| [`maki.plan`](#maki-plan) | Plan-mode surface: register menu actions on the plan form, own the |
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.Timer`](#maki-Timer) | Handle returned by `maki.defer_fn`. |
 | [`maki.task`](#maki-task) | The subagents of the focused session and their transcripts. |
@@ -506,6 +509,133 @@ maki.api.register_permission_rule({
 
 ---
 
+### `maki.api.register_reviewer()` {#maki-api-register_reviewer}
+
+```lua
+maki.api.register_reviewer({spec})
+```
+
+Register a reviewer for permission prompts. When a tool call would
+prompt the human, registered reviewers are asked first, in chain
+order: each answers ALLOW (run it), DENY (block it, with the reason
+shown to the agent), or ASK (escalate to the next reviewer, then the
+human). Under yolo mode an unresolved chain denies with retry guidance
+instead of prompting, so the agent never stalls on a question.
+
+A link is either a model (`model` + `policy`: maki calls the model and
+parses its verdict) or a `handler` (your function computes the verdict:
+rulebooks, quotas, external approval systems, custom prompts). The
+handler receives one table — `tool`, `input` (decoded), `scopes` (for
+bash: the parsed command segments), `parseable`, `cwd`,
+`last_user_message`, `recent_user_messages` (trailing user messages,
+oldest first), `attempt` (`{ count, history }` on repeats) — and
+returns `"ALLOW"|"DENY"|"ASK"` plus an optional reason; anything else
+escalates. Handlers may block (e.g. on `maki.ui.picker`); the outer
+chain waits at most `timeout_ms` and cancels the handler when the wait
+ends, so a slow handler cannot outlive its caller.
+
+One rule governs visibility: reviewers see the tools they name.
+Tools that never reach the permission layer (`question`, `todo_write`)
+are therefore only seen by reviewers naming them with a real pattern —
+the `"*"` default does not reach them — and for those calls anything
+short of a DENY (allow, timeout, exhausted escalation) lets the tool
+run as usual. A goal plugin can e.g. deny the question tool while a
+goal is active, so the agent decides instead of stalling on the human.
+
+Registration is live: it takes effect immediately and re-registering
+the same `name` replaces the earlier entry, so a toggle command can
+re-register on enable and `unregister_reviewer` on disable. A
+`/reload` drops the plugin's reviewers before the plugin runs again.
+
+The reviewer model receives the raw tool input, the permission scopes
+maki derived, the working directory, and the latest user message.
+
+**Parameters:**
+
+- `{spec}` (`table`) Reviewer specification:
+  - `name` (`string`) Required. Unique per plugin; same name replaces.
+  - `model` (`string`) Required. Model spec `provider/model-id`, e.g.
+    "anthropic/claude-haiku-4-5-20251001".
+  - `policy` (`string`) Required with `model`. System-prompt policy text
+    the reviewer judges calls against.
+  - `handler` (`function`) Alternative to `model`/`policy`: computes the
+    verdict itself. `function(call) -> verdict, reason?`
+  - `tools` (`table`) Optional. Tool filters matched against the tool
+    key (`"bash"`, `"server.tool"`); `*` globs, e.g.
+    `{ "bash", "myserver.*" }`. Default `{ "*" }`.
+    Real patterns also opt permission-free tools
+    into review (see above); the default does not.
+  - `timeout_ms` (`integer`) Optional. Per-call timeout; default 5000 for
+    model links, 300000 for handler links (they may
+    wait on a human). Handlers also receive the full
+    untruncated input, unlike model links.
+  - `order` (`integer`) Optional. Chain position, lowest first; default 0.
+  - `redirect_guidance` (`string`) Optional. Replaces the built-in "try a
+    different approach" text when an unresolved chain
+    denies under yolo, so the agent hears your
+    plugin's voice (e.g. restate the goal).
+
+**Example:**
+
+```lua
+maki.api.register_reviewer({
+  name = "cheap",
+  model = "anthropic/claude-haiku-4-5-20251001",
+  policy = "ALLOW clearly read-only commands. Otherwise ASK.",
+})
+maki.api.register_reviewer({
+  name = "rulebook",
+  order = -1,
+  handler = function(call)
+    if call.tool == "bash" and call.scopes[1]:find("^git ") then
+      return "ALLOW"
+    end
+    return "ASK"
+  end,
+})
+```
+
+---
+
+### `maki.api.unregister_reviewer()` {#maki-api-unregister_reviewer}
+
+```lua
+maki.api.unregister_reviewer({name})
+```
+
+Remove one of this plugin's reviewers by name. Unknown names are a
+no-op, so a toggle can call it unconditionally; `clear_reviewers`
+drops all of the plugin's reviewers at once.
+
+**Parameters:**
+
+- `{name}` (`string`) The `name` the reviewer was registered under.
+
+**Example:**
+
+```lua
+maki.api.unregister_reviewer("goal-no-questions")
+```
+
+---
+
+### `maki.api.clear_reviewers()` {#maki-api-clear_reviewers}
+
+```lua
+maki.api.clear_reviewers()
+```
+
+Drop every reviewer this plugin registered, effective immediately.
+The counterpart of `register_reviewer` for disable toggles.
+
+**Example:**
+
+```lua
+maki.api.clear_reviewers()
+```
+
+---
+
 ### `maki.api.register_command()` {#maki-api-register_command}
 
 ```lua
@@ -768,24 +898,27 @@ Listen for one or more events. Returns an id you can pass to
 `del_autocmd` later to remove the listener.
 
 Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
-`"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
-`"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
-`"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-and `"ModelChanged"`. Plugins can also fire their own events with
-`exec_autocmds`.
+`"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"ToolReviewed"`,
+`"AutoCompacting"`, `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`,
+`"SessionEnd"`, `"SessionFocusChanged"`, `"SessionStatusChanged"`,
+`"TaskStatusChanged"`, and `"ModelChanged"`. Plugins can also fire their
+own events with `exec_autocmds`.
 
 Every host event carries `data.session_id`. For `"SessionReset"` and
 `"SessionEnd"` that is the session being left behind, the other events
 name the session now running or focused. What each event adds:
 
 - `"ToolStart"`, `"ToolDone"`: `data.tool_id` and `data.tool`.
+- `"ToolReviewed"`: `data.tool`, `data.reviewer`, `data.model`,
+  `data.verdict`, `data.reason`, `data.resolution`, `data.cost`, and
+  `data.list_cost`.
 - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
   `"max_turns"`, or `"cancelled"`), `data.usage` (four token fields,
   cache included), `data.cost`, `data.list_cost`, `data.context_size`,
   `data.context_window`, and `data.num_turns` (model round-trips the
-  turn took). `list_cost` is the un-subsidised list price and `cost` is
-  the real bill, so a budget plugin charges against whichever one it
-  wants.
+  turn took). `cost` is the real bill; `list_cost` is the un-subsidised
+  reference price and is only set for subsidised models, so a budget
+  plugin against list price should fall back to `cost` when absent.
 - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
   trigger time.
 - `"CompactionDone"`: `data.context_size_before`,
@@ -975,6 +1108,10 @@ table to replace the value, nothing to leave it alone, or
 tool declares, and a tool declaring none costs every permission. See
 [Hooks](/docs/hooks/).
 
+Wrapping a plugin-declared slot you do not own steers a chain someone
+else's plugin trusts, so it costs full trust (every permission granted).
+Layering your own slot is free.
+
 **Parameters:**
 
 - `{name}` (`string`) Slot name to wrap.
@@ -1007,6 +1144,90 @@ which plugins own or wrap each slot.
 for name, info in pairs(maki.api.get_slots()) do
   print(name, info.owner, info.declared)
 end
+```
+
+---
+
+### `maki.api.register_plan_action()` {#maki-api-register_plan_action}
+
+```lua
+maki.api.register_plan_action({spec})
+```
+
+Add a row to the plan-mode form menu. The form appears when the agent
+finishes writing a plan; plugin rows sit alongside the built-in
+"Refine plan", "Clear context and implement", and "Implement plan"
+entries, sorted by `order`.
+
+Same `name` registered twice by the same plugin replaces in place, so
+a reload never stacks duplicates. Two different plugins can each
+register the same name because rows are keyed by `(plugin, name)`.
+
+The handler runs on the Lua thread when the user picks the row. Fire
+the built-in outcomes with `maki.plan.implement` or
+`maki.plan.open_editor`; returning without calling one just hides the
+form.
+
+**Parameters:**
+
+- `{spec}` (`table`) Action specification:
+  - `name` (`string`) Required. Unique per plugin.
+  - `label` (`string`) Required. Menu row title.
+  - `desc` (`string`) Optional. Second row shown under the title.
+  - `order` (`integer`) Optional. Position among rows (default 500). Built-ins are 0, 1000, 2000.
+  - `handler` (`function`) Required. Called with `{ path, parallel, selected }` when the row is picked.
+
+**Example:**
+
+```lua
+maki.api.register_plan_action({
+  name = "commit-and-implement",
+  label = "Commit and implement",
+  desc  = "Commit the plan file first, then implement",
+  handler = function(opts)
+    -- write the plan file to git etc.
+    maki.plan.implement({ clear_context = false })
+  end,
+})
+```
+
+---
+
+### `maki.api.unregister_plan_action()` {#maki-api-unregister_plan_action}
+
+```lua
+maki.api.unregister_plan_action({name})
+```
+
+Remove one of this plugin's plan actions by name. Unknown names are a
+no-op so a toggle can call it unconditionally.
+
+**Parameters:**
+
+- `{name}` (`string`) The name the action was registered under.
+
+**Example:**
+
+```lua
+maki.api.unregister_plan_action("commit-and-implement")
+```
+
+---
+
+### `maki.api.clear_plan_actions()` {#maki-api-clear_plan_actions}
+
+```lua
+maki.api.clear_plan_actions()
+```
+
+Drop every plan action this plugin registered. Companion to
+`unregister_plan_action` for disable toggles that don't want to name
+each action.
+
+**Example:**
+
+```lua
+maki.api.clear_plan_actions()
 ```
 
 
@@ -3273,6 +3494,66 @@ maki.model.set({ spec = "zai/glm-5", thinking = "high" })
 maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
 ```
 
+---
+
+### `maki.model.info()` {#maki-model-info}
+
+```lua
+maki.model.info({spec})
+```
+
+Resolve a model spec to everything maki knows about it: identity, tier,
+context window, and the price table the session would be billed by --
+including rates resolved from provider config or the bundled catalog
+(e.g. subsidised custom providers), which the provider's own /v1/models
+endpoint may never report. Purely local -- no UI round-trip, no network
+-- so it also works from slash commands and headless embeddings.
+
+**Parameters:**
+
+- `{spec}` (`string`) `"provider/id"`, as listed by `available()`.
+
+**Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, provider_display,
+  tier, context_window, max_output_tokens?, free?, pricing?}`, or nil and
+  an error. `pricing` is present only when rates are known:
+  `{input, output, cache_write, cache_read}` in USD per million tokens,
+  plus optional `fast = {input, output}` and `subsidised_by` -- the
+  subscription prepaying this provider (billed cost is $0; the rates are
+  the list-price reference).
+
+**Example:**
+
+```lua
+local m, err = maki.model.info("anthropic/claude-opus-4-6")
+if m and m.pricing then print(m.pricing.input, m.pricing.subsidised_by) end
+```
+
+---
+
+### `maki.model.refresh()` {#maki-model-refresh}
+
+```lua
+maki.model.refresh({opts?})
+```
+
+Re-run model discovery. The list `available()` returns and the model
+picker read from the same slot this refreshes. With `live = true` the
+on-disk discovery cache is skipped and every provider is re-probed (what
+`R` does in the picker); otherwise the cached replay-then-background-
+refresh path runs.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Optional fields: `live` (boolean) force live re-probe.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true`, or nil and an error.
+
+**Example:**
+
+```lua
+maki.model.refresh({ live = true })
+```
+
 
 ## maki.net {#maki-net}
 
@@ -3329,6 +3610,132 @@ if err then
 else
   print(res.status, res.body)
 end
+```
+
+
+## maki.plan {#maki-plan}
+
+Plan-mode surface: register menu actions on the plan form, own the
+UI by suppressing the built-in form, read the plan without touching
+session state, and fire the built-in implement/edit outcomes.
+
+@example
+-- Own the plan UI:
+maki.plan.suppress_form(true)
+maki.api.create_autocmd("PlanReady", {
+  callback = function(ev)
+    local plan = maki.plan.read()
+    -- render plan.content in your own window
+  end,
+})
+
+---
+
+### `maki.plan.read()` {#maki-plan-read}
+
+```lua
+maki.plan.read()
+```
+
+Read the current plan state without reaching into session internals.
+Returns `{ mode, path, content, ready }`:
+- `mode` is `"plan"` or `"build"`.
+- `path` is the absolute plan path when in plan mode, else `nil`.
+- `content` is the file contents when `ready` is true, else `nil`
+  (`nil` distinguishes "not ready" and "read failed" from an empty
+  plan).
+- `ready` is `true` once the agent has written the plan file.
+
+**Returns:** (`table|nil`, `string|nil`) Plan snapshot table, or nil and an error.
+
+**Example:**
+
+```lua
+local plan, err = maki.plan.read()
+if plan and plan.ready then
+  print("plan at " .. plan.path)
+  print(plan.content)
+end
+```
+
+---
+
+### `maki.plan.suppress_form()` {#maki-plan-suppress_form}
+
+```lua
+maki.plan.suppress_form({hidden?})
+```
+
+Read or set whether the built-in plan form stays hidden when the
+agent finishes writing a plan. A plan-viewer plugin sets this to
+`true` so it can present its own UI on the `PlanReady` autocmd
+without the built-in form flashing open.
+
+Session-scoped, not persisted: a plugin re-asserts on `SessionReset`
+if it wants durable suppression. The user's manual `Ctrl+T`
+(`PlanToggle`) still opens the form, so the built-in stays reachable
+as an escape hatch when the plugin's UI errors.
+
+Pass no argument to read the current value.
+
+**Parameters:**
+
+- `{hidden?}` (`boolean?`) `true` to suppress, `false` to restore default, or nil to read.
+
+**Returns:** (`boolean|nil`, `string|nil`) Previous value (or current when reading), or nil and an error.
+
+**Example:**
+
+```lua
+maki.plan.suppress_form(true)
+local was = maki.plan.suppress_form(false)
+local now = maki.plan.suppress_form()
+```
+
+---
+
+### `maki.plan.implement()` {#maki-plan-implement}
+
+```lua
+maki.plan.implement({opts?})
+```
+
+Fire the same "implement the plan" code path a built-in row would.
+Call from a plan-action handler when it decides the plan is ready to
+execute. `clear_context = true` starts a fresh session first
+(equivalent to picking "Clear context and implement" from the
+built-in menu).
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Options:
+  - `clear_context` (`boolean`) Default false. Start a fresh session before implementing.
+
+**Returns:** (`boolean|nil`, `string|nil`) true once dispatched, or nil and an error.
+
+**Example:**
+
+```lua
+maki.plan.implement({ clear_context = true })
+```
+
+---
+
+### `maki.plan.open_editor()` {#maki-plan-open_editor}
+
+```lua
+maki.plan.open_editor()
+```
+
+Open the current plan file in `$EDITOR`, same as the "edit plan"
+keybinding on the built-in form.
+
+**Returns:** (`boolean|nil`, `string|nil`) true once dispatched, or nil and an error.
+
+**Example:**
+
+```lua
+maki.plan.open_editor()
 ```
 
 

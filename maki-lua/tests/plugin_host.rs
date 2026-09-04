@@ -6552,3 +6552,174 @@ maki.api.register_tool({{
         "VM must stay usable, got: {again}"
     );
 }
+
+const HANDLER_REVIEWER_SRC: &str = r#"
+maki.api.register_reviewer({
+  name = "rulebook",
+  handler = function(call)
+    if call.tool == "bash" and call.parseable and call.scopes[1] == "git status" then
+      return "ALLOW"
+    end
+    if call.input and call.input.command == "rm -rf /" then
+      return "DENY", "cwd " .. call.cwd .. ", segments " .. #call.scopes
+    end
+    return "ASK"
+  end,
+})
+"#;
+
+fn enforce_with_handler(
+    host: &PluginHost,
+    command: &str,
+    scopes: &[&str],
+) -> Result<(), maki_agent::permissions::PermissionError> {
+    let mgr = maki_agent::permissions::PermissionManager::new(
+        maki_config::PermissionsConfig::default(),
+        "/work".into(),
+        host.plugin_rules(),
+    );
+    let (tx, _rx) = flume::unbounded();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let perm_scopes = maki_agent::tools::PermissionScopes {
+        scopes: scopes.iter().map(|s| (*s).to_owned()).collect(),
+        force_prompt: false,
+    };
+    let input = serde_json::json!({ "command": command });
+    smol::block_on(mgr.enforce(
+        &ToolKey::native("bash"),
+        &perm_scopes,
+        &event_tx,
+        None,
+        "review-1",
+        &maki_agent::cancel::CancelToken::none(),
+        None,
+        maki_agent::permissions::ReviewSource {
+            input: Some(&input),
+            recent_user_messages: &[],
+            timeouts: maki_providers::Timeouts::default(),
+        },
+    ))
+}
+
+#[test]
+fn handler_reviewer_allows_denies_and_escalates_through_enforce() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("rev_plugin", HANDLER_REVIEWER_SRC)
+        .unwrap();
+
+    assert!(enforce_with_handler(&host, "git status", &["git status"]).is_ok());
+
+    let err = enforce_with_handler(&host, "rm -rf /", &["rm -rf /"])
+        .expect_err("handler DENY must deny")
+        .to_string();
+    assert!(
+        err.contains("denied by reviewer rulebook: cwd /work, segments 1"),
+        "handler fields must reach the reason: {err}"
+    );
+
+    let err = enforce_with_handler(&host, "cargo build", &["cargo build"])
+        .expect_err("ASK with no prompt channel denies");
+    assert!(!err.to_string().contains("denied by reviewer"));
+
+    host.unload("rev_plugin").unwrap();
+    assert!(!host.plugin_rules().has_reviewers("bash"));
+}
+
+#[test]
+fn unregister_reviewer_removes_one_and_leaves_the_rest() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "two_reviewers",
+        r#"
+        maki.api.register_reviewer({ name = "a", handler = function() return "ALLOW" end })
+        maki.api.register_reviewer({ name = "b", handler = function() return "ALLOW" end })
+        maki.api.unregister_reviewer("a")
+        maki.api.unregister_reviewer("never-existed")
+        "#,
+    )
+    .unwrap();
+
+    let chain = host.plugin_rules().reviewer_chain("bash");
+    assert_eq!(chain.len(), 1);
+    assert_eq!(&*chain[0].name, "b");
+}
+
+#[test]
+fn register_reviewer_rejects_invalid_tool_filter() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .load_source(
+            "bad_filter",
+            r#"
+            maki.api.register_reviewer({
+              name = "typo",
+              tools = { "bash " },
+              handler = function() return "ALLOW" end,
+            })
+            "#,
+        )
+        .expect_err("trailing space must not silently disable the reviewer");
+    let msg = err.to_string();
+    assert!(msg.contains("register_reviewer"), "{msg}");
+    assert!(msg.contains("invalid tool filter"), "{msg}");
+    assert!(msg.contains("bash "), "{msg}");
+    assert!(
+        host.plugin_rules().reviewer_chain("bash").is_empty(),
+        "rejected registration must not land in the store"
+    );
+}
+
+/// A reviewer that names a permission-free tool explicitly can veto it;
+/// the "*" default cannot.
+#[test]
+fn explicit_reviewer_vetoes_a_permission_free_tool() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "goal_plugin",
+        r#"
+        maki.api.register_reviewer({
+          name = "no-questions",
+          tools = { "question" },
+          handler = function(call)
+            return "DENY", "goal mode is active — decide autonomously"
+          end,
+        })
+        maki.api.register_reviewer({
+          name = "catch-all",
+          handler = function() return "DENY", "must never fire for veto" end,
+        })
+        "#,
+    )
+    .unwrap();
+
+    let mgr = maki_agent::permissions::PermissionManager::new(
+        maki_config::PermissionsConfig::default(),
+        "/work".into(),
+        host.plugin_rules(),
+    );
+    let (tx, _rx) = flume::unbounded();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let veto = |tool: &str| {
+        smol::block_on(mgr.veto_review(
+            tool,
+            maki_agent::permissions::ReviewSource::none(),
+            &event_tx,
+            &maki_agent::cancel::CancelToken::none(),
+        ))
+    };
+
+    let err = veto("question")
+        .expect_err("explicit DENY must veto")
+        .to_string();
+    assert!(
+        err.contains("denied by reviewer no-questions: goal mode is active — decide autonomously"),
+        "reason must reach the agent: {err}"
+    );
+
+    // Only the catch-all matches todo_write, and catch-alls never veto.
+    assert!(veto("todo_write").is_ok());
+}

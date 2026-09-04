@@ -56,6 +56,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_write: 0.00,
                 cache_read: 0.00,
                 fast: None,
+                subsidised_by: None,
             },
             max_output_tokens: Some(120_000),
             context_window: 120_000,
@@ -72,6 +73,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_write: 0.00,
                 cache_read: 0.00,
                 fast: None,
+                subsidised_by: None,
             },
             max_output_tokens: Some(120_000),
             context_window: 120_000,
@@ -88,6 +90,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_write: 0.00,
                 cache_read: 0.00,
                 fast: None,
+                subsidised_by: None,
             },
             // The group advertises 120k output against an 80k input window;
             // capped so a tier default never promises more output than the
@@ -257,6 +260,7 @@ fn join_model_info(ids: Vec<String>, groups: Vec<ModelGroup>) -> Vec<crate::mode
                     cache_write: 0.00,
                     cache_read: 0.00,
                     fast: None,
+                    subsidised_by: None,
                 }),
                 _ => None,
             };

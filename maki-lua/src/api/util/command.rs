@@ -440,6 +440,20 @@ pub enum SessionRequest {
     },
 }
 
+pub enum PlanRequest {
+    /// Snapshot of the current plan: `{ mode, path, content, ready }`.
+    Read,
+    /// `Some(true)` suppresses the built-in plan form on `PlanReady`;
+    /// `Some(false)` restores default; `None` reads without mutating.
+    /// The UI answers with the previous (or current, when reading) bool.
+    SuppressForm(Option<bool>),
+    /// Fires the same code path as the built-in "Implement plan" (and
+    /// "Clear context and implement" when `clear_context = true`) rows.
+    Implement { clear_context: bool },
+    /// Opens the current plan file in `$EDITOR`.
+    OpenEditor,
+}
+
 pub enum TaskRequest {
     List,
     Focus { id: String },
@@ -452,6 +466,10 @@ pub enum ModelRequest {
         spec: Option<String>,
         thinking: Option<String>,
         fast: Option<bool>,
+    },
+    /// Re-run model discovery; `live` skips the on-disk cache (picker `R`).
+    Refresh {
+        live: bool,
     },
 }
 
@@ -501,6 +519,12 @@ pub enum UiAction {
     Session {
         req: SessionRequest,
         reply_tx: flume::Sender<UiReply>,
+    },
+    /// `Read` and `SuppressForm` fill `reply_tx`; `Implement` and
+    /// `OpenEditor` are fire-and-forget and pass `None`.
+    Plan {
+        req: PlanRequest,
+        reply_tx: Option<flume::Sender<UiReply>>,
     },
     Model {
         req: ModelRequest,
