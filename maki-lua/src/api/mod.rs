@@ -63,7 +63,15 @@ pub(crate) fn create_maki_global(
     maki.set("fs", fs::create_fs_table(lua, permissions)?)?;
     maki.set("log", log::create_log_table(lua, Arc::clone(&plugin))?)?;
     maki.set("treesitter", treesitter::create_treesitter_table(lua)?)?;
-    maki.set("uv", uv::create_uv_table(lua, permissions)?)?;
+    maki.set(
+        "uv",
+        uv::create_uv_table(
+            lua,
+            Arc::clone(&plugin),
+            permissions,
+            permissions.is_allowed(Permission::Net),
+        )?,
+    )?;
     maki.set("base64", base64::create_base64_table(lua)?)?;
     maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;

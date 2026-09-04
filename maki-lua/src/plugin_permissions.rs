@@ -204,10 +204,14 @@ pub(crate) fn requested_permissions_from_text(
         })
 }
 
-pub(crate) fn denied_error(perm: Permission) -> LuaError {
-    let msg = format!(
+pub(crate) fn denied_message(perm: Permission) -> String {
+    format!(
         "permission denied: '{perm}' not granted for this plugin (grant it in {MANIFEST_FILE} next to the plugin file)"
-    );
+    )
+}
+
+pub(crate) fn denied_error(perm: Permission) -> LuaError {
+    let msg = denied_message(perm);
     warn!(permission = %perm, "{msg}");
     LuaError::runtime(msg)
 }
