@@ -229,7 +229,14 @@ fn main() {
                     MintTokens::Any
                 }
             };
-            if let Err(err) = server::serve(&bind, ws_bind.as_deref(), store, oidc, allow_local, mint_tokens) {
+            if let Err(err) = server::serve(
+                &bind,
+                ws_bind.as_deref(),
+                store,
+                oidc,
+                allow_local,
+                mint_tokens,
+            ) {
                 eprintln!("fatal: {err}");
                 std::process::exit(1);
             }

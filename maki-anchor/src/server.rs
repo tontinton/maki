@@ -2175,7 +2175,8 @@ mod tests {
     }
 
     #[test]
-    fn split_token_path_accepts_valid_token() {        let token = "a".repeat(32);
+    fn split_token_path_accepts_valid_token() {
+        let token = "a".repeat(32);
         assert_eq!(
             split_token_path(&format!("/{token}/events")),
             Some((token.as_str(), "events"))
