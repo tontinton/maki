@@ -49,6 +49,14 @@ pub(super) fn continue_message(config: &AgentConfig) -> String {
     }
 }
 
+/// Replaces `history` with a summary of itself, retrying on overflow by
+/// pruning what it sends.
+///
+/// The last `carry_len` messages are held out of the summary and re-appended
+/// after it, so input no turn has answered yet survives verbatim without ever
+/// leaving `history`. Anything less and the mirror would publish a transcript
+/// missing that input for the length of the summary request.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn compact_history(
     provider: &dyn maki_providers::provider::Provider,
     model: &Model,
@@ -57,9 +65,11 @@ pub(super) async fn compact_history(
     cancel: &CancelToken,
     config: &AgentConfig,
     instructions: Option<&str>,
+    carry_len: usize,
 ) -> Result<TokenUsage, AgentError> {
     let compact_start = std::time::Instant::now();
-    let mut compaction_history: Vec<Message> = history.as_slice().to_vec();
+    let summarized = history.len().saturating_sub(carry_len);
+    let mut compaction_history: Vec<Message> = history.as_slice()[..summarized].to_vec();
     remove_orphaned_tool_results(&mut compaction_history);
     strip_images(&mut compaction_history);
     strip_thinking(&mut compaction_history);
@@ -88,7 +98,14 @@ pub(super) async fn compact_history(
                 if attempt > 0 {
                     info!(attempt, "compaction succeeded after pruning history");
                 }
-                return finish_compact(response, history, event_tx, compact_start, model);
+                return finish_compact(
+                    response,
+                    history,
+                    summarized,
+                    event_tx,
+                    compact_start,
+                    model,
+                );
             }
             Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
                 last_error = Some(e);
@@ -110,6 +127,7 @@ pub(super) async fn compact_history(
 fn finish_compact(
     response: StreamResponse,
     history: &mut History,
+    summarized: usize,
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
@@ -129,10 +147,11 @@ fn finish_compact(
         return Err(AgentError::EmptySummary);
     }
 
-    let new_history = vec![
+    let mut new_history = vec![
         Message::user("What did we do so far?".into()),
         response.message,
     ];
+    new_history.extend_from_slice(&history.as_slice()[summarized..]);
     history.replace(new_history);
     info!(
         model = %model.id,
@@ -160,6 +179,7 @@ pub async fn compact(
         &cancel,
         config,
         instructions,
+        0,
     )
     .await?;
     if let Some(post) = normalize(config.post_compaction_instructions.as_deref()) {
@@ -544,6 +564,7 @@ mod tests {
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
+                0,
             )
             .await
             .unwrap();
@@ -748,6 +769,7 @@ mod tests {
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
+                0,
             )
             .await
             .unwrap();
@@ -796,12 +818,54 @@ mod tests {
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
+                0,
             )
             .await
             .unwrap();
 
             let requests = provider.requests.lock().unwrap();
             assert!(requests[1].len() < requests[0].len(), "{NO_COLLAPSE_MSG}");
+        });
+    }
+
+    const CARRIED: &str = "answer this next";
+    const CARRY_UNSENT_MSG: &str = "carried input is not the summariser's to read";
+    const CARRY_KEPT_MSG: &str = "carried input must outlive the summary verbatim";
+
+    #[test]
+    fn compact_history_carries_the_tail_past_the_summary() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![
+                Message::user("first".into()),
+                Message::user(CARRIED.into()),
+            ]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact_history(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
+                &AgentConfig::default(),
+                None,
+                1,
+            )
+            .await
+            .unwrap();
+
+            let carried = |messages: &[Message]| {
+                messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|block| matches!(block, ContentBlock::Text { text } if text == CARRIED))
+            };
+            assert!(
+                !carried(&provider.requests.lock().unwrap()[0]),
+                "{CARRY_UNSENT_MSG}"
+            );
+            assert!(carried(history.as_slice()), "{CARRY_KEPT_MSG}");
         });
     }
 
@@ -829,6 +893,7 @@ mod tests {
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
+                0,
             )
             .await
             .unwrap();
