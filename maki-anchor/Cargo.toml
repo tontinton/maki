@@ -13,13 +13,13 @@ path = "src/main.rs"
 tiny_http = { workspace = true }
 tungstenite = { workspace = true }
 rusqlite = { workspace = true }
+argon2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 sha2 = { workspace = true }
-subtle = { workspace = true }
 getrandom = { workspace = true }
 clap = { workspace = true }
 base64 = { workspace = true }

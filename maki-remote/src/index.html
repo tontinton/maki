@@ -480,11 +480,15 @@
     const label = document.createElement("span");
     label.textContent = "sessions:";
     sessionsBar.appendChild(label);
+    // Page lives at /{token}/ or /{token}/s/{id}/; buttons open the target
+    // session's own scoped page, which pins every request to it.
+    const token = location.pathname.split('/')[1] || "";
     for (const s of data.sessions) {
       const b = document.createElement("button");
       b.className = "sess mini" + (s.focused ? " focused" : "");
       b.textContent = `${s.title || s.id.slice(0,8)} · ${s.model || ""}`;
       b.title = s.id;
+      b.onclick = () => { location.href = `/${token}/s/${s.id}/`; };
       sessionsBar.appendChild(b);
     }
     sessionsBar.style.display = data.sessions.length ? "flex" : "none";

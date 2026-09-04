@@ -4,6 +4,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use argon2::{
+    Argon2, PasswordHash, PasswordHasher as _, PasswordVerifier as _, password_hash::SaltString,
+};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
@@ -58,12 +61,25 @@ impl MintTokens {
     }
 }
 
+/// Instance names must be safe to mint links for and echo in the dashboard.
+pub fn valid_instance_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("not found")]
     NotFound,
+    #[error("already exists")]
+    Exists,
+    #[error("hash: {0}")]
+    Hash(String),
 }
 
 pub fn hash_token(token: &str) -> String {
@@ -79,19 +95,15 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Both arguments must be presented in the same form; hashing one raw token
-/// against an already-hashed value would never match.
-pub fn tokens_equal_constant_time(a: &str, b: &str) -> bool {
-    use subtle::ConstantTimeEq;
-    a.as_bytes().ct_eq(b.as_bytes()).into()
-}
-
 pub fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+/// Rows past expiry by more than this are pruned when new links are minted.
+const LINK_GRACE_SECS: i64 = 24 * 60 * 60;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -133,7 +145,6 @@ pub struct LinkRow {
     pub instance_id: i64,
     pub external_session_id: Option<String>,
     pub rights: String,
-    pub expires_at: i64,
 }
 
 impl Store {
@@ -141,6 +152,7 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS instances (
                  id INTEGER PRIMARY KEY,
                  name TEXT NOT NULL UNIQUE,
@@ -187,12 +199,14 @@ impl Store {
                  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                  expires_at INTEGER NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS grants (
-                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                 instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
-                 rights TEXT NOT NULL,
-                 PRIMARY KEY (user_id, instance_id)
-              );",
+              CREATE TABLE IF NOT EXISTS grants (
+                  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+                  rights TEXT NOT NULL,
+                  PRIMARY KEY (user_id, instance_id)
+               );
+              CREATE INDEX IF NOT EXISTS instances_registration_token
+                  ON instances(registration_token_hash);",
         )?;
         // Migrations for local users (add columns if DB was created before this version).
         let _ = conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT", []);
@@ -207,6 +221,7 @@ impl Store {
         }))
     }
 
+    /// CLI registration: create, or rotate an existing instance's token.
     pub fn register_instance(
         &self,
         name: &str,
@@ -219,35 +234,48 @@ impl Store {
              last_seen = excluded.last_seen",
             rusqlite::params![name, registration_token_hash, now_unix()],
         )?;
+        instance_id_by_name_locked(&conn, name)
+    }
+
+    /// Dashboard registration: create only. Rotating a live instance's token
+    /// over an anonymous API would hand whoever guesses the name the ability
+    /// to displace and impersonate the real tunnel, so the API never rotates.
+    pub fn create_instance(
+        &self,
+        name: &str,
+        registration_token_hash: &str,
+    ) -> Result<i64, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM instances WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )?;
+        if exists > 0 {
+            return Err(StoreError::Exists);
+        }
+        conn.execute(
+            "INSERT INTO instances (name, registration_token_hash, last_seen) VALUES (?1, ?2, ?3)",
+            rusqlite::params![name, registration_token_hash, now_unix()],
+        )?;
         Ok(conn.last_insert_rowid())
     }
 
+    /// Hashes are indexed; an exact lookup is both constant-time and O(1).
     pub fn instance_by_registration_token(&self, token: &str) -> Result<InstanceRow, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, name, registration_token_hash, last_seen FROM instances")?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
-        let presented = hash_token(token);
-        for (id, name, stored_hash, last_seen) in rows {
-            if tokens_equal_constant_time(&presented, &stored_hash) {
-                return Ok(InstanceRow {
-                    id,
-                    name,
-                    last_seen,
-                });
-            }
-        }
-        Err(StoreError::NotFound)
+        conn.query_row(
+            "SELECT id, name, last_seen FROM instances WHERE registration_token_hash = ?1",
+            [hash_token(token)],
+            |row| {
+                Ok(InstanceRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    last_seen: row.get(2)?,
+                })
+            },
+        )
+        .map_err(StoreError::from)
     }
 
     pub fn touch_instance(&self, id: i64) -> Result<(), StoreError> {
@@ -344,6 +372,8 @@ impl Store {
         Ok(rows)
     }
 
+    /// Expired links still in the table are only ever scanned by direct
+    /// lookups, so prune them opportunistically when minting.
     pub fn create_link(
         &self,
         token_hash: &str,
@@ -353,6 +383,11 @@ impl Store {
         ttl: Duration,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
+        let now = now_unix();
+        conn.execute(
+            "DELETE FROM links WHERE expires_at < ?1",
+            [now - LINK_GRACE_SECS],
+        )?;
         conn.execute(
             "INSERT INTO links (token_hash, instance_id, external_session_id, rights, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -361,7 +396,7 @@ impl Store {
                 instance_id,
                 external_session_id,
                 rights,
-                now_unix() + ttl.as_secs() as i64,
+                now + ttl.as_secs() as i64,
             ],
         )?;
         Ok(())
@@ -369,37 +404,37 @@ impl Store {
 
     pub fn link_by_token(&self, token: &str) -> Result<LinkRow, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT token_hash, instance_id, external_session_id, rights, expires_at
-             FROM links WHERE revoked_at IS NULL",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
+        conn.query_row(
+            "SELECT token_hash, instance_id, external_session_id, rights
+             FROM links WHERE token_hash = ?1 AND revoked_at IS NULL AND expires_at > ?2",
+            rusqlite::params![hash_token(token), now_unix()],
+            |row| {
                 Ok(LinkRow {
                     token_hash: row.get(0)?,
                     instance_id: row.get(1)?,
                     external_session_id: row.get(2)?,
                     rights: row.get(3)?,
-                    expires_at: row.get(4)?,
                 })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
-        let presented = hash_token(token);
-        for link in rows {
-            let matched = tokens_equal_constant_time(&presented, &link.token_hash);
-            if matched {
-                if link.expires_at <= now_unix() {
-                    return Err(StoreError::NotFound);
-                }
-                return Ok(link);
-            }
-        }
-        Err(StoreError::NotFound)
+            },
+        )
+        .map_err(StoreError::from)
     }
 
-    /// Upsert a user after OIDC login. The first user to log in becomes admin
-    /// when no admin exists yet, so a fresh deployment bootstraps itself.
+    /// Slides a live link's expiry forward, so a control link minted for a
+    /// tunnel outlives the tunnel instead of stranding the user mid-session.
+    pub fn extend_link(&self, token_hash: &str, ttl: Duration) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE links SET expires_at = ?1 WHERE token_hash = ?2 AND revoked_at IS NULL",
+            rusqlite::params![now_unix() + ttl.as_secs() as i64, token_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Upsert a user after OIDC login. The very first user of a fresh
+    /// deployment becomes admin so it can self-bootstrap; once any user
+    /// exists, logging in never grants admin, so deleting the last admin
+    /// cannot hand the role to whoever happens to authenticate next.
     pub fn upsert_user(
         &self,
         oidc_sub: &str,
@@ -407,26 +442,13 @@ impl Store {
         name: Option<&str>,
     ) -> Result<UserRow, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let admins = conn.query_row("SELECT COUNT(*) FROM users WHERE is_admin = 1", [], |r| {
-            r.get::<_, i64>(0)
-        })?;
+        let users = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get::<_, i64>(0))?;
         conn.execute(
             "INSERT INTO users (oidc_sub, email, name, is_admin) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(oidc_sub) DO UPDATE SET email = excluded.email, name = excluded.name",
-            rusqlite::params![oidc_sub, email, name, i64::from(admins == 0)],
+            rusqlite::params![oidc_sub, email, name, i64::from(users == 0)],
         )?;
-        let id = conn.query_row(
-            "SELECT id FROM users WHERE oidc_sub = ?1",
-            [oidc_sub],
-            |r| r.get(0),
-        )?;
-        Ok(UserRow {
-            id,
-            oidc_sub: oidc_sub.to_owned(),
-            email: email.map(str::to_owned),
-            name: name.map(str::to_owned),
-            is_admin: admins == 0,
-        })
+        Self::user_by_sub_locked(&conn, oidc_sub)
     }
 
     pub fn user_by_sub(&self, oidc_sub: &str) -> Result<UserRow, StoreError> {
@@ -669,7 +691,35 @@ impl Store {
         Ok(rows)
     }
 
-    fn hash_password(username: &str, password: &str) -> String {
+    fn user_by_sub_locked(conn: &Connection, oidc_sub: &str) -> Result<UserRow, StoreError> {
+        Ok(conn.query_row(
+            "SELECT id, oidc_sub, email, name, is_admin FROM users WHERE oidc_sub = ?1",
+            [oidc_sub],
+            |row| {
+                Ok(UserRow {
+                    id: row.get(0)?,
+                    oidc_sub: row.get(1)?,
+                    email: row.get(2)?,
+                    name: row.get(3)?,
+                    is_admin: row.get::<_, i64>(4)? != 0,
+                })
+            },
+        )?)
+    }
+
+    fn hash_password(password: &str) -> Result<String, StoreError> {
+        let mut salt_bytes = [0u8; 16];
+        getrandom::fill(&mut salt_bytes).expect("rng failed");
+        let salt =
+            SaltString::encode_b64(&salt_bytes).map_err(|e| StoreError::Hash(e.to_string()))?;
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map(|h| h.to_string())
+            .map_err(|e| StoreError::Hash(e.to_string()))
+    }
+
+    /// Legacy single-round SHA-256, verified only to be re-hashed on the spot.
+    fn legacy_password_hash(username: &str, password: &str) -> String {
         hash_token(&format!("{username}\0{password}"))
     }
 
@@ -682,49 +732,67 @@ impl Store {
         is_admin: bool,
     ) -> Result<UserRow, StoreError> {
         let oidc_sub = format!("local:{username}");
-        let hash = Self::hash_password(username, password);
+        let hash = Self::hash_password(password)?;
         let conn = self.conn.lock().unwrap();
-        let admins: i64 =
-            conn.query_row("SELECT COUNT(*) FROM users WHERE is_admin = 1", [], |r| {
-                r.get(0)
-            })?;
-        let is_admin = is_admin || admins == 0;
+        let users = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get::<_, i64>(0))?;
+        let is_admin = is_admin || users == 0;
         conn.execute(
             "INSERT INTO users (oidc_sub, email, name, is_admin, password_hash, local_username) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(oidc_sub) DO UPDATE SET email=excluded.email, name=excluded.name, is_admin=excluded.is_admin, password_hash=excluded.password_hash, local_username=excluded.local_username",
             rusqlite::params![oidc_sub, email, name, i64::from(is_admin), hash, username],
         )?;
-        let id = conn.query_row(
-            "SELECT id FROM users WHERE oidc_sub = ?1",
-            [&oidc_sub],
-            |r| r.get(0),
-        )?;
-        Ok(UserRow {
-            id,
-            oidc_sub,
-            email: email.map(str::to_owned),
-            name: name.map(str::to_owned),
-            is_admin,
-        })
+        Self::user_by_sub_locked(&conn, &oidc_sub)
     }
 
     pub fn verify_local_user(&self, username: &str, password: &str) -> Result<UserRow, StoreError> {
-        let hash = Self::hash_password(username, password);
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT id, oidc_sub, email, name, is_admin FROM users WHERE local_username = ?1 AND password_hash = ?2",
-            rusqlite::params![username, hash],
-            |row| {
-                Ok(UserRow {
-                    id: row.get(0)?,
-                    oidc_sub: row.get(1)?,
-                    email: row.get(2)?,
-                    name: row.get(3)?,
-                    is_admin: row.get::<_, i64>(4)? != 0,
+        let (user, stored) = {
+            let conn = self.conn.lock().unwrap();
+            let (user, stored): (UserRow, Option<String>) = conn
+                .query_row(
+                    "SELECT id, oidc_sub, email, name, is_admin, password_hash FROM users WHERE local_username = ?1",
+                    rusqlite::params![username],
+                    |row| {
+                        Ok((
+                            UserRow {
+                                id: row.get(0)?,
+                                oidc_sub: row.get(1)?,
+                                email: row.get(2)?,
+                                name: row.get(3)?,
+                                is_admin: row.get::<_, i64>(4)? != 0,
+                            },
+                            row.get::<_, Option<String>>(5)?,
+                        ))
+                    },
+                )
+                .map_err(StoreError::from)?;
+            (user, stored)
+        };
+        let Some(stored) = stored else {
+            return Err(StoreError::NotFound);
+        };
+        let ok = if stored.starts_with("$argon2") {
+            PasswordHash::new(&stored)
+                .map(|hash| {
+                    Argon2::default()
+                        .verify_password(password.as_bytes(), &hash)
+                        .is_ok()
                 })
-            },
-        )
-        .map_err(StoreError::from)
+                .unwrap_or(false)
+        } else {
+            stored == Self::legacy_password_hash(username, password)
+        };
+        if !ok {
+            return Err(StoreError::NotFound);
+        }
+        if !stored.starts_with("$argon2") {
+            let hash = Self::hash_password(password)?;
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE users SET password_hash = ?1 WHERE id = ?2",
+                rusqlite::params![hash, user.id],
+            )?;
+        }
+        Ok(user)
     }
 
     pub fn local_user_by_username(&self, username: &str) -> Result<UserRow, StoreError> {
@@ -744,6 +812,14 @@ impl Store {
         )
         .map_err(StoreError::from)
     }
+}
+
+fn instance_id_by_name_locked(conn: &Connection, name: &str) -> Result<i64, StoreError> {
+    Ok(
+        conn.query_row("SELECT id FROM instances WHERE name = ?1", [name], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
 fn map_session(row: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
@@ -863,5 +939,153 @@ mod tests {
         assert_eq!(link.rights, "viewer");
         assert!(store.revoke_link(&hash_token("link-2")).unwrap());
         assert!(store.link_by_token("link-2").is_err());
+    }
+
+    #[test]
+    fn extend_link_keeps_revoked_links_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        let id = store
+            .register_instance("host-a", &hash_token("reg"))
+            .unwrap();
+        store
+            .create_link(
+                &hash_token("live"),
+                id,
+                None,
+                "controller",
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        store
+            .create_link(
+                &hash_token("dead"),
+                id,
+                None,
+                "controller",
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        store.revoke_link(&hash_token("dead")).unwrap();
+
+        store
+            .extend_link(&hash_token("live"), Duration::from_secs(7200))
+            .unwrap();
+        store
+            .extend_link(&hash_token("dead"), Duration::from_secs(7200))
+            .unwrap();
+        assert!(store.link_by_token("live").is_ok());
+        assert!(store.link_by_token("dead").is_err());
+    }
+
+    #[test]
+    fn create_instance_refuses_existing_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        let id = store.create_instance("dup", &hash_token("t1")).unwrap();
+        assert!(store.create_instance("dup", &hash_token("t2")).is_err());
+        // The original token still authenticates; rotation is CLI-only.
+        let row = store.instance_by_registration_token("t1").unwrap();
+        assert_eq!(row.id, id);
+        assert!(store.instance_by_registration_token("t2").is_err());
+    }
+
+    #[test]
+    fn register_instance_rotates_cli_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        let first = store.register_instance("host", &hash_token("t1")).unwrap();
+        let second = store.register_instance("host", &hash_token("t2")).unwrap();
+        assert_eq!(first, second, "re-registering the same name reuses the row");
+        assert!(store.instance_by_registration_token("t1").is_err());
+        assert_eq!(
+            store.instance_by_registration_token("t2").unwrap().name,
+            "host"
+        );
+    }
+
+    #[test]
+    fn deleting_the_last_admin_does_not_promote_whoever_logs_in_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        let first = store.upsert_user("sub-1", None, None).unwrap();
+        assert!(first.is_admin, "fresh deployment bootstraps");
+        store.upsert_user("sub-2", None, None).unwrap();
+        // Deleting the only admin must not reopen the bootstrap while other
+        // users remain: role restoration is an explicit act, not a race.
+        store.delete_user(first.id).unwrap();
+        let next = store.upsert_user("sub-2", None, None).unwrap();
+        assert!(!next.is_admin);
+        let newcomer = store.upsert_user("sub-9", None, None).unwrap();
+        assert!(!newcomer.is_admin);
+        store.set_user_admin(newcomer.id, true).unwrap();
+        assert!(store.user_by_id(newcomer.id).unwrap().is_admin);
+        // A fully emptied table is a fresh deployment again.
+        for u in store.list_users().unwrap() {
+            store.delete_user(u.id).unwrap();
+        }
+        assert!(store.upsert_user("sub-3", None, None).unwrap().is_admin);
+    }
+
+    #[test]
+    fn local_users_hash_with_argon_and_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        let first = store
+            .create_local_user("ops", "hunter2-hunter2", None, None, false)
+            .unwrap();
+        assert!(first.is_admin, "first user bootstraps to admin");
+        let second = store
+            .create_local_user("peer", "other-password", None, None, false)
+            .unwrap();
+        assert!(!second.is_admin);
+        assert!(store.verify_local_user("peer", "other-password").is_ok());
+    }
+
+    #[test]
+    fn legacy_passwords_upgrade_on_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        store
+            .create_local_user("old", "unused-unused", None, None, true)
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE users SET password_hash = ?1 WHERE local_username = ?2",
+                rusqlite::params![Store::legacy_password_hash("old", "hunter2-hunter2"), "old"],
+            )
+            .unwrap();
+        }
+        assert!(store.verify_local_user("old", "hunter2-hunter2").is_ok());
+        let conn = store.conn.lock().unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT password_hash FROM users WHERE local_username = 'old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(stored.starts_with("$argon2"), "upgraded in place");
+    }
+
+    #[test]
+    fn local_user_wrong_password_finds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        store
+            .create_local_user("bob", "right-password", None, None, false)
+            .unwrap();
+        assert!(store.verify_local_user("bob", "wrong-password").is_err());
+        assert!(store.verify_local_user("nobody", "right-password").is_err());
+    }
+
+    #[test]
+    fn instance_names_validate_charset() {
+        assert!(valid_instance_name("work-laptop_1.local"));
+        assert!(!valid_instance_name(""));
+        assert!(!valid_instance_name("x/y"));
+        assert!(!valid_instance_name("<script>"));
+        assert!(!valid_instance_name(&"a".repeat(65)));
     }
 }

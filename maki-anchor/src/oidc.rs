@@ -80,8 +80,14 @@ pub fn discover(config: &OidcConfig) -> Result<Discovery, OidcError> {
     Ok(discovery)
 }
 
-/// Build the browser redirect URL for the authorization code flow.
-pub fn authorization_url(config: &OidcConfig, discovery: &Discovery, state: &str) -> String {
+/// Build the browser redirect URL for the authorization code flow (with
+/// PKCE; the verifier lives anchor-side against the state).
+pub fn authorization_url(
+    config: &OidcConfig,
+    discovery: &Discovery,
+    state: &str,
+    code_challenge: &str,
+) -> String {
     let mut url =
         ::url::Url::parse(&discovery.authorization_endpoint).expect("issuer endpoint is a url");
     url.query_pairs_mut()
@@ -92,8 +98,19 @@ pub fn authorization_url(config: &OidcConfig, discovery: &Discovery, state: &str
             &format!("{}/callback", config.origin.trim_end_matches('/')),
         )
         .append_pair("scope", "openid profile email")
-        .append_pair("state", state);
+        .append_pair("state", state)
+        .append_pair("nonce", state)
+        .append_pair("code_challenge", code_challenge)
+        .append_pair("code_challenge_method", "S256");
     url.to_string()
+}
+
+/// S256 code challenge for a verifier, per RFC 7636.
+pub fn pkce_challenge(verifier: &str) -> String {
+    use base64::Engine;
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,7 +123,8 @@ pub fn exchange_code(
     config: &OidcConfig,
     discovery: &Discovery,
     code: &str,
-    state: &str,
+    code_verifier: &str,
+    expected_nonce: &str,
 ) -> Result<Claims, OidcError> {
     let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
     let response = agent
@@ -121,14 +139,14 @@ pub fn exchange_code(
             ),
             ("client_id", &config.client_id),
             ("client_secret", &config.client_secret),
-            ("state", state),
+            ("code_verifier", code_verifier),
         ]))
         .map_err(|e| OidcError::Exchange(e.to_string()))?;
     let body = response
         .into_string()
         .map_err(|e| OidcError::Exchange(e.to_string()))?;
     let token: TokenResponse = serde_json::from_str(&body)?;
-    validate_id_token(config, discovery, &token.id_token)
+    validate_id_token(config, discovery, &token.id_token, expected_nonce)
 }
 
 fn form_urlencoded(pairs: &[(&str, &str)]) -> String {
@@ -161,6 +179,7 @@ fn validate_id_token(
     config: &OidcConfig,
     discovery: &Discovery,
     token: &str,
+    expected_nonce: &str,
 ) -> Result<Claims, OidcError> {
     let (header_b64, payload_b64, signature_b64) = split_jwt(token)?;
     let header: JwtHeader = serde_json::from_slice(&b64_decode(&header_b64)?)?;
@@ -170,9 +189,16 @@ fn validate_id_token(
             header.alg
         )));
     }
+    // A missing kid would let an unsigned-kid token match any kid-less key;
+    // real providers always label theirs.
+    let kid = header
+        .kid
+        .as_deref()
+        .ok_or_else(|| OidcError::InvalidToken("jwt header missing kid".to_owned()))?;
     let claims: serde_json::Value = serde_json::from_slice(&b64_decode(&payload_b64)?)?;
 
-    // Audience and issuer are checked locally; expiry with skew tolerance.
+    // Audience, issuer and nonce are checked locally; expiry and not-before
+    // with skew tolerance.
     if claims["iss"].as_str() != Some(discovery.issuer.as_str()) {
         return Err(OidcError::InvalidToken(format!(
             "issuer mismatch: {:?} != {:?}",
@@ -189,22 +215,30 @@ fn validate_id_token(
             return Err(OidcError::InvalidToken("audience mismatch".to_owned()));
         }
     }
-    let exp = claims["exp"]
-        .as_i64()
-        .ok_or_else(|| OidcError::InvalidToken("missing exp".to_owned()))?;
+    if claims["nonce"].as_str() != Some(expected_nonce) {
+        return Err(OidcError::InvalidToken("nonce mismatch".to_owned()));
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    let exp = claims["exp"]
+        .as_i64()
+        .ok_or_else(|| OidcError::InvalidToken("missing exp".to_owned()))?;
     if exp + CLOCK_SKEW_SECS < now {
         return Err(OidcError::InvalidToken("token expired".to_owned()));
+    }
+    if let Some(nbf) = claims["nbf"].as_i64()
+        && nbf > now + CLOCK_SKEW_SECS
+    {
+        return Err(OidcError::InvalidToken("token not yet valid".to_owned()));
     }
 
     let jwks = fetch_jwks(discovery)?;
     let key = jwks
         .keys
         .iter()
-        .find(|k| k.kid.as_deref() == header.kid.as_deref() && k.kty == "RSA")
+        .find(|k| k.kid.as_deref() == Some(kid) && k.kty == "RSA")
         .ok_or(OidcError::BadSignature)?;
     let signature = b64_decode(signature_b64.trim())?;
     verify_rs256(key, &signed_bytes(&header_b64, &payload_b64), &signature)?;
@@ -320,4 +354,138 @@ fn verify_rs256(key: &Jwk, message: &[u8], signature: &[u8]) -> Result<(), OidcE
 
 fn rs_base64_to_biguint(value: &str) -> Result<num_bigint::BigUint, OidcError> {
     Ok(num_bigint::BigUint::from_bytes_be(&b64_decode(value)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> OidcConfig {
+        OidcConfig {
+            issuer: "https://auth.example.com".into(),
+            client_id: "maki-anchor".into(),
+            client_secret: "s".into(),
+            origin: "https://maki.example.com".into(),
+        }
+    }
+
+    fn discovery() -> Discovery {
+        Discovery {
+            authorization_endpoint: "https://auth.example.com/authorize".into(),
+            token_endpoint: "https://auth.example.com/token".into(),
+            jwks_uri: "https://auth.example.com/jwks".into(),
+            issuer: "https://auth.example.com".into(),
+        }
+    }
+
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    fn b64(s: &str) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s)
+    }
+
+    /// Signature garbage is fine: every case here fails on a claim check that
+    /// runs before `fetch_jwks`, so the network is never touched.
+    fn token(header: &str, claims: serde_json::Value) -> String {
+        format!(
+            "{}.{}.{}",
+            b64(header),
+            b64(&claims.to_string()),
+            b64("sig")
+        )
+    }
+
+    fn claims() -> serde_json::Value {
+        serde_json::json!({
+            "iss": "https://auth.example.com",
+            "aud": "maki-anchor",
+            "sub": "user-1",
+            "nonce": "n0nce",
+            "exp": now() + 3600,
+        })
+    }
+
+    fn validate(header: &str, claims: serde_json::Value, nonce: &str) -> String {
+        validate_id_token(&config(), &discovery(), &token(header, claims), nonce)
+            .expect_err("expected rejection")
+            .to_string()
+    }
+
+    #[test]
+    fn pkce_challenge_matches_rfc7636_vector() {
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn rejects_alg_none() {
+        let msg = validate(r#"{"alg":"none","kid":"k"}"#, claims(), "n0nce");
+        assert!(msg.contains("unsupported alg"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_missing_kid() {
+        let msg = validate(r#"{"alg":"RS256"}"#, claims(), "n0nce");
+        assert!(msg.contains("missing kid"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_issuer_and_audience_mismatch() {
+        let mut bad = claims();
+        bad["iss"] = serde_json::json!("https://evil");
+        assert!(validate(r#"{"alg":"RS256","kid":"k"}"#, bad, "n0nce").contains("issuer mismatch"));
+
+        let mut bad = claims();
+        bad["aud"] = serde_json::json!("someone-else");
+        assert!(
+            validate(r#"{"alg":"RS256","kid":"k"}"#, bad, "n0nce").contains("audience mismatch")
+        );
+    }
+
+    #[test]
+    fn rejects_nonce_mismatch() {
+        assert!(
+            validate(r#"{"alg":"RS256","kid":"k"}"#, claims(), "stolen").contains("nonce mismatch")
+        );
+    }
+
+    #[test]
+    fn rejects_expired_and_not_yet_valid() {
+        let mut bad = claims();
+        bad["exp"] = serde_json::json!(now() - 3600);
+        assert!(validate(r#"{"alg":"RS256","kid":"k"}"#, bad, "n0nce").contains("expired"));
+
+        let mut bad = claims();
+        bad["nbf"] = serde_json::json!(now() + 3600);
+        assert!(validate(r#"{"alg":"RS256","kid":"k"}"#, bad, "n0nce").contains("not yet valid"));
+    }
+
+    #[test]
+    fn array_audience_passes_the_gate() {
+        // A valid array aud containing the client id must clear the audience
+        // check; the next rejection is the deliberately-wrong nonce, proving
+        // we got past audience (and never reach the JWKS fetch).
+        let mut c = claims();
+        c["aud"] = serde_json::json!(["other", "maki-anchor"]);
+        let msg = validate(r#"{"alg":"RS256","kid":"k"}"#, c, "wrong-n0nce");
+        assert!(
+            msg.contains("nonce mismatch"),
+            "audience should have passed: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_jwt() {
+        let msg = validate_id_token(&config(), &discovery(), "a.b", "n")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("not a JWT"), "{msg}");
+    }
 }

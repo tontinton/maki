@@ -103,6 +103,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "json"] }
 clap = { version = "4", features = ["derive"] }
 sha2 = { version = "0.10", default-features = false }
+argon2 = "0.5"
 subtle = "2"
 hmac = { version = "0.12", default-features = false }
 base64 = "0.22"
@@ -118,7 +119,7 @@ strum = { version = "0.27", features = ["derive"] }
 htmd = "0.5"
 tempfile = "3"
 tiny_http = { version = "0.12" }
-tungstenite = { version = "0.28", default-features = false, features = ["handshake", "url"] }
+tungstenite = { version = "0.28", default-features = false, features = ["handshake", "url", "native-tls"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
 globset = "0.4"

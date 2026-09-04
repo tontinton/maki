@@ -53,7 +53,7 @@ pub const MIN_MAX_LOG_BYTES_MB: u64 = 1;
 pub const MIN_MAX_LOG_FILES: u32 = 1;
 pub const MIN_INPUT_HISTORY_SIZE: usize = 10;
 pub const DEFAULT_REMOTE_CONTROL_PORT: u16 = 8687;
-const DEFAULT_REMOTE_CONTROL_BIND: &str = "0.0.0.0";
+const DEFAULT_REMOTE_CONTROL_BIND: &str = "127.0.0.1";
 const MIN_PORT: u16 = 1;
 pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
 pub const MIN_LOW_SPEED_TIMEOUT_SECS: u64 = 1;
@@ -1478,7 +1478,7 @@ pub struct RemoteControlConfig {
     #[config(default = DEFAULT_REMOTE_CONTROL_PORT, min = MIN_PORT, desc = "TCP port the control server listens on")]
     pub port: u16,
 
-    #[config(default = DEFAULT_REMOTE_CONTROL_BIND.to_owned(), desc = "Address to bind the control server to: `0.0.0.0` when the proxy runs on another machine, `127.0.0.1` to keep it local")]
+    #[config(default = DEFAULT_REMOTE_CONTROL_BIND.to_owned(), desc = "Address to bind the control server to: `127.0.0.1` when the reverse proxy runs on this machine (the safe default), `0.0.0.0` only when it runs elsewhere")]
     pub bind: String,
 }
 

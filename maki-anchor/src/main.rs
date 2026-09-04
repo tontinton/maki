@@ -228,6 +228,10 @@ fn main() {
             let store = Store::open(&db).expect("open anchor db");
             match sub {
                 TokenCommand::Add { name } => {
+                    if !store::valid_instance_name(&name) {
+                        eprintln!("instance name must be 1-64 chars of alphanumeric, -, _, .");
+                        std::process::exit(1);
+                    }
                     let token = new_token();
                     store
                         .register_instance(&name, &store::hash_token(&token))

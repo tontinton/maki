@@ -16,21 +16,26 @@ const TOKEN_BYTES: usize = 16;
 const TOKEN_LEN: usize = 2 * TOKEN_BYTES;
 
 /// One pending action the event loop must perform, answered over `reply`.
+/// `session` selects a tab by id; `None` means the focused one.
 #[derive(Debug)]
 pub enum RemoteRequest {
     Prompt {
+        session: Option<String>,
         text: String,
         reply: Sender<Result<(), String>>,
     },
     Answer {
+        session: Option<String>,
         request_id: String,
         answer: String,
         reply: Sender<Result<(), String>>,
     },
     Stop {
+        session: Option<String>,
         reply: Sender<Result<(), String>>,
     },
     Command {
+        session: Option<String>,
         cmdline: String,
         reply: Sender<Result<(), String>>,
     },
@@ -38,9 +43,11 @@ pub enum RemoteRequest {
         reply: Sender<serde_json::Value>,
     },
     ModelGet {
+        session: Option<String>,
         reply: Sender<serde_json::Value>,
     },
     ModelSet {
+        session: Option<String>,
         spec: Option<String>,
         thinking: Option<String>,
         fast: Option<bool>,
@@ -50,8 +57,25 @@ pub enum RemoteRequest {
     /// stats, status. The loop answers with the JSON payload to emit as the
     /// first SSE frame, so a fresh tab opens on the TUI's world.
     Snapshot {
+        session: Option<String>,
         reply: Sender<serde_json::Value>,
     },
+}
+
+impl RemoteRequest {
+    /// The tab this request targets; `None` is the focused one.
+    pub fn session(&self) -> Option<&str> {
+        match self {
+            Self::Prompt { session, .. }
+            | Self::Answer { session, .. }
+            | Self::Stop { session, .. }
+            | Self::Command { session, .. }
+            | Self::ModelGet { session, .. }
+            | Self::ModelSet { session, .. }
+            | Self::Snapshot { session, .. } => session.as_deref(),
+            Self::Sessions { .. } => None,
+        }
+    }
 }
 
 pub struct RemoteServer {
@@ -140,20 +164,28 @@ impl RemoteServer {
         self.bound_port
     }
 
-    fn route(&self, path: &str, method: &Method) -> Option<crate::dispatch::Route> {
-        let rest = path.strip_prefix('/')?;
+    fn route(
+        &self,
+        path: &str,
+        method: &Method,
+    ) -> (Option<String>, Option<crate::dispatch::Route>) {
+        let Some(rest) = path.strip_prefix('/') else {
+            return (None, None);
+        };
         let (token, tail) = match rest.split_once('/') {
             Some((token, tail)) => (token, tail),
             None => (rest, ""),
         };
+        // A query string is not part of the path.
+        let tail = tail.split('?').next().unwrap_or(tail);
         if !constant_time_eq(token.as_bytes(), &self.token) {
-            return None;
+            return (None, None);
         }
-        crate::dispatch::Route::from_tail(tail, method.as_str())
+        crate::dispatch::parse_tail(tail, method.as_str())
     }
 
     fn handle(&self, mut request: tiny_http::Request) {
-        let route = self.route(request.url(), request.method());
+        let (session, route) = self.route(request.url(), request.method());
         let body = if matches!(
             route,
             Some(
@@ -174,7 +206,7 @@ impl RemoteServer {
         } else {
             String::new()
         };
-        match self.dispatcher.dispatch(route, &body) {
+        match self.dispatcher.dispatch(route, session, &body) {
             crate::dispatch::DispatchOutcome::NotFound => {
                 let _ = request.respond(Response::empty(404));
             }
@@ -194,8 +226,19 @@ impl RemoteServer {
                     .spawn(move || serve_events(request, &mut source))
                     .expect("spawn SSE thread");
             }
-            crate::dispatch::DispatchOutcome::Posted(status) => {
-                let _ = request.respond(Response::empty(status));
+            crate::dispatch::DispatchOutcome::Posted(status, error) => {
+                let body = match error {
+                    Some(reason) => serde_json::json!({"error": reason})
+                        .to_string()
+                        .into_bytes(),
+                    None => Vec::new(),
+                };
+                let has_error = !body.is_empty();
+                let mut response = Response::from_data(body).with_status_code(status);
+                if has_error {
+                    response = response.with_header(content_type("application/json"));
+                }
+                let _ = request.respond(response);
             }
             crate::dispatch::DispatchOutcome::Json { status, body } => {
                 let response = Response::from_data(body)
@@ -301,50 +344,83 @@ mod tests {
         let server = test_server(hex_token("abcdef0123456789abcdef0123456789"));
         let get = &Method::Get;
         let post = &Method::Post;
-        assert!(matches!(
-            server.route("/abcdef0123456789abcdef0123456789/", get),
-            Some(crate::dispatch::Route::Index)
-        ));
-        assert!(matches!(
-            server.route("/abcdef0123456789abcdef0123456789", get),
-            Some(crate::dispatch::Route::Index)
-        ));
-        assert!(matches!(
-            server.route("/abcdef0123456789abcdef0123456789/events", get),
-            Some(crate::dispatch::Route::Events)
-        ));
-        assert!(matches!(
-            server.route("/abcdef0123456789abcdef0123456789/prompt", post),
-            Some(crate::dispatch::Route::Prompt)
-        ));
-        assert!(matches!(
-            server.route("/abcdef0123456789abcdef0123456789/command", post),
-            Some(crate::dispatch::Route::Command)
-        ));
-        assert!(matches!(
-            server.route("/abcdef0123456789abcdef0123456789/sessions", get),
-            Some(crate::dispatch::Route::Sessions)
-        ));
-        assert!(matches!(
-            server.route("/abcdef0123456789abcdef0123456789/model", get),
-            Some(crate::dispatch::Route::ModelGet)
-        ));
-        assert!(matches!(
-            server.route("/abcdef0123456789abcdef0123456789/model", post),
-            Some(crate::dispatch::Route::ModelPost)
-        ));
-        assert!(server.route("/wrongtoken/events", get).is_none());
-        assert!(
-            server
-                .route("/abcdef0123456789abcdef0123456788/events", get)
-                .is_none()
-        );
-        assert!(
-            server
-                .route("/abcdef0123456789abcdef0123456789/prompt", get)
-                .is_none()
-        );
-        assert!(server.route("//events", get).is_none());
+        let cases: &[(&str, &Method, Option<&str>, Option<crate::dispatch::Route>)] = &[
+            (
+                "/abcdef0123456789abcdef0123456789/",
+                get,
+                None,
+                Some(crate::dispatch::Route::Index),
+            ),
+            (
+                "/abcdef0123456789abcdef0123456789",
+                get,
+                None,
+                Some(crate::dispatch::Route::Index),
+            ),
+            (
+                "/abcdef0123456789abcdef0123456789/events",
+                get,
+                None,
+                Some(crate::dispatch::Route::Events),
+            ),
+            (
+                "/abcdef0123456789abcdef0123456789/prompt",
+                post,
+                None,
+                Some(crate::dispatch::Route::Prompt),
+            ),
+            (
+                "/abcdef0123456789abcdef0123456789/command",
+                post,
+                None,
+                Some(crate::dispatch::Route::Command),
+            ),
+            (
+                "/abcdef0123456789abcdef0123456789/sessions",
+                get,
+                None,
+                Some(crate::dispatch::Route::Sessions),
+            ),
+            (
+                "/abcdef0123456789abcdef0123456789/model",
+                get,
+                None,
+                Some(crate::dispatch::Route::ModelGet),
+            ),
+            (
+                "/abcdef0123456789abcdef0123456789/model",
+                post,
+                None,
+                Some(crate::dispatch::Route::ModelPost),
+            ),
+            (
+                "/abcdef0123456789abcdef0123456789/s/42/events",
+                get,
+                Some("42"),
+                Some(crate::dispatch::Route::Events),
+            ),
+            (
+                "/abcdef0123456789abcdef0123456789/s/42/",
+                get,
+                Some("42"),
+                Some(crate::dispatch::Route::Index),
+            ),
+            (
+                "/abcdef0123456789abcdef0123456789/s/42/prompt",
+                post,
+                Some("42"),
+                Some(crate::dispatch::Route::Prompt),
+            ),
+            ("/wrongtoken/events", get, None, None),
+            ("/abcdef0123456789abcdef0123456788/events", get, None, None),
+            ("/abcdef0123456789abcdef0123456789/prompt", get, None, None),
+            ("//events", get, None, None),
+        ];
+        for (path, method, session, route) in cases {
+            let (got_session, got_route) = server.route(path, method);
+            assert_eq!(&got_session.as_deref(), session, "path {path}");
+            assert_eq!(&got_route, route, "path {path}");
+        }
     }
 
     #[test]

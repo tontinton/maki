@@ -59,7 +59,7 @@ fn spawn_server() -> TestServer {
     std::thread::spawn(move || {
         loop {
             match rx.recv() {
-                Ok(RemoteRequest::Snapshot { reply }) => {
+                Ok(RemoteRequest::Snapshot { reply, .. }) => {
                     let _ = reply.send(serde_json::json!({
                         "messages": [{"type": "user_message", "text": RC_TEST_SEED}],
                         "status": "idle",
@@ -110,6 +110,14 @@ fn http_serves_index_only_behind_token() {
     );
     assert!(page.starts_with("HTTP/1.1 200"), "got {page:?}");
     assert!(page.contains("maki remote"));
+    // Bug #1 regression: the index must carry text/html. If standalone drops
+    // it, the anchor cannot forward it and the page never renders.
+    assert!(
+        page.to_ascii_lowercase()
+            .contains("content-type: text/html"),
+        "index must be served as HTML, got header block: {:?}",
+        page.lines().take(6).collect::<Vec<_>>()
+    );
 
     let blocked = http_exchange(
         server.port(),
@@ -131,6 +139,36 @@ fn http_serves_index_only_behind_token() {
 }
 
 #[test]
+fn scoped_prompt_carries_the_session_id() {
+    let server = spawn_server();
+    let token = server.url.rsplit('/').next().unwrap();
+
+    let text = "{\"text\":\"scoped\"}";
+    let body = format!(
+        "POST /{token}/s/sess-42/prompt HTTP/1.1\r\nHost: {RC_TEST_DOMAIN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{text}",
+        text.len()
+    );
+    let client = std::thread::spawn({
+        let port = server.port();
+        move || http_exchange(port, &body)
+    });
+
+    let request = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("scoped request");
+    assert_eq!(
+        request.session(),
+        Some("sess-42"),
+        "route prefix must reach the loop as session"
+    );
+    if let RemoteRequest::Prompt { reply, .. } = request {
+        let _ = reply.send(Ok(()));
+    }
+    assert!(client.join().unwrap().starts_with("HTTP/1.1 200"));
+}
+
+#[test]
 fn prompt_post_reaches_request_channel() {
     let server = spawn_server();
     let token = server.url.rsplit('/').next().unwrap();
@@ -149,7 +187,7 @@ fn prompt_post_reaches_request_channel() {
         .requests
         .recv_timeout(Duration::from_secs(5))
         .expect("request");
-    let RemoteRequest::Prompt { text, reply } = request else {
+    let RemoteRequest::Prompt { text, reply, .. } = request else {
         panic!("expected prompt");
     };
     assert_eq!(text, "hi web");
@@ -168,7 +206,8 @@ fn answered_prompt_post_returns_ok() {
     let surface = server.requests.clone();
 
     std::thread::spawn(move || {
-        if let Ok(RemoteRequest::Stop { reply }) = surface.recv_timeout(Duration::from_secs(5)) {
+        if let Ok(RemoteRequest::Stop { reply, .. }) = surface.recv_timeout(Duration::from_secs(5))
+        {
             let _ = reply.send(Ok(()));
         }
     });

@@ -57,7 +57,7 @@ use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_resp
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
-use crate::components::{Action, DisplayMessage, DisplayRole, ExitRequest, Status};
+use crate::components::{Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, Status};
 use crate::input::InputReader;
 use crate::repaint::{Dirty, IDLE_POLL};
 
@@ -79,6 +79,7 @@ const REMOTE_NO_DOMAIN_MSG: &str =
     "remote control needs a domain: set remote_control.domain in the config, or run /rc <domain>";
 const REMOTE_URL_MSG: &str = "Remote control: ";
 const REMOTE_COPY_ERR: &str = "clipboard copy failed";
+const REMOTE_STOPPED_MSG: &str = "remote control stopped";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -338,6 +339,9 @@ struct SessionRuntime {
     /// so a new task would inherit the old one's status.
     last_tasks: Vec<(Arc<str>, TaskStatus)>,
     notifications: RunNotificationState,
+    /// The permission request last mirrored to remote clients; when the
+    /// prompt closes without a remote answer, this is what tells them.
+    last_permission_id: Option<String>,
 }
 
 impl SessionRuntime {
@@ -439,6 +443,7 @@ impl SpawnCtx {
             last_status: SessionStatus::Idle,
             last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
+            last_permission_id: None,
         }
     }
 }
@@ -852,6 +857,7 @@ impl<'t> EventLoop<'t> {
             state.send_envelope(&rt.id().to_string(), &envelope);
             if let maki_agent::AgentEvent::PermissionRequest { id, tool, scopes } = &envelope.event
             {
+                rt.last_permission_id = Some(id.clone());
                 state.send_permission(
                     &rt.id().to_string(),
                     maki_remote::PermissionFrame {
@@ -913,13 +919,39 @@ impl<'t> EventLoop<'t> {
                     .collect();
                 serde_json::json!({ "sessions": list, "focused": focused_id })
             };
+            // The anchor's dashboard only sees what instances push, so the
+            // tunnel ships the same index when it changes.
+            let index = serde_json::json!(
+                self.sessions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, rt)| {
+                        let usage = rt.app.state.token_usage.total_input() as i64;
+                        serde_json::json!({
+                            "session_id": rt.id().to_string(),
+                            "title": rt.app.state.session.title,
+                            "model": rt.app.state.model.spec(),
+                            "cwd": rt.app.state.session.cwd,
+                            "status": SessionStatus::of(&rt.app).as_str(),
+                            "cost_cents": (rt.app.state.cost.unwrap_or_default() * 100.0).round() as i64,
+                            "tokens_in": usage,
+                            "tokens_out": rt.app.state.token_usage.output as i64,
+                            "context_window": rt.app.state.model.context_window as i64,
+                            "focused": i == focused,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            );
+            self.remote.push_session_index(&index);
             let sessions_json_clone = sessions_json.clone();
-            let actions = self
+            let grouped = self
                 .remote
-                .drain_requests_with(&mut self.sessions[focused].app, move || {
+                .drain_requests_with(&mut self.sessions, focused, move || {
                     sessions_json_clone.clone()
                 });
-            self.dispatch(focused, actions);
+            for (idx, actions) in grouped {
+                self.dispatch(idx, actions);
+            }
         }
         // Leftovers beyond the budget are picked up right after the next draw.
         for _ in 0..DRAIN_BUDGET {
@@ -1054,6 +1086,13 @@ impl<'t> EventLoop<'t> {
     fn emit_status_changes(&mut self) {
         let handle = &self.ctx.lua_event_handle;
         for (i, rt) in self.sessions.iter_mut().enumerate() {
+            // A prompt that closed locally (answered on the TUI, or dropped
+            // by the agent) must clear its card on every remote client too.
+            if !rt.app.permission_prompt.is_open()
+                && let Some((state, id)) = self.remote.state().zip(rt.last_permission_id.take())
+            {
+                state.send_permission_resolved(&rt.id().to_string(), &id);
+            }
             let status = SessionStatus::of(&rt.app);
             if status == rt.last_status {
                 continue;
@@ -1719,17 +1758,36 @@ impl<'t> EventLoop<'t> {
         self.dispatch(self.focused, actions);
     }
 
-    /// `/rc` (optionally with a domain override). With no domain and no
-    /// config default, tells the user what to set; `/rc` while running
-    /// restarts the server (fresh token). The URL goes to the clipboard and
-    /// the transcript, since the status bar flash is too narrow to hold one.
-    fn handle_remote_control(&mut self, domain: Option<String>) {
-        let Some(domain) = domain.or_else(|| self.ctx.remote_control.domain.clone()) else {
+    /// `/rc` (optionally with a domain override), `/rc off` to stop. With no
+    /// domain, no config default, and no anchor, tells the user what to set;
+    /// `/rc` while running restarts the server (fresh token). The URL goes to
+    /// the clipboard and the transcript, since the status bar flash is too
+    /// narrow to hold one.
+    fn handle_remote_control(&mut self, arg: Option<String>) {
+        if arg.as_deref() == Some("off") {
+            let msg = if self.remote.stop() {
+                REMOTE_STOPPED_MSG
+            } else {
+                "remote control is not running"
+            }
+            .to_owned();
+            self.focused_app().flash(msg);
+            return;
+        }
+        let domain = arg.or_else(|| self.ctx.remote_control.domain.clone());
+        // Standalone needs a domain for the URL; an anchor mints its own.
+        if domain.is_none()
+            && !self
+                .ctx
+                .anchor
+                .as_ref()
+                .is_some_and(|a| a.complete().is_some())
+        {
             self.focused_app().flash(REMOTE_NO_DOMAIN_MSG.into());
             return;
-        };
+        }
         let config = RemoteControlConfig {
-            domain: Some(domain),
+            domain,
             ..self.ctx.remote_control.clone()
         };
         match self.remote.start(&config, self.ctx.anchor.as_ref()) {

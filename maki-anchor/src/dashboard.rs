@@ -169,7 +169,7 @@ pub fn render(
         body.push_str("<p class=\"small\">Showing only instances you have a grant for. Ask an admin for access to more.</p>");
     }
     body.push_str("</div>");
-    body.push_str("<div class=\"card\"><h2>Sessions</h2><table><tr><th>Instance</th><th>Title</th><th>Model</th><th>Status</th><th>Updated</th></tr>");
+    body.push_str("<div class=\"card\"><h2>Sessions</h2><table><tr><th>Instance</th><th>Title</th><th>Model</th><th>Status</th><th>Cost</th><th>Updated</th><th></th></tr>");
     let names: std::collections::HashMap<i64, String> =
         instances.iter().map(|i| (i.id, i.name.clone())).collect();
     let all_names: std::collections::HashMap<i64, String> = store
@@ -179,7 +179,7 @@ pub fn render(
         .map(|i| (i.id, i.name))
         .collect();
     if sessions.is_empty() {
-        body.push_str("<tr><td colspan=5 class=\"small\">no sessions yet</td></tr>");
+        body.push_str("<tr><td colspan=7 class=\"small\">no sessions yet</td></tr>");
     }
     for session in &sessions {
         let name_map = if names.contains_key(&session.instance_id) {
@@ -187,14 +187,27 @@ pub fn render(
         } else {
             &all_names
         };
+        let instance_name = name_map
+            .get(&session.instance_id)
+            .map(String::as_str)
+            .unwrap_or("?");
+        // Cost is pushed by the instance; render dollars, blank when unpriced.
+        let cost = if session.cost_cents == 0 && session.tokens_in == 0 {
+            String::new()
+        } else {
+            format!("${:.2}", session.cost_cents as f64 / 100.0)
+        };
+        // An Open link mints a two-hour control link scoped to just this
+        // session, so the dashboard's scoped-share path needs no hand-typed ids.
+        let open = format!(
+            "/links?instance={}&amp;session={}&amp;rights=control&amp;hours=2",
+            urlencode(instance_name),
+            urlencode(&session.external_id),
+        );
         body.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}s ago</td></tr>",
-            html_escape(
-                name_map
-                    .get(&session.instance_id)
-                    .map(String::as_str)
-                    .unwrap_or("?")
-            ),
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{cost}</td><td>{}s ago</td>\
+             <td><a href=\"{open}\">open</a></td></tr>",
+            html_escape(instance_name),
             html_escape(&session.title),
             html_escape(&session.model),
             html_escape(&session.status),
@@ -211,7 +224,17 @@ pub fn render(
     body.push_str(
         "<div class=\"card\"><h2>Share a session</h2>\
          <form method=\"get\" action=\"/links\" style=\"display:flex;gap:.5rem;flex-wrap:wrap;align-items:end\">\
-         <label>Instance<br><input name=\"instance\" type=\"number\" min=\"1\" required></label> \
+         <label>Instance<br><input name=\"instance\" list=\"instance-names\" required></label> \
+         <datalist id=\"instance-names\">"
+    );
+    for instance in &instances {
+        body.push_str(&format!(
+            "<option value=\"{}\"></option>",
+            html_escape(&instance.name)
+        ));
+    }
+    body.push_str(
+        "</datalist> \
          <label>Session ID<br><input name=\"session\" placeholder=\"optional\"></label> \
          <label>Rights<br><select name=\"rights\"><option>view</option><option>control</option></select></label> \
          <label>Hours<br><input name=\"hours\" type=\"number\" min=\"1\" value=\"2\"></label> \
@@ -285,7 +308,7 @@ pub fn render_admin(
           const fetchJson = async (u, opts) => {{
             try {{ const r = await fetch(u, opts); const j = await r.json().catch(()=>({{}})); return {{ok: r.ok, j, status: r.status}}; }} catch(e){{ return {{ok:false, j:{{error:String(e)}}}}; }}
           }};
-          const escape = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+          const escape = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
           const loadSso = async () => {{
             const {{ok, j}} = await fetchJson('/api/sso');
             if (!ok) {{ ssoEl.textContent = 'SSO: unknown'; return; }}
@@ -388,7 +411,7 @@ pub fn render_admin(
 }
 
 pub fn render_link(
-    store: &Arc<Store>,
+    store: &Store,
     user: Option<&UserRow>,
     instance: &str,
     session: Option<&str>,
@@ -406,29 +429,61 @@ pub fn render_link(
         return (
             404,
             "text/plain".to_string(),
-            format!("unknown instance {instance}").into_bytes(),
+            format!("unknown instance {}", html_escape(instance)).into_bytes(),
         );
     };
-    let _ = user;
-    let token = crate::server::mint_link(
+    // Only admins and users with a grant on the instance can share it; a
+    // logged-in user with no rights gets nothing. A minted control link
+    // bypasses grants entirely, so this gate matters most there.
+    if let Some(u) = user
+        && !u.is_admin
+        && store
+            .grant_for(u.id, instance_row.id)
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        return (
+            403,
+            "text/plain".to_string(),
+            b"you have no access to this instance".to_vec(),
+        );
+    }
+    let hours = hours.clamp(1, MAX_LINK_HOURS);
+    let token = match crate::server::mint_link(
         store,
         instance_row.id,
         session,
         role,
         std::time::Duration::from_secs(hours * 3600),
-    );
+    ) {
+        Ok(token) => token,
+        Err(err) => {
+            tracing::warn!(error = %err, "link mint failed");
+            return (500, "text/plain".to_string(), b"link mint failed".to_vec());
+        }
+    };
+    let open_path = match session {
+        Some(s) => format!("/{token}/s/{s}/"),
+        None => format!("/{token}/"),
+    };
     let mut body = String::from(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>link</title>\
          <style>body{font-family:system-ui;margin:2rem}</style></head><body>",
     );
     body.push_str(&format!(
-        "<h2>Link for {instance} ({})</h2><p><code>{token}</code></p>\
-         <p>Open: <a href=\"/{token}/\">/{token}/</a> — expires in {hours}h</p>",
+        "<h2>Link for {} ({})</h2><p><code>{token}</code></p>\
+         <p>Open: <a href=\"{open_path}\">{open_path}</a> — expires in {hours}h</p>",
+        html_escape(instance),
         role.as_str(),
     ));
     body.push_str("<p><a href=\"/\">back</a></p></body></html>");
     (200, "text/html".to_string(), body.into_bytes())
 }
+
+/// Cap hand-minted link lifetimes; the instance control link still refreshes
+/// itself while connected.
+const MAX_LINK_HOURS: u64 = 24 * 30;
 
 fn html_escape(value: &str) -> String {
     value
@@ -436,4 +491,146 @@ fn html_escape(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Percent-encode a value for a query string, leaving the unreserved set.
+fn urlencode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Role;
+
+    fn test_store() -> Store {
+        // Leak the tempdir so the sqlite file lives for the test.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        std::mem::forget(dir);
+        Arc::into_inner(Store::open(&path).unwrap()).expect("no other refs")
+    }
+
+    fn user(id: i64, is_admin: bool) -> UserRow {
+        UserRow {
+            id,
+            oidc_sub: format!("sub-{id}"),
+            email: None,
+            name: None,
+            is_admin,
+        }
+    }
+
+    #[test]
+    fn render_link_refuses_users_without_a_grant_on_the_instance() {
+        let store = test_store();
+        let instance = store.create_instance("gated", "hash").unwrap();
+        store.upsert_user("admin-seed", None, None).unwrap();
+        let stranger = store.upsert_user("sub-2", None, None).unwrap();
+        assert!(!stranger.is_admin, "second user is a plain user");
+        let (status, _, _) = render_link(&store, Some(&stranger), "gated", None, "control", 2);
+        assert_eq!(status, 403, "a user with no grant must not mint");
+        store
+            .set_grant(stranger.id, instance, Role::Viewer)
+            .unwrap();
+        let (status, _, _) = render_link(&store, Some(&stranger), "gated", None, "view", 2);
+        assert_eq!(status, 200, "a grant opens minting");
+    }
+
+    #[test]
+    fn render_link_scopes_open_path_and_clamps_hours() {
+        let store = test_store();
+        store.create_instance("open", "hash").unwrap();
+        let (status, _, body) = render_link(
+            &store,
+            Some(&user(1, true)),
+            "open",
+            Some("sid-9"),
+            "view",
+            100_000,
+        );
+        assert_eq!(status, 200);
+        let html = String::from_utf8(body).unwrap();
+        assert!(
+            html.contains("/s/sid-9/"),
+            "scoped link must carry the session: {html}"
+        );
+        assert!(
+            html.contains(&format!("expires in {MAX_LINK_HOURS}h")),
+            "hours clamped"
+        );
+    }
+
+    #[test]
+    fn render_link_escapes_the_instance_name() {
+        let store = test_store();
+        // CLI names are charset-checked, but a legacy row could carry HTML.
+        store
+            .register_instance("<img src=x onerror=alert(1)>", "hash")
+            .unwrap();
+        let (_, _, body) = render_link(
+            &store,
+            Some(&user(1, true)),
+            "<img src=x onerror=alert(1)>",
+            None,
+            "view",
+            2,
+        );
+        let html = String::from_utf8(body).unwrap();
+        assert!(
+            !html.contains("<img src=x"),
+            "instance name must be escaped: {html}"
+        );
+        assert!(html.contains("&lt;img"), "escaped form expected: {html}");
+    }
+
+    #[test]
+    fn urlencode_leaves_safe_chars_and_percent_encodes_the_rest() {
+        assert_eq!(urlencode("work-laptop_1.local~"), "work-laptop_1.local~");
+        assert_eq!(urlencode("a b&c"), "a%20b%26c");
+    }
+
+    #[test]
+    fn render_shows_pushed_cost_and_a_scoped_open_link() {
+        let store = Arc::new(test_store());
+        let instance = store.create_instance("host-a", "hash").unwrap();
+        store
+            .upsert_session(&crate::store::SessionRow {
+                instance_id: instance,
+                external_id: "sid-1".into(),
+                title: "Refactor parser".into(),
+                model: "claude".into(),
+                cwd: "/work".into(),
+                status: "idle".into(),
+                cost_cents: 421,
+                tokens_in: 1000,
+                tokens_out: 200,
+                context_window: 200_000,
+                updated_at: crate::store::now_unix(),
+            })
+            .unwrap();
+        let auth = crate::auth::Auth::new(
+            Arc::clone(&store),
+            None,
+            true,
+            crate::store::MintTokens::Any,
+        );
+        let (_, _, body) = render(&store, None, &auth);
+        let html = String::from_utf8(body).unwrap();
+        assert!(html.contains("$4.21"), "cost should render: {html}");
+        assert!(
+            html.contains("/links?instance=host-a&amp;session=sid-1&amp;rights=control"),
+            "open link should mint a scoped control link: {html}"
+        );
+    }
 }

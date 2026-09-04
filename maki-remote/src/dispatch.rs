@@ -41,20 +41,35 @@ impl Route {
     }
 }
 
+/// Split the optional `s/<session-id>/` prefix a session-scoped link puts in
+/// front of every route, so one page URL pins the whole tab of requests to
+/// that session. Returns the session id and the route under it.
+pub fn parse_tail(tail: &str, method: &str) -> (Option<String>, Option<Route>) {
+    let Some(rest) = tail.strip_prefix("s/") else {
+        return (None, Route::from_tail(tail, method));
+    };
+    let (id, sub) = match rest.split_once('/') {
+        Some((id, sub)) => (id, sub),
+        None => (rest, ""),
+    };
+    (Some(id.to_owned()), Route::from_tail(sub, method))
+}
+
 /// Everything a mode needs to answer one request path.
 pub struct Dispatcher {
     pub state: RemoteState,
     pub requests: Sender<crate::RemoteRequest>,
 }
 
-/// Outcome of dispatching one non-SSE route.
+/// Outcome of dispatching one request path.
 pub enum DispatchOutcome {
     Index,
     /// SSE: the caller streams frames produced by `SseSource` until it ends.
     Events {
         source: SseSource,
     },
-    Posted(u16),
+    /// Status plus an error message when the request was rejected.
+    Posted(u16, Option<String>),
     Json {
         status: u16,
         body: Vec<u8>,
@@ -63,9 +78,15 @@ pub enum DispatchOutcome {
 }
 
 impl Dispatcher {
-    /// Match `/{token}/{tail}` and produce the response payload. Token check
-    /// is the caller's job: both modes compare against their own secret.
-    pub fn dispatch(&self, route: Option<Route>, body: &str) -> DispatchOutcome {
+    /// Match `/{token}[/{session}]/{tail}` and produce the response payload.
+    /// Token check is the caller's job: both modes compare against their own
+    /// secret.
+    pub fn dispatch(
+        &self,
+        route: Option<Route>,
+        session: Option<String>,
+        body: &str,
+    ) -> DispatchOutcome {
         let Some(route) = route else {
             return DispatchOutcome::NotFound;
         };
@@ -73,9 +94,9 @@ impl Dispatcher {
             Route::Index => DispatchOutcome::Index,
             Route::Events => {
                 let subscription = self.state.subscribe();
-                let snapshot = self.snapshot_json();
+                let snapshot = self.snapshot_json(session.clone());
                 DispatchOutcome::Events {
-                    source: SseSource::new(subscription, &snapshot),
+                    source: SseSource::new(subscription, &snapshot, session),
                 }
             }
             Route::Sessions => match self.dispatch_sessions() {
@@ -88,7 +109,7 @@ impl Dispatcher {
                     body: br#"{"error":"event loop wedged"}"#.to_vec(),
                 },
             },
-            Route::ModelGet => match self.dispatch_model_get() {
+            Route::ModelGet => match self.dispatch_model_get(session) {
                 Some(value) => DispatchOutcome::Json {
                     status: 200,
                     body: serde_json::to_vec(&value).unwrap_or_default(),
@@ -98,7 +119,7 @@ impl Dispatcher {
                     body: br#"{"error":"event loop wedged"}"#.to_vec(),
                 },
             },
-            Route::ModelPost => match self.dispatch_model_set(body) {
+            Route::ModelPost => match self.dispatch_model_set(session, body) {
                 Some(Ok(value)) => DispatchOutcome::Json {
                     status: 200,
                     body: serde_json::to_vec(&value).unwrap_or_default(),
@@ -113,22 +134,21 @@ impl Dispatcher {
                 },
             },
             Route::Prompt | Route::Answer | Route::Stop | Route::Command => {
-                let status = match self.dispatch_post(route, body) {
-                    Some(()) => 200,
-                    None => 400,
-                };
-                DispatchOutcome::Posted(status)
+                match self.dispatch_post(route, session, body) {
+                    Ok(()) => DispatchOutcome::Posted(200, None),
+                    Err(reason) => DispatchOutcome::Posted(400, Some(reason)),
+                }
             }
         }
     }
 
     /// Asks the event loop for the current session snapshot. Empty object if
     /// the loop is wedged; the stream still opens with live events.
-    fn snapshot_json(&self) -> serde_json::Value {
+    fn snapshot_json(&self, session: Option<String>) -> serde_json::Value {
         let (tx, rx) = flume::bounded(1);
         if self
             .requests
-            .try_send(crate::RemoteRequest::Snapshot { reply: tx })
+            .try_send(crate::RemoteRequest::Snapshot { session, reply: tx })
             .is_err()
         {
             return json!({});
@@ -146,16 +166,20 @@ impl Dispatcher {
             .ok()
     }
 
-    fn dispatch_model_get(&self) -> Option<serde_json::Value> {
+    fn dispatch_model_get(&self, session: Option<String>) -> Option<serde_json::Value> {
         let (tx, rx) = flume::bounded(1);
         self.requests
-            .try_send(crate::RemoteRequest::ModelGet { reply: tx })
+            .try_send(crate::RemoteRequest::ModelGet { session, reply: tx })
             .ok()?;
         rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS))
             .ok()
     }
 
-    fn dispatch_model_set(&self, body: &str) -> Option<Result<serde_json::Value, String>> {
+    fn dispatch_model_set(
+        &self,
+        session: Option<String>,
+        body: &str,
+    ) -> Option<Result<serde_json::Value, String>> {
         let value: serde_json::Value = match serde_json::from_str(body) {
             Ok(v) => v,
             Err(_) => return Some(Err("invalid json".into())),
@@ -175,6 +199,7 @@ impl Dispatcher {
         let (tx, rx) = flume::bounded(1);
         self.requests
             .try_send(crate::RemoteRequest::ModelSet {
+                session,
                 spec,
                 thinking,
                 fast,
@@ -185,20 +210,36 @@ impl Dispatcher {
             .ok()
     }
 
-    fn dispatch_post(&self, route: Route, body: &str) -> Option<()> {
+    fn dispatch_post(
+        &self,
+        route: Route,
+        session: Option<String>,
+        body: &str,
+    ) -> Result<(), String> {
         let (request, reply_rx) = match route {
             Route::Prompt => {
-                let text = parse_json_field(body, "text")?;
+                let text = parse_json_field(body, "text")
+                    .filter(|t| !t.trim().is_empty())
+                    .ok_or_else(|| "missing text".to_owned())?;
                 let (tx, rx) = flume::unbounded();
-                (crate::RemoteRequest::Prompt { text, reply: tx }, rx)
+                (
+                    crate::RemoteRequest::Prompt {
+                        session,
+                        text,
+                        reply: tx,
+                    },
+                    rx,
+                )
             }
             Route::Answer => {
-                let value: serde_json::Value = serde_json::from_str(body).ok()?;
-                let request_id = value.get("request_id")?.as_str()?.to_owned();
-                let answer = value.get("answer")?.as_str()?.to_owned();
+                let value: serde_json::Value =
+                    serde_json::from_str(body).map_err(|_| "invalid json".to_owned())?;
+                let request_id = required_str(&value, "request_id")?;
+                let answer = required_str(&value, "answer")?;
                 let (tx, rx) = flume::unbounded();
                 (
                     crate::RemoteRequest::Answer {
+                        session,
                         request_id,
                         answer,
                         reply: tx,
@@ -208,52 +249,79 @@ impl Dispatcher {
             }
             Route::Stop => {
                 let (tx, rx) = flume::unbounded();
-                (crate::RemoteRequest::Stop { reply: tx }, rx)
+                (crate::RemoteRequest::Stop { session, reply: tx }, rx)
             }
             Route::Command => {
-                let value: serde_json::Value = serde_json::from_str(body).ok()?;
+                let value: serde_json::Value =
+                    serde_json::from_str(body).map_err(|_| "invalid json".to_owned())?;
                 let cmdline = value
                     .get("cmdline")
                     .or_else(|| value.get("command"))
                     .or_else(|| value.get("text"))
                     .and_then(|v| v.as_str())
-                    .map(str::to_owned)?;
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| "missing cmdline".to_owned())?
+                    .to_owned();
                 let (tx, rx) = flume::unbounded();
-                (crate::RemoteRequest::Command { cmdline, reply: tx }, rx)
+                (
+                    crate::RemoteRequest::Command {
+                        session,
+                        cmdline,
+                        reply: tx,
+                    },
+                    rx,
+                )
             }
             Route::Index | Route::Events | Route::Sessions | Route::ModelGet | Route::ModelPost => {
-                return None;
+                return Err("not a post route".to_owned());
             }
         };
-        self.requests.try_send(request).ok()?;
+        self.requests
+            .try_send(request)
+            .map_err(|_| "event loop wedged".to_owned())?;
         // The loop answers fast (it only flips state or forwards); still,
         // bound the wait so a wedged UI thread cannot leak connections.
         match reply_rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS)) {
-            Ok(Ok(())) => Some(()),
+            Ok(Ok(())) => Ok(()),
             Ok(Err(reason)) => {
                 tracing::debug!(%reason, "remote control: request rejected");
-                None
+                Err(reason)
             }
-            Err(_) => None,
+            Err(_) => Err("event loop wedged".to_owned()),
         }
     }
 }
 
+fn required_str(value: &serde_json::Value, field: &str) -> Result<String, String> {
+    value
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("missing {field}"))
+}
+
 /// The SSE frame source, shared by both modes. Pulls the fan-out channel and
 /// formats frames; standalone mode reads it via `Read`, the tunnel sends each
-/// frame as a WS text message.
+/// frame as a WS text message. With a session set, frames for other sessions
+/// are dropped, so a scoped link never leaks its neighbours' traffic.
 pub struct SseSource {
     subscription: crate::state::Subscription,
+    session: Option<String>,
     idle_deadline: Option<std::time::Instant>,
     buf: Vec<u8>,
 }
 
 impl SseSource {
-    pub fn new(subscription: crate::state::Subscription, snapshot: &serde_json::Value) -> Self {
+    pub fn new(
+        subscription: crate::state::Subscription,
+        snapshot: &serde_json::Value,
+        session: Option<String>,
+    ) -> Self {
         let mut buf = Vec::new();
         write_frame(&mut buf, "snapshot", snapshot);
         Self {
             subscription,
+            session,
             idle_deadline: None,
             buf,
         }
@@ -261,7 +329,7 @@ impl SseSource {
 
     /// Blocks until the next frame is fully available. `None` ends the stream.
     pub fn next_frame(&mut self) -> Option<Vec<u8>> {
-        if self.buf.is_empty() {
+        while self.buf.is_empty() {
             let updates = &self.subscription.updates;
             let update = match self.idle_deadline {
                 Some(deadline) => match updates.recv_deadline(deadline) {
@@ -278,31 +346,38 @@ impl SseSource {
                     Err(_) => return None,
                 },
             };
-            if let Some(update) = update {
-                self.idle_deadline =
-                    Some(std::time::Instant::now() + Duration::from_secs(SSE_PING_SECS));
-                match update {
-                    RemoteUpdate::Envelope { event, .. } => {
-                        write_frame(&mut self.buf, "event", &event);
-                    }
-                    RemoteUpdate::Status { status, .. } => {
-                        write_frame(&mut self.buf, "status", &json!(status));
-                    }
-                    RemoteUpdate::Permission { frame, .. } => {
-                        write_frame(&mut self.buf, "permission", &frame_json(&frame));
-                    }
-                    RemoteUpdate::PermissionResolved { request_id, .. } => {
-                        write_frame(
-                            &mut self.buf,
-                            "permission_resolved",
-                            &json!({ "id": request_id }),
-                        );
-                    }
-                    RemoteUpdate::Shutdown => return None,
+            let Some(update) = update else { continue };
+            self.idle_deadline =
+                Some(std::time::Instant::now() + Duration::from_secs(SSE_PING_SECS));
+            match update {
+                RemoteUpdate::Shutdown => return None,
+                update if self.mutes(&update) => {}
+                RemoteUpdate::Envelope { event, .. } => {
+                    write_frame(&mut self.buf, "event", &event);
+                }
+                RemoteUpdate::Status { status, .. } => {
+                    write_frame(&mut self.buf, "status", &json!(status));
+                }
+                RemoteUpdate::Permission { frame, .. } => {
+                    write_frame(&mut self.buf, "permission", &frame_json(&frame));
+                }
+                RemoteUpdate::PermissionResolved { request_id, .. } => {
+                    write_frame(
+                        &mut self.buf,
+                        "permission_resolved",
+                        &json!({ "id": request_id }),
+                    );
                 }
             }
         }
         Some(std::mem::take(&mut self.buf))
+    }
+
+    fn mutes(&self, update: &RemoteUpdate) -> bool {
+        match (&self.session, update.session()) {
+            (Some(watched), Some(session)) => watched != session,
+            _ => false,
+        }
     }
 }
 
@@ -322,4 +397,58 @@ fn frame_json(frame: &PermissionFrame) -> serde_json::Value {
 pub fn parse_json_field(body: &str, field: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     value.get(field)?.as_str().map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tail_splits_session_scope() {
+        let (session, route) = parse_tail("s/abc/events", "GET");
+        assert_eq!(session.as_deref(), Some("abc"));
+        assert_eq!(route, Some(Route::Events));
+
+        let (session, route) = parse_tail("s/abc/", "GET");
+        assert_eq!(session.as_deref(), Some("abc"));
+        assert_eq!(route, Some(Route::Index));
+
+        let (session, route) = parse_tail("s/abc/prompt", "POST");
+        assert_eq!(session.as_deref(), Some("abc"));
+        assert_eq!(route, Some(Route::Prompt));
+
+        let (session, route) = parse_tail("events", "GET");
+        assert_eq!(session, None);
+        assert_eq!(route, Some(Route::Events));
+
+        let (session, route) = parse_tail("s/abc/nope", "GET");
+        assert_eq!(session.as_deref(), Some("abc"));
+        assert_eq!(route, None);
+    }
+
+    #[test]
+    fn scoped_source_drops_other_sessions() {
+        let state = RemoteState::new();
+        let sub = state.subscribe();
+        let mut source = SseSource::new(sub, &json!({}), Some("watched".into()));
+        state.send_status("other", "working");
+        state.send_status("watched", "idle");
+        // First frame is the snapshot; the next must be the watched session's.
+        let snapshot = String::from_utf8(source.next_frame().unwrap()).unwrap();
+        assert!(snapshot.contains("event: snapshot"));
+        let frame = String::from_utf8(source.next_frame().unwrap()).unwrap();
+        assert!(frame.contains("idle"), "frame: {frame}");
+    }
+
+    #[test]
+    fn unscoped_source_keeps_every_session() {
+        let state = RemoteState::new();
+        let sub = state.subscribe();
+        let mut source = SseSource::new(sub, &json!({}), None);
+        state.send_status("any", "working");
+        let snapshot = source.next_frame().unwrap();
+        assert!(!snapshot.is_empty());
+        let frame = String::from_utf8(source.next_frame().unwrap()).unwrap();
+        assert!(frame.contains("working"), "frame: {frame}");
+    }
 }

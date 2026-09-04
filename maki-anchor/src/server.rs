@@ -3,12 +3,14 @@ use std::{
     net::TcpListener,
     sync::{
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{Receiver, channel},
     },
     thread,
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tiny_http::{Header, Response, Server};
 use tungstenite::{Message as WsMessage, protocol::WebSocket};
 
@@ -18,6 +20,10 @@ use crate::{
 };
 
 const TUNNEL_LINK_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+/// Browser requests and instance tunnels each get a thread; cap the counts so
+/// a flood costs 503s instead of unbounded threads.
+const MAX_CONCURRENT_REQUESTS: usize = 256;
+const MAX_CONCURRENT_TUNNELS: usize = 64;
 const INSTALL_SH: &str = include_str!("../../install.sh");
 const INSTALL_PS1: &str = include_str!("../../install.ps1");
 
@@ -28,18 +34,16 @@ pub fn mint_link(
     session_id: Option<&str>,
     rights: Role,
     ttl: Duration,
-) -> String {
+) -> Result<String, store::StoreError> {
     let token = new_link_token();
-    store
-        .create_link(
-            &store::hash_token(&token),
-            instance_id,
-            session_id,
-            rights.as_str(),
-            ttl,
-        )
-        .expect("create link");
-    token
+    store.create_link(
+        &store::hash_token(&token),
+        instance_id,
+        session_id,
+        rights.as_str(),
+        ttl,
+    )?;
+    Ok(token)
 }
 
 fn request_path_session(tail: &str) -> Option<String> {
@@ -98,10 +102,23 @@ enum TunnelWireFrame {
     Response {
         conn_id: u64,
         status: u16,
+        #[serde(default)]
+        content_type: Option<String>,
+        #[serde(deserialize_with = "serde_b64::deserialize")]
         body: Vec<u8>,
         #[serde(rename = "final")]
         final_chunk: bool,
     },
+}
+
+mod serde_b64 {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize as _, Deserializer};
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        STANDARD.decode(&text).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -160,15 +177,23 @@ pub fn serve(
     ));
     let ws_store = Arc::clone(&store);
     let ws_hub = Arc::clone(&hub);
+    let tunnel_slots = Arc::new(AtomicUsize::new(0));
+    let ws_slots = Arc::clone(&tunnel_slots);
     thread::spawn(move || {
         for socket in ws_listener.incoming() {
             let Ok(socket) = socket else {
                 continue;
             };
+            if ws_slots.fetch_add(1, Ordering::Relaxed) >= MAX_CONCURRENT_TUNNELS {
+                ws_slots.fetch_sub(1, Ordering::Relaxed);
+                continue;
+            }
             let _ = socket.set_nodelay(true);
             let hub = Arc::clone(&ws_hub);
             let store = Arc::clone(&ws_store);
+            let slots = Arc::clone(&ws_slots);
             thread::spawn(move || {
+                let _slot = SlotGuard(slots);
                 let Ok(websocket) = tungstenite::accept(socket) else {
                     return;
                 };
@@ -179,6 +204,7 @@ pub fn serve(
 
     tracing::info!(addr, ws_addr, "anchor listening");
 
+    let request_slots = Arc::new(AtomicUsize::new(0));
     loop {
         let request = match server.recv() {
             Ok(request) => request,
@@ -187,12 +213,33 @@ pub fn serve(
                 continue;
             }
         };
+        if request_slots.fetch_add(1, Ordering::Relaxed) >= MAX_CONCURRENT_REQUESTS {
+            request_slots.fetch_sub(1, Ordering::Relaxed);
+            let response = Response::from_string("too many requests")
+                .with_status_code(503)
+                .with_header(
+                    Header::from_bytes(&b"Content-Type"[..], b"text/plain".as_ref()).unwrap(),
+                );
+            let _ = request.respond(response);
+            continue;
+        }
         let hub = Arc::clone(&hub);
         let store = Arc::clone(&store);
         let auth = Arc::clone(&auth);
+        let slots = Arc::clone(&request_slots);
         thread::spawn(move || {
+            let _slot = SlotGuard(slots);
             handle_request(request, hub, store, auth);
         });
+    }
+}
+
+/// Frees a concurrency slot when the thread holding it ends.
+struct SlotGuard(Arc<AtomicUsize>);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -344,6 +391,16 @@ fn cookie_header(request: &tiny_http::Request) -> Option<&str> {
         .map(|h| h.value.as_str())
 }
 
+/// Best-effort client identity for login rate limiting. IP only (ports churn
+/// per connection), and behind a reverse proxy every request shares one
+/// address, so the limiter keys per proxy; local brute-forcing still trips it.
+fn remote_origin(request: &tiny_http::Request) -> String {
+    request
+        .remote_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 fn start_login(request: tiny_http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
     match auth.begin_login() {
         Ok(url) => {
@@ -410,7 +467,8 @@ fn handle_local_login(mut request: tiny_http::Request, auth: &crate::auth::Auth)
     let params = parse_form(&body_str);
     let username = params.get("username").map(|s| s.as_str()).unwrap_or("");
     let password = params.get("password").map(|s| s.as_str()).unwrap_or("");
-    match auth.login_local(username, password) {
+    let origin = remote_origin(&request);
+    match auth.login_local(&origin, username, password) {
         Ok(cookie) => {
             let response = Response::empty(302)
                 .with_header(Header::from_bytes("Location", "/".as_bytes()).unwrap())
@@ -424,6 +482,15 @@ fn handle_local_login(mut request: tiny_http::Request, auth: &crate::auth::Auth)
             let _ = request.respond(response);
             RouteOutcome::Streamed
         }
+        Err(crate::auth::AuthError::RateLimited) => buffered(
+            (
+                429,
+                "text/html".to_string(),
+                b"<html><body>too many failed logins, wait a while <a href=\"/login\">back</a></body></html>"
+                    .to_vec(),
+            ),
+            request,
+        ),
         Err(_) => buffered(
             (
                 401,
@@ -473,7 +540,8 @@ fn handle_api_local_login(
     };
     let username = value.get("username").and_then(|v| v.as_str()).unwrap_or("");
     let password = value.get("password").and_then(|v| v.as_str()).unwrap_or("");
-    match auth.login_local(username, password) {
+    let origin = remote_origin(&request);
+    match auth.login_local(&origin, username, password) {
         Ok(cookie) => {
             // For API, return JSON and also set cookie if request is browser fetch with credentials
             let body = br#"{"ok":true}"#.to_vec();
@@ -490,6 +558,14 @@ fn handle_api_local_login(
             let _ = request.respond(response);
             RouteOutcome::Streamed
         }
+        Err(crate::auth::AuthError::RateLimited) => buffered(
+            (
+                429,
+                "application/json".to_string(),
+                br#"{"error":"too many failed logins, wait a while"}"#.to_vec(),
+            ),
+            request,
+        ),
         Err(_) => buffered(
             (
                 401,
@@ -513,23 +589,39 @@ fn parse_form(body: &str) -> std::collections::HashMap<String, String> {
     map
 }
 
+/// Percent-decode plus form `+`-as-space. Decodes to bytes then UTF-8, so
+/// multibyte sequences survive instead of becoming one-char-per-byte mojibake.
 fn url_decode(s: &str) -> String {
-    let mut out = String::new();
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '+' {
-            out.push(' ');
-        } else if c == '%' {
-            let hi = chars.next().and_then(|c| c.to_digit(16));
-            let lo = chars.next().and_then(|c| c.to_digit(16));
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8 as char);
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
             }
-        } else {
-            out.push(c);
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                match (hi, lo) {
+                    (Some(hi), Some(lo)) => {
+                        out.push((hi * 16 + lo) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn finish_login(request: tiny_http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
@@ -537,7 +629,7 @@ fn finish_login(request: tiny_http::Request, auth: &crate::auth::Auth) -> RouteO
     let params = |key: &str| {
         query.split('&').find_map(|pair| {
             let (k, v) = pair.split_once('=')?;
-            (k == key).then(|| v.to_owned())
+            (k == key).then(|| url_decode(v))
         })
     };
     let Some(code) = params("code") else {
@@ -587,7 +679,7 @@ fn render_link(
     let params = |key: &str| {
         query.split('&').find_map(|pair| {
             let (k, v) = pair.split_once('=')?;
-            (k == key).then(|| v.replace("%3A", ":").replace('+', " "))
+            (k == key).then(|| url_decode(v))
         })
     };
     let Some(instance) = params("instance") else {
@@ -615,6 +707,23 @@ fn redirect_to_login(request: tiny_http::Request) -> RouteOutcome {
         .with_header(Header::from_bytes("Location", "/login".as_bytes()).unwrap());
     let _ = request.respond(response);
     RouteOutcome::Streamed
+}
+
+/// A logged-in non-admin. Anonymous (LAN-trust / CLI) callers are not
+/// covered; the dashboard admin tables are simply open to everyone there.
+fn is_non_admin(user: Option<&crate::store::UserRow>) -> bool {
+    user.is_some_and(|u| !u.is_admin)
+}
+
+fn forbidden_json(request: tiny_http::Request) -> RouteOutcome {
+    buffered(
+        (
+            403,
+            "application/json".to_string(),
+            br#"{"error":"admin required"}"#.to_vec(),
+        ),
+        request,
+    )
 }
 
 fn handle_api_create_instance(
@@ -693,11 +802,7 @@ fn handle_api_create_instance(
             request,
         );
     }
-    if name.len() > 64
-        || !name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
-    {
+    if !store::valid_instance_name(&name) {
         return buffered(
             (
                 400,
@@ -709,17 +814,30 @@ fn handle_api_create_instance(
     }
     let token = new_link_token();
     let hash = store::hash_token(&token);
-    if let Err(e) = store.register_instance(&name, &hash) {
-        return buffered(
-            (
-                500,
-                "application/json".to_string(),
-                serde_json::json!({"error": format!("store error: {e}")})
-                    .to_string()
-                    .into_bytes(),
-            ),
-            request,
-        );
+    match store.create_instance(&name, &hash) {
+        Ok(_) => {}
+        Err(store::StoreError::Exists) => {
+            return buffered(
+                (
+                    409,
+                    "application/json".to_string(),
+                    br#"{"error":"instance exists; rotate its token with `maki-anchor tokens add`"}"#.to_vec(),
+                ),
+                request,
+            );
+        }
+        Err(e) => {
+            return buffered(
+                (
+                    500,
+                    "application/json".to_string(),
+                    serde_json::json!({"error": format!("store error: {e}")})
+                        .to_string()
+                        .into_bytes(),
+                ),
+                request,
+            );
+        }
     }
     let body = serde_json::json!({"name": name, "token": token})
         .to_string()
@@ -1034,29 +1152,20 @@ fn handle_api_create_user(
             request,
         );
     }
-    if let Some(u) = user
-        && !u.is_admin
-    {
-        // Allow bootstrapping: if no users exist yet, anyone can create first admin
-        let has_users = store.list_users().map(|u| !u.is_empty()).unwrap_or(false);
+    // User creation is admin-only. The one exception is bootstrapping an
+    // empty deployment: with no users at all, the first call creates the
+    // first admin. Mint policy governs share links, not account creation,
+    // so `any` can never be used to add admins to an established anchor.
+    let is_admin_caller = user.as_ref().is_some_and(|u| u.is_admin);
+    if !is_admin_caller {
+        let has_users = store.list_users().map(|u| !u.is_empty()).unwrap_or(true);
         if has_users {
+            let status = if user.is_some() { 403 } else { 401 };
             return buffered(
                 (
-                    403,
+                    status,
                     "application/json".to_string(),
-                    br#"{"error":"admin required"}"#.to_vec(),
-                ),
-                request,
-            );
-        }
-    } else if user.is_none() {
-        let has_users = store.list_users().map(|u| !u.is_empty()).unwrap_or(false);
-        if has_users && auth.effective_mint_tokens() != store::MintTokens::Any {
-            return buffered(
-                (
-                    401,
-                    "application/json".to_string(),
-                    br#"{"error":"authentication required"}"#.to_vec(),
+                    br#"{"error":"admin required to create users"}"#.to_vec(),
                 ),
                 request,
             );
@@ -1515,7 +1624,12 @@ fn route_authorized(
     }
     if path == "/api/users" {
         return match request.method().as_str() {
-            "GET" => buffered(json_list_users(store), request),
+            "GET" => {
+                if is_non_admin(user.as_ref()) {
+                    return forbidden_json(request);
+                }
+                buffered(json_list_users(store), request)
+            }
             "POST" => handle_api_create_user(request, store, user.as_ref(), auth),
             _ => buffered(
                 (
@@ -1535,7 +1649,12 @@ fn route_authorized(
     }
     if path == "/api/grants" {
         return match request.method().as_str() {
-            "GET" => buffered(json_list_grants(store), request),
+            "GET" => {
+                if is_non_admin(user.as_ref()) {
+                    return forbidden_json(request);
+                }
+                buffered(json_list_grants(store), request)
+            }
             "POST" => handle_api_set_grant(request, store, user.as_ref()),
             _ => buffered(
                 (
@@ -1638,23 +1757,6 @@ fn route_authorized(
     buffered(outcome, request)
 }
 
-#[allow(dead_code)]
-fn json_list_instances(store: &Arc<Store>) -> (u16, String, Vec<u8>) {
-    match store.list_instances() {
-        Ok(rows) => {
-            let body = serde_json::to_vec(&rows).unwrap_or_default();
-            (200, "application/json".to_string(), body)
-        }
-        Err(err) => (
-            500,
-            "application/json".to_string(),
-            serde_json::json!({"error": format!("store error: {err}")})
-                .to_string()
-                .into_bytes(),
-        ),
-    }
-}
-
 fn json_list_instances_for(
     store: &Arc<Store>,
     user: Option<&crate::store::UserRow>,
@@ -1664,23 +1766,6 @@ fn json_list_instances_for(
         None => store.list_instances(),
     };
     match res {
-        Ok(rows) => {
-            let body = serde_json::to_vec(&rows).unwrap_or_default();
-            (200, "application/json".to_string(), body)
-        }
-        Err(err) => (
-            500,
-            "application/json".to_string(),
-            serde_json::json!({"error": format!("store error: {err}")})
-                .to_string()
-                .into_bytes(),
-        ),
-    }
-}
-
-#[allow(dead_code)]
-fn json_list_sessions(store: &Arc<Store>) -> (u16, String, Vec<u8>) {
-    match store.list_sessions() {
         Ok(rows) => {
             let body = serde_json::to_vec(&rows).unwrap_or_default();
             (200, "application/json".to_string(), body)
@@ -1718,19 +1803,14 @@ fn json_list_sessions_for(
     }
 }
 
-/// Persist a session-index push from an instance.
-fn handle_push(store: &Arc<Store>, push: TunnelPush) {
-    let TunnelPush::SessionIndex {
-        instance_name,
-        sessions,
-    } = push;
-    let Ok(instance) = store.instance_by_name(&instance_name) else {
-        tracing::warn!(instance_name, "push from unknown instance");
-        return;
-    };
+/// Persist a session-index push from an instance. The owning instance is the
+/// authenticated tunnel, so a registered host can never rewrite another's
+/// index by claiming a name in the frame.
+fn handle_push(store: &Arc<Store>, instance_id: i64, push: TunnelPush) {
+    let TunnelPush::SessionIndex { sessions } = push;
     for entry in sessions {
         let row = SessionRow {
-            instance_id: instance.id,
+            instance_id,
             external_id: entry.session_id,
             title: entry.title,
             model: entry.model,
@@ -1743,15 +1823,22 @@ fn handle_push(store: &Arc<Store>, push: TunnelPush) {
             updated_at: crate::store::now_unix(),
         };
         if let Err(err) = store.upsert_session(&row) {
-            tracing::warn!(error = %err, instance_name, "session upsert failed");
+            tracing::warn!(error = %err, instance_id, "session upsert failed");
         }
     }
+}
+
+/// The route under an optional `s/<session>/` prefix.
+fn tail_under_session(tail: &str) -> &str {
+    tail.strip_prefix("s/")
+        .map(|rest| rest.split_once('/').map(|(_, sub)| sub).unwrap_or(""))
+        .unwrap_or(tail)
 }
 
 fn proxy_remote(
     token: &str,
     tail: &str,
-    mut request: tiny_http::Request,
+    request: tiny_http::Request,
     hub: &Hub,
     store: &Arc<Store>,
     user: Option<&crate::store::UserRow>,
@@ -1776,10 +1863,20 @@ fn proxy_remote(
         );
     }
 
-    // A session-scoped link only opens that session's view.
+    // A session-scoped link only opens that session: the bare index bounces
+    // into the scoped path (so the UI's relative requests carry it), and
+    // anything outside it is refused.
     if let Some(session_id) = link.external_session_id.as_deref() {
-        let requested = request_path_session(tail);
-        if requested.is_none_or(|id| id != session_id) {
+        if tail.is_empty() {
+            let response = Response::empty(302).with_header(
+                Header::from_bytes("Location", format!("/{token}/s/{session_id}/").as_bytes())
+                    .unwrap(),
+            );
+            let _ = request.respond(response);
+            return RouteOutcome::Streamed;
+        }
+        let scoped = request_path_session(tail);
+        if scoped.as_deref() != Some(session_id) {
             return buffered(
                 (
                     404,
@@ -1815,6 +1912,7 @@ fn proxy_remote(
         );
     }
     let mut body = Vec::new();
+    let mut request = request;
     if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
         return buffered(
             (413, "text/plain".to_string(), b"body too large".to_vec()),
@@ -1828,7 +1926,7 @@ fn proxy_remote(
         "method": method,
         "path": format!("/{tail}"),
         "headers": {},
-        "body": body,
+        "body": STANDARD.encode(&body),
     })
     .to_string();
 
@@ -1845,6 +1943,13 @@ fn proxy_remote(
             );
         }
     };
+    // Traffic on the tunnel's own control link slides its expiry, so it stays
+    // alive as long as the tunnel does.
+    if hub.link_hash(link.instance_id).as_deref() == Some(link.token_hash.as_str())
+        && let Err(err) = store.extend_link(&link.token_hash, TUNNEL_LINK_TTL)
+    {
+        tracing::warn!(error = %err, "link extend failed");
+    }
     let first = match hub.wait_first(&rx) {
         Ok(first) => first,
         Err(err) => {
@@ -1859,10 +1964,15 @@ fn proxy_remote(
         }
     };
     let status = first.status;
-    // SSE streams chunk as they are produced; everything else buffers.
-    if tail == "events" && status == 200 {
-        return stream_to_browser(request, hub, rx, status);
+    // SSE streams chunk as they are produced; everything else buffers. The
+    // first chunk is handed to the streamer so an already-final stream cannot
+    // leave the browser waiting on the chunk timeout.
+    if tail_under_session(tail) == "events" && status == 200 {
+        return stream_to_browser(request, hub, rx, first);
     }
+    let content_type = first
+        .content_type
+        .unwrap_or_else(|| "application/json".to_string());
     let mut acc = first.body;
     if !first.final_chunk {
         while let Ok(chunk) = hub.wait_chunk(&rx) {
@@ -1872,7 +1982,7 @@ fn proxy_remote(
             }
         }
     }
-    buffered((status, "application/json".to_string(), acc), request)
+    buffered((status, content_type, acc), request)
 }
 
 /// Streams tunnel SSE chunks to the browser with tiny_http bypassed: its
@@ -1881,8 +1991,9 @@ fn stream_to_browser(
     request: tiny_http::Request,
     hub: &Hub,
     rx: Receiver<hub::TunnelResponse>,
-    status: u16,
+    first: hub::TunnelResponse,
 ) -> RouteOutcome {
+    let status = first.status;
     let mut writer = request.into_writer();
     let head = format!(
         "HTTP/1.1 {status} OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n"
@@ -1890,18 +2001,25 @@ fn stream_to_browser(
     if writer.write_all(head.as_bytes()).is_err() || writer.flush().is_err() {
         return RouteOutcome::Streamed;
     }
-    while let Ok(chunk) = hub.wait_chunk(&rx) {
-        if writer.write_all(&chunk.body).is_err() || writer.flush().is_err() {
-            break;
-        }
-        if chunk.final_chunk {
+    let mut first = Some(first);
+    loop {
+        let chunk = match first.take() {
+            Some(chunk) => chunk,
+            None => match hub.wait_chunk(&rx) {
+                Ok(chunk) => chunk,
+                Err(_) => break,
+            },
+        };
+        let final_chunk = chunk.final_chunk;
+        if writer.write_all(&chunk.body).is_err() || writer.flush().is_err() || final_chunk {
             break;
         }
     }
     RouteOutcome::Streamed
 }
 
-fn drive_tunnel(mut websocket: WebSocket<std::net::TcpStream>, hub: Arc<Hub>, store: Arc<Store>) {
+fn drive_tunnel(websocket: WebSocket<std::net::TcpStream>, hub: Arc<Hub>, store: Arc<Store>) {
+    let mut websocket = websocket;
     let hello = match websocket.read() {
         Ok(WsMessage::Text(text)) => text,
         _ => return,
@@ -1917,26 +2035,34 @@ fn drive_tunnel(mut websocket: WebSocket<std::net::TcpStream>, hub: Arc<Hub>, st
         }
     };
     store.touch_instance(instance.id).ok();
-    // Every tunnel gets a fresh control link valid while the tunnel lives
-    // (plus a grace window); the URL goes back to the instance to display.
-    let control_link = mint_link(
+    // Every tunnel gets a fresh control link; traffic on it slides the expiry
+    // (see proxy_remote) so it lives as long as the tunnel does. The URL goes
+    // back to the instance to display.
+    let control_link = match mint_link(
         store.as_ref(),
         instance.id,
         None,
         Role::Controller,
         TUNNEL_LINK_TTL,
-    );
+    ) {
+        Ok(link) => link,
+        Err(err) => {
+            tracing::warn!(error = %err, instance_id = instance.id, "link mint failed");
+            return;
+        }
+    };
+    let link_hash = store::hash_token(&control_link);
     let _ = websocket.send(WsMessage::text(
         serde_json::json!({"link": control_link}).to_string(),
     ));
     let (cmd_tx, cmd_rx) = channel::<TunnelCommand>();
-    hub.attach(instance.id, cmd_tx);
+    let epoch = hub.attach(instance.id, cmd_tx, link_hash.clone());
 
     let write_socket = websocket.into_inner();
     let read_socket = match write_socket.try_clone() {
         Ok(read_socket) => read_socket,
         Err(_) => {
-            hub.detach(instance.id);
+            hub.detach(instance.id, epoch);
             return;
         }
     };
@@ -1949,7 +2075,7 @@ fn drive_tunnel(mut websocket: WebSocket<std::net::TcpStream>, hub: Arc<Hub>, st
     let writer_hub = Arc::clone(&hub);
     let writer_id = instance.id;
     let writer_handle = Arc::clone(&writer);
-    thread::spawn(move || {
+    let _ = thread::spawn(move || {
         while let Ok(command) = cmd_rx.recv() {
             let TunnelCommand::Request { conn_id, request } = command;
             let mut wire = serde_json::Map::new();
@@ -1965,7 +2091,8 @@ fn drive_tunnel(mut websocket: WebSocket<std::net::TcpStream>, hub: Arc<Hub>, st
                 break;
             }
         }
-        writer_hub.detach(writer_id);
+        // Only drops the hub entry if this is still the live tunnel.
+        writer_hub.detach(writer_id, epoch);
     });
 
     let mut reader =
@@ -1978,7 +2105,7 @@ fn drive_tunnel(mut websocket: WebSocket<std::net::TcpStream>, hub: Arc<Hub>, st
         match message {
             WsMessage::Text(text) => {
                 if let Ok(push) = serde_json::from_str::<TunnelPush>(&text) {
-                    handle_push(&store, push);
+                    handle_push(&store, instance.id, push);
                     continue;
                 }
                 let Ok(frame) = serde_json::from_str::<TunnelWireFrame>(&text) else {
@@ -1987,27 +2114,35 @@ fn drive_tunnel(mut websocket: WebSocket<std::net::TcpStream>, hub: Arc<Hub>, st
                 let TunnelWireFrame::Response {
                     conn_id,
                     status,
+                    content_type,
                     body,
                     final_chunk,
                 } = frame;
                 hub.deliver_response(
+                    instance.id,
                     conn_id,
                     hub::TunnelResponse {
                         status,
+                        content_type,
                         body,
                         final_chunk,
                     },
                 );
             }
             WsMessage::Ping(payload) => {
+                // Instance keepalive: proof of life for the dashboard and the
+                // tunnel's control link.
+                store.touch_instance(instance.id).ok();
+                store.extend_link(&link_hash, TUNNEL_LINK_TTL).ok();
                 let _ = writer.lock().unwrap().send(WsMessage::Pong(payload));
             }
             WsMessage::Close(_) => break,
             _ => {}
         }
     }
-    hub.detach(instance.id);
-    store.touch_instance(instance.id).ok();
+    if hub.detach(instance.id, epoch) {
+        store.touch_instance(instance.id).ok();
+    }
 }
 
 #[cfg(test)]
@@ -2042,5 +2177,55 @@ mod tests {
         );
         assert_eq!(split_token_path("//events"), None);
         assert_eq!(split_token_path("/api"), None);
+    }
+
+    #[test]
+    fn request_path_session_extracts_scoped_id() {
+        assert_eq!(request_path_session("s/abc/events").as_deref(), Some("abc"));
+        assert_eq!(request_path_session("s/abc").as_deref(), Some("abc"));
+        assert_eq!(request_path_session("events"), None);
+        assert_eq!(request_path_session("s/").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn tail_under_session_strips_scope_for_route_match() {
+        assert_eq!(tail_under_session("s/abc/events"), "events");
+        assert_eq!(tail_under_session("events"), "events");
+        // The scope with no route under it is the index.
+        assert_eq!(tail_under_session("s/abc/"), "");
+        assert_eq!(tail_under_session("s/abc"), "");
+    }
+
+    #[test]
+    fn non_admin_gate_spares_anonymous_and_admins() {
+        let admin = crate::store::UserRow {
+            id: 1,
+            oidc_sub: "a".into(),
+            email: None,
+            name: None,
+            is_admin: true,
+        };
+        let user = crate::store::UserRow {
+            is_admin: false,
+            ..admin.clone()
+        };
+        assert!(
+            !is_non_admin(None),
+            "LAN-trust anonymous is not a non-admin"
+        );
+        assert!(!is_non_admin(Some(&admin)));
+        assert!(is_non_admin(Some(&user)));
+    }
+
+    #[test]
+    fn url_decode_handles_percent_and_plus() {
+        assert_eq!(url_decode("a%20b"), "a b");
+        assert_eq!(url_decode("a+b"), "a b");
+        assert_eq!(url_decode("%3A"), ":");
+        // Multibyte: %C3%A9 is é, which the old byte-into-char decode mangled.
+        assert_eq!(url_decode("%C3%A9"), "é");
+        // A stray percent stays literal instead of eating following chars.
+        assert_eq!(url_decode("100%"), "100%");
+        assert_eq!(url_decode("bad%zz"), "bad%zz");
     }
 }

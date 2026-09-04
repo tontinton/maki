@@ -7,6 +7,7 @@ edition.workspace = true
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
 arc-swap = { workspace = true }
+base64 = { workspace = true }
 flume = { workspace = true }
 getrandom = { workspace = true }
 serde = { workspace = true }

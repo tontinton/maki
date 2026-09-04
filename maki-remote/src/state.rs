@@ -29,6 +29,19 @@ pub enum RemoteUpdate {
     Shutdown,
 }
 
+impl RemoteUpdate {
+    /// The session this update belongs to; `Shutdown` fans out to everyone.
+    pub fn session(&self) -> Option<&str> {
+        match self {
+            Self::Envelope { session, .. }
+            | Self::Status { session, .. }
+            | Self::Permission { session, .. }
+            | Self::PermissionResolved { session, .. } => Some(session),
+            Self::Shutdown => None,
+        }
+    }
+}
+
 /// What a remote client needs to render one approval card.
 #[derive(Debug, Clone)]
 pub struct PermissionFrame {
@@ -37,12 +50,24 @@ pub struct PermissionFrame {
     pub scopes: Vec<String>,
 }
 
-/// A live SSE subscriber. Returned by [`RemoteState::subscribe`] and handed
-/// back to [`RemoteState::unsubscribe`] when the stream ends.
+/// A live SSE subscriber. Unregisters from the fan-out when dropped, so every
+/// stream end (normal, error, panic unwinding) cleans up.
 #[derive(Debug)]
 pub struct Subscription {
     id: u64,
     pub updates: flume::Receiver<RemoteUpdate>,
+    inner: Arc<Inner>,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.inner.updates.rcu(|subs| {
+            subs.iter()
+                .filter(|(id, _)| *id != self.id)
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+    }
 }
 
 /// Fan-out hub between the event loop's tee and every connected web client.
@@ -87,17 +112,11 @@ impl RemoteState {
             subs.push((id, tx.clone()));
             subs
         });
-        Subscription { id, updates }
-    }
-
-    /// Removes a subscriber's queue slot; used when its SSE stream ends.
-    pub fn unsubscribe(&self, sub: &Subscription) {
-        self.inner.updates.rcu(|subs| {
-            subs.iter()
-                .filter(|(id, _)| *id != sub.id)
-                .cloned()
-                .collect::<Vec<_>>()
-        });
+        Subscription {
+            id,
+            updates,
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     fn publish(&self, update: RemoteUpdate) {
@@ -179,14 +198,13 @@ mod tests {
     }
 
     #[test]
-    fn unsubscribe_removes_only_that_receiver() {
+    fn dropping_a_subscription_removes_only_that_receiver() {
         let state = RemoteState::new();
         let a = state.subscribe();
         let b = state.subscribe();
-        state.unsubscribe(&a);
+        drop(a);
 
         state.send_status(SESSION, STATUS_IDLE);
         assert!(b.updates.try_recv().is_ok());
-        assert!(a.updates.try_recv().is_err());
     }
 }

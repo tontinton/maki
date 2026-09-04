@@ -66,7 +66,8 @@ anchor. Without it, `/rc` behaves as described in
 
 ## Share links
 
-Every tunnel gets a fresh control link when it connects, valid for two hours.
+Every tunnel gets a fresh control link when it connects. Traffic and
+keepalives slide its expiry forward, so it stays valid while the tunnel lives.
 You can also mint links by hand:
 
 ```
@@ -77,7 +78,10 @@ maki-anchor tokens revoke <token>
 
 A link is `/{token}/` under the anchor domain. `view` links open the session
 read-only; `control` links can prompt, answer permission requests, and stop
-runs. A `--session` scoped link only opens that one session.
+runs. A `--session` scoped link only opens that one session, and every request
+under it is routed to that tab rather than the focused one. The dashboard
+Sessions table lists each instance's live sessions with their pushed cost and
+an **open** link that mints a two-hour control link scoped to that session.
 
 ## Login and roles
 
