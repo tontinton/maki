@@ -121,15 +121,16 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} --package maki --package maki-anchor
 
       - name: Azure login (Windows Trusted Signing via az)
-        if: runner.os == 'Windows' && secrets.AZURE_CLIENT_ID != ''
+        if: runner.os == 'Windows'
         uses: azure/login@v2
+        continue-on-error: true
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Sign Windows binaries (az Trusted Signing)
-        if: runner.os == 'Windows' && secrets.AZURE_CLIENT_ID != ''
+        if: runner.os == 'Windows'
         shell: pwsh
         env:
           AZURE_TRUSTED_SIGNING_ACCOUNT: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT }}
@@ -137,9 +138,10 @@ jobs:
           AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
         run: |
           az --version
-          az account show
-          if (-not $env:AZURE_TRUSTED_SIGNING_ACCOUNT) { Write-Error "AZURE_TRUSTED_SIGNING_ACCOUNT secret not set"; exit 1 }
-          if (-not $env:AZURE_TRUSTED_SIGNING_PROFILE) { Write-Error "AZURE_TRUSTED_SIGNING_PROFILE secret not set"; exit 1 }
+          az account show 2>$null
+          if ($LASTEXITCODE -ne 0) { Write-Host "az not logged in (no AZURE_CLIENT_ID), skipping signing"; exit 0 }
+          if (-not $env:AZURE_TRUSTED_SIGNING_ACCOUNT) { Write-Host "AZURE_TRUSTED_SIGNING_ACCOUNT not set, skipping signing"; exit 0 }
+          if (-not $env:AZURE_TRUSTED_SIGNING_PROFILE) { Write-Host "AZURE_TRUSTED_SIGNING_PROFILE not set, skipping signing"; exit 0 }
           if (-not $env:AZURE_TRUSTED_SIGNING_ENDPOINT) { $env:AZURE_TRUSTED_SIGNING_ENDPOINT = "https://eus.codesigning.azure.net" }
           Write-Host "Installing AzureSignTool..."
           dotnet tool install --global AzureSignTool --version 6.0.0 2>$null
