@@ -133,12 +133,35 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
-        "Themes use 24-bit colors, but not every terminal can show them. Maki \
-         checks the environment, terminfo, and the terminal itself, and when \
-         truecolor is missing it quietly falls back to the closest of the 256 \
-         classic terminal colors. If detection gets it wrong, set \
+        "Themes use 24-bit colors by default, but not every terminal can show \
+         them. Maki checks the environment, terminfo, and the terminal itself, \
+         and when truecolor is missing it quietly falls back to the closest of \
+         the 256 classic terminal colors. If detection gets it wrong, set \
          `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force \
          the fallback.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "Theme files can also name terminal colors instead of giving hex \
+         values, using the same names as Helix: `default`, `black`, `red`, \
+         `green`, `yellow`, `blue`, `magenta`, `cyan`, `gray`, `light-red`, \
+         `light-green`, `light-yellow`, `light-blue`, `light-magenta`, \
+         `light-cyan`, `light-gray`, and `white`. Write them exactly as \
+         listed. `lightgray`, `light_gray` and `LIGHT-GRAY` are all rejected. \
+         `default` means the terminal default. Maki also takes a number from \
+         `0` to `255` to pick a palette entry by index, which Helix does \
+         not.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "These work everywhere a hex value does, including syntax \
+         highlighting scopes, so a theme can be written entirely against the \
+         palette your terminal already defines. Maki passes them through as \
+         palette references rather than resolving them to RGB, so the colors \
+         stay correct in terminals that mangle truecolor, such as nested tmux \
+         over ssh.\n"
     )
     .unwrap();
 }

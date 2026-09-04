@@ -886,10 +886,32 @@ pub enum SpanStyle {
     Inline(InlineStyle),
 }
 
+/// A color a plugin can ask for. `Ansi` and `Default` keep terminal-owned
+/// colors symbolic all the way to the renderer, so maki never has to guess
+/// what a given index looks like on the user's terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SpanColor {
+    /// Serializes as `[r, g, b]`, matching sessions written before palette
+    /// colors existed.
+    Rgb((u8, u8, u8)),
+    Ansi(u8),
+    /// Serializes as the string `"default"`, the same spelling themes use.
+    Default(DefaultColor),
+}
+
+/// Gives [`SpanColor::Default`] a distinct serialized shape under
+/// `#[serde(untagged)]`, which has no room for a unit variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultColor {
+    Default,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct InlineStyle {
-    pub fg: Option<(u8, u8, u8)>,
-    pub bg: Option<(u8, u8, u8)>,
+    pub fg: Option<SpanColor>,
+    pub bg: Option<SpanColor>,
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
@@ -1449,7 +1471,7 @@ mod tests {
     #[test_case(SpanStyle::Default ; "default")]
     #[test_case(SpanStyle::Named("comment".into()) ; "named")]
     #[test_case(SpanStyle::Inline(InlineStyle {
-        fg: Some((255, 0, 0)),
+        fg: Some(SpanColor::Rgb((255, 0, 0))),
         bg: None,
         bold: true,
         italic: false,
@@ -1466,6 +1488,21 @@ mod tests {
         let json = serde_json::to_string(&span).unwrap();
         let parsed: SnapshotSpan = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, span);
+    }
+
+    /// `#[serde(untagged)]` exists purely so sessions written before palette
+    /// colors still load, so the wire shapes are pinned rather than left to
+    /// whatever the variant order happens to produce.
+    #[test_case(SpanColor::Rgb((255, 0, 0)), "[255,0,0]" ; "rgb stays a triple")]
+    #[test_case(SpanColor::Ansi(4), "4" ; "palette index is a bare number")]
+    #[test_case(SpanColor::Default(DefaultColor::Default), "\"default\"" ; "terminal default is a string")]
+    fn span_color_wire_format(color: SpanColor, expected: &str) {
+        assert_eq!(serde_json::to_string(&color).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_str::<SpanColor>(expected).unwrap(),
+            color,
+            "a stored session must read back as what wrote it"
+        );
     }
 
     #[test_case("", true  ; "plain_output_is_empty_for_empty_string")]

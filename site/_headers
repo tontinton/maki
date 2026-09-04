@@ -1,0 +1,33 @@
+# Cloudflare Pages response headers.
+
+# .cast is an unknown extension, so it is served as application/octet-stream and Cloudflare
+# leaves it uncompressed: 516 KB on the wire for the single asset the hero waits on.
+# Declaring it as text drops it to ~48 KB.
+/demo.cast
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: public, max-age=604800, stale-while-revalidate=2592000
+
+/asciinema-player.min.js
+  Cache-Control: public, max-age=604800, stale-while-revalidate=2592000
+
+/asciinema-player.css
+  Cache-Control: public, max-age=604800, stale-while-revalidate=2592000
+
+/doom-av1.mp4
+  Cache-Control: public, max-age=2592000, stale-while-revalidate=2592000
+
+/doom.mp4
+  Cache-Control: public, max-age=2592000, stale-while-revalidate=2592000
+
+/doom-poster.webp
+  Cache-Control: public, max-age=2592000, stale-while-revalidate=2592000
+
+# fonts are only ever replaced under a new name
+/docs/fonts/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/*.png
+  Cache-Control: public, max-age=2592000
+
+/favicon.ico
+  Cache-Control: public, max-age=2592000

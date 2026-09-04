@@ -579,6 +579,15 @@ mod tests {
     }
 
     #[test]
+    fn package_mutation_is_not_exposed_as_a_startup_lua_api() {
+        let lua = Lua::new();
+        let pack = create_pack_table(&lua).unwrap();
+
+        assert!(pack.get::<Option<LuaValue>>("update").unwrap().is_none());
+        assert!(pack.get::<Option<LuaValue>>("del").unwrap().is_none());
+    }
+
+    #[test]
     fn get_preserves_order_and_reports_exact_state() {
         let (lua, store) = lua_with_store();
         let zeta = lua.create_table().unwrap();

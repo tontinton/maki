@@ -20,6 +20,7 @@ pub(crate) mod split;
 pub(crate) mod task;
 pub(crate) mod text;
 pub(crate) mod tool;
+pub(crate) mod top;
 pub(crate) mod treesitter;
 pub(crate) mod ui;
 pub(crate) mod util;
@@ -28,7 +29,7 @@ pub(crate) mod yaml;
 
 use std::sync::Arc;
 
-use mlua::{Lua, Result as LuaResult, Table};
+use mlua::{Lua, Result as LuaResult, Table, Value};
 
 use crate::api::options::PluginOpts;
 use crate::api::tool::{PendingRules, PendingTools};
@@ -89,10 +90,11 @@ pub(crate) fn create_maki_global(
             Arc::clone(&plugin),
             permissions,
             permissions.is_allowed(Permission::FsWrite),
-            ui_action_tx,
+            ui_action_tx.clone(),
         )?,
     )?;
     split::split__register(&maki, lua)?;
+    top::add_top_methods(&maki, lua, Arc::clone(&plugin))?;
     maki.set("async", r#async::create_async_table(lua)?)?;
     maki.set(
         "interpreter",
@@ -105,6 +107,24 @@ pub(crate) fn create_maki_global(
     )?;
     pack::add_packadd(lua, &maki)?;
     maki.set("pack", pack::create_pack_read_table(lua)?)?;
+
+    // `notify` sits on the metatable's `__index` rather than on the table
+    // itself, because Lua only fires `__newindex` for keys missing from the
+    // raw table. That is what gives `maki.notify = fn` somewhere to be caught
+    // and routed into the one shared slot, instead of quietly shadowing notify
+    // for the assigning plugin alone.
+    let index = lua.create_table()?;
+    top::notify__register(&index, lua, ui_action_tx, Arc::clone(&plugin))?;
+    let notify_router = lua.create_function(
+        move |lua, (t, k, v): (Table, String, Value)| match k.as_str() {
+            "notify" => top::install_notify_handler(lua, Arc::clone(&plugin), v),
+            _ => t.raw_set(k, v),
+        },
+    )?;
+    let meta = lua.create_table()?;
+    meta.set("__index", index)?;
+    meta.set("__newindex", notify_router)?;
+    maki.set_metatable(Some(meta))?;
 
     Ok(maki)
 }

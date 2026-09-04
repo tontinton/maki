@@ -23,7 +23,7 @@ const CWD_MODEL_SEPARATOR: &str = "  ";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
 const YOLO_LABEL: &str = " [yolo]";
-const YOLO_DIM_FACTOR: f32 = 0.5;
+const YOLO_DIM_FACTOR: f32 = 0.15;
 
 pub struct UsageStats {
     /// The whole session's bill, drawn next to the focused chat's own once

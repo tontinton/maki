@@ -2,7 +2,7 @@ use crate::model::{ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::providers::{
     anthropic, aperture, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama,
-    openai, openrouter, regolo, synthetic, tensorx, xai, zai,
+    openai, opencode, openrouter, regolo, synthetic, tensorx, xai, zai,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -177,7 +177,7 @@ const TENSORX: ProviderManifest = ProviderManifest {
 };
 
 const OPENCODE: ProviderManifest = ProviderManifest {
-    slug: "opencode",
+    slug: opencode::ZEN_SLUG,
     display_name: "Opencode Zen",
     family: ModelFamily::Generic,
     supports_thinking: true,
@@ -201,7 +201,7 @@ const XAI: ProviderManifest = ProviderManifest {
 };
 
 const OPENCODE_GO: ProviderManifest = ProviderManifest {
-    slug: "opencode-go",
+    slug: opencode::GO_SLUG,
     display_name: "Opencode Go",
     family: ModelFamily::Generic,
     supports_thinking: false,
@@ -278,6 +278,7 @@ impl ManifestRegistry {
 mod tests {
     use super::*;
     use crate::provider::ProviderKind;
+    use crate::providers::catalog::CATALOG_BACKED_BUILTINS;
     use maki_config::providers::BuiltInProvider;
     use std::str::FromStr;
     use strum::IntoEnumIterator;
@@ -341,16 +342,12 @@ mod tests {
         }
     }
 
-    /// Opencode Zen and Opencode Go come from the fetched catalog and stay
-    /// hidden until the user is authed, so they never join the inventory.
-    const CATALOG_ONLY_SLUGS: &[&str] = &["opencode", "opencode-go"];
-
     /// The picker lists the inventory, so a manifest without an entry is a
     /// provider the user cannot reach. OpenRouter shipped that way for months.
     #[test]
     fn every_builtin_manifest_has_inventory_entry() {
         for manifest in BUILTINS {
-            if CATALOG_ONLY_SLUGS.contains(&manifest.slug) {
+            if CATALOG_BACKED_BUILTINS.contains(&manifest.slug) {
                 continue;
             }
             assert!(

@@ -121,6 +121,7 @@ The rules:
 | [`maki.model`](#maki-model) | The model behind the focused session. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
 | [`maki.session`](#maki-session) | Host session primitives. |
+| [`maki.Timer`](#maki-Timer) | Handle returned by `maki.defer_fn`. |
 | [`maki.task`](#maki-task) | The subagents of the focused session and their transcripts. |
 | [`maki.text`](#maki-text) | Text transformation utilities. |
 | [`maki.treesitter`](#maki-treesitter) | Tree-sitter parsing and query API. |
@@ -207,6 +208,115 @@ Load an installed package that is not active.
 **Parameters:**
 
 - `{name}` (`string`) Package name.
+
+---
+
+### `maki.defer_fn()` {#maki-defer_fn}
+
+```lua
+maki.defer_fn({callback}, {ms})
+```
+
+Run {callback} after {ms} milliseconds, on the Lua thread and outside
+any task scope. The timer does not hang off the caller's cancel token
+or the 60 second `async.run` deadline, so the callback still fires
+once the tool call that scheduled it is over. That is what a toast
+needs to dismiss itself, and the difference from `maki.async.sleep`.
+
+You get back a handle. Its `:stop()` cancels a callback that has not
+fired yet, which is how you debounce: schedule, then stop and
+reschedule on every new event. An error raised by the callback is
+logged and dropped, since nobody is waiting for a result.
+
+**Parameters:**
+
+- `{callback}` (`function`) Called with no arguments.
+- `{ms}` (`integer`) Delay in milliseconds. Zero fires on the next tick.
+
+**Returns:** ([`maki.Timer`](#maki-Timer)) Handle with `:stop()` to cancel before it fires.
+
+**Example:**
+
+```lua
+-- A toast that dismisses itself 4 seconds later:
+local buf = maki.ui.buf({ scratch = true })
+buf:line("copied!")
+local win = maki.ui.open_win(buf, { split = "right", width = 20, height = 3 })
+maki.defer_fn(function() win:close() end, 4000)
+
+-- Repaint only after the user has stopped typing for half a second:
+local pending
+local function repaint_soon()
+  if pending then
+    pending:stop()
+  end
+  pending = maki.defer_fn(repaint, 500)
+end
+```
+
+---
+
+### `maki.notify()` {#maki-notify}
+
+```lua
+maki.notify({msg}, {level?}, {opts?})
+```
+
+Show a one line notice. By default it goes to `maki.ui.flash`, with
+`{opts.title}` in front of the message when you pass one. A run with
+no UI, such as `maki -p` or the sdk, logs the notice instead of
+dropping it.
+
+There is one handler for the whole process. Once a plugin calls
+`maki.set_notify_handler`, notices from every plugin go through it.
+That is how a UI plugin turns flashes into stacked toasts without
+any of the callers knowing about it.
+
+{level} reaches the handler untouched, and the default ignores it.
+
+**Parameters:**
+
+- `{msg}` (`string`) Notice text.
+- `{level?}` (`string?`) Optional. Severity name such as "info", "warn" or "error".
+- `{opts?}` (`table?`) Optional. `title` (string) labels the notice. Free form otherwise.
+
+**Example:**
+
+```lua
+maki.notify("saved!")
+maki.notify("build failed", "error", { title = "make" })
+```
+
+---
+
+### `maki.set_notify_handler()` {#maki-set_notify_handler}
+
+```lua
+maki.set_notify_handler({handler})
+```
+
+Install the handler that every `maki.notify` call in the process goes
+through, in place of the default flash. Pass `nil` to put the default
+back.
+
+The handler runs on the Lua thread, so keep it short and hand real
+work to `maki.async.run`. If it raises an error, the error is logged
+and the notice falls back to `maki.ui.flash`, so the user still sees
+it. Unloading the plugin that installed the handler also restores the
+default.
+
+**Parameters:**
+
+- `{handler}` (`function|nil`) Handler `function(msg, level?, opts?)`, or nil.
+
+**Example:**
+
+```lua
+local Toast = require("maki.toast")
+maki.set_notify_handler(function(msg, level, opts)
+  Toast.show(msg, { title = opts and opts.title, level = level })
+end)
+```
 
 
 ## maki.pack {#maki-pack}
@@ -322,7 +432,7 @@ string or a table with richer output fields.
   - `examples` (`table`) Optional. Array of example input objects for documentation.
   - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
   - `permission` (`string`) Required with `permission_scopes`. The capability the tool exposes to the model: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves this tool.
-  - `mutable_path` (`string`) Schema field name (type: string) for the primary path the tool writes.
+  - `mutable_path` (`string`) Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 
 **Example:**
@@ -1269,6 +1379,34 @@ callback.
 maki.async.run(function()
   local data = expensive_fetch()
   process(data)
+end)
+```
+
+---
+
+### `maki.async.sleep()` {#maki-async-sleep}
+
+```lua
+maki.async.sleep({ms})
+```
+
+Suspend the calling task for {ms} milliseconds. The plugin thread is
+never blocked, so other tasks and the UI keep running, and a cancel
+still lands while you sleep.
+
+For a timer that has to outlive the tool call that started it, such
+as a toast dismissing itself, use `maki.defer_fn`.
+
+**Parameters:**
+
+- `{ms}` (`integer`) Milliseconds to sleep.
+
+**Example:**
+
+```lua
+maki.async.run(function()
+  maki.async.sleep(4000)
+  win:close()
 end)
 ```
 
@@ -3455,6 +3593,30 @@ local _, err = maki.session.set_title({ id = id, title = "refactor" })
 ```
 
 
+## maki.Timer {#maki-Timer}
+
+Handle returned by `maki.defer_fn`. Its `:stop()` cancels the
+callback before it fires, which is what debouncing is built on.
+
+---
+
+### `Timer:stop()` {#Timer-stop}
+
+```lua
+Timer:stop()
+```
+
+Cancel the pending callback. Safe to call more than once, and does
+nothing once the callback has already run.
+
+**Example:**
+
+```lua
+local h = maki.defer_fn(function() rebuild() end, 300)
+h:stop()
+```
+
+
 ## maki.task {#maki-task}
 
 The subagents of the focused session and their transcripts. Tasks are
@@ -4710,21 +4872,32 @@ local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 
 ### `maki.ui.buf()` {#maki-ui-buf}
 
 ```lua
-maki.ui.buf()
+maki.ui.buf({opts?})
 ```
 
-Creates a new buffer for building UI content. The first buffer you
-create in a task becomes the "live" buffer, streamed to the UI while
-your tool runs. Create more buffers for secondary content like
-floating windows.
+Creates a new buffer for building UI content. The first buffer
+created in a task becomes the "live" buffer, streamed to the UI while
+the tool runs, which is what the tool's own output pane wants. A
+float that opens during a tool call would take that spot away, so
+create its buffer with `{ scratch = true }`. It matches nvim's
+`nvim_create_buf(false, true)`.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Optional. `scratch` (boolean) keeps the buffer out of the live slot, default false.
 
 **Returns:** ([`Buf`](#maki-ui-Buf)) Buffer handle.
 
 **Example:**
 
 ```lua
-local buf = maki.ui.buf()
-buf:line("hello world")
+-- The tool's output pane:
+local out = maki.ui.buf()
+out:line("hello world")
+
+-- A float raised during a tool call needs its own buffer:
+local toast = maki.ui.buf({ scratch = true })
+toast:line("copied!")
 ```
 
 ---
@@ -4742,7 +4915,10 @@ your plugin's colors consistent with the rest of the UI.
 
 - `{name}` (`string`) Semantic color name, e.g. "accent" or "background".
 
-**Returns:** (`string|nil`) "#rrggbb" hex color, or nil if the name is unknown.
+**Returns:** (`string|nil`) "#rrggbb" for a truecolor theme, a palette index as a
+  string like "4" when the theme names an ANSI color, or "default" for the
+  terminal's own color. Nil only when the name is unknown. Every form can be
+  passed straight to a span's `fg`/`bg`.
 
 **Example:**
 
@@ -4764,6 +4940,11 @@ maki.ui.highlight({code}, {lang}, {opts?})
 Syntax-highlights a chunk of source code. Returns a table of styled
 lines that you can feed into a buffer. Each line is a list of
 `{text, style}` spans where style is a `{fg, bold?, italic?, underline?}` table.
+
+`fg` is "#rrggbb" for a truecolor theme, a palette index as a string like
+"4" when the theme names an ANSI color, or "default" for the terminal's own
+color. Pass the span straight to `buf:line` and it resolves correctly in
+every case.
 
 **Parameters:**
 
@@ -5023,6 +5204,7 @@ and close the window when you are done.
   - `focus` (`boolean`) whether the window takes keyboard focus on open. Default true.
   - `visible` (`boolean`) whether the window is initially visible. Default true.
   - `needs_input` (`boolean`) whether the window means the session needs user input. Default false.
+  - `stack` (`boolean`) offset the window past the other stacked windows sharing its anchor, in open order, with a one row gap. Closing one moves the rest up. Floating windows only. Default false.
 
 **Returns:** ([`Win`](#maki-ui-Win)) Window handle.
 
@@ -5310,8 +5492,11 @@ Buf:line({line})
 Appends a single line to the end of the buffer. You can pass a
 plain string for unstyled text, or a table of `{text, style?}` spans
 for rich content. Style can be a named string like "bold" or
-"keyword", or an inline table `{fg?, bg?, bold?, italic?, underline?, dim?, strikethrough?, reversed?}`
-with "#rrggbb" color strings.
+"keyword", or an inline table `{fg?, bg?, bold?, italic?, underline?, dim?, strikethrough?, reversed?}`.
+Colors accept "#rrggbb", a terminal color name like "blue" or "light-gray",
+or a palette index as a string like "4". Names must be spelled exactly,
+hyphens included. Named and indexed colors are left for the terminal to
+resolve, so they follow the user's palette.
 
 **Parameters:**
 
@@ -5665,10 +5850,10 @@ shown as full source, larger ones as their public interface.
 local M = {}
 
 function M.lerp(from, to, t)
-  local fr, fg, fb = from:match("#(%x%x)(%x%x)(%x%x)")
-  local tr, tg, tb = to:match("#(%x%x)(%x%x)(%x%x)")
+  local fr, fg, fb = from:match("^#(%x%x)(%x%x)(%x%x)$")
+  local tr, tg, tb = to:match("^#(%x%x)(%x%x)(%x%x)$")
   if not fr or not tr then
-    return from
+    return nil
   end
   fr, fg, fb = tonumber(fr, 16), tonumber(fg, 16), tonumber(fb, 16)
   tr, tg, tb = tonumber(tr, 16), tonumber(tg, 16), tonumber(tb, 16)
@@ -5679,8 +5864,8 @@ function M.lerp(from, to, t)
 end
 
 function M.dim(color, factor)
-  local bg = maki.ui.theme_color("background") or "#000000"
-  return M.lerp(color, bg, factor)
+  local bg = maki.ui.theme_color("background")
+  return bg and M.lerp(color, bg, factor)
 end
 
 return M
@@ -5722,7 +5907,10 @@ function ListPicker.render_header(win, lines, input, prefix, inner)
 -- Open a fuzzy-filter picker in a floating window and block until the user
 -- decides. {items} is a list of strings or { label, detail? } tables. {opts}:
 -- title, footer, cursor (initial index), submit_keys (extra submit keys
--- besides enter). Returns { type = "choice"|"delete", index } or
+-- besides enter), action_keys (keys that close the picker and report
+-- themselves, like { "R" } for a refresh binding. Use uppercase keys, since
+-- lowercase ones keep feeding the filter). Returns
+-- { type = "choice"|"delete", index }, { type = "key", key, index? } or
 -- { type = "close" }.
 function ListPicker.open(items, opts)
 ListPicker.split_words = split_words
@@ -5897,6 +6085,19 @@ function TextInput:handle_key(key)
 -- Wrap lines to {width} with {prefix} before the first row. Returns
 -- { lines = styled lines, cursor_row = 1-based row holding the cursor }.
 function TextInput:render(prefix, prefix_width, width)
+```
+
+### `require("maki.toast")`
+
+```lua
+-- Corner toast notifications built on floating windows. `maki.ui.flash` gives
+-- you one line in the status area. A toast stays up long enough to read, can
+-- carry a title, and stacks under the toasts already on screen.
+
+-- Show {text} as a toast, up to 5 lines of it. {opts}: title (string),
+-- timeout_secs (integer, default 4). Returns right away and the toast
+-- dismisses itself when the time is up.
+function Toast.show(text, opts)
 ```
 
 ### `require("maki.tool_view")`

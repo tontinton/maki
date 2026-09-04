@@ -5,14 +5,14 @@
 //! quotes, camelCase keys, extra wrappers). Plan mode rejects writes to
 //! anything but the plan file before they reach the tool.
 
-mod file_tracker;
+mod file_access;
 pub mod grep;
 pub mod hook;
 pub mod interpreter_bridge;
 pub mod registry;
 pub mod schema;
 
-pub use file_tracker::FileReadTracker;
+pub use file_access::{FileAccess, FileKey};
 pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
@@ -345,7 +345,7 @@ pub struct ToolContext {
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: maki_providers::Timeouts,
-    pub file_tracker: Arc<FileReadTracker>,
+    pub file_access: Arc<FileAccess>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub opts: RequestOptions,
     pub subagent_cancels: Arc<CancelMap<String>>,
@@ -548,7 +548,7 @@ pub fn interpreter_ctx(
     event_tx: &EventSender,
     cancel: CancelToken,
     permissions: Arc<PermissionManager>,
-    file_tracker: Arc<FileReadTracker>,
+    file_access: Arc<FileAccess>,
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     registry: Arc<ToolRegistry>,
 ) -> ToolContext {
@@ -572,7 +572,7 @@ pub fn interpreter_ctx(
         tool_output_lines: ToolOutputLines::default(),
         permissions,
         timeouts: maki_providers::Timeouts::default(),
-        file_tracker,
+        file_access,
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),
@@ -604,7 +604,7 @@ pub fn cli_tool_ctx() -> ToolContext {
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             Arc::default(),
         )),
-        Arc::new(FileReadTracker::new()),
+        FileAccess::fresh(),
         None,
         Arc::clone(ToolRegistry::global_arc()),
     )
@@ -733,7 +733,7 @@ pub mod test_support {
             event_tx,
             CancelToken::none(),
             Arc::clone(&TEST_PERMISSIONS),
-            Arc::new(FileReadTracker::new()),
+            FileAccess::fresh(),
             None,
             Arc::new(ToolRegistry::new()),
         );
@@ -757,7 +757,7 @@ pub mod test_support {
             &event_tx,
             CancelToken::none(),
             permissions,
-            Arc::new(FileReadTracker::new()),
+            FileAccess::fresh(),
             None,
             Arc::new(ToolRegistry::new()),
         );

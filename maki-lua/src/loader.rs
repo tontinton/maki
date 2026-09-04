@@ -28,6 +28,7 @@ use maki_agent::prompt::ResolvedSlots;
 use maki_storage::id::MakiId;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const PACK_STATE_UNAVAILABLE: &str = "could not read package state: plugin host stopped";
 const USER_PLUGIN: &str = "user";
 pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
 /// Tests assert on this exact text, so a wording tweak here updates them too.
@@ -301,7 +302,7 @@ impl PluginHost {
     ) -> Result<Option<RawConfig>, PluginError> {
         let mut merged: Option<RawConfig> = None;
 
-        for global_dir in maki_config::global_config_dirs() {
+        for global_dir in maki_storage::paths::config_search_dirs() {
             self.run_init_file(
                 &global_dir.join("init.lua"),
                 ConfigScope::Global,
@@ -969,6 +970,20 @@ impl EventHandle {
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
         rx.recv().unwrap_or_default()
+    }
+
+    pub fn package_context(&self) -> Result<crate::pack::PackContext, String> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send(Request::CollectPackageContext { reply: reply_tx })
+            .map_err(|_| PACK_STATE_UNAVAILABLE.to_owned())?;
+        let (declared, active) = reply_rx
+            .recv()
+            .map_err(|_| PACK_STATE_UNAVAILABLE.to_owned())?;
+        let installed = crate::pack::installed_names()
+            .ok_or_else(|| "could not read the package lockfile".to_owned())?;
+
+        Ok(crate::pack::PackContext::new(declared, installed, active))
     }
 
     pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {

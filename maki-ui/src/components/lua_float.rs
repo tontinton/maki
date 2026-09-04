@@ -19,6 +19,9 @@ use crate::components::{
 use crate::repaint::{Cadence, Dirty};
 use crate::theme;
 
+/// Blank rows kept between two windows of the same stack.
+const STACK_GAP: u16 = 1;
+
 /// A top band, a bottom band, and the scrollable middle. When the window is too
 /// short for both bands the bottom wins, so footers like keybind hints survive
 /// even when the header gets squeezed out.
@@ -301,6 +304,32 @@ impl FloatManager {
         true
     }
 
+    /// A stacked window sits below (or above, for the south anchors) every
+    /// stacked window opened before it in the same corner, so its offset can
+    /// only be known here, where the whole list is in scope. Recomputing it
+    /// each frame is what makes survivors close the hole left by a window
+    /// that went away, with nothing to keep in sync.
+    fn stack_offset(&self, idx: usize, area: Rect) -> u16 {
+        let win = &self.windows[idx];
+        if !Self::stacks(win) {
+            return 0;
+        }
+        self.windows
+            .iter()
+            .filter(|w| Self::stacks(w) && w.config.anchor == win.config.anchor && w.id < win.id)
+            .fold(0, |acc, w| {
+                acc.saturating_add(w.config.height.resolve(area.height).min(area.height))
+                    .saturating_add(STACK_GAP)
+            })
+    }
+
+    /// Deliberately blind to `visible`: `view` paints every float whatever
+    /// that flag says, and a window that is drawn but left out of the stack
+    /// would land right on top of whoever took its slot.
+    fn stacks(win: &FloatWindow) -> bool {
+        win.config.stack && win.config.split == Split::None
+    }
+
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         let mut union = Rect::default();
 
@@ -308,7 +337,11 @@ impl FloatManager {
             if self.windows[idx].config.split != Split::None {
                 continue;
             }
-            let popup = resolve_rect(&self.windows[idx].config, area);
+            let popup = resolve_rect(
+                &self.windows[idx].config,
+                area,
+                self.stack_offset(idx, area),
+            );
             if popup.width == 0 || popup.height == 0 {
                 continue;
             }
@@ -542,7 +575,10 @@ fn hint_footer<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> 
     Line::from(spans)
 }
 
-fn resolve_rect(config: &FloatConfig, area: Rect) -> Rect {
+/// `stack_offset` slides the window along the anchor's vertical direction
+/// after `config.row` has been applied, so `row` stays the point the stack
+/// grows from.
+fn resolve_rect(config: &FloatConfig, area: Rect, stack_offset: u16) -> Rect {
     let w = config.width.resolve(area.width).min(area.width);
     let h = config.height.resolve(area.height).min(area.height);
 
@@ -575,6 +611,12 @@ fn resolve_rect(config: &FloatConfig, area: Rect) -> Rect {
             (x, y)
         }
     };
+
+    let y = match config.anchor {
+        Anchor::NW | Anchor::NE => y.saturating_add(stack_offset),
+        Anchor::SW | Anchor::SE => y.saturating_sub(stack_offset),
+    }
+    .clamp(area.y, area.y + area.height);
 
     let clamped_w = w.min(area.x + area.width - x);
     let clamped_h = h.min(area.y + area.height - y);
@@ -674,6 +716,7 @@ mod tests {
     const EXPECT_PASTE_TRUE: &str = "handle_paste should return true when focused";
     const EXPECT_PASTE_FALSE: &str = "handle_paste should return false with no focus";
     const PASTE_TEXT: &str = "hello";
+    const NO_STACK_OFFSET: u16 = 0;
 
     fn make_line(text: &str) -> SnapshotLine {
         SnapshotLine {
@@ -757,7 +800,7 @@ mod tests {
             height: Dimension::Percent(40),
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
         assert_eq!(r.width, 100);
         assert_eq!(r.height, 40);
         assert_eq!(r.x, 50);
@@ -775,7 +818,7 @@ mod tests {
             anchor: Anchor::NW,
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
         assert_eq!(r.x, 10);
         assert_eq!(r.y, 5);
         assert_eq!(r.width, 20);
@@ -793,7 +836,7 @@ mod tests {
             anchor: Anchor::SE,
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
         assert_eq!(r.x, 80);
         assert_eq!(r.y, 40);
     }
@@ -806,7 +849,7 @@ mod tests {
             height: Dimension::Abs(50),
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
         assert_eq!(r.width, 30);
         assert_eq!(r.height, 20);
     }
@@ -822,7 +865,7 @@ mod tests {
             anchor: Anchor::NE,
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
         assert_eq!(r.x, 80);
         assert_eq!(r.y, 5);
     }
@@ -838,7 +881,7 @@ mod tests {
             anchor: Anchor::SW,
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
         assert_eq!(r.x, 5);
         assert_eq!(r.y, 40);
     }
@@ -854,7 +897,7 @@ mod tests {
             anchor: Anchor::SE,
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
         assert_eq!(r.x, 70);
         assert_eq!(r.y, 35);
     }
@@ -867,7 +910,7 @@ mod tests {
             height: Dimension::Abs(10),
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
         assert_eq!(r.x, 40);
         assert_eq!(r.y, 20);
         assert!(r.x >= area.x && r.x + r.width <= area.x + area.width);
@@ -882,7 +925,7 @@ mod tests {
             height: Dimension::Abs(10),
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
         assert_eq!(r.width, 0);
         assert_eq!(r.height, 0);
     }
@@ -898,9 +941,92 @@ mod tests {
             anchor: Anchor::NW,
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
         assert_eq!(r.x, 10);
         assert_eq!(r.y, 0, "only col is set, so row falls back to 0");
+    }
+
+    const STACK_AREA: Rect = Rect::new(0, 0, 100, 50);
+    const STACK_ROW: i16 = 1;
+    const STACK_HEIGHT: u16 = 4;
+    const EXPECT_STACK_STEPS: &str =
+        "a stacked float must clear every earlier float in its corner, plus the gap";
+    const EXPECT_STACK_CLOSES_GAP: &str = "survivors must take over the closed float's slot";
+    const EXPECT_PLAIN_UNSTACKED: &str =
+        "a float without stack must neither move nor take up stack room";
+
+    fn stack_config(anchor: Anchor, stack: bool) -> FloatConfig {
+        FloatConfig {
+            width: Dimension::Abs(20),
+            height: Dimension::Abs(STACK_HEIGHT),
+            row: Some(STACK_ROW),
+            col: Some(0),
+            anchor,
+            stack,
+            ..FloatConfig::default()
+        }
+    }
+
+    fn open_float(mgr: &mut FloatManager, config: FloatConfig) -> u32 {
+        let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
+        mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
+        mgr.next_id - 1
+    }
+
+    /// Rows the windows would be painted at this frame, keyed by id so the
+    /// zindex sort of `windows` cannot make the expectations drift.
+    fn rows_by_id(mgr: &FloatManager) -> Vec<(u32, u16)> {
+        let mut rows: Vec<(u32, u16)> = (0..mgr.windows.len())
+            .map(|idx| {
+                let win = &mgr.windows[idx];
+                let offset = mgr.stack_offset(idx, STACK_AREA);
+                (win.id, resolve_rect(&win.config, STACK_AREA, offset).y)
+            })
+            .collect();
+        rows.sort_by_key(|(id, _)| *id);
+        rows
+    }
+
+    #[test_case(Anchor::NE, [1, 6, 11] ; "ne_grows_downwards")]
+    #[test_case(Anchor::SE, [47, 42, 37] ; "se_grows_upwards")]
+    fn stacked_floats_offset_past_earlier_windows(anchor: Anchor, expected: [u16; 3]) {
+        let mut mgr = FloatManager::new();
+        for _ in 0..expected.len() {
+            open_float(&mut mgr, stack_config(anchor, true));
+        }
+
+        let rows: Vec<u16> = rows_by_id(&mgr).into_iter().map(|(_, y)| y).collect();
+        assert_eq!(rows, expected, "{EXPECT_STACK_STEPS}");
+    }
+
+    #[test]
+    fn closing_first_stacked_float_moves_survivors_up() {
+        let mut mgr = FloatManager::new();
+        let first = open_float(&mut mgr, stack_config(Anchor::NE, true));
+        let second = open_float(&mut mgr, stack_config(Anchor::NE, true));
+        let third = open_float(&mut mgr, stack_config(Anchor::NE, true));
+
+        mgr.remove_windows(|w| w.id == first);
+
+        assert_eq!(
+            rows_by_id(&mgr),
+            vec![(second, 1), (third, 6)],
+            "{EXPECT_STACK_CLOSES_GAP}",
+        );
+    }
+
+    #[test]
+    fn plain_float_neither_shifts_nor_joins_the_stack() {
+        let mut mgr = FloatManager::new();
+        let first = open_float(&mut mgr, stack_config(Anchor::NE, true));
+        let plain = open_float(&mut mgr, stack_config(Anchor::NE, false));
+        let second = open_float(&mut mgr, stack_config(Anchor::NE, true));
+
+        assert_eq!(
+            rows_by_id(&mgr),
+            vec![(first, 1), (plain, 1), (second, 6)],
+            "{EXPECT_PLAIN_UNSTACKED}",
+        );
     }
 
     #[test_case(0, 5, 0, 10 => 0 ; "empty_content")]

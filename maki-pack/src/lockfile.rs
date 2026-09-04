@@ -46,6 +46,10 @@ impl Lockfile {
         );
     }
 
+    pub fn remove(&mut self, name: &str) {
+        self.packages.remove(name);
+    }
+
     /// Every recorded name, alphabetically. Pruning and `pack.get` walk the
     /// lockfile this way, so neither depends on insertion order.
     pub fn install_order(&self) -> impl Iterator<Item = &str> {

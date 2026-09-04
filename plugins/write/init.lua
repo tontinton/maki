@@ -76,11 +76,6 @@ maki.api.register_tool({
 
     local path = maki.fs.abspath(raw)
 
-    local ok, err = ctx:check_before_edit(path)
-    if not ok then
-      return { llm_output = err, is_error = true }
-    end
-
     local parent = maki.fs.dirname(path)
     if parent then
       maki.fs.mkdir(parent, { parents = true })
@@ -90,8 +85,6 @@ maki.api.register_tool({
     if write_err then
       return { llm_output = "write error: " .. tostring(write_err), is_error = true }
     end
-
-    ctx:record_read(path)
 
     local byte_count = #content
     local rel = shorten_path(path)

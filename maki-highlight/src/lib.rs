@@ -11,16 +11,105 @@ use syntect::highlighting::{
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
+pub mod pool;
+
 const TOKEN_ALIASES: &[(&str, &str)] = &[("jsx", "js")];
 pub const TAB_SPACES: &str = "  ";
 const BLOCK_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 
+/// Bat encodes ANSI palette semantics in the syntect alpha channel, and
+/// syntect passes the bytes through untouched. `a = 0` means `r` holds a
+/// palette index, `a = 1` means the terminal default.
+const ANSI_ALPHA_INDEX: u8 = 0x00;
+const ANSI_ALPHA_DEFAULT: u8 = 0x01;
+pub const DEFAULT_COLOR_NAME: &str = "default";
+const HEX_RGB_LEN: usize = 6;
+
 type Rgb = (u8, u8, u8);
 pub type BlockSegments = Arc<Vec<Vec<StyledSegment>>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentColor {
+    Rgb(Rgb),
+    Ansi(u8),
+    Default,
+}
+
+impl SegmentColor {
+    pub fn from_syntect(c: syntect::highlighting::Color) -> Self {
+        match c.a {
+            ANSI_ALPHA_INDEX => Self::Ansi(c.r),
+            ANSI_ALPHA_DEFAULT => Self::Default,
+            _ => Self::Rgb((c.r, c.g, c.b)),
+        }
+    }
+
+    pub fn to_syntect(self) -> syntect::highlighting::Color {
+        let (r, g, b, a) = match self {
+            Self::Rgb((r, g, b)) => (r, g, b, 0xFF),
+            Self::Ansi(i) => (i, 0, 0, ANSI_ALPHA_INDEX),
+            Self::Default => (0, 0, 0, ANSI_ALPHA_DEFAULT),
+        };
+        syntect::highlighting::Color { r, g, b, a }
+    }
+
+    /// The one reader of the `#rrggbb | index | name | default` grammar, so
+    /// themes, syntax scopes and plugin spans cannot drift apart on what they
+    /// accept.
+    pub fn parse(s: &str) -> Option<Self> {
+        if let Some(hex) = s.strip_prefix('#') {
+            return parse_hex_rgb(hex).map(Self::Rgb);
+        }
+        if s == DEFAULT_COLOR_NAME {
+            return Some(Self::Default);
+        }
+        if s.bytes().all(|b| b.is_ascii_digit()) {
+            return s.parse().ok().map(Self::Ansi);
+        }
+        ansi_color_index(s).map(Self::Ansi)
+    }
+}
+
+/// Rejects the `+4` and `-0` that `u8::from_str` would otherwise accept, and
+/// any casing or separator sloppiness, so a spelling either resolves exactly
+/// or not at all.
+fn parse_hex_rgb(hex: &str) -> Option<Rgb> {
+    if hex.len() != HEX_RGB_LEN || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some((channel(0)?, channel(2)?, channel(4)?))
+}
+
+/// Resolve a terminal color name to its palette index. These are Helix's
+/// palette names, so its themes load unchanged. Spelling is exact:
+/// `light-gray` resolves, `lightgray` and `LIGHT-GRAY` do not.
+pub fn ansi_color_index(name: &str) -> Option<u8> {
+    let index = match name {
+        "black" => 0,
+        "red" => 1,
+        "green" => 2,
+        "yellow" => 3,
+        "blue" => 4,
+        "magenta" => 5,
+        "cyan" => 6,
+        "gray" => 7,
+        "light-gray" => 8,
+        "light-red" => 9,
+        "light-green" => 10,
+        "light-yellow" => 11,
+        "light-blue" => 12,
+        "light-magenta" => 13,
+        "light-cyan" => 14,
+        "white" => 15,
+        _ => return None,
+    };
+    Some(index)
+}
+
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<RwLock<Arc<Theme>>> = OnceLock::new();
-static UI_COLORS: OnceLock<RwLock<HashMap<String, Rgb>>> = OnceLock::new();
+static UI_COLORS: OnceLock<RwLock<HashMap<String, SegmentColor>>> = OnceLock::new();
 static BLOCK_CACHE: OnceLock<RwLock<BlockCache>> = OnceLock::new();
 static THEME_GEN: AtomicU64 = AtomicU64::new(0);
 
@@ -149,15 +238,15 @@ pub fn theme() -> Arc<Theme> {
         .clone()
 }
 
-fn ui_colors_lock() -> &'static RwLock<HashMap<String, Rgb>> {
+fn ui_colors_lock() -> &'static RwLock<HashMap<String, SegmentColor>> {
     UI_COLORS.get_or_init(RwLock::default)
 }
 
-pub fn set_ui_colors(colors: HashMap<String, Rgb>) {
+pub fn set_ui_colors(colors: HashMap<String, SegmentColor>) {
     *ui_colors_lock().write().unwrap_or_else(|e| e.into_inner()) = colors;
 }
 
-pub fn theme_color(name: &str) -> Option<Rgb> {
+pub fn theme_color(name: &str) -> Option<SegmentColor> {
     if let Some(&c) = ui_colors_lock()
         .read()
         .unwrap_or_else(|e| e.into_inner())
@@ -167,13 +256,14 @@ pub fn theme_color(name: &str) -> Option<Rgb> {
     }
     let settings = &theme().settings;
     let map = serde_json::to_value(settings).ok()?;
-    let obj = map.as_object()?;
-    let val = obj.get(name)?;
-    let obj = val.as_object()?;
-    let r = obj.get("r")?.as_u64()? as u8;
-    let g = obj.get("g")?.as_u64()? as u8;
-    let b = obj.get("b")?.as_u64()? as u8;
-    Some((r, g, b))
+    let obj = map.as_object()?.get(name)?.as_object()?;
+    let channel = |k: &str| obj.get(k)?.as_u64().map(|v| v as u8);
+    Some(SegmentColor::from_syntect(syntect::highlighting::Color {
+        r: channel("r")?,
+        g: channel("g")?,
+        b: channel("b")?,
+        a: channel("a")?,
+    }))
 }
 
 pub fn syntax_set() -> &'static SyntaxSet {
@@ -279,7 +369,7 @@ impl Highlighter {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StyledSegment {
     pub text: String,
-    pub fg: (u8, u8, u8),
+    pub fg: SegmentColor,
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
@@ -287,10 +377,9 @@ pub struct StyledSegment {
 
 impl StyledSegment {
     fn from_syntect(style: SynStyle, text: String) -> Self {
-        let f = style.foreground;
         Self {
             text,
-            fg: (f.r, f.g, f.b),
+            fg: SegmentColor::from_syntect(style.foreground),
             bold: style.font_style.contains(FontStyle::BOLD),
             italic: style.font_style.contains(FontStyle::ITALIC),
             underline: style.font_style.contains(FontStyle::UNDERLINE),
@@ -300,7 +389,7 @@ impl StyledSegment {
     fn fallback(text: String) -> Self {
         Self {
             text,
-            fg: (204, 204, 204),
+            fg: SegmentColor::Default,
             bold: false,
             italic: false,
             underline: false,
@@ -351,19 +440,29 @@ pub fn highlight_lines_independent(lang: &str, code: &str) -> Vec<Vec<StyledSegm
         .collect()
 }
 
-pub fn highlight_ansi(lang: &str, code: &str, bg: (u8, u8, u8)) -> String {
-    let bg_code = format!("\x1b[48;2;{};{};{}m", bg.0, bg.1, bg.2);
+pub fn highlight_ansi(lang: &str, code: &str, bg: SegmentColor) -> String {
+    let bg_code = match bg {
+        SegmentColor::Rgb((r, g, b)) => format!("\x1b[48;2;{r};{g};{b}m"),
+        SegmentColor::Ansi(i) => format!("\x1b[48;5;{i}m"),
+        SegmentColor::Default => "\x1b[49m".to_owned(),
+    };
     let mut hl = Highlighter::for_token(lang);
     let mut out = String::new();
     for line in LinesWithEndings::from(code) {
         out.push_str(&bg_code);
         for seg in hl.highlight_line(line) {
             let bold = if seg.bold { "1;" } else { "" };
-            let _ = write!(
-                out,
-                "\x1b[{bold}38;2;{};{};{}m{}",
-                seg.fg.0, seg.fg.1, seg.fg.2, seg.text
-            );
+            match seg.fg {
+                SegmentColor::Ansi(i) => {
+                    let _ = write!(out, "\x1b[{bold}38;5;{i}m{}", seg.text);
+                }
+                SegmentColor::Default => {
+                    let _ = write!(out, "\x1b[{bold}39m{}", seg.text);
+                }
+                SegmentColor::Rgb((r, g, b)) => {
+                    let _ = write!(out, "\x1b[{bold}38;2;{r};{g};{b}m{}", seg.text);
+                }
+            }
         }
         out.push_str("\x1b[K\x1b[0m\n");
     }
@@ -460,6 +559,69 @@ impl CodeHighlighter {
         }
 
         &self.cached_segments
+    }
+}
+
+#[cfg(test)]
+mod color_names {
+    use super::{SegmentColor, ansi_color_index};
+    use test_case::test_case;
+
+    /// Every name in Helix's default palette, which we accept unchanged.
+    /// https://docs.helix-editor.com/themes.html#color-palettes
+    #[test_case("black", 0)]
+    #[test_case("red", 1)]
+    #[test_case("green", 2)]
+    #[test_case("yellow", 3)]
+    #[test_case("blue", 4)]
+    #[test_case("magenta", 5)]
+    #[test_case("cyan", 6)]
+    #[test_case("gray", 7)]
+    #[test_case("light-red", 9)]
+    #[test_case("light-green", 10)]
+    #[test_case("light-yellow", 11)]
+    #[test_case("light-blue", 12)]
+    #[test_case("light-magenta", 13)]
+    #[test_case("light-cyan", 14)]
+    #[test_case("light-gray", 8)]
+    #[test_case("white", 15)]
+    fn helix_palette_names_resolve(name: &str, index: u8) {
+        assert_eq!(ansi_color_index(name), Some(index));
+    }
+
+    #[test_case("lightgray"; "missing separator")]
+    #[test_case("LIGHT-GRAY"; "uppercase")]
+    #[test_case("bright-red"; "bright is not a helix name")]
+    #[test_case("grey"; "grey is not a helix name")]
+    fn sloppy_spellings_are_rejected(name: &str) {
+        assert_eq!(ansi_color_index(name), None);
+    }
+
+    /// Themes, syntax scopes and plugin spans all read the grammar through
+    /// here, so the accepted spellings are pinned once at the source rather
+    /// than at each of the three call sites.
+    #[test_case("#fda331", SegmentColor::Rgb((0xfd, 0xa3, 0x31)); "lowercase hex")]
+    #[test_case("#FDA331", SegmentColor::Rgb((0xfd, 0xa3, 0x31)); "uppercase hex")]
+    #[test_case("light-blue", SegmentColor::Ansi(12); "helix name")]
+    #[test_case("0", SegmentColor::Ansi(0); "first index")]
+    #[test_case("255", SegmentColor::Ansi(255); "last index")]
+    #[test_case("default", SegmentColor::Default; "terminal default")]
+    fn accepted_spellings(input: &str, expected: SegmentColor) {
+        assert_eq!(SegmentColor::parse(input), Some(expected));
+    }
+
+    #[test_case("+4"; "signed index")]
+    #[test_case("-0"; "negative index")]
+    #[test_case("256"; "index out of range")]
+    #[test_case("ff0000"; "hex without a hash")]
+    #[test_case("#fff"; "three digit hex")]
+    #[test_case("#gggggg"; "hex with non hex digits")]
+    #[test_case("#ff000000"; "eight digit hex")]
+    #[test_case("lightgray"; "sloppy name")]
+    #[test_case("LIGHT-GRAY"; "uppercase name")]
+    #[test_case(""; "empty")]
+    fn rejected_spellings(input: &str) {
+        assert_eq!(SegmentColor::parse(input), None);
     }
 }
 
@@ -639,7 +801,11 @@ mod tests {
     #[test]
     fn highlight_ansi_formatting() {
         warmup();
-        let out = highlight_ansi("rust", "let x = 1;\nlet y = 2;\n", (30, 30, 30));
+        let out = highlight_ansi(
+            "rust",
+            "let x = 1;\nlet y = 2;\n",
+            SegmentColor::Rgb((30, 30, 30)),
+        );
         let bg_count = out.matches("\x1b[48;2;30;30;30m").count();
         assert_eq!(bg_count, 2, "each line should get its own bg escape");
         assert!(out.ends_with("\x1b[K\x1b[0m\n"));
@@ -901,5 +1067,33 @@ mod tests {
         let aliased = syntax_for_token(alias);
         let canonical_syntax = syntax_set().find_syntax_by_token(canonical).unwrap();
         assert_eq!(aliased.name, canonical_syntax.name);
+    }
+
+    #[test_case(ANSI_ALPHA_INDEX, SegmentColor::Ansi(9); "index marker")]
+    #[test_case(ANSI_ALPHA_DEFAULT, SegmentColor::Default; "default marker")]
+    #[test_case(0xFF, SegmentColor::Rgb((9, 2, 3)); "opaque rgb")]
+    fn alpha_marker_decodes_to_segment_color(alpha: u8, expected: SegmentColor) {
+        let c = syntect::highlighting::Color {
+            r: 9,
+            g: 2,
+            b: 3,
+            a: alpha,
+        };
+        assert_eq!(SegmentColor::from_syntect(c), expected);
+    }
+
+    #[test_case(SegmentColor::Rgb((9, 2, 3)); "rgb")]
+    #[test_case(SegmentColor::Ansi(9); "palette index")]
+    #[test_case(SegmentColor::Default; "terminal default")]
+    fn segment_color_survives_a_syntect_roundtrip(color: SegmentColor) {
+        assert_eq!(SegmentColor::from_syntect(color.to_syntect()), color);
+    }
+
+    #[test_case(SegmentColor::Ansi(4), "\x1b[48;5;4m"; "palette background")]
+    #[test_case(SegmentColor::Default, "\x1b[49m"; "terminal default background")]
+    fn highlight_ansi_keeps_non_rgb_backgrounds_symbolic(bg: SegmentColor, expected: &str) {
+        warmup();
+        let out = highlight_ansi("rust", "let x = 1;\n", bg);
+        assert!(out.contains(expected), "{out:?}");
     }
 }

@@ -20,11 +20,13 @@ use maki_agent::{
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{
-    BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader, SessionEndReason,
+    BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader, PackCommand,
+    PackPlan, PackPreparation, PackReport, SessionEndReason,
 };
 use maki_providers::{ContentBlock, Effort, Message, Role, THINKING_USAGE, TokenUsage};
 use maki_storage::sessions::{SessionMeta, StoredMode, StoredThinking};
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -33,6 +35,11 @@ use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const TASK_ID: &str = "task1";
+const PACKUPDATE: &str = "/packupdate";
+const PACK_NAME: &str = "demo";
+const PACKDEL_USAGE: &str = "/packdel: name a package, or pass ++all";
+const PACK_FAILURES: &str = "first; second";
+const PACK_REVIEW_PROMPT: &str = "Apply these package changes?";
 pub(crate) const RESEARCH_NAME: &str = "research";
 const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
@@ -51,6 +58,10 @@ const MODEL_CHANGED_EVENT: &str = "ModelChanged";
 const PLAN_READY_EVENT: &str = "PlanReady";
 const PLAN_DRAFT_PATH: &str = "/tmp/plan.md";
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
+const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
+const CURSOR_ON_SCREEN: &str = "the reported cursor must be on screen";
+const CURSOR_ON_REVERSED_CELL: &str = "the focused input box owns a reversed cursor cell";
+const OVERLAY_TAKES_THE_CURSOR: &str = "an overlay unfocuses the input box, so no cell is reversed";
 /// Stands in for a size the provider measured, baseline included.
 const MEASURED_CONTEXT: u32 = 100_000;
 const TEST_MODEL_SPEC: &str = "test-model";
@@ -666,10 +677,16 @@ pub(crate) fn error_app(app: &mut App) {
     }));
 }
 
-fn cmd(name: &str) -> ParsedCommand {
+/// Splits the line the way the palette does, so a test can write what the
+/// user types.
+fn cmd(cmdline: &str) -> ParsedCommand {
+    let (name, args) = cmdline
+        .split_once(char::is_whitespace)
+        .unwrap_or((cmdline, ""));
     ParsedCommand {
         name: name.to_string(),
-        args: String::new(),
+        args: args.trim().to_string(),
+        bang: false,
     }
 }
 
@@ -1534,24 +1551,31 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
     );
 }
 
-#[test]
-fn compact_command_sets_streaming() {
+const COMPACT_GUIDANCE: &str = "keep the failing test names";
+const COMPACT_WITH_GUIDANCE: &str = "/compact keep the failing test names";
+
+#[test_case("/compact", None ; "no_guidance")]
+#[test_case(COMPACT_WITH_GUIDANCE, Some(COMPACT_GUIDANCE) ; "guidance_forwarded")]
+fn compact_command_sets_streaming(cmdline: &str, expected: Option<&str>) {
     let mut app = test_app();
-    let actions = app.execute_command(cmd("/compact"), 0);
-    assert!(matches!(&actions[0], Action::Compact));
+    let actions = app.execute_command(cmd(cmdline), 0);
+    assert!(
+        matches!(&actions[0], Action::Compact(instructions) if instructions.as_deref() == expected)
+    );
     assert_eq!(app.status, Status::Streaming);
 }
 
-#[test]
-fn compact_during_streaming_queues_item() {
+#[test_case("/compact" ; "bare")]
+#[test_case(COMPACT_WITH_GUIDANCE ; "guidance_shown_in_panel")]
+fn compact_during_streaming_queues_item(cmdline: &str) {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
 
-    let actions = app.execute_command(cmd("/compact"), 0);
+    let actions = app.execute_command(cmd(cmdline), 0);
     assert!(actions.is_empty());
     assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.queue.panel_entries()[0].text, "/compact");
+    assert_eq!(app.queue.panel_entries()[0].text, cmdline);
 }
 
 #[test]
@@ -1850,8 +1874,47 @@ fn status_hints_published_by_a_plugin_reach_the_screen() {
 fn rendered(app: &mut App) -> String {
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal.draw(|frame| app.view(frame)).unwrap();
+    terminal
+        .draw(|frame| {
+            app.view(frame);
+        })
+        .unwrap();
     buffer_text(terminal.backend().buffer())
+}
+
+/// The event loop parks the terminal cursor on whatever `view` reports, so an
+/// IME anchors its preedit text there. The report has to be the very cell the
+/// input box reversed for its software cursor, and the hardware cursor has to
+/// stay hidden: shown, it would invert that cell back to plain text.
+#[test]
+fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
+    let mut app = test_app();
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    let mut draw = |app: &mut App| {
+        let mut cursor = None;
+        terminal.draw(|frame| cursor = app.view(frame)).unwrap();
+        assert!(
+            !terminal.backend().cursor_visible(),
+            "{CURSOR_STAYS_HIDDEN}"
+        );
+        cursor.map(|pos| {
+            let cell = terminal
+                .backend()
+                .buffer()
+                .cell(pos)
+                .expect(CURSOR_ON_SCREEN);
+            (pos, cell.modifier.contains(Modifier::REVERSED))
+        })
+    };
+
+    assert!(
+        matches!(draw(&mut app), Some((_, true))),
+        "{CURSOR_ON_REVERSED_CELL}"
+    );
+
+    app.update(Msg::Key(kb::HELP.to_key_event()));
+    assert_eq!(draw(&mut app), None, "{OVERLAY_TAKES_THE_CURSOR}");
 }
 
 /// When the picker gives up on a directory it cannot list, the flash is the
@@ -2699,6 +2762,7 @@ fn cd_command_behavior() {
         ParsedCommand {
             name: "/cd".into(),
             args: "/tmp".into(),
+            bang: false,
         },
         0,
     );
@@ -2715,6 +2779,7 @@ fn cd_command_behavior() {
         ParsedCommand {
             name: "/cd".into(),
             args: "/nonexistent_path_12345".into(),
+            bang: false,
         },
         0,
     );
@@ -3255,6 +3320,7 @@ fn btw_empty_flashes_error() {
         ParsedCommand {
             name: "/btw".into(),
             args: String::new(),
+            bang: false,
         },
         0,
     );
@@ -3272,6 +3338,7 @@ fn btw_with_question_returns_action() {
         ParsedCommand {
             name: "/btw".into(),
             args: "what is rust?".into(),
+            bang: false,
         },
         0,
     );
@@ -4035,6 +4102,7 @@ fn thinking_explicit_args() {
         ParsedCommand {
             name: "/thinking".into(),
             args: "8192".into(),
+            bang: false,
         },
         0,
     );
@@ -4044,6 +4112,7 @@ fn thinking_explicit_args() {
         ParsedCommand {
             name: "/thinking".into(),
             args: "high".into(),
+            bang: false,
         },
         0,
     );
@@ -4058,6 +4127,93 @@ fn thinking_unsupported_model_flashes_error() {
     app.execute_command(cmd("/thinking"), 0);
     assert_eq!(app.state.thinking, ThinkingConfig::Off);
     assert_eq!(app.status_bar.flash_text(), Some(THINKING_UNSUPPORTED_MSG));
+}
+
+#[test]
+fn package_commands_are_user_only_and_preserve_update_bang() {
+    let mut app = test_app();
+    let typed = || ParsedCommand {
+        name: PACKUPDATE.into(),
+        args: PACK_NAME.into(),
+        bang: true,
+    };
+
+    app.execute_command(typed(), 1);
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert_eq!(
+        app.status_bar.flash_text().unwrap(),
+        format!("{PACKUPDATE}{PACK_USER_ONLY_SUFFIX}")
+    );
+
+    let actions = app.execute_command(typed(), 0);
+    assert_eq!(app.exit_request, ExitRequest::None);
+    let [Action::PreparePack(PackCommand::Update { name, options })] = actions.as_slice() else {
+        panic!("expected one package preparation action");
+    };
+    assert_eq!(name.as_deref(), Some(PACK_NAME));
+    assert!(options.force);
+}
+
+#[test]
+fn invalid_package_command_stays_in_the_current_tui() {
+    let mut app = test_app();
+
+    let actions = app.execute_command(
+        ParsedCommand {
+            name: "/packdel".into(),
+            args: "one two".into(),
+            bang: false,
+        },
+        0,
+    );
+
+    assert!(actions.is_empty());
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert_eq!(app.status_bar.flash_text(), Some(PACKDEL_USAGE));
+}
+
+#[test]
+fn completed_package_preparation_reports_all_failures_without_exit() {
+    let mut app = test_app();
+    let report = PackReport {
+        failures: vec!["first".into(), "second".into()],
+        ..PackReport::default()
+    };
+
+    let actions = app.handle_pack_preparation(PackPreparation::Complete(report));
+
+    assert!(actions.is_empty());
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert_eq!(app.status_bar.flash_text(), Some(PACK_FAILURES));
+}
+
+/// Preparation runs off the event loop, so an agent can raise a permission
+/// prompt while the review is already up. The prompt has a tool waiting on it
+/// and owns the bottom panel, so it answers first even though it opened last.
+#[test]
+fn a_pending_permission_prompt_answers_before_the_package_review() {
+    let mut app = test_app();
+    app.handle_pack_preparation(PackPreparation::Review {
+        prompt: PACK_REVIEW_PROMPT.into(),
+        plan: PackPlan::default(),
+    });
+    app.permission_prompt.open(
+        "id".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+    );
+
+    app.update(Msg::Key(KeyEvent::from(KeyCode::Char('y'))));
+
+    assert!(!app.permission_prompt.is_open());
+    assert!(app.pack_review.is_open(), "the review waits its turn");
+    assert_eq!(app.exit_request, ExitRequest::None);
+
+    app.update(Msg::Key(KeyEvent::from(KeyCode::Char('y'))));
+
+    assert!(!app.pack_review.is_open());
+    assert!(matches!(app.exit_request, ExitRequest::Pack(_)));
 }
 
 #[test]

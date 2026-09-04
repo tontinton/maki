@@ -7,6 +7,7 @@
 //! waits on every event source at once and wakes the moment a plugin action,
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,8 +29,9 @@ use maki_lua::session_snapshot::{
     SessionSnapshot,
 };
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionEndReason,
-    SessionRequest, TaskRequest, UiAction, UiAttachment, UiReply,
+    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, PackCommand,
+    PackPreparation, SessionEndReason, SessionRequest, TaskRequest, UiAction, UiAttachment,
+    UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -38,13 +40,14 @@ use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::sessions::{SessionError, normalize_title};
+use ratatui::backend::Backend;
 use serde_json::json;
 use tracing::{info, warn};
 
 use crate::AppSession;
 use crate::agent::{
     AgentCommand, AgentHandles, ModelSlot,
-    shared_queue::{QueueItem, QueuedInput},
+    shared_queue::{Compaction, QueueItem, QueuedInput},
 };
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::tasks::{TaskStatus, diff_task_states};
@@ -67,6 +70,9 @@ const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
 const INVALID_MODEL_ERR: &str = "Invalid model";
 const PROVIDER_INIT_ERR: &str = "Failed to create provider";
 const NOT_LIVE_ERR: &str = "session not live";
+const PACK_PREPARING: &str = "Checking packages...";
+const PACK_BUSY_ERR: &str = "a package command is already running";
+const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -83,6 +89,7 @@ pub struct EventLoopParams {
     pub sessions: Vec<AppSession>,
     pub focused: usize,
     pub startup_warnings: Vec<String>,
+    pub startup_notice: Option<String>,
     pub storage: StateDir,
     pub config: AgentConfig,
     pub ui_config: UiConfig,
@@ -439,6 +446,12 @@ pub(crate) struct EventLoop<'t> {
     warn_tx: flume::Sender<String>,
     ui_action_rx: flume::Receiver<UiAction>,
     ui_attachment: UiAttachment,
+    pack_tx: flume::Sender<Box<PackPreparation>>,
+    pack_rx: flume::Receiver<Box<PackPreparation>>,
+    /// One package command at a time. The work runs on its own thread, so
+    /// without this a second `/packupdate` would race the first over the same
+    /// clones and locks.
+    pack_running: bool,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -451,6 +464,7 @@ enum Wake {
     Agent(usize, Box<maki_agent::Envelope>),
     Shell(usize, ShellEvent),
     Warn(String),
+    Pack(Box<PackPreparation>),
 }
 
 struct BackgroundModels {
@@ -540,6 +554,7 @@ impl<'t> EventLoop<'t> {
             sessions,
             focused,
             mut startup_warnings,
+            startup_notice,
             storage,
             config,
             ui_config,
@@ -574,7 +589,7 @@ impl<'t> EventLoop<'t> {
 
         static PROCESS_WARMUP: std::sync::Once = std::sync::Once::new();
         PROCESS_WARMUP.call_once(|| {
-            std::thread::spawn(crate::highlight::warmup);
+            maki_highlight::pool::spawn(crate::highlight::warmup);
             crate::update::spawn_check();
         });
 
@@ -633,10 +648,14 @@ impl<'t> EventLoop<'t> {
             let msg = format!("MCP config error: {}", ctx.mcp_config_errors);
             app.flash(msg);
         }
-        for w in startup_warnings {
-            app.flash(w);
+        if let Some(notice) = startup_notice {
+            app.flash(notice);
+        }
+        for warning in startup_warnings {
+            app.flash(warning);
         }
 
+        let (pack_tx, pack_rx) = flume::unbounded();
         Ok(Self {
             terminal,
             sessions: runtimes,
@@ -650,12 +669,40 @@ impl<'t> EventLoop<'t> {
             warn_tx: bg.warn_tx,
             ui_action_rx,
             ui_attachment,
+            pack_tx,
+            pack_rx,
+            pack_running: false,
             _model_fetch_task: bg.task,
         })
     }
 
     fn focused_app(&mut self) -> &mut App {
         &mut self.sessions[self.focused].app
+    }
+
+    /// Paints a frame and parks the terminal cursor on the cell the input box
+    /// reversed, without showing it. macOS anchors IME preedit text to the
+    /// cursor, so it has to sit there, but a visible one would invert that
+    /// already reversed cell back to plain text and ride along with every cell
+    /// the next diff writes.
+    ///
+    /// `Frame::set_cursor_position` cannot do this: ratatui shows the cursor
+    /// whenever a frame asks for a position. Hence the move after the draw,
+    /// and the hide that goes with it, so a widget that does ask for one
+    /// cannot bring the block cursor back.
+    fn paint(&mut self) -> Result<()> {
+        let app = &mut self.sessions[self.focused].app;
+        let mut cursor = None;
+        self.terminal.draw(|f| {
+            cursor = app.view(f);
+            color_compat::downgrade_if_needed(f.buffer_mut());
+        })?;
+        if let Some(pos) = cursor {
+            self.terminal.hide_cursor()?;
+            self.terminal.set_cursor_position(pos)?;
+            self.terminal.backend_mut().flush()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<ShutdownReport> {
@@ -677,14 +724,10 @@ impl<'t> EventLoop<'t> {
                 Err(e) => break Err(e),
             }
             self.checkpoint_all();
-            if dirty.take() {
-                let app = &mut self.sessions[self.focused].app;
-                if let Err(e) = self.terminal.draw(|f| {
-                    app.view(f);
-                    color_compat::downgrade_if_needed(f.buffer_mut());
-                }) {
-                    break Err(e.into());
-                }
+            if dirty.take()
+                && let Err(e) = self.paint()
+            {
+                break Err(e);
             }
 
             if let Some(i) = self.sessions.iter().position(|rt| {
@@ -734,6 +777,7 @@ impl<'t> EventLoop<'t> {
             sel = sel.recv(&self.ui_action_rx, |res| res.ok().map(Wake::Ui));
         }
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
+        sel = sel.recv(&self.pack_rx, |res| res.ok().map(Wake::Pack));
         for (i, rt) in self.sessions.iter().enumerate() {
             if !rt.handles.agent_rx.is_disconnected() {
                 sel = sel.recv(&rt.handles.agent_rx, move |res| {
@@ -755,6 +799,7 @@ impl<'t> EventLoop<'t> {
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
+            Wake::Pack(preparation) => self.finish_pack(*preparation),
         }
         Ok(())
     }
@@ -1484,11 +1529,14 @@ impl<'t> EventLoop<'t> {
             Action::UnassignTier(spec, tier) => {
                 maki_providers::model_registry::unset_and_persist(&spec, tier, &self.ctx.storage);
             }
-            Action::Compact => {
+            Action::Compact(instructions) => {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();
                 let run_id = rt.app.run_id;
-                rt.handles.queue.push(QueueItem::Compact { run_id });
+                rt.handles.queue.push(QueueItem::Compact(Compaction {
+                    run_id,
+                    instructions,
+                }));
             }
             Action::ToggleMcp(server_name, enabled) => {
                 self.sessions[idx].handles.send_mcp(McpCommand::Toggle {
@@ -1536,6 +1584,7 @@ impl<'t> EventLoop<'t> {
                     slot.model.clone(),
                 );
             }
+            Action::PreparePack(command) => self.start_pack(idx, command),
             Action::Suspend => {
                 let _pause = self.input.pause();
                 terminal::suspend(self.terminal);
@@ -1564,6 +1613,42 @@ impl<'t> EventLoop<'t> {
             provider: Arc::from(new_provider),
         }));
         Ok(())
+    }
+
+    /// Prepares a package command on its own thread.
+    ///
+    /// Preparation fetches over the network through a git child process nothing
+    /// here can cancel. Inline it would freeze drawing and input for as long as
+    /// the slowest remote takes, so the answer comes back as an event instead.
+    fn start_pack(&mut self, idx: usize, command: PackCommand) {
+        if self.pack_running {
+            self.sessions[idx].app.flash(PACK_BUSY_ERR.to_owned());
+            return;
+        }
+        self.pack_running = true;
+        self.sessions[idx].app.flash(PACK_PREPARING.to_owned());
+        let handle = self.ctx.lua_event_handle.clone();
+        let tx = self.pack_tx.clone();
+        std::thread::spawn(move || {
+            // Without this a panic drops the sender with no answer, and
+            // `pack_running` stays set for the rest of the process, so every
+            // later package command reports "already running".
+            let preparation = catch_unwind(AssertUnwindSafe(|| match handle.package_context() {
+                Ok(context) => maki_lua::prepare_pack_command(&command, &context),
+                Err(error) => PackPreparation::failed(error),
+            }))
+            .unwrap_or_else(|_| PackPreparation::failed(PACK_PANIC_ERR.to_owned()));
+            let _ = tx.send(Box::new(preparation));
+        });
+    }
+
+    /// The answer lands on the focused session, not on the one that asked: a
+    /// package command reloads the whole Lua host, and only the focused session
+    /// is read for an exit request or seen by whoever answers the review.
+    fn finish_pack(&mut self, preparation: PackPreparation) {
+        self.pack_running = false;
+        let actions = self.focused_app().handle_pack_preparation(preparation);
+        self.dispatch(self.focused, actions);
     }
 
     fn refresh_models(&self) {
@@ -1624,7 +1709,7 @@ impl<'t> EventLoop<'t> {
             phase_start = Instant::now();
             elapsed
         };
-        let exit = self.sessions[self.focused].app.exit_request;
+        let exit = self.sessions[self.focused].app.exit_request.clone();
         // The loop already stopped draining `UiAction`, so say so before the
         // handlers run. Dropping the receiver does not, since the Lua runtime
         // holds one of its own, and a handler touching the UI would then park

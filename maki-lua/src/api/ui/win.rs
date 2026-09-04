@@ -226,6 +226,10 @@ fn set_config(_lua: &Lua, this: &WinHandle, opts: Table) -> LuaResult<()> {
     }
     patch.width = try_parse_dimension(&opts, "width");
     patch.height = try_parse_dimension(&opts, "height");
+    // A missing key leaves the window where it is. Lua has no way to say
+    // "clear this back to the centre", since a table cannot hold a nil.
+    patch.row = opts.get::<Option<i16>>("row")?.map(Some);
+    patch.col = opts.get::<Option<i16>>("col")?.map(Some);
     this.send(WinCommand::SetConfig(patch));
     Ok(())
 }

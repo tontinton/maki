@@ -1,8 +1,17 @@
 local ToolView = require("maki.tool_view")
 local helpers = require("memory_helpers")
 local ListPicker = require("maki.list_picker")
+local Toast = require("maki.toast")
 
 local WRITE_TOOLS = { "write", "edit", "multiedit", "edit_lines", "insert_lines" }
+
+-- A toast and not a flash, because this feedback has to stay readable while
+-- the picker is still covering the screen. Kept local on purpose: claiming the
+-- global `maki.notify` slot here would put a "memory" toast in front of every
+-- other plugin's notices too.
+local function notify(msg)
+  Toast.show(msg, { title = "memory" })
+end
 
 local function memories_path_suffix()
   local cwd = maki.uv.cwd()
@@ -301,10 +310,12 @@ maki.api.register_command({
         title = " Memory Files ",
         cursor = last_cursor,
         submit_keys = { "ctrl+o" },
+        action_keys = { "R" },
         footer = {
           { "Enter", "open" },
           { "Ctrl+O", "edit" },
           { "Ctrl+D", "delete" },
+          { "R", "refresh" },
         },
       })
 
@@ -326,14 +337,21 @@ maki.api.register_command({
         local item = items[event.index]
         local ok, err = maki.fs.rm(maki.fs.joinpath(dir, item.label))
         if ok then
-          maki.ui.flash("Deleted " .. item.label)
+          notify("Deleted " .. item.label)
           items = popup_build_items(dir)
           if #items == 0 then
             break
           end
         else
-          maki.ui.flash("Delete failed: " .. tostring(err))
+          notify("Delete failed: " .. tostring(err))
         end
+      elseif event.type == "key" and event.key == "R" then
+        items = popup_build_items(dir)
+        if #items == 0 then
+          notify("No memories yet")
+          break
+        end
+        notify(#items .. " memories loaded")
       else
         break
       end

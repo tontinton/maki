@@ -28,8 +28,7 @@ fn a_session_count_reaches_the_collector() {
         ..TelemetryConfig::default()
     };
 
-    // The env is empty in this binary, so only the Lua side is in play.
-    maki_otel::init(&config).expect("telemetry should start");
+    maki_otel::init_with_env(&config, support::no_env).expect("telemetry should start");
     assert!(maki_otel::enabled());
 
     maki_otel::emit::session_started(maki_otel::emit::START_FRESH, None);

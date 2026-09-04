@@ -7,7 +7,6 @@
 //! pending whitespace widths, the only scratch we keep.
 
 use std::mem;
-use std::slice;
 
 use ratatui::buffer::CellWidth;
 use ratatui::style::Style;
@@ -26,21 +25,36 @@ pub(crate) enum Break {
 ///
 /// Public so `benches/wrap.rs` can race it against `Paragraph::line_count`.
 pub fn total_rows(lines: &[Line<'_>], width: u16) -> u16 {
-    if width == 0 {
-        return lines.len() as u16;
+    let mut measure = Measure::new(width);
+    lines
+        .iter()
+        .fold(0, |rows, line| rows.saturating_add(measure.rows(line)))
+}
+
+/// Measures one line at a time, keeping the scan machine between them, so a
+/// caller that walks a segment in pieces pays for measuring it once instead of
+/// once per piece.
+pub(crate) struct Measure {
+    /// Absent at zero width, where every line counts as one row.
+    scan: Option<Scan>,
+}
+
+impl Measure {
+    pub(crate) fn new(width: u16) -> Self {
+        Self {
+            scan: (width > 0).then(|| Scan::new(u32::from(width))),
+        }
     }
-    let mut scan = Scan::new(u32::from(width));
-    lines.iter().fold(0, |rows, line| {
-        rows.saturating_add(scan.run(line, &mut |_| {}))
-    })
+
+    pub(crate) fn rows(&mut self, line: &Line<'_>) -> u16 {
+        self.scan
+            .as_mut()
+            .map_or(1, |scan| scan.run(line, &mut |_| {}))
+    }
 }
 
-pub(crate) fn line_rows(line: &Line<'_>, width: u16) -> u16 {
-    total_rows(slice::from_ref(line), width)
-}
-
-/// Calls `on_break` once per row boundary inside `line`, so exactly
-/// `line_rows(line, width) - 1` times.
+/// Calls `on_break` once per row boundary inside `line`, so exactly one less
+/// than the rows the line draws as.
 ///
 /// The scan reports one break too many when a row ends on whitespace the
 /// renderer swallows: that break closes the line instead of opening a row, so a
@@ -210,7 +224,7 @@ impl Scan {
 
 #[cfg(test)]
 mod tests {
-    use super::{Break, breaks, line_rows, total_rows};
+    use super::{Break, breaks, total_rows};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Paragraph, Wrap};
     use std::slice;
@@ -269,7 +283,7 @@ mod tests {
         let lines = corpus_lines();
         for width in (1..=40).chain([80, 200]) {
             for line in &lines {
-                let rows = line_rows(line, width);
+                let rows = total_rows(slice::from_ref(line), width);
                 assert_eq!(
                     rows,
                     ratatui_rows(slice::from_ref(line), width),

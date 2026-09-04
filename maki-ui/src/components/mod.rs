@@ -13,6 +13,7 @@ pub(crate) mod mcp_picker;
 pub mod messages;
 pub(crate) mod modal;
 pub(crate) mod model_picker;
+pub(crate) mod pack_review;
 pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
@@ -33,6 +34,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
 use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
+use maki_lua::{PackCommand, PackPlan};
 use maki_providers::{Message, ModelTier};
 use ratatui::text::{Line, Span};
 
@@ -200,29 +202,31 @@ pub enum Action {
     UnassignTier(String, ModelTier),
     RefreshModels,
     RefreshUsage,
-    Compact,
+    Compact(Option<String>),
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),
     EditInputInEditor,
     Btw(String),
+    PreparePack(PackCommand),
     Suspend,
 }
 
 const ERROR_DISPLAY: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ExitRequest {
     #[default]
     None,
     Success,
     Error,
     Reload,
+    Pack(PackPlan),
 }
 
 impl ExitRequest {
     pub fn code(&self) -> i32 {
         match self {
-            Self::None | Self::Success | Self::Reload => 0,
+            Self::None | Self::Success | Self::Reload | Self::Pack(_) => 0,
             Self::Error => 1,
         }
     }

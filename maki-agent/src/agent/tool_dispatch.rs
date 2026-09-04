@@ -13,7 +13,8 @@ use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
 use crate::tools::registry::{InstalledHook, RegisteredTool, ToolInvocation};
 use crate::tools::{
-    CallOrigin, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext, truncate_bytes,
+    CallOrigin, Deadline, FileKey, LocalTool, LocalToolFn, ToolAudience, ToolContext,
+    truncate_bytes,
 };
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::ToolKey;
@@ -506,18 +507,27 @@ async fn run_native_tool(
         }
     };
 
-    if let Some(target) = invocation.mutable_path() {
-        let is_plan_target = ctx.mode.plan_path().is_some_and(|pp| target == pp);
+    // The one declaration a file-mutating tool makes, and the only place its
+    // four consequences live: plan-mode block, boundary block, write
+    // serialization, and the stale-read check. Keyed once so all four agree on
+    // what "the same file" means.
+    let mutated = invocation.mutable_path().map(FileKey::new);
+
+    if let Some(key) = &mutated {
+        let is_plan_target = ctx
+            .mode
+            .plan_path()
+            .is_some_and(|plan| FileKey::new(plan) == *key);
         if !is_plan_target {
             if ctx.mode.plan_path().is_some() {
                 warn!(
                     tool = %name,
-                    target = %target.display(),
+                    target = %key.as_path().display(),
                     "blocked write in plan mode"
                 );
                 return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
             }
-            if let Some(reason) = ctx.permissions.boundary_block_reason(target) {
+            if let Some(reason) = ctx.permissions.boundary_block_reason(key.as_path()) {
                 return done_error(reason);
             }
         }
@@ -544,7 +554,38 @@ async fn run_native_tool(
         return done_error(e);
     }
 
+    // Taken after the permission gate, so a pending approval prompt never
+    // holds a file lock, and around the whole handler, so it may `await`
+    // freely without a sibling call on the same file interleaving its
+    // read-modify-write. Every early return below drops it.
+    //
+    // The stale-read check belongs inside the lock: outside it, two siblings
+    // both pass before either writes.
+    let _guard = match &mutated {
+        Some(key) => {
+            let guard = ctx.file_access.acquire(key).await;
+            if ctx.config.stale_read_check
+                && let Err(message) = ctx.file_access.check_before_edit(key)
+            {
+                return done_error(message);
+            }
+            Some(guard)
+        }
+        None => None,
+    };
+
     let result = invocation.execute(ctx).await;
+
+    // Nothing else could have touched the file while the guard was held, so the
+    // mtime is refreshed here instead of by each write plugin remembering to.
+    // Only on success: a failed or half-finished write must leave the changed
+    // mtime visible, so the next edit is correctly told the file moved.
+    if result.output.is_ok()
+        && let Some(key) = &mutated
+    {
+        ctx.file_access.record_read(key);
+    }
+
     let elapsed = started.elapsed();
     match result.output {
         Ok(output) => {

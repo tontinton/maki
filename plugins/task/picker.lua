@@ -37,16 +37,14 @@ local function dispw(s)
   return utf8.len(s) or #s
 end
 
--- Opening a subagent puts its transcript where the main chat was, and the picker
--- is the only way back, so the input area advertises the key while the session
--- has subagents. maki.task.list() suspends and autocmd callbacks cannot, so the
--- round-trip runs off to the side.
+-- The input area advertises the picker key while subagents are still working,
+-- and drops the hint once the last one finishes. maki.task.list() suspends and
+-- autocmd callbacks cannot, so the round-trip runs off to the side.
 local function refresh_hint()
   maki.async.run(function()
     local n = 0
     for _, task in ipairs(maki.task.list() or {}) do
-      -- The main chat is listed too, and it is the one entry without a status.
-      if task.status then
+      if task.status == "working" then
         n = n + 1
       end
     end

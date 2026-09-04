@@ -7,7 +7,7 @@ use maki_agent::mcp::{McpHandle, McpSession};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::template;
 use maki_agent::template::Vars;
-use maki_agent::tools::{FileReadTracker, RequestTools, ToolAudience, ToolRegistry};
+use maki_agent::tools::{FileAccess, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, History, Instructions,
@@ -36,7 +36,7 @@ pub(super) struct AgentLoop {
     cancel_map: Arc<RunCancelMap>,
     init_cancel: CancelToken,
     permissions: Arc<PermissionManager>,
-    file_tracker: Arc<FileReadTracker>,
+    file_access: Arc<FileAccess>,
     min_run_id: u64,
     agent_tx: flume::Sender<Envelope>,
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
@@ -86,7 +86,7 @@ impl AgentLoop {
             cancel_map,
             init_cancel,
             permissions,
-            file_tracker: FileReadTracker::fresh(),
+            file_access: FileAccess::fresh(),
             min_run_id: 0,
             agent_tx,
             answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
@@ -126,7 +126,10 @@ impl AgentLoop {
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
 
         let result = match run {
-            QueueRun::Compact { .. } => self.do_compact(&event_tx).await,
+            QueueRun::Compact(compaction) => {
+                self.do_compact(&event_tx, compaction.instructions.as_deref())
+                    .await
+            }
             QueueRun::Messages(messages) => {
                 let inputs = messages
                     .into_iter()
@@ -173,7 +176,11 @@ impl AgentLoop {
         !self.init_cancel.is_cancelled()
     }
 
-    async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
+    async fn do_compact(
+        &mut self,
+        event_tx: &EventSender,
+        instructions: Option<&str>,
+    ) -> Result<(), AgentError> {
         let slot = self.model_slot.load();
         let (provider, model) = agent::resolve_compaction_model(
             &slot.provider,
@@ -187,6 +194,7 @@ impl AgentLoop {
             &mut self.history,
             event_tx,
             &self.config,
+            instructions,
         )
         .await
     }
@@ -258,7 +266,7 @@ impl AgentLoop {
                 session_id: self.session_id.clone(),
                 mailbox: self.mailbox.clone(),
                 timeouts: self.timeouts,
-                file_tracker: Arc::clone(&self.file_tracker),
+                file_access: Arc::clone(&self.file_access),
                 prompt_slots: Arc::new(prompt_slots),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
                 ledger: Arc::new(RunLedger::default()),

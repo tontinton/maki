@@ -12,6 +12,11 @@ pub struct Request {
     pub body: Vec<u8>,
 }
 
+/// Empty environment, so only the Lua config is in play.
+pub fn no_env(_key: &str) -> Option<String> {
+    None
+}
+
 pub fn serve_once() -> (String, JoinHandle<Request>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let endpoint = format!("http://{}", listener.local_addr().unwrap());

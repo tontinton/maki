@@ -40,6 +40,11 @@ const TOOLS_MCP_PROBE: &str = "tools_mcp_probe";
 /// registry.
 const CLIENT_TOOL: &str = "client_probe";
 const CLIENT_TOOL_OUT: &str = "client ran";
+const EDIT_TARGET: &str = "f.rs";
+const MARKER_A: &str = "AAA";
+const MARKER_B: &str = "BBB";
+const EDITED_A: &str = "aaa";
+const EDITED_B: &str = "bbb";
 
 fn fixture_plugin() -> String {
     format!(
@@ -249,6 +254,37 @@ fn gather_keeps_sibling_results_when_one_call_fails(call: &str) {
     assert!(
         out.contains(&format!("{ERROR_PREFIX}interp_fail: {FAIL_MSG}")),
         "failed call must name the tool and its error: {out}"
+    );
+}
+
+/// Regression, and the sibling of `parallel_edits_to_one_file_all_apply` in
+/// `batch_policy`: `asyncio.gather` is the other way two `edit` calls end up
+/// interleaved, and a batch-only fix would miss it.
+#[test]
+fn parallel_edits_to_one_file_all_apply() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join(EDIT_TARGET);
+    std::fs::write(&path, format!("{MARKER_A}\n{MARKER_B}\n")).unwrap();
+    let quoted = path.to_str().expect("utf-8 temp path");
+
+    let reg = Arc::new(ToolRegistry::new());
+    let _host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let out = exec_code(
+        &reg,
+        &shaped_ctx(&reg, |_| {}),
+        &format!(
+            "await asyncio.gather(\n\
+             \x20 edit(path='{quoted}', old_string='{MARKER_A}', new_string='{EDITED_A}'),\n\
+             \x20 edit(path='{quoted}', old_string='{MARKER_B}', new_string='{EDITED_B}'),\n\
+             )"
+        ),
+    )
+    .expect("both edits must succeed");
+
+    assert!(!out.contains(ERROR_PREFIX), "got: {out}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{EDITED_A}\n{EDITED_B}\n")
     );
 }
 

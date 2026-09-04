@@ -12,16 +12,7 @@ use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = maki_storage::paths::home() {
-            return home.join(rest);
-        }
-    } else if path == "~"
-        && let Some(home) = maki_storage::paths::home()
-    {
-        return home;
-    }
-    PathBuf::from(path)
+    maki_storage::paths::expand_tilde(Path::new(path))
 }
 
 fn make_absolute(path: &str) -> LuaResult<PathBuf> {

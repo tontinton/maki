@@ -74,7 +74,7 @@ fn style_for_token(
             italic,
             underline,
         } => {
-            let mut s = Style::default().fg(ratatui::style::Color::Rgb(fg.0, fg.1, fg.2));
+            let mut s = theme::segment_style(*fg);
             if *bold {
                 s = s.add_modifier(Modifier::BOLD);
             }

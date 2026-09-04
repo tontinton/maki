@@ -116,6 +116,28 @@ pub fn incremental_canonicalize(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Resolve a leading `~`. The one answer to what a tilde means, because a
+/// spelling one layer expands and another does not is two names for one file.
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    match (path.strip_prefix("~"), home()) {
+        (Ok(rest), Some(home)) => home.join(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// The identity of a file, independent of how a path was spelled: relative or
+/// absolute, with `..` or not, through a symlink or not, under `~` or spelled
+/// out, existing or not yet.
+///
+/// Over-resolving is safe here; under-resolving is the bug, because two keys
+/// for one file mean two locks for one file, or a staleness check that looks
+/// up an entry nobody wrote.
+pub fn canonical_key(path: &Path) -> PathBuf {
+    let expanded = expand_tilde(path);
+    let abs = std::path::absolute(&expanded).unwrap_or(expanded);
+    incremental_canonicalize(&abs).unwrap_or_else(|| normalize_path(&abs))
+}
+
 /// Strip the `\\?\` prefix that Windows `canonicalize` adds, using the
 /// Rust `Prefix` enum for correct WTF-8 handling (no `.to_str()` lossy
 /// conversion).
@@ -269,24 +291,91 @@ pub fn legacy_home_dir() -> Option<PathBuf> {
         .filter(|d| d.is_dir())
 }
 
-/// Candidate config directories for `subdir` from `home` and `xdg_config`.
-/// Pure: no env reads, no process-home fallback. Production callers pass
-/// `config_dir().ok()` as `xdg_config` (which honors `XDG_CONFIG_HOME`, the
-/// `~/.maki` fallback, and the Windows `AppData\Roaming` strategy via
-/// `resolve()`); tests pass tempdirs.
-pub fn user_config_dirs(
-    home: Option<&Path>,
-    xdg_config: Option<&Path>,
-    subdir: &str,
-) -> Vec<PathBuf> {
-    let legacy = home.map(|h| h.join(FALLBACK_DIR).join(subdir));
-    let xdg = xdg_config.map(|d| d.join(subdir));
+/// Where to look for user config, best match first. Writes still go to
+/// `config_dir()`.
+///
+/// The two are not the same: `config_dir()` collapses to `~/.maki` the moment
+/// that directory exists, so anything that reads it alone goes blind to
+/// `~/.config/maki`, which is where the docs tell people to put their files.
+pub fn config_search_dirs() -> Vec<PathBuf> {
+    config_search_dirs_from(home().as_deref(), xdg_config_dir().ok().as_deref())
+}
+
+pub fn find_config_path(name: &str) -> Option<PathBuf> {
+    config_search_dirs()
+        .into_iter()
+        .map(|dir| dir.join(name))
+        .find(|path| path.exists())
+}
+
+/// Pure core of `config_search_dirs`: no env reads, no process-home fallback,
+/// so tests can hand it tempdirs.
+pub fn config_search_dirs_from(home: Option<&Path>, xdg_config: Option<&Path>) -> Vec<PathBuf> {
+    let legacy = home.map(|h| h.join(FALLBACK_DIR)).filter(|d| d.is_dir());
+    let xdg = xdg_config
+        .map(Path::to_path_buf)
+        .filter(|d| Some(d) != legacy.as_ref());
     [legacy, xdg].into_iter().flatten().collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
+
+    const KEYED_FILE: &str = "f.rs";
+    const SUBDIR: &str = "sub";
+
+    #[test_case(|_rel, abs| abs.join(KEYED_FILE); "absolute")]
+    #[test_case(|rel, _abs| rel.join(KEYED_FILE); "relative")]
+    #[test_case(|rel, _abs| rel.join(SUBDIR).join("..").join(KEYED_FILE); "parent_component")]
+    fn every_spelling_of_one_file_is_one_key(spell: fn(&Path, &Path) -> PathBuf) {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::TempDir::new_in(&cwd).unwrap();
+        let abs = dir.path();
+        let rel = PathBuf::from(abs.file_name().unwrap());
+        fs::create_dir(abs.join(SUBDIR)).unwrap();
+
+        let expected = canonical_key(&abs.join(KEYED_FILE));
+        assert_eq!(
+            canonical_key(&spell(&rel, abs)),
+            expected,
+            "before the file exists"
+        );
+
+        fs::write(abs.join(KEYED_FILE), "content").unwrap();
+        assert_eq!(
+            canonical_key(&spell(&rel, abs)),
+            expected,
+            "once the file exists"
+        );
+    }
+
+    #[test]
+    fn tilde_spelling_is_one_key() {
+        let home = home().expect("no home dir");
+        assert_eq!(
+            canonical_key(Path::new("~").join(KEYED_FILE).as_path()),
+            canonical_key(&home.join(KEYED_FILE))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_spelling_is_one_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join(SUBDIR);
+        let link = dir.path().join("link");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join(KEYED_FILE), "content").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            canonical_key(&link.join(KEYED_FILE)),
+            canonical_key(&real.join(KEYED_FILE))
+        );
+    }
 
     #[test]
     fn normalize_path_resolves_parent() {
@@ -350,38 +439,55 @@ mod tests {
     }
 
     #[test]
-    fn user_config_dirs_returns_legacy_and_xdg() {
+    fn search_dirs_returns_legacy_and_xdg() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy = home.path().join(FALLBACK_DIR);
+        let xdg = home.path().join(".config").join(APP_NAME);
+        fs::create_dir(&legacy).unwrap();
+
+        let dirs = config_search_dirs_from(Some(home.path()), Some(&xdg));
+        assert_eq!(dirs, vec![legacy, xdg]);
+    }
+
+    #[test]
+    fn search_dirs_omits_legacy_when_it_does_not_exist() {
         let home = tempfile::tempdir().unwrap();
         let xdg = home.path().join(".config").join(APP_NAME);
 
-        let dirs = user_config_dirs(Some(home.path()), Some(&xdg), "AGENTS.md");
-        assert_eq!(
-            dirs,
-            vec![
-                home.path().join(FALLBACK_DIR).join("AGENTS.md"),
-                xdg.join("AGENTS.md"),
-            ]
-        );
+        let dirs = config_search_dirs_from(Some(home.path()), Some(&xdg));
+        assert_eq!(dirs, vec![xdg]);
     }
 
     #[test]
-    fn user_config_dirs_omits_legacy_when_home_none() {
+    fn search_dirs_omits_legacy_when_home_none() {
         let xdg = tempfile::tempdir().unwrap();
 
-        let dirs = user_config_dirs(None, Some(xdg.path()), "AGENTS.md");
-        assert_eq!(dirs, vec![xdg.path().join("AGENTS.md")]);
+        let dirs = config_search_dirs_from(None, Some(xdg.path()));
+        assert_eq!(dirs, vec![xdg.path().to_path_buf()]);
     }
 
     #[test]
-    fn user_config_dirs_omits_xdg_when_xdg_none() {
+    fn search_dirs_omits_xdg_when_xdg_none() {
         let home = tempfile::tempdir().unwrap();
+        let legacy = home.path().join(FALLBACK_DIR);
+        fs::create_dir(&legacy).unwrap();
 
-        let dirs = user_config_dirs(Some(home.path()), None, "AGENTS.md");
-        assert_eq!(dirs, vec![home.path().join(FALLBACK_DIR).join("AGENTS.md")]);
+        let dirs = config_search_dirs_from(Some(home.path()), None);
+        assert_eq!(dirs, vec![legacy]);
     }
 
     #[test]
-    fn user_config_dirs_neither_depends_on_process_env() {
+    fn search_dirs_does_not_repeat_the_same_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy = home.path().join(FALLBACK_DIR);
+        fs::create_dir(&legacy).unwrap();
+
+        let dirs = config_search_dirs_from(Some(home.path()), Some(&legacy));
+        assert_eq!(dirs, vec![legacy]);
+    }
+
+    #[test]
+    fn search_dirs_neither_depends_on_process_env() {
         let home_a = tempfile::tempdir().unwrap();
         let xdg_a = home_a.path().join(".config").join(APP_NAME);
 
@@ -391,7 +497,7 @@ mod tests {
         // SAFETY: tests run single-threaded within a process nextest invokes once.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", hostile.path()) };
 
-        let dirs = user_config_dirs(Some(home_a.path()), Some(&xdg_a), "AGENTS.md");
+        let dirs = config_search_dirs_from(Some(home_a.path()), Some(&xdg_a));
 
         // SAFETY: same single-threaded assumption as above.
         unsafe {

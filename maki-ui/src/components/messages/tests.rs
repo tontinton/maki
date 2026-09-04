@@ -10,6 +10,7 @@ use maki_agent::{
 };
 use ratatui::backend::TestBackend;
 use std::collections::HashSet;
+use std::ops::Range;
 use std::time::Duration;
 use test_case::test_case;
 
@@ -2125,6 +2126,64 @@ fn height_measures_the_width_asked_for_even_while_stale() {
         2,
         "a stale segment must report what its lines really draw as"
     );
+}
+
+const ROW_WALK_WIDTH: u16 = 10;
+
+/// Rows at width 10: `a` on 0, `bbb...` on 1-3, `c` on 4, `ddd...` on 5-6.
+fn wrapped_segment() -> Segment {
+    let seg = Segment::with_lines(
+        vec![
+            Line::from("a"),
+            Line::from("b".repeat(25)),
+            Line::from("c"),
+            Line::from("d".repeat(15)),
+        ],
+        "test".into(),
+        None,
+    );
+    assert_eq!(seg.height(ROW_WALK_WIDTH), 7, "fixture must wrap as above");
+    seg
+}
+
+/// The copy path draws a chunk at the row the cursor reports, so a seek landing
+/// in the middle of a wrapped line has to back up to that line's first row. Off
+/// by one there and the whole chunk lands on the wrong rows.
+#[test_case(0 => Some((0, 0..1)) ; "row_of_its_own")]
+#[test_case(1 => Some((1, 1..4)) ; "first_row_of_a_wrapped_line")]
+#[test_case(3 => Some((1, 1..4)) ; "last_row_backs_up_to_the_line_start")]
+#[test_case(7 => None ; "past_the_last_row")]
+fn row_walk_seeks_to_the_line_covering_a_row(row: u16) -> Option<(usize, Range<u16>)> {
+    let seg = wrapped_segment();
+    let mut walk = seg.rows_from(row, ROW_WALK_WIDTH);
+    let line = walk.line()?;
+    Some((line, walk.next_chunk(1)?.1))
+}
+
+/// Chunking is only invisible to the copy path if the pieces tile the segment:
+/// contiguous rows, each source line in exactly one piece, every row down to
+/// the last covered. No row budget may change that, not even one too small to
+/// fit the tallest line.
+#[test_case(1 ; "one_row_at_a_time")]
+#[test_case(2 ; "budget_shorter_than_the_tallest_line")]
+#[test_case(7 ; "budget_taller_than_the_segment")]
+fn row_walk_tiles_the_segment(max_rows: u16) {
+    let seg = wrapped_segment();
+    let mut walk = seg.rows_from(0, ROW_WALK_WIDTH);
+    let mut covered = 0..0;
+    let mut lines = 0;
+    while let Some((chunk, rows)) = walk.next_chunk(max_rows) {
+        assert_eq!(rows.start, covered.end, "chunks must be contiguous");
+        assert_eq!(
+            wrap::total_rows(chunk, ROW_WALK_WIDTH),
+            rows.end - rows.start,
+            "a chunk must report the rows its lines really draw as"
+        );
+        lines += chunk.len();
+        covered = rows;
+    }
+    assert_eq!(covered.end, seg.height(ROW_WALK_WIDTH), "every row covered");
+    assert_eq!(lines, seg.lines().len(), "every line covered once");
 }
 
 /// The copy path sizes its buffer from `height` and then re-wraps the lines

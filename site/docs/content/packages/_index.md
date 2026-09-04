@@ -96,6 +96,49 @@ and permission prompts come back.
 Removing a `maki.pack.add` entry stops the package from loading. Its lockfile
 entry and its checkout stay on disk until you delete them.
 
+## Update packages
+
+Run `/packupdate` to update every installed package that the global config
+still declares. Pass one package name to update only that package:
+
+```text
+/packupdate maki-review
+```
+
+Maki fetches the source and shows the old and proposed commits. It compares the
+proposed permission request with the permissions already approved for that
+package and source. Accepting the review applies the revision and approves the
+permissions it showed. Declining leaves the installed revision alone.
+
+Use `/packupdate!` to skip the update review. The bang does not cover
+permissions, so Maki still asks about a new one when it loads the updated
+package.
+
+Pass `++lockfile` to restore the commit already recorded in the lockfile
+instead of resolving the declared version:
+
+```text
+/packupdate ++lockfile maki-review
+```
+
+Project config and packages cannot update global package state.
+
+## Remove packages
+
+First remove the package declaration from the global `init.lua` and reload.
+Then remove the inactive package:
+
+```text
+/packdel maki-review
+```
+
+`/packdel ++all` removes every installed package that is no longer declared.
+Maki shows what it is about to remove and waits for you to accept. A package
+that is still active, here or in another Maki process, is refused. The package
+approval goes away once its files are gone.
+
+Use `/packdel!` to skip that review. The refusals still apply.
+
 ## Package permissions
 
 A managed package can ask for guarded APIs in `plugin.toml`:

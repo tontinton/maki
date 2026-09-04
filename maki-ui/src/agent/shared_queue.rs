@@ -72,9 +72,23 @@ impl QueuedInput {
     }
 }
 
+pub(crate) struct Compaction {
+    pub(crate) run_id: u64,
+    pub(crate) instructions: Option<String>,
+}
+
+impl Compaction {
+    fn label(&self) -> Cow<'static, str> {
+        match self.instructions {
+            Some(ref extra) => Cow::Owned(format!("{COMPACT_LABEL} {extra}")),
+            None => Cow::Borrowed(COMPACT_LABEL),
+        }
+    }
+}
+
 pub(crate) enum QueueItem {
     Message(QueuedInput),
-    Compact { run_id: u64 },
+    Compact(Compaction),
 }
 
 /// One turn's worth of work. Plain messages typed back to back under the same
@@ -83,7 +97,7 @@ pub(crate) enum QueueItem {
 /// `/compact` rewrites the history the later messages land in.
 pub(crate) enum QueueRun {
     Messages(Vec<QueuedInput>),
-    Compact { run_id: u64 },
+    Compact(Compaction),
 }
 
 impl QueueRun {
@@ -96,7 +110,9 @@ impl QueueRun {
                 messages.retain(|queued| queued.run_id >= min_run_id);
                 Some(messages.last()?.run_id)
             }
-            Self::Compact { run_id } => (*run_id >= min_run_id).then_some(*run_id),
+            Self::Compact(compaction) => {
+                (compaction.run_id >= min_run_id).then_some(compaction.run_id)
+            }
         }
     }
 }
@@ -108,8 +124,8 @@ impl QueueItem {
                 text: Cow::Owned(queued.text.clone()),
                 color: theme::current().foreground,
             },
-            Self::Compact { .. } => QueueEntry {
-                text: Cow::Borrowed(COMPACT_LABEL),
+            Self::Compact(compaction) => QueueEntry {
+                text: compaction.label(),
                 color: theme::current()
                     .queue
                     .fg
@@ -121,7 +137,7 @@ impl QueueItem {
     fn batch_key(&self) -> Option<BatchKey> {
         match self {
             Self::Message(queued) => queued.batch_key(),
-            Self::Compact { .. } => None,
+            Self::Compact(_) => None,
         }
     }
 
@@ -131,7 +147,7 @@ impl QueueItem {
     fn visible_in_panel(&self) -> bool {
         match self {
             Self::Message(queued) => !queued.displayed,
-            Self::Compact { .. } => true,
+            Self::Compact(_) => true,
         }
     }
 }
@@ -192,7 +208,7 @@ impl QueueSender {
             .filter(|item| item.visible_in_panel())
             .filter_map(|item| match item {
                 QueueItem::Message(queued) => Some(queued.text.clone()),
-                QueueItem::Compact { .. } => None,
+                QueueItem::Compact(_) => None,
             })
             .collect()
     }
@@ -219,7 +235,7 @@ impl QueueReceiver {
     pub(crate) fn pop_run(&self) -> Option<QueueRun> {
         let mut items = lock(&self.items);
         let first = match items.pop_front()? {
-            QueueItem::Compact { run_id } => return Some(QueueRun::Compact { run_id }),
+            QueueItem::Compact(compaction) => return Some(QueueRun::Compact(compaction)),
             QueueItem::Message(first) => first,
         };
         let key = first.batch_key();
@@ -250,7 +266,7 @@ impl QueueReceiver {
 impl InterruptSource for QueueReceiver {
     fn poll(&self) -> Option<ExtractedCommand> {
         Some(match self.pop_run()? {
-            QueueRun::Compact { .. } => ExtractedCommand::Compact,
+            QueueRun::Compact(compaction) => ExtractedCommand::Compact(compaction.instructions),
             QueueRun::Messages(run) => {
                 ExtractedCommand::Interrupt(run.into_iter().map(|queued| queued.input).collect())
             }
@@ -298,6 +314,7 @@ mod tests {
     const PROMPT_NAME: &str = "server/review";
     const PLAN_PATH: &str = "plan.md";
     const NOT_AN_INTERRUPT: &str = "expected an interrupt carrying the queued messages";
+    const GUIDANCE: &str = "keep the failing test names";
     /// One image block plus one text block.
     const BLOCKS_PER_MESSAGE: usize = 2;
 
@@ -349,8 +366,11 @@ mod tests {
         QueueItem::Message(queued)
     }
 
-    fn compact() -> QueueItem {
-        QueueItem::Compact { run_id: 0 }
+    fn compact(instructions: Option<&str>) -> QueueItem {
+        QueueItem::Compact(Compaction {
+            run_id: 0,
+            instructions: instructions.map(str::to_string),
+        })
     }
 
     /// Drains the queue and names every run it hands over: the texts of a
@@ -370,7 +390,7 @@ mod tests {
 
     #[test_case(message(FIRST), true  ; "deferred_message_visible")]
     #[test_case(QueueItem::Message(QueuedInput { displayed: true, ..queued(FIRST, 0) }), false ; "displayed_message_hidden")]
-    #[test_case(compact(), true  ; "compact_visible")]
+    #[test_case(compact(None), true  ; "compact_visible")]
     fn panel_visibility(item: QueueItem, visible: bool) {
         let (tx, _rx) = queue();
         tx.push(item);
@@ -412,7 +432,7 @@ mod tests {
     }
 
     #[test_case(vec![message(FIRST), message(SECOND), message(THIRD)], vec![vec![FIRST, SECOND, THIRD]] ; "adjacent_messages_ride_together")]
-    #[test_case(vec![message(FIRST), compact(), message(SECOND)], vec![vec![FIRST], vec![COMPACT_LABEL], vec![SECOND]] ; "compact_splits_the_drain_and_keeps_its_place")]
+    #[test_case(vec![message(FIRST), compact(None), message(SECOND)], vec![vec![FIRST], vec![COMPACT_LABEL], vec![SECOND]] ; "compact_splits_the_drain_and_keeps_its_place")]
     #[test_case(vec![message(FIRST), prompt_message(SECOND), message(THIRD)], vec![vec![FIRST], vec![SECOND], vec![THIRD]] ; "mcp_prompt_runs_alone")]
     #[test_case(vec![message(FIRST)], vec![vec![FIRST]] ; "single_message_unchanged")]
     #[test_case(vec![plan_message(FIRST), plan_message(SECOND)], vec![vec![FIRST, SECOND]] ; "one_mode_rides_together")]
@@ -451,6 +471,16 @@ mod tests {
 
         assert_eq!(messages, [FIRST, SECOND, THIRD]);
         assert!(rx.poll().is_none());
+    }
+
+    #[test]
+    fn poll_carries_compact_guidance() {
+        let (tx, rx) = queue();
+        tx.push(compact(Some(GUIDANCE)));
+
+        assert!(
+            matches!(rx.poll(), Some(ExtractedCommand::Compact(Some(extra))) if extra == GUIDANCE)
+        );
     }
 
     #[test_case(&[FIRST] ; "single_message_stays_alone")]

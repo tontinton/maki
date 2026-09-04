@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use maki_agent::agent::LoadedInstructions;
 use maki_agent::cancel::CancelToken;
-use maki_agent::tools::{Deadline, FileReadTracker, ToolAudience, ToolContext, ToolLive};
+use maki_agent::tools::{Deadline, FileKey, ToolAudience, ToolContext, ToolLive};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::SessionRef;
 use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
@@ -194,10 +194,6 @@ impl LuaCtx {
         }
     }
 
-    fn file_tracker(&self) -> Option<&FileReadTracker> {
-        self.agent().map(|a| &*a.file_tracker)
-    }
-
     fn loaded_instructions(&self) -> Option<&LoadedInstructions> {
         match &self.caps {
             Caps::Handler {
@@ -321,25 +317,17 @@ impl UserData for LuaCtx {
             Ok((Some(true), None))
         });
 
+        // The matching check before a write is not exposed: the dispatcher
+        // runs it under the file lock for every tool declaring `mutable_path`,
+        // and a handler-side copy would race its own sibling.
         methods.add_method("record_read", |_, this, path: String| {
-            let Some(tracker) = this.file_tracker() else {
+            let Some(agent) = this.agent() else {
                 return Ok(this.cap_err_pair("record_read"));
             };
-            tracker.record_read(Path::new(&path));
+            agent
+                .file_access
+                .record_read(&FileKey::new(Path::new(&path)));
             Ok((Some(true), None))
-        });
-
-        methods.add_method("check_before_edit", |_, this, path: String| {
-            let Some(agent) = this.agent() else {
-                return Ok(this.cap_err_pair("check_before_edit"));
-            };
-            if !agent.config.stale_read_check {
-                return Ok((Some(true), None));
-            }
-            match agent.file_tracker.check_before_edit(Path::new(&path)) {
-                Ok(()) => Ok((Some(true), None)),
-                Err(msg) => Ok((Some(false), Some(msg))),
-            }
         });
 
         methods.add_async_method(

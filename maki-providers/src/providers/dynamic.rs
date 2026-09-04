@@ -145,9 +145,7 @@ fn builtin_slugs() -> Vec<String> {
 }
 
 fn providers_dir() -> Option<PathBuf> {
-    maki_storage::paths::config_dir()
-        .ok()
-        .map(|d| d.join(PROVIDERS_DIR))
+    maki_storage::paths::find_config_path(PROVIDERS_DIR)
 }
 
 fn run_script(path: &Path, subcommand: &str, timeout: Duration) -> Result<String, AgentError> {

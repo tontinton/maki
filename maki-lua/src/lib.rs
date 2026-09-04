@@ -26,8 +26,10 @@ pub use error::PluginError;
 pub use loader::{EventHandle, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING};
 pub use maki_agent::SessionEndReason;
 pub use pack::{
-    DiscoveredPackage, Discovery, InstallReport, Interaction, MANAGED_GROUP, Origin, discover,
-    discover_installed, install_declared, lockfile_path, sanitize_message, site_dir,
+    DeleteTarget, DiscoveredPackage, Discovery, InstallReport, Interaction, MANAGED_GROUP, Origin,
+    PackCommand, PackContext, PackPlan, PackPreparation, PackReport, PlannedOp, UpdateOptions,
+    UpdateTarget, apply_pack_plan, discover, discover_installed, install_declared, installed_names,
+    lockfile_path, prepare_pack_command, sanitize_message, site_dir,
 };
 pub use plugin_permissions::{Permission, PluginPermissions, Requested};
 pub use runtime::{KILL_GRACE, MAX_INFLIGHT_TOOLS, RestoreItem, WARM_TOOL_CAP};

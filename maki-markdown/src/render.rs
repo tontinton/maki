@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::iter;
 use std::mem;
 
-use maki_highlight::{CodeHighlighter, StyledSegment};
+use maki_highlight::{CodeHighlighter, SegmentColor, StyledSegment};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
@@ -30,10 +30,10 @@ const LONG_LINE_SUFFIX: &str = "...";
 pub enum StyleToken {
     Text,
     InlineCode,
-    /// Syntax-highlighted token. Carries resolved rgb + modifiers so the
+    /// Syntax-highlighted token. Carries the resolved color + modifiers so the
     /// consumer doesn't need to know the language.
     Highlight {
-        fg: (u8, u8, u8),
+        fg: SegmentColor,
         bold: bool,
         italic: bool,
         underline: bool,
