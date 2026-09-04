@@ -2846,7 +2846,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
- "tiny_http",
  "toml",
  "tracing",
  "tracing-subscriber",

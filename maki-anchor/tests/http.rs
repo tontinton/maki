@@ -91,7 +91,7 @@ fn anchor_responding(port: u16) -> bool {
 
 /// A plain TCP connect is not readiness: the kernel queues connections into
 /// the listener backlog before the server loop runs, and the anchor still
-/// exits if its `port + 1` ws bind collides. A real request succeeds only
+/// tunnel shares the one port now. A real request succeeds only
 /// once both ports are bound and the loop is serving.
 fn wait_ready(child: &mut Child, port: u16) -> Result<(), ()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -207,7 +207,7 @@ fn tunnel_carries_browser_requests() {
     assert!(out.status.success());
     let link = String::from_utf8_lossy(&out.stdout).trim().to_string();
 
-    let ws_port = anchor.port + 1;
+    let ws_port = anchor.port;
     // The instance's tunnel stays open (the anchor writer thread holds the
     // command channel), so the dial thread is never joined.
     thread::spawn(move || fake_instance(ws_port, "host-x", &reg_token));
@@ -370,7 +370,7 @@ fn scoped_and_view_links_are_enforced_end_to_end() {
     );
     let view = cli(&db, &["tokens", "link", "gate-host", "view"]);
     let control = cli(&db, &["tokens", "link", "gate-host", "control"]);
-    thread::spawn(move || fake_instance_serving(anchor.port + 1, "gate-host", &reg));
+    thread::spawn(move || fake_instance_serving(anchor.port, "gate-host", &reg));
     wait_online(anchor.port, &control);
 
     // A scoped link's bare index bounces into the session path, and anything

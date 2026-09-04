@@ -42,7 +42,7 @@ impl Drop for AnchorProcess {
 
 /// Ephemeral ports race under full-suite load (another process can take the
 /// port between `free_port` releasing it and the anchor binding it), and the
-/// anchor also binds `port + 1` for tunnels. Retry until one sticks, and
+/// tunnel listener shares that port. Retry until one sticks, and
 /// poll a real request for readiness instead of sleeping.
 fn spawn_anchor(db: &std::path::Path) -> AnchorProcess {
     for attempt in 0..10 {
@@ -62,7 +62,7 @@ fn spawn_anchor(db: &std::path::Path) -> AnchorProcess {
         let mut process = AnchorProcess {
             child,
             http_port: port,
-            ws_port: port + 1,
+            ws_port: port,
         };
         if wait_ready(&mut process) {
             return process;

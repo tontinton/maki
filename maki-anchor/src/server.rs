@@ -11,18 +11,18 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use tiny_http::{Header, Response, Server};
 use tungstenite::{Message as WsMessage, protocol::WebSocket};
 
 use crate::{
+    http::{self, Header, Response},
     hub::{self, Hub, TunnelCommand, TunnelPush},
     store::{self, Role, SessionRow, Store},
 };
 
 const TUNNEL_LINK_TTL: Duration = Duration::from_secs(2 * 60 * 60);
-/// Browser requests and instance tunnels each get a thread; cap the counts so
-/// a flood costs 503s instead of unbounded threads.
-const MAX_CONCURRENT_REQUESTS: usize = 256;
+/// One thread per connection; cap the counts so a flood costs 503s and
+/// refused sockets instead of unbounded threads.
+const MAX_CONCURRENT_CONNECTIONS: usize = 512;
 const MAX_CONCURRENT_TUNNELS: usize = 64;
 const INSTALL_SH: &str = include_str!("../../install.sh");
 const INSTALL_PS1: &str = include_str!("../../install.ps1");
@@ -53,7 +53,7 @@ fn request_path_session(tail: &str) -> Option<String> {
 
 fn buffered(
     (status, content_type, body): (u16, String, Vec<u8>),
-    request: tiny_http::Request,
+    request: http::Request,
 ) -> RouteOutcome {
     RouteOutcome::Buffered(Box::new(BufferedResponse {
         status,
@@ -85,7 +85,7 @@ struct BufferedResponse {
     status: u16,
     content_type: String,
     body: Vec<u8>,
-    request: tiny_http::Request,
+    request: http::Request,
 }
 
 const MAX_BODY: usize = 10 * 1024 * 1024;
@@ -143,26 +143,8 @@ fn split_token_path(path: &str) -> Option<(&str, &str)> {
     Some((token, tail))
 }
 
-/// Tunnel listen address: an explicit `ws_bind` host (with `:port`) wins,
-/// otherwise the HTTP host with `http_port + 1`. Keeps the default behavior
-/// while letting operators bind the tunnel to loopback only.
-fn resolve_ws_addr(ws_bind: Option<&str>, addr: &str, http_port: u16) -> String {
-    match ws_bind {
-        None => format!(
-            "{}:{}",
-            addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr),
-            http_port + 1
-        ),
-        Some(bind) => match bind.rsplit_once(':') {
-            Some((_host, port)) if port.parse::<u16>().is_ok() => bind.to_owned(),
-            _ => format!("{bind}:{}", http_port + 1),
-        },
-    }
-}
-
 pub fn serve(
     addr: &str,
-    ws_bind: Option<&str>,
     store: Arc<Store>,
     oidc: Option<crate::oidc::OidcConfig>,
     allow_local: bool,
@@ -172,80 +154,40 @@ pub fn serve(
         addr: addr.to_string(),
         source,
     })?;
-    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-    let server = Arc::new(Server::from_listener(listener, None).expect("tiny_http server"));
     let hub = Hub::new();
-
-    // The instance tunnel lives on its own listener: browser traffic goes
-    // through tiny_http, tunnels through a plain socket we drive directly.
-    // `ws_bind` overrides the host (and optionally the port) so operators
-    // fronting one public origin can pin the tunnel to loopback.
-    let ws_addr = resolve_ws_addr(ws_bind, addr, port);
-    let ws_listener = TcpListener::bind(&ws_addr).map_err(|source| ServerError::Bind {
-        addr: ws_addr.clone(),
-        source,
-    })?;
     let auth = Arc::new(crate::auth::Auth::new(
         Arc::clone(&store),
         oidc,
         allow_local,
         mint_tokens,
     ));
-    let ws_store = Arc::clone(&store);
-    let ws_hub = Arc::clone(&hub);
+    // One port, one accept loop: every connection is either a WebSocket
+    // upgrade on /ws (an instance tunnel) or one HTTP request. The
+    // connection cap bounds threads; the tunnel cap bounds how many
+    // long-lived sockets a flood can pin.
+    let connection_slots = Arc::new(AtomicUsize::new(0));
     let tunnel_slots = Arc::new(AtomicUsize::new(0));
-    let ws_slots = Arc::clone(&tunnel_slots);
-    thread::spawn(move || {
-        for socket in ws_listener.incoming() {
-            let Ok(socket) = socket else {
-                continue;
-            };
-            if ws_slots.fetch_add(1, Ordering::Relaxed) >= MAX_CONCURRENT_TUNNELS {
-                ws_slots.fetch_sub(1, Ordering::Relaxed);
-                continue;
-            }
-            let _ = socket.set_nodelay(true);
-            let hub = Arc::clone(&ws_hub);
-            let store = Arc::clone(&ws_store);
-            let slots = Arc::clone(&ws_slots);
-            thread::spawn(move || {
-                let _slot = SlotGuard(slots);
-                let Ok(websocket) = tungstenite::accept(socket) else {
-                    return;
-                };
-                drive_tunnel(websocket, hub, store);
-            });
-        }
-    });
-
-    tracing::info!(addr, ws_addr, "anchor listening");
-
-    let request_slots = Arc::new(AtomicUsize::new(0));
+    tracing::info!(addr, "anchor listening");
     loop {
-        let request = match server.recv() {
-            Ok(request) => request,
+        let (stream, peer) = match listener.accept() {
+            Ok(conn) => conn,
             Err(err) => {
                 tracing::warn!(error = %err, "accept failed");
                 continue;
             }
         };
-        if request_slots.fetch_add(1, Ordering::Relaxed) >= MAX_CONCURRENT_REQUESTS {
-            request_slots.fetch_sub(1, Ordering::Relaxed);
-            let response = Response::from_string("too many requests")
-                .with_status_code(503)
-                .with_header(
-                    Header::from_bytes(&b"Content-Type"[..], b"text/plain".as_ref()).unwrap(),
-                );
-            let _ = request.respond(response);
+        if connection_slots.fetch_add(1, Ordering::Relaxed) >= MAX_CONCURRENT_CONNECTIONS {
+            connection_slots.fetch_sub(1, Ordering::Relaxed);
             continue;
         }
         let hub = Arc::clone(&hub);
         let store = Arc::clone(&store);
         let auth = Arc::clone(&auth);
-        let slots = Arc::clone(&request_slots);
+        let connections = Arc::clone(&connection_slots);
+        let tunnels = Arc::clone(&tunnel_slots);
         thread::spawn(move || {
-            let _slot = SlotGuard(slots);
-            handle_request(request, hub, store, auth);
+            let _slot = SlotGuard(connections);
+            handle_connection(stream, peer, hub, store, auth, tunnels);
         });
     }
 }
@@ -259,21 +201,161 @@ impl Drop for SlotGuard {
     }
 }
 
+fn handle_connection(
+    stream: std::net::TcpStream,
+    peer: std::net::SocketAddr,
+    hub: Arc<Hub>,
+    store: Arc<Store>,
+    auth: Arc<crate::auth::Auth>,
+    tunnel_slots: Arc<AtomicUsize>,
+) {
+    let _ = stream.set_read_timeout(Some(http::HEAD_TIMEOUT));
+    let _ = stream.set_nodelay(true);
+    let sink = match stream.try_clone() {
+        Ok(sink) => sink,
+        Err(_) => return,
+    };
+    let mut reader = std::io::BufReader::new(stream);
+    let head = match http::read_head(&mut reader) {
+        Ok(head) => head,
+        Err(reject) => {
+            if let Some(response) = reject.response() {
+                let mut sink = sink;
+                let _ = http::write_response(&mut sink, &response);
+            }
+            return;
+        }
+    };
+    if head.is_upgrade() {
+        if tunnel_slots.fetch_add(1, Ordering::Relaxed) >= MAX_CONCURRENT_TUNNELS {
+            tunnel_slots.fetch_sub(1, Ordering::Relaxed);
+            let mut sink = sink;
+            let _ = http::write_response(
+                &mut sink,
+                &Response::from_string("too many tunnels").with_status_code(503),
+            );
+            return;
+        }
+        let _tunnel_slot = SlotGuard(tunnel_slots);
+        accept_tunnel(reader, sink, head.replay, hub, store);
+        return;
+    }
+    if head.content_length > 0
+        && head
+            .header("expect")
+            .is_some_and(|e| e.eq_ignore_ascii_case("100-continue"))
+        && let Ok(mut cont) = sink.try_clone()
+    {
+        let _ = cont.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+        let _ = cont.flush();
+    }
+    // Read the body up to the cap plus one byte, so handlers keep owning the
+    // 413 decision exactly as before; the rest dies with the connection.
+    let mut body = Vec::new();
+    if head.content_length > 0 {
+        use std::io::Read;
+        let want = head.content_length.min(MAX_BODY + 1);
+        let _ = (&mut reader).take(want as u64).read_to_end(&mut body);
+    }
+    let request = http::Request::new(head, body, sink, peer);
+    handle_request(request, hub, store, auth);
+}
+
+/// One port's two souls: reads replay the already-consumed handshake bytes,
+/// writes go straight to the socket. Cloning hands each direction to its own
+/// thread, replacing the `try_clone` the raw listener used.
+#[derive(Clone)]
+struct HalfDuplex {
+    read: Arc<Mutex<Replay<std::io::BufReader<std::net::TcpStream>>>>,
+    write: Arc<Mutex<std::net::TcpStream>>,
+}
+
+struct Replay<R> {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: R,
+}
+
+impl<R: std::io::Read> std::io::Read for Replay<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos < self.prefix.len() {
+            let n = (self.prefix.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.prefix[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Read for HalfDuplex {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read.lock().unwrap().read(buf)
+    }
+}
+
+impl std::io::Write for HalfDuplex {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.write.lock().unwrap().flush()
+    }
+}
+
+fn accept_tunnel(
+    reader: std::io::BufReader<std::net::TcpStream>,
+    sink: std::net::TcpStream,
+    replay: Vec<u8>,
+    hub: Arc<Hub>,
+    store: Arc<Store>,
+) {
+    let duplex = HalfDuplex {
+        read: Arc::new(Mutex::new(Replay {
+            prefix: replay,
+            pos: 0,
+            inner: reader,
+        })),
+        write: Arc::new(Mutex::new(sink)),
+    };
+    // The handshake reads through the replay under the head timeout still set
+    // on the socket; a client that sends headers and stalls cannot pin a slot.
+    let Ok(accepted) = tungstenite::accept(duplex.clone()) else {
+        return;
+    };
+    // The tunnel idles between pings by design: no more read deadlines.
+    let _ = accepted
+        .get_ref()
+        .write
+        .lock()
+        .unwrap()
+        .set_read_timeout(None);
+    let stream = accepted.into_inner();
+    let writer = Arc::new(Mutex::new(WebSocket::from_raw_socket(
+        stream.clone(),
+        tungstenite::protocol::Role::Server,
+        None,
+    )));
+    let reader = WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None);
+    drive_tunnel(reader, writer, hub, store);
+}
+
 fn handle_request(
-    request: tiny_http::Request,
+    request: http::Request,
     hub: Arc<Hub>,
     store: Arc<Store>,
     auth: Arc<crate::auth::Auth>,
 ) {
-    let method = request.method().to_string();
-    let url = request.url().to_string();
+    let method = request.method().to_owned();
+    let url = request.url().to_owned();
     let path = url.split('?').next().unwrap_or("");
 
     if path == "/ws" {
-        // The tunnel endpoint lives on the WS listener (HTTP port + 1).
-        let response = Response::from_string("use the ws port")
+        // Reached only by non-upgrade requests; tunnels arrive via the demux.
+        let response = Response::from_string("websockets connect with an upgrade")
             .with_status_code(426)
-            .with_header(Header::from_bytes(&b"Content-Type"[..], b"text/plain".as_ref()).unwrap());
+            .with_header(Header::from_bytes("Content-Type", "text/plain").unwrap());
         let _ = request.respond(response);
         return;
     }
@@ -284,8 +366,7 @@ fn handle_request(
             let response = Response::from_data(buffered.body)
                 .with_status_code(buffered.status)
                 .with_header(
-                    Header::from_bytes(&b"Content-Type"[..], buffered.content_type.as_bytes())
-                        .unwrap(),
+                    Header::from_bytes("Content-Type", buffered.content_type.as_bytes()).unwrap(),
                 );
             let _ = buffered.request.respond(response);
             tracing::debug!(method, path, status = buffered.status, "request");
@@ -296,7 +377,7 @@ fn handle_request(
 
 fn route(
     path: &str,
-    request: tiny_http::Request,
+    request: http::Request,
     hub: &Hub,
     store: &Arc<Store>,
     auth: &crate::auth::Auth,
@@ -345,7 +426,7 @@ fn route(
     // Auth endpoints work without a session; everything user-facing below
     // needs one when OIDC is on.
     if path == "/login" {
-        if request.method().as_str() == "POST" && auth.allow_local {
+        if request.method() == "POST" && auth.allow_local {
             return handle_local_login(request, auth);
         }
         // GET /login: if OIDC+local enabled, show chooser; if OIDC only, redirect; if local only, show form
@@ -399,25 +480,25 @@ fn route(
     route_authorized(path, request, hub, store, user, auth)
 }
 
-fn cookie_header(request: &tiny_http::Request) -> Option<&str> {
+fn cookie_header(request: &http::Request) -> Option<&str> {
     request
         .headers()
         .iter()
-        .find(|h| h.field.as_str().as_str() == "Cookie")
+        .find(|h| h.field.eq_ignore_ascii_case("Cookie"))
         .map(|h| h.value.as_str())
 }
 
 /// Best-effort client identity for login rate limiting. IP only (ports churn
 /// per connection), and behind a reverse proxy every request shares one
 /// address, so the limiter keys per proxy; local brute-forcing still trips it.
-fn remote_origin(request: &tiny_http::Request) -> String {
+fn remote_origin(request: &http::Request) -> String {
     request
         .remote_addr()
         .map(|a| a.ip().to_string())
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-fn start_login(request: tiny_http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
+fn start_login(request: http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
     match auth.begin_login() {
         Ok(url) => {
             let response = Response::empty(302)
@@ -436,7 +517,7 @@ fn start_login(request: tiny_http::Request, auth: &crate::auth::Auth) -> RouteOu
     }
 }
 
-fn render_login_page(request: tiny_http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
+fn render_login_page(request: http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
     let has_oidc = auth.enabled();
     let allow_local = auth.allow_local;
     // If ?oidc=1 is present, do OIDC redirect directly
@@ -471,7 +552,7 @@ fn render_login_page(request: tiny_http::Request, auth: &crate::auth::Auth) -> R
     buffered((200, "text/html".to_string(), body.into_bytes()), request)
 }
 
-fn handle_local_login(mut request: tiny_http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
+fn handle_local_login(mut request: http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
     let mut body = Vec::new();
     if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
         return buffered(
@@ -519,10 +600,7 @@ fn handle_local_login(mut request: tiny_http::Request, auth: &crate::auth::Auth)
     }
 }
 
-fn handle_api_local_login(
-    mut request: tiny_http::Request,
-    auth: &crate::auth::Auth,
-) -> RouteOutcome {
+fn handle_api_local_login(mut request: http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
     let mut body = Vec::new();
     if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
         return buffered(
@@ -640,7 +718,7 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn finish_login(request: tiny_http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
+fn finish_login(request: http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
     let query = request.url().split('?').nth(1).unwrap_or("");
     let params = |key: &str| {
         query.split('&').find_map(|pair| {
@@ -687,7 +765,7 @@ fn finish_login(request: tiny_http::Request, auth: &crate::auth::Auth) -> RouteO
 
 /// GET /links?instance=&session=&rights=&hours=: mint and display a link.
 fn render_link(
-    request: tiny_http::Request,
+    request: http::Request,
     store: &Arc<Store>,
     user: Option<&crate::store::UserRow>,
 ) -> RouteOutcome {
@@ -718,7 +796,7 @@ fn render_link(
     buffered(outcome, request)
 }
 
-fn redirect_to_login(request: tiny_http::Request) -> RouteOutcome {
+fn redirect_to_login(request: http::Request) -> RouteOutcome {
     let response = Response::empty(302)
         .with_header(Header::from_bytes("Location", "/login".as_bytes()).unwrap());
     let _ = request.respond(response);
@@ -731,7 +809,7 @@ fn is_non_admin(user: Option<&crate::store::UserRow>) -> bool {
     user.is_some_and(|u| !u.is_admin)
 }
 
-fn forbidden_json(request: tiny_http::Request) -> RouteOutcome {
+fn forbidden_json(request: http::Request) -> RouteOutcome {
     buffered(
         (
             403,
@@ -743,12 +821,12 @@ fn forbidden_json(request: tiny_http::Request) -> RouteOutcome {
 }
 
 fn handle_api_create_instance(
-    mut request: tiny_http::Request,
+    mut request: http::Request,
     store: &Arc<Store>,
     user: Option<&crate::store::UserRow>,
     auth: &crate::auth::Auth,
 ) -> RouteOutcome {
-    if request.method().as_str() != "POST" {
+    if request.method() != "POST" {
         return buffered(
             (
                 405,
@@ -894,11 +972,11 @@ fn json_list_grants(store: &Arc<Store>) -> (u16, String, Vec<u8>) {
 }
 
 fn handle_api_set_grant(
-    mut request: tiny_http::Request,
+    mut request: http::Request,
     store: &Arc<Store>,
     user: Option<&crate::store::UserRow>,
 ) -> RouteOutcome {
-    if request.method().as_str() != "POST" {
+    if request.method() != "POST" {
         return buffered(
             (
                 405,
@@ -1032,11 +1110,11 @@ fn handle_api_set_grant(
 }
 
 fn handle_api_revoke_grant(
-    mut request: tiny_http::Request,
+    mut request: http::Request,
     store: &Arc<Store>,
     user: Option<&crate::store::UserRow>,
 ) -> RouteOutcome {
-    if request.method().as_str() != "POST" {
+    if request.method() != "POST" {
         return buffered(
             (
                 405,
@@ -1153,7 +1231,7 @@ fn handle_api_revoke_grant(
 }
 
 fn handle_api_create_user(
-    mut request: tiny_http::Request,
+    mut request: http::Request,
     store: &Arc<Store>,
     user: Option<&crate::store::UserRow>,
     auth: &crate::auth::Auth,
@@ -1296,11 +1374,11 @@ fn handle_api_create_user(
 }
 
 fn handle_api_set_admin(
-    mut request: tiny_http::Request,
+    mut request: http::Request,
     store: &Arc<Store>,
     user: Option<&crate::store::UserRow>,
 ) -> RouteOutcome {
-    if request.method().as_str() != "POST" {
+    if request.method() != "POST" {
         return buffered(
             (
                 405,
@@ -1401,11 +1479,11 @@ fn handle_api_set_admin(
 }
 
 fn handle_api_delete_user(
-    mut request: tiny_http::Request,
+    mut request: http::Request,
     store: &Arc<Store>,
     user: Option<&crate::store::UserRow>,
 ) -> RouteOutcome {
-    if request.method().as_str() != "POST" {
+    if request.method() != "POST" {
         return buffered(
             (
                 405,
@@ -1527,12 +1605,12 @@ fn handle_api_delete_user(
 }
 
 fn handle_api_set_mint_tokens(
-    mut request: tiny_http::Request,
+    mut request: http::Request,
     store: &Arc<Store>,
     user: Option<&crate::store::UserRow>,
     auth: &crate::auth::Auth,
 ) -> RouteOutcome {
-    if request.method().as_str() != "POST" {
+    if request.method() != "POST" {
         return buffered(
             (
                 405,
@@ -1620,7 +1698,7 @@ fn handle_api_set_mint_tokens(
 /// LAN-trust mode) is available for future per-instance filtering.
 fn route_authorized(
     path: &str,
-    request: tiny_http::Request,
+    request: http::Request,
     _hub: &Hub,
     store: &Arc<Store>,
     user: Option<crate::store::UserRow>,
@@ -1639,7 +1717,7 @@ fn route_authorized(
         return handle_api_create_instance(request, store, user.as_ref(), auth);
     }
     if path == "/api/users" {
-        return match request.method().as_str() {
+        return match request.method() {
             "GET" => {
                 if is_non_admin(user.as_ref()) {
                     return forbidden_json(request);
@@ -1664,7 +1742,7 @@ fn route_authorized(
         return handle_api_delete_user(request, store, user.as_ref());
     }
     if path == "/api/grants" {
-        return match request.method().as_str() {
+        return match request.method() {
             "GET" => {
                 if is_non_admin(user.as_ref()) {
                     return forbidden_json(request);
@@ -1707,7 +1785,7 @@ fn route_authorized(
         }
     }
     if path == "/api/config/mint_tokens" {
-        return match request.method().as_str() {
+        return match request.method() {
             "GET" => {
                 let v = auth.effective_mint_tokens().as_str().to_owned();
                 let body = serde_json::json!({"mint_tokens": v})
@@ -1854,7 +1932,7 @@ fn tail_under_session(tail: &str) -> &str {
 fn proxy_remote(
     token: &str,
     tail: &str,
-    request: tiny_http::Request,
+    request: http::Request,
     hub: &Hub,
     store: &Arc<Store>,
     user: Option<&crate::store::UserRow>,
@@ -1904,7 +1982,7 @@ fn proxy_remote(
         }
     }
 
-    let method = request.method().as_str().to_string();
+    let method = request.method().to_owned();
     let write = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
     // Grants raise the floor, never lower it: a controller grant upgrades a
     // view link for the logged-in user.
@@ -2004,7 +2082,7 @@ fn proxy_remote(
 /// Streams tunnel SSE chunks to the browser with tiny_http bypassed: its
 /// chunked encoder buffers, and SSE frames must flush as they arrive.
 fn stream_to_browser(
-    request: tiny_http::Request,
+    request: http::Request,
     hub: &Hub,
     rx: Receiver<hub::TunnelResponse>,
     first: hub::TunnelResponse,
@@ -2034,9 +2112,13 @@ fn stream_to_browser(
     RouteOutcome::Streamed
 }
 
-fn drive_tunnel(websocket: WebSocket<std::net::TcpStream>, hub: Arc<Hub>, store: Arc<Store>) {
-    let mut websocket = websocket;
-    let hello = match websocket.read() {
+fn drive_tunnel(
+    mut reader: WebSocket<HalfDuplex>,
+    writer: Arc<Mutex<WebSocket<HalfDuplex>>>,
+    hub: Arc<Hub>,
+    store: Arc<Store>,
+) {
+    let hello = match reader.read() {
         Ok(WsMessage::Text(text)) => text,
         _ => return,
     };
@@ -2046,7 +2128,7 @@ fn drive_tunnel(websocket: WebSocket<std::net::TcpStream>, hub: Arc<Hub>, store:
     let instance = match store.instance_by_registration_token(&parsed.registration_token) {
         Ok(instance) if instance.name == parsed.instance_name => instance,
         _ => {
-            let _ = websocket.send(WsMessage::text("auth failed"));
+            let _ = writer.lock().unwrap().send(WsMessage::text("auth failed"));
             return;
         }
     };
@@ -2068,26 +2150,13 @@ fn drive_tunnel(websocket: WebSocket<std::net::TcpStream>, hub: Arc<Hub>, store:
         }
     };
     let link_hash = store::hash_token(&control_link);
-    let _ = websocket.send(WsMessage::text(
+    let _ = writer.lock().unwrap().send(WsMessage::text(
         serde_json::json!({"link": control_link}).to_string(),
     ));
     let (cmd_tx, cmd_rx) = channel::<TunnelCommand>();
     let epoch = hub.attach(instance.id, cmd_tx, link_hash.clone());
 
-    let write_socket = websocket.into_inner();
-    let read_socket = match write_socket.try_clone() {
-        Ok(read_socket) => read_socket,
-        Err(_) => {
-            hub.detach(instance.id, epoch);
-            return;
-        }
-    };
-    // Only the writer thread touches this handle; reader uses its own clone.
-    let writer = Arc::new(Mutex::new(WebSocket::from_raw_socket(
-        write_socket,
-        tungstenite::protocol::Role::Server,
-        None,
-    )));
+    // Only the writer thread touches the write side; this thread keeps reading.
     let writer_hub = Arc::clone(&hub);
     let writer_id = instance.id;
     let writer_handle = Arc::clone(&writer);
@@ -2111,8 +2180,6 @@ fn drive_tunnel(websocket: WebSocket<std::net::TcpStream>, hub: Arc<Hub>, store:
         writer_hub.detach(writer_id, epoch);
     });
 
-    let mut reader =
-        WebSocket::from_raw_socket(read_socket, tungstenite::protocol::Role::Server, None);
     loop {
         let message = match reader.read() {
             Ok(message) => message,
@@ -2243,25 +2310,5 @@ mod tests {
         // A stray percent stays literal instead of eating following chars.
         assert_eq!(url_decode("100%"), "100%");
         assert_eq!(url_decode("bad%zz"), "bad%zz");
-    }
-
-    #[test]
-    fn ws_addr_defaults_to_http_host_plus_one() {
-        assert_eq!(resolve_ws_addr(None, "0.0.0.0:8688", 8688), "0.0.0.0:8689");
-        assert_eq!(resolve_ws_addr(None, "127.0.0.1:0", 4321), "127.0.0.1:4322");
-    }
-
-    #[test]
-    fn ws_addr_honors_host_only_or_full_bind() {
-        // Host only -> reuse http port + 1 on that host.
-        assert_eq!(
-            resolve_ws_addr(Some("127.0.0.1"), "0.0.0.0:8688", 8688),
-            "127.0.0.1:8689"
-        );
-        // Explicit port wins.
-        assert_eq!(
-            resolve_ws_addr(Some("127.0.0.1:9000"), "0.0.0.0:8688", 8688),
-            "127.0.0.1:9000"
-        );
     }
 }

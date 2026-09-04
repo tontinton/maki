@@ -10,7 +10,6 @@ name = "maki-anchor"
 path = "src/main.rs"
 
 [dependencies]
-tiny_http = { workspace = true }
 tungstenite = { workspace = true }
 rusqlite = { workspace = true }
 argon2 = { workspace = true }
