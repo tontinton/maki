@@ -12,7 +12,11 @@ use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender};
 
 const FUNCTIONS_PREFIX: &str = "functions.";
-const MIN_OUTPUT_TOKENS: u32 = 1024;
+/// Floor for the clamp below, never applied above the model's own cap.
+/// Anthropic derives the thinking budget from `max_tokens` (half of it, at
+/// least 1024) and rejects a request where the two are equal, so clamping the
+/// cap all the way down to 1024 would trade an overflow for a 400.
+const MIN_OUTPUT_TOKENS: u32 = 4096;
 
 /// GPT models sometimes emit `functions.<name>`, a Codex training habit.
 /// Stripped here at the provider boundary so no raw name enters the agent;
@@ -93,7 +97,9 @@ impl From<StreamError> for AgentError {
 fn clamped_output_tokens(model: &Model, prompt_tokens: u32) -> Option<u32> {
     let max_output = model.max_output_tokens?;
     let remaining = model.context_window.saturating_sub(prompt_tokens);
-    (max_output > remaining).then(|| remaining.max(MIN_OUTPUT_TOKENS))
+    // The `min` keeps the floor from raising the cap over what the model
+    // declared, since it would reject a number it never offered.
+    (max_output > remaining).then(|| remaining.max(MIN_OUTPUT_TOKENS).min(max_output))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -110,24 +116,20 @@ pub(crate) async fn stream_with_retry(
 ) -> Result<StreamResponse, StreamError> {
     let opts = opts.clamped(model);
     let prompt_tokens = estimate_prompt_tokens(messages, system, tools);
-    let clamped;
-    let model = match clamped_output_tokens(model, prompt_tokens) {
-        Some(max_output) => {
-            warn!(
-                model = %model.id,
-                prompt_tokens,
-                context_window = model.context_window,
-                max_output_tokens = max_output,
-                "clamped max output tokens to fit the context window"
-            );
-            clamped = Model {
-                max_output_tokens: Some(max_output),
-                ..model.clone()
-            };
-            &clamped
+    let fitted = clamped_output_tokens(model, prompt_tokens).map(|max_output_tokens| {
+        warn!(
+            model = %model.id,
+            prompt_tokens,
+            context_window = model.context_window,
+            max_output_tokens,
+            "clamped max output tokens to fit the context window"
+        );
+        Model {
+            max_output_tokens: Some(max_output_tokens),
+            ..model.clone()
         }
-        None => model,
-    };
+    });
+    let model = fitted.as_ref().unwrap_or(model);
     let messages = maki_providers::adapt_images_for_model(model, messages);
     let messages = &*messages;
     let mut retry = RetryState::new();
@@ -249,28 +251,33 @@ mod tests {
 
     const SECRET_BODY: &str = "messages.0.content: \"my private prompt\", key sk-abc";
     const WINDOW: u32 = 262_144;
-    const BIG_PROMPT: u32 = 162_145;
     const BIG_MAX_OUTPUT: u32 = 100_000;
+    const SMALL_MAX_OUTPUT: u32 = 2_048;
+    const SMALL_PROMPT: u32 = 1_000;
+    /// One token more than the window can spare for `BIG_MAX_OUTPUT`.
+    const CROWDING_PROMPT: u32 = WINDOW - BIG_MAX_OUTPUT + 1;
 
-    fn model_with(context_window: u32, max_output_tokens: Option<u32>) -> Model {
+    fn model_with(max_output_tokens: Option<u32>) -> Model {
         let mut model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        model.context_window = context_window;
+        model.context_window = WINDOW;
         model.max_output_tokens = max_output_tokens;
         model
     }
 
-    #[test_case(WINDOW, Some(BIG_MAX_OUTPUT), 1_000, None; "cap_fits_inside_remaining_window")]
-    #[test_case(WINDOW, Some(BIG_MAX_OUTPUT), BIG_PROMPT, Some(WINDOW - BIG_PROMPT); "cap_exceeds_remaining_window")]
-    #[test_case(WINDOW, Some(BIG_MAX_OUTPUT), WINDOW + 1, Some(MIN_OUTPUT_TOKENS); "prompt_larger_than_window_floors_at_minimum")]
-    #[test_case(WINDOW, None, BIG_PROMPT, None; "provider_chosen_cap_is_left_alone")]
+    #[test_case(Some(BIG_MAX_OUTPUT), SMALL_PROMPT, None; "cap_fits_inside_remaining_window")]
+    #[test_case(Some(BIG_MAX_OUTPUT), CROWDING_PROMPT, Some(WINDOW - CROWDING_PROMPT); "cap_exceeds_remaining_window")]
+    #[test_case(Some(BIG_MAX_OUTPUT), WINDOW + 1, Some(MIN_OUTPUT_TOKENS); "prompt_over_window_floors_at_minimum")]
+    #[test_case(Some(SMALL_MAX_OUTPUT), WINDOW + 1, Some(SMALL_MAX_OUTPUT); "floor_never_exceeds_the_model_cap")]
+    #[test_case(None, CROWDING_PROMPT, None; "provider_chosen_cap_is_left_alone")]
     fn clamps_output_tokens_to_the_remaining_window(
-        context_window: u32,
         max_output_tokens: Option<u32>,
         prompt_tokens: u32,
         expected: Option<u32>,
     ) {
-        let model = model_with(context_window, max_output_tokens);
-        assert_eq!(clamped_output_tokens(&model, prompt_tokens), expected);
+        assert_eq!(
+            clamped_output_tokens(&model_with(max_output_tokens), prompt_tokens),
+            expected
+        );
     }
 
     #[test]
