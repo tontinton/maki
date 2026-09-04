@@ -124,6 +124,15 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
+        "Diff signs use `diff_old_sign` and `diff_new_sign`, which default to \
+         `diff_old` and `diff_new`. These styles are applied after `code_block`, \
+         so their properties take precedence. Diff gutters use \
+         `diff_old_line_nr` and `diff_new_line_nr`, which default to \
+         `diff_line_nr`.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
         "Themes use 24-bit colors, but not every terminal can show them. Maki \
          checks the environment, terminfo, and the terminal itself, and when \
          truecolor is missing it quietly falls back to the closest of the 256 \
