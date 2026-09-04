@@ -239,7 +239,7 @@ high = {{ reasoning_effort = "xhigh" }}
 max = {{ reasoning_effort = "xhigh" }}
 ```
 
-Each declared key is a thinking mode the model accepts; a session level snaps down to the nearest declared level. Named modes send only their fragment, no token budget.
+Each declared key is a thinking mode the model accepts; a session level snaps to the nearest declared level below it, or up to the lowest one when below every key. Named modes send only their fragment, no token budget.
 
 You can also create a custom provider interactively with `maki auth login` and choosing the custom option. That writes a starter entry to this file.
 

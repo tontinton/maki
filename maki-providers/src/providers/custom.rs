@@ -17,7 +17,7 @@ use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, Think
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
 use crate::types::ThinkingFields;
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     // Custom providers resolve their own base URL (including any override) from
@@ -48,6 +48,16 @@ fn is_builtin_slug(slug: &str) -> bool {
 pub fn base_kind(slug: &str) -> Option<ProviderKind> {
     let config = ProvidersConfig::load();
     Some(protocol_kind(config.get(slug)?.protocol?))
+}
+
+fn parse_thinking_fields(value: &serde_json::Value, slug: &str) -> Option<Box<ThinkingFields>> {
+    match serde_json::from_value::<ThinkingFields>(value.clone()) {
+        Ok(fields) => Some(Box::new(fields)),
+        Err(error) => {
+            warn!(slug, %error, "invalid thinking_fields, dropping them");
+            None
+        }
+    }
 }
 
 fn resolve_custom_auth(slug: &str) -> Result<ResolvedAuth, AgentError> {
@@ -130,13 +140,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
     );
     let thinking_fields = declared
         .and_then(|m| m.thinking_fields.as_ref())
-        .and_then(|v| match serde_json::from_value::<ThinkingFields>(v.clone()) {
-            Ok(fields) => Some(Box::new(fields)),
-            Err(error) => {
-                warn!(slug, %error, "invalid thinking_fields, dropping them");
-                None
-            }
-        });
+        .and_then(|v| parse_thinking_fields(v, slug));
     let supports_vision_override = declared.and_then(|m| m.supports_vision);
     let pricing = declared
         .filter(|m| m.has_pricing())
@@ -308,11 +312,8 @@ impl Provider for CustomOpenAiProvider {
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
-            if model.thinking_fields.is_some() {
-                opts.thinking.apply_local_thinking(&mut body, model);
-            } else if model.supports_thinking() {
-                opts.thinking.apply_reasoning_effort(&mut body, &dialect::OLLAMA, model);
-            }
+            opts.thinking
+                .apply_openai_thinking(&mut body, model, &crate::dialect::OLLAMA);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
