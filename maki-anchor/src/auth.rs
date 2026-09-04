@@ -21,6 +21,8 @@ pub enum AuthError {
 pub struct Auth {
     pub oidc: Option<OidcConfig>,
     pub store: Arc<Store>,
+    pub allow_local: bool,
+    pub require_auth_for_tokens: bool,
     /// Login state -> timestamp, so /callback can verify the state parameter.
     /// Bounded by pruning on insert.
     pending: std::sync::Mutex<std::collections::HashMap<String, i64>>,
@@ -30,12 +32,36 @@ const PENDING_TTL_SECS: i64 = 600;
 const PENDING_CAP: usize = 100;
 
 impl Auth {
-    pub fn new(store: Arc<Store>, oidc: Option<OidcConfig>) -> Self {
+    pub fn new(
+        store: Arc<Store>,
+        oidc: Option<OidcConfig>,
+        allow_local: bool,
+        require_auth_for_tokens: bool,
+    ) -> Self {
         Self {
             oidc,
             store,
+            allow_local,
+            require_auth_for_tokens,
             pending: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    pub fn login_local(&self, username: &str, password: &str) -> Result<String, AuthError> {
+        if !self.allow_local {
+            return Err(AuthError::NotConfigured);
+        }
+        let user = self
+            .store
+            .verify_local_user(username, password)
+            .map_err(|_| {
+                AuthError::Oidc(oidc::OidcError::InvalidToken("invalid credentials".into()))
+            })?;
+        let cookie = new_session_cookie();
+        self.store
+            .create_oidc_session(&cookie, user.id, SESSION_TTL)
+            .map_err(AuthError::Store)?;
+        Ok(cookie)
     }
 
     pub fn enabled(&self) -> bool {

@@ -126,6 +126,8 @@ pub fn serve(
     addr: &str,
     store: Arc<Store>,
     oidc: Option<crate::oidc::OidcConfig>,
+    allow_local: bool,
+    require_auth_for_tokens: bool,
 ) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).map_err(|source| ServerError::Bind {
         addr: addr.to_string(),
@@ -146,7 +148,12 @@ pub fn serve(
         addr: ws_addr.clone(),
         source,
     })?;
-    let auth = Arc::new(crate::auth::Auth::new(Arc::clone(&store), oidc));
+    let auth = Arc::new(crate::auth::Auth::new(
+        Arc::clone(&store),
+        oidc,
+        allow_local,
+        require_auth_for_tokens,
+    ));
     let ws_store = Arc::clone(&store);
     let ws_hub = Arc::clone(&hub);
     thread::spawn(move || {
@@ -271,7 +278,30 @@ fn route(
     // Auth endpoints work without a session; everything user-facing below
     // needs one when OIDC is on.
     if path == "/login" {
-        return start_login(request, auth);
+        if request.method().as_str() == "POST" && auth.allow_local {
+            return handle_local_login(request, auth);
+        }
+        // GET /login: if OIDC+local enabled, show chooser; if OIDC only, redirect; if local only, show form
+        if auth.enabled() && auth.allow_local {
+            return render_login_page(request, auth);
+        }
+        if auth.enabled() {
+            return start_login(request, auth);
+        }
+        if auth.allow_local {
+            return render_login_page(request, auth);
+        }
+        return buffered(
+            (
+                404,
+                "text/plain".to_string(),
+                b"no login configured".to_vec(),
+            ),
+            request,
+        );
+    }
+    if path == "/api/login" && auth.allow_local {
+        return handle_api_local_login(request, auth);
     }
     if path == "/callback" {
         return finish_login(request, auth);
@@ -291,7 +321,14 @@ fn route(
     if auth.enabled() && user.is_none() {
         return redirect_to_login(request);
     }
-    route_authorized(path, request, hub, store, user)
+    if auth.allow_local && auth.require_auth_for_tokens && user.is_none() {
+        // Only require auth for dashboard if there is at least one user (otherwise bootstrapping)
+        let has_users = store.list_users().map(|u| !u.is_empty()).unwrap_or(false);
+        if has_users {
+            return redirect_to_login(request);
+        }
+    }
+    route_authorized(path, request, hub, store, user, auth)
 }
 
 fn cookie_header(request: &tiny_http::Request) -> Option<&str> {
@@ -319,6 +356,175 @@ fn start_login(request: tiny_http::Request, auth: &crate::auth::Auth) -> RouteOu
             request,
         ),
     }
+}
+
+fn render_login_page(request: tiny_http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
+    let has_oidc = auth.enabled();
+    let allow_local = auth.allow_local;
+    // If ?oidc=1 is present, do OIDC redirect directly
+    if has_oidc && request.url().contains("oidc=1") {
+        return start_login(request, auth);
+    }
+    let mut body = String::from(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>login</title>\
+         <style>body{font-family:system-ui;margin:2rem auto;max-width:40rem;padding:0 1rem} form{margin:1rem 0;padding:1rem;border:1px solid #ddd;border-radius:.5rem} input{padding:.4rem .6rem;border:1px solid #ccc;border-radius:.3rem;width:100%;box-sizing:border-box} button{padding:.5rem 1rem;margin-top:.5rem}</style></head><body><h1>maki anchor — login</h1>",
+    );
+    if has_oidc {
+        body.push_str("<p><a href=\"/login?oidc=1\" style=\"display:inline-block;padding:.6rem 1rem;background:#0072ff;color:#fff;text-decoration:none;border-radius:.3rem\">Log in with SSO</a></p>");
+        if allow_local {
+            body.push_str("<hr>");
+        }
+    }
+    if allow_local {
+        body.push_str(
+            r#"<form method="post" action="/login">
+            <h3>Local login</h3>
+            <label>Username<br><input name="username" required></label><br><br>
+            <label>Password<br><input type="password" name="password" required></label><br>
+            <button type="submit">Log in</button>
+            </form>
+            <p><small>First local user becomes admin. Create users on server: <code>maki-anchor users add &lt;username&gt; --admin</code></small></p>"#,
+        );
+    }
+    if !has_oidc && !allow_local {
+        body.push_str("<p>No login configured (OIDC and local disabled).</p>");
+    }
+    body.push_str("</body></html>");
+    buffered((200, "text/html".to_string(), body.into_bytes()), request)
+}
+
+fn handle_local_login(mut request: tiny_http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
+    let mut body = Vec::new();
+    if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
+        return buffered(
+            (413, "text/plain".to_string(), b"body too large".to_vec()),
+            request,
+        );
+    }
+    let body_str = String::from_utf8_lossy(&body);
+    let params = parse_form(&body_str);
+    let username = params.get("username").map(|s| s.as_str()).unwrap_or("");
+    let password = params.get("password").map(|s| s.as_str()).unwrap_or("");
+    match auth.login_local(username, password) {
+        Ok(cookie) => {
+            let response = Response::empty(302)
+                .with_header(Header::from_bytes("Location", "/".as_bytes()).unwrap())
+                .with_header(
+                    Header::from_bytes(
+                        "Set-Cookie",
+                        crate::auth::Auth::session_set_cookie(&cookie).as_bytes(),
+                    )
+                    .unwrap(),
+                );
+            let _ = request.respond(response);
+            RouteOutcome::Streamed
+        }
+        Err(_) => buffered(
+            (
+                401,
+                "text/html".to_string(),
+                b"<html><body>invalid credentials <a href=\"/login\">back</a></body></html>"
+                    .to_vec(),
+            ),
+            request,
+        ),
+    }
+}
+
+fn handle_api_local_login(
+    mut request: tiny_http::Request,
+    auth: &crate::auth::Auth,
+) -> RouteOutcome {
+    let mut body = Vec::new();
+    if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
+        return buffered(
+            (
+                413,
+                "application/json".to_string(),
+                br#"{"error":"body too large"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            // Try form fallback
+            let s = String::from_utf8_lossy(&body);
+            let p = parse_form(&s);
+            if let (Some(u), Some(p)) = (p.get("username"), p.get("password")) {
+                serde_json::json!({"username": u, "password": p})
+            } else {
+                return buffered(
+                    (
+                        400,
+                        "application/json".to_string(),
+                        br#"{"error":"invalid json"}"#.to_vec(),
+                    ),
+                    request,
+                );
+            }
+        }
+    };
+    let username = value.get("username").and_then(|v| v.as_str()).unwrap_or("");
+    let password = value.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    match auth.login_local(username, password) {
+        Ok(cookie) => {
+            // For API, return JSON and also set cookie if request is browser fetch with credentials
+            let body = br#"{"ok":true}"#.to_vec();
+            let response = Response::from_data(body)
+                .with_status_code(200)
+                .with_header(Header::from_bytes("Content-Type", b"application/json").unwrap())
+                .with_header(
+                    Header::from_bytes(
+                        "Set-Cookie",
+                        crate::auth::Auth::session_set_cookie(&cookie).as_bytes(),
+                    )
+                    .unwrap(),
+                );
+            let _ = request.respond(response);
+            RouteOutcome::Streamed
+        }
+        Err(_) => buffered(
+            (
+                401,
+                "application/json".to_string(),
+                br#"{"error":"invalid credentials"}"#.to_vec(),
+            ),
+            request,
+        ),
+    }
+}
+
+fn parse_form(body: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for pair in body.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            let k = url_decode(k);
+            let v = url_decode(v);
+            map.insert(k, v);
+        }
+    }
+    map
+}
+
+fn url_decode(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '+' {
+            out.push(' ');
+        } else if c == '%' {
+            let hi = chars.next().and_then(|c| c.to_digit(16));
+            let lo = chars.next().and_then(|c| c.to_digit(16));
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8 as char);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn finish_login(request: tiny_http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
@@ -409,14 +615,25 @@ fn redirect_to_login(request: tiny_http::Request) -> RouteOutcome {
 fn handle_api_create_instance(
     mut request: tiny_http::Request,
     store: &Arc<Store>,
-    _user: Option<&crate::store::UserRow>,
+    user: Option<&crate::store::UserRow>,
+    auth: &crate::auth::Auth,
 ) -> RouteOutcome {
     if request.method().as_str() != "POST" {
         return buffered(
             (
                 405,
-                "text/plain".to_string(),
-                b"method not allowed".to_vec(),
+                "application/json".to_string(),
+                br#"{"error":"method not allowed"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    if auth.require_auth_for_tokens && user.is_none() {
+        return buffered(
+            (
+                401,
+                "application/json".to_string(),
+                br#"{"error":"authentication required"}"#.to_vec(),
             ),
             request,
         );
@@ -424,7 +641,11 @@ fn handle_api_create_instance(
     let mut body = Vec::new();
     if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
         return buffered(
-            (413, "text/plain".to_string(), b"body too large".to_vec()),
+            (
+                413,
+                "application/json".to_string(),
+                br#"{"error":"body too large"}"#.to_vec(),
+            ),
             request,
         );
     }
@@ -432,7 +653,11 @@ fn handle_api_create_instance(
         Ok(v) => v,
         Err(_) => {
             return buffered(
-                (400, "text/plain".to_string(), b"invalid json".to_vec()),
+                (
+                    400,
+                    "application/json".to_string(),
+                    br#"{"error":"invalid json"}"#.to_vec(),
+                ),
                 request,
             );
         }
@@ -473,8 +698,10 @@ fn handle_api_create_instance(
         return buffered(
             (
                 500,
-                "text/plain".to_string(),
-                format!("store error: {e}").into_bytes(),
+                "application/json".to_string(),
+                serde_json::json!({"error": format!("store error: {e}")})
+                    .to_string()
+                    .into_bytes(),
             ),
             request,
         );
@@ -493,8 +720,10 @@ fn json_list_users(store: &Arc<Store>) -> (u16, String, Vec<u8>) {
         }
         Err(err) => (
             500,
-            "text/plain".to_string(),
-            format!("store error: {err}").into_bytes(),
+            "application/json".to_string(),
+            serde_json::json!({"error": format!("store error: {err}")})
+                .to_string()
+                .into_bytes(),
         ),
     }
 }
@@ -507,8 +736,10 @@ fn json_list_grants(store: &Arc<Store>) -> (u16, String, Vec<u8>) {
         }
         Err(err) => (
             500,
-            "text/plain".to_string(),
-            format!("store error: {err}").into_bytes(),
+            "application/json".to_string(),
+            serde_json::json!({"error": format!("store error: {err}")})
+                .to_string()
+                .into_bytes(),
         ),
     }
 }
@@ -522,8 +753,8 @@ fn handle_api_set_grant(
         return buffered(
             (
                 405,
-                "text/plain".to_string(),
-                b"method not allowed".to_vec(),
+                "application/json".to_string(),
+                br#"{"error":"method not allowed"}"#.to_vec(),
             ),
             request,
         );
@@ -543,7 +774,11 @@ fn handle_api_set_grant(
     let mut body = Vec::new();
     if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
         return buffered(
-            (413, "text/plain".to_string(), b"body too large".to_vec()),
+            (
+                413,
+                "application/json".to_string(),
+                br#"{"error":"body too large"}"#.to_vec(),
+            ),
             request,
         );
     }
@@ -551,7 +786,11 @@ fn handle_api_set_grant(
         Ok(v) => v,
         Err(_) => {
             return buffered(
-                (400, "text/plain".to_string(), b"invalid json".to_vec()),
+                (
+                    400,
+                    "application/json".to_string(),
+                    br#"{"error":"invalid json"}"#.to_vec(),
+                ),
                 request,
             );
         }
@@ -625,8 +864,10 @@ fn handle_api_set_grant(
         return buffered(
             (
                 500,
-                "text/plain".to_string(),
-                format!("store error: {e}").into_bytes(),
+                "application/json".to_string(),
+                serde_json::json!({"error": format!("store error: {e}")})
+                    .to_string()
+                    .into_bytes(),
             ),
             request,
         );
@@ -650,8 +891,8 @@ fn handle_api_revoke_grant(
         return buffered(
             (
                 405,
-                "text/plain".to_string(),
-                b"method not allowed".to_vec(),
+                "application/json".to_string(),
+                br#"{"error":"method not allowed"}"#.to_vec(),
             ),
             request,
         );
@@ -671,7 +912,11 @@ fn handle_api_revoke_grant(
     let mut body = Vec::new();
     if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
         return buffered(
-            (413, "text/plain".to_string(), b"body too large".to_vec()),
+            (
+                413,
+                "application/json".to_string(),
+                br#"{"error":"body too large"}"#.to_vec(),
+            ),
             request,
         );
     }
@@ -679,7 +924,11 @@ fn handle_api_revoke_grant(
         Ok(v) => v,
         Err(_) => {
             return buffered(
-                (400, "text/plain".to_string(), b"invalid json".to_vec()),
+                (
+                    400,
+                    "application/json".to_string(),
+                    br#"{"error":"invalid json"}"#.to_vec(),
+                ),
                 request,
             );
         }
@@ -744,8 +993,162 @@ fn handle_api_revoke_grant(
         Err(e) => buffered(
             (
                 500,
-                "text/plain".to_string(),
-                format!("store error: {e}").into_bytes(),
+                "application/json".to_string(),
+                serde_json::json!({"error": format!("store error: {e}")})
+                    .to_string()
+                    .into_bytes(),
+            ),
+            request,
+        ),
+    }
+}
+
+fn handle_api_create_user(
+    mut request: tiny_http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+    auth: &crate::auth::Auth,
+) -> RouteOutcome {
+    if !auth.allow_local {
+        return buffered(
+            (
+                403,
+                "application/json".to_string(),
+                br#"{"error":"local users disabled"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    if let Some(u) = user
+        && !u.is_admin
+    {
+        // Allow bootstrapping: if no users exist yet, anyone can create first admin
+        let has_users = store.list_users().map(|u| !u.is_empty()).unwrap_or(false);
+        if has_users {
+            return buffered(
+                (
+                    403,
+                    "application/json".to_string(),
+                    br#"{"error":"admin required"}"#.to_vec(),
+                ),
+                request,
+            );
+        }
+    } else if user.is_none() {
+        let has_users = store.list_users().map(|u| !u.is_empty()).unwrap_or(false);
+        if has_users && auth.require_auth_for_tokens {
+            return buffered(
+                (
+                    401,
+                    "application/json".to_string(),
+                    br#"{"error":"authentication required"}"#.to_vec(),
+                ),
+                request,
+            );
+        }
+    }
+    let mut body = Vec::new();
+    if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
+        return buffered(
+            (
+                413,
+                "application/json".to_string(),
+                br#"{"error":"body too large"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return buffered(
+                (
+                    400,
+                    "application/json".to_string(),
+                    br#"{"error":"invalid json"}"#.to_vec(),
+                ),
+                request,
+            );
+        }
+    };
+    let username = value
+        .get("username")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    let password = value
+        .get("password")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let email = value
+        .get("email")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+    let name = value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+    let is_admin = value
+        .get("is_admin")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if username.is_empty() || password.is_empty() {
+        return buffered(
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"missing username or password"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    if username.len() > 32
+        || !username
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return buffered(
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"username must be 1-32 alphanumeric/_-."}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    if password.len() < 8 {
+        return buffered(
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"password must be at least 8 chars"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    match store.create_local_user(
+        &username,
+        &password,
+        email.as_deref(),
+        name.as_deref(),
+        is_admin,
+    ) {
+        Ok(u) => {
+            let body =
+                serde_json::json!({"id": u.id, "username": username, "is_admin": u.is_admin})
+                    .to_string()
+                    .into_bytes();
+            buffered((200, "application/json".to_string(), body), request)
+        }
+        Err(e) => buffered(
+            (
+                500,
+                "application/json".to_string(),
+                serde_json::json!({"error": format!("store error: {e}")})
+                    .to_string()
+                    .into_bytes(),
             ),
             request,
         ),
@@ -760,28 +1163,33 @@ fn route_authorized(
     _hub: &Hub,
     store: &Arc<Store>,
     user: Option<crate::store::UserRow>,
+    auth: &crate::auth::Auth,
 ) -> RouteOutcome {
     if path == "/" {
-        return buffered(crate::dashboard::render(store, user.as_ref()), request);
+        return buffered(
+            crate::dashboard::render(store, user.as_ref(), auth),
+            request,
+        );
     }
     if path == "/links" {
         return render_link(request, store, user.as_ref());
     }
     if path == "/api/instances" {
-        return handle_api_create_instance(request, store, user.as_ref());
+        return handle_api_create_instance(request, store, user.as_ref(), auth);
     }
     if path == "/api/users" {
-        if request.method().as_str() != "GET" {
-            return buffered(
+        return match request.method().as_str() {
+            "GET" => buffered(json_list_users(store), request),
+            "POST" => handle_api_create_user(request, store, user.as_ref(), auth),
+            _ => buffered(
                 (
                     405,
-                    "text/plain".to_string(),
-                    b"method not allowed".to_vec(),
+                    "application/json".to_string(),
+                    br#"{"error":"method not allowed"}"#.to_vec(),
                 ),
                 request,
-            );
-        }
-        return buffered(json_list_users(store), request);
+            ),
+        };
     }
     if path == "/api/grants" {
         return match request.method().as_str() {

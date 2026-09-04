@@ -25,6 +25,17 @@ const DEFAULT_LINK_TTL_HOURS: u64 = 2;
 #[serde(default, deny_unknown_fields)]
 struct AnchorConfig {
     oidc: Option<OidcFileConfig>,
+    auth: Option<AuthFileConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct AuthFileConfig {
+    /// Allow username/password local users in addition to OIDC. Default true.
+    allow_local_users: Option<bool>,
+    /// If true, only authenticated users (OIDC or local) can mint instance tokens via the UI/API.
+    /// Default: true when OIDC is configured, false otherwise. Override with MAKI_ANCHOR_REQUIRE_AUTH_FOR_TOKENS env.
+    require_auth_for_tokens: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -80,6 +91,13 @@ enum Command {
         #[arg(long, default_value = DEFAULT_DB_PATH, global = true)]
         db: PathBuf,
     },
+    /// Manage local users (username/password) for when OIDC is not used or as fallback
+    Users {
+        #[command(subcommand)]
+        sub: UserCommand,
+        #[arg(long, default_value = DEFAULT_DB_PATH, global = true)]
+        db: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -97,6 +115,24 @@ enum GrantCommand {
     List,
     /// Look up a user id by OIDC subject (for writing grants)
     Lookup { oidc_sub: String },
+}
+
+#[derive(Subcommand)]
+enum UserCommand {
+    /// Add a local user (prompts for password)
+    Add {
+        username: String,
+        #[arg(long)]
+        admin: bool,
+        #[arg(long)]
+        email: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List users
+    List,
+    /// Set password for a local user
+    SetPassword { username: String },
 }
 
 #[derive(Subcommand)]
@@ -143,7 +179,24 @@ fn main() {
                 .inspect(|_| {
                     tracing::info!("OIDC login enabled");
                 });
-            if let Err(err) = server::serve(&bind, store, oidc) {
+            let allow_local = anchor_config
+                .auth
+                .as_ref()
+                .and_then(|a| a.allow_local_users)
+                .unwrap_or(true);
+            let require_auth_for_tokens = anchor_config
+                .auth
+                .as_ref()
+                .and_then(|a| a.require_auth_for_tokens)
+                .or_else(|| {
+                    std::env::var("MAKI_ANCHOR_REQUIRE_AUTH_FOR_TOKENS")
+                        .ok()
+                        .map(|v| v != "0" && v.to_lowercase() != "false")
+                })
+                .unwrap_or_else(|| oidc.is_some());
+            if let Err(err) =
+                server::serve(&bind, store, oidc, allow_local, require_auth_for_tokens)
+            {
                 eprintln!("fatal: {err}");
                 std::process::exit(1);
             }
@@ -239,7 +292,99 @@ fn main() {
                 }
             }
         }
+        Command::Users { sub, db } => {
+            let store = Store::open(&db).expect("open anchor db");
+            match sub {
+                UserCommand::Add {
+                    username,
+                    admin,
+                    email,
+                    name,
+                } => {
+                    let password = prompt_password(&format!("Password for {username}: "));
+                    let confirm = prompt_password("Confirm: ");
+                    if password != confirm {
+                        eprintln!("passwords do not match");
+                        std::process::exit(1);
+                    }
+                    if password.len() < 8 {
+                        eprintln!("password must be at least 8 characters");
+                        std::process::exit(1);
+                    }
+                    let user = store
+                        .create_local_user(
+                            &username,
+                            &password,
+                            email.as_deref(),
+                            name.as_deref(),
+                            admin,
+                        )
+                        .expect("create local user");
+                    println!(
+                        "local user {} id {} admin={} created",
+                        username, user.id, user.is_admin
+                    );
+                }
+                UserCommand::List => {
+                    for u in store.list_users().expect("list users") {
+                        println!(
+                            "{} {} {} {} admin={} local={}",
+                            u.id,
+                            u.oidc_sub,
+                            u.email.as_deref().unwrap_or("-"),
+                            u.name.as_deref().unwrap_or("-"),
+                            u.is_admin,
+                            u.oidc_sub.starts_with("local:")
+                        );
+                    }
+                }
+                UserCommand::SetPassword { username } => {
+                    let password = prompt_password(&format!("New password for {username}: "));
+                    let confirm = prompt_password("Confirm: ");
+                    if password != confirm {
+                        eprintln!("passwords do not match");
+                        std::process::exit(1);
+                    }
+                    let existing = store
+                        .local_user_by_username(&username)
+                        .expect("no such local user");
+                    store
+                        .create_local_user(
+                            &username,
+                            &password,
+                            existing.email.as_deref(),
+                            existing.name.as_deref(),
+                            existing.is_admin,
+                        )
+                        .expect("set password");
+                    println!("password updated for {username}");
+                }
+            }
+        }
     }
+}
+
+fn prompt_password(prompt: &str) -> String {
+    use std::io::{self, Write};
+    print!("{prompt}");
+    io::stdout().flush().unwrap();
+    // Try to disable echo with stty if available, otherwise just read.
+    let mut password = String::new();
+    // Use rpassword if available via tty, fallback.
+    #[cfg(unix)]
+    {
+        let _ = io::stdout().flush();
+        // Try stty -echo
+        let _ = std::process::Command::new("stty").arg("-echo").status();
+        let res = io::stdin().read_line(&mut password);
+        let _ = std::process::Command::new("stty").arg("echo").status();
+        println!();
+        if res.is_ok() {
+            return password.trim().to_owned();
+        }
+    }
+    io::stdin().read_line(&mut password).unwrap();
+    password.trim().to_owned()
 }
 
 fn instance_id_by_name(store: &Store, name: &str) -> i64 {

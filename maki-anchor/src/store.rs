@@ -142,13 +142,15 @@ impl Store {
                  expires_at INTEGER NOT NULL,
                  revoked_at INTEGER
              );
-             CREATE TABLE IF NOT EXISTS users (
-                 id INTEGER PRIMARY KEY,
-                 oidc_sub TEXT NOT NULL UNIQUE,
-                 email TEXT,
-                 name TEXT,
-                 is_admin INTEGER NOT NULL DEFAULT 0
-             );
+              CREATE TABLE IF NOT EXISTS users (
+                  id INTEGER PRIMARY KEY,
+                  oidc_sub TEXT NOT NULL UNIQUE,
+                  email TEXT,
+                  name TEXT,
+                  is_admin INTEGER NOT NULL DEFAULT 0,
+                  password_hash TEXT,
+                  local_username TEXT UNIQUE
+              );
              CREATE TABLE IF NOT EXISTS oidc_sessions (
                  cookie TEXT PRIMARY KEY,
                  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -159,8 +161,16 @@ impl Store {
                  instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
                  rights TEXT NOT NULL,
                  PRIMARY KEY (user_id, instance_id)
-             );",
+              );",
         )?;
+        // Migrations for local users (add columns if DB was created before this version).
+        let _ = conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT", []);
+        let _ = conn.execute("ALTER TABLE users ADD COLUMN local_username TEXT", []);
+        // Ensure unique index for local_username where not null (older DBs may not have it).
+        let _ = conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS users_local_username_unique ON users(local_username) WHERE local_username IS NOT NULL",
+            [],
+        );
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
@@ -545,6 +555,82 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    fn hash_password(username: &str, password: &str) -> String {
+        hash_token(&format!("{username}\0{password}"))
+    }
+
+    pub fn create_local_user(
+        &self,
+        username: &str,
+        password: &str,
+        email: Option<&str>,
+        name: Option<&str>,
+        is_admin: bool,
+    ) -> Result<UserRow, StoreError> {
+        let oidc_sub = format!("local:{username}");
+        let hash = Self::hash_password(username, password);
+        let conn = self.conn.lock().unwrap();
+        let admins: i64 =
+            conn.query_row("SELECT COUNT(*) FROM users WHERE is_admin = 1", [], |r| {
+                r.get(0)
+            })?;
+        let is_admin = is_admin || admins == 0;
+        conn.execute(
+            "INSERT INTO users (oidc_sub, email, name, is_admin, password_hash, local_username) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(oidc_sub) DO UPDATE SET email=excluded.email, name=excluded.name, is_admin=excluded.is_admin, password_hash=excluded.password_hash, local_username=excluded.local_username",
+            rusqlite::params![oidc_sub, email, name, i64::from(is_admin), hash, username],
+        )?;
+        let id = conn.query_row(
+            "SELECT id FROM users WHERE oidc_sub = ?1",
+            [&oidc_sub],
+            |r| r.get(0),
+        )?;
+        Ok(UserRow {
+            id,
+            oidc_sub,
+            email: email.map(str::to_owned),
+            name: name.map(str::to_owned),
+            is_admin,
+        })
+    }
+
+    pub fn verify_local_user(&self, username: &str, password: &str) -> Result<UserRow, StoreError> {
+        let hash = Self::hash_password(username, password);
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, oidc_sub, email, name, is_admin FROM users WHERE local_username = ?1 AND password_hash = ?2",
+            rusqlite::params![username, hash],
+            |row| {
+                Ok(UserRow {
+                    id: row.get(0)?,
+                    oidc_sub: row.get(1)?,
+                    email: row.get(2)?,
+                    name: row.get(3)?,
+                    is_admin: row.get::<_, i64>(4)? != 0,
+                })
+            },
+        )
+        .map_err(StoreError::from)
+    }
+
+    pub fn local_user_by_username(&self, username: &str) -> Result<UserRow, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, oidc_sub, email, name, is_admin FROM users WHERE local_username = ?1",
+            [username],
+            |row| {
+                Ok(UserRow {
+                    id: row.get(0)?,
+                    oidc_sub: row.get(1)?,
+                    email: row.get(2)?,
+                    name: row.get(3)?,
+                    is_admin: row.get::<_, i64>(4)? != 0,
+                })
+            },
+        )
+        .map_err(StoreError::from)
     }
 }
 

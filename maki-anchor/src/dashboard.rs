@@ -7,7 +7,11 @@ use crate::store::{Store, UserRow};
 
 /// Renders the dashboard. No templating engine: the page is small, and
 /// `format!` keeps the dependency set tiny.
-pub fn render(store: &Arc<Store>, user: Option<&UserRow>) -> (u16, String, Vec<u8>) {
+pub fn render(
+    store: &Arc<Store>,
+    user: Option<&UserRow>,
+    _auth: &crate::auth::Auth,
+) -> (u16, String, Vec<u8>) {
     let instances = store.list_instances().unwrap_or_default();
     let sessions = store.list_sessions().unwrap_or_default();
     let now = crate::store::now_unix();
@@ -142,7 +146,20 @@ pub fn render(store: &Arc<Store>, user: Option<&UserRow>) -> (u16, String, Vec<u
           <button type="button" id="grant-revoke" style="padding:.4rem .8rem">Revoke</button>
           <span id="grant-status" style="color:#666"></span>
         </form>
-        <small>Admin only: first user to log in via SSO becomes admin. Grants give <code>view</code> (read) or <code>control</code> (prompt + approve) on an instance. Without SSO, grants are unused.</small>
+        <div style="margin-top:1rem;padding-top:1rem;border-top:1px solid #ddd">
+          <h3>Create local user (when SSO disabled or as fallback)</h3>
+          <form id="user-create-form" style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:end">
+            <label>Username <input id="new-username" required style="padding:.3rem .5rem;border:1px solid #ccc;border-radius:.3rem"></label>
+            <label>Password <input id="new-password" type="password" required style="padding:.3rem .5rem;border:1px solid #ccc;border-radius:.3rem"></label>
+            <label>Email <input id="new-email" placeholder="optional" style="padding:.3rem .5rem;border:1px solid #ccc;border-radius:.3rem"></label>
+            <label>Name <input id="new-name" placeholder="optional" style="padding:.3rem .5rem;border:1px solid #ccc;border-radius:.3rem"></label>
+            <label><input type="checkbox" id="new-admin"> Admin</label>
+            <button type="submit" style="padding:.4rem .8rem">Create</button>
+            <span id="user-create-status" style="color:#666"></span>
+          </form>
+          <small>First user (SSO or local) becomes admin. Local users log in via <a href="/login">/login</a>.</small>
+        </div>
+        <small>Admin only: first user to log in via SSO becomes admin. Grants give <code>view</code> (read) or <code>control</code> (prompt + approve) on an instance. Without SSO, grants are unused unless <code>require_auth_for_tokens</code> is set.</small>
         </div>
         <script>
         (() => {
@@ -201,6 +218,22 @@ pub fn render(store: &Arc<Store>, user: Option<&UserRow>) -> (u16, String, Vec<u
             grantStatus.textContent = ok ? 'revoked' : (j.error||'failed');
             if (ok) loadGrants();
           };
+          const userCreateForm = document.getElementById('user-create-form');
+          const userCreateStatus = document.getElementById('user-create-status');
+          if (userCreateForm) {
+            userCreateForm.onsubmit = async (e) => {
+              e.preventDefault();
+              const username = document.getElementById('new-username').value.trim();
+              const password = document.getElementById('new-password').value;
+              const email = document.getElementById('new-email').value.trim();
+              const name = document.getElementById('new-name').value.trim();
+              const is_admin = document.getElementById('new-admin').checked;
+              userCreateStatus.textContent='creating…';
+              const {ok, j} = await fetchJson('/api/users', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username, password, email: email||undefined, name: name||undefined, is_admin})});
+              userCreateStatus.textContent = ok ? `created ${j.username} id ${j.id}` : (j.error||'failed');
+              if (ok) { loadUsers(); userCreateForm.reset(); }
+            };
+          }
           loadSso(); loadUsers(); loadGrants();
         })();
         </script>
