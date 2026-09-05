@@ -8,6 +8,7 @@ use std::time::UNIX_EPOCH;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 
+use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
 
@@ -476,11 +477,11 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
     let abs = make_absolute(&path)?;
     let recursive = opts
         .as_ref()
-        .and_then(|t| t.get::<bool>("recursive").ok())
+        .and_then(|t| opt_bool(t, "recursive"))
         .unwrap_or(false);
     let force = opts
         .as_ref()
-        .and_then(|t| t.get::<bool>("force").ok())
+        .and_then(|t| opt_bool(t, "force"))
         .unwrap_or(false);
     let result = smol::unblock(move || -> std::io::Result<()> {
         let meta = match std::fs::symlink_metadata(&abs) {
@@ -519,7 +520,7 @@ async fn mkdir(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<b
     let abs = make_absolute(&path)?;
     let parents = opts
         .as_ref()
-        .and_then(|t| t.get::<bool>("parents").ok())
+        .and_then(|t| opt_bool(t, "parents"))
         .unwrap_or(false);
     let result = if parents {
         smol::fs::create_dir_all(&abs).await
@@ -562,7 +563,7 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
     let limit = opts.as_ref().and_then(|t| t.get::<usize>("limit").ok());
     let gitignore = opts
         .as_ref()
-        .and_then(|t| t.get::<bool>("gitignore").ok())
+        .and_then(|t| opt_bool(t, "gitignore"))
         .unwrap_or(true);
     let sort = opts.as_ref().and_then(|t| t.get::<String>("sort").ok());
     let sort_mtime = sort.as_deref() == Some("mtime");
@@ -709,6 +710,7 @@ mod tests {
     use crate::plugin_permissions::PluginPermissions;
     use mlua::Lua;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     const FIRST_CONTENT: &str = "first";
     const REPLACEMENT_CONTENT: &str = "replacement";
@@ -1370,6 +1372,33 @@ mod tests {
             smol::block_on(glob.call_async::<(Table, mlua::Value)>(("*.rs", opts))).unwrap();
         assert!(matches!(err, mlua::Value::Nil));
         assert_eq!(result.len().unwrap(), 2);
+    }
+
+    /// The fixture ignores through `.ignore` so the walker needs no git repo,
+    /// and hides a directory rather than a file because the glob patterns turn
+    /// into whitelist overrides that outrank a file-level ignore rule.
+    #[test_case(None, 0 ; "omitted_key_keeps_the_true_default")]
+    #[test_case(Some(false), 1 ; "false_includes_ignored_files")]
+    fn glob_gitignore_option(gitignore: Option<bool>, expected_hits: i64) {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".ignore"), "sub/\n").unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("sub/ignored.log"), "").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        if let Some(gitignore) = gitignore {
+            opts.set("gitignore", gitignore).unwrap();
+        }
+
+        let (result, err): (Table, mlua::Value) =
+            smol::block_on(glob.call_async::<(Table, mlua::Value)>(("**/*.log", opts))).unwrap();
+        assert!(matches!(err, mlua::Value::Nil));
+        assert_eq!(result.len().unwrap(), expected_hits);
     }
 
     #[test]

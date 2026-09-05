@@ -13,6 +13,7 @@ use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, Split,
     TitlePos, UiAction, WinCommand, WinEvent, ui_send,
 };
+use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 pub(crate) mod blit;
@@ -95,10 +96,7 @@ pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
 /// toast:line("copied!")
 #[lua_fn]
 fn buf(lua: &Lua, opts: Option<Table>) -> LuaResult<buf::BufHandle> {
-    let scratch = match opts {
-        Some(t) => t.get::<Option<bool>>("scratch")?.unwrap_or(false),
-        None => false,
-    };
+    let scratch = opts.and_then(|t| opt_bool(&t, "scratch")).unwrap_or(false);
     Ok(with_task_bufs(lua, |store| {
         if scratch {
             store.create()
@@ -155,7 +153,7 @@ fn theme_color(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
 async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) -> LuaResult<Table> {
     let independent = opts
         .as_ref()
-        .and_then(|t| t.get::<bool>("independent").ok())
+        .and_then(|t| opt_bool(t, "independent"))
         .unwrap_or(false);
     let prefix = opts
         .and_then(|t| t.get::<String>("prefix").ok())
@@ -409,15 +407,11 @@ fn open_win(
 ) -> LuaResult<WinHandle> {
     let buf_handle = buf.borrow::<buf::BufHandle>()?;
     let title: String = opts.get("title").unwrap_or_default();
-    let cursor_line: bool = opts.get("cursor_line").unwrap_or(false);
+    let cursor_line = opt_bool(&opts, "cursor_line").unwrap_or(false);
     let footer = parse_footer(&opts)?;
     let reserved_bottom: usize = opts.get("reserved_bottom").unwrap_or(0);
     let reserved_top: usize = opts.get("reserved_top").unwrap_or(0);
-    let focus: bool = opts
-        .get::<Option<bool>>("focus")
-        .ok()
-        .flatten()
-        .unwrap_or(true);
+    let focus = opt_bool(&opts, "focus").unwrap_or(true);
     let zindex: u16 = opts.get("zindex").unwrap_or(50);
 
     let width = parse_dimension(&opts, "width", Dimension::Percent(60));
@@ -429,9 +423,9 @@ fn open_win(
     let title_pos = parse_title_pos(&opts);
     let split = parse_split(&opts);
     let order: u16 = opts.get("order").unwrap_or(50);
-    let visible: bool = opts.get("visible").unwrap_or(true);
-    let needs_input: bool = opts.get("needs_input").unwrap_or(false);
-    let stack: bool = opts.get("stack").unwrap_or(false);
+    let visible = opt_bool(&opts, "visible").unwrap_or(true);
+    let needs_input = opt_bool(&opts, "needs_input").unwrap_or(false);
+    let stack = opt_bool(&opts, "stack").unwrap_or(false);
 
     let config = FloatConfig {
         width,
