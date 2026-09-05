@@ -37,23 +37,23 @@ pre{background:#fff;border:1px solid #e2e8f0;padding:.7rem;border-radius:8px;ove
 "#
 }
 
-fn layout_start(title: &str, user: Option<&UserRow>) -> String {
-    let mut s = String::new();
-    s.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
+fn layout_start(title: &str, user: Option<&UserRow>, page: &str) -> String {
+    let mut s = String::from(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>",
+    );
     s.push_str(&html_escape(title));
     s.push_str("</title><style>");
     s.push_str(base_style());
-    s.push_str("</style></head><body><header><h1>maki anchor</h1><nav class=\"nav\"><a href=\"/\" class=\"");
-    s.push_str(if title == "maki anchor" { "active" } else { "" });
-    s.push_str("\">Dashboard</a>");
+    s.push_str("</style></head><body><header><h1>maki anchor</h1><nav class=\"nav\">");
+    let item = |href: &str, label: &str, id: &str| -> String {
+        let cls = if page == id { "active" } else { "" };
+        format!("<a href=\"{href}\" class=\"{cls}\">{label}</a>")
+    };
+    s.push_str(&item("/", "Sessions", "sessions"));
+    s.push_str(&item("/instances", "Instances", "instances"));
+    s.push_str(&item("/links", "Links", "links"));
     if user.is_some_and(|u| u.is_admin) {
-        s.push_str("<a href=\"/admin\" class=\"");
-        s.push_str(if title == "maki anchor — admin" {
-            "active"
-        } else {
-            ""
-        });
-        s.push_str("\">Admin</a>");
+        s.push_str(&item("/admin", "Admin", "admin"));
     }
     s.push_str("</nav>");
     if let Some(user) = user {
@@ -79,24 +79,86 @@ fn layout_end() -> &'static str {
     "</main></body></html>"
 }
 
-pub fn render(
-    store: &Arc<Store>,
+/// What this viewer may see: everything for admins, granted rows otherwise.
+fn visible(
+    store: &Store,
     user: Option<&UserRow>,
-    _auth: &crate::auth::Auth,
+) -> (
+    Vec<crate::store::InstanceRow>,
+    Vec<crate::store::SessionRow>,
+) {
+    match user {
+        Some(u) if !u.is_admin => (
+            store.instances_for_user(u.id, false).unwrap_or_default(),
+            store.sessions_for_user(u.id, false).unwrap_or_default(),
+        ),
+        _ => (
+            store.list_instances().unwrap_or_default(),
+            store.list_sessions().unwrap_or_default(),
+        ),
+    }
+}
+
+/// The home page: which shares are live right now, and the sessions the
+/// instances have reported.
+pub fn render_sessions(
+    store: &Store,
+    hub: &crate::hub::Hub,
+    user: Option<&UserRow>,
 ) -> (u16, String, Vec<u8>) {
-    let instances_all = store.list_instances().unwrap_or_default();
-    let sessions_all = store.list_sessions().unwrap_or_default();
-    let (instances, sessions) = match user {
-        Some(u) if !u.is_admin => {
-            let inst = store.instances_for_user(u.id, false).unwrap_or_default();
-            let sess = store.sessions_for_user(u.id, false).unwrap_or_default();
-            (inst, sess)
-        }
-        _ => (instances_all, sessions_all),
-    };
+    let (instances, sessions) = visible(store, user);
     let now = crate::store::now_unix();
     let mut body = String::with_capacity(8192);
-    body.push_str(&layout_start("maki anchor", user));
+    body.push_str(&layout_start("maki anchor", user, "sessions"));
+    body.push_str(&links_card(store, hub, user, &instances));
+    body.push_str("<div class=\"card\"><h2>Sessions</h2><table><tr><th>Instance</th><th>Title</th><th>Model</th><th>Status</th><th>Cost</th><th>Updated</th><th></th></tr>");
+    let names: std::collections::HashMap<i64, String> =
+        instances.iter().map(|i| (i.id, i.name.clone())).collect();
+    if sessions.is_empty() {
+        body.push_str("<tr><td colspan=7 class=\"small\">no sessions yet</td></tr>");
+    }
+    for session in &sessions {
+        let instance_name = names
+            .get(&session.instance_id)
+            .map(String::as_str)
+            .unwrap_or("?");
+        let cost = if session.cost_cents == 0 && session.tokens_in == 0 {
+            String::new()
+        } else {
+            format!("${:.2}", session.cost_cents as f64 / 100.0)
+        };
+        // An Open link mints a two-hour control link scoped to just this
+        // session, so the dashboard's scoped-share path needs no hand-typed ids.
+        let open = format!(
+            "/links?instance={}&amp;session={}&amp;rights=control&amp;hours=2",
+            urlencode(instance_name),
+            urlencode(&session.external_id),
+        );
+        body.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{cost}</td><td>{}s ago</td>\
+             <td><a href=\"{open}\">open</a></td></tr>",
+            html_escape(instance_name),
+            html_escape(&session.title),
+            html_escape(&session.model),
+            html_escape(&session.status),
+            now - session.updated_at,
+        ));
+    }
+    body.push_str("</table>");
+    if user.is_some_and(|u| !u.is_admin) {
+        body.push_str("<p class=\"small\">Filtered to your grants. Admins see all on <a href=\"/admin\">Admin</a>.</p>");
+    }
+    body.push_str("</div>");
+    body.push_str(layout_end());
+    (200, "text/html".to_string(), body.into_bytes())
+}
+
+/// The Instances page: the install wizard and the fleet roster.
+pub fn render_instances(store: &Store, user: Option<&UserRow>) -> (u16, String, Vec<u8>) {
+    let (instances, _) = visible(store, user);
+    let now = crate::store::now_unix();
+    let mut body = String::with_capacity(8192);
+    body.push_str(&layout_start("maki anchor — instances", user, "instances"));
     body.push_str(
         r#"<div class="card" id="install">
         <h2>Install on a new host</h2>
@@ -169,63 +231,24 @@ pub fn render(
         body.push_str("<p class=\"small\">Showing only instances you have a grant for. Ask an admin for access to more.</p>");
     }
     body.push_str("</div>");
-    body.push_str("<div class=\"card\"><h2>Sessions</h2><table><tr><th>Instance</th><th>Title</th><th>Model</th><th>Status</th><th>Cost</th><th>Updated</th><th></th></tr>");
-    let names: std::collections::HashMap<i64, String> =
-        instances.iter().map(|i| (i.id, i.name.clone())).collect();
-    let all_names: std::collections::HashMap<i64, String> = store
-        .list_instances()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|i| (i.id, i.name))
-        .collect();
-    if sessions.is_empty() {
-        body.push_str("<tr><td colspan=7 class=\"small\">no sessions yet</td></tr>");
-    }
-    for session in &sessions {
-        let name_map = if names.contains_key(&session.instance_id) {
-            &names
-        } else {
-            &all_names
-        };
-        let instance_name = name_map
-            .get(&session.instance_id)
-            .map(String::as_str)
-            .unwrap_or("?");
-        // Cost is pushed by the instance; render dollars, blank when unpriced.
-        let cost = if session.cost_cents == 0 && session.tokens_in == 0 {
-            String::new()
-        } else {
-            format!("${:.2}", session.cost_cents as f64 / 100.0)
-        };
-        // An Open link mints a two-hour control link scoped to just this
-        // session, so the dashboard's scoped-share path needs no hand-typed ids.
-        let open = format!(
-            "/links?instance={}&amp;session={}&amp;rights=control&amp;hours=2",
-            urlencode(instance_name),
-            urlencode(&session.external_id),
-        );
-        body.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{cost}</td><td>{}s ago</td>\
-             <td><a href=\"{open}\">open</a></td></tr>",
-            html_escape(instance_name),
-            html_escape(&session.title),
-            html_escape(&session.model),
-            html_escape(&session.status),
-            now - session.updated_at,
-        ));
-    }
-    body.push_str("</table>");
-    if user.is_some_and(|u| !u.is_admin) {
-        body.push_str("<p class=\"small\">Filtered to your grants. Admins see all on <a href=\"/admin\">Admin</a>.</p>");
-    } else if user.is_some_and(|u| u.is_admin) {
-        body.push_str("<p class=\"small\"><a href=\"/admin\">Admin</a> → manage users, grants, and mint policy.</p>");
-    }
-    body.push_str("</div>");
+    body.push_str(layout_end());
+    (200, "text/html".to_string(), body.into_bytes())
+}
+
+/// The Links page: mint a share, and see every live one.
+pub fn render_links(
+    store: &Store,
+    hub: &crate::hub::Hub,
+    user: Option<&UserRow>,
+) -> (u16, String, Vec<u8>) {
+    let (instances, _) = visible(store, user);
+    let mut body = String::with_capacity(8192);
+    body.push_str(&layout_start("maki anchor — links", user, "links"));
     body.push_str(
         "<div class=\"card\"><h2>Share a session</h2>\
          <form method=\"get\" action=\"/links\" style=\"display:flex;gap:.5rem;flex-wrap:wrap;align-items:end\">\
          <label>Instance<br><input name=\"instance\" list=\"instance-names\" required></label> \
-         <datalist id=\"instance-names\">"
+         <datalist id=\"instance-names\">",
     );
     for instance in &instances {
         body.push_str(&format!(
@@ -241,8 +264,78 @@ pub fn render(
          <button type=\"submit\" class=\"primary\">Mint link</button></form>\
          <p class=\"small\">Links are proxied via the tunnel; grants can upgrade a view link to control for you.</p></div>",
     );
+    body.push_str(&links_card(store, hub, user, &instances));
     body.push_str(layout_end());
     (200, "text/html".to_string(), body.into_bytes())
+}
+
+/// One table of live links, shared by the home and links pages. Admins get a
+/// revoke button: links carry no owner column, so revoking stays an admin
+/// privilege rather than a guess about who minted what.
+fn links_card(
+    store: &Store,
+    hub: &crate::hub::Hub,
+    user: Option<&UserRow>,
+    instances: &[crate::store::InstanceRow],
+) -> String {
+    let now = crate::store::now_unix();
+    let is_admin = user.is_some_and(|u| u.is_admin);
+    let links: Vec<crate::store::LinkView> = store
+        .list_links()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|link| {
+            is_admin
+                || instances
+                    .iter()
+                    .any(|i| i.id == link.instance_id && i.name == link.instance_name)
+        })
+        .collect();
+    let mut s = String::from(
+        "<div class=\"card\" id=\"links\"><h2>Live shares</h2><table><tr><th>Instance</th><th>Scope</th><th>Rights</th><th>Tunnel</th><th>Expires in</th><th></th></tr>",
+    );
+    if links.is_empty() {
+        s.push_str("<tr><td colspan=6 class=\"small\">no live links — mint one or wait for a tunnel</td></tr>");
+    }
+    for link in &links {
+        let open = match &link.token {
+            Some(token) => {
+                let href = match &link.external_session_id {
+                    Some(session) => format!("/{token}/s/{session}/"),
+                    None => format!("/{token}/"),
+                };
+                format!("<a href=\"{href}\">open</a>")
+            }
+            None => "<span class=\"small\">minted before tokens were shown</span>".into(),
+        };
+        let revoke = if is_admin {
+            format!(
+                "<button class=\"revoke\" data-hash=\"{}\">revoke</button>",
+                html_escape(&link.token_hash)
+            )
+        } else {
+            String::new()
+        };
+        s.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td><span class=\"badge {}\">{}</span></td><td>{}h</td><td>{open} {revoke}</td></tr>",
+            html_escape(&link.instance_name),
+            html_escape(link.external_session_id.as_deref().unwrap_or("all tabs")),
+            html_escape(&link.rights),
+            if hub.is_online(link.instance_id) { "on" } else { "off" },
+            if hub.is_online(link.instance_id) { "online" } else { "offline" },
+            (link.expires_at - now).div_euclid(3600),
+        ));
+    }
+    s.push_str("</table>");
+    if is_admin {
+        s.push_str(
+            "<script>(() => { for (const b of document.querySelectorAll('.revoke')) b.onclick = async () => { \
+             await fetch('/api/links/revoke', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token_hash: b.dataset.hash})}); \
+             location.reload(); }; })();</script>",
+        );
+    }
+    s.push_str("</div>");
+    s
 }
 
 pub fn render_admin(
@@ -251,7 +344,7 @@ pub fn render_admin(
     auth: &crate::auth::Auth,
 ) -> (u16, String, Vec<u8>) {
     let mut body = String::with_capacity(8192);
-    body.push_str(&layout_start("maki anchor — admin", user));
+    body.push_str(&layout_start("maki anchor — admin", user, "admin"));
     let mint = auth.effective_mint_tokens().as_str().to_owned();
     body.push_str(&format!(
         r##"<div class="card">
@@ -467,17 +560,15 @@ pub fn render_link(
         Some(s) => format!("/{token}/s/{s}/"),
         None => format!("/{token}/"),
     };
-    let mut body = String::from(
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>link</title>\
-         <style>body{font-family:system-ui;margin:2rem}</style></head><body>",
-    );
+    let mut body = layout_start("maki anchor — links", user, "links");
     body.push_str(&format!(
         "<h2>Link for {} ({})</h2><p><code>{token}</code></p>\
          <p>Open: <a href=\"{open_path}\">{open_path}</a> — expires in {hours}h</p>",
         html_escape(instance),
         role.as_str(),
     ));
-    body.push_str("<p><a href=\"/\">back</a></p></body></html>");
+    body.push_str("<p><a href=\"/links\">all links</a></p>");
+    body.push_str(layout_end());
     (200, "text/html".to_string(), body.into_bytes())
 }
 
@@ -619,18 +710,115 @@ mod tests {
                 updated_at: crate::store::now_unix(),
             })
             .unwrap();
-        let auth = crate::auth::Auth::new(
-            Arc::clone(&store),
-            None,
-            true,
-            crate::store::MintTokens::Any,
-        );
-        let (_, _, body) = render(&store, None, &auth);
+        let hub = crate::hub::Hub::new();
+        let (_, _, body) = render_sessions(&store, &hub, None);
         let html = String::from_utf8(body).unwrap();
         assert!(html.contains("$4.21"), "cost should render: {html}");
         assert!(
             html.contains("/links?instance=host-a&amp;session=sid-1&amp;rights=control"),
             "open link should mint a scoped control link: {html}"
         );
+    }
+
+    #[test]
+    fn the_pages_share_a_nav_and_split_the_old_dashboard() {
+        let store = test_store();
+        let instance = store.create_instance("nav-host", "hash").unwrap();
+        store
+            .create_link(
+                "tok123",
+                instance,
+                None,
+                "controller",
+                std::time::Duration::from_secs(7200),
+            )
+            .unwrap();
+        let hub = crate::hub::Hub::new();
+        let admin = UserRow {
+            id: 9,
+            oidc_sub: "local:root".into(),
+            email: None,
+            name: None,
+            is_admin: true,
+        };
+        let sessions_html =
+            String::from_utf8(render_sessions(&store, &hub, Some(&admin)).2).unwrap();
+        assert!(sessions_html.contains("Live shares"), "home shows shares");
+        assert!(
+            sessions_html.contains("tok123"),
+            "live links carry their open token"
+        );
+        assert!(
+            sessions_html.contains("href=\"/tok123/\""),
+            "open href: {sessions_html}"
+        );
+        assert!(
+            sessions_html.contains("revoke"),
+            "admins get the revoke button"
+        );
+        assert!(
+            !sessions_html.contains("<h2>Instances</h2>"),
+            "roster moved off home"
+        );
+        let instances_html = String::from_utf8(render_instances(&store, Some(&admin)).2).unwrap();
+        assert!(instances_html.contains("nav-host"));
+        assert!(
+            instances_html.contains("Install on a new host"),
+            "wizard lives here"
+        );
+        assert!(
+            !instances_html.contains("Live shares"),
+            "and only here or home"
+        );
+        let links_html = String::from_utf8(render_links(&store, &hub, Some(&admin)).2).unwrap();
+        assert!(links_html.contains("Share a session"), "mint form");
+        assert!(links_html.contains("tok123"), "live link list");
+        for html in [&sessions_html, &instances_html, &links_html] {
+            assert!(html.contains("class=\"active\""), "nav marks the page");
+        }
+    }
+
+    #[test]
+    fn non_admins_see_links_only_for_granted_instances() {
+        let store = test_store();
+        let mine = store.create_instance("mine", "hash").unwrap();
+        let theirs = store.create_instance("theirs", "hash2").unwrap();
+        store
+            .create_link(
+                "t-mine",
+                mine,
+                None,
+                "view",
+                std::time::Duration::from_secs(7200),
+            )
+            .unwrap();
+        store
+            .create_link(
+                "t-theirs",
+                theirs,
+                None,
+                "view",
+                std::time::Duration::from_secs(7200),
+            )
+            .unwrap();
+        store.upsert_user("stranger", None, None).unwrap();
+        store
+            .create_local_user("stranger", "pw", None, None, false)
+            .unwrap();
+        let stranger = store.verify_local_user("stranger", "pw").unwrap();
+        assert!(!stranger.is_admin);
+        let hub = crate::hub::Hub::new();
+        let html = String::from_utf8(render_links(&store, &hub, Some(&stranger)).2).unwrap();
+        assert!(
+            !html.contains("t-mine") && !html.contains("t-theirs"),
+            "no grants yet: {html}"
+        );
+        store
+            .set_grant(stranger.id, mine, crate::store::Role::Viewer)
+            .unwrap();
+        let html = String::from_utf8(render_links(&store, &hub, Some(&stranger)).2).unwrap();
+        assert!(html.contains("t-mine"), "granted instance shows");
+        assert!(!html.contains("t-theirs"), "the rest stays invisible");
+        assert!(!html.contains("revoke"), "revoking is an admin privilege");
     }
 }

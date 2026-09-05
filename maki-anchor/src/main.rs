@@ -257,7 +257,7 @@ fn main() {
                     let link = new_token();
                     store
                         .create_link(
-                            &store::hash_token(&link),
+                            &link,
                             instance_id,
                             session.as_deref(),
                             rights,

@@ -140,6 +140,20 @@ pub struct SessionRow {
     pub updated_at: i64,
 }
 
+/// A live link as the management pages show it. `token` is None for links
+/// minted before plaintext storage existed.
+#[derive(Debug)]
+pub struct LinkView {
+    pub token: Option<String>,
+    pub token_hash: String,
+    pub instance_id: i64,
+    pub instance_name: String,
+    pub external_session_id: Option<String>,
+    pub rights: String,
+    pub expires_at: i64,
+}
+
+#[derive(Debug)]
 pub struct LinkRow {
     pub token_hash: String,
     pub instance_id: i64,
@@ -176,6 +190,7 @@ impl Store {
              );
               CREATE TABLE IF NOT EXISTS links (
                   token_hash TEXT PRIMARY KEY,
+                  token_plain TEXT,
                   instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
                   external_session_id TEXT,
                   rights TEXT NOT NULL,
@@ -212,6 +227,9 @@ impl Store {
         // Migrations for local users (add columns if DB was created before this version).
         let _ = conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT", []);
         let _ = conn.execute("ALTER TABLE users ADD COLUMN local_username TEXT", []);
+        // The dashboard re-shows live links, which needs the token it once
+        // handed out; links minted before this column only ever appear bare.
+        let _ = conn.execute("ALTER TABLE links ADD COLUMN token_plain TEXT", []);
         // Ensure unique index for local_username where not null (older DBs may not have it).
         let _ = conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS users_local_username_unique ON users(local_username) WHERE local_username IS NOT NULL",
@@ -377,7 +395,7 @@ impl Store {
     /// lookups, so prune them opportunistically when minting.
     pub fn create_link(
         &self,
-        token_hash: &str,
+        token: &str,
         instance_id: i64,
         external_session_id: Option<&str>,
         rights: &str,
@@ -390,10 +408,11 @@ impl Store {
             [now - LINK_GRACE_SECS],
         )?;
         conn.execute(
-            "INSERT INTO links (token_hash, instance_id, external_session_id, rights, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO links (token_hash, token_plain, instance_id, external_session_id, rights, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
-                token_hash,
+                hash_token(token),
+                token,
                 instance_id,
                 external_session_id,
                 rights,
@@ -401,6 +420,32 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Live (unexpired, unrevoked) links with their instance names, newest
+    /// expiry first; the sessions home and the links page.
+    pub fn list_links(&self) -> Result<Vec<LinkView>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT l.token_plain, l.token_hash, l.instance_id, i.name, l.external_session_id, l.rights, l.expires_at
+             FROM links l JOIN instances i ON i.id = l.instance_id
+             WHERE l.revoked_at IS NULL AND l.expires_at > ?1
+             ORDER BY l.expires_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([now_unix()], |row| {
+                Ok(LinkView {
+                    token: row.get(0)?,
+                    token_hash: row.get(1)?,
+                    instance_id: row.get(2)?,
+                    instance_name: row.get(3)?,
+                    external_session_id: row.get(4)?,
+                    rights: row.get(5)?,
+                    expires_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn link_by_token(&self, token: &str) -> Result<LinkRow, StoreError> {
@@ -591,6 +636,48 @@ impl Store {
             rusqlite::params![now_unix(), token_hash],
         )?;
         Ok(changed > 0)
+    }
+
+    pub fn has_users(&self) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+        Ok(count > 0)
+    }
+
+    /// Whether local (username+password) logins have any chance of working,
+    /// which also covers the admin created by first-run setup on an anchor
+    /// that never configured `allow_local`.
+    pub fn has_local_users(&self) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM users WHERE password_hash IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Creates the first admin under the same lock that counts users, so two
+    /// concurrent setups cannot overwrite each other's password. `None` once
+    /// anyone exists: setup is a one-time door.
+    pub fn setup_first_admin(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<Option<UserRow>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let users: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
+        if users > 0 {
+            return Ok(None);
+        }
+        let oidc_sub = format!("local:{username}");
+        let hash = Self::hash_password(password)?;
+        conn.execute(
+            "INSERT INTO users (oidc_sub, email, name, is_admin, password_hash, local_username)
+             VALUES (?1, NULL, NULL, 1, ?2, ?3)",
+            rusqlite::params![oidc_sub, hash, username],
+        )?;
+        Ok(Some(Self::user_by_sub_locked(&conn, &oidc_sub)?))
     }
 
     pub fn list_users(&self) -> Result<Vec<UserRow>, StoreError> {
@@ -922,13 +1009,13 @@ mod tests {
             .register_instance("host-a", &hash_token("reg"))
             .unwrap();
         store
-            .create_link(&hash_token("link-1"), id, None, "viewer", Duration::ZERO)
+            .create_link("link-1", id, None, "viewer", Duration::ZERO)
             .unwrap();
         assert!(store.link_by_token("link-1").is_err());
 
         store
             .create_link(
-                &hash_token("link-2"),
+                "link-2",
                 id,
                 None,
                 "viewer",
@@ -950,22 +1037,10 @@ mod tests {
             .register_instance("host-a", &hash_token("reg"))
             .unwrap();
         store
-            .create_link(
-                &hash_token("live"),
-                id,
-                None,
-                "controller",
-                Duration::from_secs(60),
-            )
+            .create_link("live", id, None, "controller", Duration::from_secs(60))
             .unwrap();
         store
-            .create_link(
-                &hash_token("dead"),
-                id,
-                None,
-                "controller",
-                Duration::from_secs(60),
-            )
+            .create_link("dead", id, None, "controller", Duration::from_secs(60))
             .unwrap();
         store.revoke_link(&hash_token("dead")).unwrap();
 

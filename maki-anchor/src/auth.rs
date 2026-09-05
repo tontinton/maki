@@ -26,6 +26,8 @@ pub enum AuthError {
     NotConfigured,
     #[error("too many failed logins, try again later")]
     RateLimited,
+    #[error("setup already happened: users exist")]
+    AlreadySetup,
 }
 
 /// One in-flight OIDC authorization: when it started plus the values the
@@ -94,13 +96,52 @@ impl Auth {
         }
     }
 
+    /// Local passwords may be tried: asked for in config, or simply on file
+    /// (first-run setup writes one even when nobody configured `allow_local`).
+    pub fn local_login_allowed(&self) -> bool {
+        self.allow_local || self.store.has_local_users().unwrap_or(false)
+    }
+
+    pub fn has_users(&self) -> bool {
+        self.store.has_users().unwrap_or(true)
+    }
+
+    /// First-run account creation: the very first admin, on a store with no
+    /// users, plus a live session cookie for immediate entry.
+    pub fn setup_admin(
+        &self,
+        origin: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<String, AuthError> {
+        let key = format!("{origin}|setup");
+        if self.locked_out(&key) {
+            return Err(AuthError::RateLimited);
+        }
+        match self.store.setup_first_admin(username, password) {
+            Ok(Some(user)) => {
+                self.attempts.lock().unwrap().remove(&key);
+                let cookie = new_session_cookie();
+                self.store
+                    .create_oidc_session(&cookie, user.id, SESSION_TTL)
+                    .map_err(AuthError::Store)?;
+                Ok(cookie)
+            }
+            Ok(None) => Err(AuthError::AlreadySetup),
+            Err(err) => {
+                self.record_failure(&key);
+                Err(err.into())
+            }
+        }
+    }
+
     pub fn login_local(
         &self,
         origin: &str,
         username: &str,
         password: &str,
     ) -> Result<String, AuthError> {
-        if !self.allow_local {
+        if !self.local_login_allowed() {
             return Err(AuthError::NotConfigured);
         }
         let key = format!("{origin}|{username}");

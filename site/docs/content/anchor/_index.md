@@ -61,9 +61,14 @@ maki.setup {
 ```
 
 All three fields are required together. With `[anchor]` set, `/rc` dials the
-anchor instead of binding a local port, and prints a share link minted by the
-anchor. Without it, `/rc` behaves as described in
+anchor instead of binding a local port, and prints the full share URL minted
+by the anchor. Without it, `/rc` behaves as described in
 [Commands](/docs/commands/).
+
+If the link drops (an anchor restart, a network blip), the client reconnects on
+its own with a capped backoff and flashes the new URL when it lands. The
+status bar shows `remote` while the link is up, and `remote·N` while N browsers
+watch that tab.
 
 ## Share links
 
@@ -80,13 +85,34 @@ maki-anchor tokens revoke <token>
 A link is `/{token}/` under the anchor domain. `view` links open the session
 read-only; `control` links can prompt, answer permission requests, and stop
 runs. A `--session` scoped link only opens that one session, and every request
-under it is routed to that tab rather than the focused one. The dashboard
-Sessions table lists each instance's live sessions with their pushed cost and
-an **open** link that mints a two-hour control link scoped to that session.
+under it is routed to that tab rather than the focused one. Share links are
+capability-only: anyone holding one reaches the session without an anchor
+login. The management pages below the domain root are a separate surface and
+always require a login.
+
+Every link the anchor created appears on the **Links** page (and on the
+dashboard home while it is live) with an open button, so minted URLs never have
+to becopied from scrollback.
+
+## Pages
+
+| Page | Contents |
+|---|---|
+| `/` (home) | Live shares: every unexpired link, its instance, tunnel state, and an open button. Below it, each instance's sessions with pushed cost and an **open** action that mints a two-hour control link scoped to that session |
+| `/instances` | The install wizard (create an instance, copy the one-liner) and the fleet roster |
+| `/links` | Mint a share link and revoke live ones |
+| `/admin` | Users, grants, mint policy (admins only) |
+
+Non-admins see the pages filtered to instances they hold a grant for.
 
 ## Login and roles
 
-The anchor supports OIDC single sign-on. Point it at any standard provider
+A fresh anchor opens on a setup page: the first username and password you
+submit becomes the admin account, and the page closes behind it. Every
+management page then requires a login. Share links stay reachable by token
+alone.
+
+The anchor also supports OIDC single sign-on. Point it at any standard provider
 (Authelia, Authentik, Keycloak, Pocket ID, Google):
 
 ```toml
@@ -111,9 +137,10 @@ maki-anchor grants revoke <user id> work-laptop
 maki-anchor grants lookup <oidc sub>   # find the user id after first login
 ```
 
-Without `[oidc]` the anchor runs in LAN trust mode: no login, and everyone who
-reaches the dashboard is treated as trusted. Only use this mode on a network
-you control.
+Local accounts work with or without OIDC: the setup page creates one, and so
+does `maki-anchor users add <name> --admin`. Log in at `/login`, which offers
+the password form whenever a local account exists, alongside SSO when
+configured.
 
 ## Data model
 
@@ -122,6 +149,6 @@ you control.
 | `instances` | Registered hosts, one per registration token |
 | `sessions` | Session index, updated by the instances themselves |
 | `links` | Share links with rights and expiry |
-| `users` | OIDC identities; the first login becomes admin |
+| `users` | OIDC and local identities; first-run setup creates the admin |
 | `oidc_sessions` | Browser cookie sessions |
 | `grants` | Per-user rights per instance |

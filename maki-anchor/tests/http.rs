@@ -122,10 +122,24 @@ fn wait_online(port: u16, link: &str) {
 }
 
 fn http(port: u16, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    http_auth(port, method, path, body, None)
+}
+
+/// Same request with an optional session cookie, for the login-walled pages.
+fn http_auth(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    cookie: Option<&str>,
+) -> (u16, Vec<u8>) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let cookie_line = cookie
+        .map(|c| format!("Cookie: {c}\r\n"))
+        .unwrap_or_default();
     stream
         .write_all(
-            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n{cookie_line}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len())
                 .as_bytes(),
         )
         .unwrap();
@@ -219,16 +233,58 @@ fn tunnel_carries_browser_requests() {
 }
 
 #[test]
-fn anchor_serves_instances_and_sessions() {
+fn the_paged_management_ui_needs_a_session_and_the_json_api_lives_under_api() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("db.sqlite3");
     let anchor = spawn_anchor(&db);
-    let (status, _) = http(anchor.port, "GET", "/instances", &[]);
+    let cookie = setup_admin(anchor.port);
+    for path in ["/", "/instances", "/links", "/admin"] {
+        let (status, body) = http_auth(anchor.port, "GET", path, &[], Some(&cookie));
+        assert_eq!(status, 200, "{path} must render for the admin");
+        assert!(
+            String::from_utf8_lossy(&body).contains("<nav"),
+            "{path} is a page"
+        );
+    }
+    let (status, body) = http_auth(anchor.port, "GET", "/api/instances", &[], Some(&cookie));
     assert_eq!(status, 200);
-    let (status, _) = http(anchor.port, "GET", "/sessions", &[]);
+    assert!(serde_json::from_slice::<serde_json::Value>(&body).is_ok());
+    let (status, body) = http_auth(anchor.port, "GET", "/api/sessions", &[], Some(&cookie));
     assert_eq!(status, 200);
-    let (status, _) = http(anchor.port, "GET", "/nope", &[]);
+    assert!(serde_json::from_slice::<serde_json::Value>(&body).is_ok());
+    let (status, _) = http_auth(anchor.port, "GET", "/nope", &[], Some(&cookie));
     assert_eq!(status, 404);
+}
+
+#[test]
+fn first_run_setup_closes_behind_itself_and_every_page_demands_login() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db.sqlite3");
+    let anchor = spawn_anchor(&db);
+    let full = http_full(anchor.port, "GET", "/", b"");
+    assert!(full.starts_with("HTTP/1.1 302"), "empty store: {full}");
+    assert!(
+        full.to_lowercase().contains("location: /setup"),
+        "forced to setup: {full}"
+    );
+    let (status, body) = http(anchor.port, "GET", "/setup", &[]);
+    assert_eq!(status, 200);
+    assert!(
+        String::from_utf8_lossy(&body).contains("Create admin"),
+        "setup form: {status}"
+    );
+    let cookie = setup_admin(anchor.port);
+    assert_eq!(
+        http(anchor.port, "GET", "/", &[]).0,
+        302,
+        "no cookie, no dashboard"
+    );
+    let (status, _) = http_auth(anchor.port, "GET", "/setup", &[], Some(&cookie));
+    assert_eq!(status, 302, "the setup door shut behind the admin");
+    let (status, _) = http_auth(anchor.port, "GET", "/admin", &[], Some(&cookie));
+    assert_eq!(status, 200, "the admin who set up reaches the admin page");
+    let (status, _) = http(anchor.port, "GET", "/install.sh", &[]);
+    assert_eq!(status, 200, "installers stay open for hosts to join");
 }
 
 #[test]
@@ -236,8 +292,15 @@ fn api_instances_is_not_treated_as_token() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("db.sqlite3");
     let anchor = spawn_anchor(&db);
+    let cookie = setup_admin(anchor.port);
     // POST /api/instances should be JSON API, not proxy 404 "invalid or expired link"
-    let (status, body) = http(anchor.port, "POST", "/api/instances", br#"{"name":"test"}"#);
+    let (status, body) = http_auth(
+        anchor.port,
+        "POST",
+        "/api/instances",
+        br#"{"name":"test"}"#,
+        Some(&cookie),
+    );
     // Should be 200 (any) or 401/403 JSON, never 404 text/plain "invalid or expired link"
     assert_ne!(status, 404);
     let text = String::from_utf8_lossy(&body);
@@ -257,12 +320,42 @@ fn api_users_and_grants_require_json() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("db.sqlite3");
     let anchor = spawn_anchor(&db);
-    let (status, body) = http(anchor.port, "GET", "/api/users", &[]);
+    let cookie = setup_admin(anchor.port);
+    let (status, body) = http_auth(anchor.port, "GET", "/api/users", &[], Some(&cookie));
     assert_eq!(status, 200);
     assert!(serde_json::from_slice::<serde_json::Value>(&body).is_ok());
-    let (status, body) = http(anchor.port, "GET", "/api/grants", &[]);
+    let (status, body) = http_auth(anchor.port, "GET", "/api/grants", &[], Some(&cookie));
     assert_eq!(status, 200);
     assert!(serde_json::from_slice::<serde_json::Value>(&body).is_ok());
+}
+
+const COOKIE_NAME: &str = "maki_anchor_session";
+
+/// Runs the first-run setup as a brand-new admin and returns the session
+/// cookie the anchor handed back.
+fn setup_admin(port: u16) -> String {
+    let full = http_full(
+        port,
+        "POST",
+        "/setup",
+        b"username=root&password=password1234",
+    );
+    assert!(
+        full.starts_with("HTTP/1.1 302"),
+        "setup must land an admin in: {full}"
+    );
+    let set_cookie = full
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+        .expect("setup must set a session cookie");
+    let value = set_cookie
+        .split(&format!("{COOKIE_NAME}="))
+        .nth(1)
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    format!("{COOKIE_NAME}={value}")
 }
 
 /// Full response (headers included) for tests that assert on them.
@@ -329,13 +422,13 @@ fn instance_api_cannot_rotate_an_existing_instances_token() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("db.sqlite3");
     let anchor = spawn_anchor(&db);
-    thread::sleep(Duration::from_millis(300));
-
-    let (status, body) = http(
+    let cookie = setup_admin(anchor.port);
+    let (status, body) = http_auth(
         anchor.port,
         "POST",
         "/api/instances",
         br#"{"name":"dup-host"}"#,
+        Some(&cookie),
     );
     assert_eq!(
         status,
@@ -343,11 +436,12 @@ fn instance_api_cannot_rotate_an_existing_instances_token() {
         "first create must succeed: {}",
         String::from_utf8_lossy(&body)
     );
-    let (status, body) = http(
+    let (status, body) = http_auth(
         anchor.port,
         "POST",
         "/api/instances",
         br#"{"name":"dup-host"}"#,
+        Some(&cookie),
     );
     assert_eq!(status, 409, "re-creating must not rotate the token");
     let text = String::from_utf8_lossy(&body).to_lowercase();

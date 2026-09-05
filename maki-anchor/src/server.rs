@@ -36,13 +36,7 @@ pub fn mint_link(
     ttl: Duration,
 ) -> Result<String, store::StoreError> {
     let token = new_link_token();
-    store.create_link(
-        &store::hash_token(&token),
-        instance_id,
-        session_id,
-        rights.as_str(),
-        ttl,
-    )?;
+    store.create_link(&token, instance_id, session_id, rights.as_str(), ttl)?;
     Ok(token)
 }
 
@@ -425,18 +419,19 @@ fn route(
     }
     // Auth endpoints work without a session; everything user-facing below
     // needs one when OIDC is on.
+    let local_login = auth.local_login_allowed();
     if path == "/login" {
-        if request.method() == "POST" && auth.allow_local {
+        if request.method() == "POST" && local_login {
             return handle_local_login(request, auth);
         }
         // GET /login: if OIDC+local enabled, show chooser; if OIDC only, redirect; if local only, show form
-        if auth.enabled() && auth.allow_local {
+        if auth.enabled() && local_login {
             return render_login_page(request, auth);
         }
         if auth.enabled() {
             return start_login(request, auth);
         }
-        if auth.allow_local {
+        if local_login {
             return render_login_page(request, auth);
         }
         return buffered(
@@ -448,7 +443,7 @@ fn route(
             request,
         );
     }
-    if path == "/api/login" && auth.allow_local {
+    if path == "/api/login" && local_login {
         return handle_api_local_login(request, auth);
     }
     if path == "/callback" {
@@ -466,18 +461,106 @@ fn route(
         return RouteOutcome::Streamed;
     }
     let user = auth.user_from_cookie(cookie_header(&request));
-    if auth.enabled() && user.is_none() {
+    // An anchor with no users is not a dashboard yet, it is a setup page:
+    // nothing but /setup renders until the first admin exists.
+    if !auth.has_users() {
+        return match path {
+            "/setup" => handle_setup(request, auth),
+            _ => redirect(request, "/setup"),
+        };
+    }
+    // From here every management surface requires a session; share links
+    // are capability-gated by their token and answered far above.
+    if user.is_none() {
         return redirect_to_login(request);
     }
-    if auth.allow_local && auth.effective_mint_tokens() != store::MintTokens::Any && user.is_none()
-    {
-        // Only require auth for dashboard if there is at least one user (otherwise bootstrapping)
-        let has_users = store.list_users().map(|u| !u.is_empty()).unwrap_or(false);
-        if has_users {
-            return redirect_to_login(request);
-        }
+    if path == "/setup" {
+        return redirect(request, "/");
     }
     route_authorized(path, request, hub, store, user, auth)
+}
+
+/// 302 that also logs the browser in.
+fn redirect_with_cookie(request: http::Request, to: &str, cookie: &str) -> RouteOutcome {
+    let response = Response::empty(302)
+        .with_header(Header::from_bytes("Location", to.as_bytes()).unwrap())
+        .with_header(
+            Header::from_bytes(
+                "Set-Cookie",
+                crate::auth::Auth::session_set_cookie(cookie).as_bytes(),
+            )
+            .unwrap(),
+        );
+    let _ = request.respond(response);
+    RouteOutcome::Streamed
+}
+
+/// 302 to a path on this anchor.
+fn redirect(request: http::Request, to: &str) -> RouteOutcome {
+    let response =
+        Response::empty(302).with_header(Header::from_bytes("Location", to.as_bytes()).unwrap());
+    let _ = request.respond(response);
+    RouteOutcome::Streamed
+}
+
+/// First-run admin creation: a form while the store is empty, an account and
+/// live cookie on submit, and a bounce as soon as anyone exists (race
+/// attempts land on the login page through the wall above anyway).
+fn handle_setup(mut request: http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
+    const MIN_PASSWORD: usize = 8;
+    if request.method() != "POST" {
+        let body = format!(
+            r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>setup</title>
+             <style>body{{font-family:system-ui;margin:2rem auto;max-width:40rem;padding:0 1rem}}
+             form{{margin:1rem 0;padding:1rem;border:1px solid #ddd;border-radius:.5rem}}
+             input{{padding:.4rem .6rem;border:1px solid #ccc;border-radius:.3rem;width:100%;box-sizing:border-box}}
+             button{{padding:.5rem 1rem;margin-top:.5rem}}</style></head><body>
+             <h1>maki anchor — setup</h1>
+             <p>No users exist yet. Create the first administrator; this page closes behind it.</p>
+             <form method="post" action="/setup">
+             <p><label>Username<br><input name="username" autocomplete="username" required></label></p>
+             <p><label>Password (at least {MIN_PASSWORD} chars)<br><input name="password" type="password" autocomplete="new-password" required minlength="{MIN_PASSWORD}"></label></p>
+             <button type="submit" style="padding:.5rem 1rem;background:#0072ff;color:#fff;border:none;border-radius:.3rem">Create admin</button>
+             </form></body></html>"#
+        );
+        return buffered((200, "text/html".to_string(), body.into_bytes()), request);
+    }
+    let mut body = Vec::new();
+    if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
+        return buffered(
+            (413, "text/plain".to_string(), b"body too large".to_vec()),
+            request,
+        );
+    }
+    let params = parse_form(&String::from_utf8_lossy(&body));
+    let username = params.get("username").map(|s| s.as_str()).unwrap_or("");
+    let password = params.get("password").map(|s| s.as_str()).unwrap_or("");
+    if username.trim().is_empty() || username.len() > 64 || password.len() < MIN_PASSWORD {
+        return buffered(
+            (
+                400,
+                "text/plain".to_string(),
+                b"username and a password of at least 8 characters are required".to_vec(),
+            ),
+            request,
+        );
+    }
+    let origin = remote_origin(&request);
+    match auth.setup_admin(&origin, username.trim(), password) {
+        Ok(cookie) => {
+            tracing::info!(username, "first admin created");
+            redirect_with_cookie(request, "/", &cookie)
+        }
+        Err(crate::auth::AuthError::AlreadySetup) => redirect(request, "/login"),
+        Err(err) => buffered(
+            (
+                400,
+                "text/plain".to_string(),
+                format!("setup: {err}").into_bytes(),
+            ),
+            request,
+        ),
+    }
 }
 
 fn cookie_header(request: &http::Request) -> Option<&str> {
@@ -566,19 +649,7 @@ fn handle_local_login(mut request: http::Request, auth: &crate::auth::Auth) -> R
     let password = params.get("password").map(|s| s.as_str()).unwrap_or("");
     let origin = remote_origin(&request);
     match auth.login_local(&origin, username, password) {
-        Ok(cookie) => {
-            let response = Response::empty(302)
-                .with_header(Header::from_bytes("Location", "/".as_bytes()).unwrap())
-                .with_header(
-                    Header::from_bytes(
-                        "Set-Cookie",
-                        crate::auth::Auth::session_set_cookie(&cookie).as_bytes(),
-                    )
-                    .unwrap(),
-                );
-            let _ = request.respond(response);
-            RouteOutcome::Streamed
-        }
+        Ok(cookie) => redirect_with_cookie(request, "/", &cookie),
         Err(crate::auth::AuthError::RateLimited) => buffered(
             (
                 429,
@@ -1107,6 +1178,90 @@ fn handle_api_set_grant(
         ),
         request,
     )
+}
+
+/// Revokes a live link by hash. Links carry no owner column, so this is an
+/// admin privilege; the revoke button on the pages only renders for admins.
+fn handle_api_revoke_link(
+    mut request: http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method() != "POST" {
+        return buffered(
+            (
+                405,
+                "application/json".to_string(),
+                br#"{"error":"method not allowed"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    if is_non_admin(user) {
+        return forbidden_json(request);
+    }
+    let mut body = Vec::new();
+    if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
+        return buffered(
+            (
+                413,
+                "application/json".to_string(),
+                br#"{"error":"body too large"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return buffered(
+                (
+                    400,
+                    "application/json".to_string(),
+                    br#"{"error":"invalid json"}"#.to_vec(),
+                ),
+                request,
+            );
+        }
+    };
+    let Some(hash) = value.get("token_hash").and_then(|v| v.as_str()) else {
+        return buffered(
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"token_hash required"}"#.to_vec(),
+            ),
+            request,
+        );
+    };
+    match store.revoke_link(hash) {
+        Ok(true) => buffered(
+            (
+                200,
+                "application/json".to_string(),
+                br#"{"revoked":true}"#.to_vec(),
+            ),
+            request,
+        ),
+        Ok(false) => buffered(
+            (
+                404,
+                "application/json".to_string(),
+                br#"{"error":"link not live"}"#.to_vec(),
+            ),
+            request,
+        ),
+        Err(err) => buffered(
+            (
+                500,
+                "application/json".to_string(),
+                serde_json::json!({"error": err.to_string()})
+                    .to_string()
+                    .into_bytes(),
+            ),
+            request,
+        ),
+    }
 }
 
 fn handle_api_revoke_grant(
@@ -1699,22 +1854,51 @@ fn handle_api_set_mint_tokens(
 fn route_authorized(
     path: &str,
     request: http::Request,
-    _hub: &Hub,
+    hub: &Hub,
     store: &Arc<Store>,
     user: Option<crate::store::UserRow>,
     auth: &crate::auth::Auth,
 ) -> RouteOutcome {
     if path == "/" {
         return buffered(
-            crate::dashboard::render(store, user.as_ref(), auth),
+            crate::dashboard::render_sessions(store, hub, user.as_ref()),
+            request,
+        );
+    }
+    if path == "/instances" {
+        return buffered(
+            crate::dashboard::render_instances(store, user.as_ref()),
             request,
         );
     }
     if path == "/links" {
-        return render_link(request, store, user.as_ref());
+        if request.url().contains("instance=") {
+            return render_link(request, store, user.as_ref());
+        }
+        return buffered(
+            crate::dashboard::render_links(store, hub, user.as_ref()),
+            request,
+        );
+    }
+    if path == "/api/links/revoke" {
+        return handle_api_revoke_link(request, store, user.as_ref());
     }
     if path == "/api/instances" {
-        return handle_api_create_instance(request, store, user.as_ref(), auth);
+        return match request.method() {
+            "GET" => buffered(json_list_instances_for(store, user.as_ref()), request),
+            "POST" => handle_api_create_instance(request, store, user.as_ref(), auth),
+            _ => buffered(
+                (
+                    405,
+                    "application/json".to_string(),
+                    br#"{"error":"method not allowed"}"#.to_vec(),
+                ),
+                request,
+            ),
+        };
+    }
+    if path == "/api/sessions" {
+        return buffered(json_list_sessions_for(store, user.as_ref()), request);
     }
     if path == "/api/users" {
         return match request.method() {
@@ -1804,11 +1988,9 @@ fn route_authorized(
             ),
         };
     }
-    let outcome = if path == "/instances" {
-        json_list_instances_for(store, user.as_ref())
-    } else if path == "/sessions" {
+    let outcome = if path == "/api/sessions" {
         json_list_sessions_for(store, user.as_ref())
-    } else if let Some(rest) = path.strip_prefix("/sessions/") {
+    } else if let Some(rest) = path.strip_prefix("/api/sessions/") {
         match rest.parse::<i64>() {
             Ok(instance_id) => {
                 if let Some(u) = &user
