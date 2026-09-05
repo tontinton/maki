@@ -139,6 +139,7 @@ pub mod key {
     pub const POP_QUEUE: Bind = ctrl_bind!('q');
     pub const DELETE_WORD: Bind = ctrl_bind!('w');
     pub const SEARCH: Bind = ctrl_bind!('f');
+    pub const SANDBOX: Bind = ctrl_bind!('i');
     pub const FILE_PICKER: Bind = ctrl_bind!('s');
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
     pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
@@ -170,6 +171,7 @@ pub enum KeybindContext {
     CommandPalette,
     Search,
     FilePicker,
+    Sandbox,
 }
 
 impl KeybindContext {
@@ -187,6 +189,7 @@ impl KeybindContext {
             Self::CommandPalette => "Commands",
             Self::Search => "Search",
             Self::FilePicker => "File Picker",
+            Self::Sandbox => "Sandbox",
         }
     }
 
@@ -198,7 +201,8 @@ impl KeybindContext {
             | Self::QueueFocus
             | Self::CommandPalette
             | Self::Search
-            | Self::FilePicker => Some(Self::Picker),
+            | Self::FilePicker
+            | Self::Sandbox => Some(Self::Picker),
             _ => None,
         }
     }
@@ -346,6 +350,12 @@ pub const KEYBINDS: &[Keybind] = &[
         description: "Suspend process",
         context: KeybindContext::General,
         platform: Platform::UnixOnly,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::SANDBOX.label),
+        description: "Inspect sandbox configuration",
+        context: KeybindContext::General,
+        platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
@@ -534,6 +544,48 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single("!/@/#/$"),
         description: "Set tier (strong/medium/weak/compaction)",
         context: KeybindContext::ModelPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Tab"),
+        description: "Switch mode (Info/Browse/Shell)",
+        context: KeybindContext::Sandbox,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Enter"),
+        description: "Open directory / run command",
+        context: KeybindContext::Sandbox,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Esc"),
+        description: "Close / go back",
+        context: KeybindContext::Sandbox,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Backspace"),
+        description: "Go to parent directory",
+        context: KeybindContext::Sandbox,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("↑", "↓"),
+        description: "Navigate entries",
+        context: KeybindContext::Sandbox,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("PageUp", "PageDown"),
+        description: "Scroll page up / down",
+        context: KeybindContext::Sandbox,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
+        description: "Scroll half page up / down",
+        context: KeybindContext::Sandbox,
         platform: Platform::All,
     },
 ];

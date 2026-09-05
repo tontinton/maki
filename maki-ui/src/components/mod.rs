@@ -19,6 +19,9 @@ pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
 pub mod queue_panel;
 pub(crate) mod rewind_picker;
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+#[path = "sandbox_modal.rs"]
+pub(crate) mod sandbox_modal;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
 pub(crate) mod split_layout;
@@ -134,6 +137,14 @@ impl ModalScroll {
         }
     }
 
+    /// Used only by the sandbox modal, which is compiled out when the
+    /// `sandbox` feature is unavailable.
+    #[allow(dead_code)]
+    pub fn scroll_to_bottom(&mut self) {
+        self.auto_scroll = true;
+        self.offset = self.max_offset;
+    }
+
     pub fn scroll(&mut self, delta: i32) {
         self.offset = apply_scroll_delta(self.offset, delta);
         self.clamp();
@@ -145,6 +156,16 @@ impl ModalScroll {
         match key_event.code {
             KeyCode::Up => self.scroll(1),
             KeyCode::Down => self.scroll(-1),
+            KeyCode::PageUp => self.scroll(self.half_page()),
+            KeyCode::PageDown => self.scroll(-self.half_page()),
+            KeyCode::Home => {
+                self.offset = 0;
+                self.auto_scroll = false;
+            }
+            KeyCode::End => {
+                self.auto_scroll = true;
+                self.offset = self.max_offset;
+            }
             _ if key::SCROLL_HALF_UP.matches(key_event) => self.scroll(self.half_page()),
             _ if key::SCROLL_HALF_DOWN.matches(key_event) => self.scroll(-self.half_page()),
             _ if key::SCROLL_LINE_UP.matches(key_event) => self.scroll(1),

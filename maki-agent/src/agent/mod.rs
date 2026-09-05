@@ -5,6 +5,8 @@ mod run;
 mod streaming;
 pub mod tool_dispatch;
 
+pub use tool_dispatch::UNKNOWN_TOOL_PREFIX;
+
 pub use compaction::compact;
 pub use history::{
     History, HistorySnapshot, SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls,

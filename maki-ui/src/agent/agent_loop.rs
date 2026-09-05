@@ -1,3 +1,5 @@
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+use std::path::Path;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -244,7 +246,7 @@ impl AgentLoop {
 
         let prompt_slots = self.lua_handle.collect_prompt_slots_async().await;
         let system = agent::build_system_prompt(
-            &self.vars,
+            &self.prompt_vars(),
             &input.mode,
             &self.instructions.text,
             &prompt_slots,
@@ -322,12 +324,39 @@ impl AgentLoop {
         self.instructions = smol::unblock(move || agent::load_instructions(&cwd)).await;
     }
 
+    /// Vars for prompt assembly: when the sandbox is active, `{cwd}` points at
+    /// the workspace path the filesystem tools actually operate on.
+    fn prompt_vars(&self) -> template::Vars {
+        match self.sandbox_cwd() {
+            Some(cwd) => self.vars.clone().set("{cwd}", cwd),
+            None => self.vars.clone(),
+        }
+    }
+
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    fn sandbox_cwd(&self) -> Option<String> {
+        if !self.config.sandbox_enabled {
+            return None;
+        }
+        let host_cwd = self.vars.apply("{cwd}").into_owned();
+        let workspace_name = Path::new(&host_cwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Some(format!("/home/maki/workspace/{workspace_name}"))
+    }
+
+    #[cfg(not(all(feature = "sandbox", target_os = "linux")))]
+    fn sandbox_cwd(&self) -> Option<String> {
+        None
+    }
+
     /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
     /// the model. Everything else matches the live prompt.
     fn publish_btw_system(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
         let slot = self.model_slot.load();
         let system = agent::build_system_prompt(
-            &self.vars,
+            &self.prompt_vars(),
             &maki_agent::AgentMode::Build,
             &self.instructions.text,
             prompt_slots,

@@ -121,6 +121,8 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
 | `rtk` | bool | `true` | - | Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
+| `sandbox_enabled` | bool | `false` | - | Run code execution in a sandboxed child process with namespace isolation |
+| `sandbox_profiles` | string[] | `none` | - | Enabled sandbox profiles; only listed profiles contribute mounts and PATH entries |
 
 ### `provider`
 

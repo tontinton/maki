@@ -21,6 +21,7 @@ pub use api::util::command::{
     HintReader, HintSnapshot, LuaCommandInfo, LuaCommandReader, ModelRequest, SessionRequest,
     Split, TaskRequest, TitlePos, UiAction, UiAttachment, UiReply, WinCommand, WinEvent, WinView,
 };
+pub use api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
 pub use loader::{EventHandle, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING};
@@ -32,7 +33,7 @@ pub use pack::{
     lockfile_path, prepare_pack_command, sanitize_message, site_dir,
 };
 pub use plugin_permissions::{Permission, PluginPermissions, Requested};
-pub use runtime::{KILL_GRACE, MAX_INFLIGHT_TOOLS, RestoreItem, WARM_TOOL_CAP};
+pub use runtime::{KILL_GRACE, MAX_INFLIGHT_TOOLS, RestoreItem, SandboxRunner, WARM_TOOL_CAP};
 pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 
 pub mod test_support {

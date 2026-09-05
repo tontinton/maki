@@ -23,6 +23,8 @@ use crate::setup;
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+const EMPTY_TOOL_RESULT: &str = "empty tool result";
 
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
 /// Dropping it joins the Lua thread via `PluginHost::drop`.
@@ -32,6 +34,8 @@ struct Stack {
     commands: Vec<CustomCommand>,
     model: Model,
     needs_login: bool,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    sandbox: Option<Arc<maki_sandbox::Sandbox>>,
 }
 
 impl Stack {
@@ -101,6 +105,19 @@ fn load_config(
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
     }
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    if cli.sandbox {
+        maki_sandbox::namespace::probe()
+            .map_err(|e| color_eyre::eyre::eyre!("{e}"))
+            .context("sandbox preflight check failed -- cannot start with --sandbox")?;
+        config.agent.sandbox_enabled = true;
+    }
+    #[cfg(not(all(feature = "sandbox", target_os = "linux")))]
+    if cli.sandbox {
+        return Err(color_eyre::eyre::eyre!(
+            "--sandbox is only supported on Linux"
+        ));
+    }
     if !cli.allowed_tools.is_empty() {
         config.agent.allowed_tools = cli
             .allowed_tools
@@ -162,6 +179,53 @@ fn build_stack(
         },
     )?;
 
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    let sandbox = if config.agent.sandbox_enabled {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let workspace_name = cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ns_config = {
+            let mut cfg = maki_sandbox::namespace::NamespaceConfig::from_agent_config(
+                config.agent.sandbox_allowed_env.clone(),
+                &config.agent.sandbox_allowed_paths,
+                &config.agent.sandbox_extra_dirs,
+                &maki_sandbox::profiles::select_profiles(&config.agent.sandbox_profiles),
+                cwd,
+                workspace_name,
+            );
+            cfg.prune_missing_mounts();
+            cfg
+        };
+        let sandbox = maki_sandbox::Sandbox::new(ns_config).context("initialize sandbox")?;
+        let sandbox_for_runner = Arc::clone(&sandbox);
+        let config_json = serde_json::to_string(&config.agent)?;
+        let runner: std::sync::Arc<maki_lua::SandboxRunner> =
+            std::sync::Arc::new(move |lua, code, timeout, fns| {
+                let sandbox = Arc::clone(&sandbox_for_runner);
+                let config_json = config_json.clone();
+                Box::pin(async move {
+                    maki_tools::run_sandbox_with(&sandbox, lua, code, timeout, fns, config_json)
+                        .await
+                })
+            });
+        plugin_host.set_sandbox_config(runner)?;
+        let sandbox_for_router = Arc::clone(&sandbox);
+        plugin_host.set_sandbox_router(Arc::new(
+            move |name, args, kwargs| match sandbox_for_router.call_tool(name, args, kwargs) {
+                Ok(r) => r
+                    .error
+                    .map(Err)
+                    .unwrap_or_else(|| r.output.ok_or_else(|| EMPTY_TOOL_RESULT.into())),
+                Err(e) => Err(e.to_string()),
+            },
+        ))?;
+        Some(sandbox)
+    } else {
+        None
+    };
+
     let commands = discover_commands(cli.no_commands);
 
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, storage);
@@ -185,6 +249,8 @@ fn build_stack(
             commands,
             model,
             needs_login,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            sandbox,
         },
         super::sanitize_warnings(&warnings),
     ))
@@ -375,6 +441,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 ui_attachment: stack.plugin_host.ui_attachment(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+                #[cfg(all(feature = "sandbox", target_os = "linux"))]
+                sandbox: stack.sandbox.as_ref().map(Arc::clone),
             },
             initial_prompt.take(),
         )

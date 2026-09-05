@@ -57,6 +57,7 @@ Rust workspace, key crates in root dir:
 - maki-storage: Persistent state across runs (e.g. sessions, auth)
 - maki-config: User config
 - maki-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir
+- maki-sandbox: Filesystem and process sandboxing using Linux user/mount namespaces with pivot_root. Forks a child process that runs inside an isolated filesystem (workspace bind-mounted to `/home/maki/workspace`). The child communicates with the parent over a Unix socket IPC. Command execution uses raw `fork()+execve()` instead of `std::process::Command` because `posix_spawnp` fails inside user+mount namespaces. `sandbox-shell` binary provides an interactive CLI for testing sandbox behavior.
 - maki-acp: ACP ndjson stdio server
 
 Built-in lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), bash, glob, question, skill, memory, webfetch, websearch, todo_write, read, write, edit, task, code_execution (python sandbox), batch.

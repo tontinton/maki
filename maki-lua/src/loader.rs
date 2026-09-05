@@ -22,7 +22,7 @@ use crate::plugin_permissions::{
 };
 use crate::runtime::{
     self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, Request,
-    RestoreItem,
+    RestoreItem, SandboxRouter, SandboxRunner,
 };
 use maki_agent::prompt::ResolvedSlots;
 use maki_storage::id::MakiId;
@@ -914,6 +914,24 @@ impl PluginHost {
     /// dropping it would leave a handler parked on a reply that never comes.
     pub fn ui_attachment(&self) -> UiAttachment {
         self.inner.ui_attachment.clone()
+    }
+
+    pub fn set_sandbox_router(&self, router: Arc<SandboxRouter>) -> Result<(), PluginError> {
+        if let Err(e) = self.inner.tx.try_send(Request::SetSandboxRouter(router)) {
+            tracing::warn!("failed to send sandbox router to lua runtime: {e}");
+            Err(PluginError::HostDead)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn set_sandbox_config(&self, runner: Arc<SandboxRunner>) -> Result<(), PluginError> {
+        if let Err(e) = self.inner.tx.try_send(Request::SetSandboxConfig(runner)) {
+            tracing::warn!("failed to send sandbox config to lua runtime: {e}");
+            Err(PluginError::HostDead)
+        } else {
+            Ok(())
+        }
     }
 }
 

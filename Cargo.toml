@@ -24,6 +24,8 @@ maki-config = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
 maki-lua = { workspace = true }
+maki-sandbox = { workspace = true, optional = true }
+maki-tools = { workspace = true, optional = true }
 maki-otel = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
@@ -41,6 +43,10 @@ uuid = { workspace = true }
 flume = { workspace = true }
 open = { workspace = true }
 
+[features]
+default = ["sandbox"]
+sandbox = ["dep:maki-sandbox", "maki-sandbox/sandbox", "dep:maki-tools", "maki-ui/sandbox"]
+
 [dev-dependencies]
 test-case = { workspace = true }
 
@@ -57,7 +63,9 @@ members = [
   "maki-otel",
   "maki-pack",
   "maki-providers",
+  "maki-sandbox",
   "maki-storage",
+  "maki-tools",
   "maki-config-macro",
   "maki-lua-macro",
   "maki-ui",
@@ -78,7 +86,9 @@ maki-acp = { path = "maki-acp" }
 maki-config = { path = "maki-config" }
 maki-interpreter = { path = "maki-interpreter" }
 maki-providers = { path = "maki-providers" }
+maki-sandbox = { path = "maki-sandbox" }
 maki-storage = { path = "maki-storage" }
+maki-tools = { path = "maki-tools" }
 maki-ui = { path = "maki-ui" }
 maki-lua = { path = "maki-lua" }
 maki-config-macro = { path = "maki-config-macro" }
@@ -131,6 +141,7 @@ pin-project-lite = "0.2"
 rustix = { version = "1", default-features = false, features = ["process"] }
 humantime = "2"
 semver = "1"
+nix = { version = "0.29", default-features = false, features = ["sched", "mount", "fs", "process", "user", "signal", "poll"] }
 toml = "0.8"
 toml_edit = "0.22"
 smol = "2"

@@ -32,6 +32,8 @@ Type `/` in the input box to open the command palette.
 | `/reload` | Reload plugins and config |
 | `/packupdate` | Update packages (++lockfile, ! skips review) |
 | `/packdel` | Remove undeclared packages (++all, or a name) |
+| `/sandbox` | Open sandbox environment info, file browser, and shell |
+| `/add-dir` | Bind-mount a host directory into the sandbox workspace |
 | `/memory` | View, edit, and delete memory files |
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |
