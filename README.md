@@ -19,15 +19,29 @@ hosts with one shared entry point:
     approve).
   * Share links with rights and expiry: `view` / `control`, default 2 hours.
   * Fleet dashboard: all instances, their sessions, costs, and status.
+    Login is mandatory (first run walks you through creating the admin), and
+    the link to your instance reconnects itself when the network blinks.
   * Transcripts are fetched live from the owning instance; the anchor stores
     metadata only.
+* **Signed Windows binaries** - releases ship an Authenticode-signed `.exe`
+  (Azure Trusted Signing), so SmartScreen stays quiet, next to static Linux
+  (x86_64 + arm64) and macOS builds.
 
 Quick start for the anchor:
 
 ```sh
-# On the server (reverse proxy handles TLS, forwards WebSocket upgrades).
-maki-anchor serve --bind 0.0.0.0:8688
+# On the server: install or update maki-anchor as a systemd service.
+# As root it writes a system unit; as a user, a user unit with linger.
+curl -fsSL https://raw.githubusercontent.com/wmantly/maki/main/install-anchor.sh | sh
+
+# Register an instance and copy the printed one-liner for its host.
 maki-anchor tokens add work-laptop
+```
+
+```sh
+# Or skip systemd and run in the foreground
+# (reverse proxy handles TLS and forwards WebSocket upgrades).
+maki-anchor serve --bind 0.0.0.0:8688
 ```
 
 ```lua

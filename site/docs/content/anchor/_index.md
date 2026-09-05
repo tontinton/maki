@@ -26,6 +26,21 @@ the index, but its transcript is unavailable until it reconnects.
 
 ## Run the anchor
 
+One line installs or updates the anchor as a systemd service. As root it
+writes a system unit under `/var/lib/maki-anchor`; as a regular user it writes
+a user unit under `~/.local/state/maki-anchor` and enables linger. Re-run the
+same line to update: the binary swaps and the service restarts.
+
+```
+curl -fsSL https://raw.githubusercontent.com/wmantly/maki/main/install-anchor.sh | sh
+```
+
+Environment overrides: `MAKI_INSTALL_REPO` (release source), `MAKI_ANCHOR_VERSION`
+(a tag, default latest), `MAKI_ANCHOR_BIND` (default `127.0.0.1:8688`, right
+behind a local reverse proxy).
+
+Or run it directly:
+
 ```
 maki-anchor serve --bind 0.0.0.0:8688
 ```
@@ -64,6 +79,9 @@ All three fields are required together. With `[anchor]` set, `/rc` dials the
 anchor instead of binding a local port, and prints the full share URL minted
 by the anchor. Without it, `/rc` behaves as described in
 [Commands](/docs/commands/).
+
+To make every session remote from launch without typing `/rc`, set
+`remote_control = { auto_start = true }` in `maki.setup`.
 
 If the link drops (an anchor restart, a network blip), the client reconnects on
 its own with a capped backoff and flashes the new URL when it lands. The
