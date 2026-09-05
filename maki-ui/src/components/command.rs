@@ -119,14 +119,14 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/remote-control",
-        description: "Start or report remote control (`off` keeps the link, `down` revokes it)",
-        max_args: 1,
+        description: "Remote control: report, `stop`/`down`, `link [new|rm]`, `always`, `qr`",
+        max_args: 3,
         bang: false,
     },
     BuiltinCommand {
         name: "/rc",
         description: "Alias of /remote-control",
-        max_args: 1,
+        max_args: 3,
         bang: false,
     },
     BuiltinCommand {

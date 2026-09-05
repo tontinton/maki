@@ -10,6 +10,7 @@ pub mod log;
 pub mod model;
 pub mod paths;
 pub mod plans;
+pub mod remote;
 pub mod sessions;
 pub mod theme;
 pub mod version;

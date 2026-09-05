@@ -106,10 +106,18 @@ its own with a capped backoff and re-registers under the same URL. The status
 bar shows `remote` while the link is up, and `remote·N` while N browsers watch
 that tab.
 
-`/rc` in the TUI speaks three verbs: bare `/rc` starts the link, or reports it
-(URL, QR, watchers per tab) when one is already running; `/rc off` disconnects
-and keeps the link alive for the next start; `/rc down` disconnects and has the
-anchor revoke the link, so shared URLs stop working immediately.
+`/rc` in the TUI speaks a small grammar:
+
+| Invocation | Effect |
+|---|---|
+| `/rc` | Start when stopped; when running, report the link, the QR, and who is watching each tab (name and rights) |
+| `/rc stop` (or `off`) | Disconnect; the link stays alive for the next `/rc` |
+| `/rc down` | Disconnect and revoke the link, so shared URLs stop working immediately |
+| `/rc link` | List this instance's anchor-side links with rights and expiry |
+| `/rc link new [view\|control] [hours]` | Mint a link (default view, 2 hours); the fresh URL arrives with a QR |
+| `/rc link rm <token>` | Revoke one link and kick its live viewers |
+| `/rc always` / `/rc never` | Persist whether remote control starts at launch |
+| `/rc qr` | Flash the link's QR again |
 
 ## Share links
 
@@ -144,17 +152,20 @@ to becopied from scrollback.
 | `/` (home) | Live shares: every unexpired link, its instance, tunnel state, and an open button. Below it, each instance's sessions with pushed cost and an **open** action that mints a two-hour control link scoped to that session |
 | `/instances` | The install wizard (create an instance, copy the one-liner) and the fleet roster |
 | `/links` | Mint a share link and revoke live ones |
-| `/admin` | Users, grants, mint policy (admins only) |
+| `/admin` | Users, grants, mint policy, and the OIDC/SSO setup form (admins only) |
 
 Non-admins see the pages filtered to instances they hold a grant for.
 
 ## The remote session page
 
-Beyond the transcript, the page (both anchor and standalone) carries a control
-center under the top-left menu: live watcher counts per tab, and, for anchor
-users with a controller grant on the instance, invite links (mint and revoke)
-plus a button to close the current link. Callers without a login just see
-watchers.
+Beyond the transcript, the header's right side carries two controls: a `QR`
+button that pops the page's own link as a scannable code, and the `remote ▾`
+control center: who is watching (name and rights per browser, e.g.
+`alice·control`, `anon·view`), the instance state, and, for anchor users with a
+controller grant on the instance, invite links (mint and revoke) plus a button
+that closes the current link and drops its live viewers. Callers without a
+login just see watchers. A link scoped to a tab that no longer exists says so
+instead of rendering an empty page.
 
 The composer takes uploads: a `+` button attaches images to the next prompt
 for vision models, or saves any file into the session's working directory and
@@ -198,6 +209,11 @@ Local accounts work with or without OIDC: the setup page creates one, and so
 does `maki-anchor users add <name> --admin`. Log in at `/login`, which offers
 the password form whenever a local account exists, alongside SSO when
 configured.
+
+SSO itself is configurable without shell access: the admin page writes the
+issuer, client, secret, and origin into the anchor's database, which takes
+precedence over the config file's `[oidc]` block. Saving needs one anchor
+restart to take effect.
 
 ## Data model
 

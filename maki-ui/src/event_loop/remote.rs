@@ -124,6 +124,16 @@ impl RemoteControl {
         }
     }
 
+    /// The openable URL for any anchor-side token.
+    fn join_link(&self, token: &str) -> Option<String> {
+        match self {
+            Self::Standalone { .. } => None,
+            Self::Tunnel { base_url, .. } => {
+                Some(format!("{}/{token}/", base_url.trim_end_matches('/')))
+            }
+        }
+    }
+
     fn thread_done(&self) -> bool {
         match self {
             Self::Standalone { .. } => false,
@@ -169,6 +179,8 @@ pub(crate) enum TunnelHappen {
     Link { url: String, reconnected: bool },
     /// A lifecycle line worth flashing: link lost, anchor refused, thread gone.
     Notice(String),
+    /// The anchor's answer to a link list/mint/remove push.
+    Links(serde_json::Value),
 }
 
 fn validate_token_hex(token: &str) -> color_eyre::Result<()> {
@@ -316,6 +328,7 @@ impl RemoteSlot {
                     "anchor refused the tunnel: {reason}"
                 )))
             }
+            Some(TunnelReport::Links(value)) => Some(TunnelHappen::Links(value)),
             None if control.thread_done() => {
                 self.link_up = false;
                 Some(TunnelHappen::Notice(REMOTE_TUNNEL_STOPPED.to_owned()))
@@ -328,6 +341,45 @@ impl RemoteSlot {
             self.control = Some(control);
         }
         happen
+    }
+
+    /// Whether link management (`/rc link new|rm`) is wired to an anchor.
+    pub(crate) fn has_anchor(&self) -> bool {
+        matches!(self.control, Some(RemoteControl::Tunnel { .. }))
+    }
+
+    /// One control push to the anchor, answered later with a Links report.
+    fn push_control(&mut self, frame: serde_json::Value) -> bool {
+        match &mut self.control {
+            Some(RemoteControl::Tunnel { out, .. }) => out.send(TunnelOut::Push(frame)).is_ok(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn links_list(&mut self) -> bool {
+        self.push_control(serde_json::json!({ "list_links": true }))
+    }
+
+    pub(crate) fn links_mint(&mut self, rights: &str, hours: u64) -> bool {
+        self.push_control(serde_json::json!({
+            "link_mint": { "rights": rights, "hours": hours }
+        }))
+    }
+
+    pub(crate) fn links_remove(&mut self, token: &str) -> bool {
+        self.push_control(serde_json::json!({ "link_rm": token }))
+    }
+
+    /// The URL a minted token becomes, for the mint reply.
+    pub(crate) fn join_link(&self, token: &str) -> Option<String> {
+        self.control.as_ref().and_then(|c| c.join_link(token))
+    }
+
+    /// Who is watching, with names and rights: (tab, tag) per browser.
+    pub(crate) fn watchers(&self) -> Vec<(Option<String>, String)> {
+        self.state()
+            .map(|state| state.watchers())
+            .unwrap_or_default()
     }
 
     /// Ship the session index to the anchor when it changed. Only tunnel mode
@@ -637,6 +689,52 @@ mod tests {
         };
         assert!(reconnected, "a link after a drop reads as a reconnect");
         assert!(url.starts_with("https://maki.example.com/"), "{url}");
+    }
+
+    #[test]
+    fn link_reports_answer_the_link_commands() {
+        let (mut slot, tx, _shutdown, _out) = tunnel_slot();
+        tx.send(TunnelReport::Link("a".repeat(32))).unwrap();
+        slot.poll_tunnel();
+        tx.send(TunnelReport::Links(serde_json::json!({
+            "links": [{"token": "b".repeat(32), "rights": "view", "session": null, "expires": 0}],
+            "minted": "b".repeat(32),
+        })))
+        .unwrap();
+        let TunnelHappen::Links(value) = slot.poll_tunnel().expect("links reply") else {
+            panic!("expected a links report");
+        };
+        assert_eq!(value["minted"], "b".repeat(32));
+        let url = slot
+            .join_link(value["minted"].as_str().unwrap())
+            .expect("joined");
+        assert_eq!(url, format!("https://maki.example.com/{}/", "b".repeat(32)));
+        assert!(slot.links_list(), "a tunnel accepts control pushes");
+        match slot.control.as_ref().unwrap() {
+            RemoteControl::Tunnel { out, .. } => {
+                // The push itself is queued; proving the frame shape is the
+                // job of the anchor tests, this proves the plumbing is open.
+                let _ = out;
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn watchers_list_browsers_with_their_tags() {
+        let (slot, _tx, _shutdown, _out) = tunnel_slot();
+        let state = slot.state().unwrap();
+        let _tab = state.subscribe(Some("t1".into()), "alice·control".into());
+        let _all = state.subscribe(None, "anon·view".into());
+        let mut watchers = slot.watchers();
+        watchers.sort();
+        assert_eq!(
+            watchers,
+            vec![
+                (None, "anon·view".to_string()),
+                (Some("t1".into()), "alice·control".into()),
+            ]
+        );
     }
 
     #[test]

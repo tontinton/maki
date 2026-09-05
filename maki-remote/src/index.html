@@ -163,9 +163,9 @@
     max-height: 200px;
   }
   #prompt:focus { outline: none; border-color: var(--accent); }
-  #center-wrap { position: relative; }
+  #center-wrap { position: relative; margin-left: auto; display: flex; gap: 4px; align-items: center; }
   #center {
-    position: absolute; top: 130%; left: 0; z-index: 60;
+    position: absolute; top: 130%; right: 0; z-index: 60;
     width: min(340px, 92vw); max-height: 70vh; overflow-y: auto;
     background: var(--panel, #1e2128); border: 1px solid var(--border);
     border-radius: 10px; padding: 10px 12px; font-size: 13px;
@@ -177,7 +177,13 @@
   #center td { padding: 2px 4px; border-bottom: 1px solid var(--border); }
   #center input, #center select { font-size: 12px; padding: 3px 6px; background: var(--bg); color: inherit; border: 1px solid var(--border); border-radius: 6px; }
   #center .ok { color: #9ece6a; } #center .bad { color: #f7768e; }
-  #center img.qr { background: #fff; border-radius: 8px; padding: 4px; display: block; margin-top: 4px; }
+  #center img.qr, #qr-pop img.qr { background: #fff; border-radius: 8px; padding: 4px; display: block; margin-top: 4px; }
+  #qr-pop {
+    position: fixed; top: 54px; right: 10px; z-index: 70;
+    background: var(--panel, #1e2128); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px; font-size: 12px; text-align: center;
+  }
+  #qr-pop a { color: var(--muted); word-break: break-all; }
   #chips { display: flex; gap: 6px; flex-wrap: wrap; padding: 4px 8px 0; }
   .chip {
     display: inline-flex; align-items: center; gap: 4px; font-size: 12px;
@@ -189,10 +195,6 @@
 </head>
 <body>
 <header>
-  <div id="center-wrap">
-    <button class="mini" id="center-btn" title="Remote control center">maki ▾</button>
-    <div id="center" hidden></div>
-  </div>
   <h1>maki</h1>
   <span id="title"></span>
   <span id="cwd"></span>
@@ -200,6 +202,11 @@
   <span id="status" data-status="idle">idle</span>
   <span id="stats"></span>
   <span id="conn" data-conn="down">connecting</span>
+  <div id="center-wrap">
+    <button class="mini" id="qr-btn" title="QR code for this page's link">QR</button>
+    <button class="mini" id="center-btn" title="Remote control center">remote ▾</button>
+    <div id="center" hidden></div>
+  </div>
 </header>
 <div id="toolbar">
   <input id="cmd-input" list="cmd-list" placeholder="/command — type to filter, Enter to run">
@@ -219,6 +226,7 @@
 <datalist id="cmd-list"></datalist>
 <div id="sessions-bar"></div>
 <main id="log"></main>
+<div id="qr-pop" hidden></div>
 <div id="toast"></div>
 <div id="perm">
   <div>Permission needed: <span class="toolname" id="perm-tool"></span></div>
@@ -259,6 +267,8 @@
   const modelSelect = document.getElementById("model-select");
   const modeSelect = document.getElementById("mode-select");
   const yoloCheck = document.getElementById("yolo-check");
+  const SHARE_TOKEN = (location.pathname.split("/")[1] || "").replace(/\/$/, "");
+  const isSharePage = /^[0-9a-f]{32}$/.test(SHARE_TOKEN);
   const sessionsBar = document.getElementById("sessions-bar");
   const toastEl = document.getElementById("toast");
   let pendingPermission = null;
@@ -416,6 +426,19 @@
   // use, so rendering is the same code path.
   const renderSnapshot = (snap) => {
     log.replaceChildren();
+    if (snap.error) {
+      const bare = "/" + SHARE_TOKEN + "/";
+      const note = el("msg system", "this link points at a tab that is no longer live");
+      log.appendChild(note);
+      if (location.pathname.replace(/\/$/, "") !== bare.replace(/\/$/, "")) {
+        const back = document.createElement("a");
+        back.href = bare;
+        back.textContent = "open the whole instance instead";
+        note.appendChild(document.createElement("br"));
+        note.appendChild(back);
+      }
+      return;
+    }
     for (const event of snap.messages || []) renderEvent(event);
     // Snapshot tool cards arrive as start+result pairs; close them.
     for (const details of log.querySelectorAll(".tool.running")) {
@@ -661,8 +684,6 @@
   };
 
   // ---- control center ---------------------------------------------------
-  const SHARE_TOKEN = (location.pathname.split("/")[1] || "").replace(/\/$/, "");
-  const isSharePage = /^[0-9a-f]{32}$/.test(SHARE_TOKEN);
   const centerBtn = document.getElementById("center-btn");
   const centerEl = document.getElementById("center");
   let centerData = null;
@@ -686,8 +707,14 @@
     const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
     let html = "";
     const viewers = (inst && inst.viewers) || [];
-    const watching = inst && inst.watching;
-    html += `<h3>Watchers</h3><div class="row">${watching ? `<span class="ok">${viewers.reduce((a, v) => a + v.viewers, 0)} browser(s) attached</span>` : "<span class='bad'>nobody watching this instance right now</span>"}</div>`;
+    html += `<h3>Watchers</h3>`;
+    if (!viewers.length) {
+      html += `<div class="row bad">nobody watching this instance right now</div>`;
+    } else {
+      for (const v of viewers) {
+        html += `<div class="row"><span class="ok">${esc(v.tag)}</span> <span style="color:var(--muted)">on ${v.session ? esc(v.session.slice(0, 8)) : "all tabs"}</span></div>`;
+      }
+    }
     if (anchor) {
       html += `<h3>Instance</h3><div class="row"><b>${esc(anchor.instance.name)}</b> <span class="${anchor.online ? "ok" : "bad"}">${anchor.online ? "online" : "offline"}</span> · you: ${esc(anchor.me ? anchor.me.name : "?")} (${esc(anchor.rights)})</div>`;
       const tabs = [];
@@ -739,6 +766,23 @@
       slot.appendChild(img);
     };
   };
+
+  const qrPop = document.getElementById("qr-pop");
+  document.getElementById("qr-btn").onclick = (ev) => {
+    ev.stopPropagation();
+    if (!qrPop.hidden) { qrPop.hidden = true; return; }
+    qrPop.innerHTML = "";
+    const img = document.createElement("img");
+    img.className = "qr"; img.width = 168; img.height = 168;
+    img.src = `qr?text=${encodeURIComponent(location.href)}`;
+    const link = document.createElement("a");
+    link.href = location.href; link.textContent = location.pathname;
+    qrPop.append(img, link);
+    qrPop.hidden = false;
+  };
+  document.addEventListener("click", (ev) => {
+    if (!qrPop.hidden && !qrPop.contains(ev.target)) qrPop.hidden = true;
+  });
 
   centerBtn.onclick = () => {
     centerEl.hidden = !centerEl.hidden;

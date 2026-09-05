@@ -735,7 +735,8 @@ impl<'t> EventLoop<'t> {
             let actions = self.focused_app().handle_submit(sub);
             self.dispatch(self.focused, actions);
         }
-        if self.ctx.remote_control.auto_start {
+        let always = maki_storage::remote::read_always(&self.ctx.storage);
+        if always.unwrap_or(self.ctx.remote_control.auto_start) {
             self.handle_remote_control(None);
         }
         // The first frame always paints. After that only a poller, an event or
@@ -1767,35 +1768,110 @@ impl<'t> EventLoop<'t> {
         self.dispatch(self.focused, actions);
     }
 
-    /// `/rc` (optionally with a domain override), `/rc off` to stop. With no
-    /// domain, no config default, and no anchor, tells the user what to set;
-    /// `/rc` while running restarts the server (fresh token). The URL goes to
-    /// the clipboard and the transcript, since the status bar flash is too
-    /// narrow to hold one.
+    /// The `/rc` family: bare `/rc` starts (when stopped) or reports (when
+    /// running, with who is watching and at what rights); `stop`/`off`
+    /// disconnects and keeps the link; `down` also revokes it; `always` and
+    /// `never` persist the launch switch; `link [new|rm]` manages anchor
+    /// side share links. With no domain, no config default, and no anchor,
+    /// the start path tells the user what to set.
     fn handle_remote_control(&mut self, arg: Option<String>) {
-        if matches!(arg.as_deref(), Some("off") | Some("down")) {
-            let revoke = arg.as_deref() == Some("down");
-            let msg = if self.remote.stop(revoke) {
-                if revoke {
-                    "remote control down: link revoked"
+        let mut words = arg.as_deref().unwrap_or("").split_whitespace();
+        match words.next() {
+            None | Some("status") => {
+                if self.remote.is_running() {
+                    self.report_remote_state();
                 } else {
-                    REMOTE_STOPPED_MSG
+                    self.start_remote_control(None);
                 }
-            } else {
-                "remote control is not running"
             }
-            .to_owned();
-            self.focused_app().flash(msg);
-            return;
+            Some("stop") | Some("off") => {
+                let msg = if self.remote.stop(false) {
+                    format!("{REMOTE_STOPPED_MSG}; the link stays open for the next /rc")
+                } else {
+                    "remote control is not running".to_owned()
+                };
+                self.focused_app().flash(msg.to_owned());
+            }
+            Some("down") => {
+                let msg = if self.remote.stop(true) {
+                    "remote control down: link revoked, viewers kicked".to_owned()
+                } else {
+                    "remote control is not running".to_owned()
+                };
+                self.focused_app().flash(msg.to_owned());
+            }
+            Some(verb @ ("always" | "never")) => {
+                let on = verb == "always";
+                maki_storage::remote::persist_always(&self.ctx.storage, on);
+                self.ctx.remote_control.auto_start = on;
+                self.focused_app().flash(if on {
+                    "remote control will start at every launch".to_owned()
+                } else {
+                    "remote control will not start on its own".to_owned()
+                });
+            }
+            Some("link") => {
+                if !self.remote.is_running() {
+                    self.focused_app().flash("remote control is not running".into());
+                    return;
+                }
+                if !self.remote.has_anchor() {
+                    self.focused_app().flash("share links are an anchor feature".into());
+                    return;
+                }
+                match words.next() {
+                    None | Some("list") => {
+                        let ok = self.remote.links_list();
+                        self.focused_app().flash(if ok {
+                            "asking the anchor for links..."
+                        } else {
+                            "cannot reach the anchor right now"
+                        }.to_owned());
+                    }
+                    Some("new") => {
+                        let rights = words.next().unwrap_or("view");
+                        let hours = words.next().and_then(|h| h.parse().ok()).unwrap_or(2);
+                        let ok = self.remote.links_mint(rights, hours);
+                        self.focused_app().flash(if ok {
+                            format!("minting a {rights} link...")
+                        } else {
+                            "cannot reach the anchor right now".to_owned()
+                        });
+                    }
+                    Some("rm") => match words.next() {
+                        Some(target) => {
+                            let ok = self.remote.links_remove(target);
+                            self.focused_app().flash(if ok {
+                                "revoking..."
+                            } else {
+                                "cannot reach the anchor right now"
+                            }.to_owned());
+                        }
+                        None => self.focused_app().flash("usage: /rc link rm <token>".into()),
+                    },
+                    Some(other) => {
+                        self.focused_app()
+                            .flash(format!("unknown subcommand: /rc link {other}"));
+                    }
+                }
+            }
+            Some("qr") => match self.remote.url() {
+                Some(url) => self.show_link(&url, REMOTE_URL_MSG),
+                None if self.remote.is_running() => {
+                    self.focused_app().flash("the link is not up yet".into())
+                }
+                None => self.start_remote_control(None),
+            },
+            Some(other) => self
+                .focused_app()
+                .flash(format!("usage: /rc [status|stop|down|link [list|new [view|control] [hours]|rm <token>]|always|never|qr]  (unknown: {other})")),
         }
-        if self.remote.is_running() {
-            // `/rc` again is a question, not a restart: same URL, current
-            // state, everyone watching. Restarting would burn the link.
-            self.report_remote_state();
-            return;
-        }
-        let domain = arg.or_else(|| self.ctx.remote_control.domain.clone());
-        // Standalone needs a domain for the URL; an anchor mints its own.
+    }
+
+    /// Start the server (domain override wins over config; an anchor
+    /// config skips both) and flash the URL, or say what is missing.
+    fn start_remote_control(&mut self, domain: Option<String>) {
+        let domain = domain.or_else(|| self.ctx.remote_control.domain.clone());
         if domain.is_none()
             && !self
                 .ctx
@@ -1816,8 +1892,7 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// `/rc` while already running asks, it does not restart: report the
-    /// link, its state, and who is watching each tab.
+    /// `/rc` while running: the link, the people on it, and what each may do.
     fn report_remote_state(&mut self) {
         let link = if self.remote.link_up() {
             "online"
@@ -1829,43 +1904,35 @@ impl<'t> EventLoop<'t> {
             Some(url) => format!("remote {link} · {url}"),
             None => format!("remote {link}"),
         }];
-        let mut watchers = 0;
-        for rt in self.sessions.iter() {
-            let id = rt.id().to_string();
-            let viewers = self.remote.viewers(&id);
-            watchers += viewers;
-            let crowd = if viewers > 0 {
-                format!("{viewers} watching")
-            } else {
-                "alone".into()
+        let titles: std::collections::HashMap<String, String> = self
+            .sessions
+            .iter()
+            .map(|rt| (rt.id().to_string(), rt.app.state.session.title.clone()))
+            .collect();
+        let watchers = self.remote.watchers();
+        if watchers.is_empty() {
+            lines.push(" nobody watching".into());
+        }
+        for (session, tag) in &watchers {
+            let at = match session.as_deref() {
+                Some(id) => titles
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("tab {id}")),
+                None => "all tabs".to_string(),
             };
-            lines.push(format!(" · {}: {crowd}", rt.app.state.session.title));
+            lines.push(format!(" · {tag} on {at}"));
         }
         let app = self.focused_app();
         app.main_chat()
             .push(DisplayMessage::new(DisplayRole::Done, lines.join("\n")));
-        app.flash(format!("remote {link} · {watchers} watching"));
-    }
-
-    /// A share URL joins the transcript with a scannable QR (where the text
-    /// fits one) and goes to the clipboard; the flash carries just the URL.
-    fn show_link(&mut self, url: &str, prefix: &str) {
-        let qr = if url.starts_with("http") {
-            crate::qr::block_qr(url)
+        app.flash(if watchers.is_empty() {
+            format!("remote {link} · nobody watching")
         } else {
-            None
-        };
-        let copy = self.focused_app().clipboard.copy_text(url);
-        let app = self.focused_app();
-        let text = match qr {
-            Some(qr) => format!("{prefix}{url}\n{qr}"),
-            None => format!("{prefix}{url}"),
-        };
-        app.main_chat()
-            .push(DisplayMessage::new(DisplayRole::Done, text));
-        app.flash(url.to_owned());
-        if let Err(e) = copy {
-            app.flash(format!("{REMOTE_COPY_ERR}: {e}"));
+            format!("remote {link} · {} watching", watchers.len())
+        });
+        if let Some(url) = url {
+            self.show_link(&url, "share: ");
         }
     }
 
@@ -1896,8 +1963,74 @@ impl<'t> EventLoop<'t> {
                 Some(remote::TunnelHappen::Notice(message)) => {
                     self.focused_app().flash(format!("remote: {message}"));
                 }
+                Some(remote::TunnelHappen::Links(value)) => {
+                    self.show_link_roster(&value);
+                }
             }
         }
+    }
+
+    /// A share URL joins the transcript with a scannable QR (where the text
+    /// fits one) and goes to the clipboard; the flash carries just the URL.
+    fn show_link(&mut self, url: &str, prefix: &str) {
+        let qr = if url.starts_with("http") {
+            crate::qr::block_qr(url)
+        } else {
+            None
+        };
+        let copy = self.focused_app().clipboard.copy_text(url);
+        let app = self.focused_app();
+        let text = match qr {
+            Some(qr) => format!("{prefix}{url}\n{qr}"),
+            None => format!("{prefix}{url}"),
+        };
+        app.main_chat()
+            .push(DisplayMessage::new(DisplayRole::Done, text));
+        app.flash(url.to_owned());
+        if let Err(e) = copy {
+            app.flash(format!("{REMOTE_COPY_ERR}: {e}"));
+        }
+    }
+
+    /// The anchor's answer to `/rc link [new|rm]`: the instance's share
+    /// links, and a full hand-off (URL, QR, clipboard) for a fresh mint.
+    fn show_link_roster(&mut self, value: &serde_json::Value) {
+        if let Some(minted) = value["minted"].as_str()
+            && let Some(url) = self.remote.join_link(minted)
+        {
+            self.show_link(&url, "new link: ");
+        }
+        let mut lines = Vec::new();
+        if let Some(links) = value["links"].as_array() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or_default();
+            lines.push(format!("{} anchor link(s):", links.len()));
+            for link in links {
+                let token = link["token"].as_str().unwrap_or("?");
+                let rights = link["rights"].as_str().unwrap_or("?");
+                let scope = link["session"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "all tabs".into());
+                let left = link["expires"].as_i64().map(|e| (e - now).div_euclid(3600));
+                let tail = match left {
+                    Some(h) if h <= 0 => "expiring".to_string(),
+                    Some(h) => format!("{h}h left"),
+                    None => String::new(),
+                };
+                lines.push(format!(" · /{token}/ {rights} · {scope} · {tail}"));
+            }
+        }
+        if lines.is_empty() {
+            self.focused_app()
+                .flash("remote: no links reported by the anchor".into());
+            return;
+        }
+        let app = self.focused_app();
+        app.main_chat()
+            .push(DisplayMessage::new(DisplayRole::Done, lines.join("\n")));
     }
 
     fn refresh_models(&self) {
