@@ -36,13 +36,31 @@ curl -fsSL https://raw.githubusercontent.com/wmantly/maki/main/install-anchor.sh
 ```
 
 Environment overrides: `MAKI_INSTALL_REPO` (release source), `MAKI_ANCHOR_VERSION`
-(a tag, default latest), `MAKI_ANCHOR_BIND` (default `127.0.0.1:8688`, right
-behind a local reverse proxy).
+(a tag, default latest), `MAKI_ANCHOR_BIND` and `MAKI_ANCHOR_ALLOW_LOCAL`
+(both only seed a fresh config file).
 
-Or run it directly:
+The first install writes a config file: `/etc/maki/anchor.toml` for a system
+unit, `~/.config/maki-anchor/anchor.toml` for a user unit. It sets the bind
+address, the local-login switch, the mint policy, and (commented out) the OIDC
+block. Updates never touch it. Edit and restart:
+
+```toml
+bind = "127.0.0.1:8688"   # keep local behind a reverse proxy
+
+[auth]
+allow_local_users = true
+# mint_tokens = "admin"   # any | user | admin
+```
 
 ```
-maki-anchor serve --bind 0.0.0.0:8688
+systemctl restart maki-anchor              # system unit
+systemctl --user restart maki-anchor       # user unit
+```
+
+Or run it directly (the `--bind` flag beats the file):
+
+```
+maki-anchor serve --config /etc/maki/anchor.toml
 ```
 
 One port serves everything: the dashboard, the browser API, and the instance

@@ -21,10 +21,13 @@ const DEFAULT_CONFIG_PATH: &str = "maki-anchor.toml";
 const DEFAULT_BIND: &str = "0.0.0.0:8688";
 const DEFAULT_LINK_TTL_HOURS: u64 = 2;
 
-/// Anchor's own config file: OIDC settings live here, not in maki's config.
+/// Anchor's own config file: listen address, OIDC and auth policy live here,
+/// not in maki's config.
 #[derive(Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct AnchorConfig {
+    /// Listen address, e.g. `127.0.0.1:8688`. The `--bind` flag wins.
+    bind: Option<String>,
     oidc: Option<OidcFileConfig>,
     auth: Option<AuthFileConfig>,
 }
@@ -72,8 +75,8 @@ struct Cli {
 enum Command {
     /// Run the anchor server
     Serve {
-        #[arg(long, default_value = DEFAULT_BIND)]
-        bind: String,
+        #[arg(long)]
+        bind: Option<String>,
         #[arg(long, default_value = DEFAULT_DB_PATH)]
         db: PathBuf,
         #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
@@ -190,6 +193,7 @@ fn main() {
                 .inspect(|_| {
                     tracing::info!("OIDC login enabled");
                 });
+            let bind = resolve_bind(bind.as_deref(), anchor_config.bind.as_deref());
             let allow_local = anchor_config
                 .auth
                 .as_ref()
@@ -449,4 +453,32 @@ fn new_token() -> String {
     getrandom::fill(&mut bytes).expect("rng failed");
     let digest = Sha256::digest(bytes);
     format!("{:x}", digest)[..32].to_string()
+}
+
+/// Where the listener binds: the flag still wins over the file, and the
+/// file over history.
+fn resolve_bind(flag: Option<&str>, file: Option<&str>) -> String {
+    flag.or(file).unwrap_or(DEFAULT_BIND).to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    #[test_case(Some("1.2.3.4:1"), Some("5.6.7.8:2") => "1.2.3.4:1".to_owned() ; "flag_wins")]
+    #[test_case(None,              Some("5.6.7.8:2") => "5.6.7.8:2".to_owned() ; "file_second")]
+    #[test_case(None,              None             => DEFAULT_BIND.to_owned() ; "default_last")]
+    fn bind_precedence(flag: Option<&str>, file: Option<&str>) -> String {
+        resolve_bind(flag, file)
+    }
+
+    #[test]
+    fn config_file_accepts_bind() {
+        let parsed: AnchorConfig =
+            toml::from_str("bind = \"127.0.0.1:9999\"\n[auth]\nallow_local_users = false\n")
+                .expect("bind is a known key");
+        assert_eq!(parsed.bind.as_deref(), Some("127.0.0.1:9999"));
+        assert_eq!(parsed.auth.unwrap().allow_local_users, Some(false));
+    }
 }

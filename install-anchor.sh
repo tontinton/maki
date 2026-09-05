@@ -8,10 +8,16 @@
 # ~/.local/state/maki-anchor). Re-run the same line to update: the binary is
 # swapped and the service restarted.
 #
+# The first install writes an anchor.toml (system: /etc/maki/anchor.toml,
+# user: ~/.config/maki-anchor/anchor.toml) that holds the bind address, the
+# local-login switch, the mint policy and the OIDC block. It is never
+# overwritten by an update; edit it and restart the service.
+#
 # Env:
-#   MAKI_INSTALL_REPO   release source, default wmantly/maki
-#   MAKI_ANCHOR_VERSION release tag, default: the latest release
-#   MAKI_ANCHOR_BIND    listen address, default 127.0.0.1:8688
+#   MAKI_INSTALL_REPO     release source, default wmantly/maki
+#   MAKI_ANCHOR_VERSION   release tag, default: the latest release
+#   MAKI_ANCHOR_BIND      bind seeded into a fresh anchor.toml, default 127.0.0.1:8688
+#   MAKI_ANCHOR_ALLOW_LOCAL  local password login in a fresh anchor.toml, default true
 set -eu
 
 REPO="${MAKI_INSTALL_REPO:-wmantly/maki}"
@@ -34,7 +40,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=${BIN} serve --bind ${BIND}
+ExecStart=${BIN} serve --config ${CONFIG}
 WorkingDirectory=${STATE}
 Restart=on-failure
 RestartSec=2
@@ -53,6 +59,32 @@ install_binary() {
     install -m 0755 "$tmp" "$BIN"
 }
 
+write_config() {
+    cat > "$CONFIG" <<EOF
+# maki anchor configuration. Edit and restart the service to apply.
+# Docs: https://maki.sh/docs/anchor/
+
+# Listen address. Keep 127.0.0.1 behind a local reverse proxy that
+# terminates TLS; use 0.0.0.0 only if this box serves traffic directly.
+bind = "${BIND}"
+
+[auth]
+# Username/password accounts (created via the first-run setup page or
+# \`maki-anchor users add\`). Safe to leave on; OIDC can sit beside it.
+allow_local_users = ${allow_local}
+# Who may create instance tokens from the dashboard: any | user | admin.
+# mint_tokens = "admin"
+
+# Single sign-on with any standard OIDC provider (Authelia, Authentik,
+# Keycloak, Pocket ID, Google). The callback URL is {origin}/callback.
+# [oidc]
+# issuer = "https://auth.example.com/realms/main"
+# client_id = "maki-anchor"
+# client_secret = "..."
+# origin = "https://maki.example.com"
+EOF
+}
+
 main() {
     [ "$(uname -s)" = "Linux" ] || err "the anchor installer needs Linux"
     command -v systemctl >/dev/null || err "systemd (systemctl) not found"
@@ -68,20 +100,30 @@ main() {
     [ -n "$tag" ] || err "could not resolve the latest release of ${REPO}"
     URL="https://github.com/${REPO}/releases/download/${tag}/maki-anchor-${tag}-${arch}-unknown-linux-musl"
 
+    allow_local="${MAKI_ANCHOR_ALLOW_LOCAL:-true}"
     if [ "$(id -u)" = "0" ]; then
         mode=system
         BIN=/usr/local/bin/maki-anchor
         STATE=/var/lib/maki-anchor
         UNIT=/etc/systemd/system/${SERVICE}.service
+        CONFIG=/etc/maki/anchor.toml
         WANTED_BY=multi-user.target
-        mkdir -p "$STATE"
+        mkdir -p "$STATE" /etc/maki
     else
         mode=user
         BIN="$HOME/.local/bin/maki-anchor"
         STATE="$HOME/.local/state/maki-anchor"
         UNIT="$HOME/.config/systemd/user/${SERVICE}.service"
+        CONFIG="$HOME/.config/maki-anchor/anchor.toml"
         WANTED_BY=default.target
-        mkdir -p "$HOME/.local/bin" "$STATE" "$HOME/.config/systemd/user"
+        mkdir -p "$HOME/.local/bin" "$STATE" "$HOME/.config/systemd/user" "$HOME/.config/maki-anchor"
+    fi
+
+    if [ -f "$CONFIG" ]; then
+        say "keeping existing config: $CONFIG"
+    else
+        write_config
+        say "wrote config: $CONFIG"
     fi
 
     install_binary
@@ -105,7 +147,7 @@ main() {
     fi
 
     say ""
-    say "anchor is up on ${BIND} (data in ${STATE})"
+    say "anchor is up (config in ${CONFIG}, data in ${STATE})"
     say "register an instance:   ${BIN} tokens add <name>"
     say "update later: re-run the same curl line"
 }
