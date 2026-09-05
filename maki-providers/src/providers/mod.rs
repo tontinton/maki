@@ -138,6 +138,9 @@ pub struct ResolvedAuth {
     /// the provider sets afterwards, so a key rotation cannot drop a gateway
     /// credential that replaced the built-in auth header.
     config_headers: Vec<String>,
+    /// `[<slug>] top_p`, carried with the auth so whoever the slug's
+    /// credentials reach (aperture routes, catalog sub-providers) sends it.
+    pub top_p: Option<f64>,
 }
 
 impl ResolvedAuth {
@@ -150,9 +153,11 @@ impl ResolvedAuth {
             base_url: None,
             headers,
             config_headers: Vec::new(),
+            top_p: None,
         };
         if let Some(def) = maki_config::providers::ProvidersConfig::load().get(slug) {
             auth.apply_config_headers(slug, &def.headers)?;
+            auth.top_p = def.top_p;
         }
         Ok(auth)
     }
@@ -196,6 +201,7 @@ impl ResolvedAuth {
             base_url: None,
             headers: Vec::new(),
             config_headers: Vec::new(),
+            top_p: None,
         }
     }
 
@@ -251,6 +257,7 @@ impl ResolvedAuth {
             base_url,
             headers,
             config_headers: Vec::new(),
+            top_p: None,
         }
     }
 }

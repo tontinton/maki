@@ -762,7 +762,14 @@ impl CatalogTransport {
     ) -> Result<StreamResponse, AgentError> {
         match api_format {
             EndpointType::ChatCompletions => {
-                let mut body = self.chat_compat.build_body(model, messages, system, tools);
+                let mut body = self.chat_compat.build_body(
+                    model,
+                    messages,
+                    system,
+                    tools,
+                    opts.thinking,
+                    auth.top_p,
+                );
                 opts.thinking
                     .apply_reasoning_effort(&mut body, &dialect::PREFER_HIGH, model);
                 self.chat_compat
@@ -781,6 +788,7 @@ impl CatalogTransport {
                     &system_blocks,
                     tools,
                     opts.thinking,
+                    auth.top_p,
                 );
                 body["model"] = serde_json::json!(model.id);
                 body["stream"] = serde_json::json!(true);

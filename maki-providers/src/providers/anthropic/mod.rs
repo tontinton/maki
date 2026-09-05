@@ -485,12 +485,14 @@ impl Provider for Anthropic {
                 }]
             };
 
+            let top_p = self.auth.lock().unwrap().top_p;
             let mut body = shared::build_request_body_with_system(
                 model,
                 messages,
                 &system_blocks,
                 tools,
                 opts.thinking,
+                top_p,
             );
             body["model"] = json!(shared::strip_long_context(&model.id));
             body["stream"] = json!(true);

@@ -190,6 +190,7 @@ supports_vision = false
 | `api_key` | string | Inline key (prefer the env var or `maki auth login`) |
 | `headers` | table | Extra HTTP headers sent on every request to this provider. Values expand `${{VAR}}` from the environment; an unset or empty variable fails the provider instead of sending a half-filled header. A same-name header (case-insensitive) replaces the built-in auth header and survives key rotation |
 | `default_model` | string | Used after login when no model is saved yet. On a custom entry it is also the startup fallback when no built-in or plugin provider is available. Without it, startup picks a declared `strong` or `medium` model |
+| `top_p` | f64 | Nucleus sampling probability, sent as `top_p` in the request body for OpenAI-compatible, Anthropic, Bedrock and Google providers. Claude and GPT models reject it while thinking is on, so it is dropped there. Never sent to Copilot or over the OpenAI responses path. Only sent when set, so the provider's own default applies otherwise. Must be in `(0, 1]` |
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
 | `subsidised_by` | string | Name of the flat subscription prepaying this provider (e.g. `"Max"`). Models bill $0 and show the published list price beside it as a reference. The list-price fallback needs `protocol = "anthropic"` |

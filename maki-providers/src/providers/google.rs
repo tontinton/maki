@@ -191,6 +191,7 @@ impl Google {
         system: &str,
         tools: &Value,
         thinking: ThinkingConfig,
+        top_p: Option<f64>,
     ) -> Value {
         let mut body = json!({
             "contents": convert_messages(messages),
@@ -204,6 +205,12 @@ impl Google {
 
         if let Some(max_output) = model.output_tokens() {
             body["generationConfig"]["maxOutputTokens"] = json!(max_output);
+        }
+        // Gemini ignores `topP` on models that dropped sampling params (3.6+)
+        // instead of erroring, and 2.5 thinking models accept it, so unlike
+        // Anthropic and OpenAI it rides along even when thinking is on.
+        if let Some(top_p) = top_p {
+            body["generationConfig"]["topP"] = json!(top_p);
         }
 
         let tool_decls = convert_tools(tools);
@@ -223,7 +230,8 @@ impl Google {
         event_tx: &Sender<ProviderEvent>,
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
-        let body = self.build_body(model, messages, system, tools, thinking);
+        let top_p = self.auth.lock().unwrap().top_p;
+        let body = self.build_body(model, messages, system, tools, thinking, top_p);
         let url = self.stream_url(&model.id);
         let json_body = serde_json::to_vec(&body)?;
 
@@ -769,12 +777,30 @@ mod tests {
             "be helpful",
             &json!([]),
             ThinkingConfig::Off,
+            None,
         );
 
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be helpful");
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 8192);
         assert!(body.get("tools").is_none());
+        assert!(body["generationConfig"].get("topP").is_none());
+    }
+
+    #[test_case(ThinkingConfig::Off ; "without_thinking")]
+    #[test_case(ThinkingConfig::Adaptive ; "with_thinking")]
+    fn google_build_body_sends_top_p(thinking: ThinkingConfig) {
+        let google = Google::with_auth(test_auth(), test_timeouts());
+        let messages = vec![Message::user("hello".into())];
+        let body = google.build_body(
+            &test_model(),
+            &messages,
+            "",
+            &json!([]),
+            thinking,
+            Some(0.8),
+        );
+        assert_eq!(body["generationConfig"]["topP"], 0.8);
     }
 
     #[test]
@@ -787,6 +813,7 @@ mod tests {
             "",
             &json!([]),
             ThinkingConfig::Adaptive,
+            None,
         );
 
         assert_eq!(
@@ -805,6 +832,7 @@ mod tests {
             "",
             &json!([]),
             ThinkingConfig::Budget(8192),
+            None,
         );
 
         // Clamped to the model's max thinking budget (half of 8192 output tokens).

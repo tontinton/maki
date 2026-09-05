@@ -12,8 +12,10 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use super::ResolvedAuth;
+use crate::model::ModelFamily;
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
+    ThinkingConfig, TokenUsage,
 };
 
 const STREAM_DONE: &str = "[DONE]";
@@ -158,6 +160,8 @@ impl OpenAiCompatProvider {
         messages: &[Message],
         system: &str,
         tools: &Value,
+        thinking: ThinkingConfig,
+        top_p: Option<f64>,
     ) -> Value {
         let wire_messages = convert_messages(messages, system);
         let wire_tools = convert_tools(tools);
@@ -167,6 +171,14 @@ impl OpenAiCompatProvider {
             "messages": wire_messages,
             "stream": true,
         });
+        // OpenAI's reasoning models reject `top_p` whenever reasoning effort
+        // is set. Everyone else (deepseek, glm, grok, llama.cpp) takes it
+        // alongside thinking, so only the GPT family is gated.
+        if let Some(top_p) = top_p
+            && !(thinking.is_enabled() && model.family == ModelFamily::Gpt)
+        {
+            body["top_p"] = json!(top_p);
+        }
         if let Some(max_output) = model.output_tokens() {
             body[&*self.config.max_tokens_field] = json!(max_output);
         }
@@ -809,7 +821,10 @@ pub async fn parse_sse(
 mod tests {
     use super::*;
     use futures_lite::io::Cursor;
+    use std::sync::Arc;
     use test_case::test_case;
+
+    use crate::model::{Model, ModelPricing, ModelTier};
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const COUNTS_SURVIVE_A_BAD_COST: &str =
@@ -1434,5 +1449,76 @@ data: [DONE]\n";
             assert_eq!(text_deltas, vec!["Hello"]);
             assert_eq!(thinking_deltas, vec!["Let me think", "..."]);
         })
+    }
+
+    static TEST_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+        slug: Cow::Borrowed("top-p-test"),
+        api_key_env: Cow::Borrowed(""),
+        base_url: Cow::Borrowed("https://example.test/v1"),
+        max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
+        include_stream_usage: true,
+        provider_name: Cow::Borrowed("test"),
+    };
+
+    fn test_model(family: ModelFamily) -> Model {
+        Model {
+            id: "test-model".into(),
+            provider: Arc::<str>::from("test"),
+            tier: ModelTier::Medium,
+            family,
+            supports_tool_examples_override: None,
+            thinking_override: None,
+            supports_vision_override: None,
+            supports_fast_override: None,
+            pricing: ModelPricing::default(),
+            subsidised_by: None,
+            discovered_free: false,
+            max_output_tokens: Some(8192),
+            turn_output_tokens: None,
+            context_window: 131_072,
+            thinking_fields: None,
+        }
+    }
+
+    fn test_provider() -> OpenAiCompatProvider {
+        OpenAiCompatProvider {
+            client: super::super::http_client(super::super::Timeouts::default()),
+            config: Cow::Borrowed(&TEST_CONFIG),
+            stream_timeout: TEST_STREAM_TIMEOUT,
+            resolved_base_url: None,
+        }
+    }
+
+    #[test_case(ModelFamily::Gpt, ThinkingConfig::Off, true ; "gpt_off_sends")]
+    #[test_case(ModelFamily::Gpt, ThinkingConfig::Adaptive, false ; "gpt_thinking_omits")]
+    #[test_case(ModelFamily::Generic, ThinkingConfig::Adaptive, true ; "generic_thinking_sends")]
+    #[test_case(ModelFamily::Glm, ThinkingConfig::Effort(crate::Effort::High), true ; "glm_effort_sends")]
+    fn build_body_top_p_gated_on_gpt_reasoning(
+        family: ModelFamily,
+        thinking: ThinkingConfig,
+        sent: bool,
+    ) {
+        let body = test_provider().build_body(
+            &test_model(family),
+            &[Message::user("hi".into())],
+            "",
+            &json!([]),
+            thinking,
+            Some(0.8),
+        );
+        assert_eq!(body.get("top_p") == Some(&json!(0.8)), sent);
+    }
+
+    #[test]
+    fn build_body_omits_top_p_when_unset() {
+        let body = test_provider().build_body(
+            &test_model(ModelFamily::Generic),
+            &[Message::user("hi".into())],
+            "",
+            &json!([]),
+            ThinkingConfig::Off,
+            None,
+        );
+        assert!(body.get("top_p").is_none());
     }
 }

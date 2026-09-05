@@ -536,7 +536,10 @@ impl Provider for OpenAi {
                     .await;
             }
 
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let top_p = self.current_auth().top_p;
+            let mut body =
+                self.compat
+                    .build_body(model, messages, system, tools, opts.thinking, top_p);
             opts.thinking.apply_thinking(
                 &mut body,
                 model,

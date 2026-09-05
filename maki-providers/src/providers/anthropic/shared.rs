@@ -235,6 +235,7 @@ pub(crate) fn build_request_body_with_system(
     system_blocks: &[SystemBlock<'_>],
     tools: &Value,
     thinking: ThinkingConfig,
+    top_p: Option<f64>,
 ) -> Value {
     let wire_messages = build_wire_messages(messages);
     let wire_tools = build_wire_tools(tools);
@@ -245,6 +246,11 @@ pub(crate) fn build_request_body_with_system(
         "messages": wire_messages,
         "tools": wire_tools,
     });
+    if let Some(top_p) = top_p
+        && !thinking.is_enabled()
+    {
+        body["top_p"] = json!(top_p);
+    }
 
     thinking.apply_to_body(&mut body, model);
     body
@@ -430,11 +436,17 @@ impl EventParser {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
     use test_case::test_case;
 
     use super::{
-        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, long_context_window, strip_long_context,
+        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, SystemBlock, build_request_body_with_system,
+        long_context_window, strip_long_context,
     };
+    use crate::model::{Model, ModelFamily, ModelPricing, ModelTier};
+    use crate::{Message, ThinkingConfig};
 
     #[test_case("claude-opus-4-8-1m", "claude-opus-4-8" ; "strips_suffix")]
     #[test_case("claude-opus-4-8", "claude-opus-4-8" ; "leaves_plain_id")]
@@ -447,5 +459,43 @@ mod tests {
     fn long_context_window_follows_suffix(model_id: &str, expected: Option<u32>) {
         assert_eq!(long_context_window(model_id), expected);
         assert!(LONG_CONTEXT_SUFFIX.ends_with("1m"));
+    }
+
+    fn test_model() -> Model {
+        Model {
+            id: "claude-test".into(),
+            provider: Arc::<str>::from("anthropic"),
+            tier: ModelTier::Medium,
+            family: ModelFamily::Claude,
+            supports_tool_examples_override: None,
+            thinking_override: None,
+            supports_vision_override: None,
+            supports_fast_override: None,
+            pricing: ModelPricing::default(),
+            subsidised_by: None,
+            discovered_free: false,
+            max_output_tokens: Some(8192),
+            turn_output_tokens: None,
+            context_window: 200_000,
+            thinking_fields: None,
+        }
+    }
+
+    #[test_case(ThinkingConfig::Off, true ; "off_sends_top_p")]
+    #[test_case(ThinkingConfig::Adaptive, false ; "thinking_omits_top_p")]
+    fn top_p_is_sent_unless_thinking(thinking: ThinkingConfig, sent: bool) {
+        let body = build_request_body_with_system(
+            &test_model(),
+            &[Message::user("hi".into())],
+            &[SystemBlock {
+                r#type: "text",
+                text: "sys",
+                cache_control: None,
+            }],
+            &json!([]),
+            thinking,
+            Some(0.8),
+        );
+        assert_eq!(body.get("top_p") == Some(&json!(0.8)), sent);
     }
 }

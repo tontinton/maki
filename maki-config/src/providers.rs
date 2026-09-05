@@ -32,6 +32,10 @@ type FileStamp = (PathBuf, Option<SystemTime>, u64);
 /// those costs a read plus a full TOML parse.
 static PARSED: Mutex<Option<(FileStamp, ProvidersConfig)>> = Mutex::new(None);
 
+/// Valid `top_p` is in the open interval exclusive of 0, up to 1 inclusive.
+const TOP_P_MIN: f64 = 0.0;
+const TOP_P_MAX: f64 = 1.0;
+
 /// The role a model plays, which is what tiered requests dispatch on. Lives
 /// here rather than in maki-providers so `providers.toml` can name it.
 ///
@@ -287,6 +291,15 @@ pub struct ProviderDef {
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Nucleus sampling threshold sent as `top_p` in the request body to this
+    /// provider. When unset, no `top_p` is sent (the provider's own default
+    /// applies). Must be in `(0, 1]`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_top_p"
+    )]
+    pub top_p: Option<f64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub discover_models: bool,
     /// Extra HTTP headers sent with every request to this provider. Values
@@ -611,6 +624,30 @@ pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
     builtin_provider(slug).and_then(|b| b.login_url.map(|u| u.to_string()))
 }
 
+/// The `top_p` configured for `slug`. Read with `load_or_default` so a
+/// mid-session typo in `providers.toml` degrades to the default instead of
+/// taking the process down.
+pub fn top_p_for(slug: &str) -> Option<f64> {
+    ProvidersConfig::load_or_default()
+        .get(slug)
+        .and_then(|def| def.top_p)
+}
+
+fn de_top_p<'de, D>(de: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(de)?;
+    if let Some(v) = value
+        && (v.is_nan() || v <= TOP_P_MIN || v > TOP_P_MAX)
+    {
+        return Err(serde::de::Error::custom(format!(
+            "top_p must be in ({TOP_P_MIN}, {TOP_P_MAX}], got {v}"
+        )));
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -919,6 +956,30 @@ tier = "{input}"
     fn thinking_level_keys_are_checked_at_parse(fields: &str, parses: bool) {
         let entry = format!(r#"models = [{{ id = "m", thinking_fields = {fields} }}]"#);
         assert_eq!(toml::from_str::<ProviderDef>(&entry).is_ok(), parses);
+    }
+
+    #[test_case(0.0; "zero")]
+    #[test_case(-0.1; "negative")]
+    #[test_case(1.5; "above_one")]
+    fn top_p_out_of_range_rejected(value: f64) {
+        let res = toml::from_str::<ProviderDef>(&format!("top_p = {value}"));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn top_p_nan_rejected() {
+        let err = toml::from_str::<ProviderDef>("top_p = nan")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("top_p must be in"), "{err}");
+    }
+
+    #[test]
+    fn top_p_boundaries_accepted() {
+        let def: ProviderDef = toml::from_str("top_p = 1.0").unwrap();
+        assert_eq!(def.top_p, Some(1.0));
+        let def2: ProviderDef = toml::from_str(&format!("top_p = {}", f64::MIN_POSITIVE)).unwrap();
+        assert!(def2.top_p.unwrap() > 0.0);
     }
 
     #[test_case("MyProvider", "myprovider"; "mixed_case")]
