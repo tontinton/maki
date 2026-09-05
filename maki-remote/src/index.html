@@ -104,7 +104,7 @@
     border-bottom: 1px solid var(--border);
     background: var(--panel);
   }
-  #toolbar input {
+  #toolbar input, #toolbar select {
     background: var(--bg);
     color: var(--text);
     border: 1px solid var(--border);
@@ -113,7 +113,9 @@
     font: inherit;
     font-size: 12px;
   }
-  #toolbar #model-input { width: 220px; }
+  #toolbar label.mini { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 12px; padding: 0 4px; }
+  #toolbar #provider-select { max-width: 160px; }
+  #toolbar #model-select { max-width: 240px; }
   #toolbar #cmd-input { flex: 1; min-width: 160px; }
   #sessions-bar {
     display: none;
@@ -174,16 +176,21 @@
   <span id="conn" data-conn="down">connecting</span>
 </header>
 <div id="toolbar">
-  <input id="cmd-input" placeholder="/command  (e.g. /yolo, /compact, /model)  Enter to run">
+  <input id="cmd-input" list="cmd-list" placeholder="/command — type to filter, Enter to run">
   <button class="mini" id="cmd-run">Run</button>
-  <input id="model-input" placeholder="model spec (provider/model)">
-  <button class="mini" id="model-set">Set model</button>
-  <button class="mini" id="btn-yolo">/yolo</button>
-  <button class="mini" id="btn-fast">/fast</button>
-  <button class="mini" id="btn-thinking">/thinking</button>
-  <button class="mini" id="btn-new">/new</button>
-  <button class="mini" id="btn-compact">/compact</button>
+  <select id="provider-select" title="Filter models by provider"><option value="">all providers</option></select>
+  <select id="model-select" title="Model"><option value="">model…</option></select>
+  <select id="mode-select" title="Mode">
+    <option value="build">build</option>
+    <option value="plan">plan</option>
+  </select>
+  <label class="mini" title="Auto-approve tool permissions"><input type="checkbox" id="yolo-check"> yolo</label>
+  <button class="mini" id="btn-fast" title="Toggle fast mode">/fast</button>
+  <button class="mini" id="btn-thinking" title="Set thinking level">/thinking</button>
+  <button class="mini" id="btn-new" title="New session">/new</button>
+  <button class="mini" id="btn-compact" title="Compact context">/compact</button>
 </div>
+<datalist id="cmd-list"></datalist>
 <div id="sessions-bar"></div>
 <main id="log"></main>
 <div id="toast"></div>
@@ -218,10 +225,15 @@
   const stopBtn = document.getElementById("stop");
   const denyGuidance = document.getElementById("deny-guidance");
   const cmdInput = document.getElementById("cmd-input");
-  const modelInput = document.getElementById("model-input");
+  const cmdList = document.getElementById("cmd-list");
+  const providerSelect = document.getElementById("provider-select");
+  const modelSelect = document.getElementById("model-select");
+  const modeSelect = document.getElementById("mode-select");
+  const yoloCheck = document.getElementById("yolo-check");
   const sessionsBar = document.getElementById("sessions-bar");
   const toastEl = document.getElementById("toast");
   let pendingPermission = null;
+  let allModels = [];
 
   const el = (cls, text) => {
     const node = document.createElement("div");
@@ -254,7 +266,7 @@
     if (snap.cwd) cwdEl.textContent = snap.cwd;
     if (snap.model) {
       modelEl.textContent = snap.model;
-      if (modelInput && !modelInput.dataset.touched) modelInput.value = snap.model;
+      reflectModel(snap.model);
     }
     setStats(snap);
     if (snap.status) setStatus(snap.status);
@@ -437,6 +449,13 @@
     try { const r = await fetch(path); if (!r.ok) return null; return await r.json(); } catch { return null; }
   };
 
+  const postJson = async (path, body) => {
+    try {
+      const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      return await r.json().catch(() => (r.ok ? {} : { error: "failed" }));
+    } catch { return { error: "network" }; }
+  };
+
   const sendPrompt = async () => {
     const text = promptEl.value.trim();
     if (!text) return;
@@ -461,17 +480,13 @@
     const cmdline = cmdInput.value.trim();
     if (!cmdline) return;
     const ok = await submit("command", { cmdline });
-    if (ok) { toast(`ran ${cmdline}`); cmdInput.value = ""; setTimeout(() => { refreshModel(); refreshSessions(); }, 600); }
+    if (ok) { toast(`ran ${cmdline}`); cmdInput.value = ""; setTimeout(() => { refreshOptions(); refreshSessions(); }, 600); }
   };
-  const setModel = async () => {
-    const spec = modelInput.value.trim();
+  const setModel = async (spec) => {
     if (!spec) return;
-    try {
-      const res = await fetch("model", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ spec }) });
-      const j = await res.json().catch(() => ({}));
-      if (res.ok) { toast(`model → ${j.spec || spec}`); modelEl.textContent = j.spec || spec; }
-      else toast(j.error || "model change failed");
-    } catch { toast("model change failed"); }
+    const j = await postJson("model", { spec });
+    if (j && j.spec) { toast(`model → ${j.spec}`); modelEl.textContent = j.spec; reflectModel(j.spec); }
+    else toast((j && j.error) || "model change failed");
   };
   const refreshSessions = async () => {
     const data = await fetchJson("sessions");
@@ -493,15 +508,76 @@
     }
     sessionsBar.style.display = data.sessions.length ? "flex" : "none";
   };
-  const refreshModel = async () => {
-    const m = await fetchJson("model");
-    if (m && m.spec) { modelEl.textContent = m.spec; if (!modelInput.dataset.touched) modelInput.value = m.spec; }
+
+  // The model <select> is filtered by the provider <select> but always keeps
+  // the current spec, even when it belongs to a provider now filtered out.
+  const reflectModel = (spec) => {
+    if (!spec) return;
+    const want = providerSelect.value;
+    if (!want) modelSelect.value = spec;
+    if (modelSelect.value !== spec) {
+      const opt = document.createElement("option");
+      opt.value = spec; opt.textContent = spec; opt.dataset.current = "1";
+      modelSelect.prepend(opt);
+      modelSelect.value = spec;
+    }
+  };
+
+  const rebuildModelSelect = () => {
+    const current = modelEl.textContent;
+    const want = providerSelect.value;
+    modelSelect.replaceChildren();
+    for (const spec of allModels) {
+      if (want && !spec.startsWith(want + "/")) continue;
+      const o = document.createElement("option");
+      o.value = spec; o.textContent = spec;
+      modelSelect.appendChild(o);
+    }
+    if (current && ![...modelSelect.options].some((o) => o.value === current)) {
+      const o = document.createElement("option");
+      o.value = current; o.textContent = current; o.dataset.current = "1";
+      modelSelect.prepend(o);
+    }
+    if (current) modelSelect.value = current;
+  };
+
+  const refreshOptions = async () => {
+    const o = await fetchJson("options");
+    if (!o) return;
+    allModels = Array.isArray(o.models) ? o.models : allModels;
+    const known = [...new Set(allModels.map((s) => s.split("/")[0]))];
+    const keep = providerSelect.value;
+    providerSelect.replaceChildren();
+    const all = document.createElement("option");
+    all.value = ""; all.textContent = "all providers";
+    providerSelect.appendChild(all);
+    for (const p of (o.providers || known)) {
+      const opt = document.createElement("option");
+      opt.value = p; opt.textContent = p;
+      providerSelect.appendChild(opt);
+    }
+    providerSelect.value = keep;
+    modelEl.textContent = o.model || modelEl.textContent;
+    rebuildModelSelect();
+    if (o.mode) modeSelect.value = o.mode;
+    if (typeof o.yolo === "boolean") yoloCheck.checked = o.yolo;
+  };
+
+  const refreshCommands = async () => {
+    const list = await fetchJson("commands");
+    if (!Array.isArray(list)) return;
+    cmdList.replaceChildren();
+    for (const c of list) {
+      const o = document.createElement("option");
+      o.value = c.name;
+      o.label = c.description || "";
+      o.textContent = `${c.name} — ${c.description || ""}`;
+      cmdList.appendChild(o);
+    }
   };
 
   document.getElementById("send").onclick = sendPrompt;
   document.getElementById("cmd-run").onclick = runCommand;
-  document.getElementById("model-set").onclick = setModel;
-  document.getElementById("btn-yolo").onclick = () => submit("command", { cmdline: "/yolo" }).then(ok => ok && toast("toggled /yolo"));
   document.getElementById("btn-fast").onclick = () => submit("command", { cmdline: "/fast" }).then(ok => ok && toast("toggled /fast"));
   document.getElementById("btn-thinking").onclick = () => {
     const v = prompt("thinking: off / adaptive / high / low (blank toggles)", "");
@@ -510,8 +586,16 @@
   document.getElementById("btn-new").onclick = () => submit("command", { cmdline: "/new" }).then(ok => ok && toast("new session"));
   document.getElementById("btn-compact").onclick = () => submit("command", { cmdline: "/compact" }).then(ok => ok && toast("compact queued"));
   cmdInput.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); runCommand(); } });
-  modelInput.addEventListener("input", () => modelInput.dataset.touched = "1");
-  modelInput.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); setModel(); } });
+  providerSelect.onchange = rebuildModelSelect;
+  modelSelect.onchange = () => { if (modelSelect.value) setModel(modelSelect.value); };
+  modeSelect.onchange = async () => {
+    const j = await postJson("options", { mode: modeSelect.value });
+    if (j && !j.error) toast(`mode: ${modeSelect.value}`); else { toast((j && j.error) || "mode change failed"); refreshOptions(); }
+  };
+  yoloCheck.onchange = async () => {
+    const j = await postJson("options", { yolo: yoloCheck.checked });
+    if (j && !j.error) toast(`yolo ${yoloCheck.checked ? "on" : "off"}`); else refreshOptions();
+  };
   promptEl.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && !ev.shiftKey) {
       ev.preventDefault();
@@ -536,9 +620,10 @@
   });
 
   connect();
-  refreshModel();
+  refreshOptions();
+  refreshCommands();
   refreshSessions();
-  setInterval(refreshSessions, 8000);
+  setInterval(() => { refreshSessions(); refreshOptions(); }, 8000);
   promptEl.focus();
 })();
 </script>

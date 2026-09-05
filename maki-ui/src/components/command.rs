@@ -337,6 +337,32 @@ impl CommandPalette {
         !self.filtered.is_empty()
     }
 
+    /// Every command with its description, for the web UI's command picker.
+    /// Refreshes the plugin/MCP snapshots the same way `sync` does.
+    pub fn listing(&mut self) -> Vec<(String, String)> {
+        let mcp_snap = self.mcp_reader.load();
+        let lua_snap = self.lua_reader.load();
+        if mcp_snap.generation != self.mcp_generation || lua_snap.generation != self.lua_generation
+        {
+            self.mcp_generation = mcp_snap.generation;
+            self.mcp_prompts = mcp_snap.prompts.clone();
+            self.lua_generation = lua_snap.generation;
+            self.lua_commands = lua_snap.commands.clone();
+            self.nucleo = Self::build_nucleo(&self.custom, &self.mcp_prompts, &self.lua_commands);
+        }
+        Self::items(&self.custom, &self.mcp_prompts, &self.lua_commands)
+            .map(|item| {
+                let description = match &item.command_type {
+                    CommandType::Builtin(cmd) => cmd.description.to_string(),
+                    CommandType::Custom(i) => self.custom[*i].description.clone(),
+                    CommandType::McpPrompt(i) => self.mcp_prompts[*i].description.clone(),
+                    CommandType::Lua(i) => self.lua_commands[*i].description.to_string(),
+                };
+                (item.name, description)
+            })
+            .collect()
+    }
+
     pub fn sync(&mut self, input: &str) {
         let mcp_snap = self.mcp_reader.load();
         let lua_snap = self.lua_reader.load();

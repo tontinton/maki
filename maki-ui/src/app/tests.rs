@@ -5509,15 +5509,41 @@ fn remote_snapshot_renders_transcript_and_stats() {
     ]);
     let snap = app.remote_snapshot();
     let msgs = snap["messages"].as_array().unwrap();
-    assert_eq!(msgs.len(), 4, "user, text, tool_use, tool_result: {msgs:?}");
+    assert_eq!(msgs.len(), 4, "user, text, tool_use, tool_done: {msgs:?}");
     assert_eq!(msgs[0]["type"], "user_message");
     assert_eq!(msgs[0]["text"], RC_SNAPSHOT_PROMPT);
     assert_eq!(msgs[1]["type"], "assistant_text");
     assert_eq!(msgs[2]["type"], "tool_start");
-    assert_eq!(msgs[3]["type"], "tool_result");
+    // tool_done closes the card tool_start opened, and carries the FULL
+    // stored output when the session has one, not the model summary.
+    assert_eq!(msgs[3]["type"], "tool_done");
     assert_eq!(msgs[3]["id"], "tool-1");
+    assert_eq!(msgs[3]["output"], "out");
     assert!(snap["model"].is_string());
     assert!(snap["status"].is_string());
+}
+
+#[test]
+fn remote_snapshot_prefers_stored_tool_output_over_inline_summary() {
+    let mut app = test_app();
+    app.state.session_mut().replace_messages(vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "tool-1".into(),
+            content: "truncated summary…".into(),
+            is_error: false,
+        }],
+        display_text: Some(String::new()),
+        ..Default::default()
+    }]);
+    let full = maki_agent::ToolOutput::Plain("the whole output, lines and lines".into());
+    app.state
+        .session_mut()
+        .insert_tool_output("tool-1".into(), Arc::new(full));
+    let snap = app.remote_snapshot();
+    let msgs = snap["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0]["output"], "the whole output, lines and lines");
 }
 
 const RC_SNAPSHOT_PROMPT: &str = "snapshot question";

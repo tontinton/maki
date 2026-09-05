@@ -60,6 +60,23 @@ pub enum RemoteRequest {
         session: Option<String>,
         reply: Sender<serde_json::Value>,
     },
+    /// The slash commands the focused session knows, for the web picker.
+    Commands {
+        session: Option<String>,
+        reply: Sender<serde_json::Value>,
+    },
+    /// Picker data: available models plus the session's mode/yolo/fast.
+    Options {
+        session: Option<String>,
+        reply: Sender<serde_json::Value>,
+    },
+    /// Turn a permission flag or the mode on/off; answers with fresh options.
+    SetOptions {
+        session: Option<String>,
+        yolo: Option<bool>,
+        mode: Option<String>,
+        reply: Sender<serde_json::Value>,
+    },
 }
 
 impl RemoteRequest {
@@ -72,7 +89,10 @@ impl RemoteRequest {
             | Self::Command { session, .. }
             | Self::ModelGet { session, .. }
             | Self::ModelSet { session, .. }
-            | Self::Snapshot { session, .. } => session.as_deref(),
+            | Self::Snapshot { session, .. }
+            | Self::Commands { session, .. }
+            | Self::Options { session, .. }
+            | Self::SetOptions { session, .. } => session.as_deref(),
             Self::Sessions { .. } => None,
         }
     }
@@ -186,16 +206,7 @@ impl RemoteServer {
 
     fn handle(&self, mut request: tiny_http::Request) {
         let (session, route) = self.route(request.url(), request.method());
-        let body = if matches!(
-            route,
-            Some(
-                crate::dispatch::Route::Prompt
-                    | crate::dispatch::Route::Answer
-                    | crate::dispatch::Route::Stop
-                    | crate::dispatch::Route::Command
-                    | crate::dispatch::Route::ModelPost
-            )
-        ) {
+        let body = if reads_body(route) {
             match read_body(&mut request) {
                 Ok(body) => body,
                 Err(_) => {
@@ -273,6 +284,22 @@ fn serve_events(request: tiny_http::Request, source: &mut crate::dispatch::SseSo
 
 fn content_type(value: &str) -> tiny_http::Header {
     tiny_http::Header::from_bytes("Content-Type", value).expect("static content type")
+}
+
+/// Routes that carry a request body the HTTP handler must read before
+/// dispatch; everything else answers from the path alone.
+fn reads_body(route: Option<crate::dispatch::Route>) -> bool {
+    matches!(
+        route,
+        Some(
+            crate::dispatch::Route::Prompt
+                | crate::dispatch::Route::Answer
+                | crate::dispatch::Route::Stop
+                | crate::dispatch::Route::Command
+                | crate::dispatch::Route::ModelPost
+                | crate::dispatch::Route::OptionsPost
+        )
+    )
 }
 
 fn read_body(request: &mut tiny_http::Request) -> Result<String, ()> {

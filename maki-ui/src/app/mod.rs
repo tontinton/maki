@@ -622,6 +622,65 @@ impl App {
         Ok(())
     }
 
+    /// Slash commands with descriptions, for the web command picker.
+    pub(crate) fn remote_commands(&mut self) -> serde_json::Value {
+        let items = self
+            .command_palette
+            .listing()
+            .into_iter()
+            .map(|(name, description)| json!({ "name": name, "description": description }))
+            .collect::<Vec<_>>();
+        json!(items)
+    }
+
+    /// Picker data for the web: every model with its provider, plus the
+    /// session's current mode and permission toggles.
+    pub(crate) fn remote_options(&self) -> serde_json::Value {
+        let models = self.model_picker.available_specs();
+        let mut providers: Vec<String> = models
+            .iter()
+            .filter_map(|spec| spec.split_once('/').map(|(p, _)| p.to_owned()))
+            .collect();
+        providers.sort_unstable();
+        providers.dedup();
+        json!({
+            "models": models,
+            "providers": providers,
+            "model": self.state.model.spec(),
+            "mode": match self.state.mode {
+                Mode::Build => "build",
+                Mode::Plan => "plan",
+            },
+            "yolo": self.permissions.is_yolo(),
+            "fast": self.state.fast,
+            "thinking": self.state.thinking.to_string(),
+        })
+    }
+
+    /// Set plan/build mode from the web, mirroring the Tab toggle.
+    pub(crate) fn remote_set_mode(&mut self, mode: &str) -> Result<serde_json::Value, String> {
+        let plan = match mode {
+            "plan" => true,
+            "build" => false,
+            other => return Err(format!("unknown mode {other:?}")),
+        };
+        if plan == (self.state.mode == Mode::Plan) {
+            return Ok(self.remote_options());
+        }
+        let actions = self.toggle_mode();
+        debug_assert!(actions.is_empty(), "mode toggle owes no loop actions");
+        Ok(self.remote_options())
+    }
+
+    /// Turn a permission flag on or off from the web, reusing the same
+    /// commands the keyboard runs.
+    pub(crate) fn remote_set_yolo(&mut self, on: bool) -> serde_json::Value {
+        if self.permissions.is_yolo() != on {
+            self.permissions.toggle_yolo();
+        }
+        self.remote_options()
+    }
+
     /// Everything a freshly connected web client needs to catch up to what
     /// the TUI shows: transcript, stats, mode, status, pending permission.
     /// Mirrors what the TUI renders, not the raw LLM history.
@@ -633,6 +692,10 @@ impl App {
             Some(shared) => shared.load().messages.clone(),
             None => self.state.session.messages().to_vec().into(),
         };
+        // Full-fidelity tool results live in the session's output store keyed by
+        // tool id; the inline `ToolResult.content` is only the truncated model
+        // summary, so a snapshot that reads it shows the web less than the TUI.
+        let tool_outputs = self.state.session.tool_outputs();
         for message in history.iter() {
             // Observation messages are host bookkeeping the TUI hides.
             if message.kind == MessageKind::Observation {
@@ -663,10 +726,14 @@ impl App {
                             is_error,
                         } = block
                         {
+                            let full = tool_outputs
+                                .get(tool_use_id.as_str())
+                                .map(|o| o.as_text())
+                                .unwrap_or_else(|| content.clone());
                             messages.push(json!({
-                                "type": "tool_result",
+                                "type": "tool_done",
                                 "id": tool_use_id,
-                                "content": content,
+                                "output": full,
                                 "is_error": is_error,
                             }));
                         }

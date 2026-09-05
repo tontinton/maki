@@ -220,6 +220,83 @@ fn answered_prompt_post_returns_ok() {
 }
 
 #[test]
+fn commands_get_surfaces_and_answers_json() {
+    let server = spawn_server();
+    let token = server.url.rsplit('/').next().unwrap();
+    let surface = server.requests.clone();
+
+    std::thread::spawn(move || {
+        if let Ok(RemoteRequest::Commands { reply, .. }) =
+            surface.recv_timeout(Duration::from_secs(5))
+        {
+            let _ = reply.send(serde_json::json!([{"name": "/rc", "description": "remote"}]));
+        }
+    });
+
+    let reply = http_exchange(
+        server.port(),
+        &format!("GET /{token}/commands HTTP/1.1\r\nHost: {RC_TEST_DOMAIN}\r\n\r\n"),
+    );
+    assert!(reply.starts_with("HTTP/1.1 200"), "got {reply:?}");
+    assert!(
+        reply.contains("/rc"),
+        "body should carry the command: {reply:?}"
+    );
+}
+
+#[test]
+fn options_post_carries_yolo_and_mode() {
+    let server = spawn_server();
+    let token = server.url.rsplit('/').next().unwrap();
+    let surface = server.requests.clone();
+
+    let client = std::thread::spawn({
+        let port = server.port();
+        let token = token.to_owned();
+        move || {
+            let body = "{\"yolo\":true,\"mode\":\"plan\"}";
+            http_exchange(
+                port,
+                &format!(
+                    "POST /{token}/options HTTP/1.1\r\nHost: {RC_TEST_DOMAIN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        }
+    });
+
+    let request = surface
+        .recv_timeout(Duration::from_secs(5))
+        .expect("options request");
+    let RemoteRequest::SetOptions {
+        yolo, mode, reply, ..
+    } = request
+    else {
+        panic!("expected SetOptions");
+    };
+    assert_eq!(yolo, Some(true));
+    assert_eq!(mode.as_deref(), Some("plan"));
+    let _ = reply.send(serde_json::json!({"mode": "plan", "yolo": true}));
+    assert!(client.join().unwrap().starts_with("HTTP/1.1 200"));
+}
+
+#[test]
+fn options_post_rejects_empty_body() {
+    let server = spawn_server();
+    let token = server.url.rsplit('/').next().unwrap();
+    let reply = http_exchange(
+        server.port(),
+        &format!(
+            "POST /{token}/options HTTP/1.1\r\nHost: {RC_TEST_DOMAIN}\r\nContent-Length: 2\r\n\r\n{{}}",
+        ),
+    );
+    assert!(
+        reply.starts_with("HTTP/1.1 400"),
+        "empty set must 400: {reply:?}"
+    );
+}
+
+#[test]
 fn sse_opens_with_snapshot_then_carries_published_frames() {
     let server = spawn_server();
     let token = server.url.rsplit('/').next().unwrap();

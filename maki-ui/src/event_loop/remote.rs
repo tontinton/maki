@@ -30,6 +30,9 @@ pub(crate) enum RemoteControl {
         link_rx: Option<flume::Receiver<String>>,
         out: std::sync::mpsc::Sender<TunnelOut>,
         shutdown: Arc<AtomicBool>,
+        /// Anchor origin; the handshake only returns the token, and a bare
+        /// token is not a URL a user can open.
+        base_url: String,
     },
 }
 
@@ -78,6 +81,7 @@ impl RemoteControl {
                     link_rx: Some(link_rx),
                     out,
                     shutdown,
+                    base_url: url,
                 },
                 REMOTE_TUNNEL_STARTING.to_owned(),
             ))
@@ -104,14 +108,16 @@ impl RemoteControl {
         }
     }
 
-    /// The anchor-minted link once the tunnel handshake completes.
+    /// The full openable URL once the tunnel handshake completes: the
+    /// handshake carries only the token, so the anchor origin is joined here.
     fn tunnel_link(&mut self) -> Option<String> {
-        if let Self::Tunnel { link_rx, .. } = self {
-            let link = link_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-            if link.is_some() {
-                *link_rx = None;
-            }
-            link
+        if let Self::Tunnel {
+            link_rx, base_url, ..
+        } = self
+        {
+            let token = link_rx.as_ref().and_then(|rx| rx.try_recv().ok())?;
+            *link_rx = None;
+            Some(format!("{}/{token}/", base_url.trim_end_matches('/')))
         } else {
             None
         }
@@ -303,6 +309,30 @@ fn handle_request(
             let _ = reply.send(app.remote_snapshot());
             Ok(vec![])
         }
+        RemoteRequest::Commands { reply, .. } => {
+            let _ = reply.send(app.remote_commands());
+            Ok(vec![])
+        }
+        RemoteRequest::Options { reply, .. } => {
+            let _ = reply.send(app.remote_options());
+            Ok(vec![])
+        }
+        RemoteRequest::SetOptions {
+            yolo, mode, reply, ..
+        } => {
+            let mut options = None;
+            if let Some(on) = yolo {
+                options = Some(app.remote_set_yolo(on));
+            }
+            if let Some(mode) = mode.as_deref()
+                && let Ok(o) = app.remote_set_mode(mode)
+            {
+                options = Some(o);
+            }
+            let value = options.unwrap_or_else(|| app.remote_options());
+            let _ = reply.send(value);
+            Ok(vec![])
+        }
     };
     outcome.unwrap_or_default()
 }
@@ -320,7 +350,10 @@ fn reject(request: RemoteRequest, reason: &str) {
         }
         RemoteRequest::Sessions { reply }
         | RemoteRequest::ModelGet { reply, .. }
-        | RemoteRequest::Snapshot { reply, .. } => {
+        | RemoteRequest::Snapshot { reply, .. }
+        | RemoteRequest::Commands { reply, .. }
+        | RemoteRequest::Options { reply, .. }
+        | RemoteRequest::SetOptions { reply, .. } => {
             let _ = reply.send(serde_json::json!({"error": reason}));
         }
     }
@@ -393,9 +426,36 @@ mod tests {
             link_rx: None,
             out,
             shutdown: Arc::clone(&shutdown),
+            base_url: "https://anchor.test".into(),
         };
         control.stop();
         assert!(shutdown.load(Ordering::Relaxed), "tunnel must observe stop");
+    }
+
+    #[test]
+    fn tunnel_link_becomes_a_full_url() {
+        let (link_tx, link_rx) = flume::bounded::<String>(1);
+        let (out, _sink) = std::sync::mpsc::channel();
+        let mut control = RemoteControl::Tunnel {
+            state: maki_remote::RemoteState::new(),
+            link_rx: Some(link_rx),
+            out,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            base_url: "https://maki.example.com/".into(),
+        };
+        link_tx.send("a".repeat(32)).unwrap();
+        let url = control
+            .tunnel_link()
+            .expect("full url once the token arrives");
+        assert_eq!(
+            url,
+            format!("https://maki.example.com/{}/", "a".repeat(32)),
+            "{url}"
+        );
+        assert!(
+            control.tunnel_link().is_none(),
+            "the link flashes exactly once"
+        );
     }
 
     #[test]

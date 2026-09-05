@@ -22,6 +22,9 @@ pub enum Route {
     Sessions,
     ModelGet,
     ModelPost,
+    Commands,
+    Options,
+    OptionsPost,
 }
 
 impl Route {
@@ -36,6 +39,9 @@ impl Route {
             ("sessions", "GET") => Some(Route::Sessions),
             ("model", "GET") => Some(Route::ModelGet),
             ("model", "POST") => Some(Route::ModelPost),
+            ("commands", "GET") => Some(Route::Commands),
+            ("options", "GET") => Some(Route::Options),
+            ("options", "POST") => Some(Route::OptionsPost),
             _ => None,
         }
     }
@@ -99,6 +105,69 @@ impl Dispatcher {
                     source: SseSource::new(subscription, &snapshot, session),
                 }
             }
+            Route::Commands => match self.dispatch_value(|reply| crate::RemoteRequest::Commands {
+                session: session.clone(),
+                reply,
+            }) {
+                Some(value) => DispatchOutcome::Json {
+                    status: 200,
+                    body: serde_json::to_vec(&value).unwrap_or_default(),
+                },
+                None => DispatchOutcome::Json {
+                    status: 503,
+                    body: br#"{"error":"event loop wedged"}"#.to_vec(),
+                },
+            },
+            Route::Options => match self.dispatch_value(|reply| crate::RemoteRequest::Options {
+                session: session.clone(),
+                reply,
+            }) {
+                Some(value) => DispatchOutcome::Json {
+                    status: 200,
+                    body: serde_json::to_vec(&value).unwrap_or_default(),
+                },
+                None => DispatchOutcome::Json {
+                    status: 503,
+                    body: br#"{"error":"event loop wedged"}"#.to_vec(),
+                },
+            },
+            Route::OptionsPost => {
+                let parsed: serde_json::Value = match serde_json::from_str(body) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return DispatchOutcome::Json {
+                            status: 400,
+                            body: br#"{"error":"invalid json"}"#.to_vec(),
+                        };
+                    }
+                };
+                let yolo = parsed.get("yolo").and_then(|v| v.as_bool());
+                let mode = parsed
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                if yolo.is_none() && mode.is_none() {
+                    return DispatchOutcome::Json {
+                        status: 400,
+                        body: br#"{"error":"no fields: need yolo or mode"}"#.to_vec(),
+                    };
+                }
+                match self.dispatch_value(|reply| crate::RemoteRequest::SetOptions {
+                    session: session.clone(),
+                    yolo,
+                    mode,
+                    reply,
+                }) {
+                    Some(value) => DispatchOutcome::Json {
+                        status: 200,
+                        body: serde_json::to_vec(&value).unwrap_or_default(),
+                    },
+                    None => DispatchOutcome::Json {
+                        status: 503,
+                        body: br#"{"error":"event loop wedged"}"#.to_vec(),
+                    },
+                }
+            }
             Route::Sessions => match self.dispatch_sessions() {
                 Some(value) => DispatchOutcome::Json {
                     status: 200,
@@ -140,6 +209,18 @@ impl Dispatcher {
                 }
             }
         }
+    }
+
+    /// One-shot request that answers with a JSON value (commands list,
+    /// options). `None` when the loop cannot reply in time.
+    fn dispatch_value(
+        &self,
+        make: impl FnOnce(Sender<serde_json::Value>) -> crate::RemoteRequest,
+    ) -> Option<serde_json::Value> {
+        let (tx, rx) = flume::bounded(1);
+        self.requests.try_send(make(tx)).ok()?;
+        rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS))
+            .ok()
     }
 
     /// Asks the event loop for the current session snapshot. Empty object if
@@ -272,7 +353,14 @@ impl Dispatcher {
                     rx,
                 )
             }
-            Route::Index | Route::Events | Route::Sessions | Route::ModelGet | Route::ModelPost => {
+            Route::Index
+            | Route::Events
+            | Route::Sessions
+            | Route::ModelGet
+            | Route::ModelPost
+            | Route::Commands
+            | Route::Options
+            | Route::OptionsPost => {
                 return Err("not a post route".to_owned());
             }
         };
@@ -424,6 +512,18 @@ mod tests {
         let (session, route) = parse_tail("s/abc/nope", "GET");
         assert_eq!(session.as_deref(), Some("abc"));
         assert_eq!(route, None);
+    }
+
+    #[test]
+    fn picker_routes_reach_the_dispatcher() {
+        assert_eq!(Route::from_tail("commands", "GET"), Some(Route::Commands));
+        assert_eq!(Route::from_tail("options", "GET"), Some(Route::Options));
+        assert_eq!(
+            Route::from_tail("options", "POST"),
+            Some(Route::OptionsPost)
+        );
+        // A GET on the setter route is not a route at all.
+        assert_eq!(Route::from_tail("options", "DELETE"), None);
     }
 
     #[test]
