@@ -1279,8 +1279,11 @@ local sess, err = maki.agent.session(ctx, {
   name = "researcher",
 })
 if err then error(err) end
-local result = sess:prompt("Summarize this file.")
+
+-- Close before handling the error, so no path leaves the session open.
+local result, prompt_err = sess:prompt("Summarize this file.")
 sess:close()
+if prompt_err then error(prompt_err) end
 ```
 
 
@@ -1290,8 +1293,11 @@ A subagent session with its own conversation history.
 
 Create one with `maki.agent.session()`, then send messages with
 `:prompt()`. The session remembers previous turns, so you can have
-a multi-step conversation. Call `:close()` when you are done, or let
-garbage collection handle it.
+a multi-step conversation.
+
+Always call `:close()` when you are done, on error paths too. The
+garbage collector is a fallback that may never run while the VM sits
+idle, so a session you only drop can stay open for the rest of the run.
 
 ---
 
@@ -1335,9 +1341,12 @@ print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
 Session:close()
 ```
 
-Close the session and flush its history back to the parent agent. You can
-call this multiple times safely. If you forget, it runs automatically when
-the session is garbage collected.
+Close the session and flush its history back to the parent agent. Calling
+it more than once is safe.
+
+Close on every path, error paths included. Dropping the session instead
+leaves the work to the Lua garbage collector, which may never run while
+the VM sits idle, and the subagent's event relay stays alive until it does.
 
 
 ## maki.async {#maki-async}

@@ -2629,7 +2629,6 @@ dependencies = [
  "clap",
  "color-eyre",
  "flume 0.11.1",
- "futures-lite",
  "isahc",
  "libc",
  "maki-acp",

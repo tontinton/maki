@@ -595,6 +595,19 @@ impl McpHandle {
             warn!("MCP shutdown timed out after {MCP_SHUTDOWN_TIMEOUT:?}");
         }
     }
+
+    /// Handle whose command loop is whatever the caller does with `cmd_rx`,
+    /// so a test can hold a `Shutdown` unacked and observe a wedged teardown.
+    #[cfg(test)]
+    pub(crate) fn for_test(cmd_tx: flume::Sender<McpCommand>) -> Self {
+        Self {
+            cmd_tx,
+            index: Arc::new(ArcSwap::from_pointee(ToolIndex::default())),
+            snapshot: Arc::new(ArcSwap::from_pointee(McpSnapshot::default())),
+            defer_tools: 0,
+            ready_rx: flume::bounded(0).1,
+        }
+    }
 }
 
 /// Returns as soon as the config is read, so nothing with a screen waits on a
