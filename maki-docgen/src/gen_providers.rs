@@ -56,6 +56,8 @@ You will need `AWS_REGION` and one of the following for auth:
 
 You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROPIC_BEDROCK_BASE_URL`. These env var names match Claude Code, so if you were already using Bedrock there, the same setup works here."#;
 
+const OPENAI_OAUTH_NOTE: &str = r#"`maki auth login openai` offers device-code login by default. Select browser login to use PKCE and a callback on `localhost:1455`. Tokens refresh automatically."#;
+
 const XAI_OAUTH_NOTE: &str = r#"OAuth uses the same first-party xAI client as the official Grok CLI (`maki auth login xai`). Browser login (PKCE) is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically. After login, Maki fetches your account catalog from `GET /v1/models-v2` on the Grok CLI proxy and caches it for 15 minutes. `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth proxy.
 
 If `~/.grok/auth.json` already exists, login offers to reuse it without writing that file."#;
@@ -387,7 +389,10 @@ fn build_sections() -> Vec<ProviderSection> {
                 sections.push(ProviderSection {
                     kind,
                     name: kind.display_name(),
-                    auth_line: format!("{} (also supports OAuth device flow)", format_auth(kind)),
+                    auth_line: format!(
+                        "{} (also supports OAuth via `maki auth login openai`)",
+                        format_auth(kind)
+                    ),
                     urls: vec![kind.base_url()],
                     features: kind.features(),
                     entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
@@ -546,6 +551,10 @@ fn write_section(out: &mut String, section: &ProviderSection) {
     if section.name == "Anthropic" {
         let _ = writeln!(out, "\n{LONG_CONTEXT_NOTE}");
         let _ = writeln!(out, "\n{BEDROCK_NOTE}");
+    }
+
+    if section.kind == ProviderKind::OpenAi {
+        let _ = writeln!(out, "\n{OPENAI_OAUTH_NOTE}");
     }
 
     if section.kind == ProviderKind::Opencode {
