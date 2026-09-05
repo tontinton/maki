@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_lock::Mutex;
-use maki_config::ModelPolicy;
+use maki_config::{ModelPolicy, SessionDefaults};
 use maki_providers::Message;
 use maki_providers::Timeouts;
 use maki_providers::TokenUsage;
@@ -83,8 +83,9 @@ pub struct HeadlessParams {
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
-    pub fast: bool,
-    pub workflow: bool,
+    /// The `always_*` knobs. A headless run has no toggle UI, so config is the
+    /// whole answer. The model gate stays in `RequestOptions::clamped`.
+    pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
 }
@@ -151,7 +152,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
         &params.model,
         &params.config,
         &params.excluded_tools,
-        params.workflow,
+        params.defaults.workflow,
         params.mcp_handle.as_ref(),
     );
 
@@ -173,8 +174,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let session_ref = SessionRef::from(session_id);
     let session_ref_clone = session_ref.clone();
     let mailbox = SessionMailbox::register(session_id);
-    let fast = params.fast;
-    let workflow = params.workflow;
+    let defaults = params.defaults;
     let working_dir_path = params.initial_wd.clone();
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
@@ -224,16 +224,12 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
         .with_mcp(mcp);
 
         let result = agent
-            .run(AgentInput {
-                message: params.prompt,
+            .run(AgentInput::from_defaults(
+                params.prompt,
                 mode,
-                images: params.images,
-                preamble: Vec::new(),
-                thinking: Default::default(),
-                fast,
-                workflow,
-                prompt: None,
-            })
+                params.images,
+                defaults,
+            ))
             .await;
         drop(agent);
 
@@ -270,7 +266,9 @@ pub struct InteractiveParams {
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
-    pub workflow: bool,
+    /// The `always_*` knobs. `workflow` picks the tool catalog here; the rest
+    /// are what a host without toggles puts on every [`AgentInput`] it sends.
+    pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     /// Host-side overrides that shadow a registered tool's execution while
@@ -298,7 +296,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
         &params.model,
         &params.config,
         &params.excluded_tools,
-        params.workflow,
+        params.defaults.workflow,
         params.mcp_handle.as_ref(),
     );
 
@@ -392,7 +390,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                             &new_model,
                             &params.config,
                             &params.excluded_tools,
-                            params.workflow,
+                            params.defaults.workflow,
                             mcp.is_some(),
                         );
                         model = new_model;

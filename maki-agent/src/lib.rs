@@ -20,7 +20,7 @@ pub use agent::{
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use mailbox::{MailboxError, SessionMailbox};
-pub use maki_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
+pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub mod command;
 pub mod diff;
 pub mod permissions;
@@ -91,4 +91,27 @@ pub struct AgentInput {
     /// No `Default` on this struct so adding a field forces every call site to update.
     pub workflow: bool,
     pub prompt: Option<Box<McpPromptRef>>,
+}
+
+impl AgentInput {
+    /// What a host with no toggle UI sends. `-p`, the SDK and ACP know nothing
+    /// about the toggles beyond what config says, so they all build their input
+    /// here and a knob added to [`SessionDefaults`] reaches every one of them.
+    pub fn from_defaults(
+        message: String,
+        mode: AgentMode,
+        images: Vec<ImageSource>,
+        defaults: SessionDefaults,
+    ) -> Self {
+        Self {
+            message,
+            mode,
+            images,
+            preamble: Vec::new(),
+            thinking: defaults.thinking.into(),
+            fast: defaults.fast,
+            workflow: defaults.workflow,
+            prompt: None,
+        }
+    }
 }

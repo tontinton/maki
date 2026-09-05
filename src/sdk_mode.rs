@@ -26,7 +26,7 @@ use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, PermissionsConfig,
     SessionEndReason, SessionEvents, ToolOutput,
 };
-use maki_config::ModelPolicy;
+use maki_config::{ModelPolicy, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
@@ -448,8 +448,7 @@ pub struct SdkParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt_slots: ResolvedSlots,
-    pub fast: bool,
-    pub workflow: bool,
+    pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     /// Plugins loaded here still want turn events, and this is what fires
@@ -532,8 +531,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         permissions_config,
         timeouts,
         prompt_slots,
-        fast,
-        workflow,
+        defaults,
         model_policy,
         plugin_rules,
         lua_handle,
@@ -576,7 +574,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         yolo: permission_mode == PermissionMode::BypassPermissions,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
-        workflow,
+        defaults,
         model_policy: Arc::clone(&model_policy),
         plugin_rules,
         local_tools: Default::default(),
@@ -680,16 +678,8 @@ pub fn run(params: SdkParams) -> Result<()> {
                     shared.turn_start = Instant::now();
                     shared.permission_mode
                 };
-                let input = AgentInput {
-                    message: prompt,
-                    mode: mode.agent_mode(&cwd),
-                    images,
-                    preamble: Vec::new(),
-                    thinking: Default::default(),
-                    fast,
-                    workflow,
-                    prompt: None,
-                };
+                let input =
+                    AgentInput::from_defaults(prompt, mode.agent_mode(&cwd), images, defaults);
                 if handle.input_tx.send(input).is_err() {
                     break;
                 }

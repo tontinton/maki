@@ -26,7 +26,7 @@ use maki_agent::types::AgentEvent;
 use maki_agent::{
     AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, SessionEndReason, SessionEvents,
 };
-use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy};
+use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, SessionDefaults};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{Message, TokenUsage, add_cost, settle_session};
@@ -41,8 +41,6 @@ use tracing::{debug, warn};
 use crate::{AcpParams, SessionEndHook, elicitation, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
-/// ACP has no fast-mode toggle, so a restored total is priced at standard rates.
-const RESTORED_FAST: bool = false;
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
@@ -77,6 +75,7 @@ struct Server {
     model_specs: Vec<String>,
     model_policy: Arc<ModelPolicy>,
     client_elicits_form: bool,
+    defaults: SessionDefaults,
     session: Option<SessionState>,
     on_session_end: Option<SessionEndHook>,
 }
@@ -111,6 +110,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         model_specs: available_model_specs(&params.model_policy),
         model_policy: Arc::clone(&params.model_policy),
         client_elicits_form: false,
+        defaults: params.defaults,
         session: None,
         on_session_end: params.on_session_end.clone(),
     };
@@ -297,7 +297,7 @@ async fn load_session(
         &restored.usage,
         &mut restored.by_model,
         &recorded_model,
-        RESTORED_FAST,
+        params.defaults.fast,
     );
     let started = start_session(
         srv,
@@ -352,7 +352,7 @@ fn start_session(
         yolo: params.yolo,
         system_prompt_override: None,
         append_system_prompt: None,
-        workflow: false,
+        defaults: params.defaults,
         model_policy: Arc::clone(&params.model_policy),
         plugin_rules: Arc::clone(&params.plugin_rules),
         local_tools,
@@ -575,16 +575,8 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     let session = srv.session.as_ref().ok_or_else(no_session)?;
 
     let (message, images) = extract_prompt_content(&req.prompt);
-    let input = AgentInput {
-        message,
-        mode: session.current_mode.clone(),
-        images,
-        preamble: Vec::new(),
-        thinking: Default::default(),
-        fast: false,
-        workflow: false,
-        prompt: None,
-    };
+    let input =
+        AgentInput::from_defaults(message, session.current_mode.clone(), images, srv.defaults);
 
     session
         .handle
@@ -904,6 +896,7 @@ mod tests {
             model_specs: Vec::new(),
             model_policy: Arc::new(ModelPolicy::default()),
             client_elicits_form: false,
+            defaults: SessionDefaults::default(),
             on_session_end: None,
             session: Some(SessionState {
                 handle,
@@ -1206,7 +1199,7 @@ mod tests {
                 &restored.usage,
                 &mut restored.by_model,
                 &recorded_model,
-                RESTORED_FAST
+                false
             ),
             Some(RECORDED_COST)
         );

@@ -68,6 +68,7 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
         initial_wd: cwd,
         prompt_slots: Arc::new(prompt_slots),
         yolo,
+        defaults: config.session_defaults,
         model_policy: Arc::new(config.provider.model_policy.clone()),
         plugin_rules: plugin_host.plugin_rules(),
         on_session_end: Some(Arc::new(move |id, reason| {

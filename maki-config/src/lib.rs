@@ -6,7 +6,7 @@ use std::time::Duration;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use maki_config_macro::ConfigSection;
 use maki_storage::paths;
-use maki_storage::sessions::{StoredThinking, ThinkingParseError};
+use maki_storage::sessions::{SessionMeta, StoredThinking, ThinkingParseError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use strum::VariantArray;
@@ -326,6 +326,36 @@ impl AlwaysThinking {
     }
 }
 
+/// The `always_*` knobs that seed a session's own toggles.
+///
+/// One value, so every entry point that starts a session (TUI, `-p`, the SDK,
+/// ACP) takes the whole set at once. A knob that lives here cannot be honoured
+/// by one frontend and dropped by another, which is how `always_thinking` once
+/// reached the TUI and nobody else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionDefaults {
+    pub fast: bool,
+    pub workflow: bool,
+    pub thinking: Option<StoredThinking>,
+}
+
+impl SessionDefaults {
+    /// Seeds a session that has not spoken yet. An unset knob means "no
+    /// opinion" and leaves the session's own toggle alone, so a `/fast` from an
+    /// earlier run survives a config that never mentions it.
+    ///
+    /// The model is nobody's business here. `RequestOptions::clamped` is the
+    /// single gate for what the model can actually do, and the model can still
+    /// change after this runs.
+    pub fn seed(self, meta: &mut SessionMeta) {
+        meta.fast |= self.fast;
+        meta.workflow |= self.workflow;
+        if self.thinking.is_some() {
+            meta.thinking = self.thinking;
+        }
+    }
+}
+
 #[derive(Deserialize, Default, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawConfig {
@@ -380,12 +410,14 @@ impl RawConfig {
         self.validate_plugin_tables(packages)?;
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
-            always_fast: self.always_fast.unwrap_or(false),
-            always_workflow: self.always_workflow.unwrap_or(false),
-            always_thinking: self
-                .always_thinking
-                .map(AlwaysThinking::resolve)
-                .transpose()?,
+            session_defaults: SessionDefaults {
+                fast: self.always_fast.unwrap_or(false),
+                workflow: self.always_workflow.unwrap_or(false),
+                thinking: self
+                    .always_thinking
+                    .map(AlwaysThinking::resolve)
+                    .transpose()?,
+            },
             ui: UiConfig::from_file(self.ui),
             agent: AgentConfig::from_file(self.agent),
             provider: ProviderConfig::from_file(self.provider)?,
@@ -949,9 +981,7 @@ pub struct PermissionsConfig {
 #[derive(Clone)]
 pub struct Config {
     pub always_yolo: bool,
-    pub always_fast: bool,
-    pub always_workflow: bool,
-    pub always_thinking: Option<StoredThinking>,
+    pub session_defaults: SessionDefaults,
     pub ui: UiConfig,
     pub agent: AgentConfig,
     pub provider: ProviderConfig,
@@ -2608,13 +2638,46 @@ mod tests {
     #[test]
     fn always_workflow_resolves_default_and_set() {
         let defaults = RawConfig::default().into_config(&[]).unwrap();
-        assert!(!defaults.always_workflow, "absent resolves to false");
+        assert!(
+            !defaults.session_defaults.workflow,
+            "absent resolves to false"
+        );
 
         let raw = RawConfig {
             always_workflow: Some(true),
             ..Default::default()
         };
-        assert!(raw.into_config(&[]).unwrap().always_workflow);
+        assert!(raw.into_config(&[]).unwrap().session_defaults.workflow);
+    }
+
+    /// `(fast, workflow, thinking)`, for both the config knobs and the session.
+    type Toggles = (bool, bool, Option<StoredThinking>);
+
+    const HIGH: Option<StoredThinking> = Some(StoredThinking::Effort {
+        level: Effort::High,
+    });
+
+    #[test_case((true, true, Some(StoredThinking::Adaptive)), (false, false, None)
+        => (true, true, Some(StoredThinking::Adaptive)) ; "blank_session_takes_every_knob")]
+    #[test_case((false, false, None), (true, true, HIGH)
+        => (true, true, HIGH) ; "silence_leaves_the_session_alone")]
+    #[test_case((false, false, Some(StoredThinking::Off)), (false, false, Some(StoredThinking::Adaptive))
+        => (false, false, Some(StoredThinking::Off)) ; "explicit_off_still_wins")]
+    fn seed_applies_only_the_knobs_config_sets(defaults: Toggles, session: Toggles) -> Toggles {
+        let mut meta = SessionMeta {
+            fast: session.0,
+            workflow: session.1,
+            thinking: session.2,
+            ..Default::default()
+        };
+        SessionDefaults {
+            fast: defaults.0,
+            workflow: defaults.1,
+            thinking: defaults.2,
+        }
+        .seed(&mut meta);
+
+        (meta.fast, meta.workflow, meta.thinking)
     }
 
     #[test_case(AlwaysThinking::Toggle(true), StoredThinking::Adaptive ; "toggle_true")]
@@ -2629,7 +2692,7 @@ mod tests {
     #[test]
     fn into_config_resolves_always_thinking() {
         let defaults = RawConfig::default().into_config(&[]).unwrap();
-        assert!(defaults.always_thinking.is_none());
+        assert!(defaults.session_defaults.thinking.is_none());
 
         let raw = RawConfig {
             always_thinking: Some(AlwaysThinking::Mode("8192".into())),
@@ -2637,7 +2700,7 @@ mod tests {
         };
         let config = raw.into_config(&[]).unwrap();
         assert_eq!(
-            config.always_thinking,
+            config.session_defaults.thinking,
             Some(StoredThinking::Budget { tokens: 8192 })
         );
 
@@ -2693,9 +2756,7 @@ mod tests {
     fn validate_rejects_invalid_sections(section: &str, field: &str, value: u64) {
         let mut config = Config {
             always_yolo: false,
-            always_fast: false,
-            always_workflow: false,
-            always_thinking: None,
+            session_defaults: SessionDefaults::default(),
             ui: UiConfig::default(),
             agent: AgentConfig::default(),
             provider: ProviderConfig::default(),

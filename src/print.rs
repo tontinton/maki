@@ -19,7 +19,7 @@ use maki_agent::headless::{self, HeadlessHandle, HeadlessParams};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig};
-use maki_config::ModelPolicy;
+use maki_config::{ModelPolicy, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::model::Model;
@@ -135,23 +135,38 @@ impl VerboseOutput {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    model: &Model,
-    prompt_arg: Option<String>,
-    image_paths: Vec<PathBuf>,
-    format: OutputFormat,
-    verbose: bool,
-    config: AgentConfig,
-    permissions_config: PermissionsConfig,
-    timeouts: maki_providers::Timeouts,
-    lua_handle: EventHandle,
-    fast: bool,
-    workflow: bool,
-    model_policy: Arc<ModelPolicy>,
-    plugin_rules: Arc<PluginRuleStore>,
-) -> Result<()> {
-    let prompt = match prompt_arg {
+pub struct PrintParams {
+    pub model: Model,
+    pub prompt: Option<String>,
+    pub image_paths: Vec<PathBuf>,
+    pub format: OutputFormat,
+    pub verbose: bool,
+    pub config: AgentConfig,
+    pub permissions_config: PermissionsConfig,
+    pub timeouts: maki_providers::Timeouts,
+    pub lua_handle: EventHandle,
+    pub defaults: SessionDefaults,
+    pub model_policy: Arc<ModelPolicy>,
+    pub plugin_rules: Arc<PluginRuleStore>,
+}
+
+pub fn run(params: PrintParams) -> Result<()> {
+    let PrintParams {
+        model,
+        prompt,
+        image_paths,
+        format,
+        verbose,
+        config,
+        permissions_config,
+        timeouts,
+        lua_handle,
+        defaults,
+        model_policy,
+        plugin_rules,
+    } = params;
+
+    let prompt = match prompt {
         Some(p) => p,
         None => {
             let mut buf = String::new();
@@ -181,8 +196,7 @@ pub fn run(
         excluded_tools: vec![QUESTION_TOOL_NAME],
         mcp_handle,
         initial_wd: cwd,
-        fast,
-        workflow,
+        defaults,
         model_policy,
         plugin_rules,
     });
