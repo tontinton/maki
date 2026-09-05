@@ -1575,6 +1575,74 @@ mod tests {
         assert_eq!(model.is_free(), expected);
     }
 
+    #[test_case("vision-model", true; "catalog_marks_model_as_vision")]
+    #[test_case("text-model", false; "catalog_marks_model_as_text_only")]
+    fn supports_vision_falls_back_to_catalog_for_builtins(model_id: &str, expected: bool) {
+        let (_tmp, state_dir) = temp_state_dir();
+        let models = HashMap::from([
+            (
+                "vision-model".into(),
+                CatalogModel {
+                    attachment: true,
+                    ..Default::default()
+                },
+            ),
+            ("text-model".into(), CatalogModel::default()),
+        ]);
+        let index: CatalogIndex = HashMap::from([(
+            "opencode-go".into(),
+            CatalogProvider {
+                name: "Opencode Go".into(),
+                env: vec!["OPENCODE_API_KEY".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://opencode.ai/zen/go/v1".into()),
+                models,
+            },
+        )]);
+        super::seed_catalog_for_tests(index, state_dir);
+
+        let model = super::Model::from_spec(&format!("opencode-go/{model_id}")).unwrap();
+        assert_eq!(model.supports_vision(), expected);
+    }
+
+    #[test]
+    fn catalog_miss_falls_back_to_family() {
+        let (_tmp, state_dir) = temp_state_dir();
+        super::warm_empty_catalog_for_tests(state_dir);
+
+        let model = super::Model::from_spec("opencode-go/unlisted-model").unwrap();
+        assert!(!model.supports_vision());
+    }
+
+    #[test]
+    fn manifest_entry_beats_catalog_vision() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let models = HashMap::from([(
+            "claude-opus-5".into(),
+            CatalogModel {
+                attachment: false,
+                ..Default::default()
+            },
+        )]);
+        let index: CatalogIndex = HashMap::from([(
+            "anthropic".into(),
+            CatalogProvider {
+                name: "Anthropic".into(),
+                env: vec!["ANTHROPIC_API_KEY".into()],
+                npm: "@ai-sdk/anthropic".into(),
+                api: Some("https://api.anthropic.com".into()),
+                models,
+            },
+        )]);
+        super::seed_catalog_for_tests(index, state_dir);
+
+        let model = super::Model::from_spec("anthropic/claude-opus-5").unwrap();
+        assert!(
+            model.supports_vision(),
+            "manifest entry must win over catalog metadata"
+        );
+    }
+
     #[test]
     fn catalog_to_data_opencode_all_models_with_key() {
         let (_tmp, state_dir) = temp_state_dir();
