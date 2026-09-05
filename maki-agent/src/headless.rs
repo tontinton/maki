@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_lock::Mutex;
-use maki_config::{ModelPolicy, SessionDefaults};
+use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::Message;
 use maki_providers::Timeouts;
 use maki_providers::TokenUsage;
@@ -88,6 +88,7 @@ pub struct HeadlessParams {
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
+    pub project_config: ProjectConfig,
 }
 
 pub struct HeadlessHandle {
@@ -200,6 +201,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                 permissions: Arc::new(PermissionManager::new(
                     params.permissions_config,
                     working_dir_path,
+                    params.project_config,
                     params.plugin_rules,
                 )),
                 session_id: Some(session_ref_clone.clone()),
@@ -271,6 +273,7 @@ pub struct InteractiveParams {
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
+    pub project_config: ProjectConfig,
     /// Host-side overrides that shadow a registered tool's execution while
     /// keeping its advertised schema (e.g. ACP answers `question` via elicitation).
     pub local_tools: LocalTools,
@@ -328,6 +331,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let permissions = Arc::new(PermissionManager::new(
         permissions_config,
         params.initial_wd,
+        params.project_config,
         Arc::clone(&params.plugin_rules),
     ));
 

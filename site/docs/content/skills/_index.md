@@ -22,6 +22,10 @@ A skill is a directory with a `SKILL.md` inside. Maki looks for them every time 
 
 So project skills beat personal ones, and a skill at the repo root beats one with the same name deeper down. The `.claude`, `.opencode` and `.agents` dirs are there so skills you already wrote for other agents keep working.
 
+[Folder trust](/docs/permissions/#folder-trust) does not gate skills. Every
+project skill name and description is in the system prompt from startup,
+trusted or not, so read a repository's skills before you work in it.
+
 Only `SKILL.md` is read. If you want extra notes, put them in files next to it and link them from the body, like `./notes.md`.
 
 ## Writing one

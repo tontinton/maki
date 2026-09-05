@@ -196,8 +196,9 @@ fn write_overrides(out: &mut String) {
     out.push_str(
         "Skips user `init.lua` files (global and project) but keeps the \
          Lua host and builtin plugins running, so tools still work. \
-         `permissions.toml`, custom commands, and env files load as \
-         usual.\n\n",
+         Custom commands and skills still load, and the project \
+         permission rules and env file follow \
+         [folder trust](/docs/permissions/#folder-trust).\n\n",
     );
     out.push_str(
         "The default keymap lives in Rust, not Lua, so `--no-plugins` \

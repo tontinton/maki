@@ -18,9 +18,11 @@ struct Frontmatter {
     argument_hint: Option<String>,
 }
 
-pub(crate) fn find_project_ancestor_dirs(cwd: &Path) -> impl Iterator<Item = PathBuf> {
+/// Walks up from `cwd` and stops at the first Git checkout, so a command in the
+/// repository root is found from anywhere inside it without leaking into
+/// whatever sits above the checkout.
+pub(crate) fn project_ancestor_dirs(cwd: &Path) -> impl Iterator<Item = PathBuf> {
     let mut current = Some(cwd.to_path_buf());
-
     std::iter::from_fn(move || {
         let dir = current.take()?;
         if !dir.join(".git").exists() {
@@ -105,7 +107,7 @@ fn discover_commands_inner(
         }
     }
 
-    for dir in find_project_ancestor_dirs(cwd) {
+    for dir in project_ancestor_dirs(cwd) {
         for cmd_dir in PROJECT_COMMAND_DIRS {
             scan_command_dir(&dir.join(cmd_dir), CommandScope::Project, &mut commands);
         }
@@ -274,6 +276,25 @@ mod tests {
     }
 
     #[test]
+    fn discover_loads_commands_from_each_project_owner() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        let child = root.path().join("child");
+        for (owner, name) in [(root.path(), "root"), (child.as_path(), "child")] {
+            let command_dir = owner.join(".maki/commands");
+            fs::create_dir_all(&command_dir).unwrap();
+            fs::write(command_dir.join(format!("{name}.md")), name).unwrap();
+        }
+
+        let commands = discover_commands_inner(&child, None, None);
+        let names = commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["child", "root"]);
+    }
+
+    #[test]
     fn discover_ignores_non_md_files() {
         let dir = TempDir::new().unwrap();
         let cmd_dir = dir.path().join(".maki/commands");
@@ -308,13 +329,13 @@ mod tests {
     }
 
     #[test]
-    fn find_project_ancestor_dirs_stops_at_git() {
+    fn project_ancestor_dirs_stop_at_git() {
         let tmp = TempDir::new().unwrap();
         let deep = tmp.path().join("a/b/c");
         fs::create_dir_all(&deep).unwrap();
         fs::create_dir_all(tmp.path().join("a/.git")).unwrap();
 
-        let dirs: Vec<_> = find_project_ancestor_dirs(&deep).collect();
+        let dirs: Vec<_> = project_ancestor_dirs(&deep).collect();
         let dir_strs: Vec<_> = dirs
             .iter()
             .map(|d| d.to_string_lossy().into_owned())

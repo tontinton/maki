@@ -1218,8 +1218,9 @@ impl App {
         }
 
         if let ChatEventResult::PermissionRequest { id, tool, scopes } = result {
+            let project_trusted = self.permissions.project_is_trusted();
             self.permission_prompt
-                .open(id, tool, scopes, subagent_id.clone());
+                .open(id, tool, scopes, subagent_id.clone(), project_trusted);
             return vec![];
         }
 

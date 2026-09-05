@@ -29,6 +29,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use humantime::format_duration;
 use ignore::WalkBuilder;
+use maki_config::ProjectConfig;
 use serde_json::Value;
 
 use crate::agent::LoadedInstructions;
@@ -591,6 +592,7 @@ pub fn interpreter_ctx(
 pub fn cli_tool_ctx() -> ToolContext {
     let (tx, _rx) = flume::unbounded::<crate::Envelope>();
     let event_tx = crate::EventSender::new(tx, 0);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     interpreter_ctx(
         &AgentMode::Build,
         &event_tx,
@@ -601,7 +603,8 @@ pub fn cli_tool_ctx() -> ToolContext {
                 rules: vec![],
                 ..Default::default()
             },
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            cwd.clone(),
+            ProjectConfig::discover(&cwd),
             Arc::default(),
         )),
         FileAccess::fresh(),
@@ -711,6 +714,7 @@ pub mod test_support {
                 ..Default::default()
             },
             std::path::PathBuf::from("/tmp"),
+            ProjectConfig::discover(Path::new("/tmp")),
             Arc::default(),
         ))
     });

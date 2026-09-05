@@ -16,8 +16,8 @@ use maki_config::{
     ToolOutputLines,
 };
 use maki_lua::{
-    MAX_INFLIGHT_TOOLS, PERMISSION_NAME_WARNING, PluginError, PluginHost, SKIPPED_PLUGIN_WARNING,
-    SessionEndReason, WARM_TOOL_CAP,
+    InitFiles, MAX_INFLIGHT_TOOLS, PERMISSION_NAME_WARNING, PluginError, PluginHost,
+    SKIPPED_PLUGIN_WARNING, SessionEndReason, WARM_TOOL_CAP,
 };
 use maki_providers::Model;
 use maki_storage::id::SessionRef;
@@ -1216,7 +1216,7 @@ fn incompatible_plugin_warns_instead_of_aborting_startup() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let mut warnings = Vec::new();
-    host.load_init_files_or_skip(false, tmp.path(), &mut warnings)
+    host.load_init_files(InitFiles::GlobalAndProject, tmp.path(), &mut warnings)
         .expect("an incompatible plugin must not abort startup");
 
     assert!(!reg.has("echo_"));
@@ -1252,7 +1252,7 @@ fn init_file_taking_a_permission_keyed_tool_name_warns(tool: &str, expected: usi
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let mut warnings = Vec::new();
-    host.load_init_files_or_skip(false, tmp.path(), &mut warnings)
+    host.load_init_files(InitFiles::GlobalAndProject, tmp.path(), &mut warnings)
         .expect("init.lua must load");
 
     assert!(reg.has(tool));

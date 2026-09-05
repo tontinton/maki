@@ -155,6 +155,19 @@ maki migrate xdg
 
 Moves data from `~/.maki/` into platform directories. Safe to re-run. See [Configuration](/docs/configuration/#directory-layout).
 
+### `maki trust`
+
+```bash
+maki trust add [PATH]
+maki trust add [PATH] --yes
+maki trust remove [PATH]
+maki trust list
+```
+
+Records whether a folder's `.maki` configuration may load. `PATH` defaults to
+the current directory, and `--yes` skips the confirmation for scripted setup.
+See [Folder Trust](/docs/permissions/#folder-trust) for what is gated.
+
 ## Everyday examples
 
 ```bash

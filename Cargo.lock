@@ -2906,7 +2906,7 @@ dependencies = [
 name = "maki-pack"
 version = "0.5.0"
 dependencies = [
- "fs4",
+ "maki-storage",
  "serde",
  "serde_json",
  "smol",
@@ -2954,6 +2954,7 @@ version = "0.5.0"
 dependencies = [
  "bs58",
  "etcetera",
+ "fs4",
  "getrandom 0.3.4",
  "isahc",
  "serde",

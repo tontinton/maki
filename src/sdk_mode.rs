@@ -26,7 +26,7 @@ use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, PermissionsConfig,
     SessionEndReason, SessionEvents, ToolOutput,
 };
-use maki_config::{ModelPolicy, SessionDefaults};
+use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
@@ -454,6 +454,7 @@ pub struct SdkParams {
     /// Plugins loaded here still want turn events, and this is what fires
     /// them the way `maki-ui` does.
     pub lua_handle: maki_lua::EventHandle,
+    pub project_config: ProjectConfig,
 }
 
 /// Routes permission answers between stdin and the agent.
@@ -535,6 +536,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         model_policy,
         plugin_rules,
         lua_handle,
+        project_config,
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
@@ -554,7 +556,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         session_id.as_ref(),
     );
 
-    let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start_connected(&cwd));
+    let (mcp_handle, mcp_config_errors) =
+        smol::block_on(mcp::start_connected(&cwd, project_config.clone()));
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -577,6 +580,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         defaults,
         model_policy: Arc::clone(&model_policy),
         plugin_rules,
+        project_config,
         local_tools: Default::default(),
     });
 

@@ -19,7 +19,7 @@ use maki_agent::headless::{self, HeadlessHandle, HeadlessParams};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig};
-use maki_config::{ModelPolicy, SessionDefaults};
+use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::model::Model;
@@ -148,6 +148,7 @@ pub struct PrintParams {
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
+    pub project_config: ProjectConfig,
 }
 
 pub fn run(params: PrintParams) -> Result<()> {
@@ -164,6 +165,7 @@ pub fn run(params: PrintParams) -> Result<()> {
         defaults,
         model_policy,
         plugin_rules,
+        project_config,
     } = params;
 
     let prompt = match prompt {
@@ -180,7 +182,10 @@ pub fn run(params: PrintParams) -> Result<()> {
     let prompt_slots = lua_handle.collect_prompt_slots();
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start_connected(&cwd));
+    let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start_connected(
+        &cwd,
+        project_config.clone(),
+    ));
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -199,6 +204,7 @@ pub fn run(params: PrintParams) -> Result<()> {
         defaults,
         model_policy,
         plugin_rules,
+        project_config,
     });
 
     let HeadlessHandle {

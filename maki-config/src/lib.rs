@@ -16,6 +16,11 @@ use tracing::warn;
 const PROJECT_DIR: &str = ".maki";
 const PERMISSIONS_FILE: &str = "permissions.toml";
 const ENV_FILE: &str = ".env";
+pub const UNTRUSTED_PROJECT_WRITE: &str =
+    "folder is not trusted, so nothing was saved to .maki/permissions.toml";
+
+pub mod project;
+pub use project::ProjectConfig;
 
 pub mod providers;
 
@@ -715,6 +720,21 @@ struct PermissionsFileConfig {
     mcp_defaults: HashMap<ToolKey, DefaultEffect>,
 }
 
+impl PermissionsFileConfig {
+    /// An untrusted project may only restrict the agent, never widen it: keep
+    /// explicit deny scopes and drop allow scopes plus every default, so the
+    /// repository cannot set a fallback effect of its own.
+    fn restrict_to_deny_scopes(&mut self) {
+        self.default = None;
+        self.mcp_defaults.clear();
+        self.mcp_rules.retain(|rule| rule.effect == Effect::Deny);
+        for perms in self.tools.values_mut() {
+            perms.allow = None;
+            perms.default = None;
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for PermissionsFileConfig {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let table = toml::Table::deserialize(deserializer)?;
@@ -820,7 +840,7 @@ impl From<Effect> for DefaultEffect {
 #[derive(Debug, Clone)]
 pub enum PermissionTarget {
     Global,
-    Project(PathBuf),
+    Project(ProjectConfig),
 }
 
 use std::sync::Arc;
@@ -2036,16 +2056,24 @@ fn build_permissions(
     }
 }
 
-pub fn load_env_files(cwd: &Path) {
-    load_env_files_with_global(cwd, paths::find_config_path(ENV_FILE).as_deref());
+pub fn load_env_files(project_config: &ProjectConfig) {
+    load_env_files_with_global(paths::find_config_path(ENV_FILE).as_deref(), project_config);
 }
 
-fn load_env_files_with_global(cwd: &Path, global_env: Option<&Path>) {
+fn load_env_files_with_global(global_env: Option<&Path>, project_config: &ProjectConfig) {
     let mut vars = HashMap::new();
     if let Some(path) = global_env {
         collect_env_vars(path, &mut vars);
     }
-    collect_env_vars(&cwd.join(PROJECT_DIR).join(ENV_FILE), &mut vars);
+    if project_config.is_trusted() {
+        collect_env_vars(
+            &project_config
+                .config_root()
+                .join(PROJECT_DIR)
+                .join(ENV_FILE),
+            &mut vars,
+        );
+    }
 
     for (key, value) in vars {
         if std::env::var_os(&key).is_none() {
@@ -2064,20 +2092,32 @@ fn collect_env_vars(path: &Path, vars: &mut HashMap<String, String>) {
     }
 }
 
-pub fn load_permissions(cwd: &Path) -> PermissionsConfig {
-    load_permissions_inner(cwd, &paths::config_search_dirs())
+pub fn load_permissions(project_config: &ProjectConfig) -> PermissionsConfig {
+    load_permissions_inner(&paths::config_search_dirs(), project_config)
 }
 
-fn load_permissions_inner(cwd: &Path, global_dirs: &[PathBuf]) -> PermissionsConfig {
+fn load_permissions_inner(
+    global_dirs: &[PathBuf],
+    project_config: &ProjectConfig,
+) -> PermissionsConfig {
     let mut global_perms = PermissionsFileConfig::default();
     for dir in global_dirs {
-        if let Some(p) = read_permissions_file(&dir.join(PERMISSIONS_FILE)) {
+        if let Some(p) = read_permissions_file(&dir.join(PERMISSIONS_FILE), true) {
             global_perms = p;
         }
     }
 
-    let project_perms =
-        read_permissions_file(&cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE)).unwrap_or_default();
+    let mut project_perms = read_permissions_file(
+        &project_config
+            .config_root()
+            .join(PROJECT_DIR)
+            .join(PERMISSIONS_FILE),
+        project_config.is_trusted(),
+    )
+    .unwrap_or_default();
+    if !project_config.is_trusted() {
+        project_perms.restrict_to_deny_scopes();
+    }
 
     build_permissions(global_perms, project_perms)
 }
@@ -2138,7 +2178,10 @@ fn migrate_mcp_entry(
 /// Migrates old permission formats and returns the (possibly rewritten)
 /// file content. The rewrite to disk is best-effort: loading uses the
 /// migrated content even when the write fails.
-fn migrate_permissions_file(path: &Path) -> Option<String> {
+///
+/// `persist` is off for an untrusted project: its deny rules still apply, but
+/// declining to trust a repository must not leave Maki editing files in it.
+fn migrate_permissions_file(path: &Path, persist: bool) -> Option<String> {
     let content = fs::read_to_string(path).ok()?;
     let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>() else {
         return Some(content);
@@ -2232,14 +2275,14 @@ fn migrate_permissions_file(path: &Path) -> Option<String> {
         return Some(content);
     }
     let new_content = doc.to_string();
-    if let Err(e) = maki_storage::atomic_write(path, new_content.as_bytes()) {
+    if persist && let Err(e) = maki_storage::atomic_write(path, new_content.as_bytes()) {
         warn!(path = %path.display(), error = %e, "failed to persist migrated permissions file");
     }
     Some(new_content)
 }
 
-fn read_permissions_file(path: &Path) -> Option<PermissionsFileConfig> {
-    let content = migrate_permissions_file(path)?;
+fn read_permissions_file(path: &Path, persist_migration: bool) -> Option<PermissionsFileConfig> {
+    let content = migrate_permissions_file(path, persist_migration)?;
     match toml::from_str(&content) {
         Ok(p) => Some(p),
         Err(e) => {
@@ -2272,7 +2315,9 @@ fn append_permission_rule_with_global(
 ) -> Result<(), String> {
     match target {
         PermissionTarget::Global => append_global_permission(tool, scope, effect, global),
-        PermissionTarget::Project(cwd) => append_project_permission(tool, scope, effect, cwd),
+        PermissionTarget::Project(project_config) => {
+            append_project_permission(tool, scope, effect, project_config)
+        }
     }
 }
 
@@ -2304,21 +2349,34 @@ fn append_project_permission(
     tool: &ToolKey,
     scope: Option<&str>,
     effect: Effect,
-    cwd: &Path,
+    project_config: &ProjectConfig,
 ) -> Result<(), String> {
-    let path = cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE);
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut doc: toml_edit::DocumentMut = content
+    // Declining to trust a repository must not leave Maki editing files in it,
+    // and an allow rule saved here would be stripped again on the next start.
+    if !project_config.is_trusted() {
+        return Err(UNTRUSTED_PROJECT_WRITE.to_string());
+    }
+    let path = project_config
+        .config_root()
+        .join(PROJECT_DIR)
+        .join(PERMISSIONS_FILE);
+    let existing = fs::read_to_string(&path).ok();
+    let mut doc: toml_edit::DocumentMut = existing
+        .as_deref()
+        .unwrap_or_default()
         .parse()
         .map_err(|e| format!("failed to parse .maki/{PERMISSIONS_FILE}: {e}"))?;
 
     insert_permission_entry(&mut doc, tool, scope, effect)?;
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create .maki dir: {e}"))?;
+        fs::create_dir_all(parent).map_err(|e| format!("cannot create .maki dir: {e}"))?;
     }
     maki_storage::atomic_write(&path, doc.to_string().as_bytes())
         .map_err(|e| format!("cannot write .maki/{PERMISSIONS_FILE}: {e}"))?;
+    if existing.is_none() {
+        project::record_written_file(project_config, PERMISSIONS_FILE);
+    }
     Ok(())
 }
 
@@ -2363,13 +2421,23 @@ fn insert_permission_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_storage::StateDir;
     use maki_storage::sessions::Effort;
+    use maki_storage::trusted_folders::{CanonicalFolder, TrustDecision, TrustedFolders};
     use std::fs;
     use tempfile::TempDir;
     use test_case::test_case;
 
     const GLOBAL_ALLOWED_HOST: &str = "ollama.lan";
     const PROJECT_ALLOWED_HOST: &str = "searx.lan:8888";
+
+    /// The temp directory a test builds its project in, with its parent
+    /// standing in for the home directory. Plain discovery would read the real
+    /// `$HOME` and walk the real filesystem instead, so a `.git` anywhere above
+    /// the temp directory would decide the result.
+    fn untrusted_project(root: &Path) -> ProjectConfig {
+        ProjectConfig::rooted(root, root.parent())
+    }
 
     fn plugin_enabled(enabled: bool) -> PluginFileConfig {
         PluginFileConfig {
@@ -2386,6 +2454,12 @@ mod tests {
 
     fn global_config_dir(dir: &Path) -> PathBuf {
         dir.join(".config/maki")
+    }
+
+    fn write_project_permissions(dir: &Path, content: &str) {
+        let perms_dir = dir.join(PROJECT_DIR);
+        fs::create_dir_all(&perms_dir).unwrap();
+        fs::write(perms_dir.join(PERMISSIONS_FILE), content).unwrap();
     }
 
     #[test_case("12000", CompactionBuffer::Tokens(12_000) ; "tokens_number")]
@@ -2793,7 +2867,10 @@ mod tests {
              [bash]\nallow = [\n    \"cargo *\",\n]\ndeny = [\n    \"rm -rf *\",\n]\n",
         );
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(perms.default, DefaultEffect::Allow);
         assert_eq!(perms.rules.len(), 2);
         assert_eq!(perms.rules[0].effect, Effect::Deny);
@@ -2812,16 +2889,16 @@ mod tests {
             dir.path(),
             "[bash]\nallow = [\"git *\"]\ndeny = [\"rm -rf *\"]\n",
         );
-        let maki_dir = dir.path().join(".maki");
-        fs::create_dir_all(&maki_dir).unwrap();
-        fs::write(
-            maki_dir.join("permissions.toml"),
+        write_project_permissions(
+            dir.path(),
             "[read]\nallow = true\n\
              [write]\ndeny = [\"/etc/*\"]\n",
-        )
-        .unwrap();
+        );
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert_eq!(perms.rules.len(), 4);
 
@@ -2845,6 +2922,246 @@ mod tests {
         assert_eq!(allow_rules[1].tool, ToolKey::native("read"));
     }
 
+    #[test_case(false ; "untrusted_project_file_is_left_alone")]
+    #[test_case(true ; "trusted_project_file_is_migrated")]
+    fn legacy_project_permissions_migrate_only_when_trusted(trusted: bool) {
+        const LEGACY_KEY: &str = "allow_all";
+        const DENY_SCOPE: &str = "rm -rf *";
+
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        let legacy = format!("{LEGACY_KEY} = true\n\n[bash]\ndeny = [\"{DENY_SCOPE}\"]\n");
+        write_project_permissions(dir.path(), &legacy);
+
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::discover(dir.path()).with_trust(trusted),
+        );
+
+        assert!(perms.rules.iter().any(|rule| {
+            rule.tool == ToolKey::native("bash")
+                && rule.effect == Effect::Deny
+                && rule.scope.as_deref() == Some(DENY_SCOPE)
+        }));
+
+        let on_disk =
+            fs::read_to_string(dir.path().join(PROJECT_DIR).join(PERMISSIONS_FILE)).unwrap();
+        if trusted {
+            assert!(!on_disk.contains(LEGACY_KEY));
+        } else {
+            assert_eq!(on_disk, legacy);
+        }
+    }
+
+    /// An untrusted repository may only narrow the agent: deny scopes survive,
+    /// allow scopes and every default the file sets are dropped.
+    #[test_case(false, 2, DefaultEffect::Prompt, None ; "untrusted_keeps_only_deny")]
+    #[test_case(true, 4, DefaultEffect::Deny, Some(DefaultEffect::Deny) ; "trusted_applies_the_whole_file")]
+    fn project_permissions_follow_folder_trust(
+        trusted: bool,
+        expected_rules: usize,
+        expected_default: DefaultEffect,
+        expected_read_default: Option<DefaultEffect>,
+    ) {
+        const ALLOW_SCOPE: &str = "cargo *";
+        const DENY_SCOPE: &str = "rm -rf *";
+        const MCP_ALLOW: &str = "create_issue";
+        const MCP_DENY: &str = "admin_delete";
+
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_project_permissions(
+            dir.path(),
+            &format!(
+                "default = \"deny\"\n\n\
+                 [bash]\nallow = [\"{ALLOW_SCOPE}\"]\ndeny = [\"{DENY_SCOPE}\"]\n\n\
+                 [read]\ndefault = \"deny\"\n\n\
+                 [mcp.github]\nallow = [\"{MCP_ALLOW}\"]\ndeny = [\"{MCP_DENY}\"]\n"
+            ),
+        );
+
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::discover(dir.path()).with_trust(trusted),
+        );
+
+        assert_eq!(perms.rules.len(), expected_rules);
+        assert_eq!(perms.default, expected_default);
+        assert_eq!(
+            perms.tool_defaults.get(&ToolKey::native("read")).copied(),
+            expected_read_default
+        );
+        let mcp_deny = ToolKey::McpTool {
+            server: "github".into(),
+            tool: MCP_DENY.into(),
+        };
+        assert!(perms.rules.iter().any(|rule| {
+            rule.effect == Effect::Deny && rule.scope.as_deref() == Some(DENY_SCOPE)
+        }));
+        assert!(
+            perms
+                .rules
+                .iter()
+                .any(|rule| rule.effect == Effect::Deny && rule.tool == mcp_deny)
+        );
+        assert_eq!(
+            perms.rules.iter().any(|rule| rule.effect == Effect::Allow),
+            trusted
+        );
+    }
+
+    /// Not "no widening defaults" but no defaults at all: a repository nobody
+    /// vouched for does not get to pick the fallback effect either way.
+    #[test_case("allow" ; "allow")]
+    #[test_case("deny" ; "deny")]
+    fn an_untrusted_project_sets_no_defaults(project_default: &str) {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_project_permissions(
+            dir.path(),
+            &format!(
+                "default = \"{project_default}\"\n\n\
+                 [bash]\ndefault = \"{project_default}\"\n\n\
+                 [mcp.github]\ndefault = \"{project_default}\"\n"
+            ),
+        );
+
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::discover(dir.path()),
+        );
+
+        assert_eq!(perms.default, DefaultEffect::Prompt);
+        assert!(perms.tool_defaults.is_empty());
+    }
+
+    #[test]
+    fn global_allow_with_untrusted_project_deny_resolves_to_deny() {
+        const SCOPE: &str = "git push *";
+
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            &format!("default = \"allow\"\n\n[bash]\nallow = [\"{SCOPE}\"]\n"),
+        );
+        write_project_permissions(dir.path(), &format!("[bash]\ndeny = [\"{SCOPE}\"]\n"));
+
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::discover(dir.path()),
+        );
+        assert_eq!(perms.default, DefaultEffect::Allow);
+        let scoped: Vec<_> = perms
+            .rules
+            .iter()
+            .filter(|r| r.scope.as_deref() == Some(SCOPE))
+            .collect();
+        assert_eq!(scoped.len(), 2);
+        assert!(
+            scoped.iter().any(|r| r.effect == Effect::Deny),
+            "project deny survives an untrusted load and wins over the global allow"
+        );
+    }
+
+    /// A linked worktree spells `.git` as a file pointing back at the main
+    /// checkout, so discovery has to stop in the worktree and read the
+    /// `.maki` that sits there, not the one in the main checkout.
+    #[test]
+    fn linked_worktree_loads_permissions_from_its_own_checkout() {
+        const MAIN_SCOPE: &str = "main-only";
+        const LINKED_SCOPE: &str = "linked-only";
+        const GIT_FILE_POINTER: &str = "gitdir: ../main/.git/worktrees/linked\n";
+
+        let container = TempDir::new().unwrap();
+        let main = container.path().join("main");
+        let linked = container.path().join("linked");
+        for (checkout, scope) in [(&main, MAIN_SCOPE), (&linked, LINKED_SCOPE)] {
+            fs::create_dir(checkout).unwrap();
+            write_project_permissions(checkout, &format!("[bash]\nallow = [\"{scope}\"]\n"));
+        }
+        fs::create_dir(main.join(".git")).unwrap();
+        fs::write(linked.join(".git"), GIT_FILE_POINTER).unwrap();
+        let global = global_config_dir(container.path());
+
+        let permissions = load_permissions_inner(&[global], &ProjectConfig::for_project(&linked));
+
+        let scopes = permissions
+            .rules
+            .iter()
+            .filter_map(|rule| rule.scope.as_deref())
+            .collect::<Vec<_>>();
+        assert!(scopes.contains(&LINKED_SCOPE));
+        assert!(!scopes.contains(&MAIN_SCOPE));
+    }
+
+    /// A trusted folder collects the rule. An untrusted one is refused at the
+    /// write, so no `.maki` directory appears in a repository the user declined.
+    #[test_case(true ; "trusted_project_collects_the_rule")]
+    #[test_case(false ; "untrusted_project_is_left_alone")]
+    fn project_permission_write_follows_folder_trust(trusted: bool) {
+        const SCOPE: &str = "cargo *";
+
+        let dir = TempDir::new().unwrap();
+        let project = ProjectConfig::discover(dir.path()).with_trust(trusted);
+
+        let result = append_permission_rule_with_global(
+            &ToolKey::native("bash"),
+            Some(SCOPE),
+            Effect::Allow,
+            &PermissionTarget::Project(project.clone()),
+            None,
+        );
+
+        let maki_dir = project.config_root().join(PROJECT_DIR);
+        if !trusted {
+            assert_eq!(result, Err(UNTRUSTED_PROJECT_WRITE.to_string()));
+            assert!(!maki_dir.exists());
+            return;
+        }
+        result.unwrap();
+        let content = fs::read_to_string(maki_dir.join(PERMISSIONS_FILE)).unwrap();
+        assert!(content.contains(SCOPE));
+    }
+
+    /// "Allow always for this project" writes `.maki/permissions.toml` itself,
+    /// and the trust answer has to learn about that file right away, or the
+    /// next start asks about a file Maki created for the user. The store the
+    /// config carries is what a test can point at a temp directory, so this
+    /// checks the production path without touching the real state directory.
+    #[test]
+    fn a_permissions_file_maki_writes_joins_the_trust_answer() {
+        const SCOPE: &str = "cargo *";
+
+        let state = TempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let project = untrusted_project(dir.path())
+            .with_trust(true)
+            .with_trust_store(&storage);
+        let folder = CanonicalFolder::resolve(project.config_root()).unwrap();
+        TrustedFolders::new(&storage)
+            .add(&folder, &[ENV_FILE])
+            .unwrap();
+
+        append_permission_rule_with_global(
+            &ToolKey::native("bash"),
+            Some(SCOPE),
+            Effect::Allow,
+            &PermissionTarget::Project(project),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            TrustedFolders::new(&storage)
+                .decide(&folder, &[PERMISSIONS_FILE], &project::project_root)
+                .unwrap(),
+            TrustDecision::Trusted,
+            "the file Maki wrote must not read as one the project added"
+        );
+    }
+
     #[test]
     fn project_default_allow_ignored() {
         let dir = TempDir::new().unwrap();
@@ -2853,7 +3170,10 @@ mod tests {
         fs::create_dir_all(&maki_dir).unwrap();
         fs::write(maki_dir.join("permissions.toml"), "default = \"allow\"\n").unwrap();
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(perms.default, DefaultEffect::Prompt);
     }
 
@@ -2913,7 +3233,10 @@ mod tests {
     fn no_permissions_file_returns_defaults() {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert!(perms.rules.is_empty());
     }
@@ -2927,7 +3250,10 @@ mod tests {
             "[bash]\nallow = [\"git *\"]\ndeny = [\"rm *\"]\n",
         );
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(perms.rules[0].effect, Effect::Deny);
         assert_eq!(perms.rules[1].effect, Effect::Allow);
     }
@@ -2938,7 +3264,10 @@ mod tests {
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "default = \"deny\"\n");
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(perms.default, DefaultEffect::Deny);
     }
 
@@ -2951,7 +3280,10 @@ mod tests {
             "default = \"deny\"\n\n[bash]\ndefault = \"allow\"\nallow = [\"cargo *\"]\n",
         );
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(perms.default, DefaultEffect::Deny);
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::native("bash")).copied(),
@@ -2972,7 +3304,10 @@ mod tests {
         )
         .unwrap();
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::native("bash")).copied(),
             Some(DefaultEffect::Deny)
@@ -2988,7 +3323,10 @@ mod tests {
             "allow_all = true\n\n[bash]\nallow = [\"cargo *\"]\n",
         );
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(perms.default, DefaultEffect::Allow);
 
         let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
@@ -3002,7 +3340,10 @@ mod tests {
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "allow_all = false\n");
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(perms.default, DefaultEffect::Prompt);
 
         let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
@@ -3018,7 +3359,10 @@ mod tests {
         fs::create_dir_all(&maki_dir).unwrap();
         fs::write(maki_dir.join("permissions.toml"), "default = \"deny\"\n").unwrap();
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(perms.default, DefaultEffect::Deny);
     }
 
@@ -3060,6 +3404,7 @@ mod tests {
     #[test]
     fn env_file_precedence() {
         const GLOBAL_ONLY: &str = "TEST_MAKI_GLOBAL_ONLY";
+        const PROJECT_ONLY: &str = "TEST_MAKI_PROJECT_ONLY";
         const PROJECT_SHADOWS: &str = "TEST_MAKI_PROJECT_SHADOWS";
         const PROCESS_WINS: &str = "TEST_MAKI_PROCESS_WINS";
 
@@ -3076,24 +3421,47 @@ mod tests {
         fs::create_dir_all(&maki_dir).unwrap();
         fs::write(
             maki_dir.join(".env"),
-            format!("{PROJECT_SHADOWS}=project\n{PROCESS_WINS}=project"),
+            format!("{PROJECT_ONLY}=project\n{PROJECT_SHADOWS}=project\n{PROCESS_WINS}=project"),
         )
         .unwrap();
 
+        // SAFETY: see the note on environment variables at the top of this module.
         unsafe {
             std::env::remove_var(GLOBAL_ONLY);
+            std::env::remove_var(PROJECT_ONLY);
             std::env::remove_var(PROJECT_SHADOWS);
             std::env::set_var(PROCESS_WINS, "process");
         }
 
-        load_env_files_with_global(dir.path(), Some(&global.join(ENV_FILE)));
+        load_env_files_with_global(Some(&global.join(ENV_FILE)), &untrusted_project(dir.path()));
 
         assert_eq!(std::env::var(GLOBAL_ONLY).unwrap(), "global");
+        assert!(std::env::var_os(PROJECT_ONLY).is_none());
+        assert_eq!(std::env::var(PROJECT_SHADOWS).unwrap(), "global");
+        assert_eq!(std::env::var(PROCESS_WINS).unwrap(), "process");
+
+        // SAFETY: see the note on environment variables at the top of this module.
+        unsafe {
+            std::env::remove_var(GLOBAL_ONLY);
+            std::env::remove_var(PROJECT_ONLY);
+            std::env::remove_var(PROJECT_SHADOWS);
+            std::env::set_var(PROCESS_WINS, "process");
+        }
+
+        load_env_files_with_global(
+            Some(&global.join(ENV_FILE)),
+            &untrusted_project(dir.path()).with_trust(true),
+        );
+
+        assert_eq!(std::env::var(GLOBAL_ONLY).unwrap(), "global");
+        assert_eq!(std::env::var(PROJECT_ONLY).unwrap(), "project");
         assert_eq!(std::env::var(PROJECT_SHADOWS).unwrap(), "project");
         assert_eq!(std::env::var(PROCESS_WINS).unwrap(), "process");
 
+        // SAFETY: see the note on environment variables at the top of this module.
         unsafe {
             std::env::remove_var(GLOBAL_ONLY);
+            std::env::remove_var(PROJECT_ONLY);
             std::env::remove_var(PROJECT_SHADOWS);
             std::env::remove_var(PROCESS_WINS);
         }
@@ -3460,7 +3828,10 @@ mod tests {
             dir.path(),
             "[mcp.deepwiki]\nallow = [\"search\", \"fetch\"]\n",
         );
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(perms.rules.len(), 2);
         assert!(perms.rules.iter().any(|r| r.tool
             == ToolKey::McpTool {
@@ -3481,7 +3852,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[mcp.deepwiki]\nallow = true\n");
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(perms.rules.len(), 0, "no rules generated");
         assert!(
             !perms.tool_defaults.contains_key(&ToolKey::McpServer {
@@ -3496,7 +3870,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[mcp.server]\ndeny = true\n");
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert!(
             !perms.tool_defaults.contains_key(&ToolKey::McpServer {
                 server: "server".into()
@@ -3513,7 +3890,10 @@ mod tests {
             dir.path(),
             "[mcp.server]\ndefault = \"allow\"\ndeny = true\n",
         );
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::McpServer {
                 server: "server".into()
@@ -3528,7 +3908,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[mcp.github]\ndeny = [\"admin_delete\"]\n");
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(perms.rules.len(), 1);
         assert_eq!(
             perms.rules[0].tool,
@@ -3545,7 +3928,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[mcp.myserver]\nallow = [\"web.search\"]\n");
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(perms.rules.len(), 0, "dotted tool name should be rejected");
     }
 
@@ -3557,7 +3943,10 @@ mod tests {
             dir.path(),
             "default = \"deny\"\n\n[mcp.exa]\ndefault = \"allow\"\n",
         );
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::McpServer {
                 server: "exa".into()
@@ -3575,7 +3964,10 @@ mod tests {
             dir.path(),
             "[mcp.exa]\ndefault = \"prompt\"\nallow = [\"search\"]\n",
         );
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::McpServer {
                 server: "exa".into()
@@ -3606,7 +3998,10 @@ mod tests {
         )
         .unwrap();
 
-        let _perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let _perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
 
         let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
         assert!(content.contains("[mcp.deepwiki]"), "server table present");
@@ -3635,7 +4030,10 @@ mod tests {
         )
         .unwrap();
 
-        let _perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let _perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
 
         let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
         assert!(content.contains("[mcp.deepwiki]"), "server table present");
@@ -3650,7 +4048,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[\"\"]\ndefault = \"allow\"\nallow = [\"x\"]\n");
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         assert!(perms.rules.is_empty());
         assert!(perms.tool_defaults.is_empty());
     }
@@ -3672,7 +4073,10 @@ mod tests {
             return; // running as root, cannot simulate a read-only dir
         }
 
-        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::for_project(dir.path()),
+        );
         fs::set_permissions(&global, fs::Permissions::from_mode(0o755)).unwrap();
 
         assert_eq!(perms.rules.len(), 1);
@@ -3683,7 +4087,12 @@ mod tests {
         );
     }
 
-    // Uniquely named vars per test: env is process-global and tests run in parallel.
+    // Setting an environment variable is only sound while no other thread
+    // reads the environment at the same time, and the test runner is what
+    // holds that up: `just test` runs `cargo nextest`, which gives every test
+    // its own process. Under plain `cargo test` these tests share one process
+    // with every other test and the invariant is gone, so the unique variable
+    // names below help but do not make it safe.
 
     #[test]
     fn expand_env_literal_text_passes_through() {
@@ -3692,6 +4101,7 @@ mod tests {
 
     #[test]
     fn expand_env_expands_whole_value_var() {
+        // SAFETY: see the note on environment variables at the top of this module.
         unsafe { std::env::set_var("MAKI_TEST_HDR_WHOLE_71535", "secret") };
         assert_eq!(
             expand_env("${MAKI_TEST_HDR_WHOLE_71535}").as_deref(),
@@ -3701,6 +4111,7 @@ mod tests {
 
     #[test]
     fn expand_env_expands_mid_string_var() {
+        // SAFETY: see the note on environment variables at the top of this module.
         unsafe { std::env::set_var("MAKI_TEST_HDR_MID_71535", "tok") };
         assert_eq!(
             expand_env("Bearer ${MAKI_TEST_HDR_MID_71535}!").as_deref(),
@@ -3710,7 +4121,9 @@ mod tests {
 
     #[test]
     fn expand_env_expands_multiple_vars() {
+        // SAFETY: see the note on environment variables at the top of this module.
         unsafe { std::env::set_var("MAKI_TEST_HDR_A_71535", "a") };
+        // SAFETY: see the note on environment variables at the top of this module.
         unsafe { std::env::set_var("MAKI_TEST_HDR_B_71535", "b") };
         assert_eq!(
             expand_env("${MAKI_TEST_HDR_A_71535}-${MAKI_TEST_HDR_B_71535}").as_deref(),
@@ -3736,6 +4149,7 @@ mod tests {
 
     #[test]
     fn expand_env_empty_var_is_treated_as_unset() {
+        // SAFETY: see the note on environment variables at the top of this module.
         unsafe { std::env::set_var("MAKI_TEST_HDR_EMPTY_71535", "") };
         assert_eq!(
             expand_env("Bearer ${MAKI_TEST_HDR_EMPTY_71535}"),

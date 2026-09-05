@@ -35,6 +35,15 @@ pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
 pub const PERMISSION_NAME_WARNING: &str = "inherits maki's permission rules for the builtin \
      tool of the same name, together with any \"always allow\" you saved";
 
+/// How far user `init.lua` may reach. `--no-plugins` turns it off, and a
+/// project folder nobody vouched for stops at the global file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitFiles {
+    Disabled,
+    GlobalOnly,
+    GlobalAndProject,
+}
+
 struct BundledPlugin {
     name: &'static str,
     dir: Dir<'static>,
@@ -297,12 +306,32 @@ impl PluginHost {
     /// `plugin.toml` skips that directory's Lua) for the caller to surface.
     pub fn load_init_files(
         &self,
+        init_files: InitFiles,
         cwd: &Path,
         warnings: &mut Vec<String>,
     ) -> Result<Option<RawConfig>, PluginError> {
+        self.load_init_files_from_dirs(
+            init_files,
+            cwd,
+            maki_storage::paths::config_search_dirs(),
+            warnings,
+        )
+    }
+
+    fn load_init_files_from_dirs(
+        &self,
+        init_files: InitFiles,
+        cwd: &Path,
+        global_dirs: impl IntoIterator<Item = PathBuf>,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        if init_files == InitFiles::Disabled {
+            return Ok(None);
+        }
+
         let mut merged: Option<RawConfig> = None;
 
-        for global_dir in maki_storage::paths::config_search_dirs() {
+        for global_dir in global_dirs {
             self.run_init_file(
                 &global_dir.join("init.lua"),
                 ConfigScope::Global,
@@ -313,29 +342,16 @@ impl PluginHost {
                 break;
             }
         }
-        self.run_init_file(
-            &cwd.join(".maki/init.lua"),
-            ConfigScope::Project,
-            &mut merged,
-            warnings,
-        )?;
+        if init_files == InitFiles::GlobalAndProject {
+            self.run_init_file(
+                &cwd.join(".maki/init.lua"),
+                ConfigScope::Project,
+                &mut merged,
+                warnings,
+            )?;
+        }
 
         Ok(merged)
-    }
-
-    /// `--no-plugins` recovery path: skip every user `init.lua` while the
-    /// host and builtin plugins stay live. Centralized so every entry point
-    /// (TUI, index, acp, prompt) honors the flag identically.
-    pub fn load_init_files_or_skip(
-        &self,
-        no_plugins: bool,
-        cwd: &Path,
-        warnings: &mut Vec<String>,
-    ) -> Result<Option<RawConfig>, PluginError> {
-        if no_plugins {
-            return Ok(None);
-        }
-        self.load_init_files(cwd, warnings)
     }
 
     fn run_init_file(
@@ -1406,13 +1422,8 @@ mod tests {
         }
     }
 
-    /// `load_init_files_or_skip` is the single seam every entry point
-    /// (TUI, index, acp, prompt) uses to honor `--no-plugins`. Verify both
-    /// halves: the flag skips a broken init.lua, and absence runs it (so
-    /// the skip path is not a tautology that hides a regression in the
-    /// unconditional loader).
     #[test]
-    fn load_init_files_or_skip_respects_flag() {
+    fn init_file_scope_controls_project_execution() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".maki")).unwrap();
         fs::write(
@@ -1424,19 +1435,68 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
 
         let mut warnings = Vec::new();
-        let skipped = host
-            .load_init_files_or_skip(true, dir.path(), &mut warnings)
-            .expect("no-plugins skips broken init.lua");
-        assert!(
-            skipped.is_none(),
-            "--no-plugins must skip user init.lua entirely"
-        );
+        for scope in [InitFiles::Disabled, InitFiles::GlobalOnly] {
+            let skipped = host
+                .load_init_files_from_dirs(scope, dir.path(), [], &mut warnings)
+                .expect("scope skips broken project init.lua");
+            assert!(skipped.is_none());
+        }
 
-        let ran = host.load_init_files_or_skip(false, dir.path(), &mut warnings);
+        let ran = host.load_init_files_from_dirs(
+            InitFiles::GlobalAndProject,
+            dir.path(),
+            [],
+            &mut warnings,
+        );
         assert!(
             ran.is_err(),
-            "without --no-plugins the broken init.lua must surface as an error"
+            "project-enabled loading must surface the init.lua error"
         );
+    }
+
+    #[test]
+    fn project_scope_preserves_global_values_and_overrides_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        fs::create_dir_all(dir.path().join(".maki")).unwrap();
+        fs::create_dir(&global).unwrap();
+        fs::write(
+            global.join("init.lua"),
+            "maki.setup({ always_yolo = false, always_fast = true })",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".maki/init.lua"),
+            "maki.setup({ always_yolo = true })",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let global_host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let global_only = global_host
+            .load_init_files_from_dirs(
+                InitFiles::GlobalOnly,
+                dir.path(),
+                [global.clone()],
+                &mut warnings,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(global_only.always_yolo, Some(false));
+        assert_eq!(global_only.always_fast, Some(true));
+
+        let project_host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let merged = project_host
+            .load_init_files_from_dirs(
+                InitFiles::GlobalAndProject,
+                dir.path(),
+                [global],
+                &mut warnings,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.always_yolo, Some(true));
+        assert_eq!(merged.always_fast, Some(true));
     }
 
     #[test]
