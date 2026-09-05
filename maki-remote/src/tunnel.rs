@@ -11,7 +11,7 @@ use std::{
     io,
     net::TcpStream,
     sync::{
-        Arc, Mutex,
+        Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -23,16 +23,22 @@ use crate::RemoteRequest;
 
 const READ_POLL: Duration = Duration::from_millis(20);
 const KEEPALIVE_PING: Duration = Duration::from_secs(30);
+const BACKOFF_FIRST: Duration = Duration::from_secs(1);
+const BACKOFF_CAP: Duration = Duration::from_secs(15);
+const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 
-#[derive(Debug, thiserror::Error)]
-pub enum TunnelError {
-    #[error("connect to {url}: {source}")]
-    Connect {
-        url: String,
-        source: tungstenite::Error,
-    },
-    #[error("tunnel closed")]
-    Closed,
+/// What the tunnel thread tells the UI thread about its lifecycle, so a
+/// dropped link reads as "anchor link lost, reconnecting" rather than
+/// silence, and a dead token does not retry forever in the background.
+#[derive(Debug, Clone)]
+pub enum TunnelReport {
+    /// Registered; carries the share link the anchor minted for this tunnel.
+    /// Arrives again after every successful reconnect (with a new link).
+    Link(String),
+    /// The socket dropped and a reconnect is coming: carries the reason.
+    Lost(String),
+    /// The anchor rejected the registration; no further attempts.
+    Refused(String),
 }
 
 /// Anything the tunnel ships to the anchor: an HTTP reply chunk or an
@@ -123,58 +129,139 @@ impl TunnelClient {
     }
 }
 
-/// Runs the outbound tunnel until the anchor drops it, the process exits, or
-/// `shutdown` flips. Returns the share URL the anchor minted for this tunnel,
-/// via `link_out`. Blocking; belongs on a dedicated thread.
+/// Runs the outbound tunnel, reconnecting with capped exponential backoff
+/// until `shutdown` flips. Share links arrive on `reports` for every
+/// successful registration; a refused registration (bad token) is fatal,
+/// since retrying a door that will not open only wastes it. Blocking;
+/// belongs on a dedicated thread.
 pub fn run_tunnel(
     anchor_url: &str,
     registration_token: &str,
-    client: TunnelClient,
-    link_out: flume::Sender<String>,
-    shutdown: Arc<AtomicBool>,
-) -> Result<(), TunnelError> {
+    client: &TunnelClient,
+    reports: flume::Sender<TunnelReport>,
+    shutdown: &AtomicBool,
+) {
     let ws_url = normalize_ws_url(anchor_url);
+    let out_rx = client.take_out_rx().expect("first take of the out channel");
+    let out_tx = client.out();
+    let mut attempt = 0u32;
+    loop {
+        let lost = match tunnel_once(
+            &ws_url,
+            registration_token,
+            client,
+            &out_rx,
+            &out_tx,
+            &reports,
+            shutdown,
+        ) {
+            Ok(()) => return,
+            Err(lost) => lost,
+        };
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        attempt += 1;
+        let delay = backoff_delay(attempt);
+        let _ = reports.send(TunnelReport::Lost(format!(
+            "{lost} — reconnecting in {}s (attempt {attempt})",
+            delay.as_secs()
+        )));
+        tracing::warn!(attempt, ?delay, reason = %lost, "anchor link lost");
+        if sleep_responding(delay, shutdown) {
+            return;
+        }
+    }
+}
+
+/// Exponential from 1s, capped at 15s: attempt 1 waits 1s, 2 waits 2s,
+/// then 4, 8, 15, 15, …
+fn backoff_delay(attempt: u32) -> Duration {
+    let scaled = BACKOFF_FIRST.checked_mul(1u32 << attempt.saturating_sub(1).min(5));
+    scaled.unwrap_or(BACKOFF_CAP).min(BACKOFF_CAP)
+}
+
+/// Sleeps in poll slices so `/rc off` stops the tunnel mid-backoff. Returns
+/// whether shutdown was requested.
+fn sleep_responding(delay: Duration, shutdown: &AtomicBool) -> bool {
+    let until = Instant::now() + delay;
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return true;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(left.min(SHUTDOWN_POLL));
+    }
+}
+
+/// One connection's whole life: dial, register, serve frames until the
+/// anchor or the network ends it. `Ok(())` means stop everything (shutdown
+/// or a fatal refusal); `Err` carries a reason worth retrying.
+fn tunnel_once(
+    ws_url: &str,
+    registration_token: &str,
+    client: &TunnelClient,
+    out_rx: &std::sync::mpsc::Receiver<TunnelOut>,
+    out_tx: &std::sync::mpsc::Sender<TunnelOut>,
+    reports: &flume::Sender<TunnelReport>,
+    shutdown: &AtomicBool,
+) -> Result<(), String> {
     let request = ws_url
-        .as_str()
         .into_client_request()
-        .map_err(|source| TunnelError::Connect {
-            url: ws_url.clone(),
-            source,
-        })?;
-    let (mut socket, _response) =
-        tungstenite::connect(request).map_err(|source| TunnelError::Connect {
-            url: ws_url.clone(),
-            source,
-        })?;
+        .map_err(|e| format!("bad anchor url: {e}"))?;
+    let (mut socket, _response) = match tungstenite::connect(request) {
+        Ok(pair) => pair,
+        Err(source) => {
+            return Err(match &source {
+                tungstenite::Error::Http(resp) => format!(
+                    "anchor answered {}",
+                    resp.status().canonical_reason().unwrap_or("an error")
+                ),
+                other => format!("cannot reach anchor: {other}"),
+            });
+        }
+    };
     let hello = serde_json::json!({
         "instance_name": client.instance_name,
         "registration_token": registration_token,
     })
     .to_string();
     if socket.send(WsMessage::text(hello)).is_err() {
-        return Err(TunnelError::Closed);
+        return Err("anchor hung up during registration".into());
     }
     // First anchor frame hands back the freshly minted control link. Read it
     // without the loop's short poll timeout: the handshake round trip is not
-    // something 20ms can promise.
+    // something 20ms can promise. Anything other than a link frame is the
+    // anchor's plain-text refusal (bad token or name); that is not a
+    // transient, so it must not burn in the reconnect loop.
     let first = match socket.read() {
-        Ok(WsMessage::Text(text)) => text,
-        _ => return Err(TunnelError::Closed),
+        Ok(WsMessage::Text(text)) if text.starts_with('{') => text,
+        Ok(WsMessage::Text(text)) => {
+            let reason = if text.contains("auth") {
+                "token or instance name rejected by the anchor".into()
+            } else {
+                format!("anchor said: {text}")
+            };
+            let _ = reports.send(TunnelReport::Refused(reason));
+            return Ok(());
+        }
+        _ => return Err("anchor hung up during registration".into()),
     };
     let Ok(link_frame) = serde_json::from_str::<LinkFrame>(&first) else {
-        return Err(TunnelError::Closed);
+        return Err("anchor sent an unusable handshake".into());
     };
-    let _ = link_out.send(link_frame.link);
+    let _ = reports.send(TunnelReport::Link(link_frame.link));
     // From here on, reads are bounded so the loop can also ship replies,
     // keepalive-ping, and notice the shutdown flag.
     set_read_timeout(socket.get_ref());
-    let out_rx = client.take_out_rx().ok_or(TunnelError::Closed)?;
-    let out_tx = client.out();
 
     let mut next_ping = Instant::now() + KEEPALIVE_PING;
     loop {
         if shutdown.load(Ordering::Relaxed) {
-            break;
+            return Ok(());
         }
         while let Ok(out) = out_rx.try_recv() {
             let frame = match out {
@@ -183,10 +270,10 @@ pub fn run_tunnel(
             };
             let Ok(text) = frame else { break };
             if socket.send(WsMessage::text(text)).is_err() {
-                return Ok(());
+                return Err("anchor socket died mid-write".into());
             }
             if shutdown.load(Ordering::Relaxed) {
-                break;
+                return Ok(());
             }
         }
         if Instant::now() >= next_ping {
@@ -195,7 +282,7 @@ pub fn run_tunnel(
                 .send(WsMessage::Ping(tungstenite::Bytes::new()))
                 .is_err()
             {
-                return Ok(());
+                return Err("keepalive ping failed".into());
             }
         }
         let _ = socket.flush();
@@ -204,24 +291,21 @@ pub fn run_tunnel(
                 let Ok(parsed) = serde_json::from_str::<ForwardedRequest>(&text) else {
                     continue;
                 };
-                handle_forwarded(&client, parsed, out_tx.clone());
+                handle_forwarded(client, parsed, out_tx.clone());
             }
             Ok(WsMessage::Ping(payload)) => {
                 let _ = socket.send(WsMessage::Pong(payload));
             }
-            Ok(WsMessage::Close(_)) => break,
+            Ok(WsMessage::Close(_)) => return Err("anchor closed the link".into()),
             Ok(_) => {}
             Err(tungstenite::Error::Io(err))
                 if matches!(
                     err.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) => {}
-            Err(_) => break,
+            Err(_) => return Err("anchor link dropped".into()),
         }
     }
-    let _ = socket.send(WsMessage::Close(None));
-    let _ = socket.flush();
-    Ok(())
 }
 
 /// Config and docs speak in `http(s)://` anchor URLs; the socket speaks ws.
@@ -366,6 +450,9 @@ mod serde_b64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    const REPORT_WAIT: Duration = Duration::from_secs(10);
 
     #[test]
     fn normalize_ws_url_maps_http_schemes() {
@@ -395,29 +482,104 @@ mod tests {
     }
 
     #[test]
-    fn run_tunnel_connects_the_normalised_scheme_and_reports_failure() {
+    fn tunnel_once_reports_the_failure_after_rewriting_the_scheme() {
         // An https anchor config must be dialed as wss://.../ws: the failure
-        // message proves the scheme was rewritten before connecting, without
-        // needing a TLS terminator in the test.
+        // proves the scheme was rewritten before connecting, without needing
+        // a TLS terminator in the test.
         let dead_port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
         let (tx, _rx) = flume::unbounded();
         let client = TunnelClient::new(tx, "e".repeat(32), "host".into());
-        let (link_tx, _link_rx) = flume::bounded(1);
-        let err = run_tunnel(
-            &format!("https://127.0.0.1:{dead_port}"),
+        let out_rx = client.take_out_rx().unwrap();
+        let out_tx = client.out();
+        let (reports, _sink) = flume::unbounded();
+        let lost = tunnel_once(
+            &format!("wss://127.0.0.1:{dead_port}/ws"),
             "token",
-            client,
-            link_tx,
-            Arc::new(AtomicBool::new(false)),
+            &client,
+            &out_rx,
+            &out_tx,
+            &reports,
+            &AtomicBool::new(false),
         )
         .expect_err("a dead port must not connect");
+        assert!(lost.contains("cannot reach anchor"), "reason: {lost}");
+    }
+
+    #[test]
+    fn the_tunnel_reconnects_after_the_anchor_drops_the_link() {
+        // A stub anchor: accept two connections, hand each a link frame, then
+        // slam the door. The supervisor must narrate the drop and come back.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for n in 0..2 {
+                let stream = listener.accept().unwrap().0;
+                let mut ws = match tungstenite::accept(stream) {
+                    Ok(ws) => ws,
+                    Err(_) => return,
+                };
+                let _hello = ws.read().unwrap();
+                let link = serde_json::json!({ "link": format!("tok{n}") }).to_string();
+                let _ = ws.send(WsMessage::text(link));
+                let _ = ws.send(WsMessage::Close(None));
+                let _ = ws.flush();
+            }
+        });
+        let (requests, _sink) = flume::unbounded();
+        let client = TunnelClient::new(requests, "e".repeat(32), "host".into());
+        let (reports, seen) = flume::bounded::<TunnelReport>(8);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let worker = std::thread::spawn(move || {
+            run_tunnel(
+                &format!("http://127.0.0.1:{port}"),
+                "token",
+                &client,
+                reports,
+                &thread_shutdown,
+            );
+        });
+        let first = match seen.recv_timeout(REPORT_WAIT) {
+            Ok(TunnelReport::Link(link)) => link,
+            other => panic!("expected the first link, got {other:?}"),
+        };
+        assert_eq!(first, "tok0");
+        assert!(matches!(
+            seen.recv_timeout(REPORT_WAIT),
+            Ok(TunnelReport::Lost(_))
+        ));
+        let second = match seen.recv_timeout(REPORT_WAIT) {
+            Ok(TunnelReport::Link(link)) => link,
+            other => panic!("expected the reconnected link, got {other:?}"),
+        };
+        assert_eq!(second, "tok1", "the client redials and re-registers");
+        shutdown.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn backoff_grows_and_caps() {
+        assert_eq!(backoff_delay(1), Duration::from_secs(1));
+        assert_eq!(backoff_delay(2), Duration::from_secs(2));
+        assert_eq!(backoff_delay(4), Duration::from_secs(8));
+        assert_eq!(backoff_delay(5), BACKOFF_CAP);
+        assert_eq!(backoff_delay(64), BACKOFF_CAP, "no shift overflow");
+    }
+
+    #[test]
+    fn backoff_sleep_releases_on_shutdown() {
+        let shutdown = AtomicBool::new(true);
         assert!(
-            err.to_string()
-                .contains(&format!("wss://127.0.0.1:{dead_port}/ws")),
-            "error should carry the wss url: {err}"
+            sleep_responding(Duration::from_secs(30), &shutdown),
+            "a flip during /rc off must stop the wait instantly"
+        );
+        let shutdown = AtomicBool::new(false);
+        assert!(
+            !sleep_responding(Duration::from_millis(1), &shutdown),
+            "a short wait expires normally"
         );
     }
 

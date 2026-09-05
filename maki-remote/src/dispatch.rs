@@ -99,7 +99,7 @@ impl Dispatcher {
         match route {
             Route::Index => DispatchOutcome::Index,
             Route::Events => {
-                let subscription = self.state.subscribe();
+                let subscription = self.state.subscribe(session.clone());
                 let snapshot = self.snapshot_json(session.clone());
                 DispatchOutcome::Events {
                     source: SseSource::new(subscription, &snapshot, session),
@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn scoped_source_drops_other_sessions() {
         let state = RemoteState::new();
-        let sub = state.subscribe();
+        let sub = state.subscribe(None);
         let mut source = SseSource::new(sub, &json!({}), Some("watched".into()));
         state.send_status("other", "working");
         state.send_status("watched", "idle");
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn unscoped_source_keeps_every_session() {
         let state = RemoteState::new();
-        let sub = state.subscribe();
+        let sub = state.subscribe(None);
         let mut source = SseSource::new(sub, &json!({}), None);
         state.send_status("any", "working");
         let snapshot = source.next_frame().unwrap();

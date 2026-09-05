@@ -254,6 +254,10 @@ pub struct App {
     hints: Watch<HintSnapshot>,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
+    /// Link is reachable by browsers (tunnel registered or standalone bound).
+    pub(super) remote_link: bool,
+    /// Browsers watching THIS tab right now.
+    pub(super) remote_viewers: usize,
     subagent_answers: HashMap<String, flume::Sender<String>>,
 }
 
@@ -347,6 +351,8 @@ impl App {
             hint_reader,
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
+            remote_link: false,
+            remote_viewers: 0,
             subagent_answers: HashMap::new(),
         };
         app.model_picker.set_recents(
@@ -631,6 +637,12 @@ impl App {
             .map(|(name, description)| json!({ "name": name, "description": description }))
             .collect::<Vec<_>>();
         json!(items)
+    }
+
+    /// Mirror of the remote control lifecycle into the status bar.
+    pub(crate) fn set_remote_indicator(&mut self, link: bool, viewers: usize) {
+        self.remote_link = link;
+        self.remote_viewers = viewers;
     }
 
     /// Picker data for the web: every model with its provider, plus the

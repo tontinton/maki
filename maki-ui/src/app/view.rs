@@ -313,6 +313,8 @@ impl App {
             workflow: self.state.workflow,
             yolo: self.permissions.is_yolo(),
             restoring: self.restoring.load(Ordering::Relaxed),
+            remote_link: self.remote_link,
+            remote_viewers: self.remote_viewers,
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

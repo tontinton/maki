@@ -115,12 +115,26 @@ fn free_port() -> u16 {
 }
 
 fn http(port: u16, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    http_auth(port, method, path, body, None)
+}
+
+/// Same request with an optional session cookie, for the login-walled API.
+fn http_auth(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    cookie: Option<&str>,
+) -> (u16, Vec<u8>) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream.set_read_timeout(Some(BROWSER_TIMEOUT)).unwrap();
+    let cookie_line = cookie
+        .map(|c| format!("Cookie: {c}\r\n"))
+        .unwrap_or_default();
     stream
         .write_all(
             format!(
-                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{cookie_line}Content-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .as_bytes(),
@@ -175,6 +189,37 @@ fn http_raw(port: u16, method: &str, path: &str, body: &[u8]) -> Vec<u8> {
 }
 
 /// Registers an instance through the CLI and returns the registration token.
+/// First-run admin via /setup; returns the session cookie the anchor set.
+fn setup_admin(port: u16) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let body = b"username=root&password=password1234";
+    stream
+        .write_all(
+            format!(
+                "POST /setup HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    stream.write_all(body).unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).unwrap();
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let value = text
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+        .expect("setup sets a cookie")
+        .split("maki_anchor_session=")
+        .nth(1)
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    format!("maki_anchor_session={value}")
+}
+
 fn register(db: &std::path::Path, name: &str) -> String {
     let out = Command::new(anchor_bin())
         .args(["tokens", "add", name, "--db", db.to_str().unwrap()])
@@ -217,21 +262,21 @@ fn tunnel_client_serves_index_sse_and_prompt_through_anchor() {
     let reg_token = register(&db, "e2e-host");
     let (requests_tx, _loop_handle) = loop_side();
 
-    let (link_tx, link_rx) = flume::bounded::<String>(1);
+    let (reports_tx, reports_rx) = flume::bounded::<maki_remote::tunnel::TunnelReport>(4);
     let client = TunnelClient::new(requests_tx, "e2e".to_owned(), "e2e-host".to_owned());
     let out = client.out();
     let shutdown = Arc::new(AtomicBool::new(false));
     let ws_url = format!("ws://127.0.0.1:{}", anchor.ws_port);
     let thread_shutdown = Arc::clone(&shutdown);
     thread::spawn(move || {
-        let _ =
-            maki_remote::tunnel::run_tunnel(&ws_url, &reg_token, client, link_tx, thread_shutdown);
+        maki_remote::tunnel::run_tunnel(&ws_url, &reg_token, &client, reports_tx, &thread_shutdown);
     });
 
     // The anchor minted a link during the handshake.
-    let link = link_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("handshake link");
+    let link = match reports_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(maki_remote::tunnel::TunnelReport::Link(link)) => link,
+        other => panic!("expected handshake link, got {other:?}"),
+    };
     assert_eq!(link.len(), 32);
 
     // Index flows through the tunnel, and the anchor forwards the instance's
@@ -248,6 +293,7 @@ fn tunnel_client_serves_index_sse_and_prompt_through_anchor() {
     );
 
     // A session-index push lands in the anchor's store.
+    let cookie = setup_admin(anchor.http_port);
     out.send(maki_remote::tunnel::TunnelOut::Push(serde_json::json!({
         "sessions": [{
             "session_id": "e2e-session",
@@ -260,7 +306,8 @@ fn tunnel_client_serves_index_sse_and_prompt_through_anchor() {
     .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let sessions = loop {
-        let (_status, body) = http(anchor.http_port, "GET", "/sessions", &[]);
+        let (_status, body) =
+            http_auth(anchor.http_port, "GET", "/api/sessions", &[], Some(&cookie));
         let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
         if list.as_array().is_some_and(|a| !a.is_empty()) {
             break list;

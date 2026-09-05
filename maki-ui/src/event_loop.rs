@@ -896,7 +896,7 @@ impl<'t> EventLoop<'t> {
         // Remote control POSTs are answered here, before the wake loop: the
         // HTTP handler parks up to its timeout, so it must never wait on the
         // next real event.
-        self.flash_tunnel_link_if_ready();
+        self.report_tunnel();
         if self.remote.is_running() {
             let focused = self.focused;
             let sessions_json = {
@@ -943,6 +943,12 @@ impl<'t> EventLoop<'t> {
                     .collect::<Vec<_>>()
             );
             self.remote.push_session_index(&index);
+            let link_up = self.remote.link_up();
+            for rt in self.sessions.iter_mut() {
+                let id = rt.id().to_string();
+                rt.app
+                    .set_remote_indicator(link_up, self.remote.viewers(&id));
+            }
             let sessions_json_clone = sessions_json.clone();
             let grouped = self
                 .remote
@@ -1807,21 +1813,34 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// Swaps the tunnel's placeholder flash for the anchor-minted link as soon
-    /// as the handshake hands it back; also copies it to the clipboard.
-    fn flash_tunnel_link_if_ready(&mut self) {
-        let Some(url) = self.remote.tunnel_link() else {
-            return;
-        };
-        let copy = self.focused_app().clipboard.copy_text(&url);
-        let app = self.focused_app();
-        app.main_chat().push(DisplayMessage::new(
-            DisplayRole::Done,
-            format!("{REMOTE_URL_MSG}{url}"),
-        ));
-        app.flash(url);
-        if let Err(e) = copy {
-            app.flash(format!("{REMOTE_COPY_ERR}: {e}"));
+    /// Narrates the tunnel's life: the anchor-minted link (also copied),
+    /// reconnect chatter, and refusals. The link flash reuses the `/rc`
+    /// treatment; lifecycle lines get a plain flash on the focused tab.
+    fn report_tunnel(&mut self) {
+        for _ in 0..remote::REPORT_BUDGET {
+            match self.remote.poll_tunnel() {
+                None => break,
+                Some(remote::TunnelHappen::Link { url, reconnected }) => {
+                    let copy = self.focused_app().clipboard.copy_text(&url);
+                    let prefix = if reconnected {
+                        "remote reconnected: "
+                    } else {
+                        REMOTE_URL_MSG
+                    };
+                    let app = self.focused_app();
+                    app.main_chat().push(DisplayMessage::new(
+                        DisplayRole::Done,
+                        format!("{prefix}{url}"),
+                    ));
+                    app.flash(url);
+                    if let Err(e) = copy {
+                        app.flash(format!("{REMOTE_COPY_ERR}: {e}"));
+                    }
+                }
+                Some(remote::TunnelHappen::Notice(message)) => {
+                    self.focused_app().flash(format!("remote: {message}"));
+                }
+            }
         }
     }
 

@@ -63,11 +63,21 @@ impl Drop for Subscription {
     fn drop(&mut self) {
         self.inner.updates.rcu(|subs| {
             subs.iter()
-                .filter(|(id, _)| *id != self.id)
+                .filter(|sub| sub.id != self.id)
                 .cloned()
                 .collect::<Vec<_>>()
         });
     }
+}
+
+/// One attached browser. `session` is the tab the stream was scoped to;
+/// `None` is an unscoped viewer that can flip to any tab, so it counts as
+/// watching whichever tab the TUI asks about.
+#[derive(Debug, Clone)]
+struct Subscriber {
+    id: u64,
+    tx: flume::Sender<RemoteUpdate>,
+    session: Option<String>,
 }
 
 /// Fan-out hub between the event loop's tee and every connected web client.
@@ -82,7 +92,7 @@ pub struct RemoteState {
 
 #[derive(Debug)]
 struct Inner {
-    updates: ArcSwap<Vec<(u64, flume::Sender<RemoteUpdate>)>>,
+    updates: ArcSwap<Vec<Subscriber>>,
     next_id: AtomicU64,
 }
 
@@ -104,12 +114,18 @@ impl RemoteState {
         Self::default()
     }
 
-    pub fn subscribe(&self) -> Subscription {
+    /// Attaches a browser stream. `session` is the tab the stream is scoped
+    /// to (None for the unscoped index, which can flip tabs at any time).
+    pub fn subscribe(&self, session: Option<String>) -> Subscription {
         let (tx, updates) = flume::bounded(SUBSCRIBER_QUEUE_CAP);
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         self.inner.updates.rcu(|subs| {
             let mut subs = Vec::clone(subs);
-            subs.push((id, tx.clone()));
+            subs.push(Subscriber {
+                id,
+                tx: tx.clone(),
+                session: session.clone(),
+            });
             subs
         });
         Subscription {
@@ -119,10 +135,26 @@ impl RemoteState {
         }
     }
 
+    /// Browsers attached right now, counting an unscoped viewer toward any
+    /// tab it could switch to. The TUI asks for the focused tab.
+    pub fn viewers(&self, focused: &str) -> usize {
+        self.inner
+            .updates
+            .load()
+            .iter()
+            .filter(|sub| sub.session.as_deref().is_none_or(|s| s == focused))
+            .count()
+    }
+
+    /// Any browser attached at all, on any tab.
+    pub fn has_viewers(&self) -> bool {
+        !self.inner.updates.load().is_empty()
+    }
+
     fn publish(&self, update: RemoteUpdate) {
         let subs = self.inner.updates.load_full();
-        for (_, tx) in subs.iter() {
-            let _ = tx.try_send(update.clone());
+        for sub in subs.iter() {
+            let _ = sub.tx.try_send(update.clone());
         }
     }
 
@@ -174,8 +206,8 @@ mod tests {
     #[test]
     fn subscribers_receive_independently_and_slow_one_drops() {
         let state = RemoteState::new();
-        let a = state.subscribe();
-        let b = state.subscribe();
+        let a = state.subscribe(None);
+        let b = state.subscribe(None);
 
         state.send_status(SESSION, STATUS_IDLE);
         assert!(matches!(
@@ -198,10 +230,29 @@ mod tests {
     }
 
     #[test]
+    fn viewers_count_scoped_and_unscoped_streams() {
+        let state = RemoteState::new();
+        assert_eq!(state.viewers("t1"), 0);
+        assert!(!state.has_viewers());
+        let scoped = state.subscribe(Some("t1".into()));
+        let other = state.subscribe(Some("t2".into()));
+        let unscoped = state.subscribe(None);
+        assert_eq!(state.viewers("t1"), 2, "own tab plus the tab-hopper");
+        assert_eq!(state.viewers("t2"), 2);
+        assert_eq!(state.viewers("t3"), 1, "only the unscoped viewer");
+        drop(scoped);
+        drop(unscoped);
+        assert_eq!(state.viewers("t1"), 0, "t2's viewer cannot see t1");
+        assert!(state.has_viewers());
+        drop(other);
+        assert!(!state.has_viewers());
+    }
+
+    #[test]
     fn dropping_a_subscription_removes_only_that_receiver() {
         let state = RemoteState::new();
-        let a = state.subscribe();
-        let b = state.subscribe();
+        let a = state.subscribe(None);
+        let b = state.subscribe(None);
         drop(a);
 
         state.send_status(SESSION, STATUS_IDLE);
