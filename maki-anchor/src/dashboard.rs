@@ -25,6 +25,17 @@ button.primary{background:#0f172a;color:#fff;border-color:#0f172a}
 button:hover{filter:brightness(.98)}
 pre{background:#fff;border:1px solid #e2e8f0;padding:.7rem;border-radius:8px;overflow:auto}
 .small{color:#64748b;font-size:.85rem}
+footer{margin:2.5rem auto 1.2rem;max-width:64rem;padding:.9rem 1.2rem 0;border-top:1px solid #e2e8f0;color:#64748b;font-size:.85rem;display:flex;gap:1.1rem;flex-wrap:wrap}
+footer a{color:#64748b;border-bottom:1px solid #cbd5e1}
+footer a:hover{color:#2563eb;border-color:#2563eb;text-decoration:none}
+.card.narrow{max-width:30rem}
+.card label{display:block;color:#64748b;font-size:.85rem}
+.card input,.card select{width:100%;margin-top:.15rem}
+.card form p{margin:.6rem 0}
+button.primary,a.btn{background:#0f172a;color:#fff;border-color:#0f172a}
+a.btn{display:inline-block;padding:.45rem .8rem;border-radius:8px;text-decoration:none}
+a.btn:hover{filter:brightness(1.35);text-decoration:none}
+button.danger{border-color:#fca5a5;color:#b91c1c;background:#fef2f2;padding:.25rem .55rem;font-size:.8rem}
 @media (prefers-color-scheme: dark){
  body{background:#0b1220;color:#e2e8f0}
  header{background:#0f172a;border-color:#1e293b}
@@ -32,7 +43,10 @@ pre{background:#fff;border:1px solid #e2e8f0;padding:.7rem;border-radius:8px;ove
  th{background:#1e293b}
  td,th{border-color:#1e293b}
  input,select,pre,button{background:#1e293b;border-color:#334155;color:#e2e8f0}
+ button.primary,a.btn{background:#e2e8f0;color:#0f172a;border-color:#e2e8f0}
+ button.danger{background:#2a1517;border-color:#7f1d1d;color:#fca5a5}
  .badge{border-color:#334155}
+ footer{border-color:#1e293b}
 }
 "#
 }
@@ -75,8 +89,24 @@ fn layout_start(title: &str, user: Option<&UserRow>, page: &str) -> String {
     s
 }
 
-fn layout_end() -> &'static str {
-    "</main></body></html>"
+/// Every anchored page signs off to the same three places.
+const FOOTER: &str = "<footer><a href=\"https://github.com/wmantly/maki\">maki fork</a><a href=\"https://github.com/tontinton/maki\">upstream</a><a href=\"https://community.theta42.com/\">community</a></footer>";
+
+fn layout_end() -> String {
+    format!("{FOOTER}</main></body></html>")
+}
+
+/// A page without the nav (setup, login, refusals): same skin, centered card,
+/// same footer.
+pub fn standalone_page(status: u16, title: &str, content: &str) -> (u16, String, Vec<u8>) {
+    let body = format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>{}</style></head><body><header><h1>maki anchor</h1></header><main><div class=\"card narrow\">{}</div>{}</body></html>",
+        html_escape(title),
+        base_style(),
+        content,
+        FOOTER
+    );
+    (status, "text/html".to_string(), body.into_bytes())
 }
 
 /// What this viewer may see: everything for admins, granted rows otherwise.
@@ -149,7 +179,7 @@ pub fn render_sessions(
         body.push_str("<p class=\"small\">Filtered to your grants. Admins see all on <a href=\"/admin\">Admin</a>.</p>");
     }
     body.push_str("</div>");
-    body.push_str(layout_end());
+    body.push_str(&layout_end());
     (200, "text/html".to_string(), body.into_bytes())
 }
 
@@ -231,7 +261,7 @@ pub fn render_instances(store: &Store, user: Option<&UserRow>) -> (u16, String, 
         body.push_str("<p class=\"small\">Showing only instances you have a grant for. Ask an admin for access to more.</p>");
     }
     body.push_str("</div>");
-    body.push_str(layout_end());
+    body.push_str(&layout_end());
     (200, "text/html".to_string(), body.into_bytes())
 }
 
@@ -265,7 +295,7 @@ pub fn render_links(
          <p class=\"small\">Links are proxied via the tunnel; grants can upgrade a view link to control for you.</p></div>",
     );
     body.push_str(&links_card(store, hub, user, &instances));
-    body.push_str(layout_end());
+    body.push_str(&layout_end());
     (200, "text/html".to_string(), body.into_bytes())
 }
 
@@ -310,7 +340,7 @@ fn links_card(
         };
         let revoke = if is_admin {
             format!(
-                "<button class=\"revoke\" data-hash=\"{}\">revoke</button>",
+                "<button class=\"danger\" data-hash=\"{}\">revoke</button>",
                 html_escape(&link.token_hash)
             )
         } else {
@@ -499,7 +529,7 @@ pub fn render_admin(
         "##,
         mint, mint
     ));
-    body.push_str(layout_end());
+    body.push_str(&layout_end());
     (200, "text/html".to_string(), body.into_bytes())
 }
 
@@ -568,7 +598,7 @@ pub fn render_link(
         role.as_str(),
     ));
     body.push_str("<p><a href=\"/links\">all links</a></p>");
-    body.push_str(layout_end());
+    body.push_str(&layout_end());
     (200, "text/html".to_string(), body.into_bytes())
 }
 

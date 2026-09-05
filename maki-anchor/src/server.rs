@@ -510,20 +510,18 @@ fn handle_setup(mut request: http::Request, auth: &crate::auth::Auth) -> RouteOu
     const MIN_PASSWORD: usize = 8;
     if request.method() != "POST" {
         let body = format!(
-            r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>setup</title>
-             <style>body{{font-family:system-ui;margin:2rem auto;max-width:40rem;padding:0 1rem}}
-             form{{margin:1rem 0;padding:1rem;border:1px solid #ddd;border-radius:.5rem}}
-             input{{padding:.4rem .6rem;border:1px solid #ccc;border-radius:.3rem;width:100%;box-sizing:border-box}}
-             button{{padding:.5rem 1rem;margin-top:.5rem}}</style></head><body>
-             <h1>maki anchor — setup</h1>
+            r#"<h2>Setup</h2>
              <p>No users exist yet. Create the first administrator; this page closes behind it.</p>
              <form method="post" action="/setup">
              <p><label>Username<br><input name="username" autocomplete="username" required></label></p>
              <p><label>Password (at least {MIN_PASSWORD} chars)<br><input name="password" type="password" autocomplete="new-password" required minlength="{MIN_PASSWORD}"></label></p>
-             <button type="submit" style="padding:.5rem 1rem;background:#0072ff;color:#fff;border:none;border-radius:.3rem">Create admin</button>
-             </form></body></html>"#
+             <button class="primary" type="submit">Create admin</button>
+             </form>"#
         );
-        return buffered((200, "text/html".to_string(), body.into_bytes()), request);
+        return buffered(
+            crate::dashboard::standalone_page(200, "maki anchor — setup", &body),
+            request,
+        );
     }
     let mut body = Vec::new();
     if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
@@ -536,13 +534,9 @@ fn handle_setup(mut request: http::Request, auth: &crate::auth::Auth) -> RouteOu
     let username = params.get("username").map(|s| s.as_str()).unwrap_or("");
     let password = params.get("password").map(|s| s.as_str()).unwrap_or("");
     if username.trim().is_empty() || username.len() > 64 || password.len() < MIN_PASSWORD {
-        return buffered(
-            (
-                400,
-                "text/plain".to_string(),
-                b"username and a password of at least 8 characters are required".to_vec(),
-            ),
+        return setup_failure(
             request,
+            "Username and a password of at least 8 characters are required.",
         );
     }
     let origin = remote_origin(&request);
@@ -552,17 +546,20 @@ fn handle_setup(mut request: http::Request, auth: &crate::auth::Auth) -> RouteOu
             redirect_with_cookie(request, "/", &cookie)
         }
         Err(crate::auth::AuthError::AlreadySetup) => redirect(request, "/login"),
-        Err(err) => buffered(
-            (
-                400,
-                "text/plain".to_string(),
-                format!("setup: {err}").into_bytes(),
-            ),
-            request,
-        ),
+        Err(err) => setup_failure(request, &format!("Setup failed: {err}")),
     }
 }
 
+fn setup_failure(request: http::Request, message: &str) -> RouteOutcome {
+    let content = format!(
+        "<h2>Setup</h2><p>{}</p><p><a href=\"/setup\">Try again</a></p>",
+        message.replace('<', "&lt;")
+    );
+    buffered(
+        crate::dashboard::standalone_page(400, "maki anchor — setup", &content),
+        request,
+    )
+}
 fn cookie_header(request: &http::Request) -> Option<&str> {
     request
         .headers()
@@ -602,37 +599,29 @@ fn start_login(request: http::Request, auth: &crate::auth::Auth) -> RouteOutcome
 
 fn render_login_page(request: http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
     let has_oidc = auth.enabled();
-    let allow_local = auth.allow_local;
+    let allow_local = auth.local_login_allowed();
     // If ?oidc=1 is present, do OIDC redirect directly
     if has_oidc && request.url().contains("oidc=1") {
         return start_login(request, auth);
     }
-    let mut body = String::from(
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>login</title>\
-         <style>body{font-family:system-ui;margin:2rem auto;max-width:40rem;padding:0 1rem} form{margin:1rem 0;padding:1rem;border:1px solid #ddd;border-radius:.5rem} input{padding:.4rem .6rem;border:1px solid #ccc;border-radius:.3rem;width:100%;box-sizing:border-box} button{padding:.5rem 1rem;margin-top:.5rem}</style></head><body><h1>maki anchor — login</h1>",
-    );
+    let mut body = String::from("<h2>Log in</h2>");
     if has_oidc {
-        body.push_str("<p><a href=\"/login?oidc=1\" style=\"display:inline-block;padding:.6rem 1rem;background:#0072ff;color:#fff;text-decoration:none;border-radius:.3rem\">Log in with SSO</a></p>");
-        if allow_local {
-            body.push_str("<hr>");
-        }
+        body.push_str("<p><a class=\"btn\" href=\"/login?oidc=1\">Log in with SSO</a></p>");
     }
     if allow_local {
         body.push_str(
-            r#"<form method="post" action="/login">
-            <h3>Local login</h3>
-            <label>Username<br><input name="username" required></label><br><br>
-            <label>Password<br><input type="password" name="password" required></label><br>
-            <button type="submit">Log in</button>
-            </form>
-            <p><small>First local user becomes admin. Create users on server: <code>maki-anchor users add &lt;username&gt; --admin</code></small></p>"#,
+            "<form method=\"post\" action=\"/login\">\
+             <p><label>Username<br><input name=\"username\" autocomplete=\"username\" required></label></p>\
+             <p><label>Password<br><input type=\"password\" name=\"password\" autocomplete=\"current-password\" required></label></p>\
+             <button class=\"primary\" type=\"submit\">Log in</button>\
+             </form>",
         );
     }
     if !has_oidc && !allow_local {
-        body.push_str("<p>No login configured (OIDC and local disabled).</p>");
+        body.push_str("<p>No login is configured. OIDC and local auth are both off.</p>");
     }
-    body.push_str("</body></html>");
-    buffered((200, "text/html".to_string(), body.into_bytes()), request)
+    let page = crate::dashboard::standalone_page(200, "maki anchor — login", &body);
+    buffered(page, request)
 }
 
 fn handle_local_login(mut request: http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
@@ -654,7 +643,12 @@ fn handle_local_login(mut request: http::Request, auth: &crate::auth::Auth) -> R
             (
                 429,
                 "text/html".to_string(),
-                b"<html><body>too many failed logins, wait a while <a href=\"/login\">back</a></body></html>"
+                crate::dashboard::standalone_page(
+                    429,
+                    "maki anchor — login",
+                    "<h2>Slow down</h2><p>Too many failed logins. Wait a while, then <a href=\"/login\">try again</a>.</p>",
+                )
+                .2
                     .to_vec(),
             ),
             request,
@@ -663,7 +657,12 @@ fn handle_local_login(mut request: http::Request, auth: &crate::auth::Auth) -> R
             (
                 401,
                 "text/html".to_string(),
-                b"<html><body>invalid credentials <a href=\"/login\">back</a></body></html>"
+                crate::dashboard::standalone_page(
+                    401,
+                    "maki anchor — login",
+                    "<h2>Wrong username or password</h2><p><a href=\"/login\">Back to the login form</a></p>",
+                )
+                .2
                     .to_vec(),
             ),
             request,
@@ -1960,7 +1959,12 @@ fn route_authorized(
                     (
                         403,
                         "text/html".to_string(),
-                        b"<html><body>admin only <a href=\"/\">back</a></body></html>".to_vec(),
+                        crate::dashboard::standalone_page(
+                            403,
+                            "maki anchor — admin",
+                            "<h2>Admins only</h2><p>This page is for anchor administrators. <a href=\"/\">Back to sessions</a>.</p>",
+                        )
+                        .2,
                     ),
                     request,
                 );
