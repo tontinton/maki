@@ -38,6 +38,7 @@ isahc = { workspace = true }
 thiserror = { workspace = true }
 libc = { workspace = true }
 uuid = { workspace = true }
+fast_qr = { version = "0.14", features = ["svg"] }
 flume = { workspace = true }
 open = { workspace = true }
 
@@ -67,7 +68,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.5.0-rc.18"
+version = "0.5.0-rc.19"
 edition = "2024"
 authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"
@@ -135,6 +136,7 @@ jiff = { version = "0.2", default-features = false, features = ["std", "tz-syste
 keyring = "4"
 arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+fast_qr = { version = "0.14", features = ["svg"] }
 flume = { version = "0.11", default-features = false, features = ["async", "select"] }
 fs4 = "1"
 pin-project-lite = "0.2"
