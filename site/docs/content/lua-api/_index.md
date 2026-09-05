@@ -1266,6 +1266,13 @@ and tool set.
     `"max"`), or a budget integer (token count). Inherits parent setting
     if omitted.
   - `fast` (`boolean?`) use fast mode. Inherits parent setting if omitted.
+  - `scope` (`table?`) `{ session = "<id>" }` detaches the session from the
+    call that spawned it: it survives the call returning and the turn
+    ending, instead of being cancelled the moment either does. `<id>`
+    must be the caller's own session (`ctx:session_id()`). Only cancel-all
+    and a targeted cancel of this session's tool call id can stop it from
+    here on; keep the returned handle (or its id) if you need to reach it
+    later. Omit for the default: tied to the call that spawned it.
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
 
@@ -1332,12 +1339,16 @@ print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
 ### `Session:close()` {#Session-close}
 
 ```lua
-Session:close()
+Session:close({err?})
 ```
 
 Close the session and flush its history back to the parent agent. You can
 call this multiple times safely. If you forget, it runs automatically when
 the session is garbage collected.
+
+**Parameters:**
+
+- `{err?}` (`string?`) Pass the failure reason when the run failed, so the session's UI item ends as errored even without a following tool result.
 
 
 ## maki.async {#maki-async}
@@ -1361,17 +1372,21 @@ local results = maki.async.gather({
 ### `maki.async.run()` {#maki-async-run}
 
 ```lua
-maki.async.run({fn}, {on_finish?})
+maki.async.run({fn}, {opts?})
 ```
 
 Fire off a function as a new async task. It runs in the background and
 you do not wait for it. If you need the result, pass an {on_finish}
 callback.
 
+A spawned task must finish within 60 seconds by default; pass
+{deadline_ms} to change that, or `false` to remove the cap for
+genuinely long work.
+
 **Parameters:**
 
 - `{fn}` (`function`) Zero-argument function to execute.
-- `{on_finish?}` (`function?`) Optional callback `function(err, result)`. Called once {fn} completes.
+- `{opts?}` (`table?`) {on_finish} is `function(err, result)`, called once {fn} completes. {deadline_ms} is integer milliseconds, or `false` for no deadline.
 
 **Example:**
 
@@ -1379,7 +1394,7 @@ callback.
 maki.async.run(function()
   local data = expensive_fetch()
   process(data)
-end)
+end, { deadline_ms = false })
 ```
 
 ---
@@ -1390,23 +1405,23 @@ end)
 maki.async.sleep({ms})
 ```
 
-Suspend the calling task for {ms} milliseconds. The plugin thread is
-never blocked, so other tasks and the UI keep running, and a cancel
-still lands while you sleep.
+Suspend the current coroutine for {ms} milliseconds. The timer runs on
+the async executor, so nothing spins and other tasks keep running.
+Cancelling the owning task interrupts the sleep with the cancel error.
 
 For a timer that has to outlive the tool call that started it, such
 as a toast dismissing itself, use `maki.defer_fn`.
 
 **Parameters:**
 
-- `{ms}` (`integer`) Milliseconds to sleep.
+- `{ms}` (`integer`) Milliseconds to wait. Must be >= 0.
 
 **Example:**
 
 ```lua
 maki.async.run(function()
-  maki.async.sleep(4000)
-  win:close()
+  maki.async.sleep(250)
+  retry()
 end)
 ```
 

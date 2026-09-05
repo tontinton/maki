@@ -56,6 +56,10 @@ pub struct Chat {
     /// The ending and the index of the bubble announcing it, so a later, better
     /// informed outcome can fix that bubble instead of appending a second one.
     finish: Option<(TaskOutcome, usize)>,
+    /// A background handoff: the tool call ended but the subagent keeps
+    /// running. The turn-end janitor must spare it, and the verdict arrives
+    /// with the `SubagentHistory` sent at session close.
+    detached: bool,
     /// `None` for the main chat, the subagent's `tool_use_id` otherwise. That
     /// is the handle `maki.task` addresses a task by, see `app::tasks`.
     task_id: Option<Arc<str>>,
@@ -71,6 +75,7 @@ impl Chat {
             pending_turn_usage: None,
             messages_panel: MessagesPanel::new(ui_config, lua_event_handle),
             finish: None,
+            detached: false,
             task_id: None,
         }
     }
@@ -357,6 +362,14 @@ impl Chat {
 
     pub fn is_finished(&self) -> bool {
         self.finish.is_some()
+    }
+
+    pub(crate) fn mark_detached(&mut self) {
+        self.detached = true;
+    }
+
+    pub(crate) fn is_detached(&self) -> bool {
+        self.detached
     }
 
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {

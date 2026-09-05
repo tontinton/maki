@@ -17,7 +17,7 @@ pub(crate) mod tasks;
 pub(crate) mod tests;
 pub(crate) mod view;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -254,6 +254,10 @@ pub struct App {
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
+    /// Receipts whose annotated ToolDone beat the session's first envelope:
+    /// the chat does not exist yet, so the handoff is parked here until the
+    /// chat is born.
+    detached_receipts: HashSet<String>,
 }
 
 impl App {
@@ -347,6 +351,7 @@ impl App {
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
+            detached_receipts: HashSet::new(),
         };
         app.model_picker.set_recents(
             maki_storage::model::read_recents(&app.storage)
@@ -1095,6 +1100,38 @@ impl App {
             }
             return vec![];
         }
+
+        // A backgrounded session closes long after its spawning run ended,
+        // so the close verdict and transcript skip the stale-run gate.
+        if let AgentEvent::SubagentHistory {
+            tool_use_id,
+            messages,
+            failed,
+        } = envelope.event
+        {
+            // Workflow sessions use synthetic ids that no ToolDone will match,
+            // so we finish them here on SubagentHistory. Without a verdict it
+            // only knows that the transcript closed, so say Unknown and leave
+            // the outcome to the ToolDone that follows elsewhere; a detached
+            // (background) session closes with its own verdict.
+            if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
+                let outcome = if failed {
+                    TaskOutcome::Error
+                } else if self.chats[sub_idx].is_detached() {
+                    TaskOutcome::Done
+                } else {
+                    TaskOutcome::Unknown
+                };
+                self.chats[sub_idx].mark_finished(outcome, DONE_TEXT);
+            }
+            self.state
+                .session_mut()
+                .set_subagent_messages(tool_use_id, messages);
+            return vec![];
+        }
+
+        // A backgrounded session closes long after its spawning run ended,
+        // so the close verdict and transcript skip the stale-run gate.
         if envelope.run_id != self.run_id {
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
@@ -1108,24 +1145,6 @@ impl App {
                     "tool render event dropped: stale run_id"
                 );
             }
-            return vec![];
-        }
-
-        if let AgentEvent::SubagentHistory {
-            tool_use_id,
-            messages,
-        } = envelope.event
-        {
-            // Workflow sessions use synthetic ids that no ToolDone will match,
-            // so we finish them here on SubagentHistory. This event only knows
-            // that the transcript closed, so say Unknown and leave the verdict
-            // to the ToolDone that follows elsewhere.
-            if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
-                self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
-            }
-            self.state
-                .session_mut()
-                .set_subagent_messages(tool_use_id, messages);
             return vec![];
         }
 
@@ -1155,7 +1174,14 @@ impl App {
             self.state
                 .session_mut()
                 .insert_tool_output(e.id.clone(), e.output.clone());
-            if let Some(&sub_idx) = self.chat_index.get(&e.id) {
+            if e.annotation.as_deref() == Some(maki_agent::tools::TASK_HANDOFF_ANNOTATION) {
+                match self.chat_index.get(&e.id) {
+                    Some(&sub_idx) => self.chats[sub_idx].mark_detached(),
+                    None => {
+                        self.detached_receipts.insert(e.id.clone());
+                    }
+                }
+            } else if let Some(&sub_idx) = self.chat_index.get(&e.id) {
                 let (outcome, text) = if e.is_error {
                     (TaskOutcome::Error, ERROR_TEXT)
                 } else {
@@ -1243,7 +1269,7 @@ impl App {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
                     self.terminalize_turn(MISSING_TOOL_COMPLETION);
-                    self.chat_index.clear();
+                    self.retain_detached_subagents();
                     self.subagent_answers.clear();
                     self.status = Status::Idle;
                     if self.exit_on_done {
@@ -1258,6 +1284,11 @@ impl App {
                     self.recoverable_queue = self.queue.text_messages();
                     self.queue.clear();
                     self.chat_index.clear();
+                    self.retain_detached_subagents();
+                    self.fire_session_autocmd(
+                        "TurnError",
+                        serde_json::json!({ "message": message }),
+                    );
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
                     }
@@ -1295,6 +1326,9 @@ impl App {
         chat.model_id = subagent.model.clone();
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
+        }
+        if self.detached_receipts.remove(id) {
+            chat.mark_detached();
         }
         self.chats.push(chat);
         self.sync_subagents();
@@ -1725,7 +1759,9 @@ impl App {
         self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
         self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
         for chat in self.chats.iter_mut().skip(1) {
-            chat.fail_in_progress_with_message(message.into());
+            if !chat.is_detached() {
+                chat.fail_in_progress_with_message(message.into());
+            }
         }
     }
 
@@ -1734,14 +1770,23 @@ impl App {
     /// completed.
     fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str) {
         self.chat_index.retain(|_, &mut sub_idx| {
-            if self.chats[sub_idx].is_finished() {
+            let chat = &mut self.chats[sub_idx];
+            if chat.is_detached() || chat.is_finished() {
                 true
             } else {
-                self.chats[sub_idx].mark_finished(outcome, text);
+                chat.mark_finished(outcome, text);
                 false
             }
         });
         self.sync_subagents();
+    }
+
+    /// Keeps only the detached (background) subagents routable across the turn
+    /// boundary; their items are still live while newer turns already ran.
+    /// Prunes silently: the janitor already synced the persisted set.
+    fn retain_detached_subagents(&mut self) {
+        self.chat_index
+            .retain(|_, &mut sub_idx| self.chats[sub_idx].is_detached());
     }
 
     pub fn flush_all_chats(&mut self) {

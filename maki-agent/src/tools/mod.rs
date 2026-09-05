@@ -244,6 +244,10 @@ pub const MULTIEDIT_TOOL_NAME: &str = "multiedit";
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const READ_TOOL_NAME: &str = "read";
 pub const TASK_TOOL_NAME: &str = "task";
+/// Receipt annotation marking a `task` call that handed its subagent to the
+/// background: the UI keeps the item working and takes the verdict from the
+/// `SubagentHistory` sent at session close.
+pub const TASK_HANDOFF_ANNOTATION: &str = "backgrounded";
 pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
 pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 pub const WRITE_TOOL_NAME: &str = "write";

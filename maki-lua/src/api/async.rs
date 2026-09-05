@@ -8,10 +8,17 @@ use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 
 use crate::docs::{FnDoc, ParamDoc};
-use crate::runtime::{TaskHandle, enqueue_async_task, lock_cell, register_cancel_hook};
+use crate::runtime::{
+    ASYNC_RUN_DEFAULT_DEADLINE, TaskHandle, enqueue_async_task_deadline, lock_cell,
+    register_cancel_hook,
+};
 
 const AWAIT_MIN_ARGS: usize = 2;
+const RUN_ON_FINISH_TYPE_ERR: &str = "on_finish must be a function";
+const RUN_DEADLINE_NEGATIVE_ERR: &str = "deadline_ms must be >= 0";
+const RUN_DEADLINE_TYPE_ERR: &str = "deadline_ms must be an integer (milliseconds) or false";
 const PERMIT_RELEASED_ERR: &str = "permit already released";
+const SLEEP_NEGATIVE_ERR: &str = "maki.async.sleep: ms must be >= 0";
 
 /// Cancel-aware counting semaphore. Permits release on `:release()` or gc.
 struct LuaSemaphore {
@@ -85,15 +92,39 @@ lua_class! {
 /// you do not wait for it. If you need the result, pass an {on_finish}
 /// callback.
 ///
+/// A spawned task must finish within 60 seconds by default; pass
+/// {deadline_ms} to change that, or `false` to remove the cap for
+/// genuinely long work.
+///
 /// @param fn function Zero-argument function to execute.
-/// @param on_finish function? Optional callback `function(err, result)`. Called once {fn} completes.
+/// @param opts table? {on_finish} is `function(err, result)`, called once {fn} completes. {deadline_ms} is integer milliseconds, or `false` for no deadline.
 /// @example
 /// maki.async.run(function()
 ///   local data = expensive_fetch()
 ///   process(data)
-/// end)
+/// end, { deadline_ms = false })
 #[lua_fn]
-fn run(lua: &Lua, r#fn: Function, on_finish: Option<Function>) -> LuaResult<()> {
+fn run(lua: &Lua, r#fn: Function, opts: Option<Table>) -> LuaResult<()> {
+    let (on_finish, deadline) = match &opts {
+        None => (None, Some(ASYNC_RUN_DEFAULT_DEADLINE)),
+        Some(opts) => {
+            let on_finish = match opts.raw_get::<Value>("on_finish")? {
+                Value::Nil => None,
+                Value::Function(f) => Some(f),
+                _ => return Err(mlua::Error::runtime(RUN_ON_FINISH_TYPE_ERR)),
+            };
+            let deadline = match opts.raw_get::<Value>("deadline_ms")? {
+                Value::Nil => Some(ASYNC_RUN_DEFAULT_DEADLINE),
+                Value::Boolean(false) => None,
+                Value::Integer(ms) if ms >= 0 => Some(Duration::from_millis(ms as u64)),
+                Value::Integer(_) => {
+                    return Err(mlua::Error::runtime(RUN_DEADLINE_NEGATIVE_ERR));
+                }
+                _ => return Err(mlua::Error::runtime(RUN_DEADLINE_TYPE_ERR)),
+            };
+            (on_finish, deadline)
+        }
+    };
     let actual_work = if let Some(cb) = on_finish {
         lua.load(
             r#"
@@ -113,7 +144,7 @@ fn run(lua: &Lua, r#fn: Function, on_finish: Option<Function>) -> LuaResult<()> 
         r#fn
     };
     let work_key = lua.create_registry_value(actual_work)?;
-    enqueue_async_task(lua, work_key)?;
+    enqueue_async_task_deadline(lua, work_key, deadline)?;
     Ok(())
 }
 
@@ -196,26 +227,6 @@ async fn gather(lua: Lua, fns: Table) -> LuaResult<Table> {
     Ok(out)
 }
 
-/// Suspend the calling task for {ms} milliseconds. The plugin thread is
-/// never blocked, so other tasks and the UI keep running, and a cancel
-/// still lands while you sleep.
-///
-/// For a timer that has to outlive the tool call that started it, such
-/// as a toast dismissing itself, use `maki.defer_fn`.
-///
-/// @param ms integer Milliseconds to sleep.
-/// @return
-/// @example
-/// maki.async.run(function()
-///   maki.async.sleep(4000)
-///   win:close()
-/// end)
-#[lua_fn]
-async fn sleep(_lua: Lua, ms: u64) -> LuaResult<()> {
-    smol::Timer::after(Duration::from_millis(ms)).await;
-    Ok(())
-}
-
 /// Create a counting semaphore that allows at most {n} concurrent permits.
 /// Use this to limit how many tasks hit a resource at the same time.
 ///
@@ -232,6 +243,35 @@ fn semaphore(_lua: &Lua, n: usize) -> LuaResult<LuaSemaphore> {
     Ok(LuaSemaphore {
         sem: Arc::new(Semaphore::new(n.max(1))),
     })
+}
+
+/// Suspend the current coroutine for {ms} milliseconds. The timer runs on
+/// the async executor, so nothing spins and other tasks keep running.
+/// Cancelling the owning task interrupts the sleep with the cancel error.
+///
+/// For a timer that has to outlive the tool call that started it, such
+/// as a toast dismissing itself, use `maki.defer_fn`.
+///
+/// @param ms integer Milliseconds to wait. Must be >= 0.
+/// @example
+/// maki.async.run(function()
+///   maki.async.sleep(250)
+///   retry()
+/// end)
+#[lua_fn]
+async fn sleep(lua: Lua, ms: i64) -> LuaResult<()> {
+    if ms < 0 {
+        return Err(mlua::Error::runtime(SLEEP_NEGATIVE_ERR));
+    }
+    let cancel = lua
+        .app_data_ref::<TaskHandle>()
+        .map(|h| lock_cell(&h).cancel.clone())
+        .unwrap_or_else(CancelToken::none);
+    cancel
+        .race(smol::Timer::after(Duration::from_millis(ms as u64)))
+        .await
+        .map_err(mlua::Error::runtime)?;
+    Ok(())
 }
 
 /// `await`, `wrap`, and `join` are registered by hand below: `await`
@@ -392,11 +432,11 @@ pub(crate) fn create_async_table(lua: &Lua) -> LuaResult<Table> {
                         if to_go == 0 then
                             on_finish()
                         elseif #remaining > 0 then
-                            async_tbl.run(table.remove(remaining, 1), run_next)
+                            async_tbl.run(table.remove(remaining, 1), { on_finish = run_next })
                         end
                     end
                     for i = 1, max_jobs do
-                        async_tbl.run(funs[i], run_next)
+                        async_tbl.run(funs[i], { on_finish = run_next })
                     end
                 end)
             end
@@ -440,6 +480,7 @@ mod tests {
     const ERR_ARGC_GE_1: &str = "argc must be >= 1";
     const ERR_ARGC_INTEGER: &str = "argc must be an integer";
     const ERR_SECOND_ARG_FN: &str = "second argument must be a function";
+    const ERR_SLEEP_NEGATIVE: &str = "ms must be >= 0";
 
     fn setup() -> (Lua, Table) {
         let lua = Lua::new();
@@ -460,6 +501,88 @@ mod tests {
             assert!(
                 msg.contains(expected_err),
                 "expected error containing {expected_err:?}, got: {msg}"
+            );
+        });
+    }
+
+    #[test_case(r#"return async_tbl.sleep(-1)"#, ERR_SLEEP_NEGATIVE ; "negative_ms")]
+    fn sleep_validation(code: &str, expected_err: &str) {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            let err = lua.load(code).eval_async::<Value>().await.unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expected_err),
+                "expected error containing {expected_err:?}, got: {msg}"
+            );
+        });
+    }
+
+    #[test_case(
+        r#"return async_tbl.run(function() end, { on_finish = 42 })"#,
+        RUN_ON_FINISH_TYPE_ERR ; "on_finish_not_fn"
+    )]
+    #[test_case(
+        r#"return async_tbl.run(function() end, { deadline_ms = -1 })"#,
+        RUN_DEADLINE_NEGATIVE_ERR ; "negative_deadline"
+    )]
+    #[test_case(
+        r#"return async_tbl.run(function() end, { deadline_ms = "soon" })"#,
+        RUN_DEADLINE_TYPE_ERR ; "deadline_not_integer"
+    )]
+    #[test_case(
+        r#"return async_tbl.run(function() end, { deadline_ms = true })"#,
+        RUN_DEADLINE_TYPE_ERR ; "deadline_true_invalid"
+    )]
+    fn run_validation(code: &str, expected_err: &str) {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            let err = lua.load(code).eval_async::<Value>().await.unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expected_err),
+                "expected error containing {expected_err:?}, got: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn sleep_suspends_for_the_requested_duration() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            let began = std::time::Instant::now();
+            lua.load("async_tbl.sleep(30)").exec_async().await.unwrap();
+            assert!(
+                began.elapsed() >= Duration::from_millis(30),
+                "sleep(30) returned early after {:?}",
+                began.elapsed()
+            );
+        });
+    }
+
+    #[test]
+    fn sleep_observes_caller_cancel() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            lua.set_app_data::<TaskHandle>(cancelled_task_handle());
+            let code = r#"
+                local ok, err = pcall(async_tbl.sleep, 60_000)
+                return ok, tostring(err)
+            "#;
+            let vals: Vec<Value> = lua
+                .load(code)
+                .eval_async::<MultiValue>()
+                .await
+                .unwrap()
+                .into_vec();
+            assert!(!vals[0].as_boolean().unwrap());
+            assert!(
+                vals[1]
+                    .as_string()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(CANCELLED_MSG),
+                "sleep should observe the caller's cancel token"
             );
         });
     }

@@ -33,6 +33,18 @@ local INVALID_INPUT_PREFIX =
 local BODY_INDENT_COLS = 4
 local MIN_MD_WIDTH = 20
 local DEFAULT_OUTPUT_LINES = 5
+local BG_WORKING = "working"
+local BG_DONE = "done"
+local BG_ERROR = "error"
+local BG_TICK_MS = 100
+local BG_WAIT_DEFAULT_MS = 60000
+local BG_WAIT_MAX_MS = 600000
+local BG_WAIT_MIN_ERR = "timeout_ms must be >= 1"
+local BG_NOTIFY_MAX_CHARS = 2000
+local BG_UNKNOWN_ID_PREFIX = "unknown task id: "
+-- Mirrors maki_agent::TASK_HANDOFF_ANNOTATION: the receipt annotation tells
+-- the UI the subagent keeps running after this tool call ends.
+local TASK_HANDOFF_ANNOTATION = "backgrounded"
 
 local description = [[Launch an autonomous subagent to perform tasks independently. Best combined with batch.
 
@@ -45,6 +57,7 @@ Notes:
 2. The agent's result is not visible to the user. Summarize it in your response.
 3. Each invocation starts fresh - inline any needed context into the prompt.
 4. Tell it to return concise summaries with file:line refs, not full file contents.
+5. With `background = true` the call returns a receipt at once, the outcome arrives as a message when the subagent finishes (`task_result` fetches it, `task_wait` blocks for it, a /reload cancels it).
 ]]
 
 local opts = maki.api.register_options({
@@ -71,6 +84,10 @@ local schema = {
     subagent_type = {
       type = "string",
       description = 'Subagent type: "research" (read-only, default) or "general" (can modify files)',
+    },
+    background = {
+      type = "boolean",
+      description = "Run in the background. The call returns a receipt at once, the outcome arrives as a message when the subagent finishes, and task_result or task_wait can fetch it.",
     },
     model_tier = {
       type = "string",
@@ -102,6 +119,10 @@ local examples = {
 -- Process-wide cap on concurrent subagents.
 local semaphore = maki.async.semaphore(opts.max_concurrent)
 
+-- Background receipts: task_id -> { description, status, is_error, result }.
+local bg_tasks = {}
+local bg_seq = 0
+
 local function bounded_errors(errors)
   local out = {}
   for i = 1, math.min(#errors, MAX_SCHEMA_ERRORS) do
@@ -110,7 +131,70 @@ local function bounded_errors(errors)
   return table.concat(out, "\n")
 end
 
+local function finish_subagent(sess, message, validator, state)
+  local result, err = sess:prompt(message)
+  local retries = 0
+  while not err and retries < MAX_NUDGES do
+    if validator and not state.captured then
+      retries = retries + 1
+      result, err = sess:prompt(NUDGE_MISSING)
+    elseif not validator and result.text == "" then
+      retries = retries + 1
+      result, err = sess:prompt(NUDGE_SUMMARY)
+    else
+      break
+    end
+  end
+
+  -- Classify before closing: close carries the verdict so a backgrounded
+  -- session's UI item ends correctly even though no tool result follows.
+  local out
+  if err then
+    -- A result alongside the error means the run was cut short after
+    -- streaming some text, and half a transcript beats a bare error.
+    if result then
+      out = {
+        llm_output = "sub-agent interrupted (" .. err .. "). Partial output:\n" .. result.text,
+        is_error = true,
+      }
+    else
+      out = { llm_output = "sub-agent error: " .. err, is_error = true }
+    end
+  elseif validator and not state.captured then
+    local msg = state.last_errors and (STRUCTURED_INVALID_ERROR .. ":\n" .. state.last_errors)
+      or STRUCTURED_MISSING_ERROR
+    out = { llm_output = msg, is_error = true }
+  elseif not validator and result.text == "" then
+    out = { llm_output = SUMMARY_MISSING_ERROR, is_error = true }
+  else
+    out = { llm_output = state.captured and maki.json.encode(state.captured) or result.text, format = "markdown" }
+  end
+
+  sess:close(out.is_error and out.llm_output or nil)
+  return out
+end
+
+local function notify_bg(task_id, entry, session_id)
+  local body = entry.result or ""
+  if #body > BG_NOTIFY_MAX_CHARS then
+    body = body:sub(1, BG_NOTIFY_MAX_CHARS) .. "..."
+  end
+  local label = entry.is_error and "failed" or "finished"
+  maki.session.notify(
+    "Background task " .. task_id .. " (" .. entry.description .. ") " .. label .. ":\n" .. body,
+    { session = session_id, wake = true }
+  )
+end
+
+local function task_output(entry, task_id)
+  if entry.status == BG_WORKING then
+    return { llm_output = "task " .. task_id .. " still working: " .. entry.description }
+  end
+  return { llm_output = entry.result, is_error = entry.is_error }
+end
+
 local function handler(input, ctx)
+  local sid = ctx:session_id()
   local subagent_type = input.subagent_type or "research"
   if subagent_type ~= "research" and subagent_type ~= "general" then
     return { llm_output = "unknown subagent type: " .. subagent_type, is_error = true }
@@ -155,7 +239,7 @@ local function handler(input, ctx)
     return { llm_output = tools_err, is_error = true }
   end
 
-  local captured, last_errors
+  local state = {}
   local local_tools
   if validator then
     local_tools = {
@@ -165,79 +249,99 @@ local function handler(input, ctx)
         handler = function(value)
           local errs = validator:validate(value)
           if errs then
-            last_errors = bounded_errors(errs)
-            return nil, INVALID_INPUT_PREFIX .. last_errors
+            state.last_errors = bounded_errors(errs)
+            return nil, INVALID_INPUT_PREFIX .. state.last_errors
           end
-          captured = value
+          state.captured = value
           return STRUCTURED_OUTPUT_ACK
         end,
       },
     }
   end
 
-  local permit = semaphore:acquire()
-
-  -- pcall so a raised error cannot leak the permit.
-  local ok, out = pcall(function()
-    local sess, sess_err = maki.agent.session(ctx, {
-      model_spec = model.spec,
-      system = system,
-      tools = tool_defs,
-      local_tools = local_tools,
-      audience = audience,
-      name = input.description,
-    })
-    if sess_err then
-      return { llm_output = sess_err, is_error = true }
-    end
-
-    local message = input.prompt
-    if validator then
-      message = message .. STRUCTURED_OUTPUT_PROMPT_SUFFIX
-    end
-
-    local result, err = sess:prompt(message)
-    local retries = 0
-    while not err and retries < MAX_NUDGES do
-      if validator and not captured then
-        retries = retries + 1
-        result, err = sess:prompt(NUDGE_MISSING)
-      elseif not validator and result.text == "" then
-        retries = retries + 1
-        result, err = sess:prompt(NUDGE_SUMMARY)
-      else
-        break
-      end
-    end
-
-    sess:close()
-
-    if err then
-      -- A result alongside the error means the run was cut short after
-      -- streaming some text, and half a transcript beats a bare error.
-      if result then
-        return {
-          llm_output = "sub-agent interrupted (" .. err .. "). Partial output:\n" .. result.text,
-          is_error = true,
-        }
-      end
-      return { llm_output = "sub-agent error: " .. err, is_error = true }
-    end
-    if validator and not captured then
-      local msg = last_errors and (STRUCTURED_INVALID_ERROR .. ":\n" .. last_errors) or STRUCTURED_MISSING_ERROR
-      return { llm_output = msg, is_error = true }
-    end
-    if not validator and result.text == "" then
-      return { llm_output = SUMMARY_MISSING_ERROR, is_error = true }
-    end
-    return { llm_output = captured and maki.json.encode(captured) or result.text, format = "markdown" }
-  end)
-
-  permit:release()
-  if not ok then
-    error(out, 0)
+  local message = input.prompt
+  if validator then
+    message = message .. STRUCTURED_OUTPUT_PROMPT_SUFFIX
   end
-  return out
+
+  local session_opts = {
+    model_spec = model.spec,
+    system = system,
+    tools = tool_defs,
+    local_tools = local_tools,
+    audience = audience,
+    name = input.description,
+  }
+
+  -- A backgrounded subagent must outlive this call and the turn that made
+  -- it, so it cannot be a child of this call's cancel token. Only possible
+  -- with a real session to tie it to; without one (headless/one-shot) it
+  -- falls back to the call-scoped default.
+  if input.background and sid then
+    session_opts.scope = { session = sid }
+  end
+
+  if not input.background then
+    local permit = semaphore:acquire()
+    local ok, out = pcall(function()
+      local sess, sess_err = maki.agent.session(ctx, session_opts)
+      if sess_err then
+        return { llm_output = sess_err, is_error = true }
+      end
+      return finish_subagent(sess, message, validator, state)
+    end)
+    permit:release()
+    if not ok then
+      error(out, 0)
+    end
+    return out
+  end
+
+  local permit = semaphore:acquire()
+  local sess, sess_err
+  local ok, raised = pcall(function()
+    sess, sess_err = maki.agent.session(ctx, session_opts)
+  end)
+  if not ok then
+    permit:release()
+    error(raised, 0)
+  end
+  if sess_err then
+    permit:release()
+    return { llm_output = sess_err, is_error = true }
+  end
+
+  bg_seq = bg_seq + 1
+  local task_id = (sid or "session") .. ":" .. bg_seq
+  local entry = { description = input.description, status = BG_WORKING, is_error = false }
+  bg_tasks[task_id] = entry
+
+  maki.async.run(function()
+    return finish_subagent(sess, message, validator, state)
+  end, {
+    deadline_ms = false,
+    on_finish = function(err, out)
+      permit:release()
+      if err then
+        entry.status, entry.is_error, entry.result = BG_ERROR, true, tostring(err)
+      elseif out.is_error then
+        entry.status, entry.is_error, entry.result = BG_ERROR, true, out.llm_output
+      else
+        entry.status, entry.result = BG_DONE, out.llm_output
+      end
+      notify_bg(task_id, entry, sid)
+    end,
+  })
+
+  return {
+    llm_output = "Background task "
+      .. task_id
+      .. " started ("
+      .. input.description
+      .. "). The outcome arrives as a message when it finishes; task_result fetches it, task_wait blocks for it.",
+    format = "markdown",
+    annotation = TASK_HANDOFF_ANNOTATION,
+  }
 end
 
 local function header(input)
@@ -266,4 +370,74 @@ maki.api.register_tool({
   handler = handler,
   header = header,
   restore = restore,
+})
+
+local task_id_schema = {
+  type = "object",
+  required = { "task_id" },
+  additionalProperties = false,
+  properties = {
+    task_id = {
+      type = "string",
+      description = "Task id from the background receipt.",
+    },
+  },
+}
+
+maki.api.register_tool({
+  name = "task_result",
+  description = "Fetch the status or final output of a background task launched with the task tool (`background = true`).",
+  kind = "read",
+  audiences = { "main", "workflow" },
+  schema = task_id_schema,
+  handler = function(input, _ctx)
+    local entry = bg_tasks[input.task_id]
+    if not entry then
+      return { llm_output = BG_UNKNOWN_ID_PREFIX .. input.task_id, is_error = true }
+    end
+    return task_output(entry, input.task_id)
+  end,
+})
+
+maki.api.register_tool({
+  name = "task_wait",
+  description = "Block until a background task finishes or the timeout passes. Returns the result when done, a still-working note on timeout.",
+  kind = "read",
+  audiences = { "main", "workflow" },
+  schema = {
+    type = "object",
+    required = { "task_id" },
+    additionalProperties = false,
+    properties = {
+      task_id = {
+        type = "string",
+        description = "Task id from the background receipt.",
+      },
+      timeout_ms = {
+        type = "integer",
+        description = "Maximum wait in milliseconds (default 60000, cap 600000).",
+      },
+    },
+  },
+  handler = function(input, _ctx)
+    local entry = bg_tasks[input.task_id]
+    if not entry then
+      return { llm_output = BG_UNKNOWN_ID_PREFIX .. input.task_id, is_error = true }
+    end
+    local timeout_ms = input.timeout_ms or BG_WAIT_DEFAULT_MS
+    if timeout_ms < 1 then
+      return { llm_output = BG_WAIT_MIN_ERR, is_error = true }
+    end
+    timeout_ms = math.min(timeout_ms, BG_WAIT_MAX_MS)
+    local waited = 0
+    while entry.status == BG_WORKING and waited < timeout_ms do
+      local tick = math.min(BG_TICK_MS, timeout_ms - waited)
+      maki.async.sleep(tick)
+      waited = waited + tick
+    end
+    if entry.status == BG_WORKING then
+      return { llm_output = "task " .. input.task_id .. " still working after " .. timeout_ms .. "ms" }
+    end
+    return task_output(entry, input.task_id)
+  end,
 })

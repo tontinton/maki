@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
 use maki_agent::agent::tool_dispatch;
-use maki_agent::cancel::{CancelMap, CancelSlot};
+use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
@@ -26,7 +26,7 @@ use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{ContentBlock, Model, ModelError, Role, ThinkingConfig, TokenUsage, add_cost};
-use maki_storage::id::MakiId;
+use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::StoredThinking;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
@@ -41,6 +41,8 @@ use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
+const SCOPE_TABLE_ERR: &str = "scope must be { session = \"<id>\" }";
+const SCOPE_SESSION_MISMATCH_ERR: &str = "scope.session must be the caller's own session id";
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
     let Some(tier_str) = tier else {
@@ -430,6 +432,13 @@ async fn call_tool(
 ///     `"max"`), or a budget integer (token count). Inherits parent setting
 ///     if omitted.
 ///   `fast` (boolean?) - use fast mode. Inherits parent setting if omitted.
+///   `scope` (table?) - `{ session = "<id>" }` detaches the session from the
+///     call that spawned it: it survives the call returning and the turn
+///     ending, instead of being cancelled the moment either does. `<id>`
+///     must be the caller's own session (`ctx:session_id()`). Only cancel-all
+///     and a targeted cancel of this session's tool call id can stop it from
+///     here on; keep the returned handle (or its id) if you need to reach it
+///     later. Omit for the default: tied to the call that spawned it.
 /// @return (Session?, string?) Session handle, or `(nil, err)` on failure.
 /// @example
 /// local tools = maki.agent.tools(ctx, { audience = "general_sub" })
@@ -449,6 +458,24 @@ async fn session(
 ) -> LuaResult<Pair<mlua::AnyUserData>> {
     let agent_ctx = try_pair!(dispatch_ctx(&ctx, "session")).clone();
     drop(ctx);
+    let detached: bool = match opts.get::<LuaValue>("scope")? {
+        LuaValue::Nil => false,
+        LuaValue::Table(scope) => {
+            let Ok(LuaValue::String(raw)) = scope.get::<LuaValue>("session") else {
+                return Ok(err_pair(SCOPE_TABLE_ERR));
+            };
+            let session: MakiId = try_pair!(
+                raw.to_str()?
+                    .parse()
+                    .map_err(|e: maki_storage::id::MakiIdParseError| e.to_string())
+            );
+            if agent_ctx.session_id.as_ref().map(SessionRef::id) != Some(session) {
+                return Ok(err_pair(SCOPE_SESSION_MISMATCH_ERR));
+            }
+            true
+        }
+        _ => return Ok(err_pair(SCOPE_TABLE_ERR)),
+    };
     let model_spec: Option<String> = opts.get("model_spec")?;
     let system: Option<String> = opts.get("system")?;
     let tools_val: Option<LuaValue> = opts.get("tools")?;
@@ -571,7 +598,14 @@ async fn session(
         .tool_use_id
         .clone()
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
-    let (child_trigger, child_cancel) = agent_ctx.cancel.child();
+    // A detached child stands on its own token instead of the caller's: it
+    // must outlive the call (and the turn) that spawned it, only stopped by
+    // a targeted cancel or cancel-all from here on.
+    let (child_trigger, child_cancel) = if detached {
+        CancelToken::new()
+    } else {
+        agent_ctx.cancel.child()
+    };
     // Several sessions can share one `ui_id`, so keep the slot and retire
     // only ours on close instead of clearing the whole key.
     let cancel_slot = agent_ctx
@@ -757,7 +791,7 @@ struct SessionState {
 }
 
 impl SessionState {
-    fn close(&mut self) {
+    fn close(&mut self, failed: bool) {
         if self.closed {
             return;
         }
@@ -767,6 +801,7 @@ impl SessionState {
         let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
             tool_use_id: self.ui_id.clone(),
             messages,
+            failed,
         });
         info!(
             name = %self.name,
@@ -785,12 +820,12 @@ struct LuaSession {
 impl Drop for LuaSession {
     fn drop(&mut self) {
         match self.inner.try_lock() {
-            Some(mut s) => s.close(),
+            Some(mut s) => s.close(false),
             // Prompt still in flight: close asynchronously so history
             // and cancel entry are never silently leaked.
             None => {
                 let inner = Arc::clone(&self.inner);
-                smol::spawn(async move { inner.lock().await.close() }).detach();
+                smol::spawn(async move { inner.lock().await.close(false) }).detach();
             }
         }
     }
@@ -932,13 +967,18 @@ async fn prompt(
 /// call this multiple times safely. If you forget, it runs automatically when
 /// the session is garbage collected.
 ///
+/// @param err string? Pass the failure reason when the run failed, so the session's UI item ends as errored even without a following tool result.
 /// @return
 #[lua_fn]
-async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> {
+async fn close(
+    _lua: Lua,
+    this: mlua::UserDataRef<LuaSession>,
+    err: Option<String>,
+) -> LuaResult<()> {
     let inner = Arc::clone(&this.inner);
     drop(this);
     let mut s = inner.lock().await;
-    s.close();
+    s.close(err.is_some());
     Ok(())
 }
 

@@ -1380,6 +1380,7 @@ pub(crate) fn close_subagent_transcript(app: &mut App, id: &str) {
     app.update(agent_msg(AgentEvent::SubagentHistory {
         tool_use_id: id.into(),
         messages: vec![],
+        failed: false,
     }));
 }
 
@@ -1390,6 +1391,19 @@ pub(crate) fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
         output: Arc::new(ToolOutput::Plain("result".into())),
         is_error,
         annotation: None,
+        written_path: None,
+    }))));
+}
+
+/// The receipt of a backgrounded `task` call: the tool call ends while the
+/// subagent keeps running.
+fn handoff_subagent(app: &mut App, id: &str) {
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: id.into(),
+        tool: "task".into(),
+        output: ToolOutput::Plain("receipt".into()),
+        is_error: false,
+        annotation: Some(maki_agent::tools::TASK_HANDOFF_ANNOTATION.into()),
         written_path: None,
     }))));
 }
@@ -1490,6 +1504,105 @@ fn tasks_report_main_chat_then_subagent_outcomes() {
             { "id": "task3", "name": "deploy", "status": "working", "focused": false },
         ])
     );
+}
+
+/// A background handoff must keep the item working across turn ends and
+/// late envelopes, with the close verdict as the only terminal signal.
+#[test]
+fn handoff_keeps_the_subagent_working_past_the_tool_call() {
+    let mut app = app_with_subagent();
+    handoff_subagent(&mut app, TASK_ID);
+    assert!(!app.chats[1].is_finished(), "handoff must not terminalize");
+
+    end_turn(&mut app);
+    assert!(
+        !app.chats[1].is_finished(),
+        "turn end must spare a detached chat"
+    );
+    assert!(
+        app.chat_index.contains_key(TASK_ID),
+        "detached chat must stay routable"
+    );
+
+    start_subagent(&mut app, TASK_ID, RESEARCH_NAME);
+    assert_eq!(
+        app.chats.len(),
+        2,
+        "late envelopes must reuse the same chat"
+    );
+
+    app.update(agent_msg(AgentEvent::SubagentHistory {
+        tool_use_id: TASK_ID.into(),
+        messages: vec![],
+        failed: false,
+    }));
+    assert!(app.chats[1].is_finished());
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    assert_eq!(tasks[1]["status"], serde_json::json!("done"));
+}
+
+#[test]
+fn handoff_failure_lands_as_error_at_close() {
+    let mut app = app_with_subagent();
+    handoff_subagent(&mut app, TASK_ID);
+    app.update(agent_msg(AgentEvent::SubagentHistory {
+        tool_use_id: TASK_ID.into(),
+        messages: vec![],
+        failed: true,
+    }));
+    assert!(app.chats[1].is_finished());
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    assert_eq!(tasks[1]["status"], serde_json::json!("error"));
+}
+
+#[test]
+fn handoff_receipt_before_the_first_envelope_still_detaches() {
+    let mut app = streaming_app();
+    handoff_subagent(&mut app, TASK_ID);
+
+    start_subagent(&mut app, TASK_ID, RESEARCH_NAME);
+    assert_eq!(app.chats.len(), 2);
+    assert!(
+        app.chats[1].is_detached(),
+        "a chat born after the receipt must inherit the handoff"
+    );
+
+    end_turn(&mut app);
+    assert!(
+        !app.chats[1].is_finished() && app.chat_index.contains_key(TASK_ID),
+        "turn end must spare a chat detached from a parked receipt"
+    );
+
+    app.update(agent_msg(AgentEvent::SubagentHistory {
+        tool_use_id: TASK_ID.into(),
+        messages: vec![],
+        failed: false,
+    }));
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    assert_eq!(tasks[1]["status"], serde_json::json!("done"));
+}
+
+#[test]
+fn close_verdict_lands_after_the_spawning_run_goes_stale() {
+    let mut app = streaming_app();
+    handoff_subagent(&mut app, TASK_ID);
+    start_subagent(&mut app, TASK_ID, RESEARCH_NAME);
+    end_turn(&mut app);
+
+    // The session closes minutes later, long after newer runs moved the
+    // current run id on; the stale-run gate must not eat the close.
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentHistory {
+            tool_use_id: TASK_ID.into(),
+            messages: vec![],
+            failed: false,
+        },
+        subagent: None,
+        run_id: app.run_id + 7,
+    })));
+    assert!(app.chats[1].is_finished());
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    assert_eq!(tasks[1]["status"], serde_json::json!("done"));
 }
 
 /// Escaping out of a subagent takes the single-chat cancel path instead of the
@@ -4351,6 +4464,7 @@ fn subagent_history_finishes_workflow_chat() {
         AgentEvent::SubagentHistory {
             tool_use_id: "session-abc".into(),
             messages: vec![],
+            failed: false,
         },
         1,
     ));

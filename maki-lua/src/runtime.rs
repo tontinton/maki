@@ -93,7 +93,7 @@ const CANCEL_ABANDON_AFTER: Duration = Duration::from_secs(5);
 const OPT_LEVEL_JIT: u8 = 2;
 const OPT_LEVEL_DEBUGGABLE: u8 = 1;
 const DEBUG_INFO_FULL: u8 = 2;
-const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
+pub(crate) const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
 /// Async tasks spawned during restore may spawn further tasks; cap the rounds.
 const RESTORE_SPAWN_ROUNDS: usize = 8;
 /// Keeps a buggy plugin's restore task from freezing the lua loop.
@@ -1381,7 +1381,12 @@ pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Opti
     lock_cell(&handle).live.as_ref().map(f)
 }
 
-pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
+/// A `deadline` of `None` removes the cap entirely, for genuinely long work.
+pub(crate) fn enqueue_async_task_deadline(
+    lua: &Lua,
+    work_fn: RegistryKey,
+    deadline: Option<Duration>,
+) -> Result<(), mlua::Error> {
     let handle = lua.app_data_ref::<TaskHandle>();
     let (cancel, live_ctx, command_depth) = match &handle {
         Some(h) => {
@@ -1394,7 +1399,7 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
     let mut task = PendingAsyncTask {
         work_fn,
         cancel,
-        deadline: Some(Instant::now() + ASYNC_RUN_DEFAULT_DEADLINE),
+        deadline: deadline.map(|d| Instant::now() + d),
         live_ctx,
         owner: None,
         command_depth,
@@ -4159,6 +4164,10 @@ mod tests {
         lua.create_registry_value(func).unwrap()
     }
 
+    fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
+        enqueue_async_task_deadline(lua, work_fn, Some(ASYNC_RUN_DEFAULT_DEADLINE))
+    }
+
     fn set_active(lua: &Lua, cell: TaskCell) -> TaskScope {
         TaskScope::new(lua, cell)
     }
@@ -4260,6 +4269,58 @@ mod tests {
         assert!(
             task_deadline > before,
             "async task should get a fresh deadline, not inherit expired parent"
+        );
+    }
+
+    fn run_table_lua() -> Lua {
+        let lua = enqueue_test_lua();
+        let tbl = crate::api::r#async::create_async_table(&lua).unwrap();
+        lua.globals().set("async_tbl", tbl).unwrap();
+        lua
+    }
+
+    #[test]
+    fn async_run_defaults_to_the_sixty_second_deadline() {
+        let lua = run_table_lua();
+        lua.load("async_tbl.run(function() end)").exec().unwrap();
+
+        let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
+        let deadline = queue.rx.try_recv().unwrap().deadline.unwrap();
+        let left = deadline.duration_since(Instant::now());
+        assert!(
+            left <= ASYNC_RUN_DEFAULT_DEADLINE
+                && left >= ASYNC_RUN_DEFAULT_DEADLINE - Duration::from_secs(1),
+            "default deadline should be about 60s, got {left:?}"
+        );
+    }
+
+    #[test]
+    fn async_run_honors_deadline_override() {
+        let lua = run_table_lua();
+        lua.load("async_tbl.run(function() end, { deadline_ms = 5000 })")
+            .exec()
+            .unwrap();
+
+        let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
+        let deadline = queue.rx.try_recv().unwrap().deadline.unwrap();
+        let left = deadline.duration_since(Instant::now());
+        assert!(
+            left <= Duration::from_secs(5) && left >= Duration::from_secs(4),
+            "deadline override should be about 5s, got {left:?}"
+        );
+    }
+
+    #[test]
+    fn async_run_false_deadline_clears_the_cap() {
+        let lua = run_table_lua();
+        lua.load("async_tbl.run(function() end, { deadline_ms = false })")
+            .exec()
+            .unwrap();
+
+        let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
+        assert!(
+            queue.rx.try_recv().unwrap().deadline.is_none(),
+            "deadline_ms = false must remove the cap"
         );
     }
 
