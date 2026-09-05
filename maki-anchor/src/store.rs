@@ -1112,7 +1112,10 @@ mod tests {
         let id = store
             .register_instance("host-a", &hash_token("reg"))
             .unwrap();
-        assert!(store.live_control_link(id).unwrap().is_none(), "no link yet");
+        assert!(
+            store.live_control_link(id).unwrap().is_none(),
+            "no link yet"
+        );
         store
             .create_link("ctl-live", id, None, "controller", Duration::from_secs(60))
             .unwrap();
@@ -1120,7 +1123,13 @@ mod tests {
             .create_link("ctl-dead", id, None, "controller", Duration::ZERO)
             .unwrap();
         store
-            .create_link("scoped", id, Some("s1"), "controller", Duration::from_secs(60))
+            .create_link(
+                "scoped",
+                id,
+                Some("s1"),
+                "controller",
+                Duration::from_secs(60),
+            )
             .unwrap();
         store
             .create_link("viewer", id, None, "viewer", Duration::from_secs(60))
