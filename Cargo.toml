@@ -38,7 +38,6 @@ isahc = { workspace = true }
 thiserror = { workspace = true }
 libc = { workspace = true }
 uuid = { workspace = true }
-fast_qr = { version = "0.14", features = ["svg"] }
 flume = { workspace = true }
 open = { workspace = true }
 

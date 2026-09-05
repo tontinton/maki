@@ -1106,6 +1106,35 @@ mod tests {
     }
 
     #[test]
+    fn live_control_link_survives_traffic_and_dies_on_revoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        let id = store
+            .register_instance("host-a", &hash_token("reg"))
+            .unwrap();
+        assert!(store.live_control_link(id).unwrap().is_none(), "no link yet");
+        store
+            .create_link("ctl-live", id, None, "controller", Duration::from_secs(60))
+            .unwrap();
+        store
+            .create_link("ctl-dead", id, None, "controller", Duration::ZERO)
+            .unwrap();
+        store
+            .create_link("scoped", id, Some("s1"), "controller", Duration::from_secs(60))
+            .unwrap();
+        store
+            .create_link("viewer", id, None, "viewer", Duration::from_secs(60))
+            .unwrap();
+        let live = store.live_control_link(id).unwrap().expect("the live one");
+        assert_eq!(live.token, "ctl-live", "scoped and viewer links stay out");
+        store.revoke_link(&hash_token("ctl-live")).unwrap();
+        assert!(
+            store.live_control_link(id).unwrap().is_none(),
+            "revocation ends the reuse"
+        );
+    }
+
+    #[test]
     fn create_instance_refuses_existing_names() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
