@@ -735,6 +735,9 @@ impl<'t> EventLoop<'t> {
             let actions = self.focused_app().handle_submit(sub);
             self.dispatch(self.focused, actions);
         }
+        if self.ctx.remote_control.auto_start {
+            self.handle_remote_control(None);
+        }
         // The first frame always paints. After that only a poller, an event or
         // an animation tick owes another.
         let mut dirty = Dirty::YES;

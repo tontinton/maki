@@ -670,11 +670,12 @@ pub struct RemoteControlFileConfig {
     pub domain: Option<String>,
     pub port: Option<u16>,
     pub bind: Option<String>,
+    pub auto_start: Option<bool>,
 }
 
 impl RemoteControlFileConfig {
     fn merge(&mut self, overlay: RemoteControlFileConfig) {
-        merge_option!(self, overlay, domain, port, bind);
+        merge_option!(self, overlay, domain, port, bind, auto_start);
     }
 }
 
@@ -1481,6 +1482,12 @@ pub struct RemoteControlConfig {
 
     #[config(default = DEFAULT_REMOTE_CONTROL_BIND.to_owned(), desc = "Address to bind the control server to: `127.0.0.1` when the reverse proxy runs on this machine (the safe default), `0.0.0.0` only when it runs elsewhere")]
     pub bind: String,
+
+    #[config(
+        default = false,
+        desc = "Run `/rc` automatically at startup, so every session is remote from the first frame. Needs `domain` (standalone) or a complete `anchor` section, like `/rc` itself"
+    )]
+    pub auto_start: bool,
 }
 
 impl RemoteControlConfig {
@@ -1491,6 +1498,7 @@ impl RemoteControlConfig {
             bind: f
                 .bind
                 .unwrap_or_else(|| DEFAULT_REMOTE_CONTROL_BIND.to_owned()),
+            auto_start: f.auto_start.unwrap_or(false),
         }
     }
 }
@@ -2631,12 +2639,14 @@ mod tests {
         assert_eq!(defaults.remote_control.domain, None);
         assert_eq!(defaults.remote_control.port, DEFAULT_REMOTE_CONTROL_PORT);
         assert_eq!(defaults.remote_control.bind, DEFAULT_REMOTE_CONTROL_BIND);
+        assert!(!defaults.remote_control.auto_start);
 
         let raw_with = |domain: &str| RawConfig {
             remote_control: RemoteControlFileConfig {
                 domain: Some(domain.into()),
                 port: Some(RC_CUSTOM_PORT),
                 bind: Some(RC_CUSTOM_BIND.into()),
+                auto_start: Some(true),
             },
             ..Default::default()
         };
@@ -2648,6 +2658,7 @@ mod tests {
         assert_eq!(rc.domain.as_deref(), Some(RC_PROJECT_DOMAIN));
         assert_eq!(rc.port, RC_CUSTOM_PORT);
         assert_eq!(rc.bind, RC_CUSTOM_BIND);
+        assert!(rc.auto_start);
     }
 
     #[test]
@@ -2685,6 +2696,7 @@ mod tests {
                 domain: None,
                 port: 0,
                 bind: DEFAULT_REMOTE_CONTROL_BIND.to_owned(),
+                auto_start: false,
             },
             telemetry: TelemetryConfig::default(),
             permissions: PermissionsConfig::default(),

@@ -26,6 +26,7 @@ fn test_config() -> RemoteControlConfig {
         // restarts never contend.
         port: 0,
         bind: "127.0.0.1".into(),
+        auto_start: false,
     }
 }
 
