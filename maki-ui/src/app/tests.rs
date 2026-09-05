@@ -5386,16 +5386,71 @@ fn rc_bare_command_yields_none_arg_for_config_default() {
 #[test]
 fn remote_prompt_submits_like_typed() {
     let mut app = test_app();
-    app.submit_remote_prompt(RC_REMOTE_PROMPT.into()).unwrap();
+    app.submit_remote_prompt(RC_REMOTE_PROMPT.into(), vec![])
+        .unwrap();
     assert_eq!(app.status, Status::Streaming);
     assert!(app.run_id > 0, "run started");
+}
+
+/// A saved upload lands in the session directory under a clean name and
+/// stops collisions by suffixing.
+#[test]
+fn save_upload_writes_scrubbed_unique_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = super::save_upload(dir.path(), "sub/dir:notes*.md", b"see here").unwrap();
+    assert_eq!(path.display().to_string(), "dir_notes_.md");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("dir_notes_.md")).unwrap(),
+        "see here"
+    );
+    super::save_upload(dir.path(), "notes.md", b"x").unwrap();
+    let again = super::save_upload(dir.path(), "notes.md", b"y").unwrap();
+    assert_eq!(again.display().to_string(), "notes(1).md", "no clobbering");
+}
+
+/// An attached upload starts the run like any prompt; a non-image attach is
+/// refused by name.
+#[test]
+fn remote_prompt_accepts_image_uploads() {
+    use maki_remote::{RemoteFile, UploadMode};
+    let mut app = test_app();
+    let outcome = app.submit_remote_prompt(
+        "look".into(),
+        vec![RemoteFile {
+            name: "shot.png".into(),
+            media_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+            mode: UploadMode::Attach,
+        }],
+    );
+    assert!(outcome.is_ok(), "png attaches");
+    assert_eq!(app.status, Status::Streaming);
+}
+
+#[test]
+fn remote_prompt_rejects_non_image_attach_uploads() {
+    use maki_remote::{RemoteFile, UploadMode};
+    let mut app = test_app();
+    let err = app
+        .submit_remote_prompt(
+            "x".into(),
+            vec![RemoteFile {
+                name: "movie.mp4".into(),
+                media_type: "video/mp4".into(),
+                data: "AAA=".into(),
+                mode: UploadMode::Attach,
+            }],
+        )
+        .err()
+        .expect("a video cannot ride the image path");
+    assert!(err.contains("movie.mp4"), "names the offender: {err}");
 }
 
 #[test]
 fn remote_prompt_rejects_empty() {
     let mut app = test_app();
     let err = app
-        .submit_remote_prompt("   ".into())
+        .submit_remote_prompt("   ".into(), vec![])
         .err()
         .expect("empty prompt rejected");
     assert_eq!(err, EMPTY_PROMPT_ERR);
@@ -5451,7 +5506,7 @@ fn remote_permission_answer_routes_and_closes() {
         vec![],
         None,
     );
-    app.submit_remote_prompt("hi".into()).unwrap();
+    app.submit_remote_prompt("hi".into(), vec![]).unwrap();
     app.answer_remote_permission(RC_REQUEST_ID, "allow")
         .expect("answer accepted");
     assert!(!app.permission_prompt.is_open());

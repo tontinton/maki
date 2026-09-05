@@ -10,10 +10,33 @@ pub(crate) const INDEX_HTML: &str = include_str!("index.html");
 
 /// How long a POST waits for the event loop to confirm it handled the
 /// request. The loop only flips state or forwards, so this is generous.
-const MAX_BODY_BYTES: usize = 1 << 20;
+/// Prompt bodies carry base64 uploads: ~6MB of files fit with headroom.
+const MAX_BODY_BYTES: usize = 32 << 20;
 const TOKEN_BYTES: usize = 16;
 /// `2 * TOKEN_BYTES` hex chars: 128 bits of entropy, the only gate.
 const TOKEN_LEN: usize = 2 * TOKEN_BYTES;
+
+/// A browser upload riding on a prompt.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RemoteFile {
+    pub name: String,
+    #[serde(default)]
+    pub media_type: String,
+    /// Standard-alphabet base64 of the bytes.
+    pub data: String,
+    /// `attach` feeds images to the model; `save` writes into the session's
+    /// working directory and references the path in the prompt.
+    #[serde(default)]
+    pub mode: UploadMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UploadMode {
+    #[default]
+    Attach,
+    Save,
+}
 
 /// One pending action the event loop must perform, answered over `reply`.
 /// `session` selects a tab by id; `None` means the focused one.
@@ -22,6 +45,7 @@ pub enum RemoteRequest {
     Prompt {
         session: Option<String>,
         text: String,
+        files: Vec<RemoteFile>,
         reply: Sender<Result<(), String>>,
     },
     Answer {
@@ -188,24 +212,22 @@ impl RemoteServer {
         &self,
         path: &str,
         method: &Method,
-    ) -> (Option<String>, Option<crate::dispatch::Route>) {
+    ) -> (Option<String>, Option<crate::dispatch::Route>, String) {
         let Some(rest) = path.strip_prefix('/') else {
-            return (None, None);
+            return (None, None, String::new());
         };
         let (token, tail) = match rest.split_once('/') {
             Some((token, tail)) => (token, tail),
             None => (rest, ""),
         };
-        // A query string is not part of the path.
-        let tail = tail.split('?').next().unwrap_or(tail);
         if !constant_time_eq(token.as_bytes(), &self.token) {
-            return (None, None);
+            return (None, None, String::new());
         }
         crate::dispatch::parse_tail(tail, method.as_str())
     }
 
     fn handle(&self, mut request: tiny_http::Request) {
-        let (session, route) = self.route(request.url(), request.method());
+        let (session, route, query) = self.route(request.url(), request.method());
         let body = if reads_body(route) {
             match read_body(&mut request) {
                 Ok(body) => body,
@@ -217,7 +239,7 @@ impl RemoteServer {
         } else {
             String::new()
         };
-        match self.dispatcher.dispatch(route, session, &body) {
+        match self.dispatcher.dispatch(route, session, &query, &body) {
             crate::dispatch::DispatchOutcome::NotFound => {
                 let _ = request.respond(Response::empty(404));
             }
@@ -236,6 +258,10 @@ impl RemoteServer {
                     .name("remote-control-sse".into())
                     .spawn(move || serve_events(request, &mut source))
                     .expect("spawn SSE thread");
+            }
+            crate::dispatch::DispatchOutcome::Svg(body) => {
+                let response = Response::from_data(body).with_header(content_type("image/svg+xml"));
+                let _ = request.respond(response);
             }
             crate::dispatch::DispatchOutcome::Posted(status, error) => {
                 let body = match error {
@@ -444,23 +470,10 @@ mod tests {
             ("//events", get, None, None),
         ];
         for (path, method, session, route) in cases {
-            let (got_session, got_route) = server.route(path, method);
+            let (got_session, got_route, _query) = server.route(path, method);
             assert_eq!(&got_session.as_deref(), session, "path {path}");
             assert_eq!(&got_route, route, "path {path}");
         }
-    }
-
-    #[test]
-    fn prompt_body_parses_text_field() {
-        assert_eq!(
-            crate::dispatch::parse_json_field(r#"{"text":"hi"}"#, "text"),
-            Some("hi".into())
-        );
-        assert_eq!(
-            crate::dispatch::parse_json_field(r#"{"text":42}"#, "text"),
-            None
-        );
-        assert_eq!(crate::dispatch::parse_json_field("not json", "text"), None);
     }
 
     #[test]

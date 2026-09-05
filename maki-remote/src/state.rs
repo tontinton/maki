@@ -146,6 +146,20 @@ impl RemoteState {
             .count()
     }
 
+    /// Who is attached right now, grouped by tab. `None` keys the unscoped
+    /// viewers that can flip tabs at will.
+    pub fn viewers_by_session(&self) -> Vec<(Option<String>, usize)> {
+        let subs = self.inner.updates.load();
+        let mut grouped: Vec<(Option<String>, usize)> = Vec::new();
+        for sub in subs.iter() {
+            match grouped.iter_mut().find(|(s, _)| *s == sub.session) {
+                Some((_, n)) => *n += 1,
+                None => grouped.push((sub.session.clone(), 1)),
+            }
+        }
+        grouped
+    }
+
     /// Any browser attached at all, on any tab.
     pub fn has_viewers(&self) -> bool {
         !self.inner.updates.load().is_empty()

@@ -24,6 +24,7 @@ arboard = { workspace = true }
 jiff = { workspace = true }
 smol = { workspace = true }
 flume = { workspace = true }
+fast_qr = { workspace = true }
 async-lock = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }

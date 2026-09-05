@@ -84,14 +84,21 @@ To make every session remote from launch without typing `/rc`, set
 `remote_control = { auto_start = true }` in `maki.setup`.
 
 If the link drops (an anchor restart, a network blip), the client reconnects on
-its own with a capped backoff and flashes the new URL when it lands. The
-status bar shows `remote` while the link is up, and `remote·N` while N browsers
-watch that tab.
+its own with a capped backoff and re-registers under the same URL. The status
+bar shows `remote` while the link is up, and `remote·N` while N browsers watch
+that tab.
+
+`/rc` in the TUI speaks three verbs: bare `/rc` starts the link, or reports it
+(URL, QR, watchers per tab) when one is already running; `/rc off` disconnects
+and keeps the link alive for the next start; `/rc down` disconnects and has the
+anchor revoke the link, so shared URLs stop working immediately.
 
 ## Share links
 
-Every tunnel gets a fresh control link when it connects. Traffic and
-keepalives slide its expiry forward, so it stays valid while the tunnel lives.
+Every tunnel registers under a control link. Reconnects and repeated `/rc`
+calls reuse the still-live link, so one URL survives anchor restarts and
+client flaps. Traffic and keepalives slide its expiry forward, so it stays
+valid while the tunnel lives.
 You can also mint links by hand:
 
 ```
@@ -122,6 +129,20 @@ to becopied from scrollback.
 | `/admin` | Users, grants, mint policy (admins only) |
 
 Non-admins see the pages filtered to instances they hold a grant for.
+
+## The remote session page
+
+Beyond the transcript, the page (both anchor and standalone) carries a control
+center under the top-left menu: live watcher counts per tab, and, for anchor
+users with a controller grant on the instance, invite links (mint and revoke)
+plus a button to close the current link. Callers without a login just see
+watchers.
+
+The composer takes uploads: a `+` button attaches images to the next prompt
+for vision models, or saves any file into the session's working directory and
+tells the agent where it landed. Each chip toggles between the two modes.
+`/rc` and the link pages render the share URL as a QR, scannable straight off
+the terminal.
 
 ## Login and roles
 

@@ -28,6 +28,7 @@ const REMOTE_TUNNEL_STOPPED: &str = "remote control stopped";
 pub(crate) enum RemoteControl {
     Standalone {
         server: Arc<RemoteServer>,
+        url: String,
     },
     Tunnel {
         state: maki_remote::RemoteState,
@@ -101,7 +102,13 @@ impl RemoteControl {
                 .name("remote-control".into())
                 .spawn(move || thread_server.serve())
                 .map_err(|e| color_eyre::eyre::eyre!("remote control thread: {e}"))?;
-            Ok((Self::Standalone { server }, url))
+            Ok((
+                Self::Standalone {
+                    server,
+                    url: url.clone(),
+                },
+                url,
+            ))
         }
     }
 
@@ -112,7 +119,7 @@ impl RemoteControl {
     /// attached and `/rc off` actually tears it down.
     fn stop(&self) {
         match self {
-            Self::Standalone { server } => server.shutdown(),
+            Self::Standalone { server, .. } => server.shutdown(),
             Self::Tunnel { shutdown, .. } => shutdown.store(true, Ordering::Relaxed),
         }
     }
@@ -121,6 +128,18 @@ impl RemoteControl {
         match self {
             Self::Standalone { .. } => false,
             Self::Tunnel { thread_done, .. } => thread_done.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Stop, but first ship a revoke request for the tunnel's link so the
+    /// anchor kills the URL instead of letting it expire on its own.
+    fn stop_revoke(&self, token: &str) {
+        match self {
+            Self::Standalone { server, .. } => server.shutdown(),
+            Self::Tunnel { out, shutdown, .. } => {
+                let _ = out.send(TunnelOut::Push(serde_json::json!({ "link_revoke": token })));
+                shutdown.store(true, Ordering::Relaxed);
+            }
         }
     }
 
@@ -174,6 +193,9 @@ pub(crate) struct RemoteSlot {
     link_up: bool,
     /// Whether a link has flashed this session, to word reconnect notices.
     link_shown: bool,
+    /// The anchor's latest link, kept so `/rc down` can ask for its revocation.
+    link_token: Option<String>,
+    link_url: Option<String>,
 }
 
 impl RemoteSlot {
@@ -186,6 +208,8 @@ impl RemoteSlot {
             last_pushed_index: None,
             link_up: false,
             link_shown: false,
+            link_token: None,
+            link_url: None,
         }
     }
 
@@ -193,8 +217,18 @@ impl RemoteSlot {
         self.control.is_some()
     }
 
-    /// Starts (or restarts) the server. Returns the public URL to flash.
-    /// A fresh token is minted every start.
+    /// The URL browsers should open: the standalone bind URL, or the anchor
+    /// link once one has landed (None while the tunnel is still coming up).
+    pub(crate) fn url(&self) -> Option<String> {
+        match &self.control {
+            None => None,
+            Some(RemoteControl::Standalone { url, .. }) => Some(url.clone()),
+            Some(RemoteControl::Tunnel { .. }) => self.link_url.clone(),
+        }
+    }
+
+    /// Starts the server, or reports when already running (callers check
+    /// first). Returns the public URL or placeholder to flash.
     pub(crate) fn start(
         &mut self,
         config: &RemoteControlConfig,
@@ -206,24 +240,38 @@ impl RemoteSlot {
         self.last_pushed_index = None;
         self.link_up = false;
         self.link_shown = false;
+        self.link_token = None;
+        self.link_url = None;
         let (control, url) = RemoteControl::start(config, anchor, self.requests_tx.clone())?;
         self.control = Some(control);
         Ok(url)
     }
 
-    /// Stops the server. Returns whether one was running.
-    pub(crate) fn stop(&mut self) -> bool {
+    /// Stops the server. `revoke` (`/rc down`) also kills the anchor link so
+    /// shared URLs stop working immediately; plain off keeps it for the next
+    /// `/rc`. Returns whether one was running.
+    pub(crate) fn stop(&mut self, revoke: bool) -> bool {
         let Some(old) = self.control.take() else {
             return false;
         };
-        old.stop();
+        if revoke {
+            match &self.link_token {
+                Some(token) => old.stop_revoke(token),
+                None => old.stop(),
+            }
+        } else {
+            old.stop();
+        }
+        self.link_up = false;
+        self.link_token = None;
+        self.link_url = None;
         true
     }
 
     /// The live fan-out hub, or nothing while remote control is off.
     pub(crate) fn state(&self) -> Option<maki_remote::RemoteState> {
         self.control.as_ref().map(|c| match c {
-            RemoteControl::Standalone { server } => server.state().clone(),
+            RemoteControl::Standalone { server, .. } => server.state().clone(),
             RemoteControl::Tunnel { state, .. } => state.clone(),
         })
     }
@@ -252,11 +300,11 @@ impl RemoteSlot {
         let happen = match control.poll() {
             Some(TunnelReport::Link(token)) => {
                 self.link_up = true;
+                self.link_token = Some(token.clone());
                 let reconnected = std::mem::replace(&mut self.link_shown, true);
-                Some(TunnelHappen::Link {
-                    url: control.full_link_url(&token),
-                    reconnected,
-                })
+                let url = control.full_link_url(&token);
+                self.link_url = Some(url.clone());
+                Some(TunnelHappen::Link { url, reconnected })
             }
             Some(TunnelReport::Lost(message)) => {
                 self.link_up = false;
@@ -347,8 +395,10 @@ fn handle_request(
     sessions_value: &serde_json::Value,
 ) -> Vec<Action> {
     let outcome: Result<Vec<Action>, String> = match request {
-        RemoteRequest::Prompt { text, reply, .. } => {
-            let outcome = app.submit_remote_prompt(text);
+        RemoteRequest::Prompt {
+            text, files, reply, ..
+        } => {
+            let outcome = app.submit_remote_prompt(text, files);
             let _ = reply.send(outcome.as_ref().map(|_| ()).map_err(Clone::clone));
             outcome
         }
@@ -455,6 +505,7 @@ mod tests {
             RemoteRequest::Prompt {
                 session: Some("dead".into()),
                 text: "hi".into(),
+                files: vec![],
                 reply: tx,
             },
             rx,
@@ -500,12 +551,17 @@ mod tests {
 
     #[test]
     fn stop_on_a_fresh_slot_reports_nothing_was_running() {
-        assert!(!RemoteSlot::new().stop());
+        assert!(!RemoteSlot::new().stop(false));
     }
 
-    fn tunnel_slot() -> (RemoteSlot, flume::Sender<TunnelReport>, Arc<AtomicBool>) {
+    fn tunnel_slot() -> (
+        RemoteSlot,
+        flume::Sender<TunnelReport>,
+        Arc<AtomicBool>,
+        std::sync::mpsc::Receiver<TunnelOut>,
+    ) {
         let (tx, reports) = flume::bounded(4);
-        let (out, _sink) = std::sync::mpsc::channel();
+        let (out, out_rx) = std::sync::mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut slot = RemoteSlot::new();
         slot.control = Some(RemoteControl::Tunnel {
@@ -516,12 +572,43 @@ mod tests {
             thread_done: Arc::new(AtomicBool::new(false)),
             base_url: "https://maki.example.com/".into(),
         });
-        (slot, tx, shutdown)
+        (slot, tx, shutdown, out_rx)
+    }
+
+    #[test]
+    fn rc_down_revokes_the_live_link_before_shutting_the_flag() {
+        let (mut slot, tx, shutdown, out_rx) = tunnel_slot();
+        let token = "f".repeat(32);
+        tx.send(TunnelReport::Link(token.clone())).unwrap();
+        slot.poll_tunnel();
+        assert!(slot.stop(true), "a live tunnel was running");
+        let frame = out_rx.try_recv().expect("the revoke push ships first");
+        match frame {
+            TunnelOut::Push(push) => assert_eq!(push["link_revoke"], token),
+            other => panic!("expected a push, got {other:?}"),
+        }
+        assert!(
+            shutdown.load(Ordering::Relaxed),
+            "and the tunnel comes down"
+        );
+        assert_eq!(slot.url(), None, "the slot forgets the killed link");
+    }
+
+    #[test]
+    fn rc_off_keeps_the_link_for_a_later_rc() {
+        let (mut slot, tx, shutdown, out_rx) = tunnel_slot();
+        tx.send(TunnelReport::Link("e".repeat(32))).unwrap();
+        slot.poll_tunnel();
+        let url = slot.url().expect("the link url is reportable");
+        assert!(url.starts_with("https://maki.example.com/"));
+        assert!(slot.stop(false));
+        assert!(out_rx.try_recv().is_err(), "plain off sends no revoke push");
+        assert!(shutdown.load(Ordering::Relaxed));
     }
 
     #[test]
     fn tunnel_stop_flips_the_shutdown_flag() {
-        let (mut slot, _tx, shutdown) = tunnel_slot();
+        let (mut slot, _tx, shutdown, _out) = tunnel_slot();
         let control = slot.control.take().unwrap();
         control.stop();
         assert!(shutdown.load(Ordering::Relaxed), "tunnel must observe stop");
@@ -529,7 +616,7 @@ mod tests {
 
     #[test]
     fn link_reports_become_a_full_url_and_track_the_state() {
-        let (mut slot, tx, _shutdown) = tunnel_slot();
+        let (mut slot, tx, _shutdown, _out) = tunnel_slot();
         tx.send(TunnelReport::Link("a".repeat(32))).unwrap();
         let TunnelHappen::Link { url, reconnected } = slot.poll_tunnel().expect("link") else {
             panic!("expected a link report");
@@ -554,7 +641,7 @@ mod tests {
 
     #[test]
     fn a_refused_tunnel_stops_without_retry_and_clears_the_slot() {
-        let (mut slot, tx, _shutdown) = tunnel_slot();
+        let (mut slot, tx, _shutdown, _out) = tunnel_slot();
         tx.send(TunnelReport::Refused(
             "token or instance name rejected by the anchor".into(),
         ))
@@ -585,6 +672,7 @@ mod tests {
             RemoteRequest::Prompt {
                 session: None,
                 text: "hello web".into(),
+                files: vec![],
                 reply: tx,
             },
             &serde_json::json!({}),

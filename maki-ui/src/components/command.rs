@@ -119,7 +119,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/remote-control",
-        description: "Start remote control (`off` stops it); prints a tokenized web URL",
+        description: "Start or report remote control (`off` keeps the link, `down` revokes it)",
         max_args: 1,
         bang: false,
     },

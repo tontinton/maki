@@ -1773,14 +1773,25 @@ impl<'t> EventLoop<'t> {
     /// the clipboard and the transcript, since the status bar flash is too
     /// narrow to hold one.
     fn handle_remote_control(&mut self, arg: Option<String>) {
-        if arg.as_deref() == Some("off") {
-            let msg = if self.remote.stop() {
-                REMOTE_STOPPED_MSG
+        if matches!(arg.as_deref(), Some("off") | Some("down")) {
+            let revoke = arg.as_deref() == Some("down");
+            let msg = if self.remote.stop(revoke) {
+                if revoke {
+                    "remote control down: link revoked"
+                } else {
+                    REMOTE_STOPPED_MSG
+                }
             } else {
                 "remote control is not running"
             }
             .to_owned();
             self.focused_app().flash(msg);
+            return;
+        }
+        if self.remote.is_running() {
+            // `/rc` again is a question, not a restart: same URL, current
+            // state, everyone watching. Restarting would burn the link.
+            self.report_remote_state();
             return;
         }
         let domain = arg.or_else(|| self.ctx.remote_control.domain.clone());
@@ -1800,19 +1811,61 @@ impl<'t> EventLoop<'t> {
             ..self.ctx.remote_control.clone()
         };
         match self.remote.start(&config, self.ctx.anchor.as_ref()) {
-            Ok(url) => {
-                let copy = self.focused_app().clipboard.copy_text(&url);
-                let app = self.focused_app();
-                app.main_chat().push(DisplayMessage::new(
-                    DisplayRole::Done,
-                    format!("{REMOTE_URL_MSG}{url}"),
-                ));
-                app.flash(url);
-                if let Err(e) = copy {
-                    app.flash(format!("{REMOTE_COPY_ERR}: {e}"));
-                }
-            }
+            Ok(url) => self.show_link(&url, REMOTE_URL_MSG),
             Err(e) => self.focused_app().flash(format!("{e}")),
+        }
+    }
+
+    /// `/rc` while already running asks, it does not restart: report the
+    /// link, its state, and who is watching each tab.
+    fn report_remote_state(&mut self) {
+        let link = if self.remote.link_up() {
+            "online"
+        } else {
+            "connecting"
+        };
+        let url = self.remote.url();
+        let mut lines = vec![match &url {
+            Some(url) => format!("remote {link} · {url}"),
+            None => format!("remote {link}"),
+        }];
+        let mut watchers = 0;
+        for rt in self.sessions.iter() {
+            let id = rt.id().to_string();
+            let viewers = self.remote.viewers(&id);
+            watchers += viewers;
+            let crowd = if viewers > 0 {
+                format!("{viewers} watching")
+            } else {
+                "alone".into()
+            };
+            lines.push(format!(" · {}: {crowd}", rt.app.state.session.title));
+        }
+        let app = self.focused_app();
+        app.main_chat()
+            .push(DisplayMessage::new(DisplayRole::Done, lines.join("\n")));
+        app.flash(format!("remote {link} · {watchers} watching"));
+    }
+
+    /// A share URL joins the transcript with a scannable QR (where the text
+    /// fits one) and goes to the clipboard; the flash carries just the URL.
+    fn show_link(&mut self, url: &str, prefix: &str) {
+        let qr = if url.starts_with("http") {
+            crate::qr::block_qr(url)
+        } else {
+            None
+        };
+        let copy = self.focused_app().clipboard.copy_text(url);
+        let app = self.focused_app();
+        let text = match qr {
+            Some(qr) => format!("{prefix}{url}\n{qr}"),
+            None => format!("{prefix}{url}"),
+        };
+        app.main_chat()
+            .push(DisplayMessage::new(DisplayRole::Done, text));
+        app.flash(url.to_owned());
+        if let Err(e) = copy {
+            app.flash(format!("{REMOTE_COPY_ERR}: {e}"));
         }
     }
 
@@ -1912,7 +1965,7 @@ impl<'t> EventLoop<'t> {
         // until the shared deadline, taking every later tab's `SessionEnd`
         // down with it.
         self.ui_attachment.detach();
-        self.remote.stop();
+        self.remote.stop(false);
         // `/reload` hands these same sessions to the next generation, so
         // their handlers must not hear that the process is quitting.
         let reason = match exit {

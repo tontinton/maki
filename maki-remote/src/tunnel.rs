@@ -261,6 +261,7 @@ fn tunnel_once(
     let mut next_ping = Instant::now() + KEEPALIVE_PING;
     loop {
         if shutdown.load(Ordering::Relaxed) {
+            ship_pending(&mut socket, out_rx);
             return Ok(());
         }
         while let Ok(out) = out_rx.try_recv() {
@@ -273,6 +274,10 @@ fn tunnel_once(
                 return Err("anchor socket died mid-write".into());
             }
             if shutdown.load(Ordering::Relaxed) {
+                // `/rc down` queues its revoke push and flips the flag in the
+                // same breath; a shutdown exit that skips the backlog kills
+                // the message the anchor needs to revoke the link.
+                ship_pending(&mut socket, out_rx);
                 return Ok(());
             }
         }
@@ -304,6 +309,24 @@ fn tunnel_once(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) => {}
             Err(_) => return Err("anchor link dropped".into()),
+        }
+    }
+}
+
+/// Writes everything still queued on the out channel before the socket goes
+/// away; a lost goodbye is a link that stays alive for nothing.
+fn ship_pending(
+    socket: &mut tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
+    out_rx: &std::sync::mpsc::Receiver<TunnelOut>,
+) {
+    while let Ok(out) = out_rx.try_recv() {
+        let text = match out {
+            TunnelOut::Reply(reply) => serde_json::to_string(&reply),
+            TunnelOut::Push(push) => serde_json::to_string(&push),
+        };
+        let Ok(text) = text else { return };
+        if socket.send(WsMessage::text(text)).is_err() {
+            return;
         }
     }
 }
@@ -351,9 +374,9 @@ fn handle_forwarded(
     // The anchor forwards the bare tail (it owns the link token); accept the
     // token-prefixed shape too so the dispatcher stays testable standalone.
     let tail = forwarded_tail(&request.path, &client.token_hex);
-    let (session, route) = crate::dispatch::parse_tail(tail, &request.method);
+    let (session, route, query) = crate::dispatch::parse_tail(tail, &request.method);
     let body = String::from_utf8_lossy(&request.body).into_owned();
-    let outcome = client.dispatcher().dispatch(route, session, &body);
+    let outcome = client.dispatcher().dispatch(route, session, &query, &body);
     let conn_id = request.conn_id;
     let send = |status: u16, content_type: &'static str, body: Vec<u8>, final_chunk: bool| {
         let _ = out.send(TunnelOut::Reply(TunnelReplyWire {
@@ -388,6 +411,7 @@ fn handle_forwarded(
         crate::dispatch::DispatchOutcome::Json { status, body } => {
             send(status, "application/json", body, true)
         }
+        crate::dispatch::DispatchOutcome::Svg(body) => send(200, "image/svg+xml", body, true),
         // SSE: the producer blocks on the fan-out channel and ships frames;
         // the tunnel thread forwards them until the stream ends.
         crate::dispatch::DispatchOutcome::Events { mut source } => {

@@ -57,8 +57,8 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::{
-    AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SharedMessages, SubagentInfo,
+    AgentEvent, Envelope, ImageMediaType, ImageSource, McpConfigErrors, McpPromptInfo,
+    McpSnapshotReader, SharedMessages, SubagentInfo,
 };
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
@@ -84,6 +84,68 @@ pub(crate) use session::session_has_content;
 use session_state::SessionState;
 
 const CANCEL_MSG: &str = "Cancelled.";
+/// Base64 payload ceiling per uploaded file (16 MB of bytes on the wire).
+const UPLOAD_B64_LIMIT: usize = 22 * 1024 * 1024;
+
+/// Writes a remote upload into the session's working directory under a
+/// scrubbed, collision-free name; returns the path relative to cwd.
+fn save_upload(
+    cwd: &std::path::Path,
+    raw_name: &str,
+    bytes: &[u8],
+) -> Result<std::path::PathBuf, String> {
+    let base = raw_name
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("upload.bin");
+    let clean: String = base
+        .chars()
+        .map(|c| {
+            if c.is_control()
+                || c == ':'
+                || c == '*'
+                || c == '?'
+                || c == '<'
+                || c == '>'
+                || c == '|'
+            {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(96)
+        .collect();
+    let (stem, ext) = match clean.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() && e.len() <= 8 => (s.to_owned(), format!(".{e}")),
+        _ => (clean.clone(), String::new()),
+    };
+    for attempt in 0..100 {
+        let name = if attempt == 0 {
+            clean.clone()
+        } else {
+            format!("{stem}({attempt}){ext}")
+        };
+        let path = cwd.join(&name);
+        if path.exists() {
+            continue;
+        }
+        match std::fs::File::create(&path) {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(bytes)
+                    .map_err(|e| format!("write {name}: {e}"))?;
+                return Ok(std::path::PathBuf::from(name));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!("session directory {} is gone", cwd.display()));
+            }
+            Err(_) => continue,
+        }
+    }
+    Err(format!("no free name near {clean}"))
+}
 /// Bypasses the per-run staleness filter because re-bake replies
 /// don't belong to any real agent run.
 pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
@@ -542,11 +604,43 @@ impl App {
 
     /// Remote control submitted a prompt. Same path as the Lua session API:
     /// started or queued exactly like a typed one, minus the input box.
-    pub(crate) fn submit_remote_prompt(&mut self, text: String) -> Result<Vec<Action>, String> {
-        match self.submit_prompt(QueuedMessage {
-            text,
-            images: Vec::new(),
-        }) {
+    pub(crate) fn submit_remote_prompt(
+        &mut self,
+        text: String,
+        files: Vec<maki_remote::RemoteFile>,
+    ) -> Result<Vec<Action>, String> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use maki_remote::UploadMode;
+        let mut text = text;
+        let mut images: Vec<ImageSource> = Vec::new();
+        for file in files {
+            if file.data.len() > UPLOAD_B64_LIMIT {
+                return Err(format!("upload {} exceeds the size limit", file.name));
+            }
+            let bytes = STANDARD
+                .decode(&file.data)
+                .map_err(|_| format!("upload {}: not valid base64", file.name))?;
+            match file.mode {
+                UploadMode::Attach => {
+                    let media = ImageMediaType::from_mime(&file.media_type).ok_or_else(|| {
+                        format!(
+                            "cannot attach {} ({}) as an image",
+                            file.name, file.media_type
+                        )
+                    })?;
+                    images.push(ImageSource::new(media, file.data.into()));
+                }
+                UploadMode::Save => {
+                    let path = save_upload(
+                        std::path::Path::new(&self.state.session.cwd),
+                        &file.name,
+                        &bytes,
+                    )?;
+                    text.push_str(&format!("\nUploaded file at {}", path.display()));
+                }
+            }
+        }
+        match self.submit_prompt(QueuedMessage { text, images }) {
             SubmitOutcome::Started(actions) => Ok(actions),
             SubmitOutcome::Queued => Ok(vec![]),
             SubmitOutcome::Rejected(e) => Err(e.into()),

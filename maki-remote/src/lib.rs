@@ -11,7 +11,7 @@ mod state;
 pub mod tunnel;
 
 pub use dispatch::Route;
-pub use server::{RemoteRequest, RemoteServer};
+pub use server::{RemoteFile, RemoteRequest, RemoteServer, UploadMode};
 pub use state::{PermissionFrame, RemoteState, RemoteUpdate};
 pub use tunnel::{TunnelClient, TunnelReport, run_tunnel};
 
