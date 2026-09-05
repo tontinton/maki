@@ -140,6 +140,11 @@ pub struct SessionRow {
     pub updated_at: i64,
 }
 
+pub struct LiveLink {
+    pub token: String,
+    pub token_hash: String,
+}
+
 /// A live link as the management pages show it. `token` is None for links
 /// minted before plaintext storage existed.
 #[derive(Debug)]
@@ -422,6 +427,32 @@ impl Store {
         Ok(())
     }
 
+    /// The instance's still-live unscoped control link, if any: reconnects
+    /// and repeated `/rc` calls reuse it so the shared URL stays stable.
+    /// Links minted before plaintext storage cannot be re-shown, and are
+    /// skipped rather than resurrected.
+    pub fn live_control_link(&self, instance_id: i64) -> Result<Option<LiveLink>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let found = conn.query_row(
+            "SELECT token_plain, token_hash FROM links
+             WHERE instance_id = ?1 AND external_session_id IS NULL AND rights = 'controller'
+               AND revoked_at IS NULL AND expires_at > ?2 AND token_plain IS NOT NULL
+             ORDER BY expires_at DESC LIMIT 1",
+            rusqlite::params![instance_id, now_unix()],
+            |row| {
+                Ok(LiveLink {
+                    token: row.get(0)?,
+                    token_hash: row.get(1)?,
+                })
+            },
+        );
+        match found {
+            Ok(link) => Ok(Some(link)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     /// Live (unexpired, unrevoked) links with their instance names, newest
     /// expiry first; the sessions home and the links page.
     pub fn list_links(&self) -> Result<Vec<LinkView>, StoreError> {
@@ -678,6 +709,26 @@ impl Store {
             rusqlite::params![oidc_sub, hash, username],
         )?;
         Ok(Some(Self::user_by_sub_locked(&conn, &oidc_sub)?))
+    }
+
+    pub fn instance_by_id(&self, id: i64) -> Result<Option<InstanceRow>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let found = conn.query_row(
+            "SELECT id, name, last_seen FROM instances WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(InstanceRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    last_seen: row.get(2)?,
+                })
+            },
+        );
+        match found {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
     }
 
     pub fn list_users(&self) -> Result<Vec<UserRow>, StoreError> {

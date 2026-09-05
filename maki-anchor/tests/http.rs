@@ -452,6 +452,110 @@ fn instance_api_cannot_rotate_an_existing_instances_token() {
 }
 
 #[test]
+fn the_control_center_feeds_managers_and_shrugs_at_anonymity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db.sqlite3");
+    let anchor = spawn_anchor(&db);
+    let cookie = setup_admin(anchor.port);
+    let instance = cli(&db, &["tokens", "add", "center-host"]);
+    let _ = instance; // cli prints the registration token
+    let link = cli(
+        &db,
+        &[
+            "tokens",
+            "link",
+            "center-host",
+            "control",
+            "--ttl-hours",
+            "2",
+        ],
+    );
+
+    // The admin holding the link learns rights, instance and the link list.
+    let (status, body) = http_auth(
+        anchor.port,
+        "GET",
+        &format!("/api/center?link={link}"),
+        &[],
+        Some(&cookie),
+    );
+    assert_eq!(status, 200);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["instance"]["name"], "center-host");
+    assert_eq!(json["can_manage"], true);
+    assert_eq!(json["rights"], "controller");
+    assert!(
+        !json["links"].as_array().unwrap().is_empty(),
+        "links listed"
+    );
+    // The invite round trip: mint via api, the fresh link resolves.
+    let (status, body) = http_auth(
+        anchor.port,
+        "POST",
+        "/api/links/mint",
+        serde_json::json!({"link": link, "rights": "view", "hours": 1})
+            .to_string()
+            .as_bytes(),
+        Some(&cookie),
+    );
+    assert_eq!(
+        status,
+        200,
+        "invite mint: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let invite: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let invite_token = invite["token"].as_str().unwrap().to_owned();
+    assert_eq!(invite["path"], format!("/{invite_token}/"));
+    let (status, _) = http(anchor.port, "GET", &format!("/{invite_token}/"), &[]);
+    assert_eq!(status, 503, "a valid invite on an offline instance waits");
+    let (status, _) = http(anchor.port, "GET", &format!("/{link}nope/"), &[]);
+    assert_eq!(
+        status, 302,
+        "a mangled path is management territory, behind the wall"
+    );
+
+    // Closing kills the URL immediately.
+    let (status, _) = http_auth(
+        anchor.port,
+        "POST",
+        "/api/links/close",
+        serde_json::json!({"link": invite_token})
+            .to_string()
+            .as_bytes(),
+        Some(&cookie),
+    );
+    assert_eq!(status, 200);
+    let (status, _) = http(anchor.port, "GET", &format!("/{invite_token}/"), &[]);
+    assert_eq!(status, 404, "closed means gone, not offline");
+
+    // No cookie: the wall bounces the management API.
+    let (status, _) = http(anchor.port, "GET", &format!("/api/center?link={link}"), &[]);
+    assert_eq!(status, 302, "anonymous callers do not get the center feed");
+}
+
+#[test]
+fn the_qr_endpoint_renders_share_links_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db.sqlite3");
+    let anchor = spawn_anchor(&db);
+    let token = "ab".repeat(16);
+    let (status, body) = http(
+        anchor.port,
+        "GET",
+        &format!("/qr?text=https%3A%2F%2Fhost%2F{token}%2F"),
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert!(
+        String::from_utf8_lossy(&body).starts_with("<svg"),
+        "svg body"
+    );
+    let (status, _) = http(anchor.port, "GET", "/qr?text=hello+world", &[]);
+    assert_eq!(status, 400, "not a general-purpose qr service");
+}
+
+#[test]
 fn scoped_and_view_links_are_enforced_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("db.sqlite3");

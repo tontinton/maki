@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 tungstenite = { workspace = true }
+fast_qr = { workspace = true }
 rusqlite = { workspace = true }
 argon2 = { workspace = true }
 serde = { workspace = true }

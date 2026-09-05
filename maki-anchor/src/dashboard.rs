@@ -46,7 +46,17 @@ button.danger{border-color:#fca5a5;color:#b91c1c;background:#fef2f2;padding:.25r
  button.primary,a.btn{background:#e2e8f0;color:#0f172a;border-color:#e2e8f0}
  button.danger{background:#2a1517;border-color:#7f1d1d;color:#fca5a5}
  .badge{border-color:#334155}
+ .badge.on{background:#052e16;border-color:#14532d;color:#86efac}
+ .badge.off{background:#450a0a;border-color:#7f1d1d;color:#fca5a5}
  footer{border-color:#1e293b}
+}
+@media (max-width:680px){
+ .card{margin:.8rem .5rem;padding:.9rem .8rem}
+ table{display:block;overflow-x:auto;white-space:nowrap}
+ header{padding:.6rem .7rem}
+ .user{margin-left:0;width:100%}
+ .card form label{margin-bottom:.4rem}
+ button.primary{width:auto}
 }
 "#
 }
@@ -593,7 +603,9 @@ pub fn render_link(
     let mut body = layout_start("maki anchor — links", user, "links");
     body.push_str(&format!(
         "<h2>Link for {} ({})</h2><p><code>{token}</code></p>\
-         <p>Open: <a href=\"{open_path}\">{open_path}</a> — expires in {hours}h</p>",
+         <p>Open: <a href=\"{open_path}\">{open_path}</a> — expires in {hours}h</p>\
+         <p><img id=\"qr\" data-path=\"{open_path}\" width=\"160\" height=\"160\" alt=\"share link qr\">\
+         <script>const q=document.getElementById('qr');q.src='/qr?text='+encodeURIComponent(location.origin+q.dataset.path);</script></p>",
         html_escape(instance),
         role.as_str(),
     ));
@@ -604,7 +616,7 @@ pub fn render_link(
 
 /// Cap hand-minted link lifetimes; the instance control link still refreshes
 /// itself while connected.
-const MAX_LINK_HOURS: u64 = 24 * 30;
+pub(crate) const MAX_LINK_HOURS: u64 = 24 * 30;
 
 fn html_escape(value: &str) -> String {
     value

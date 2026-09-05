@@ -38,7 +38,15 @@ pub enum TunnelCommand {
 #[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
 pub enum TunnelPush {
-    SessionIndex { sessions: Vec<SessionIndexEntry> },
+    SessionIndex {
+        sessions: Vec<SessionIndexEntry>,
+    },
+    /// `/rc down`: the instance asks the anchor to revoke the very link that
+    /// fronts this tunnel, so shared URLs die with it rather than lingering
+    /// for the rest of their TTL.
+    LinkRevoke {
+        link_revoke: String,
+    },
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -199,6 +207,15 @@ impl Hub {
             self.pending.lock().unwrap().drop_for_instance(instance_id);
         }
         current
+    }
+
+    /// Forgets and kills the tunnel for an instance: dropping the command
+    /// sender ends its writer thread, which closes the socket. Used when a
+    /// link is closed from the dashboard; the instance notices the drop and
+    /// re-registers for a fresh link.
+    pub fn disconnect(&self, instance_id: i64) {
+        let mut connections = self.connections.lock().unwrap();
+        connections.remove(&instance_id);
     }
 
     pub fn is_online(&self, instance_id: i64) -> bool {

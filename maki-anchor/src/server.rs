@@ -413,6 +413,37 @@ fn route(
         };
         return buffered((200, "application/json".to_string(), body), request);
     }
+    if path == "/qr" {
+        let query = request.url().split_once('?').map(|(_, q)| q).unwrap_or("");
+        let text = query_param(query, "text").unwrap_or_default();
+        let outcome = if text.len() > 512
+            || !text
+                .split('/')
+                .any(|seg| seg.len() == 32 && seg.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            (
+                400,
+                "text/plain".to_string(),
+                b"qr text must contain a share token".to_vec(),
+            )
+        } else {
+            match fast_qr::QRBuilder::new(text).build() {
+                Ok(code) => (
+                    200,
+                    "image/svg+xml".to_string(),
+                    fast_qr::convert::svg::SvgBuilder::default()
+                        .to_str(&code)
+                        .into_bytes(),
+                ),
+                Err(_) => (
+                    400,
+                    "text/plain".to_string(),
+                    b"text out of qr capacity".to_vec(),
+                ),
+            }
+        };
+        return buffered(outcome, request);
+    }
     if let Some((token, tail)) = split_token_path(path) {
         let user = auth.user_from_cookie(cookie_header(&request));
         return proxy_remote(token, tail, request, hub, store, user.as_ref());
@@ -1179,87 +1210,280 @@ fn handle_api_set_grant(
     )
 }
 
-/// Revokes a live link by hash. Links carry no owner column, so this is an
-/// admin privilege; the revoke button on the pages only renders for admins.
+/// Everything the control center and the management pages need to know about
+/// one share link: its instance, the effective rights of the caller, and
+/// whether the caller may manage it.
+struct CenterView {
+    instance: store::InstanceRow,
+    rights: String,
+    can_manage: bool,
+}
+
+fn center_view(
+    store: &Store,
+    link_token: &str,
+    user: Option<&crate::store::UserRow>,
+) -> Option<CenterView> {
+    let link = store.link_by_token(link_token).ok()?;
+    let instance = store.instance_by_id(link.instance_id).ok()??;
+    let grant = user.and_then(|u| store.grant_for(u.id, link.instance_id).ok().flatten());
+    // Grants raise the floor, never lower it, exactly like proxy_remote.
+    let rights =
+        if link.rights == Role::Viewer.as_str() && grant.is_some_and(|r| r == Role::Controller) {
+            Role::Controller.as_str().to_owned()
+        } else {
+            link.rights.clone()
+        };
+    let can_manage =
+        user.is_some_and(|u| u.is_admin || grant.is_some_and(|r| r == Role::Controller));
+    Some(CenterView {
+        instance,
+        rights,
+        can_manage,
+    })
+}
+
+fn center_json(status: u16, body: serde_json::Value) -> (u16, String, Vec<u8>) {
+    (
+        status,
+        "application/json".to_string(),
+        body.to_string().into_bytes(),
+    )
+}
+
+fn json_error(request: http::Request, status: u16, reason: &str) -> RouteOutcome {
+    buffered(
+        center_json(status, serde_json::json!({"error": reason})),
+        request,
+    )
+}
+
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| url_decode(v))
+    })
+}
+
+/// GET /api/center?link=<token>: the remote page's control-center feed.
+/// Anonymous callers learn nothing (the page then falls back to instance
+/// data); a logged-in user learns their rights, and managers also get the
+/// instance's live links and grants.
+fn handle_api_center(
+    request: http::Request,
+    store: &Arc<Store>,
+    hub: &Hub,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    let query = request.url().split_once('?').map(|(_, q)| q).unwrap_or("");
+    let Some(link_token) = query_param(query, "link") else {
+        return json_error(request, 400, "link required");
+    };
+    let Some(view) = center_view(store, &link_token, user) else {
+        return json_error(request, 404, "invalid or expired link");
+    };
+    let me = user.map(|u| {
+        serde_json::json!({
+            "id": u.id,
+            "name": u.name.clone().or_else(|| u.email.clone()).unwrap_or_else(|| format!("user {}", u.id)),
+            "admin": u.is_admin,
+        })
+    });
+    let online = hub.is_online(view.instance.id);
+    let mut body = serde_json::json!({
+        "instance": {"id": view.instance.id, "name": view.instance.name, "last_seen": view.instance.last_seen},
+        "online": online,
+        "rights": view.rights,
+        "can_manage": view.can_manage,
+        "me": me,
+    });
+    if view.can_manage {
+        let links: Vec<serde_json::Value> = store
+            .list_links()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|l| l.instance_id == view.instance.id)
+            .map(|l| {
+                serde_json::json!({
+                    "token": l.token,
+                    "hash": l.token_hash,
+                    "rights": l.rights,
+                    "session": l.external_session_id,
+                    "expires": l.expires_at,
+                })
+            })
+            .collect();
+        let grants: Vec<serde_json::Value> = store
+            .list_grants()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, instance, _)| *instance == view.instance.name)
+            .map(|(user_id, _, rights)| serde_json::json!({"user_id": user_id, "rights": rights}))
+            .collect();
+        body["links"] = serde_json::Value::Array(links);
+        body["grants"] = serde_json::Value::Array(grants);
+    }
+    buffered(center_json(200, body), request)
+}
+
+fn read_json(request: &mut http::Request) -> Result<serde_json::Value, String> {
+    let mut body = Vec::new();
+    if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
+        return Err("body too large".to_owned());
+    }
+    serde_json::from_slice(&body).map_err(|_| "invalid json".to_owned())
+}
+
+/// POST /api/links/mint {link, rights, hours, session?}: managers create
+/// invite links for their instance.
+fn handle_api_center_invite(
+    mut request: http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method() != "POST" {
+        return json_error(request, 405, "method not allowed");
+    }
+    let value = match read_json(&mut request) {
+        Ok(v) => v,
+        Err(e) => return json_error(request, 400, &e),
+    };
+    let Some(link) = value.get("link").and_then(|v| v.as_str()) else {
+        return json_error(request, 400, "link required");
+    };
+    let Some(view) = center_view(store, link, user) else {
+        return json_error(request, 404, "invalid or expired link");
+    };
+    if !view.can_manage {
+        return json_error(request, 403, "managers only: a controller grant is needed");
+    }
+    let rights = value
+        .get("rights")
+        .and_then(|v| v.as_str())
+        .unwrap_or("view");
+    let Some(role) = Role::parse(rights) else {
+        return json_error(request, 400, "rights must be view or control");
+    };
+    let hours = value
+        .get("hours")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2)
+        .clamp(1, crate::dashboard::MAX_LINK_HOURS);
+    let session = value
+        .get("session")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let token = match mint_link(
+        store,
+        view.instance.id,
+        session.as_deref(),
+        role,
+        std::time::Duration::from_secs(hours * 3600),
+    ) {
+        Ok(token) => token,
+        Err(err) => {
+            tracing::warn!(error = %err, "invite mint failed");
+            return json_error(request, 500, "mint failed");
+        }
+    };
+    let path = match &session {
+        Some(s) => format!("/{token}/s/{s}/"),
+        None => format!("/{token}/"),
+    };
+    buffered(
+        center_json(
+            200,
+            serde_json::json!({"token": token, "path": path, "hours": hours}),
+        ),
+        request,
+    )
+}
+
+/// POST /api/links/close {link}: managers kill this very share URL and drop
+/// the tunnel behind it, so a leaked link stops serving immediately. The
+/// instance notices and registers again under a fresh link.
+fn handle_api_center_close(
+    mut request: http::Request,
+    store: &Arc<Store>,
+    hub: &Hub,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method() != "POST" {
+        return json_error(request, 405, "method not allowed");
+    }
+    let value = match read_json(&mut request) {
+        Ok(v) => v,
+        Err(e) => return json_error(request, 400, &e),
+    };
+    let Some(link) = value.get("link").and_then(|v| v.as_str()) else {
+        return json_error(request, 400, "link required");
+    };
+    let Some(view) = center_view(store, link, user) else {
+        return json_error(request, 404, "invalid or expired link");
+    };
+    if !view.can_manage {
+        return json_error(request, 403, "managers only: a controller grant is needed");
+    }
+    store.revoke_link(&store::hash_token(link)).ok();
+    hub.disconnect(view.instance.id);
+    tracing::info!(
+        instance = view.instance.name,
+        "share link closed from the control center"
+    );
+    buffered(
+        center_json(200, serde_json::json!({"closed": true})),
+        request,
+    )
+}
+
+/// Revokes a live link by hash. Admins may revoke anything (the dashboard
+/// sends just the hash); controllers may revoke links belonging to instances
+/// they manage, and must name the link that gives them that right.
 fn handle_api_revoke_link(
     mut request: http::Request,
     store: &Arc<Store>,
     user: Option<&crate::store::UserRow>,
 ) -> RouteOutcome {
     if request.method() != "POST" {
-        return buffered(
-            (
-                405,
-                "application/json".to_string(),
-                br#"{"error":"method not allowed"}"#.to_vec(),
-            ),
-            request,
-        );
+        return json_error(request, 405, "method not allowed");
     }
-    if is_non_admin(user) {
-        return forbidden_json(request);
+    if user.is_none() {
+        return json_error(request, 401, "login required");
     }
-    let mut body = Vec::new();
-    if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
-        return buffered(
-            (
-                413,
-                "application/json".to_string(),
-                br#"{"error":"body too large"}"#.to_vec(),
-            ),
-            request,
-        );
-    }
-    let value: serde_json::Value = match serde_json::from_slice(&body) {
+    let value = match read_json(&mut request) {
         Ok(v) => v,
-        Err(_) => {
-            return buffered(
-                (
-                    400,
-                    "application/json".to_string(),
-                    br#"{"error":"invalid json"}"#.to_vec(),
-                ),
-                request,
-            );
-        }
+        Err(e) => return json_error(request, 400, &e),
     };
     let Some(hash) = value.get("token_hash").and_then(|v| v.as_str()) else {
-        return buffered(
-            (
-                400,
-                "application/json".to_string(),
-                br#"{"error":"token_hash required"}"#.to_vec(),
-            ),
-            request,
-        );
+        return json_error(request, 400, "token_hash required");
     };
+    let is_admin = user.is_some_and(|u| u.is_admin);
+    if !is_admin {
+        let Some(link) = value.get("link").and_then(|v| v.as_str()) else {
+            return json_error(request, 403, "admin required");
+        };
+        let Some(view) = center_view(store, link, user) else {
+            return json_error(request, 404, "invalid or expired link");
+        };
+        if !view.can_manage {
+            return json_error(request, 403, "managers only");
+        }
+        let owns = store
+            .list_links()
+            .unwrap_or_default()
+            .into_iter()
+            .any(|l| l.token_hash == hash && l.instance_id == view.instance.id);
+        if !owns {
+            return json_error(request, 403, "that link is not on your instance");
+        }
+    }
     match store.revoke_link(hash) {
         Ok(true) => buffered(
-            (
-                200,
-                "application/json".to_string(),
-                br#"{"revoked":true}"#.to_vec(),
-            ),
+            center_json(200, serde_json::json!({"revoked": true})),
             request,
         ),
-        Ok(false) => buffered(
-            (
-                404,
-                "application/json".to_string(),
-                br#"{"error":"link not live"}"#.to_vec(),
-            ),
-            request,
-        ),
-        Err(err) => buffered(
-            (
-                500,
-                "application/json".to_string(),
-                serde_json::json!({"error": err.to_string()})
-                    .to_string()
-                    .into_bytes(),
-            ),
-            request,
-        ),
+        Ok(false) => json_error(request, 404, "link not live"),
+        Err(err) => json_error(request, 500, &err.to_string()),
     }
 }
 
@@ -1882,6 +2106,15 @@ fn route_authorized(
     if path == "/api/links/revoke" {
         return handle_api_revoke_link(request, store, user.as_ref());
     }
+    if path == "/api/center" {
+        return handle_api_center(request, store, hub, user.as_ref());
+    }
+    if path == "/api/links/mint" {
+        return handle_api_center_invite(request, store, user.as_ref());
+    }
+    if path == "/api/links/close" {
+        return handle_api_center_close(request, store, hub, user.as_ref());
+    }
     if path == "/api/instances" {
         return match request.method() {
             "GET" => buffered(json_list_instances_for(store, user.as_ref()), request),
@@ -2086,8 +2319,23 @@ fn json_list_sessions_for(
 /// Persist a session-index push from an instance. The owning instance is the
 /// authenticated tunnel, so a registered host can never rewrite another's
 /// index by claiming a name in the frame.
-fn handle_push(store: &Arc<Store>, instance_id: i64, push: TunnelPush) {
-    let TunnelPush::SessionIndex { sessions } = push;
+fn handle_push(store: &Arc<Store>, hub: &Hub, instance_id: i64, push: TunnelPush) {
+    let sessions = match push {
+        TunnelPush::LinkRevoke { link_revoke } => {
+            let hash = store::hash_token(&link_revoke);
+            match store.revoke_link(&hash) {
+                Ok(true) => {
+                    tracing::info!(instance_id, "tunnel closed its own link");
+                    // The link is gone; nothing left for the tunnel to serve.
+                    hub.disconnect(instance_id);
+                }
+                Ok(false) => tracing::debug!(instance_id, "revoke for a link that was not live"),
+                Err(err) => tracing::warn!(error = %err, instance_id, "link revoke failed"),
+            }
+            return;
+        }
+        TunnelPush::SessionIndex { sessions } => sessions,
+    };
     for entry in sessions {
         let row = SessionRow {
             instance_id,
@@ -2319,23 +2567,30 @@ fn drive_tunnel(
         }
     };
     store.touch_instance(instance.id).ok();
-    // Every tunnel gets a fresh control link; traffic on it slides the expiry
-    // (see proxy_remote) so it lives as long as the tunnel does. The URL goes
-    // back to the instance to display.
-    let control_link = match mint_link(
-        store.as_ref(),
-        instance.id,
-        None,
-        Role::Controller,
-        TUNNEL_LINK_TTL,
-    ) {
-        Ok(link) => link,
-        Err(err) => {
-            tracing::warn!(error = %err, instance_id = instance.id, "link mint failed");
-            return;
+    // A tunnel reuses the instance's still-live control link, so reconnects
+    // and repeated /rc calls keep the URL people have already shared; only a
+    // dead link (expired, revoked, or pre-plaintext legacy) gets a fresh mint.
+    // Traffic on it slides the expiry (see proxy_remote) so it lives as long
+    // as the tunnel does.
+    let (control_link, link_hash) = match store.live_control_link(instance.id).ok().flatten() {
+        Some(live) => {
+            store.extend_link(&live.token_hash, TUNNEL_LINK_TTL).ok();
+            (live.token, live.token_hash)
         }
+        None => match mint_link(
+            store.as_ref(),
+            instance.id,
+            None,
+            Role::Controller,
+            TUNNEL_LINK_TTL,
+        ) {
+            Ok(link) => (link.clone(), store::hash_token(&link)),
+            Err(err) => {
+                tracing::warn!(error = %err, instance_id = instance.id, "link mint failed");
+                return;
+            }
+        },
     };
-    let link_hash = store::hash_token(&control_link);
     // Attach first, then hand the link to the instance: a client that holds
     // the link must find the tunnel already online, or a request fired the
     // instant the link arrives races a 503 against the hub insert.
@@ -2377,7 +2632,7 @@ fn drive_tunnel(
         match message {
             WsMessage::Text(text) => {
                 if let Ok(push) = serde_json::from_str::<TunnelPush>(&text) {
-                    handle_push(&store, instance.id, push);
+                    handle_push(&store, &hub, instance.id, push);
                     continue;
                 }
                 let Ok(frame) = serde_json::from_str::<TunnelWireFrame>(&text) else {
