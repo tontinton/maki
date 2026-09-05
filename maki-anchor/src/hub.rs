@@ -30,7 +30,17 @@ pub struct TunnelResponse {
 
 /// Anchor-side messages bound for the instance over its tunnel.
 pub enum TunnelCommand {
-    Request { conn_id: u64, request: String },
+    Request {
+        conn_id: u64,
+        request: String,
+    },
+    /// The browser behind one stream is gone (tab closed, page reloaded,
+    /// link revoked): the instance must retire its producer and subscriber.
+    Cancel {
+        conn_id: u64,
+    },
+    /// A JSON control frame to hand to the instance verbatim.
+    Control(String),
 }
 
 /// Asynchronous instance -> anchor pushes that need no response. The owning
@@ -47,6 +57,26 @@ pub enum TunnelPush {
     LinkRevoke {
         link_revoke: String,
     },
+    /// `/rc link`, `/rc link new`, `/rc link rm`: list this instance's
+    /// anchor-side links, mint one, or revoke one. Each is answered with the
+    /// fresh list as a control frame.
+    LinkList {
+        list_links: bool,
+    },
+    LinkMint {
+        link_mint: MintSpec,
+    },
+    LinkRm {
+        link_rm: String,
+    },
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct MintSpec {
+    #[serde(default)]
+    pub rights: String,
+    #[serde(default)]
+    pub hours: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -256,6 +286,25 @@ impl Hub {
     }
 
     /// Blocks until the next chunk. A chunk with `final_chunk` ends the stream.
+    /// Fire-and-forget stream cancellation; an offline instance needs no
+    /// notice, its next registration clears every old producer itself.
+    pub fn cancel(&self, instance_id: i64, conn_id: u64) {
+        let conns = self.connections.lock().unwrap();
+        if let Some(conn) = conns.get(&instance_id) {
+            let _ = conn.commands.send(TunnelCommand::Cancel { conn_id });
+        }
+    }
+
+    /// Ask the instance side to send a control frame back (link lists,
+    /// mint results). Reuses the response bus with a synthetic conn id the
+    /// browser never sees.
+    pub fn control(&self, instance_id: i64, frame: String) {
+        let conns = self.connections.lock().unwrap();
+        if let Some(conn) = conns.get(&instance_id) {
+            let _ = conn.commands.send(TunnelCommand::Control(frame));
+        }
+    }
+
     pub fn wait_chunk(&self, rx: &Receiver<TunnelResponse>) -> Result<TunnelResponse, HubError> {
         match rx.recv_timeout(REQ_TIMEOUT) {
             Ok(response) => Ok(response),
@@ -275,6 +324,16 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_response_frame_is_not_a_push() {
+        const RESPONSE: &str =
+            r#"{"conn_id":1,"status":200,"content_type":"text/plain","body":"aGk=","final":true}"#;
+        let push: Result<TunnelPush, _> = serde_json::from_str(RESPONSE);
+        assert!(push.is_err(), "response must not parse as a push: {push:?}");
+        let mint_like: Result<TunnelPush, _> = serde_json::from_str(r#"{"list_links":true}"#);
+        assert!(matches!(mint_like, Ok(TunnelPush::LinkList { .. })));
+    }
 
     #[test]
     fn stale_detach_leaves_the_live_tunnel_attached() {

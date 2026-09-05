@@ -72,12 +72,14 @@ impl Drop for Subscription {
 
 /// One attached browser. `session` is the tab the stream was scoped to;
 /// `None` is an unscoped viewer that can flip to any tab, so it counts as
-/// watching whichever tab the TUI asks about.
+/// watching whichever tab the TUI asks about. `tag` identifies the holder
+/// for the status surfaces: `alice·control`, `anon·view`, …
 #[derive(Debug, Clone)]
 struct Subscriber {
     id: u64,
     tx: flume::Sender<RemoteUpdate>,
     session: Option<String>,
+    tag: String,
 }
 
 /// Fan-out hub between the event loop's tee and every connected web client.
@@ -115,8 +117,9 @@ impl RemoteState {
     }
 
     /// Attaches a browser stream. `session` is the tab the stream is scoped
-    /// to (None for the unscoped index, which can flip tabs at any time).
-    pub fn subscribe(&self, session: Option<String>) -> Subscription {
+    /// to (None for the unscoped index, which can flip tabs at any time) and
+    /// `tag` says who is behind it.
+    pub fn subscribe(&self, session: Option<String>, tag: String) -> Subscription {
         let (tx, updates) = flume::bounded(SUBSCRIBER_QUEUE_CAP);
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         self.inner.updates.rcu(|subs| {
@@ -125,6 +128,7 @@ impl RemoteState {
                 id,
                 tx: tx.clone(),
                 session: session.clone(),
+                tag: tag.clone(),
             });
             subs
         });
@@ -146,18 +150,15 @@ impl RemoteState {
             .count()
     }
 
-    /// Who is attached right now, grouped by tab. `None` keys the unscoped
-    /// viewers that can flip tabs at will.
-    pub fn viewers_by_session(&self) -> Vec<(Option<String>, usize)> {
-        let subs = self.inner.updates.load();
-        let mut grouped: Vec<(Option<String>, usize)> = Vec::new();
-        for sub in subs.iter() {
-            match grouped.iter_mut().find(|(s, _)| *s == sub.session) {
-                Some((_, n)) => *n += 1,
-                None => grouped.push((sub.session.clone(), 1)),
-            }
-        }
-        grouped
+    /// Who is attached right now: (scoped tab, holder tag) per browser.
+    /// A `None` tab is an unscoped viewer that can flip at will.
+    pub fn watchers(&self) -> Vec<(Option<String>, String)> {
+        self.inner
+            .updates
+            .load()
+            .iter()
+            .map(|sub| (sub.session.clone(), sub.tag.clone()))
+            .collect()
     }
 
     /// Any browser attached at all, on any tab.
@@ -220,8 +221,8 @@ mod tests {
     #[test]
     fn subscribers_receive_independently_and_slow_one_drops() {
         let state = RemoteState::new();
-        let a = state.subscribe(None);
-        let b = state.subscribe(None);
+        let a = state.subscribe(None, "t·view".into());
+        let b = state.subscribe(None, "t·view".into());
 
         state.send_status(SESSION, STATUS_IDLE);
         assert!(matches!(
@@ -248,9 +249,9 @@ mod tests {
         let state = RemoteState::new();
         assert_eq!(state.viewers("t1"), 0);
         assert!(!state.has_viewers());
-        let scoped = state.subscribe(Some("t1".into()));
-        let other = state.subscribe(Some("t2".into()));
-        let unscoped = state.subscribe(None);
+        let scoped = state.subscribe(Some("t1".into()), "alice·control".into());
+        let other = state.subscribe(Some("t2".into()), "bob·view".into());
+        let unscoped = state.subscribe(None, "anon·view".into());
         assert_eq!(state.viewers("t1"), 2, "own tab plus the tab-hopper");
         assert_eq!(state.viewers("t2"), 2);
         assert_eq!(state.viewers("t3"), 1, "only the unscoped viewer");
@@ -263,10 +264,29 @@ mod tests {
     }
 
     #[test]
+    fn watchers_report_who_and_where() {
+        let state = RemoteState::new();
+        let scoped = state.subscribe(Some("t1".into()), "alice·control".into());
+        let loose = state.subscribe(None, "anon·view".into());
+        let mut seen = state.watchers();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                (None, "anon·view".to_string()),
+                (Some("t1".into()), "alice·control".into()),
+            ]
+        );
+        drop(scoped);
+        drop(loose);
+        assert!(state.watchers().is_empty());
+    }
+
+    #[test]
     fn dropping_a_subscription_removes_only_that_receiver() {
         let state = RemoteState::new();
-        let a = state.subscribe(None);
-        let b = state.subscribe(None);
+        let a = state.subscribe(None, "t·view".into());
+        let b = state.subscribe(None, "t·view".into());
         drop(a);
 
         state.send_status(SESSION, STATUS_IDLE);

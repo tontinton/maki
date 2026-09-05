@@ -165,12 +165,15 @@ impl Dispatcher {
     /// Match `/{token}[/{session}]/{tail}` and produce the response payload.
     /// Token check is the caller's job: both modes compare against their own
     /// secret.
+    /// `viewer` tags the attached browser (`alice·control`, `anon·view`) so
+    /// the status surfaces can say who is watching, not just how many.
     pub fn dispatch(
         &self,
         route: Option<Route>,
         session: Option<String>,
         query: &str,
         body: &str,
+        viewer: &str,
     ) -> DispatchOutcome {
         let Some(route) = route else {
             return DispatchOutcome::NotFound;
@@ -180,9 +183,9 @@ impl Dispatcher {
             Route::Center => {
                 let viewers = serde_json::json!(
                     self.state
-                        .viewers_by_session()
+                        .watchers()
                         .into_iter()
-                        .map(|(session, n)| serde_json::json!({"session": session, "viewers": n}))
+                        .map(|(session, tag)| serde_json::json!({"session": session, "tag": tag}))
                         .collect::<Vec<_>>()
                 );
                 let total = self.state.has_viewers();
@@ -218,7 +221,7 @@ impl Dispatcher {
                 }
             }
             Route::Events => {
-                let subscription = self.state.subscribe(session.clone());
+                let subscription = self.state.subscribe(session.clone(), viewer.to_owned());
                 let snapshot = self.snapshot_json(session.clone());
                 DispatchOutcome::Events {
                     source: SseSource::new(subscription, &snapshot, session),
@@ -623,11 +626,11 @@ mod tests {
     #[test]
     fn center_counts_attached_browsers_per_tab() {
         let state = RemoteState::new();
-        let _tab = state.subscribe(Some("t1".into()));
-        let _any = state.subscribe(None);
+        let _tab = state.subscribe(Some("t1".into()), "t·view".into());
+        let _any = state.subscribe(None, "t·view".into());
         let dispatcher = dispatcher_for(state);
         let DispatchOutcome::Json { status, body } =
-            dispatcher.dispatch(Some(Route::Center), None, "", "")
+            dispatcher.dispatch(Some(Route::Center), None, "", "", "alice·control")
         else {
             panic!("center answers json");
         };
@@ -651,15 +654,20 @@ mod tests {
         let token = "a".repeat(32);
         let dispatcher = dispatcher_for(RemoteState::new());
         let query = format!("text=http%3A%2F%2Fanchor.test%2F{token}%2F");
-        let DispatchOutcome::Svg(svg) = dispatcher.dispatch(Some(Route::Qr), None, &query, "")
+        let DispatchOutcome::Svg(svg) =
+            dispatcher.dispatch(Some(Route::Qr), None, &query, "", "anon·view")
         else {
             panic!("a share link renders");
         };
         let svg = String::from_utf8(svg).unwrap();
         assert!(svg.starts_with("<svg"), "svg: {svg:.40}");
-        let DispatchOutcome::Json { status, .. } =
-            dispatcher.dispatch(Some(Route::Qr), None, "text=https://evil/whatever", "")
-        else {
+        let DispatchOutcome::Json { status, .. } = dispatcher.dispatch(
+            Some(Route::Qr),
+            None,
+            "text=https://evil/whatever",
+            "",
+            "anon·view",
+        ) else {
             panic!("off-shape text is refused");
         };
         assert_eq!(
@@ -667,7 +675,7 @@ mod tests {
             "the qr endpoint is not a general-purpose encoder"
         );
         let DispatchOutcome::Json { status, .. } =
-            dispatcher.dispatch(Some(Route::Qr), None, "", "")
+            dispatcher.dispatch(Some(Route::Qr), None, "", "", "anon·view")
         else {
             panic!("missing text is refused");
         };
@@ -699,6 +707,7 @@ mod tests {
             None,
             "",
             r#"{"text":"look","files":[{"name":"shot.png","media_type":"image/png","data":"AAA=","mode":"attach"}]}"#,
+            "anon·control",
         );
         assert!(
             matches!(outcome, DispatchOutcome::Posted(200, None)),
@@ -725,6 +734,7 @@ mod tests {
             None,
             "",
             r#"{"files":[{"name":"notes.md","data":"aGk=","mode":"save"}]}"#,
+            "anon·control",
         );
         assert!(
             matches!(outcome, DispatchOutcome::Posted(200, None)),
@@ -778,7 +788,7 @@ mod tests {
     #[test]
     fn scoped_source_drops_other_sessions() {
         let state = RemoteState::new();
-        let sub = state.subscribe(None);
+        let sub = state.subscribe(None, "t·view".into());
         let mut source = SseSource::new(sub, &json!({}), Some("watched".into()));
         state.send_status("other", "working");
         state.send_status("watched", "idle");
@@ -792,7 +802,7 @@ mod tests {
     #[test]
     fn unscoped_source_keeps_every_session() {
         let state = RemoteState::new();
-        let sub = state.subscribe(None);
+        let sub = state.subscribe(None, "t·view".into());
         let mut source = SseSource::new(sub, &json!({}), None);
         state.send_status("any", "working");
         let snapshot = source.next_frame().unwrap();

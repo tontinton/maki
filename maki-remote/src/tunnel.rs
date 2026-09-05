@@ -8,10 +8,11 @@
 //! would be impossible over TLS anyway.
 
 use std::{
+    collections::HashMap,
     io,
     net::TcpStream,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -39,6 +40,9 @@ pub enum TunnelReport {
     Lost(String),
     /// The anchor rejected the registration; no further attempts.
     Refused(String),
+    /// Reply to a link list/mint/remove push: the instance's current
+    /// anchor-side links, plus `minted` when one was just created.
+    Links(serde_json::Value),
 }
 
 /// Anything the tunnel ships to the anchor: an HTTP reply chunk or an
@@ -70,6 +74,27 @@ pub struct ForwardedRequest {
     pub path: String,
     #[serde(default, deserialize_with = "serde_b64::deserialize")]
     pub body: Vec<u8>,
+    /// Who the anchor saw behind the request (logged-in display name), if
+    /// anyone; and what the effective rights of that request turned out to
+    /// be. The instance repeats them back in its watcher rosters.
+    #[serde(default)]
+    pub actor: Option<String>,
+    #[serde(default)]
+    pub rights: String,
+}
+
+/// The anchor's "the browser on this stream hung up" notice.
+#[derive(Debug, serde::Deserialize)]
+struct CancelFrame {
+    cancel: u64,
+}
+
+/// Anchor control replies about share links (`/rc link*`).
+#[derive(Debug, serde::Deserialize)]
+struct LinksFrame {
+    links: serde_json::Value,
+    #[serde(default)]
+    minted: Option<String>,
 }
 
 /// The anchor's handshake frame: the share link minted for this tunnel.
@@ -91,6 +116,10 @@ pub struct TunnelClient {
     dispatcher: crate::dispatch::Dispatcher,
     out_tx: std::sync::mpsc::Sender<TunnelOut>,
     out_rx: Mutex<Option<std::sync::mpsc::Receiver<TunnelOut>>>,
+    /// Live SSE producers by tunnel conn id, so the anchor's "the browser
+    /// hung up" notice can retire a stream. Without this, every closed tab
+    /// leaves a subscriber fanning frames to nobody forever.
+    streams: Arc<Mutex<HashMap<u64, flume::Sender<()>>>>,
 }
 
 impl TunnelClient {
@@ -112,6 +141,7 @@ impl TunnelClient {
             instance_name,
             out_tx,
             out_rx: Mutex::new(Some(out_rx)),
+            streams: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -126,6 +156,27 @@ impl TunnelClient {
 
     fn dispatcher(&self) -> &crate::dispatch::Dispatcher {
         &self.dispatcher
+    }
+
+    fn register_stream(&self, conn_id: u64) -> flume::Receiver<()> {
+        let (tx, rx) = flume::bounded(1);
+        self.streams.lock().unwrap().insert(conn_id, tx);
+        rx
+    }
+
+    /// Tell every live producer to wrap up: a fresh connection means every
+    /// browser on the old one is gone, whatever the anchor says.
+    fn cancel_all_streams(&self) {
+        let stale: Vec<_> = self.streams.lock().unwrap().drain().collect();
+        for (_, tx) in stale {
+            let _ = tx.send(());
+        }
+    }
+
+    fn cancel_stream(&self, conn_id: u64) {
+        if let Some(tx) = self.streams.lock().unwrap().remove(&conn_id) {
+            let _ = tx.send(());
+        }
     }
 }
 
@@ -254,6 +305,9 @@ fn tunnel_once(
         return Err("anchor sent an unusable handshake".into());
     };
     let _ = reports.send(TunnelReport::Link(link_frame.link));
+    // New socket, stale browsers: nothing on the previous connection can
+    // still be reading, so retire its producers before serving again.
+    client.cancel_all_streams();
     // From here on, reads are bounded so the loop can also ship replies,
     // keepalive-ping, and notice the shutdown flag.
     set_read_timeout(socket.get_ref());
@@ -293,6 +347,17 @@ fn tunnel_once(
         let _ = socket.flush();
         match socket.read() {
             Ok(WsMessage::Text(text)) => {
+                if let Ok(cancel) = serde_json::from_str::<CancelFrame>(&text) {
+                    client.cancel_stream(cancel.cancel);
+                    continue;
+                }
+                if let Ok(links) = serde_json::from_str::<LinksFrame>(&text) {
+                    let _ = reports.send(TunnelReport::Links(serde_json::json!({
+                        "links": links.links,
+                        "minted": links.minted,
+                    })));
+                    continue;
+                }
                 let Ok(parsed) = serde_json::from_str::<ForwardedRequest>(&text) else {
                     continue;
                 };
@@ -376,7 +441,16 @@ fn handle_forwarded(
     let tail = forwarded_tail(&request.path, &client.token_hex);
     let (session, route, query) = crate::dispatch::parse_tail(tail, &request.method);
     let body = String::from_utf8_lossy(&request.body).into_owned();
-    let outcome = client.dispatcher().dispatch(route, session, &query, &body);
+    let actor = request.actor.unwrap_or_else(|| "anon".into());
+    let rights = if request.rights.is_empty() {
+        "control"
+    } else {
+        request.rights.as_str()
+    };
+    let outcome =
+        client
+            .dispatcher()
+            .dispatch(route, session, &query, &body, &format!("{actor}·{rights}"));
     let conn_id = request.conn_id;
     let send = |status: u16, content_type: &'static str, body: Vec<u8>, final_chunk: bool| {
         let _ = out.send(TunnelOut::Reply(TunnelReplyWire {
@@ -427,10 +501,16 @@ fn handle_forwarded(
             {
                 return;
             }
+            let cancel = client.register_stream(conn_id);
+            let client_out = client.out();
+            let streams = Arc::clone(&client.streams);
             std::thread::Builder::new()
                 .name("remote-tunnel-sse".into())
                 .spawn(move || {
                     while let Some(frame) = source.next_frame() {
+                        if cancel.try_recv().is_ok() {
+                            break;
+                        }
                         if out
                             .send(TunnelOut::Reply(TunnelReplyWire {
                                 conn_id,
@@ -444,7 +524,13 @@ fn handle_forwarded(
                             return;
                         }
                     }
-                    let _ = out.send(TunnelOut::Reply(TunnelReplyWire {
+                    // The map entry goes with the producer, whatever ended
+                    // it; the anchor only ever sees live conn ids.
+                    streams.lock().unwrap().remove(&conn_id);
+                    // Final chunk either way: it releases the anchor's
+                    // pending slot, and dropping the source retires the
+                    // subscriber so watcher counts stay honest.
+                    let _ = client_out.send(TunnelOut::Reply(TunnelReplyWire {
                         conn_id,
                         status: 200,
                         content_type: "text/event-stream",
@@ -474,7 +560,6 @@ mod serde_b64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     const REPORT_WAIT: Duration = Duration::from_secs(10);
 

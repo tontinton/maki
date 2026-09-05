@@ -646,18 +646,36 @@ impl Store {
         Ok(rights.as_deref().and_then(Role::parse))
     }
 
-    pub fn list_grants(&self) -> Result<Vec<(i64, String, String)>, StoreError> {
+    /// (user id, display name, instance, rights). The name prefers the real
+    /// name, then email, then the local username, over the raw OIDC subject.
+    #[allow(clippy::type_complexity)]
+    pub fn list_grants(&self) -> Result<Vec<(i64, String, String, String)>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT u.id, i.name, g.rights FROM grants g
+            "SELECT u.id, COALESCE(NULLIF(u.name,''), NULLIF(u.email,''), REPLACE(u.oidc_sub,'local:','')), i.name, g.rights
+             FROM grants g
              JOIN users u ON u.id = g.user_id
              JOIN instances i ON i.id = g.instance_id
              ORDER BY u.id, i.name",
         )?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Whether a link would still be honored: the streamer checks it between
+    /// chunks so a revoked link cuts live viewers off at the next frame.
+    pub fn link_is_live(&self, token_hash: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT 1 FROM links WHERE token_hash = ?1 AND revoked_at IS NULL AND expires_at > ?2",
+            rusqlite::params![token_hash, now_unix()],
+            |_| Ok(()),
+        )
+        .is_ok()
     }
 
     pub fn revoke_link(&self, token_hash: &str) -> Result<bool, StoreError> {
@@ -760,6 +778,12 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    pub fn delete_setting(&self, key: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM settings WHERE key = ?1", [key])?;
+        Ok(())
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {

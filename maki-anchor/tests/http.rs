@@ -535,6 +535,26 @@ fn the_control_center_feeds_managers_and_shrugs_at_anonymity() {
 }
 
 #[test]
+fn oidc_can_be_configured_from_the_admin_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db.sqlite3");
+    let anchor = spawn_anchor(&db);
+    let cookie = setup_admin(anchor.port);
+    let post =
+        |body: &[u8]| http_auth(anchor.port, "POST", "/api/config/oidc", body, Some(&cookie));
+    let (status, _) = post(br#"{"issuer":"https://auth.test/realm","client_id":"anchor"}"#);
+    assert_eq!(status, 400, "a half-configured SSO is refused");
+    let (status, body) = post(
+        br#"{"issuer":"https://auth.test/realm","client_id":"anchor","client_secret":"shh","origin":"https://maki.test"}"#,
+    );
+    assert_eq!(status, 200, "save: {}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("restart"));
+    let (status, body) = post(br#"{"issuer":"","client_id":"","client_secret":"","origin":""}"#);
+    assert_eq!(status, 200, "clear: {}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("cleared"));
+}
+
+#[test]
 fn the_qr_endpoint_renders_share_links_only() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("db.sqlite3");

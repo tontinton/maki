@@ -239,7 +239,12 @@ impl RemoteServer {
         } else {
             String::new()
         };
-        match self.dispatcher.dispatch(route, session, &query, &body) {
+        // The single token is the whole story in standalone mode: everyone
+        // who reaches the page holds it and gets full control.
+        match self
+            .dispatcher
+            .dispatch(route, session, &query, &body, "anon·control")
+        {
             crate::dispatch::DispatchOutcome::NotFound => {
                 let _ = request.respond(Response::empty(404));
             }

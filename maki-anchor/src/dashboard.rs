@@ -87,10 +87,9 @@ fn layout_start(title: &str, user: Option<&UserRow>, page: &str) -> String {
             .or(user.email.as_deref())
             .unwrap_or("user");
         s.push_str(&format!(
-            "<span class=\"user\">{} (id {}){} · <a href=\"/logout\">log out</a></span>",
+            "<span class=\"user\">{}{} · <a href=\"/logout\">log out</a></span>",
             html_escape(who),
-            user.id,
-            if user.is_admin { " · admin" } else { "" }
+            if user.is_admin { " (admin)" } else { "" }
         ));
     } else {
         s.push_str("<span class=\"user\"><a href=\"/login\">log in</a></span>");
@@ -390,6 +389,19 @@ pub fn render_admin(
         r##"<div class="card">
         <h2>Admin — User management</h2>
         <div id="sso-status" class="small" style="margin:.5rem 0"></div>
+        <h3>Single sign-on (OIDC)</h3>
+        <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:end;margin:.4rem 0">
+          <label style="flex:2;min-width:14rem">Issuer<br><input id="sso-issuer" placeholder="https://auth.example.com/realms/main"></label>
+          <label style="flex:1;min-width:8rem">Client ID<br><input id="sso-client" placeholder="maki-anchor"></label>
+          <label style="flex:1;min-width:8rem">Client secret<br><input id="sso-secret" type="password" placeholder="kept on the server"></label>
+          <label style="flex:1;min-width:8rem">Origin<br><input id="sso-origin" placeholder="https://maki.example.com"></label>
+        </div>
+        <div style="display:flex;gap:.5rem;align-items:center">
+          <button id="sso-save" class="primary">Save SSO</button>
+          <button id="sso-clear">Disable</button>
+          <span id="sso-form-status" class="small"></span>
+        </div>
+        <p class="small">The provider callback URL is {{origin}}/callback. Changes apply on the next anchor restart. A config file's [oidc] block is used until you save here.</p>
         <div style="display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin:.6rem 0">
           <label>Mint tokens<br><select id="mint-select"><option value="any">any (anonymous)</option><option value="user">user (any logged-in)</option><option value="admin">admin only</option></select></label>
           <button id="mint-save">Save</button>
@@ -397,11 +409,11 @@ pub fn render_admin(
           <span class="small">Current: <code id="mint-current">{}</code></span>
         </div>
         <h3>Users</h3>
-        <table id="users-table" style="width:100%"><tr><th>ID</th><th>Sub</th><th>Email</th><th>Name</th><th>Admin</th><th>Actions</th></tr></table>
+        <table id="users-table" style="width:100%"><tr><th>Name</th><th>Subject</th><th>Admin</th><th>Actions</th></tr></table>
         <h3>Grants (per-user per-instance)</h3>
-        <table id="grants-table" style="width:100%"><tr><th>User ID</th><th>Instance</th><th>Rights</th></tr></table>
+        <table id="grants-table" style="width:100%"><tr><th>User</th><th>Instance</th><th>Rights</th></tr></table>
         <form id="grant-form" style="margin:.8rem 0;display:flex;gap:.5rem;flex-wrap:wrap;align-items:end">
-          <label>User ID<br><input id="grant-user" type="number" min="1" required style="width:6rem"></label>
+          <label>User<br><select id="grant-user" required></select></label>
           <label>Instance<br><input id="grant-instance" placeholder="work-laptop" required></label>
           <label>Rights<br><select id="grant-rights"><option value="view">view</option><option value="control">control</option></select></label>
           <button type="submit" class="primary">Set grant</button>
@@ -446,7 +458,26 @@ pub fn render_admin(
             const {{ok, j}} = await fetchJson('/api/sso');
             if (!ok) {{ ssoEl.textContent = 'SSO: unknown'; return; }}
             ssoEl.textContent = j.enabled ? `SSO enabled — issuer ${{j.issuer}} origin ${{j.origin}}` : 'SSO disabled';
+            if (j.enabled) {{
+              document.getElementById('sso-issuer').value = j.issuer || '';
+              document.getElementById('sso-client').value = j.client_id || '';
+              document.getElementById('sso-origin').value = j.origin || '';
+            }}
           }};
+          const ssoSend = async (body, busy) => {{
+            const st = document.getElementById('sso-form-status');
+            st.textContent = busy;
+            const {{ok, j}} = await fetchJson('/api/config/oidc', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(body)}});
+            st.textContent = ok ? ((j.cleared ?? 'saved') + ' — restart the anchor to apply') : (j.error || 'failed');
+            if (ok) loadSso();
+          }};
+          document.getElementById('sso-save').onclick = () => ssoSend({{
+            issuer: document.getElementById('sso-issuer').value.trim(),
+            client_id: document.getElementById('sso-client').value.trim(),
+            client_secret: document.getElementById('sso-secret').value,
+            origin: document.getElementById('sso-origin').value.trim(),
+          }}, 'saving…');
+          document.getElementById('sso-clear').onclick = () => ssoSend({{issuer:'', client_id:'', client_secret:'', origin:''}}, 'clearing…');
           const loadMint = async () => {{
             const {{ok, j}} = await fetchJson('/api/config/mint_tokens');
             if (ok && j.mint_tokens) {{ mintSelect.value = j.mint_tokens; mintCurrent.textContent = j.mint_tokens; }}
@@ -463,19 +494,23 @@ pub fn render_admin(
             usersTable.querySelectorAll('tr:not(:first-child)').forEach(r=>r.remove());
             for (const u of j) {{
               const tr = document.createElement('tr');
-              tr.innerHTML = `<td>${{u.id}}</td><td style="max-width:18rem;overflow:hidden;text-overflow:ellipsis">${{escape(u.oidc_sub)}}</td><td>${{escape(u.email||'')}}</td><td>${{escape(u.name||'')}}</td><td>${{u.is_admin?'yes':''}}</td><td class="small"><a href="#" data-user="${{escape(u.oidc_sub)}}">copy sub</a></td>`;
+              const label = u.name || u.email || u.oidc_sub;
+              tr.innerHTML = `<td><b>${{escape(label)}}</b></td><td class="small" style="max-width:18rem;overflow:hidden;text-overflow:ellipsis">${{escape(u.oidc_sub)}}</td><td>${{u.is_admin?'yes':''}}</td><td class="small"><a href="#" data-user="${{escape(u.oidc_sub)}}">copy sub</a></td>`;
               usersTable.appendChild(tr);
             }}
             if (j.length===0) {{
-              const tr=document.createElement('tr'); tr.innerHTML='<td colspan=6 style="color:#64748b">no users yet</td>'; usersTable.appendChild(tr);
+              const tr=document.createElement('tr'); tr.innerHTML='<td colspan=4 style="color:#64748b">no users yet</td>'; usersTable.appendChild(tr);
             }}
+            const grantUser = document.getElementById('grant-user');
+            grantUser.innerHTML = j.map(u => `<option value="${{u.id}}">${{escape(u.name||u.email||u.oidc_sub)}}</option>`).join('');
+            grantUser.dataset.ready = '1';
           }};
           const loadGrants = async () => {{
             const {{ok, j}} = await fetchJson('/api/grants');
             if (!ok) return;
             grantsTable.querySelectorAll('tr:not(:first-child)').forEach(r=>r.remove());
             for (const g of j) {{
-              const tr=document.createElement('tr'); tr.innerHTML=`<td>${{g[0]}}</td><td>${{escape(g[1])}}</td><td>${{escape(g[2])}}</td>`;
+              const tr=document.createElement('tr'); tr.innerHTML=`<td>${{escape(g.user)}}</td><td>${{escape(g.instance)}}</td><td>${{escape(g.rights)}}</td>`;
               grantsTable.appendChild(tr);
             }}
           }};

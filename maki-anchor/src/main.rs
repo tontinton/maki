@@ -186,10 +186,13 @@ fn main() {
                 }),
                 Err(_) => AnchorConfig::default(),
             };
-            let oidc = anchor_config
-                .oidc
-                .as_ref()
-                .and_then(OidcFileConfig::complete)
+            let oidc = db_oidc(&store)
+                .or_else(|| {
+                    anchor_config
+                        .oidc
+                        .as_ref()
+                        .and_then(OidcFileConfig::complete)
+                })
                 .inspect(|_| {
                     tracing::info!("OIDC login enabled");
                 });
@@ -314,8 +317,10 @@ fn main() {
                     }
                 }
                 GrantCommand::List => {
-                    for (user, instance, rights) in store.list_grants().expect("list grants") {
-                        println!("{user} {instance} {rights}");
+                    for (user_id, user, instance, rights) in
+                        store.list_grants().expect("list grants")
+                    {
+                        println!("{user} {instance} {rights} (user {user_id})");
                     }
                 }
                 GrantCommand::Lookup { oidc_sub } => {
@@ -461,6 +466,22 @@ fn resolve_bind(flag: Option<&str>, file: Option<&str>) -> String {
     flag.or(file).unwrap_or(DEFAULT_BIND).to_owned()
 }
 
+/// SSO configured from the admin page lives in the settings table and beats
+/// the file: hosted installs should not need shell access to turn on OIDC.
+fn db_oidc(store: &Store) -> Option<OidcConfig> {
+    let issuer = store.get_setting("oidc_issuer").ok()?;
+    let client_id = store.get_setting("oidc_client_id").ok()?;
+    let client_secret = store.get_setting("oidc_client_secret").ok()?;
+    let origin = store.get_setting("oidc_origin").ok()?;
+    let config = OidcConfig {
+        issuer: issuer?,
+        client_id: client_id?,
+        client_secret: client_secret?,
+        origin: origin?,
+    };
+    (!config.issuer.is_empty() && !config.origin.is_empty()).then_some(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,6 +492,26 @@ mod tests {
     #[test_case(None,              None             => DEFAULT_BIND.to_owned() ; "default_last")]
     fn bind_precedence(flag: Option<&str>, file: Option<&str>) -> String {
         resolve_bind(flag, file)
+    }
+
+    #[test]
+    fn settings_table_beats_the_file_for_sso() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        assert!(db_oidc(&store).is_none(), "nothing configured yet");
+        for (key, value) in [
+            ("oidc_issuer", "https://auth.test/realms/main"),
+            ("oidc_client_id", "maki-anchor"),
+            ("oidc_client_secret", "shh"),
+            ("oidc_origin", "https://maki.test"),
+        ] {
+            store.set_setting(key, value).unwrap();
+        }
+        let oidc = db_oidc(&store).expect("the full set configures SSO");
+        assert_eq!(oidc.issuer, "https://auth.test/realms/main");
+        assert_eq!(oidc.origin, "https://maki.test");
+        store.delete_setting("oidc_issuer").unwrap();
+        assert!(db_oidc(&store).is_none(), "a half set is no set");
     }
 
     #[test]

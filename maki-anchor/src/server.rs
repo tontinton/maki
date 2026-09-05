@@ -534,6 +534,156 @@ fn redirect(request: http::Request, to: &str) -> RouteOutcome {
     RouteOutcome::Streamed
 }
 
+/// The `/rc link*` pushes: answer the instance with its current anchor-side
+/// links (and the freshly minted token when this was a mint).
+fn handle_link_push(store: &Arc<Store>, hub: &Hub, instance_id: i64, push: TunnelPush) {
+    let (minted, revoked) = match push {
+        TunnelPush::LinkList { list_links } => {
+            if !list_links {
+                return;
+            }
+            (None, None)
+        }
+        TunnelPush::LinkMint { link_mint } => {
+            let Some(role) = Role::parse(&link_mint.rights) else {
+                tracing::debug!(instance_id, rights = link_mint.rights, "bad mint rights");
+                return;
+            };
+            let hours = link_mint
+                .hours
+                .unwrap_or(2)
+                .clamp(1, crate::dashboard::MAX_LINK_HOURS);
+            match mint_link(
+                store.as_ref(),
+                instance_id,
+                None,
+                role,
+                std::time::Duration::from_secs(hours * 3600),
+            ) {
+                Ok(token) => (Some(token), None),
+                Err(err) => {
+                    tracing::warn!(error = %err, instance_id, "tunnel mint failed");
+                    return;
+                }
+            }
+        }
+        TunnelPush::LinkRm { link_rm } => {
+            let token = link_rm
+                .split('/')
+                .find(|seg| seg.len() == 32 && seg.bytes().all(|b| b.is_ascii_hexdigit()))
+                .unwrap_or(link_rm.trim());
+            match store.revoke_link(&store::hash_token(token)) {
+                Ok(true) => (None, Some(token.to_owned())),
+                Ok(false) => (None, None),
+                Err(err) => {
+                    tracing::warn!(error = %err, instance_id, "tunnel revoke failed");
+                    return;
+                }
+            }
+        }
+        _ => (None, None),
+    };
+    let links: Vec<serde_json::Value> = store
+        .list_links()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|l| l.instance_id == instance_id)
+        .map(|l| {
+            serde_json::json!({
+                "token": l.token,
+                "rights": l.rights,
+                "session": l.external_session_id,
+                "expires": l.expires_at,
+            })
+        })
+        .collect();
+    let mut frame = serde_json::json!({ "links": links });
+    if let Some(token) = minted {
+        frame["minted"] = serde_json::Value::String(token);
+    }
+    hub.control(instance_id, frame.to_string());
+    if revoked.is_some() {
+        // Anything streaming on the dead token should stop now, not after
+        // its next browser reconnect.
+        hub.disconnect(instance_id);
+    }
+}
+
+/// Save (or clear) the OIDC block from the admin page. Secrets stay on the
+/// server: the response and GET surface never echo them back.
+fn handle_api_set_oidc(
+    mut request: http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method() != "POST" {
+        return json_error(request, 405, "method not allowed");
+    }
+    if is_non_admin(user) {
+        return forbidden_json(request);
+    }
+    let value = match read_json(&mut request) {
+        Ok(v) => v,
+        Err(e) => return json_error(request, 400, &e),
+    };
+    let field = |k: &str| {
+        value
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned()
+    };
+    let (issuer, client_id, client_secret, origin) = (
+        field("issuer"),
+        field("client_id"),
+        field("client_secret"),
+        field("origin"),
+    );
+    if issuer.is_empty() && client_id.is_empty() && client_secret.is_empty() && origin.is_empty() {
+        for key in [
+            "oidc_issuer",
+            "oidc_client_id",
+            "oidc_client_secret",
+            "oidc_origin",
+        ] {
+            if let Err(err) = store.delete_setting(key) {
+                return json_error(request, 500, &err.to_string());
+            }
+        }
+        tracing::info!("OIDC cleared from the admin page");
+        return buffered(
+            center_json(200, serde_json::json!({"cleared": true})),
+            request,
+        );
+    }
+    if issuer.is_empty() || client_id.is_empty() || origin.is_empty() || client_secret.is_empty() {
+        return json_error(
+            request,
+            400,
+            "fill issuer, client id, secret and origin, or clear SSO with all four empty",
+        );
+    }
+    for (key, val) in [
+        ("oidc_issuer", issuer.as_str()),
+        ("oidc_client_id", client_id.as_str()),
+        ("oidc_client_secret", client_secret.as_str()),
+        ("oidc_origin", origin.as_str()),
+    ] {
+        if let Err(err) = store.set_setting(key, val) {
+            return json_error(request, 500, &err.to_string());
+        }
+    }
+    tracing::info!(issuer, "OIDC saved from the admin page");
+    buffered(
+        center_json(
+            200,
+            serde_json::json!({"saved": true, "restart_required": true}),
+        ),
+        request,
+    )
+}
+
 /// First-run admin creation: a form while the store is empty, an account and
 /// live cookie on submit, and a bounce as soon as anyone exists (race
 /// attempts land on the login page through the wall above anyway).
@@ -1059,7 +1209,13 @@ fn json_list_users(store: &Arc<Store>) -> (u16, String, Vec<u8>) {
 fn json_list_grants(store: &Arc<Store>) -> (u16, String, Vec<u8>) {
     match store.list_grants() {
         Ok(rows) => {
-            let body = serde_json::to_vec(&rows).unwrap_or_default();
+            let body: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|(user_id, user, instance, rights)| {
+                    serde_json::json!({"user_id": user_id, "user": user, "instance": instance, "rights": rights})
+                })
+                .collect();
+            let body = serde_json::to_vec(&body).unwrap_or_default();
             (200, "application/json".to_string(), body)
         }
         Err(err) => (
@@ -1317,8 +1473,10 @@ fn handle_api_center(
             .list_grants()
             .unwrap_or_default()
             .into_iter()
-            .filter(|(_, instance, _)| *instance == view.instance.name)
-            .map(|(user_id, _, rights)| serde_json::json!({"user_id": user_id, "rights": rights}))
+            .filter(|(_, _, instance, _)| *instance == view.instance.name)
+            .map(|(user_id, user, _, rights)| {
+                serde_json::json!({"user_id": user_id, "user": user, "rights": rights})
+            })
             .collect();
         body["links"] = serde_json::Value::Array(links);
         body["grants"] = serde_json::Value::Array(grants);
@@ -2205,6 +2363,9 @@ fn route_authorized(
             None => return redirect_to_login(request),
         }
     }
+    if path == "/api/config/oidc" {
+        return handle_api_set_oidc(request, store, user.as_ref());
+    }
     if path == "/api/config/mint_tokens" {
         return match request.method() {
             "GET" => {
@@ -2335,6 +2496,10 @@ fn handle_push(store: &Arc<Store>, hub: &Hub, instance_id: i64, push: TunnelPush
             return;
         }
         TunnelPush::SessionIndex { sessions } => sessions,
+        other => {
+            handle_link_push(store, hub, instance_id, other);
+            return;
+        }
     };
     for entry in sessions {
         let row = SessionRow {
@@ -2455,10 +2620,14 @@ fn proxy_remote(
         "path": format!("/{tail}"),
         "headers": {},
         "body": STANDARD.encode(&body),
+        // Who is behind this request, as the anchor can tell, and what they
+        // ended up allowed to do: the instance echoes both in watcher rosters.
+        "actor": user.map(display_name),
+        "rights": rights,
     })
     .to_string();
 
-    let (_conn_id, rx) = match hub.request(link.instance_id, forwarded) {
+    let (conn_id, rx) = match hub.request(link.instance_id, forwarded) {
         Ok(pair) => pair,
         Err(err) => {
             return buffered(
@@ -2496,7 +2665,18 @@ fn proxy_remote(
     // first chunk is handed to the streamer so an already-final stream cannot
     // leave the browser waiting on the chunk timeout.
     if tail_under_session(tail) == "events" && status == 200 {
-        return stream_to_browser(request, hub, rx, first);
+        return stream_to_browser(
+            request,
+            hub,
+            store,
+            rx,
+            first,
+            StreamTarget {
+                instance_id: link.instance_id,
+                conn_id,
+                token_hash: link.token_hash.clone(),
+            },
+        );
     }
     let content_type = first
         .content_type
@@ -2515,35 +2695,76 @@ fn proxy_remote(
 
 /// Streams tunnel SSE chunks to the browser with tiny_http bypassed: its
 /// chunked encoder buffers, and SSE frames must flush as they arrive.
+/// Where an SSE stream is headed, so its teardown can tell the instance to
+/// stop feeding it.
+struct StreamTarget {
+    instance_id: i64,
+    conn_id: u64,
+    token_hash: String,
+}
+
 fn stream_to_browser(
     request: http::Request,
     hub: &Hub,
+    store: &Arc<Store>,
     rx: Receiver<hub::TunnelResponse>,
     first: hub::TunnelResponse,
+    target: StreamTarget,
 ) -> RouteOutcome {
-    let status = first.status;
+    let StreamTarget {
+        instance_id,
+        conn_id,
+        token_hash,
+    } = target;
     let mut writer = request.into_writer();
     let head = format!(
-        "HTTP/1.1 {status} OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n"
+        "HTTP/1.1 {} OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n",
+        first.status
     );
-    if writer.write_all(head.as_bytes()).is_err() || writer.flush().is_err() {
-        return RouteOutcome::Streamed;
-    }
-    let mut first = Some(first);
-    loop {
-        let chunk = match first.take() {
-            Some(chunk) => chunk,
-            None => match hub.wait_chunk(&rx) {
-                Ok(chunk) => chunk,
-                Err(_) => break,
-            },
-        };
-        let final_chunk = chunk.final_chunk;
-        if writer.write_all(&chunk.body).is_err() || writer.flush().is_err() || final_chunk {
-            break;
+    let mut final_chunk = false;
+    if writer.write_all(head.as_bytes()).is_ok() && writer.flush().is_ok() {
+        let mut pending = Some(first);
+        loop {
+            let chunk = match pending.take() {
+                Some(chunk) => chunk,
+                None => match hub.wait_chunk(&rx) {
+                    Ok(chunk) => chunk,
+                    Err(_) => break,
+                },
+            };
+            final_chunk = chunk.final_chunk;
+            if final_chunk {
+                break;
+            }
+            if !store.link_is_live(&token_hash) {
+                // The link was revoked or expired mid-stream: this is the kick.
+                break;
+            }
+            if writer.write_all(&chunk.body).is_err() || writer.flush().is_err() {
+                break;
+            }
         }
     }
+    if !final_chunk {
+        // Anything short of a final chunk leaves the instance streaming into
+        // a dead browser; tell it to stop and retire the watcher.
+        hub.cancel(instance_id, conn_id);
+    }
     RouteOutcome::Streamed
+}
+
+/// A browser-visible name for logged-in requests; anonymous token holders
+/// stay anonymous.
+fn display_name(user: &crate::store::UserRow) -> String {
+    user.name
+        .clone()
+        .or_else(|| user.email.clone())
+        .unwrap_or_else(|| {
+            user.oidc_sub
+                .strip_prefix("local:")
+                .unwrap_or(&user.oidc_sub)
+                .to_owned()
+        })
 }
 
 fn drive_tunnel(
@@ -2606,15 +2827,22 @@ fn drive_tunnel(
     let writer_handle = Arc::clone(&writer);
     let _ = thread::spawn(move || {
         while let Ok(command) = cmd_rx.recv() {
-            let TunnelCommand::Request { conn_id, request } = command;
-            let mut wire = serde_json::Map::new();
-            wire.insert("conn_id".into(), conn_id.into());
-            if let Ok(inner) =
-                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&request)
-            {
-                wire.extend(inner);
-            }
-            let wire = serde_json::Value::Object(wire).to_string();
+            let wire = match command {
+                TunnelCommand::Request { conn_id, request } => {
+                    let mut wire = serde_json::Map::new();
+                    wire.insert("conn_id".into(), conn_id.into());
+                    if let Ok(inner) =
+                        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&request)
+                    {
+                        wire.extend(inner);
+                    }
+                    serde_json::Value::Object(wire).to_string()
+                }
+                TunnelCommand::Cancel { conn_id } => {
+                    serde_json::json!({ "cancel": conn_id }).to_string()
+                }
+                TunnelCommand::Control(frame) => frame,
+            };
             let mut guard = writer_handle.lock().unwrap();
             if guard.send(WsMessage::text(wire)).is_err() {
                 break;
