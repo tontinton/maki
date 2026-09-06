@@ -42,6 +42,7 @@ getrandom = { workspace = true }
 
 
 [dev-dependencies]
+maki-config = { workspace = true, features = ["test-util"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 

@@ -494,12 +494,14 @@ mod tests {
         let hostile = tempfile::tempdir().unwrap();
 
         let prev = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: tests run single-threaded within a process nextest invokes once.
+        // SAFETY: setting a variable is only sound while no other thread reads
+        // the environment, and the runner is what holds that up: `just test`
+        // runs `cargo nextest`, which gives every test its own process.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", hostile.path()) };
 
         let dirs = config_search_dirs_from(Some(home_a.path()), Some(&xdg_a));
 
-        // SAFETY: same single-threaded assumption as above.
+        // SAFETY: same one process per test rule as above.
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),

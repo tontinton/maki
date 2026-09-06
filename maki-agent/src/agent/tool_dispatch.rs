@@ -954,7 +954,9 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use maki_config::{Effect, Permission, PermissionRule, PermissionsConfig, ToolKey};
+    use maki_config::{
+        Effect, Permission, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
+    };
     use test_case::test_case;
 
     use super::*;
@@ -1105,6 +1107,7 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new(
             config,
             PathBuf::from(TEST_ROOT),
+            ProjectConfig::for_project(Path::new(TEST_ROOT)),
             Arc::default(),
         ));
         stub_ctx_with_permissions(mode, permissions)

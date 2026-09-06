@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use super::error::McpError;
 use crate::tools::is_builtin_tool;
-use maki_config::{expand_env, is_valid_server_name};
+use maki_config::{ProjectConfig, expand_env, is_valid_server_name};
 use serde::Deserialize;
 use toml_edit::DocumentMut;
 
@@ -364,15 +364,32 @@ fn merge_config(merged: &mut McpConfig, errors: &mut McpConfigErrors, path: &Pat
     }
 }
 
-pub fn load_config(cwd: &Path) -> (McpConfig, McpConfigErrors) {
+pub fn load_config(cwd: &Path, project_config: ProjectConfig) -> (McpConfig, McpConfigErrors) {
+    load_config_inner(
+        cwd,
+        maki_storage::paths::find_config_path(MCP_CONFIG_FILE).as_deref(),
+        project_config,
+    )
+}
+
+fn load_config_inner(
+    cwd: &Path,
+    global_path: Option<&Path>,
+    project_config: ProjectConfig,
+) -> (McpConfig, McpConfigErrors) {
     let mut merged = McpConfig::default();
     let mut errors = McpConfigErrors::new(cwd.to_path_buf());
 
-    if let Some(global_path) = maki_storage::paths::find_config_path(MCP_CONFIG_FILE) {
-        merge_config(&mut merged, &mut errors, &global_path);
+    if let Some(global_path) = global_path {
+        merge_config(&mut merged, &mut errors, global_path);
     }
-    let project_path = cwd.join(".maki").join(MCP_CONFIG_FILE);
-    merge_config(&mut merged, &mut errors, &project_path);
+    if project_config.is_trusted() {
+        let project_path = project_config
+            .config_root()
+            .join(".maki")
+            .join(MCP_CONFIG_FILE);
+        merge_config(&mut merged, &mut errors, &project_path);
+    }
     (merged, errors)
 }
 
@@ -698,15 +715,24 @@ command = ["project"]
         )
         .unwrap();
 
-        let project_cfg = read_config(&project_maki_dir.join("mcp.toml"))
-            .unwrap()
-            .unwrap();
-        let global_cfg = read_config(&global_dir.join("mcp.toml")).unwrap().unwrap();
+        let (global_only, errors) = load_config_inner(
+            &project_dir,
+            Some(&global_dir.join(MCP_CONFIG_FILE)),
+            ProjectConfig::discover(&project_dir),
+        );
+        assert!(errors.is_empty());
+        let global = parse_server("srv".to_owned(), global_only.mcp["srv"].clone()).unwrap();
+        match global.transport {
+            Transport::Stdio { program, .. } => assert_eq!(program, "global"),
+            _ => panic!("expected Stdio"),
+        }
 
-        let mut merged = McpConfig::default();
-        merged.mcp.extend(global_cfg.mcp);
-        merged.mcp.extend(project_cfg.mcp);
-
+        let (merged, errors) = load_config_inner(
+            &project_dir,
+            Some(&global_dir.join(MCP_CONFIG_FILE)),
+            ProjectConfig::for_project(&project_dir),
+        );
+        assert!(errors.is_empty());
         let all: Vec<_> = merged
             .mcp
             .into_iter()

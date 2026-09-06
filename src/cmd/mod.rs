@@ -10,7 +10,8 @@ use maki_config::Config;
 use maki_lua::{DiscoveredPackage, Interaction, PluginHost};
 use maki_storage::StateDir;
 
-use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction};
+use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction, TrustAction};
+use crate::project_trust;
 use crate::update;
 
 fn sanitize_warnings(warnings: &[String]) -> Vec<String> {
@@ -148,6 +149,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,
         },
+        Some(Command::Trust { action }) => {
+            let storage = StateDir::resolve().context("resolve state directory")?;
+            match action {
+                TrustAction::Add { path, yes } => {
+                    project_trust::add(&storage, path.as_deref(), yes)?
+                }
+                TrustAction::Remove { path } => project_trust::remove(&storage, path.as_deref())?,
+                TrustAction::List => {
+                    for decision in project_trust::list(&storage)? {
+                        println!("{decision}");
+                    }
+                }
+            }
+        }
         Some(Command::Prompt {
             variant,
             plan,

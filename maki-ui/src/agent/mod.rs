@@ -291,11 +291,11 @@ fn spawn_agent_internal(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
 
     use maki_agent::AgentEvent;
-    use maki_config::PermissionsConfig;
+    use maki_config::{PermissionsConfig, ProjectConfig};
     use maki_providers::provider::BoxFuture;
     use maki_providers::{AgentError, ModelInfo, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -350,6 +350,7 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
+            ProjectConfig::for_project(Path::new("/tmp")),
             Arc::default(),
         ));
         let handles = AgentHandles::spawn(

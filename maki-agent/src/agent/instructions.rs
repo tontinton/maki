@@ -3,11 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use maki_providers::model::Model;
-
 use crate::AgentMode;
-use crate::command::find_project_ancestor_dirs;
+use crate::command::project_ancestor_dirs;
 use crate::template::Vars;
+use maki_providers::model::Model;
 
 const INSTRUCTION_FILES: &[&str] = &[
     "AGENTS.md",
@@ -91,7 +90,7 @@ fn collect_instruction_files(
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
 
-    let ancestor_dirs: Vec<_> = find_project_ancestor_dirs(Path::new(cwd)).collect();
+    let ancestor_dirs: Vec<_> = project_ancestor_dirs(Path::new(cwd)).collect();
     let has_git_root = ancestor_dirs.iter().any(|dir| dir.join(".git").exists());
     let project_dirs = if has_git_root {
         ancestor_dirs

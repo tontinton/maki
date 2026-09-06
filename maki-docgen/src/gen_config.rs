@@ -237,9 +237,12 @@ Settings go in `init.lua`, a Lua script that calls `maki.setup()`. Same language
 Two places, both optional:
 
 - **Global**: `~/.config/maki/init.lua`
-- **Project**: `.maki/init.lua` (relative to your working directory)
+- **Project**: `.maki/init.lua` in the active Git checkout, or in the working
+  directory outside Git
 
 When both exist, project settings override global ones. Neither file is required.
+A project `init.lua` runs only once you trust that folder, see
+[Folder Trust](/docs/permissions/#folder-trust).
 
 ## Example
 
@@ -364,7 +367,7 @@ Maki follows platform directory conventions. On Linux and macOS that is XDG. On 
 | Logs | `~/.local/logs/maki/` | `%APPDATA%\\maki\\` |
 | Cache | `~/.cache/maki/` | `%LOCALAPPDATA%\\maki\\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\maki` on Windows; that is separate from these runtime dirs.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, folder trust, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\maki` on Windows; that is separate from these runtime dirs.
 
 `~/.maki/` (or `%USERPROFILE%\\.maki\\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
 

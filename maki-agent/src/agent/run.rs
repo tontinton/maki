@@ -767,8 +767,10 @@ fn json_len(value: &Value) -> usize {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
+    use maki_config::ProjectConfig;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
@@ -944,6 +946,7 @@ mod tests {
                         ..Default::default()
                     },
                     std::path::PathBuf::from("/tmp"),
+                    ProjectConfig::for_project(Path::new("/tmp")),
                     Arc::default(),
                 )),
                 session_id: None,

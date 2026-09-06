@@ -124,4 +124,9 @@ AGENTS.md              # always in context
 AGENTS.local.md        # personal per-project instructions (gitignored)
 ```
 
+`init.lua`, `mcp.toml` and the allow rules in `permissions.toml` can run code,
+so Maki asks once per folder before it loads them. Commands, skills and
+`AGENTS.md` load either way. See
+[Folder Trust](/docs/permissions/#folder-trust).
+
 Which instruction file wins, when subdirectory rules load, and how skills and memory fit together: [Context](/docs/context/). All settings: [Configuration](/docs/configuration/).

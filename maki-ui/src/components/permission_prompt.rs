@@ -27,6 +27,24 @@ const HINT_DENY_ROW: &[(&str, &str)] = &[
     ("D", "Deny-always (all)"),
 ];
 
+// An untrusted folder keeps its project answers in memory, so the rows say
+// what the answer really does instead of promising a saved rule.
+const HINT_ALLOW_ROW_UNTRUSTED: &[(&str, &str)] = &[
+    ("y", "Allow"),
+    ("a", "Project (this session)"),
+    ("A", "Always (all projects, saved)"),
+    ("s", "Session"),
+];
+const HINT_DENY_ROW_UNTRUSTED: &[(&str, &str)] = &[
+    ("n", "Deny"),
+    ("d", "Deny project (this session)"),
+    ("D", "Deny-always (all, saved)"),
+];
+const UNTRUSTED_NOTICE: &str = "folder not trusted, project answers last for this session only";
+/// Nothing is written into a folder the user declined, so the answer that
+/// survives a restart is the global one and the prompt has to name it.
+const UNTRUSTED_DURABLE_ANSWER: &str = "use D to save a deny that outlives this session";
+
 const CONFIRM_ALLOW_PROJECT_HINTS: &[(&str, &str)] = &[
     ("Enter / y", "Confirm allow-always (project)"),
     ("any", "Cancel"),
@@ -43,6 +61,14 @@ const CONFIRM_DENY_PROJECT_HINTS: &[(&str, &str)] = &[
 ];
 const CONFIRM_DENY_ALL_HINTS: &[(&str, &str)] = &[
     ("Enter / y", "Confirm deny-always (all projects)"),
+    ("any", "Cancel"),
+];
+const CONFIRM_ALLOW_PROJECT_SESSION_HINTS: &[(&str, &str)] = &[
+    ("Enter / y", "Confirm allow (project, this session)"),
+    ("any", "Cancel"),
+];
+const CONFIRM_DENY_PROJECT_SESSION_HINTS: &[(&str, &str)] = &[
+    ("Enter / y", "Confirm deny (project, this session)"),
     ("any", "Cancel"),
 ];
 
@@ -83,10 +109,10 @@ fn aligned_hint_rows(rows: &[&[(&str, &str)]]) -> Vec<Line<'static>> {
 pub(crate) enum PromptState {
     #[default]
     Normal,
-    ConfirmAllowAlwaysLocal,
+    ConfirmAllowAlwaysProject,
     ConfirmAllowAlwaysGlobal,
     ConfirmAllowSession,
-    ConfirmDenyAlwaysLocal,
+    ConfirmDenyAlwaysProject,
     ConfirmDenyAlwaysGlobal,
     DenyEditing,
 }
@@ -100,6 +126,7 @@ pub enum PermissionPrompt {
         scopes: Vec<String>,
         subagent_id: Option<String>,
         allow_scopes: Vec<String>,
+        project_trusted: bool,
         state: PromptState,
         buffer: TextBuffer,
     },
@@ -130,6 +157,7 @@ impl PermissionPrompt {
         tool: ToolKey,
         scopes: Vec<String>,
         subagent_id: Option<String>,
+        project_trusted: bool,
     ) {
         let allow_scopes = generalized_scopes(&tool, &scopes);
         let allow_scopes = if allow_scopes == scopes {
@@ -143,6 +171,7 @@ impl PermissionPrompt {
             scopes,
             subagent_id,
             allow_scopes,
+            project_trusted,
             state: PromptState::Normal,
             buffer: TextBuffer::new(String::new()),
         };
@@ -197,10 +226,10 @@ impl PermissionPrompt {
             return None;
         }
         let confirm_answer = match *state {
-            PromptState::ConfirmAllowAlwaysLocal => Some(PermissionAnswer::AllowAlwaysLocal),
+            PromptState::ConfirmAllowAlwaysProject => Some(PermissionAnswer::AllowAlwaysProject),
             PromptState::ConfirmAllowAlwaysGlobal => Some(PermissionAnswer::AllowAlwaysGlobal),
             PromptState::ConfirmAllowSession => Some(PermissionAnswer::AllowSession),
-            PromptState::ConfirmDenyAlwaysLocal => Some(PermissionAnswer::DenyAlwaysLocal),
+            PromptState::ConfirmDenyAlwaysProject => Some(PermissionAnswer::DenyAlwaysProject),
             PromptState::ConfirmDenyAlwaysGlobal => Some(PermissionAnswer::DenyAlwaysGlobal),
             _ => None,
         };
@@ -220,7 +249,7 @@ impl PermissionPrompt {
                 None
             }
             KeyCode::Char('a') => {
-                *state = PromptState::ConfirmAllowAlwaysLocal;
+                *state = PromptState::ConfirmAllowAlwaysProject;
                 None
             }
             KeyCode::Char('A') => {
@@ -228,7 +257,7 @@ impl PermissionPrompt {
                 None
             }
             KeyCode::Char('d') => {
-                *state = PromptState::ConfirmDenyAlwaysLocal;
+                *state = PromptState::ConfirmDenyAlwaysProject;
                 None
             }
             KeyCode::Char('D') => {
@@ -260,6 +289,7 @@ impl PermissionPrompt {
             scopes,
             subagent_id,
             allow_scopes,
+            project_trusted,
             state,
             buffer,
             ..
@@ -324,10 +354,23 @@ impl PermissionPrompt {
             lines.push(Line::from(spans));
         }
 
+        if !*project_trusted {
+            for notice in [UNTRUSTED_NOTICE, UNTRUSTED_DURABLE_ANSWER] {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(notice, t.tool_dim),
+                ]));
+            }
+        }
+
         lines.push(Line::raw(""));
         match *state {
-            PromptState::ConfirmAllowAlwaysLocal => {
-                lines.push(hint_line(CONFIRM_ALLOW_PROJECT_HINTS));
+            PromptState::ConfirmAllowAlwaysProject => {
+                lines.push(hint_line(if *project_trusted {
+                    CONFIRM_ALLOW_PROJECT_HINTS
+                } else {
+                    CONFIRM_ALLOW_PROJECT_SESSION_HINTS
+                }));
             }
             PromptState::ConfirmAllowAlwaysGlobal => {
                 lines.push(hint_line(CONFIRM_ALLOW_ALL_HINTS));
@@ -335,8 +378,12 @@ impl PermissionPrompt {
             PromptState::ConfirmAllowSession => {
                 lines.push(hint_line(CONFIRM_SESSION_HINTS));
             }
-            PromptState::ConfirmDenyAlwaysLocal => {
-                lines.push(hint_line(CONFIRM_DENY_PROJECT_HINTS));
+            PromptState::ConfirmDenyAlwaysProject => {
+                lines.push(hint_line(if *project_trusted {
+                    CONFIRM_DENY_PROJECT_HINTS
+                } else {
+                    CONFIRM_DENY_PROJECT_SESSION_HINTS
+                }));
             }
             PromptState::ConfirmDenyAlwaysGlobal => {
                 lines.push(hint_line(CONFIRM_DENY_ALL_HINTS));
@@ -345,7 +392,12 @@ impl PermissionPrompt {
                 lines.push(hint_line(DENY_GUIDANCE_HINTS));
             }
             PromptState::Normal => {
-                lines.extend(aligned_hint_rows(&[HINT_ALLOW_ROW, HINT_DENY_ROW]));
+                let rows: &[&[(&str, &str)]] = if *project_trusted {
+                    &[HINT_ALLOW_ROW, HINT_DENY_ROW]
+                } else {
+                    &[HINT_ALLOW_ROW_UNTRUSTED, HINT_DENY_ROW_UNTRUSTED]
+                };
+                lines.extend(aligned_hint_rows(rows));
             }
         }
         lines.push(Line::raw(""));
@@ -374,18 +426,37 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_agent::permissions::PermissionAnswer;
     use maki_config::ToolKey;
+    use test_case::test_case;
 
-    use super::{PermissionPrompt, PromptState};
+    use super::{
+        CONFIRM_ALLOW_PROJECT_HINTS, CONFIRM_ALLOW_PROJECT_SESSION_HINTS,
+        CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS, PermissionPrompt,
+        PromptState, UNTRUSTED_DURABLE_ANSWER, UNTRUSTED_NOTICE,
+    };
 
-    fn open_prompt() -> PermissionPrompt {
-        let mut prompt = PermissionPrompt::new();
+    fn open_trusted(prompt: &mut PermissionPrompt, project_trusted: bool) {
         prompt.open(
             "id".into(),
             ToolKey::native("bash"),
             vec!["execute".into()],
             None,
+            project_trusted,
         );
+    }
+
+    fn open_prompt() -> PermissionPrompt {
+        let mut prompt = PermissionPrompt::new();
+        open_trusted(&mut prompt, true);
         prompt
+    }
+
+    fn rendered(prompt: &PermissionPrompt) -> String {
+        prompt
+            .build_lines()
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     fn ctrl_c() -> KeyEvent {
@@ -469,7 +540,56 @@ mod tests {
     #[test]
     fn wildcard_tool_key_opens() {
         let mut prompt = PermissionPrompt::new();
-        prompt.open("id".into(), ToolKey::Wildcard, vec![], None);
+        prompt.open("id".into(), ToolKey::Wildcard, vec![], None, true);
         assert!(matches!(prompt, PermissionPrompt::Open { .. }));
+    }
+
+    /// The always-answers are scoped to the project, and the hint has to say so
+    /// before the user commits to one. In an untrusted folder the answer only
+    /// holds for the session, and the hint says that instead.
+    #[test_case(KeyCode::Char('a'), true, PromptState::ConfirmAllowAlwaysProject, CONFIRM_ALLOW_PROJECT_HINTS ; "allow_always")]
+    #[test_case(KeyCode::Char('d'), true, PromptState::ConfirmDenyAlwaysProject, CONFIRM_DENY_PROJECT_HINTS ; "deny_always")]
+    #[test_case(KeyCode::Char('a'), false, PromptState::ConfirmAllowAlwaysProject, CONFIRM_ALLOW_PROJECT_SESSION_HINTS ; "allow_always_untrusted")]
+    #[test_case(KeyCode::Char('d'), false, PromptState::ConfirmDenyAlwaysProject, CONFIRM_DENY_PROJECT_SESSION_HINTS ; "deny_always_untrusted")]
+    fn project_answers_confirm_before_they_apply(
+        code: KeyCode,
+        project_trusted: bool,
+        expected: PromptState,
+        hints: &[(&str, &str)],
+    ) {
+        let mut prompt = PermissionPrompt::new();
+        open_trusted(&mut prompt, project_trusted);
+
+        assert_eq!(prompt.handle_key(key(code)), None);
+
+        let PermissionPrompt::Open { state, .. } = &prompt else {
+            panic!("expected Open");
+        };
+        assert_eq!(*state, expected);
+        let text = rendered(&prompt);
+        assert!(text.contains(hints[0].1), "hint missing from: {text}");
+    }
+
+    /// The project answers stay on the screen in an untrusted folder, so the
+    /// prompt has to explain how long they last and where a lasting deny goes
+    /// instead.
+    #[test_case(true, false ; "trusted_folder_says_nothing")]
+    #[test_case(false, true ; "untrusted_folder_warns")]
+    fn untrusted_folder_notice_follows_trust(project_trusted: bool, warned: bool) {
+        let mut prompt = PermissionPrompt::new();
+        open_trusted(&mut prompt, project_trusted);
+
+        let text = rendered(&prompt);
+        assert_eq!(text.contains(UNTRUSTED_NOTICE), warned, "rendered: {text}");
+        assert_eq!(
+            text.contains(UNTRUSTED_DURABLE_ANSWER),
+            warned,
+            "rendered: {text}"
+        );
+        assert_eq!(
+            prompt.handle_key(key(KeyCode::Char('a'))),
+            None,
+            "the project answer stays available either way"
+        );
     }
 }

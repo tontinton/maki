@@ -10,17 +10,21 @@ use color_eyre::eyre::Context;
 
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
-use maki_config::{Config, load_env_files, load_permissions};
-use maki_lua::{Interaction, PluginHost};
+use maki_config::project::{self, ProjectDecision};
+use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
+use maki_lua::{InitFiles, Interaction, PluginHost};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
 use maki_ui::{AppSession, RunOutcome};
 
 use crate::cli::{Cli, normalize_tool_name};
+use crate::project_trust;
 use crate::setup;
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
+const STALE_PROJECT_CONFIG: &str = ".maki/config.toml";
+const STALE_GLOBAL_CONFIG: &str = "config.toml";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
 
@@ -73,30 +77,30 @@ impl Drop for Teardown {
     }
 }
 
-fn discover_commands(disable: bool) -> Vec<CustomCommand> {
+fn discover_commands(disable: bool, cwd: &Path) -> Vec<CustomCommand> {
     if disable {
         return Vec::new();
     }
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    command::discover_commands(&cwd)
+    command::discover_commands(cwd)
 }
 
 fn load_config(
     plugin_host: &PluginHost,
     cli: &Cli,
-    cwd: &Path,
+    init_files: InitFiles,
+    project_config: &ProjectConfig,
     names: &super::KnownNames<'_>,
     warnings: &mut Vec<String>,
 ) -> Result<Config> {
     let raw_config = plugin_host
-        .load_init_files_or_skip(cli.no_plugins, cwd, warnings)
+        .load_init_files(init_files, project_config.config_root(), warnings)
         .context("load init.lua files")?;
 
     let mut config = raw_config
         .unwrap_or_default()
         .into_config(&names(plugin_host)?)
         .context("invalid config")?;
-    config.permissions = load_permissions(cwd);
+    config.permissions = load_permissions(project_config);
 
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
@@ -141,6 +145,7 @@ fn build_stack(
     cwd: &Path,
     storage: &StateDir,
     interaction: Interaction,
+    trust: &ProjectDecision,
     fallback: Option<(Config, Model)>,
 ) -> Result<(Stack, Vec<String>)> {
     let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
@@ -157,12 +162,20 @@ fn build_stack(
         },
         interaction,
         |host, names, warnings| {
-            let loaded = load_config(host, cli, cwd, names, warnings);
+            warnings.extend(trust.warning.clone());
+            let loaded = load_config(
+                host,
+                cli,
+                project_trust::init_files(&trust.project_config, cli.no_plugins),
+                &trust.project_config,
+                names,
+                warnings,
+            );
             config_or_fallback(loaded, fallback_config, warnings)
         },
     )?;
 
-    let commands = discover_commands(cli.no_commands);
+    let commands = discover_commands(cli.no_commands, cwd);
 
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, storage);
     let (model, needs_login) = match (model_result, fallback_model) {
@@ -242,17 +255,24 @@ pub fn run(mut cli: Cli) -> Result<()> {
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
-    load_env_files(&cwd);
-    warn_stale_config_toml(&cwd);
-
-    // Only the interactive UI can answer an install confirmation, so the other
-    // modes refuse the install with its reason even when a terminal is attached.
-    let interaction = if cli.print || cli.is_sdk_mode() {
+    // Only the interactive UI can answer an install confirmation or a trust
+    // prompt. The other modes refuse the install with its reason and skip
+    // untrusted project config with a warning, terminal or not.
+    let headless = cli.print || cli.is_sdk_mode();
+    let interaction = if headless {
         Interaction::None
     } else {
         Interaction::Tty
     };
-    let (mut stack, startup_warnings) = build_stack(&cli, &cwd, &storage, interaction, None)?;
+    let trust = project::resolve(
+        &storage,
+        &cwd,
+        !headless && io::stdin().is_terminal() && io::stderr().is_terminal(),
+    );
+    load_env_files(&trust.project_config);
+    warn_stale_config_toml(&trust.project_config);
+    let (mut stack, startup_warnings) =
+        build_stack(&cli, &cwd, &storage, interaction, &trust, None)?;
 
     setup::init_logging(&stack.config.storage);
     setup::init_telemetry(&stack.config.telemetry);
@@ -283,6 +303,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
             lua_handle: stack.plugin_host.event_handle(),
+            project_config: trust.project_config.clone(),
         })
         .context("run sdk mode")?;
         return Ok(());
@@ -302,6 +323,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             defaults: stack.config.session_defaults,
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
+            project_config: trust.project_config.clone(),
         })
         .context("run print mode")?;
         return Ok(());
@@ -356,6 +378,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
                     stack.config.permissions.clone(),
                     cwd.clone(),
+                    trust.project_config.clone(),
                     stack.plugin_host.plugin_rules(),
                 )),
                 timeouts: stack.timeouts(),
@@ -367,6 +390,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 ui_attachment: stack.plugin_host.ui_attachment(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+                project_config: trust.project_config.clone(),
             },
             initial_prompt.take(),
         )
@@ -416,7 +440,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     None
                 };
                 let (new_stack, new_warnings) =
-                    build_stack(&cli, &cwd, &storage, interaction, Some(last_good))?;
+                    build_stack(&cli, &cwd, &storage, interaction, &trust, Some(last_good))?;
                 tabs = reloaded;
                 if tabs.is_empty() {
                     let session = AppSession::new(&new_stack.model.spec(), &cwd_str);
@@ -440,10 +464,13 @@ pub fn run(mut cli: Cli) -> Result<()> {
     }
 }
 
-fn warn_stale_config_toml(cwd: &std::path::Path) {
+/// Trust has nothing to say about this file, because Maki no longer reads it.
+/// Someone who declined trust deserves to hear that the file is inert just as
+/// much as someone who accepted.
+fn warn_stale_config_toml(project_config: &ProjectConfig) {
     let stale_paths = [
-        maki_config::global_config_dir().map(|d| d.join("config.toml")),
-        Some(cwd.join(".maki/config.toml")),
+        maki_config::global_config_dir().map(|dir| dir.join(STALE_GLOBAL_CONFIG)),
+        Some(project_config.config_root().join(STALE_PROJECT_CONFIG)),
     ];
     for path in stale_paths.into_iter().flatten() {
         if path.is_file() {
@@ -563,8 +590,15 @@ mod tests {
         let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
             .expect("live host boots under --no-plugins");
 
-        let config = load_config(&plugin_host, &cli, dir.path(), &no_names, &mut Vec::new())
-            .expect("no-plugins must skip the broken init.lua and still load defaults");
+        let config = load_config(
+            &plugin_host,
+            &cli,
+            InitFiles::Disabled,
+            &ProjectConfig::for_project(dir.path()),
+            &no_names,
+            &mut Vec::new(),
+        )
+        .expect("no-plugins must skip the broken init.lua and still load defaults");
         assert!(
             !config.plugins.names.is_empty(),
             "default builtin plugins must still be enabled under --no-plugins"
@@ -601,7 +635,14 @@ mod tests {
         let mut plugin_host =
             PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
 
-        match load_config(&plugin_host, &cli, dir.path(), &no_names, &mut Vec::new()) {
+        match load_config(
+            &plugin_host,
+            &cli,
+            InitFiles::GlobalAndProject,
+            &ProjectConfig::for_project(dir.path()),
+            &no_names,
+            &mut Vec::new(),
+        ) {
             Err(_) => {}
             Ok(_) => panic!("broken init.lua must error without --no-plugins"),
         }

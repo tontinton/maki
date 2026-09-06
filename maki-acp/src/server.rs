@@ -26,10 +26,11 @@ use maki_agent::types::AgentEvent;
 use maki_agent::{
     AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, SessionEndReason, SessionEvents,
 };
-use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, SessionDefaults};
+use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, project};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{Message, TokenUsage, add_cost, settle_session};
+use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::StoredTokenUsage;
 use serde::Serialize;
@@ -265,8 +266,18 @@ async fn new_session(
 ) -> Result<AgentResponse, AcpError> {
     let req: NewSessionRequest = parse_params(raw)?;
     close_session(srv, SessionEndReason::Replaced).await;
-    let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
-    let session_ref = start_session(srv, params, req.cwd, None, Vec::new(), mcp, None);
+    let project_config = trusted_project_config(&req.cwd, &params.storage);
+    let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone()).await;
+    let session_ref = start_session(
+        srv,
+        params,
+        req.cwd,
+        None,
+        Vec::new(),
+        mcp,
+        project_config,
+        None,
+    );
     maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(session_ref.as_str()));
     let spec = params.model.spec();
     let resp = methods::new_session_response(session_ref.as_str())
@@ -287,7 +298,8 @@ async fn load_session(
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
     let mut restored = load_history(session_ref.id())?;
     close_session(srv, SessionEndReason::Replaced).await;
-    let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
+    let project_config = trusted_project_config(&req.cwd, &params.storage);
+    let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone()).await;
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
     let replay_cwd = restored.cwd.as_deref().unwrap_or(&req.cwd);
@@ -310,6 +322,7 @@ async fn load_session(
         Some(session_ref),
         restored.history,
         mcp,
+        project_config,
         restored_cost,
     );
     maki_otel::emit::session_started(maki_otel::emit::START_RESUME, Some(started.as_str()));
@@ -322,6 +335,7 @@ async fn load_session(
 /// Spawns a session and installs it as the server's current one. Spawning
 /// alone is not a useful state: the event stream has exactly one reader, so it
 /// must be handed to the pump here rather than travel any further.
+#[allow(clippy::too_many_arguments)]
 fn start_session(
     srv: &mut Server,
     params: &AcpParams,
@@ -329,6 +343,7 @@ fn start_session(
     session_id: Option<SessionRef>,
     history: Vec<Message>,
     mcp: Option<McpHandle>,
+    project_config: ProjectConfig,
     initial_cost: Option<f64>,
 ) -> SessionRef {
     let pending = PendingState::default();
@@ -342,10 +357,15 @@ fn start_session(
     } else {
         (vec![QUESTION_TOOL_NAME], LocalTools::default())
     };
+    // The ACP process cwd owns env, Lua, and application config, but the client
+    // picks the session cwd. So permissions, where a saved answer lands, and
+    // MCP config all follow the session's project, not ours.
+    let project_trusted = project_config.is_trusted();
+    let permissions_config = maki_config::load_permissions(&project_config);
     let (handle, events) = headless::spawn_interactive(InteractiveParams {
         model: params.model.clone(),
         config: params.config.clone(),
-        permissions_config: params.permissions_config.clone(),
+        permissions_config,
         timeouts: params.timeouts,
         prompt_slots: Arc::clone(&params.prompt_slots),
         excluded_tools,
@@ -359,6 +379,7 @@ fn start_session(
         defaults: params.defaults,
         model_policy: Arc::clone(&params.model_policy),
         plugin_rules: Arc::clone(&params.plugin_rules),
+        project_config,
         local_tools,
     });
     let session_ref = handle.session_id.clone();
@@ -369,6 +390,7 @@ fn start_session(
         Arc::clone(&pending),
         cwd,
         maki_storage::paths::home(),
+        project_trusted,
         initial_cost,
     )
     .detach();
@@ -502,12 +524,25 @@ fn pairs<T>(items: &[T], split: impl Fn(&T) -> (&String, &String)) -> HashMap<St
 
 /// MCP is per session: the client picks the cwd and may inject its own servers.
 /// Returns as soon as the config is read, the first prompt waits for the tools.
-async fn start_mcp(cwd: &Path, servers: &[McpServer]) -> Option<McpHandle> {
-    let (handle, errors) = mcp::start_with_extra(cwd, injected_servers(servers)).await;
+async fn start_mcp(
+    cwd: &Path,
+    servers: &[McpServer],
+    project_config: ProjectConfig,
+) -> Option<McpHandle> {
+    let (handle, errors) =
+        mcp::start_with_extra(cwd, project_config, injected_servers(servers)).await;
     if !errors.is_empty() {
         warn!(%errors, "MCP config errors");
     }
     handle
+}
+
+fn trusted_project_config(cwd: &Path, storage: &StateDir) -> ProjectConfig {
+    let decision = project::resolve(storage, cwd, false);
+    if let Some(warning) = decision.warning {
+        warn!(%warning, "ACP project configuration trust warning");
+    }
+    decision.project_config
 }
 
 /// Stop the old session before the next one starts, so two generations of the
@@ -748,6 +783,7 @@ fn image_media_type(mime: &str) -> ImageMediaType {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_event_pump(
     mut events: SessionEvents,
     session_id: SessionRef,
@@ -755,6 +791,7 @@ fn start_event_pump(
     pending: PendingState,
     cwd: PathBuf,
     home: Option<PathBuf>,
+    project_trusted: bool,
     initial_cost: Option<f64>,
 ) -> Task<()> {
     smol::spawn(async move {
@@ -791,7 +828,7 @@ fn start_event_pump(
                         AgentRequest::RequestPermissionRequest(RequestPermissionRequest::new(
                             sid.clone(),
                             ToolCallUpdate::new(ToolCallId::from(id), fields),
-                            permissions::permission_options(),
+                            permissions::permission_options(project_trusted),
                         ));
                     ask_client(&out_tx, &pending, AskKind::Permission, request);
                     continue;
@@ -855,9 +892,11 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 mod tests {
     use maki_agent::permissions::PermissionManager;
     use maki_agent::{DoneReason, SubagentInfo, TurnCompleteEvent};
+    use maki_config::{Effect, ToolKey};
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::sessions::Session;
+    use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -873,6 +912,105 @@ mod tests {
     const RETIRED_SPEC: &str = "retired-vendor/retired-model-9000";
     const RETIRED_MODEL_ID: &str = "retired-model-9000";
     const RECORDED_COST: f64 = 1.25;
+    /// Generous on purpose: the work under test is a few file reads, so any
+    /// wait near this long is the deadlock and not a slow machine.
+    const STDIN_DEADLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const DENY_SCOPE: &str = "acp-session-trust-boundary-test-deny";
+    const ALLOW_SCOPE: &str = "acp-session-trust-boundary-test-allow";
+
+    /// The client picks the session cwd, so that folder's stored trust decides
+    /// whether its `.maki` may widen permissions. Its deny rules need no trust:
+    /// a repository can only narrow what the agent may do.
+    #[test]
+    fn session_project_config_follows_stored_folder_trust() {
+        let state = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let maki_dir = project.path().join(".maki");
+        std::fs::create_dir(project.path().join(".git")).unwrap();
+        std::fs::create_dir(&maki_dir).unwrap();
+        std::fs::write(
+            maki_dir.join("permissions.toml"),
+            format!("[bash]\ndeny = [\"{DENY_SCOPE}\"]\nallow = [\"{ALLOW_SCOPE}\"]\n"),
+        )
+        .unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+
+        let untrusted = trusted_project_config(project.path(), &storage);
+        assert!(!untrusted.is_trusted());
+        let rules = maki_config::load_permissions(&untrusted).rules;
+        assert!(
+            rules
+                .iter()
+                .any(|rule| bash_rule(rule, DENY_SCOPE, Effect::Deny))
+        );
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule.scope.as_deref() == Some(ALLOW_SCOPE))
+        );
+
+        let folder = CanonicalFolder::resolve(project.path()).unwrap();
+        TrustedFolders::new(&storage)
+            .add(&folder, &maki_config::project::gated_files(project.path()))
+            .unwrap();
+
+        let trusted = trusted_project_config(project.path(), &storage);
+        assert!(trusted.is_trusted());
+        assert_eq!(
+            trusted.config_root(),
+            ProjectConfig::for_project(project.path()).config_root()
+        );
+        let rules = maki_config::load_permissions(&trusted).rules;
+        assert!(
+            rules
+                .iter()
+                .any(|rule| bash_rule(rule, DENY_SCOPE, Effect::Deny))
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|rule| bash_rule(rule, ALLOW_SCOPE, Effect::Allow))
+        );
+    }
+
+    /// ACP resolves folder trust from its dispatch loop, on the same executor
+    /// that another thread is blocking on a whole stdin read. Reaching for
+    /// stdin on a path that can never ask a question parked the loop until the
+    /// client sent bytes it was only going to send after our answer, so the
+    /// first session hung forever.
+    #[test]
+    fn resolving_trust_without_a_prompt_does_not_wait_for_stdin() {
+        let state = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir(project.path().join(".git")).unwrap();
+        std::fs::create_dir(project.path().join(".maki")).unwrap();
+        std::fs::write(project.path().join(".maki/init.lua"), "return {}").unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let cwd = project.path().to_path_buf();
+
+        let held = std::io::stdin().lock();
+        let (done_tx, done_rx) = flume::bounded(1);
+        let worker = std::thread::spawn(move || {
+            let config = trusted_project_config(&cwd, &storage);
+            let _ = done_tx.send(config.is_trusted());
+        });
+
+        let finished = done_rx.recv_timeout(STDIN_DEADLOCK_TIMEOUT);
+        drop(held);
+        worker.join().unwrap();
+
+        assert_eq!(
+            finished,
+            Ok(false),
+            "a non-interactive trust resolution must not touch stdin"
+        );
+    }
+
+    fn bash_rule(rule: &maki_config::PermissionRule, scope: &str, effect: Effect) -> bool {
+        rule.tool == ToolKey::native("bash")
+            && rule.scope.as_deref() == Some(scope)
+            && rule.effect == effect
+    }
 
     fn allow_once(id: i64) -> Value {
         serde_json::json!({
@@ -902,6 +1040,7 @@ mod tests {
             permissions: Arc::new(PermissionManager::new(
                 maki_config::PermissionsConfig::default(),
                 PathBuf::from("/project"),
+                ProjectConfig::for_project(Path::new("/project")),
                 Arc::default(),
             )),
             task: smol::spawn(async {}),
@@ -935,6 +1074,9 @@ mod tests {
     const CONTEXT_WINDOW: u32 = 200_000;
     const PARENT_TOOL_USE_ID: &str = "toolu_1";
     const SUBAGENT_NAME: &str = "task";
+    /// These cover cost and transcript plumbing, not the trust-scoped wording
+    /// of permission options.
+    const PUMP_TRUSTED: bool = true;
 
     fn spawn_pump(srv: &Server, events: SessionEvents, initial_cost: Option<f64>) -> Task<()> {
         let session = srv.session.as_ref().expect("a session is installed");
@@ -945,6 +1087,7 @@ mod tests {
             Arc::clone(&session.pending),
             PathBuf::from(PUMP_CWD),
             None,
+            PUMP_TRUSTED,
             initial_cost,
         )
     }

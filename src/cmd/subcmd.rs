@@ -8,6 +8,7 @@ use color_eyre::eyre::{Context, bail};
 
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
+use maki_config::project::{self, ProjectDecision};
 use maki_config::providers::{
     ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
@@ -23,6 +24,8 @@ use maki_storage::auth::{
     delete_provider_credentials, load_provider_credentials, load_tokens, save_provider_credentials,
 };
 use maki_storage::model::persist_model;
+
+use crate::project_trust;
 
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
@@ -539,7 +542,8 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
 
 pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    load_env_files(&cwd);
+    let trust = project::resolve_noninteractive(&cwd);
+    load_env_files(&trust.project_config);
 
     let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
@@ -548,7 +552,7 @@ pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
         no_plugins,
         super::BuiltinFailure::Fatal,
         maki_lua::Interaction::None,
-        |host, names, warnings| load_effective_config(host, no_plugins, &cwd, names, warnings),
+        |host, names, warnings| load_effective_config(host, no_plugins, &trust, names, warnings),
     )?;
     super::report_warnings(warnings);
 
@@ -570,12 +574,17 @@ pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
 fn load_effective_config(
     host: &PluginHost,
     no_plugins: bool,
-    cwd: &Path,
+    trust: &ProjectDecision,
     names: &super::KnownNames<'_>,
     warnings: &mut Vec<String>,
 ) -> Result<Config> {
+    warnings.extend(trust.warning.clone());
     let raw_config = host
-        .load_init_files_or_skip(no_plugins, cwd, warnings)
+        .load_init_files(
+            project_trust::init_files(&trust.project_config, no_plugins),
+            trust.project_config.config_root(),
+            warnings,
+        )
         .context("load init.lua files")?;
     raw_config
         .unwrap_or_default()
@@ -585,7 +594,8 @@ fn load_effective_config(
 
 pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    load_env_files(&cwd);
+    let trust = project::resolve_noninteractive(&cwd);
+    load_env_files(&trust.project_config);
 
     let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
@@ -596,8 +606,8 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
         super::BuiltinFailure::Fatal,
         maki_lua::Interaction::None,
         |host, names, warnings| {
-            let mut config = load_effective_config(host, no_plugins, &cwd, names, warnings)?;
-            config.permissions = load_permissions(&cwd);
+            let mut config = load_effective_config(host, no_plugins, &trust, names, warnings)?;
+            config.permissions = load_permissions(&trust.project_config);
             Ok(config)
         },
     )?;
@@ -627,7 +637,9 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
 pub fn mcp_auth(server: &str, storage: &StateDir) -> Result<()> {
     smol::block_on(async {
         let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-        let (config, _) = mcp_config::load_config(&cwd);
+        let trust = project::resolve(storage, &cwd, false);
+        super::report_warnings(trust.warning.into_iter().collect());
+        let (config, _) = mcp_config::load_config(&cwd, trust.project_config);
         let raw = config
             .mcp
             .get(server)
@@ -681,7 +693,8 @@ pub fn prompt(
     }
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    load_env_files(&cwd);
+    let trust = project::resolve_noninteractive(&cwd);
+    load_env_files(&trust.project_config);
 
     let vars = template::env_vars();
     let reg = ToolRegistry::global_arc();
@@ -692,7 +705,7 @@ pub fn prompt(
         no_plugins,
         super::BuiltinFailure::Fatal,
         maki_lua::Interaction::None,
-        |host, names, warnings| load_effective_config(host, no_plugins, &cwd, names, warnings),
+        |host, names, warnings| load_effective_config(host, no_plugins, &trust, names, warnings),
     )?;
     super::report_warnings(warnings);
 

@@ -3,6 +3,11 @@ name = "maki-config"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Keeps `ProjectConfig::for_project` out of the production API. Only
+# `project::resolve` may hand out a trusted config to a real run.
+test-util = []
+
 [dependencies]
 maki-config-macro = { workspace = true }
 maki-storage = { workspace = true }
