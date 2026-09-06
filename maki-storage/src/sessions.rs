@@ -1554,6 +1554,23 @@ where
         self.touch();
     }
 
+    /// Deleting a task drops its transcript from the log, which an append
+    /// cannot express, so the cursors are voided like any rewrite. The
+    /// `tool_ids` closure extracts tool-use ids from messages so the
+    /// subagent's tool outputs are reclaimed from the shared map.
+    pub fn remove_subagent(&mut self, id: &str, tool_ids: impl Fn(&M) -> Vec<String>) {
+        let removed = self.subagent_messages.remove(id);
+        if let Some(msgs) = &removed {
+            let stale: HashSet<String> = msgs.iter().flat_map(&tool_ids).collect();
+            self.tool_outputs.retain(|tid, _| !stale.contains(tid));
+        }
+        let len = self.subagents.len();
+        self.subagents.retain(|sa| sa.tool_use_id != id);
+        if removed.is_some() || self.subagents.len() != len {
+            self.rewrite();
+        }
+    }
+
     pub fn usage_by_model(&self) -> &HashMap<String, StoredTokenUsage> {
         &self.usage_by_model
     }

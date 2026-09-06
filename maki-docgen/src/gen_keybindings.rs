@@ -12,6 +12,11 @@ const LUA_CONTEXT_BINDS: &[(&str, &str, &str)] = &[
     ("Session Picker", "`Ctrl+N`", "New session"),
     ("Session Picker", "`Ctrl+R`", "Rename session"),
     ("Session Picker", "`Ctrl+D`", "Delete session (press twice)"),
+    (
+        "Task Picker",
+        "`Ctrl+D`",
+        "Delete finished task (press twice)",
+    ),
 ];
 
 // Built-in plugins own these globally, so they never reach `KEYBINDS`.

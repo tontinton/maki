@@ -86,6 +86,7 @@ Some pickers add extra bindings on top of the defaults:
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
+| Task Picker | `Ctrl+D` | Delete finished task (press twice) |
 
 ## Plugins
 

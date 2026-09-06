@@ -3680,6 +3680,33 @@ another session returns an error instead of landing on the wrong task.
 local _, err = maki.task.focus("main")
 ```
 
+---
+
+### `maki.task.remove()` {#maki-task-remove}
+
+```lua
+maki.task.remove({id})
+```
+
+Deletes a finished task and its transcript, so a reload cannot bring it
+back. The main chat and still-running tasks are refused.
+
+If the deleted task was the focused one, focus falls back to the previous
+chat (or the main chat if the deleted task was first). Callers that need
+a specific focus should call `maki.task.focus()` afterwards.
+
+**Parameters:**
+
+- `{id}` (`string`) Task id, as returned by `list()`.
+
+**Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+
+**Example:**
+
+```lua
+local _, err = maki.task.remove("toolu_01")
+```
+
 
 ## maki.text {#maki-text}
 

@@ -443,6 +443,7 @@ pub enum SessionRequest {
 pub enum TaskRequest {
     List,
     Focus { id: String },
+    Remove { id: String },
 }
 
 pub enum ModelRequest {

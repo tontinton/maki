@@ -1246,6 +1246,7 @@ impl<'t> EventLoop<'t> {
         match req {
             TaskRequest::List => Ok(json!(self.focused_app().tasks())),
             TaskRequest::Focus { id } => self.focused_app().focus_task(&id).map(|()| json!(true)),
+            TaskRequest::Remove { id } => self.focused_app().remove_task(&id).map(|()| json!(true)),
         }
     }
 
