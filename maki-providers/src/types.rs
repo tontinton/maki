@@ -520,6 +520,12 @@ pub mod dialect {
         adaptive: Some(Medium),
         off: None,
     };
+    /// Standard OpenAI chat completions: low, medium, high.
+    pub const OPENAI_COMPAT: EffortDialect = EffortDialect {
+        supported: &[Low, Medium, High],
+        adaptive: Some(Medium),
+        off: None,
+    };
     /// OpenAI Responses API models whose highest effort is `xhigh`.
     pub const CODEX: EffortDialect = EffortDialect {
         supported: &[Low, Medium, High, XHigh],
@@ -1047,7 +1053,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&first.data, &read(INTERNED_DATA).data));
     }
 
-    use Effort::{High, Low, Max, Minimal, XHigh};
+    use Effort::{High, Low, Max, Medium, Minimal, XHigh};
 
     /// `max_output_tokens: 8192`, so `max_thinking_budget()` is 4096.
     fn thinking_model(id: &str) -> crate::model::Model {
@@ -1080,6 +1086,7 @@ mod tests {
     fn dialects_have_non_empty_ascending_supported() {
         let all = [
             &dialect::STANDARD,
+            &dialect::OPENAI_COMPAT,
             &dialect::CODEX,
             &dialect::CODEX_5_1,
             &dialect::CODING_PLAN,
@@ -1130,6 +1137,13 @@ mod tests {
     #[test_case(&dialect::STANDARD, ThinkingConfig::Effort(Minimal), Some("minimal") ; "standard_minimal_passthrough")]
     #[test_case(&dialect::STANDARD, ThinkingConfig::Effort(Max),     Some("high")    ; "standard_max_snaps_down")]
     #[test_case(&dialect::STANDARD, ThinkingConfig::Budget(1024),    Some("medium")  ; "standard_quarter_budget")]
+    #[test_case(&dialect::OPENAI_COMPAT, ThinkingConfig::Off,             None           ; "openai_compat_off")]
+    #[test_case(&dialect::OPENAI_COMPAT, ThinkingConfig::Adaptive,        Some("medium") ; "openai_compat_adaptive")]
+    #[test_case(&dialect::OPENAI_COMPAT, ThinkingConfig::Effort(Minimal), Some("low")    ; "openai_compat_minimal_snaps_up")]
+    #[test_case(&dialect::OPENAI_COMPAT, ThinkingConfig::Effort(Low),     Some("low")    ; "openai_compat_low")]
+    #[test_case(&dialect::OPENAI_COMPAT, ThinkingConfig::Effort(Medium),  Some("medium") ; "openai_compat_medium")]
+    #[test_case(&dialect::OPENAI_COMPAT, ThinkingConfig::Effort(High),    Some("high")   ; "openai_compat_high")]
+    #[test_case(&dialect::OPENAI_COMPAT, ThinkingConfig::Effort(Max),     Some("high")   ; "openai_compat_max_snaps_down")]
     #[test_case(&dialect::CODEX, ThinkingConfig::Adaptive,        Some("medium") ; "codex_adaptive")]
     #[test_case(&dialect::CODEX, ThinkingConfig::Effort(Minimal), Some("low")    ; "codex_minimal_snaps_up")]
     #[test_case(&dialect::CODEX, ThinkingConfig::Effort(Max),     Some("xhigh")  ; "codex_max_snaps_down")]
