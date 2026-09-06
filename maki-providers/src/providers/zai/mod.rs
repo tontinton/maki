@@ -130,6 +130,38 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             context_window: 200_000,
         },
         ModelEntry {
+            prefixes: &["glm-5.3"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Glm,
+            vision: false,
+            default: false,
+            pricing: ModelPricing {
+                input: 1.40,
+                output: 4.40,
+                cache_write: 0.00,
+                cache_read: 0.26,
+                fast: None,
+            },
+            max_output_tokens: Some(131072),
+            context_window: 1_000_000,
+        },
+        ModelEntry {
+            prefixes: &["glm-5.3-flash"],
+            tier: ModelTier::Weak,
+            family: ModelFamily::Glm,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.075,
+                output: 0.25,
+                cache_write: 0.00,
+                cache_read: 0.015,
+                fast: None,
+            },
+            max_output_tokens: Some(131072),
+            context_window: 1_000_000,
+        },
+        ModelEntry {
             prefixes: &["glm-5.2"],
             tier: ModelTier::Strong,
             family: ModelFamily::Glm,
@@ -354,8 +386,22 @@ impl Provider for Zai {
     }
 }
 
+/// First GLM version that takes thinking parameters.
+const THINKING_SINCE: (u32, u32) = (5, 2);
+
+/// `glm-5.3` -> `(5, 3)`, `glm-5.3-flash` -> `(5, 3)`, `glm-5-code` -> `(5, 0)`.
+/// A version check, not an allowlist, so future GLM releases work automatically
+/// (same idea as `claude_version`/`ADAPTIVE_SINCE` for Anthropic).
+fn glm_version(model_id: &str) -> Option<(u32, u32)> {
+    let bare = model_id.rsplit('/').next().unwrap_or(model_id);
+    let mut parts = bare.strip_prefix("glm-")?.split(['-', '.']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor))
+}
+
 fn adjust_model(model: &mut Model) {
-    if model.id.starts_with("glm-5.2") {
+    if glm_version(&model.id).is_some_and(|v| v >= THINKING_SINCE) {
         model.thinking_override = Some(ThinkingSupport::Yes);
     }
 }
@@ -371,13 +417,25 @@ mod tests {
         {"type":"TIME_LIMIT","unit":5,"percentage":0,"nextResetTime":1780336384978}
     ],"level":"lite"}}"#;
 
+    #[test_case("zai/glm-5.3", true ; "glm_5_3_supports_thinking")]
+    #[test_case("zai/glm-5.3-flash", true ; "glm_5_3_flash_supports_thinking")]
+    #[test_case("zai/glm-5.4", true ; "future_glm_5_x_supports_thinking")]
     #[test_case("zai/glm-5.2", true ; "glm_5_2_supports_thinking")]
     #[test_case("zai/glm-5.1", false ; "glm_5_1_no_thinking")]
+    #[test_case("zai/glm-5-code", false ; "glm_5_code_no_thinking")]
     #[test_case("zai/glm-4.7", false ; "glm_4_7_no_thinking")]
     fn adjust_model_sets_thinking_support(spec: &str, expected: bool) {
         let mut model = Model::from_spec(spec).unwrap();
         adjust_model(&mut model);
         assert_eq!(model.supports_thinking(), expected);
+    }
+
+    #[test_case("zai/glm-5.3", 1_000_000 ; "glm_5_3_1m_context")]
+    #[test_case("zai/glm-5.3-flash", 1_000_000 ; "glm_5_3_flash_1m_context")]
+    #[test_case("zai/glm-5.4", 200_000 ; "unknown_glm_5_x_falls_back_to_glm_5_entry")]
+    fn model_entry_context_window(spec: &str, expected: u32) {
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(model.context_window, expected);
     }
 
     #[test]
