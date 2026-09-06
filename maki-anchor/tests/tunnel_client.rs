@@ -392,6 +392,11 @@ fn tunnel_client_serves_index_sse_and_prompt_through_anchor() {
     let sse_text = String::from_utf8_lossy(&sse);
     assert!(sse_text.contains("event: snapshot"), "sse: {sse_text:.120}");
     assert!(sse_text.contains("e2e-session"), "sse: {sse_text:.120}");
+    assert!(
+        sse_text.to_ascii_lowercase().contains("x-accel-buffering: no"),
+        "a reverse proxy in front of the anchor must not buffer this response, \
+         or the snapshot sits unseen until more bytes arrive: {sse_text:.200}"
+    );
 
     // `/rc off` cooperatively: the flag wakes the poll loop and ends the
     // tunnel thread.

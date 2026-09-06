@@ -2388,7 +2388,7 @@ fn route_authorized(
 ) -> RouteOutcome {
     if path == "/" {
         return buffered(
-            crate::dashboard::render_sessions(store, hub, user.as_ref()),
+            crate::dashboard::render_sessions(store, user.as_ref()),
             request,
         );
     }
@@ -3045,8 +3045,16 @@ fn stream_to_browser(
         token_hash,
     } = target;
     let mut writer = request.into_writer();
+    // `X-Accel-Buffering: no` is the de-facto standard a reverse proxy (nginx
+    // in particular, the common choice for the TLS termination this anchor
+    // relies on) looks for to skip response buffering. Without it, a proxy
+    // buffers this stream like any other response and withholds the whole
+    // snapshot frame from the browser until either the buffer fills or the
+    // connection closes — the page looks like history never loaded, and
+    // sending a prompt (more bytes down the same stream) is what finally
+    // pushes it over the buffering threshold and reveals everything at once.
     let head = format!(
-        "HTTP/1.1 {} OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n",
+        "HTTP/1.1 {} OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\n\r\n",
         first.status
     );
     let mut final_chunk = false;

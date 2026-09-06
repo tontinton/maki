@@ -296,8 +296,11 @@ fn serve_events(request: tiny_http::Request, source: &mut crate::dispatch::SseSo
     // Handled by hand instead of `respond`: tiny_http's chunked encoder
     // buffers 8 KiB before sending, which would sit on small SSE frames
     // forever. The raw writer lets each frame flush as it is produced.
-    let head =
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n";
+    // `X-Accel-Buffering: no` does the same for whatever reverse proxy sits
+    // in front (this mode is documented as needing one for TLS) — without
+    // it, a buffering proxy (nginx by default) withholds this stream's
+    // bytes until its own buffer fills or the connection closes.
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\n\r\n";
     let outcome = (|| -> std::io::Result<()> {
         let mut writer = request.into_writer();
         writer.write_all(head.as_bytes())?;

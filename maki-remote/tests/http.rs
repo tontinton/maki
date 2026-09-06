@@ -322,6 +322,11 @@ fn sse_opens_with_snapshot_then_carries_published_frames() {
         headers.to_ascii_lowercase().contains("text/event-stream"),
         "SSE must open event-stream, got {headers:?}"
     );
+    assert!(
+        headers.to_ascii_lowercase().contains("x-accel-buffering: no"),
+        "SSE must disable reverse-proxy buffering or a buffering proxy \
+         withholds the snapshot frame until more bytes arrive: {headers:?}"
+    );
 
     server.state().send_status(RC_TEST_SESSION, RC_TEST_STATUS);
     let mut buf = Vec::new();
