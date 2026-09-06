@@ -17,9 +17,10 @@ pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::pack::{Declared, PackOp};
 pub use api::session::SessionSnapshotFn;
 pub use api::util::command::{
-    Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
-    HintReader, HintSnapshot, LuaCommandInfo, LuaCommandReader, ModelRequest, SessionRequest,
-    Split, TaskRequest, TitlePos, UiAction, UiAttachment, UiReply, WinCommand, WinEvent, WinView,
+    Anchor, Axis, Border, BuiltinAction, CompleterInfo, CompleterReader, CompleterSnapshot,
+    CompletionItem, Dimension, Edge, FloatConfig, FloatConfigPatch, HintReader, HintSnapshot,
+    LuaCommandInfo, LuaCommandReader, ModelRequest, SessionRequest, Split, TaskRequest, TitlePos,
+    UiAction, UiAttachment, UiReply, WinCommand, WinEvent, WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
@@ -40,7 +41,8 @@ pub mod test_support {
     use crate::SessionEndReason;
     use crate::api::keymap::{KeymapEntry, KeymapWriter};
     use crate::api::util::command::{
-        HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
+        CompleterWriter, HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader,
+        LuaCommandWriter,
     };
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
     use maki_storage::id::MakiId;
@@ -70,6 +72,20 @@ pub mod test_support {
     pub fn hint_writer_pair() -> (HintWriterHandle, HintReader) {
         let (writer, reader) = HintWriter::new();
         (HintWriterHandle(writer), reader)
+    }
+
+    /// Stands in for the Lua thread publishing registered input completers.
+    pub struct CompleterWriterHandle(CompleterWriter);
+
+    impl CompleterWriterHandle {
+        pub fn publish(&self, completers: Vec<crate::CompleterInfo>) {
+            self.0.publish(completers);
+        }
+    }
+
+    pub fn completer_writer_pair() -> (CompleterWriterHandle, crate::CompleterReader) {
+        let (writer, reader) = CompleterWriter::new();
+        (CompleterWriterHandle(writer), reader)
     }
 
     /// Observes which requests an [`crate::EventHandle`] sends, without a
@@ -104,6 +120,28 @@ pub mod test_support {
                 } = req
                 {
                     return Some((command.to_string(), args, depth));
+                }
+            }
+            None
+        }
+
+        /// Answer the next pending input-completer query with {items},
+        /// returning `(plugin, name, query)`; skips other requests.
+        pub fn answer_completer_query(
+            &self,
+            items: Option<Vec<crate::CompletionItem>>,
+        ) -> Option<(String, String, String)> {
+            use crate::runtime::Request;
+            while let Ok(req) = self.0.try_recv() {
+                if let Request::QueryInputCompleter {
+                    plugin,
+                    name,
+                    query,
+                    reply,
+                } = req
+                {
+                    let _ = reply.send(items);
+                    return Some((plugin.to_string(), name.to_string(), query));
                 }
             }
             None

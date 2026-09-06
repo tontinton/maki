@@ -352,6 +352,172 @@ fn unload_round_trip() {
     assert!(!reg.has("echo_"));
 }
 
+const COMPLETER_SRC: &str = r#"
+maki.api.register_input_completer({
+  trigger = "@",
+  name = "files",
+  handler = function(query)
+    return {
+      { label = "src/" .. query, detail = "recent" },
+      { label = "other", insert = "OTHER" },
+    }
+  end,
+})"#;
+
+#[test]
+fn input_completer_publishes_answers_and_unloads() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    host.load_source("mention", COMPLETER_SRC).unwrap();
+    let snap = host.completer_reader().load_full();
+    assert_eq!(snap.completers.len(), 1);
+    assert_eq!(snap.completers[0].trigger, '@');
+    assert_eq!(&*snap.completers[0].plugin, "mention");
+    assert_eq!(&*snap.completers[0].name, "files");
+
+    let items = host
+        .event_handle()
+        .query_input_completer(Arc::from("mention"), Arc::from("files"), "ma".into())
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .expect("handler should answer");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].label, "src/ma");
+    assert_eq!(items[0].insert, "src/ma", "insert defaults to label");
+    assert_eq!(items[0].detail.as_deref(), Some("recent"));
+    assert_eq!(items[1].insert, "OTHER");
+
+    host.unload("mention").unwrap();
+    assert!(host.completer_reader().load_full().completers.is_empty());
+}
+
+#[test]
+fn unregister_input_completer_removes_one_and_republishes() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "mentions",
+        r##"
+        maki.api.register_input_completer({ trigger = "@", name = "files", handler = function() end })
+        maki.api.register_input_completer({ trigger = "#", name = "prs", handler = function() end })
+        maki.api.unregister_input_completer("files")
+        maki.api.unregister_input_completer("never-existed")
+        "##,
+    )
+    .unwrap();
+
+    let snap = host.completer_reader().load_full();
+    assert_eq!(snap.completers.len(), 1);
+    assert_eq!(&*snap.completers[0].name, "prs");
+}
+
+#[test]
+fn input_completer_rejects_duplicate_trigger_across_plugins() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "first",
+        r#"maki.api.register_input_completer({ trigger = "@", name = "files", handler = function() end })"#,
+    )
+    .unwrap();
+    let err = host
+        .load_source(
+            "second",
+            r#"maki.api.register_input_completer({ trigger = "@", name = "files", handler = function() end })"#,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("already registered by plugin 'first'"),
+        "unexpected error: {err}"
+    );
+    host.load_source(
+        "first",
+        r#"maki.api.register_input_completer({ trigger = "@", name = "files", handler = function() return {} end })"#,
+    )
+    .expect("same plugin may replace its own registration");
+}
+
+#[test]
+fn input_completer_malformed_items_answer_none() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "mal",
+        r##"maki.api.register_input_completer({
+            trigger = "@",
+            name = "missing_label",
+            handler = function() return { { insert = "x" } } end,
+        })
+        maki.api.register_input_completer({
+            trigger = "#",
+            name = "wrong_type",
+            handler = function() return { { label = "ok", insert = 42 } } end,
+        })"##,
+    )
+    .unwrap();
+
+    for name in ["missing_label", "wrong_type"] {
+        let out = host
+            .event_handle()
+            .query_input_completer(Arc::from("mal"), Arc::from(name), String::new())
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(out.is_none(), "{name} should error, not fall back");
+    }
+}
+
+#[test]
+fn input_completer_unknown_name_and_handler_error_answer_none() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "broken",
+        r##"maki.api.register_input_completer({
+            trigger = "#",
+            name = "boom",
+            handler = function() error("nope") end,
+        })"##,
+    )
+    .unwrap();
+
+    let unknown = host
+        .event_handle()
+        .query_input_completer(Arc::from("broken"), Arc::from("missing"), String::new())
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert!(unknown.is_none());
+
+    let failed = host
+        .event_handle()
+        .query_input_completer(Arc::from("broken"), Arc::from("boom"), String::new())
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert!(failed.is_none());
+}
+
+#[test]
+fn input_completer_rejects_bad_specs() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let cases = [
+        r#"maki.api.register_input_completer({ trigger = "ab", name = "x", handler = function() end })"#,
+        r#"maki.api.register_input_completer({ trigger = "a", name = "x", handler = function() end })"#,
+        r#"maki.api.register_input_completer({ trigger = " ", name = "x", handler = function() end })"#,
+        r#"maki.api.register_input_completer({ trigger = "@", name = "", handler = function() end })"#,
+        r#"maki.api.register_input_completer({ trigger = "@", name = "x" })"#,
+        r#"maki.api.register_input_completer({ trigger = "_", name = "x", handler = function() end })"#,
+    ];
+    for (i, src) in cases.iter().enumerate() {
+        assert!(
+            host.load_source(&format!("bad_completer_{i}"), src)
+                .is_err(),
+            "case {i} should be rejected"
+        );
+    }
+}
+
 const PERMISSION_RULE_SRC: &str =
     r#"maki.api.register_permission_rule({ tool = "edit", scope = "/tmp/x/**" })"#;
 const NO_RULE_SRC: &str = "local _ = 1";

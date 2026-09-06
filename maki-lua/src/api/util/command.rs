@@ -127,6 +127,89 @@ impl HintWriter {
     }
 }
 
+/// One inline-completion candidate a completer handler returned.
+#[derive(Clone, Debug)]
+pub struct CompletionItem {
+    pub label: String,
+    pub insert: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct CompleterInfo {
+    pub trigger: char,
+    pub plugin: Arc<str>,
+    pub name: Arc<str>,
+}
+
+#[derive(Clone, Default)]
+pub struct CompleterSnapshot {
+    pub completers: Vec<CompleterInfo>,
+    pub generation: u64,
+}
+
+#[derive(Clone)]
+pub struct CompleterReader(Arc<ArcSwap<CompleterSnapshot>>);
+
+impl CompleterReader {
+    pub fn empty() -> Self {
+        Self(Arc::new(
+            ArcSwap::from_pointee(CompleterSnapshot::default()),
+        ))
+    }
+
+    pub fn load_full(&self) -> Arc<CompleterSnapshot> {
+        self.0.load_full()
+    }
+}
+
+pub(crate) struct CompleterWriter {
+    store: Arc<ArcSwap<CompleterSnapshot>>,
+    generation: AtomicU64,
+}
+
+impl CompleterWriter {
+    pub fn new() -> (Self, CompleterReader) {
+        let inner = Arc::new(ArcSwap::from_pointee(CompleterSnapshot::default()));
+        (
+            Self {
+                store: Arc::clone(&inner),
+                generation: AtomicU64::new(0),
+            },
+            CompleterReader(inner),
+        )
+    }
+
+    pub fn publish(&self, completers: Vec<CompleterInfo>) {
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.store.store(Arc::new(CompleterSnapshot {
+            completers,
+            generation,
+        }));
+    }
+}
+
+pub(crate) struct CompleterEntry {
+    pub trigger: char,
+    pub handler: RegistryKey,
+}
+
+pub(crate) type CompleterMap = HashMap<Arc<str>, HashMap<Arc<str>, CompleterEntry>>;
+
+pub(crate) fn publish_completer_snapshot(map: &CompleterMap, writer: &CompleterWriter) {
+    let completers = map
+        .iter()
+        .flat_map(|(plugin, entries)| {
+            entries.iter().map(move |(name, entry)| CompleterInfo {
+                trigger: entry.trigger,
+                plugin: Arc::clone(plugin),
+                name: Arc::clone(name),
+            })
+        })
+        .collect();
+    writer.publish(completers);
+}
+
 pub(crate) struct CommandEntry {
     pub handler: RegistryKey,
     pub description: Arc<str>,
@@ -493,6 +576,7 @@ pub enum UiAction {
         cmd_rx: flume::Receiver<WinCommand>,
     },
     Flash(String),
+    InsertInput(String),
     SetWindowTitle(String),
     OpenEditor {
         path: PathBuf,

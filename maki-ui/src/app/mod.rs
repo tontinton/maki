@@ -30,6 +30,7 @@ use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
+use crate::components::completion::{CompletionAction, CompletionPopup};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
@@ -62,8 +63,8 @@ use maki_agent::{
 };
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader,
-    PackCommand, PackPreparation, WinView,
+    BuiltinAction, CompleterReader, EventHandle, HintReader, HintSnapshot, KeymapReader,
+    LuaCommandReader, PackCommand, PackPreparation, WinView,
 };
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
@@ -213,6 +214,7 @@ pub struct App {
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
     pub(super) pack_review: PackReview,
+    pub(super) completion: CompletionPopup,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
@@ -268,6 +270,7 @@ impl App {
         lua_command_reader: LuaCommandReader,
         keymap_reader: KeymapReader,
         hint_reader: HintReader,
+        completer_reader: CompleterReader,
         storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
@@ -310,6 +313,7 @@ impl App {
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
             pack_review: PackReview::new(),
+            completion: CompletionPopup::new(completer_reader, lua_event_handle.clone()),
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(flash),
@@ -697,6 +701,7 @@ impl App {
                     {
                         self.command_palette.sync(&val);
                     }
+                    self.sync_completion();
                     vec![]
                 }
                 FilePickerModalAction::Close => {
@@ -932,8 +937,22 @@ impl App {
             CommandAction::Passthrough => {}
         }
 
+        if self.completion.is_open() {
+            match self.completion.handle_key(key) {
+                CompletionAction::Consumed => return vec![],
+                CompletionAction::Accept(rep) => {
+                    self.input_box
+                        .buffer
+                        .replace_range(rep.y, rep.start_x, rep.end_x, &rep.insert);
+                    self.sync_completion();
+                    return vec![];
+                }
+                CompletionAction::Passthrough => {}
+            }
+        }
+
         let streaming = self.status == Status::Streaming;
-        match self.input_box.handle_key(key) {
+        let actions = match self.input_box.handle_key(key) {
             InputAction::Submit(sub) => self.handle_submit(sub),
             InputAction::PaletteSync(val) => {
                 self.command_palette.sync(&val);
@@ -979,6 +998,18 @@ impl App {
                 }
             }
             InputAction::ContinueLine | InputAction::None => vec![],
+        };
+        self.sync_completion();
+        actions
+    }
+
+    /// Completion piggybacks on the palette's sync points; the palette wins
+    /// when both could claim the input.
+    fn sync_completion(&mut self) {
+        if self.command_palette.is_active() {
+            self.completion.close();
+        } else {
+            self.completion.sync(&self.input_box.buffer);
         }
     }
 
@@ -1685,6 +1716,7 @@ impl App {
             | self.usage_modal.poll(&self.usage_slot)
             | self.hints.poll(self.hint_reader.load_full())
             | self.tick_file_picker()
+            | self.completion.tick()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
     }
 
@@ -1750,6 +1782,15 @@ impl App {
         }
     }
 
+    /// Insert text into the prompt input on behalf of a plugin
+    /// (`maki.ui.insert_input`).
+    pub(crate) fn insert_input(&mut self, text: &str) {
+        if let InputAction::PaletteSync(val) = self.input_box.handle_paste_with_spaces(text) {
+            self.command_palette.sync(&val);
+        }
+        self.sync_completion();
+    }
+
     fn route_text_paste(&mut self, text: &str) {
         if self.plan_form_active() {
             return;
@@ -1784,6 +1825,7 @@ impl App {
         if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {
             self.command_palette.sync(&val);
         }
+        self.sync_completion();
     }
 
     fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {

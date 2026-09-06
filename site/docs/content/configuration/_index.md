@@ -242,6 +242,12 @@ maki.setup({
 | `insert_lines` | boolean | `false` | - | Provide the opt-in `insert_lines` tool. |
 | `multiedit` | boolean | `true` | - | Provide the `multiedit` tool. |
 
+### `plugins.file_mention`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `result_limit` | integer | `10` | 1 | Max files shown in the completion popup. |
+
 ### `plugins.glob`
 
 | Field | Type | Default | Min | Description |

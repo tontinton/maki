@@ -213,6 +213,7 @@ impl App {
                 panel_hint,
             );
             self.command_palette.view(frame, layout.input_area);
+            self.completion.view(frame, layout.input_area);
             return cursor;
         }
         None

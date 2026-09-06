@@ -1009,6 +1009,78 @@ for name, info in pairs(maki.api.get_slots()) do
 end
 ```
 
+---
+
+### `maki.api.register_input_completer()` {#maki-api-register_input_completer}
+
+```lua
+maki.api.register_input_completer({spec})
+```
+
+Register an inline completion source for the prompt input. When the
+user types {trigger} at a word boundary, a popup opens and `handler`
+is called with the text typed after the trigger, re-queried on every
+keystroke. Selecting an item replaces the trigger and query with the
+item's `insert` text (default: its label); Esc keeps the literal text.
+
+The bundled files completer registers `@` this way; a plugin can bind
+any other character to any source (issue trackers, snippets, emoji).
+
+Handlers run outside any tool-call task scope, so `maki.fn.jobstart`
+there needs `owner = "plugin"`. An `insert` that starts with the
+trigger reopens the popup on the inserted text — the bundled files
+completer uses this to drill into directories.
+
+Registration is live and same-name replaces; `/reload` clears a
+plugin's completers.
+
+**Parameters:**
+
+- `{spec}` (`table`) Completer specification:
+  - `trigger` (`string`) Required. Single character, e.g. "@" or "#".
+  - `name` (`string`) Required. Unique per plugin; same name replaces.
+  - `handler` (`function`) Required. `function(query) -> items` where items
+    is a list of `{ label (required), insert?, detail? }`.
+    Returning nil or an empty list shows "no matches".
+
+**Example:**
+
+```lua
+maki.api.register_input_completer({
+  trigger = "#",
+  name = "github-prs",
+  handler = function(query)
+    local out = {}
+    for _, pr in ipairs(search_prs(query)) do
+      out[#out + 1] = { label = "#" .. pr.number .. " " .. pr.title, insert = pr.url }
+    end
+    return out
+  end,
+})
+```
+
+---
+
+### `maki.api.unregister_input_completer()` {#maki-api-unregister_input_completer}
+
+```lua
+maki.api.unregister_input_completer({name})
+```
+
+Remove one of this plugin's input completers by name. Unknown names
+are a no-op, so a toggle can call it unconditionally; `/reload`
+drops all of a plugin's completers.
+
+**Parameters:**
+
+- `{name}` (`string`) The `name` the completer was registered under.
+
+**Example:**
+
+```lua
+maki.api.unregister_input_completer("github-prs")
+```
+
 
 ## maki.agent {#maki-agent}
 
@@ -5279,6 +5351,27 @@ shell, on terminals that support the title stack.
 maki.ui.set_window_title("maki: " .. session_name)
 -- Give the title back to the shell:
 maki.ui.set_window_title("")
+```
+
+---
+
+### `maki.ui.insert_input()` {#maki-ui-insert_input}
+
+```lua
+maki.ui.insert_input({text})
+```
+
+Inserts text into the prompt input at the cursor, as if typed. The
+input keeps focus; nothing is submitted.
+
+**Parameters:**
+
+- `{text}` (`string`) Text to insert.
+
+**Example:**
+
+```lua
+maki.ui.insert_input("@src/main.rs ")
 ```
 
 
