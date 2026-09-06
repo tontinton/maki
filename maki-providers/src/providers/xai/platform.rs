@@ -76,8 +76,14 @@ impl Xai {
         let storage = self.storage.clone().ok_or_else(|| AgentError::Config {
             message: "OAuth refresh not available for externally-managed auth".into(),
         })?;
+        let rejected = self.auth.lock().unwrap().access_token().map(str::to_owned);
         let resolved = smol::unblock(move || {
-            match refreshed_tokens(&storage, auth::PROVIDER, auth::refresh_tokens) {
+            match refreshed_tokens(
+                &storage,
+                auth::PROVIDER,
+                rejected.as_deref(),
+                auth::refresh_tokens,
+            ) {
                 Ok(fresh) => auth::build_oauth_resolved(&fresh),
                 Err(e) => {
                     warn!(error = %e, "xAI OAuth refresh failed, clearing stale tokens");

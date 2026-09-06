@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
-use flume::{Receiver, Sender};
+use flume::Sender;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PluginRuleStore};
@@ -24,9 +24,9 @@ use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, PermissionsConfig,
-    ToolOutput,
+    SessionEndReason, SessionEvents, ToolOutput,
 };
-use maki_config::ModelPolicy;
+use maki_config::{ModelPolicy, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
@@ -448,8 +448,7 @@ pub struct SdkParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt_slots: ResolvedSlots,
-    pub fast: bool,
-    pub workflow: bool,
+    pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     /// Plugins loaded here still want turn events, and this is what fires
@@ -457,11 +456,71 @@ pub struct SdkParams {
     pub lua_handle: maki_lua::EventHandle,
 }
 
+/// Routes permission answers between stdin and the agent.
+///
+/// Owning the outstanding ids *and* the answer channel is the point: an
+/// unanswered request parks the agent forever, so a request may only be
+/// recorded while a source that could answer it exists.
+struct Permissions {
+    answer_tx: Sender<String>,
+    outstanding: HashSet<String>,
+    answerable: bool,
+}
+
+impl Permissions {
+    fn new(answer_tx: Sender<String>) -> Self {
+        Self {
+            answer_tx,
+            outstanding: HashSet::new(),
+            answerable: true,
+        }
+    }
+
+    fn answer(&self, answer: PermissionAnswer) {
+        let _ = self.answer_tx.send(answer.encode());
+    }
+
+    fn deny_unanswerable(&self, request_id: &str) {
+        warn!(%request_id, "denying tool permission: stdin closed");
+        self.answer(PermissionAnswer::Deny);
+    }
+
+    /// Records an outstanding request. `false` means nobody is left to answer
+    /// it, so it was denied here and must not be put on the wire.
+    fn ask(&mut self, request_id: String) -> bool {
+        if !self.answerable {
+            self.deny_unanswerable(&request_id);
+            return false;
+        }
+        self.outstanding.insert(request_id);
+        true
+    }
+
+    fn resolve(&mut self, request_id: &str, answer: PermissionAnswer) {
+        if self.outstanding.remove(request_id) {
+            self.answer(answer);
+        }
+    }
+
+    /// The turn is over, so the agent is no longer parked on any of these.
+    fn forget_outstanding(&mut self) {
+        self.outstanding.clear();
+    }
+
+    /// No further answers can arrive. Idempotent.
+    fn close(&mut self) {
+        self.answerable = false;
+        for request_id in std::mem::take(&mut self.outstanding) {
+            self.deny_unanswerable(&request_id);
+        }
+    }
+}
+
 struct Shared {
     model: Model,
     permission_mode: PermissionMode,
     turn_start: Instant,
-    pending: HashSet<String>,
+    permissions: Permissions,
 }
 
 pub fn run(params: SdkParams) -> Result<()> {
@@ -472,8 +531,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         permissions_config,
         timeouts,
         prompt_slots,
-        fast,
-        workflow,
+        defaults,
         model_policy,
         plugin_rules,
         lua_handle,
@@ -502,7 +560,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     }
 
     let startup_model = model.clone();
-    let handle = headless::spawn_interactive(InteractiveParams {
+    let (handle, events) = headless::spawn_interactive(InteractiveParams {
         model,
         config,
         permissions_config,
@@ -516,7 +574,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         yolo: permission_mode == PermissionMode::BypassPermissions,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
-        workflow,
+        defaults,
         model_policy: Arc::clone(&model_policy),
         plugin_rules,
         local_tools: Default::default(),
@@ -559,7 +617,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         model: startup_model.clone(),
         permission_mode,
         turn_start: Instant::now(),
-        pending: HashSet::new(),
+        permissions: Permissions::new(handle.answer_tx.clone()),
     }));
 
     let snapshot = HeadlessSnapshot::default();
@@ -581,7 +639,6 @@ pub fn run(params: SdkParams) -> Result<()> {
     let pump = EventPump {
         writer: writer.clone(),
         shared: Arc::clone(&shared),
-        answer_tx: handle.answer_tx.clone(),
         include_partial_messages: cli.include_partial_messages,
         synth: StreamSynth::new(),
         tool_inputs: HashMap::new(),
@@ -592,7 +649,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         session_id: handle.session_id.to_string(),
         snapshot,
     }
-    .spawn(handle.event_rx.clone());
+    .spawn(events);
 
     for line in io::stdin().lock().lines() {
         let line = line.context("read stdin")?;
@@ -621,16 +678,8 @@ pub fn run(params: SdkParams) -> Result<()> {
                     shared.turn_start = Instant::now();
                     shared.permission_mode
                 };
-                let input = AgentInput {
-                    message: prompt,
-                    mode: mode.agent_mode(&cwd),
-                    images,
-                    preamble: Vec::new(),
-                    thinking: Default::default(),
-                    fast,
-                    workflow,
-                    prompt: None,
-                };
+                let input =
+                    AgentInput::from_defaults(prompt, mode.agent_mode(&cwd), images, defaults);
                 if handle.input_tx.send(input).is_err() {
                     break;
                 }
@@ -657,12 +706,9 @@ pub fn run(params: SdkParams) -> Result<()> {
                     continue;
                 };
                 let data = cr.response;
-                if let Some(req_id) = data.get("request_id").and_then(Value::as_str)
-                    && shared.lock().unwrap().pending.remove(req_id)
-                {
-                    let _ = handle
-                        .answer_tx
-                        .send(decode_permission_response(&data).encode());
+                if let Some(req_id) = data.get("request_id").and_then(Value::as_str) {
+                    let answer = decode_permission_response(&data);
+                    shared.lock().unwrap().permissions.resolve(req_id, answer);
                 }
             }
             "control_cancel_request" => {
@@ -672,20 +718,38 @@ pub fn run(params: SdkParams) -> Result<()> {
                 ) else {
                     continue;
                 };
-                if shared.lock().unwrap().pending.remove(&ccr.request_id) {
-                    let _ = handle.answer_tx.send(PermissionAnswer::Deny.encode());
-                }
+                shared
+                    .lock()
+                    .unwrap()
+                    .permissions
+                    .resolve(&ccr.request_id, PermissionAnswer::Deny);
             }
             other => warn!("unknown inbound message type: {other}"),
         }
     }
 
-    let InteractiveHandle { input_tx, task, .. } = handle;
+    // stdin was the only source of permission answers, so a run still in
+    // flight has to stop asking now: an unanswerable request parks the agent,
+    // and a parked agent never ends the event stream the pump waits on.
+    shared.lock().unwrap().permissions.close();
+
+    let InteractiveHandle {
+        input_tx,
+        task,
+        session_id,
+        ..
+    } = handle;
     drop(input_tx);
     smol::block_on(async {
-        task.await;
+        // Unbounded: the pump ends at the stream marker, which the session
+        // emits once it has answered every prompt stdin queued.
         pump.await;
+        headless::await_shutdown(task).await;
     });
+    // Reaps session-owned plugin jobs before the writer thread joins: an
+    // orphan inheriting stdout would keep an orchestrator's read blocked
+    // after maki exits.
+    lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
     drop(writer);
     let _ = writer_thread.join();
     Ok(())
@@ -883,7 +947,6 @@ fn decode_permission_response(data: &Value) -> PermissionAnswer {
 struct EventPump {
     writer: SdkWriter,
     shared: Arc<Mutex<Shared>>,
-    answer_tx: Sender<String>,
     include_partial_messages: bool,
     synth: StreamSynth,
     tool_inputs: HashMap<String, (String, Value)>,
@@ -898,9 +961,9 @@ struct EventPump {
 }
 
 impl EventPump {
-    fn spawn(mut self, event_rx: Receiver<Envelope>) -> smol::Task<()> {
+    fn spawn(mut self, mut events: SessionEvents) -> smol::Task<()> {
         smol::spawn(async move {
-            while let Ok(envelope) = event_rx.recv_async().await {
+            while let Some(envelope) = events.next().await {
                 // Folded in first, so a plugin handling `TurnEnd` finds the
                 // finished totals when it calls `maki.session.read()`.
                 self.snapshot.observe(&envelope);
@@ -934,7 +997,7 @@ impl EventPump {
         self.tool_inputs.clear();
         self.result_text.clear();
         self.cost = None;
-        self.shared.lock().unwrap().pending.clear();
+        self.shared.lock().unwrap().permissions.forget_outstanding();
     }
 
     fn emit_turn_result(
@@ -1016,7 +1079,8 @@ impl EventPump {
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
-            | AgentEvent::PromptProgress { .. } => {}
+            | AgentEvent::PromptProgress { .. }
+            | AgentEvent::StreamClosed => {}
             AgentEvent::Retry {
                 attempt,
                 message,
@@ -1064,10 +1128,12 @@ impl EventPump {
                 }))?;
             }
             AgentEvent::PermissionRequest { id, tool, .. } => {
-                if self.shared.lock().unwrap().permission_mode == PermissionMode::BypassPermissions
                 {
-                    let _ = self.answer_tx.send(PermissionAnswer::AllowSession.encode());
-                    return Ok(());
+                    let shared = self.shared.lock().unwrap();
+                    if shared.permission_mode == PermissionMode::BypassPermissions {
+                        shared.permissions.answer(PermissionAnswer::AllowSession);
+                        return Ok(());
+                    }
                 }
 
                 let (tool_name, input) = self
@@ -1078,7 +1144,9 @@ impl EventPump {
 
                 self.request_counter += 1;
                 let req_id = format!("req_{}", self.request_counter);
-                self.shared.lock().unwrap().pending.insert(req_id.clone());
+                if !self.shared.lock().unwrap().permissions.ask(req_id.clone()) {
+                    return Ok(());
+                }
 
                 self.writer
                     .emit(WireInner::ControlRequest(ControlRequestPayload {
@@ -1134,8 +1202,11 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use flume::Receiver;
+    use maki_config::ToolKey;
     use test_case::test_case;
+
+    use super::*;
 
     fn claude_to_maki_tool_name(name: &str) -> &str {
         TOOL_NAME_MAP
@@ -1516,5 +1587,196 @@ mod tests {
         assert_eq!(mapped[0]["type"], "text");
         assert_eq!(mapped[1]["name"], "Read");
         assert_eq!(mapped[2]["name"], "unknown_native");
+    }
+
+    const TEST_MODEL_SPEC: &str = "anthropic/claude-test";
+    const PUMP_ERROR: &str = "boom";
+    const PUMP_FORWARDED: &str = "the pump must forward what was queued before the close";
+    const TEST_TOOL: &str = "bash";
+    const TEST_TOOL_WIRE_NAME: &str = "Bash";
+    const TEST_TOOL_USE_ID: &str = "toolu_1";
+    const CONTROL_REQUEST_TYPE: &str = "control_request";
+    const NO_CONTROL_REQUEST: &str = "a request nobody can answer must not go on the wire";
+    const NO_ANSWER: &str = "answer sent with nobody parked on it";
+    const SOURCE_OPEN: &str = "a turn end must not close the answer source";
+    const OUTSTANDING_REQ: &str = "req_1";
+    const LATE_REQ: &str = "req_2";
+
+    fn test_pump(
+        permission_mode: PermissionMode,
+        answer_tx: Sender<String>,
+    ) -> (EventPump, Receiver<String>) {
+        let (out_tx, out_rx) = flume::unbounded();
+        let session_id = SessionRef::from(maki_storage::id::MakiId::generate());
+        let pump = EventPump {
+            writer: SdkWriter {
+                session_id: session_id.clone(),
+                out_tx,
+            },
+            shared: Arc::new(Mutex::new(Shared {
+                model: Model::from_spec(TEST_MODEL_SPEC).unwrap(),
+                permission_mode,
+                turn_start: Instant::now(),
+                permissions: Permissions::new(answer_tx),
+            })),
+            include_partial_messages: false,
+            synth: StreamSynth::new(),
+            tool_inputs: HashMap::new(),
+            result_text: String::new(),
+            cost: None,
+            request_counter: 0,
+            lua_handle: maki_lua::EventHandle::disconnected_for_test(),
+            session_id: session_id.to_string(),
+            snapshot: HeadlessSnapshot::default(),
+        };
+        (pump, out_rx)
+    }
+
+    fn permission_request() -> Envelope {
+        Envelope {
+            event: AgentEvent::PermissionRequest {
+                id: TEST_TOOL_USE_ID.to_owned(),
+                tool: ToolKey::parse(TEST_TOOL).unwrap(),
+                scopes: Vec::new(),
+            },
+            subagent: None,
+            run_id: 0,
+        }
+    }
+
+    /// The SDK hang: `retained` is the Lua tool context that keeps a sender
+    /// alive on an idle VM, so the pump has to end on the stream marker and
+    /// still report everything queued ahead of it.
+    #[test]
+    fn pump_ends_at_stream_close_with_a_retained_sender() {
+        let (guard, events) = maki_agent::event_stream();
+        let retained = guard.sender(0);
+        let (pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        let pump = pump.spawn(events);
+
+        retained
+            .send(AgentEvent::Error {
+                message: PUMP_ERROR.into(),
+            })
+            .unwrap();
+        drop(guard);
+        smol::block_on(pump);
+
+        let line = out_rx.try_recv().expect(PUMP_FORWARDED);
+        assert!(line.contains(PUMP_ERROR), "got: {line}");
+    }
+
+    /// Stdin is the only answerer, so once it is gone every request has to be
+    /// denied here. A single unanswered one parks the agent, and a parked
+    /// agent never ends the event stream the exit path waits on.
+    #[test]
+    fn closing_the_answer_source_denies_outstanding_and_later_requests() {
+        let (answer_tx, answer_rx) = flume::unbounded();
+        let mut permissions = Permissions::new(answer_tx);
+
+        assert!(permissions.ask(OUTSTANDING_REQ.to_owned()));
+        assert!(answer_rx.is_empty());
+
+        permissions.close();
+        assert_eq!(answer_rx.try_recv(), Ok(PermissionAnswer::Deny.encode()));
+
+        assert!(!permissions.ask(LATE_REQ.to_owned()));
+        assert_eq!(answer_rx.try_recv(), Ok(PermissionAnswer::Deny.encode()));
+
+        permissions.close();
+        assert!(answer_rx.is_empty());
+    }
+
+    /// Every answer has to match an id the agent is actually parked on. A
+    /// spare one would be picked up by the *next* turn's request and
+    /// auto-answer it, which is also why a turn end forgets its ids silently
+    /// instead of denying them the way `close` does.
+    #[test]
+    fn only_requests_the_agent_waits_on_get_answered() {
+        let (answer_tx, answer_rx) = flume::unbounded();
+        let mut permissions = Permissions::new(answer_tx);
+        assert!(permissions.ask(OUTSTANDING_REQ.to_owned()));
+
+        permissions.resolve(LATE_REQ, PermissionAnswer::AllowOnce);
+        assert!(answer_rx.is_empty(), "{NO_ANSWER}");
+
+        permissions.resolve(OUTSTANDING_REQ, PermissionAnswer::AllowOnce);
+        assert_eq!(
+            answer_rx.try_recv(),
+            Ok(PermissionAnswer::AllowOnce.encode())
+        );
+
+        permissions.resolve(OUTSTANDING_REQ, PermissionAnswer::AllowOnce);
+        assert!(answer_rx.is_empty(), "{NO_ANSWER}");
+
+        assert!(permissions.ask(LATE_REQ.to_owned()));
+        permissions.forget_outstanding();
+        permissions.resolve(LATE_REQ, PermissionAnswer::AllowOnce);
+        assert!(answer_rx.is_empty(), "{NO_ANSWER}");
+
+        assert!(permissions.ask(OUTSTANDING_REQ.to_owned()), "{SOURCE_OPEN}");
+        permissions.forget_outstanding();
+        permissions.close();
+        assert!(answer_rx.is_empty(), "{NO_ANSWER}");
+    }
+
+    /// Bypass answers on the spot, so recording the id or emitting a control
+    /// request would leave an answer nobody is parked on: stdin's reply (or
+    /// the deny on exit) would land on whatever the agent asks next.
+    #[test]
+    fn bypass_answers_immediately_without_recording_or_emitting() {
+        let (answer_tx, answer_rx) = flume::unbounded();
+        let (mut pump, out_rx) = test_pump(PermissionMode::BypassPermissions, answer_tx);
+
+        pump.handle(permission_request()).unwrap();
+
+        assert_eq!(
+            answer_rx.try_recv(),
+            Ok(PermissionAnswer::AllowSession.encode())
+        );
+        assert!(answer_rx.is_empty(), "{NO_ANSWER}");
+        assert!(out_rx.is_empty(), "{NO_CONTROL_REQUEST}");
+        assert!(
+            pump.shared
+                .lock()
+                .unwrap()
+                .permissions
+                .outstanding
+                .is_empty()
+        );
+    }
+
+    /// The wire and the outstanding set have to move together: an id on the
+    /// wire that was never recorded is unanswerable, and one recorded without
+    /// being asked parks the agent until exit.
+    #[test]
+    fn permission_request_reaches_the_wire_only_while_answerable() {
+        let (answer_tx, answer_rx) = flume::unbounded();
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, answer_tx);
+
+        pump.handle(permission_request()).unwrap();
+
+        let wire: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(wire["type"], CONTROL_REQUEST_TYPE);
+        assert_eq!(wire["request"]["tool_name"], TEST_TOOL_WIRE_NAME);
+        assert_eq!(wire["request"]["tool_use_id"], TEST_TOOL_USE_ID);
+        assert!(answer_rx.is_empty(), "{NO_ANSWER}");
+
+        let request_id = wire["request_id"].as_str().unwrap().to_owned();
+        pump.shared
+            .lock()
+            .unwrap()
+            .permissions
+            .resolve(&request_id, PermissionAnswer::AllowOnce);
+        assert_eq!(
+            answer_rx.try_recv(),
+            Ok(PermissionAnswer::AllowOnce.encode())
+        );
+
+        pump.shared.lock().unwrap().permissions.close();
+        pump.handle(permission_request()).unwrap();
+
+        assert_eq!(answer_rx.try_recv(), Ok(PermissionAnswer::Deny.encode()));
+        assert!(out_rx.is_empty(), "{NO_CONTROL_REQUEST}");
     }
 }

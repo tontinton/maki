@@ -6,11 +6,12 @@
 //! is never given back, not even when the thread exits. It is charged per
 //! language too: against a warmed `SyntaxSet` every extra concurrent thread
 //! retains about 2.7 MB for `rust` and 1.7 MB for `markdown`, so a session
-//! touching several syntaxes pays the bill several times. The pool shards 8 ways
-//! per regex, so the first handful of threads do most of the damage, `rust`
-//! alone saturating near 37 MB. That is how the old render pool, which let
-//! workers idle out and respawn every 5s, ended a session at +113 MB after 48
-//! threads had come and gone one at a time.
+//! touching several syntaxes pays the bill several times. Nothing caps the
+//! total: the 8 stacks the pool keeps per regex only spread contention, each
+//! one is an uncapped `Vec`, so every thread that ever contended stays charged.
+//! That is how the old render pool, which let workers idle out and respawn
+//! every 5s, ended a session at +113 MB after 48 threads had come and gone one
+//! at a time.
 //!
 //! Compiling a syntax's regexes the first time costs a further ~10 MB, but that
 //! one is global and paid once, so no amount of single-threading wins it back.

@@ -778,6 +778,15 @@ impl From<StoredThinking> for ThinkingConfig {
     }
 }
 
+/// One place decides what silence means, so a session that never set a level, a
+/// config without `always_thinking` and a frontend with no toggle all read it
+/// the same way: off.
+impl From<Option<StoredThinking>> for ThinkingConfig {
+    fn from(s: Option<StoredThinking>) -> Self {
+        s.map_or(Self::Off, Self::from)
+    }
+}
+
 impl From<ThinkingConfig> for StoredThinking {
     fn from(c: ThinkingConfig) -> Self {
         match c {
@@ -1286,6 +1295,15 @@ mod tests {
             fast: false,
         };
         assert_eq!(opts.clamped(&model).thinking, expected);
+    }
+
+    #[test_case(None,                           ThinkingConfig::Off      ; "absent_means_off")]
+    #[test_case(Some(StoredThinking::Adaptive), ThinkingConfig::Adaptive ; "a_stored_level_carries_over")]
+    fn optional_stored_thinking_into_config(
+        stored: Option<StoredThinking>,
+        expected: ThinkingConfig,
+    ) {
+        assert_eq!(ThinkingConfig::from(stored), expected);
     }
 
     #[test]

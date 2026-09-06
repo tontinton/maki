@@ -10,16 +10,16 @@
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
-use maki_agent::headless::{HeadlessHandle, HeadlessParams};
+use maki_agent::headless::{self, HeadlessHandle, HeadlessParams};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig};
-use maki_config::ModelPolicy;
+use maki_config::{ModelPolicy, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::model::Model;
@@ -27,8 +27,6 @@ use maki_providers::{TokenUsage, add_cost};
 use maki_storage::id::SessionRef;
 use serde::Serialize;
 use serde_json::Value;
-
-const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Fails fast: silently dropping an image the caller explicitly attached
 // would be worse than erroring.
@@ -137,23 +135,38 @@ impl VerboseOutput {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    model: &Model,
-    prompt_arg: Option<String>,
-    image_paths: Vec<PathBuf>,
-    format: OutputFormat,
-    verbose: bool,
-    config: AgentConfig,
-    permissions_config: PermissionsConfig,
-    timeouts: maki_providers::Timeouts,
-    lua_handle: EventHandle,
-    fast: bool,
-    workflow: bool,
-    model_policy: Arc<ModelPolicy>,
-    plugin_rules: Arc<PluginRuleStore>,
-) -> Result<()> {
-    let prompt = match prompt_arg {
+pub struct PrintParams {
+    pub model: Model,
+    pub prompt: Option<String>,
+    pub image_paths: Vec<PathBuf>,
+    pub format: OutputFormat,
+    pub verbose: bool,
+    pub config: AgentConfig,
+    pub permissions_config: PermissionsConfig,
+    pub timeouts: maki_providers::Timeouts,
+    pub lua_handle: EventHandle,
+    pub defaults: SessionDefaults,
+    pub model_policy: Arc<ModelPolicy>,
+    pub plugin_rules: Arc<PluginRuleStore>,
+}
+
+pub fn run(params: PrintParams) -> Result<()> {
+    let PrintParams {
+        model,
+        prompt,
+        image_paths,
+        format,
+        verbose,
+        config,
+        permissions_config,
+        timeouts,
+        lua_handle,
+        defaults,
+        model_policy,
+        plugin_rules,
+    } = params;
+
+    let prompt = match prompt {
         Some(p) => p,
         None => {
             let mut buf = String::new();
@@ -172,7 +185,7 @@ pub fn run(
         eprintln!("MCP config error: {mcp_config_errors}");
     }
 
-    let handle = maki_agent::headless::spawn(HeadlessParams {
+    let (handle, mut events) = maki_agent::headless::spawn(HeadlessParams {
         model: model.clone(),
         config,
         permissions_config,
@@ -183,14 +196,12 @@ pub fn run(
         excluded_tools: vec![QUESTION_TOOL_NAME],
         mcp_handle,
         initial_wd: cwd,
-        fast,
-        workflow,
+        defaults,
         model_policy,
         plugin_rules,
     });
 
     let HeadlessHandle {
-        event_rx,
         tool_names,
         session_id,
         cwd,
@@ -238,7 +249,7 @@ pub fn run(
         || MODE_BUILD,
     );
 
-    while let Ok(envelope) = smol::block_on(event_rx.recv_async()) {
+    while let Some(envelope) = smol::block_on(events.next()) {
         // Folded in first, so a plugin handling `TurnEnd` finds the finished
         // totals when it calls `maki.session.read()`.
         snapshot.observe(&envelope);
@@ -277,7 +288,8 @@ pub fn run(
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
-            | AgentEvent::PromptProgress { .. } => {}
+            | AgentEvent::PromptProgress { .. }
+            | AgentEvent::StreamClosed => {}
             AgentEvent::Retry {
                 attempt,
                 message,
@@ -347,12 +359,7 @@ pub fn run(
             }
         }
     }
-    smol::block_on(async {
-        futures_lite::future::or(task, async {
-            smol::Timer::after(AGENT_SHUTDOWN_TIMEOUT).await;
-        })
-        .await;
-    });
+    smol::block_on(headless::await_shutdown(task));
     lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
 
     let duration_ms = start.elapsed().as_millis();

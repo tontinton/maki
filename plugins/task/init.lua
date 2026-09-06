@@ -176,10 +176,14 @@ local function handler(input, ctx)
   end
 
   local permit = semaphore:acquire()
+  -- Declared out here so the epilogue closes it on every path: left to the
+  -- garbage collector it keeps the subagent's event relay alive on an idle VM.
+  local sess
 
-  -- pcall so a raised error cannot leak the permit.
+  -- pcall so a raised error cannot leak the permit or the session.
   local ok, out = pcall(function()
-    local sess, sess_err = maki.agent.session(ctx, {
+    local sess_err
+    sess, sess_err = maki.agent.session(ctx, {
       model_spec = model.spec,
       system = system,
       tools = tool_defs,
@@ -210,8 +214,6 @@ local function handler(input, ctx)
       end
     end
 
-    sess:close()
-
     if err then
       -- A result alongside the error means the run was cut short after
       -- streaming some text, and half a transcript beats a bare error.
@@ -233,6 +235,9 @@ local function handler(input, ctx)
     return { llm_output = captured and maki.json.encode(captured) or result.text, format = "markdown" }
   end)
 
+  if sess then
+    sess:close()
+  end
   permit:release()
   if not ok then
     error(out, 0)

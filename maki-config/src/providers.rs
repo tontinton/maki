@@ -223,26 +223,39 @@ impl ProvidersConfig {
     /// in tier or pricing surfaces immediately instead of silently dropping
     /// every provider and starting maki with an empty registry.
     pub fn load() -> Self {
+        Self::read().unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            process::exit(BAD_CONFIG_EXIT_CODE);
+        })
+    }
+
+    /// Same read, but a typo only costs the answer. For callers past startup,
+    /// where taking the process down mid-session is never the right trade.
+    pub fn load_or_default() -> Self {
+        Self::read().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "ignoring providers.toml");
+            Self::default()
+        })
+    }
+
+    fn read() -> Result<Self, String> {
         let path = providers_file_path();
         if !path.exists() {
-            return Self::default();
+            return Ok(Self::default());
         }
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "cannot read providers.toml");
-                return Self::default();
+                return Ok(Self::default());
             }
         };
         match toml::from_str::<ProvidersConfig>(&content) {
             Ok(config) => {
                 debug!(path = %path.display(), "loaded providers config");
-                config
+                Ok(config)
             }
-            Err(e) => {
-                eprintln!("error: invalid {}: {e}", path.display());
-                process::exit(BAD_CONFIG_EXIT_CODE);
-            }
+            Err(e) => Err(format!("invalid {}: {e}", path.display())),
         }
     }
 

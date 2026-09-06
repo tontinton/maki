@@ -191,7 +191,7 @@ impl Chat {
                     ));
                 }
             }
-            AgentEvent::SubagentHistory { .. } => {}
+            AgentEvent::SubagentHistory { .. } | AgentEvent::StreamClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
             }

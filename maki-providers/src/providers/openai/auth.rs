@@ -271,7 +271,7 @@ pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
             debug!("using OpenAI OAuth authentication");
             return build_oauth_resolved(&tokens);
         }
-        match refreshed_tokens(dir, PROVIDER, refresh_tokens) {
+        match refreshed_tokens(dir, PROVIDER, None, refresh_tokens) {
             Ok(fresh) => {
                 debug!("using OpenAI OAuth authentication (refreshed)");
                 return build_oauth_resolved(&fresh);

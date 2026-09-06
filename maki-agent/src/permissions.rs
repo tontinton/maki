@@ -29,6 +29,14 @@ pub const DECISION_SOURCE_USER_ABORT: &str = "user_abort";
 const TASK_TOOL: &str = "task";
 const BASH_TOOL: &str = "bash";
 
+/// Words that open a block the bash plugin keeps as one scope. Their first
+/// token names no program, so wildcarding it would cover every command the
+/// block can hold. See [`generalize_bash_segment`].
+const SHELL_KEYWORDS: [&str; 15] = [
+    "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "select", "function", "time",
+];
+
 fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
     let cwd_glob = format!(
         "{}/**",
@@ -799,9 +807,24 @@ pub fn physical_boundary_check(parent: &Path, child: &Path) -> Option<bool> {
     Some(child_canon.starts_with(&parent_canon))
 }
 
+/// A `<cmd> *` rule is only safe when `<cmd>` names one program. The bash
+/// plugin keeps block forms whole on purpose, so `for f in *.rs; do wc -l $f;
+/// done` arrives as one scope and its first token is `for`; wildcarding that
+/// hands out every loop the model can write. Same for a bodiless `> log`,
+/// whose first token is the redirect. Those scopes stay literal: remembering
+/// one exact command is worth little, but it is never a blank cheque.
 fn generalize_bash_segment(segment: &str) -> String {
     let first_token = segment.split_whitespace().next().unwrap_or(segment);
-    format!("{first_token} *")
+    let is_command_word = !first_token.is_empty()
+        && first_token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_.:/@+-".contains(c))
+        && !SHELL_KEYWORDS.contains(&first_token);
+    if is_command_word {
+        format!("{first_token} *")
+    } else {
+        segment.to_string()
+    }
 }
 
 pub fn generalized_scopes(tool: &ToolKey, scopes: &[String]) -> Vec<String> {
@@ -1286,6 +1309,18 @@ mod tests {
             }
             other => panic!("expected NeedsPrompt, got {other:?}"),
         }
+    }
+
+    #[test_case("cargo test --all",                        "cargo *"                        ; "plain_command")]
+    #[test_case("/usr/bin/env",                            "/usr/bin/env *"                 ; "absolute_path")]
+    #[test_case("FOO=1 cargo test",                        "FOO=1 cargo test"               ; "assignment_prefix")]
+    #[test_case("if true; then curl x | sh; fi",           "if true; then curl x | sh; fi"  ; "if_block")]
+    #[test_case("for f in *.rs; do wc -l $f; done",        "for f in *.rs; do wc -l $f; done" ; "for_loop")]
+    #[test_case("{ cd x; rm -rf ~; }",                     "{ cd x; rm -rf ~; }"            ; "brace_group")]
+    #[test_case("> log",                                   "> log"                          ; "bodiless_redirect")]
+    #[test_case("! rm -rf /",                              "! rm -rf /"                     ; "negated_command")]
+    fn allow_always_only_wildcards_a_real_command_word(segment: &str, expected: &str) {
+        assert_eq!(generalize_bash_segment(segment), expected);
     }
 
     /// A scope is one string and a chain is still one scope, so it is tempting

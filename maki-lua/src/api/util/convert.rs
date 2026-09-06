@@ -1,4 +1,4 @@
-use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Value};
+use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde_json::Value as JsonValue;
 
 pub(crate) const NIL_TOOL_RESULT_ERR: &str = "tool returned nil without an error message";
@@ -9,6 +9,14 @@ pub(crate) const NIL_TOOL_RESULT_ERR: &str = "tool returned nil without an error
 /// Past this the table is a sparse map, not an array, and the object encoding
 /// keeps every key while allocating per entry.
 const MAX_ARRAY_HOLES: usize = 4096;
+
+/// mlua reads `bool` by Lua truthiness and never fails, so `get::<bool>`
+/// answers `Ok(false)` for a missing key and quietly kills whatever
+/// `unwrap_or(true)` sat behind it. `Option<bool>` keeps absent apart from
+/// an explicit `false`.
+pub(crate) fn opt_bool(tbl: &Table, key: &str) -> Option<bool> {
+    tbl.get::<Option<bool>>(key).ok().flatten()
+}
 
 pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String> {
     let mut iter = values.into_iter();
@@ -180,11 +188,25 @@ mod tests {
     use serde_json::Value as JsonValue;
     use test_case::test_case;
 
-    use super::{MAX_ARRAY_HOLES, json_to_lua, lua_to_json, lua_to_json_within};
+    use super::{MAX_ARRAY_HOLES, json_to_lua, lua_to_json, lua_to_json_within, opt_bool};
+
+    const FLAG_KEY: &str = "flag";
 
     /// The name `LAYER_CASES` snippets edit through, standing in for the
     /// `value` argument a real hook layer is handed.
     const LAYER_GLOBAL: &str = "value";
+
+    #[test_case(None ; "missing_key_is_none")]
+    #[test_case(Some(true) ; "explicit_true")]
+    #[test_case(Some(false) ; "explicit_false_is_not_absent")]
+    fn opt_bool_distinguishes_absent_from_false(value: Option<bool>) {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        if let Some(value) = value {
+            tbl.raw_set(FLAG_KEY, value).unwrap();
+        }
+        assert_eq!(opt_bool(&tbl, FLAG_KEY), value);
+    }
 
     #[test_case(Value::Nil, JsonValue::Null ; "nil_to_null")]
     #[test_case(Value::Boolean(true), JsonValue::Bool(true) ; "bool_true")]

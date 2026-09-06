@@ -94,6 +94,12 @@ impl From<StreamError> for AgentError {
 /// Servers like vLLM reject `prompt + max_tokens > window` even when the
 /// prompt alone fits. Returns the reduced cap, or `None` when the model's own
 /// cap already fits.
+///
+/// `prompt_tokens` must not be the chars/4 estimate alone. That estimate is a
+/// floor, and on code or JSON it lands well under the real count, which leaves
+/// `remaining` too generous and skips the clamp on exactly the long sessions
+/// this exists for. The caller's measured count from the last response is the
+/// better number whenever it is larger.
 fn clamped_output_tokens(model: &Model, prompt_tokens: u32) -> Option<u32> {
     let max_output = model.max_output_tokens?;
     let remaining = model.context_window.saturating_sub(prompt_tokens);
@@ -112,10 +118,11 @@ pub(crate) async fn stream_with_retry(
     event_tx: &EventSender,
     cancel: &CancelToken,
     opts: RequestOptions,
+    measured_prompt_tokens: u32,
     session_id: Option<&SessionRef>,
 ) -> Result<StreamResponse, StreamError> {
     let opts = opts.clamped(model);
-    let prompt_tokens = estimate_prompt_tokens(messages, system, tools);
+    let prompt_tokens = estimate_prompt_tokens(messages, system, tools).max(measured_prompt_tokens);
     let fitted = clamped_output_tokens(model, prompt_tokens).map(|max_output_tokens| {
         warn!(
             model = %model.id,

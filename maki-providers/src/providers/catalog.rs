@@ -72,8 +72,11 @@ pub struct FreeTier {
 }
 
 impl FreeTier {
+    /// Read live so an edit takes effect without a restart, and read leniently
+    /// because this runs per request: `load()` exits the process on a parse
+    /// error, which is fine at startup and fatal in the middle of a turn.
     fn opted_in(&self) -> bool {
-        ProvidersConfig::load()
+        ProvidersConfig::load_or_default()
             .get(self.config_slug)
             .and_then(|def| def.enable_free_models)
             .unwrap_or(false)

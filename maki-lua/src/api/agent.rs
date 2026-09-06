@@ -19,8 +19,8 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
-    EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession, RunLedger, SubagentInfo,
-    ToolDoneEvent,
+    EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, McpSession, RunLedger,
+    SessionEvents, SubagentInfo, ToolDoneEvent, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -82,14 +82,14 @@ fn dispatch_ctx<'a>(ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, S
 /// turn's tokens plus the run's summed cost), and one total per run on
 /// `usage_tx`, which `prompt` waits for.
 async fn relay_session_events(
-    sub_rx: flume::Receiver<Envelope>,
+    mut sub_events: SessionEvents,
     parent_tx: EventSender,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     usage_tx: flume::Sender<TokenUsage>,
     live_sink: Option<flume::Sender<ToolLive>>,
 ) {
     let mut cost = None;
-    while let Ok(mut envelope) = sub_rx.recv_async().await {
+    while let Some(mut envelope) = sub_events.next().await {
         match &envelope.event {
             AgentEvent::TurnComplete(turn) => {
                 add_cost(&mut cost, turn.cost);
@@ -439,8 +439,11 @@ async fn call_tool(
 ///   name = "researcher",
 /// })
 /// if err then error(err) end
-/// local result = sess:prompt("Summarize this file.")
+///
+/// -- Close before handling the error, so no path leaves the session open.
+/// local result, prompt_err = sess:prompt("Summarize this file.")
 /// sess:close()
+/// if prompt_err then error(prompt_err) end
 #[lua_fn]
 async fn session(
     lua: Lua,
@@ -546,8 +549,8 @@ async fn session(
         None => agent_ctx.opts.thinking,
     };
 
-    let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
-    let sub_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
+    let (stream_guard, sub_events) = event_stream();
+    let sub_event_tx = stream_guard.sender(agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
 
@@ -555,7 +558,7 @@ async fn session(
     let (usage_tx, usage_rx) = flume::unbounded();
 
     smol::spawn(relay_session_events(
-        sub_rx,
+        sub_events,
         parent_tx.clone(),
         Arc::clone(&subagent_info),
         usage_tx,
@@ -619,6 +622,7 @@ async fn session(
             .map(McpSession::fresh),
         history: History::new(Vec::new()),
         sub_event_tx,
+        stream_guard: Some(stream_guard),
         child_cancel,
         answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
         answer_tx: Some(answer_tx),
@@ -736,6 +740,10 @@ struct SessionState {
     mcp: Option<McpSession>,
     history: History,
     sub_event_tx: EventSender,
+    /// Dropped on close, which ends the relay task. Tool contexts keep
+    /// [`EventSender`] clones alive past the run, so the relay cannot key off
+    /// sender disconnect.
+    stream_guard: Option<EventStreamGuard>,
     child_cancel: maki_agent::cancel::CancelToken,
     answer_rx: Arc<AsyncMutex<flume::Receiver<String>>>,
     answer_tx: Option<flume::Sender<String>>,
@@ -762,6 +770,7 @@ impl SessionState {
             return;
         }
         self.closed = true;
+        self.stream_guard.take();
         self.parent_cancels.retire(&self.ui_id, self.cancel_slot);
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
         let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
@@ -928,9 +937,12 @@ async fn prompt(
     Ok((Some(tbl), None))
 }
 
-/// Close the session and flush its history back to the parent agent. You can
-/// call this multiple times safely. If you forget, it runs automatically when
-/// the session is garbage collected.
+/// Close the session and flush its history back to the parent agent. Calling
+/// it more than once is safe.
+///
+/// Close on every path, error paths included. Dropping the session instead
+/// leaves the work to the Lua garbage collector, which may never run while
+/// the VM sits idle, and the subagent's event relay stays alive until it does.
 ///
 /// @return
 #[lua_fn]
@@ -947,8 +959,11 @@ lua_class! {
     ///
     /// Create one with `maki.agent.session()`, then send messages with
     /// `:prompt()`. The session remembers previous turns, so you can have
-    /// a multi-step conversation. Call `:close()` when you are done, or let
-    /// garbage collection handle it.
+    /// a multi-step conversation.
+    ///
+    /// Always call `:close()` when you are done, on error paths too. The
+    /// garbage collector is a fallback that may never run while the VM sits
+    /// idle, so a session you only drop can stay open for the rest of the run.
     "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close]
 }
 
@@ -1014,14 +1029,6 @@ mod tests {
         }
     }
 
-    fn envelope(event: AgentEvent) -> Envelope {
-        Envelope {
-            event,
-            subagent: None,
-            run_id: RUN_ID,
-        }
-    }
-
     fn turn(usage: TokenUsage, cost: f64) -> AgentEvent {
         AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
             message: Message::default(),
@@ -1033,20 +1040,28 @@ mod tests {
         }))
     }
 
+    fn subagent_info() -> Arc<OnceLock<SubagentInfo>> {
+        let info = Arc::new(OnceLock::new());
+        info.set(SubagentInfo {
+            parent_tool_use_id: PARENT_ID.into(),
+            name: "research".into(),
+            prompt: None,
+            model: None,
+            answer_tx: None,
+        })
+        .unwrap();
+        info
+    }
+
+    /// Dropping the guard is what ends the relay: a Lua tool context keeps a
+    /// sender alive past the run, so disconnect never comes. The forwarded
+    /// count also pins down that the close marker itself stays behind, since
+    /// passing it on would end the *parent's* stream at the first subagent.
     #[test]
     fn relay_session_events_reports_live_usage_and_done_total() {
-        let (sub_tx, sub_rx) = flume::unbounded();
+        let (guard, sub_events) = event_stream();
+        let sub_tx = guard.sender(RUN_ID);
         let (parent_raw_tx, parent_rx) = flume::unbounded();
-        let subagent_info = Arc::new(OnceLock::new());
-        subagent_info
-            .set(SubagentInfo {
-                parent_tool_use_id: PARENT_ID.into(),
-                name: "research".into(),
-                prompt: None,
-                model: None,
-                answer_tx: None,
-            })
-            .unwrap();
         let (usage_tx, usage_rx) = flume::unbounded();
         let (live_tx, live_rx) = flume::unbounded();
 
@@ -1066,14 +1081,14 @@ mod tests {
                 reason: DoneReason::EndTurn,
             },
         ] {
-            sub_tx.send(envelope(event)).unwrap();
+            sub_tx.send(event).unwrap();
         }
-        drop(sub_tx);
+        drop(guard);
 
         smol::block_on(relay_session_events(
-            sub_rx,
+            sub_events,
             EventSender::new(parent_raw_tx, RUN_ID),
-            subagent_info,
+            subagent_info(),
             usage_tx,
             Some(live_tx),
         ));

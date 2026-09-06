@@ -90,6 +90,9 @@ pub(super) async fn compact_history(
             event_tx,
             cancel,
             RequestOptions::default(),
+            // The compaction prompt is built here, so the estimate is all we
+            // have and the session's measured size describes other messages.
+            0,
             None,
         )
         .await

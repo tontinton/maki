@@ -9,7 +9,7 @@ use isahc::config::{Configurable, VersionNegotiation};
 use isahc::http::request::Builder;
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, load_tokens, lock_tokens, save_tokens};
@@ -42,9 +42,10 @@ const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
 const UNAUTHORIZED_STATUS: u16 = 401;
 const AUTHORIZATION_HEADER: &str = "authorization";
+const BEARER_PREFIX: &str = "Bearer ";
 
 fn bearer_value(api_key: &str) -> String {
-    format!("Bearer {api_key}")
+    format!("{BEARER_PREFIX}{api_key}")
 }
 
 pub(crate) fn user_agent() -> &'static str {
@@ -77,9 +78,17 @@ impl Default for Timeouts {
 /// queued behind a peer here is holding a copy the peer already spent, and
 /// replaying a rotated refresh token gets the whole family revoked, so the
 /// tokens are loaded again once the lock is in hand.
+///
+/// `rejected` is the access token a 401 was just served for, and it is what
+/// separates the two reasons to be here. Disk holding something else means a
+/// peer already rotated and its copy is all we need; disk holding the same
+/// token means only a real refresh gets us out of the loop, whatever the
+/// expiry clock says, because that clock is wrong exactly when a server
+/// revokes early or the local time drifts.
 pub(crate) fn refreshed_tokens(
     dir: &StateDir,
     provider: &str,
+    rejected: Option<&str>,
     refresh: impl FnOnce(&OAuthTokens) -> Result<OAuthTokens, AgentError>,
 ) -> Result<OAuthTokens, AgentError> {
     let _lock = lock_tokens(dir, provider);
@@ -87,11 +96,17 @@ pub(crate) fn refreshed_tokens(
         status: UNAUTHORIZED_STATUS,
         message: format!("{provider} OAuth tokens not found on disk"),
     })?;
-    if !current.is_expired() {
+    if rejected.is_none_or(|stale| current.access != stale) && !current.is_expired() {
         return Ok(current);
     }
     let fresh = refresh(&current)?;
-    save_tokens(dir, provider, &fresh)?;
+    // Not `?`: every caller reads an error here as "these credentials are
+    // dead" and deletes the token file, so a full disk would log the user out
+    // over a refresh that actually succeeded. The run keeps the token it just
+    // got and the next start refreshes again.
+    if let Err(e) = save_tokens(dir, provider, &fresh) {
+        warn!(provider, error = %e, "could not persist refreshed OAuth tokens");
+    }
     Ok(fresh)
 }
 
@@ -142,6 +157,15 @@ impl ResolvedAuth {
             self.config_headers.push(name.clone());
         }
         Ok(())
+    }
+
+    /// The access token behind the bearer header, so a 401 retry can say which
+    /// token it was using.
+    pub(crate) fn access_token(&self) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(AUTHORIZATION_HEADER))
+            .and_then(|(_, value)| value.strip_prefix(BEARER_PREFIX))
     }
 
     pub fn bearer(slug: &str, api_key: &str) -> Result<Self, AgentError> {
@@ -414,12 +438,60 @@ impl KeyPool {
 
 #[cfg(test)]
 mod tests {
+    use maki_storage::auth::save_tokens;
+    use tempfile::TempDir;
+
     use super::*;
     use futures_lite::io::AsyncBufReadExt;
     use test_case::test_case;
 
     const ERROR_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
     const PARSE_FAILED: &str = "SSE error payload should deserialize";
+    const TEST_PROVIDER: &str = "openai";
+    const ON_DISK: &str = "on-disk-access";
+    const FRESH: &str = "fresh-access";
+    const REFRESHED: &str = "refresh should have run";
+    const NOT_REFRESHED: &str = "refresh should not have run";
+
+    fn state_with_tokens(access: &str) -> TempDir {
+        let dir = TempDir::new().expect("temp dir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        save_tokens(
+            &state,
+            TEST_PROVIDER,
+            &OAuthTokens {
+                access: access.into(),
+                refresh: "refresh".into(),
+                expires: u64::MAX,
+                account_id: None,
+            },
+        )
+        .expect("save tokens");
+        dir
+    }
+
+    fn fresh_tokens(_: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
+        Ok(OAuthTokens {
+            access: FRESH.into(),
+            refresh: "refresh".into(),
+            expires: u64::MAX,
+            account_id: None,
+        })
+    }
+
+    #[test_case(Some(ON_DISK), FRESH,  REFRESHED     ; "the rejected token is the one on disk")]
+    #[test_case(Some("older"), ON_DISK, NOT_REFRESHED ; "a peer already rotated it")]
+    #[test_case(None,          ON_DISK, NOT_REFRESHED ; "not expired and nothing was rejected")]
+    fn refreshed_tokens_forces_a_refresh_only_for_the_rejected_token(
+        rejected: Option<&str>,
+        expected: &str,
+        reason: &str,
+    ) {
+        let dir = state_with_tokens(ON_DISK);
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        let got = refreshed_tokens(&state, TEST_PROVIDER, rejected, fresh_tokens).expect("refresh");
+        assert_eq!(got.access, expected, "{reason}");
+    }
 
     // Codex only admits the overload in `code`, and anything we cannot place has to stay a plain
     // 400 so a user mistake is not retried forever: https://github.com/tontinton/maki/issues/777

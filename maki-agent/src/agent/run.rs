@@ -343,6 +343,7 @@ impl<'h> Agent<'h> {
             &self.event_tx,
             &self.cancel,
             self.opts,
+            self.context_size,
             self.session_id.as_ref(),
         )
         .await
@@ -480,9 +481,8 @@ impl<'h> Agent<'h> {
     }
 
     fn emit_turn_complete(&self, response: &StreamResponse) -> Result<(), AgentError> {
-        let fast = self.opts.clamped(&self.model).fast;
-        let cost = self.model.billed_cost(&response.usage, fast);
-        let list_cost = self.model.list_cost(&response.usage, fast);
+        let cost = self.model.billed_cost(&response.usage, self.opts.fast);
+        let list_cost = self.model.list_cost(&response.usage, self.opts.fast);
         self.ledger.add(response.usage, cost, list_cost);
         self.event_tx
             .send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
@@ -645,10 +645,10 @@ impl<'h> Agent<'h> {
         )
         .await?;
         // The summariser can be a different model, so price this with
-        // `compact_model` and not `self.model`.
-        let fast = self.opts.clamped(&compact_model).fast;
-        let compact_cost = compact_model.billed_cost(&compaction_usage, fast);
-        let compact_list_cost = compact_model.list_cost(&compaction_usage, fast);
+        // `compact_model` and not `self.model`. `list_cost` gates `fast`
+        // against whichever one it gets.
+        let compact_cost = compact_model.billed_cost(&compaction_usage, self.opts.fast);
+        let compact_list_cost = compact_model.list_cost(&compaction_usage, self.opts.fast);
         self.ledger
             .add(compaction_usage, compact_cost, compact_list_cost);
         // The summary the model just wrote is all the next call will see, plus

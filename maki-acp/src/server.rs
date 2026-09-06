@@ -16,15 +16,17 @@ use agent_client_protocol_schema::{
     ToolCallUpdate, ToolCallUpdateFields,
 };
 use color_eyre::eyre::Context;
-use flume::{Receiver, Sender, WeakSender};
+use flume::{Sender, WeakSender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::PermissionAnswer;
 use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
 use maki_agent::types::AgentEvent;
-use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, SessionEndReason};
-use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy};
+use maki_agent::{
+    AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, SessionEndReason, SessionEvents,
+};
+use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, SessionDefaults};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{Message, TokenUsage, add_cost, settle_session};
@@ -32,13 +34,16 @@ use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::StoredTokenUsage;
 use serde::Serialize;
 use serde_json::Value;
+use smol::Task;
 use smol::io::AsyncBufReadExt;
 use tracing::{debug, warn};
 
 use crate::{AcpParams, SessionEndHook, elicitation, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
-/// ACP has no fast-mode toggle, so a restored total is priced at standard rates.
+/// Turns already recorded were priced when they ran. `always_fast` is a live
+/// config value, so reading it here would reprice history the user paid for at
+/// standard rates. New turns still honour it.
 const RESTORED_FAST: bool = false;
 
 /// Ids come from here and are never reused, so a late answer for a closed
@@ -74,6 +79,7 @@ struct Server {
     model_specs: Vec<String>,
     model_policy: Arc<ModelPolicy>,
     client_elicits_form: bool,
+    defaults: SessionDefaults,
     session: Option<SessionState>,
     on_session_end: Option<SessionEndHook>,
 }
@@ -108,6 +114,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         model_specs: available_model_specs(&params.model_policy),
         model_policy: Arc::clone(&params.model_policy),
         client_elicits_form: false,
+        defaults: params.defaults,
         session: None,
         on_session_end: params.on_session_end.clone(),
     };
@@ -259,16 +266,11 @@ async fn new_session(
     let req: NewSessionRequest = parse_params(raw)?;
     close_session(srv, SessionEndReason::Replaced).await;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
-    let cwd = req.cwd.clone();
-    let (handle, pending) = spawn_session(srv, params, req.cwd, None, Vec::new(), mcp.clone());
-    maki_otel::emit::session_started(
-        maki_otel::emit::START_FRESH,
-        Some(handle.session_id.as_str()),
-    );
+    let session_ref = start_session(srv, params, req.cwd, None, Vec::new(), mcp, None);
+    maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(session_ref.as_str()));
     let spec = params.model.spec();
-    let resp = methods::new_session_response(handle.session_id.as_str())
+    let resp = methods::new_session_response(session_ref.as_str())
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-    install_session(srv, handle, mcp, spec, pending, cwd, None);
     Ok(AgentResponse::NewSessionResponse(resp))
 }
 
@@ -292,22 +294,6 @@ async fn load_session(
     for update in translate::replay_history(&restored.history, replay_cwd, home.as_deref()) {
         session_update(&srv.out_tx, &sid, update);
     }
-    let cwd = req.cwd.clone();
-    let (handle, pending) = spawn_session(
-        srv,
-        params,
-        req.cwd,
-        Some(session_ref),
-        restored.history,
-        mcp.clone(),
-    );
-    maki_otel::emit::session_started(
-        maki_otel::emit::START_RESUME,
-        Some(handle.session_id.as_str()),
-    );
-    let spec = params.model.spec();
-    let resp = methods::load_session_response()
-        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
     // Priced against the model the session recorded, not the one selected now
     // (which may cost 10x more or less). Later turns add their own exact cost.
     let recorded_model = Model::from_spec(&restored.model).unwrap_or_else(|_| params.model.clone());
@@ -317,49 +303,83 @@ async fn load_session(
         &recorded_model,
         RESTORED_FAST,
     );
-    install_session(srv, handle, mcp, spec, pending, cwd, restored_cost);
+    let started = start_session(
+        srv,
+        params,
+        req.cwd,
+        Some(session_ref),
+        restored.history,
+        mcp,
+        restored_cost,
+    );
+    maki_otel::emit::session_started(maki_otel::emit::START_RESUME, Some(started.as_str()));
+    let spec = params.model.spec();
+    let resp = methods::load_session_response()
+        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
-fn spawn_session(
-    srv: &Server,
+/// Spawns a session and installs it as the server's current one. Spawning
+/// alone is not a useful state: the event stream has exactly one reader, so it
+/// must be handed to the pump here rather than travel any further.
+fn start_session(
+    srv: &mut Server,
     params: &AcpParams,
     cwd: PathBuf,
     session_id: Option<SessionRef>,
     history: Vec<Message>,
-    mcp_handle: Option<McpHandle>,
-) -> (InteractiveHandle, PendingState) {
+    mcp: Option<McpHandle>,
+    initial_cost: Option<f64>,
+) -> SessionRef {
     let pending = PendingState::default();
     // Without form elicitation the question tool would spin forever waiting
     // for a TUI that does not exist, so it is dropped and the model asks in
     // plain text instead.
     let (excluded_tools, local_tools) = if srv.client_elicits_form {
-        let tool = question_tool(srv.out_tx.clone(), Arc::clone(&pending));
+        let tool = question_tool(srv.out_tx.downgrade(), Arc::clone(&pending));
         let map: LocalTools = Arc::new(HashMap::from([(QUESTION_TOOL_NAME.to_owned(), tool)]));
         (Vec::new(), map)
     } else {
         (vec![QUESTION_TOOL_NAME], LocalTools::default())
     };
-    let handle = headless::spawn_interactive(InteractiveParams {
+    let (handle, events) = headless::spawn_interactive(InteractiveParams {
         model: params.model.clone(),
         config: params.config.clone(),
         permissions_config: params.permissions_config.clone(),
         timeouts: params.timeouts,
         prompt_slots: Arc::clone(&params.prompt_slots),
         excluded_tools,
-        mcp_handle,
-        initial_wd: cwd,
+        mcp_handle: mcp.clone(),
+        initial_wd: cwd.clone(),
         session_id,
         initial_history: history,
         yolo: params.yolo,
         system_prompt_override: None,
         append_system_prompt: None,
-        workflow: false,
+        defaults: params.defaults,
         model_policy: Arc::clone(&params.model_policy),
         plugin_rules: Arc::clone(&params.plugin_rules),
         local_tools,
     });
-    (handle, pending)
+    let session_ref = handle.session_id.clone();
+    start_event_pump(
+        events,
+        session_ref.clone(),
+        srv.out_tx.clone(),
+        Arc::clone(&pending),
+        cwd,
+        maki_storage::paths::home(),
+        initial_cost,
+    )
+    .detach();
+    srv.session = Some(SessionState {
+        handle,
+        mcp,
+        current_mode: AgentMode::Build,
+        current_model: params.model.spec(),
+        pending,
+    });
+    session_ref
 }
 
 /// Sends a request the client must answer and records it as the outstanding
@@ -386,7 +406,10 @@ fn ask_client(
 /// Shadows the Lua `question` tool: sends `elicitation/create` to the client
 /// and blocks the tool call until the form comes back. Serializes on the same
 /// answer channel as permissions, so at most one ask is in flight.
-fn question_tool(out_tx: Sender<Value>, pending: PendingState) -> LocalTool {
+/// Weak, because `LocalTools` is captured verbatim by every `LuaCtx` a tool
+/// call parks and an idle VM never collects it. A strong clone here outlives
+/// `serve()` and leaves `writer_task` waiting on a sender nobody will drop.
+fn question_tool(out_tx: WeakSender<Value>, pending: PendingState) -> LocalTool {
     // The audience the Lua `question` tool carries: shadowing a tool must not
     // widen who may call it.
     local_tool(ToolAudience::MAIN, move |input, ctx| {
@@ -402,6 +425,7 @@ fn question_tool(out_tx: Sender<Value>, pending: PendingState) -> LocalTool {
             // scope pointing at a tool call the client never saw would get
             // the elicitation rejected or dropped.
             let tool_call_id = ctx.tool_use_id.filter(|id| !id.is_empty());
+            let out_tx = out_tx.upgrade().ok_or("connection closed")?;
             let request = elicitation::form_request(&session_id, tool_call_id, &input)?;
             let rx = ctx.user_response_rx.as_ref().ok_or("no answer channel")?;
 
@@ -510,33 +534,6 @@ async fn close_session(srv: &mut Server, reason: SessionEndReason) {
     }
 }
 
-fn install_session(
-    srv: &mut Server,
-    handle: InteractiveHandle,
-    mcp: Option<McpHandle>,
-    current_model: String,
-    pending: PendingState,
-    cwd: PathBuf,
-    initial_cost: Option<f64>,
-) {
-    start_event_pump(
-        handle.event_rx.clone(),
-        handle.session_id.clone(),
-        srv.out_tx.clone(),
-        Arc::clone(&pending),
-        cwd,
-        maki_storage::paths::home(),
-        initial_cost,
-    );
-    srv.session = Some(SessionState {
-        handle,
-        mcp,
-        current_mode: AgentMode::Build,
-        current_model,
-        pending,
-    });
-}
-
 #[derive(Debug)]
 struct Restored {
     history: Vec<Message>,
@@ -586,23 +583,22 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     let session = srv.session.as_ref().ok_or_else(no_session)?;
 
     let (message, images) = extract_prompt_content(&req.prompt);
-    let input = AgentInput {
-        message,
-        mode: session.current_mode.clone(),
-        images,
-        preamble: Vec::new(),
-        thinking: Default::default(),
-        fast: false,
-        workflow: false,
-        prompt: None,
-    };
+    let input =
+        AgentInput::from_defaults(message, session.current_mode.clone(), images, srv.defaults);
 
+    // One outstanding id per session, checked and set under the same guard:
+    // `input_tx` is unbounded, so a second prompt would queue happily and
+    // overwrite the first id, leaving that request unanswered forever.
+    let mut pending = session.pending.lock().unwrap();
+    if pending.prompt.is_some() {
+        return Err(AcpError::new(-32603, "a prompt is already running"));
+    }
     session
         .handle
         .input_tx
         .send(input)
         .map_err(|_| AcpError::new(-32603, "session ended"))?;
-    session.pending.lock().unwrap().prompt = Some(id.clone());
+    pending.prompt = Some(id.clone());
     Ok(())
 }
 
@@ -753,21 +749,21 @@ fn image_media_type(mime: &str) -> ImageMediaType {
 }
 
 fn start_event_pump(
-    event_rx: Receiver<Envelope>,
+    mut events: SessionEvents,
     session_id: SessionRef,
     out_tx: Sender<Value>,
     pending: PendingState,
     cwd: PathBuf,
     home: Option<PathBuf>,
     initial_cost: Option<f64>,
-) {
+) -> Task<()> {
     smol::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
         let mut cost_total = initial_cost;
 
-        while let Ok(Envelope {
+        while let Some(Envelope {
             event, subagent, ..
-        }) = event_rx.recv_async().await
+        }) = events.next().await
         {
             // Subagent stream events stay out of the transcript, but their
             // turns still spend session money.
@@ -822,7 +818,6 @@ fn start_event_pump(
             session_update(&out_tx, &sid, update);
         }
     })
-    .detach();
 }
 
 fn send(out_tx: &Sender<Value>, msg: impl Serialize) {
@@ -859,6 +854,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 #[cfg(test)]
 mod tests {
     use maki_agent::permissions::PermissionManager;
+    use maki_agent::{DoneReason, SubagentInfo, TurnCompleteEvent};
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::sessions::Session;
@@ -893,11 +889,10 @@ mod tests {
         assert_eq!(permission_answer(&raw), expected);
     }
 
-    fn server_with_ask(kind: AskKind) -> (Server, Receiver<String>, Receiver<Value>) {
+    fn server_with_ask(kind: AskKind) -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
         let (answer_tx, answer_rx) = flume::unbounded();
         let (out_tx, out_rx) = flume::unbounded();
         let handle = InteractiveHandle {
-            event_rx: flume::unbounded().1,
             tool_names: Vec::new(),
             input_tx: flume::unbounded().0,
             answer_tx,
@@ -916,6 +911,7 @@ mod tests {
             model_specs: Vec::new(),
             model_policy: Arc::new(ModelPolicy::default()),
             client_elicits_form: false,
+            defaults: SessionDefaults::default(),
             on_session_end: None,
             session: Some(SessionState {
                 handle,
@@ -929,6 +925,125 @@ mod tests {
             }),
         };
         (server, answer_rx, out_rx)
+    }
+
+    const PUMP_CWD: &str = "/project";
+    const QUEUED_TEXT: &str = "queued before close";
+    const PROMPT_ID: i64 = 7;
+    const SUBAGENT_COST: f64 = 0.25;
+    const TURN_COST: f64 = 0.5;
+    const CONTEXT_WINDOW: u32 = 200_000;
+    const PARENT_TOOL_USE_ID: &str = "toolu_1";
+    const SUBAGENT_NAME: &str = "task";
+
+    fn spawn_pump(srv: &Server, events: SessionEvents, initial_cost: Option<f64>) -> Task<()> {
+        let session = srv.session.as_ref().expect("a session is installed");
+        start_event_pump(
+            events,
+            session.handle.session_id.clone(),
+            srv.out_tx.clone(),
+            Arc::clone(&session.pending),
+            PathBuf::from(PUMP_CWD),
+            None,
+            initial_cost,
+        )
+    }
+
+    fn turn_complete(cost: f64) -> Box<TurnCompleteEvent> {
+        Box::new(TurnCompleteEvent {
+            message: Message::user(String::new()),
+            usage: TokenUsage::default(),
+            model: SELECTED_SPEC.to_owned(),
+            cost: Some(cost),
+            context_size: None,
+            context_window: CONTEXT_WINDOW,
+        })
+    }
+
+    /// The close marker rides the same FIFO as the events, so a turn that was
+    /// still streaming when the session got replaced is reported in full and
+    /// the client's outstanding `session/prompt` is answered instead of
+    /// hanging. `sender` outliving the guard is the ACP leak: a Lua tool
+    /// context parks a clone that an idle VM never collects, so a pump keyed
+    /// off sender disconnect would block here forever.
+    #[test]
+    fn event_pump_delivers_everything_queued_before_the_close() {
+        let (srv, .., out_rx) = server_with_ask(AskKind::Permission);
+        let pending = Arc::clone(&srv.session.as_ref().unwrap().pending);
+        pending.lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
+        let (guard, events) = maki_agent::event_stream();
+        let sender = guard.sender(0);
+        let pump = spawn_pump(&srv, events, None);
+
+        sender
+            .send(AgentEvent::TextDelta {
+                text: QUEUED_TEXT.to_owned(),
+            })
+            .unwrap();
+        sender
+            .send(AgentEvent::Done {
+                usage: TokenUsage::default(),
+                cost: None,
+                list_cost: None,
+                context_size: 0,
+                context_window: CONTEXT_WINDOW,
+                num_turns: 1,
+                reason: DoneReason::EndTurn,
+            })
+            .unwrap();
+        drop(guard);
+        smol::block_on(pump);
+
+        let chunk = out_rx.try_recv().expect("the queued text reaches the wire");
+        let update = &chunk["params"]["update"];
+        assert_eq!(update["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(update["content"]["text"], QUEUED_TEXT);
+
+        let answer = out_rx.try_recv().expect("the pending prompt is answered");
+        assert_eq!(answer["id"], PROMPT_ID);
+        assert_eq!(answer["result"]["stopReason"], "end_turn");
+        assert!(pending.lock().unwrap().prompt.is_none());
+    }
+
+    /// A resumed session opens with a bill, and subagent turns spend against it
+    /// even though their events never enter the transcript.
+    #[test]
+    fn event_pump_folds_restored_and_subagent_cost_into_the_usage_update() {
+        let (srv, .., out_rx) = server_with_ask(AskKind::Permission);
+        let (guard, events) = maki_agent::event_stream();
+        let sender = guard.sender(0);
+        let pump = spawn_pump(&srv, events, Some(RECORDED_COST));
+
+        sender
+            .send_envelope(Envelope {
+                event: AgentEvent::TurnComplete(turn_complete(SUBAGENT_COST)),
+                subagent: Some(SubagentInfo {
+                    parent_tool_use_id: PARENT_TOOL_USE_ID.to_owned(),
+                    name: SUBAGENT_NAME.to_owned(),
+                    prompt: None,
+                    model: None,
+                    answer_tx: None,
+                }),
+                run_id: 0,
+            })
+            .unwrap();
+        sender
+            .send(AgentEvent::TurnComplete(turn_complete(TURN_COST)))
+            .unwrap();
+        drop(guard);
+        smol::block_on(pump);
+
+        let usage = out_rx.try_recv().expect("the session's own turn reports");
+        let update = &usage["params"]["update"];
+        assert_eq!(update["sessionUpdate"], "usage_update");
+        assert_eq!(
+            update["cost"]["amount"].as_f64(),
+            Some(RECORDED_COST + SUBAGENT_COST + TURN_COST)
+        );
+        assert!(
+            out_rx.is_empty(),
+            "the subagent turn pays but stays out of the transcript"
+        );
     }
 
     #[test]
@@ -1099,7 +1214,7 @@ mod tests {
                 &restored.usage,
                 &mut restored.by_model,
                 &recorded_model,
-                RESTORED_FAST
+                false
             ),
             Some(RECORDED_COST)
         );

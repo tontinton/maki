@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use maki_config::{Effect, ModelPolicy};
 use maki_providers::provider::adjust_model;
-use maki_providers::{Model, ThinkingConfig, Timeouts, TokenUsage, settle_session};
+use maki_providers::{Model, RequestOptions, ThinkingConfig, Timeouts, TokenUsage, settle_session};
 use maki_storage::StateDir;
 use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule};
 
@@ -30,6 +30,13 @@ pub(crate) struct SessionState {
 }
 
 const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started a new plan";
+
+/// The badge, the cost line and the request all read the same gate, so none of
+/// them can advertise a mode this model lacks, or miss one it demands.
+fn clamp(thinking: ThinkingConfig, fast: bool, model: &Model) -> (ThinkingConfig, bool) {
+    let opts = RequestOptions { thinking, fast }.clamped(model);
+    (opts.thinking, opts.fast)
+}
 
 impl SessionState {
     pub fn from_session(
@@ -81,20 +88,15 @@ impl SessionState {
             plan.allocate_path(storage);
         }
 
-        let fast = session.meta.fast && model.supports_fast();
+        // Saved model may differ from the live one (updated, removed, etc), so
+        // reconcile before anyone reads the toggles or prices history with them.
+        let (thinking, fast) = clamp(session.meta.thinking.into(), session.meta.fast, &model);
         let token_usage = session.token_usage;
         let cost = settle_session(&token_usage, session.usage_by_model_mut(), &model, fast);
         let context_size = session.meta.context_size;
 
         Self {
-            // Saved model may differ from the live one (updated, removed, etc).
-            // Reconcile so the UI badge and agent always see the truth.
-            thinking: session
-                .meta
-                .thinking
-                .map(Into::into)
-                .filter(|_| model.supports_thinking())
-                .unwrap_or_default(),
+            thinking,
             fast,
             workflow: session.meta.workflow,
             session: Arc::new(session),
@@ -113,12 +115,7 @@ impl SessionState {
     }
 
     pub fn update_model(&mut self, model: &Model) {
-        if !model.supports_thinking() {
-            self.thinking = ThinkingConfig::Off;
-        }
-        if !model.supports_fast() {
-            self.fast = false;
-        }
+        (self.thinking, self.fast) = clamp(self.thinking, self.fast, model);
         self.session_mut().set_model(model.spec());
         self.model = model.clone();
     }
@@ -208,7 +205,7 @@ pub(crate) fn stored_to_rules(stored: &[StoredRule]) -> Vec<maki_config::Permiss
 mod tests {
     use super::*;
     use crate::components::{test_model, test_pricing};
-    use maki_providers::{FastPricing, ModelPricing};
+    use maki_providers::{FastPricing, ModelPricing, ThinkingSupport};
     use maki_storage::sessions::StoredThinking;
     use test_case::test_case;
 
@@ -227,6 +224,8 @@ mod tests {
     const FAST_INPUT_RATE: f64 = 6.0;
     const UNRESOLVABLE_MODEL: &str = "a-model-no-table-has-ever-heard-of";
     const FAST_FLAG_LOST: &str = "the model has fast pricing, so the flag must survive as stored";
+    const THINKING_NOT_LIFTED: &str =
+        "a model that requires thinking must not show, or send, thinking off";
 
     fn resumed(session: AppSession, model: &Model) -> SessionState {
         let tmp = tempfile::tempdir().unwrap();
@@ -357,6 +356,21 @@ mod tests {
             SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
         assert_eq!(state.mode, Mode::Build);
         assert!(state.plan.path().is_none());
+    }
+
+    /// The level `clamped` picks is its own business. All this layer promises
+    /// is that it asks, instead of keeping its own rule that only knew how to
+    /// turn thinking off.
+    #[test]
+    fn update_model_lifts_thinking_for_a_model_that_requires_it() {
+        let mut state = resumed(AppSession::new("test-model", "/tmp"), &test_model());
+        state.thinking = ThinkingConfig::Off;
+
+        let mut required = test_model();
+        required.thinking_override = Some(ThinkingSupport::Required);
+        state.update_model(&required);
+
+        assert_ne!(state.thinking, ThinkingConfig::Off, "{THINKING_NOT_LIFTED}");
     }
 
     #[test]

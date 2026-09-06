@@ -10,7 +10,7 @@ use std::sync::Arc;
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::{AgentConfig, PermissionsConfig, SessionEndReason};
-use maki_config::ModelPolicy;
+use maki_config::{ModelPolicy, SessionDefaults};
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_storage::id::MakiId;
@@ -26,6 +26,9 @@ pub struct AcpParams {
     pub initial_wd: PathBuf,
     pub prompt_slots: Arc<ResolvedSlots>,
     pub yolo: bool,
+    /// ACP exposes no toggles of its own, so the `always_*` knobs are the whole
+    /// answer for every prompt this server runs.
+    pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     /// Called with the reason when an ACP session is replaced or the server
