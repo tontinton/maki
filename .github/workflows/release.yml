@@ -1,23 +1,35 @@
 # To release:
-#   git tag vX.Y.Z
-#   git push origin vX.Y.Z
+#   bump [workspace.package] version to X.Y.Z-rc.N in Cargo.toml, push to main.
+#   The release-bot workflow tags vX.Y.Z-rc.N, which triggers this workflow.
+#
+# Raw binaries are uploaded per target (no archives): maki and maki-anchor.
+# Windows binaries are Trusted Signed via `az` and carry a -signed suffix:
+#   maki-vX.Y.Z-x86_64-pc-windows-msvc-signed.exe
 name: Release
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.5.0-rc.1)"
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
-  BINARY_NAME: maki
+  # Tag to release: from a `v*` push ref, or the workflow_dispatch input.
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   GH_TOKEN: ${{ github.token }}
   GH_REPO: ${{ github.repository }}
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   create-release:
@@ -25,11 +37,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Create draft release
         run: |
           .github/scripts/retry.sh bash -c \
-            'gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes'
+            'gh release view "$RELEASE_TAG" >/dev/null 2>&1 || gh release create "$RELEASE_TAG" --draft --title "$RELEASE_TAG" --generate-notes'
 
   build-linux:
     name: Build (${{ matrix.target }})
@@ -46,6 +60,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Build in Alpine container
         run: |
@@ -59,20 +75,20 @@ jobs:
               git config --global --add safe.directory /workspace
               curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.target }}
               source "$HOME/.cargo/env"
-              cargo build --release --target ${{ matrix.target }}
+              cargo build --release --target ${{ matrix.target }} --package maki --package maki-anchor
             '
           sudo chown -R $(id -u):$(id -g) target/
 
-      - name: Package
+      - name: Upload raw binaries
         run: |
-          tag="$GITHUB_REF_NAME"
-          archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}"
-          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
-
-      - name: Upload artifact
-        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
+          tag="$RELEASE_TAG"
+          for bin in maki maki-anchor; do
+            src="target/${{ matrix.target }}/release/$bin"
+            dest="${bin}-${tag}-${{ matrix.target }}"
+            cp "$src" "$dest"
+            echo "Uploading $dest"
+            .github/scripts/retry.sh gh release upload "$RELEASE_TAG" "$dest" --clobber
+          done
 
   build-other:
     name: Build (${{ matrix.target }})
@@ -91,6 +107,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust toolchain
         run: rustup target add ${{ matrix.target }}
@@ -100,30 +118,73 @@ jobs:
           key: ${{ matrix.target }}-${{ github.ref_name }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --package maki --package maki-anchor
 
-      - name: Package (Unix)
+      - name: Azure login (Windows Trusted Signing via az)
+        if: runner.os == 'Windows'
+        uses: azure/login@v2
+        continue-on-error: true
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows binaries (az Trusted Signing)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          AZURE_TRUSTED_SIGNING_ACCOUNT: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT }}
+          AZURE_TRUSTED_SIGNING_PROFILE: ${{ secrets.AZURE_TRUSTED_SIGNING_PROFILE }}
+          AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+        run: |
+          az --version
+          az account show 2>$null
+          if ($LASTEXITCODE -ne 0) { Write-Host "az not logged in (no AZURE_CLIENT_ID), skipping signing"; exit 0 }
+          if (-not $env:AZURE_TRUSTED_SIGNING_ACCOUNT) { Write-Host "AZURE_TRUSTED_SIGNING_ACCOUNT not set, skipping signing"; exit 0 }
+          if (-not $env:AZURE_TRUSTED_SIGNING_PROFILE) { Write-Host "AZURE_TRUSTED_SIGNING_PROFILE not set, skipping signing"; exit 0 }
+          if (-not $env:AZURE_TRUSTED_SIGNING_ENDPOINT) { $env:AZURE_TRUSTED_SIGNING_ENDPOINT = "https://eus.codesigning.azure.net" }
+          Write-Host "Installing AzureSignTool..."
+          dotnet tool install --global AzureSignTool --version 6.0.0 2>$null
+          if ($LASTEXITCODE -ne 0) { dotnet tool update --global AzureSignTool }
+          $files = @("target/${{ matrix.target }}/release/maki.exe", "target/${{ matrix.target }}/release/maki-anchor.exe")
+          foreach ($f in $files) { if (-not (Test-Path $f)) { Write-Error "missing $f"; exit 1 } }
+          Write-Host "Signing with az Trusted Signing: $env:AZURE_TRUSTED_SIGNING_ACCOUNT / $env:AZURE_TRUSTED_SIGNING_PROFILE @ $env:AZURE_TRUSTED_SIGNING_ENDPOINT"
+          AzureSignTool sign `
+            --azure-trusted-signing-account $env:AZURE_TRUSTED_SIGNING_ACCOUNT `
+            --azure-trusted-signing-certificate-profile $env:AZURE_TRUSTED_SIGNING_PROFILE `
+            --azure-trusted-signing-endpoint $env:AZURE_TRUSTED_SIGNING_ENDPOINT `
+            --timestamp-rfc3161 http://timestamp.acs.microsoft.com `
+            --timestamp-digest SHA256 `
+            --file-digest SHA256 `
+            --verbose `
+            $files
+          Write-Host "Verifying signatures..."
+          foreach ($f in $files) { & signtool verify /pa $f; if ($LASTEXITCODE -ne 0) { Write-Error "verify failed for $f"; exit 1 } }
+
+      - name: Upload raw binaries (Unix)
         if: runner.os != 'Windows'
         run: |
-          tag="$GITHUB_REF_NAME"
-          archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}"
-          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
+          tag="$RELEASE_TAG"
+          for bin in maki maki-anchor; do
+            src="target/${{ matrix.target }}/release/$bin"
+            dest="${bin}-${tag}-${{ matrix.target }}"
+            cp "$src" "$dest"
+            echo "Uploading $dest"
+            .github/scripts/retry.sh gh release upload "$RELEASE_TAG" "$dest" --clobber
+          done
 
-      - name: Package (Windows)
+      - name: Upload raw binaries (Windows, signed)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          tag="$GITHUB_REF_NAME"
-          archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.zip"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}.exe" "${BINARY_NAME}.exe"
-          7z a "${archive}" "${BINARY_NAME}.exe"
-          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
-
-      - name: Upload artifact
-        shell: bash
-        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
+          tag="$RELEASE_TAG"
+          for bin in maki maki-anchor; do
+            src="target/${{ matrix.target }}/release/${bin}.exe"
+            dest="${bin}-${tag}-${{ matrix.target }}-signed.exe"
+            cp "$src" "$dest"
+            echo "Uploading $dest (signed)"
+            .github/scripts/retry.sh gh release upload "$RELEASE_TAG" "$dest" --clobber
+          done
 
   publish:
     name: Publish Release
@@ -131,9 +192,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Download artifacts
-        run: .github/scripts/retry.sh gh release download "$GITHUB_REF_NAME" --dir artifacts
+        run: .github/scripts/retry.sh gh release download "$RELEASE_TAG" --dir artifacts
 
       - name: Generate checksums
         run: |
@@ -142,7 +205,7 @@ jobs:
           cat ../sha256sums.txt
 
       - name: Upload checksums
-        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" sha256sums.txt --clobber
+        run: .github/scripts/retry.sh gh release upload "$RELEASE_TAG" sha256sums.txt --clobber
 
       - name: Mark release as published
-        run: .github/scripts/retry.sh gh release edit "$GITHUB_REF_NAME" --draft=false
+        run: .github/scripts/retry.sh gh release edit "$RELEASE_TAG" --draft=false

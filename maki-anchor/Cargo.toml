@@ -1,0 +1,35 @@
+[package]
+name = "maki-anchor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "maki-anchor"
+path = "src/main.rs"
+
+[dependencies]
+tungstenite = { workspace = true }
+fast_qr = { workspace = true }
+rusqlite = { workspace = true }
+argon2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+sha2 = { workspace = true }
+getrandom = { workspace = true }
+clap = { workspace = true }
+base64 = { workspace = true }
+num-bigint = "0.4"
+ureq = { workspace = true }
+url = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }
+tempfile = { workspace = true }
+flume = { workspace = true }
+maki-remote = { workspace = true }

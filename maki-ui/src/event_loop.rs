@@ -7,6 +7,8 @@
 //! waits on every event source at once and wakes the moment a plugin action,
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
+mod remote;
+
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,7 +25,7 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
-use maki_config::{ModelPolicy, UiConfig};
+use maki_config::{ModelPolicy, RemoteControlConfig, UiConfig};
 use maki_lua::session_snapshot::{
     MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
     SessionSnapshot,
@@ -55,7 +57,7 @@ use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_resp
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
-use crate::components::{Action, ExitRequest, Status};
+use crate::components::{Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, Status};
 use crate::input::InputReader;
 use crate::repaint::{Dirty, IDLE_POLL};
 
@@ -73,6 +75,11 @@ const NOT_LIVE_ERR: &str = "session not live";
 const PACK_PREPARING: &str = "Checking packages...";
 const PACK_BUSY_ERR: &str = "a package command is already running";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
+const REMOTE_NO_DOMAIN_MSG: &str =
+    "remote control needs a domain: set remote_control.domain in the config, or run /rc <domain>";
+const REMOTE_URL_MSG: &str = "Remote control: ";
+const REMOTE_COPY_ERR: &str = "clipboard copy failed";
+const REMOTE_STOPPED_MSG: &str = "remote control stopped";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -93,6 +100,8 @@ pub struct EventLoopParams {
     pub storage: StateDir,
     pub config: AgentConfig,
     pub ui_config: UiConfig,
+    pub remote_control: RemoteControlConfig,
+    pub anchor: Option<maki_config::AnchorConfig>,
     pub input_history_size: usize,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: Timeouts,
@@ -330,6 +339,9 @@ struct SessionRuntime {
     /// so a new task would inherit the old one's status.
     last_tasks: Vec<(Arc<str>, TaskStatus)>,
     notifications: RunNotificationState,
+    /// The permission request last mirrored to remote clients; when the
+    /// prompt closes without a remote answer, this is what tells them.
+    last_permission_id: Option<String>,
 }
 
 impl SessionRuntime {
@@ -362,6 +374,8 @@ struct SpawnCtx {
     storage: StateDir,
     config: AgentConfig,
     ui_config: UiConfig,
+    remote_control: RemoteControlConfig,
+    anchor: Option<maki_config::AnchorConfig>,
     input_history_size: usize,
     /// Prototype only: every runtime forks its own manager so session rules
     /// stay per-session. `App::new` then restates the fork from the session's
@@ -429,6 +443,7 @@ impl SpawnCtx {
             last_status: SessionStatus::Idle,
             last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
+            last_permission_id: None,
         }
     }
 }
@@ -452,6 +467,7 @@ pub(crate) struct EventLoop<'t> {
     /// without this a second `/packupdate` would race the first over the same
     /// clones and locks.
     pack_running: bool,
+    remote: remote::RemoteSlot,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -558,6 +574,8 @@ impl<'t> EventLoop<'t> {
             storage,
             config,
             ui_config,
+            remote_control,
+            ref anchor,
             input_history_size,
             permissions,
             timeouts,
@@ -615,6 +633,8 @@ impl<'t> EventLoop<'t> {
             storage,
             config,
             ui_config,
+            remote_control,
+            anchor: anchor.clone(),
             input_history_size,
             permissions,
             timeouts,
@@ -672,6 +692,7 @@ impl<'t> EventLoop<'t> {
             pack_tx,
             pack_rx,
             pack_running: false,
+            remote: remote::RemoteSlot::new(),
             _model_fetch_task: bg.task,
         })
     }
@@ -713,6 +734,10 @@ impl<'t> EventLoop<'t> {
             };
             let actions = self.focused_app().handle_submit(sub);
             self.dispatch(self.focused, actions);
+        }
+        let always = maki_storage::remote::read_always(&self.ctx.storage);
+        if always.unwrap_or(self.ctx.remote_control.auto_start) {
+            self.handle_remote_control(None);
         }
         // The first frame always paints. After that only a poller, an event or
         // an animation tick owes another.
@@ -832,6 +857,21 @@ impl<'t> EventLoop<'t> {
     fn handle_agent(&mut self, idx: usize, envelope: Box<maki_agent::Envelope>) {
         let rt = &mut self.sessions[idx];
         let current = is_current_top_level(rt.app.run_id, &envelope);
+        if let Some(state) = self.remote.state() {
+            state.send_envelope(&rt.id().to_string(), &envelope);
+            if let maki_agent::AgentEvent::PermissionRequest { id, tool, scopes } = &envelope.event
+            {
+                rt.last_permission_id = Some(id.clone());
+                state.send_permission(
+                    &rt.id().to_string(),
+                    maki_remote::PermissionFrame {
+                        id: id.clone(),
+                        tool: tool.to_string(),
+                        scopes: scopes.clone(),
+                    },
+                );
+            }
+        }
         match &envelope.event {
             AgentEvent::QueueDrained => {
                 if current {
@@ -857,6 +897,82 @@ impl<'t> EventLoop<'t> {
 
     fn drain_channels(&mut self) -> Result<Dirty> {
         let mut dirty = Dirty::NO;
+        // Remote control POSTs are answered here, before the wake loop: the
+        // HTTP handler parks up to its timeout, so it must never wait on the
+        // next real event.
+        self.report_tunnel();
+        if self.remote.is_running() {
+            let focused = self.focused;
+            let sessions_json = {
+                let sessions = &self.sessions;
+                let focused_id = sessions[focused].id().to_string();
+                let list: Vec<serde_json::Value> = sessions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, rt)| {
+                        serde_json::json!({
+                            "id": rt.id().to_string(),
+                            "title": rt.app.state.session.title,
+                            "cwd": rt.app.state.session.cwd,
+                            "model": rt.app.state.model.spec(),
+                            "status": SessionStatus::of(&rt.app).as_str(),
+                            "focused": i == focused,
+                            "updated_at": rt.app.state.session.updated_at,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({ "sessions": list, "focused": focused_id })
+            };
+            // The anchor's dashboard only sees what instances push, so the
+            // tunnel ships the same index when it changes.
+            let index = serde_json::json!(
+                self.sessions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, rt)| {
+                        let usage = rt.app.state.token_usage.total_input() as i64;
+                        serde_json::json!({
+                            "session_id": rt.id().to_string(),
+                            "title": rt.app.state.session.title,
+                            "model": rt.app.state.model.spec(),
+                            "cwd": rt.app.state.session.cwd,
+                            "status": SessionStatus::of(&rt.app).as_str(),
+                            "cost_cents": (rt.app.state.cost.unwrap_or_default() * 100.0).round() as i64,
+                            "tokens_in": usage,
+                            "tokens_out": rt.app.state.token_usage.output as i64,
+                            "context_window": rt.app.state.model.context_window as i64,
+                            "focused": i == focused,
+                            // The full transcript rides the index so the anchor
+                            // can persist and serve it; the dedupe above means
+                            // it only ships when the session actually changed.
+                            // The anchor's `SessionIndexEntry::transcript` is a
+                            // `String` (it lands straight in a TEXT column), so
+                            // this must ship pre-serialized — an inline array
+                            // fails that field's deserialization, which silently
+                            // drops the whole untagged `TunnelPush` frame with
+                            // no error on either side.
+                            "transcript": rt.app.remote_snapshot()["messages"].to_string(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            );
+            self.remote.push_session_index(&index);
+            let link_up = self.remote.link_up();
+            for rt in self.sessions.iter_mut() {
+                let id = rt.id().to_string();
+                rt.app
+                    .set_remote_indicator(link_up, self.remote.viewers(&id));
+            }
+            let sessions_json_clone = sessions_json.clone();
+            let grouped = self
+                .remote
+                .drain_requests_with(&mut self.sessions, focused, move || {
+                    sessions_json_clone.clone()
+                });
+            for (idx, actions) in grouped {
+                self.dispatch(idx, actions);
+            }
+        }
         // Leftovers beyond the budget are picked up right after the next draw.
         for _ in 0..DRAIN_BUDGET {
             match self.next_wake(Duration::ZERO) {
@@ -990,11 +1106,21 @@ impl<'t> EventLoop<'t> {
     fn emit_status_changes(&mut self) {
         let handle = &self.ctx.lua_event_handle;
         for (i, rt) in self.sessions.iter_mut().enumerate() {
+            // A prompt that closed locally (answered on the TUI, or dropped
+            // by the agent) must clear its card on every remote client too.
+            if !rt.app.permission_prompt.is_open()
+                && let Some((state, id)) = self.remote.state().zip(rt.last_permission_id.take())
+            {
+                state.send_permission_resolved(&rt.id().to_string(), &id);
+            }
             let status = SessionStatus::of(&rt.app);
             if status == rt.last_status {
                 continue;
             }
             rt.last_status = status;
+            if let Some(state) = self.remote.state() {
+                state.send_status(&rt.id().to_string(), status.as_str());
+            }
             handle.fire_autocmd(
                 "SessionStatusChanged",
                 json!({
@@ -1585,6 +1711,7 @@ impl<'t> EventLoop<'t> {
                 );
             }
             Action::PreparePack(command) => self.start_pack(idx, command),
+            Action::RemoteControl(domain) => self.handle_remote_control(domain),
             Action::Suspend => {
                 let _pause = self.input.pause();
                 terminal::suspend(self.terminal);
@@ -1649,6 +1776,271 @@ impl<'t> EventLoop<'t> {
         self.pack_running = false;
         let actions = self.focused_app().handle_pack_preparation(preparation);
         self.dispatch(self.focused, actions);
+    }
+
+    /// The `/rc` family: bare `/rc` starts (when stopped) or reports (when
+    /// running, with who is watching and at what rights); `stop`/`off`
+    /// disconnects and keeps the link; `down` also revokes it; `always` and
+    /// `never` persist the launch switch; `link [new|rm]` manages anchor
+    /// side share links. With no domain, no config default, and no anchor,
+    /// the start path tells the user what to set.
+    fn handle_remote_control(&mut self, arg: Option<String>) {
+        let mut words = arg.as_deref().unwrap_or("").split_whitespace();
+        match words.next() {
+            None | Some("status") => {
+                if self.remote.is_running() {
+                    self.report_remote_state();
+                } else {
+                    self.start_remote_control(None);
+                }
+            }
+            Some("stop") | Some("off") => {
+                let msg = if self.remote.stop(false) {
+                    format!("{REMOTE_STOPPED_MSG}; the link stays open for the next /rc")
+                } else {
+                    "remote control is not running".to_owned()
+                };
+                self.focused_app().flash(msg.to_owned());
+            }
+            Some("down") => {
+                let msg = if self.remote.stop(true) {
+                    "remote control down: link revoked, viewers kicked".to_owned()
+                } else {
+                    "remote control is not running".to_owned()
+                };
+                self.focused_app().flash(msg.to_owned());
+            }
+            Some(verb @ ("always" | "never")) => {
+                let on = verb == "always";
+                maki_storage::remote::persist_always(&self.ctx.storage, on);
+                self.ctx.remote_control.auto_start = on;
+                self.focused_app().flash(if on {
+                    "remote control will start at every launch".to_owned()
+                } else {
+                    "remote control will not start on its own".to_owned()
+                });
+            }
+            Some("link") => {
+                if !self.remote.is_running() {
+                    self.focused_app().flash("remote control is not running".into());
+                    return;
+                }
+                if !self.remote.has_anchor() {
+                    self.focused_app().flash("share links are an anchor feature".into());
+                    return;
+                }
+                match words.next() {
+                    None | Some("list") => {
+                        let ok = self.remote.links_list();
+                        self.focused_app().flash(if ok {
+                            "asking the anchor for links..."
+                        } else {
+                            "cannot reach the anchor right now"
+                        }.to_owned());
+                    }
+                    Some("new") => {
+                        let rights = words.next().unwrap_or("view");
+                        let hours = words.next().and_then(|h| h.parse().ok()).unwrap_or(2);
+                        let ok = self.remote.links_mint(rights, hours);
+                        self.focused_app().flash(if ok {
+                            format!("minting a {rights} link...")
+                        } else {
+                            "cannot reach the anchor right now".to_owned()
+                        });
+                    }
+                    Some("rm") => match words.next() {
+                        Some(target) => {
+                            let ok = self.remote.links_remove(target);
+                            self.focused_app().flash(if ok {
+                                "revoking..."
+                            } else {
+                                "cannot reach the anchor right now"
+                            }.to_owned());
+                        }
+                        None => self.focused_app().flash("usage: /rc link rm <token>".into()),
+                    },
+                    Some(other) => {
+                        self.focused_app()
+                            .flash(format!("unknown subcommand: /rc link {other}"));
+                    }
+                }
+            }
+            Some("qr") => match self.remote.url() {
+                Some(url) => self.show_link(&url, REMOTE_URL_MSG),
+                None if self.remote.is_running() => {
+                    self.focused_app().flash("the link is not up yet".into())
+                }
+                None => self.start_remote_control(None),
+            },
+            Some(other) => self
+                .focused_app()
+                .flash(format!("usage: /rc [status|stop|down|link [list|new [view|control] [hours]|rm <token>]|always|never|qr]  (unknown: {other})")),
+        }
+    }
+
+    /// Start the server (domain override wins over config; an anchor
+    /// config skips both) and flash the URL, or say what is missing.
+    fn start_remote_control(&mut self, domain: Option<String>) {
+        let domain = domain.or_else(|| self.ctx.remote_control.domain.clone());
+        if domain.is_none()
+            && !self
+                .ctx
+                .anchor
+                .as_ref()
+                .is_some_and(|a| a.complete().is_some())
+        {
+            self.focused_app().flash(REMOTE_NO_DOMAIN_MSG.into());
+            return;
+        }
+        let config = RemoteControlConfig {
+            domain,
+            ..self.ctx.remote_control.clone()
+        };
+        match self.remote.start(&config, self.ctx.anchor.as_ref()) {
+            Ok(url) => self.show_link(&url, REMOTE_URL_MSG),
+            Err(e) => self.focused_app().flash(format!("{e}")),
+        }
+    }
+
+    /// `/rc` while running: the link, the people on it, and what each may do.
+    fn report_remote_state(&mut self) {
+        let link = if self.remote.link_up() {
+            "online"
+        } else {
+            "connecting"
+        };
+        let url = self.remote.url();
+        let mut lines = vec![match &url {
+            Some(url) => format!("remote {link} · {url}"),
+            None => format!("remote {link}"),
+        }];
+        let titles: std::collections::HashMap<String, String> = self
+            .sessions
+            .iter()
+            .map(|rt| (rt.id().to_string(), rt.app.state.session.title.clone()))
+            .collect();
+        let watchers = self.remote.watchers();
+        if watchers.is_empty() {
+            lines.push(" nobody watching".into());
+        }
+        for (session, tag) in &watchers {
+            let at = match session.as_deref() {
+                Some(id) => titles
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("tab {id}")),
+                None => "all tabs".to_string(),
+            };
+            lines.push(format!(" · {tag} on {at}"));
+        }
+        let app = self.focused_app();
+        app.main_chat()
+            .push(DisplayMessage::new(DisplayRole::Done, lines.join("\n")));
+        app.flash(if watchers.is_empty() {
+            format!("remote {link} · nobody watching")
+        } else {
+            format!("remote {link} · {} watching", watchers.len())
+        });
+        if let Some(url) = url {
+            self.show_link(&url, "share: ");
+        }
+    }
+
+    /// Narrates the tunnel's life: the anchor-minted link (also copied),
+    /// reconnect chatter, and refusals. The link flash reuses the `/rc`
+    /// treatment; lifecycle lines get a plain flash on the focused tab.
+    fn report_tunnel(&mut self) {
+        for _ in 0..remote::REPORT_BUDGET {
+            match self.remote.poll_tunnel() {
+                None => break,
+                Some(remote::TunnelHappen::Link { url, reconnected }) => {
+                    let copy = self.focused_app().clipboard.copy_text(&url);
+                    let prefix = if reconnected {
+                        "remote reconnected: "
+                    } else {
+                        REMOTE_URL_MSG
+                    };
+                    let app = self.focused_app();
+                    app.main_chat().push(DisplayMessage::new(
+                        DisplayRole::Done,
+                        format!("{prefix}{url}"),
+                    ));
+                    app.flash(url);
+                    if let Err(e) = copy {
+                        app.flash(format!("{REMOTE_COPY_ERR}: {e}"));
+                    }
+                }
+                Some(remote::TunnelHappen::Notice(message)) => {
+                    self.focused_app().flash(format!("remote: {message}"));
+                }
+                Some(remote::TunnelHappen::Links(value)) => {
+                    self.show_link_roster(&value);
+                }
+            }
+        }
+    }
+
+    /// A share URL joins the transcript with a scannable QR (where the text
+    /// fits one) and goes to the clipboard; the flash carries just the URL.
+    fn show_link(&mut self, url: &str, prefix: &str) {
+        let qr = if url.starts_with("http") {
+            crate::qr::block_qr(url)
+        } else {
+            None
+        };
+        let copy = self.focused_app().clipboard.copy_text(url);
+        let app = self.focused_app();
+        let text = match qr {
+            Some(qr) => format!("{prefix}{url}\n{qr}"),
+            None => format!("{prefix}{url}"),
+        };
+        app.main_chat()
+            .push(DisplayMessage::new(DisplayRole::Done, text));
+        app.flash(url.to_owned());
+        if let Err(e) = copy {
+            app.flash(format!("{REMOTE_COPY_ERR}: {e}"));
+        }
+    }
+
+    /// The anchor's answer to `/rc link [new|rm]`: the instance's share
+    /// links, and a full hand-off (URL, QR, clipboard) for a fresh mint.
+    fn show_link_roster(&mut self, value: &serde_json::Value) {
+        if let Some(minted) = value["minted"].as_str()
+            && let Some(url) = self.remote.join_link(minted)
+        {
+            self.show_link(&url, "new link: ");
+        }
+        let mut lines = Vec::new();
+        if let Some(links) = value["links"].as_array() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or_default();
+            lines.push(format!("{} anchor link(s):", links.len()));
+            for link in links {
+                let token = link["token"].as_str().unwrap_or("?");
+                let rights = link["rights"].as_str().unwrap_or("?");
+                let scope = link["session"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "all tabs".into());
+                let left = link["expires"].as_i64().map(|e| (e - now).div_euclid(3600));
+                let tail = match left {
+                    Some(h) if h <= 0 => "expiring".to_string(),
+                    Some(h) => format!("{h}h left"),
+                    None => String::new(),
+                };
+                lines.push(format!(" · /{token}/ {rights} · {scope} · {tail}"));
+            }
+        }
+        if lines.is_empty() {
+            self.focused_app()
+                .flash("remote: no links reported by the anchor".into());
+            return;
+        }
+        let app = self.focused_app();
+        app.main_chat()
+            .push(DisplayMessage::new(DisplayRole::Done, lines.join("\n")));
     }
 
     fn refresh_models(&self) {
@@ -1716,6 +2108,7 @@ impl<'t> EventLoop<'t> {
         // until the shared deadline, taking every later tab's `SessionEnd`
         // down with it.
         self.ui_attachment.detach();
+        self.remote.stop(false);
         // `/reload` hands these same sessions to the next generation, so
         // their handlers must not hear that the process is quitting.
         let reason = match exit {

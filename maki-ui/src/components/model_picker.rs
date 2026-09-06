@@ -196,6 +196,14 @@ impl ModelPicker {
         self.picker.is_open()
     }
 
+    /// The full model catalog, provider-prefixed specs, for the web pickers.
+    pub fn available_specs(&self) -> Vec<String> {
+        self.models
+            .load_full()
+            .map(|m| m.to_vec())
+            .unwrap_or_default()
+    }
+
     pub fn close(&mut self) {
         self.picker.close();
     }

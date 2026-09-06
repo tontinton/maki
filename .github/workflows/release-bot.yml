@@ -1,0 +1,68 @@
+# Cuts a release tag when the workspace version changes on main.
+#
+# This fork tracks upstream versions with an -rc.N suffix (e.g. 0.5.0-rc.1).
+# Bump [workspace.package] version in Cargo.toml and push to main; the bot
+# tags vX.Y.Z-rc.N and the Release workflow takes over.
+name: Release bot
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - ".github/workflows/release-bot.yml"
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+permissions:
+  contents: write
+  # The bot dispatches release.yml explicitly, because a GITHUB_TOKEN tag push
+  # would not trigger workflows.
+  actions: write
+
+jobs:
+  tag-release:
+    name: Tag new version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: version
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Skip non-release versions
+        if: ${{ !contains(steps.version.outputs.version, '-rc.') }}
+        run: echo "version ${{ steps.version.outputs.version }} has no -rc suffix; nothing to release"
+
+      - name: Check tag does not exist
+        id: tag
+        if: contains(steps.version.outputs.version, '-rc.')
+        run: |
+          tag="v${{ steps.version.outputs.version }}"
+          if git ls-remote --tags origin "refs/tags/$tag" | grep -q "$tag"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "tag $tag already exists; skipping"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cut tag
+        if: steps.tag.outputs.exists == 'false'
+        run: |
+          tag="v${{ steps.version.outputs.version }}"
+          git config user.name "maki release bot"
+          git config user.email "noreply@github.com"
+          git tag -a "$tag" -m "Release $tag" "${{ github.sha }}"
+          git push origin "$tag"
+          echo "tagged $tag"
+          # GITHUB_TOKEN tag pushes do not trigger workflows, so start the
+          # release explicitly.
+          gh workflow run release.yml --ref main -f tag="$tag"
+          echo "dispatched release for $tag"

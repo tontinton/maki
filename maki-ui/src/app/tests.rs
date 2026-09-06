@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::shared_queue;
+use crate::app::queue::EMPTY_PROMPT_ERR;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
@@ -5356,3 +5357,249 @@ fn alt_m_opens_model_picker() {
     app.update(Msg::Key(key));
     assert!(app.model_picker.is_open());
 }
+
+const RC_ARG_DOMAIN: &str = "tunnel.example.org";
+
+#[test]
+fn rc_command_yields_remote_control_action() {
+    let mut app = test_app();
+    let actions = app.execute_command(
+        ParsedCommand {
+            name: "/remote-control".into(),
+            args: RC_ARG_DOMAIN.into(),
+            bang: false,
+        },
+        0,
+    );
+    assert!(
+        matches!(&actions[..], [Action::RemoteControl(Some(domain))] if domain == RC_ARG_DOMAIN)
+    );
+}
+
+#[test]
+fn rc_bare_command_yields_none_arg_for_config_default() {
+    let mut app = test_app();
+    let actions = app.execute_command(cmd("/rc"), 0);
+    assert!(matches!(&actions[..], [Action::RemoteControl(None)]));
+}
+
+#[test]
+fn remote_prompt_submits_like_typed() {
+    let mut app = test_app();
+    app.submit_remote_prompt(RC_REMOTE_PROMPT.into(), vec![])
+        .unwrap();
+    assert_eq!(app.status, Status::Streaming);
+    assert!(app.run_id > 0, "run started");
+}
+
+/// A saved upload lands in the session directory under a clean name and
+/// stops collisions by suffixing.
+#[test]
+fn save_upload_writes_scrubbed_unique_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = super::save_upload(dir.path(), "sub/dir:notes*.md", b"see here").unwrap();
+    assert_eq!(path.display().to_string(), "dir_notes_.md");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("dir_notes_.md")).unwrap(),
+        "see here"
+    );
+    super::save_upload(dir.path(), "notes.md", b"x").unwrap();
+    let again = super::save_upload(dir.path(), "notes.md", b"y").unwrap();
+    assert_eq!(again.display().to_string(), "notes(1).md", "no clobbering");
+}
+
+/// An attached upload starts the run like any prompt; a non-image attach is
+/// refused by name.
+#[test]
+fn remote_prompt_accepts_image_uploads() {
+    use maki_remote::{RemoteFile, UploadMode};
+    let mut app = test_app();
+    let outcome = app.submit_remote_prompt(
+        "look".into(),
+        vec![RemoteFile {
+            name: "shot.png".into(),
+            media_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+            mode: UploadMode::Attach,
+        }],
+    );
+    assert!(outcome.is_ok(), "png attaches");
+    assert_eq!(app.status, Status::Streaming);
+}
+
+#[test]
+fn remote_prompt_rejects_non_image_attach_uploads() {
+    use maki_remote::{RemoteFile, UploadMode};
+    let mut app = test_app();
+    let err = app
+        .submit_remote_prompt(
+            "x".into(),
+            vec![RemoteFile {
+                name: "movie.mp4".into(),
+                media_type: "video/mp4".into(),
+                data: "AAA=".into(),
+                mode: UploadMode::Attach,
+            }],
+        )
+        .err()
+        .expect("a video cannot ride the image path");
+    assert!(err.contains("movie.mp4"), "names the offender: {err}");
+}
+
+#[test]
+fn remote_prompt_rejects_empty() {
+    let mut app = test_app();
+    let err = app
+        .submit_remote_prompt("   ".into(), vec![])
+        .err()
+        .expect("empty prompt rejected");
+    assert_eq!(err, EMPTY_PROMPT_ERR);
+}
+
+#[test]
+fn remote_stop_rejects_when_idle() {
+    let mut app = test_app();
+    let err = app.stop_remote_run().err().expect("idle stop rejected");
+    assert_eq!(err, REMOTE_NO_RUN_ERR);
+}
+
+#[test]
+fn remote_stop_cancels_streaming_run() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let actions = app.stop_remote_run().unwrap();
+    assert!(matches!(&actions[..], [Action::CancelAgent { run_id: 1 }]));
+}
+
+#[test]
+fn remote_permission_answer_requires_pending_prompt() {
+    let mut app = test_app();
+    let err = app
+        .answer_remote_permission(RC_REQUEST_ID, "allow")
+        .unwrap_err();
+    assert_eq!(err, REMOTE_NO_PROMPT_ERR);
+}
+
+#[test]
+fn remote_permission_answer_rejects_unknown_answer() {
+    let mut app = test_app();
+    app.permission_prompt.open(
+        RC_REQUEST_ID.into(),
+        maki_config::ToolKey::native("bash"),
+        vec![],
+        None,
+    );
+    let err = app
+        .answer_remote_permission(RC_REQUEST_ID, "nonsense")
+        .unwrap_err();
+    assert!(err.contains(RC_INVALID_ANSWER));
+    assert!(app.permission_prompt.is_open(), "bad answer keeps prompt");
+}
+
+#[test]
+fn remote_permission_answer_routes_and_closes() {
+    let mut app = test_app();
+    app.permission_prompt.open(
+        RC_REQUEST_ID.into(),
+        maki_config::ToolKey::native("bash"),
+        vec![],
+        None,
+    );
+    app.submit_remote_prompt("hi".into(), vec![]).unwrap();
+    app.answer_remote_permission(RC_REQUEST_ID, "allow")
+        .expect("answer accepted");
+    assert!(!app.permission_prompt.is_open());
+}
+
+const RC_REQUEST_ID: &str = "req-1";
+const RC_REMOTE_PROMPT: &str = "hello from the web";
+const RC_INVALID_ANSWER: &str = "invalid answer";
+const REMOTE_NO_RUN_ERR: &str = "no run is active";
+const REMOTE_NO_PROMPT_ERR: &str = "no permission prompt is pending";
+
+#[test]
+fn typed_rc_with_domain_arg_executes() {
+    let mut app = test_app();
+    let actions = type_and_submit(&mut app, "/remote-control rc.example.com");
+    assert!(
+        matches!(&actions[..], [Action::RemoteControl(Some(domain))] if domain == "rc.example.com"),
+        "typed slash command must dispatch, got {} action(s)",
+        actions.len()
+    );
+}
+
+#[test]
+fn typed_rc_alias_without_args_executes() {
+    let mut app = test_app();
+    let actions = type_and_submit(&mut app, "/rc");
+    assert!(matches!(&actions[..], [Action::RemoteControl(None)]));
+}
+
+#[test]
+fn remote_snapshot_renders_transcript_and_stats() {
+    let mut app = test_app();
+    app.state.session_mut().replace_messages(vec![
+        Message::user(RC_SNAPSHOT_PROMPT.into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: RC_SNAPSHOT_REPLY.into(),
+                },
+                ContentBlock::tool_use("tool-1", "bash", serde_json::json!({"command": "ls"})),
+            ],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "tool-1".into(),
+                content: "out".into(),
+                is_error: false,
+            }],
+            display_text: Some(String::new()),
+            ..Default::default()
+        },
+    ]);
+    let snap = app.remote_snapshot();
+    let msgs = snap["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 4, "user, text, tool_use, tool_done: {msgs:?}");
+    assert_eq!(msgs[0]["type"], "user_message");
+    assert_eq!(msgs[0]["text"], RC_SNAPSHOT_PROMPT);
+    assert_eq!(msgs[1]["type"], "assistant_text");
+    assert_eq!(msgs[2]["type"], "tool_start");
+    // tool_done closes the card tool_start opened, and carries the FULL
+    // stored output when the session has one, not the model summary.
+    assert_eq!(msgs[3]["type"], "tool_done");
+    assert_eq!(msgs[3]["id"], "tool-1");
+    assert_eq!(msgs[3]["output"], "out");
+    assert!(snap["model"].is_string());
+    assert!(snap["status"].is_string());
+}
+
+#[test]
+fn remote_snapshot_prefers_stored_tool_output_over_inline_summary() {
+    let mut app = test_app();
+    app.state.session_mut().replace_messages(vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "tool-1".into(),
+            content: "truncated summary…".into(),
+            is_error: false,
+        }],
+        display_text: Some(String::new()),
+        ..Default::default()
+    }]);
+    let full = maki_agent::ToolOutput::Plain("the whole output, lines and lines".into());
+    app.state
+        .session_mut()
+        .insert_tool_output("tool-1".into(), Arc::new(full));
+    let snap = app.remote_snapshot();
+    let msgs = snap["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0]["output"], "the whole output, lines and lines");
+}
+
+const RC_SNAPSHOT_PROMPT: &str = "snapshot question";
+const RC_SNAPSHOT_REPLY: &str = "snapshot answer";

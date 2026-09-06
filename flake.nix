@@ -60,7 +60,11 @@
             || (builtins.match ".*/prompts/.*" path != null)
             || (builtins.match ".*/themes/.*" path != null)
             || (builtins.match ".*/words/.*" path != null)
-            || (lib.hasSuffix ".lua" path);
+            || (lib.hasSuffix ".lua" path)
+            || (lib.hasSuffix "index.html" path && lib.hasInfix "maki-remote" path)
+            # maki-anchor embeds these installers with include_str!.
+            || (lib.hasSuffix "/install.sh" path)
+            || (lib.hasSuffix "/install.ps1" path);
           src = lib.cleanSource ./.;
         };
 
@@ -169,7 +173,7 @@
               inherit version;
               src = workspaceSrc;
               cargoArtifacts = cargoArtifacts;
-              cargoExtraArgs = "--package ${packageName}";
+              cargoExtraArgs = "--package ${packageName} --package maki-anchor";
               doCheck = false;
             }
           );

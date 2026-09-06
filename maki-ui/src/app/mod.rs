@@ -55,20 +55,21 @@ use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
-use maki_agent::permissions::PermissionManager;
+use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::{
-    AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SharedMessages, SubagentInfo,
+    AgentEvent, Envelope, ImageMediaType, ImageSource, McpConfigErrors, McpPromptInfo,
+    McpSnapshotReader, SharedMessages, SubagentInfo,
 };
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader,
     PackCommand, PackPreparation, WinView,
 };
-use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
+use maki_providers::{ContentBlock, Message, MessageKind, Model, Role, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
+use serde_json::json;
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::Position;
@@ -83,6 +84,68 @@ pub(crate) use session::session_has_content;
 use session_state::SessionState;
 
 const CANCEL_MSG: &str = "Cancelled.";
+/// Base64 payload ceiling per uploaded file (16 MB of bytes on the wire).
+const UPLOAD_B64_LIMIT: usize = 22 * 1024 * 1024;
+
+/// Writes a remote upload into the session's working directory under a
+/// scrubbed, collision-free name; returns the path relative to cwd.
+fn save_upload(
+    cwd: &std::path::Path,
+    raw_name: &str,
+    bytes: &[u8],
+) -> Result<std::path::PathBuf, String> {
+    let base = raw_name
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("upload.bin");
+    let clean: String = base
+        .chars()
+        .map(|c| {
+            if c.is_control()
+                || c == ':'
+                || c == '*'
+                || c == '?'
+                || c == '<'
+                || c == '>'
+                || c == '|'
+            {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(96)
+        .collect();
+    let (stem, ext) = match clean.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() && e.len() <= 8 => (s.to_owned(), format!(".{e}")),
+        _ => (clean.clone(), String::new()),
+    };
+    for attempt in 0..100 {
+        let name = if attempt == 0 {
+            clean.clone()
+        } else {
+            format!("{stem}({attempt}){ext}")
+        };
+        let path = cwd.join(&name);
+        if path.exists() {
+            continue;
+        }
+        match std::fs::File::create(&path) {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(bytes)
+                    .map_err(|e| format!("write {name}: {e}"))?;
+                return Ok(std::path::PathBuf::from(name));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!("session directory {} is gone", cwd.display()));
+            }
+            Err(_) => continue,
+        }
+    }
+    Err(format!("no free name near {clean}"))
+}
 /// Bypasses the per-run staleness filter because re-bake replies
 /// don't belong to any real agent run.
 pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
@@ -253,6 +316,10 @@ pub struct App {
     hints: Watch<HintSnapshot>,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
+    /// Link is reachable by browsers (tunnel registered or standalone bound).
+    pub(super) remote_link: bool,
+    /// Browsers watching THIS tab right now.
+    pub(super) remote_viewers: usize,
     subagent_answers: HashMap<String, flume::Sender<String>>,
 }
 
@@ -346,6 +413,8 @@ impl App {
             hint_reader,
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
+            remote_link: false,
+            remote_viewers: 0,
             subagent_answers: HashMap::new(),
         };
         app.model_picker.set_recents(
@@ -531,6 +600,298 @@ impl App {
         } else {
             self.send_answer(answer);
         }
+    }
+
+    /// Remote control submitted a prompt. Same path as the Lua session API:
+    /// started or queued exactly like a typed one, minus the input box.
+    pub(crate) fn submit_remote_prompt(
+        &mut self,
+        text: String,
+        files: Vec<maki_remote::RemoteFile>,
+    ) -> Result<Vec<Action>, String> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use maki_remote::UploadMode;
+        let mut text = text;
+        let mut images: Vec<ImageSource> = Vec::new();
+        for file in files {
+            if file.data.len() > UPLOAD_B64_LIMIT {
+                return Err(format!("upload {} exceeds the size limit", file.name));
+            }
+            let bytes = STANDARD
+                .decode(&file.data)
+                .map_err(|_| format!("upload {}: not valid base64", file.name))?;
+            match file.mode {
+                UploadMode::Attach => {
+                    let media = ImageMediaType::from_mime(&file.media_type).ok_or_else(|| {
+                        format!(
+                            "cannot attach {} ({}) as an image",
+                            file.name, file.media_type
+                        )
+                    })?;
+                    images.push(ImageSource::new(media, file.data.into()));
+                }
+                UploadMode::Save => {
+                    let path = save_upload(
+                        std::path::Path::new(&self.state.session.cwd),
+                        &file.name,
+                        &bytes,
+                    )?;
+                    text.push_str(&format!("\nUploaded file at {}", path.display()));
+                }
+            }
+        }
+        match self.submit_prompt(QueuedMessage { text, images }) {
+            SubmitOutcome::Started(actions) => Ok(actions),
+            SubmitOutcome::Queued => Ok(vec![]),
+            SubmitOutcome::Rejected(e) => Err(e.into()),
+        }
+    }
+
+    /// Remote control answered the pending permission prompt. The request id
+    /// must still match, so a stale answer cannot hit a newer prompt.
+    pub(crate) fn answer_remote_permission(
+        &mut self,
+        request_id: &str,
+        answer: &str,
+    ) -> Result<(), String> {
+        let Some((pending_id, subagent_id)) = self.pending_permission_ids() else {
+            return Err("no permission prompt is pending".into());
+        };
+        if pending_id != request_id {
+            return Err("that permission prompt is no longer pending".into());
+        }
+        let decoded =
+            PermissionAnswer::decode(answer).ok_or_else(|| format!("invalid answer {answer:?}"))?;
+        self.send_to_agent(subagent_id.as_deref(), decoded.encode());
+        self.permission_prompt.close();
+        Ok(())
+    }
+
+    /// The pending permission request's id and its owning subagent, if any.
+    pub(crate) fn pending_permission_ids(&self) -> Option<(String, Option<String>)> {
+        match &self.permission_prompt {
+            PermissionPrompt::Open {
+                id, subagent_id, ..
+            } => Some((id.clone(), subagent_id.clone())),
+            PermissionPrompt::Closed => None,
+        }
+    }
+
+    /// Remote control asked to stop the run; identical to double-esc cancel.
+    /// The cancel's `Action`s come back to the caller to dispatch.
+    pub(crate) fn stop_remote_run(&mut self) -> Result<Vec<Action>, String> {
+        if self.status != Status::Streaming {
+            return Err("no run is active".into());
+        }
+        Ok(self.handle_cancel())
+    }
+
+    pub(crate) fn run_remote_command(&mut self, cmdline: &str) -> Result<Vec<Action>, String> {
+        self.run_cmdline(cmdline, 0)
+    }
+
+    pub(crate) fn remote_model_get(&self) -> serde_json::Value {
+        self.model_state()
+    }
+
+    pub(crate) fn remote_model_set(
+        &mut self,
+        spec: Option<&str>,
+        thinking: Option<&str>,
+        fast: Option<bool>,
+    ) -> Result<serde_json::Value, String> {
+        if let Some(spec) = spec {
+            self.change_model_via_remote(spec)?;
+        }
+        if let Some(thinking) = thinking {
+            self.set_thinking(thinking)?;
+        }
+        if let Some(fast) = fast {
+            self.set_fast(fast)?;
+        }
+        Ok(self.model_state())
+    }
+
+    fn change_model_via_remote(&mut self, spec: &str) -> Result<(), String> {
+        let model = maki_providers::model::Model::from_spec(spec).map_err(|e| e.to_string())?;
+        if !self.model_policy.allows(&model.spec()) {
+            return Err("Model is not allowed by policy".into());
+        }
+        self.update_model(&model);
+        self.record_recent_model(spec);
+        Ok(())
+    }
+
+    /// Slash commands with descriptions, for the web command picker.
+    pub(crate) fn remote_commands(&mut self) -> serde_json::Value {
+        let items = self
+            .command_palette
+            .listing()
+            .into_iter()
+            .map(|(name, description)| json!({ "name": name, "description": description }))
+            .collect::<Vec<_>>();
+        json!(items)
+    }
+
+    /// Mirror of the remote control lifecycle into the status bar.
+    pub(crate) fn set_remote_indicator(&mut self, link: bool, viewers: usize) {
+        self.remote_link = link;
+        self.remote_viewers = viewers;
+    }
+
+    /// Picker data for the web: every model with its provider, plus the
+    /// session's current mode and permission toggles.
+    pub(crate) fn remote_options(&self) -> serde_json::Value {
+        let models = self.model_picker.available_specs();
+        let mut providers: Vec<String> = models
+            .iter()
+            .filter_map(|spec| spec.split_once('/').map(|(p, _)| p.to_owned()))
+            .collect();
+        providers.sort_unstable();
+        providers.dedup();
+        json!({
+            "models": models,
+            "providers": providers,
+            "model": self.state.model.spec(),
+            "mode": match self.state.mode {
+                Mode::Build => "build",
+                Mode::Plan => "plan",
+            },
+            "yolo": self.permissions.is_yolo(),
+            "fast": self.state.fast,
+            "thinking": self.state.thinking.to_string(),
+        })
+    }
+
+    /// Set plan/build mode from the web, mirroring the Tab toggle.
+    pub(crate) fn remote_set_mode(&mut self, mode: &str) -> Result<serde_json::Value, String> {
+        let plan = match mode {
+            "plan" => true,
+            "build" => false,
+            other => return Err(format!("unknown mode {other:?}")),
+        };
+        if plan == (self.state.mode == Mode::Plan) {
+            return Ok(self.remote_options());
+        }
+        let actions = self.toggle_mode();
+        debug_assert!(actions.is_empty(), "mode toggle owes no loop actions");
+        Ok(self.remote_options())
+    }
+
+    /// Turn a permission flag on or off from the web, reusing the same
+    /// commands the keyboard runs.
+    pub(crate) fn remote_set_yolo(&mut self, on: bool) -> serde_json::Value {
+        if self.permissions.is_yolo() != on {
+            self.permissions.toggle_yolo();
+        }
+        self.remote_options()
+    }
+
+    /// Everything a freshly connected web client needs to catch up to what
+    /// the TUI shows: transcript, stats, mode, status, pending permission.
+    /// Mirrors what the TUI renders, not the raw LLM history.
+    pub(crate) fn remote_snapshot(&self) -> serde_json::Value {
+        let mut messages = Vec::new();
+        // The live mirror while a run exists; the session's own list otherwise
+        // (e.g. before the first spawn applies the mirror).
+        let history: std::sync::Arc<Vec<Message>> = match &self.shared_history {
+            Some(shared) => shared.load().messages.clone(),
+            None => self.state.session.messages().to_vec().into(),
+        };
+        // Full-fidelity tool results live in the session's output store keyed by
+        // tool id; the inline `ToolResult.content` is only the truncated model
+        // summary, so a snapshot that reads it shows the web less than the TUI.
+        let tool_outputs = self.state.session.tool_outputs();
+        for message in history.iter() {
+            // Observation messages are host bookkeeping the TUI hides.
+            if message.kind == MessageKind::Observation {
+                continue;
+            }
+            match message.role {
+                Role::User => {
+                    // Empty display text marks host bookkeeping (synthetic
+                    // prompts, cancel markers on result-only messages); the
+                    // tool results themselves still render.
+                    let has_results = message
+                        .content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+                    if message.display_text.as_deref().is_some_and(str::is_empty) && !has_results {
+                        continue;
+                    }
+                    if let Some(text) = message.user_text() {
+                        messages.push(json!({
+                            "type": "user_message",
+                            "text": text,
+                        }));
+                    }
+                    for block in &message.content {
+                        if let ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } = block
+                        {
+                            let full = tool_outputs
+                                .get(tool_use_id.as_str())
+                                .map(|o| o.as_text())
+                                .unwrap_or_else(|| content.clone());
+                            messages.push(json!({
+                                "type": "tool_done",
+                                "id": tool_use_id,
+                                "output": full,
+                                "is_error": is_error,
+                            }));
+                        }
+                    }
+                }
+                Role::Assistant => {
+                    for block in &message.content {
+                        match block {
+                            ContentBlock::Text { text } if !text.is_empty() => {
+                                messages.push(json!({
+                                    "type": "assistant_text",
+                                    "text": text,
+                                }));
+                            }
+                            ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                                messages.push(json!({
+                                    "type": "thinking",
+                                    "text": thinking,
+                                }));
+                            }
+                            ContentBlock::ToolUse {
+                                id, name, input, ..
+                            } => {
+                                messages.push(json!({
+                                    "type": "tool_start",
+                                    "id": id,
+                                    "tool": name,
+                                    "input": input,
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        let session = &self.state.session;
+        json!({
+            "messages": messages,
+            "session_id": session.id.to_string(),
+            "title": session.title,
+            "cwd": session.cwd,
+            "model": self.state.model.spec(),
+            "status": if self.status == Status::Streaming { "working" } else { "idle" },
+            "context_size": self.state.context_size,
+            "context_window": self.state.model.context_window,
+            "cost": self.state.cost,
+            "token_usage": self.state.token_usage,
+            "queue": self.queue.text_messages(),
+            "pending_permission": self.pending_permission_ids()
+                .map(|(id, _)| json!({ "id": id })),
+        })
     }
 
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
@@ -1418,6 +1779,12 @@ impl App {
                     .into(),
                 );
                 vec![]
+            }
+            "/remote-control" | "/rc" => {
+                let domain = cmd.args.trim();
+                vec![Action::RemoteControl(
+                    (!domain.is_empty()).then(|| domain.to_owned()),
+                )]
             }
             "/exit" => self.quit(),
             "/reload" => self.quit_with(ExitRequest::Reload),

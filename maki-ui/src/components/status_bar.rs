@@ -49,6 +49,8 @@ pub struct StatusBarContext<'a> {
     pub workflow: bool,
     pub yolo: bool,
     pub restoring: bool,
+    pub remote_link: bool,
+    pub remote_viewers: usize,
 }
 
 pub struct StatusBar {
@@ -139,6 +141,18 @@ impl StatusBar {
         }
 
         left_spans.push(Span::styled(format!(" {}", ctx.mode_label), ctx.mode_style));
+
+        if ctx.remote_link {
+            let (label, style) = if ctx.remote_viewers > 0 {
+                (
+                    format!(" remote·{}", ctx.remote_viewers),
+                    theme::current().status_notice,
+                )
+            } else {
+                (" remote".into(), theme::current().status_dim)
+            };
+            left_spans.push(Span::styled(label, style));
+        }
 
         if let Some(name) = ctx.chat_name {
             left_spans.push(Span::styled(
@@ -386,6 +400,21 @@ mod tests {
         show_global: bool,
         yolo: bool,
     ) -> String {
+        render_full(status, global_cost, show_global, yolo, false, 0)
+    }
+
+    fn render_remote(link: bool, viewers: usize) -> String {
+        render_full(&Status::Idle, None, false, false, link, viewers)
+    }
+
+    fn render_full(
+        status: &Status,
+        global_cost: Option<f64>,
+        show_global: bool,
+        yolo: bool,
+        remote_link: bool,
+        remote_viewers: usize,
+    ) -> String {
         let bar = StatusBar::new(FLASH_TTL);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
@@ -409,9 +438,21 @@ mod tests {
             workflow: false,
             yolo,
             restoring: false,
+            remote_link,
+            remote_viewers,
         };
         terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
         crate::components::buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn the_bar_advertises_the_remote_link_and_its_viewers() {
+        assert!(!render_remote(false, 0).contains("remote"), "off: no badge");
+        let idle_link = render_remote(true, 0);
+        assert!(idle_link.contains("remote"), "connected: {idle_link}");
+        assert!(!idle_link.contains("remote·"), "nobody watching: no count");
+        let watched = render_remote(true, 2);
+        assert!(watched.contains("remote·2"), "viewers counted: {watched}");
     }
 
     /// The sigma is the whole session's bill, and only the session can hand it

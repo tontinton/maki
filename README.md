@@ -1,5 +1,82 @@
 <img src="./banner.png">
 
+## About this fork
+
+This fork adds remote control over the web, built for running maki on many
+hosts with one shared entry point:
+
+* **`/rc` standalone** - run `/rc` in the TUI and it prints a tokenized web URL
+  (behind your own reverse proxy for TLS). The web view mirrors the live
+  session: full transcript, thinking, tool calls with results, model, context
+  and cost stats. You can prompt, answer permission requests, and stop runs
+  from the browser.
+* **`maki-anchor`** - a central server for many instances. Instances dial out
+  over a WebSocket, so they need no inbound ports. One domain, one dashboard,
+  one login:
+  * OIDC single sign-on (Authelia, Authentik, Keycloak, Pocket ID, ...), first
+    login becomes admin.
+  * Per-user, per-instance grants: `viewer` (read) or `controller` (prompt and
+    approve).
+  * Share links with rights and expiry: `view` / `control`, default 2 hours.
+  * Fleet dashboard: all instances, their sessions, costs, and status.
+    Login is mandatory (first run walks you through creating the admin), and
+    the link to your instance reconnects itself when the network blinks.
+  * Full session transcripts are persisted on the anchor for fast reload and
+    search, with per-session delete, off-the-record (OTR, never persisted),
+    and a configurable pruning timeline.
+* **Signed Windows binaries** - releases ship an Authenticode-signed `.exe`
+  (Azure Trusted Signing), so SmartScreen stays quiet, next to static Linux
+  (x86_64 + arm64) and macOS builds.
+
+Quick start for the anchor:
+
+```sh
+# On the server: install or update maki-anchor as a systemd service.
+# As root it writes a system unit; as a user, a user unit with linger.
+curl -fsSL https://raw.githubusercontent.com/wmantly/maki/main/install-anchor.sh | sh
+
+# Register an instance and copy the printed one-liner for its host.
+maki-anchor tokens add work-laptop
+
+# A CLI-minted instance has no grants yet, so it's invisible on a non-admin's
+# dashboard until you grant one. Either do it in one step:
+maki-anchor tokens add work-laptop --user-id 2 --rights control
+# ...or grant it after the fact (see `maki-anchor users list` for ids):
+maki-anchor grants set 2 work-laptop control
+```
+
+```sh
+# Or skip systemd and run in the foreground
+# (reverse proxy handles TLS and forwards WebSocket upgrades).
+maki-anchor serve --bind 0.0.0.0:8688
+```
+
+```lua
+-- In ~/.config/maki/init.lua on the instance host.
+maki.setup {
+  anchor = {
+    url = "https://maki.example.com",
+    name = "work-laptop",
+    token = "<token from tokens add>",
+  },
+}
+```
+
+Now `/rc` prints an anchor link instead of binding a local port. See the
+[anchor docs](https://maki.sh/docs/anchor/) for SSO setup, grants, and share
+links.
+
+### Screenshots
+
+| | |
+|---|---|
+| ![Anchor dashboard](./screenshots/anchor-dashboard.jpg) Fleet dashboard: live shares and sessions, each with a search box over titles and full transcripts. | ![Remote terminal](./screenshots/remote-terminal.jpg) The remote terminal: full transcript, model/provider pickers, and the command toolbar. |
+| ![Compact mobile view](./screenshots/remote-terminal-compact.jpg) Compact mode with the toolbar tucked away, for a phone screen. | ![QR code popup](./screenshots/remote-terminal-qr.jpg) One tap to flash the page's own link as a QR code. |
+
+Everything below is upstream's README.
+
+---
+
 An AI coding agent optimized for minimal use of context tokens, while providing a great user experience.
 
 ## Features

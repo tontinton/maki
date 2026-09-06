@@ -1,0 +1,1078 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>maki remote</title>
+<style>
+  :root {
+    --bg: #16181d;
+    --panel: #1d2026;
+    --border: #2c313a;
+    --text: #d6dbe3;
+    --muted: #8b93a1;
+    --accent: #7aa2f7;
+    --user: #9ece6a;
+    --error: #f7768e;
+    --tool: #bb9af7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
+  }
+  header {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    flex-wrap: wrap;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  header h1 { font-size: 14px; margin: 0; }
+  #title { color: var(--text); }
+  #cwd, #model { color: var(--muted); font-size: 12px; }
+  #status { color: var(--muted); }
+  #status[data-status="working"] { color: var(--accent); }
+  #stats { color: var(--muted); font-size: 12px; margin-left: auto; }
+  #conn { color: var(--muted); font-size: 12px; }
+  #conn[data-conn="live"] { color: var(--user); }
+  #conn[data-conn="down"] { color: var(--error); }
+  main {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px 14px;
+  }
+  .msg { margin: 6px 0; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { color: var(--user); }
+  .msg.user::before { content: "you> "; color: var(--muted); }
+  .msg.assistant { color: var(--text); }
+  .msg.thinking { color: var(--muted); font-style: italic; }
+  .msg.error { color: var(--error); }
+  .msg.system { color: var(--muted); }
+  .tool { margin: 6px 0; border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; background: var(--panel); }
+  .tool summary { color: var(--tool); cursor: pointer; user-select: none; }
+  .tool .out { white-space: pre-wrap; word-break: break-word; color: var(--muted); margin-top: 4px; max-height: 300px; overflow-y: auto; }
+  .tool.running summary::after { content: " …"; color: var(--accent); }
+  .tool.is-error { border-color: var(--error); }
+  #perm {
+    display: none;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    background: var(--panel);
+    padding: 10px 14px;
+    margin: 8px 14px;
+  }
+  #perm .toolname { color: var(--accent); }
+  #perm .scopes { color: var(--muted); margin: 4px 0 8px; }
+  #perm .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  #perm textarea {
+    width: 100%;
+    min-height: 60px;
+    margin-top: 8px;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font: inherit;
+    display: none;
+  }
+  button {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 14px;
+    font: inherit;
+    cursor: pointer;
+  }
+  button.primary { border-color: var(--user); color: var(--user); }
+  button.danger { border-color: var(--error); color: var(--error); }
+  button.mini { padding: 2px 8px; font-size: 12px; }
+  #toolbar {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    align-items: center;
+    padding: 6px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  /* Author rules always beat the UA `[hidden]` default regardless of
+     specificity, so #toolbar's own `display: flex` above would otherwise
+     win over a bare `hidden` attribute; this rule restores it. */
+  #toolbar[hidden] { display: none; }
+  #toolbar input, #toolbar select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font: inherit;
+    font-size: 12px;
+  }
+  #toolbar label.mini { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 12px; padding: 0 4px; }
+  #toolbar #provider-select { max-width: 160px; }
+  #toolbar #model-select { max-width: 240px; }
+  #toolbar #cmd-input { flex: 1; min-width: 160px; }
+  #sessions-bar {
+    display: none;
+    gap: 6px;
+    padding: 6px 14px;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  #sessions-bar span { color: var(--muted); font-size: 12px; }
+  #sessions-bar .sess { cursor: pointer; padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border); }
+  #sessions-bar .sess.focused { border-color: var(--accent); color: var(--accent); }
+  #toast {
+    position: fixed;
+    bottom: 80px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 14px;
+    border-radius: 6px;
+    display: none;
+    max-width: 80vw;
+  }
+  #stoprow { padding: 4px 14px; }
+  #stoprow button { display: none; }
+  #inputrow {
+    display: flex;
+    gap: 8px;
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  #prompt {
+    flex: 1;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    font: inherit;
+    resize: none;
+    height: 44px;
+    max-height: 200px;
+  }
+  #prompt:focus { outline: none; border-color: var(--accent); }
+  #center-wrap { position: relative; margin-left: auto; display: flex; gap: 4px; align-items: center; }
+  #center {
+    position: absolute; top: 130%; right: 0; z-index: 60;
+    width: min(340px, 92vw); max-height: 70vh; overflow-y: auto;
+    background: var(--panel, #1e2128); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px; font-size: 13px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.4);
+  }
+  #center h3 { margin: 2px 0 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  #center .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 4px 0; }
+  #center table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  #center td { padding: 2px 4px; border-bottom: 1px solid var(--border); }
+  #center input, #center select { font-size: 12px; padding: 3px 6px; background: var(--bg); color: inherit; border: 1px solid var(--border); border-radius: 6px; }
+  #center .ok { color: #9ece6a; } #center .bad { color: #f7768e; }
+  #center img.qr, #qr-pop img.qr { background: #fff; border-radius: 8px; padding: 4px; display: block; margin-top: 4px; }
+  #qr-pop {
+    position: fixed; top: 54px; right: 10px; z-index: 70;
+    background: var(--panel, #1e2128); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px; font-size: 12px; text-align: center;
+  }
+  #qr-pop a { color: var(--muted); word-break: break-all; }
+  #chips { display: flex; gap: 6px; flex-wrap: wrap; padding: 4px 8px 0; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 4px; font-size: 12px;
+    border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px; color: var(--muted);
+  }
+  .chip select { font-size: 11px; background: none; color: inherit; border: none; }
+  .chip button { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 12px; }
+  /* Markdown-ish rendering for assistant messages. */
+  .msg.assistant p { margin: 4px 0; }
+  .msg.assistant h1, .msg.assistant h2, .msg.assistant h3 { margin: 8px 0 4px; color: var(--text); }
+  .msg.assistant ul, .msg.assistant ol { margin: 4px 0; padding-left: 20px; }
+  .msg.assistant code { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+  .msg.assistant pre { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px; overflow-x: auto; }
+  .msg.assistant pre code { background: none; border: none; padding: 0; }
+  .msg.assistant blockquote { border-left: 3px solid var(--border); margin: 4px 0; padding-left: 10px; color: var(--muted); }
+  .msg.assistant a { color: var(--accent); }
+  .msg.assistant table { border-collapse: collapse; margin: 4px 0; }
+  .msg.assistant th, .msg.assistant td { border: 1px solid var(--border); padding: 3px 8px; }
+  /* Floating "jump to bottom" button, shown when scrolled away. */
+  #jump-bottom {
+    position: fixed; right: 16px; bottom: 90px; z-index: 50;
+    display: none; align-items: center; gap: 4px;
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 6px 12px; font-size: 12px; cursor: pointer;
+    box-shadow: 0 4px 12px rgba(0,0,0,.35);
+  }
+  #jump-bottom:hover { border-color: var(--accent); color: var(--accent); }
+  /* Compact mode: shrink the header and toolbar to save vertical space. */
+  body.compact header { padding: 3px 10px; }
+  body.compact header h1 { font-size: 12px; }
+  body.compact #toolbar { padding: 2px 10px; }
+  body.compact #toolbar input, body.compact #toolbar select { padding: 2px 6px; font-size: 11px; }
+  body.compact #sessions-bar { padding: 2px 10px; }
+  body.compact #inputrow { padding: 6px 10px; }
+  body.compact #prompt { height: 36px; padding: 6px; }
+  #compact-toggle { cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1>maki</h1>
+  <span id="title"></span>
+  <span id="cwd"></span>
+  <span id="model"></span>
+  <span id="status" data-status="idle">idle</span>
+  <span id="stats"></span>
+  <span id="conn" data-conn="down">connecting</span>
+  <div id="center-wrap">
+    <button class="mini" id="toolbar-toggle" title="Hide/show the toolbar to save space">tools ▾</button>
+    <button class="mini" id="compact-toggle" title="Shrink the headers to save space">compact</button>
+    <button class="mini" id="qr-btn" title="QR code for this page's link">QR</button>
+    <button class="mini" id="center-btn" title="Remote control center">remote ▾</button>
+    <div id="center" hidden></div>
+  </div>
+</header>
+<div id="toolbar">
+  <input id="cmd-input" list="cmd-list" placeholder="/command — type to filter, Enter to run">
+  <button class="mini" id="cmd-run">Run</button>
+  <select id="provider-select" title="Filter models by provider"><option value="">all providers</option></select>
+  <select id="model-select" title="Model"><option value="">model…</option></select>
+  <select id="mode-select" title="Mode">
+    <option value="build">build</option>
+    <option value="plan">plan</option>
+  </select>
+  <label class="mini" title="Auto-approve tool permissions"><input type="checkbox" id="yolo-check"> yolo</label>
+  <button class="mini" id="btn-fast" title="Toggle fast mode">/fast</button>
+  <button class="mini" id="btn-thinking" title="Set thinking level">/thinking</button>
+  <button class="mini" id="btn-new" title="New session">/new</button>
+  <button class="mini" id="btn-compact" title="Compact context">/compact</button>
+</div>
+<datalist id="cmd-list"></datalist>
+<div id="sessions-bar"></div>
+<main id="log"></main>
+<div id="qr-pop" hidden></div>
+<div id="toast"></div>
+<button id="jump-bottom" title="Jump to the latest message">↓ latest</button>
+<div id="perm">
+  <div>Permission needed: <span class="toolname" id="perm-tool"></span></div>
+  <div class="scopes" id="perm-scopes"></div>
+  <div class="row">
+    <button class="primary" data-answer="allow">Allow</button>
+    <button data-answer="allow_session">Allow session</button>
+    <button data-answer="allow_always_local">Always (repo)</button>
+    <button data-answer="allow_always_global">Always (global)</button>
+    <button class="danger" id="deny-btn" data-answer="deny">Deny</button>
+  </div>
+  <textarea id="deny-guidance" placeholder="Guidance for the agent (optional; submit with the deny button)"></textarea>
+</div>
+<div id="stoprow"><button class="danger" id="stop">Stop run (Esc)</button></div>
+<div id="chips"></div>
+<div id="inputrow">
+  <button class="mini" id="btn-attach" title="Upload an image or document">+</button>
+  <input type="file" id="file-input" multiple hidden>
+  <textarea id="prompt" placeholder="Message maki… (Enter to send, Shift+Enter for newline)"></textarea>
+  <button id="send" class="primary">Send</button>
+</div>
+<script>
+(() => {
+  const log = document.getElementById("log");
+  const connEl = document.getElementById("conn");
+  const statusEl = document.getElementById("status");
+  const statsEl = document.getElementById("stats");
+  const titleEl = document.getElementById("title");
+  const cwdEl = document.getElementById("cwd");
+  const modelEl = document.getElementById("model");
+  const permEl = document.getElementById("perm");
+  const promptEl = document.getElementById("prompt");
+  const stopBtn = document.getElementById("stop");
+  const denyGuidance = document.getElementById("deny-guidance");
+  const cmdInput = document.getElementById("cmd-input");
+  const cmdList = document.getElementById("cmd-list");
+  const providerSelect = document.getElementById("provider-select");
+  const modelSelect = document.getElementById("model-select");
+  const modeSelect = document.getElementById("mode-select");
+  const yoloCheck = document.getElementById("yolo-check");
+  const SHARE_TOKEN = (location.pathname.split("/")[1] || "").replace(/\/$/, "");
+  const isSharePage = /^[0-9a-f]{32}$/.test(SHARE_TOKEN);
+  const sessionsBar = document.getElementById("sessions-bar");
+  const toastEl = document.getElementById("toast");
+  const jumpBtn = document.getElementById("jump-bottom");
+  let pendingPermission = null;
+  let allModels = [];
+
+  const el = (cls, text) => {
+    const node = document.createElement("div");
+    node.className = cls;
+    node.textContent = text ?? "";
+    return node;
+  };
+
+  let pinned = true;
+  const scrollDown = () => { log.scrollTop = log.scrollHeight; updateJump(); };
+
+  // Show the "jump to bottom" button only when the user has scrolled away
+  // from the latest message, so it never gets in the way at the bottom. Also
+  // tracks whether the view is "pinned" to the bottom: live updates only
+  // autoscroll while pinned, so reading older messages is never interrupted.
+  const updateJump = () => {
+    const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    pinned = nearBottom;
+    jumpBtn.style.display = nearBottom ? "none" : "flex";
+  };
+  log.addEventListener("scroll", updateJump);
+  jumpBtn.onclick = () => { pinned = true; scrollDown(); };
+
+  // Follow new output only when already pinned to the bottom; otherwise leave
+  // the scroll position alone and just keep the jump button in sync.
+  const autoScroll = () => { if (pinned) scrollDown(); else updateJump(); };
+
+  // Compact mode: persist the choice so a phone reload keeps the layout.
+  const compactToggle = document.getElementById("compact-toggle");
+  const applyCompact = (on) => {
+    document.body.classList.toggle("compact", on);
+    compactToggle.textContent = on ? "expand" : "compact";
+    try { localStorage.setItem("maki_compact", on ? "1" : "0"); } catch {}
+  };
+  compactToggle.onclick = () => applyCompact(!document.body.classList.contains("compact"));
+  try { applyCompact(localStorage.getItem("maki_compact") === "1"); } catch {}
+
+  // Toolbar hide/show: the command bar (model picker, /fast, /thinking, ...)
+  // is the biggest single chunk of header space on a phone and is rarely
+  // touched mid-conversation, so it can be tucked away independently of
+  // compact mode. Persisted the same way so a reload keeps the choice.
+  const toolbarToggle = document.getElementById("toolbar-toggle");
+  const toolbarEl = document.getElementById("toolbar");
+  const applyToolbar = (hidden) => {
+    toolbarEl.hidden = hidden;
+    toolbarToggle.textContent = hidden ? "tools ▸" : "tools ▾";
+    try { localStorage.setItem("maki_toolbar_hidden", hidden ? "1" : "0"); } catch {}
+  };
+  toolbarToggle.onclick = () => applyToolbar(!toolbarEl.hidden);
+  try { applyToolbar(localStorage.getItem("maki_toolbar_hidden") === "1"); } catch {}
+
+  const fmtTokens = (n) =>
+    n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
+
+  const setStats = (stats) => {
+    if (!stats) return;
+    const parts = [];
+    if (typeof stats.context_size === "number" && stats.context_window) {
+      const pct = Math.round(stats.context_size / stats.context_window * 100);
+      parts.push(`${fmtTokens(stats.context_size)}/${fmtTokens(stats.context_window)} (${pct}%)`);
+    }
+    if (typeof stats.cost === "number") parts.push(`$${stats.cost.toFixed(3)}`);
+    const usage = stats.token_usage || {};
+    const inTok = (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0);
+    if (inTok || usage.output_tokens) parts.push(`in ${fmtTokens(inTok)} out ${fmtTokens(usage.output_tokens || 0)}`);
+    statsEl.textContent = parts.join(" · ");
+  };
+
+  const setHeader = (snap) => {
+    if (snap.title) titleEl.textContent = snap.title;
+    if (snap.cwd) cwdEl.textContent = snap.cwd;
+    if (snap.model) {
+      modelEl.textContent = snap.model;
+      reflectModel(snap.model);
+    }
+    setStats(snap);
+    if (snap.status) setStatus(snap.status);
+  };
+
+  const toast = (msg, ms = 2500) => {
+    toastEl.textContent = msg;
+    toastEl.style.display = "block";
+    clearTimeout(toastEl._t);
+    toastEl._t = setTimeout(() => toastEl.style.display = "none", ms);
+  };
+
+  const toolCard = (event) => {
+    const details = document.createElement("details");
+    details.className = "tool running";
+    details.dataset.id = event.id;
+    const summary = document.createElement("summary");
+    let label = event.tool || "";
+    if (event.summary) label += ` — ${event.summary}`;
+    else if (event.input) {
+      const bits = [];
+      for (const key of ["command", "path", "file_path", "pattern", "query", "url"]) {
+        if (event.input[key]) bits.push(String(event.input[key]).slice(0, 80));
+      }
+      if (bits.length) label += ` — ${bits.join(" ")}`;
+    }
+    summary.textContent = label;
+    const out = document.createElement("div");
+    out.className = "out";
+    details.appendChild(summary);
+    details.appendChild(out);
+    log.appendChild(details);
+    return details;
+  };
+
+  const toolById = (id) => log.querySelector(`.tool[data-id="${CSS.escape(id)}"]`);
+
+  // A tiny, safe markdown renderer for assistant messages: escape first, then
+  // apply a small set of block and inline rules. Good enough to read code,
+  // lists (ordered and unordered), headings, rules and links the way the CLI
+  // does, without a dependency.
+  const escHtml = (s) => String(s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  // Code spans are pulled out behind a placeholder before bold/italic/strike
+  // run, so `**`/`~~` inside inline code is never reinterpreted as markup.
+  const inlineMd = (s) => {
+    const spans = [];
+    const placeheld = escHtml(s).replace(/`([^`]+)`/g, (_, code) => {
+      spans.push(code);
+      return ` ${spans.length - 1} `;
+    });
+    const html = placeheld
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "<em>$1</em>")
+      .replace(/~~([^~]+)~~/g, "<del>$1</del>")
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    return html.replace(/ (\d+) /g, (_, i) => `<code>${spans[Number(i)]}</code>`);
+  };
+  const renderMarkdown = (text) => {
+    const lines = String(text).split("\n");
+    let html = "";
+    let inCode = false;
+    let listType = null; // "ul" | "ol" | null
+    let inTable = false;
+    let tableRows = [];
+    // A paragraph is a run of plain lines; markdown reflows them into one
+    // block, so buffer and join with a space rather than emitting a <p> per
+    // source line — otherwise every soft-wrapped line reads as its own
+    // paragraph, which looks nothing like the CLI's rendering.
+    let para = [];
+    const closeList = () => { if (listType) { html += `</${listType}>`; listType = null; } };
+    const closeTable = () => {
+      if (inTable) {
+        html += "<table>" + tableRows.map(r => `<tr>${r.map(c => `<td>${inlineMd(c)}</td>`).join("")}</tr>`).join("") + "</table>";
+        inTable = false; tableRows = [];
+      }
+    };
+    const flushPara = () => {
+      if (para.length) { html += `<p>${inlineMd(para.join(" "))}</p>`; para = []; }
+    };
+    for (const raw of lines) {
+      const line = raw.trimEnd();
+      if (line.startsWith("```")) {
+        flushPara(); closeList(); closeTable();
+        if (inCode) { html += "</code></pre>"; inCode = false; }
+        else { html += "<pre><code>"; inCode = true; }
+        continue;
+      }
+      if (inCode) { html += escHtml(line) + "\n"; continue; }
+      if (/^\s*\|.*\|\s*$/.test(line)) {
+        flushPara(); closeList();
+        const cells = line.split("|").slice(1, -1).map(c => c.trim());
+        if (/^[\s:|-]+$/.test(cells.join(""))) continue; // separator row
+        inTable = true; tableRows.push(cells);
+        continue;
+      }
+      closeTable();
+      if (/^ {0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) {
+        flushPara(); closeList();
+        html += "<hr>";
+      } else if (/^#{1,3}\s/.test(line)) {
+        flushPara(); closeList();
+        const level = line.match(/^#+/)[0].length;
+        html += `<h${level}>${inlineMd(line.replace(/^#+\s/, ""))}</h${level}>`;
+      } else if (/^\s*[-*]\s+/.test(line)) {
+        flushPara();
+        if (listType !== "ul") { closeList(); html += "<ul>"; listType = "ul"; }
+        html += `<li>${inlineMd(line.replace(/^\s*[-*]\s+/, ""))}</li>`;
+      } else if (/^\s*\d+[.)]\s+/.test(line)) {
+        flushPara();
+        if (listType !== "ol") { closeList(); html += "<ol>"; listType = "ol"; }
+        html += `<li>${inlineMd(line.replace(/^\s*\d+[.)]\s+/, ""))}</li>`;
+      } else if (/^\s*>\s?/.test(line)) {
+        flushPara(); closeList();
+        html += `<blockquote>${inlineMd(line.replace(/^\s*>\s?/, ""))}</blockquote>`;
+      } else if (line.trim() === "") {
+        flushPara(); closeList();
+      } else {
+        closeList();
+        para.push(line.trim());
+      }
+    }
+    flushPara(); closeList(); closeTable();
+    if (inCode) html += "</code></pre>";
+    return html;
+  };
+
+  // The CLI never dumps a whole network chunk onto the screen at once — it
+  // reveals it at a steady pace (`typewriter_ms_per_char`, 4ms/char, clamped
+  // to 30-1000ms per chunk) so text always looks like it's being typed,
+  // however big the underlying delta was. The web page received the exact
+  // same envelopes just as fast, but rendered them instantly, which read as
+  // "batches" next to the CLI. This mirrors that same reveal algorithm
+  // client-side, keyed per message node so several streaming messages (e.g.
+  // thinking + assistant text) animate independently.
+  const TYPEWRITER_MS_PER_CHAR = 4;
+  const TYPEWRITER_MIN_MS = 30;
+  const TYPEWRITER_MAX_MS = 1000;
+  const typewriterNodes = new Set();
+  let typewriterRunning = false;
+  const runTypewriter = () => {
+    const now = performance.now();
+    for (const node of [...typewriterNodes]) {
+      if (!node.isConnected) { typewriterNodes.delete(node); continue; }
+      const progress = Math.min(1, (now - node._twStart) / node._twDuration);
+      const shown = Math.round(node._twFrom + (node._twTo - node._twFrom) * progress);
+      if (shown !== node._twVisible) {
+        node._twVisible = shown;
+        node._twRender(node.dataset.raw.slice(0, shown));
+      }
+      if (progress >= 1) typewriterNodes.delete(node);
+    }
+    autoScroll();
+    if (typewriterNodes.size) requestAnimationFrame(runTypewriter);
+    else typewriterRunning = false;
+  };
+  // Feeds more text into a node's reveal, extending its animation the same
+  // way the CLI's typewriter does: retarget from wherever it currently is
+  // toward the new full length, over a duration sized to what's unrevealed.
+  const pushTypewriter = (node, renderFn) => {
+    node._twRender = renderFn;
+    node._twVisible = node._twVisible ?? 0;
+    node._twFrom = node._twVisible;
+    node._twTo = node.dataset.raw.length;
+    const unrevealed = node._twTo - node._twFrom;
+    node._twDuration = Math.min(TYPEWRITER_MAX_MS, Math.max(TYPEWRITER_MIN_MS, unrevealed * TYPEWRITER_MS_PER_CHAR));
+    node._twStart = performance.now();
+    typewriterNodes.add(node);
+    if (!typewriterRunning) { typewriterRunning = true; requestAnimationFrame(runTypewriter); }
+  };
+
+  const renderEvent = (event) => {
+    switch (event.type) {
+      case "text_delta": {
+        const last = log.lastElementChild;
+        const node = (last && last.dataset.kind === "assistant") ? last : (() => {
+          const n = el("msg assistant", "");
+          n.dataset.kind = "assistant";
+          n.dataset.raw = "";
+          log.appendChild(n);
+          return n;
+        })();
+        node.dataset.raw = (node.dataset.raw || "") + event.text;
+        pushTypewriter(node, (visible) => { node.innerHTML = renderMarkdown(visible); });
+        break;
+      }
+      case "thinking_delta": {
+        const last = log.lastElementChild;
+        const node = (last && last.dataset.kind === "thinking") ? last : (() => {
+          const n = el("msg thinking", "");
+          n.dataset.kind = "thinking";
+          n.dataset.raw = "";
+          log.appendChild(n);
+          return n;
+        })();
+        node.dataset.raw = (node.dataset.raw || "") + event.text;
+        pushTypewriter(node, (visible) => { node.textContent = visible; });
+        break;
+      }
+      case "tool_start": toolCard(event); break;
+      case "tool_output": {
+        const details = toolById(event.id);
+        if (details) details.querySelector(".out").textContent = event.content;
+        break;
+      }
+      case "tool_done": {
+        const details = toolById(event.id);
+        if (details) {
+          details.classList.remove("running");
+          const out = details.querySelector(".out");
+          const text = typeof event.output === "string"
+            ? event.output
+            : (event.output && event.output.Plain && event.output.Plain.text) || JSON.stringify(event.output);
+          out.textContent = event.is_error ? `[error] ${text}` : text;
+        }
+        break;
+      }
+      case "error": log.appendChild(el("msg error", event.message)); break;
+      case "done": {
+        log.appendChild(el("msg system", `— done (${event.num_turns ?? "?"} turns)`));
+        setStats({ context_size: event.context_size, context_window: event.context_window, cost: event.cost });
+        break;
+      }
+      case "turn_complete": {
+        if (event.usage) setStats({ token_usage: event.usage, cost: event.cost });
+        break;
+      }
+      case "permission_request": {
+        pendingPermission = event;
+        document.getElementById("perm-tool").textContent = event.tool;
+        document.getElementById("perm-scopes").textContent = (event.scopes || []).join(", ");
+        denyGuidance.value = "";
+        denyGuidance.style.display = "none";
+        permEl.style.display = "block";
+        break;
+      }
+      case "permission_resolved": {
+        if (pendingPermission && pendingPermission.id === event.id) {
+          pendingPermission = null;
+          permEl.style.display = "none";
+        }
+        break;
+      }
+      case "user_message": log.appendChild(el("msg user", event.text)); break;
+      case "assistant_text": {
+        const node = el("msg assistant", "");
+        node.dataset.kind = "assistant";
+        node.dataset.raw = event.text;
+        node.innerHTML = renderMarkdown(event.text);
+        log.appendChild(node);
+        break;
+      }
+    }
+    autoScroll();
+  };
+
+  // One pass over the snapshot's message list: the same shapes live events
+  // use, so rendering is the same code path.
+  const renderSnapshot = (snap) => {
+    log.replaceChildren();
+    if (snap.error) {
+      const bare = "/" + SHARE_TOKEN + "/";
+      const note = el("msg system", "this link points at a tab that is no longer live");
+      log.appendChild(note);
+      if (location.pathname.replace(/\/$/, "") !== bare.replace(/\/$/, "")) {
+        const back = document.createElement("a");
+        back.href = bare;
+        back.textContent = "open the whole instance instead";
+        note.appendChild(document.createElement("br"));
+        note.appendChild(back);
+      }
+      return;
+    }
+    for (const event of snap.messages || []) renderEvent(event);
+    // Snapshot tool cards arrive as start+result pairs; close them.
+    for (const details of log.querySelectorAll(".tool.running")) {
+      details.classList.remove("running");
+    }
+    if (snap.pending_permission) {
+      renderEvent({ type: "permission_request", id: snap.pending_permission.id, tool: "resuming" });
+    }
+    setHeader(snap);
+    if (Array.isArray(snap.queue) && snap.queue.length) {
+      log.appendChild(el("msg system", `— ${snap.queue.length} queued prompt(s)`));
+    }
+    // A fresh snapshot (first load or reconnect) always starts pinned to the
+    // bottom, same as opening the page; only later live updates respect scroll.
+    pinned = true;
+    scrollDown();
+  };
+
+  const setStatus = (status) => {
+    statusEl.dataset.status = status;
+    statusEl.textContent = status;
+    stopBtn.style.display = status === "working" ? "inline-block" : "none";
+  };
+
+  const connect = () => {
+    const es = new EventSource("events");
+    es.onopen = () => { connEl.dataset.conn = "live"; connEl.textContent = "live"; };
+    es.onerror = () => {
+      connEl.dataset.conn = "down";
+      connEl.textContent = "reconnecting";
+      es.close();
+      // Reconnect with a short delay. On a phone whose screen slept, the
+      // socket is gone but the page is still open; re-fetching the snapshot
+      // on reconnect restores the chat without a hard refresh.
+      setTimeout(() => { connect(); refreshSnapshot(); }, 2000);
+    };
+    for (const kind of ["snapshot", "event", "status", "permission", "permission_resolved"]) {
+      es.addEventListener(kind, (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          if (kind === "snapshot") renderSnapshot(data);
+          else if (kind === "event") renderEvent(data);
+          else if (kind === "status") setStatus(data);
+          else if (kind === "permission") renderEvent({ type: "permission_request", ...data });
+          else if (kind === "permission_resolved") renderEvent({ type: "permission_resolved", ...data });
+        } catch {}
+      });
+    }
+  };
+
+  // Re-fetch the current snapshot so a reconnect (e.g. after the phone screen
+  // slept) restores the full chat without a hard refresh.
+  const refreshSnapshot = async () => {
+    const snap = await fetchJson("snapshot");
+    if (snap) renderSnapshot(snap);
+  };
+
+  const submit = async (path, body) => {
+    try {
+      const res = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        try { const j = await res.json(); if (j.error) toast(j.error); } catch {}
+      }
+      return res.ok;
+    } catch { return false; }
+  };
+
+  const fetchJson = async (path) => {
+    try { const r = await fetch(path); if (!r.ok) return null; return await r.json(); } catch { return null; }
+  };
+
+  const postJson = async (path, body) => {
+    try {
+      const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      return await r.json().catch(() => (r.ok ? {} : { error: "failed" }));
+    } catch { return { error: "network" }; }
+  };
+
+  const sendPrompt = async () => {
+    const text = promptEl.value.trim();
+    if (!text && !pendingFiles.length) return;
+    const files = pendingFiles.splice(0).map(f => ({ name: f.name, media_type: f.mediaType, data: f.data, mode: f.mode }));
+    promptEl.value = "";
+    renderChips();
+    if (await submit("prompt", { text, files })) {
+      const label = text + (files.length ? ` (+${files.length} upload${files.length > 1 ? "s" : ""})` : "");
+      renderEvent({ type: "user_message", text: label });
+    }
+  };
+
+  const answerPermission = async (answer) => {
+    if (!pendingPermission) return;
+    if (answer === "deny" && denyGuidance.value.trim()) {
+      answer = "deny:" + denyGuidance.value.trim();
+    }
+    const requestId = pendingPermission.id;
+    pendingPermission = null;
+    permEl.style.display = "none";
+    await submit("answer", { request_id: requestId, answer });
+  };
+
+  const runCommand = async () => {
+    const cmdline = cmdInput.value.trim();
+    if (!cmdline) return;
+    const ok = await submit("command", { cmdline });
+    if (ok) { toast(`ran ${cmdline}`); cmdInput.value = ""; setTimeout(() => { refreshOptions(); refreshSessions(); }, 600); }
+  };
+  const setModel = async (spec) => {
+    if (!spec) return;
+    const j = await postJson("model", { spec });
+    if (j && j.spec) { toast(`model → ${j.spec}`); modelEl.textContent = j.spec; reflectModel(j.spec); }
+    else toast((j && j.error) || "model change failed");
+  };
+  const refreshSessions = async () => {
+    const data = await fetchJson("sessions");
+    if (!data || !Array.isArray(data.sessions)) return;
+    sessionsBar.replaceChildren();
+    const label = document.createElement("span");
+    label.textContent = "sessions:";
+    sessionsBar.appendChild(label);
+    // Page lives at /{token}/ or /{token}/s/{id}/; buttons open the target
+    // session's own scoped page, which pins every request to it.
+    const token = location.pathname.split('/')[1] || "";
+    for (const s of data.sessions) {
+      const b = document.createElement("button");
+      b.className = "sess mini" + (s.focused ? " focused" : "");
+      b.textContent = `${s.title || s.id.slice(0,8)} · ${s.model || ""}`;
+      b.title = s.id;
+      b.onclick = () => { location.href = `/${token}/s/${s.id}/`; };
+      sessionsBar.appendChild(b);
+    }
+    sessionsBar.style.display = data.sessions.length ? "flex" : "none";
+  };
+
+  // The model <select> is filtered by the provider <select> but always keeps
+  // the current spec, even when it belongs to a provider now filtered out.
+  const reflectModel = (spec) => {
+    if (!spec) return;
+    const want = providerSelect.value;
+    if (!want) modelSelect.value = spec;
+    if (modelSelect.value !== spec) {
+      const opt = document.createElement("option");
+      opt.value = spec; opt.textContent = spec; opt.dataset.current = "1";
+      modelSelect.prepend(opt);
+      modelSelect.value = spec;
+    }
+  };
+
+  const rebuildModelSelect = () => {
+    const current = modelEl.textContent;
+    const want = providerSelect.value;
+    modelSelect.replaceChildren();
+    for (const spec of allModels) {
+      if (want && !spec.startsWith(want + "/")) continue;
+      const o = document.createElement("option");
+      o.value = spec; o.textContent = spec;
+      modelSelect.appendChild(o);
+    }
+    if (current && ![...modelSelect.options].some((o) => o.value === current)) {
+      const o = document.createElement("option");
+      o.value = current; o.textContent = current; o.dataset.current = "1";
+      modelSelect.prepend(o);
+    }
+    if (current) modelSelect.value = current;
+  };
+
+  const refreshOptions = async () => {
+    const o = await fetchJson("options");
+    if (!o) return;
+    allModels = Array.isArray(o.models) ? o.models : allModels;
+    const known = [...new Set(allModels.map((s) => s.split("/")[0]))];
+    const keep = providerSelect.value;
+    providerSelect.replaceChildren();
+    const all = document.createElement("option");
+    all.value = ""; all.textContent = "all providers";
+    providerSelect.appendChild(all);
+    for (const p of (o.providers || known)) {
+      const opt = document.createElement("option");
+      opt.value = p; opt.textContent = p;
+      providerSelect.appendChild(opt);
+    }
+    providerSelect.value = keep;
+    modelEl.textContent = o.model || modelEl.textContent;
+    rebuildModelSelect();
+    if (o.mode) modeSelect.value = o.mode;
+    if (typeof o.yolo === "boolean") yoloCheck.checked = o.yolo;
+  };
+
+  const refreshCommands = async () => {
+    const list = await fetchJson("commands");
+    if (!Array.isArray(list)) return;
+    cmdList.replaceChildren();
+    for (const c of list) {
+      const o = document.createElement("option");
+      o.value = c.name;
+      o.label = c.description || "";
+      o.textContent = `${c.name} — ${c.description || ""}`;
+      cmdList.appendChild(o);
+    }
+  };
+
+  document.getElementById("send").onclick = sendPrompt;
+  document.getElementById("cmd-run").onclick = runCommand;
+  // ---- uploads ----------------------------------------------------------
+  const pendingFiles = [];
+  const MAX_UPLOAD = 16 * 1024 * 1024;
+  const chipsEl = document.getElementById("chips");
+  const fileInput = document.getElementById("file-input");
+  document.getElementById("btn-attach").onclick = () => fileInput.click();
+  const toBase64 = (file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",")[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+  const renderChips = () => {
+    chipsEl.innerHTML = "";
+    for (const [i, f] of pendingFiles.entries()) {
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      const name = document.createElement("span");
+      name.textContent = f.name;
+      const mode = document.createElement("select");
+      mode.title = "attach: send it to the model · save: drop it in the session's directory";
+      for (const [value, label] of [["attach", "attach"], ["save", "save"]]) {
+        const opt = document.createElement("option");
+        opt.value = value; opt.textContent = label; opt.selected = f.mode === value;
+        mode.appendChild(opt);
+      }
+      mode.onchange = () => { f.mode = mode.value; };
+      const drop = document.createElement("button");
+      drop.textContent = "×";
+      drop.onclick = () => { pendingFiles.splice(i, 1); renderChips(); };
+      chip.append(name, mode, drop);
+      chipsEl.appendChild(chip);
+    }
+  };
+  fileInput.onchange = async () => {
+    for (const file of fileInput.files) {
+      if (file.size > MAX_UPLOAD) { toast(`${file.name} is over 16MB`); continue; }
+      try {
+        pendingFiles.push({
+          name: file.name,
+          mediaType: file.type || "application/octet-stream",
+          data: await toBase64(file),
+          mode: (file.type || "").startsWith("image/") ? "attach" : "save",
+        });
+      } catch { toast(`could not read ${file.name}`); }
+    }
+    fileInput.value = "";
+    renderChips();
+  };
+
+  // ---- control center ---------------------------------------------------
+  const centerBtn = document.getElementById("center-btn");
+  const centerEl = document.getElementById("center");
+  let centerData = null;
+
+  const loadCenter = async () => {
+    const inst = await fetchJson("center");
+    let anchor = null;
+    if (isSharePage) {
+      try {
+        const r = await fetch(`/api/center?link=${SHARE_TOKEN}`, { headers: { accept: "application/json" } });
+        if (r.ok) anchor = await r.json();
+      } catch {}
+    }
+    centerData = { inst, anchor };
+    renderCenter();
+  };
+
+  const renderCenter = () => {
+    if (!centerData) { centerEl.innerHTML = "loading…"; return; }
+    const { inst, anchor } = centerData;
+    const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    let html = "";
+    const viewers = (inst && inst.viewers) || [];
+    html += `<h3>Watchers</h3>`;
+    if (!viewers.length) {
+      html += `<div class="row bad">nobody watching this instance right now</div>`;
+    } else {
+      for (const v of viewers) {
+        html += `<div class="row"><span class="ok">${esc(v.tag)}</span> <span style="color:var(--muted)">on ${v.session ? esc(v.session.slice(0, 8)) : "all tabs"}</span></div>`;
+      }
+    }
+    if (anchor) {
+      html += `<h3>Instance</h3><div class="row"><b>${esc(anchor.instance.name)}</b> <span class="${anchor.online ? "ok" : "bad"}">${anchor.online ? "online" : "offline"}</span> · you: ${esc(anchor.me ? anchor.me.name : "?")} (${esc(anchor.rights)})</div>`;
+      const tabs = [];
+      if (anchor.links) for (const l of anchor.links) {
+        const who = l.session ? `tab ${esc(l.session.slice(0, 8))}` : "all tabs";
+        const href = l.token ? `/${l.token}/${l.session ? "s/" + encodeURIComponent(l.session) + "/" : ""}` : "";
+        tabs.push(`<tr><td>${esc(l.rights)} · ${who}</td><td>${href ? `<a href="${href}" target="_blank">open</a>` : "—"}</td><td>${anchor.can_manage && l.hash ? `<button class="mini" data-revoke="${esc(l.hash)}">revoke</button>` : ""}</td></tr>`);
+      }
+      if (anchor.can_manage) {
+        html += `<h3>Invite</h3><div class="row"><select id="c-rights"><option value="view">view</option><option value="control">control</option></select><input id="c-hours" type="number" min="1" value="2" style="width:52px"><button class="mini" id="c-mint">create link</button></div><div id="c-invite"></div>`;
+        html += `<h3>Live links</h3><table>${tabs.join("")}</table><div class="row"><button class="mini" id="c-close">close this link</button> <button class="mini" id="c-qr">show QR</button></div>`;
+      } else {
+        html += `<div class="row" style="color:var(--muted)">signed in without manage rights</div>`;
+      }
+      html += `<div id="c-qr-slot"></div>`;
+    } else if (isSharePage) {
+      html += `<div class="row" style="color:var(--muted)">management needs an anchor sign-in; you are on a share link</div><div class="row"><button class="mini" id="c-qr">show QR</button></div><div id="c-qr-slot"></div>`;
+    } else {
+      html += `<div class="row" style="color:var(--muted)">this is not an anchor share page</div>`;
+    }
+    centerEl.innerHTML = html;
+    for (const b of centerEl.querySelectorAll("[data-revoke]")) {
+      b.onclick = async () => {
+        const r = await postJson("/api/links/revoke", { token_hash: b.dataset.revoke, link: SHARE_TOKEN });
+        if (r.error) toast(r.error); else loadCenter();
+      };
+    }
+    const mint = centerEl.querySelector("#c-mint");
+    if (mint) mint.onclick = async () => {
+      const rights = centerEl.querySelector("#c-rights").value;
+      const hours = Number(centerEl.querySelector("#c-hours").value || 2);
+      const r = await postJson("/api/links/mint", { link: SHARE_TOKEN, rights, hours });
+      if (r.error) { toast(r.error); return; }
+      const url = location.origin + r.path;
+      centerEl.querySelector("#c-invite").innerHTML = `<div class="row"><a href="${r.path}" target="_blank">${esc(r.path)}</a></div><img class="qr" src="/qr?text=${encodeURIComponent(url)}" width="120" height="120">`;
+    };
+    const close = centerEl.querySelector("#c-close");
+    if (close) close.onclick = async () => {
+      if (!confirm("Close this share link? Current viewers are dropped.")) return;
+      const r = await postJson("/api/links/close", { link: SHARE_TOKEN });
+      if (r.error) toast(r.error); else { centerEl.innerHTML = "<h3>Closed</h3><div class='row'>this link no longer works</div>"; }
+    };
+    for (const b of centerEl.querySelectorAll("#c-qr")) b.onclick = () => {
+      const slot = centerEl.querySelector("#c-qr-slot");
+      if (slot.firstChild) { slot.innerHTML = ""; return; }
+      const img = document.createElement("img");
+      img.className = "qr"; img.width = 140; img.height = 140;
+      img.src = `qr?text=${encodeURIComponent(location.href)}`;
+      slot.appendChild(img);
+    };
+  };
+
+  const qrPop = document.getElementById("qr-pop");
+  document.getElementById("qr-btn").onclick = (ev) => {
+    ev.stopPropagation();
+    if (!qrPop.hidden) { qrPop.hidden = true; return; }
+    qrPop.innerHTML = "";
+    const img = document.createElement("img");
+    img.className = "qr"; img.width = 168; img.height = 168;
+    img.src = `qr?text=${encodeURIComponent(location.href)}`;
+    const link = document.createElement("a");
+    link.href = location.href; link.textContent = location.pathname;
+    qrPop.append(img, link);
+    qrPop.hidden = false;
+  };
+  document.addEventListener("click", (ev) => {
+    if (!qrPop.hidden && !qrPop.contains(ev.target)) qrPop.hidden = true;
+  });
+
+  centerBtn.onclick = () => {
+    centerEl.hidden = !centerEl.hidden;
+    if (!centerEl.hidden) loadCenter();
+  };
+  document.addEventListener("click", (ev) => {
+    if (!centerEl.hidden && !centerEl.contains(ev.target) && ev.target !== centerBtn) centerEl.hidden = true;
+  });
+
+  document.getElementById("btn-fast").onclick = () => submit("command", { cmdline: "/fast" }).then(ok => ok && toast("toggled /fast"));
+  document.getElementById("btn-thinking").onclick = () => {
+    const v = prompt("thinking: off / adaptive / high / low (blank toggles)", "");
+    if (v !== null) submit("command", { cmdline: "/thinking " + v }).then(ok => ok && toast("thinking updated"));
+  };
+  document.getElementById("btn-new").onclick = () => submit("command", { cmdline: "/new" }).then(ok => ok && toast("new session"));
+  document.getElementById("btn-compact").onclick = () => submit("command", { cmdline: "/compact" }).then(ok => ok && toast("compact queued"));
+  cmdInput.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); runCommand(); } });
+  providerSelect.onchange = rebuildModelSelect;
+  modelSelect.onchange = () => { if (modelSelect.value) setModel(modelSelect.value); };
+  modeSelect.onchange = async () => {
+    const j = await postJson("options", { mode: modeSelect.value });
+    if (j && !j.error) toast(`mode: ${modeSelect.value}`); else { toast((j && j.error) || "mode change failed"); refreshOptions(); }
+  };
+  yoloCheck.onchange = async () => {
+    const j = await postJson("options", { yolo: yoloCheck.checked });
+    if (j && !j.error) toast(`yolo ${yoloCheck.checked ? "on" : "off"}`); else refreshOptions();
+  };
+  promptEl.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      // slash at start → route to command endpoint so autocomplete, model, etc. work from the main box too
+      const t = promptEl.value.trim();
+      if (t.startsWith("/")) { cmdInput.value = t; promptEl.value = ""; runCommand(); return; }
+      sendPrompt();
+    }
+  });
+  stopBtn.onclick = () => submit("stop", {});
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && statusEl.dataset.status === "working") submit("stop", {});
+  });
+  permEl.addEventListener("click", (ev) => {
+    const answer = ev.target?.dataset?.answer;
+    if (!answer) return;
+    if (answer === "deny") {
+      denyGuidance.style.display = denyGuidance.style.display === "none" ? "block" : "none";
+      if (!denyGuidance.value.trim()) return;
+    }
+    answerPermission(answer);
+  });
+
+  connect();
+  refreshOptions();
+  refreshCommands();
+  refreshSessions();
+  setInterval(() => { refreshSessions(); refreshOptions(); }, 8000);
+  promptEl.focus();
+})();
+</script>
+</body>
+</html>

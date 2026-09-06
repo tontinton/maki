@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use maki_storage::version::{self, VersionError};
 use maki_storage::{StateDir, StorageError};
 
-const INSTALL_SCRIPT_URL: &str = "https://maki.sh/install.sh";
 const BACKUP_FILENAME: &str = "maki_backup";
 const INSTALL_DIR_ENV: &str = "MAKI_INSTALL_DIR";
 
@@ -14,7 +13,7 @@ const INSTALL_DIR_ENV: &str = "MAKI_INSTALL_DIR";
 pub enum UpdateError {
     #[error("failed to fetch {url}: {source}")]
     Fetch {
-        url: &'static str,
+        url: String,
         #[source]
         source: isahc::Error,
     },
@@ -57,14 +56,15 @@ pub enum UpdateError {
 
 fn fetch_script() -> Result<String, UpdateError> {
     use isahc::ReadResponseExt;
-    isahc::get(INSTALL_SCRIPT_URL)
+    let url = version::install_script_url();
+    isahc::get(&url)
         .and_then(|mut r| r.text().map_err(Into::into))
         .map_err(|source| UpdateError::Fetch {
-            url: INSTALL_SCRIPT_URL,
+            url: url.clone(),
             source,
         })
         .or_else(|e| {
-            version::curl_fetch(INSTALL_SCRIPT_URL)
+            version::curl_fetch(&url)
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .map_err(|_| e)
         })
