@@ -248,8 +248,14 @@ impl Store {
         // handed out; links minted before this column only ever appear bare.
         let _ = conn.execute("ALTER TABLE links ADD COLUMN token_plain TEXT", []);
         // Full-transcript history: older DBs lack the columns, so add them.
-        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN transcript TEXT NOT NULL DEFAULT '[]'", []);
-        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN otr INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN transcript TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN otr INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN prune_after INTEGER", []);
         // Ensure unique index for local_username where not null (older DBs may not have it).
         let _ = conn.execute(
@@ -1116,7 +1122,10 @@ fn instance_id_by_name_locked(conn: &Connection, name: &str) -> Result<i64, Stor
 /// Escapes a user's search text for a `LIKE ... ESCAPE '\\'` clause and wraps
 /// it for a substring match, so `%`/`_` in the query can't widen the scan.
 fn like_pattern(query: &str) -> String {
-    let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let escaped = query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
     format!("%{escaped}%")
 }
 
@@ -1441,7 +1450,10 @@ mod tests {
         };
         store.upsert_session(&row).unwrap();
         let stored = store.sessions_for_instance(id).unwrap();
-        assert_eq!(stored[0].transcript.as_deref(), Some(r#"[{"type":"user_message","text":"hi"}]"#));
+        assert_eq!(
+            stored[0].transcript.as_deref(),
+            Some(r#"[{"type":"user_message","text":"hi"}]"#)
+        );
 
         // OTR clears the transcript.
         store.set_session_otr(id, "s1", true).unwrap();
@@ -1457,7 +1469,9 @@ mod tests {
                 ..row
             })
             .unwrap();
-        store.set_session_prune(id, "s1", Some(now_unix() - 1)).unwrap();
+        store
+            .set_session_prune(id, "s1", Some(now_unix() - 1))
+            .unwrap();
         assert_eq!(store.prune_expired_transcripts().unwrap(), 1);
         let stored = store.sessions_for_instance(id).unwrap();
         assert_eq!(stored[0].transcript.as_deref(), Some("[]"));

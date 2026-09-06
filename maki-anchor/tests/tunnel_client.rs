@@ -361,12 +361,7 @@ fn tunnel_client_serves_index_sse_and_prompt_through_anchor() {
         &format!("/{scoped_token}/s/e2e-session/qr?text={scoped_qr_text}"),
         &[],
     );
-    assert_eq!(
-        status,
-        200,
-        "scoped qr: {}",
-        String::from_utf8_lossy(&body)
-    );
+    assert_eq!(status, 200, "scoped qr: {}", String::from_utf8_lossy(&body));
     assert!(
         String::from_utf8_lossy(&body).contains("svg"),
         "scoped qr body: {:.120}",

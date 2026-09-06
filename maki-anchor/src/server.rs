@@ -1089,10 +1089,18 @@ fn render_session_page(
 ) -> RouteOutcome {
     let (instance, session) = match rest.split_once('/') {
         Some((i, s)) => (i, s),
-        None => return buffered((404, "text/plain".to_string(), b"not found".to_vec()), request),
+        None => {
+            return buffered(
+                (404, "text/plain".to_string(), b"not found".to_vec()),
+                request,
+            );
+        }
     };
     let Ok(instance_row) = store.instance_by_name(instance) else {
-        return buffered((404, "text/plain".to_string(), b"unknown instance".to_vec()), request);
+        return buffered(
+            (404, "text/plain".to_string(), b"unknown instance".to_vec()),
+            request,
+        );
     };
     if !can_manage_session(store, user, instance_row.id) {
         return buffered(
@@ -1104,9 +1112,14 @@ fn render_session_page(
             request,
         );
     }
-    let sessions = store.sessions_for_instance(instance_row.id).unwrap_or_default();
+    let sessions = store
+        .sessions_for_instance(instance_row.id)
+        .unwrap_or_default();
     let Some(row) = sessions.into_iter().find(|s| s.external_id == session) else {
-        return buffered((404, "text/plain".to_string(), b"session not found".to_vec()), request);
+        return buffered(
+            (404, "text/plain".to_string(), b"session not found".to_vec()),
+            request,
+        );
     };
     let otr = row.otr.unwrap_or(false);
     let transcript: Vec<serde_json::Value> = if otr {
@@ -2655,20 +2668,14 @@ fn json_search_sessions_for(
 }
 
 /// Resolve an instance name to its id, or 404.
-fn instance_id_or_404(
-    store: &Store,
-    instance: &str,
-) -> Result<i64, (u16, String, Vec<u8>)> {
-    store
-        .instance_by_name(instance)
-        .map(|r| r.id)
-        .map_err(|_| {
-            (
-                404,
-                "application/json".to_string(),
-                br#"{"error":"unknown instance"}"#.to_vec(),
-            )
-        })
+fn instance_id_or_404(store: &Store, instance: &str) -> Result<i64, (u16, String, Vec<u8>)> {
+    store.instance_by_name(instance).map(|r| r.id).map_err(|_| {
+        (
+            404,
+            "application/json".to_string(),
+            br#"{"error":"unknown instance"}"#.to_vec(),
+        )
+    })
 }
 
 /// A logged-in user may manage a session only if they are an admin or hold a
@@ -2680,11 +2687,7 @@ fn can_manage_session(
 ) -> bool {
     match user {
         Some(u) if u.is_admin => true,
-        Some(u) => store
-            .grant_for(u.id, instance_id)
-            .ok()
-            .flatten()
-            .is_some(),
+        Some(u) => store.grant_for(u.id, instance_id).ok().flatten().is_some(),
         None => false,
     }
 }
@@ -2714,7 +2717,10 @@ fn handle_api_session_delete(
         return json_error(request, 403, "no access to this instance");
     }
     match store.delete_session(instance_id, session) {
-        Ok(true) => buffered(center_json(200, serde_json::json!({"deleted": true})), request),
+        Ok(true) => buffered(
+            center_json(200, serde_json::json!({"deleted": true})),
+            request,
+        ),
         Ok(false) => json_error(request, 404, "session not found"),
         Err(err) => json_error(request, 500, &err.to_string()),
     }
