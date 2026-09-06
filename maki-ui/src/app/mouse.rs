@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::clipboard::CopyResult;
+use crate::components::scrollbar;
 use crate::selection::{
     self, ContentRegion, DocPos, EdgeScroll, RowPos, ScreenSelection, Selection, SelectionState,
     SelectionZone,
@@ -206,8 +207,12 @@ impl App {
                     self.selection_state = None;
                     return;
                 };
+                let mut area = sel.area;
+                if scrollbar::is_enabled() {
+                    area.width = area.width.saturating_sub(1);
+                }
                 let regions = [ContentRegion {
-                    area: sel.area,
+                    area,
                     ..Default::default()
                 }];
                 selection::extract_selected_text(buf, &screen_sel, &regions)

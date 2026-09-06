@@ -1,7 +1,7 @@
 use crate::components::ModalScroll;
 use crate::components::Overlay;
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::render_vertical_scrollbar_in_border;
 use crate::components::streaming_content::StreamingContent;
 use crate::components::tool_display::{assistant_style, thinking_indicator, thinking_style};
 use crate::theme;
@@ -172,7 +172,7 @@ impl BtwModal {
         frame.render_widget(paragraph, padded);
 
         if total > viewport_h {
-            render_vertical_scrollbar(frame, inner, u32::from(total), u32::from(scroll));
+            render_vertical_scrollbar_in_border(frame, inner, u32::from(total), u32::from(scroll));
         }
 
         popup
