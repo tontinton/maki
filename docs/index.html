@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>maki anchor — remote control for maki</title>
+<meta name="description" content="A fork of maki that adds remote control over the web and a self-hosted anchor server for a fleet of instances.">
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161922;
+    --panel-2: #1c202b;
+    --border: #262b38;
+    --text: #d9dde5;
+    --muted: #8b93a5;
+    --accent: #7aa2f7;
+    --accent-2: #9ece6a;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  a { color: var(--accent); }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+  header.top {
+    position: sticky; top: 0; z-index: 20;
+    background: rgba(15,17,21,.85); backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  header.top .wrap { display: flex; align-items: center; gap: 20px; padding: 14px 20px; }
+  .brand { font-weight: 700; letter-spacing: -.01em; margin-right: auto; }
+  .brand .mono { color: var(--accent-2); }
+  nav.top-nav { display: flex; gap: 18px; font-size: 14px; flex-wrap: wrap; }
+  nav.top-nav a { color: var(--muted); text-decoration: none; }
+  nav.top-nav a:hover { color: var(--text); }
+
+  .hero { padding: 64px 0 40px; text-align: center; }
+  .hero img.banner { max-width: 100%; width: 640px; border-radius: 14px; border: 1px solid var(--border); box-shadow: 0 20px 60px rgba(0,0,0,.4); }
+  .hero h1 { font-size: clamp(28px, 4vw, 42px); margin: 32px 0 12px; letter-spacing: -.02em; }
+  .hero p.tagline { color: var(--muted); font-size: 18px; max-width: 640px; margin: 0 auto 28px; }
+  .cta-row { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 10px 18px; border-radius: 8px; font-size: 14px; font-weight: 600;
+    text-decoration: none; border: 1px solid var(--border);
+  }
+  .btn.primary { background: var(--accent); color: #0f1115; border-color: var(--accent); }
+  .btn.primary:hover { filter: brightness(1.08); }
+  .btn.ghost { color: var(--text); }
+  .btn.ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+  section { padding: 56px 0; border-top: 1px solid var(--border); }
+  section > .wrap > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 28px; }
+
+  .feature-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 720px) { .feature-grid { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 24px;
+  }
+  .card h3 { margin: 0 0 6px; font-size: 18px; }
+  .card p.sub { color: var(--muted); margin: 0 0 16px; font-size: 14px; }
+  .card ul { margin: 0; padding-left: 20px; color: var(--text); font-size: 14.5px; }
+  .card li { margin: 6px 0; }
+  .card li::marker { color: var(--accent-2); }
+
+  .shots { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 720px) { .shots { grid-template-columns: 1fr; } }
+  figure { margin: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  figure img { display: block; width: 100%; height: auto; border-bottom: 1px solid var(--border); }
+  figcaption { padding: 12px 14px; color: var(--muted); font-size: 13.5px; }
+
+  pre {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 18px; overflow-x: auto; font-size: 13.5px; line-height: 1.55;
+  }
+  pre .c { color: var(--muted); }
+  .quickstart-grid { display: grid; gap: 14px; }
+
+  .credit {
+    background: linear-gradient(180deg, var(--panel), var(--panel-2));
+    border: 1px solid var(--border); border-radius: 14px; padding: 32px;
+  }
+  .credit h2 { margin-top: 0; font-size: 20px; color: var(--text); text-transform: none; letter-spacing: normal; }
+  .credit p { color: var(--muted); max-width: 720px; }
+  .credit .btn { margin-top: 8px; }
+
+  footer.bottom { padding: 32px 0 60px; }
+  footer.bottom .wrap {
+    display: flex; gap: 16px; flex-wrap: wrap; align-items: center;
+    color: var(--muted); font-size: 13.5px; border-top: 1px solid var(--border); padding-top: 24px;
+  }
+  footer.bottom a { color: var(--muted); }
+  footer.bottom a:hover { color: var(--accent); }
+  footer.bottom .ver { margin-left: auto; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <div class="brand">maki <span class="mono">anchor</span></div>
+    <nav class="top-nav">
+      <a href="#features">Features</a>
+      <a href="#screenshots">Screenshots</a>
+      <a href="#quickstart">Quick start</a>
+      <a href="https://github.com/wmantly/maki" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/tontinton/maki/pull/953" target="_blank" rel="noopener">Upstream PR</a>
+    </nav>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="wrap">
+    <img class="banner" src="./assets/banner.jpg" alt="maki banner">
+    <h1>Prompt your coding agent from your phone.</h1>
+    <p class="tagline">
+      A fork of <a href="https://github.com/tontinton/maki" target="_blank" rel="noopener">maki</a> that adds
+      web-based remote control and a self-hosted anchor server, so one login gets you a dashboard over every
+      instance you run — laptop, homelab, or a box in the cloud.
+    </p>
+    <div class="cta-row">
+      <a class="btn primary" href="https://github.com/wmantly/maki" target="_blank" rel="noopener">View on GitHub</a>
+      <a class="btn ghost" href="https://maki.sh/docs/anchor/" target="_blank" rel="noopener">Read the anchor docs</a>
+      <a class="btn ghost" href="https://github.com/tontinton/maki/pull/953" target="_blank" rel="noopener">See the upstream PR</a>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <h2>What this fork adds</h2>
+    <div class="feature-grid">
+      <div class="card">
+        <h3>Remote control — <span class="mono">/rc</span></h3>
+        <p class="sub">A web UI that mirrors a running session, live.</p>
+        <ul>
+          <li>Full transcript, thinking, and tool calls with results — streamed as they happen</li>
+          <li>Prompt, answer permission requests, switch models, and stop runs from the browser</li>
+          <li>Standalone (local bind) or tunneled through an anchor, with no inbound port needed</li>
+          <li>Mobile-friendly: markdown rendering, a compact mode, and pinned auto-scroll</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="mono">maki-anchor</span></h3>
+        <p class="sub">One domain, one dashboard, one login for a whole fleet.</p>
+        <ul>
+          <li>OIDC SSO (Authelia, Authentik, Keycloak, Pocket ID, …) or local accounts</li>
+          <li>Per-user, per-instance grants — viewer or controller</li>
+          <li>Share links with rights and expiry, rendered as a QR code</li>
+          <li>Full session transcripts, persisted, searchable, with delete / off-the-record / prune</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="screenshots">
+  <div class="wrap">
+    <h2>Screenshots</h2>
+    <div class="shots">
+      <figure>
+        <img src="./assets/anchor-dashboard.jpg" alt="Anchor dashboard showing sessions with search">
+        <figcaption>Fleet dashboard — every session across every instance, searchable by title or transcript.</figcaption>
+      </figure>
+      <figure>
+        <img src="./assets/remote-terminal.jpg" alt="Remote terminal showing a live session">
+        <figcaption>The remote terminal — transcript, model picker, and command toolbar.</figcaption>
+      </figure>
+      <figure>
+        <img src="./assets/remote-terminal-compact.jpg" alt="Remote terminal in compact mobile mode">
+        <figcaption>Compact mode, for when the screen is a phone.</figcaption>
+      </figure>
+      <figure>
+        <img src="./assets/remote-terminal-qr.jpg" alt="QR code popup for the page link">
+        <figcaption>One tap turns the current link into a scannable QR code.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section id="quickstart">
+  <div class="wrap">
+    <h2>Quick start</h2>
+    <div class="quickstart-grid">
+      <pre><span class="c"># On the server: install or update maki-anchor as a systemd service.</span>
+curl -fsSL https://raw.githubusercontent.com/wmantly/maki/main/install-anchor.sh | sh
+
+<span class="c"># Register an instance and copy the printed one-liner for its host.</span>
+maki-anchor tokens add work-laptop</pre>
+      <pre><span class="c">-- In ~/.config/maki/init.lua on the instance host.</span>
+maki.setup {
+  anchor = {
+    url = "https://maki.example.com",
+    name = "work-laptop",
+    token = "&lt;token from tokens add&gt;",
+  },
+}</pre>
+      <p style="color:var(--muted); font-size:14.5px;">
+        Now <span class="mono">/rc</span> prints an anchor link instead of binding a local port.
+        Full setup, SSO, grants, and share links are in the
+        <a href="https://maki.sh/docs/anchor/" target="_blank" rel="noopener">anchor docs</a>.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="credit">
+      <h2>Built on maki</h2>
+      <p>
+        This repo is a fork of <a href="https://github.com/tontinton/maki" target="_blank" rel="noopener">tontinton/maki</a> —
+        an AI coding agent for the terminal, built for minimal context-token use: fast startup, a tree-sitter-based
+        permission system, subagents, Lua plugins, and support for a long list of model providers, all without a
+        JavaScript runtime in sight. Remote control and the anchor server are additions layered on top; everything
+        else in this repository is upstream's work. If you just want the agent itself, start there.
+      </p>
+      <a class="btn ghost" href="https://github.com/tontinton/maki" target="_blank" rel="noopener">tontinton/maki →</a>
+    </div>
+  </div>
+</section>
+
+<footer class="bottom">
+  <div class="wrap">
+    <a href="https://github.com/tontinton/maki" target="_blank" rel="noopener">maki original</a>
+    <a href="https://github.com/wmantly/maki" target="_blank" rel="noopener">maki anchor fork</a>
+    <a href="https://github.com/wmantly/maki/releases" target="_blank" rel="noopener">releases</a>
+    <a href="https://github.com/tontinton/maki/pull/953" target="_blank" rel="noopener">upstream PR #953</a>
+    <a href="https://community.theta42.com/" target="_blank" rel="noopener">brought to you by Theta42 community</a>
+    <span class="ver mono">maki anchor</span>
+  </div>
+</footer>
+
+</body>
+</html>
