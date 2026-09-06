@@ -521,6 +521,31 @@ fn handle_request(
             let _ = reply.send(value);
             Ok(vec![])
         }
+        RemoteRequest::FilesList { path, reply, .. } => {
+            let _ = reply.send(app.remote_files_list(&path));
+            Ok(vec![])
+        }
+        RemoteRequest::FileRead { path, reply, .. } => {
+            let _ = reply.send(app.remote_file_read(&path));
+            Ok(vec![])
+        }
+        RemoteRequest::FileWrite {
+            path,
+            content,
+            reply,
+            ..
+        } => {
+            let _ = reply.send(app.remote_file_write(&path, &content));
+            Ok(vec![])
+        }
+        RemoteRequest::GitStatus { reply, .. } => {
+            let _ = reply.send(app.remote_git_status());
+            Ok(vec![])
+        }
+        RemoteRequest::GitDiff { path, reply, .. } => {
+            let _ = reply.send(app.remote_git_diff(&path));
+            Ok(vec![])
+        }
     };
     outcome.unwrap_or_default()
 }
@@ -534,6 +559,15 @@ fn reject(request: RemoteRequest, reason: &str) {
             let _ = reply.send(Err(reason.to_owned()));
         }
         RemoteRequest::ModelSet { reply, .. } => {
+            let _ = reply.send(Err(reason.to_owned()));
+        }
+        RemoteRequest::FilesList { reply, .. }
+        | RemoteRequest::FileRead { reply, .. }
+        | RemoteRequest::GitStatus { reply, .. }
+        | RemoteRequest::GitDiff { reply, .. } => {
+            let _ = reply.send(Err(reason.to_owned()));
+        }
+        RemoteRequest::FileWrite { reply, .. } => {
             let _ = reply.send(Err(reason.to_owned()));
         }
         RemoteRequest::Sessions { reply }

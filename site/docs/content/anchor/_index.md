@@ -175,6 +175,29 @@ tells the agent where it landed. Each chip toggles between the two modes.
 `/rc` and the link pages render the share URL as a QR, scannable straight off
 the terminal.
 
+## File explorer
+
+The `files` button in the header slides out a panel over the transcript: a
+gitignore-aware tree of the session's working directory, lazy-loaded one
+level at a time so a large repo never pays to list itself up front. If the
+directory is a git repo, each entry carries its `git status --porcelain`
+code (`M`, `??`, `D`, ...) and the panel's own header shows the current
+branch.
+
+Open a file to read it. Markdown renders by default, with an "edit source"
+toggle to drop to the raw text; anything else opens straight into a plain
+text editor. A `diff` button swaps in the file's unified git diff — tracked
+changes diff against the index, untracked files diff against `/dev/null` (via
+`git diff --no-index`) so a brand new file still shows what it adds. `save`
+writes the edit straight to disk over the same tunnel as everything else, no
+separate upload step.
+
+Reads are capped at 1.5MB and a directory listing at 4000 entries; anything
+larger reports its size instead of trying to render. Every path is resolved
+and canonicalized against the session's working directory before it touches
+disk, so a link or a crafted path can't read or write outside the project
+root.
+
 ## Login and roles
 
 A fresh anchor opens on a setup page: the first username and password you

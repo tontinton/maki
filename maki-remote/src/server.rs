@@ -101,6 +101,39 @@ pub enum RemoteRequest {
         mode: Option<String>,
         reply: Sender<serde_json::Value>,
     },
+    /// One level of a directory under the session's cwd, for the file panel.
+    /// `path` is relative to cwd (empty string for the root).
+    FilesList {
+        session: Option<String>,
+        path: String,
+        reply: Sender<Result<serde_json::Value, String>>,
+    },
+    /// A file's content, capped and UTF-8 checked, for the file panel's viewer.
+    FileRead {
+        session: Option<String>,
+        path: String,
+        reply: Sender<Result<serde_json::Value, String>>,
+    },
+    /// Overwrite an existing file's content from the file panel's editor.
+    FileWrite {
+        session: Option<String>,
+        path: String,
+        content: String,
+        reply: Sender<Result<(), String>>,
+    },
+    /// `git status --porcelain` under the session's cwd, for badges in the
+    /// file panel's tree.
+    GitStatus {
+        session: Option<String>,
+        reply: Sender<Result<serde_json::Value, String>>,
+    },
+    /// A unified diff for one file against `HEAD` (or the whole file, marked
+    /// added, when it's untracked).
+    GitDiff {
+        session: Option<String>,
+        path: String,
+        reply: Sender<Result<serde_json::Value, String>>,
+    },
 }
 
 impl RemoteRequest {
@@ -116,7 +149,12 @@ impl RemoteRequest {
             | Self::Snapshot { session, .. }
             | Self::Commands { session, .. }
             | Self::Options { session, .. }
-            | Self::SetOptions { session, .. } => session.as_deref(),
+            | Self::SetOptions { session, .. }
+            | Self::FilesList { session, .. }
+            | Self::FileRead { session, .. }
+            | Self::FileWrite { session, .. }
+            | Self::GitStatus { session, .. }
+            | Self::GitDiff { session, .. } => session.as_deref(),
             Self::Sessions { .. } => None,
         }
     }

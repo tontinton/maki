@@ -9,6 +9,7 @@ mod image_paste;
 pub(crate) mod mode;
 mod mouse;
 mod queue;
+pub(crate) mod remote_fs;
 mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;

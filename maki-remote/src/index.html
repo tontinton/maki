@@ -233,6 +233,72 @@
   body.compact #inputrow { padding: 6px 10px; }
   body.compact #prompt { height: 36px; padding: 6px; }
   #compact-toggle { cursor: pointer; }
+
+  /* File panel: slides out from the left over the transcript. */
+  #files-backdrop {
+    position: fixed; inset: 0; z-index: 89;
+    background: rgba(0,0,0,.4);
+  }
+  #files-panel {
+    position: fixed; top: 0; left: 0; bottom: 0; z-index: 90;
+    width: min(380px, 92vw);
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    box-shadow: 4px 0 24px rgba(0,0,0,.35);
+    display: flex; flex-direction: column;
+    transform: translateX(-100%);
+    transition: transform .18s ease;
+  }
+  #files-panel.open { transform: translateX(0); }
+  #files-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px; border-bottom: 1px solid var(--border);
+  }
+  #files-head #files-branch { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #files-head .mini:last-child { margin-left: auto; }
+  #files-tree {
+    flex: 1; overflow-y: auto; padding: 6px 0;
+    font-size: 13px;
+  }
+  .files-row {
+    display: flex; align-items: center; gap: 6px;
+    padding: 3px 10px; cursor: pointer; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .files-row:hover { background: var(--panel-2, rgba(255,255,255,.05)); }
+  .files-row .files-icon { color: var(--muted); width: 1em; flex: none; }
+  .files-row .files-name { overflow: hidden; text-overflow: ellipsis; }
+  .files-row .files-git {
+    margin-left: auto; flex: none; font-size: 10px; font-weight: 700;
+    border-radius: 3px; padding: 0 4px; line-height: 1.5;
+  }
+  .files-git[data-code="M"] { color: var(--accent); }
+  .files-git[data-code="A"], .files-git[data-code="??"] { color: var(--user); }
+  .files-git[data-code="D"] { color: var(--error); }
+  .files-git[data-code="R"] { color: var(--tool); }
+  .files-git[data-code="*"] { color: var(--muted); }
+  .files-children { padding-left: 14px; display: none; }
+  .files-children.open { display: block; }
+  .files-empty { color: var(--muted); padding: 6px 12px; font-size: 12px; }
+  #files-view { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  #files-view-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px; border-bottom: 1px solid var(--border);
+  }
+  #files-view-head .spacer { flex: 1; }
+  #files-view-path { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #files-view-body { flex: 1; overflow: auto; padding: 10px 12px; }
+  #files-view-body textarea {
+    width: 100%; height: 100%; min-height: 200px; resize: none;
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  #files-view-body .msg.assistant { white-space: normal; }
+  .files-diff { font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+  .files-diff .add { color: var(--user); }
+  .files-diff .del { color: var(--error); }
+  .files-diff .hunk { color: var(--tool); }
+  .files-note { color: var(--muted); font-size: 12.5px; }
 </style>
 </head>
 <body>
@@ -245,6 +311,7 @@
   <span id="stats"></span>
   <span id="conn" data-conn="down">connecting</span>
   <div id="center-wrap">
+    <button class="mini" id="files-btn" title="Browse files">files</button>
     <button class="mini" id="toolbar-toggle" title="Hide/show the toolbar to save space">tools ▾</button>
     <button class="mini" id="compact-toggle" title="Shrink the headers to save space">compact</button>
     <button class="mini" id="qr-btn" title="QR code for this page's link">QR</button>
@@ -252,6 +319,26 @@
     <div id="center" hidden></div>
   </div>
 </header>
+<div id="files-backdrop" hidden></div>
+<aside id="files-panel" aria-hidden="true">
+  <div id="files-head">
+    <strong id="files-title">Files</strong>
+    <span id="files-branch" class="small"></span>
+    <button class="mini" id="files-refresh" title="Refresh">↻</button>
+    <button class="mini" id="files-close" title="Close">×</button>
+  </div>
+  <div id="files-tree" role="tree"></div>
+  <div id="files-view" hidden>
+    <div id="files-view-head">
+      <button class="mini" id="files-back" title="Back to tree">← tree</button>
+      <span id="files-view-path" class="mono"></span>
+      <span class="spacer"></span>
+      <button class="mini" id="files-toggle-diff" title="Show what changed" hidden>diff</button>
+      <button class="mini primary" id="files-save" title="Save changes" hidden>save</button>
+    </div>
+    <div id="files-view-body"></div>
+  </div>
+</aside>
 <div id="toolbar">
   <input id="cmd-input" list="cmd-list" placeholder="/command — type to filter, Enter to run">
   <button class="mini" id="cmd-run">Run</button>
@@ -766,6 +853,189 @@
       const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       return await r.json().catch(() => (r.ok ? {} : { error: "failed" }));
     } catch { return { error: "network" }; }
+  };
+
+  // ---- file panel ---------------------------------------------------------
+  // Slides out from the left: a gitignore-aware tree (server-side, jailed to
+  // the session's cwd), a viewer/editor per file (markdown renders through
+  // the same renderer the transcript uses), and a diff view against HEAD.
+  // Reading needs only the link's own rights; saving is a plain POST, so a
+  // view-only link gets the same 403-and-toast every other write does.
+  const filesBtn = document.getElementById("files-btn");
+  const filesBackdrop = document.getElementById("files-backdrop");
+  const filesPanel = document.getElementById("files-panel");
+  const filesTree = document.getElementById("files-tree");
+  const filesView = document.getElementById("files-view");
+  const filesViewBody = document.getElementById("files-view-body");
+  const filesViewPath = document.getElementById("files-view-path");
+  const filesBranchEl = document.getElementById("files-branch");
+  const filesSaveBtn = document.getElementById("files-save");
+  const filesDiffBtn = document.getElementById("files-toggle-diff");
+  const filesBackBtn = document.getElementById("files-back");
+
+  let filesOpen = false;
+  let currentFile = null; // { path, content, binary, tooLarge, editing }
+  let showingDiff = false;
+
+  const isMarkdownPath = (p) => /\.(md|markdown)$/i.test(p);
+
+  const openFilesPanel = () => {
+    filesOpen = true;
+    filesPanel.classList.add("open");
+    filesPanel.setAttribute("aria-hidden", "false");
+    filesBackdrop.hidden = false;
+    if (!filesTree.dataset.loaded) loadFilesTree();
+    fetchJson("git/status").then((status) => {
+      filesBranchEl.textContent = status && status.is_repo && status.branch ? `⎇ ${status.branch}` : "";
+    });
+  };
+  const closeFilesPanel = () => {
+    filesOpen = false;
+    filesPanel.classList.remove("open");
+    filesPanel.setAttribute("aria-hidden", "true");
+    filesBackdrop.hidden = true;
+  };
+  filesBtn.onclick = () => (filesOpen ? closeFilesPanel() : openFilesPanel());
+  document.getElementById("files-close").onclick = closeFilesPanel;
+  filesBackdrop.onclick = closeFilesPanel;
+
+  const gitBadge = (code) => code
+    ? `<span class="files-git" data-code="${escHtml(code)}">${escHtml(code)}</span>`
+    : "";
+
+  // Each row is built fresh per directory fetch; a directory's `<div>` of
+  // children is lazy — nothing under it loads until it's actually expanded.
+  const filesRow = (entry, parentPath) => {
+    const row = document.createElement("div");
+    row.className = "files-row";
+    row.setAttribute("role", "treeitem");
+    const fullPath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
+    row.innerHTML = `<span class="files-icon">${entry.is_dir ? "▸" : "·"}</span>` +
+      `<span class="files-name">${escHtml(entry.name)}</span>${gitBadge(entry.git)}`;
+    if (!entry.is_dir) {
+      row.onclick = () => openFile(fullPath);
+      return [row];
+    }
+    const children = document.createElement("div");
+    children.className = "files-children";
+    row.onclick = () => {
+      const icon = row.querySelector(".files-icon");
+      const isOpen = children.classList.toggle("open");
+      icon.textContent = isOpen ? "▾" : "▸";
+      if (isOpen && !children.dataset.loaded) {
+        children.dataset.loaded = "1";
+        loadFilesInto(children, fullPath);
+      }
+    };
+    return [row, children];
+  };
+
+  const loadFilesInto = async (container, path) => {
+    container.innerHTML = `<div class="files-empty">loading…</div>`;
+    const data = await fetchJson(`files?path=${encodeURIComponent(path)}`);
+    container.innerHTML = "";
+    if (!data || !Array.isArray(data.entries) || !data.entries.length) {
+      container.innerHTML = `<div class="files-empty">${data ? "empty" : "failed to load"}</div>`;
+      return;
+    }
+    for (const entry of data.entries) {
+      for (const el of filesRow(entry, path)) container.appendChild(el);
+    }
+  };
+
+  const loadFilesTree = () => {
+    filesTree.dataset.loaded = "1";
+    loadFilesInto(filesTree, "");
+  };
+  document.getElementById("files-refresh").onclick = () => {
+    delete filesTree.dataset.loaded;
+    loadFilesTree();
+  };
+
+  const diffLineClass = (line) => {
+    if (line.startsWith("+") && !line.startsWith("+++")) return "add";
+    if (line.startsWith("-") && !line.startsWith("---")) return "del";
+    if (line.startsWith("@@")) return "hunk";
+    return "";
+  };
+
+  const renderFileBody = () => {
+    if (!currentFile) return;
+    filesDiffBtn.hidden = false;
+    filesDiffBtn.textContent = showingDiff ? "content" : "diff";
+    filesSaveBtn.hidden = showingDiff || currentFile.binary || currentFile.tooLarge;
+    if (showingDiff) {
+      filesViewBody.innerHTML = `<div class="files-note">loading diff…</div>`;
+      fetchJson(`git/diff?path=${encodeURIComponent(currentFile.path)}`).then((d) => {
+        if (!d || !d.diff) {
+          filesViewBody.innerHTML = `<div class="files-note">no changes against HEAD</div>`;
+          return;
+        }
+        const lines = d.diff.split("\n")
+          .map((line) => `<div class="${diffLineClass(line)}">${escHtml(line) || " "}</div>`)
+          .join("");
+        filesViewBody.innerHTML = `<div class="files-diff">${lines}</div>`;
+      });
+      return;
+    }
+    if (currentFile.binary) {
+      filesViewBody.innerHTML = `<div class="files-note">binary file — not shown</div>`;
+      return;
+    }
+    if (currentFile.tooLarge) {
+      filesViewBody.innerHTML = `<div class="files-note">file too large to display here (over 1.5MB)</div>`;
+      return;
+    }
+    if (isMarkdownPath(currentFile.path) && !currentFile.editing) {
+      const node = el("msg assistant", "");
+      node.innerHTML = renderMarkdown(currentFile.content);
+      const editBtn = document.createElement("button");
+      editBtn.className = "mini";
+      editBtn.textContent = "edit source";
+      editBtn.style.marginTop = "8px";
+      editBtn.onclick = () => { currentFile.editing = true; renderFileBody(); };
+      filesViewBody.replaceChildren(node, editBtn);
+      return;
+    }
+    const ta = document.createElement("textarea");
+    ta.value = currentFile.content;
+    ta.spellcheck = false;
+    ta.oninput = () => { currentFile.content = ta.value; };
+    filesViewBody.replaceChildren(ta);
+  };
+
+  const openFile = async (path) => {
+    filesViewPath.textContent = path;
+    filesViewBody.innerHTML = `<div class="files-note">loading…</div>`;
+    filesTree.hidden = true;
+    filesView.hidden = false;
+    showingDiff = false;
+    const data = await fetchJson(`file?path=${encodeURIComponent(path)}`);
+    if (!data) {
+      filesViewBody.innerHTML = `<div class="files-note">failed to load</div>`;
+      currentFile = null;
+      return;
+    }
+    currentFile = {
+      path,
+      content: data.content || "",
+      binary: !!data.binary,
+      tooLarge: !!data.too_large,
+      editing: false,
+    };
+    renderFileBody();
+  };
+
+  filesBackBtn.onclick = () => {
+    filesView.hidden = true;
+    filesTree.hidden = false;
+    currentFile = null;
+  };
+  filesDiffBtn.onclick = () => { showingDiff = !showingDiff; renderFileBody(); };
+  filesSaveBtn.onclick = async () => {
+    if (!currentFile) return;
+    const r = await postJson("file", { path: currentFile.path, content: currentFile.content });
+    toast(r && r.error ? r.error : "saved");
   };
 
   const sendPrompt = async () => {

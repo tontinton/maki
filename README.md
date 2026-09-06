@@ -2,6 +2,16 @@
 
 ## About this fork
 
+I've used the remote-control features in Claude Code and in Oh My Pi (OMP)
+and found both genuinely useful — being able to walk away from my computer
+and still drive a session, or hand it off entirely, is a real workflow
+upgrade. What I kept running into with OMP was that its terminal proxy
+server isn't something you can self-host, which bugged me on both privacy
+and safety grounds: a session with control over my machine, brokered by
+infrastructure I don't run. So this fork adds the same kind of remote
+control to maki, plus a self-hosted proxy (what we call the anchor) so the
+whole path stays under your own roof.
+
 This fork adds remote control over the web, built for running maki on many
 hosts with one shared entry point:
 
@@ -10,6 +20,10 @@ hosts with one shared entry point:
   session: full transcript, thinking, tool calls with results, model, context
   and cost stats. You can prompt, answer permission requests, and stop runs
   from the browser.
+* **File explorer** - a git-aware file panel slides out from the terminal
+  page: gitignore-respecting tree, per-file status badges, markdown
+  rendering with a raw-source toggle, unified diffs (tracked or untracked),
+  and a save path straight back to disk over the same tunnel.
 * **`maki-anchor`** - a central server for many instances. Instances dial out
   over a WebSocket, so they need no inbound ports. One domain, one dashboard,
   one login:
@@ -71,6 +85,7 @@ links.
 | | |
 |---|---|
 | ![Anchor dashboard](./screenshots/anchor-dashboard.jpg) Fleet dashboard: live shares and sessions, each with a search box over titles and full transcripts. | ![Remote terminal](./screenshots/remote-terminal.jpg) The remote terminal: full transcript, model/provider pickers, and the command toolbar. |
+| ![File explorer panel](./screenshots/remote-terminal-files.jpg) The file panel: a gitignore-aware tree with per-file status badges. | ![Markdown file rendered in the file panel](./screenshots/remote-terminal-files-markdown.jpg) Markdown renders in place, with a toggle to edit the raw source. |
 | ![Compact mobile view](./screenshots/remote-terminal-compact.jpg) Compact mode with the toolbar tucked away, for a phone screen. | ![QR code popup](./screenshots/remote-terminal-qr.jpg) One tap to flash the page's own link as a QR code. |
 
 Everything below is upstream's README.

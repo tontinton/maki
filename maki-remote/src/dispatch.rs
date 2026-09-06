@@ -28,6 +28,11 @@ pub enum Route {
     Center,
     Qr,
     Snapshot,
+    Files,
+    FileRead,
+    FileWrite,
+    GitStatus,
+    GitDiff,
 }
 
 impl Route {
@@ -48,6 +53,11 @@ impl Route {
             ("center", "GET") => Some(Route::Center),
             ("qr", "GET") => Some(Route::Qr),
             ("snapshot", "GET") => Some(Route::Snapshot),
+            ("files", "GET") => Some(Route::Files),
+            ("file", "GET") => Some(Route::FileRead),
+            ("file", "POST") => Some(Route::FileWrite),
+            ("git/status", "GET") => Some(Route::GitStatus),
+            ("git/diff", "GET") => Some(Route::GitDiff),
             _ => None,
         }
     }
@@ -310,6 +320,66 @@ impl Dispatcher {
                     body: serde_json::to_vec(&value).unwrap_or_default(),
                 }
             }
+            Route::Files => {
+                let path = query_param(query, "path")
+                    .map(url_decode)
+                    .unwrap_or_default();
+                self.dispatch_result(|reply| crate::RemoteRequest::FilesList {
+                    session,
+                    path,
+                    reply,
+                })
+            }
+            Route::FileRead => {
+                let path = query_param(query, "path")
+                    .map(url_decode)
+                    .unwrap_or_default();
+                self.dispatch_result(|reply| crate::RemoteRequest::FileRead {
+                    session,
+                    path,
+                    reply,
+                })
+            }
+            Route::FileWrite => {
+                let parsed: serde_json::Value = match serde_json::from_str(body) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return DispatchOutcome::Json {
+                            status: 400,
+                            body: br#"{"error":"invalid json"}"#.to_vec(),
+                        };
+                    }
+                };
+                let (Some(path), Some(content)) = (
+                    parsed.get("path").and_then(|v| v.as_str()),
+                    parsed.get("content").and_then(|v| v.as_str()),
+                ) else {
+                    return DispatchOutcome::Json {
+                        status: 400,
+                        body: br#"{"error":"need path and content"}"#.to_vec(),
+                    };
+                };
+                let (path, content) = (path.to_owned(), content.to_owned());
+                self.dispatch_result(|reply| crate::RemoteRequest::FileWrite {
+                    session,
+                    path,
+                    content,
+                    reply,
+                })
+            }
+            Route::GitStatus => {
+                self.dispatch_result(|reply| crate::RemoteRequest::GitStatus { session, reply })
+            }
+            Route::GitDiff => {
+                let path = query_param(query, "path")
+                    .map(url_decode)
+                    .unwrap_or_default();
+                self.dispatch_result(|reply| crate::RemoteRequest::GitDiff {
+                    session,
+                    path,
+                    reply,
+                })
+            }
             Route::ModelGet => match self.dispatch_model_get(session) {
                 Some(value) => DispatchOutcome::Json {
                     status: 200,
@@ -353,6 +423,39 @@ impl Dispatcher {
         self.requests.try_send(make(tx)).ok()?;
         rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS))
             .ok()
+    }
+
+    /// Like `dispatch_value`, but for a request the loop can itself refuse
+    /// (a path outside the session's cwd, a file that doesn't exist, no git
+    /// repo here) — those become a 400 with the loop's own message rather
+    /// than the generic 503 a wedged loop gets.
+    fn dispatch_result<T: serde::Serialize>(
+        &self,
+        make: impl FnOnce(Sender<Result<T, String>>) -> crate::RemoteRequest,
+    ) -> DispatchOutcome {
+        let (tx, rx) = flume::bounded(1);
+        if self.requests.try_send(make(tx)).is_err() {
+            return DispatchOutcome::Json {
+                status: 503,
+                body: br#"{"error":"event loop wedged"}"#.to_vec(),
+            };
+        }
+        match rx.recv_timeout(Duration::from_secs(REQUEST_REPLY_TIMEOUT_SECS)) {
+            Ok(Ok(value)) => DispatchOutcome::Json {
+                status: 200,
+                body: serde_json::to_vec(&value).unwrap_or_default(),
+            },
+            Ok(Err(reason)) => DispatchOutcome::Json {
+                status: 400,
+                body: serde_json::json!({ "error": reason })
+                    .to_string()
+                    .into_bytes(),
+            },
+            Err(_) => DispatchOutcome::Json {
+                status: 503,
+                body: br#"{"error":"event loop wedged"}"#.to_vec(),
+            },
+        }
     }
 
     /// Asks the event loop for the current session snapshot. Empty object if
@@ -507,7 +610,12 @@ impl Dispatcher {
             | Route::OptionsPost
             | Route::Center
             | Route::Qr
-            | Route::Snapshot => {
+            | Route::Snapshot
+            | Route::Files
+            | Route::FileRead
+            | Route::FileWrite
+            | Route::GitStatus
+            | Route::GitDiff => {
                 return Err("not a post route".to_owned());
             }
         };
