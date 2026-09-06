@@ -318,12 +318,12 @@ fn tunnel_once(
             ship_pending(&mut socket, out_rx);
             return Ok(());
         }
-        while let Ok(out) = out_rx.try_recv() {
+        for out in drain_prioritized(out_rx) {
             let frame = match out {
                 TunnelOut::Reply(reply) => serde_json::to_string(&reply),
                 TunnelOut::Push(push) => serde_json::to_string(&push),
             };
-            let Ok(text) = frame else { break };
+            let Ok(text) = frame else { continue };
             if socket.send(WsMessage::text(text)).is_err() {
                 return Err("anchor socket died mid-write".into());
             }
@@ -380,16 +380,48 @@ fn tunnel_once(
 
 /// Writes everything still queued on the out channel before the socket goes
 /// away; a lost goodbye is a link that stays alive for nothing.
+/// Drains everything currently queued without blocking, reordered so a
+/// browser-facing reply never waits behind a burst of background pushes: a
+/// `push_session_index` fires on every event-loop wake while remote control
+/// is running, so a terminal opening mid-turn can otherwise find its own
+/// `options`/`sessions`/`events` replies queued behind a pile of session-index
+/// snapshots. Session-index pushes (`{"sessions": ...}`) are also collapsed
+/// to the latest one — each carries the instance's full current state, so
+/// anything queued behind a later one is already stale. Other pushes (link
+/// mint/revoke/list) are one-off control signals, kept in order, untouched.
+fn drain_prioritized(out_rx: &std::sync::mpsc::Receiver<TunnelOut>) -> Vec<TunnelOut> {
+    let mut replies = Vec::new();
+    let mut other_pushes = Vec::new();
+    let mut latest_sessions_push = None;
+    while let Ok(out) = out_rx.try_recv() {
+        match out {
+            TunnelOut::Reply(reply) => replies.push(TunnelOut::Reply(reply)),
+            TunnelOut::Push(push) => {
+                if push.get("sessions").is_some() {
+                    latest_sessions_push = Some(push);
+                } else {
+                    other_pushes.push(TunnelOut::Push(push));
+                }
+            }
+        }
+    }
+    replies.extend(other_pushes);
+    if let Some(push) = latest_sessions_push {
+        replies.push(TunnelOut::Push(push));
+    }
+    replies
+}
+
 fn ship_pending(
     socket: &mut tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
     out_rx: &std::sync::mpsc::Receiver<TunnelOut>,
 ) {
-    while let Ok(out) = out_rx.try_recv() {
+    for out in drain_prioritized(out_rx) {
         let text = match out {
             TunnelOut::Reply(reply) => serde_json::to_string(&reply),
             TunnelOut::Push(push) => serde_json::to_string(&push),
         };
-        let Ok(text) = text else { return };
+        let Ok(text) = text else { continue };
         if socket.send(WsMessage::text(text)).is_err() {
             return;
         }
@@ -562,6 +594,45 @@ mod tests {
     use super::*;
 
     const REPORT_WAIT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn drain_prioritized_puts_replies_first_and_coalesces_session_pushes() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reply = |id: u64| {
+            TunnelOut::Reply(TunnelReplyWire {
+                conn_id: id,
+                status: 200,
+                content_type: "application/json",
+                body: Vec::new(),
+                final_chunk: true,
+            })
+        };
+        tx.send(TunnelOut::Push(serde_json::json!({ "sessions": "stale" })))
+            .unwrap();
+        tx.send(reply(1)).unwrap();
+        tx.send(TunnelOut::Push(serde_json::json!({ "sessions": "fresh" })))
+            .unwrap();
+        tx.send(reply(2)).unwrap();
+        tx.send(TunnelOut::Push(serde_json::json!({ "link_revoke": "tok" })))
+            .unwrap();
+
+        let drained = drain_prioritized(&rx);
+        let describe = |out: &TunnelOut| match out {
+            TunnelOut::Reply(r) => format!("reply:{}", r.conn_id),
+            TunnelOut::Push(p) => p.to_string(),
+        };
+        let order: Vec<String> = drained.iter().map(describe).collect();
+        assert_eq!(
+            order,
+            vec![
+                "reply:1".to_string(),
+                "reply:2".to_string(),
+                serde_json::json!({ "link_revoke": "tok" }).to_string(),
+                serde_json::json!({ "sessions": "fresh" }).to_string(),
+            ],
+            "replies must come first, superseded session pushes must be dropped"
+        );
+    }
 
     #[test]
     fn normalize_ws_url_maps_http_schemes() {
