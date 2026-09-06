@@ -546,7 +546,12 @@ impl SseSource {
         Self {
             subscription,
             session,
-            idle_deadline: None,
+            // Start the keepalive clock now, not after the first event: an
+            // idle session would otherwise block on `recv()` forever and never
+            // ping, so a dead browser (phone screen sleep, closed tab) is
+            // never noticed and its subscriber leaks, inflating the viewer
+            // count on every reconnect.
+            idle_deadline: Some(std::time::Instant::now() + Duration::from_secs(SSE_PING_SECS)),
             buf,
         }
     }
