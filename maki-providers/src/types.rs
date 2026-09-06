@@ -600,6 +600,14 @@ pub mod dialect {
         adaptive: Some(High),
         off: None,
     };
+    /// Ollama's OpenAI-compat /v1/chat/completions. Omitted effort
+    /// auto-enables thinking on capable models, so Off sends "none"
+    /// explicitly. Only use behind `Model::supports_thinking`.
+    pub const OLLAMA: EffortDialect = EffortDialect {
+        supported: &[Low, Medium, High, Max],
+        adaptive: Some(Medium),
+        off: Some(OFF),
+    };
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -703,6 +711,24 @@ impl ThinkingConfig {
     pub fn apply_reasoning_effort(self, body: &mut Value, dialect: &EffortDialect, model: &Model) {
         if let Some(effort) = self.effort_str(dialect, model) {
             body["reasoning_effort"] = json!(effort);
+        }
+    }
+
+    /// Declared fragments win over the dialect; otherwise the dialect sends
+    /// effort only for thinking-capable models, so plain gateways stay quiet.
+    /// Fragments are the only openai-compat spelling: when no fragment spells
+    /// this mode there is nothing truthful to send, so unlike the local path
+    /// there is no budget-field fallback (that field is llama.cpp-only).
+    pub fn apply_openai_thinking(self, body: &mut Value, model: &Model, dialect: &EffortDialect) {
+        if let Some(fields) = &model.thinking_fields {
+            let max = model.max_thinking_budget();
+            if let Some((fragment, _)) = fields.fragment(self, max)
+                && let Some(object) = body.as_object_mut()
+            {
+                merge_body(object, fragment);
+            }
+        } else if model.supports_thinking() {
+            self.apply_reasoning_effort(body, dialect, model);
         }
     }
 
@@ -1091,6 +1117,7 @@ mod tests {
             &dialect::ANTHROPIC_ADAPTIVE,
             &dialect::TENSORX,
             &dialect::GROK,
+            &dialect::OLLAMA,
         ];
         for d in all {
             assert!(!d.supported.is_empty());
@@ -1148,6 +1175,11 @@ mod tests {
     #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Adaptive,      None         ; "anthropic_adaptive_is_native")]
     #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Effort(XHigh), Some("high") ; "anthropic_xhigh_snaps_down")]
     #[test_case(&dialect::TENSORX, ThinkingConfig::Off,             Some("none") ; "tensorx_off_explicit_none")]
+    #[test_case(&dialect::OLLAMA, ThinkingConfig::Off,             Some("none")   ; "ollama_off_explicit_none")]
+    #[test_case(&dialect::OLLAMA, ThinkingConfig::Adaptive,        Some("medium") ; "ollama_adaptive")]
+    #[test_case(&dialect::OLLAMA, ThinkingConfig::Effort(Minimal), Some("low")    ; "ollama_minimal_snaps_up")]
+    #[test_case(&dialect::OLLAMA, ThinkingConfig::Effort(XHigh),   Some("high")   ; "ollama_xhigh_snaps_down")]
+    #[test_case(&dialect::OLLAMA, ThinkingConfig::Effort(Max),     Some("max")    ; "ollama_max_passthrough")]
     fn thinking_apply_reasoning_effort(
         dialect: &EffortDialect,
         config: ThinkingConfig,
@@ -1161,6 +1193,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn openai_thinking_prefers_declared_fields_over_dialect() {
+        let model = native_effort_model();
+        let mut body = json!({"model": "test"});
+        ThinkingConfig::Effort(XHigh).apply_openai_thinking(&mut body, &model, &dialect::OLLAMA);
+        assert_eq!(body["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn openai_thinking_sends_nothing_without_a_matching_fragment() {
+        let model = native_thinking_model("fields-model", json!({"high": {"reasoning_effort": "xhigh"}}));
+        let mut body = json!({"model": "test"});
+        ThinkingConfig::Off.apply_openai_thinking(&mut body, &model, &dialect::OLLAMA);
+        assert_eq!(body, json!({"model": "test"}));
+    }
     #[test_case(ThinkingConfig::Off,             Some(4096), Budgeted::Off            ; "off")]
     #[test_case(ThinkingConfig::Adaptive,        Some(4096), Budgeted::Adaptive       ; "adaptive")]
     #[test_case(ThinkingConfig::Effort(Max),     Some(4096), Budgeted::Tokens(4096)   ; "effort_delegates_to_level_budget")]

@@ -42,6 +42,10 @@ pub struct ModelDef {
     pub supports_thinking: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_thinking: Option<bool>,
+    /// Per-model thinking fields; typed + validated in maki-providers where the
+    /// request path lives. Malformed values are dropped, not fatal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_fields: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
