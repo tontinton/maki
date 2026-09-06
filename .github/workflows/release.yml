@@ -1,6 +1,6 @@
 # To release:
-#   bump [workspace.package] version to X.Y.Z-rc.N in Cargo.toml, push to main.
-#   The release-bot workflow tags vX.Y.Z-rc.N, which triggers this workflow.
+#   bump [workspace.package] version to X.Y.Z-anchor-N in Cargo.toml, push to main.
+#   The release-bot workflow tags vX.Y.Z-anchor-N, which triggers this workflow.
 #
 # Raw binaries are uploaded per target (no archives): maki and maki-anchor.
 # Windows binaries are Trusted Signed via `az` and carry a -signed suffix:
@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (e.g. v0.5.0-rc.1)"
+        description: "Tag to release (e.g. v0.5.0-anchor-1)"
         required: true
         type: string
 

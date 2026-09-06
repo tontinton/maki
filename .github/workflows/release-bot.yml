@@ -1,8 +1,8 @@
 # Cuts a release tag when the workspace version changes on main.
 #
-# This fork tracks upstream versions with an -rc.N suffix (e.g. 0.5.0-rc.1).
+# This fork tracks upstream versions with an -anchor-N suffix (e.g. 0.5.0-anchor-1).
 # Bump [workspace.package] version in Cargo.toml and push to main; the bot
-# tags vX.Y.Z-rc.N and the Release workflow takes over.
+# tags vX.Y.Z-anchor-N and the Release workflow takes over.
 name: Release bot
 
 on:
@@ -38,12 +38,12 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Skip non-release versions
-        if: ${{ !contains(steps.version.outputs.version, '-rc.') }}
-        run: echo "version ${{ steps.version.outputs.version }} has no -rc suffix; nothing to release"
+        if: ${{ !contains(steps.version.outputs.version, '-anchor-') }}
+        run: echo "version ${{ steps.version.outputs.version }} has no -anchor suffix; nothing to release"
 
       - name: Check tag does not exist
         id: tag
-        if: contains(steps.version.outputs.version, '-rc.')
+        if: contains(steps.version.outputs.version, '-anchor-')
         run: |
           tag="v${{ steps.version.outputs.version }}"
           if git ls-remote --tags origin "refs/tags/$tag" | grep -q "$tag"; then
