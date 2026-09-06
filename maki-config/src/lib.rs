@@ -2713,9 +2713,11 @@ mod tests {
     fn remote_control_port_below_minimum_fails_validate() {
         let config = Config {
             always_yolo: false,
-            always_fast: false,
-            always_workflow: false,
-            always_thinking: None,
+            session_defaults: SessionDefaults {
+                fast: false,
+                workflow: false,
+                thinking: None,
+            },
             ui: UiConfig::default(),
             agent: AgentConfig::default(),
             provider: ProviderConfig::default(),
