@@ -21,8 +21,9 @@ hosts with one shared entry point:
   * Fleet dashboard: all instances, their sessions, costs, and status.
     Login is mandatory (first run walks you through creating the admin), and
     the link to your instance reconnects itself when the network blinks.
-  * Transcripts are fetched live from the owning instance; the anchor stores
-    metadata only.
+  * Full session transcripts are persisted on the anchor for fast reload and
+    search, with per-session delete, off-the-record (OTR, never persisted),
+    and a configurable pruning timeline.
 * **Signed Windows binaries** - releases ship an Authenticode-signed `.exe`
   (Azure Trusted Signing), so SmartScreen stays quiet, next to static Linux
   (x86_64 + arm64) and macOS builds.
@@ -36,6 +37,12 @@ curl -fsSL https://raw.githubusercontent.com/wmantly/maki/main/install-anchor.sh
 
 # Register an instance and copy the printed one-liner for its host.
 maki-anchor tokens add work-laptop
+
+# A CLI-minted instance has no grants yet, so it's invisible on a non-admin's
+# dashboard until you grant one. Either do it in one step:
+maki-anchor tokens add work-laptop --user-id 2 --rights control
+# ...or grant it after the fact (see `maki-anchor users list` for ids):
+maki-anchor grants set 2 work-laptop control
 ```
 
 ```sh
@@ -58,6 +65,13 @@ maki.setup {
 Now `/rc` prints an anchor link instead of binding a local port. See the
 [anchor docs](https://maki.sh/docs/anchor/) for SSO setup, grants, and share
 links.
+
+### Screenshots
+
+| | |
+|---|---|
+| ![Anchor dashboard](./screenshots/anchor-dashboard.jpg) Fleet dashboard: live shares and sessions, each with a search box over titles and full transcripts. | ![Remote terminal](./screenshots/remote-terminal.jpg) The remote terminal: full transcript, model/provider pickers, and the command toolbar. |
+| ![Compact mobile view](./screenshots/remote-terminal-compact.jpg) Compact mode with the toolbar tucked away, for a phone screen. | ![QR code popup](./screenshots/remote-terminal-qr.jpg) One tap to flash the page's own link as a QR code. |
 
 Everything below is upstream's README.
 

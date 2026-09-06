@@ -19,10 +19,12 @@ browser ──HTTPS──> anchor (login, grants, dashboard, routing)
                maki host A   maki host B
 ```
 
-The anchor stores session metadata only: title, model, cost, status.
-Transcripts are fetched live from the owning instance when you open a page, so
-nothing sensitive lands on the anchor host. An offline instance still shows in
-the index, but its transcript is unavailable until it reconnects.
+The anchor persists the full session transcript alongside its metadata
+(title, model, cost, status), so reopening or searching a session is instant
+even after the instance goes offline. Mark a session off-the-record (OTR) to
+skip persistence entirely, delete a saved transcript any time, and set a
+pruning timeline to age old transcripts out automatically. See
+[Session history](#session-history) below.
 
 ## Run the anchor
 

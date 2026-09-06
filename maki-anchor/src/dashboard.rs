@@ -154,7 +154,12 @@ pub fn render_sessions(
     let mut body = String::with_capacity(8192);
     body.push_str(&layout_start("maki anchor", user, "sessions"));
     body.push_str(&links_card(store, hub, user, &instances));
-    body.push_str("<div class=\"card\"><h2>Sessions</h2><table><tr><th>Instance</th><th>Title</th><th>Model</th><th>Status</th><th>Cost</th><th>Updated</th><th></th></tr>");
+    body.push_str(
+        "<div class=\"card\"><h2>Sessions</h2>\
+         <div style=\"margin-bottom:.5rem\"><input id=\"session-search\" type=\"search\" \
+         placeholder=\"search titles and transcripts…\" style=\"width:100%;max-width:24rem\"></div>\
+         <table><tr><th>Instance</th><th>Title</th><th>Model</th><th>Status</th><th>Cost</th><th>Updated</th><th></th></tr><tbody id=\"sessions-tbody\">",
+    );
     let names: std::collections::HashMap<i64, String> =
         instances.iter().map(|i| (i.id, i.name.clone())).collect();
     if sessions.is_empty() {
@@ -192,7 +197,46 @@ pub fn render_sessions(
             now - session.updated_at,
         ));
     }
-    body.push_str("</table>");
+    body.push_str("</tbody></table>");
+    body.push_str(&format!(
+        "<script>
+        (() => {{
+          const names = {};
+          const tbody = document.getElementById('sessions-tbody');
+          const initial = tbody.innerHTML;
+          const input = document.getElementById('session-search');
+          const esc = s => s.replace(/[&<>\"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}})[c]);
+          const enc = encodeURIComponent;
+          let inflight = 0;
+          const render = rows => {{
+            if (!rows.length) {{ tbody.innerHTML = '<tr><td colspan=7 class=\"small\">no matches</td></tr>'; return; }}
+            const now = Date.now() / 1000;
+            tbody.innerHTML = rows.map(s => {{
+              const instance = names[s.instance_id] || '?';
+              const detail = `/session/${{enc(instance)}}/${{enc(s.external_id)}}`;
+              const open = `/links?instance=${{enc(instance)}}&session=${{enc(s.external_id)}}&rights=control&hours=2`;
+              const cost = (s.cost_cents || s.tokens_in) ? `$${{(s.cost_cents/100).toFixed(2)}}` : '';
+              return `<tr><td>${{esc(instance)}}</td><td><a href=\"${{detail}}\">${{esc(s.title)}}</a></td><td>${{esc(s.model)}}</td><td>${{esc(s.status)}}</td><td>${{cost}}</td><td>${{Math.max(0,Math.floor(now - s.updated_at))}}s ago</td><td><a href=\"${{open}}\">open</a></td></tr>`;
+            }}).join('');
+          }};
+          let timer = null;
+          input.oninput = () => {{
+            clearTimeout(timer);
+            const q = input.value.trim();
+            if (!q) {{ tbody.innerHTML = initial; return; }}
+            timer = setTimeout(async () => {{
+              const mine = ++inflight;
+              try {{
+                const res = await fetch(`/api/sessions/search?q=${{enc(q)}}`);
+                const rows = await res.json();
+                if (mine === inflight && res.ok) render(rows);
+              }} catch (e) {{ /* leave the table as-is on a transient failure */ }}
+            }}, 250);
+          }};
+        }})();
+        </script>",
+        serde_json::to_string(&names).unwrap_or_else(|_| "{}".to_string()),
+    ));
     if user.is_some_and(|u| !u.is_admin) {
         body.push_str("<p class=\"small\">Filtered to your grants. Admins see all on <a href=\"/admin\">Admin</a>.</p>");
     }
@@ -252,8 +296,15 @@ pub fn render_instances(store: &Store, user: Option<&UserRow>) -> (u16, String, 
               const cmdPs = `irm ${origin}/install.ps1 -OutFile install.ps1; .\install.ps1 -Anchor "${origin}" -Name "${j.name}" -Token "${j.token}"`;
               cmdEl.textContent = cmd;
               cmdPsEl.textContent = cmdPs;
-              await navigator.clipboard.writeText(cmd);
-              statusEl.textContent = 'copied Linux command (PS below)';
+              statusEl.textContent = 'created — copy the command below';
+              // Clipboard writes can hang or reject outside a trusted user
+              // gesture (e.g. some embedded/automated contexts); the instance
+              // is already created and the command is on screen either way,
+              // so a clipboard failure only gets a quiet note, never blocks
+              // the success status above.
+              navigator.clipboard.writeText(cmd)
+                .then(() => { statusEl.textContent = 'copied Linux command (PS below)'; })
+                .catch(() => { statusEl.textContent = 'created — copy the command below (clipboard blocked)'; });
             } catch (e) { statusEl.textContent = 'error: '+e; }
           };
         })();

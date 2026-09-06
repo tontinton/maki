@@ -40,6 +40,38 @@ pub fn mint_link(
     Ok(token)
 }
 
+/// Renders `text` as an SVG QR code, refusing anything that isn't shaped
+/// like a link the anchor itself minted (a 32-hex-char token somewhere in
+/// the path) — this is a public, unauthenticated endpoint, so it must not
+/// become a generic "turn arbitrary text into a QR" oracle.
+fn qr_svg(text: &str) -> (u16, String, Vec<u8>) {
+    if text.len() > 512
+        || !text
+            .split('/')
+            .any(|seg| seg.len() == 32 && seg.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return (
+            400,
+            "text/plain".to_string(),
+            b"qr text must contain a share token".to_vec(),
+        );
+    }
+    match fast_qr::QRBuilder::new(text).build() {
+        Ok(code) => (
+            200,
+            "image/svg+xml".to_string(),
+            fast_qr::convert::svg::SvgBuilder::default()
+                .to_str(&code)
+                .into_bytes(),
+        ),
+        Err(_) => (
+            400,
+            "text/plain".to_string(),
+            b"text out of qr capacity".to_vec(),
+        ),
+    }
+}
+
 fn request_path_session(tail: &str) -> Option<String> {
     let rest = tail.strip_prefix("s/")?;
     Some(rest.split('/').next().unwrap_or(rest).to_owned())
@@ -416,35 +448,27 @@ fn route(
     if path == "/qr" {
         let query = request.url().split_once('?').map(|(_, q)| q).unwrap_or("");
         let text = query_param(query, "text").unwrap_or_default();
-        let outcome = if text.len() > 512
-            || !text
-                .split('/')
-                .any(|seg| seg.len() == 32 && seg.bytes().all(|b| b.is_ascii_hexdigit()))
-        {
-            (
-                400,
-                "text/plain".to_string(),
-                b"qr text must contain a share token".to_vec(),
-            )
-        } else {
-            match fast_qr::QRBuilder::new(text).build() {
-                Ok(code) => (
-                    200,
-                    "image/svg+xml".to_string(),
-                    fast_qr::convert::svg::SvgBuilder::default()
-                        .to_str(&code)
-                        .into_bytes(),
-                ),
-                Err(_) => (
-                    400,
-                    "text/plain".to_string(),
-                    b"text out of qr capacity".to_vec(),
-                ),
-            }
-        };
-        return buffered(outcome, request);
+        return buffered(qr_svg(&text), request);
     }
-    if let Some((token, tail)) = split_token_path(path) {
+    // Split on the full URL, not the query-stripped `path`: the tail is
+    // forwarded to the instance verbatim, and routes like `qr?text=...`
+    // need their query string to survive the trip.
+    let full_url = request.url().to_owned();
+    if let Some((token, tail)) = split_token_path(&full_url) {
+        // The QR code is a pure rendering of the page's own URL — it needs
+        // no data from the instance — so it's answered here directly rather
+        // than proxied. That also means it keeps working on an offline
+        // instance, and isn't refused by a session-scoped link's own scope
+        // check (a scoped page's relative `qr?text=...` request lands under
+        // `s/<id>/qr`, which `proxy_remote` would otherwise 404 as "outside
+        // the link's scope").
+        let scoped_tail = tail_under_session(tail);
+        let path_only = scoped_tail.split('?').next().unwrap_or(scoped_tail);
+        if path_only == "qr" {
+            let query = tail.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let text = query_param(query, "text").unwrap_or_default();
+            return buffered(qr_svg(&text), request);
+        }
         let user = auth.user_from_cookie(cookie_header(&request));
         return proxy_remote(token, tail, request, hub, store, user.as_ref());
     }
@@ -1258,7 +1282,18 @@ fn handle_api_create_instance(
     let token = new_link_token();
     let hash = store::hash_token(&token);
     match store.create_instance(&name, &hash) {
-        Ok(_) => {}
+        Ok(instance_id) => {
+            // Whoever mints the token for an instance needs to see it on
+            // their own dashboard, or it's invisible the moment they created
+            // it — non-admins are filtered to instances they hold a grant
+            // for, and creating one doesn't imply an admin has granted them
+            // anything yet.
+            if let Some(u) = user
+                && let Err(e) = store.set_grant(u.id, instance_id, store::Role::Controller)
+            {
+                tracing::warn!("failed to grant creator of instance {name:?}: {e}");
+            }
+        }
         Err(store::StoreError::Exists) => {
             return buffered(
                 (
@@ -2388,6 +2423,11 @@ fn route_authorized(
     if path == "/api/sessions" {
         return buffered(json_list_sessions_for(store, user.as_ref()), request);
     }
+    if path == "/api/sessions/search" {
+        let query = request.url().split_once('?').map(|(_, q)| q).unwrap_or("");
+        let q = query_param(query, "q").unwrap_or_default();
+        return buffered(json_search_sessions_for(store, user.as_ref(), &q), request);
+    }
     if let Some(rest) = path.strip_prefix("/session/") {
         return render_session_page(rest, request, store, user.as_ref());
     }
@@ -2571,6 +2611,33 @@ fn json_list_sessions_for(
     let res = match user {
         Some(u) => store.sessions_for_user(u.id, u.is_admin),
         None => store.list_sessions(),
+    };
+    match res {
+        Ok(rows) => {
+            let body = serde_json::to_vec(&rows).unwrap_or_default();
+            (200, "application/json".to_string(), body)
+        }
+        Err(err) => (
+            500,
+            "application/json".to_string(),
+            serde_json::json!({"error": format!("store error: {err}")})
+                .to_string()
+                .into_bytes(),
+        ),
+    }
+}
+
+fn json_search_sessions_for(
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+    query: &str,
+) -> (u16, String, Vec<u8>) {
+    if query.trim().is_empty() {
+        return (200, "application/json".to_string(), b"[]".to_vec());
+    }
+    let res = match user {
+        Some(u) if !u.is_admin => store.search_sessions_for_user(query, u.id),
+        _ => store.search_sessions(query),
     };
     match res {
         Ok(rows) => {
@@ -2809,9 +2876,11 @@ fn proxy_remote(
 
     // A session-scoped link only opens that session: the bare index bounces
     // into the scoped path (so the UI's relative requests carry it), and
-    // anything outside it is refused.
+    // anything outside it is refused. `tail` may carry a `?query` (the qr
+    // route needs one), so scoping decisions look only at the path part.
+    let scope_tail = tail.split('?').next().unwrap_or(tail);
     if let Some(session_id) = link.external_session_id.as_deref() {
-        if tail.is_empty() {
+        if scope_tail.is_empty() {
             let response = Response::empty(302).with_header(
                 Header::from_bytes("Location", format!("/{token}/s/{session_id}/").as_bytes())
                     .unwrap(),
@@ -2819,7 +2888,7 @@ fn proxy_remote(
             let _ = request.respond(response);
             return RouteOutcome::Streamed;
         }
-        let scoped = request_path_session(tail);
+        let scoped = request_path_session(scope_tail);
         if scoped.as_deref() != Some(session_id) {
             return buffered(
                 (
@@ -2915,7 +2984,9 @@ fn proxy_remote(
     // SSE streams chunk as they are produced; everything else buffers. The
     // first chunk is handed to the streamer so an already-final stream cannot
     // leave the browser waiting on the chunk timeout.
-    if tail_under_session(tail) == "events" && status == 200 {
+    let route_tail = tail_under_session(tail);
+    let route_tail = route_tail.split('?').next().unwrap_or(route_tail);
+    if route_tail == "events" && status == 200 {
         return stream_to_browser(
             request,
             hub,

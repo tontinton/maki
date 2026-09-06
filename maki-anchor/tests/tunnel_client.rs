@@ -292,6 +292,23 @@ fn tunnel_client_serves_index_sse_and_prompt_through_anchor() {
         "index must carry its content type through the anchor: {headers:.200}"
     );
 
+    // The anchor answers `qr?text=...` itself (no instance round trip), but
+    // still must parse the query string out of the full request URL rather
+    // than a query-stripped path, or `text` never arrives.
+    let qr_text = format!("https://example.com/{link}/");
+    let (status, body) = http(
+        anchor.http_port,
+        "GET",
+        &format!("/{link}/qr?text={qr_text}"),
+        &[],
+    );
+    assert_eq!(status, 200, "qr: {}", String::from_utf8_lossy(&body));
+    assert!(
+        String::from_utf8_lossy(&body).contains("svg"),
+        "qr body: {:.120}",
+        String::from_utf8_lossy(&body)
+    );
+
     // A session-index push lands in the anchor's store.
     let cookie = setup_admin(anchor.http_port);
     out.send(maki_remote::tunnel::TunnelOut::Push(serde_json::json!({
@@ -320,6 +337,41 @@ fn tunnel_client_serves_index_sse_and_prompt_through_anchor() {
     };
     assert_eq!(sessions[0]["external_id"], "e2e-session");
     assert_eq!(sessions[0]["cwd"], "/work");
+
+    // QR must also work on a session-scoped link: the page's own relative
+    // `qr?text=...` request lands under `<token>/s/<id>/qr`, which used to
+    // be refused by proxy_remote's scope check ("outside the link's scope")
+    // since the QR route was answered by proxying to the instance instead of
+    // being handled directly by the anchor.
+    let (status, body) = http_auth(
+        anchor.http_port,
+        "POST",
+        "/api/links/mint",
+        format!(r#"{{"link":"{link}","rights":"view","hours":1,"session":"e2e-session"}}"#)
+            .as_bytes(),
+        Some(&cookie),
+    );
+    assert_eq!(status, 200, "mint: {}", String::from_utf8_lossy(&body));
+    let minted: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let scoped_token = minted["token"].as_str().expect("minted token");
+    let scoped_qr_text = format!("https://example.com/{scoped_token}/s/e2e-session/");
+    let (status, body) = http(
+        anchor.http_port,
+        "GET",
+        &format!("/{scoped_token}/s/e2e-session/qr?text={scoped_qr_text}"),
+        &[],
+    );
+    assert_eq!(
+        status,
+        200,
+        "scoped qr: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains("svg"),
+        "scoped qr body: {:.120}",
+        String::from_utf8_lossy(&body)
+    );
 
     // SSE opens with the snapshot frame, then stays live.
     let mut stream = TcpStream::connect(("127.0.0.1", anchor.http_port)).unwrap();

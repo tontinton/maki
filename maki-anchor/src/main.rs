@@ -152,7 +152,16 @@ enum UserCommand {
 #[derive(Subcommand)]
 enum TokenCommand {
     /// Create (or rotate) a registration token for an instance
-    Add { name: String },
+    Add {
+        name: String,
+        /// Grant this user rights on the instance immediately (see `users list`
+        /// for ids). Without this, a CLI-minted instance has no grants, and
+        /// stays invisible on every non-admin dashboard until `grants set`.
+        #[arg(long)]
+        user_id: Option<i64>,
+        #[arg(long, default_value = "control")]
+        rights: String,
+    },
     /// Mint a share link: `view` or `control` rights, hours until expiry
     Link {
         instance: String,
@@ -235,15 +244,36 @@ fn main() {
         Command::Tokens { sub, db } => {
             let store = Store::open(&db).expect("open anchor db");
             match sub {
-                TokenCommand::Add { name } => {
+                TokenCommand::Add {
+                    name,
+                    user_id,
+                    rights,
+                } => {
                     if !store::valid_instance_name(&name) {
                         eprintln!("instance name must be 1-64 chars of alphanumeric, -, _, .");
                         std::process::exit(1);
                     }
+                    let rights = if user_id.is_some() {
+                        match Role::parse(&rights) {
+                            Some(rights) => rights,
+                            None => {
+                                eprintln!("rights must be `view` or `control`, got `{rights}`");
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        Role::Controller
+                    };
                     let token = new_token();
-                    store
+                    let instance_id = store
                         .register_instance(&name, &store::hash_token(&token))
                         .expect("register instance");
+                    if let Some(user_id) = user_id {
+                        store
+                            .set_grant(user_id, instance_id, rights)
+                            .expect("grant user on instance");
+                        eprintln!("granted user {user_id} {} on {name}", rights.as_str());
+                    }
                     println!("{token}");
                 }
                 TokenCommand::Link {

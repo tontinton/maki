@@ -327,6 +327,16 @@ impl Store {
         Ok(())
     }
 
+    /// `otr` and `prune_after` are anchor-controlled settings the instance
+    /// has no concept of — its push always carries the zero value for both
+    /// (see `SessionIndexEntry`), so a routine update must never let that
+    /// overwrite what `set_session_otr`/`set_session_prune` already set on
+    /// this row; both are left out of the `DO UPDATE SET` list entirely so
+    /// SQLite keeps the existing value on conflict, and only the initial
+    /// `INSERT` (a session the anchor has never seen) seeds them. Likewise,
+    /// once a session is OTR, its transcript must stay cleared no matter
+    /// what the instance keeps pushing, so the update keeps it blanked
+    /// whenever the existing row is already marked OTR.
     pub fn upsert_session(&self, session: &SessionRow) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -338,7 +348,7 @@ impl Store {
                  status = excluded.status, cost_cents = excluded.cost_cents,
                  tokens_in = excluded.tokens_in, tokens_out = excluded.tokens_out,
                  context_window = excluded.context_window, updated_at = excluded.updated_at,
-                 transcript = excluded.transcript, otr = excluded.otr, prune_after = excluded.prune_after",
+                 transcript = CASE WHEN otr THEN '[]' ELSE excluded.transcript END",
             rusqlite::params![
                 session.instance_id,
                 session.external_id,
@@ -442,6 +452,48 @@ impl Store {
             },
         )
         .map_err(StoreError::from)
+    }
+
+    /// Every session persisted here is a full transcript, so search covers
+    /// both: title as a quick filter, transcript for finding what was
+    /// actually said. OTR sessions never had a transcript stored, and are
+    /// excluded outright so a title match can't surface one.
+    pub fn search_sessions(&self, query: &str) -> Result<Vec<SessionRow>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = like_pattern(query);
+        let mut stmt = conn.prepare(
+            "SELECT instance_id, external_id, title, model, cwd, status, cost_cents, tokens_in,
+                 tokens_out, context_window, updated_at, transcript, otr, prune_after
+             FROM sessions
+             WHERE otr = 0 AND (title LIKE ?1 ESCAPE '\\' OR transcript LIKE ?1 ESCAPE '\\')
+             ORDER BY updated_at DESC LIMIT 200",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![pattern], map_session)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Same search, scoped to the sessions a non-admin user holds a grant for.
+    pub fn search_sessions_for_user(
+        &self,
+        query: &str,
+        user_id: i64,
+    ) -> Result<Vec<SessionRow>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = like_pattern(query);
+        let mut stmt = conn.prepare(
+            "SELECT s.instance_id, s.external_id, s.title, s.model, s.cwd, s.status, s.cost_cents,
+                 s.tokens_in, s.tokens_out, s.context_window, s.updated_at, s.transcript, s.otr, s.prune_after
+             FROM sessions s JOIN grants g ON g.instance_id = s.instance_id
+             WHERE g.user_id = ?1 AND s.otr = 0
+                 AND (s.title LIKE ?2 ESCAPE '\\' OR s.transcript LIKE ?2 ESCAPE '\\')
+             ORDER BY s.updated_at DESC LIMIT 200",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![user_id, pattern], map_session)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionRow>, StoreError> {
@@ -1061,6 +1113,13 @@ fn instance_id_by_name_locked(conn: &Connection, name: &str) -> Result<i64, Stor
     )
 }
 
+/// Escapes a user's search text for a `LIKE ... ESCAPE '\\'` clause and wraps
+/// it for a substring match, so `%`/`_` in the query can't widen the scan.
+fn like_pattern(query: &str) -> String {
+    let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
 fn map_session(row: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
         instance_id: row.get(0)?,
@@ -1406,5 +1465,67 @@ mod tests {
         // Delete removes the row.
         assert!(store.delete_session(id, "s1").unwrap());
         assert!(store.sessions_for_instance(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn routine_upsert_never_clobbers_otr_prune_or_reopens_an_otr_transcript() {
+        // The instance pushing a session update has no concept of OTR or a
+        // prune deadline — it always sends `otr: false, prune_after: None`
+        // (see `SessionIndexEntry`'s defaults) — so a live session's normal,
+        // frequent index pushes must never undo what the anchor dashboard
+        // set, and must never let a fresh transcript slip back into an
+        // OTR session between the dashboard's own OTR toggle and the next
+        // push.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        let id = store
+            .register_instance("host-b", &hash_token("reg2"))
+            .unwrap();
+        let base = SessionRow {
+            instance_id: id,
+            external_id: "s2".into(),
+            title: "t".into(),
+            model: "m".into(),
+            cwd: "/w".into(),
+            status: "idle".into(),
+            cost_cents: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            context_window: 0,
+            updated_at: now_unix(),
+            transcript: Some(r#"[{"type":"user_message","text":"hi"}]"#.into()),
+            otr: Some(false),
+            prune_after: None,
+        };
+        store.upsert_session(&base).unwrap();
+        store.set_session_otr(id, "s2", true).unwrap();
+        store
+            .set_session_prune(id, "s2", Some(now_unix() + 3600))
+            .unwrap();
+
+        // A routine push, shaped exactly like what a live instance sends:
+        // `otr: Some(false)` and `prune_after: None`, plus a fresh transcript
+        // it thinks should be recorded.
+        store
+            .upsert_session(&SessionRow {
+                updated_at: now_unix(),
+                transcript: Some(r#"[{"type":"user_message","text":"still talking"}]"#.into()),
+                otr: Some(false),
+                prune_after: None,
+                ..base
+            })
+            .unwrap();
+
+        let stored = &store.sessions_for_instance(id).unwrap()[0];
+        assert_eq!(stored.otr, Some(true), "a routine push must not un-OTR");
+        assert!(
+            stored.prune_after.is_some(),
+            "a routine push must not clear a set prune deadline"
+        );
+        assert_eq!(
+            stored.transcript.as_deref(),
+            Some("[]"),
+            "an OTR session's transcript must stay cleared across routine pushes"
+        );
     }
 }

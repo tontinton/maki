@@ -945,7 +945,13 @@ impl<'t> EventLoop<'t> {
                             // The full transcript rides the index so the anchor
                             // can persist and serve it; the dedupe above means
                             // it only ships when the session actually changed.
-                            "transcript": rt.app.remote_snapshot()["messages"],
+                            // The anchor's `SessionIndexEntry::transcript` is a
+                            // `String` (it lands straight in a TEXT column), so
+                            // this must ship pre-serialized — an inline array
+                            // fails that field's deserialization, which silently
+                            // drops the whole untagged `TunnelPush` frame with
+                            // no error on either side.
+                            "transcript": rt.app.remote_snapshot()["messages"].to_string(),
                         })
                     })
                     .collect::<Vec<_>>()
