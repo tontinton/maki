@@ -27,6 +27,7 @@ pub enum Route {
     OptionsPost,
     Center,
     Qr,
+    Snapshot,
 }
 
 impl Route {
@@ -46,6 +47,7 @@ impl Route {
             ("options", "POST") => Some(Route::OptionsPost),
             ("center", "GET") => Some(Route::Center),
             ("qr", "GET") => Some(Route::Qr),
+            ("snapshot", "GET") => Some(Route::Snapshot),
             _ => None,
         }
     }
@@ -300,6 +302,13 @@ impl Dispatcher {
                     body: br#"{"error":"event loop wedged"}"#.to_vec(),
                 },
             },
+            Route::Snapshot => {
+                let value = self.snapshot_json(session);
+                DispatchOutcome::Json {
+                    status: 200,
+                    body: serde_json::to_vec(&value).unwrap_or_default(),
+                }
+            }
             Route::ModelGet => match self.dispatch_model_get(session) {
                 Some(value) => DispatchOutcome::Json {
                     status: 200,
@@ -496,7 +505,8 @@ impl Dispatcher {
             | Route::Options
             | Route::OptionsPost
             | Route::Center
-            | Route::Qr => {
+            | Route::Qr
+            | Route::Snapshot => {
                 return Err("not a post route".to_owned());
             }
         };

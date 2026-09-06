@@ -191,6 +191,36 @@
   }
   .chip select { font-size: 11px; background: none; color: inherit; border: none; }
   .chip button { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 12px; }
+  /* Markdown-ish rendering for assistant messages. */
+  .msg.assistant p { margin: 4px 0; }
+  .msg.assistant h1, .msg.assistant h2, .msg.assistant h3 { margin: 8px 0 4px; color: var(--text); }
+  .msg.assistant ul, .msg.assistant ol { margin: 4px 0; padding-left: 20px; }
+  .msg.assistant code { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+  .msg.assistant pre { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px; overflow-x: auto; }
+  .msg.assistant pre code { background: none; border: none; padding: 0; }
+  .msg.assistant blockquote { border-left: 3px solid var(--border); margin: 4px 0; padding-left: 10px; color: var(--muted); }
+  .msg.assistant a { color: var(--accent); }
+  .msg.assistant table { border-collapse: collapse; margin: 4px 0; }
+  .msg.assistant th, .msg.assistant td { border: 1px solid var(--border); padding: 3px 8px; }
+  /* Floating "jump to bottom" button, shown when scrolled away. */
+  #jump-bottom {
+    position: fixed; right: 16px; bottom: 90px; z-index: 50;
+    display: none; align-items: center; gap: 4px;
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 6px 12px; font-size: 12px; cursor: pointer;
+    box-shadow: 0 4px 12px rgba(0,0,0,.35);
+  }
+  #jump-bottom:hover { border-color: var(--accent); color: var(--accent); }
+  /* Compact mode: shrink the header and toolbar to save vertical space. */
+  body.compact header { padding: 3px 10px; }
+  body.compact header h1 { font-size: 12px; }
+  body.compact #toolbar { padding: 2px 10px; }
+  body.compact #toolbar input, body.compact #toolbar select { padding: 2px 6px; font-size: 11px; }
+  body.compact #sessions-bar { padding: 2px 10px; }
+  body.compact #inputrow { padding: 6px 10px; }
+  body.compact #prompt { height: 36px; padding: 6px; }
+  #compact-toggle { cursor: pointer; }
 </style>
 </head>
 <body>
@@ -203,6 +233,7 @@
   <span id="stats"></span>
   <span id="conn" data-conn="down">connecting</span>
   <div id="center-wrap">
+    <button class="mini" id="compact-toggle" title="Shrink the headers to save space">compact</button>
     <button class="mini" id="qr-btn" title="QR code for this page's link">QR</button>
     <button class="mini" id="center-btn" title="Remote control center">remote ▾</button>
     <div id="center" hidden></div>
@@ -228,6 +259,7 @@
 <main id="log"></main>
 <div id="qr-pop" hidden></div>
 <div id="toast"></div>
+<button id="jump-bottom" title="Jump to the latest message">↓ latest</button>
 <div id="perm">
   <div>Permission needed: <span class="toolname" id="perm-tool"></span></div>
   <div class="scopes" id="perm-scopes"></div>
@@ -271,6 +303,7 @@
   const isSharePage = /^[0-9a-f]{32}$/.test(SHARE_TOKEN);
   const sessionsBar = document.getElementById("sessions-bar");
   const toastEl = document.getElementById("toast");
+  const jumpBtn = document.getElementById("jump-bottom");
   let pendingPermission = null;
   let allModels = [];
 
@@ -281,7 +314,26 @@
     return node;
   };
 
-  const scrollDown = () => { log.scrollTop = log.scrollHeight; };
+  const scrollDown = () => { log.scrollTop = log.scrollHeight; updateJump(); };
+
+  // Show the "jump to bottom" button only when the user has scrolled away
+  // from the latest message, so it never gets in the way at the bottom.
+  const updateJump = () => {
+    const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    jumpBtn.style.display = nearBottom ? "none" : "flex";
+  };
+  log.addEventListener("scroll", updateJump);
+  jumpBtn.onclick = () => { scrollDown(); updateJump(); };
+
+  // Compact mode: persist the choice so a phone reload keeps the layout.
+  const compactToggle = document.getElementById("compact-toggle");
+  const applyCompact = (on) => {
+    document.body.classList.toggle("compact", on);
+    compactToggle.textContent = on ? "expand" : "compact";
+    try { localStorage.setItem("maki_compact", on ? "1" : "0"); } catch {}
+  };
+  compactToggle.onclick = () => applyCompact(!document.body.classList.contains("compact"));
+  try { applyCompact(localStorage.getItem("maki_compact") === "1"); } catch {}
 
   const fmtTokens = (n) =>
     n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
@@ -343,15 +395,82 @@
 
   const toolById = (id) => log.querySelector(`.tool[data-id="${CSS.escape(id)}"]`);
 
+  // A tiny, safe markdown renderer for assistant messages: escape first, then
+  // apply a small set of block and inline rules. Good enough to read code,
+  // lists, headings and links the way the CLI does, without a dependency.
+  const escHtml = (s) => String(s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  const inlineMd = (s) => escHtml(s)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  const renderMarkdown = (text) => {
+    const lines = String(text).split("\n");
+    let html = "";
+    let inCode = false;
+    let inList = false;
+    let inTable = false;
+    let tableRows = [];
+    const closeList = () => { if (inList) { html += "</ul>"; inList = false; } };
+    const closeTable = () => {
+      if (inTable) {
+        html += "<table>" + tableRows.map(r => `<tr>${r.map(c => `<td>${inlineMd(c)}</td>`).join("")}</tr>`).join("") + "</table>";
+        inTable = false; tableRows = [];
+      }
+    };
+    for (const raw of lines) {
+      const line = raw.trimEnd();
+      if (line.startsWith("```")) {
+        closeList(); closeTable();
+        if (inCode) { html += "</code></pre>"; inCode = false; }
+        else { html += "<pre><code>"; inCode = true; }
+        continue;
+      }
+      if (inCode) { html += escHtml(line) + "\n"; continue; }
+      if (/^\s*\|.*\|\s*$/.test(line)) {
+        closeList();
+        const cells = line.split("|").slice(1, -1).map(c => c.trim());
+        if (/^[\s:|-]+$/.test(cells.join(""))) continue; // separator row
+        inTable = true; tableRows.push(cells);
+        continue;
+      }
+      closeTable();
+      if (/^#{1,3}\s/.test(line)) {
+        closeList();
+        const level = line.match(/^#+/)[0].length;
+        html += `<h${level}>${inlineMd(line.replace(/^#+\s/, ""))}</h${level}>`;
+      } else if (/^\s*[-*]\s+/.test(line)) {
+        if (!inList) { html += "<ul>"; inList = true; }
+        html += `<li>${inlineMd(line.replace(/^\s*[-*]\s+/, ""))}</li>`;
+      } else if (/^\s*>\s?/.test(line)) {
+        closeList();
+        html += `<blockquote>${inlineMd(line.replace(/^\s*>\s?/, ""))}</blockquote>`;
+      } else if (line.trim() === "") {
+        closeList();
+      } else {
+        closeList();
+        html += `<p>${inlineMd(line)}</p>`;
+      }
+    }
+    closeList(); closeTable();
+    if (inCode) html += "</code></pre>";
+    return html;
+  };
+
   const renderEvent = (event) => {
     switch (event.type) {
       case "text_delta": {
         const last = log.lastElementChild;
         if (last && last.dataset.kind === "assistant") {
-          last.textContent += event.text;
+          last.dataset.raw = (last.dataset.raw || "") + event.text;
+          last.innerHTML = renderMarkdown(last.dataset.raw);
         } else {
-          const node = el("msg assistant", event.text);
+          const node = el("msg assistant", "");
           node.dataset.kind = "assistant";
+          node.dataset.raw = event.text;
+          node.innerHTML = renderMarkdown(event.text);
           log.appendChild(node);
         }
         break;
@@ -413,8 +532,10 @@
       }
       case "user_message": log.appendChild(el("msg user", event.text)); break;
       case "assistant_text": {
-        const node = el("msg assistant", event.text);
+        const node = el("msg assistant", "");
         node.dataset.kind = "assistant";
+        node.dataset.raw = event.text;
+        node.innerHTML = renderMarkdown(event.text);
         log.appendChild(node);
         break;
       }
@@ -467,7 +588,10 @@
       connEl.dataset.conn = "down";
       connEl.textContent = "reconnecting";
       es.close();
-      setTimeout(connect, 2000);
+      // Reconnect with a short delay. On a phone whose screen slept, the
+      // socket is gone but the page is still open; re-fetching the snapshot
+      // on reconnect restores the chat without a hard refresh.
+      setTimeout(() => { connect(); refreshSnapshot(); }, 2000);
     };
     for (const kind of ["snapshot", "event", "status", "permission", "permission_resolved"]) {
       es.addEventListener(kind, (ev) => {
@@ -481,6 +605,13 @@
         } catch {}
       });
     }
+  };
+
+  // Re-fetch the current snapshot so a reconnect (e.g. after the phone screen
+  // slept) restores the full chat without a hard refresh.
+  const refreshSnapshot = async () => {
+    const snap = await fetchJson("snapshot");
+    if (snap) renderSnapshot(snap);
   };
 
   const submit = async (path, body) => {
