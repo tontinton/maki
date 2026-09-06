@@ -5886,6 +5886,13 @@ fn session_close_idempotent_and_prompt_after_close_errors() {
 #[test_case::test_case("{ audience = 'wurkflow' }", "unknown audience: wurkflow" ; "unknown_audience")]
 #[test_case::test_case("{ local_tools = { foo = { handler = function() return '' end } } }", "local_tools.foo: 'description' is required" ; "local_tool_missing_description")]
 #[test_case::test_case("{ local_tools = { foo = { description = 'd' } } }", "local_tools.foo: 'handler' is required" ; "local_tool_missing_handler")]
+#[test_case::test_case("{ scope = 'session' }", "scope must be" ; "scope_wrong_type")]
+#[test_case::test_case("{ scope = {} }", "scope must be" ; "scope_table_missing_session")]
+#[test_case::test_case(
+    "{ scope = { session = '01965087-4c71-7f00-8000-000000000000' } }",
+    "scope.session must be the caller's own session id"
+    ; "scope_session_mismatch"
+)]
 fn session_opts_validation_rejects(opts: &str, expected: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -5905,6 +5912,35 @@ fn session_opts_validation_rejects(opts: &str, expected: &str) {
     host.load_source("session_opts_plugin", &src).unwrap();
     let out = exec_tool(&reg, "session_opts_probe", serde_json::json!({})).unwrap();
     assert!(out.contains(expected), "got: {out}");
+}
+
+#[test]
+fn session_scope_accepts_the_callers_own_session() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "detach_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local id = ctx:session_id()
+                local sess, err = maki.agent.session(ctx, {{ scope = {{ session = id }} }})
+                if err ~= nil then return "err:" .. err end
+                sess:close()
+                return "ok"
+            end
+        }})"#
+    );
+    host.load_source("detach_plugin", &src).unwrap();
+    let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
+        .parse()
+        .expect("valid session id");
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.session_id = Some(session);
+    let out = exec_with_ctx(&reg, "detach_probe", json!({}), &ctx).unwrap();
+    assert_eq!(out, "ok");
 }
 
 fn load_img_tool(host: &PluginHost) {

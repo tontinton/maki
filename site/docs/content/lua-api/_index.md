@@ -1266,6 +1266,13 @@ and tool set.
     `"max"`), or a budget integer (token count). Inherits parent setting
     if omitted.
   - `fast` (`boolean?`) use fast mode. Inherits parent setting if omitted.
+  - `scope` (`table?`) `{ session = "<id>" }` detaches the session from the
+    call that spawned it: it survives the call returning and the turn
+    ending, instead of being cancelled the moment either does. `<id>`
+    must be the caller's own session (`ctx:session_id()`). Only cancel-all
+    and a targeted cancel of this session's tool call id can stop it from
+    here on; keep the returned handle (or its id) if you need to reach it
+    later. Omit for the default: tied to the call that spawned it.
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
 
@@ -1377,6 +1384,9 @@ Fire off a function as a new async task. It runs in the background and
 you do not wait for it. If you need the result, pass an {on_finish}
 callback.
 
+The task must finish within 60 seconds; waiting minutes for a build or a
+subagent inside one dies partway through.
+
 **Parameters:**
 
 - `{fn}` (`function`) Zero-argument function to execute.
@@ -1399,23 +1409,23 @@ end)
 maki.async.sleep({ms})
 ```
 
-Suspend the calling task for {ms} milliseconds. The plugin thread is
-never blocked, so other tasks and the UI keep running, and a cancel
-still lands while you sleep.
+Suspend the current coroutine for {ms} milliseconds. The timer runs on
+the async executor, so nothing spins and other tasks keep running.
+Cancelling the owning task interrupts the sleep with the cancel error.
 
 For a timer that has to outlive the tool call that started it, such
 as a toast dismissing itself, use `maki.defer_fn`.
 
 **Parameters:**
 
-- `{ms}` (`integer`) Milliseconds to sleep.
+- `{ms}` (`integer`) Milliseconds to wait. Must be >= 0.
 
 **Example:**
 
 ```lua
 maki.async.run(function()
-  maki.async.sleep(4000)
-  win:close()
+  maki.async.sleep(250)
+  retry()
 end)
 ```
 
