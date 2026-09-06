@@ -358,6 +358,12 @@ impl Model {
         self.thinking_override == Some(ThinkingSupport::Required)
     }
 
+    /// Vision support, most specific first:
+    /// 1. per-model override
+    /// 2. discovery
+    /// 3. manifest entry
+    /// 4. warm models.dev metadata (builtins skip the catalog in from_spec)
+    /// 5. the family default
     pub fn supports_vision(&self) -> bool {
         if let Some(vision) = self.supports_vision_override {
             return vision;
@@ -371,6 +377,10 @@ impl Model {
                 manifest
                     .and_then(|m| lookup_entry(m.models, &self.id).ok())
                     .map(|e| e.vision)
+            })
+            .or_else(|| {
+                crate::providers::catalog::model_meta_if_available(&self.provider, &self.id)
+                    .map(|meta| meta.supports_vision)
             })
             .unwrap_or_else(|| self.family.supports_vision())
     }
