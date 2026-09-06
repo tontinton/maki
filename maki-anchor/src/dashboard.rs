@@ -85,7 +85,11 @@ fn layout_start(title: &str, user: Option<&UserRow>, page: &str) -> String {
             .name
             .as_deref()
             .or(user.email.as_deref())
-            .unwrap_or("user");
+            .unwrap_or_else(|| {
+                user.oidc_sub
+                    .strip_prefix("local:")
+                    .unwrap_or(&user.oidc_sub)
+            });
         s.push_str(&format!(
             "<span class=\"user\">{}{} · <a href=\"/logout\">log out</a></span>",
             html_escape(who),
@@ -99,7 +103,7 @@ fn layout_start(title: &str, user: Option<&UserRow>, page: &str) -> String {
 }
 
 /// Every anchored page signs off to the same three places.
-const FOOTER: &str = "<footer><a href=\"https://github.com/wmantly/maki\">maki fork</a><a href=\"https://github.com/tontinton/maki\">upstream</a><a href=\"https://community.theta42.com/\">community</a></footer>";
+const FOOTER: &str = "<footer><a href=\"https://github.com/wmantly/maki\">maki anchor fork</a><a href=\"https://github.com/tontinton/maki\">maki original</a><a href=\"https://community.theta42.com/\">Theta42 community</a></footer>";
 
 fn layout_end() -> String {
     format!("{FOOTER}</main></body></html>")

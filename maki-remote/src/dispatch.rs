@@ -559,7 +559,13 @@ impl SseSource {
                 Some(deadline) => match updates.recv_deadline(deadline) {
                     Ok(update) => Some(update),
                     Err(flume::RecvTimeoutError::Timeout) => {
-                        self.idle_deadline = None;
+                        // Keep the keepalive deadline rolling: a one-shot ping
+                        // would leave the stream blocked on `recv()` forever, so
+                        // a closed browser (broken pipe on the write, or a cancel
+                        // frame in tunnel mode) would never be noticed and the
+                        // subscriber would leak, inflating the viewer count.
+                        self.idle_deadline =
+                            Some(std::time::Instant::now() + Duration::from_secs(SSE_PING_SECS));
                         self.buf.extend_from_slice(b": ping\n\n");
                         None
                     }
