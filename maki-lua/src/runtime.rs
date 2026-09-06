@@ -61,6 +61,20 @@ const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
 const INTERRUPT_DEADLINE_MSG: &str = "plugin interrupted: deadline exceeded";
 const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// A delay that does not ride the async-io driver thread. The dispatch loops
+/// and deadlines below were observed parked forever when an async-io timer
+/// wake went missing (smol `Timer` needs that driver to re-poll the task);
+/// `futures_timer::Delay` wakes from its own thread straight through the
+/// executor's unpark, the path cancel handling already depends on.
+pub(crate) fn delay(dur: Duration) -> futures_timer::Delay {
+    futures_timer::Delay::new(dur)
+}
+
+pub(crate) fn delay_until(at: Instant) -> futures_timer::Delay {
+    futures_timer::Delay::new(at.saturating_duration_since(Instant::now()))
+}
+
 const NIL_WITHOUT_FINISH_MSG: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
 pub(crate) const CANCELLED_MSG: &str = "cancelled";
@@ -1156,7 +1170,7 @@ async fn run_scoped<F: Future>(lua: &Lua, scope: TaskScope, fut: F) -> F::Output
                 with_jobs(lua, |store| store.next_event(&owner))
             })
             .await;
-            smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+            delay(DISPATCH_POLL_INTERVAL).await;
         }
     };
     let out = scope.scope_future(smol::future::or(fut, pump)).await;
@@ -1744,7 +1758,7 @@ async fn until_abandoned<T>(
             match deadline {
                 Some(dl) if dl <= Instant::now() => break,
                 Some(dl) => {
-                    futures_lite::future::or(async { _ = smol::Timer::at(dl).await }, changed).await
+                    futures_lite::future::or(async { _ = delay_until(dl).await }, changed).await
                 }
                 None => changed.await,
             }
@@ -1753,7 +1767,7 @@ async fn until_abandoned<T>(
     };
     let cancelled = async {
         cancel.cancelled().await;
-        smol::Timer::after(CANCEL_ABANDON_AFTER).await;
+        delay(CANCEL_ABANDON_AFTER).await;
         CANCELLED_MSG
     };
     futures_lite::future::or(async { Ok(fut.await) }, async {
@@ -2798,7 +2812,7 @@ fn spawn_restore(
         let res = covered(
             slot,
             futures_lite::future::race(restore_item(&lua, &plugins, item), async {
-                smol::Timer::after(RESTORE_ITEM_TIMEOUT).await;
+                delay(RESTORE_ITEM_TIMEOUT).await;
                 tracing::warn!(tool = &*tool, "restore item timed out");
                 None
             }),
@@ -2860,7 +2874,7 @@ async fn dispatch_async(
     let owner = JobOwner::Task(lock_cell(&handle).id);
     if with_jobs(lua, |store| store.is_empty(&owner)) {
         lua.gc_collect().ok();
-        smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+        delay(DISPATCH_POLL_INTERVAL).await;
         return match finish_rx.try_recv() {
             Ok(reply) => reply,
             _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
@@ -2899,13 +2913,13 @@ async fn dispatch_async(
         }
 
         if with_jobs(lua, |store| store.is_empty(&owner)) {
-            smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+            delay(DISPATCH_POLL_INTERVAL).await;
             return match finish_rx.try_recv() {
                 Ok(reply) => reply,
                 _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
             };
         }
-        smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+        delay(DISPATCH_POLL_INTERVAL).await;
     }
 }
 
@@ -3336,7 +3350,7 @@ pub fn spawn(
                                 .await;
                             drop(scope);
                         }
-                        smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
+                        delay(DISPATCH_POLL_INTERVAL).await;
                     }
                 })
                 .detach();

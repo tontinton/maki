@@ -184,7 +184,7 @@ pub(crate) async fn stream_with_retry(
                 })?;
                 futures_lite::future::race(
                     async {
-                        smol::Timer::after(delay).await;
+                        futures_timer::Delay::new(delay).await;
                     },
                     cancel.cancelled(),
                 )
