@@ -52,6 +52,12 @@
   .msg { margin: 6px 0; white-space: pre-wrap; word-break: break-word; }
   .msg.user { color: var(--user); }
   .msg.user::before { content: "you> "; color: var(--muted); }
+  .msg.user a.upload-link { color: var(--accent); text-decoration: none; }
+  .msg.user a.upload-link:hover { text-decoration: underline; }
+  .msg.user img.upload-thumb {
+    display: inline-block; max-width: 240px; max-height: 240px;
+    margin-top: 4px; border-radius: 6px; border: 1px solid var(--border);
+  }
   .msg.assistant { color: var(--text); }
   .msg.thinking { color: var(--muted); font-style: italic; }
   .msg.error { color: var(--error); }
@@ -241,7 +247,8 @@
   }
   #files-panel {
     position: fixed; top: 0; left: 0; bottom: 0; z-index: 90;
-    width: min(380px, 92vw);
+    width: min(640px, 92vw);
+    min-width: 260px;
     background: var(--panel);
     border-right: 1px solid var(--border);
     box-shadow: 4px 0 24px rgba(0,0,0,.35);
@@ -250,6 +257,12 @@
     transition: transform .18s ease;
   }
   #files-panel.open { transform: translateX(0); }
+  #files-panel.resizing { transition: none; user-select: none; }
+  #files-resize {
+    position: absolute; top: 0; right: -4px; bottom: 0; width: 8px;
+    cursor: ew-resize; z-index: 91; touch-action: none;
+  }
+  #files-resize:hover, #files-panel.resizing #files-resize { background: rgba(122,162,247,.35); }
   #files-head {
     display: flex; align-items: center; gap: 8px;
     padding: 10px 12px; border-bottom: 1px solid var(--border);
@@ -314,6 +327,7 @@
     <button class="mini" id="files-btn" title="Browse files">files</button>
     <button class="mini" id="toolbar-toggle" title="Hide/show the toolbar to save space">tools ▾</button>
     <button class="mini" id="compact-toggle" title="Shrink the headers to save space">compact</button>
+    <button class="mini" id="notify-btn" title="Get notified when the run stops or needs you">🔕</button>
     <button class="mini" id="qr-btn" title="QR code for this page's link">QR</button>
     <button class="mini" id="center-btn" title="Remote control center">remote ▾</button>
     <div id="center" hidden></div>
@@ -321,6 +335,7 @@
 </header>
 <div id="files-backdrop" hidden></div>
 <aside id="files-panel" aria-hidden="true">
+  <div id="files-resize" title="Drag to resize"></div>
   <div id="files-head">
     <strong id="files-title">Files</strong>
     <span id="files-branch" class="small"></span>
@@ -469,7 +484,47 @@
     try { localStorage.setItem("maki_toolbar_hidden", hidden ? "1" : "0"); } catch {}
   };
   toolbarToggle.onclick = () => applyToolbar(!toolbarEl.hidden);
-  try { applyToolbar(localStorage.getItem("maki_toolbar_hidden") === "1"); } catch {}
+  // Same first-visit rule as compact mode: an unset preference defaults from
+  // the viewport instead of always starting expanded, so a phone's first
+  // load isn't the full command bar eating half the screen.
+  try {
+    const stored = localStorage.getItem("maki_toolbar_hidden");
+    applyToolbar(stored === null ? window.innerWidth < 600 : stored === "1");
+  } catch { applyToolbar(window.innerWidth < 600); }
+
+  // Notifications: opt-in (a page can't silently start popping OS alerts),
+  // persisted like the layout toggles, and only for events that actually
+  // need you back at the screen — not every text delta.
+  const notifyBtn = document.getElementById("notify-btn");
+  const notifyEnabled = () => { try { return localStorage.getItem("maki_notify") === "1"; } catch { return false; } };
+  const applyNotifyBtn = () => {
+    const on = notifyEnabled();
+    notifyBtn.textContent = on ? "🔔" : "🔕";
+    notifyBtn.title = on ? "Notifications on — click to turn off" : "Get notified when the run stops or needs you";
+  };
+  // Historical events replayed from a snapshot (page load, reconnect) must
+  // never notify — only genuinely new live ones.
+  let replaying = false;
+  const notify = (title, body) => {
+    if (replaying || !notifyEnabled()) return;
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    if (document.visibilityState === "visible") return;
+    try { new Notification(title, { body, tag: "maki-remote" }); } catch {}
+  };
+  notifyBtn.onclick = async () => {
+    if (notifyEnabled()) {
+      try { localStorage.setItem("maki_notify", "0"); } catch {}
+      applyNotifyBtn();
+      return;
+    }
+    if (typeof Notification === "undefined") { toast("notifications aren't supported here"); return; }
+    const perm = Notification.permission === "granted" ? "granted" : await Notification.requestPermission();
+    if (perm !== "granted") { toast("notification permission denied"); return; }
+    try { localStorage.setItem("maki_notify", "1"); } catch {}
+    applyNotifyBtn();
+    new Notification("maki", { body: "You'll be notified when the run stops or needs you." });
+  };
+  applyNotifyBtn();
 
   const fmtTokens = (n) =>
     n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
@@ -506,25 +561,78 @@
     toastEl._t = setTimeout(() => toastEl.style.display = "none", ms);
   };
 
+  // `question` (maki's ask-the-user tool, like a Lua plugin's AskUserQuestion)
+  // opens a native TUI form via a general Lua windowing API, not a fixed
+  // permission-style prompt — there's no remote bridge for that yet, so the
+  // best the web view can do is show what's being asked instead of a bare,
+  // permanently-empty "question" card that looks like a silent hang.
+  const questionPreview = (input) => {
+    const qs = input && input.questions;
+    if (!Array.isArray(qs) || !qs.length) return "";
+    return String(qs[0].question || "").slice(0, 140);
+  };
+  const renderQuestionBody = (input) => {
+    const wrap = document.createElement("div");
+    for (const q of (input && input.questions) || []) {
+      const block = document.createElement("div");
+      block.style.margin = "4px 0 8px";
+      const text = document.createElement("div");
+      text.textContent = q.question || "";
+      block.appendChild(text);
+      if (Array.isArray(q.options) && q.options.length) {
+        const ul = document.createElement("ul");
+        ul.style.margin = "4px 0 0 18px";
+        for (const opt of q.options) {
+          const li = document.createElement("li");
+          li.textContent = opt.description ? `${opt.label} — ${opt.description}` : (opt.label || "");
+          ul.appendChild(li);
+        }
+        block.appendChild(ul);
+      }
+      wrap.appendChild(block);
+    }
+    const note = document.createElement("div");
+    note.className = "files-note";
+    note.textContent = "Answer this at the terminal — the remote view can't fill in maki's interactive question form yet.";
+    wrap.appendChild(note);
+    return wrap;
+  };
+
   const toolCard = (event) => {
     const details = document.createElement("details");
     details.className = "tool running";
     details.dataset.id = event.id;
     const summary = document.createElement("summary");
+    const out = document.createElement("div");
+    out.className = "out";
     let label = event.tool || "";
-    if (event.summary) label += ` — ${event.summary}`;
+    if (event.tool === "question") {
+      const preview = questionPreview(event.input);
+      if (preview) label += ` — ${preview}`;
+      details.open = true;
+    } else if (event.summary) label += ` — ${event.summary}`;
     else if (event.input) {
       const bits = [];
       for (const key of ["command", "path", "file_path", "pattern", "query", "url"]) {
         if (event.input[key]) bits.push(String(event.input[key]).slice(0, 80));
       }
       if (bits.length) label += ` — ${bits.join(" ")}`;
+      else {
+        // A tool this build has no bespoke summary for — almost always a
+        // Lua plugin's own tool, built-in or third-party. Dumping its raw
+        // call arguments beats a bare name with an indefinitely empty body,
+        // and needs no per-tool knowledge to do.
+        const json = JSON.stringify(event.input);
+        if (json && json !== "{}" && json !== "null") {
+          label += ` — ${json.slice(0, 100)}`;
+          out.textContent = JSON.stringify(event.input, null, 2);
+        }
+      }
     }
     summary.textContent = label;
-    const out = document.createElement("div");
-    out.className = "out";
     details.appendChild(summary);
     details.appendChild(out);
+    if (event.tool === "question" && event.input) out.appendChild(renderQuestionBody(event.input));
     log.appendChild(details);
     return details;
   };
@@ -666,6 +774,45 @@
     if (!typewriterRunning) { typewriterRunning = true; requestAnimationFrame(runTypewriter); }
   };
 
+  // A user message may carry images (vision attachments, rendered as
+  // thumbnails) and a "save"-mode upload leaves a plain "Uploaded file at
+  // NAME" line in its own text — turned into a link into the file panel
+  // instead of dead text, since NAME is already a path relative to cwd.
+  const UPLOAD_LINE_RE = /^Uploaded file at (.+)$/gm;
+  const renderUserMessage = (event) => {
+    const wrap = document.createElement("div");
+    wrap.className = "msg user";
+    const text = String(event.text || "");
+    let last = 0;
+    let m;
+    UPLOAD_LINE_RE.lastIndex = 0;
+    while ((m = UPLOAD_LINE_RE.exec(text))) {
+      wrap.appendChild(document.createTextNode(text.slice(last, m.index)));
+      const path = m[1];
+      const link = document.createElement("a");
+      link.href = "#";
+      link.className = "upload-link";
+      link.textContent = `📎 ${path}`;
+      link.onclick = (ev) => { ev.preventDefault(); openFilesPanel(); openFile(path); };
+      wrap.appendChild(link);
+      last = UPLOAD_LINE_RE.lastIndex;
+    }
+    wrap.appendChild(document.createTextNode(text.slice(last)));
+    for (const src of event.images || []) {
+      wrap.appendChild(document.createElement("br"));
+      const link = document.createElement("a");
+      link.href = src;
+      link.target = "_blank";
+      link.rel = "noopener";
+      const img = document.createElement("img");
+      img.className = "upload-thumb";
+      img.src = src;
+      link.appendChild(img);
+      wrap.appendChild(link);
+    }
+    log.appendChild(wrap);
+  };
+
   const renderEvent = (event) => {
     switch (event.type) {
       case "text_delta": {
@@ -694,7 +841,19 @@
         pushTypewriter(node, (visible) => { node.textContent = visible; });
         break;
       }
-      case "tool_start": toolCard(event); break;
+      case "tool_start": {
+        toolCard(event);
+        // The `question` tool opens a native TUI form the web has no way to
+        // drive (it isn't a fixed-shape prompt like permissions — it's an
+        // arbitrary interactive Lua window), so the run is genuinely stuck
+        // here until someone answers at the actual terminal. Surfacing what's
+        // being asked, and paging whoever's watching remotely, at least means
+        // that's not a silent, unexplained hang.
+        if (event.tool === "question") {
+          notify("maki — question", questionPreview(event.input) || "needs your input at the terminal");
+        }
+        break;
+      }
       case "tool_output": {
         const details = toolById(event.id);
         if (details) details.querySelector(".out").textContent = event.content;
@@ -716,11 +875,17 @@
       // relying only on a separate "status" SSE frame left it stuck showing
       // on a run that had, in fact, already finished (a status frame lost to
       // a phone backgrounding the tab, or a reconnect that missed it).
-      case "error": log.appendChild(el("msg error", event.message)); setStatus("idle"); break;
+      case "error": {
+        log.appendChild(el("msg error", event.message));
+        setStatus("idle");
+        notify("maki — stopped", event.message || "the run ended with an error");
+        break;
+      }
       case "done": {
         log.appendChild(el("msg system", `— done (${event.num_turns ?? "?"} turns)`));
         setStats({ context_size: event.context_size, context_window: event.context_window, cost: event.cost });
         setStatus("idle");
+        notify("maki — done", `${titleEl.textContent || "session"} finished (${event.num_turns ?? "?"} turns)`);
         break;
       }
       case "turn_complete": {
@@ -734,6 +899,7 @@
         denyGuidance.value = "";
         denyGuidance.style.display = "none";
         permEl.style.display = "block";
+        notify("maki — permission needed", event.tool ? `wants to run ${event.tool}` : "needs your input");
         break;
       }
       case "permission_resolved": {
@@ -743,7 +909,7 @@
         }
         break;
       }
-      case "user_message": log.appendChild(el("msg user", event.text)); break;
+      case "user_message": renderUserMessage(event); break;
       case "assistant_text": {
         const node = el("msg assistant", "");
         node.dataset.kind = "assistant";
@@ -773,6 +939,7 @@
       }
       return;
     }
+    replaying = true;
     for (const event of snap.messages || []) renderEvent(event);
     // Snapshot tool cards arrive as start+result pairs; close them.
     for (const details of log.querySelectorAll(".tool.running")) {
@@ -781,6 +948,7 @@
     if (snap.pending_permission) {
       renderEvent({ type: "permission_request", id: snap.pending_permission.id, tool: "resuming" });
     }
+    replaying = false;
     setHeader(snap);
     if (Array.isArray(snap.queue) && snap.queue.length) {
       log.appendChild(el("msg system", `— ${snap.queue.length} queued prompt(s)`));
@@ -872,6 +1040,35 @@
   const filesSaveBtn = document.getElementById("files-save");
   const filesDiffBtn = document.getElementById("files-toggle-diff");
   const filesBackBtn = document.getElementById("files-back");
+  const filesResize = document.getElementById("files-resize");
+
+  try {
+    const savedWidth = localStorage.getItem("maki_files_width");
+    if (savedWidth) filesPanel.style.width = savedWidth + "px";
+  } catch {}
+  (() => {
+    let startX = 0;
+    let startWidth = 0;
+    const onMove = (ev) => {
+      const x = ev.touches ? ev.touches[0].clientX : ev.clientX;
+      const w = Math.min(window.innerWidth * 0.92, Math.max(260, startWidth + (x - startX)));
+      filesPanel.style.width = w + "px";
+    };
+    const onUp = () => {
+      filesPanel.classList.remove("resizing");
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      try { localStorage.setItem("maki_files_width", String(filesPanel.getBoundingClientRect().width)); } catch {}
+    };
+    filesResize.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      startX = ev.clientX;
+      startWidth = filesPanel.getBoundingClientRect().width;
+      filesPanel.classList.add("resizing");
+      document.addEventListener("pointermove", onMove);
+      document.addEventListener("pointerup", onUp);
+    });
+  })();
 
   let filesOpen = false;
   let currentFile = null; // { path, content, binary, tooLarge, editing }
@@ -1046,8 +1243,19 @@
     autoGrowPrompt();
     renderChips();
     if (await submit("prompt", { text, files })) {
-      const label = text + (files.length ? ` (+${files.length} upload${files.length > 1 ? "s" : ""})` : "");
-      renderEvent({ type: "user_message", text: label });
+      // Optimistic render: attached images are known in full right now (we
+      // hold the bytes), so show them immediately rather than waiting on a
+      // reload. A "save" upload's final name isn't known until the backend
+      // resolves a collision, so it gets a plain note here; the real,
+      // clickable "Uploaded file at ..." line takes over once history
+      // (snapshot/reload) reflects what actually landed on disk.
+      let label = text;
+      const images = [];
+      for (const f of files) {
+        if (f.mode === "attach") images.push(`data:${f.media_type};base64,${f.data}`);
+        else label += `${label ? "\n" : ""}📎 saved ${f.name}`;
+      }
+      renderUserMessage({ text: label, images });
     }
   };
 
@@ -1092,7 +1300,9 @@
       b.onclick = () => { location.href = `/${token}/s/${s.id}/`; };
       sessionsBar.appendChild(b);
     }
-    sessionsBar.style.display = data.sessions.length ? "flex" : "none";
+    // A single-session roster is just the tab you're already looking at —
+    // showing it wastes a whole row, especially on a phone.
+    sessionsBar.style.display = data.sessions.length > 1 ? "flex" : "none";
   };
 
   // The model <select> is filtered by the provider <select> but always keeps

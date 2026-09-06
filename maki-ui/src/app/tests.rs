@@ -5579,6 +5579,49 @@ fn remote_snapshot_renders_transcript_and_stats() {
 }
 
 #[test]
+fn remote_snapshot_carries_attached_images_as_data_urls() {
+    use maki_agent::{ImageMediaType, ImageSource};
+
+    let mut app = test_app();
+    app.state.session_mut().replace_messages(vec![
+        Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "check this out".into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::new(ImageMediaType::Png, "aGVsbG8=".into()),
+                },
+            ],
+            ..Default::default()
+        },
+        // Image-only (no caption) must still surface: user_text() alone
+        // would skip the message and silently drop the picture too.
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                source: ImageSource::new(ImageMediaType::Jpeg, "d29ybGQ=".into()),
+            }],
+            ..Default::default()
+        },
+    ]);
+    let snap = app.remote_snapshot();
+    let msgs = snap["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2, "{msgs:?}");
+    assert_eq!(msgs[0]["text"], "check this out");
+    assert_eq!(
+        msgs[0]["images"].as_array().unwrap(),
+        &[serde_json::json!("data:image/png;base64,aGVsbG8=")]
+    );
+    assert_eq!(msgs[1]["text"], "");
+    assert_eq!(
+        msgs[1]["images"].as_array().unwrap(),
+        &[serde_json::json!("data:image/jpeg;base64,d29ybGQ=")]
+    );
+}
+
+#[test]
 fn remote_snapshot_prefers_stored_tool_output_over_inline_summary() {
     let mut app = test_app();
     app.state.session_mut().replace_messages(vec![Message {

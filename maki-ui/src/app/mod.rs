@@ -820,11 +820,24 @@ impl App {
                     if message.display_text.as_deref().is_some_and(str::is_empty) && !has_results {
                         continue;
                     }
-                    if let Some(text) = message.user_text() {
-                        messages.push(json!({
+                    let text = message.user_text().unwrap_or_default();
+                    let images: Vec<String> = message
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Image { source } => Some(source.to_data_url()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !text.is_empty() || !images.is_empty() {
+                        let mut event = json!({
                             "type": "user_message",
                             "text": text,
-                        }));
+                        });
+                        if !images.is_empty() {
+                            event["images"] = json!(images);
+                        }
+                        messages.push(event);
                     }
                     for block in &message.content {
                         if let ContentBlock::ToolResult {
