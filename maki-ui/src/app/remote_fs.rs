@@ -332,14 +332,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn resolve_in_cwd_refuses_a_symlink_that_points_outside() {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret.txt"), "nope").unwrap();
         let dir = tempfile::tempdir().unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path().join("secret.txt"), dir.path().join("link"))
             .unwrap();
-        #[cfg(unix)]
         assert!(resolve_in_cwd(&dir.path().to_string_lossy(), "link").is_err());
     }
 
