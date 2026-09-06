@@ -165,6 +165,7 @@
     resize: none;
     height: 44px;
     max-height: 200px;
+    overflow-y: auto;
   }
   #prompt:focus { outline: none; border-color: var(--accent); }
   #center-wrap { position: relative; margin-left: auto; display: flex; gap: 4px; align-items: center; }
@@ -219,6 +220,13 @@
   /* Compact mode: shrink the header and toolbar to save vertical space. */
   body.compact header { padding: 3px 10px; }
   body.compact header h1 { font-size: 12px; }
+  /* The header's own content (cwd, model) is what forced it to wrap across
+     several lines on a narrow phone — shrinking padding/font alone left
+     that untouched. Both are redundant here (the model is already in the
+     toolbar's picker, cwd is rarely needed at a glance), so compact drops
+     them entirely rather than just shrinking them. */
+  body.compact #cwd, body.compact #model { display: none; }
+  body.compact #stats { font-size: 11px; }
   body.compact #toolbar { padding: 2px 10px; }
   body.compact #toolbar input, body.compact #toolbar select { padding: 2px 6px; font-size: 11px; }
   body.compact #sessions-bar { padding: 2px 10px; }
@@ -296,6 +304,14 @@
   const modelEl = document.getElementById("model");
   const permEl = document.getElementById("perm");
   const promptEl = document.getElementById("prompt");
+  // Grows the box with its content up to the CSS max-height (which then
+  // scrolls internally), and snaps back down once it's cleared — matching
+  // ordinary chat-composer behavior instead of a fixed two-line box.
+  const autoGrowPrompt = () => {
+    promptEl.style.height = "auto";
+    promptEl.style.height = promptEl.scrollHeight + "px";
+  };
+  promptEl.addEventListener("input", autoGrowPrompt);
   const stopBtn = document.getElementById("stop");
   const denyGuidance = document.getElementById("deny-guidance");
   const cmdInput = document.getElementById("cmd-input");
@@ -346,7 +362,13 @@
     try { localStorage.setItem("maki_compact", on ? "1" : "0"); } catch {}
   };
   compactToggle.onclick = () => applyCompact(!document.body.classList.contains("compact"));
-  try { applyCompact(localStorage.getItem("maki_compact") === "1"); } catch {}
+  // A first-time visit has no stored choice yet; default it from the
+  // viewport instead of always starting expanded, so a phone doesn't have
+  // to discover and click the toggle just to get a usable amount of screen.
+  try {
+    const stored = localStorage.getItem("maki_compact");
+    applyCompact(stored === null ? window.innerWidth < 600 : stored === "1");
+  } catch { applyCompact(window.innerWidth < 600); }
 
   // Toolbar hide/show: the command bar (model picker, /fast, /thinking, ...)
   // is the biggest single chunk of header space on a phone and is rarely
@@ -435,14 +457,14 @@
     const spans = [];
     const placeheld = escHtml(s).replace(/`([^`]+)`/g, (_, code) => {
       spans.push(code);
-      return ` ${spans.length - 1} `;
+      return ` ${spans.length - 1} `;
     });
     const html = placeheld
       .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
       .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "<em>$1</em>")
       .replace(/~~([^~]+)~~/g, "<del>$1</del>")
       .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-    return html.replace(/ (\d+) /g, (_, i) => `<code>${spans[Number(i)]}</code>`);
+    return html.replace(/ (\d+) /g, (_, i) => `<code>${spans[Number(i)]}</code>`);
   };
   const renderMarkdown = (text) => {
     const lines = String(text).split("\n");
@@ -603,10 +625,15 @@
         }
         break;
       }
-      case "error": log.appendChild(el("msg error", event.message)); break;
+      // Both end the run outright, so the stop button must go with them —
+      // relying only on a separate "status" SSE frame left it stuck showing
+      // on a run that had, in fact, already finished (a status frame lost to
+      // a phone backgrounding the tab, or a reconnect that missed it).
+      case "error": log.appendChild(el("msg error", event.message)); setStatus("idle"); break;
       case "done": {
         log.appendChild(el("msg system", `— done (${event.num_turns ?? "?"} turns)`));
         setStats({ context_size: event.context_size, context_window: event.context_window, cost: event.cost });
+        setStatus("idle");
         break;
       }
       case "turn_complete": {
@@ -746,6 +773,7 @@
     if (!text && !pendingFiles.length) return;
     const files = pendingFiles.splice(0).map(f => ({ name: f.name, media_type: f.mediaType, data: f.data, mode: f.mode }));
     promptEl.value = "";
+    autoGrowPrompt();
     renderChips();
     if (await submit("prompt", { text, files })) {
       const label = text + (files.length ? ` (+${files.length} upload${files.length > 1 ? "s" : ""})` : "");
@@ -1048,7 +1076,7 @@
       ev.preventDefault();
       // slash at start → route to command endpoint so autocomplete, model, etc. work from the main box too
       const t = promptEl.value.trim();
-      if (t.startsWith("/")) { cmdInput.value = t; promptEl.value = ""; runCommand(); return; }
+      if (t.startsWith("/")) { cmdInput.value = t; promptEl.value = ""; autoGrowPrompt(); runCommand(); return; }
       sendPrompt();
     }
   });
