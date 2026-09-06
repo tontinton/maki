@@ -209,6 +209,28 @@ Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to th
 
 To reach a service on your own machine or network, list it in [`net.allowed_private_hosts`](/docs/configuration/#net). An allowed host also keeps plain `http://` instead of being upgraded to `https://`, since a service on your LAN rarely has a certificate.
 
+## Maki's Own Files
+
+The file tools and every plugin that calls `maki.fs` ask one guard before they touch a path. Maki's state, cache and log directories are closed, so provider tokens, session history and logs are out of reach. The parts real features write stay open: memory notes, the skill reference and plan files.
+
+In a config dir, the files that decide how Maki behaves, or that Maki runs, are readable and refuse writes.
+
+| Path | The agent may |
+|------|---------------|
+| `permissions.toml`, `plugin.toml`, `mcp.toml`, `providers.toml`, `providers/`, `.env` | read |
+| `init.lua`, `lua/` | write, after you allow it |
+| `config.toml`, `AGENTS.md`, `skills/`, `commands/`, `themes/` | write |
+
+Anything else you keep in a config dir is an ordinary file, unless the dir is `~/.maki`, which is Maki's state dir as well and closed apart from the names above.
+
+A project's own `.maki` refuses writes to `permissions.toml`, `plugin.toml`, `mcp.toml` and `.env`, in any project the agent reaches rather than only the one you opened. Trusting a folder is your decision, so the agent working there does not get to rewrite the answer. The rest of `.maki` stays writable. Packages Maki installs are read only too, since it runs the Lua in them.
+
+`init.lua` and `lua/` are the one place inside the folder you opened where a write asks first. Asking Maki to [write a plugin](/docs/plugins/) is a normal thing to do, so this is an ordinary permission and "always allow" is remembered like any other answer.
+
+Adding an MCP server or pointing Maki at your own gateway is now yours to do. Edit `mcp.toml` and `providers.toml` in your editor.
+
+All of this holds only while `bash` is gated. A shell command reads and writes these files directly, and no check inside Maki can stop that. An OS sandbox can.
+
 ## Session Persistence
 
 When you save a session, its permission rules are saved too. Loading the session restores them.

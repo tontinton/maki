@@ -257,7 +257,11 @@ struct ScriptDescription {
 type ScriptCache = HashMap<String, ScriptDescription>;
 
 fn cache_path() -> Option<PathBuf> {
-    Some(StateDir::resolve().ok()?.path().join(SCRIPT_CACHE_FILE))
+    Some(cache_path_in(StateDir::resolve().ok()?.path()))
+}
+
+fn cache_path_in(state: &Path) -> PathBuf {
+    state.join(SCRIPT_CACHE_FILE)
 }
 
 fn read_cache() -> ScriptCache {
@@ -400,14 +404,24 @@ fn write_cache(cache: &ScriptCache) {
 }
 
 fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
+    let cache = read_cache();
+    let (result, next) = describe_scripts_in(dir, &cache);
+    if next != cache {
+        write_cache(&next);
+    }
+    result
+}
+
+/// The cache is passed in and handed back rather than read and written here,
+/// so a test can discover scripts without touching Maki's real state dir.
+fn describe_scripts_in(dir: &Path, cache: &ScriptCache) -> (Vec<DynamicProviderMeta>, ScriptCache) {
+    let mut next = ScriptCache::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), next),
     };
 
     let builtins = builtin_slugs();
-    let cache = read_cache();
-    let mut next = ScriptCache::new();
     let mut result = Vec::new();
 
     for entry in entries.flatten() {
@@ -470,10 +484,7 @@ fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
         next.insert(slug, described);
     }
 
-    if next != cache {
-        write_cache(&next);
-    }
-    result
+    (result, next)
 }
 
 static DISCOVERED: OnceLock<Vec<DynamicProviderMeta>> = OnceLock::new();
@@ -895,6 +906,25 @@ mod tests {
         assert_eq!(is_valid_slug(input), expected);
     }
 
+    /// This cache names the scripts maki runs, so nothing outside maki may
+    /// touch it. The path comes from the code that writes it, so moving the
+    /// file cannot move it out from under the rule in silence.
+    ///
+    /// The layout is one this test owns. Asking the real one would make the
+    /// answer depend on whether the machine running it has a `~/.maki`, and a
+    /// guard that is off must not look like a broken test.
+    #[test]
+    fn the_script_cache_is_out_of_reach() {
+        let state = tempfile::TempDir::new().unwrap();
+        let guard = maki_storage::paths::Guard::for_layout(&maki_storage::paths::Layout {
+            state: Some(state.path()),
+            ..Default::default()
+        });
+        let path = cache_path_in(state.path());
+
+        assert!(guard.is_unreachable(&path), "{path:?}");
+    }
+
     #[test]
     fn script_resolved_auth_deserialization() {
         let with_base =
@@ -974,6 +1004,13 @@ mod tests {
         assert!(meta.models[0].thinking_fields.is_none());
     }
 
+    /// Discovery with an empty cache and nowhere to write one, so the test run
+    /// leaves Maki's real state dir alone.
+    #[cfg(unix)]
+    fn discovered_in(dir: &Path) -> Vec<DynamicProviderMeta> {
+        describe_scripts_in(dir, &ScriptCache::new()).0
+    }
+
     #[cfg(unix)]
     fn write_script(dir: &Path, name: &str, info_json: &str) -> PathBuf {
         let path = dir.join(name);
@@ -997,7 +1034,7 @@ mod tests {
             "test-provider",
             r#"{"display_name": "Test", "base": "anthropic", "has_auth": true}"#,
         );
-        let providers = discover_in(tmp.path());
+        let providers = discovered_in(tmp.path());
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].slug, "test-provider");
         assert_eq!(providers[0].display_name, "Test");
@@ -1013,7 +1050,7 @@ mod tests {
     fn discover_skips_invalid(name: &str, info_json: &str) {
         let tmp = TempDir::new().unwrap();
         write_script(tmp.path(), name, info_json);
-        assert!(discover_in(tmp.path()).is_empty());
+        assert!(discovered_in(tmp.path()).is_empty());
     }
 
     #[cfg(unix)]
@@ -1034,7 +1071,7 @@ esac
         file.sync_all().unwrap();
         drop(file);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        let providers = discover_in(tmp.path());
+        let providers = discovered_in(tmp.path());
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].models.len(), 1);
         assert_eq!(providers[0].models[0].id, "custom-v1");
@@ -1150,7 +1187,7 @@ esac
         let tmp = TempDir::new().unwrap();
         let info = format!(r#"{{"display_name": "Test", "base": "{base}", "has_auth": false}}"#);
         write_script(tmp.path(), "custom-test", &info);
-        let providers = discover_in(tmp.path());
+        let providers = discovered_in(tmp.path());
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].base, expected);
     }

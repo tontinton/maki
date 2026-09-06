@@ -2036,7 +2036,16 @@ fn build_permissions(
     }
 }
 
+/// Load `.env` for this run: the global one first, then the project one.
+///
+/// The order of the two lines below is the point. `.env` files are read into
+/// Maki's own environment, and `HOME` is a key like any other, so a project
+/// could otherwise move Maki's config dir, state dir and the rules that
+/// protect them by writing one line. Pinning the layout first means an `.env`
+/// still reaches the tools Maki runs, and no longer decides where Maki reads
+/// its own files from.
 pub fn load_env_files(cwd: &Path) {
+    paths::freeze();
     load_env_files_with_global(cwd, paths::find_config_path(ENV_FILE).as_deref());
 }
 

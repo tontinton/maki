@@ -4758,7 +4758,7 @@ fn package_without_manifest_cannot_use_guarded_apis() {
         &[(
             "init.lua",
             r#"
-local ok = pcall(function() return maki.env.config_dir() end)
+local ok = pcall(function() return maki.env.legacy_dir() end)
 maki.api.register_command({
   name = ok and "/allowed" or "/denied",
   handler = function() end,
@@ -4794,7 +4794,7 @@ fn manual_package_is_granted_what_its_manifest_requests() {
         &[(
             "init.lua",
             r#"
-local ok = pcall(function() return maki.env.config_dir() end)
+local ok = pcall(function() return maki.env.legacy_dir() end)
 maki.api.register_command({
   name = ok and "/allowed" or "/denied",
   handler = function() end,
@@ -5349,7 +5349,7 @@ fn user_plugin_with_fs_read_can_read_but_not_write() {
 /// file lives and never what the environment holds. `fs_read` is what these
 /// cost, and it is also what they need, so `env` stays the key to the process
 /// environment alone.
-#[test_case::test_case("maki.env.state_dir()" ; "state_dir")]
+#[test_case::test_case("maki.env.legacy_dir()" ; "legacy_dir")]
 #[test_case::test_case(r#"maki.fn.executable("ls")"# ; "executable")]
 fn location_queries_cost_fs_read(call: &str) {
     const TOOL: &str = "location_test";

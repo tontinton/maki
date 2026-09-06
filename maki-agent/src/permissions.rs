@@ -57,6 +57,26 @@ fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
 
 pub const BOUNDARY_UNVERIFIABLE_PREFIX: &str = "Cannot verify project boundary for";
 
+fn writes_files(tool: &ToolKey) -> bool {
+    matches!(tool, ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()))
+}
+
+/// Whether the allows Maki ships get to claim this scope.
+///
+/// The cwd allow is what makes editing a project quiet, and Maki's own
+/// startup Lua sits inside a project too, as `<project>/.maki/init.lua` and
+/// the modules beside it. Writing one is a fair thing to ask Maki for, and it
+/// is also what the next start runs, so it is worth one question.
+///
+/// Not matching is the whole mechanism, and it has to be. A deny would win
+/// over everything, so the user could never answer "always" and mean it.
+/// Falling through leaves the answer to the default, which prompts, and the
+/// rule the user gets when they say "always" is a rule of theirs, which the
+/// lists beside this one still match.
+fn builtin_allows_cover(tool: &ToolKey, scope: &str) -> bool {
+    !writes_files(tool) || !maki_storage::paths::is_startup_lua(Path::new(scope))
+}
+
 /// Whether the builtin defaults treat `tool` specially. File write tools get
 /// the cwd allow and the plan mode allow, `task` gets a blanket allow, and an
 /// "allow always" for `bash` is stored under the first word of the command.
@@ -374,10 +394,15 @@ impl PermissionManager {
 
         for scope in scopes {
             let mut has_allow = false;
+            let builtin: &[PermissionRule] = if builtin_allows_cover(tool, scope) {
+                &self.builtin_rules
+            } else {
+                &[]
+            };
             for r in session
                 .iter()
                 .chain(&self.config_rules)
-                .chain(&self.builtin_rules)
+                .chain(builtin)
                 .chain(&plugin)
             {
                 let Some(approval) = rule_reach(&r.tool, tool) else {
@@ -422,13 +447,12 @@ impl PermissionManager {
         // A single non-plan scope means we must prompt for the rest.
         if !force_prompt && !pending.is_empty() {
             let is_plan_write = plan_path.is_some_and(|pp| {
-                matches!(tool, ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()))
-                    && {
-                        let normalized_plan = normalize_scope_path(&pp.display().to_string());
-                        pending
-                            .iter()
-                            .all(|s| normalize_scope_path(s) == normalized_plan)
-                    }
+                writes_files(tool) && {
+                    let normalized_plan = normalize_scope_path(&pp.display().to_string());
+                    pending
+                        .iter()
+                        .all(|s| normalize_scope_path(s) == normalized_plan)
+                }
             });
             if is_plan_write {
                 return PermissionCheck::Allowed;
@@ -869,6 +893,10 @@ mod tests {
     const MCP_ARGS: &str = "{\"q\":\"maki\"}";
     const READ_TOOL: &str = "read";
     const READ_SCOPE: &str = "/home/user/project/src/main.rs";
+    const WRITE_TOOL: &str = "write";
+    const PROJECT_ENTRY_POINT: &str = ".maki/init.lua";
+    const PROJECT_LUA_MODULE: &str = ".maki/lua/thing.lua";
+    const ORDINARY_PROJECT_FILE: &str = "src/main.rs";
 
     const ALLOWED: &str = "allowed";
     const DENIED: &str = "denied";
@@ -1016,6 +1044,45 @@ mod tests {
             default_mgr().check(&ToolKey::native(tool), scope, None),
             PermissionCheck::Allowed
         )
+    }
+
+    /// Maki's own startup Lua sits inside the project, so the cwd allow would
+    /// otherwise rewrite it without a word. One question is what it is worth,
+    /// and the rest of the project stays as quiet as it was.
+    #[test_case(PROJECT_ENTRY_POINT, PROMPTS ; "the_entry_point_of_a_maki_dir")]
+    #[test_case(PROJECT_LUA_MODULE, PROMPTS ; "a_module_of_a_maki_dir")]
+    #[test_case(ORDINARY_PROJECT_FILE, ALLOWED ; "an_ordinary_project_file")]
+    fn the_builtin_cwd_allow_stops_at_makis_own_lua(rel: &str, expected: &str) {
+        let cwd = tempfile::TempDir::new().unwrap();
+        let mgr = mgr_with(PermissionsConfig::default(), cwd.path().to_path_buf());
+        let scope = cwd.path().join(rel).display().to_string();
+
+        assert_eq!(
+            outcome(mgr.check(&ToolKey::native(WRITE_TOOL), &scope, None)),
+            expected
+        );
+    }
+
+    /// Answering "always allow" writes a rule of the user's, and only the
+    /// allow Maki ships is held back, so the answer sticks and the next write
+    /// is silent.
+    #[test]
+    fn a_user_allow_still_covers_makis_own_lua() {
+        let cwd = tempfile::TempDir::new().unwrap();
+        let scope = cwd.path().join(PROJECT_ENTRY_POINT).display().to_string();
+        let mgr = mgr_with(
+            make_config(vec![PermissionRule {
+                tool: ToolKey::native(WRITE_TOOL),
+                scope: Some(scope.clone()),
+                effect: Effect::Allow,
+            }]),
+            cwd.path().to_path_buf(),
+        );
+
+        assert_eq!(
+            outcome(mgr.check(&ToolKey::native(WRITE_TOOL), &scope, None)),
+            ALLOWED
+        );
     }
 
     #[test]

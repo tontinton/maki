@@ -66,6 +66,10 @@ run = true
 4. Run `/reload`, then read the log as described below, to see that it loaded
    and what it printed.
 
+If you ask maki to write the plugin for you, step 1 and step 2 ask you for
+permission first, and step 3 is refused: `plugin.toml` is read only to the
+agent, so write that one yourself. See [permissions](/docs/permissions/).
+
 Leave `maki.api.register_options` to bundled plugins: maki rejects a
 `plugins.<name>` table for a plugin it does not ship, and startup fails. Keep
 settings in a local table, or export a `setup(opts)` function `init.lua` calls.

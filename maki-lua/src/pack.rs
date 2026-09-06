@@ -54,7 +54,7 @@ pub use maki_pack::paths::MANAGED_GROUP;
 
 /// `<data>/site`, the root Neovim would call a package path.
 pub fn site_dir() -> Result<PathBuf, std::io::Error> {
-    maki_storage::paths::data_dir().map(|d| d.join("site"))
+    maki_storage::paths::data_dir().map(|d| d.join(maki_storage::paths::SITE_DIR))
 }
 
 /// How a package reached the disk, which is what decides whose word grants its
@@ -107,7 +107,7 @@ pub fn lockfile_path() -> Option<PathBuf> {
         .map(|dir| dir.join("pack-lock.json"))
 }
 
-/// `pack-approvals.json`, in the state directory beside the checkouts.
+/// `pack-approvals.json`, in the site directory beside the checkouts.
 ///
 /// Deliberately not beside the lockfile. A lockfile is meant to be committed,
 /// so a package set reproduces on another machine. An approval is the opposite
