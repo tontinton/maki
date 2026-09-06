@@ -1,7 +1,7 @@
 local todos = {}
-local popped = {}
 local focused = nil
 local buf, win
+local user_hidden = false
 
 local STATUS_MARKERS = {
   completed = { "[✓]", "todo_completed" },
@@ -46,6 +46,9 @@ end
 
 local function ensure_win(visible)
   if buf and win and win:is_open() then
+    if visible and not user_hidden then
+      win:show()
+    end
     return
   end
   buf = maki.ui.buf()
@@ -56,7 +59,7 @@ local function ensure_win(visible)
     title = " Todos ",
     border = "rounded",
     focus = false,
-    visible = visible,
+    visible = visible and not user_hidden,
     footer = {
       { "Ctrl+T", "to hide" },
     },
@@ -155,12 +158,8 @@ maki.api.register_tool({
     local sid = ctx:session_id() or ""
     local items = input.todos or {}
     todos[sid] = items
-    local pop = #items > 0 and not popped[sid]
-    if pop then
-      popped[sid] = true
-    end
     if is_focused(sid) then
-      sync_panel(items, pop)
+      sync_panel(items, #items > 0)
     end
     return #items == 0 and "Todos cleared" or ""
   end,
@@ -172,9 +171,11 @@ local function toggle()
     return
   end
   if win:is_visible() then
+    user_hidden = true
     win:hide()
     update_hint(items)
   elseif win:is_open() then
+    user_hidden = false
     win:show()
     maki.ui.set_status_hint(nil)
   else
@@ -187,7 +188,8 @@ maki.keymap.set("n", "<C-t>", toggle, { desc = "Toggle todo panel" })
 maki.api.create_autocmd({ "TurnEnd", "SessionReset" }, {
   callback = function(ev)
     local sid = ev.data and ev.data.session_id or ""
-    todos[sid], popped[sid] = nil, nil
+    todos[sid] = nil
+    user_hidden = false
     if is_focused(sid) then
       hide_panel()
     end
