@@ -323,7 +323,9 @@ fn sse_opens_with_snapshot_then_carries_published_frames() {
         "SSE must open event-stream, got {headers:?}"
     );
     assert!(
-        headers.to_ascii_lowercase().contains("x-accel-buffering: no"),
+        headers
+            .to_ascii_lowercase()
+            .contains("x-accel-buffering: no"),
         "SSE must disable reverse-proxy buffering or a buffering proxy \
          withholds the snapshot frame until more bytes arrive: {headers:?}"
     );
