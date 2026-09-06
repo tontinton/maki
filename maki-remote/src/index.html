@@ -104,6 +104,10 @@
     border-bottom: 1px solid var(--border);
     background: var(--panel);
   }
+  /* Author rules always beat the UA `[hidden]` default regardless of
+     specificity, so #toolbar's own `display: flex` above would otherwise
+     win over a bare `hidden` attribute; this rule restores it. */
+  #toolbar[hidden] { display: none; }
   #toolbar input, #toolbar select {
     background: var(--bg);
     color: var(--text);
@@ -233,6 +237,7 @@
   <span id="stats"></span>
   <span id="conn" data-conn="down">connecting</span>
   <div id="center-wrap">
+    <button class="mini" id="toolbar-toggle" title="Hide/show the toolbar to save space">tools ▾</button>
     <button class="mini" id="compact-toggle" title="Shrink the headers to save space">compact</button>
     <button class="mini" id="qr-btn" title="QR code for this page's link">QR</button>
     <button class="mini" id="center-btn" title="Remote control center">remote ▾</button>
@@ -314,16 +319,24 @@
     return node;
   };
 
+  let pinned = true;
   const scrollDown = () => { log.scrollTop = log.scrollHeight; updateJump(); };
 
   // Show the "jump to bottom" button only when the user has scrolled away
-  // from the latest message, so it never gets in the way at the bottom.
+  // from the latest message, so it never gets in the way at the bottom. Also
+  // tracks whether the view is "pinned" to the bottom: live updates only
+  // autoscroll while pinned, so reading older messages is never interrupted.
   const updateJump = () => {
     const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    pinned = nearBottom;
     jumpBtn.style.display = nearBottom ? "none" : "flex";
   };
   log.addEventListener("scroll", updateJump);
-  jumpBtn.onclick = () => { scrollDown(); updateJump(); };
+  jumpBtn.onclick = () => { pinned = true; scrollDown(); };
+
+  // Follow new output only when already pinned to the bottom; otherwise leave
+  // the scroll position alone and just keep the jump button in sync.
+  const autoScroll = () => { if (pinned) scrollDown(); else updateJump(); };
 
   // Compact mode: persist the choice so a phone reload keeps the layout.
   const compactToggle = document.getElementById("compact-toggle");
@@ -334,6 +347,20 @@
   };
   compactToggle.onclick = () => applyCompact(!document.body.classList.contains("compact"));
   try { applyCompact(localStorage.getItem("maki_compact") === "1"); } catch {}
+
+  // Toolbar hide/show: the command bar (model picker, /fast, /thinking, ...)
+  // is the biggest single chunk of header space on a phone and is rarely
+  // touched mid-conversation, so it can be tucked away independently of
+  // compact mode. Persisted the same way so a reload keeps the choice.
+  const toolbarToggle = document.getElementById("toolbar-toggle");
+  const toolbarEl = document.getElementById("toolbar");
+  const applyToolbar = (hidden) => {
+    toolbarEl.hidden = hidden;
+    toolbarToggle.textContent = hidden ? "tools ▸" : "tools ▾";
+    try { localStorage.setItem("maki_toolbar_hidden", hidden ? "1" : "0"); } catch {}
+  };
+  toolbarToggle.onclick = () => applyToolbar(!toolbarEl.hidden);
+  try { applyToolbar(localStorage.getItem("maki_toolbar_hidden") === "1"); } catch {}
 
   const fmtTokens = (n) =>
     n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
@@ -397,93 +424,165 @@
 
   // A tiny, safe markdown renderer for assistant messages: escape first, then
   // apply a small set of block and inline rules. Good enough to read code,
-  // lists, headings and links the way the CLI does, without a dependency.
+  // lists (ordered and unordered), headings, rules and links the way the CLI
+  // does, without a dependency.
   const escHtml = (s) => String(s)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-  const inlineMd = (s) => escHtml(s)
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // Code spans are pulled out behind a placeholder before bold/italic/strike
+  // run, so `**`/`~~` inside inline code is never reinterpreted as markup.
+  const inlineMd = (s) => {
+    const spans = [];
+    const placeheld = escHtml(s).replace(/`([^`]+)`/g, (_, code) => {
+      spans.push(code);
+      return ` ${spans.length - 1} `;
+    });
+    const html = placeheld
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "<em>$1</em>")
+      .replace(/~~([^~]+)~~/g, "<del>$1</del>")
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    return html.replace(/ (\d+) /g, (_, i) => `<code>${spans[Number(i)]}</code>`);
+  };
   const renderMarkdown = (text) => {
     const lines = String(text).split("\n");
     let html = "";
     let inCode = false;
-    let inList = false;
+    let listType = null; // "ul" | "ol" | null
     let inTable = false;
     let tableRows = [];
-    const closeList = () => { if (inList) { html += "</ul>"; inList = false; } };
+    // A paragraph is a run of plain lines; markdown reflows them into one
+    // block, so buffer and join with a space rather than emitting a <p> per
+    // source line — otherwise every soft-wrapped line reads as its own
+    // paragraph, which looks nothing like the CLI's rendering.
+    let para = [];
+    const closeList = () => { if (listType) { html += `</${listType}>`; listType = null; } };
     const closeTable = () => {
       if (inTable) {
         html += "<table>" + tableRows.map(r => `<tr>${r.map(c => `<td>${inlineMd(c)}</td>`).join("")}</tr>`).join("") + "</table>";
         inTable = false; tableRows = [];
       }
     };
+    const flushPara = () => {
+      if (para.length) { html += `<p>${inlineMd(para.join(" "))}</p>`; para = []; }
+    };
     for (const raw of lines) {
       const line = raw.trimEnd();
       if (line.startsWith("```")) {
-        closeList(); closeTable();
+        flushPara(); closeList(); closeTable();
         if (inCode) { html += "</code></pre>"; inCode = false; }
         else { html += "<pre><code>"; inCode = true; }
         continue;
       }
       if (inCode) { html += escHtml(line) + "\n"; continue; }
       if (/^\s*\|.*\|\s*$/.test(line)) {
-        closeList();
+        flushPara(); closeList();
         const cells = line.split("|").slice(1, -1).map(c => c.trim());
         if (/^[\s:|-]+$/.test(cells.join(""))) continue; // separator row
         inTable = true; tableRows.push(cells);
         continue;
       }
       closeTable();
-      if (/^#{1,3}\s/.test(line)) {
-        closeList();
+      if (/^ {0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) {
+        flushPara(); closeList();
+        html += "<hr>";
+      } else if (/^#{1,3}\s/.test(line)) {
+        flushPara(); closeList();
         const level = line.match(/^#+/)[0].length;
         html += `<h${level}>${inlineMd(line.replace(/^#+\s/, ""))}</h${level}>`;
       } else if (/^\s*[-*]\s+/.test(line)) {
-        if (!inList) { html += "<ul>"; inList = true; }
+        flushPara();
+        if (listType !== "ul") { closeList(); html += "<ul>"; listType = "ul"; }
         html += `<li>${inlineMd(line.replace(/^\s*[-*]\s+/, ""))}</li>`;
+      } else if (/^\s*\d+[.)]\s+/.test(line)) {
+        flushPara();
+        if (listType !== "ol") { closeList(); html += "<ol>"; listType = "ol"; }
+        html += `<li>${inlineMd(line.replace(/^\s*\d+[.)]\s+/, ""))}</li>`;
       } else if (/^\s*>\s?/.test(line)) {
-        closeList();
+        flushPara(); closeList();
         html += `<blockquote>${inlineMd(line.replace(/^\s*>\s?/, ""))}</blockquote>`;
       } else if (line.trim() === "") {
-        closeList();
+        flushPara(); closeList();
       } else {
         closeList();
-        html += `<p>${inlineMd(line)}</p>`;
+        para.push(line.trim());
       }
     }
-    closeList(); closeTable();
+    flushPara(); closeList(); closeTable();
     if (inCode) html += "</code></pre>";
     return html;
+  };
+
+  // The CLI never dumps a whole network chunk onto the screen at once — it
+  // reveals it at a steady pace (`typewriter_ms_per_char`, 4ms/char, clamped
+  // to 30-1000ms per chunk) so text always looks like it's being typed,
+  // however big the underlying delta was. The web page received the exact
+  // same envelopes just as fast, but rendered them instantly, which read as
+  // "batches" next to the CLI. This mirrors that same reveal algorithm
+  // client-side, keyed per message node so several streaming messages (e.g.
+  // thinking + assistant text) animate independently.
+  const TYPEWRITER_MS_PER_CHAR = 4;
+  const TYPEWRITER_MIN_MS = 30;
+  const TYPEWRITER_MAX_MS = 1000;
+  const typewriterNodes = new Set();
+  let typewriterRunning = false;
+  const runTypewriter = () => {
+    const now = performance.now();
+    for (const node of [...typewriterNodes]) {
+      if (!node.isConnected) { typewriterNodes.delete(node); continue; }
+      const progress = Math.min(1, (now - node._twStart) / node._twDuration);
+      const shown = Math.round(node._twFrom + (node._twTo - node._twFrom) * progress);
+      if (shown !== node._twVisible) {
+        node._twVisible = shown;
+        node._twRender(node.dataset.raw.slice(0, shown));
+      }
+      if (progress >= 1) typewriterNodes.delete(node);
+    }
+    autoScroll();
+    if (typewriterNodes.size) requestAnimationFrame(runTypewriter);
+    else typewriterRunning = false;
+  };
+  // Feeds more text into a node's reveal, extending its animation the same
+  // way the CLI's typewriter does: retarget from wherever it currently is
+  // toward the new full length, over a duration sized to what's unrevealed.
+  const pushTypewriter = (node, renderFn) => {
+    node._twRender = renderFn;
+    node._twVisible = node._twVisible ?? 0;
+    node._twFrom = node._twVisible;
+    node._twTo = node.dataset.raw.length;
+    const unrevealed = node._twTo - node._twFrom;
+    node._twDuration = Math.min(TYPEWRITER_MAX_MS, Math.max(TYPEWRITER_MIN_MS, unrevealed * TYPEWRITER_MS_PER_CHAR));
+    node._twStart = performance.now();
+    typewriterNodes.add(node);
+    if (!typewriterRunning) { typewriterRunning = true; requestAnimationFrame(runTypewriter); }
   };
 
   const renderEvent = (event) => {
     switch (event.type) {
       case "text_delta": {
         const last = log.lastElementChild;
-        if (last && last.dataset.kind === "assistant") {
-          last.dataset.raw = (last.dataset.raw || "") + event.text;
-          last.innerHTML = renderMarkdown(last.dataset.raw);
-        } else {
-          const node = el("msg assistant", "");
-          node.dataset.kind = "assistant";
-          node.dataset.raw = event.text;
-          node.innerHTML = renderMarkdown(event.text);
-          log.appendChild(node);
-        }
+        const node = (last && last.dataset.kind === "assistant") ? last : (() => {
+          const n = el("msg assistant", "");
+          n.dataset.kind = "assistant";
+          n.dataset.raw = "";
+          log.appendChild(n);
+          return n;
+        })();
+        node.dataset.raw = (node.dataset.raw || "") + event.text;
+        pushTypewriter(node, (visible) => { node.innerHTML = renderMarkdown(visible); });
         break;
       }
       case "thinking_delta": {
         const last = log.lastElementChild;
-        if (last && last.dataset.kind === "thinking") {
-          last.textContent += event.text;
-        } else {
-          const node = el("msg thinking", event.text);
-          node.dataset.kind = "thinking";
-          log.appendChild(node);
-        }
+        const node = (last && last.dataset.kind === "thinking") ? last : (() => {
+          const n = el("msg thinking", "");
+          n.dataset.kind = "thinking";
+          n.dataset.raw = "";
+          log.appendChild(n);
+          return n;
+        })();
+        node.dataset.raw = (node.dataset.raw || "") + event.text;
+        pushTypewriter(node, (visible) => { node.textContent = visible; });
         break;
       }
       case "tool_start": toolCard(event); break;
@@ -540,7 +639,7 @@
         break;
       }
     }
-    scrollDown();
+    autoScroll();
   };
 
   // One pass over the snapshot's message list: the same shapes live events
@@ -572,6 +671,9 @@
     if (Array.isArray(snap.queue) && snap.queue.length) {
       log.appendChild(el("msg system", `— ${snap.queue.length} queued prompt(s)`));
     }
+    // A fresh snapshot (first load or reconnect) always starts pinned to the
+    // bottom, same as opening the page; only later live updates respect scroll.
+    pinned = true;
     scrollDown();
   };
 
