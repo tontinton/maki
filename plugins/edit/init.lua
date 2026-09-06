@@ -99,11 +99,11 @@ end
 -- The one gutter builder both render passes share: the plain render and
 -- the async highlight rewrite must produce byte-identical gutters or the
 -- columns shift when highlights land.
-local function nr_span(fmt, start_nr, i)
-  return { string.format(fmt, start_nr and (start_nr + i - 1) or ""), "line_nr" }
+local function nr_span(fmt, start_nr, i, style)
+  return { string.format(fmt, start_nr and (start_nr + i - 1) or ""), style }
 end
 
-local function append_diff_lines(view, text, style, prefix, nr_fmt, start_nr, jobs)
+local function append_diff_lines(view, text, style, prefix, sign_style, line_nr_style, nr_fmt, start_nr, jobs)
   local lines = split_lines(text or "")
   if #lines == 0 then
     return
@@ -113,14 +113,17 @@ local function append_diff_lines(view, text, style, prefix, nr_fmt, start_nr, jo
     text = table.concat(lines, "\n"),
     style = style,
     prefix = prefix,
+    sign_style = sign_style,
+    line_nr_style = line_nr_style,
     start_nr = start_nr,
   }
   for i, line in ipairs(lines) do
     local spans = {}
     if nr_fmt then
-      spans[#spans + 1] = nr_span(nr_fmt, start_nr, i)
+      spans[#spans + 1] = nr_span(nr_fmt, start_nr, i, line_nr_style)
     end
-    spans[#spans + 1] = { prefix .. line, style }
+    spans[#spans + 1] = { prefix, sign_style }
+    spans[#spans + 1] = { line, style }
     view:append(spans)
   end
 end
@@ -139,9 +142,9 @@ local function apply_highlights(view, fmt, jobs, ext)
         end
         local spans = {}
         if fmt then
-          spans[#spans + 1] = nr_span(fmt, job.start_nr, i)
+          spans[#spans + 1] = nr_span(fmt, job.start_nr, i, job.line_nr_style)
         end
-        spans[#spans + 1] = { job.prefix, { bg = bg } }
+        spans[#spans + 1] = { job.prefix, job.sign_style }
         for _, seg in ipairs(hl_line) do
           local s = type(seg[2]) == "table" and seg[2] or {}
           s.bg = bg
@@ -164,16 +167,16 @@ local function diff_view(blocks, path)
   local w = gutter_width(blocks)
   local fmt = w > 0 and ("%" .. w .. "s ") or nil
   local jobs = {}
-  local function append(text, style, prefix, start_nr)
-    append_diff_lines(view, text, style, prefix, fmt, start_nr, jobs)
+  local function append(text, style, prefix, sign_style, line_nr_style, start_nr)
+    append_diff_lines(view, text, style, prefix, sign_style, line_nr_style, fmt, start_nr, jobs)
   end
   for i, block in ipairs(blocks) do
     if i > 1 then
       view:append({})
     end
     local has_old = (block.old or "") ~= ""
-    append(block.old, "diff_old", "- ", block.nr)
-    append(block.new, "diff_new", "+ ", not has_old and block.nr or nil)
+    append(block.old, "diff_old", "- ", "diff_old_sign", "diff_old_line_nr", block.nr)
+    append(block.new, "diff_new", "+ ", "diff_new_sign", "diff_new_line_nr", not has_old and block.nr or nil)
   end
   view:finish()
   local ext = (path or ""):match("%.([^%.]+)$")

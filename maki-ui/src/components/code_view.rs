@@ -24,7 +24,11 @@ fn nr_width(max_nr: usize) -> usize {
 }
 
 fn gutter(nr_str: &str) -> Span<'static> {
-    Span::styled(format!("{nr_str} "), theme::current().diff_line_nr)
+    gutter_styled(nr_str, theme::current().diff_line_nr)
+}
+
+fn gutter_styled(nr_str: &str, style: Style) -> Span<'static> {
+    Span::styled(format!("{nr_str} "), style)
 }
 
 fn gap_ellipsis() -> Line<'static> {
@@ -186,8 +190,8 @@ fn render_diff(
     lines
 }
 
-fn numbered_gutter(line_nr: &mut usize, w: usize) -> Span<'static> {
-    let span = gutter(&format!("{line_nr:>w$}"));
+fn numbered_gutter(line_nr: &mut usize, w: usize, style: Style) -> Span<'static> {
+    let span = gutter_styled(&format!("{line_nr:>w$}"), style);
     *line_nr += 1;
     span
 }
@@ -207,17 +211,21 @@ fn render_hunk_line(
                 before.skip();
                 after.highlight_next()
             });
-            let mut spans = vec![numbered_gutter(line_nr, w), Span::raw("  ")];
+            let mut spans = vec![
+                numbered_gutter(line_nr, w, theme.diff_line_nr),
+                Span::raw("  "),
+            ];
             spans.extend(syntax_to_spans(after_spans, t));
             Line::from(spans)
         }
         DiffLine::Removed(ds) => {
             let before_spans = walkers.and_then(|(before, _)| before.highlight_next());
-            let mut spans = vec![numbered_gutter(line_nr, w)];
+            let mut spans = vec![numbered_gutter(line_nr, w, theme.diff_old_line_nr)];
             spans.extend(diff_change_spans(
                 "- ",
                 ds,
                 before_spans,
+                theme.diff_old_sign,
                 theme.diff_old,
                 theme.diff_old_emphasis,
             ));
@@ -225,11 +233,12 @@ fn render_hunk_line(
         }
         DiffLine::Added(ds) => {
             let after_spans = walkers.and_then(|(_, after)| after.highlight_next());
-            let mut spans = vec![gutter(&" ".repeat(w))];
+            let mut spans = vec![gutter_styled(&" ".repeat(w), theme.diff_new_line_nr)];
             spans.extend(diff_change_spans(
                 "+ ",
                 ds,
                 after_spans,
+                theme.diff_new_sign,
                 theme.diff_new,
                 theme.diff_new_emphasis,
             ));
@@ -249,12 +258,13 @@ fn diff_change_spans(
     prefix: &'static str,
     ds: &[DiffSpan],
     syntax: Option<Vec<Span<'static>>>,
+    sign: Style,
     base: Style,
     emph: Style,
 ) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(
         prefix,
-        base.patch(theme::current().code_block),
+        theme::current().code_block.patch(sign),
     )];
     match syntax {
         Some(syn) => spans.extend(merge_syntax_with_diff(&syn, ds, base, emph)),
@@ -701,6 +711,86 @@ mod tests {
         let diff = vec![plain("ab")];
         let result = merge_syntax_with_diff(&syn, &diff, base, Style::default());
         assert_eq!(spans_text(&result), "abcd");
+    }
+
+    #[test]
+    fn diff_change_spans_uses_sign_style_for_prefix_only() {
+        theme::set(
+            theme::Theme::from_toml(
+                r##"
+[palette]
+foreground = "#ffffff"
+
+[ui]
+code_block = { fg = "foreground" }
+"##,
+            )
+            .expect("theme must parse"),
+        );
+        let sign = Style::new().fg(Color::Red);
+        let base = Style::new().bg(Color::Blue);
+        let emph = Style::new().bg(Color::Green);
+        let ds = vec![plain("x")];
+        let result = diff_change_spans("- ", &ds, None, sign, base, emph);
+        assert_eq!(result[0].content.as_ref(), "- ");
+        assert_eq!(result[0].style.fg, Some(Color::Red));
+        assert_eq!(result[1].style.bg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn numbered_gutter_applies_given_style_and_advances_counter() {
+        let style = Style::new().bg(Color::Magenta);
+        let mut nr = 5;
+        let span = numbered_gutter(&mut nr, 2, style);
+        assert_eq!(span.content.as_ref(), " 5 ");
+        assert_eq!(span.style.bg, Some(Color::Magenta));
+        assert_eq!(nr, 6);
+    }
+
+    const DIFF_GUTTER_TEST_THEME: &str = r##"
+[palette]
+old_sign = "#111111"
+old_code = "#222222"
+old_nr = "#333333"
+new_sign = "#444444"
+new_code = "#555555"
+new_nr = "#666666"
+
+[ui]
+diff_old = { fg = "old_code" }
+diff_new = { fg = "new_code" }
+diff_old_sign = { fg = "old_sign" }
+diff_new_sign = { fg = "new_sign" }
+diff_old_line_nr = { fg = "old_nr" }
+diff_new_line_nr = { fg = "new_nr" }
+"##;
+
+    #[test]
+    fn render_diff_wires_dedicated_sign_and_line_nr_styles() {
+        theme::set(theme::Theme::from_toml(DIFF_GUTTER_TEST_THEME).expect("theme must parse"));
+
+        let before = "keep\nold\n";
+        let after = "keep\nnew\n";
+        let lines = render_diff(None, before, after);
+
+        let old_sign_fg = Some(Color::Rgb(0x11, 0x11, 0x11));
+        let old_nr_fg = Some(Color::Rgb(0x33, 0x33, 0x33));
+        let new_sign_fg = Some(Color::Rgb(0x44, 0x44, 0x44));
+        let new_nr_fg = Some(Color::Rgb(0x66, 0x66, 0x66));
+
+        let unchanged = &lines[0];
+        assert_eq!(unchanged.spans[0].style, theme::current().diff_line_nr);
+
+        let removed = &lines[1];
+        assert_eq!(removed.spans[0].style.fg, old_nr_fg);
+        assert_eq!(removed.spans[1].content.as_ref(), "- ");
+        assert_eq!(removed.spans[1].style.fg, old_sign_fg);
+
+        let added = &lines[2];
+        assert_eq!(added.spans[0].content.as_ref().trim(), "");
+        assert_eq!(added.spans[0].style.fg, new_nr_fg);
+        assert_eq!(added.spans[1].content.as_ref(), "+ ");
+        assert_eq!(added.spans[1].style.fg, new_sign_fg);
     }
 
     fn grep_entries(files: &[(&str, &[usize])]) -> Vec<GrepFileEntry> {

@@ -1080,16 +1080,16 @@ fn edit_child_body_renders_diff_not_summary() {
         ] })),
     );
     let spans: Vec<(String, SpanStyle)> = lines.into_iter().flatten().collect();
-    let old_span = (
-        "- let a = 1;".to_owned(),
-        SpanStyle::Named("diff_old".into()),
-    );
-    let new_span = (
-        "+ let a = 2;".to_owned(),
-        SpanStyle::Named("diff_new".into()),
-    );
-    assert!(spans.contains(&old_span), "old line in diff_old: {spans:?}");
-    assert!(spans.contains(&new_span), "new line in diff_new: {spans:?}");
+    let expected_spans = [
+        ("- ", "diff_old_sign"),
+        ("let a = 1;", "diff_old"),
+        ("+ ", "diff_new_sign"),
+        ("let a = 2;", "diff_new"),
+    ];
+    for (text, style) in expected_spans {
+        let span = (text.to_owned(), SpanStyle::Named(style.into()));
+        assert!(spans.contains(&span), "{text:?} in {style}: {spans:?}");
+    }
     assert!(
         !spans
             .iter()

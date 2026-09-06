@@ -383,6 +383,11 @@ pub fn style_by_name(name: &str) -> Style {
         "line_nr" | "index_line_nr" => t.index_line_nr,
         "diff_old" => t.diff_old,
         "diff_new" => t.diff_new,
+        "diff_old_sign" => t.diff_old_sign,
+        "diff_new_sign" => t.diff_new_sign,
+        "diff_line_nr" => t.diff_line_nr,
+        "diff_old_line_nr" => t.diff_old_line_nr,
+        "diff_new_line_nr" => t.diff_new_line_nr,
         "item" => t.item,
         "item_desc" => t.item_desc,
         "item_selected" | "selected" => t.item_selected,
@@ -436,9 +441,13 @@ pub struct Theme {
     pub table_border: Style,
     pub diff_old: Style,
     pub diff_new: Style,
+    pub diff_old_sign: Style,
+    pub diff_new_sign: Style,
     pub diff_old_emphasis: Style,
     pub diff_new_emphasis: Style,
     pub diff_line_nr: Style,
+    pub diff_old_line_nr: Style,
+    pub diff_new_line_nr: Style,
     pub todo_completed: Style,
     pub todo_in_progress: Style,
     pub todo_pending: Style,
@@ -756,6 +765,12 @@ impl Theme {
                 .map(|d| resolve_style(d, &palette))
                 .unwrap_or_default()
         };
+        let style_or = |key: &str, fallback: &str| -> Style {
+            ui.get(key)
+                .or_else(|| ui.get(fallback))
+                .map(|d| resolve_style(d, &palette))
+                .unwrap_or_default()
+        };
 
         let derived_color = |ui_key: &str, scopes: &[&str]| -> Color {
             if let Some(c) = palette.get(ui_key) {
@@ -850,9 +865,13 @@ impl Theme {
             table_border: style("table_border"),
             diff_old: style("diff_old"),
             diff_new: style("diff_new"),
+            diff_old_sign: style_or("diff_old_sign", "diff_old"),
+            diff_new_sign: style_or("diff_new_sign", "diff_new"),
             diff_old_emphasis: style("diff_old_emphasis"),
             diff_new_emphasis: style("diff_new_emphasis"),
             diff_line_nr: style("diff_line_nr"),
+            diff_old_line_nr: style_or("diff_old_line_nr", "diff_line_nr"),
+            diff_new_line_nr: style_or("diff_new_line_nr", "diff_line_nr"),
             todo_completed: style("todo_completed"),
             todo_in_progress: style("todo_in_progress"),
             todo_pending: style("todo_pending"),
@@ -1233,6 +1252,62 @@ mode_build = "#112233"
     }
 
     #[test]
+    fn diff_sign_and_line_nr_fall_back_to_legacy_keys_when_unset() {
+        let toml = r##"
+[palette]
+foreground = "#f8f8f2"
+background = "#282a36"
+red = "#ff5555"
+green = "#50fa7b"
+grey = "#6272a4"
+
+[ui]
+diff_old = { fg = "red" }
+diff_new = { fg = "green" }
+diff_line_nr = { fg = "grey" }
+"##;
+        let t = Theme::from_toml(toml).unwrap();
+        assert_eq!(t.diff_old_sign, t.diff_old);
+        assert_eq!(t.diff_new_sign, t.diff_new);
+        assert_eq!(t.diff_old_line_nr, t.diff_line_nr);
+        assert_eq!(t.diff_new_line_nr, t.diff_line_nr);
+    }
+
+    #[test]
+    fn diff_sign_and_line_nr_keys_override_legacy_fallback() {
+        let toml = r##"
+[palette]
+foreground = "#f8f8f2"
+background = "#282a36"
+red = "#ff5555"
+green = "#50fa7b"
+grey = "#6272a4"
+old_sign = "#aa1111"
+new_sign = "#11aa11"
+old_nr = "#222222"
+new_nr = "#333333"
+
+[ui]
+diff_old = { fg = "red" }
+diff_new = { fg = "green" }
+diff_line_nr = { fg = "grey" }
+diff_old_sign = { fg = "old_sign" }
+diff_new_sign = { fg = "new_sign" }
+diff_old_line_nr = { fg = "old_nr" }
+diff_new_line_nr = { fg = "new_nr" }
+"##;
+        let t = Theme::from_toml(toml).unwrap();
+        assert_eq!(t.diff_old_sign.fg, Some(Color::Rgb(0xaa, 0x11, 0x11)));
+        assert_ne!(t.diff_old_sign, t.diff_old);
+        assert_eq!(t.diff_new_sign.fg, Some(Color::Rgb(0x11, 0xaa, 0x11)));
+        assert_ne!(t.diff_new_sign, t.diff_new);
+        assert_eq!(t.diff_old_line_nr.fg, Some(Color::Rgb(0x22, 0x22, 0x22)));
+        assert_ne!(t.diff_old_line_nr, t.diff_line_nr);
+        assert_eq!(t.diff_new_line_nr.fg, Some(Color::Rgb(0x33, 0x33, 0x33)));
+        assert_ne!(t.diff_new_line_nr, t.diff_line_nr);
+    }
+
+    #[test]
     fn style_by_name_resolves() {
         set(dracula());
         let t = current();
@@ -1253,6 +1328,11 @@ mode_build = "#112233"
         assert_eq!(style_by_name("bold_italic"), t.bold_italic);
         assert_eq!(style_by_name("diff_old"), t.diff_old);
         assert_eq!(style_by_name("diff_new"), t.diff_new);
+        assert_eq!(style_by_name("diff_old_sign"), t.diff_old_sign);
+        assert_eq!(style_by_name("diff_new_sign"), t.diff_new_sign);
+        assert_eq!(style_by_name("diff_line_nr"), t.diff_line_nr);
+        assert_eq!(style_by_name("diff_old_line_nr"), t.diff_old_line_nr);
+        assert_eq!(style_by_name("diff_new_line_nr"), t.diff_new_line_nr);
         assert_eq!(style_by_name("item_selected"), t.item_selected);
         assert_eq!(style_by_name("item"), t.item);
         assert_eq!(style_by_name("item_desc"), t.item_desc);
