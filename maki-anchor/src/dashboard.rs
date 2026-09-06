@@ -102,8 +102,16 @@ pub(crate) fn layout_start(title: &str, user: Option<&UserRow>, page: &str) -> S
     s
 }
 
-/// Every anchored page signs off to the same three places.
-const FOOTER: &str = "<footer><a href=\"https://github.com/wmantly/maki\">maki anchor fork</a><a href=\"https://github.com/tontinton/maki\">maki original</a><a href=\"https://community.theta42.com/\">Theta42 community</a></footer>";
+/// Every anchored page signs off with credit, links (each opening in its own
+/// tab, since they lead off the dashboard), and the running build's version.
+const FOOTER: &str = concat!(
+    "<footer><span><a href=\"https://github.com/tontinton/maki\" target=\"_blank\" rel=\"noopener\">maki original</a> · ",
+    "<a href=\"https://github.com/wmantly/maki\" target=\"_blank\" rel=\"noopener\">maki anchor fork</a> · ",
+    "brought to you by <a href=\"https://community.theta42.com/\" target=\"_blank\" rel=\"noopener\">Theta42 community</a></span>",
+    "<span class=\"small\">v",
+    env!("CARGO_PKG_VERSION"),
+    "</span></footer>"
+);
 
 pub(crate) fn layout_end() -> String {
     format!("{FOOTER}</main></body></html>")
@@ -144,16 +152,11 @@ fn visible(
 
 /// The home page: which shares are live right now, and the sessions the
 /// instances have reported.
-pub fn render_sessions(
-    store: &Store,
-    hub: &crate::hub::Hub,
-    user: Option<&UserRow>,
-) -> (u16, String, Vec<u8>) {
+pub fn render_sessions(store: &Store, user: Option<&UserRow>) -> (u16, String, Vec<u8>) {
     let (instances, sessions) = visible(store, user);
     let now = crate::store::now_unix();
     let mut body = String::with_capacity(8192);
     body.push_str(&layout_start("maki anchor", user, "sessions"));
-    body.push_str(&links_card(store, hub, user, &instances));
     body.push_str(
         "<div class=\"card\"><h2>Sessions</h2>\
          <div style=\"margin-bottom:.5rem\"><input id=\"session-search\" type=\"search\" \
@@ -850,8 +853,7 @@ mod tests {
                 prune_after: None,
             })
             .unwrap();
-        let hub = crate::hub::Hub::new();
-        let (_, _, body) = render_sessions(&store, &hub, None);
+        let (_, _, body) = render_sessions(&store, None);
         let html = String::from_utf8(body).unwrap();
         assert!(html.contains("$4.21"), "cost should render: {html}");
         assert!(
@@ -881,20 +883,10 @@ mod tests {
             name: None,
             is_admin: true,
         };
-        let sessions_html =
-            String::from_utf8(render_sessions(&store, &hub, Some(&admin)).2).unwrap();
-        assert!(sessions_html.contains("Live shares"), "home shows shares");
+        let sessions_html = String::from_utf8(render_sessions(&store, Some(&admin)).2).unwrap();
         assert!(
-            sessions_html.contains("tok123"),
-            "live links carry their open token"
-        );
-        assert!(
-            sessions_html.contains("href=\"/tok123/\""),
-            "open href: {sessions_html}"
-        );
-        assert!(
-            sessions_html.contains("revoke"),
-            "admins get the revoke button"
+            !sessions_html.contains("Live shares"),
+            "shares moved off home to /links, so home isn't a redundant copy of it"
         );
         assert!(
             !sessions_html.contains("<h2>Instances</h2>"),
@@ -908,11 +900,22 @@ mod tests {
         );
         assert!(
             !instances_html.contains("Live shares"),
-            "and only here or home"
+            "and only on /links"
         );
         let links_html = String::from_utf8(render_links(&store, &hub, Some(&admin)).2).unwrap();
         assert!(links_html.contains("Share a session"), "mint form");
-        assert!(links_html.contains("tok123"), "live link list");
+        assert!(
+            links_html.contains("tok123"),
+            "live links carry their open token"
+        );
+        assert!(
+            links_html.contains("href=\"/tok123/\""),
+            "open href: {links_html}"
+        );
+        assert!(
+            links_html.contains("revoke"),
+            "admins get the revoke button"
+        );
         for html in [&sessions_html, &instances_html, &links_html] {
             assert!(html.contains("class=\"active\""), "nav marks the page");
         }
