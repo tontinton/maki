@@ -138,6 +138,15 @@ pub struct SessionRow {
     pub tokens_out: i64,
     pub context_window: i64,
     pub updated_at: i64,
+    /// The full transcript as a JSON array of web-renderable messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
+    /// Off-the-record: the transcript is not stored or served.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub otr: Option<bool>,
+    /// Prune the transcript after this many seconds (None = keep forever).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prune_after: Option<i64>,
 }
 
 pub struct LiveLink {
@@ -191,6 +200,9 @@ impl Store {
                  tokens_out INTEGER NOT NULL DEFAULT 0,
                  context_window INTEGER NOT NULL DEFAULT 0,
                  updated_at INTEGER NOT NULL,
+                 transcript TEXT NOT NULL DEFAULT '[]',
+                 otr INTEGER NOT NULL DEFAULT 0,
+                 prune_after INTEGER,
                  PRIMARY KEY (instance_id, external_id)
              );
               CREATE TABLE IF NOT EXISTS links (
@@ -235,6 +247,10 @@ impl Store {
         // The dashboard re-shows live links, which needs the token it once
         // handed out; links minted before this column only ever appear bare.
         let _ = conn.execute("ALTER TABLE links ADD COLUMN token_plain TEXT", []);
+        // Full-transcript history: older DBs lack the columns, so add them.
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN transcript TEXT NOT NULL DEFAULT '[]'", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN otr INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN prune_after INTEGER", []);
         // Ensure unique index for local_username where not null (older DBs may not have it).
         let _ = conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS users_local_username_unique ON users(local_username) WHERE local_username IS NOT NULL",
@@ -315,13 +331,14 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO sessions (instance_id, external_id, title, model, cwd, status, cost_cents,
-                 tokens_in, tokens_out, context_window, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 tokens_in, tokens_out, context_window, updated_at, transcript, otr, prune_after)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(instance_id, external_id) DO UPDATE SET
                  title = excluded.title, model = excluded.model, cwd = excluded.cwd,
                  status = excluded.status, cost_cents = excluded.cost_cents,
                  tokens_in = excluded.tokens_in, tokens_out = excluded.tokens_out,
-                 context_window = excluded.context_window, updated_at = excluded.updated_at",
+                 context_window = excluded.context_window, updated_at = excluded.updated_at,
+                 transcript = excluded.transcript, otr = excluded.otr, prune_after = excluded.prune_after",
             rusqlite::params![
                 session.instance_id,
                 session.external_id,
@@ -334,6 +351,9 @@ impl Store {
                 session.tokens_out,
                 session.context_window,
                 session.updated_at,
+                session.transcript.as_deref().unwrap_or("[]"),
+                session.otr.unwrap_or(false),
+                session.prune_after,
             ],
         )?;
         Ok(())
@@ -343,13 +363,69 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT instance_id, external_id, title, model, cwd, status, cost_cents, tokens_in,
-                 tokens_out, context_window, updated_at
+                 tokens_out, context_window, updated_at, transcript, otr, prune_after
              FROM sessions WHERE instance_id = ?1 ORDER BY updated_at DESC LIMIT 200",
         )?;
         let rows = stmt
             .query_map(rusqlite::params![instance_id], map_session)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Delete a session and its stored transcript.
+    pub fn delete_session(&self, instance_id: i64, external_id: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "DELETE FROM sessions WHERE instance_id = ?1 AND external_id = ?2",
+            rusqlite::params![instance_id, external_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Mark a session off-the-record: its transcript is cleared and never
+    /// stored again (the row keeps its metadata so the session still lists).
+    pub fn set_session_otr(
+        &self,
+        instance_id: i64,
+        external_id: &str,
+        otr: bool,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET otr = ?1, transcript = CASE WHEN ?1 THEN '[]' ELSE transcript END
+             WHERE instance_id = ?2 AND external_id = ?3",
+            rusqlite::params![otr, instance_id, external_id],
+        )?;
+        Ok(())
+    }
+
+    /// Set how long a session's transcript is kept (seconds). None keeps it
+    /// forever. Expired transcripts are pruned on the next write.
+    pub fn set_session_prune(
+        &self,
+        instance_id: i64,
+        external_id: &str,
+        prune_after: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET prune_after = ?1 WHERE instance_id = ?2 AND external_id = ?3",
+            rusqlite::params![prune_after, instance_id, external_id],
+        )?;
+        Ok(())
+    }
+
+    /// Clear transcripts whose prune deadline has passed. Called opportunistically
+    /// on writes so a busy anchor never grows without bound.
+    pub fn prune_expired_transcripts(&self) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_unix();
+        let changed = conn.execute(
+            "UPDATE sessions SET transcript = '[]'
+             WHERE prune_after IS NOT NULL AND prune_after < ?1 AND transcript != '[]'",
+            [now],
+        )?;
+        Ok(changed)
     }
 
     pub fn instance_by_name(&self, name: &str) -> Result<InstanceRow, StoreError> {
@@ -372,7 +448,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT instance_id, external_id, title, model, cwd, status, cost_cents, tokens_in,
-                 tokens_out, context_window, updated_at
+                 tokens_out, context_window, updated_at, transcript, otr, prune_after
              FROM sessions ORDER BY updated_at DESC LIMIT 500",
         )?;
         let rows = stmt
@@ -821,7 +897,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         // Sessions visible where user has a grant on the instance
         let mut stmt = conn.prepare(
-            "SELECT s.instance_id, s.external_id, s.title, s.model, s.cwd, s.status, s.cost_cents, s.tokens_in, s.tokens_out, s.context_window, s.updated_at
+            "SELECT s.instance_id, s.external_id, s.title, s.model, s.cwd, s.status, s.cost_cents, s.tokens_in, s.tokens_out, s.context_window, s.updated_at, s.transcript, s.otr, s.prune_after
              FROM sessions s JOIN grants g ON g.instance_id = s.instance_id WHERE g.user_id = ?1 ORDER BY s.updated_at DESC LIMIT 500",
         )?;
         let rows = stmt
@@ -998,6 +1074,9 @@ fn map_session(row: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
         tokens_out: row.get(8)?,
         context_window: row.get(9)?,
         updated_at: row.get(10)?,
+        transcript: row.get(11)?,
+        otr: row.get(12)?,
+        prune_after: row.get(13)?,
     })
 }
 
@@ -1276,5 +1355,56 @@ mod tests {
         assert!(!valid_instance_name("x/y"));
         assert!(!valid_instance_name("<script>"));
         assert!(!valid_instance_name(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn transcripts_store_otr_and_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        let id = store
+            .register_instance("host-a", &hash_token("reg"))
+            .unwrap();
+        let row = SessionRow {
+            instance_id: id,
+            external_id: "s1".into(),
+            title: "t".into(),
+            model: "m".into(),
+            cwd: "/w".into(),
+            status: "idle".into(),
+            cost_cents: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            context_window: 0,
+            updated_at: now_unix(),
+            transcript: Some(r#"[{"type":"user_message","text":"hi"}]"#.into()),
+            otr: Some(false),
+            prune_after: None,
+        };
+        store.upsert_session(&row).unwrap();
+        let stored = store.sessions_for_instance(id).unwrap();
+        assert_eq!(stored[0].transcript.as_deref(), Some(r#"[{"type":"user_message","text":"hi"}]"#));
+
+        // OTR clears the transcript.
+        store.set_session_otr(id, "s1", true).unwrap();
+        let stored = store.sessions_for_instance(id).unwrap();
+        assert_eq!(stored[0].otr, Some(true));
+        assert_eq!(stored[0].transcript.as_deref(), Some("[]"));
+
+        // Prune deadline clears the transcript once past.
+        store.set_session_otr(id, "s1", false).unwrap();
+        store
+            .upsert_session(&SessionRow {
+                transcript: Some(r#"[{"type":"user_message","text":"again"}]"#.into()),
+                ..row
+            })
+            .unwrap();
+        store.set_session_prune(id, "s1", Some(now_unix() - 1)).unwrap();
+        assert_eq!(store.prune_expired_transcripts().unwrap(), 1);
+        let stored = store.sessions_for_instance(id).unwrap();
+        assert_eq!(stored[0].transcript.as_deref(), Some("[]"));
+
+        // Delete removes the row.
+        assert!(store.delete_session(id, "s1").unwrap());
+        assert!(store.sessions_for_instance(id).unwrap().is_empty());
     }
 }

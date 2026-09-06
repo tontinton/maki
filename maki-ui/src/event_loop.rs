@@ -942,6 +942,10 @@ impl<'t> EventLoop<'t> {
                             "tokens_out": rt.app.state.token_usage.output as i64,
                             "context_window": rt.app.state.model.context_window as i64,
                             "focused": i == focused,
+                            // The full transcript rides the index so the anchor
+                            // can persist and serve it; the dedupe above means
+                            // it only ships when the session actually changed.
+                            "transcript": rt.app.remote_snapshot()["messages"],
                         })
                     })
                     .collect::<Vec<_>>()

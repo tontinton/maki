@@ -61,7 +61,7 @@ button.danger{border-color:#fca5a5;color:#b91c1c;background:#fef2f2;padding:.25r
 "#
 }
 
-fn layout_start(title: &str, user: Option<&UserRow>, page: &str) -> String {
+pub(crate) fn layout_start(title: &str, user: Option<&UserRow>, page: &str) -> String {
     let mut s = String::from(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>",
     );
@@ -105,7 +105,7 @@ fn layout_start(title: &str, user: Option<&UserRow>, page: &str) -> String {
 /// Every anchored page signs off to the same three places.
 const FOOTER: &str = "<footer><a href=\"https://github.com/wmantly/maki\">maki anchor fork</a><a href=\"https://github.com/tontinton/maki\">maki original</a><a href=\"https://community.theta42.com/\">Theta42 community</a></footer>";
 
-fn layout_end() -> String {
+pub(crate) fn layout_end() -> String {
     format!("{FOOTER}</main></body></html>")
 }
 
@@ -177,8 +177,13 @@ pub fn render_sessions(
             urlencode(instance_name),
             urlencode(&session.external_id),
         );
+        let detail = format!(
+            "/session/{}/{}",
+            urlencode(instance_name),
+            urlencode(&session.external_id),
+        );
         body.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{cost}</td><td>{}s ago</td>\
+            "<tr><td>{}</td><td><a href=\"{detail}\">{}</a></td><td>{}</td><td>{}</td><td>{cost}</td><td>{}s ago</td>\
              <td><a href=\"{open}\">open</a></td></tr>",
             html_escape(instance_name),
             html_escape(&session.title),
@@ -657,7 +662,7 @@ pub fn render_link(
 /// itself while connected.
 pub(crate) const MAX_LINK_HOURS: u64 = 24 * 30;
 
-fn html_escape(value: &str) -> String {
+pub(crate) fn html_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -789,6 +794,9 @@ mod tests {
                 tokens_out: 200,
                 context_window: 200_000,
                 updated_at: crate::store::now_unix(),
+                transcript: None,
+                otr: None,
+                prune_after: None,
             })
             .unwrap();
         let hub = crate::hub::Hub::new();

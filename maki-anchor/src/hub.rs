@@ -94,6 +94,16 @@ pub struct SessionIndexEntry {
     pub tokens_out: i64,
     #[serde(default)]
     pub context_window: i64,
+    /// The full transcript as a JSON array of web-renderable messages, when
+    /// the instance ships it (off-the-record sessions omit it).
+    #[serde(default)]
+    pub transcript: Option<String>,
+    /// Off-the-record flag echoed from the instance.
+    #[serde(default)]
+    pub otr: bool,
+    /// Prune deadline (unix seconds) for the transcript, if any.
+    #[serde(default)]
+    pub prune_after: Option<i64>,
 }
 
 /// A live tunnel for one instance. The epoch distinguishes a reconnect from

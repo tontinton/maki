@@ -1054,6 +1054,104 @@ fn redirect_to_login(request: http::Request) -> RouteOutcome {
     RouteOutcome::Streamed
 }
 
+/// GET /session/<instance>/<external_id>: a session's full transcript with
+/// delete / off-the-record / prune controls. The path is `instance/session`
+/// so the URL is shareable and the grant check is per-instance.
+fn render_session_page(
+    rest: &str,
+    request: http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    let (instance, session) = match rest.split_once('/') {
+        Some((i, s)) => (i, s),
+        None => return buffered((404, "text/plain".to_string(), b"not found".to_vec()), request),
+    };
+    let Ok(instance_row) = store.instance_by_name(instance) else {
+        return buffered((404, "text/plain".to_string(), b"unknown instance".to_vec()), request);
+    };
+    if !can_manage_session(store, user, instance_row.id) {
+        return buffered(
+            (
+                403,
+                "text/plain".to_string(),
+                b"no access to this instance".to_vec(),
+            ),
+            request,
+        );
+    }
+    let sessions = store.sessions_for_instance(instance_row.id).unwrap_or_default();
+    let Some(row) = sessions.into_iter().find(|s| s.external_id == session) else {
+        return buffered((404, "text/plain".to_string(), b"session not found".to_vec()), request);
+    };
+    let otr = row.otr.unwrap_or(false);
+    let transcript: Vec<serde_json::Value> = if otr {
+        Vec::new()
+    } else {
+        serde_json::from_str(row.transcript.as_deref().unwrap_or("[]")).unwrap_or_default()
+    };
+    let mut body = String::with_capacity(8192);
+    body.push_str(&crate::dashboard::layout_start(
+        "maki anchor — session",
+        user,
+        "sessions",
+    ));
+    body.push_str(&format!(
+        "<div class=\"card\"><h2>{}</h2><p class=\"small\">{} · {} · {} · {}</p>",
+        crate::dashboard::html_escape(&row.title),
+        crate::dashboard::html_escape(instance),
+        crate::dashboard::html_escape(&row.model),
+        crate::dashboard::html_escape(&row.status),
+        if otr { "off the record" } else { "recorded" },
+    ));
+    body.push_str(&format!(
+        "<div style=\"display:flex;gap:.5rem;flex-wrap:wrap;margin:.6rem 0\">\
+         <button class=\"danger\" data-act=\"delete\" data-instance=\"{}\" data-session=\"{}\">delete</button>\
+         <button data-act=\"otr\" data-instance=\"{}\" data-session=\"{}\">{}</button>\
+         <label class=\"small\">prune after <input id=\"prune-hours\" type=\"number\" min=\"0\" value=\"0\" style=\"width:4rem\">h</label>\
+         <button data-act=\"prune\" data-instance=\"{}\" data-session=\"{}\">set prune</button>\
+         <span id=\"act-status\" class=\"small\"></span></div>",
+        crate::dashboard::html_escape(instance),
+        crate::dashboard::html_escape(session),
+        crate::dashboard::html_escape(instance),
+        crate::dashboard::html_escape(session),
+        if otr { "un-OTR" } else { "off the record" },
+        crate::dashboard::html_escape(instance),
+        crate::dashboard::html_escape(session),
+    ));
+    body.push_str("<pre id=\"transcript\" style=\"white-space:pre-wrap\">");
+    if transcript.is_empty() {
+        body.push_str(if otr {
+            "This session is off the record; no transcript is stored."
+        } else {
+            "No transcript yet."
+        });
+    } else {
+        for msg in &transcript {
+            let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let kind = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            body.push_str(&format!(
+                "[{}] {}\n",
+                crate::dashboard::html_escape(kind),
+                crate::dashboard::html_escape(text)
+            ));
+        }
+    }
+    body.push_str("</pre></div>");
+    body.push_str(
+        "<script>(() => { for (const b of document.querySelectorAll('[data-act]')) b.onclick = async () => { \
+         const act = b.dataset.act; const body = {instance: b.dataset.instance, session: b.dataset.session}; \
+         if (act === 'otr') body.otr = b.textContent.includes('un-OTR'); \
+         if (act === 'prune') body.hours = Number(document.getElementById('prune-hours').value || 0); \
+         const r = await fetch('/api/sessions/' + act, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}); \
+         const j = await r.json().catch(()=>({})); \
+         document.getElementById('act-status').textContent = r.ok ? (j.error || 'ok') : (j.error || 'failed'); \
+         if (r.ok) setTimeout(() => location.reload(), 400); }; })();</script>",
+    );
+    body.push_str(&crate::dashboard::layout_end());
+    buffered((200, "text/html".to_string(), body.into_bytes()), request)
+}
+
 /// A logged-in non-admin. Anonymous (LAN-trust / CLI) callers are not
 /// covered; the dashboard admin tables are simply open to everyone there.
 fn is_non_admin(user: Option<&crate::store::UserRow>) -> bool {
@@ -2290,6 +2388,18 @@ fn route_authorized(
     if path == "/api/sessions" {
         return buffered(json_list_sessions_for(store, user.as_ref()), request);
     }
+    if let Some(rest) = path.strip_prefix("/session/") {
+        return render_session_page(rest, request, store, user.as_ref());
+    }
+    if path == "/api/sessions/delete" {
+        return handle_api_session_delete(request, store, user.as_ref());
+    }
+    if path == "/api/sessions/otr" {
+        return handle_api_session_otr(request, store, user.as_ref());
+    }
+    if path == "/api/sessions/prune" {
+        return handle_api_session_prune(request, store, user.as_ref());
+    }
     if path == "/api/users" {
         return match request.method() {
             "GET" => {
@@ -2477,6 +2587,139 @@ fn json_list_sessions_for(
     }
 }
 
+/// Resolve an instance name to its id, or 404.
+fn instance_id_or_404(
+    store: &Store,
+    instance: &str,
+) -> Result<i64, (u16, String, Vec<u8>)> {
+    store
+        .instance_by_name(instance)
+        .map(|r| r.id)
+        .map_err(|_| {
+            (
+                404,
+                "application/json".to_string(),
+                br#"{"error":"unknown instance"}"#.to_vec(),
+            )
+        })
+}
+
+/// A logged-in user may manage a session only if they are an admin or hold a
+/// grant on the instance it belongs to.
+fn can_manage_session(
+    store: &Store,
+    user: Option<&crate::store::UserRow>,
+    instance_id: i64,
+) -> bool {
+    match user {
+        Some(u) if u.is_admin => true,
+        Some(u) => store
+            .grant_for(u.id, instance_id)
+            .ok()
+            .flatten()
+            .is_some(),
+        None => false,
+    }
+}
+
+fn handle_api_session_delete(
+    mut request: http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method() != "POST" {
+        return json_error(request, 405, "method not allowed");
+    }
+    let value = match read_json(&mut request) {
+        Ok(v) => v,
+        Err(e) => return json_error(request, 400, &e),
+    };
+    let (Some(instance), Some(session)) = (
+        value.get("instance").and_then(|v| v.as_str()),
+        value.get("session").and_then(|v| v.as_str()),
+    ) else {
+        return json_error(request, 400, "instance and session required");
+    };
+    let Ok(instance_id) = instance_id_or_404(store, instance) else {
+        return json_error(request, 404, "unknown instance");
+    };
+    if !can_manage_session(store, user, instance_id) {
+        return json_error(request, 403, "no access to this instance");
+    }
+    match store.delete_session(instance_id, session) {
+        Ok(true) => buffered(center_json(200, serde_json::json!({"deleted": true})), request),
+        Ok(false) => json_error(request, 404, "session not found"),
+        Err(err) => json_error(request, 500, &err.to_string()),
+    }
+}
+
+fn handle_api_session_otr(
+    mut request: http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method() != "POST" {
+        return json_error(request, 405, "method not allowed");
+    }
+    let value = match read_json(&mut request) {
+        Ok(v) => v,
+        Err(e) => return json_error(request, 400, &e),
+    };
+    let (Some(instance), Some(session)) = (
+        value.get("instance").and_then(|v| v.as_str()),
+        value.get("session").and_then(|v| v.as_str()),
+    ) else {
+        return json_error(request, 400, "instance and session required");
+    };
+    let otr = value.get("otr").and_then(|v| v.as_bool()).unwrap_or(true);
+    let Ok(instance_id) = instance_id_or_404(store, instance) else {
+        return json_error(request, 404, "unknown instance");
+    };
+    if !can_manage_session(store, user, instance_id) {
+        return json_error(request, 403, "no access to this instance");
+    }
+    match store.set_session_otr(instance_id, session, otr) {
+        Ok(()) => buffered(center_json(200, serde_json::json!({"otr": otr})), request),
+        Err(err) => json_error(request, 500, &err.to_string()),
+    }
+}
+
+fn handle_api_session_prune(
+    mut request: http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method() != "POST" {
+        return json_error(request, 405, "method not allowed");
+    }
+    let value = match read_json(&mut request) {
+        Ok(v) => v,
+        Err(e) => return json_error(request, 400, &e),
+    };
+    let (Some(instance), Some(session)) = (
+        value.get("instance").and_then(|v| v.as_str()),
+        value.get("session").and_then(|v| v.as_str()),
+    ) else {
+        return json_error(request, 400, "instance and session required");
+    };
+    // prune_after is seconds from now; 0 or absent clears the deadline.
+    let hours = value.get("hours").and_then(|v| v.as_u64()).unwrap_or(0);
+    let prune_after = (hours > 0).then(|| crate::store::now_unix() + hours as i64 * 3600);
+    let Ok(instance_id) = instance_id_or_404(store, instance) else {
+        return json_error(request, 404, "unknown instance");
+    };
+    if !can_manage_session(store, user, instance_id) {
+        return json_error(request, 403, "no access to this instance");
+    }
+    match store.set_session_prune(instance_id, session, prune_after) {
+        Ok(()) => buffered(
+            center_json(200, serde_json::json!({"prune_after": prune_after})),
+            request,
+        ),
+        Err(err) => json_error(request, 500, &err.to_string()),
+    }
+}
+
 /// Persist a session-index push from an instance. The owning instance is the
 /// authenticated tunnel, so a registered host can never rewrite another's
 /// index by claiming a name in the frame.
@@ -2514,10 +2757,18 @@ fn handle_push(store: &Arc<Store>, hub: &Hub, instance_id: i64, push: TunnelPush
             tokens_out: entry.tokens_out,
             context_window: entry.context_window,
             updated_at: crate::store::now_unix(),
+            transcript: entry.transcript,
+            otr: Some(entry.otr),
+            prune_after: entry.prune_after,
         };
         if let Err(err) = store.upsert_session(&row) {
             tracing::warn!(error = %err, instance_id, "session upsert failed");
         }
+    }
+    // Opportunistic pruning: a busy anchor clears expired transcripts as it
+    // writes, so the table cannot grow without bound.
+    if let Err(err) = store.prune_expired_transcripts() {
+        tracing::warn!(error = %err, "transcript prune failed");
     }
 }
 
