@@ -546,6 +546,13 @@ pub mod dialect {
         adaptive: Some(Medium),
         off: Some(OFF),
     };
+    /// OpenAI GPT-6 (Astra): `low` through `max`, no `minimal` and no
+    /// explicit opt-out, so Off omits the reasoning field.
+    pub const GPT_6: EffortDialect = EffortDialect {
+        supported: &[Low, Medium, High, XHigh, Max],
+        adaptive: Some(Medium),
+        off: None,
+    };
     /// opencode chat-completions, openrouter (static fallback).
     pub const PREFER_HIGH: EffortDialect = EffortDialect {
         supported: &[Low, Medium, High],

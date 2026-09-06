@@ -32,6 +32,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 // Codex models are matched by their `-codex` substring in
 // `coding_plan_context_window`, so they never need listing here.
 pub(crate) const PLAN_MODELS: &[&str] = &[
+    "gpt-6-astra",
     "gpt-5.6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-sol",
@@ -273,11 +274,13 @@ fn resolve_openai_base_url() -> Option<String> {
     maki_config::providers::configured_base_url("openai", config.get("openai"))
 }
 
-// Codex models drop `minimal` and never take an explicit "none", so they get
-// their own dialects; the plain plan models keep both.
+// Codex models and GPT-6 drop `minimal` and never take an explicit "none", so
+// they get their own dialects; the plain plan models keep both.
 fn plan_dialect(model_id: &str) -> &'static EffortDialect<'static> {
     if !model_id.contains("-codex") {
-        return if model_id.starts_with("gpt-5.6-") {
+        return if model_id.starts_with("gpt-6-") {
+            &dialect::GPT_6
+        } else if model_id.starts_with("gpt-5.6-") {
             &dialect::GPT_5_6
         } else {
             &dialect::CODING_PLAN
@@ -424,6 +427,7 @@ mod tests {
         assert!(is_codex_model(model_id));
     }
 
+    #[test_case("gpt-6-astra", Some(272_000))]
     #[test_case("gpt-5.6-luna", Some(372_000))]
     #[test_case("gpt-5.6-terra", Some(372_000))]
     #[test_case("gpt-5.6-sol", Some(372_000))]
@@ -453,6 +457,9 @@ mod tests {
     #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-5.6-sol", "max" ; "max_passes_through_on_5_6_sol")]
     #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-5.6-terra", "max" ; "max_passes_through_on_5_6_terra")]
     #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-5.6-luna", "max" ; "max_passes_through_on_5_6_luna")]
+    #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-6-astra", "max" ; "max_passes_through_on_6_astra")]
+    #[test_case(ThinkingConfig::Effort(Effort::Minimal), "gpt-6-astra", "low" ; "minimal_snaps_to_low_on_6_astra")]
+    #[test_case(ThinkingConfig::Adaptive, "gpt-6-astra", "medium" ; "adaptive_on_6_astra")]
     fn responses_reasoning_uses_responses_effort_object(
         thinking: ThinkingConfig,
         model_id: &str,
@@ -468,6 +475,7 @@ mod tests {
     #[test]
     fn plan_models_have_a_reviewed_dialect() {
         const EXPECTED: &[(&str, &EffortDialect)] = &[
+            ("gpt-6-astra", &dialect::GPT_6),
             ("gpt-5.6-luna", &dialect::GPT_5_6),
             ("gpt-5.6-terra", &dialect::GPT_5_6),
             ("gpt-5.6-sol", &dialect::GPT_5_6),
@@ -487,9 +495,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn responses_reasoning_omits_effort_when_disabled() {
-        let model = Model::from_spec("openai/gpt-5.3-codex").unwrap();
+    #[test_case("gpt-5.3-codex")]
+    #[test_case("gpt-6-astra")]
+    fn responses_reasoning_omits_effort_when_disabled(model_id: &str) {
+        let model = Model::from_spec(&format!("openai/{model_id}")).unwrap();
         let mut body = json!({});
         responses::apply_responses_reasoning(
             &mut body,
