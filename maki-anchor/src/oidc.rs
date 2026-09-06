@@ -86,6 +86,7 @@ pub fn authorization_url(
     config: &OidcConfig,
     discovery: &Discovery,
     state: &str,
+    nonce: &str,
     code_challenge: &str,
 ) -> String {
     let mut url =
@@ -99,7 +100,7 @@ pub fn authorization_url(
         )
         .append_pair("scope", "openid profile email")
         .append_pair("state", state)
-        .append_pair("nonce", state)
+        .append_pair("nonce", nonce)
         .append_pair("code_challenge", code_challenge)
         .append_pair("code_challenge_method", "S256");
     url.to_string()
@@ -326,12 +327,21 @@ fn verify_rs256(key: &Jwk, message: &[u8], signature: &[u8]) -> Result<(), OidcE
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(message);
     let modulus_len = modulus.to_bytes_be().len();
+    // A modulus this small has no business signing anything by 2026 (RSA-512
+    // was broken decades ago); reject it here rather than let it reach the
+    // arithmetic below, which assumes real key sizes.
+    if modulus_len < 256 {
+        return Err(OidcError::BadSignature);
+    }
     let mut expected = vec![0u8; modulus_len - 1];
     // EM = 0x01 || PS(0xff...) || 0x00 || DigestInfo || digest, per RFC 8017;
     // the leading 0x00 is the byte cut off by the length above.
     expected[0] = 0x01;
     let tail_len = 1 + DIGEST_INFO.len() + digest.len();
-    if tail_len > modulus_len - 1 {
+    // Strictly less-than `modulus_len - 1`: `ps_len` below needs at least one
+    // byte of padding, and `tail_len == modulus_len - 1` would underflow it
+    // (`modulus_len - 1 - tail_len - 1` going negative on unsigned math).
+    if tail_len >= modulus_len - 1 {
         return Err(OidcError::BadSignature);
     }
     let ps_len = modulus_len - 1 - tail_len - 1;
@@ -383,6 +393,22 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64
+    }
+
+    #[test]
+    fn authorization_url_sends_the_real_nonce_not_the_state() {
+        // The provider echoes whatever `nonce` param it's sent back into the
+        // ID token's `nonce` claim; the callback then checks that claim
+        // against the nonce the anchor itself stashed for this login
+        // attempt. Sending `state` as the nonce (as this once did) means
+        // that stashed value is never what the provider actually saw, so
+        // every single login fails `nonce mismatch` at the last step.
+        let url = authorization_url(&config(), &discovery(), "the-state", "the-nonce", "chal");
+        let parsed = ::url::Url::parse(&url).unwrap();
+        let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(pairs.get("state").map(String::as_str), Some("the-state"));
+        assert_eq!(pairs.get("nonce").map(String::as_str), Some("the-nonce"));
+        assert_ne!(pairs.get("nonce"), pairs.get("state"));
     }
 
     fn b64(s: &str) -> String {

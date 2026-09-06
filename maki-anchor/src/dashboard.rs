@@ -402,17 +402,21 @@ fn links_card(
     for link in &links {
         let open = match &link.token {
             Some(token) => {
-                let href = match &link.external_session_id {
+                // `external_session_id` can carry whatever a link was minted
+                // with (the mint path accepts arbitrary text), so this table
+                // renders it back out on every visit — escape it here too,
+                // not just where it was typed in.
+                let href = html_escape(&match &link.external_session_id {
                     Some(session) => format!("/{token}/s/{session}/"),
                     None => format!("/{token}/"),
-                };
+                });
                 format!("<a href=\"{href}\">open</a>")
             }
             None => "<span class=\"small\">minted before tokens were shown</span>".into(),
         };
         let revoke = if is_admin {
             format!(
-                "<button class=\"danger\" data-hash=\"{}\">revoke</button>",
+                "<button class=\"danger revoke\" data-hash=\"{}\">revoke</button>",
                 html_escape(&link.token_hash)
             )
         } else {
@@ -464,7 +468,7 @@ pub fn render_admin(
           <button id="sso-clear">Disable</button>
           <span id="sso-form-status" class="small"></span>
         </div>
-        <p class="small">The provider callback URL is {{origin}}/callback. Changes apply on the next anchor restart. A config file's [oidc] block is used until you save here.</p>
+        <p class="small">Callback URL to register with the provider: <code id="sso-callback-hint">(fill in Origin above)</code>. Changes apply on the next anchor restart. A config file's [oidc] block is used until you save here.</p>
         <div style="display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin:.6rem 0">
           <label>Mint tokens<br><select id="mint-select"><option value="any">any (anonymous)</option><option value="user">user (any logged-in)</option><option value="admin">admin only</option></select></label>
           <button id="mint-save">Save</button>
@@ -517,6 +521,13 @@ pub fn render_admin(
             try {{ const r = await fetch(u, opts); const j = await r.json().catch(()=>({{}})); return {{ok: r.ok, j, status: r.status}}; }} catch(e){{ return {{ok:false, j:{{error:String(e)}}}}; }}
           }};
           const escape = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+          const originEl = document.getElementById('sso-origin');
+          const callbackHint = document.getElementById('sso-callback-hint');
+          const updateCallbackHint = () => {{
+            const origin = originEl.value.trim();
+            callbackHint.textContent = origin ? `${{origin.replace(/\/+$/, '')}}/callback` : '(fill in Origin above)';
+          }};
+          originEl.addEventListener('input', updateCallbackHint);
           const loadSso = async () => {{
             const {{ok, j}} = await fetchJson('/api/sso');
             if (!ok) {{ ssoEl.textContent = 'SSO: unknown'; return; }}
@@ -524,8 +535,9 @@ pub fn render_admin(
             if (j.enabled) {{
               document.getElementById('sso-issuer').value = j.issuer || '';
               document.getElementById('sso-client').value = j.client_id || '';
-              document.getElementById('sso-origin').value = j.origin || '';
+              originEl.value = j.origin || '';
             }}
+            updateCallbackHint();
           }};
           const ssoSend = async (body, busy) => {{
             const st = document.getElementById('sso-form-status');
@@ -664,21 +676,26 @@ pub fn render_link(
         );
     };
     // Only admins and users with a grant on the instance can share it; a
-    // logged-in user with no rights gets nothing. A minted control link
-    // bypasses grants entirely, so this gate matters most there.
+    // logged-in user with no rights gets nothing. A minted link's rights
+    // must not exceed the caller's own grant either, or a viewer could mint
+    // themselves a control link on an instance they were only given view
+    // access to — `rights` is a query param the caller picks freely.
     if let Some(u) = user
         && !u.is_admin
-        && store
-            .grant_for(u.id, instance_row.id)
-            .ok()
-            .flatten()
-            .is_none()
     {
-        return (
-            403,
-            "text/plain".to_string(),
-            b"you have no access to this instance".to_vec(),
-        );
+        let grant = store.grant_for(u.id, instance_row.id).ok().flatten();
+        let allowed = match grant {
+            Some(crate::store::Role::Controller) => true,
+            Some(crate::store::Role::Viewer) => role != crate::store::Role::Controller,
+            None => false,
+        };
+        if !allowed {
+            return (
+                403,
+                "text/plain".to_string(),
+                b"you have no access to this instance".to_vec(),
+            );
+        }
     }
     let hours = hours.clamp(1, MAX_LINK_HOURS);
     let token = match crate::server::mint_link(
@@ -694,10 +711,15 @@ pub fn render_link(
             return (500, "text/plain".to_string(), b"link mint failed".to_vec());
         }
     };
-    let open_path = match session {
+    // `session` is caller-controlled (a raw query-string value with no
+    // charset restriction) and rides straight into markup below — escape the
+    // whole path, not just the pieces that felt risky, or a session id like
+    // `"><script>...` breaks out of the `data-path` attribute into a live
+    // script tag on the anchor's own origin.
+    let open_path = html_escape(&match session {
         Some(s) => format!("/{token}/s/{s}/"),
         None => format!("/{token}/"),
-    };
+    });
     let mut body = layout_start("maki anchor — links", user, "links");
     body.push_str(&format!(
         "<h2>Link for {} ({})</h2><p><code>{token}</code></p>\
@@ -823,6 +845,57 @@ mod tests {
             "instance name must be escaped: {html}"
         );
         assert!(html.contains("&lt;img"), "escaped form expected: {html}");
+    }
+
+    #[test]
+    fn render_link_escapes_the_session_id() {
+        // `session` is a raw, caller-controlled query-string value with no
+        // charset restriction — it must never ride straight into the
+        // href/data-path markup it lands in.
+        let store = test_store();
+        store.create_instance("open", "hash").unwrap();
+        let payload = "\"><script>alert(1)</script>";
+        let (_, _, body) = render_link(
+            &store,
+            Some(&user(1, true)),
+            "open",
+            Some(payload),
+            "view",
+            2,
+        );
+        let html = String::from_utf8(body).unwrap();
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "session id must be escaped: {html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "escaped form expected: {html}"
+        );
+    }
+
+    #[test]
+    fn render_link_refuses_a_viewer_minting_a_control_link() {
+        // Only the rights a caller already holds (or admin) may be minted —
+        // `rights` is a query param the caller picks freely, so a viewer
+        // grant must not be enough to hand themselves a control link.
+        let store = test_store();
+        let instance = store.create_instance("gated", "hash").unwrap();
+        store.upsert_user("admin-seed", None, None).unwrap(); // consumes the first-user-is-admin slot
+        let viewer = store.upsert_user("sub-viewer", None, None).unwrap();
+        assert!(!viewer.is_admin, "second user is a plain user");
+        store.set_grant(viewer.id, instance, Role::Viewer).unwrap();
+        let (status, _, _) = render_link(&store, Some(&viewer), "gated", None, "control", 2);
+        assert_eq!(status, 403, "a viewer grant must not mint a control link");
+        let (status, _, _) = render_link(&store, Some(&viewer), "gated", None, "view", 2);
+        assert_eq!(status, 200, "a viewer grant may still mint a view link");
+
+        let controller = store.upsert_user("sub-controller", None, None).unwrap();
+        store
+            .set_grant(controller.id, instance, Role::Controller)
+            .unwrap();
+        let (status, _, _) = render_link(&store, Some(&controller), "gated", None, "control", 2);
+        assert_eq!(status, 200, "a controller grant may mint a control link");
     }
 
     #[test]

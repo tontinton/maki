@@ -45,7 +45,15 @@ pub fn mint_link(
 /// the path) — this is a public, unauthenticated endpoint, so it must not
 /// become a generic "turn arbitrary text into a QR" oracle.
 fn qr_svg(text: &str) -> (u16, String, Vec<u8>) {
+    // This is a public, unauthenticated endpoint: beyond the share-token
+    // check, the text must actually be shaped like a link (http(s):// or a
+    // bare path), or an anonymous caller can get the trusted anchor origin
+    // to render a QR for `javascript:`/`data:`/arbitrary-scheme content —
+    // not XSS (the SVG never embeds the text), but a ready-made phishing aid.
+    let shaped =
+        text.starts_with("http://") || text.starts_with("https://") || text.starts_with('/');
     if text.len() > 512
+        || !shaped
         || !text
             .split('/')
             .any(|seg| seg.len() == 32 && seg.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -175,6 +183,7 @@ pub fn serve(
     oidc: Option<crate::oidc::OidcConfig>,
     allow_local: bool,
     mint_tokens: store::MintTokens,
+    trust_proxy: bool,
 ) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).map_err(|source| ServerError::Bind {
         addr: addr.to_string(),
@@ -186,6 +195,7 @@ pub fn serve(
         oidc,
         allow_local,
         mint_tokens,
+        trust_proxy,
     ));
     // One port, one accept loop: every connection is either a WebSocket
     // upgrade on /ws (an instance tunnel) or one HTTP request. The
@@ -350,13 +360,10 @@ fn accept_tunnel(
     let Ok(accepted) = tungstenite::accept(duplex.clone()) else {
         return;
     };
-    // The tunnel idles between pings by design: no more read deadlines.
-    let _ = accepted
-        .get_ref()
-        .write
-        .lock()
-        .unwrap()
-        .set_read_timeout(None);
+    // The read deadline stays in force through the tunnel's own hello/auth
+    // frame (drive_tunnel clears it only once that succeeds) — an attacker
+    // who completes the WS upgrade and then sends nothing must not be able
+    // to hold one of the limited tunnel slots open indefinitely.
     let stream = accepted.into_inner();
     let writer = Arc::new(Mutex::new(WebSocket::from_raw_socket(
         stream.clone(),
@@ -507,10 +514,11 @@ fn route(
     if path == "/logout" {
         let cookie_header = cookie_header(&request);
         auth.logout(cookie_header);
+        let secure = is_https(&request, auth);
         let response = Response::empty(302)
             .with_header(Header::from_bytes("Location", "/").unwrap())
             .with_header(
-                Header::from_bytes("Set-Cookie", crate::auth::Auth::clear_cookie()).unwrap(),
+                Header::from_bytes("Set-Cookie", crate::auth::Auth::clear_cookie(secure)).unwrap(),
             );
         let _ = request.respond(response);
         return RouteOutcome::Streamed;
@@ -536,13 +544,19 @@ fn route(
 }
 
 /// 302 that also logs the browser in.
-fn redirect_with_cookie(request: http::Request, to: &str, cookie: &str) -> RouteOutcome {
+fn redirect_with_cookie(
+    request: http::Request,
+    to: &str,
+    cookie: &str,
+    auth: &crate::auth::Auth,
+) -> RouteOutcome {
+    let secure = is_https(&request, auth);
     let response = Response::empty(302)
         .with_header(Header::from_bytes("Location", to.as_bytes()).unwrap())
         .with_header(
             Header::from_bytes(
                 "Set-Cookie",
-                crate::auth::Auth::session_set_cookie(cookie).as_bytes(),
+                crate::auth::Auth::session_set_cookie(cookie, secure).as_bytes(),
             )
             .unwrap(),
         );
@@ -596,7 +610,7 @@ fn handle_link_push(store: &Arc<Store>, hub: &Hub, instance_id: i64, push: Tunne
                 .split('/')
                 .find(|seg| seg.len() == 32 && seg.bytes().all(|b| b.is_ascii_hexdigit()))
                 .unwrap_or(link_rm.trim());
-            match store.revoke_link(&store::hash_token(token)) {
+            match store.revoke_link_for_instance(&store::hash_token(token), instance_id) {
                 Ok(true) => (None, Some(token.to_owned())),
                 Ok(false) => (None, None),
                 Err(err) => {
@@ -744,11 +758,11 @@ fn handle_setup(mut request: http::Request, auth: &crate::auth::Auth) -> RouteOu
             "Username and a password of at least 8 characters are required.",
         );
     }
-    let origin = remote_origin(&request);
+    let origin = remote_origin(&request, auth);
     match auth.setup_admin(&origin, username.trim(), password) {
         Ok(cookie) => {
             tracing::info!(username, "first admin created");
-            redirect_with_cookie(request, "/", &cookie)
+            redirect_with_cookie(request, "/", &cookie, auth)
         }
         Err(crate::auth::AuthError::AlreadySetup) => redirect(request, "/login"),
         Err(err) => setup_failure(request, &format!("Setup failed: {err}")),
@@ -766,21 +780,51 @@ fn setup_failure(request: http::Request, message: &str) -> RouteOutcome {
     )
 }
 fn cookie_header(request: &http::Request) -> Option<&str> {
+    header_value(request, "cookie")
+}
+
+fn header_value<'a>(request: &'a http::Request, name: &str) -> Option<&'a str> {
     request
         .headers()
         .iter()
-        .find(|h| h.field.eq_ignore_ascii_case("Cookie"))
+        .find(|h| h.field.eq_ignore_ascii_case(name))
         .map(|h| h.value.as_str())
 }
 
 /// Best-effort client identity for login rate limiting. IP only (ports churn
-/// per connection), and behind a reverse proxy every request shares one
-/// address, so the limiter keys per proxy; local brute-forcing still trips it.
-fn remote_origin(request: &http::Request) -> String {
+/// per connection). Behind a reverse proxy every request shares one raw
+/// address, which turns the per-origin lockout into a global one — anyone
+/// can lock the real admin out by failing 5 logins themselves. With
+/// `trust_proxy` on, the leftmost `X-Forwarded-For` entry (the proxy's own
+/// client-facing hop) is used instead; that's only safe when the deployment
+/// guarantees a client can't set that header itself and have it reach here
+/// unmodified, so it defaults off.
+fn remote_origin(request: &http::Request, auth: &crate::auth::Auth) -> String {
+    if auth.trust_proxy
+        && let Some(forwarded) = header_value(request, "x-forwarded-for")
+        && let Some(first) = forwarded.split(',').next()
+        && !first.trim().is_empty()
+    {
+        return first.trim().to_owned();
+    }
     request
         .remote_addr()
         .map(|a| a.ip().to_string())
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Whether this request should be treated as having arrived over HTTPS, for
+/// deciding whether a `Set-Cookie` gets `Secure`. The anchor never
+/// terminates TLS itself (its docs call for a reverse proxy in front for
+/// that), so this can only go by `X-Forwarded-Proto`, and only when
+/// `trust_proxy` says that header is trustworthy — otherwise a direct
+/// unencrypted client could claim `https` and get a cookie set without
+/// `Secure` being any safer, but a plain-HTTP deployment (local/LAN testing)
+/// would silently lose the cookie entirely if this defaulted to requiring it.
+fn is_https(request: &http::Request, auth: &crate::auth::Auth) -> bool {
+    auth.trust_proxy
+        && header_value(request, "x-forwarded-proto")
+            .is_some_and(|v| v.eq_ignore_ascii_case("https"))
 }
 
 fn start_login(request: http::Request, auth: &crate::auth::Auth) -> RouteOutcome {
@@ -841,9 +885,9 @@ fn handle_local_login(mut request: http::Request, auth: &crate::auth::Auth) -> R
     let params = parse_form(&body_str);
     let username = params.get("username").map(|s| s.as_str()).unwrap_or("");
     let password = params.get("password").map(|s| s.as_str()).unwrap_or("");
-    let origin = remote_origin(&request);
+    let origin = remote_origin(&request, auth);
     match auth.login_local(&origin, username, password) {
-        Ok(cookie) => redirect_with_cookie(request, "/", &cookie),
+        Ok(cookie) => redirect_with_cookie(request, "/", &cookie, auth),
         Err(crate::auth::AuthError::RateLimited) => buffered(
             (
                 429,
@@ -909,10 +953,11 @@ fn handle_api_local_login(mut request: http::Request, auth: &crate::auth::Auth) 
     };
     let username = value.get("username").and_then(|v| v.as_str()).unwrap_or("");
     let password = value.get("password").and_then(|v| v.as_str()).unwrap_or("");
-    let origin = remote_origin(&request);
+    let origin = remote_origin(&request, auth);
     match auth.login_local(&origin, username, password) {
         Ok(cookie) => {
             // For API, return JSON and also set cookie if request is browser fetch with credentials
+            let secure = is_https(&request, auth);
             let body = br#"{"ok":true}"#.to_vec();
             let response = Response::from_data(body)
                 .with_status_code(200)
@@ -920,7 +965,7 @@ fn handle_api_local_login(mut request: http::Request, auth: &crate::auth::Auth) 
                 .with_header(
                     Header::from_bytes(
                         "Set-Cookie",
-                        crate::auth::Auth::session_set_cookie(&cookie).as_bytes(),
+                        crate::auth::Auth::session_set_cookie(&cookie, secure).as_bytes(),
                     )
                     .unwrap(),
                 );
@@ -1015,12 +1060,13 @@ fn finish_login(request: http::Request, auth: &crate::auth::Auth) -> RouteOutcom
     };
     match auth.finish_login(&code, &state) {
         Ok(cookie_value) => {
+            let secure = is_https(&request, auth);
             let response = Response::empty(302)
                 .with_header(Header::from_bytes("Location", "/".as_bytes()).unwrap())
                 .with_header(
                     Header::from_bytes(
                         "Set-Cookie",
-                        crate::auth::Auth::session_set_cookie(&cookie_value).as_bytes(),
+                        crate::auth::Auth::session_set_cookie(&cookie_value, secure).as_bytes(),
                     )
                     .unwrap(),
                 );
@@ -2554,19 +2600,27 @@ fn route_authorized(
     } else if let Some(rest) = path.strip_prefix("/api/sessions/") {
         match rest.parse::<i64>() {
             Ok(instance_id) => {
+                // Fail closed: a store error here must deny, not silently
+                // fall through to returning every session unfiltered — the
+                // old `let Ok(visible) = ... && !visible.any(...)` chain
+                // made a failed lookup indistinguishable from "found it".
                 if let Some(u) = &user
                     && !u.is_admin
-                    && let Ok(visible) = store.instances_for_user(u.id, u.is_admin)
-                    && !visible.iter().any(|i| i.id == instance_id)
                 {
-                    return buffered(
-                        (
-                            403,
-                            "application/json".to_string(),
-                            br#"{"error":"forbidden"}"#.to_vec(),
-                        ),
-                        request,
-                    );
+                    let allowed = store
+                        .instances_for_user(u.id, u.is_admin)
+                        .map(|visible| visible.iter().any(|i| i.id == instance_id))
+                        .unwrap_or(false);
+                    if !allowed {
+                        return buffered(
+                            (
+                                403,
+                                "application/json".to_string(),
+                                br#"{"error":"forbidden"}"#.to_vec(),
+                            ),
+                            request,
+                        );
+                    }
                 }
                 match store.sessions_for_instance(instance_id) {
                     Ok(rows) => {
@@ -2680,6 +2734,8 @@ fn instance_id_or_404(store: &Store, instance: &str) -> Result<i64, (u16, String
 
 /// A logged-in user may manage a session only if they are an admin or hold a
 /// grant on the instance it belongs to.
+/// Any grant (viewer or controller) is enough to *see* a session — this
+/// gates the read-only detail page.
 fn can_manage_session(
     store: &Store,
     user: Option<&crate::store::UserRow>,
@@ -2688,6 +2744,24 @@ fn can_manage_session(
     match user {
         Some(u) if u.is_admin => true,
         Some(u) => store.grant_for(u.id, instance_id).ok().flatten().is_some(),
+        None => false,
+    }
+}
+
+/// Deleting a session, or flipping its OTR/prune settings, is a mutation —
+/// a viewer grant must not be enough, or "read-only" access can still
+/// destroy another team's history on the instance.
+fn can_mutate_session(
+    store: &Store,
+    user: Option<&crate::store::UserRow>,
+    instance_id: i64,
+) -> bool {
+    match user {
+        Some(u) if u.is_admin => true,
+        Some(u) => {
+            store.grant_for(u.id, instance_id).ok().flatten()
+                == Some(crate::store::Role::Controller)
+        }
         None => false,
     }
 }
@@ -2713,7 +2787,7 @@ fn handle_api_session_delete(
     let Ok(instance_id) = instance_id_or_404(store, instance) else {
         return json_error(request, 404, "unknown instance");
     };
-    if !can_manage_session(store, user, instance_id) {
+    if !can_mutate_session(store, user, instance_id) {
         return json_error(request, 403, "no access to this instance");
     }
     match store.delete_session(instance_id, session) {
@@ -2748,7 +2822,7 @@ fn handle_api_session_otr(
     let Ok(instance_id) = instance_id_or_404(store, instance) else {
         return json_error(request, 404, "unknown instance");
     };
-    if !can_manage_session(store, user, instance_id) {
+    if !can_mutate_session(store, user, instance_id) {
         return json_error(request, 403, "no access to this instance");
     }
     match store.set_session_otr(instance_id, session, otr) {
@@ -2781,7 +2855,7 @@ fn handle_api_session_prune(
     let Ok(instance_id) = instance_id_or_404(store, instance) else {
         return json_error(request, 404, "unknown instance");
     };
-    if !can_manage_session(store, user, instance_id) {
+    if !can_mutate_session(store, user, instance_id) {
         return json_error(request, 403, "no access to this instance");
     }
     match store.set_session_prune(instance_id, session, prune_after) {
@@ -2800,7 +2874,7 @@ fn handle_push(store: &Arc<Store>, hub: &Hub, instance_id: i64, push: TunnelPush
     let sessions = match push {
         TunnelPush::LinkRevoke { link_revoke } => {
             let hash = store::hash_token(&link_revoke);
-            match store.revoke_link(&hash) {
+            match store.revoke_link_for_instance(&hash, instance_id) {
                 Ok(true) => {
                     tracing::info!(instance_id, "tunnel closed its own link");
                     // The link is gone; nothing left for the tunnel to serve.
@@ -3124,6 +3198,16 @@ fn drive_tunnel(
         }
     };
     store.touch_instance(instance.id).ok();
+    // Authenticated: the tunnel idles between pings by design from here on,
+    // so no more read deadlines. Cleared only now — not before the hello
+    // frame was validated — so an unauthenticated connection can't sit on a
+    // tunnel slot forever.
+    let _ = reader
+        .get_ref()
+        .write
+        .lock()
+        .unwrap()
+        .set_read_timeout(None);
     // A tunnel reuses the instance's still-live control link, so reconnects
     // and repeated /rc calls keep the URL people have already shared; only a
     // dead link (expired, revoked, or pre-plaintext legacy) gets a fresh mint.

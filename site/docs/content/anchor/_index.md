@@ -193,9 +193,12 @@ client_secret = "..."
 origin = "https://maki.example.com"
 ```
 
-The callback URL to register with your provider is `{origin}/callback`. The
-first user to log in becomes an admin; everyone after that is a regular user
-until you grant them access.
+The callback URL to register with your provider is `{origin}/callback` — for
+the config above, `https://maki.example.com/callback`. The admin page's SSO
+form shows this computed from whatever you type into its Origin field, so
+you don't have to do the substitution by hand. The first user to log in
+becomes an admin; everyone after that is a regular user until you grant them
+access.
 
 Access is per instance. A user with a grant sees that instance on the
 dashboard and can open its sessions:

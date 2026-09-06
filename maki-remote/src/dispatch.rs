@@ -295,7 +295,8 @@ impl Dispatcher {
             Route::Sessions => match self.dispatch_sessions() {
                 Some(value) => DispatchOutcome::Json {
                     status: 200,
-                    body: serde_json::to_vec(&value).unwrap_or_default(),
+                    body: serde_json::to_vec(&scope_sessions(value, session.as_deref()))
+                        .unwrap_or_default(),
                 },
                 None => DispatchOutcome::Json {
                     status: 503,
@@ -524,6 +525,28 @@ impl Dispatcher {
             Err(_) => Err("event loop wedged".to_owned()),
         }
     }
+}
+
+/// `RemoteRequest::Sessions` always answers with the whole instance's tab
+/// roster (every session's title, cwd, model, status) — every other route
+/// under a session-scoped link stays inside that one session, so this must
+/// too, or a link scoped to a single session leaks the existence, titles and
+/// working directories of every other tab on the instance.
+fn scope_sessions(value: serde_json::Value, session: Option<&str>) -> serde_json::Value {
+    let Some(session) = session else {
+        return value;
+    };
+    let sessions = value
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter(|s| s.get("id").and_then(|v| v.as_str()) == Some(session))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({ "sessions": sessions, "focused": session })
 }
 
 fn required_str(value: &serde_json::Value, field: &str) -> Result<String, String> {
@@ -830,5 +853,38 @@ mod tests {
         assert!(!snapshot.is_empty());
         let frame = String::from_utf8(source.next_frame().unwrap()).unwrap();
         assert!(frame.contains("working"), "frame: {frame}");
+    }
+
+    #[test]
+    fn scope_sessions_hides_every_other_tabs_roster_entry() {
+        // A link scoped to one session must not leak the titles, cwds, or
+        // even the existence of the instance's other tabs through the plain
+        // `sessions` route, which otherwise answers with the whole roster
+        // regardless of scope.
+        let whole = json!({
+            "sessions": [
+                {"id": "watched", "title": "secret refactor", "cwd": "/work/a", "focused": false},
+                {"id": "other", "title": "unrelated project", "cwd": "/work/b", "focused": true},
+            ],
+            "focused": "other",
+        });
+        let scoped = scope_sessions(whole.clone(), Some("watched"));
+        let sessions = scoped["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "only the scoped session may appear");
+        assert_eq!(sessions[0]["id"], "watched");
+        assert_eq!(scoped["focused"], "watched");
+        assert!(
+            scoped.to_string().contains("watched") && !scoped.to_string().contains("other"),
+            "the other tab's id/title/cwd must not appear anywhere in the response: {scoped}"
+        );
+
+        // Unscoped (the owner's own "all tabs" link) still sees everything.
+        assert_eq!(
+            scope_sessions(whole, None)["sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }

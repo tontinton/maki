@@ -261,12 +261,21 @@ fn read_line<R: BufRead>(reader: &mut R, replay: &mut Vec<u8>) -> Result<Option<
                 replay.extend_from_slice(available);
                 let take = available.len();
                 reader.consume(take);
+                // `replay` is shared across every line of the head (`start`
+                // only marks where *this* line began), so this has to check
+                // the running total, not just this line — otherwise a client
+                // that never sends a newline keeps extending it a chunk at a
+                // time forever, past MAX_HEAD, since the check below only
+                // ran once the loop had already broken on finding one.
+                if replay.len() > MAX_HEAD {
+                    return Err(Reject::TooLarge);
+                }
                 continue;
             }
         }
         break;
     }
-    if replay.len() - start > MAX_HEAD {
+    if replay.len() > MAX_HEAD {
         return Err(Reject::TooLarge);
     }
     let raw = &replay[start..];

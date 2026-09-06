@@ -821,6 +821,24 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Same as `revoke_link`, scoped to one instance — for revokes an
+    /// instance asks for over its own tunnel (`/rc link rm`, `/rc down`),
+    /// where the token is caller-supplied text and must not be usable to
+    /// revoke a link that belongs to some *other* instance.
+    pub fn revoke_link_for_instance(
+        &self,
+        token_hash: &str,
+        instance_id: i64,
+    ) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE links SET revoked_at = ?1 \
+             WHERE token_hash = ?2 AND instance_id = ?3 AND revoked_at IS NULL",
+            rusqlite::params![now_unix(), token_hash, instance_id],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn has_users(&self) -> Result<bool, StoreError> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
@@ -1249,6 +1267,46 @@ mod tests {
         assert_eq!(link.rights, "viewer");
         assert!(store.revoke_link(&hash_token("link-2")).unwrap());
         assert!(store.link_by_token("link-2").is_err());
+    }
+
+    #[test]
+    fn revoke_link_for_instance_cannot_cross_into_another_instances_link() {
+        // A tunnel push carries a caller-supplied token (`/rc link rm`,
+        // `/rc down`), so revoking by hash alone would let one instance that
+        // merely knows another instance's token revoke that instance's link.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.sqlite")).unwrap();
+        let mine = store
+            .register_instance("mine", &hash_token("reg1"))
+            .unwrap();
+        let theirs = store
+            .register_instance("theirs", &hash_token("reg2"))
+            .unwrap();
+        store
+            .create_link(
+                "their-link",
+                theirs,
+                None,
+                "controller",
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        assert!(
+            !store
+                .revoke_link_for_instance(&hash_token("their-link"), mine)
+                .unwrap(),
+            "wrong instance must not revoke someone else's link"
+        );
+        assert!(store.link_by_token("their-link").is_ok(), "link survives");
+
+        assert!(
+            store
+                .revoke_link_for_instance(&hash_token("their-link"), theirs)
+                .unwrap(),
+            "the owning instance can still revoke its own link"
+        );
+        assert!(store.link_by_token("their-link").is_err());
     }
 
     #[test]

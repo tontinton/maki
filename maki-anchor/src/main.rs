@@ -42,6 +42,12 @@ struct AuthFileConfig {
     mint_tokens: Option<MintTokens>,
     /// Deprecated: use mint_tokens. If true, maps to user, if false to any.
     require_auth_for_tokens: Option<bool>,
+    /// Trust `X-Forwarded-For`/`X-Forwarded-Proto` from the peer, for the
+    /// login lockout's IP key and the session cookie's `Secure` flag. Only
+    /// turn this on when every connection genuinely arrives through a
+    /// reverse proxy that sets these headers itself — otherwise a direct
+    /// client can forge them. Default false.
+    trust_proxy: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -211,6 +217,11 @@ fn main() {
                 .as_ref()
                 .and_then(|a| a.allow_local_users)
                 .unwrap_or(true);
+            let trust_proxy = anchor_config
+                .auth
+                .as_ref()
+                .and_then(|a| a.trust_proxy)
+                .unwrap_or(false);
             let mint_tokens = {
                 if let Some(v) = std::env::var("MAKI_ANCHOR_MINT_TOKENS")
                     .ok()
@@ -236,7 +247,9 @@ fn main() {
                     MintTokens::Any
                 }
             };
-            if let Err(err) = server::serve(&bind, store, oidc, allow_local, mint_tokens) {
+            if let Err(err) =
+                server::serve(&bind, store, oidc, allow_local, mint_tokens, trust_proxy)
+            {
                 eprintln!("fatal: {err}");
                 std::process::exit(1);
             }

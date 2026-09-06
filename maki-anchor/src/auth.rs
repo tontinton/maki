@@ -51,6 +51,12 @@ pub struct Auth {
     pub store: Arc<Store>,
     pub allow_local: bool,
     pub mint_tokens: store::MintTokens,
+    /// Honor `X-Forwarded-For`/`X-Forwarded-Proto` from the peer. Only safe
+    /// when every connection genuinely comes through a reverse proxy that
+    /// sets (and the network guarantees nothing else can forge) these
+    /// headers — otherwise a direct client can hand itself an arbitrary
+    /// origin and dodge the login lockout below, so this defaults to off.
+    pub trust_proxy: bool,
     /// Login state -> pending record, so /callback can verify state and use
     /// the stored nonce/verifier. Bounded by pruning on insert.
     pending: Mutex<HashMap<String, PendingLogin>>,
@@ -67,12 +73,14 @@ impl Auth {
         oidc: Option<OidcConfig>,
         allow_local: bool,
         mint_tokens: store::MintTokens,
+        trust_proxy: bool,
     ) -> Self {
         Self {
             oidc,
             store,
             allow_local,
             mint_tokens,
+            trust_proxy,
             pending: Mutex::new(HashMap::new()),
             attempts: Mutex::new(HashMap::new()),
             rng_counter: AtomicU64::new(0),
@@ -217,7 +225,7 @@ impl Auth {
                 state.clone(),
                 PendingLogin {
                     at: now,
-                    nonce,
+                    nonce: nonce.clone(),
                     code_verifier,
                 },
             );
@@ -226,6 +234,7 @@ impl Auth {
             config,
             &discovery,
             &state,
+            &nonce,
             &code_challenge,
         ))
     }
@@ -287,12 +296,22 @@ impl Auth {
     }
 
     /// A Set-Cookie header value that clears the session.
-    pub fn clear_cookie() -> &'static str {
-        "maki_anchor_session=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+    pub fn clear_cookie(secure: bool) -> String {
+        format!(
+            "maki_anchor_session=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{}",
+            if secure { "; Secure" } else { "" }
+        )
     }
 
-    pub fn session_set_cookie(value: &str) -> String {
-        format!("{COOKIE_NAME}={value}; Path=/; Max-Age={MAX_AGE}; HttpOnly; SameSite=Lax")
+    /// `secure` should be true whenever the browser reached this response
+    /// over HTTPS (directly, or via a proxy hop `trust_proxy` allows this
+    /// caller to believe) — a session cookie is exactly the kind of thing
+    /// that must never ride cleartext.
+    pub fn session_set_cookie(value: &str, secure: bool) -> String {
+        format!(
+            "{COOKIE_NAME}={value}; Path=/; Max-Age={MAX_AGE}; HttpOnly; SameSite=Lax{}",
+            if secure { "; Secure" } else { "" }
+        )
     }
 }
 
@@ -327,6 +346,7 @@ mod tests {
             None,
             true,
             store::MintTokens::Any,
+            false,
         )
     }
 
@@ -339,9 +359,17 @@ mod tests {
 
     #[test]
     fn session_cookie_carries_max_age_and_httponly() {
-        let cookie = Auth::session_set_cookie("abc");
+        let cookie = Auth::session_set_cookie("abc", false);
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains(&format!("Max-Age={MAX_AGE}")));
+    }
+
+    #[test]
+    fn session_cookie_secure_flag_follows_the_caller() {
+        assert!(!Auth::session_set_cookie("abc", false).contains("Secure"));
+        assert!(Auth::session_set_cookie("abc", true).contains("; Secure"));
+        assert!(!Auth::clear_cookie(false).contains("Secure"));
+        assert!(Auth::clear_cookie(true).contains("; Secure"));
     }
 
     #[test]
