@@ -43,18 +43,18 @@ impl StdioTransport {
         environment: &HashMap<String, String>,
         timeout: Duration,
     ) -> Result<Self, McpError> {
-        let mut std_cmd = std::process::Command::new(program);
+        let program = crate::child_env::resolve_program(program, environment);
+        let mut std_cmd = std::process::Command::new(&program);
         std_cmd.args(args).envs(environment);
 
+        // Keep std on the posix_spawn fast path: no fork means libmalloc's
+        // atfork child handler never runs and can't print the
+        // MallocStackLogging warning from tontinton/maki#909.
         #[cfg(unix)]
-        unsafe {
-            std_cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
+        std_cmd.process_group(0);
 
         let mut cmd: async_process::Command = std_cmd.into();
+        crate::child_env::strip_inherited_malloc_stack_logging(&mut cmd);
         cmd.stdin(async_process::Stdio::piped())
             .stdout(async_process::Stdio::piped())
             .stderr(async_process::Stdio::piped());

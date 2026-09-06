@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod cancel;
+pub mod child_env;
 pub mod child_guard;
 pub use child_guard::ChildGuard;
 pub mod headless;
