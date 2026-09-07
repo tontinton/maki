@@ -48,6 +48,7 @@ pub enum Route {
     Events,
     Prompt,
     Answer,
+    WindowInput,
     Stop,
     Command,
     Sessions,
@@ -80,6 +81,7 @@ impl Route {
             ("events", "GET") => Some(Route::Events),
             ("prompt", "POST") => Some(Route::Prompt),
             ("answer", "POST") => Some(Route::Answer),
+            ("window/input", "POST") => Some(Route::WindowInput),
             ("stop", "POST") => Some(Route::Stop),
             ("command", "POST") => Some(Route::Command),
             ("sessions", "GET") => Some(Route::Sessions),
@@ -552,7 +554,7 @@ impl Dispatcher {
                     body: br#"{"error":"event loop wedged"}"#.to_vec(),
                 },
             },
-            Route::Prompt | Route::Answer | Route::Stop | Route::Command => {
+            Route::Prompt | Route::Answer | Route::WindowInput | Route::Stop | Route::Command => {
                 match self.dispatch_post(route, session, body) {
                     Ok(()) => DispatchOutcome::Posted(200, None),
                     Err(reason) => DispatchOutcome::Posted(400, Some(reason)),
@@ -718,6 +720,31 @@ impl Dispatcher {
                         session,
                         request_id,
                         answer,
+                        reply: tx,
+                    },
+                    rx,
+                )
+            }
+            Route::WindowInput => {
+                let value: serde_json::Value =
+                    serde_json::from_str(body).map_err(|_| "invalid json".to_owned())?;
+                let key = value
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let paste = value
+                    .get("paste")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                if key.is_none() && paste.is_none() {
+                    return Err("missing key or paste".to_owned());
+                }
+                let (tx, rx) = flume::unbounded();
+                (
+                    crate::RemoteRequest::WindowInput {
+                        session,
+                        key,
+                        paste,
                         reply: tx,
                     },
                     rx,
@@ -898,6 +925,15 @@ impl SseSource {
                         "permission_resolved",
                         &json!({ "id": request_id }),
                     );
+                }
+                RemoteUpdate::WindowOpen { window, .. } => {
+                    write_frame(&mut self.buf, "window_open", &window);
+                }
+                RemoteUpdate::WindowUpdate { window, .. } => {
+                    write_frame(&mut self.buf, "window_update", &window);
+                }
+                RemoteUpdate::WindowClose { id, .. } => {
+                    write_frame(&mut self.buf, "window_close", &json!({ "id": id }));
                 }
             }
         }

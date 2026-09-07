@@ -464,6 +464,13 @@ fn handle_request(
             let _ = reply.send(outcome);
             Ok(vec![])
         }
+        RemoteRequest::WindowInput {
+            key, paste, reply, ..
+        } => {
+            let outcome = app.send_remote_window_input(key.as_deref(), paste.as_deref());
+            let _ = reply.send(outcome);
+            Ok(vec![])
+        }
         RemoteRequest::Stop { reply, .. } => {
             let outcome = app.stop_remote_run();
             let _ = reply.send(outcome.as_ref().map(|_| ()).map_err(Clone::clone));
@@ -577,6 +584,7 @@ fn reject(request: RemoteRequest, reason: &str) {
     match request {
         RemoteRequest::Prompt { reply, .. }
         | RemoteRequest::Answer { reply, .. }
+        | RemoteRequest::WindowInput { reply, .. }
         | RemoteRequest::Stop { reply, .. }
         | RemoteRequest::Command { reply, .. } => {
             let _ = reply.send(Err(reason.to_owned()));

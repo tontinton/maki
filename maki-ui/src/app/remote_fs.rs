@@ -171,7 +171,7 @@ fn push_html_escaped_segment(html: &mut String, seg: &maki_highlight::StyledSegm
     }
 }
 
-fn html_escape_into(out: &mut String, s: &str) {
+pub(crate) fn html_escape_into(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
             '&' => out.push_str("&amp;"),

@@ -252,6 +252,55 @@
   #compact-toggle { cursor: pointer; }
 
   /* File panel: slides out from the left over the transcript. */
+  /* A plugin's maki.ui.open_win() float (task/session/memory pickers, the
+     question tool's form, ...), mirrored from the terminal as a generic
+     modal — see the "window bridge" JS below. */
+  #win-backdrop {
+    position: fixed; inset: 0; z-index: 95;
+    background: rgba(0,0,0,.5);
+    display: flex; align-items: center; justify-content: center;
+    padding: 16px;
+  }
+  /* Author rules always beat the UA `[hidden]` default regardless of
+     specificity — see #toolbar[hidden]/#files-view[hidden] for the same
+     fix already needed elsewhere in this file. */
+  #win-backdrop[hidden] { display: none; }
+  #win-overlay {
+    width: min(640px, 100%);
+    max-height: 80vh;
+    background: var(--panel);
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    box-shadow: 0 8px 32px rgba(0,0,0,.5);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  #win-title {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px 8px 14px;
+    border-bottom: 1px solid var(--border);
+    color: var(--accent); font-weight: bold;
+  }
+  #win-title-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #win-title .mini { margin-left: auto; }
+  #win-body {
+    flex: 1; overflow-y: auto; padding: 4px 0;
+    font-size: 13px;
+  }
+  #win-body:focus { outline: none; }
+  #win-body > div { padding: 1px 14px; white-space: pre-wrap; word-break: break-word; }
+  /* A scroll target more than a highlight: most pickers already bake their
+     own selection color into the row's spans (see picker.lua), so a strong
+     background here would double up against that. This class is now always
+     applied to the cursor row (not just when a plugin opts into cursor_line)
+     so arrow-key navigation always has something to scroll into view. */
+  #win-body > div.win-cursor { box-shadow: inset 2px 0 0 0 var(--accent); }
+  #win-footer {
+    padding: 6px 14px; border-top: 1px solid var(--border);
+    color: var(--muted); font-size: 12px;
+    display: flex; gap: 14px; flex-wrap: wrap;
+  }
+  #win-footer:empty { display: none; }
   #files-backdrop {
     position: fixed; inset: 0; z-index: 89;
     background: rgba(0,0,0,.4);
@@ -367,6 +416,13 @@
     <div id="center" hidden></div>
   </div>
 </header>
+<div id="win-backdrop" hidden>
+  <div id="win-overlay">
+    <div id="win-title"><span id="win-title-text"></span><button class="mini" id="win-close" title="Close (esc)">×</button></div>
+    <div id="win-body" tabindex="0"></div>
+    <div id="win-footer"></div>
+  </div>
+</div>
 <div id="files-backdrop" hidden></div>
 <aside id="files-panel" aria-hidden="true">
   <div id="files-resize" title="Drag to resize"></div>
@@ -1025,6 +1081,12 @@
     }
     replaying = false;
     setHeader(snap);
+    // A reconnect (phone screen waking up, a hard refresh) needs to see an
+    // already-open focused window again — window_open/window_update only
+    // fire on the next change, and some windows (the question tool's form)
+    // have no redraw loop of their own to ever produce one.
+    if (snap.window) renderWindow(snap.window);
+    else if (currentWindowId !== null) closeWindow(currentWindowId);
     if (Array.isArray(snap.queue) && snap.queue.length) {
       log.appendChild(el("msg system", `— ${snap.queue.length} queued prompt(s)`));
     }
@@ -1052,7 +1114,7 @@
       // on reconnect restores the chat without a hard refresh.
       setTimeout(() => { connect(); refreshSnapshot(); }, 2000);
     };
-    for (const kind of ["snapshot", "event", "status", "permission", "permission_resolved"]) {
+    for (const kind of ["snapshot", "event", "status", "permission", "permission_resolved", "window_open", "window_update", "window_close"]) {
       es.addEventListener(kind, (ev) => {
         try {
           const data = JSON.parse(ev.data);
@@ -1061,6 +1123,8 @@
           else if (kind === "status") setStatus(data);
           else if (kind === "permission") renderEvent({ type: "permission_request", ...data });
           else if (kind === "permission_resolved") renderEvent({ type: "permission_resolved", ...data });
+          else if (kind === "window_open" || kind === "window_update") renderWindow(data);
+          else if (kind === "window_close") closeWindow(data.id);
         } catch {}
       });
     }
@@ -1073,14 +1137,14 @@
     if (snap) renderSnapshot(snap);
   };
 
-  const submit = async (path, body) => {
+  const submit = async (path, body, quiet) => {
     try {
       const res = await fetch(path, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      if (!res.ok) {
+      if (!res.ok && !quiet) {
         try { const j = await res.json(); if (j.error) toast(j.error); } catch {}
       }
       return res.ok;
@@ -1097,6 +1161,130 @@
       return await r.json().catch(() => (r.ok ? {} : { error: "failed" }));
     } catch { return { error: "network" }; }
   };
+
+  // ---- window bridge --------------------------------------------------
+  // A plugin's maki.ui.open_win() float — /tasks, /sessions, /memory, the
+  // question tool's form, anything else built on that primitive — mirrored
+  // here as a generic modal. Input always targets whichever window is
+  // focused server-side, same as a local keypress, so there is no explicit
+  // window id to send on the way out; window_open/window_update/window_close
+  // all carry the window's own id, so a stale frame for a window this tab
+  // already replaced can be told apart from the current one.
+  const winBackdrop = document.getElementById("win-backdrop");
+  const winTitleText = document.getElementById("win-title-text");
+  const winBody = document.getElementById("win-body");
+  const winFooter = document.getElementById("win-footer");
+  const winCloseBtn = document.getElementById("win-close");
+  let currentWindowId = null;
+
+  // Each keystroke is its own POST; firing them all concurrently (the
+  // ordinary fire-and-forget `submit`) lets a slower request land after a
+  // later one and reorder fast typing at the server. Chaining onto one
+  // promise makes every request wait for the last to finish before it
+  // starts, so keys always arrive in the order they were typed.
+  let winInputChain = Promise.resolve();
+  const submitWindowInput = (body) => {
+    // quiet: true — a key can legitimately race a window closing (Enter on
+    // a picker row closes it server-side right as the keystroke lands), and
+    // that is not a fault worth a toast.
+    winInputChain = winInputChain.then(() => submit("window/input", body, true));
+    return winInputChain;
+  };
+  const submitWindowKey = (key) => submitWindowInput({ key });
+  const submitWindowPaste = (text) => submitWindowInput({ paste: text });
+
+  // Only a window that actually holds local focus is shown here — a
+  // background one (todo_write's panel, the memory plugin's toast, both
+  // opened with focus = false) is real window state a browser tab still
+  // hears about, but never worth a blocking modal: nothing local is
+  // dismissing it by hand either, and forward_key_str only ever reaches the
+  // focused window, so a modal for an unfocused one would have no way to
+  // close short of a page reload.
+  const renderWindow = (w) => {
+    if (!w.focus) {
+      // A window that just lost focus (e.g. a second one opened over it)
+      // must not leave its own now-stale modal on screen.
+      if (currentWindowId === w.id) closeWindow(w.id);
+      return;
+    }
+    currentWindowId = w.id;
+    winTitleText.textContent = (w.title || "").trim();
+    winBody.innerHTML = w.html || "";
+    winFooter.innerHTML = "";
+    for (const [key, label] of w.footer || []) {
+      const span = document.createElement("span");
+      span.textContent = `${key} ${label}`;
+      winFooter.appendChild(span);
+    }
+    const visible = w.visible !== false;
+    winBackdrop.hidden = !visible;
+    if (visible) {
+      winBody.focus();
+      // innerHTML above reset scrollTop to 0; without this, arrow-key
+      // navigation past the visible area leaves the selection off-screen
+      // with nothing on screen ever following it.
+      winBody.querySelector(".win-cursor")?.scrollIntoView({ block: "nearest" });
+    }
+  };
+
+  const closeWindow = (id) => {
+    if (currentWindowId !== id) return;
+    currentWindowId = null;
+    winBackdrop.hidden = true;
+  };
+
+  // Esc is the universal float dismissal everywhere in this app (local
+  // keybinding, permission card, ...); reusing it here means "close" needs
+  // no separate server-side concept — the plugin's own esc handling, which
+  // already runs locally, decides what closing means.
+  winCloseBtn.onclick = () => submitWindowKey("esc");
+  winBackdrop.addEventListener("click", (ev) => {
+    if (ev.target === winBackdrop) submitWindowKey("esc");
+  });
+
+  // Mirrors maki-ui's key_event_to_string exactly (components/keybindings.rs)
+  // so a browser keypress reaches the same WinEvent::Key a local one would.
+  const winKeyString = (ev) => {
+    let prefix = "";
+    if (ev.ctrlKey) prefix += "ctrl+";
+    if (ev.altKey) prefix += "alt+";
+    const isChar = ev.key.length === 1 && ev.key !== " ";
+    if (ev.shiftKey && !isChar) prefix += "shift+";
+    switch (ev.key) {
+      case " ": return prefix + "space";
+      case "Enter": return prefix + "enter";
+      case "Escape": return prefix + "esc";
+      case "Tab": return prefix + "tab";
+      case "Backspace": return prefix + "backspace";
+      case "Delete": return prefix + "delete";
+      case "ArrowUp": return prefix + "up";
+      case "ArrowDown": return prefix + "down";
+      case "ArrowLeft": return prefix + "left";
+      case "ArrowRight": return prefix + "right";
+      case "Home": return prefix + "home";
+      case "End": return prefix + "end";
+      case "PageUp": return prefix + "pageup";
+      case "PageDown": return prefix + "pagedown";
+      case "Insert": return prefix + "insert";
+      default:
+        if (/^F([1-9]|1[0-9]|2[0-4])$/.test(ev.key)) return prefix + ev.key.toLowerCase();
+        return isChar ? prefix + ev.key : "";
+    }
+  };
+
+  winBody.addEventListener("keydown", (ev) => {
+    const key = winKeyString(ev);
+    if (!key) return;
+    ev.preventDefault();
+    submitWindowKey(key);
+  });
+  winBody.addEventListener("paste", (ev) => {
+    const text = ev.clipboardData?.getData("text");
+    if (text) {
+      ev.preventDefault();
+      submitWindowPaste(text);
+    }
+  });
 
   // ---- file panel ---------------------------------------------------------
   // Slides out from the left: a gitignore-aware tree (server-side, jailed to

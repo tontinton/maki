@@ -54,6 +54,16 @@ pub enum RemoteRequest {
         answer: String,
         reply: Sender<Result<(), String>>,
     },
+    /// A key or paste event for the session's focused `open_win()` float —
+    /// `/tasks`, `/sessions`, `/memory`, the `question` tool's form, and
+    /// anything else a plugin builds on that primitive. Always targets
+    /// whichever window is focused, exactly like a local keypress would.
+    WindowInput {
+        session: Option<String>,
+        key: Option<String>,
+        paste: Option<String>,
+        reply: Sender<Result<(), String>>,
+    },
     Stop {
         session: Option<String>,
         reply: Sender<Result<(), String>>,
@@ -168,6 +178,7 @@ impl RemoteRequest {
         match self {
             Self::Prompt { session, .. }
             | Self::Answer { session, .. }
+            | Self::WindowInput { session, .. }
             | Self::Stop { session, .. }
             | Self::Command { session, .. }
             | Self::ModelGet { session, .. }

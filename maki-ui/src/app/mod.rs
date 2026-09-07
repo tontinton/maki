@@ -10,6 +10,7 @@ pub(crate) mod mode;
 mod mouse;
 mod queue;
 pub(crate) mod remote_fs;
+mod remote_windows;
 mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;
@@ -913,6 +914,12 @@ impl App {
             "queue": self.queue.text_messages(),
             "pending_permission": self.pending_permission_ids()
                 .map(|(id, _)| json!({ "id": id })),
+            // A reconnecting tab (phone screen waking up, a hard refresh)
+            // needs to see an already-open window again — some, like the
+            // question tool's form, have no redraw loop of their own to
+            // self-heal on the next content change and would otherwise
+            // hang with no way for the browser to ever show it again.
+            "window": self.remote_focused_window_snapshot(),
         })
     }
 

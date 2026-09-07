@@ -26,6 +26,23 @@ pub enum RemoteUpdate {
         session: String,
         request_id: String,
     },
+    /// A plugin (or a builtin like `/tasks`) opened a `maki.ui.open_win()`
+    /// float. `window` is the full snapshot — see
+    /// `maki_ui::app::remote_windows::App::remote_window_snapshot` for its
+    /// shape (id, title, footer, pre-rendered content HTML, visible).
+    WindowOpen {
+        session: String,
+        window: serde_json::Value,
+    },
+    /// The window's content or chrome changed; same shape as `WindowOpen`.
+    WindowUpdate {
+        session: String,
+        window: serde_json::Value,
+    },
+    WindowClose {
+        session: String,
+        id: u32,
+    },
     Shutdown,
 }
 
@@ -36,7 +53,10 @@ impl RemoteUpdate {
             Self::Envelope { session, .. }
             | Self::Status { session, .. }
             | Self::Permission { session, .. }
-            | Self::PermissionResolved { session, .. } => Some(session),
+            | Self::PermissionResolved { session, .. }
+            | Self::WindowOpen { session, .. }
+            | Self::WindowUpdate { session, .. }
+            | Self::WindowClose { session, .. } => Some(session),
             Self::Shutdown => None,
         }
     }
@@ -208,6 +228,27 @@ impl RemoteState {
 
     pub fn send_shutdown(&self) {
         self.publish(RemoteUpdate::Shutdown);
+    }
+
+    pub fn send_window_open(&self, session_id: &str, window: serde_json::Value) {
+        self.publish(RemoteUpdate::WindowOpen {
+            session: session_id.to_owned(),
+            window,
+        });
+    }
+
+    pub fn send_window_update(&self, session_id: &str, window: serde_json::Value) {
+        self.publish(RemoteUpdate::WindowUpdate {
+            session: session_id.to_owned(),
+            window,
+        });
+    }
+
+    pub fn send_window_close(&self, session_id: &str, id: u32) {
+        self.publish(RemoteUpdate::WindowClose {
+            session: session_id.to_owned(),
+            id,
+        });
     }
 }
 

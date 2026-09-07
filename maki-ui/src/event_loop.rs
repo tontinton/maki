@@ -844,11 +844,26 @@ impl<'t> EventLoop<'t> {
     /// looking at would lose the output.
     fn tick(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
+        let state = self.remote.state();
         for (i, rt) in self.sessions.iter_mut().enumerate() {
             if i == self.focused {
                 dirty |= rt.app.tick();
             } else {
                 let _ = rt.app.float_mgr.tick();
+            }
+            let (updated, closed) = rt.app.take_window_changes();
+            if let Some(state) = &state {
+                if !updated.is_empty() || !closed.is_empty() {
+                    let session_id = rt.id().to_string();
+                    for id in updated {
+                        if let Some(snapshot) = rt.app.remote_window_snapshot(id) {
+                            state.send_window_update(&session_id, snapshot);
+                        }
+                    }
+                    for id in closed {
+                        state.send_window_close(&session_id, id);
+                    }
+                }
             }
         }
         dirty
@@ -1041,8 +1056,18 @@ impl<'t> EventLoop<'t> {
                 event_tx,
                 cmd_rx,
             } => {
+                let idx = self.focused;
+                let id = self.sessions[idx]
+                    .app
+                    .float_mgr
+                    .open(buf, config, focus, event_tx, cmd_rx);
+                if let Some(state) = self.remote.state() {
+                    let session_id = self.sessions[idx].id().to_string();
+                    if let Some(snapshot) = self.sessions[idx].app.remote_window_snapshot(id) {
+                        state.send_window_open(&session_id, snapshot);
+                    }
+                }
                 let app = self.focused_app();
-                app.float_mgr.open(buf, config, focus, event_tx, cmd_rx);
                 if focus {
                     app.transition_plan(crate::app::mode::PlanTrigger::InteractivePrompt);
                 }
