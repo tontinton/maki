@@ -72,7 +72,11 @@ impl OidcFileConfig {
 }
 
 #[derive(Parser)]
-#[command(name = "maki-anchor", about = "Anchor server for maki remote control")]
+#[command(
+    name = "maki-anchor",
+    version,
+    about = "Anchor server for maki remote control"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
