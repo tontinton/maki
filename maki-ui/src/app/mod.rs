@@ -59,7 +59,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::{
     AgentEvent, Envelope, ImageMediaType, ImageSource, McpConfigErrors, McpPromptInfo,
-    McpSnapshotReader, SharedMessages, SubagentInfo,
+    McpSnapshotReader, SharedMessages, SubagentInfo, ToolOutput,
 };
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
@@ -846,14 +846,22 @@ impl App {
                             is_error,
                         } = block
                         {
-                            let full = tool_outputs
-                                .get(tool_use_id.as_str())
-                                .map(|o| o.as_text())
-                                .unwrap_or_else(|| content.clone());
+                            // An image result carries its pixels only on the
+                            // full `ToolOutput`, not in `.as_text()`'s caption
+                            // — serialize the whole variant so a page reload
+                            // still shows the picture, not just its caption.
+                            let output = match tool_outputs.get(tool_use_id.as_str()) {
+                                Some(o) => match o.as_ref() {
+                                    ToolOutput::Image { .. } => serde_json::to_value(o.as_ref())
+                                        .unwrap_or_else(|_| json!(o.as_text())),
+                                    _ => json!(o.as_text()),
+                                },
+                                None => json!(content.clone()),
+                            };
                             messages.push(json!({
                                 "type": "tool_done",
                                 "id": tool_use_id,
-                                "output": full,
+                                "output": output,
                                 "is_error": is_error,
                             }));
                         }

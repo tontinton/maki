@@ -71,6 +71,11 @@
   .tool { margin: 6px 0; border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; background: var(--panel); }
   .tool summary { color: var(--tool); cursor: pointer; user-select: none; }
   .tool .out { white-space: pre-wrap; word-break: break-word; color: var(--muted); margin-top: 4px; max-height: 300px; overflow-y: auto; }
+  .tool .out img.tool-thumb {
+    display: block; max-width: min(480px, 100%); max-height: 480px;
+    border-radius: 6px; border: 1px solid var(--border);
+  }
+  .tool .out .tool-thumb-caption { margin-top: 4px; }
   .tool.running summary::after { content: " …"; color: var(--accent); }
   .tool.is-error { border-color: var(--error); }
   #perm {
@@ -917,10 +922,26 @@
         if (details) {
           details.classList.remove("running");
           const out = details.querySelector(".out");
-          const text = typeof event.output === "string"
-            ? event.output
-            : (event.output && event.output.Plain && event.output.Plain.text) || JSON.stringify(event.output);
-          out.textContent = event.is_error ? `[error] ${text}` : text;
+          if (!event.is_error && event.output && event.output.Image) {
+            const { source, text } = event.output.Image;
+            out.textContent = "";
+            const link = document.createElement("a");
+            link.href = `data:${source.media_type};base64,${source.data}`;
+            link.target = "_blank";
+            link.rel = "noopener";
+            const img = document.createElement("img");
+            img.className = "tool-thumb";
+            img.src = link.href;
+            img.alt = text || "";
+            link.appendChild(img);
+            out.appendChild(link);
+            out.appendChild(el("tool-thumb-caption", text || ""));
+          } else {
+            const text = typeof event.output === "string"
+              ? event.output
+              : (event.output && event.output.Plain && event.output.Plain.text) || JSON.stringify(event.output);
+            out.textContent = event.is_error ? `[error] ${text}` : text;
+          }
         }
         break;
       }

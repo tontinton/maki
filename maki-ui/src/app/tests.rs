@@ -5644,5 +5644,34 @@ fn remote_snapshot_prefers_stored_tool_output_over_inline_summary() {
     assert_eq!(msgs[0]["output"], "the whole output, lines and lines");
 }
 
+#[test]
+fn remote_snapshot_keeps_the_full_image_output_not_just_its_caption() {
+    let mut app = test_app();
+    app.state.session_mut().replace_messages(vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "tool-1".into(),
+            content: "[image: pic.png 3B]".into(),
+            is_error: false,
+        }],
+        display_text: Some(String::new()),
+        ..Default::default()
+    }]);
+    let full = maki_agent::ToolOutput::Image {
+        source: ImageSource::new(ImageMediaType::Png, "aGVsbG8=".into()),
+        text: "[image: pic.png 3B]".into(),
+    };
+    app.state
+        .session_mut()
+        .insert_tool_output("tool-1".into(), Arc::new(full));
+    let snap = app.remote_snapshot();
+    let msgs = snap["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    // A reload has to render the picture again, not degrade to the caption
+    // alone — so the whole ToolOutput::Image variant rides the snapshot.
+    assert_eq!(msgs[0]["output"]["Image"]["source"]["data"], "aGVsbG8=");
+    assert_eq!(msgs[0]["output"]["Image"]["text"], "[image: pic.png 3B]");
+}
+
 const RC_SNAPSHOT_PROMPT: &str = "snapshot question";
 const RC_SNAPSHOT_REPLY: &str = "snapshot answer";
