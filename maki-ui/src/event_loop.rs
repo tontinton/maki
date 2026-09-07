@@ -852,17 +852,17 @@ impl<'t> EventLoop<'t> {
                 let _ = rt.app.float_mgr.tick();
             }
             let (updated, closed) = rt.app.take_window_changes();
-            if let Some(state) = &state {
-                if !updated.is_empty() || !closed.is_empty() {
-                    let session_id = rt.id().to_string();
-                    for id in updated {
-                        if let Some(snapshot) = rt.app.remote_window_snapshot(id) {
-                            state.send_window_update(&session_id, snapshot);
-                        }
+            if let Some(state) = &state
+                && (!updated.is_empty() || !closed.is_empty())
+            {
+                let session_id = rt.id().to_string();
+                for id in updated {
+                    if let Some(snapshot) = rt.app.remote_window_snapshot(id) {
+                        state.send_window_update(&session_id, snapshot);
                     }
-                    for id in closed {
-                        state.send_window_close(&session_id, id);
-                    }
+                }
+                for id in closed {
+                    state.send_window_close(&session_id, id);
                 }
             }
         }
