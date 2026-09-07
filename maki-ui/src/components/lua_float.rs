@@ -2373,7 +2373,10 @@ mod tests {
         // finds nothing changed.
         let _ = mgr.tick();
         let (updated, closed) = mgr.take_tick_changes();
-        assert!(updated.is_empty(), "nothing changed since open(): {updated:?}");
+        assert!(
+            updated.is_empty(),
+            "nothing changed since open(): {updated:?}"
+        );
         assert!(closed.is_empty());
 
         buf.append(make_line("b"));
@@ -2393,7 +2396,11 @@ mod tests {
         cmd_tx.send(WinCommand::SetCursor(0)).unwrap();
         let _ = mgr.tick();
         let (updated, _) = mgr.take_tick_changes();
-        assert_eq!(updated, vec![id], "a chrome-only command still counts as an update");
+        assert_eq!(
+            updated,
+            vec![id],
+            "a chrome-only command still counts as an update"
+        );
     }
 
     #[test]

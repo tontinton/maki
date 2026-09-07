@@ -14,7 +14,9 @@ use serde_json::{Value, json};
 use super::App;
 use super::remote_fs::html_escape_into;
 use crate::animation::{animation_elapsed_ms, spinner_str};
-use crate::components::tool_display::{SPINNER_STYLE_NAME, SPINNER_STYLE_PREFIX, resolve_span_style};
+use crate::components::tool_display::{
+    SPINNER_STYLE_NAME, SPINNER_STYLE_PREFIX, resolve_span_style,
+};
 use crate::theme;
 use maki_agent::{SnapshotLine, SnapshotSpan, SpanStyle};
 
@@ -119,7 +121,8 @@ fn push_span_html(html: &mut String, span: &SnapshotSpan) {
     if let SpanStyle::Named(name) = &span.style
         && (name == SPINNER_STYLE_NAME || name.starts_with(SPINNER_STYLE_PREFIX))
     {
-        let resolved = theme::style_by_name(name.strip_prefix(SPINNER_STYLE_PREFIX).unwrap_or(name));
+        let resolved =
+            theme::style_by_name(name.strip_prefix(SPINNER_STYLE_PREFIX).unwrap_or(name));
         return push_styled_text(html, spinner_str(animation_elapsed_ms()), resolved);
     }
     push_styled_text(html, &span.text, resolve_span_style(&span.style));
@@ -185,10 +188,7 @@ mod tests {
         // Rows: plain, cursor, plain — content itself still carries the
         // resolved theme color (SpanStyle::Default is not "no style").
         assert!(html.starts_with("<div>"), "html: {html}");
-        assert!(
-            html.contains("<div class=\"win-cursor\">"),
-            "html: {html}"
-        );
+        assert!(html.contains("<div class=\"win-cursor\">"), "html: {html}");
         assert!(html.contains(">a<"), "html: {html}");
         assert!(html.contains(">b<"), "html: {html}");
         assert!(html.contains(">c<"), "html: {html}");

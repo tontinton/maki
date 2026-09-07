@@ -728,10 +728,7 @@ impl Dispatcher {
             Route::WindowInput => {
                 let value: serde_json::Value =
                     serde_json::from_str(body).map_err(|_| "invalid json".to_owned())?;
-                let key = value
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned);
+                let key = value.get("key").and_then(|v| v.as_str()).map(str::to_owned);
                 let paste = value
                     .get("paste")
                     .and_then(|v| v.as_str())
