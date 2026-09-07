@@ -82,6 +82,7 @@ require("tests.lang.sql")
 require("tests.lang.swift")
 require("tests.lang.toml")
 require("tests.lang.typescript")
+require("tests.lang.v")
 require("tests.lang.yaml")
 require("tests.lang.zig")
 

@@ -45,6 +45,7 @@ local EXT_TO_LANG = {
   md = "markdown",
   markdown = "markdown",
   bzl = "bazel_bzl",
+  v = "v",
   zig = "zig",
   nix = "nix",
   dart = "dart",
@@ -421,11 +422,14 @@ local function extract_enum_variants(body, source, variant_kind)
   return values
 end
 
-local function extract_fields_truncated(body, source, field_kind, format_fn)
+local function extract_fields_truncated(body, source, field_kinds, format_fn)
+  if type(field_kinds) == "string" then
+    field_kinds = { field_kinds }
+  end
   local fields = {}
   local total = 0
   for _, child in ipairs(body:children()) do
-    if child:type() == field_kind then
+    if table.find(field_kinds, child:type()) then
       total = total + 1
       if total <= FIELD_TRUNCATE_THRESHOLD then
         fields[#fields + 1] = format_fn(child, source)
@@ -794,6 +798,12 @@ local U = {
 }
 
 local function default_extract(lang, source, root)
+  if lang.validate_root then
+    local err = lang.validate_root(root)
+    if err then
+      return nil, err
+    end
+  end
   local entries = {}
   local test_lines = {}
 
@@ -834,7 +844,7 @@ local function validate_lang(name, lang)
   end
   assert(type(lang.extract_nodes) == "function", name .. ": missing extract_nodes")
   assert(type(lang.import_separator) == "string", name .. ": missing import_separator")
-  for _, opt in ipairs({ "is_doc_comment", "is_module_doc", "is_attr", "is_test_node" }) do
+  for _, opt in ipairs({ "is_doc_comment", "is_module_doc", "is_attr", "is_test_node", "validate_root" }) do
     local v = lang[opt]
     assert(v == nil or type(v) == "function", name .. ": " .. opt .. " must be nil or function")
   end
