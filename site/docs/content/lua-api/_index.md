@@ -528,8 +528,12 @@ parses its verdict) or a `handler` (your function computes the verdict:
 rulebooks, quotas, external approval systems, custom prompts). The
 handler receives one table — `tool`, `input` (decoded), `scopes` (for
 bash: the parsed command segments), `parseable`, `cwd`,
+`opening_user_message` (how the conversation started), `task_user_message`
+(the most recent substantive request, which short follow-ups continue),
 `last_user_message`, `recent_user_messages` (trailing user messages,
-oldest first), `attempt` (`{ count, history }` on repeats) — and
+oldest first; answers the user gave to the `question` tool count),
+`assistant_intent` (the agent's last text before the call: its own
+claim, not the user's), `attempt` (`{ count, history }` on repeats) — and
 returns `"ALLOW"|"DENY"|"ASK"` plus an optional reason; anything else
 escalates. Handlers may block (e.g. on `maki.ui.picker`); the outer
 chain waits at most `timeout_ms` and cancels the handler when the wait

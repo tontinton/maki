@@ -16,8 +16,8 @@ use serde_json::Value;
 
 use crate::reviewers::{
     AttemptRecord, DEFAULT_MAX_REDIRECTS_PER_TURN, FINAL_REDIRECT_GUIDANCE, LinkCx, LinkOutcome,
-    ProviderTransport, REDIRECT_GUIDANCE, ReviewCall, ReviewTransport, ReviewerDef, Verdict,
-    build_user_message,
+    ProviderTransport, REDIRECT_GUIDANCE, ReviewCall, ReviewContext, ReviewTransport, ReviewerDef,
+    Verdict, build_user_message,
 };
 use crate::{AgentEvent, EventSender, ReviewerVerdictEvent};
 
@@ -99,16 +99,22 @@ pub enum PermissionCheck {
 #[derive(Clone, Copy)]
 pub struct ReviewSource<'a> {
     pub input: Option<&'a Value>,
-    /// Oldest first; the last is the most recent.
-    pub recent_user_messages: &'a [Arc<str>],
+    /// Conversation context the reviewer chain reads intent from.
+    pub context: &'a ReviewContext,
     pub timeouts: Timeouts,
 }
 
 impl ReviewSource<'_> {
     pub fn none() -> Self {
+        static EMPTY: ReviewContext = ReviewContext {
+            opening_user_message: None,
+            task_user_message: None,
+            recent_user_messages: Vec::new(),
+            assistant_intent: None,
+        };
         ReviewSource {
             input: None,
-            recent_user_messages: &[],
+            context: &EMPTY,
             timeouts: Timeouts::default(),
         }
     }
@@ -886,11 +892,7 @@ impl PermissionManager {
             scopes: scopes.to_vec(),
             force_prompt,
             cwd: self.cwd.display().to_string(),
-            recent_user_messages: review
-                .recent_user_messages
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            context: review.context.clone(),
             attempt: self.review_ledger().get(&ledger_key).cloned(),
         };
         let user_message = build_user_message(&call);

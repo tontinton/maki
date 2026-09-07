@@ -6684,7 +6684,7 @@ fn enforce_with_handler(
         None,
         maki_agent::permissions::ReviewSource {
             input: Some(&input),
-            recent_user_messages: &[],
+            context: &maki_agent::reviewers::ReviewContext::default(),
             timeouts: maki_providers::Timeouts::default(),
         },
     ))

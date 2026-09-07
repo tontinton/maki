@@ -730,7 +730,7 @@ async fn enforce_permission(
     }
     let review = ReviewSource {
         input: Some(input),
-        recent_user_messages: &ctx.recent_user_messages,
+        context: &ctx.review_context,
         timeouts: ctx.timeouts,
     };
     if let Some(scopes) = inv.permission_scopes().await {
@@ -796,7 +796,7 @@ async fn execute_mcp_tool(
             ctx.mode.plan_path(),
             ReviewSource {
                 input: Some(input),
-                recent_user_messages: &ctx.recent_user_messages,
+                context: &ctx.review_context,
                 timeouts: ctx.timeouts,
             },
         )

@@ -6,6 +6,8 @@ use maki_storage::sessions::next_epoch;
 use tracing::warn;
 
 const CANCEL_MARKER: &str = "[Cancelled by user]";
+/// Fewer words than this reads as a follow-up to an earlier request.
+const SUBSTANTIVE_MIN_WORDS: usize = 6;
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 
 pub type HistorySnapshot = maki_storage::sessions::HistorySnapshot<Message>;
@@ -41,10 +43,14 @@ impl History {
         &self.snapshot.messages
     }
 
-    /// The newest real user turn: observations and non-text content are
-    /// skipped, so reviewers see what the human last asked for.
-    /// Up to {n} most recent real user texts, oldest first.
+    /// Up to `n` most recent things the human said, oldest first. Real user
+    /// turns count, and so do answers to the `question` tool: those arrive as
+    /// tool results, but the human authored them, and an approval given
+    /// through a picker must reach a reviewer the same as a typed one.
+    /// Observations, cancel markers and non-text content are skipped: a
+    /// cancel interrupts a turn, it says nothing about what the human wants.
     pub fn recent_user_texts(&self, n: usize) -> Vec<&str> {
+        let question_ids = self.question_tool_use_ids();
         let mut texts: Vec<&str> = self
             .snapshot
             .messages
@@ -55,7 +61,20 @@ impl History {
                     return None;
                 }
                 msg.content.iter().find_map(|block| match block {
-                    ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+                    ContentBlock::Text { text }
+                        if !text.trim().is_empty() && text != CANCEL_MARKER =>
+                    {
+                        Some(text.as_str())
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error: false,
+                    } if question_ids.contains(&tool_use_id.as_str())
+                        && !content.trim().is_empty() =>
+                    {
+                        Some(content.as_str())
+                    }
                     _ => None,
                 })
             })
@@ -63,6 +82,69 @@ impl History {
             .collect();
         texts.reverse();
         texts
+    }
+
+    /// The first real user turn of the conversation: why the session exists.
+    /// Earlier context, not necessarily the current task; a long session
+    /// drifts, so reviewers get [`Self::task_user_text`] as well.
+    pub fn opening_user_text(&self) -> Option<&str> {
+        self.typed_user_texts().next()
+    }
+
+    /// The most recent user message with enough words to be a request of
+    /// its own. Follow-ups ("yes", "continue", "push it", "any updates?")
+    /// are short and continue whatever came before them; a new body of
+    /// work is never that terse. Together with the recent window this tells
+    /// a reviewer what the follow-ups are continuing, and moves on when the
+    /// conversation does.
+    pub fn task_user_text(&self) -> Option<&str> {
+        self.typed_user_texts()
+            .rev()
+            .find(|text| text.split_whitespace().count() >= SUBSTANTIVE_MIN_WORDS)
+    }
+
+    /// Text the human typed, oldest first: no observations, cancel markers
+    /// or tool results.
+    fn typed_user_texts(&self) -> impl DoubleEndedIterator<Item = &str> {
+        self.snapshot.messages.iter().filter_map(|msg| {
+            if !matches!(msg.role, Role::User) || matches!(msg.kind, MessageKind::Observation) {
+                return None;
+            }
+            msg.first_text_content()
+                .filter(|text| *text != CANCEL_MARKER)
+        })
+    }
+
+    /// The assistant's most recent text: what it said it was about to do
+    /// before issuing the call under review. Untrusted, but a reviewer that
+    /// cannot see the stated intent judges every command in a vacuum.
+    pub fn latest_assistant_text(&self) -> Option<&str> {
+        self.snapshot
+            .messages
+            .iter()
+            .rev()
+            .find(|msg| matches!(msg.role, Role::Assistant))
+            .and_then(|msg| {
+                msg.content.iter().rev().find_map(|block| match block {
+                    ContentBlock::Text { text }
+                        if !text.trim().is_empty() && text != EMPTY_RESPONSE_MARKER =>
+                    {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+            })
+    }
+
+    fn question_tool_use_ids(&self) -> Vec<&str> {
+        self.snapshot
+            .messages
+            .iter()
+            .filter(|msg| matches!(msg.role, Role::Assistant))
+            .flat_map(Message::tool_uses)
+            .filter(|(_, name, _)| *name == crate::tools::QUESTION_TOOL_NAME)
+            .map(|(id, _, _)| id)
+            .collect()
     }
 
     pub fn push(&mut self, msg: Message) {
@@ -267,6 +349,110 @@ mod tests {
         let last = history.as_slice().last().unwrap();
         assert!(matches!(last.role, Role::User));
         assert!(matches!(&last.content[0], ContentBlock::Text { text } if text == CANCEL_MARKER));
+    }
+
+    #[test]
+    fn reviewer_context_sees_question_answers_and_the_opening_request() {
+        let mut history = History::new(vec![Message::user("rebase my PRs and push".into())]);
+        history.push(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "I'll resolve the conflict first.".into(),
+                },
+                ContentBlock::tool_use(
+                    "q1",
+                    crate::tools::QUESTION_TOOL_NAME,
+                    serde_json::json!({}),
+                ),
+                ContentBlock::tool_use("r1", "read", serde_json::json!({})),
+            ],
+            ..Default::default()
+        });
+        history.push(Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "q1".into(),
+                    content: "yes, you have full access to jj".into(),
+                    is_error: false,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "r1".into(),
+                    content: "file contents the reviewer must not mistake for the user".into(),
+                    is_error: false,
+                },
+            ],
+            ..Default::default()
+        });
+        history.push(Message::observation("[host noticed something]".into()));
+        history.push(Message::user(CANCEL_MARKER.into()));
+        history.push(Message::user("ok".into()));
+
+        assert_eq!(
+            history.recent_user_texts(2),
+            vec!["yes, you have full access to jj", "ok"],
+            "observations and cancel markers are not things the human said"
+        );
+        assert_eq!(history.opening_user_text(), Some("rebase my PRs and push"));
+        assert_eq!(
+            history.latest_assistant_text(),
+            Some("I'll resolve the conflict first.")
+        );
+    }
+
+    #[test]
+    fn task_is_the_last_substantive_request_and_moves_with_the_conversation() {
+        let mut history = History::new(vec![Message::user(
+            "pull my maki fork up to latest main and rebase the PRs".into(),
+        )]);
+        history.push(Message::user("push all repos".into()));
+        history.push(Message::user("also dotfiles".into()));
+        assert_eq!(
+            history.task_user_text(),
+            Some("pull my maki fork up to latest main and rebase the PRs"),
+            "short follow-ups continue the earlier request"
+        );
+
+        history.push(Message::user(
+            "make it so helix uses the steel build with the grove plugin".into(),
+        ));
+        history.push(Message::user(CANCEL_MARKER.into()));
+        history.push(Message::user("yes".into()));
+        assert_eq!(
+            history.task_user_text(),
+            Some("make it so helix uses the steel build with the grove plugin"),
+            "a new body of work replaces the task; the opening request stays put"
+        );
+        assert_eq!(
+            history.opening_user_text(),
+            Some("pull my maki fork up to latest main and rebase the PRs")
+        );
+
+        // Answers to the question tool are context, not requests: they never
+        // become the task however long they are.
+        history.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                "q1",
+                crate::tools::QUESTION_TOOL_NAME,
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        });
+        history.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "q1".into(),
+                content: "yes go ahead and do whatever you need to for all of it".into(),
+                is_error: false,
+            }],
+            ..Default::default()
+        });
+        assert_eq!(
+            history.task_user_text(),
+            Some("make it so helix uses the steel build with the grove plugin")
+        );
     }
 
     fn make_tool_use_msg(ids: &[&str]) -> Message {
