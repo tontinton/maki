@@ -8,6 +8,8 @@ use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelTier};
 
 const GPT_5_6_CONTEXT_WINDOW: u32 = 372_000;
 const GPT_5_6_MAX_OUTPUT_TOKENS: u32 = 128_000;
+const GPT_6_CONTEXT_WINDOW: u32 = 1_050_000;
+const GPT_6_MAX_OUTPUT_TOKENS: u32 = 128_000;
 
 inventory::submit!(maki_config::providers::BuiltInProvider {
     slug: "openai",
@@ -70,6 +72,22 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(GPT_5_6_MAX_OUTPUT_TOKENS),
             context_window: GPT_5_6_CONTEXT_WINDOW,
+        },
+        ModelEntry {
+            prefixes: &["gpt-6-astra"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 10.00,
+                output: 50.00,
+                cache_write: 12.50,
+                cache_read: 1.00,
+                fast: None,
+            },
+            max_output_tokens: Some(GPT_6_MAX_OUTPUT_TOKENS),
+            context_window: GPT_6_CONTEXT_WINDOW,
         },
         ModelEntry {
             prefixes: &["gpt-5.4-nano"],
@@ -326,5 +344,22 @@ mod tests {
         assert_eq!(model.pricing.cache_read, cache_read);
         assert_eq!(model.pricing.cache_write, cache_write);
         assert_eq!(model.pricing.output, output);
+    }
+
+    #[test]
+    fn gpt_6_astra_is_a_strong_vision_model_with_full_context() {
+        let model = models()
+            .iter()
+            .find(|model| model.prefixes.contains(&"gpt-6-astra"))
+            .expect("GPT-6 Astra should be registered");
+
+        assert_eq!(model.tier, ModelTier::Strong);
+        assert!(model.vision);
+        assert_eq!(model.context_window, GPT_6_CONTEXT_WINDOW);
+        assert_eq!(model.max_output_tokens, Some(GPT_6_MAX_OUTPUT_TOKENS));
+        assert_eq!(model.pricing.input, 10.0);
+        assert_eq!(model.pricing.cache_read, 1.0);
+        assert_eq!(model.pricing.cache_write, 12.5);
+        assert_eq!(model.pricing.output, 50.0);
     }
 }
