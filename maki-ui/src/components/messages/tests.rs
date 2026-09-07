@@ -1733,6 +1733,31 @@ fn rebake_request_stops_watching_buf() {
     assert_eq!(probe.try_recv(), None);
 }
 
+const REBAKE_TASK_ID: &str = "toolu_sub";
+
+/// A rebake replays one call for its colors. The plugin behind it only sees
+/// the item, so the item has to say which chat it is and that nothing but
+/// the buf is wanted, or a stateful tool (the todo panel) would treat a
+/// years-old call as news from the main chat.
+#[test]
+fn rebake_stamps_the_chat_and_asks_for_a_rerender() {
+    let (eh, probe) = maki_lua::test_support::probed_event_handle();
+    let session_id = MakiId::generate();
+    let mut panel = MessagesPanel::new(UiConfig::default(), eh);
+    panel.set_chat(session_id, Some(Arc::from(REBAKE_TASK_ID)));
+    panel.set_restore_channel(Some(test_event_sender()));
+    finish_with_live_buf(&mut panel, "t1", "old-theme", false);
+
+    panel.rebake_stale_snapshots(panel.snapshot_gen_of("t1").unwrap() + 1);
+
+    let item = probe
+        .try_recv_restore_item()
+        .expect("rebake requests a restore");
+    assert_eq!(item.session_id.map(|s| s.id()), Some(session_id));
+    assert_eq!(item.task_id.as_deref(), Some(REBAKE_TASK_ID));
+    assert_eq!(item.reason, maki_lua::RestoreReason::Rerender);
+}
+
 #[test]
 fn live_buf_streams_across_clean_polls() {
     let buf = Arc::new(maki_agent::SharedBuf::new());

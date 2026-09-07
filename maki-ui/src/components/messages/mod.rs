@@ -40,6 +40,7 @@ use maki_agent::{
     ToolOutput, ToolStartEvent,
 };
 use maki_lua::{EventHandle, WARM_TOOL_CAP, WinView};
+use maki_storage::id::{MakiId, SessionRef};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -95,6 +96,10 @@ pub struct MessagesPanel {
     /// only bumps when colors actually land.
     rebake_requested: HashMap<String, u64>,
     prompt_progress: Option<PromptProgress>,
+    /// The chat this panel shows, stamped on every restore it requests so a
+    /// plugin files the call where the live one went.
+    session_id: Option<SessionRef>,
+    task_id: Option<Arc<str>>,
 }
 
 impl MessagesPanel {
@@ -140,11 +145,39 @@ impl MessagesPanel {
             clock_format: ui_config.clock_format,
             rebake_requested: HashMap::new(),
             prompt_progress: None,
+            session_id: None,
+            task_id: None,
         }
     }
 
     pub fn set_restore_channel(&mut self, event_tx: Option<EventSender>) {
         self.restore_event_tx = event_tx;
+    }
+
+    pub(crate) fn set_chat(&mut self, session_id: MakiId, task_id: Option<Arc<str>>) {
+        self.session_id = Some(SessionRef::from(session_id));
+        self.task_id = task_id;
+    }
+
+    fn stamp_chat(&self, item: &mut maki_lua::RestoreItem) {
+        item.session_id = self.session_id.clone();
+        item.task_id = self.task_id.clone();
+    }
+
+    pub(crate) fn task_id(&self) -> Option<&Arc<str>> {
+        self.task_id.as_ref()
+    }
+
+    pub(crate) fn request_restores(&self, items: Vec<maki_lua::RestoreItem>) {
+        let Some(tx) = &self.restore_event_tx else {
+            return;
+        };
+        let theme_gen = crate::theme::generation();
+        for mut item in items {
+            item.theme_gen = Some(theme_gen);
+            self.stamp_chat(&mut item);
+            self.lua_event_handle.request_restore(item, tx.clone());
+        }
     }
 
     /// Hands back the index of the message, which [`Self::replace`] needs to
@@ -1074,7 +1107,17 @@ impl MessagesPanel {
             .messages
             .iter()
             .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))?;
-        crate::chat::restore_item_for(msg, self.tool_output_lines, self.theme_generation)
+        self.restore_item_for(msg, self.theme_generation)
+    }
+
+    fn restore_item_for(
+        &self,
+        msg: &DisplayMessage,
+        theme_gen: u64,
+    ) -> Option<maki_lua::RestoreItem> {
+        let mut item = crate::chat::restore_item_for(msg, self.tool_output_lines, theme_gen)?;
+        self.stamp_chat(&mut item);
+        Some(item)
     }
 
     /// Re-restores every snapshot still painted with old-theme colors.
@@ -1085,7 +1128,6 @@ impl MessagesPanel {
         };
         let eh = &self.lua_event_handle;
         self.rebake_requested.retain(|_, g| *g >= current_gen);
-        let tol = self.tool_output_lines;
         let mut requested = Vec::new();
         for msg in &self.messages {
             let DisplayRole::Tool(role) = &msg.role else {
@@ -1098,7 +1140,7 @@ impl MessagesPanel {
             ) {
                 continue;
             }
-            if let Some(mut item) = crate::chat::restore_item_for(msg, tol, current_gen) {
+            if let Some(mut item) = self.restore_item_for(msg, current_gen) {
                 item.clicks = self.lua_clicks.get(&role.id).cloned().unwrap_or_default();
                 eh.request_restore(item, tx.clone());
                 requested.push(role.id.clone());

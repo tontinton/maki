@@ -771,8 +771,8 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-and `"ModelChanged"`. Plugins can also fire their own events with
-`exec_autocmds`.
+`"TaskFocusChanged"`, and `"ModelChanged"`. Plugins can also fire their
+own events with `exec_autocmds`.
 
 Every host event carries `data.session_id`. For `"SessionReset"` and
 `"SessionEnd"` that is the session being left behind, the other events
@@ -800,6 +800,10 @@ name the session now running or focused. What each event adds:
   (`"working"`, `"done"`, or `"error"`), when a subagent starts or
   changes status. A task that comes back from disk already finished
   stays quiet, so reloading a session does not replay old tasks.
+- `"TaskFocusChanged"`: `data.id`, the task now on screen (`"main"` or a
+  subagent's id, what `ctx:task_id()` reports inside a tool). Fires for
+  the chat cycling keys, `maki.task.focus`, and a session switch that
+  lands on another task.
 - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
   plus `data.previous_spec`. Picking the model already in use stays
   quiet, and so does startup.

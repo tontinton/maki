@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use maki_agent::agent::LoadedInstructions;
 use maki_agent::cancel::CancelToken;
-use maki_agent::tools::{Deadline, FileKey, ToolAudience, ToolContext, ToolLive};
+use maki_agent::tools::{Deadline, FileKey, MAIN_TASK_ID, ToolAudience, ToolContext, ToolLive};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::SessionRef;
 use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
@@ -14,7 +14,7 @@ use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::Pair;
-use crate::runtime::{active_task, lock_cell};
+use crate::runtime::{RestoreReason, active_task, lock_cell};
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
 
@@ -85,6 +85,11 @@ pub(crate) struct LuaCtx {
     caps: Caps,
     pub(crate) cancel: CancelToken,
     tool_output_lines: ToolOutputLines,
+    /// Which chat the run serves, see [`ToolContext::session_id`] and
+    /// [`ToolContext::task_id`]. Restore takes both from the chat being
+    /// re-rendered.
+    session_id: Option<SessionRef>,
+    task_id: Option<Arc<str>>,
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
 }
 
@@ -101,11 +106,22 @@ enum Caps {
         config: AgentConfig,
         workflow: bool,
         audience: ToolAudience,
-        session_id: Option<SessionRef>,
     },
     Restore {
         state: Option<serde_json::Value>,
+        reason: RestoreReason,
     },
+}
+
+/// What a restore run knows about the call it re-renders: the host fills it
+/// from a `RestoreItem`, batch from the plain table it hands its children.
+#[derive(Default)]
+pub(crate) struct RestoreCtx {
+    pub(crate) tool_output_lines: ToolOutputLines,
+    pub(crate) state: Option<serde_json::Value>,
+    pub(crate) session_id: Option<SessionRef>,
+    pub(crate) task_id: Option<Arc<str>>,
+    pub(crate) reason: RestoreReason,
 }
 
 impl LuaCtx {
@@ -114,6 +130,8 @@ impl LuaCtx {
             caps,
             cancel: ctx.cancel.clone(),
             tool_output_lines: ctx.tool_output_lines,
+            session_id: ctx.session_id.clone(),
+            task_id: ctx.task_id.clone(),
             finish_tx: None,
         }
     }
@@ -135,19 +153,20 @@ impl LuaCtx {
                 config: ctx.config.clone(),
                 workflow: ctx.workflow,
                 audience: ctx.audience,
-                session_id: ctx.session_id.clone(),
             },
         )
     }
 
-    pub(crate) fn restore(
-        tool_output_lines: ToolOutputLines,
-        state: Option<serde_json::Value>,
-    ) -> Self {
+    pub(crate) fn restore(ctx: RestoreCtx) -> Self {
         Self {
-            caps: Caps::Restore { state },
+            caps: Caps::Restore {
+                state: ctx.state,
+                reason: ctx.reason,
+            },
             cancel: CancelToken::none(),
-            tool_output_lines,
+            tool_output_lines: ctx.tool_output_lines,
+            session_id: ctx.session_id,
+            task_id: ctx.task_id,
             finish_tx: None,
         }
     }
@@ -184,14 +203,15 @@ impl LuaCtx {
         }
     }
 
-    /// Outer `None` means the kind has no session at all, inner `None`
-    /// means this run has one but it is not tied to a session.
-    fn session_id(&self) -> Option<Option<&SessionRef>> {
+    fn restore_reason(&self) -> Option<RestoreReason> {
         match &self.caps {
-            Caps::Handler { agent, .. } => Some(agent.session_id.as_ref()),
-            Caps::Start { session_id, .. } => Some(session_id.as_ref()),
-            Caps::Restore { .. } => None,
+            Caps::Restore { reason, .. } => Some(*reason),
+            _ => None,
         }
+    }
+
+    fn task_id(&self) -> &str {
+        self.task_id.as_deref().unwrap_or(MAIN_TASK_ID)
     }
 
     fn loaded_instructions(&self) -> Option<&LoadedInstructions> {
@@ -206,7 +226,7 @@ impl LuaCtx {
 
     fn state(&self) -> Option<&serde_json::Value> {
         match &self.caps {
-            Caps::Restore { state } => state.as_ref(),
+            Caps::Restore { state, .. } => state.as_ref(),
             _ => None,
         }
     }
@@ -246,18 +266,21 @@ impl UserData for LuaCtx {
             Ok((Some(audience.name().unwrap_or("main").to_string()), None))
         });
 
-        // The session that called this tool, which under concurrent
-        // sessions is not always the focused one `maki.session.current()`
-        // reports. Nil without an error when the run has no session, as in
-        // the `maki index` one-shot.
+        // The session that called this tool, or whose transcript a restore
+        // re-renders, which under concurrent sessions is not always the
+        // focused one `maki.session.current()` reports. Nil when the run has
+        // no session, as in the `maki index` one-shot.
         methods.add_method("session_id", |_, this, ()| {
-            let Some(session_id) = this.session_id() else {
-                return Ok(this.cap_err_pair("session_id"));
+            Ok(this.session_id.as_ref().map(|id| id.id().to_string()))
+        });
+
+        methods.add_method("task_id", |_, this, ()| Ok(this.task_id().to_owned()));
+
+        methods.add_method("restore_reason", |_, this, ()| {
+            let Some(reason) = this.restore_reason() else {
+                return Ok(this.cap_err_pair("restore_reason"));
             };
-            let Some(session_id) = session_id else {
-                return Ok((None, None));
-            };
-            Ok((Some(session_id.id().to_string()), None))
+            Ok((Some(<&str>::from(reason)), None))
         });
 
         methods.add_method("live_buf", |lua, this, buf: mlua::AnyUserData| {
@@ -394,6 +417,7 @@ mod tests {
     use maki_agent::AgentMode;
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::tools::{LocalTool, ToolAudience};
+    use test_case::test_case;
 
     use super::*;
 
@@ -402,6 +426,7 @@ mod tests {
     const LOCAL_TOOL_NAME: &str = "sess_tool";
     /// Arbitrary ids are rejected: `SessionRef` parses base58 or a uuid.
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
+    const SUBAGENT_TASK_ID: &str = "toolu_task";
 
     fn session_ref() -> SessionRef {
         SESSION_ID.parse().expect("valid session id")
@@ -472,30 +497,53 @@ mod tests {
         );
     }
 
-    #[test]
-    fn session_id_reaches_handler_and_start_but_not_restore() {
-        let ctx = populated_ctx();
-        assert_eq!(
-            LuaCtx::handler(&ctx).session_id(),
-            Some(Some(&session_ref()))
-        );
-        assert_eq!(LuaCtx::start(&ctx).session_id(), Some(Some(&session_ref())));
-        assert_eq!(
-            LuaCtx::restore(ToolOutputLines::default(), None).session_id(),
-            None,
-            "restore has no ToolContext to take a session from"
-        );
+    fn restore_ctx(ctx: &ToolContext) -> RestoreCtx {
+        RestoreCtx {
+            session_id: ctx.session_id.clone(),
+            task_id: ctx.task_id.clone(),
+            ..RestoreCtx::default()
+        }
     }
 
+    /// Restore has no `ToolContext`, so its session comes stamped on the item.
     #[test]
-    fn session_id_absent_is_distinct_from_kind_lacking_it() {
+    fn session_id_reaches_every_ctx_kind() {
+        let ctx = populated_ctx();
+        for lua_ctx in [
+            LuaCtx::handler(&ctx),
+            LuaCtx::start(&ctx),
+            LuaCtx::restore(restore_ctx(&ctx)),
+        ] {
+            assert_eq!(
+                lua_ctx.session_id,
+                Some(session_ref()),
+                "{}",
+                lua_ctx.kind()
+            );
+        }
+    }
+
+    #[test_case(None, MAIN_TASK_ID ; "session_owner")]
+    #[test_case(Some(SUBAGENT_TASK_ID), SUBAGENT_TASK_ID ; "subagent")]
+    fn task_id_reaches_every_ctx_kind(task_id: Option<&str>, expected: &str) {
         let mut ctx = populated_ctx();
-        ctx.session_id = None;
+        ctx.task_id = task_id.map(Arc::from);
+        assert_eq!(LuaCtx::handler(&ctx).task_id(), expected);
+        assert_eq!(LuaCtx::start(&ctx).task_id(), expected);
+        assert_eq!(LuaCtx::restore(restore_ctx(&ctx)).task_id(), expected);
+    }
+
+    /// A plain-table ctx that names no reason must read as a rerender: side
+    /// effects on load are opt-in, never the fallback.
+    #[test]
+    fn restore_reason_defaults_to_rerender_and_is_restore_only() {
+        let ctx = populated_ctx();
         assert_eq!(
-            LuaCtx::handler(&ctx).session_id(),
-            Some(None),
-            "a sessionless run still has the capability, so lua sees nil without an error"
+            LuaCtx::restore(RestoreCtx::default()).restore_reason(),
+            Some(RestoreReason::Rerender)
         );
+        assert_eq!(LuaCtx::handler(&ctx).restore_reason(), None);
+        assert_eq!(LuaCtx::start(&ctx).restore_reason(), None);
     }
 
     #[test]

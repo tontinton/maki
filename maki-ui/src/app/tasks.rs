@@ -7,12 +7,12 @@
 
 use std::sync::Arc;
 
+use maki_agent::tools::MAIN_TASK_ID;
 use serde::Serialize;
 
 use crate::app::App;
 use crate::components::DisplayRole;
 
-pub(crate) const MAIN_TASK_ID: &str = "main";
 const UNKNOWN_TASK_ERR: &str = "unknown task: ";
 
 /// How a chat ended, from the vaguest to the most specific. `SubagentHistory`
@@ -96,16 +96,18 @@ impl App {
         self.chats
             .iter()
             .enumerate()
-            .map(|(idx, chat)| {
-                let task_id = chat.task_id();
-                TaskInfo {
-                    id: task_id.map_or_else(|| Arc::from(MAIN_TASK_ID), Arc::clone),
-                    name: chat.name.clone(),
-                    status: task_id.map(|_| chat.task_status()),
-                    focused: idx == self.active_chat,
-                }
+            .map(|(idx, chat)| TaskInfo {
+                id: chat.task_id_or_main(),
+                name: chat.name.clone(),
+                status: chat.task_id().map(|_| chat.task_status()),
+                focused: idx == self.active_chat,
             })
             .collect()
+    }
+
+    /// The task whose transcript is on screen, in the ids `maki.task` uses.
+    pub(crate) fn active_task_id(&self) -> Arc<str> {
+        self.chats[self.active_chat].task_id_or_main()
     }
 
     /// The only writer of `active_chat` outside the chat cycling keys. Tasks

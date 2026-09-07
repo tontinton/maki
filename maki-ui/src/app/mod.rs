@@ -286,6 +286,8 @@ impl App {
         );
         let mut app = Self {
             chats: vec![Chat::new(
+                state.session.id,
+                None,
                 "Main".into(),
                 ui_config.clone(),
                 lua_event_handle.clone(),
@@ -1285,8 +1287,9 @@ impl App {
         if let Some(ref model) = subagent.model {
             self.chats[0].update_tool_model(id, model);
         }
-        let mut chat = Chat::subagent(
-            id,
+        let mut chat = Chat::new(
+            self.state.session.id,
+            Some(id),
             subagent.name.clone(),
             self.ui_config.clone(),
             self.lua_event_handle.clone(),

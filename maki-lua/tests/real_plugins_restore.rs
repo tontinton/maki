@@ -7,12 +7,14 @@ use std::sync::Arc;
 use maki_agent::AgentEvent;
 use maki_agent::tools::ToolRegistry;
 use maki_config::ToolOutputLines;
-use maki_lua::PluginHost;
+use maki_lua::{PluginHost, RestoreReason};
+use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
 const BASH_SRC: &str = include_str!("../../plugins/bash/init.lua");
 const GREP_SRC: &str = include_str!("../../plugins/grep/init.lua");
 const BATCH_SRC: &str = include_str!("../../plugins/batch/init.lua");
+const TODO_SRC: &str = include_str!("../../plugins/todo_write/init.lua");
 
 /// Only the real ToolView emits this when collapsed.
 const EXPAND_HINT: &str = "click to expand";
@@ -22,6 +24,14 @@ const EXPAND_HINT: &str = "click to expand";
 const VIEW_CAP: usize = 3;
 const INDEX_VIEW_CAP: usize = 2;
 const READ_VIEW_CAP: usize = 5;
+const TODO_TOOL: &str = "todo_write";
+const TODO_ITEM: &str = "wire the panel";
+const SUBAGENT_TASK_ID: &str = "toolu_sub";
+const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
+
+fn session_ref() -> SessionRef {
+    SESSION_ID.parse().expect("valid session id")
+}
 
 fn view_lines() -> ToolOutputLines {
     ToolOutputLines {
@@ -61,6 +71,37 @@ struct Restored {
     header: String,
 }
 
+fn restore_item(
+    tool: &str,
+    input: Value,
+    output: &str,
+    state: Option<Value>,
+    clicks: Vec<usize>,
+) -> maki_lua::RestoreItem {
+    maki_lua::RestoreItem {
+        tool: Arc::from(tool),
+        tool_use_id: "restore_id".to_owned(),
+        output: output.to_owned(),
+        input,
+        is_error: false,
+        tool_output_lines: view_lines(),
+        theme_gen: None,
+        clicks,
+        state,
+        session_id: None,
+        task_id: None,
+        reason: RestoreReason::default(),
+    }
+}
+
+/// Stamped the way the UI stamps a subagent chat's calls while its session loads.
+fn in_subagent_load(mut item: maki_lua::RestoreItem) -> maki_lua::RestoreItem {
+    item.session_id = Some(session_ref());
+    item.task_id = Some(Arc::from(SUBAGENT_TASK_ID));
+    item.reason = RestoreReason::Load;
+    item
+}
+
 fn restore(
     host: &PluginHost,
     tool: &str,
@@ -69,22 +110,13 @@ fn restore(
     state: Option<Value>,
     clicks: Vec<usize>,
 ) -> Restored {
+    run_restore(host, restore_item(tool, input, output, state, clicks))
+}
+
+fn run_restore(host: &PluginHost, item: maki_lua::RestoreItem) -> Restored {
     let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
-    handle.request_restore(
-        maki_lua::RestoreItem {
-            tool: Arc::from(tool),
-            tool_use_id: "restore_id".to_owned(),
-            output: output.to_owned(),
-            input,
-            is_error: false,
-            tool_output_lines: view_lines(),
-            theme_gen: None,
-            clicks,
-            state,
-        },
-        maki_agent::EventSender::new(tx, 0),
-    );
+    handle.request_restore(item, maki_agent::EventSender::new(tx, 0));
     handle.wait_restore_complete_for_test();
     // The empty LoadSource drains the async gate, so spawned highlight tasks
     // finish before we inspect the buffers.
@@ -343,4 +375,66 @@ fn index_dir_renders_identically_live_and_restored() {
         restored.body, live.body,
         "restored dir listing must match the live one"
     );
+}
+
+/// Nothing else runs the real plugin's restore, which now reads the chat and
+/// the reason off the ctx.
+#[test]
+fn todo_write_restore_renders_the_list() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(TODO_TOOL, TODO_SRC).unwrap();
+    let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });
+
+    let r = run_restore(
+        &host,
+        in_subagent_load(restore_item(TODO_TOOL, input, "", None, Vec::new())),
+    );
+
+    assert!(r.body.contains(TODO_ITEM), "list missing: {}", r.body);
+}
+
+const WHICH_TASK_SRC: &str = r#"
+maki.api.register_tool({
+    name = "which_task",
+    description = "reports the calling task",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    handler = function() return "" end,
+    restore = function(_input, _output, _is_error, rctx)
+        local buf = maki.ui.buf()
+        buf:line("task:" .. rctx:task_id())
+        buf:line("session:" .. tostring(rctx:session_id()))
+        buf:line("reason:" .. tostring(rctx:restore_reason()))
+        return buf
+    end,
+})
+"#;
+
+/// Batch drives child restores through a plain table ctx, so the chat and
+/// the reason have to travel with it or a batched call would pass for a
+/// rerender in the main chat.
+#[test]
+fn batch_child_restore_sees_the_chat_and_reason() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("which_task", WHICH_TASK_SRC).unwrap();
+    host.load_source("batch", BATCH_SRC).unwrap();
+    let input = json!({ "tool_calls": [{ "tool": "which_task", "parameters": {} }] });
+    let state =
+        json!({ "children": [{ "tool": "which_task", "status": "success", "output": "" }] });
+
+    let r = run_restore(
+        &host,
+        in_subagent_load(restore_item("batch", input, "", Some(state), Vec::new())),
+    );
+
+    for expected in [
+        format!("task:{SUBAGENT_TASK_ID}"),
+        format!("session:{}", session_ref().id()),
+        "reason:load".to_owned(),
+    ] {
+        assert!(
+            r.body.contains(&expected),
+            "expected {expected:?} in: {}",
+            r.body
+        );
+    }
 }

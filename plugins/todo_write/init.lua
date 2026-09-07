@@ -1,6 +1,16 @@
+local MAIN_TASK = "main"
+
+-- `todos[session_id][task_id]`: a subagent shares its session id with the
+-- parent, only the task id tells them apart.
 local todos = {}
-local popped = {}
-local focused = nil
+-- Sessions where Ctrl+T hid the panel; forgotten when the turn ends.
+local hidden = {}
+-- Sessions that ran a turn since they were loaded. Restores of their
+-- transcript are still in flight while the turn runs, so they are stale.
+local live = {}
+-- Nothing is focused until the first TaskFocusChanged; restores that land
+-- before it still file under their own session, so they show up then.
+local focused = { session = "", task = MAIN_TASK }
 local buf, win
 
 local STATUS_MARKERS = {
@@ -18,12 +28,8 @@ local DESCRIPTION = [[Create or update a structured todo list to track tasks.
 - Use ONLY for multi-step work (3+ steps).
 - Skip for trivial tasks.]]
 
-local function items_of(sid)
-  return todos[sid or ""] or {}
-end
-
-local function is_focused(sid)
-  return not focused or sid == focused
+local function items_of(sid, task)
+  return todos[sid] and todos[sid][task] or {}
 end
 
 local function count_done(items)
@@ -44,7 +50,7 @@ local function update_hint(items)
   })
 end
 
-local function ensure_win(visible)
+local function ensure_win()
   if buf and win and win:is_open() then
     return
   end
@@ -56,7 +62,7 @@ local function ensure_win(visible)
     title = " Todos ",
     border = "rounded",
     focus = false,
-    visible = visible,
+    visible = false,
     footer = {
       { "Ctrl+T", "to hide" },
     },
@@ -74,29 +80,35 @@ local function build_lines(items)
   return lines
 end
 
-local function render_panel(items, visible)
-  ensure_win(visible)
+-- Rebuilt from the focused list on every change. A hidden window still
+-- counts as open, so an "open it unless it is" shortcut would leave the
+-- panel hidden for good.
+local function sync_panel()
+  local items = items_of(focused.session, focused.task)
+  if #items == 0 then
+    if win and win:is_open() then
+      win:hide()
+    end
+    maki.ui.set_status_hint(nil)
+    return
+  end
+  ensure_win()
   buf:set_lines(build_lines(items))
   win:set_config({ height = #items + 2 })
-  if win:is_visible() then
-    maki.ui.set_status_hint(nil)
-  else
-    update_hint(items)
-  end
-end
-
-local function hide_panel()
-  if win and win:is_open() then
+  if hidden[focused.session] then
     win:hide()
+    update_hint(items)
+  else
+    win:show()
+    maki.ui.set_status_hint(nil)
   end
-  maki.ui.set_status_hint(nil)
 end
 
-local function sync_panel(items, pop)
-  if #items == 0 then
-    hide_panel()
-  else
-    render_panel(items, pop)
+local function store(sid, task, items)
+  todos[sid] = todos[sid] or {}
+  todos[sid][task] = items
+  if sid == focused.session and task == focused.task then
+    sync_panel()
   end
 end
 
@@ -139,69 +151,65 @@ maki.api.register_tool({
     return string.format("%d todos", #(input.todos or {}))
   end,
 
-  restore = function(input)
+  -- A session load replays the transcript in order, so the last call wins
+  -- and the panel picks up where the session left off. A rerender (click,
+  -- theme change) replays one call that may be long superseded.
+  restore = function(input, _output, _is_error, ctx)
     local items = input.todos or {}
-    todos[focused or ""] = items
+    local sid = ctx:session_id() or ""
+    if ctx:restore_reason() == "load" and not live[sid] then
+      store(sid, ctx:task_id(), items)
+    end
     if #items == 0 then
       return nil
     end
-    render_panel(items, false)
     local body = maki.ui.buf()
     body:set_lines(build_lines(items))
     return body
   end,
 
   handler = function(input, ctx)
-    local sid = ctx:session_id() or ""
     local items = input.todos or {}
-    todos[sid] = items
-    local pop = #items > 0 and not popped[sid]
-    if pop then
-      popped[sid] = true
-    end
-    if is_focused(sid) then
-      sync_panel(items, pop)
-    end
+    store(ctx:session_id() or "", ctx:task_id(), items)
     return #items == 0 and "Todos cleared" or ""
   end,
 })
 
 local function toggle()
-  local items = items_of(focused)
-  if not win or #items == 0 then
+  if #items_of(focused.session, focused.task) == 0 then
     return
   end
-  if win:is_visible() then
-    win:hide()
-    update_hint(items)
-  elseif win:is_open() then
-    win:show()
-    maki.ui.set_status_hint(nil)
-  else
-    render_panel(items, true)
-  end
+  hidden[focused.session] = not hidden[focused.session]
+  sync_panel()
 end
 
 maki.keymap.set("n", "<C-t>", toggle, { desc = "Toggle todo panel" })
 
-maki.api.create_autocmd({ "TurnEnd", "SessionReset" }, {
+maki.api.create_autocmd("TurnStart", {
+  callback = function(ev)
+    live[ev.data.session_id] = true
+  end,
+})
+
+-- Subagents run inside the parent's turn, so its end clears their lists too.
+maki.api.create_autocmd({ "TurnEnd", "SessionReset", "SessionEnd" }, {
   callback = function(ev)
     local sid = ev.data and ev.data.session_id or ""
-    todos[sid], popped[sid] = nil, nil
-    if is_focused(sid) then
-      hide_panel()
+    todos[sid], hidden[sid] = nil, nil
+    if ev.event ~= "TurnEnd" then
+      live[sid] = nil
+    end
+    if sid == focused.session then
+      sync_panel()
     end
   end,
 })
 
-maki.api.create_autocmd("SessionFocusChanged", {
+-- Fires on a session switch too, so this is the one focus event the panel
+-- needs to follow.
+maki.api.create_autocmd("TaskFocusChanged", {
   callback = function(ev)
-    focused = ev.data and ev.data.session_id
-    -- Startup restore lands before the first focus event, so its items sit
-    -- under the "" key; the first focused session is the one they belong to.
-    if focused and todos[""] and not todos[focused] then
-      todos[focused], todos[""] = todos[""], nil
-    end
-    sync_panel(items_of(focused), false)
+    focused = { session = ev.data.session_id, task = ev.data.id }
+    sync_panel()
   end,
 })

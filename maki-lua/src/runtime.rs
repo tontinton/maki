@@ -30,9 +30,10 @@ use mlua::{
     ffi,
 };
 use serde_json::Value;
+use strum::{EnumString, IntoStaticStr};
 
 use maki_config::RawConfig;
-use maki_storage::id::MakiId;
+use maki_storage::id::{MakiId, SessionRef};
 
 use crate::api::autocmd::AutocmdStore;
 use crate::api::create_maki_global;
@@ -51,7 +52,7 @@ use crate::api::util::command::{
     LuaCommandReader, LuaCommandWriter, UiAction, UiAttachment, install_ui_attachment,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json_within};
-use crate::api::util::ctx::LuaCtx;
+use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::setup::ConfigStore;
 use crate::docs_render;
 use crate::error::PluginError;
@@ -403,6 +404,27 @@ pub struct RestoreItem {
     pub clicks: Vec<usize>,
     /// Structured state the tool persisted alongside its output.
     pub state: Option<Value>,
+    /// The session whose transcript holds the call. Restore has no
+    /// `ToolContext`, so this is how a tool keying per-session state files a
+    /// restored call where the live one went.
+    pub session_id: Option<SessionRef>,
+    /// See [`maki_agent::tools::ToolContext::task_id`].
+    pub task_id: Option<Arc<str>>,
+    pub reason: RestoreReason,
+}
+
+/// Why a call is being restored. A tool whose restore has side effects (the
+/// todo panel refilling itself) acts on `Load` only: a rerender replays a
+/// single call whose state the tool already holds, possibly an old one.
+/// Lua sees the lowercase variant names through `ctx:restore_reason()`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, EnumString, IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
+pub enum RestoreReason {
+    /// A session's transcript is being rebuilt, every call in order.
+    Load,
+    /// A click or theme change re-renders one call for its buf.
+    #[default]
+    Rerender,
 }
 
 pub(crate) struct ClickFallback {
@@ -2689,7 +2711,13 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
     );
 
     let ctx = lua
-        .create_userdata(LuaCtx::restore(item.tool_output_lines, item.state))
+        .create_userdata(LuaCtx::restore(RestoreCtx {
+            tool_output_lines: item.tool_output_lines,
+            state: item.state,
+            session_id: item.session_id,
+            task_id: item.task_id,
+            reason: item.reason,
+        }))
         .ok()?;
     let inner = thread
         .into_async::<LuaValue>((input_lua, &*item.output, item.is_error, ctx))

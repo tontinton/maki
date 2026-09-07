@@ -437,7 +437,8 @@ pub(crate) struct EventLoop<'t> {
     terminal: &'t mut ratatui::DefaultTerminal,
     sessions: Vec<SessionRuntime>,
     focused: usize,
-    last_focused: Option<MakiId>,
+    /// The `(session, task)` pair whose transcript was on screen last frame.
+    last_focus: Option<(MakiId, Arc<str>)>,
     focus: Focus,
     notifier: Option<terminal::TerminalNotifier>,
     ctx: SpawnCtx,
@@ -660,7 +661,7 @@ impl<'t> EventLoop<'t> {
             terminal,
             sessions: runtimes,
             focused,
-            last_focused: None,
+            last_focus: None,
             focus: Focus::default(),
             notifier,
             ctx,
@@ -881,9 +882,9 @@ impl<'t> EventLoop<'t> {
         }
         drop(slot_model);
 
-        // These two only fire Lua autocmds. Anything a handler does comes back
+        // These only fire Lua autocmds. Anything a handler does comes back
         // as a `UiAction` on the next wake, which repaints then.
-        self.emit_focus_change();
+        self.emit_focus_changes();
         dirty |= self.start_mailbox_runs();
         self.emit_status_changes();
         self.emit_task_changes();
@@ -1048,19 +1049,30 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn emit_focus_change(&mut self) {
-        let id = self.sessions[self.focused].id();
-        if self.last_focused == Some(id) {
+    /// One diff per frame covers the session picker, the chat cycling keys
+    /// and `maki.task.focus`, so none of them has to remember to fire an
+    /// event. A session switch is a task switch too, so `TaskFocusChanged`
+    /// always follows `SessionFocusChanged`.
+    fn emit_focus_changes(&mut self) {
+        let rt = &self.sessions[self.focused];
+        let current = (rt.id(), rt.app.active_task_id());
+        if self.last_focus.as_ref() == Some(&current) {
             return;
         }
-        let mut data = json!({ "session_id": id });
-        if let Some(previous) = self.last_focused {
-            data["previous_session_id"] = json!(previous.to_string());
+        let previous_session = self.last_focus.replace(current.clone()).map(|(id, _)| id);
+        let (session_id, task_id) = current;
+        let eh = &self.ctx.lua_event_handle;
+        if previous_session != Some(session_id) {
+            let mut data = json!({ "session_id": session_id });
+            if let Some(id) = previous_session {
+                data["previous_session_id"] = json!(id.to_string());
+            }
+            eh.fire_autocmd("SessionFocusChanged", data);
         }
-        self.last_focused = Some(id);
-        self.ctx
-            .lua_event_handle
-            .fire_autocmd("SessionFocusChanged", data);
+        eh.fire_autocmd(
+            "TaskFocusChanged",
+            json!({ "session_id": session_id, "id": task_id }),
+        );
     }
 
     fn start_mailbox_runs(&mut self) -> Dirty {

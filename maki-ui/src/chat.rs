@@ -12,11 +12,12 @@ use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
 
 use crate::selection::{DocPos, RowPos, Selection};
-use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
+use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::WinView;
 use maki_providers::{ContentBlock, Message, Role};
+use maki_storage::id::MakiId;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -56,39 +57,44 @@ pub struct Chat {
     /// The ending and the index of the bubble announcing it, so a later, better
     /// informed outcome can fix that bubble instead of appending a second one.
     finish: Option<(TaskOutcome, usize)>,
-    /// `None` for the main chat, the subagent's `tool_use_id` otherwise. That
-    /// is the handle `maki.task` addresses a task by, see `app::tasks`.
-    task_id: Option<Arc<str>>,
 }
 
 impl Chat {
-    pub fn new(name: String, ui_config: UiConfig, lua_event_handle: maki_lua::EventHandle) -> Self {
+    /// A chat belongs to one session for life: every path that changes
+    /// `App::state.session` rebuilds the chats after the swap. `task_id` is
+    /// `None` for the main chat, the subagent's `tool_use_id` otherwise.
+    pub fn new(
+        session_id: MakiId,
+        task_id: Option<&str>,
+        name: String,
+        ui_config: UiConfig,
+        lua_event_handle: maki_lua::EventHandle,
+    ) -> Self {
+        let mut messages_panel = MessagesPanel::new(ui_config, lua_event_handle);
+        messages_panel.set_chat(session_id, task_id.map(Arc::from));
         Self {
             name,
             cost: None,
             context_size: 0,
             model_id: None,
             pending_turn_usage: None,
-            messages_panel: MessagesPanel::new(ui_config, lua_event_handle),
+            messages_panel,
             finish: None,
-            task_id: None,
         }
     }
 
-    pub(crate) fn subagent(
-        task_id: &str,
-        name: String,
-        ui_config: UiConfig,
-        lua_event_handle: maki_lua::EventHandle,
-    ) -> Self {
-        Self {
-            task_id: Some(Arc::from(task_id)),
-            ..Self::new(name, ui_config, lua_event_handle)
-        }
-    }
-
+    /// The handle `maki.task` addresses a task by, see `app::tasks`.
     pub(crate) fn task_id(&self) -> Option<&Arc<str>> {
-        self.task_id.as_ref()
+        self.messages_panel.task_id()
+    }
+
+    pub(crate) fn request_restores(&self, items: Vec<maki_lua::RestoreItem>) {
+        self.messages_panel.request_restores(items);
+    }
+
+    pub(crate) fn task_id_or_main(&self) -> Arc<str> {
+        self.task_id()
+            .map_or_else(|| Arc::from(MAIN_TASK_ID), Arc::clone)
     }
 
     pub(crate) fn task_status(&self) -> TaskStatus {
@@ -529,6 +535,9 @@ pub fn history_to_display(
                                     theme_gen: None,
                                     clicks: Vec::new(),
                                     state,
+                                    session_id: None,
+                                    task_id: None,
+                                    reason: maki_lua::RestoreReason::Load,
                                 });
                             }
                             display.push(DisplayMessage {
@@ -563,7 +572,8 @@ pub fn history_to_display(
 }
 
 /// `ToolResult` is gone after session load, so we rebuild from
-/// whatever the `DisplayMessage` kept.
+/// whatever the `DisplayMessage` kept. A rerender: the transcript was
+/// already replayed once, this asks for one call's buf again.
 pub(crate) fn restore_item_for(
     msg: &DisplayMessage,
     tool_output_lines: maki_config::ToolOutputLines,
@@ -589,6 +599,9 @@ pub(crate) fn restore_item_for(
         theme_gen: Some(theme_gen),
         clicks: Vec::new(),
         state,
+        session_id: None,
+        task_id: None,
+        reason: maki_lua::RestoreReason::Rerender,
     })
 }
 
@@ -716,6 +729,8 @@ mod tests {
 
     fn chat() -> Chat {
         Chat::new(
+            MakiId::generate(),
+            None,
             MAIN_NAME.into(),
             UiConfig::default(),
             maki_lua::EventHandle::disconnected_for_test(),
@@ -723,8 +738,9 @@ mod tests {
     }
 
     fn subagent_chat() -> Chat {
-        Chat::subagent(
-            TASK_ID,
+        Chat::new(
+            MakiId::generate(),
+            Some(TASK_ID),
             SUBAGENT_NAME.into(),
             UiConfig::default(),
             maki_lua::EventHandle::disconnected_for_test(),

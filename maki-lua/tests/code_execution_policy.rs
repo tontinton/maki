@@ -558,6 +558,9 @@ fn restore_lines_with(code: &str, output: &str, is_error: bool, clicks: Vec<usiz
             theme_gen: None,
             clicks,
             state: None,
+            task_id: None,
+            session_id: None,
+            reason: maki_lua::RestoreReason::default(),
         },
         maki_agent::EventSender::new(tx, 0),
     );

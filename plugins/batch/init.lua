@@ -142,6 +142,19 @@ local function header_spans(tool, params)
   return spans or { { tool, "tool" } }
 end
 
+-- The chat and the reason travel along so a child keying per-chat state
+-- (todo_write) files the call where it would standalone. From the handler
+-- `restore_reason` is nil, which reads as a rerender: the child's own
+-- handler already ran.
+local function child_ctx(ctx)
+  return {
+    tool_output_lines = ctx:tool_output_lines(),
+    session_id = ctx:session_id(),
+    task_id = ctx:task_id(),
+    reason = ctx:restore_reason(),
+  }
+end
+
 -- The child's own restore fn builds the body, fed the real is_error, so
 -- a failed child looks exactly like the same tool run standalone. When
 -- restore is missing, throws, or returns no buf, the ToolView fallback
@@ -149,14 +162,15 @@ end
 -- The pcall is for the cancel sweep, which runs outside the coroutine,
 -- where a restore that awaits raises instead of yielding. One child's
 -- body must not stop the sweep from repainting the rest.
-local function child_body_buf(c, tol)
+local function child_body_buf(c, cctx)
   local output = c.output or ""
   local t = maki.api.get_tool(c.tool)
   local buf
   if t and t.restore then
-    local ok, res = pcall(t.restore, c.params, output, c.status == STATUS.ERROR, { tool_output_lines = tol })
+    local ok, res = pcall(t.restore, c.params, output, c.status == STATUS.ERROR, cctx)
     buf = ok and res or nil
   end
+  local tol = cctx.tool_output_lines
   return buf or ToolView.restore(output, { max_lines = tol[c.tool] or tol.other, keep = "head" })
 end
 
@@ -343,8 +357,8 @@ end
 local Batch = {}
 Batch.__index = Batch
 
-function Batch.new(children, tol)
-  local self = setmetatable({ children = children, tol = tol }, Batch)
+function Batch.new(children, cctx)
+  local self = setmetatable({ children = children, cctx = cctx }, Batch)
   self.buf = maki.ui.buf()
   -- A click fans out to child bufs, and every child change event would
   -- recompose the whole batch; mute them and recompose once at the end.
@@ -388,7 +402,7 @@ function Batch:watch(c, buf)
 end
 
 function Batch:attach_body(c)
-  self:watch(c, child_body_buf(c, self.tol))
+  self:watch(c, child_body_buf(c, self.cctx))
 end
 
 -- Forward the click to the child's own buf so its real toggle logic
@@ -532,7 +546,7 @@ local function handler(input, ctx)
     return { llm_output = EMPTY_ERROR, is_error = true }
   end
 
-  local batch = Batch.new(children, ctx:tool_output_lines())
+  local batch = Batch.new(children, child_ctx(ctx))
   ctx:live_buf(batch.buf)
   batch:run(ctx)
 
@@ -557,7 +571,8 @@ local function legacy_restore(children, output, tol)
 end
 
 local function restore(input, output, _is_error, rctx)
-  local tol = rctx:tool_output_lines()
+  local cctx = child_ctx(rctx)
+  local tol = cctx.tool_output_lines
   local children = prepare_children(input.tool_calls or {})
   if not children then
     return ToolView.restore(output, { max_lines = tol.other, keep = "head" })
@@ -574,7 +589,7 @@ local function restore(input, output, _is_error, rctx)
       c.output, c.annotation = sc.output, sc.annotation
       c.usage = sc.usage
     end
-    return Batch.new(children, tol).buf
+    return Batch.new(children, cctx).buf
   end
   return legacy_restore(children, output, tol)
 end

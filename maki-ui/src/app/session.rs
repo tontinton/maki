@@ -162,9 +162,13 @@ impl App {
         }
     }
 
+    /// Call only once `state.session` is final: the chats it builds are
+    /// stamped with that session for life.
     pub(super) fn reset_ui_chrome(&mut self) {
         self.chats.clear();
         let mut main = Chat::new(
+            self.state.session.id,
+            None,
             "Main".into(),
             self.ui_config.clone(),
             self.lua_event_handle.clone(),
@@ -205,7 +209,7 @@ impl App {
             self.input_box.buffer.move_to_end();
         }
 
-        self.fire_restore_items(restore_items);
+        self.chats[0].request_restores(restore_items);
 
         // Read, not taken: the live chats below are the source `sync_subagents`
         // mirrors back, so emptying the session here would only make the next
@@ -226,8 +230,9 @@ impl App {
             );
             self.chat_index
                 .insert(sa.tool_use_id.clone(), self.chats.len());
-            let mut chat = Chat::subagent(
-                &sa.tool_use_id,
+            let mut chat = Chat::new(
+                self.state.session.id,
+                Some(&sa.tool_use_id),
                 sa.name,
                 self.ui_config.clone(),
                 self.lua_event_handle.clone(),
@@ -238,7 +243,7 @@ impl App {
             // The session file keeps the transcript but never how it ended,
             // so a reload admits that instead of guessing.
             chat.mark_finished(TaskOutcome::Unknown, DONE_TEXT);
-            self.fire_restore_items(items);
+            chat.request_restores(items);
             self.chats.push(chat);
         }
 
@@ -250,18 +255,6 @@ impl App {
                 .store(false, std::sync::atomic::Ordering::Relaxed);
         } else {
             eh.send_restore_complete(restoring);
-        }
-    }
-
-    fn fire_restore_items(&self, items: Vec<maki_lua::RestoreItem>) {
-        let Some(tx) = &self.restore_event_tx else {
-            return;
-        };
-        let eh = &self.lua_event_handle;
-        let theme_gen = crate::theme::generation();
-        for mut item in items {
-            item.theme_gen = Some(theme_gen);
-            eh.request_restore(item, tx.clone());
         }
     }
 
@@ -326,7 +319,6 @@ impl App {
 
     pub(super) fn reset_session(&mut self) -> Vec<Action> {
         self.checkpoint_now();
-        self.reset_ui_chrome();
         self.state.token_usage = TokenUsage::default();
         self.state.cost = None;
         self.state.context_size = 0;
@@ -343,6 +335,7 @@ impl App {
         let session = self.blank_session();
         self.apply_stored_permissions(&session.meta);
         self.state.session = Arc::new(session);
+        self.reset_ui_chrome();
         maki_otel::emit::session_started(
             maki_otel::emit::START_FRESH,
             Some(&self.state.session.id.to_string()),

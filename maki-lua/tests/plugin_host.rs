@@ -273,11 +273,7 @@ maki.api.register_tool({
     description = "reports the calling session",
     schema = { type = "object", properties = {}, additionalProperties = false },
     handler = function(_, ctx)
-        local id, err = ctx:session_id()
-        if err then
-            return "err:" .. err
-        end
-        return "id:" .. tostring(id)
+        return "id:" .. tostring(ctx:session_id())
     end,
 })
 "#;
@@ -324,6 +320,35 @@ fn handler_reads_the_calling_session() {
         out,
         format!("id:{}", session.as_str()),
         "the verbatim form would not match ids from maki.session.live()"
+    );
+}
+
+const TASK_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "which_task",
+    description = "reports the calling task",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    handler = function(_, ctx)
+        return "task:" .. ctx:task_id()
+    end,
+})
+"#;
+
+const SUBAGENT_TASK_ID: &str = "toolu_sub";
+
+/// A subagent shares the parent's session id, so the task id is what a
+/// plugin keys per-chat state on.
+#[test_case::test_case(None, "task:main" ; "session_owner")]
+#[test_case::test_case(Some(SUBAGENT_TASK_ID), "task:toolu_sub" ; "subagent")]
+fn ctx_task_id_names_the_calling_chat(task_id: Option<&str>, expected: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("task_plugin", TASK_PLUGIN).unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.task_id = task_id.map(Arc::from);
+    assert_eq!(
+        exec_with_ctx(&reg, "which_task", json!({}), &ctx).unwrap(),
+        expected
     );
 }
 
@@ -727,6 +752,9 @@ fn restore_snapshot_text(
             theme_gen: None,
             clicks,
             state,
+            task_id: None,
+            session_id: None,
+            reason: maki_lua::RestoreReason::default(),
         },
         maki_agent::EventSender::new(tx, 0),
     );
@@ -1906,6 +1934,9 @@ fn warm_restore_item(id: &str, clicks: Vec<usize>) -> maki_lua::RestoreItem {
         theme_gen: None,
         clicks,
         state: None,
+        task_id: None,
+        session_id: None,
+        reason: maki_lua::RestoreReason::default(),
     }
 }
 
@@ -5107,6 +5138,9 @@ fn restore_tool_async_ordering_and_delivery() {
         theme_gen: None,
         clicks: Vec::new(),
         state: None,
+        task_id: None,
+        session_id: None,
+        reason: maki_lua::RestoreReason::default(),
     };
     let unknown_item = maki_lua::RestoreItem {
         tool: Arc::from("definitely_not_a_tool"),
@@ -5118,6 +5152,9 @@ fn restore_tool_async_ordering_and_delivery() {
         theme_gen: None,
         clicks: Vec::new(),
         state: None,
+        task_id: None,
+        session_id: None,
+        reason: maki_lua::RestoreReason::default(),
     };
 
     handle.request_restore(unknown_item, event_tx.clone());
@@ -5185,6 +5222,9 @@ fn restore_rebuilds_body_from_input_content(
             theme_gen: None,
             clicks: vec![0],
             state: None,
+            task_id: None,
+            session_id: None,
+            reason: maki_lua::RestoreReason::default(),
         },
         maki_agent::EventSender::new(tx, 0),
     );

@@ -661,6 +661,9 @@ fn restore_snapshot_lines_opts(
             theme_gen: None,
             clicks,
             state,
+            task_id: None,
+            session_id: None,
+            reason: maki_lua::RestoreReason::default(),
         },
         EventSender::new(tx, 0),
     );

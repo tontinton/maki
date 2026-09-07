@@ -32,7 +32,7 @@ pub use pack::{
     lockfile_path, prepare_pack_command, sanitize_message, site_dir,
 };
 pub use plugin_permissions::{Permission, PluginPermissions, Requested};
-pub use runtime::{KILL_GRACE, MAX_INFLIGHT_TOOLS, RestoreItem, WARM_TOOL_CAP};
+pub use runtime::{KILL_GRACE, MAX_INFLIGHT_TOOLS, RestoreItem, RestoreReason, WARM_TOOL_CAP};
 pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 
 pub mod test_support {
@@ -104,6 +104,17 @@ pub mod test_support {
                 } = req
                 {
                     return Some((command.to_string(), args, depth));
+                }
+            }
+            None
+        }
+
+        /// Next queued restore item, skipping other requests.
+        pub fn try_recv_restore_item(&self) -> Option<crate::RestoreItem> {
+            use crate::runtime::Request;
+            while let Ok(req) = self.0.try_recv() {
+                if let Request::RestoreToolAsync { item, .. } = req {
+                    return Some(item);
                 }
             }
             None

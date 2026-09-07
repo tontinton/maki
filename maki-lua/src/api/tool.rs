@@ -36,7 +36,7 @@ use crate::api::util::command::{
     ui_roundtrip,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json};
-use crate::api::util::ctx::LuaCtx;
+use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions};
 use crate::runtime::{
@@ -1233,8 +1233,9 @@ fn wrap_header(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
 /// Normalizes a restore fn to its body buf or nil (whether it returned
 /// the buf directly or a `{ body = buf }` reply), so callers composing
 /// another tool's rendering need no pcall of their own. The ctx arg may be
-/// a real `LuaCtx` or a plain `{ tool_output_lines =, state = }` table (how
-/// batch drives child restores); either way the fn sees a restore `LuaCtx`.
+/// a real `LuaCtx` or a plain `{ tool_output_lines =, state =, session_id =,
+/// task_id =, reason = }` table (how batch drives child restores); either way
+/// the fn sees a restore `LuaCtx`.
 fn wrap_restore(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
     let prepped = lua.create_async_function(move |lua, mut args: MultiValue| {
         let f = f.clone();
@@ -1267,20 +1268,30 @@ fn normalize_restore_ctx(lua: &Lua, v: Option<&LuaValue>) -> LuaResult<LuaValue>
     {
         return Ok(LuaValue::UserData(ud.clone()));
     }
-    let (tol, state) = match v {
-        Some(LuaValue::Table(t)) => (
-            t.get::<LuaValue>("tool_output_lines")
-                .ok()
-                .and_then(|v| lua.from_value::<ToolOutputLines>(v).ok())
-                .unwrap_or_default(),
-            t.get::<LuaValue>("state")
-                .ok()
-                .and_then(|v| lua_to_json(lua, &v).ok())
-                .filter(|v| !v.is_null()),
-        ),
-        _ => (ToolOutputLines::default(), None),
+    let ctx = match v {
+        Some(LuaValue::Table(t)) => {
+            let string = |key| t.get::<Option<String>>(key).ok().flatten();
+            RestoreCtx {
+                tool_output_lines: t
+                    .get::<LuaValue>("tool_output_lines")
+                    .ok()
+                    .and_then(|v| lua.from_value::<ToolOutputLines>(v).ok())
+                    .unwrap_or_default(),
+                state: t
+                    .get::<LuaValue>("state")
+                    .ok()
+                    .and_then(|v| lua_to_json(lua, &v).ok())
+                    .filter(|v| !v.is_null()),
+                session_id: string("session_id").and_then(|s| s.parse().ok()),
+                task_id: string("task_id").map(Arc::from),
+                reason: string("reason")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_default(),
+            }
+        }
+        _ => RestoreCtx::default(),
     };
-    let ud = lua.create_userdata(LuaCtx::restore(tol, state))?;
+    let ud = lua.create_userdata(LuaCtx::restore(ctx))?;
     Ok(LuaValue::UserData(ud))
 }
 

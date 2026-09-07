@@ -566,14 +566,15 @@ async fn session(
     ))
     .detach();
 
-    // Register a cancel trigger so the child token does not fire on drop
-    // and kill the subagent at birth. The fallback key gets its own id:
-    // it keys `subagent_cancels`, so sharing the session id would make two
-    // subagents running at once collide.
+    // Doubles as the task id tools see. The fallback gets its own id: it keys
+    // `subagent_cancels`, where two subagents sharing the session id would
+    // collide.
     let ui_id = agent_ctx
         .tool_use_id
         .clone()
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
+    // Registered before the session runs so the child token does not fire
+    // on drop and kill the subagent at birth.
     let (child_trigger, child_cancel) = agent_ctx.cancel.child();
     // Several sessions can share one `ui_id`, so keep the slot and retire
     // only ours on close instead of clearing the whole key.
@@ -597,6 +598,7 @@ async fn session(
             tool_output_lines: maki_config::ToolOutputLines::default(),
             permissions: Arc::clone(&agent_ctx.permissions),
             session_id: agent_ctx.session_id.clone(),
+            task_id: Some(Arc::from(ui_id.as_str())),
             mailbox: None,
             timeouts: agent_ctx.timeouts,
             // Shared with the parent, not fresh: a lock that a subagent does

@@ -43,6 +43,8 @@ use maki_providers::provider::Provider;
 use maki_storage::id::SessionRef;
 
 pub(crate) const TOOL_NAME_FIELD: &str = "name";
+/// What `maki.task` calls the session's own chat.
+pub const MAIN_TASK_ID: &str = "main";
 
 /// Who made a tool call. A resumed session rebuilds its state from the `ToolUse`
 /// blocks in history, and those hold the model's own calls only, so a nested
@@ -334,6 +336,11 @@ pub struct ToolContext {
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `maki index` one-shot.
     pub session_id: Option<SessionRef>,
+    /// `None` in the agent that owns the session ([`MAIN_TASK_ID`]), the
+    /// spawning call's `tool_use_id` in a subagent. A subagent shares
+    /// `session_id` with its parent on purpose (provider affinity, hooks,
+    /// otel), so this is what tells their chats apart.
+    pub task_id: Option<Arc<str>>,
     pub tool_use_id: Option<String>,
     pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     pub loaded_instructions: LoadedInstructions,
@@ -561,6 +568,7 @@ pub fn interpreter_ctx(
         event_tx: event_tx.clone(),
         mode: mode.clone(),
         session_id: None,
+        task_id: None,
         tool_use_id: None,
         user_response_rx,
         loaded_instructions: LoadedInstructions::new(),
