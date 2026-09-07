@@ -122,6 +122,25 @@ impl PartialOrd for PreId {
     }
 }
 
+/// A dot-separated identifier ending in `-<digits>` (this fork's own
+/// `anchor-N` suffix) splits into a text and a numeric part so the number
+/// compares numerically: plain semver treats "anchor-10" as one opaque
+/// alphanumeric identifier and orders it *before* "anchor-9" (ASCII '1' <
+/// '9'), which silently broke updates the first time the counter reached two
+/// digits.
+fn split_trailing_number(id: &str) -> Vec<PreId> {
+    if let Some(dash) = id.rfind('-')
+        && dash > 0
+        && let Ok(n) = id[dash + 1..].parse::<u32>()
+    {
+        return vec![PreId::Text(id[..dash].to_owned()), PreId::Num(n)];
+    }
+    match id.parse::<u32>() {
+        Ok(n) => vec![PreId::Num(n)],
+        Err(_) => vec![PreId::Text(id.to_owned())],
+    }
+}
+
 impl Version {
     fn parse(s: &str) -> Option<Version> {
         let s = s.trim().strip_prefix('v').unwrap_or(s);
@@ -137,13 +156,7 @@ impl Version {
         }
         let pre = match pre {
             None => Vec::new(),
-            Some(p) => p
-                .split('.')
-                .map(|id| match id.parse::<u32>() {
-                    Ok(n) => PreId::Num(n),
-                    Err(_) => PreId::Text(id.to_owned()),
-                })
-                .collect(),
+            Some(p) => p.split('.').flat_map(split_trailing_number).collect(),
         };
         Some(Version { core, pre })
     }
@@ -236,6 +249,9 @@ mod tests {
     #[test_case("0.5.0-rc.2",  "0.5.0-rc.10", false ; "rc_number_compares_numerically")]
     #[test_case("0.5.0-rc.1.1", "0.5.0-rc.1", true ; "longer_prerelease_wins_after_prefix")]
     #[test_case("0.5", "0.5.0", false ; "missing_core_segment_is_not_newer")]
+    #[test_case("0.5.1-anchor-10", "0.5.1-anchor-9", true ; "anchor_suffix_compares_numerically_past_single_digit")]
+    #[test_case("0.5.1-anchor-9", "0.5.1-anchor-10", false ; "anchor_suffix_older_double_digit")]
+    #[test_case("0.5.1-anchor-2", "0.5.1-anchor-19", false ; "anchor_suffix_two_digit_beats_higher_looking_string")]
     fn is_newer_cases(latest: &str, current: &str, expected: bool) {
         assert_eq!(is_newer(latest, current), expected);
     }
