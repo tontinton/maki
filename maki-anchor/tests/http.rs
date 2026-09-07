@@ -608,6 +608,73 @@ fn oidc_can_be_configured_from_the_admin_page() {
 }
 
 #[test]
+fn tunnel_link_ttl_defaults_to_a_day_and_only_an_admin_can_change_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db.sqlite3");
+    let anchor = spawn_anchor(&db);
+    let cookie = setup_admin(anchor.port);
+    let get = || {
+        http_auth(
+            anchor.port,
+            "GET",
+            "/api/config/tunnel_link_ttl_hours",
+            &[],
+            Some(&cookie),
+        )
+    };
+    let post = |body: &[u8]| {
+        http_auth(
+            anchor.port,
+            "POST",
+            "/api/config/tunnel_link_ttl_hours",
+            body,
+            Some(&cookie),
+        )
+    };
+
+    let (status, body) = get();
+    assert_eq!(status, 200);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["hours"], 24, "the default before anyone changes it");
+
+    let (status, body) = post(br#"{"hours":72}"#);
+    assert_eq!(
+        status,
+        200,
+        "admin can set it: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["hours"], 72);
+
+    let (status, _) = post(br#"{"hours":0}"#);
+    assert_eq!(status, 400, "zero hours is refused, not silently clamped");
+
+    let (status, body) = post(br#"{"hours":999999}"#);
+    assert_eq!(status, 200, "an absurd value is accepted but clamped");
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["hours"].as_u64().unwrap() <= 24 * 30);
+
+    let (status, body) = get();
+    assert_eq!(status, 200);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["hours"].as_u64().unwrap(),
+        24 * 30,
+        "the change persists and is what GET reports back"
+    );
+
+    // Once a user exists, every management route requires a session at all.
+    let (status, _) = http(
+        anchor.port,
+        "POST",
+        "/api/config/tunnel_link_ttl_hours",
+        br#"{"hours":10}"#,
+    );
+    assert_eq!(status, 302, "an anonymous caller is bounced to login");
+}
+
+#[test]
 fn the_qr_endpoint_renders_share_links_only() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("db.sqlite3");

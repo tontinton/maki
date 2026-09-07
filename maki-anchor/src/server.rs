@@ -19,7 +19,29 @@ use crate::{
     store::{self, Role, SessionRow, Store},
 };
 
-const TUNNEL_LINK_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+/// Default lifetime of a tunnel's own control link, before an admin sets
+/// `tunnel_link_ttl_hours` (see [`tunnel_link_ttl`]). Traffic and reconnects
+/// both slide the expiry (`proxy_remote`, `drive_tunnel`'s keepalive), so
+/// this is really "how long can the anchor go without hearing from an
+/// instance before its link needs a fresh mint" — a day comfortably covers
+/// an overnight laptop sleep or a home network outage without forcing a new
+/// share URL on every reconnect.
+const DEFAULT_TUNNEL_LINK_TTL_HOURS: u64 = 24;
+const TUNNEL_LINK_TTL_SETTING: &str = "tunnel_link_ttl_hours";
+
+/// The tunnel control-link TTL in effect right now: an admin-set
+/// `tunnel_link_ttl_hours` setting, or [`DEFAULT_TUNNEL_LINK_TTL_HOURS`].
+/// Clamped to the same range a manually minted share link allows.
+pub(crate) fn tunnel_link_ttl(store: &Store) -> Duration {
+    let hours = store
+        .get_setting(TUNNEL_LINK_TTL_SETTING)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TUNNEL_LINK_TTL_HOURS)
+        .clamp(1, crate::dashboard::MAX_LINK_HOURS);
+    Duration::from_secs(hours * 3600)
+}
 /// One thread per connection; cap the counts so a flood costs 503s and
 /// refused sockets instead of unbounded threads.
 const MAX_CONCURRENT_CONNECTIONS: usize = 512;
@@ -2513,6 +2535,87 @@ fn handle_api_set_mint_tokens(
     buffered((200, "application/json".to_string(), body), request)
 }
 
+fn handle_api_set_tunnel_link_ttl(
+    mut request: http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method() != "POST" {
+        return buffered(
+            (
+                405,
+                "application/json".to_string(),
+                br#"{"error":"method not allowed"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    let is_admin = user.as_ref().is_some_and(|u| u.is_admin);
+    if !is_admin {
+        let has_users = store.list_users().map(|u| !u.is_empty()).unwrap_or(false);
+        if has_users {
+            return buffered(
+                (
+                    403,
+                    "application/json".to_string(),
+                    br#"{"error":"admin required"}"#.to_vec(),
+                ),
+                request,
+            );
+        }
+    }
+    let mut body = Vec::new();
+    if request.as_reader().read_to_end(&mut body).is_err() || body.len() > MAX_BODY {
+        return buffered(
+            (
+                413,
+                "application/json".to_string(),
+                br#"{"error":"body too large"}"#.to_vec(),
+            ),
+            request,
+        );
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return buffered(
+                (
+                    400,
+                    "application/json".to_string(),
+                    br#"{"error":"invalid json"}"#.to_vec(),
+                ),
+                request,
+            );
+        }
+    };
+    let hours = value.get("hours").and_then(|v| v.as_u64());
+    let Some(hours) = hours.filter(|h| *h >= 1) else {
+        return buffered(
+            (
+                400,
+                "application/json".to_string(),
+                br#"{"error":"hours must be a positive integer"}"#.to_vec(),
+            ),
+            request,
+        );
+    };
+    let hours = hours.clamp(1, crate::dashboard::MAX_LINK_HOURS);
+    if let Err(e) = store.set_setting(TUNNEL_LINK_TTL_SETTING, &hours.to_string()) {
+        return buffered(
+            (
+                500,
+                "application/json".to_string(),
+                serde_json::json!({"error": format!("store error: {e}")})
+                    .to_string()
+                    .into_bytes(),
+            ),
+            request,
+        );
+    }
+    let body = serde_json::json!({"hours": hours}).to_string().into_bytes();
+    buffered((200, "application/json".to_string(), body), request)
+}
+
 /// User-facing routes: dashboard and JSON endpoints. The user row (None in
 /// LAN-trust mode) is available for future per-instance filtering.
 fn route_authorized(
@@ -2698,6 +2801,24 @@ fn route_authorized(
                 buffered((200, "application/json".to_string(), body), request)
             }
             "POST" => handle_api_set_mint_tokens(request, store, user.as_ref(), auth),
+            _ => buffered(
+                (
+                    405,
+                    "application/json".to_string(),
+                    br#"{"error":"method not allowed"}"#.to_vec(),
+                ),
+                request,
+            ),
+        };
+    }
+    if path == "/api/config/tunnel_link_ttl_hours" {
+        return match request.method() {
+            "GET" => {
+                let hours = tunnel_link_ttl(store).as_secs() / 3600;
+                let body = serde_json::json!({"hours": hours}).to_string().into_bytes();
+                buffered((200, "application/json".to_string(), body), request)
+            }
+            "POST" => handle_api_set_tunnel_link_ttl(request, store, user.as_ref()),
             _ => buffered(
                 (
                     405,
@@ -3179,7 +3300,7 @@ fn proxy_remote(
     // Traffic on the tunnel's own control link slides its expiry, so it stays
     // alive as long as the tunnel does.
     if hub.link_hash(link.instance_id).as_deref() == Some(link.token_hash.as_str())
-        && let Err(err) = store.extend_link(&link.token_hash, TUNNEL_LINK_TTL)
+        && let Err(err) = store.extend_link(&link.token_hash, tunnel_link_ttl(store))
     {
         tracing::warn!(error = %err, "link extend failed");
     }
@@ -3351,7 +3472,9 @@ fn drive_tunnel(
     // as the tunnel does.
     let (control_link, link_hash) = match store.live_control_link(instance.id).ok().flatten() {
         Some(live) => {
-            store.extend_link(&live.token_hash, TUNNEL_LINK_TTL).ok();
+            store
+                .extend_link(&live.token_hash, tunnel_link_ttl(&store))
+                .ok();
             (live.token, live.token_hash)
         }
         None => match mint_link(
@@ -3359,7 +3482,7 @@ fn drive_tunnel(
             instance.id,
             None,
             Role::Controller,
-            TUNNEL_LINK_TTL,
+            tunnel_link_ttl(&store),
         ) {
             Ok(link) => (link.clone(), store::hash_token(&link)),
             Err(err) => {
@@ -3444,7 +3567,7 @@ fn drive_tunnel(
                 // Instance keepalive: proof of life for the dashboard and the
                 // tunnel's control link.
                 store.touch_instance(instance.id).ok();
-                store.extend_link(&link_hash, TUNNEL_LINK_TTL).ok();
+                store.extend_link(&link_hash, tunnel_link_ttl(&store)).ok();
                 let _ = writer.lock().unwrap().send(WsMessage::Pong(payload));
             }
             WsMessage::Close(_) => break,
@@ -3459,6 +3582,59 @@ fn drive_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_store() -> Store {
+        // Leak the tempdir so the sqlite file lives for the test.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        std::mem::forget(dir);
+        Arc::into_inner(Store::open(&path).unwrap()).expect("no other refs")
+    }
+
+    #[test]
+    fn tunnel_link_ttl_defaults_to_a_day() {
+        let store = test_store();
+        assert_eq!(tunnel_link_ttl(&store), Duration::from_secs(24 * 3600));
+    }
+
+    #[test]
+    fn tunnel_link_ttl_honors_an_admin_set_hours() {
+        let store = test_store();
+        store.set_setting(TUNNEL_LINK_TTL_SETTING, "48").unwrap();
+        assert_eq!(tunnel_link_ttl(&store), Duration::from_secs(48 * 3600));
+    }
+
+    #[test]
+    fn tunnel_link_ttl_clamps_to_the_same_range_a_minted_share_link_allows() {
+        let store = test_store();
+        store.set_setting(TUNNEL_LINK_TTL_SETTING, "0").unwrap();
+        assert_eq!(
+            tunnel_link_ttl(&store),
+            Duration::from_secs(3600),
+            "zero clamps up to at least an hour"
+        );
+        store
+            .set_setting(TUNNEL_LINK_TTL_SETTING, "999999")
+            .unwrap();
+        assert_eq!(
+            tunnel_link_ttl(&store),
+            Duration::from_secs(crate::dashboard::MAX_LINK_HOURS * 3600),
+            "an absurd value clamps down to the share-link cap"
+        );
+    }
+
+    #[test]
+    fn tunnel_link_ttl_ignores_unparseable_settings() {
+        let store = test_store();
+        store
+            .set_setting(TUNNEL_LINK_TTL_SETTING, "not a number")
+            .unwrap();
+        assert_eq!(
+            tunnel_link_ttl(&store),
+            Duration::from_secs(24 * 3600),
+            "garbage falls back to the default rather than panicking"
+        );
+    }
 
     #[test]
     fn is_run_finished_transition_only_fires_working_to_idle() {

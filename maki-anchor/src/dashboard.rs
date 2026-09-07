@@ -512,13 +512,14 @@ fn links_card(
 }
 
 pub fn render_admin(
-    _store: &Arc<Store>,
+    store: &Arc<Store>,
     user: Option<&UserRow>,
     auth: &crate::auth::Auth,
 ) -> (u16, String, Vec<u8>) {
     let mut body = String::with_capacity(8192);
     body.push_str(&layout_start("maki anchor — admin", user, "admin"));
     let mint = auth.effective_mint_tokens().as_str().to_owned();
+    let tunnel_link_ttl_hours = crate::server::tunnel_link_ttl(store).as_secs() / 3600;
     body.push_str(&format!(
         r##"<div class="card">
         <h2>Admin — User management</h2>
@@ -541,6 +542,12 @@ pub fn render_admin(
           <button id="mint-save">Save</button>
           <span id="mint-status" class="small"></span>
           <span class="small">Current: <code id="mint-current">{}</code></span>
+        </div>
+        <div style="display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin:.6rem 0">
+          <label>Tunnel link lifetime (hours)<br><input id="ttl-hours" type="number" min="1" max="720" value="{}" style="width:6rem"></label>
+          <button id="ttl-save">Save</button>
+          <span id="ttl-status" class="small"></span>
+          <span class="small">A tunnel's own control link renews on every reconnect and every request, so this is really "how long an instance can go unreachable before its share URL changes."</span>
         </div>
         <h3>Users</h3>
         <table id="users-table" style="width:100%"><tr><th>Name</th><th>Subject</th><th>Admin</th><th>Actions</th></tr></table>
@@ -639,6 +646,18 @@ pub fn render_admin(
             const {{ok, j}} = await fetchJson('/api/config/mint_tokens', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{mint_tokens: mintSelect.value}})}});
             mintStatus.textContent = ok ? 'saved '+j.mint_tokens : (j.error||'failed');
             if (ok) mintCurrent.textContent = j.mint_tokens;
+          }};
+          const ttlHoursEl = document.getElementById('ttl-hours');
+          const ttlStatus = document.getElementById('ttl-status');
+          const loadTunnelTtl = async () => {{
+            const {{ok, j}} = await fetchJson('/api/config/tunnel_link_ttl_hours');
+            if (ok && j.hours) ttlHoursEl.value = j.hours;
+          }};
+          document.getElementById('ttl-save').onclick = async () => {{
+            ttlStatus.textContent='saving…';
+            const {{ok, j}} = await fetchJson('/api/config/tunnel_link_ttl_hours', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{hours: Number(ttlHoursEl.value)}})}});
+            ttlStatus.textContent = ok ? 'saved '+j.hours+'h' : (j.error||'failed');
+            if (ok) ttlHoursEl.value = j.hours;
           }};
           const loadUsers = async () => {{
             const {{ok, j}} = await fetchJson('/api/users');
@@ -753,11 +772,11 @@ pub fn render_admin(
             webhookStatus.textContent = ok ? 'saved' : (j.error||'failed');
             if (ok) {{ loadWebhooks(); webhookForm.reset(); }}
           }};
-          loadSso(); loadMint(); loadUsers(); loadGrants(); loadWebhooks();
+          loadSso(); loadMint(); loadTunnelTtl(); loadUsers(); loadGrants(); loadWebhooks();
         }})();
         </script>
         "##,
-        mint, mint
+        mint, tunnel_link_ttl_hours, mint
     ));
     body.push_str(&layout_end());
     (200, "text/html".to_string(), body.into_bytes())
