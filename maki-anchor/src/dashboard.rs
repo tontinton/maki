@@ -314,14 +314,24 @@ pub fn render_instances(store: &Store, user: Option<&UserRow>) -> (u16, String, 
         </script>
         "#,
     );
-    body.push_str("<div class=\"card\"><h2>Instances</h2><table><tr><th>Name</th><th>Status</th><th>Last seen</th></tr>");
+    let is_admin = user.is_some_and(|u| u.is_admin);
+    body.push_str("<div class=\"card\"><h2>Instances</h2><table><tr><th>Name</th><th>Status</th><th>Last seen</th><th></th></tr>");
     if instances.is_empty() {
-        body.push_str("<tr><td colspan=3 class=\"small\">no instances yet — install on a host to appear</td></tr>");
+        body.push_str("<tr><td colspan=4 class=\"small\">no instances yet — install on a host to appear</td></tr>");
     }
     for instance in &instances {
         let online = now - instance.last_seen < 90;
+        let bulk_delete = if is_admin {
+            format!(
+                "<button class=\"mini danger-arm\" data-instance-id=\"{}\" data-instance-name=\"{}\">delete all sessions</button>",
+                instance.id,
+                html_escape(&instance.name),
+            )
+        } else {
+            String::new()
+        };
         body.push_str(&format!(
-            "<tr><td>{}</td><td><span class=\"badge {}\">{}</span></td><td>{}s ago</td></tr>",
+            "<tr><td>{}</td><td><span class=\"badge {}\">{}</span></td><td>{}s ago</td><td>{bulk_delete}</td></tr>",
             html_escape(&instance.name),
             if online { "on" } else { "off" },
             if online { "online" } else { "offline" },
@@ -331,6 +341,37 @@ pub fn render_instances(store: &Store, user: Option<&UserRow>) -> (u16, String, 
     body.push_str("</table>");
     if user.is_some_and(|u| !u.is_admin) {
         body.push_str("<p class=\"small\">Showing only instances you have a grant for. Ask an admin for access to more.</p>");
+    }
+    if is_admin && !instances.is_empty() {
+        // Same arm-then-confirm pattern as the links page's "revoke all" and
+        // the remote file panel's delete: a bulk, destructive action gets a
+        // second click instead of a confirm() dialog that blocks the tab.
+        body.push_str(
+            "<script>(() => { \
+             for (const b of document.querySelectorAll('.danger-arm')) { \
+               let armed = false, timer = null; \
+               b.onclick = async () => { \
+                 if (!armed) { \
+                   armed = true; b.dataset.label = b.textContent; b.textContent = 'sure?'; b.classList.add('danger'); \
+                   timer = setTimeout(() => { armed = false; b.textContent = b.dataset.label; b.classList.remove('danger'); }, 3000); \
+                   return; \
+                 } \
+                 clearTimeout(timer); \
+                 b.disabled = true; b.textContent = 'deleting…'; \
+                 const id = Number(b.dataset.instanceId); \
+                 const name = b.dataset.instanceName; \
+                 const res = await fetch('/api/sessions'); \
+                 const rows = res.ok ? await res.json() : []; \
+                 const mine = rows.filter((r) => r.instance_id === id); \
+                 await Promise.all(mine.map((r) => fetch('/api/sessions/delete', { \
+                   method: 'POST', headers: {'Content-Type': 'application/json'}, \
+                   body: JSON.stringify({instance: name, session: r.external_id}), \
+                 }))); \
+                 location.reload(); \
+               }; \
+             } \
+             })();</script>",
+        );
     }
     body.push_str("</div>");
     body.push_str(&layout_end());
@@ -393,8 +434,13 @@ fn links_card(
                     .any(|i| i.id == link.instance_id && i.name == link.instance_name)
         })
         .collect();
-    let mut s = String::from(
-        "<div class=\"card\" id=\"links\"><h2>Live shares</h2><table><tr><th>Instance</th><th>Scope</th><th>Rights</th><th>Tunnel</th><th>Expires in</th><th></th></tr>",
+    let revoke_all = if is_admin && !links.is_empty() {
+        " <button id=\"revoke-all\" class=\"mini\" type=\"button\">revoke all</button>"
+    } else {
+        ""
+    };
+    let mut s = format!(
+        "<div class=\"card\" id=\"links\"><h2>Live shares{revoke_all}</h2><table><tr><th>Instance</th><th>Scope</th><th>Rights</th><th>Tunnel</th><th>Expires in</th><th></th></tr>",
     );
     if links.is_empty() {
         s.push_str("<tr><td colspan=6 class=\"small\">no live links — mint one or wait for a tunnel</td></tr>");
@@ -434,10 +480,31 @@ fn links_card(
     }
     s.push_str("</table>");
     if is_admin {
+        // "revoke all" arms on a first click and only acts on a second one
+        // (auto-disarming after a few seconds) instead of a confirm()
+        // dialog — same reasoning as the file panel's delete button: no
+        // modal that blocks the tab (or anything scripting the page) until
+        // dismissed, for an action just as easy to walk back from by
+        // re-minting.
         s.push_str(
-            "<script>(() => { for (const b of document.querySelectorAll('.revoke')) b.onclick = async () => { \
-             await fetch('/api/links/revoke', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token_hash: b.dataset.hash})}); \
-             location.reload(); }; })();</script>",
+            "<script>(() => { \
+             const revoke = (hash) => fetch('/api/links/revoke', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token_hash: hash})}); \
+             for (const b of document.querySelectorAll('.revoke')) b.onclick = async () => { await revoke(b.dataset.hash); location.reload(); }; \
+             const allBtn = document.getElementById('revoke-all'); \
+             if (!allBtn) return; \
+             let armed = false, timer = null; \
+             allBtn.onclick = async () => { \
+               if (!armed) { \
+                 armed = true; allBtn.textContent = 'sure?'; allBtn.classList.add('danger'); \
+                 timer = setTimeout(() => { armed = false; allBtn.textContent = 'revoke all'; allBtn.classList.remove('danger'); }, 3000); \
+                 return; \
+               } \
+               clearTimeout(timer); \
+               const hashes = [...document.querySelectorAll('.revoke')].map((b) => b.dataset.hash); \
+               await Promise.all(hashes.map(revoke)); \
+               location.reload(); \
+             }; \
+             })();</script>",
         );
     }
     s.push_str("</div>");
@@ -992,6 +1059,49 @@ mod tests {
         for html in [&sessions_html, &instances_html, &links_html] {
             assert!(html.contains("class=\"active\""), "nav marks the page");
         }
+    }
+
+    #[test]
+    fn revoke_all_and_bulk_delete_buttons_are_admin_only() {
+        let store = test_store();
+        let instance = store.create_instance("bulk-host", "hash").unwrap();
+        store
+            .create_link(
+                "tok-bulk",
+                instance,
+                None,
+                "view",
+                std::time::Duration::from_secs(7200),
+            )
+            .unwrap();
+        let hub = crate::hub::Hub::new();
+        let admin = user(1, true);
+        store.upsert_user("admin-seed", None, None).unwrap();
+        let plain = store.upsert_user("plain-sub", None, None).unwrap();
+        assert!(!plain.is_admin);
+        store.set_grant(plain.id, instance, Role::Viewer).unwrap();
+
+        let admin_links = String::from_utf8(render_links(&store, &hub, Some(&admin)).2).unwrap();
+        assert!(
+            admin_links.contains("id=\"revoke-all\""),
+            "admin gets the bulk revoke button: {admin_links}"
+        );
+        let plain_links = String::from_utf8(render_links(&store, &hub, Some(&plain)).2).unwrap();
+        assert!(
+            !plain_links.contains("id=\"revoke-all\""),
+            "a non-admin gets no bulk revoke, same as the single revoke button: {plain_links}"
+        );
+
+        let admin_instances = String::from_utf8(render_instances(&store, Some(&admin)).2).unwrap();
+        assert!(
+            admin_instances.contains("delete all sessions"),
+            "admin gets the bulk session delete button: {admin_instances}"
+        );
+        let plain_instances = String::from_utf8(render_instances(&store, Some(&plain)).2).unwrap();
+        assert!(
+            !plain_instances.contains("delete all sessions"),
+            "a non-admin must not get a bulk-delete button: {plain_instances}"
+        );
     }
 
     #[test]
