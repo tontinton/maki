@@ -107,6 +107,8 @@ pub fn autocmd_for(
                 "resolution": e.resolution,
                 "cost": e.billed_cost,
                 "list_cost": e.list_cost,
+                "request": e.request,
+                "scopes": e.scopes,
             }),
         )),
         _ => None,
@@ -197,6 +199,8 @@ mod tests {
                 usage: TokenUsage::default(),
                 billed_cost: Some(0.01),
                 list_cost: Some(0.05),
+                request: "".into(),
+                scopes: Arc::from([]),
             })),
         ]
     }
@@ -213,10 +217,14 @@ mod tests {
             usage: TokenUsage::default(),
             billed_cost: Some(0.02),
             list_cost: Some(0.1),
+            request: "# Tool call under review".into(),
+            scopes: Arc::from(["rm -rf build".to_owned()]),
         }));
         let (name, data) = autocmd_for(&event, &SESSION, false).unwrap();
         assert_eq!(name, "ToolReviewed");
         assert_eq!(data["tool"], "bash");
+        assert_eq!(data["request"], "# Tool call under review");
+        assert_eq!(data["scopes"][0], "rm -rf build");
         assert_eq!(data["reviewer"], "guard");
         assert_eq!(data["verdict"], "DENY");
         assert_eq!(data["resolution"], "denied");

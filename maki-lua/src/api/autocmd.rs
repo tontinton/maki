@@ -159,8 +159,10 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///
 /// - `"ToolStart"`, `"ToolDone"`: `data.tool_id` and `data.tool`.
 /// - `"ToolReviewed"`: `data.tool`, `data.reviewer`, `data.model`,
-///   `data.verdict`, `data.reason`, `data.resolution`, `data.cost`, and
-///   `data.list_cost`.
+///   `data.verdict`, `data.reason`, `data.resolution`, `data.cost`,
+///   `data.list_cost`, `data.scopes`, and `data.request` (the exact text
+///   the reviewer was shown; empty for the synthetic `prompted` and
+///   `redirected` resolutions).
 /// - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
 ///   `"max_turns"`, or `"cancelled"`), `data.usage` (four token fields,
 ///   cache included), `data.cost`, `data.list_cost`, `data.context_size`,

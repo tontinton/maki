@@ -944,6 +944,14 @@ pub struct ReviewerVerdictEvent {
     pub billed_cost: Option<f64>,
     #[serde(skip)]
     pub list_cost: Option<f64>,
+    /// The exact request the link was shown, so a plugin can audit a
+    /// verdict against what the reviewer actually knew. Empty for the
+    /// synthetic `prompted`/`redirected` events, which had no link.
+    #[serde(skip)]
+    pub request: Arc<str>,
+    /// The permission scopes maki derived for the call.
+    #[serde(skip)]
+    pub scopes: Arc<[String]>,
 }
 
 #[derive(Debug, Serialize)]
