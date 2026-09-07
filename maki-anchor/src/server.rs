@@ -1837,6 +1837,97 @@ fn handle_api_revoke_link(
     }
 }
 
+fn json_list_webhooks(store: &Arc<Store>) -> (u16, String, Vec<u8>) {
+    match store.list_webhooks() {
+        Ok(rows) => (
+            200,
+            "application/json".to_string(),
+            serde_json::to_vec(&rows).unwrap_or_default(),
+        ),
+        Err(err) => (
+            500,
+            "application/json".to_string(),
+            serde_json::json!({"error": format!("store error: {err}")})
+                .to_string()
+                .into_bytes(),
+        ),
+    }
+}
+
+const WEBHOOK_KINDS: [&str; 4] = ["generic", "slack", "discord", "ntfy"];
+
+fn handle_api_create_webhook(
+    mut request: http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if is_non_admin(user) {
+        return forbidden_json(request);
+    }
+    let value = match read_json(&mut request) {
+        Ok(v) => v,
+        Err(e) => return json_error(request, 400, &e),
+    };
+    let Some(url) = value.get("url").and_then(|v| v.as_str()) else {
+        return json_error(request, 400, "url required");
+    };
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return json_error(request, 400, "url must be http(s)");
+    }
+    let kind = value
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("generic");
+    if !WEBHOOK_KINDS.contains(&kind) {
+        return json_error(
+            request,
+            400,
+            &format!("kind must be one of {}", WEBHOOK_KINDS.join(", ")),
+        );
+    }
+    // An empty/absent instance name means "fires for every instance" —
+    // the same shape the rest of the anchor uses for "no scope".
+    let instance_id = match value.get("instance").and_then(|v| v.as_str()) {
+        Some(name) if !name.trim().is_empty() => match instance_id_or_404(store, name) {
+            Ok(id) => Some(id),
+            Err(_) => return json_error(request, 404, "unknown instance"),
+        },
+        _ => None,
+    };
+    match store.add_webhook(instance_id, kind, url) {
+        Ok(id) => buffered(center_json(200, serde_json::json!({ "id": id })), request),
+        Err(err) => json_error(request, 500, &err.to_string()),
+    }
+}
+
+fn handle_api_delete_webhook(
+    mut request: http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method() != "POST" {
+        return json_error(request, 405, "method not allowed");
+    }
+    if is_non_admin(user) {
+        return forbidden_json(request);
+    }
+    let value = match read_json(&mut request) {
+        Ok(v) => v,
+        Err(e) => return json_error(request, 400, &e),
+    };
+    let Some(id) = value.get("id").and_then(|v| v.as_i64()) else {
+        return json_error(request, 400, "id required");
+    };
+    match store.delete_webhook(id) {
+        Ok(true) => buffered(
+            center_json(200, serde_json::json!({"deleted": true})),
+            request,
+        ),
+        Ok(false) => json_error(request, 404, "webhook not found"),
+        Err(err) => json_error(request, 500, &err.to_string()),
+    }
+}
+
 fn handle_api_revoke_grant(
     mut request: http::Request,
     store: &Arc<Store>,
@@ -2546,6 +2637,28 @@ fn route_authorized(
     if path == "/api/grants/revoke" {
         return handle_api_revoke_grant(request, store, user.as_ref());
     }
+    if path == "/api/webhooks" {
+        return match request.method() {
+            "GET" => {
+                if is_non_admin(user.as_ref()) {
+                    return forbidden_json(request);
+                }
+                buffered(json_list_webhooks(store), request)
+            }
+            "POST" => handle_api_create_webhook(request, store, user.as_ref()),
+            _ => buffered(
+                (
+                    405,
+                    "application/json".to_string(),
+                    br#"{"error":"method not allowed"}"#.to_vec(),
+                ),
+                request,
+            ),
+        };
+    }
+    if path == "/api/webhooks/delete" {
+        return handle_api_delete_webhook(request, store, user.as_ref());
+    }
     if path == "/admin" {
         match &user {
             Some(u) if u.is_admin => {
@@ -2867,6 +2980,16 @@ fn handle_api_session_prune(
     }
 }
 
+/// A run "finished" exactly when the anchor last saw this session actively
+/// working and the push just reported it idle — `previous: None` (a session
+/// the anchor has never indexed before) never fires: there's no "was
+/// working" to have transitioned from, so a freshly (re)registered instance
+/// dumping its whole roster on first push can't spuriously notify for every
+/// already-idle session in it.
+fn is_run_finished_transition(previous: Option<&str>, current: &str) -> bool {
+    previous == Some("working") && current == "idle"
+}
+
 /// Persist a session-index push from an instance. The owning instance is the
 /// authenticated tunnel, so a registered host can never rewrite another's
 /// index by claiming a name in the frame.
@@ -2892,6 +3015,12 @@ fn handle_push(store: &Arc<Store>, hub: &Hub, instance_id: i64, push: TunnelPush
         }
     };
     for entry in sessions {
+        // Read before upsert overwrites it: the push carries only the
+        // current status, so this is the only way to notice a transition.
+        let previous_status = store
+            .session_status(instance_id, &entry.session_id)
+            .ok()
+            .flatten();
         let row = SessionRow {
             instance_id,
             external_id: entry.session_id,
@@ -2910,6 +3039,13 @@ fn handle_push(store: &Arc<Store>, hub: &Hub, instance_id: i64, push: TunnelPush
         };
         if let Err(err) = store.upsert_session(&row) {
             tracing::warn!(error = %err, instance_id, "session upsert failed");
+            continue;
+        }
+        if is_run_finished_transition(previous_status.as_deref(), &row.status) {
+            let instance_name = store
+                .instance_name(instance_id)
+                .unwrap_or_else(|_| "instance".to_owned());
+            crate::webhooks::notify_run_finished(store, instance_id, &instance_name, &row.title);
         }
     }
     // Opportunistic pruning: a busy anchor clears expired transcripts as it
@@ -3323,6 +3459,23 @@ fn drive_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_run_finished_transition_only_fires_working_to_idle() {
+        assert!(is_run_finished_transition(Some("working"), "idle"));
+        assert!(
+            !is_run_finished_transition(None, "idle"),
+            "a session the anchor has never indexed has no prior state to transition from"
+        );
+        assert!(
+            !is_run_finished_transition(Some("idle"), "idle"),
+            "already idle is not a transition"
+        );
+        assert!(
+            !is_run_finished_transition(Some("working"), "working"),
+            "still working is not finished"
+        );
+    }
 
     #[test]
     fn split_token_path_rejects_api_paths() {

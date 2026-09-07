@@ -13,6 +13,7 @@ mod hub;
 mod oidc;
 mod server;
 mod store;
+mod webhooks;
 
 use store::{MintTokens, Role, Store};
 

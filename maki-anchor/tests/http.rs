@@ -329,6 +329,59 @@ fn api_users_and_grants_require_json() {
     assert!(serde_json::from_slice::<serde_json::Value>(&body).is_ok());
 }
 
+#[test]
+fn webhooks_are_admin_only_crud() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db.sqlite3");
+    let anchor = spawn_anchor(&db);
+    let cookie = setup_admin(anchor.port);
+
+    let (status, body) = http_auth(
+        anchor.port,
+        "POST",
+        "/api/webhooks",
+        br#"{"url":"https://hooks.example.com/x","kind":"slack"}"#,
+        Some(&cookie),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let id = created["id"].as_i64().expect("id in response");
+
+    let (status, body) = http_auth(anchor.port, "GET", "/api/webhooks", &[], Some(&cookie));
+    assert_eq!(status, 200);
+    let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        list.as_array().unwrap().iter().any(|w| w["id"] == id),
+        "the created webhook is listed: {list}"
+    );
+
+    // An anonymous request (no cookie) must not manage webhooks even in
+    // LAN-trust mode's read-friendly posture — creation and deletion stay
+    // admin actions like every other write in /api.
+    let (status, _) = http(
+        anchor.port,
+        "POST",
+        "/api/webhooks",
+        br#"{"url":"https://evil.example.com","kind":"generic"}"#,
+    );
+    assert_ne!(status, 200, "unauthenticated create must be refused");
+
+    let (status, body) = http_auth(
+        anchor.port,
+        "POST",
+        "/api/webhooks/delete",
+        format!(r#"{{"id":{id}}}"#).as_bytes(),
+        Some(&cookie),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let (_, body) = http_auth(anchor.port, "GET", "/api/webhooks", &[], Some(&cookie));
+    let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        !list.as_array().unwrap().iter().any(|w| w["id"] == id),
+        "deleted webhook must not still be listed: {list}"
+    );
+}
+
 const COOKIE_NAME: &str = "maki_anchor_session";
 
 /// Runs the first-run setup as a brand-new admin and returns the session

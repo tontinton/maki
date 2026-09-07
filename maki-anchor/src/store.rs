@@ -175,6 +175,20 @@ pub struct LinkRow {
     pub rights: String,
 }
 
+/// A configured notification endpoint. `instance_id: None` fires for every
+/// instance; `Some` scopes it to one. `instance_name` is only populated when
+/// listing (a join for display, never stored).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WebhookRow {
+    pub id: i64,
+    pub instance_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_name: Option<String>,
+    pub kind: String,
+    pub url: String,
+    pub created_at: i64,
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Arc<Self>, StoreError> {
         let conn = Connection::open(path)?;
@@ -238,6 +252,13 @@ impl Store {
                   rights TEXT NOT NULL,
                   PRIMARY KEY (user_id, instance_id)
                );
+              CREATE TABLE IF NOT EXISTS webhooks (
+                  id INTEGER PRIMARY KEY,
+                  instance_id INTEGER REFERENCES instances(id) ON DELETE CASCADE,
+                  kind TEXT NOT NULL,
+                  url TEXT NOT NULL,
+                  created_at INTEGER NOT NULL
+              );
               CREATE INDEX IF NOT EXISTS instances_registration_token
                   ON instances(registration_token_hash);",
         )?;
@@ -343,6 +364,27 @@ impl Store {
     /// once a session is OTR, its transcript must stay cleared no matter
     /// what the instance keeps pushing, so the update keeps it blanked
     /// whenever the existing row is already marked OTR.
+    /// A session's current `status`, read before `upsert_session` overwrites
+    /// it — the only way to notice a transition (e.g. "working" -> "idle")
+    /// the push itself doesn't carry. `None` for a session the anchor has
+    /// never seen (there's no "previous" to compare against).
+    pub fn session_status(
+        &self,
+        instance_id: i64,
+        external_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT status FROM sessions WHERE instance_id = ?1 AND external_id = ?2",
+            rusqlite::params![instance_id, external_id],
+            |row| row.get(0),
+        ) {
+            Ok(status) => Ok(Some(status)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub fn upsert_session(&self, session: &SessionRow) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1126,6 +1168,82 @@ impl Store {
             },
         )
         .map_err(StoreError::from)
+    }
+
+    pub fn instance_name(&self, instance_id: i64) -> Result<String, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT name FROM instances WHERE id = ?1",
+            [instance_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// `instance_id: None` fires for every instance.
+    pub fn add_webhook(
+        &self,
+        instance_id: Option<i64>,
+        kind: &str,
+        url: &str,
+    ) -> Result<i64, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO webhooks (instance_id, kind, url, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![instance_id, kind, url, now_unix()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn delete_webhook(&self, id: i64) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute("DELETE FROM webhooks WHERE id = ?1", [id])?;
+        Ok(changed > 0)
+    }
+
+    /// Every configured webhook, instance name joined in for display.
+    pub fn list_webhooks(&self) -> Result<Vec<WebhookRow>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT w.id, w.instance_id, i.name, w.kind, w.url, w.created_at
+             FROM webhooks w LEFT JOIN instances i ON i.id = w.instance_id
+             ORDER BY w.created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(WebhookRow {
+                    id: row.get(0)?,
+                    instance_id: row.get(1)?,
+                    instance_name: row.get(2)?,
+                    kind: row.get(3)?,
+                    url: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The webhooks that should fire for `instance_id`: scoped to it, plus
+    /// every unscoped (fires-for-everything) one.
+    pub fn webhooks_for_instance(&self, instance_id: i64) -> Result<Vec<WebhookRow>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, instance_id, NULL, kind, url, created_at FROM webhooks
+             WHERE instance_id IS NULL OR instance_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map([instance_id], |row| {
+                Ok(WebhookRow {
+                    id: row.get(0)?,
+                    instance_id: row.get(1)?,
+                    instance_name: None,
+                    kind: row.get(3)?,
+                    url: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 }
 

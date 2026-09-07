@@ -554,6 +554,16 @@ pub fn render_admin(
           <button type="button" id="grant-revoke">Revoke</button>
           <span id="grant-status" class="small"></span>
         </form>
+        <h3>Webhooks</h3>
+        <p class="small">Fires when a session goes from working to idle — the same "the run stopped" signal the web UI's own notifications use, delivered server-side so it works with no browser open anywhere.</p>
+        <table id="webhooks-table" style="width:100%"><tr><th>Instance</th><th>Kind</th><th>URL</th><th></th></tr></table>
+        <form id="webhook-form" style="margin:.8rem 0;display:flex;gap:.5rem;flex-wrap:wrap;align-items:end">
+          <label>Instance<br><input id="webhook-instance" placeholder="blank = every instance"></label>
+          <label>Kind<br><select id="webhook-kind"><option value="generic">generic JSON</option><option value="slack">Slack</option><option value="discord">Discord</option><option value="ntfy">ntfy</option></select></label>
+          <label style="flex:2;min-width:16rem">URL<br><input id="webhook-url" placeholder="https://…" required></label>
+          <button type="submit" class="primary">Add webhook</button>
+          <span id="webhook-status" class="small"></span>
+        </form>
         <div style="margin-top:1rem;padding-top:1rem;border-top:1px solid #e2e8f0">
           <h3>Create local user</h3>
           <form id="user-create-form" style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:end">
@@ -710,7 +720,40 @@ pub fn render_admin(
             s.textContent = ok ? 'deleted' : (j.error||'failed');
             if (ok) {{ loadUsers(); loadGrants(); }}
           }};
-          loadSso(); loadMint(); loadUsers(); loadGrants();
+          const webhooksTable = document.getElementById('webhooks-table');
+          const webhookForm = document.getElementById('webhook-form');
+          const webhookStatus = document.getElementById('webhook-status');
+          const loadWebhooks = async () => {{
+            const {{ok, j}} = await fetchJson('/api/webhooks');
+            if (!ok) return;
+            webhooksTable.querySelectorAll('tr:not(:first-child)').forEach(r=>r.remove());
+            for (const w of j) {{
+              const tr = document.createElement('tr');
+              tr.innerHTML = `<td>${{escape(w.instance_name || 'all instances')}}</td><td>${{escape(w.kind)}}</td><td class="small" style="max-width:20rem;overflow:hidden;text-overflow:ellipsis">${{escape(w.url)}}</td><td><button class="small" data-webhook-delete="${{w.id}}">delete</button></td>`;
+              webhooksTable.appendChild(tr);
+            }}
+            if (j.length===0) {{
+              const tr=document.createElement('tr'); tr.innerHTML='<td colspan=4 style="color:#64748b">no webhooks configured</td>'; webhooksTable.appendChild(tr);
+            }}
+            for (const b of webhooksTable.querySelectorAll('[data-webhook-delete]')) {{
+              b.onclick = async () => {{
+                const {{ok, j}} = await fetchJson('/api/webhooks/delete', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{id: Number(b.dataset.webhookDelete)}})}});
+                webhookStatus.textContent = ok ? 'deleted' : (j.error||'failed');
+                if (ok) loadWebhooks();
+              }};
+            }}
+          }};
+          webhookForm.onsubmit = async (e) => {{
+            e.preventDefault();
+            const instance = document.getElementById('webhook-instance').value.trim();
+            const kind = document.getElementById('webhook-kind').value;
+            const url = document.getElementById('webhook-url').value.trim();
+            webhookStatus.textContent = 'saving…';
+            const {{ok, j}} = await fetchJson('/api/webhooks', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{instance: instance||undefined, kind, url}})}});
+            webhookStatus.textContent = ok ? 'saved' : (j.error||'failed');
+            if (ok) {{ loadWebhooks(); webhookForm.reset(); }}
+          }};
+          loadSso(); loadMint(); loadUsers(); loadGrants(); loadWebhooks();
         }})();
         </script>
         "##,
