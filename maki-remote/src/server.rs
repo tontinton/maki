@@ -134,6 +134,32 @@ pub enum RemoteRequest {
         path: String,
         reply: Sender<Result<serde_json::Value, String>>,
     },
+    /// Every non-ignored file under cwd, flattened, for the file panel's
+    /// fuzzy finder.
+    FilesFlat {
+        session: Option<String>,
+        reply: Sender<Result<serde_json::Value, String>>,
+    },
+    /// A new, empty file or directory in the file panel.
+    FileCreate {
+        session: Option<String>,
+        path: String,
+        is_dir: bool,
+        reply: Sender<Result<serde_json::Value, String>>,
+    },
+    /// Deletes a file, or an empty directory, from the file panel.
+    FileDelete {
+        session: Option<String>,
+        path: String,
+        reply: Sender<Result<(), String>>,
+    },
+    /// Renames/moves a file or directory from the file panel.
+    FileRename {
+        session: Option<String>,
+        from: String,
+        to: String,
+        reply: Sender<Result<serde_json::Value, String>>,
+    },
 }
 
 impl RemoteRequest {
@@ -154,7 +180,11 @@ impl RemoteRequest {
             | Self::FileRead { session, .. }
             | Self::FileWrite { session, .. }
             | Self::GitStatus { session, .. }
-            | Self::GitDiff { session, .. } => session.as_deref(),
+            | Self::GitDiff { session, .. }
+            | Self::FilesFlat { session, .. }
+            | Self::FileCreate { session, .. }
+            | Self::FileDelete { session, .. }
+            | Self::FileRename { session, .. } => session.as_deref(),
             Self::Sessions { .. } => None,
         }
     }

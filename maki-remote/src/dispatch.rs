@@ -33,6 +33,10 @@ pub enum Route {
     FileWrite,
     GitStatus,
     GitDiff,
+    FilesFlat,
+    FileCreate,
+    FileDelete,
+    FileRename,
 }
 
 impl Route {
@@ -58,6 +62,10 @@ impl Route {
             ("file", "POST") => Some(Route::FileWrite),
             ("git/status", "GET") => Some(Route::GitStatus),
             ("git/diff", "GET") => Some(Route::GitDiff),
+            ("files/flat", "GET") => Some(Route::FilesFlat),
+            ("file/create", "POST") => Some(Route::FileCreate),
+            ("file/delete", "POST") => Some(Route::FileDelete),
+            ("file/rename", "POST") => Some(Route::FileRename),
             _ => None,
         }
     }
@@ -380,6 +388,87 @@ impl Dispatcher {
                     reply,
                 })
             }
+            Route::FilesFlat => {
+                self.dispatch_result(|reply| crate::RemoteRequest::FilesFlat { session, reply })
+            }
+            Route::FileCreate => {
+                let parsed: serde_json::Value = match serde_json::from_str(body) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return DispatchOutcome::Json {
+                            status: 400,
+                            body: br#"{"error":"invalid json"}"#.to_vec(),
+                        };
+                    }
+                };
+                let Some(path) = parsed.get("path").and_then(|v| v.as_str()) else {
+                    return DispatchOutcome::Json {
+                        status: 400,
+                        body: br#"{"error":"need path"}"#.to_vec(),
+                    };
+                };
+                let is_dir = parsed
+                    .get("is_dir")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let path = path.to_owned();
+                self.dispatch_result(|reply| crate::RemoteRequest::FileCreate {
+                    session,
+                    path,
+                    is_dir,
+                    reply,
+                })
+            }
+            Route::FileDelete => {
+                let parsed: serde_json::Value = match serde_json::from_str(body) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return DispatchOutcome::Json {
+                            status: 400,
+                            body: br#"{"error":"invalid json"}"#.to_vec(),
+                        };
+                    }
+                };
+                let Some(path) = parsed.get("path").and_then(|v| v.as_str()) else {
+                    return DispatchOutcome::Json {
+                        status: 400,
+                        body: br#"{"error":"need path"}"#.to_vec(),
+                    };
+                };
+                let path = path.to_owned();
+                self.dispatch_result(|reply| crate::RemoteRequest::FileDelete {
+                    session,
+                    path,
+                    reply,
+                })
+            }
+            Route::FileRename => {
+                let parsed: serde_json::Value = match serde_json::from_str(body) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return DispatchOutcome::Json {
+                            status: 400,
+                            body: br#"{"error":"invalid json"}"#.to_vec(),
+                        };
+                    }
+                };
+                let (Some(from), Some(to)) = (
+                    parsed.get("from").and_then(|v| v.as_str()),
+                    parsed.get("to").and_then(|v| v.as_str()),
+                ) else {
+                    return DispatchOutcome::Json {
+                        status: 400,
+                        body: br#"{"error":"need from and to"}"#.to_vec(),
+                    };
+                };
+                let (from, to) = (from.to_owned(), to.to_owned());
+                self.dispatch_result(|reply| crate::RemoteRequest::FileRename {
+                    session,
+                    from,
+                    to,
+                    reply,
+                })
+            }
             Route::ModelGet => match self.dispatch_model_get(session) {
                 Some(value) => DispatchOutcome::Json {
                     status: 200,
@@ -615,7 +704,11 @@ impl Dispatcher {
             | Route::FileRead
             | Route::FileWrite
             | Route::GitStatus
-            | Route::GitDiff => {
+            | Route::GitDiff
+            | Route::FilesFlat
+            | Route::FileCreate
+            | Route::FileDelete
+            | Route::FileRename => {
                 return Err("not a post route".to_owned());
             }
         };

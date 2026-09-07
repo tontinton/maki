@@ -546,6 +546,29 @@ fn handle_request(
             let _ = reply.send(app.remote_git_diff(&path));
             Ok(vec![])
         }
+        RemoteRequest::FilesFlat { reply, .. } => {
+            let _ = reply.send(app.remote_files_flat());
+            Ok(vec![])
+        }
+        RemoteRequest::FileCreate {
+            path,
+            is_dir,
+            reply,
+            ..
+        } => {
+            let _ = reply.send(app.remote_file_create(&path, is_dir));
+            Ok(vec![])
+        }
+        RemoteRequest::FileDelete { path, reply, .. } => {
+            let _ = reply.send(app.remote_file_delete(&path));
+            Ok(vec![])
+        }
+        RemoteRequest::FileRename {
+            from, to, reply, ..
+        } => {
+            let _ = reply.send(app.remote_file_rename(&from, &to));
+            Ok(vec![])
+        }
     };
     outcome.unwrap_or_default()
 }
@@ -564,10 +587,13 @@ fn reject(request: RemoteRequest, reason: &str) {
         RemoteRequest::FilesList { reply, .. }
         | RemoteRequest::FileRead { reply, .. }
         | RemoteRequest::GitStatus { reply, .. }
-        | RemoteRequest::GitDiff { reply, .. } => {
+        | RemoteRequest::GitDiff { reply, .. }
+        | RemoteRequest::FilesFlat { reply, .. }
+        | RemoteRequest::FileCreate { reply, .. }
+        | RemoteRequest::FileRename { reply, .. } => {
             let _ = reply.send(Err(reason.to_owned()));
         }
-        RemoteRequest::FileWrite { reply, .. } => {
+        RemoteRequest::FileWrite { reply, .. } | RemoteRequest::FileDelete { reply, .. } => {
             let _ = reply.send(Err(reason.to_owned()));
         }
         RemoteRequest::Sessions { reply }

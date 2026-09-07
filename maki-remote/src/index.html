@@ -269,6 +269,13 @@
   }
   #files-head #files-branch { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #files-head .mini:last-child { margin-left: auto; }
+  #files-search-row { padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  #files-search-row input {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 8px; font: inherit; font-size: 12.5px;
+  }
+  #files-search-row input:focus { outline: none; border-color: var(--accent); }
   #files-tree {
     flex: 1; overflow-y: auto; padding: 6px 0;
     font-size: 13px;
@@ -285,6 +292,17 @@
     margin-left: auto; flex: none; font-size: 10px; font-weight: 700;
     border-radius: 3px; padding: 0 4px; line-height: 1.5;
   }
+  .files-row .files-actions { flex: none; display: flex; gap: 2px; margin-left: 4px; }
+  .files-row .files-actions button {
+    padding: 0 5px; font-size: 11px; line-height: 1.7; color: var(--muted);
+  }
+  .files-row .files-actions button:hover { color: var(--text); border-color: var(--accent); }
+  .files-row .files-actions button.danger { color: var(--error); border-color: var(--error); }
+  .files-inline-input {
+    flex: 1; min-width: 0; background: var(--bg); color: var(--text);
+    border: 1px solid var(--accent); border-radius: 4px;
+    padding: 1px 6px; font: inherit; font-size: 12.5px;
+  }
   .files-git[data-code="M"] { color: var(--accent); }
   .files-git[data-code="A"], .files-git[data-code="??"] { color: var(--user); }
   .files-git[data-code="D"] { color: var(--error); }
@@ -294,6 +312,10 @@
   .files-children.open { display: block; }
   .files-empty { color: var(--muted); padding: 6px 12px; font-size: 12px; }
   #files-view { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  /* Same specificity fix as #toolbar[hidden] above: this rule's own
+     `display: flex` would otherwise beat the UA `[hidden]` default, leaving
+     the file viewer visibly stacked under the tree after "← tree". */
+  #files-view[hidden] { display: none; }
   #files-view-head {
     display: flex; align-items: center; gap: 8px;
     padding: 8px 10px; border-bottom: 1px solid var(--border);
@@ -311,6 +333,7 @@
   .files-diff .add { color: var(--user); }
   .files-diff .del { color: var(--error); }
   .files-diff .hunk { color: var(--tool); }
+  .files-highlight { font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
   .files-note { color: var(--muted); font-size: 12.5px; }
 </style>
 </head>
@@ -339,8 +362,13 @@
   <div id="files-head">
     <strong id="files-title">Files</strong>
     <span id="files-branch" class="small"></span>
+    <button class="mini" id="files-new-file" title="New file">+file</button>
+    <button class="mini" id="files-new-dir" title="New folder">+dir</button>
     <button class="mini" id="files-refresh" title="Refresh">↻</button>
     <button class="mini" id="files-close" title="Close">×</button>
+  </div>
+  <div id="files-search-row">
+    <input id="files-search" placeholder="Jump to file…" autocomplete="off">
   </div>
   <div id="files-tree" role="tree"></div>
   <div id="files-view" hidden>
@@ -529,6 +557,11 @@
   const fmtTokens = (n) =>
     n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
 
+  // A running record of cost/context at each point `setStats` sees new
+  // numbers, for the "usage this session" sparkline in the control center.
+  // In memory only, cleared on `renderSnapshot` (a fresh page load or
+  // reconnect) — a trend across *this* viewing, not a persisted history.
+  let usageHistory = [];
   const setStats = (stats) => {
     if (!stats) return;
     const parts = [];
@@ -541,6 +574,20 @@
     const inTok = (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0);
     if (inTok || usage.output_tokens) parts.push(`in ${fmtTokens(inTok)} out ${fmtTokens(usage.output_tokens || 0)}`);
     statsEl.textContent = parts.join(" · ");
+    if (typeof stats.cost === "number" || typeof stats.context_size === "number") {
+      const last = usageHistory[usageHistory.length - 1];
+      const point = {
+        cost: typeof stats.cost === "number" ? stats.cost : (last ? last.cost : 0),
+        contextSize: typeof stats.context_size === "number" ? stats.context_size : (last ? last.contextSize : 0),
+        contextWindow: stats.context_window || (last ? last.contextWindow : 0),
+      };
+      // Collapse runs of identical points (most turns don't move cost or
+      // context) so the sparkline's x-axis is "turns that changed something",
+      // not padded out with flat stretches.
+      if (!last || last.cost !== point.cost || last.contextSize !== point.contextSize) {
+        usageHistory.push(point);
+      }
+    }
   };
 
   const setHeader = (snap) => {
@@ -925,6 +972,7 @@
   // One pass over the snapshot's message list: the same shapes live events
   // use, so rendering is the same code path.
   const renderSnapshot = (snap) => {
+    usageHistory = [];
     log.replaceChildren();
     if (snap.error) {
       const bare = "/" + SHARE_TOKEN + "/";
@@ -1033,6 +1081,7 @@
   const filesBackdrop = document.getElementById("files-backdrop");
   const filesPanel = document.getElementById("files-panel");
   const filesTree = document.getElementById("files-tree");
+  const filesSearchRow = document.getElementById("files-search-row");
   const filesView = document.getElementById("files-view");
   const filesViewBody = document.getElementById("files-view-body");
   const filesViewPath = document.getElementById("files-view-path");
@@ -1073,8 +1122,89 @@
   let filesOpen = false;
   let currentFile = null; // { path, content, binary, tooLarge, editing }
   let showingDiff = false;
+  // The fuzzy finder's flat file list, fetched once and reused across
+  // keystrokes; invalidated on refresh and on any create/rename/delete.
+  let filesFlatCache = null;
 
   const isMarkdownPath = (p) => /\.(md|markdown)$/i.test(p);
+
+  // Every inline editor (new file/dir, rename) shares one "only one open at
+  // a time" slot instead of a native prompt()/confirm() — those block the
+  // whole tab until dismissed, which is worse on a phone and, not
+  // incidentally, doesn't play well with anything scripting this page.
+  let activeInlineCancel = null;
+  const cancelActiveInline = () => {
+    if (activeInlineCancel) {
+      const fn = activeInlineCancel;
+      activeInlineCancel = null;
+      fn();
+    }
+  };
+
+  const filesInlineCreate = (isDir) => {
+    cancelActiveInline();
+    const row = document.createElement("div");
+    row.className = "files-row files-inline";
+    row.innerHTML = `<span class="files-icon">${isDir ? "▸" : "·"}</span>`;
+    const input = document.createElement("input");
+    input.className = "files-inline-input";
+    input.placeholder = isDir ? "new-folder/name" : "new-file.ext";
+    row.appendChild(input);
+    filesTree.prepend(row);
+    input.focus();
+    let done = false;
+    const cancel = () => { if (done) return; done = true; row.remove(); };
+    activeInlineCancel = cancel;
+    input.onkeydown = async (ev) => {
+      if (ev.key === "Escape") { cancel(); return; }
+      if (ev.key !== "Enter") return;
+      const path = input.value.trim();
+      if (!path) return;
+      input.disabled = true;
+      const r = await postJson("file/create", { path, is_dir: isDir });
+      if (r && r.error) { toast(r.error); input.disabled = false; return; }
+      toast("created");
+      filesFlatCache = null;
+      done = true;
+      activeInlineCancel = null;
+      row.remove();
+      delete filesTree.dataset.loaded;
+      loadFilesTree();
+      if (!isDir) openFile(r.path);
+    };
+    input.onblur = () => setTimeout(cancel, 150);
+  };
+  document.getElementById("files-new-file").onclick = () => filesInlineCreate(false);
+  document.getElementById("files-new-dir").onclick = () => filesInlineCreate(true);
+
+  const filesSearchEl = document.getElementById("files-search");
+  const renderFlatMatches = (paths) => {
+    filesTree.innerHTML = "";
+    if (!paths.length) {
+      filesTree.innerHTML = `<div class="files-empty">no matches</div>`;
+      return;
+    }
+    for (const p of paths.slice(0, 200)) {
+      const row = document.createElement("div");
+      row.className = "files-row";
+      row.innerHTML = `<span class="files-icon">·</span><span class="files-name">${escHtml(p)}</span>`;
+      row.onclick = () => openFile(p);
+      filesTree.appendChild(row);
+    }
+  };
+  filesSearchEl.oninput = async () => {
+    const q = filesSearchEl.value.trim().toLowerCase();
+    if (!q) {
+      delete filesTree.dataset.loaded;
+      loadFilesTree();
+      return;
+    }
+    if (!filesFlatCache) {
+      const data = await fetchJson("files/flat");
+      filesFlatCache = (data && data.paths) || [];
+    }
+    renderFlatMatches(filesFlatCache.filter((p) => p.toLowerCase().includes(q)));
+  };
 
   const openFilesPanel = () => {
     filesOpen = true;
@@ -1102,13 +1232,97 @@
 
   // Each row is built fresh per directory fetch; a directory's `<div>` of
   // children is lazy — nothing under it loads until it's actually expanded.
-  const filesRow = (entry, parentPath) => {
+  // Rename edits the row's own name in place; delete arms on a first click
+  // and only acts on a second one (auto-disarming after a few seconds),
+  // rather than a confirm() dialog. Both refresh just the row's own
+  // container afterward, not the whole tree.
+  const filesRenameOrDelete = (entry, fullPath, parentPath, container, nameEl) => {
+    const renameBtn = document.createElement("button");
+    renameBtn.className = "mini";
+    renameBtn.textContent = "✎";
+    renameBtn.title = "Rename";
+    renameBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      cancelActiveInline();
+      const original = nameEl.textContent;
+      const input = document.createElement("input");
+      input.className = "files-inline-input";
+      input.value = original;
+      nameEl.replaceWith(input);
+      input.focus();
+      input.select();
+      let done = false;
+      const cancel = () => {
+        if (done) return;
+        done = true;
+        input.replaceWith(nameEl);
+      };
+      activeInlineCancel = cancel;
+      input.onkeydown = async (kev) => {
+        if (kev.key === "Escape") { cancel(); return; }
+        if (kev.key !== "Enter") return;
+        const next = input.value.trim();
+        if (!next || next === original) { cancel(); return; }
+        const to = parentPath ? `${parentPath}/${next}` : next;
+        input.disabled = true;
+        const r = await postJson("file/rename", { from: fullPath, to });
+        if (r && r.error) { toast(r.error); input.disabled = false; return; }
+        toast("renamed");
+        filesFlatCache = null;
+        done = true;
+        activeInlineCancel = null;
+        loadFilesInto(container, parentPath);
+      };
+      input.onblur = () => setTimeout(cancel, 150);
+    };
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "mini";
+    deleteBtn.title = entry.is_dir ? "Delete (must be empty)" : "Delete";
+    deleteBtn.textContent = "🗑";
+    let armed = false;
+    let armTimer = null;
+    deleteBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      if (!armed) {
+        armed = true;
+        deleteBtn.textContent = "sure?";
+        deleteBtn.classList.add("danger");
+        armTimer = setTimeout(() => {
+          armed = false;
+          deleteBtn.textContent = "🗑";
+          deleteBtn.classList.remove("danger");
+        }, 3000);
+        return;
+      }
+      clearTimeout(armTimer);
+      postJson("file/delete", { path: fullPath }).then((r) => {
+        if (r && r.error) {
+          toast(r.error);
+          armed = false;
+          deleteBtn.textContent = "🗑";
+          deleteBtn.classList.remove("danger");
+          return;
+        }
+        toast("deleted");
+        filesFlatCache = null;
+        loadFilesInto(container, parentPath);
+      });
+    };
+    const actions = document.createElement("span");
+    actions.className = "files-actions";
+    actions.append(renameBtn, deleteBtn);
+    return actions;
+  };
+
+  const filesRow = (entry, parentPath, container) => {
     const row = document.createElement("div");
     row.className = "files-row";
     row.setAttribute("role", "treeitem");
     const fullPath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
     row.innerHTML = `<span class="files-icon">${entry.is_dir ? "▸" : "·"}</span>` +
       `<span class="files-name">${escHtml(entry.name)}</span>${gitBadge(entry.git)}`;
+    const nameEl = row.querySelector(".files-name");
+    row.appendChild(filesRenameOrDelete(entry, fullPath, parentPath, container, nameEl));
     if (!entry.is_dir) {
       row.onclick = () => openFile(fullPath);
       return [row];
@@ -1136,7 +1350,7 @@
       return;
     }
     for (const entry of data.entries) {
-      for (const el of filesRow(entry, path)) container.appendChild(el);
+      for (const el of filesRow(entry, path, container)) container.appendChild(el);
     }
   };
 
@@ -1146,6 +1360,7 @@
   };
   document.getElementById("files-refresh").onclick = () => {
     delete filesTree.dataset.loaded;
+    filesFlatCache = null;
     loadFilesTree();
   };
 
@@ -1194,6 +1409,18 @@
       filesViewBody.replaceChildren(node, editBtn);
       return;
     }
+    if (currentFile.html && !currentFile.editing) {
+      const pre = document.createElement("div");
+      pre.className = "files-highlight";
+      pre.innerHTML = currentFile.html;
+      const editBtn = document.createElement("button");
+      editBtn.className = "mini";
+      editBtn.textContent = "edit source";
+      editBtn.style.marginTop = "8px";
+      editBtn.onclick = () => { currentFile.editing = true; renderFileBody(); };
+      filesViewBody.replaceChildren(pre, editBtn);
+      return;
+    }
     const ta = document.createElement("textarea");
     ta.value = currentFile.content;
     ta.spellcheck = false;
@@ -1205,6 +1432,7 @@
     filesViewPath.textContent = path;
     filesViewBody.innerHTML = `<div class="files-note">loading…</div>`;
     filesTree.hidden = true;
+    filesSearchRow.hidden = true;
     filesView.hidden = false;
     showingDiff = false;
     const data = await fetchJson(`file?path=${encodeURIComponent(path)}`);
@@ -1216,6 +1444,7 @@
     currentFile = {
       path,
       content: data.content || "",
+      html: data.html || "",
       binary: !!data.binary,
       tooLarge: !!data.too_large,
       editing: false,
@@ -1226,7 +1455,11 @@
   filesBackBtn.onclick = () => {
     filesView.hidden = true;
     filesTree.hidden = false;
+    filesSearchRow.hidden = false;
     currentFile = null;
+    // A search still active from before opening this file should keep
+    // filtering, not silently fall back to the unfiltered tree.
+    if (filesSearchEl.value.trim()) filesSearchEl.oninput();
   };
   filesDiffBtn.onclick = () => { showingDiff = !showingDiff; renderFileBody(); };
   filesSaveBtn.onclick = async () => {
@@ -1408,8 +1641,8 @@
       chipsEl.appendChild(chip);
     }
   };
-  fileInput.onchange = async () => {
-    for (const file of fileInput.files) {
+  const addFiles = async (files) => {
+    for (const file of files) {
       if (file.size > MAX_UPLOAD) { toast(`${file.name} is over 16MB`); continue; }
       try {
         pendingFiles.push({
@@ -1420,9 +1653,22 @@
         });
       } catch { toast(`could not read ${file.name}`); }
     }
-    fileInput.value = "";
     renderChips();
   };
+  fileInput.onchange = async () => {
+    await addFiles(fileInput.files);
+    fileInput.value = "";
+  };
+  // A screenshot pasted straight into the composer attaches the same way a
+  // picked file would — the common case on a desktop far outweighs anyone
+  // pasting an image while actually meaning to paste text over it.
+  promptEl.addEventListener("paste", (ev) => {
+    const items = [...(ev.clipboardData?.items || [])].filter((i) => i.kind === "file");
+    if (!items.length) return;
+    ev.preventDefault();
+    const files = items.map((i) => i.getAsFile()).filter(Boolean);
+    if (files.length) addFiles(files);
+  });
 
   // ---- control center ---------------------------------------------------
   const centerBtn = document.getElementById("center-btn");
@@ -1442,11 +1688,37 @@
     renderCenter();
   };
 
+  // A minimal inline-SVG line chart — no library worth pulling in for one
+  // sparkline. `min` forces the baseline to 0 (cost/percent never sensibly
+  // start elsewhere); omitted, the chart auto-fits its own value range.
+  const renderSparkline = (values, min) => {
+    if (values.length < 2) return "";
+    const w = 240, h = 32, pad = 2;
+    const lo = min ?? Math.min(...values);
+    const hi = Math.max(...values, lo + 0.0001);
+    const pts = values.map((v, i) => {
+      const x = pad + (i / (values.length - 1)) * (w - pad * 2);
+      const y = h - pad - ((v - lo) / (hi - lo)) * (h - pad * 2);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(" ");
+    return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">` +
+      `<polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5"/></svg>`;
+  };
+
   const renderCenter = () => {
     if (!centerData) { centerEl.innerHTML = "loading…"; return; }
     const { inst, anchor } = centerData;
     const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
     let html = "";
+    if (usageHistory.length > 1) {
+      const costs = usageHistory.map((p) => p.cost);
+      const pcts = usageHistory.map((p) => p.contextWindow ? (p.contextSize / p.contextWindow * 100) : 0);
+      html += `<h3>Usage this session</h3>`;
+      html += `<div class="row" style="color:var(--muted);font-size:11px;">cost — $${costs[costs.length - 1].toFixed(3)}</div>`;
+      html += renderSparkline(costs, 0);
+      html += `<div class="row" style="color:var(--muted);font-size:11px;margin-top:4px;">context fill — ${Math.round(pcts[pcts.length - 1])}%</div>`;
+      html += renderSparkline(pcts, 0);
+    }
     const viewers = (inst && inst.viewers) || [];
     html += `<h3>Watchers</h3>`;
     if (!viewers.length) {

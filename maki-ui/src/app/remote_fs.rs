@@ -44,6 +44,28 @@ fn resolve_in_cwd(cwd: &str, rel: &str) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
+/// Same jail as `resolve_in_cwd`, for a path that must *not* exist yet
+/// (create, or a rename's destination): the target itself can't be
+/// canonicalized before it's there, so its parent is checked instead.
+fn jail_new_path(cwd: &str, rel: &str) -> Result<PathBuf, String> {
+    let root = Path::new(cwd)
+        .canonicalize()
+        .map_err(|e| format!("session cwd unavailable: {e}"))?;
+    let rel = rel.trim_start_matches(['/', '\\']);
+    if rel.is_empty() {
+        return Err("missing path".to_owned());
+    }
+    let target = root.join(rel);
+    let parent = target.parent().ok_or_else(|| "invalid path".to_owned())?;
+    let parent_canon = parent
+        .canonicalize()
+        .map_err(|_| "parent directory not found".to_owned())?;
+    if parent_canon != root && !parent_canon.starts_with(&root) {
+        return Err("path escapes the project directory".to_owned());
+    }
+    Ok(target)
+}
+
 /// `git`'s own two-letter porcelain status codes take a plain path with no
 /// options special-cased, but the working directory has to be inside the
 /// repo (or `-C` pointed at it) for pathspecs to resolve the way a user
@@ -95,6 +117,71 @@ fn parse_porcelain(raw: &str) -> Vec<(String, String)> {
             Some((path.to_owned(), code))
         })
         .collect()
+}
+
+/// The same syntect-backed highlighting the TUI uses for code blocks,
+/// rendered to inline-styled HTML for the file panel's read view — colors
+/// follow the instance's own current theme, same as everywhere else maki
+/// highlights code. `<pre>`/`white-space: pre-wrap` on the client preserves
+/// the newlines this leaves as plain text between spans.
+fn highlight_html(rel: &str, content: &str) -> String {
+    let mut hl = maki_highlight::Highlighter::for_path(rel);
+    let mut html = String::with_capacity(content.len());
+    for line in content.split_inclusive('\n') {
+        // `highlight_line` strips the trailing newline from segment text (its
+        // usual caller lays out one ratatui `Line` per call and doesn't want
+        // it), so it has to be put back by hand here or every line of a
+        // "read" view runs into the next.
+        let had_newline = line.ends_with('\n');
+        for seg in hl.highlight_line(line) {
+            push_html_escaped_segment(&mut html, &seg);
+        }
+        if had_newline {
+            html.push('\n');
+        }
+    }
+    html
+}
+
+fn push_html_escaped_segment(html: &mut String, seg: &maki_highlight::StyledSegment) {
+    let mut style = String::new();
+    if let maki_highlight::SegmentColor::Rgb((r, g, b)) = seg.fg {
+        style.push_str(&format!("color:#{r:02x}{g:02x}{b:02x}"));
+    }
+    if seg.bold {
+        if !style.is_empty() {
+            style.push(';');
+        }
+        style.push_str("font-weight:bold");
+    }
+    if seg.italic {
+        if !style.is_empty() {
+            style.push(';');
+        }
+        style.push_str("font-style:italic");
+    }
+    if style.is_empty() {
+        html_escape_into(html, &seg.text);
+    } else {
+        html.push_str("<span style=\"");
+        html.push_str(&style);
+        html.push_str("\">");
+        html_escape_into(html, &seg.text);
+        html.push_str("</span>");
+    }
+}
+
+fn html_escape_into(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
 }
 
 impl App {
@@ -213,13 +300,17 @@ impl App {
         }
         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
         match String::from_utf8(bytes) {
-            Ok(content) => Ok(json!({
-                "path": rel,
-                "content": content,
-                "size": size,
-                "binary": false,
-                "too_large": false,
-            })),
+            Ok(content) => {
+                let html = highlight_html(rel, &content);
+                Ok(json!({
+                    "path": rel,
+                    "content": content,
+                    "html": html,
+                    "size": size,
+                    "binary": false,
+                    "too_large": false,
+                }))
+            }
             Err(_) => Ok(json!({ "path": rel, "binary": true, "size": size, "too_large": false })),
         }
     }
@@ -236,6 +327,101 @@ impl App {
             return Err("not a file".to_owned());
         }
         std::fs::write(&path, content).map_err(|e| e.to_string())
+    }
+
+    /// Creates an empty file or directory at `rel`, which must not already
+    /// exist. Unlike `resolve_in_cwd` (built for paths that already exist),
+    /// the jail here canonicalizes the *parent* — the target itself can't be
+    /// canonicalized before it exists.
+    pub(crate) fn remote_file_create(&self, rel: &str, is_dir: bool) -> Result<Value, String> {
+        let cwd = self.state.session.cwd.clone();
+        let target = jail_new_path(&cwd, rel)?;
+        if target.exists() {
+            return Err("already exists".to_owned());
+        }
+        if is_dir {
+            std::fs::create_dir(&target).map_err(|e| e.to_string())?;
+        } else {
+            std::fs::File::create(&target).map_err(|e| e.to_string())?;
+        }
+        Ok(json!({ "path": rel.trim_start_matches(['/', '\\']) }))
+    }
+
+    /// Deletes a file, or an empty directory, at `rel`. A non-empty
+    /// directory is refused rather than recursed into — a browser click is a
+    /// fat target for "I meant to delete one file."
+    pub(crate) fn remote_file_delete(&self, rel: &str) -> Result<(), String> {
+        let cwd = self.state.session.cwd.clone();
+        let path = resolve_in_cwd(&cwd, rel)?;
+        let root = Path::new(&cwd)
+            .canonicalize()
+            .map_err(|e| format!("session cwd unavailable: {e}"))?;
+        if path == root {
+            return Err("cannot delete the project root".to_owned());
+        }
+        if path.is_dir() {
+            std::fs::remove_dir(&path).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::DirectoryNotEmpty {
+                    "directory is not empty".to_owned()
+                } else {
+                    e.to_string()
+                }
+            })
+        } else {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())
+        }
+    }
+
+    /// Renames/moves `from` (must exist) to `to` (must not).
+    pub(crate) fn remote_file_rename(&self, from: &str, to: &str) -> Result<Value, String> {
+        let cwd = self.state.session.cwd.clone();
+        let root = Path::new(&cwd)
+            .canonicalize()
+            .map_err(|e| format!("session cwd unavailable: {e}"))?;
+        let from_path = resolve_in_cwd(&cwd, from)?;
+        if from_path == root {
+            return Err("cannot rename the project root".to_owned());
+        }
+        let to_path = jail_new_path(&cwd, to)?;
+        if to_path.exists() {
+            return Err("destination already exists".to_owned());
+        }
+        std::fs::rename(&from_path, &to_path).map_err(|e| e.to_string())?;
+        Ok(json!({ "path": to.trim_start_matches(['/', '\\']) }))
+    }
+
+    /// Every non-ignored file under cwd, flattened, for the panel's fuzzy
+    /// finder — same walker and gitignore handling as `remote_files_list`,
+    /// but with no depth limit. Directories are omitted; a finder jumps
+    /// straight to files.
+    pub(crate) fn remote_files_flat(&self) -> Result<Value, String> {
+        let cwd = self.state.session.cwd.clone();
+        let root = Path::new(&cwd)
+            .canonicalize()
+            .map_err(|e| format!("session cwd unavailable: {e}"))?;
+        let overrides = OverrideBuilder::new(&root)
+            .add("!.git")
+            .map_err(|e| e.to_string())?
+            .build()
+            .map_err(|e| e.to_string())?;
+        let paths: Vec<String> = WalkBuilder::new(&root)
+            .hidden(false)
+            .overrides(overrides)
+            .build()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.depth() != 0)
+            .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
+            .take(MAX_ENTRIES)
+            .map(|entry| {
+                entry
+                    .path()
+                    .strip_prefix(&root)
+                    .unwrap_or(entry.path())
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        Ok(json!({ "paths": paths }))
     }
 
     /// The full `git status`, plus the current branch, for the panel's own
@@ -425,6 +611,36 @@ mod tests {
     }
 
     #[test]
+    fn remote_file_read_returns_highlighted_html_for_text_but_not_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {\n    1\n}\n").unwrap();
+        std::fs::write(dir.path().join("bin.dat"), [0u8, 159, 146, 150]).unwrap();
+        let app = app_at(dir.path());
+
+        let text = app.remote_file_read("a.rs").unwrap();
+        let html = text["html"].as_str().unwrap();
+        assert!(html.contains("main"), "{html}");
+        // highlight_line's segments have their newline stripped (its usual
+        // caller lays out one ratatui Line per call); a real regression once
+        // let every highlighted line run into the next.
+        assert_eq!(
+            html.matches('\n').count(),
+            3,
+            "one of the file's own 3 newlines went missing: {html}"
+        );
+
+        let bin = app.remote_file_read("bin.dat").unwrap();
+        assert!(bin.get("html").is_none());
+    }
+
+    #[test]
+    fn html_escape_into_escapes_the_five_reserved_characters() {
+        let mut out = String::new();
+        html_escape_into(&mut out, "<a>&\"'");
+        assert_eq!(out, "&lt;a&gt;&amp;&quot;&#39;");
+    }
+
+    #[test]
     fn remote_file_write_overwrites_existing_but_never_creates() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "old").unwrap();
@@ -441,6 +657,110 @@ mod tests {
             "writing a path that doesn't exist yet must be refused"
         );
         assert!(!dir.path().join("brand-new.txt").exists());
+    }
+
+    #[test]
+    fn remote_file_create_makes_files_and_dirs_but_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_at(dir.path());
+
+        app.remote_file_create("new.txt", false).unwrap();
+        assert!(dir.path().join("new.txt").is_file());
+
+        app.remote_file_create("sub", true).unwrap();
+        assert!(dir.path().join("sub").is_dir());
+
+        app.remote_file_create("sub/nested.txt", false).unwrap();
+        assert!(dir.path().join("sub/nested.txt").is_file());
+
+        assert!(
+            app.remote_file_create("new.txt", false).is_err(),
+            "must not clobber an existing file"
+        );
+        assert!(
+            app.remote_file_create("../outside.txt", false).is_err(),
+            "must not escape the project directory"
+        );
+        assert!(
+            app.remote_file_create("does-not-exist/deep.txt", false)
+                .is_err(),
+            "parent directory must already exist"
+        );
+    }
+
+    #[test]
+    fn remote_file_delete_removes_files_and_empty_dirs_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        std::fs::create_dir(dir.path().join("empty")).unwrap();
+        std::fs::create_dir(dir.path().join("full")).unwrap();
+        std::fs::write(dir.path().join("full/x.txt"), "x").unwrap();
+        let app = app_at(dir.path());
+
+        app.remote_file_delete("a.txt").unwrap();
+        assert!(!dir.path().join("a.txt").exists());
+
+        app.remote_file_delete("empty").unwrap();
+        assert!(!dir.path().join("empty").exists());
+
+        assert!(
+            app.remote_file_delete("full").is_err(),
+            "a non-empty directory must be refused, not recursed into"
+        );
+        assert!(dir.path().join("full").exists());
+
+        assert!(
+            app.remote_file_delete("").is_err(),
+            "the project root itself must never be deletable"
+        );
+        assert!(dir.path().exists());
+    }
+
+    #[test]
+    fn remote_file_rename_moves_but_never_overwrites_or_escapes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.txt"), "content").unwrap();
+        std::fs::write(dir.path().join("taken.txt"), "already here").unwrap();
+        let app = app_at(dir.path());
+
+        app.remote_file_rename("old.txt", "new.txt").unwrap();
+        assert!(!dir.path().join("old.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+            "content"
+        );
+
+        assert!(
+            app.remote_file_rename("new.txt", "taken.txt").is_err(),
+            "must not overwrite an existing destination"
+        );
+        assert!(
+            app.remote_file_rename("new.txt", "../outside.txt").is_err(),
+            "must not escape the project directory"
+        );
+    }
+
+    #[test]
+    fn remote_files_flat_lists_every_non_ignored_file_recursively() {
+        let dir = git_repo();
+        std::fs::write(dir.path().join(".gitignore"), "ignored.log\n").unwrap();
+        std::fs::write(dir.path().join("ignored.log"), "x").unwrap();
+        std::fs::write(dir.path().join("top.txt"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("a/b/deep.txt"), "x").unwrap();
+        let app = app_at(dir.path());
+
+        let flat = app.remote_files_flat().unwrap();
+        let paths: Vec<String> = flat["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap().to_owned())
+            .collect();
+        assert!(paths.contains(&"top.txt".to_owned()));
+        assert!(paths.contains(&"a/b/deep.txt".to_owned()));
+        assert!(!paths.contains(&"ignored.log".to_owned()));
+        assert!(!paths.iter().any(|p| p == "a" || p == "a/b"));
     }
 
     #[test]
