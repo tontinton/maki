@@ -85,8 +85,10 @@ links.
 | | |
 |---|---|
 | ![Anchor dashboard](./screenshots/anchor-dashboard.jpg) Fleet dashboard: live shares and sessions, each with a search box over titles and full transcripts. | ![Remote terminal](./screenshots/remote-terminal.jpg) The remote terminal: full transcript, model/provider pickers, and the command toolbar. |
-| ![File explorer panel](./screenshots/remote-terminal-files.jpg) The file panel: a gitignore-aware tree with per-file status badges. | ![Markdown file rendered in the file panel](./screenshots/remote-terminal-files-markdown.jpg) Markdown renders in place, with a toggle to edit the raw source. |
-| ![Compact mobile view](./screenshots/remote-terminal-compact.jpg) Compact mode with the toolbar tucked away, for a phone screen. | ![QR code popup](./screenshots/remote-terminal-qr.jpg) One tap to flash the page's own link as a QR code. |
+| ![File explorer panel](./screenshots/remote-terminal-files.jpg) The file panel: create, rename, delete, and fuzzy-find files from a gitignore-aware tree. | ![Syntax-highlighted file in the file panel](./screenshots/remote-terminal-files-highlight.jpg) Non-markdown files render with full syntax highlighting. |
+| ![Markdown file rendered in the file panel](./screenshots/remote-terminal-files-markdown.jpg) Markdown renders in place, with a toggle to edit the raw source. | ![Compact mobile view](./screenshots/remote-terminal-compact.jpg) Compact mode with the toolbar tucked away, for a phone screen. |
+| ![Anchor live shares with bulk revoke](./screenshots/anchor-links.jpg) Live shares, each proxied through the tunnel, with a one-click revoke-all. | ![Anchor instances with bulk session delete](./screenshots/anchor-instances.jpg) Every connected instance, with a bulk "delete all sessions" per host. |
+| ![Anchor webhooks admin](./screenshots/anchor-webhooks.jpg) Webhooks fire to Slack, Discord, ntfy, or a generic JSON endpoint whenever a session finishes. | ![QR code popup](./screenshots/remote-terminal-qr.jpg) One tap to flash the page's own link as a QR code. |
 
 Everything below is upstream's README.
 

@@ -152,11 +152,13 @@ to becopied from scrollback.
 | Page | Contents |
 |---|---|
 | `/` (home) | Live shares: every unexpired link, its instance, tunnel state, and an open button. Below it, each instance's sessions with pushed cost and an **open** action that mints a two-hour control link scoped to that session |
-| `/instances` | The install wizard (create an instance, copy the one-liner) and the fleet roster |
-| `/links` | Mint a share link and revoke live ones |
-| `/admin` | Users, grants, mint policy, and the OIDC/SSO setup form (admins only) |
+| `/instances` | The install wizard (create an instance, copy the one-liner) and the fleet roster, with a **delete all sessions** button per host |
+| `/links` | Mint a share link, revoke live ones, or **revoke all** at once |
+| `/admin` | Users, grants, mint policy, webhooks, and the OIDC/SSO setup form (admins only) |
 
-Non-admins see the pages filtered to instances they hold a grant for.
+Non-admins see the pages filtered to instances they hold a grant for. The bulk
+buttons arm on the first click and only act on a second click within a few
+seconds, so a stray tap can't wipe a fleet.
 
 ## The remote session page
 
@@ -171,9 +173,20 @@ instead of rendering an empty page.
 
 The composer takes uploads: a `+` button attaches images to the next prompt
 for vision models, or saves any file into the session's working directory and
-tells the agent where it landed. Each chip toggles between the two modes.
-`/rc` and the link pages render the share URL as a QR, scannable straight off
-the terminal.
+tells the agent where it landed. Each chip toggles between the two modes, and
+pasting an image straight into the composer (`Ctrl+V`) attaches it the same
+way, with no need to save it to disk first. `/rc` and the link pages render
+the share URL as a QR, scannable straight off the terminal.
+
+Once a session has run for a bit, a small sparkline appears above the
+composer charting cost and context-window usage over the session so far,
+useful for spotting a run that is about to blow its budget without opening a
+transcript.
+
+The page is an installable PWA: "Add to Home Screen" (or the browser's own
+install prompt) gives it an app icon and a standalone window, no browser
+chrome. Installing does not add offline support; the page still needs the
+tunnel. It just drops the address bar.
 
 ## File explorer
 
@@ -182,21 +195,39 @@ gitignore-aware tree of the session's working directory, lazy-loaded one
 level at a time so a large repo never pays to list itself up front. If the
 directory is a git repo, each entry carries its `git status --porcelain`
 code (`M`, `??`, `D`, ...) and the panel's own header shows the current
-branch.
+branch. A search box fuzzy-finds any file in the tree by path, for jumping
+straight to a file in a large repo without expanding folders by hand.
+
+`+file` and `+dir` create new entries in place; every row carries a rename
+(✎) and delete (🗑) action. Delete arms on the first click and only removes
+the file on a second click within a few seconds, the same guard the
+dashboard's bulk actions use. None of this uses native browser dialogs, so it
+works the same on mobile as on desktop.
 
 Open a file to read it. Markdown renders by default, with an "edit source"
-toggle to drop to the raw text; anything else opens straight into a plain
-text editor. A `diff` button swaps in the file's unified git diff — tracked
-changes diff against the index, untracked files diff against `/dev/null` (via
-`git diff --no-index`) so a brand new file still shows what it adds. `save`
-writes the edit straight to disk over the same tunnel as everything else, no
-separate upload step.
+toggle to drop to the raw text. Anything else opens with full syntax
+highlighting (the same highlighter the terminal UI uses), also with a toggle
+to the raw text for editing. A `diff` button swaps in the file's unified git
+diff — tracked changes diff against the index, untracked files diff against
+`/dev/null` (via `git diff --no-index`) so a brand new file still shows what
+it adds. `save` writes the edit straight to disk over the same tunnel as
+everything else, no separate upload step.
 
 Reads are capped at 1.5MB and a directory listing at 4000 entries; anything
-larger reports its size instead of trying to render. Every path is resolved
-and canonicalized against the session's working directory before it touches
-disk, so a link or a crafted path can't read or write outside the project
-root.
+larger reports its size instead of trying to render. Every path, whether it
+is a read, write, create, rename, or delete, is resolved and canonicalized
+against the session's working directory before it touches disk, so a link or
+a crafted path cannot reach outside the project root.
+
+## Webhooks
+
+The admin page can fire a webhook the moment a session's status flips from
+`working` to `idle`, the same "the run stopped" signal the web UI's own
+in-page notifications use, delivered server-side so it fires even with no
+browser tab open anywhere. Configure a hook globally or scoped to one
+instance, as `generic` (a JSON POST describing the event), `slack`,
+`discord`, or `ntfy`. Delivery is fire-and-forget on its own thread, so a
+slow or dead endpoint never blocks the tunnel that carries everything else.
 
 ## Login and roles
 
