@@ -8,6 +8,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use flume::Sender;
 use maki_config::RemoteControlConfig;
@@ -24,6 +25,12 @@ const REMOTE_TUNNEL_STARTING: &str = "connecting to anchor...";
 /// starve the loop.
 pub(crate) const REPORT_BUDGET: usize = 16;
 const REMOTE_TUNNEL_STOPPED: &str = "remote control stopped";
+/// A flapping network can hand back several real reconnects within seconds
+/// of each other (the tunnel's own backoff still guarantees at least 1s
+/// between attempts, but that is plenty fast to spam the transcript with
+/// "remote reconnected" once per blip). Only the first reconnect in a burst
+/// this wide gets its own line; the link itself still updates on every one.
+const RECONNECT_QUIET: Duration = Duration::from_secs(10);
 
 pub(crate) enum RemoteControl {
     Standalone {
@@ -205,6 +212,9 @@ pub(crate) struct RemoteSlot {
     link_up: bool,
     /// Whether a link has flashed this session, to word reconnect notices.
     link_shown: bool,
+    /// When a reconnect was last actually shown, to debounce a flapping
+    /// network's burst of real reconnects into one transcript line.
+    link_shown_at: Option<Instant>,
     /// The anchor's latest link, kept so `/rc down` can ask for its revocation.
     link_token: Option<String>,
     link_url: Option<String>,
@@ -220,6 +230,7 @@ impl RemoteSlot {
             last_pushed_index: None,
             link_up: false,
             link_shown: false,
+            link_shown_at: None,
             link_token: None,
             link_url: None,
         }
@@ -252,6 +263,7 @@ impl RemoteSlot {
         self.last_pushed_index = None;
         self.link_up = false;
         self.link_shown = false;
+        self.link_shown_at = None;
         self.link_token = None;
         self.link_url = None;
         let (control, url) = RemoteControl::start(config, anchor, self.requests_tx.clone())?;
@@ -309,31 +321,46 @@ impl RemoteSlot {
     /// the slot is cleared so `/rc` state and the indicator agree.
     pub(crate) fn poll_tunnel(&mut self) -> Option<TunnelHappen> {
         let mut control = self.control.take()?;
-        let happen = match control.poll() {
-            Some(TunnelReport::Link(token)) => {
-                self.link_up = true;
-                self.link_token = Some(token.clone());
-                let reconnected = std::mem::replace(&mut self.link_shown, true);
-                let url = control.full_link_url(&token);
-                self.link_url = Some(url.clone());
-                Some(TunnelHappen::Link { url, reconnected })
+        let happen = loop {
+            match control.poll() {
+                Some(TunnelReport::Link(token)) => {
+                    self.link_up = true;
+                    self.link_token = Some(token.clone());
+                    let url = control.full_link_url(&token);
+                    self.link_url = Some(url.clone());
+                    let first = !self.link_shown;
+                    self.link_shown = true;
+                    let quiet_enough = self
+                        .link_shown_at
+                        .is_none_or(|at| at.elapsed() >= RECONNECT_QUIET);
+                    if !first && !quiet_enough {
+                        // The link above is still current; only the
+                        // transcript line for this reconnect is suppressed.
+                        continue;
+                    }
+                    self.link_shown_at = Some(Instant::now());
+                    break Some(TunnelHappen::Link {
+                        url,
+                        reconnected: !first,
+                    });
+                }
+                Some(TunnelReport::Lost(message)) => {
+                    self.link_up = false;
+                    break Some(TunnelHappen::Notice(message));
+                }
+                Some(TunnelReport::Refused(reason)) => {
+                    self.link_up = false;
+                    break Some(TunnelHappen::Notice(format!(
+                        "anchor refused the tunnel: {reason}"
+                    )));
+                }
+                Some(TunnelReport::Links(value)) => break Some(TunnelHappen::Links(value)),
+                None if control.thread_done() => {
+                    self.link_up = false;
+                    break Some(TunnelHappen::Notice(REMOTE_TUNNEL_STOPPED.to_owned()));
+                }
+                None => break None,
             }
-            Some(TunnelReport::Lost(message)) => {
-                self.link_up = false;
-                Some(TunnelHappen::Notice(message))
-            }
-            Some(TunnelReport::Refused(reason)) => {
-                self.link_up = false;
-                Some(TunnelHappen::Notice(format!(
-                    "anchor refused the tunnel: {reason}"
-                )))
-            }
-            Some(TunnelReport::Links(value)) => Some(TunnelHappen::Links(value)),
-            None if control.thread_done() => {
-                self.link_up = false;
-                Some(TunnelHappen::Notice(REMOTE_TUNNEL_STOPPED.to_owned()))
-            }
-            None => None,
         };
         // The slot keeps its control while the thread lives; a dead thread is
         // no remote control, whatever its last report said.
@@ -752,11 +779,34 @@ mod tests {
         assert_eq!(message, "anchor closed the link");
         assert!(!slot.link_up(), "a lost link must dim the indicator");
         tx.send(TunnelReport::Link("b".repeat(32))).unwrap();
-        let TunnelHappen::Link { url, reconnected } = slot.poll_tunnel().expect("link 2") else {
+        assert!(
+            slot.poll_tunnel().is_none(),
+            "a reconnect this soon after the last one is debounced"
+        );
+        assert!(slot.link_up(), "the link itself is still live underneath");
+        assert!(
+            slot.url().unwrap().starts_with("https://maki.example.com/"),
+            "and it updates to the new one even while the line is suppressed"
+        );
+    }
+
+    #[test]
+    fn a_reconnect_after_the_quiet_window_still_gets_its_own_line() {
+        let (mut slot, tx, _shutdown, _out) = tunnel_slot();
+        tx.send(TunnelReport::Link("a".repeat(32))).unwrap();
+        slot.poll_tunnel().expect("first link");
+        // Back-date the last-shown clock past RECONNECT_QUIET instead of
+        // sleeping in a test: a genuinely separate outage, not a burst,
+        // must still narrate.
+        slot.link_shown_at = Some(Instant::now() - RECONNECT_QUIET);
+        tx.send(TunnelReport::Link("b".repeat(32))).unwrap();
+        let TunnelHappen::Link { reconnected, .. } = slot.poll_tunnel().expect("link 2") else {
             panic!("expected a link report");
         };
-        assert!(reconnected, "a link after a drop reads as a reconnect");
-        assert!(url.starts_with("https://maki.example.com/"), "{url}");
+        assert!(
+            reconnected,
+            "a link after the quiet window reads as a reconnect"
+        );
     }
 
     #[test]
