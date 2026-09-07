@@ -11,6 +11,37 @@ use crate::state::{PermissionFrame, RemoteState, RemoteUpdate};
 pub const REQUEST_REPLY_TIMEOUT_SECS: u64 = 5;
 pub const SSE_PING_SECS: u64 = 15;
 
+/// `start_url`/`scope` are `.`, resolved relative to *this manifest's own
+/// URL* per spec — served under the same token-prefixed tail every other
+/// route here is, that lands back on the share link itself, not `/`.
+const PWA_MANIFEST: &str = r##"{
+  "name": "maki remote",
+  "short_name": "maki",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "background_color": "#16181d",
+  "theme_color": "#16181d",
+  "icons": [
+    {"src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"},
+    {"src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable"}
+  ]
+}"##;
+
+/// No caching, no offline shell — just enough (a registered worker with a
+/// fetch handler) to satisfy install criteria. A real offline cache would
+/// need its own staleness story; not worth the risk for what this buys.
+const SERVICE_WORKER_JS: &str = "\
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
+self.addEventListener('fetch', () => {});
+";
+
+const APP_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect width="100" height="100" rx="18" fill="#16181d"/>
+  <text x="50" y="68" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="56" font-weight="700" fill="#7aa2f7" text-anchor="middle">m</text>
+</svg>"##;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Route {
     Index,
@@ -37,6 +68,9 @@ pub enum Route {
     FileCreate,
     FileDelete,
     FileRename,
+    Manifest,
+    ServiceWorker,
+    Icon,
 }
 
 impl Route {
@@ -66,6 +100,9 @@ impl Route {
             ("file/create", "POST") => Some(Route::FileCreate),
             ("file/delete", "POST") => Some(Route::FileDelete),
             ("file/rename", "POST") => Some(Route::FileRename),
+            ("manifest.json", "GET") => Some(Route::Manifest),
+            ("sw.js", "GET") => Some(Route::ServiceWorker),
+            ("icon.svg", "GET") => Some(Route::Icon),
             _ => None,
         }
     }
@@ -163,6 +200,12 @@ pub enum DispatchOutcome {
     },
     /// A rendered QR, served as `image/svg+xml`.
     Svg(Vec<u8>),
+    /// A fixed asset baked into the binary: the PWA manifest, service
+    /// worker, and app icon. `content_type` is a full header value.
+    Static {
+        content_type: &'static str,
+        body: &'static str,
+    },
     NotFound,
 }
 
@@ -176,6 +219,10 @@ impl std::fmt::Debug for DispatchOutcome {
             }
             Self::Json { status, .. } => f.debug_struct("Json").field("status", status).finish(),
             Self::Svg(body) => f.debug_struct("Svg").field("len", &body.len()).finish(),
+            Self::Static { content_type, .. } => f
+                .debug_struct("Static")
+                .field("content_type", content_type)
+                .finish(),
             Self::NotFound => f.write_str("NotFound"),
         }
     }
@@ -469,6 +516,18 @@ impl Dispatcher {
                     reply,
                 })
             }
+            Route::Manifest => DispatchOutcome::Static {
+                content_type: "application/manifest+json",
+                body: PWA_MANIFEST,
+            },
+            Route::ServiceWorker => DispatchOutcome::Static {
+                content_type: "application/javascript",
+                body: SERVICE_WORKER_JS,
+            },
+            Route::Icon => DispatchOutcome::Static {
+                content_type: "image/svg+xml",
+                body: APP_ICON_SVG,
+            },
             Route::ModelGet => match self.dispatch_model_get(session) {
                 Some(value) => DispatchOutcome::Json {
                     status: 200,
@@ -708,7 +767,10 @@ impl Dispatcher {
             | Route::FilesFlat
             | Route::FileCreate
             | Route::FileDelete
-            | Route::FileRename => {
+            | Route::FileRename
+            | Route::Manifest
+            | Route::ServiceWorker
+            | Route::Icon => {
                 return Err("not a post route".to_owned());
             }
         };
@@ -925,6 +987,47 @@ mod tests {
             panic!("missing text is refused");
         };
         assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn pwa_assets_are_served_static_and_reference_each_other_by_relative_path() {
+        let dispatcher = dispatcher_for(RemoteState::new());
+        assert_eq!(
+            Route::from_tail("manifest.json", "GET"),
+            Some(Route::Manifest)
+        );
+        assert_eq!(Route::from_tail("sw.js", "GET"), Some(Route::ServiceWorker));
+        assert_eq!(Route::from_tail("icon.svg", "GET"), Some(Route::Icon));
+
+        let DispatchOutcome::Static { content_type, body } =
+            dispatcher.dispatch(Some(Route::Manifest), None, "", "", "anon·view")
+        else {
+            panic!("manifest is served statically");
+        };
+        assert_eq!(content_type, "application/manifest+json");
+        // start_url/scope resolve against the manifest's own URL, so they
+        // must stay relative — an absolute "/" would drop the share link's
+        // token prefix and land the installed app on the bare origin.
+        assert!(body.contains(r#""start_url": ".""#), "{body}");
+        assert!(
+            body.contains("icon.svg"),
+            "icon path stays relative: {body}"
+        );
+
+        let DispatchOutcome::Static { content_type, .. } =
+            dispatcher.dispatch(Some(Route::ServiceWorker), None, "", "", "anon·view")
+        else {
+            panic!("service worker is served statically");
+        };
+        assert_eq!(content_type, "application/javascript");
+
+        let DispatchOutcome::Static { content_type, body } =
+            dispatcher.dispatch(Some(Route::Icon), None, "", "", "anon·view")
+        else {
+            panic!("icon is served statically");
+        };
+        assert_eq!(content_type, "image/svg+xml");
+        assert!(body.starts_with("<svg"), "{body}");
     }
 
     #[test]

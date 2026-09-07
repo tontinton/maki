@@ -336,6 +336,13 @@ impl RemoteServer {
                 let response = Response::from_data(body).with_header(content_type("image/svg+xml"));
                 let _ = request.respond(response);
             }
+            crate::dispatch::DispatchOutcome::Static {
+                content_type: ct,
+                body,
+            } => {
+                let response = Response::from_string(body).with_header(content_type(ct));
+                let _ = request.respond(response);
+            }
             crate::dispatch::DispatchOutcome::Posted(status, error) => {
                 let body = match error {
                     Some(reason) => serde_json::json!({"error": reason})

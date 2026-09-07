@@ -518,6 +518,9 @@ fn handle_forwarded(
             send(status, "application/json", body, true)
         }
         crate::dispatch::DispatchOutcome::Svg(body) => send(200, "image/svg+xml", body, true),
+        crate::dispatch::DispatchOutcome::Static { content_type, body } => {
+            send(200, content_type, body.as_bytes().to_vec(), true)
+        }
         // SSE: the producer blocks on the fan-out channel and ships frames;
         // the tunnel thread forwards them until the stream ends.
         crate::dispatch::DispatchOutcome::Events { mut source } => {
