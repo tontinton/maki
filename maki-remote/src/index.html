@@ -62,7 +62,15 @@
   header h1 { font-size: 14px; margin: 0; }
   header h1 a { color: inherit; text-decoration: none; }
   header h1 a:hover { color: var(--accent); text-decoration: underline; }
-  #title { color: var(--text); }
+  /* Ellipsized rather than left to wrap: a long session title (this is
+     often a full auto-generated sentence, not a short label) used to wrap
+     across its own 2-3 lines even in expanded mode, which was most of what
+     made the header tall on a narrow screen before compact mode kicked in
+     (or when it hadn't, e.g. an explicit "expand" choice, or the moment
+     before the live-viewport default above applies). min-width:0 is what
+     lets a flex child actually shrink below its content size to make room
+     for the ellipsis instead of overflowing the row. */
+  #title { color: var(--text); flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #cwd, #model { color: var(--muted); font-size: 12px; }
   #status { color: var(--muted); }
   #status[data-status="working"] { color: var(--accent); }
@@ -106,6 +114,10 @@
   }
   .msg.assistant { color: var(--text); }
   .msg.thinking { color: var(--muted); font-style: italic; }
+  /* Code stays upright even inside the block's overall italic — an
+     italicized monospace code span reads badly and isn't how the CLI
+     shows it either. */
+  .msg.thinking code, .msg.thinking pre { font-style: normal; }
   .msg.error { color: var(--error); }
   .msg.system { color: var(--muted); }
   .tool { margin: 6px 0; border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; background: var(--panel); }
@@ -301,27 +313,37 @@
   }
   .chip select { font-size: 11px; background: none; color: inherit; border: none; }
   .chip button { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 12px; }
-  /* Markdown-ish rendering for assistant messages. */
-  .msg.assistant p { margin: 4px 0; }
+  /* Markdown-ish rendering for assistant messages — and, below, thinking
+     blocks too: the CLI runs thinking through the same markdown-aware
+     renderer as the final answer (just under its own muted/italic color),
+     so a bold header or a code span inside a thinking block is styled
+     there, not left as literal ** and ` characters. */
+  .msg.assistant p, .msg.thinking p { margin: 4px 0; }
   /* The CLI gives every heading level the same single style token — see
      theme.rs's `heading` style, no per-level distinction — so h4-h6 match
      h1-h3 here rather than stepping down in size/weight the way a generic
      HTML stylesheet normally would. */
   .msg.assistant h1, .msg.assistant h2, .msg.assistant h3,
-  .msg.assistant h4, .msg.assistant h5, .msg.assistant h6 {
+  .msg.assistant h4, .msg.assistant h5, .msg.assistant h6,
+  .msg.thinking h1, .msg.thinking h2, .msg.thinking h3,
+  .msg.thinking h4, .msg.thinking h5, .msg.thinking h6 {
     margin: 8px 0 4px; color: var(--text); font-size: 1em;
   }
-  .msg.assistant ul, .msg.assistant ol { margin: 4px 0; padding-left: 20px; }
+  .msg.assistant ul, .msg.assistant ol,
+  .msg.thinking ul, .msg.thinking ol { margin: 4px 0; padding-left: 20px; }
   .msg.assistant ul ul, .msg.assistant ul ol,
-  .msg.assistant ol ul, .msg.assistant ol ol { margin: 0; }
-  .msg.assistant code { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
-  .msg.assistant pre { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px; overflow-x: auto; }
-  .msg.assistant pre code { background: none; border: none; padding: 0; }
-  .msg.assistant blockquote { border-left: 3px solid var(--border); margin: 4px 0; padding-left: 10px; color: var(--muted); }
-  .msg.assistant a { color: var(--accent); }
-  .msg.assistant table { border-collapse: collapse; margin: 4px 0; }
-  .msg.assistant th, .msg.assistant td { border: 1px solid var(--border); padding: 3px 8px; text-align: left; }
-  .msg.assistant th { font-weight: 600; background: var(--panel); }
+  .msg.assistant ol ul, .msg.assistant ol ol,
+  .msg.thinking ul ul, .msg.thinking ul ol,
+  .msg.thinking ol ul, .msg.thinking ol ol { margin: 0; }
+  .msg.assistant code, .msg.thinking code { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+  .msg.assistant pre, .msg.thinking pre { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px; overflow-x: auto; }
+  .msg.assistant pre code, .msg.thinking pre code { background: none; border: none; padding: 0; }
+  .msg.assistant blockquote, .msg.thinking blockquote { border-left: 3px solid var(--border); margin: 4px 0; padding-left: 10px; color: var(--muted); }
+  .msg.assistant a, .msg.thinking a { color: var(--accent); }
+  .msg.assistant table, .msg.thinking table { border-collapse: collapse; margin: 4px 0; }
+  .msg.assistant th, .msg.assistant td,
+  .msg.thinking th, .msg.thinking td { border: 1px solid var(--border); padding: 3px 8px; text-align: left; }
+  .msg.assistant th, .msg.thinking th { font-weight: 600; background: var(--panel); }
   /* Floating "jump to bottom" button, shown when scrolled away. */
   #jump-bottom {
     position: fixed; z-index: 50;
@@ -589,6 +611,11 @@
     background: var(--panel); border: 1px solid var(--border);
     border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.35);
     font-size: 12.5px; overflow: hidden;
+    animation: panel-pop-up .18s ease-out;
+  }
+  @keyframes panel-pop-up {
+    from { transform: translateY(16px); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
   }
   .panel-card-head {
     display: flex; align-items: center; gap: 8px;
@@ -610,9 +637,18 @@
   }
   .panel-card-foot:empty { display: none; }
   .panel-card.collapsed .panel-card-body, .panel-card.collapsed .panel-card-foot { display: none; }
-  /* Compact mode leaves less headroom above the input row on a phone.
+  /* Compact mode: a small floating card in the corner reads fine with a
+     mouse and room to spare, but on an actual phone it's easy to miss and
+     awkward to reach — spans edge-to-edge instead, bottom-anchored, closer
+     to a native bottom sheet (the pop-up entrance above is the same
+     element either way; the difference here is purely width/anchoring).
      (The bottom offset already tracks the composer via --composer-h.) */
-  body.compact #panels { max-width: min(280px, calc(100vw - 20px)); }
+  body.compact #panels {
+    left: calc(8px + env(safe-area-inset-left));
+    right: calc(8px + env(safe-area-inset-right));
+    max-width: none;
+  }
+  body.compact .panel-card { border-radius: 14px 14px 8px 8px; }
 
   /* ---- touch devices ---------------------------------------------------
      Keyed off pointer:coarse rather than a width breakpoint, because the
@@ -854,7 +890,7 @@
       closeHdrTools();
     }
   });
-  const applyCompact = (on) => {
+  const applyCompact = (on, persist = true) => {
     document.body.classList.toggle("compact", on);
     compactToggle.textContent = on ? "expand" : "compact";
     // The full hint doesn't fit the shorter compact textarea, where it wraps
@@ -864,16 +900,31 @@
       : "Message maki… (Enter to send, Shift+Enter for newline)";
     closeHdrTools();
     syncComposerHeight();
-    try { localStorage.setItem("maki_compact", on ? "1" : "0"); } catch {}
+    // persist=false is the live-viewport default below applying itself —
+    // recording that as if it were a real choice would freeze it the first
+    // time it ran and defeat the whole point of tracking the viewport.
+    if (persist) { try { localStorage.setItem("maki_compact", on ? "1" : "0"); } catch {} }
   };
   compactToggle.onclick = () => applyCompact(!document.body.classList.contains("compact"));
-  // A first-time visit has no stored choice yet; default it from the
-  // viewport instead of always starting expanded, so a phone doesn't have
-  // to discover and click the toggle just to get a usable amount of screen.
+  // No explicit choice yet: live-follow the viewport instead of freezing
+  // whatever one page load happened to measure. Without this, a link first
+  // opened on a wide screen (defaulting to expanded) stays expanded forever
+  // after, even reopened later on a phone — the default only ever ran once,
+  // on that first visit, and its result was itself persisted as if it were
+  // a deliberate choice. Once the user actually clicks the toggle, that
+  // choice is sticky and this stops adjusting.
+  const narrowMq = window.matchMedia("(max-width: 599px)");
   try {
     const stored = localStorage.getItem("maki_compact");
-    applyCompact(stored === null ? window.innerWidth < 600 : stored === "1");
-  } catch { applyCompact(window.innerWidth < 600); }
+    if (stored === null) {
+      applyCompact(narrowMq.matches, false);
+      narrowMq.addEventListener("change", (ev) => {
+        if (localStorage.getItem("maki_compact") === null) applyCompact(ev.matches, false);
+      });
+    } else {
+      applyCompact(stored === "1");
+    }
+  } catch { applyCompact(window.innerWidth < 600, false); }
 
   // Toolbar hide/show: the command bar (model picker, /fast, /thinking, ...)
   // is the biggest single chunk of header space on a phone and is rarely
@@ -881,19 +932,26 @@
   // compact mode. Persisted the same way so a reload keeps the choice.
   const toolbarToggle = document.getElementById("toolbar-toggle");
   const toolbarEl = document.getElementById("toolbar");
-  const applyToolbar = (hidden) => {
+  const applyToolbar = (hidden, persist = true) => {
     toolbarEl.hidden = hidden;
     toolbarToggle.textContent = hidden ? "tools ▸" : "tools ▾";
-    try { localStorage.setItem("maki_toolbar_hidden", hidden ? "1" : "0"); } catch {}
+    if (persist) { try { localStorage.setItem("maki_toolbar_hidden", hidden ? "1" : "0"); } catch {} }
   };
   toolbarToggle.onclick = () => applyToolbar(!toolbarEl.hidden);
-  // Same first-visit rule as compact mode: an unset preference defaults from
-  // the viewport instead of always starting expanded, so a phone's first
-  // load isn't the full command bar eating half the screen.
+  // Same live-follow rule as compact mode, and the same reason: an unset
+  // preference tracks the viewport on every load instead of freezing
+  // whatever the first one happened to measure.
   try {
     const stored = localStorage.getItem("maki_toolbar_hidden");
-    applyToolbar(stored === null ? window.innerWidth < 600 : stored === "1");
-  } catch { applyToolbar(window.innerWidth < 600); }
+    if (stored === null) {
+      applyToolbar(narrowMq.matches, false);
+      narrowMq.addEventListener("change", (ev) => {
+        if (localStorage.getItem("maki_toolbar_hidden") === null) applyToolbar(ev.matches, false);
+      });
+    } else {
+      applyToolbar(stored === "1");
+    }
+  } catch { applyToolbar(window.innerWidth < 600, false); }
 
   // ---- mobile viewport ---------------------------------------------------
   syncComposerHeight();
@@ -1466,7 +1524,11 @@
           return n;
         })();
         node.dataset.raw = (node.dataset.raw || "") + event.text;
-        pushTypewriter(node, (visible) => { node.textContent = visible; });
+        // Same rendering as text_delta above — the CLI runs thinking
+        // through the same markdown-aware renderer as the final answer,
+        // just under its own muted/italic color (see the .msg.thinking
+        // CSS), not as literal, unstyled ** and ` characters.
+        pushTypewriter(node, (visible) => { node.innerHTML = renderMarkdown(visible); highlightCodeBlocks(node); });
         break;
       }
       case "tool_start": {
@@ -1560,6 +1622,21 @@
       case "assistant_text": {
         const node = el("msg assistant", "");
         node.dataset.kind = "assistant";
+        node.dataset.raw = event.text;
+        node.innerHTML = renderMarkdown(event.text);
+        highlightCodeBlocks(node);
+        log.appendChild(node);
+        break;
+      }
+      // The snapshot's replay of a past turn's thinking block — the
+      // history-side counterpart to thinking_delta above. This case was
+      // simply missing: a reconnect or fresh page load silently dropped
+      // every earlier thinking block, since nothing in this switch matched
+      // the server's {"type": "thinking", ...} shape (app/mod.rs's
+      // remote_snapshot()) until now.
+      case "thinking": {
+        const node = el("msg thinking", "");
+        node.dataset.kind = "thinking";
         node.dataset.raw = event.text;
         node.innerHTML = renderMarkdown(event.text);
         highlightCodeBlocks(node);
