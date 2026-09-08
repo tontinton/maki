@@ -200,6 +200,127 @@ fn prompt_post_reaches_request_channel() {
     );
 }
 
+/// Regression: `reads_body` (server.rs) gates which routes the standalone
+/// HTTP handler bothers reading a body for before calling into dispatch;
+/// FileWrite, FileCreate, FileDelete, FileRename, WindowInput, and Highlight
+/// were all missing from it at one point, so their POST bodies never made it
+/// past an empty string and every one 400'd as "invalid json" — a request
+/// that never even reached the channel below, not a rejection from it. The
+/// tunneled (anchor) path has no such gap, since the whole HTTP request
+/// (body included) always arrives forwarded wholesale; this only ever broke
+/// standalone `/rc`.
+#[test]
+fn write_body_routes_are_actually_read_in_standalone_mode() {
+    let server = spawn_server();
+    let token = server.url.rsplit('/').next().unwrap().to_owned();
+    let port = server.port();
+    let post = |path: &str, json: &str| {
+        format!(
+            "POST /{token}/{path} HTTP/1.1\r\nHost: {RC_TEST_DOMAIN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json}",
+            json.len()
+        )
+    };
+
+    let client = std::thread::spawn({
+        let body = post("file", r#"{"path":"a.txt","content":"hi"}"#);
+        move || http_exchange(port, &body)
+    });
+    let RemoteRequest::FileWrite {
+        path,
+        content,
+        reply,
+        ..
+    } = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("file write reached the channel")
+    else {
+        panic!("expected FileWrite");
+    };
+    assert_eq!((path.as_str(), content.as_str()), ("a.txt", "hi"));
+    let _ = reply.send(Ok(()));
+    assert!(client.join().unwrap().starts_with("HTTP/1.1 200"));
+
+    let client = std::thread::spawn({
+        let body = post("file/create", r#"{"path":"b.txt"}"#);
+        move || http_exchange(port, &body)
+    });
+    let RemoteRequest::FileCreate { path, reply, .. } = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("file create reached the channel")
+    else {
+        panic!("expected FileCreate");
+    };
+    assert_eq!(path, "b.txt");
+    let _ = reply.send(Ok(serde_json::json!({})));
+    assert!(client.join().unwrap().starts_with("HTTP/1.1 200"));
+
+    let client = std::thread::spawn({
+        let body = post("file/delete", r#"{"path":"b.txt"}"#);
+        move || http_exchange(port, &body)
+    });
+    let RemoteRequest::FileDelete { path, reply, .. } = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("file delete reached the channel")
+    else {
+        panic!("expected FileDelete");
+    };
+    assert_eq!(path, "b.txt");
+    let _ = reply.send(Ok(()));
+    assert!(client.join().unwrap().starts_with("HTTP/1.1 200"));
+
+    let client = std::thread::spawn({
+        let body = post("file/rename", r#"{"from":"a.txt","to":"c.txt"}"#);
+        move || http_exchange(port, &body)
+    });
+    let RemoteRequest::FileRename {
+        from, to, reply, ..
+    } = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("file rename reached the channel")
+    else {
+        panic!("expected FileRename");
+    };
+    assert_eq!((from.as_str(), to.as_str()), ("a.txt", "c.txt"));
+    let _ = reply.send(Ok(serde_json::json!({})));
+    assert!(client.join().unwrap().starts_with("HTTP/1.1 200"));
+
+    let client = std::thread::spawn({
+        let body = post("window/input", r#"{"key":"enter"}"#);
+        move || http_exchange(port, &body)
+    });
+    let RemoteRequest::WindowInput { key, reply, .. } = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("window input reached the channel")
+    else {
+        panic!("expected WindowInput");
+    };
+    assert_eq!(key.as_deref(), Some("enter"));
+    let _ = reply.send(Ok(()));
+    assert!(client.join().unwrap().starts_with("HTTP/1.1 200"));
+
+    let client = std::thread::spawn({
+        let body = post("highlight", r#"{"lang":"rust","code":"fn x() {}"}"#);
+        move || http_exchange(port, &body)
+    });
+    let RemoteRequest::Highlight { lang, code, reply } = server
+        .requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("highlight reached the channel")
+    else {
+        panic!("expected Highlight");
+    };
+    assert_eq!((lang.as_str(), code.as_str()), ("rust", "fn x() {}"));
+    let _ = reply.send(serde_json::json!({"html": "<span>fn</span> x() {}"}));
+    let reply = client.join().unwrap();
+    assert!(reply.starts_with("HTTP/1.1 200"), "got {reply:?}");
+    assert!(reply.contains("<span>fn</span>"));
+}
+
 #[test]
 fn answered_prompt_post_returns_ok() {
     let server = spawn_server();

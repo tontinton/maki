@@ -143,7 +143,7 @@ fn highlight_html(rel: &str, content: &str) -> String {
     html
 }
 
-fn push_html_escaped_segment(html: &mut String, seg: &maki_highlight::StyledSegment) {
+pub(crate) fn push_html_escaped_segment(html: &mut String, seg: &maki_highlight::StyledSegment) {
     let mut style = String::new();
     if let maki_highlight::SegmentColor::Rgb((r, g, b)) = seg.fg {
         style.push_str(&format!("color:#{r:02x}{g:02x}{b:02x}"));

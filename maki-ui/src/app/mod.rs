@@ -10,6 +10,7 @@ pub(crate) mod mode;
 mod mouse;
 mod queue;
 pub(crate) mod remote_fs;
+pub(crate) mod remote_highlight;
 mod remote_windows;
 mod session;
 pub(crate) mod session_state;

@@ -170,6 +170,15 @@ pub enum RemoteRequest {
         to: String,
         reply: Sender<Result<serde_json::Value, String>>,
     },
+    /// Syntax-highlights one fenced code block from a rendered markdown
+    /// message (or a markdown file preview), the same syntect-backed
+    /// highlighter the TUI and the file panel's own file viewer use.
+    /// Session-independent: the theme is process-global, not per-tab.
+    Highlight {
+        lang: String,
+        code: String,
+        reply: Sender<serde_json::Value>,
+    },
 }
 
 impl RemoteRequest {
@@ -196,7 +205,7 @@ impl RemoteRequest {
             | Self::FileCreate { session, .. }
             | Self::FileDelete { session, .. }
             | Self::FileRename { session, .. } => session.as_deref(),
-            Self::Sessions { .. } => None,
+            Self::Sessions { .. } | Self::Highlight { .. } => None,
         }
     }
 }
@@ -407,17 +416,29 @@ fn content_type(value: &str) -> tiny_http::Header {
 }
 
 /// Routes that carry a request body the HTTP handler must read before
-/// dispatch; everything else answers from the path alone.
+/// dispatch; everything else answers from the path alone. Every route whose
+/// `dispatch()`/`dispatch_post()` arm parses `body` as JSON must be listed
+/// here, in standalone mode specifically — the tunneled path always has the
+/// body already (the anchor forwards the whole request verbatim), so a gap
+/// here only ever breaks `/rc` without an anchor, quietly: the route still
+/// answers, just with "invalid json" against an empty body it was never
+/// given the chance to read.
 fn reads_body(route: Option<crate::dispatch::Route>) -> bool {
     matches!(
         route,
         Some(
             crate::dispatch::Route::Prompt
                 | crate::dispatch::Route::Answer
+                | crate::dispatch::Route::WindowInput
                 | crate::dispatch::Route::Stop
                 | crate::dispatch::Route::Command
                 | crate::dispatch::Route::ModelPost
                 | crate::dispatch::Route::OptionsPost
+                | crate::dispatch::Route::FileWrite
+                | crate::dispatch::Route::FileCreate
+                | crate::dispatch::Route::FileDelete
+                | crate::dispatch::Route::FileRename
+                | crate::dispatch::Route::Highlight
         )
     )
 }

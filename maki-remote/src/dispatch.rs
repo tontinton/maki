@@ -72,6 +72,7 @@ pub enum Route {
     Manifest,
     ServiceWorker,
     Icon,
+    Highlight,
 }
 
 impl Route {
@@ -105,6 +106,7 @@ impl Route {
             ("manifest.json", "GET") => Some(Route::Manifest),
             ("sw.js", "GET") => Some(Route::ServiceWorker),
             ("icon.svg", "GET") => Some(Route::Icon),
+            ("highlight", "POST") => Some(Route::Highlight),
             _ => None,
         }
     }
@@ -129,6 +131,10 @@ pub fn parse_tail(tail: &str, method: &str) -> (Option<String>, Option<Route>, S
 }
 
 const QR_TEXT_LIMIT: usize = 512;
+/// Well past any real code block a chat message or file preview would carry;
+/// this runs on the event loop thread, so it stays a deliberate limit rather
+/// than leaning on the 32MB general body cap.
+const HIGHLIGHT_CODE_LIMIT: usize = 200_000;
 
 /// Percent-decode one query value (`+` counts as a space, like forms).
 fn url_decode(raw: &str) -> String {
@@ -560,6 +566,53 @@ impl Dispatcher {
                     Err(reason) => DispatchOutcome::Posted(400, Some(reason)),
                 }
             }
+            Route::Highlight => {
+                let parsed: serde_json::Value = match serde_json::from_str(body) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return DispatchOutcome::Json {
+                            status: 400,
+                            body: br#"{"error":"invalid json"}"#.to_vec(),
+                        };
+                    }
+                };
+                let lang = parsed
+                    .get("lang")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                let code = parsed
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                if code.is_empty() {
+                    return DispatchOutcome::Json {
+                        status: 400,
+                        body: br#"{"error":"need code"}"#.to_vec(),
+                    };
+                }
+                if code.len() > HIGHLIGHT_CODE_LIMIT {
+                    return DispatchOutcome::Json {
+                        status: 400,
+                        body: br#"{"error":"code too large to highlight"}"#.to_vec(),
+                    };
+                }
+                match self.dispatch_value(|reply| crate::RemoteRequest::Highlight {
+                    lang,
+                    code,
+                    reply,
+                }) {
+                    Some(value) => DispatchOutcome::Json {
+                        status: 200,
+                        body: serde_json::to_vec(&value).unwrap_or_default(),
+                    },
+                    None => DispatchOutcome::Json {
+                        status: 503,
+                        body: br#"{"error":"event loop wedged"}"#.to_vec(),
+                    },
+                }
+            }
         }
     }
 
@@ -794,7 +847,8 @@ impl Dispatcher {
             | Route::FileRename
             | Route::Manifest
             | Route::ServiceWorker
-            | Route::Icon => {
+            | Route::Icon
+            | Route::Highlight => {
                 return Err("not a post route".to_owned());
             }
         };
@@ -987,6 +1041,33 @@ mod tests {
             state,
             requests: tx,
         }
+    }
+
+    #[test]
+    fn highlight_route_validates_its_body_before_touching_the_event_loop() {
+        // These are all rejected before dispatch_value ever sends a
+        // RemoteRequest, so no reply is needed from the dropped `_rx` above.
+        let dispatcher = dispatcher_for(RemoteState::new());
+        let post =
+            |body: &str| dispatcher.dispatch(Some(Route::Highlight), None, "", body, "a·control");
+
+        let DispatchOutcome::Json { status, .. } = post("not json") else {
+            panic!("json response");
+        };
+        assert_eq!(status, 400, "invalid json is refused");
+
+        let DispatchOutcome::Json { status, .. } = post(r#"{"lang":"rust"}"#) else {
+            panic!("json response");
+        };
+        assert_eq!(status, 400, "missing code is refused");
+
+        let DispatchOutcome::Json { status, .. } = post(
+            &serde_json::json!({"lang":"rust","code":"x".repeat(HIGHLIGHT_CODE_LIMIT + 1)})
+                .to_string(),
+        ) else {
+            panic!("json response");
+        };
+        assert_eq!(status, 400, "oversized code is refused");
     }
 
     #[test]

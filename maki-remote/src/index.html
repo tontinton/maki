@@ -779,6 +779,8 @@
     const lines = String(text).split("\n");
     let html = "";
     let inCode = false;
+    let codeLang = "";
+    let codeBuf = [];
     let listType = null; // "ul" | "ol" | null
     let inTable = false;
     let tableRows = [];
@@ -801,11 +803,21 @@
       const line = raw.trimEnd();
       if (line.startsWith("```")) {
         flushPara(); closeList(); closeTable();
-        if (inCode) { html += "</code></pre>"; inCode = false; }
-        else { html += "<pre><code>"; inCode = true; }
+        if (inCode) {
+          // A fence that actually closed: the block's content is final, so
+          // it's worth asking the server to syntax-highlight it (see
+          // highlightCodeBlocks below). One still open at end-of-text is
+          // left plain — its content is still growing on every reveal
+          // frame, so there's nothing stable yet worth highlighting.
+          html += `<pre><code data-lang="${escHtml(codeLang)}">${escHtml(codeBuf.join("\n"))}</code></pre>`;
+          inCode = false; codeBuf = []; codeLang = "";
+        } else {
+          inCode = true;
+          codeLang = line.slice(3).trim().split(/\s+/)[0] || "";
+        }
         continue;
       }
-      if (inCode) { html += escHtml(line) + "\n"; continue; }
+      if (inCode) { codeBuf.push(line); continue; }
       if (/^\s*\|.*\|\s*$/.test(line)) {
         flushPara(); closeList();
         const cells = line.split("|").slice(1, -1).map(c => c.trim());
@@ -840,8 +852,48 @@
       }
     }
     flushPara(); closeList(); closeTable();
-    if (inCode) html += "</code></pre>";
+    if (inCode) html += `<pre><code>${escHtml(codeBuf.join("\n"))}</code></pre>`;
     return html;
+  };
+
+  // Syntax-highlights fenced code blocks after they land in the DOM, via the
+  // same syntect-backed highlighter the TUI and the file panel's file viewer
+  // use (POST /highlight) — one highlighter, one theme, everywhere maki
+  // colors code, instead of a second client-side highlighter with its own
+  // look. Cached by "lang\0code" so the typewriter's per-frame re-render of
+  // a finished message (see pushTypewriter) reuses the first fetch instead
+  // of asking again on every frame; in-flight requests are deduped the same
+  // way. A late reply patches every currently-unhighlighted block that still
+  // matches, not just the one that triggered the fetch — the node that asked
+  // may already have been replaced by a later re-render by the time it lands.
+  const highlightCache = new Map();
+  const highlightPending = new Set();
+  const highlightCodeBlocks = (root) => {
+    for (const code of root.querySelectorAll("pre > code[data-lang]:not([data-hl])")) {
+      const lang = code.dataset.lang;
+      const text = code.textContent;
+      const key = `${lang}\0${text}`;
+      const cached = highlightCache.get(key);
+      if (cached !== undefined) {
+        code.innerHTML = cached;
+        code.dataset.hl = "1";
+        continue;
+      }
+      if (highlightPending.has(key)) continue;
+      highlightPending.add(key);
+      postJson("highlight", { lang, code: text }).then((res) => {
+        highlightPending.delete(key);
+        const html = res && typeof res.html === "string" ? res.html : null;
+        if (html === null) return;
+        highlightCache.set(key, html);
+        for (const el of document.querySelectorAll("pre > code[data-lang]:not([data-hl])")) {
+          if (el.dataset.lang === lang && el.textContent === text) {
+            el.innerHTML = html;
+            el.dataset.hl = "1";
+          }
+        }
+      });
+    }
   };
 
   // The CLI never dumps a whole network chunk onto the screen at once — it
@@ -939,7 +991,7 @@
           return n;
         })();
         node.dataset.raw = (node.dataset.raw || "") + event.text;
-        pushTypewriter(node, (visible) => { node.innerHTML = renderMarkdown(visible); });
+        pushTypewriter(node, (visible) => { node.innerHTML = renderMarkdown(visible); highlightCodeBlocks(node); });
         break;
       }
       case "thinking_delta": {
@@ -1045,6 +1097,7 @@
         node.dataset.kind = "assistant";
         node.dataset.raw = event.text;
         node.innerHTML = renderMarkdown(event.text);
+        highlightCodeBlocks(node);
         log.appendChild(node);
         break;
       }
@@ -1616,6 +1669,7 @@
     if (isMarkdownPath(currentFile.path) && !currentFile.editing) {
       const node = el("msg assistant", "");
       node.innerHTML = renderMarkdown(currentFile.content);
+      highlightCodeBlocks(node);
       const editBtn = document.createElement("button");
       editBtn.className = "mini";
       editBtn.textContent = "edit source";

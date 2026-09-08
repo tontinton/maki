@@ -512,6 +512,11 @@ fn handle_request(
             let _ = reply.send(sessions_value.clone());
             Ok(vec![])
         }
+        RemoteRequest::Highlight { lang, code, reply } => {
+            let html = crate::app::remote_highlight::highlight_code_html(&lang, &code);
+            let _ = reply.send(serde_json::json!({ "html": html }));
+            Ok(vec![])
+        }
         RemoteRequest::ModelGet { reply, .. } => {
             let _ = reply.send(app.remote_model_get());
             Ok(vec![])
@@ -636,7 +641,8 @@ fn reject(request: RemoteRequest, reason: &str) {
         | RemoteRequest::Snapshot { reply, .. }
         | RemoteRequest::Commands { reply, .. }
         | RemoteRequest::Options { reply, .. }
-        | RemoteRequest::SetOptions { reply, .. } => {
+        | RemoteRequest::SetOptions { reply, .. }
+        | RemoteRequest::Highlight { reply, .. } => {
             let _ = reply.send(serde_json::json!({"error": reason}));
         }
     }
