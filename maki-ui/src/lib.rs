@@ -10,6 +10,7 @@ mod clipboard;
 mod clock;
 mod color_compat;
 mod components;
+pub(crate) mod qr;
 pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand};
 pub use components::keybindings;
 mod highlight;

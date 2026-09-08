@@ -390,6 +390,15 @@ struct OllamaShowResponse {
     parameters: Option<String>,
     #[serde(default)]
     model_info: Option<serde_json::Map<String, Value>>,
+    /// e.g. `["completion", "vision", "tools"]`; absent on older Ollama servers.
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+}
+
+#[derive(Default)]
+struct OllamaModelDetails {
+    context_window: Option<u32>,
+    supports_vision: Option<bool>,
 }
 
 impl LocalEndpoint {
@@ -413,21 +422,21 @@ impl LocalEndpoint {
         let futures: Vec<_> = body
             .data
             .iter()
-            .map(|m| ollama_fetch_context_window(compat, auth, root, &m.id))
+            .map(|m| ollama_fetch_model_details(compat, auth, root, &m.id))
             .collect();
-        let context_windows = join_all(futures).await;
+        let details = join_all(futures).await;
 
         let mut models: Vec<crate::model::ModelInfo> = body
             .data
             .into_iter()
-            .zip(context_windows)
-            .map(|(m, context_window)| crate::model::ModelInfo {
+            .zip(details)
+            .map(|(m, d)| crate::model::ModelInfo {
                 id: m.id,
-                context_window,
+                context_window: d.context_window,
                 max_output_tokens: None,
                 pricing: Some(crate::model::ModelPricing::ZERO),
                 supports_thinking: None,
-                supports_vision: None,
+                supports_vision: d.supports_vision,
                 tier: None,
                 provider_info: None,
             })
@@ -437,15 +446,17 @@ impl LocalEndpoint {
     }
 }
 
-async fn ollama_fetch_context_window(
+async fn ollama_fetch_model_details(
     compat: &OpenAiCompatProvider,
     auth: &ResolvedAuth,
     root: &str,
     model_id: &str,
-) -> Option<u32> {
+) -> OllamaModelDetails {
     let show_url = format!("{root}/api/show");
     let body = json!({"model": model_id});
-    let json_body = serde_json::to_vec(&body).ok()?;
+    let Ok(json_body) = serde_json::to_vec(&body) else {
+        return OllamaModelDetails::default();
+    };
 
     let text = match compat
         .post_text(auth, &show_url, "application/json", &json_body)
@@ -454,30 +465,27 @@ async fn ollama_fetch_context_window(
         Ok(t) => t,
         Err(e) => {
             warn!(model = model_id, error = %e, "Ollama POST /api/show failed");
-            return None;
+            return OllamaModelDetails::default();
         }
     };
     let show: OllamaShowResponse = match serde_json::from_str(&text) {
         Ok(s) => s,
         Err(e) => {
             warn!(model = model_id, error = %e, "Failed to parse Ollama /api/show response");
-            return None;
+            return OllamaModelDetails::default();
         }
     };
 
-    if let Some(ref info) = show.model_info
-        && let Some(ctx) = ollama_extract_context_length(info)
-    {
-        return Some(ctx);
-    }
+    let context_window = show
+        .model_info
+        .as_ref()
+        .and_then(ollama_extract_context_length)
+        .or_else(|| show.parameters.as_deref().and_then(ollama_extract_num_ctx));
 
-    if let Some(ref params) = show.parameters
-        && let Some(ctx) = ollama_extract_num_ctx(params)
-    {
-        return Some(ctx);
+    OllamaModelDetails {
+        context_window,
+        supports_vision: ollama_extract_vision(show.capabilities.as_deref()),
     }
-
-    None
 }
 
 fn ollama_extract_context_length(info: &serde_json::Map<String, Value>) -> Option<u32> {
@@ -491,6 +499,13 @@ fn ollama_extract_context_length(info: &serde_json::Map<String, Value>) -> Optio
                 .and_then(|(_, v)| v.as_u64())
                 .and_then(|v| u32::try_from(v).ok())
         })
+}
+
+/// `None` when the server didn't report capabilities at all (older Ollama),
+/// so discovery falls back to the family default instead of claiming "no
+/// vision" for a model it never actually checked.
+fn ollama_extract_vision(capabilities: Option<&[String]>) -> Option<bool> {
+    capabilities.map(|caps| caps.iter().any(|c| c == "vision"))
 }
 
 fn ollama_extract_num_ctx(params: &str) -> Option<u32> {
@@ -930,6 +945,27 @@ mod tests {
         fn ignores_props_in_router_mode() {
             let props = json!({"role": "router", "modalities": {"vision": true}});
             assert_eq!(llamacpp_props_vision(&props, &ServerMode::Router), None);
+        }
+    }
+
+    mod ollama_extract_vision {
+        use super::super::*;
+
+        #[test]
+        fn true_when_capabilities_list_vision() {
+            let caps = vec!["completion".to_string(), "vision".to_string()];
+            assert_eq!(ollama_extract_vision(Some(&caps)), Some(true));
+        }
+
+        #[test]
+        fn false_when_capabilities_present_but_no_vision() {
+            let caps = vec!["completion".to_string(), "tools".to_string()];
+            assert_eq!(ollama_extract_vision(Some(&caps)), Some(false));
+        }
+
+        #[test]
+        fn none_when_server_omitted_capabilities() {
+            assert_eq!(ollama_extract_vision(None), None);
         }
     }
 

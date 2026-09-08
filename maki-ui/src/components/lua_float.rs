@@ -132,11 +132,32 @@ impl FloatWindow {
     }
 }
 
+/// A window's state as the remote bridge needs it — the chrome fields a
+/// browser overlay can show, plus content, without dragging the rest of
+/// [`FloatConfig`] (terminal-only layout: anchor, split, zindex, ...) along.
+pub(crate) struct WindowRemoteParts {
+    pub title: String,
+    pub footer: Vec<(String, String)>,
+    pub lines: Arc<Vec<SnapshotLine>>,
+    pub cursor: usize,
+    pub visible: bool,
+    /// Whether this window currently holds input focus. A background
+    /// panel/toast (opened with `focus = false`, e.g. `todo_write`'s panel
+    /// or the memory plugin's toast) is not — the remote bridge uses this
+    /// to never show one as a modal nobody can dismiss.
+    pub focused: bool,
+}
+
 pub(crate) struct FloatManager {
     windows: Vec<FloatWindow>,
     focused_id: Option<u32>,
     focused_rect: Option<Rect>,
     next_id: u32,
+    /// Ids touched by the most recent `tick()`, for the remote bridge to
+    /// mirror out as `window_update`/`window_close` SSE frames without
+    /// diffing every open window itself. Cleared and refilled each tick.
+    last_updated: Vec<u32>,
+    last_closed: Vec<u32>,
 }
 
 impl FloatManager {
@@ -146,6 +167,8 @@ impl FloatManager {
             focused_id: None,
             focused_rect: None,
             next_id: 0,
+            last_updated: Vec::new(),
+            last_closed: Vec::new(),
         }
     }
 
@@ -162,13 +185,16 @@ impl FloatManager {
             .and_then(|fid| self.windows.iter().find(|w| w.id == fid))
             .is_some_and(&should_remove);
 
+        let mut removed = Vec::new();
         self.windows.retain(|w| {
             let remove = should_remove(w);
             if remove {
                 let _ = w.event_tx.try_send(WinEvent::Close);
+                removed.push(w.id);
             }
             !remove
         });
+        self.last_closed.extend(removed);
 
         if focus_lost {
             self.focused_id = self
@@ -181,6 +207,8 @@ impl FloatManager {
         }
     }
 
+    /// Returns the new window's id, so the remote bridge can publish its
+    /// initial `window_open` snapshot without a separate lookup.
     pub fn open(
         &mut self,
         buf: Arc<SharedBuf>,
@@ -188,7 +216,7 @@ impl FloatManager {
         focus: bool,
         event_tx: flume::Sender<WinEvent>,
         cmd_rx: flume::Receiver<WinCommand>,
-    ) {
+    ) -> u32 {
         let cached_lines = buf.read_if_dirty().unwrap_or_default();
         let id = self.next_id;
         self.next_id += 1;
@@ -221,31 +249,42 @@ impl FloatManager {
         if focus {
             self.focused_id = Some(id);
         }
+        id
     }
 
     /// Runs for backgrounded sessions too, or a plugin writing to a window
     /// nobody is looking at would lose its output.
     pub fn tick(&mut self) -> Dirty {
+        self.last_updated.clear();
+        // last_closed is not cleared here: remove_windows (called below, and
+        // possibly by other paths between ticks) appends to it directly, and
+        // take_tick_changes is what drains it — clearing on every tick would
+        // drop a close that happened between the caller's last drain and now.
         let mut closed_ids = Vec::new();
         let mut dirty = Dirty::NO;
 
         for win in &mut self.windows {
+            let mut changed = false;
             if let Some(lines) = win.buf.read_if_dirty() {
                 win.cached_lines = lines;
                 win.bring_cursor_into_view();
                 dirty = Dirty::YES;
+                changed = true;
             }
 
             loop {
                 match win.cmd_rx.try_recv() {
                     Ok(WinCommand::SetConfig(patch)) => {
                         win.config.apply_patch(patch);
+                        changed = true;
                     }
                     Ok(WinCommand::SetCursor(row)) => {
                         win.set_cursor(row);
+                        changed = true;
                     }
                     Ok(WinCommand::SetVisible(v)) => {
                         win.visible = v;
+                        changed = true;
                     }
                     Ok(WinCommand::Close) | Err(flume::TryRecvError::Disconnected) => {
                         closed_ids.push(win.id);
@@ -255,6 +294,9 @@ impl FloatManager {
                 }
                 dirty = Dirty::YES;
             }
+            if changed {
+                self.last_updated.push(win.id);
+            }
         }
 
         if !closed_ids.is_empty() {
@@ -262,6 +304,59 @@ impl FloatManager {
             dirty = Dirty::YES;
         }
         dirty
+    }
+
+    /// Drains the ids touched since the last call, for the remote bridge to
+    /// mirror as SSE frames. Idempotent between calls: nothing is lost if a
+    /// caller ticks more often than it drains, since this only ever empties
+    /// what tick() (and window closes in general) appended.
+    pub(crate) fn take_tick_changes(&mut self) -> (Vec<u32>, Vec<u32>) {
+        (
+            std::mem::take(&mut self.last_updated),
+            std::mem::take(&mut self.last_closed),
+        )
+    }
+
+    /// The remote bridge's snapshot payload for one window — see
+    /// [`WindowRemoteParts`] — or `None` if the window is gone.
+    pub(crate) fn window_remote_parts(&self, id: u32) -> Option<WindowRemoteParts> {
+        let win = self.windows.iter().find(|w| w.id == id)?;
+        Some(WindowRemoteParts {
+            title: win.config.title.clone(),
+            footer: win.config.footer.clone(),
+            lines: Arc::clone(&win.cached_lines),
+            cursor: win.cursor,
+            visible: win.visible,
+            focused: self.focused_id == Some(id),
+        })
+    }
+
+    /// The currently focused window's id, if any — the remote bridge only
+    /// ever shows the focused window as its modal overlay (a background
+    /// panel or toast opened with `focus = false` is tracked but never
+    /// rendered as a blocking dialog remotely, since there would be no way
+    /// for a browser tab to dismiss one that never took focus).
+    pub(crate) fn focused_window_id(&self) -> Option<u32> {
+        self.focused_id
+    }
+
+    /// Forwards a pre-stringified key (matching [`key_event_to_string`]'s
+    /// format) to the focused window, exactly as [`Self::handle_key`] does
+    /// for a real local keypress — the shared path a remote key event uses.
+    pub(crate) fn forward_key_str(&self, key: &str) -> bool {
+        if key.is_empty() {
+            return false;
+        }
+        let Some(fid) = self.focused_id else {
+            return false;
+        };
+        let Some(win) = self.windows.iter().find(|w| w.id == fid) else {
+            return false;
+        };
+        let _ = win.event_tx.try_send(WinEvent::Key {
+            key: key.to_owned(),
+        });
+        true
     }
 
     /// Float snapshots bake spinner spans at render time, so an open float has
@@ -2214,5 +2309,142 @@ mod tests {
             "focus must not fall back to a panel window"
         );
         assert_eq!(mgr.windows.len(), 1, "panel window must survive");
+    }
+
+    // ---- remote bridge: open() id, window_remote_parts, tick change
+    // tracking, forward_key_str. See maki-remote/src/state.rs and
+    // maki-ui/src/app/remote_windows.rs for how these feed the SSE bridge.
+
+    #[test]
+    fn open_returns_the_new_windows_id_and_remote_parts_reflect_it() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _, _) = make_channels();
+        let config = FloatConfig {
+            title: "Tasks".into(),
+            footer: vec![("Enter".into(), "open".into())],
+            cursor_line: true,
+            ..FloatConfig::default()
+        };
+        let id = mgr.open(make_buf(&["a", "b"]), config, true, event_tx, cmd_rx);
+
+        let parts = mgr
+            .window_remote_parts(id)
+            .expect("just-opened window must be found by its own id");
+        assert_eq!(parts.title, "Tasks");
+        assert_eq!(parts.footer, vec![("Enter".to_owned(), "open".to_owned())]);
+        assert_eq!(parts.lines.len(), 2);
+        assert_eq!(parts.cursor, 0);
+        assert!(parts.visible);
+        assert!(parts.focused, "opened with focus = true");
+    }
+
+    #[test]
+    fn window_remote_parts_reports_focused_false_for_a_background_window() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _, _cmd_tx) = make_channels();
+        let id = mgr.open(make_buf(&["a"]), make_config(), false, event_tx, cmd_rx);
+
+        let parts = mgr.window_remote_parts(id).unwrap();
+        assert!(
+            !parts.focused,
+            "opened with focus = false, e.g. todo_write's panel or the memory toast"
+        );
+    }
+
+    #[test]
+    fn window_remote_parts_is_none_for_an_unknown_id() {
+        let mgr = FloatManager::new();
+        assert!(mgr.window_remote_parts(999).is_none());
+    }
+
+    #[test]
+    fn tick_reports_a_window_as_updated_when_its_content_changes() {
+        let mut mgr = FloatManager::new();
+        // cmd_tx must stay alive: dropping it disconnects cmd_rx, and tick()
+        // reads that as the window's controller going away — an intentional
+        // close signal (see the Err(Disconnected) arm below) that would
+        // close this window before the test gets to change its content.
+        let (event_tx, cmd_rx, _, _cmd_tx) = make_channels();
+        let buf = make_buf(&["a"]);
+        let id = mgr.open(Arc::clone(&buf), make_config(), true, event_tx, cmd_rx);
+
+        // Freshly opened: open() itself already drained the buffer's dirty
+        // flag via read_if_dirty(), so a tick before any further write
+        // finds nothing changed.
+        let _ = mgr.tick();
+        let (updated, closed) = mgr.take_tick_changes();
+        assert!(
+            updated.is_empty(),
+            "nothing changed since open(): {updated:?}"
+        );
+        assert!(closed.is_empty());
+
+        buf.append(make_line("b"));
+        let _ = mgr.tick();
+        let (updated, closed) = mgr.take_tick_changes();
+        assert_eq!(updated, vec![id]);
+        assert!(closed.is_empty());
+    }
+
+    #[test]
+    fn tick_reports_a_window_as_updated_when_a_chrome_command_applies() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _, cmd_tx) = make_channels();
+        let id = mgr.open(make_buf(&["a"]), make_config(), true, event_tx, cmd_rx);
+        mgr.take_tick_changes(); // discard the open() baseline
+
+        cmd_tx.send(WinCommand::SetCursor(0)).unwrap();
+        let _ = mgr.tick();
+        let (updated, _) = mgr.take_tick_changes();
+        assert_eq!(
+            updated,
+            vec![id],
+            "a chrome-only command still counts as an update"
+        );
+    }
+
+    #[test]
+    fn tick_reports_a_closed_window_and_take_tick_changes_drains_it_once() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _, cmd_tx) = make_channels();
+        let id = mgr.open(make_buf(&["a"]), make_config(), true, event_tx, cmd_rx);
+        mgr.take_tick_changes();
+
+        cmd_tx.send(WinCommand::Close).unwrap();
+        let _ = mgr.tick();
+
+        let (_, closed) = mgr.take_tick_changes();
+        assert_eq!(closed, vec![id]);
+        // A second drain with nothing new in between must come back empty —
+        // the remote bridge would otherwise republish a stale close.
+        let (updated_again, closed_again) = mgr.take_tick_changes();
+        assert!(updated_again.is_empty());
+        assert!(closed_again.is_empty());
+    }
+
+    #[test]
+    fn forward_key_str_reaches_the_focused_windows_event_channel() {
+        let mut mgr = FloatManager::new();
+        let (event_rx, _cmd_tx) = open_with_lines(&mut mgr, &["a"]);
+
+        assert!(mgr.forward_key_str("enter"));
+        let found = event_rx
+            .drain()
+            .any(|e| matches!(e, WinEvent::Key { key } if key == "enter"));
+        assert!(found, "expected a Key event with the given string");
+    }
+
+    #[test]
+    fn forward_key_str_returns_false_with_no_focused_window() {
+        let mgr = FloatManager::new();
+        assert!(!mgr.forward_key_str("enter"));
+    }
+
+    #[test]
+    fn forward_key_str_returns_false_for_an_empty_key() {
+        let mut mgr = FloatManager::new();
+        let (event_rx, _cmd_tx) = open_with_lines(&mut mgr, &["a"]);
+        assert!(!mgr.forward_key_str(""));
+        assert!(event_rx.drain().next().is_none(), "nothing should be sent");
     }
 }

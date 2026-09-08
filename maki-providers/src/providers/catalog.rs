@@ -842,7 +842,12 @@ impl Provider for CatalogProvider {
 
 #[cfg(test)]
 pub(crate) fn seed_catalog_for_tests(index: schema::CatalogIndex, state_dir: StateDir) {
-    let _ = SHARED_CATALOG.set(Mutex::new(CatalogData::from_index(index, &state_dir)));
+    let data = CatalogData::from_index(index, &state_dir);
+    if let Some(lock) = SHARED_CATALOG.get() {
+        *lock.lock().unwrap() = data;
+    } else {
+        let _ = SHARED_CATALOG.set(Mutex::new(data));
+    }
 }
 
 #[cfg(test)]

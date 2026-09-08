@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
 use maki_config::{
-    AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig, ProviderConfig, StorageConfig,
-    TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
+    AgentConfig, AnchorConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
+    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig, ProviderConfig,
+    RemoteControlConfig, StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines,
+    UiConfig,
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
@@ -190,6 +191,32 @@ maki.setup({{
     .unwrap();
 }
 
+fn write_remote_control_section(out: &mut String) {
+    write_section(out, "[remote_control]", RemoteControlConfig::FIELDS);
+    writeln!(
+        out,
+        "`/remote-control` (`/rc`) serves the live session over HTTP behind \
+         your own reverse proxy, which owns TLS and DNS. The command prints a \
+         `https://{{domain}}/{{token}}` link; the token is unique per start and \
+         is the only gate, so keep the proxy pointed at the control port \
+         whole and out of reach of anything you do not trust.\n"
+    )
+    .unwrap();
+}
+
+fn write_anchor_section(out: &mut String) {
+    write_section(out, "[anchor]", AnchorConfig::FIELDS);
+    writeln!(
+        out,
+        "When all three fields are set, `/rc` dials the anchor instead of \
+         binding its own listener: the anchor URL replaces the local one, and \
+         the instance needs no inbound port. Tokens come from \
+         `maki-anchor tokens add <name>`; one token per instance.
+"
+    )
+    .unwrap();
+}
+
 fn write_telemetry_section(out: &mut String) {
     write_section(out, "[telemetry]", TelemetryConfig::FIELDS);
     writeln!(
@@ -300,6 +327,8 @@ All fields are optional. Typos in field names cause an error right away.
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
     write_net_section(&mut out);
+    write_remote_control_section(&mut out);
+    write_anchor_section(&mut out);
     write_telemetry_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();

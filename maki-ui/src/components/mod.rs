@@ -208,6 +208,8 @@ pub enum Action {
     EditInputInEditor,
     Btw(String),
     PreparePack(PackCommand),
+    /// Starts, restarts, or stops the remote control server. `None` stops it.
+    RemoteControl(Option<String>),
     Suspend,
 }
 

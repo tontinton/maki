@@ -159,6 +159,27 @@ maki.setup({
 
 An entry with no port covers every port. A name you list is allowed whatever it resolves to. A name you did not list stays blocked when DNS lands it on a private address, unless that address falls in a range you allowed, so keep ranges as small as the service needs. Every redirect hop is checked against the same list. [Permissions](/docs/permissions/#network-addresses) covers what the guard protects.
 
+### `remote_control`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `domain` | String | `none` | - | Public domain the reverse proxy serves; the `/rc` link is `https://{domain}/{token}`. Required before `/rc` starts |
+| `port` | u16 | `8687` | 1 | TCP port the control server listens on |
+| `bind` | String | `none` | - | Address to bind the control server to: `127.0.0.1` when the reverse proxy runs on this machine (the safe default), `0.0.0.0` only when it runs elsewhere |
+| `auto_start` | bool | `false` | - | Run `/rc` automatically at startup, so every session is remote from the first frame. Needs `domain` (standalone) or a complete `anchor` section, like `/rc` itself |
+
+`/remote-control` (`/rc`) serves the live session over HTTP behind your own reverse proxy, which owns TLS and DNS. The command prints a `https://{domain}/{token}` link; the token is unique per start and is the only gate, so keep the proxy pointed at the control port whole and out of reach of anything you do not trust.
+
+### `anchor`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | String | `none` | Anchor base URL, e.g. `https://maki.example.com`. Required before `/rc` dials out |
+| `name` | String | `none` | Instance name shown on the anchor dashboard. Defaults to the machine hostname |
+| `token` | String | `none` | Registration token issued by `maki-anchor tokens add <name>` |
+
+When all three fields are set, `/rc` dials the anchor instead of binding its own listener: the anchor URL replaces the local one, and the instance needs no inbound port. Tokens come from `maki-anchor tokens add <name>`; one token per instance.
+
 ### `telemetry`
 
 | Field | Type | Default | Env | Description |

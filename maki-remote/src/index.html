@@ -1,0 +1,2141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>maki remote</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon.svg">
+<meta name="theme-color" content="#16181d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<style>
+  :root {
+    --bg: #16181d;
+    --panel: #1d2026;
+    --border: #2c313a;
+    --text: #d6dbe3;
+    --muted: #8b93a1;
+    --accent: #7aa2f7;
+    --user: #9ece6a;
+    --error: #f7768e;
+    --tool: #bb9af7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
+  }
+  header {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    flex-wrap: wrap;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  header h1 { font-size: 14px; margin: 0; }
+  #title { color: var(--text); }
+  #cwd, #model { color: var(--muted); font-size: 12px; }
+  #status { color: var(--muted); }
+  #status[data-status="working"] { color: var(--accent); }
+  #stats { color: var(--muted); font-size: 12px; margin-left: auto; }
+  #conn { color: var(--muted); font-size: 12px; }
+  #conn[data-conn="live"] { color: var(--user); }
+  #conn[data-conn="down"] { color: var(--error); }
+  main {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px 14px;
+  }
+  .msg { margin: 6px 0; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { color: var(--user); }
+  .msg.user::before { content: "you> "; color: var(--muted); }
+  .msg.user a.upload-link { color: var(--accent); text-decoration: none; }
+  .msg.user a.upload-link:hover { text-decoration: underline; }
+  .msg.user img.upload-thumb {
+    display: inline-block; max-width: 240px; max-height: 240px;
+    margin-top: 4px; border-radius: 6px; border: 1px solid var(--border);
+  }
+  .msg.assistant { color: var(--text); }
+  .msg.thinking { color: var(--muted); font-style: italic; }
+  .msg.error { color: var(--error); }
+  .msg.system { color: var(--muted); }
+  .tool { margin: 6px 0; border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; background: var(--panel); }
+  .tool summary { color: var(--tool); cursor: pointer; user-select: none; }
+  .tool .out { white-space: pre-wrap; word-break: break-word; color: var(--muted); margin-top: 4px; max-height: 300px; overflow-y: auto; }
+  .tool .out img.tool-thumb {
+    display: block; max-width: min(480px, 100%); max-height: 480px;
+    border-radius: 6px; border: 1px solid var(--border);
+  }
+  .tool .out .tool-thumb-caption { margin-top: 4px; }
+  .tool.running summary::after { content: " …"; color: var(--accent); }
+  .tool.is-error { border-color: var(--error); }
+  #perm {
+    display: none;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    background: var(--panel);
+    padding: 10px 14px;
+    margin: 8px 14px;
+  }
+  #perm .toolname { color: var(--accent); }
+  #perm .scopes { color: var(--muted); margin: 4px 0 8px; }
+  #perm .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  #perm textarea {
+    width: 100%;
+    min-height: 60px;
+    margin-top: 8px;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font: inherit;
+    display: none;
+  }
+  button {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 14px;
+    font: inherit;
+    cursor: pointer;
+  }
+  button.primary { border-color: var(--user); color: var(--user); }
+  button.danger { border-color: var(--error); color: var(--error); }
+  button.mini { padding: 2px 8px; font-size: 12px; }
+  #toolbar {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    align-items: center;
+    padding: 6px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  /* Author rules always beat the UA `[hidden]` default regardless of
+     specificity, so #toolbar's own `display: flex` above would otherwise
+     win over a bare `hidden` attribute; this rule restores it. */
+  #toolbar[hidden] { display: none; }
+  #toolbar input, #toolbar select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font: inherit;
+    font-size: 12px;
+  }
+  #toolbar label.mini { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 12px; padding: 0 4px; }
+  #toolbar #provider-select { max-width: 160px; }
+  #toolbar #model-select { max-width: 240px; }
+  #toolbar #cmd-input { flex: 1; min-width: 160px; }
+  #sessions-bar {
+    display: none;
+    gap: 6px;
+    padding: 6px 14px;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  #sessions-bar span { color: var(--muted); font-size: 12px; }
+  #sessions-bar .sess { cursor: pointer; padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border); }
+  #sessions-bar .sess.focused { border-color: var(--accent); color: var(--accent); }
+  #toast {
+    position: fixed;
+    bottom: 80px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 14px;
+    border-radius: 6px;
+    display: none;
+    max-width: 80vw;
+  }
+  #stoprow { padding: 4px 14px; }
+  #stoprow button { display: none; }
+  #inputrow {
+    display: flex;
+    gap: 8px;
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  #prompt {
+    flex: 1;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    font: inherit;
+    resize: none;
+    height: 44px;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+  #prompt:focus { outline: none; border-color: var(--accent); }
+  #center-wrap { position: relative; margin-left: auto; display: flex; gap: 4px; align-items: center; }
+  #center {
+    position: absolute; top: 130%; right: 0; z-index: 60;
+    width: min(340px, 92vw); max-height: 70vh; overflow-y: auto;
+    background: var(--panel, #1e2128); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px; font-size: 13px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.4);
+  }
+  #center h3 { margin: 2px 0 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  #center .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 4px 0; }
+  #center table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  #center td { padding: 2px 4px; border-bottom: 1px solid var(--border); }
+  #center input, #center select { font-size: 12px; padding: 3px 6px; background: var(--bg); color: inherit; border: 1px solid var(--border); border-radius: 6px; }
+  #center .ok { color: #9ece6a; } #center .bad { color: #f7768e; }
+  #center img.qr, #qr-pop img.qr { background: #fff; border-radius: 8px; padding: 4px; display: block; margin-top: 4px; }
+  #qr-pop {
+    position: fixed; top: 54px; right: 10px; z-index: 70;
+    background: var(--panel, #1e2128); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px; font-size: 12px; text-align: center;
+  }
+  #qr-pop a { color: var(--muted); word-break: break-all; }
+  #chips { display: flex; gap: 6px; flex-wrap: wrap; padding: 4px 8px 0; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 4px; font-size: 12px;
+    border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px; color: var(--muted);
+  }
+  .chip select { font-size: 11px; background: none; color: inherit; border: none; }
+  .chip button { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 12px; }
+  /* Markdown-ish rendering for assistant messages. */
+  .msg.assistant p { margin: 4px 0; }
+  .msg.assistant h1, .msg.assistant h2, .msg.assistant h3 { margin: 8px 0 4px; color: var(--text); }
+  .msg.assistant ul, .msg.assistant ol { margin: 4px 0; padding-left: 20px; }
+  .msg.assistant code { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+  .msg.assistant pre { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px; overflow-x: auto; }
+  .msg.assistant pre code { background: none; border: none; padding: 0; }
+  .msg.assistant blockquote { border-left: 3px solid var(--border); margin: 4px 0; padding-left: 10px; color: var(--muted); }
+  .msg.assistant a { color: var(--accent); }
+  .msg.assistant table { border-collapse: collapse; margin: 4px 0; }
+  .msg.assistant th, .msg.assistant td { border: 1px solid var(--border); padding: 3px 8px; }
+  /* Floating "jump to bottom" button, shown when scrolled away. */
+  #jump-bottom {
+    position: fixed; right: 16px; bottom: 90px; z-index: 50;
+    display: none; align-items: center; gap: 4px;
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 6px 12px; font-size: 12px; cursor: pointer;
+    box-shadow: 0 4px 12px rgba(0,0,0,.35);
+  }
+  #jump-bottom:hover { border-color: var(--accent); color: var(--accent); }
+  /* Compact mode: shrink the header and toolbar to save vertical space. */
+  body.compact header { padding: 3px 10px; }
+  body.compact header h1 { font-size: 12px; }
+  /* The header's own content (cwd, model) is what forced it to wrap across
+     several lines on a narrow phone — shrinking padding/font alone left
+     that untouched. Both are redundant here (the model is already in the
+     toolbar's picker, cwd is rarely needed at a glance), so compact drops
+     them entirely rather than just shrinking them. */
+  body.compact #cwd, body.compact #model { display: none; }
+  body.compact #stats { font-size: 11px; }
+  body.compact #toolbar { padding: 2px 10px; }
+  body.compact #toolbar input, body.compact #toolbar select { padding: 2px 6px; font-size: 11px; }
+  body.compact #sessions-bar { padding: 2px 10px; }
+  body.compact #inputrow { padding: 6px 10px; }
+  body.compact #prompt { height: 36px; padding: 6px; }
+  #compact-toggle { cursor: pointer; }
+
+  /* File panel: slides out from the left over the transcript. */
+  /* A plugin's maki.ui.open_win() float (task/session/memory pickers, the
+     question tool's form, ...), mirrored from the terminal as a generic
+     modal — see the "window bridge" JS below. */
+  #win-backdrop {
+    position: fixed; inset: 0; z-index: 95;
+    background: rgba(0,0,0,.5);
+    display: flex; align-items: center; justify-content: center;
+    padding: 16px;
+  }
+  /* Author rules always beat the UA `[hidden]` default regardless of
+     specificity — see #toolbar[hidden]/#files-view[hidden] for the same
+     fix already needed elsewhere in this file. */
+  #win-backdrop[hidden] { display: none; }
+  #win-overlay {
+    width: min(640px, 100%);
+    max-height: 80vh;
+    background: var(--panel);
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    box-shadow: 0 8px 32px rgba(0,0,0,.5);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  #win-title {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px 8px 14px;
+    border-bottom: 1px solid var(--border);
+    color: var(--accent); font-weight: bold;
+  }
+  #win-title-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #win-title .mini { margin-left: auto; }
+  #win-body {
+    flex: 1; overflow-y: auto; padding: 4px 0;
+    font-size: 13px;
+  }
+  #win-body:focus { outline: none; }
+  #win-body > div { padding: 1px 14px; white-space: pre-wrap; word-break: break-word; }
+  /* A scroll target more than a highlight: most pickers already bake their
+     own selection color into the row's spans (see picker.lua), so a strong
+     background here would double up against that. This class is now always
+     applied to the cursor row (not just when a plugin opts into cursor_line)
+     so arrow-key navigation always has something to scroll into view. */
+  #win-body > div.win-cursor { box-shadow: inset 2px 0 0 0 var(--accent); }
+  #win-footer {
+    padding: 6px 14px; border-top: 1px solid var(--border);
+    color: var(--muted); font-size: 12px;
+    display: flex; gap: 14px; flex-wrap: wrap;
+  }
+  #win-footer:empty { display: none; }
+  #files-backdrop {
+    position: fixed; inset: 0; z-index: 89;
+    background: rgba(0,0,0,.4);
+  }
+  #files-panel {
+    position: fixed; top: 0; left: 0; bottom: 0; z-index: 90;
+    width: min(640px, 92vw);
+    min-width: 260px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    box-shadow: 4px 0 24px rgba(0,0,0,.35);
+    display: flex; flex-direction: column;
+    transform: translateX(-100%);
+    transition: transform .18s ease;
+  }
+  #files-panel.open { transform: translateX(0); }
+  #files-panel.resizing { transition: none; user-select: none; }
+  #files-resize {
+    position: absolute; top: 0; right: -4px; bottom: 0; width: 8px;
+    cursor: ew-resize; z-index: 91; touch-action: none;
+  }
+  #files-resize:hover, #files-panel.resizing #files-resize { background: rgba(122,162,247,.35); }
+  #files-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px; border-bottom: 1px solid var(--border);
+  }
+  #files-head #files-branch { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #files-head .mini:last-child { margin-left: auto; }
+  #files-search-row { padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  #files-search-row input {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 8px; font: inherit; font-size: 12.5px;
+  }
+  #files-search-row input:focus { outline: none; border-color: var(--accent); }
+  #files-tree {
+    flex: 1; overflow-y: auto; padding: 6px 0;
+    font-size: 13px;
+  }
+  .files-row {
+    display: flex; align-items: center; gap: 6px;
+    padding: 3px 10px; cursor: pointer; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .files-row:hover { background: var(--panel-2, rgba(255,255,255,.05)); }
+  .files-row .files-icon { color: var(--muted); width: 1em; flex: none; }
+  .files-row .files-name { overflow: hidden; text-overflow: ellipsis; }
+  .files-row .files-git {
+    margin-left: auto; flex: none; font-size: 10px; font-weight: 700;
+    border-radius: 3px; padding: 0 4px; line-height: 1.5;
+  }
+  .files-row .files-actions { flex: none; display: flex; gap: 2px; margin-left: 4px; }
+  .files-row .files-actions button {
+    padding: 0 5px; font-size: 11px; line-height: 1.7; color: var(--muted);
+  }
+  .files-row .files-actions button:hover { color: var(--text); border-color: var(--accent); }
+  .files-row .files-actions button.danger { color: var(--error); border-color: var(--error); }
+  .files-inline-input {
+    flex: 1; min-width: 0; background: var(--bg); color: var(--text);
+    border: 1px solid var(--accent); border-radius: 4px;
+    padding: 1px 6px; font: inherit; font-size: 12.5px;
+  }
+  .files-git[data-code="M"] { color: var(--accent); }
+  .files-git[data-code="A"], .files-git[data-code="??"] { color: var(--user); }
+  .files-git[data-code="D"] { color: var(--error); }
+  .files-git[data-code="R"] { color: var(--tool); }
+  .files-git[data-code="*"] { color: var(--muted); }
+  .files-children { padding-left: 14px; display: none; }
+  .files-children.open { display: block; }
+  .files-empty { color: var(--muted); padding: 6px 12px; font-size: 12px; }
+  #files-view { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  /* Same specificity fix as #toolbar[hidden] above: this rule's own
+     `display: flex` would otherwise beat the UA `[hidden]` default, leaving
+     the file viewer visibly stacked under the tree after "← tree". */
+  #files-view[hidden] { display: none; }
+  #files-view-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px; border-bottom: 1px solid var(--border);
+  }
+  #files-view-head .spacer { flex: 1; }
+  #files-view-path { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #files-view-body { flex: 1; overflow: auto; padding: 10px 12px; }
+  #files-view-body textarea {
+    width: 100%; height: 100%; min-height: 200px; resize: none;
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  #files-view-body .msg.assistant { white-space: normal; }
+  .files-diff { font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+  .files-diff .add { color: var(--user); }
+  .files-diff .del { color: var(--error); }
+  .files-diff .hunk { color: var(--tool); }
+  .files-highlight { font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+  .files-note { color: var(--muted); font-size: 12.5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>maki</h1>
+  <span id="title"></span>
+  <span id="cwd"></span>
+  <span id="model"></span>
+  <span id="status" data-status="idle">idle</span>
+  <span id="stats"></span>
+  <span id="conn" data-conn="down">connecting</span>
+  <div id="center-wrap">
+    <button class="mini" id="files-btn" title="Browse files">files</button>
+    <button class="mini" id="toolbar-toggle" title="Hide/show the toolbar to save space">tools ▾</button>
+    <button class="mini" id="compact-toggle" title="Shrink the headers to save space">compact</button>
+    <button class="mini" id="notify-btn" title="Get notified when the run stops or needs you">🔕</button>
+    <button class="mini" id="qr-btn" title="QR code for this page's link">QR</button>
+    <button class="mini" id="center-btn" title="Remote control center">remote ▾</button>
+    <div id="center" hidden></div>
+  </div>
+</header>
+<div id="win-backdrop" hidden>
+  <div id="win-overlay">
+    <div id="win-title"><span id="win-title-text"></span><button class="mini" id="win-close" title="Close (esc)">×</button></div>
+    <div id="win-body" tabindex="0"></div>
+    <div id="win-footer"></div>
+  </div>
+</div>
+<div id="files-backdrop" hidden></div>
+<aside id="files-panel" aria-hidden="true">
+  <div id="files-resize" title="Drag to resize"></div>
+  <div id="files-head">
+    <strong id="files-title">Files</strong>
+    <span id="files-branch" class="small"></span>
+    <button class="mini" id="files-new-file" title="New file">+file</button>
+    <button class="mini" id="files-new-dir" title="New folder">+dir</button>
+    <button class="mini" id="files-refresh" title="Refresh">↻</button>
+    <button class="mini" id="files-close" title="Close">×</button>
+  </div>
+  <div id="files-search-row">
+    <input id="files-search" placeholder="Jump to file…" autocomplete="off">
+  </div>
+  <div id="files-tree" role="tree"></div>
+  <div id="files-view" hidden>
+    <div id="files-view-head">
+      <button class="mini" id="files-back" title="Back to tree">← tree</button>
+      <span id="files-view-path" class="mono"></span>
+      <span class="spacer"></span>
+      <button class="mini" id="files-toggle-diff" title="Show what changed" hidden>diff</button>
+      <button class="mini primary" id="files-save" title="Save changes" hidden>save</button>
+    </div>
+    <div id="files-view-body"></div>
+  </div>
+</aside>
+<div id="toolbar">
+  <input id="cmd-input" list="cmd-list" placeholder="/command — type to filter, Enter to run">
+  <button class="mini" id="cmd-run">Run</button>
+  <select id="provider-select" title="Filter models by provider"><option value="">all providers</option></select>
+  <select id="model-select" title="Model"><option value="">model…</option></select>
+  <select id="mode-select" title="Mode">
+    <option value="build">build</option>
+    <option value="plan">plan</option>
+  </select>
+  <label class="mini" title="Auto-approve tool permissions"><input type="checkbox" id="yolo-check"> yolo</label>
+  <button class="mini" id="btn-fast" title="Toggle fast mode">/fast</button>
+  <button class="mini" id="btn-thinking" title="Set thinking level">/thinking</button>
+  <button class="mini" id="btn-new" title="New session">/new</button>
+  <button class="mini" id="btn-compact" title="Compact context">/compact</button>
+</div>
+<datalist id="cmd-list"></datalist>
+<div id="sessions-bar"></div>
+<main id="log"></main>
+<div id="qr-pop" hidden></div>
+<div id="toast"></div>
+<button id="jump-bottom" title="Jump to the latest message">↓ latest</button>
+<div id="perm">
+  <div>Permission needed: <span class="toolname" id="perm-tool"></span></div>
+  <div class="scopes" id="perm-scopes"></div>
+  <div class="row">
+    <button class="primary" data-answer="allow">Allow</button>
+    <button data-answer="allow_session">Allow session</button>
+    <button data-answer="allow_always_local">Always (repo)</button>
+    <button data-answer="allow_always_global">Always (global)</button>
+    <button class="danger" id="deny-btn" data-answer="deny">Deny</button>
+  </div>
+  <textarea id="deny-guidance" placeholder="Guidance for the agent (optional; submit with the deny button)"></textarea>
+</div>
+<div id="stoprow"><button class="danger" id="stop">Stop run (Esc)</button></div>
+<div id="chips"></div>
+<div id="inputrow">
+  <button class="mini" id="btn-attach" title="Upload an image or document">+</button>
+  <input type="file" id="file-input" multiple hidden>
+  <textarea id="prompt" placeholder="Message maki… (Enter to send, Shift+Enter for newline)"></textarea>
+  <button id="send" class="primary">Send</button>
+</div>
+<script>
+(() => {
+  const log = document.getElementById("log");
+  const connEl = document.getElementById("conn");
+  const statusEl = document.getElementById("status");
+  const statsEl = document.getElementById("stats");
+  const titleEl = document.getElementById("title");
+  const cwdEl = document.getElementById("cwd");
+  const modelEl = document.getElementById("model");
+  const permEl = document.getElementById("perm");
+  const promptEl = document.getElementById("prompt");
+  // Grows the box with its content up to the CSS max-height (which then
+  // scrolls internally), and snaps back down once it's cleared — matching
+  // ordinary chat-composer behavior instead of a fixed two-line box.
+  const autoGrowPrompt = () => {
+    promptEl.style.height = "auto";
+    promptEl.style.height = promptEl.scrollHeight + "px";
+  };
+  promptEl.addEventListener("input", autoGrowPrompt);
+  const stopBtn = document.getElementById("stop");
+  const denyGuidance = document.getElementById("deny-guidance");
+  const cmdInput = document.getElementById("cmd-input");
+  const cmdList = document.getElementById("cmd-list");
+  const providerSelect = document.getElementById("provider-select");
+  const modelSelect = document.getElementById("model-select");
+  const modeSelect = document.getElementById("mode-select");
+  const yoloCheck = document.getElementById("yolo-check");
+  const SHARE_TOKEN = (location.pathname.split("/")[1] || "").replace(/\/$/, "");
+  const isSharePage = /^[0-9a-f]{32}$/.test(SHARE_TOKEN);
+  const sessionsBar = document.getElementById("sessions-bar");
+  const toastEl = document.getElementById("toast");
+  const jumpBtn = document.getElementById("jump-bottom");
+  let pendingPermission = null;
+  let allModels = [];
+
+  const el = (cls, text) => {
+    const node = document.createElement("div");
+    node.className = cls;
+    node.textContent = text ?? "";
+    return node;
+  };
+
+  let pinned = true;
+  const scrollDown = () => { log.scrollTop = log.scrollHeight; updateJump(); };
+
+  // Show the "jump to bottom" button only when the user has scrolled away
+  // from the latest message, so it never gets in the way at the bottom. Also
+  // tracks whether the view is "pinned" to the bottom: live updates only
+  // autoscroll while pinned, so reading older messages is never interrupted.
+  const updateJump = () => {
+    const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    pinned = nearBottom;
+    jumpBtn.style.display = nearBottom ? "none" : "flex";
+  };
+  log.addEventListener("scroll", updateJump);
+  jumpBtn.onclick = () => { pinned = true; scrollDown(); };
+
+  // Follow new output only when already pinned to the bottom; otherwise leave
+  // the scroll position alone and just keep the jump button in sync.
+  const autoScroll = () => { if (pinned) scrollDown(); else updateJump(); };
+
+  // Compact mode: persist the choice so a phone reload keeps the layout.
+  const compactToggle = document.getElementById("compact-toggle");
+  const applyCompact = (on) => {
+    document.body.classList.toggle("compact", on);
+    compactToggle.textContent = on ? "expand" : "compact";
+    try { localStorage.setItem("maki_compact", on ? "1" : "0"); } catch {}
+  };
+  compactToggle.onclick = () => applyCompact(!document.body.classList.contains("compact"));
+  // A first-time visit has no stored choice yet; default it from the
+  // viewport instead of always starting expanded, so a phone doesn't have
+  // to discover and click the toggle just to get a usable amount of screen.
+  try {
+    const stored = localStorage.getItem("maki_compact");
+    applyCompact(stored === null ? window.innerWidth < 600 : stored === "1");
+  } catch { applyCompact(window.innerWidth < 600); }
+
+  // Toolbar hide/show: the command bar (model picker, /fast, /thinking, ...)
+  // is the biggest single chunk of header space on a phone and is rarely
+  // touched mid-conversation, so it can be tucked away independently of
+  // compact mode. Persisted the same way so a reload keeps the choice.
+  const toolbarToggle = document.getElementById("toolbar-toggle");
+  const toolbarEl = document.getElementById("toolbar");
+  const applyToolbar = (hidden) => {
+    toolbarEl.hidden = hidden;
+    toolbarToggle.textContent = hidden ? "tools ▸" : "tools ▾";
+    try { localStorage.setItem("maki_toolbar_hidden", hidden ? "1" : "0"); } catch {}
+  };
+  toolbarToggle.onclick = () => applyToolbar(!toolbarEl.hidden);
+  // Same first-visit rule as compact mode: an unset preference defaults from
+  // the viewport instead of always starting expanded, so a phone's first
+  // load isn't the full command bar eating half the screen.
+  try {
+    const stored = localStorage.getItem("maki_toolbar_hidden");
+    applyToolbar(stored === null ? window.innerWidth < 600 : stored === "1");
+  } catch { applyToolbar(window.innerWidth < 600); }
+
+  // Notifications: opt-in (a page can't silently start popping OS alerts),
+  // persisted like the layout toggles, and only for events that actually
+  // need you back at the screen — not every text delta.
+  const notifyBtn = document.getElementById("notify-btn");
+  const notifyEnabled = () => { try { return localStorage.getItem("maki_notify") === "1"; } catch { return false; } };
+  const applyNotifyBtn = () => {
+    const on = notifyEnabled();
+    notifyBtn.textContent = on ? "🔔" : "🔕";
+    notifyBtn.title = on ? "Notifications on — click to turn off" : "Get notified when the run stops or needs you";
+  };
+  // Historical events replayed from a snapshot (page load, reconnect) must
+  // never notify — only genuinely new live ones.
+  let replaying = false;
+  const notify = (title, body) => {
+    if (replaying || !notifyEnabled()) return;
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    if (document.visibilityState === "visible") return;
+    try { new Notification(title, { body, tag: "maki-remote" }); } catch {}
+  };
+  notifyBtn.onclick = async () => {
+    if (notifyEnabled()) {
+      try { localStorage.setItem("maki_notify", "0"); } catch {}
+      applyNotifyBtn();
+      return;
+    }
+    if (typeof Notification === "undefined") { toast("notifications aren't supported here"); return; }
+    const perm = Notification.permission === "granted" ? "granted" : await Notification.requestPermission();
+    if (perm !== "granted") { toast("notification permission denied"); return; }
+    try { localStorage.setItem("maki_notify", "1"); } catch {}
+    applyNotifyBtn();
+    new Notification("maki", { body: "You'll be notified when the run stops or needs you." });
+  };
+  applyNotifyBtn();
+
+  const fmtTokens = (n) =>
+    n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
+
+  // A running record of cost/context at each point `setStats` sees new
+  // numbers, for the "usage this session" sparkline in the control center.
+  // In memory only, cleared on `renderSnapshot` (a fresh page load or
+  // reconnect) — a trend across *this* viewing, not a persisted history.
+  let usageHistory = [];
+  const setStats = (stats) => {
+    if (!stats) return;
+    const parts = [];
+    if (typeof stats.context_size === "number" && stats.context_window) {
+      const pct = Math.round(stats.context_size / stats.context_window * 100);
+      parts.push(`${fmtTokens(stats.context_size)}/${fmtTokens(stats.context_window)} (${pct}%)`);
+    }
+    if (typeof stats.cost === "number") parts.push(`$${stats.cost.toFixed(3)}`);
+    const usage = stats.token_usage || {};
+    const inTok = (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0);
+    if (inTok || usage.output_tokens) parts.push(`in ${fmtTokens(inTok)} out ${fmtTokens(usage.output_tokens || 0)}`);
+    statsEl.textContent = parts.join(" · ");
+    if (typeof stats.cost === "number" || typeof stats.context_size === "number") {
+      const last = usageHistory[usageHistory.length - 1];
+      const point = {
+        cost: typeof stats.cost === "number" ? stats.cost : (last ? last.cost : 0),
+        contextSize: typeof stats.context_size === "number" ? stats.context_size : (last ? last.contextSize : 0),
+        contextWindow: stats.context_window || (last ? last.contextWindow : 0),
+      };
+      // Collapse runs of identical points (most turns don't move cost or
+      // context) so the sparkline's x-axis is "turns that changed something",
+      // not padded out with flat stretches.
+      if (!last || last.cost !== point.cost || last.contextSize !== point.contextSize) {
+        usageHistory.push(point);
+      }
+    }
+  };
+
+  const setHeader = (snap) => {
+    if (snap.title) titleEl.textContent = snap.title;
+    if (snap.cwd) cwdEl.textContent = snap.cwd;
+    if (snap.model) {
+      modelEl.textContent = snap.model;
+      reflectModel(snap.model);
+    }
+    setStats(snap);
+    if (snap.status) setStatus(snap.status);
+  };
+
+  const toast = (msg, ms = 2500) => {
+    toastEl.textContent = msg;
+    toastEl.style.display = "block";
+    clearTimeout(toastEl._t);
+    toastEl._t = setTimeout(() => toastEl.style.display = "none", ms);
+  };
+
+  // `question` (maki's ask-the-user tool, like a Lua plugin's AskUserQuestion)
+  // opens a native TUI form via a general Lua windowing API, not a fixed
+  // permission-style prompt — there's no remote bridge for that yet, so the
+  // best the web view can do is show what's being asked instead of a bare,
+  // permanently-empty "question" card that looks like a silent hang.
+  const questionPreview = (input) => {
+    const qs = input && input.questions;
+    if (!Array.isArray(qs) || !qs.length) return "";
+    return String(qs[0].question || "").slice(0, 140);
+  };
+  const renderQuestionBody = (input) => {
+    const wrap = document.createElement("div");
+    for (const q of (input && input.questions) || []) {
+      const block = document.createElement("div");
+      block.style.margin = "4px 0 8px";
+      const text = document.createElement("div");
+      text.textContent = q.question || "";
+      block.appendChild(text);
+      if (Array.isArray(q.options) && q.options.length) {
+        const ul = document.createElement("ul");
+        ul.style.margin = "4px 0 0 18px";
+        for (const opt of q.options) {
+          const li = document.createElement("li");
+          li.textContent = opt.description ? `${opt.label} — ${opt.description}` : (opt.label || "");
+          ul.appendChild(li);
+        }
+        block.appendChild(ul);
+      }
+      wrap.appendChild(block);
+    }
+    const note = document.createElement("div");
+    note.className = "files-note";
+    note.textContent = "Answer this at the terminal — the remote view can't fill in maki's interactive question form yet.";
+    wrap.appendChild(note);
+    return wrap;
+  };
+
+  const toolCard = (event) => {
+    const details = document.createElement("details");
+    details.className = "tool running";
+    details.dataset.id = event.id;
+    const summary = document.createElement("summary");
+    const out = document.createElement("div");
+    out.className = "out";
+    let label = event.tool || "";
+    if (event.tool === "question") {
+      const preview = questionPreview(event.input);
+      if (preview) label += ` — ${preview}`;
+      details.open = true;
+    } else if (event.summary) label += ` — ${event.summary}`;
+    else if (event.input) {
+      const bits = [];
+      for (const key of ["command", "path", "file_path", "pattern", "query", "url"]) {
+        if (event.input[key]) bits.push(String(event.input[key]).slice(0, 80));
+      }
+      if (bits.length) label += ` — ${bits.join(" ")}`;
+      else {
+        // A tool this build has no bespoke summary for — almost always a
+        // Lua plugin's own tool, built-in or third-party. Dumping its raw
+        // call arguments beats a bare name with an indefinitely empty body,
+        // and needs no per-tool knowledge to do.
+        const json = JSON.stringify(event.input);
+        if (json && json !== "{}" && json !== "null") {
+          label += ` — ${json.slice(0, 100)}`;
+          out.textContent = JSON.stringify(event.input, null, 2);
+        }
+      }
+    }
+    summary.textContent = label;
+    details.appendChild(summary);
+    details.appendChild(out);
+    if (event.tool === "question" && event.input) out.appendChild(renderQuestionBody(event.input));
+    log.appendChild(details);
+    return details;
+  };
+
+  const toolById = (id) => log.querySelector(`.tool[data-id="${CSS.escape(id)}"]`);
+
+  // A tiny, safe markdown renderer for assistant messages: escape first, then
+  // apply a small set of block and inline rules. Good enough to read code,
+  // lists (ordered and unordered), headings, rules and links the way the CLI
+  // does, without a dependency.
+  const escHtml = (s) => String(s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  // Code spans are pulled out behind a placeholder before bold/italic/strike
+  // run, so `**`/`~~` inside inline code is never reinterpreted as markup.
+  const inlineMd = (s) => {
+    const spans = [];
+    const placeheld = escHtml(s).replace(/`([^`]+)`/g, (_, code) => {
+      spans.push(code);
+      return ` ${spans.length - 1} `;
+    });
+    const html = placeheld
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "<em>$1</em>")
+      .replace(/~~([^~]+)~~/g, "<del>$1</del>")
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    return html.replace(/ (\d+) /g, (_, i) => `<code>${spans[Number(i)]}</code>`);
+  };
+  const renderMarkdown = (text) => {
+    const lines = String(text).split("\n");
+    let html = "";
+    let inCode = false;
+    let codeLang = "";
+    let codeBuf = [];
+    let listType = null; // "ul" | "ol" | null
+    let inTable = false;
+    let tableRows = [];
+    // A paragraph is a run of plain lines; markdown reflows them into one
+    // block, so buffer and join with a space rather than emitting a <p> per
+    // source line — otherwise every soft-wrapped line reads as its own
+    // paragraph, which looks nothing like the CLI's rendering.
+    let para = [];
+    const closeList = () => { if (listType) { html += `</${listType}>`; listType = null; } };
+    const closeTable = () => {
+      if (inTable) {
+        html += "<table>" + tableRows.map(r => `<tr>${r.map(c => `<td>${inlineMd(c)}</td>`).join("")}</tr>`).join("") + "</table>";
+        inTable = false; tableRows = [];
+      }
+    };
+    const flushPara = () => {
+      if (para.length) { html += `<p>${inlineMd(para.join(" "))}</p>`; para = []; }
+    };
+    for (const raw of lines) {
+      const line = raw.trimEnd();
+      if (line.startsWith("```")) {
+        flushPara(); closeList(); closeTable();
+        if (inCode) {
+          // A fence that actually closed: the block's content is final, so
+          // it's worth asking the server to syntax-highlight it (see
+          // highlightCodeBlocks below). One still open at end-of-text is
+          // left plain — its content is still growing on every reveal
+          // frame, so there's nothing stable yet worth highlighting.
+          html += `<pre><code data-lang="${escHtml(codeLang)}">${escHtml(codeBuf.join("\n"))}</code></pre>`;
+          inCode = false; codeBuf = []; codeLang = "";
+        } else {
+          inCode = true;
+          codeLang = line.slice(3).trim().split(/\s+/)[0] || "";
+        }
+        continue;
+      }
+      if (inCode) { codeBuf.push(line); continue; }
+      if (/^\s*\|.*\|\s*$/.test(line)) {
+        flushPara(); closeList();
+        const cells = line.split("|").slice(1, -1).map(c => c.trim());
+        if (/^[\s:|-]+$/.test(cells.join(""))) continue; // separator row
+        inTable = true; tableRows.push(cells);
+        continue;
+      }
+      closeTable();
+      if (/^ {0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) {
+        flushPara(); closeList();
+        html += "<hr>";
+      } else if (/^#{1,3}\s/.test(line)) {
+        flushPara(); closeList();
+        const level = line.match(/^#+/)[0].length;
+        html += `<h${level}>${inlineMd(line.replace(/^#+\s/, ""))}</h${level}>`;
+      } else if (/^\s*[-*]\s+/.test(line)) {
+        flushPara();
+        if (listType !== "ul") { closeList(); html += "<ul>"; listType = "ul"; }
+        html += `<li>${inlineMd(line.replace(/^\s*[-*]\s+/, ""))}</li>`;
+      } else if (/^\s*\d+[.)]\s+/.test(line)) {
+        flushPara();
+        if (listType !== "ol") { closeList(); html += "<ol>"; listType = "ol"; }
+        html += `<li>${inlineMd(line.replace(/^\s*\d+[.)]\s+/, ""))}</li>`;
+      } else if (/^\s*>\s?/.test(line)) {
+        flushPara(); closeList();
+        html += `<blockquote>${inlineMd(line.replace(/^\s*>\s?/, ""))}</blockquote>`;
+      } else if (line.trim() === "") {
+        flushPara(); closeList();
+      } else {
+        closeList();
+        para.push(line.trim());
+      }
+    }
+    flushPara(); closeList(); closeTable();
+    if (inCode) html += `<pre><code>${escHtml(codeBuf.join("\n"))}</code></pre>`;
+    return html;
+  };
+
+  // Syntax-highlights fenced code blocks after they land in the DOM, via the
+  // same syntect-backed highlighter the TUI and the file panel's file viewer
+  // use (POST /highlight) — one highlighter, one theme, everywhere maki
+  // colors code, instead of a second client-side highlighter with its own
+  // look. Cached by "lang\0code" so the typewriter's per-frame re-render of
+  // a finished message (see pushTypewriter) reuses the first fetch instead
+  // of asking again on every frame; in-flight requests are deduped the same
+  // way. A late reply patches every currently-unhighlighted block that still
+  // matches, not just the one that triggered the fetch — the node that asked
+  // may already have been replaced by a later re-render by the time it lands.
+  //
+  // A failure (empty fence, code past the server's own limit, a wedged event
+  // loop, ...) is cached too, as `null` — every unhighlighted block gets
+  // reattempted on essentially every typewriter frame until it is marked
+  // `data-hl`, so leaving a failing key retryable turns one bad block into a
+  // retry storm for the rest of that message's reveal. `HIGHLIGHT_CODE_LIMIT`
+  // mirrors dispatch.rs so an oversized block is never even sent.
+  const HIGHLIGHT_CODE_LIMIT = 200_000;
+  const highlightCache = new Map();
+  const highlightPending = new Set();
+  const highlightCodeBlocks = (root) => {
+    for (const code of root.querySelectorAll("pre > code[data-lang]:not([data-hl])")) {
+      const lang = code.dataset.lang;
+      const text = code.textContent;
+      if (!text) { code.dataset.hl = "1"; continue; }
+      const key = `${lang}\0${text}`;
+      if (highlightCache.has(key)) {
+        const html = highlightCache.get(key);
+        if (html !== null) code.innerHTML = html;
+        code.dataset.hl = "1";
+        continue;
+      }
+      if (text.length > HIGHLIGHT_CODE_LIMIT) { highlightCache.set(key, null); code.dataset.hl = "1"; continue; }
+      if (highlightPending.has(key)) continue;
+      highlightPending.add(key);
+      postJson("highlight", { lang, code: text }).then((res) => {
+        highlightPending.delete(key);
+        const html = res && typeof res.html === "string" ? res.html : null;
+        highlightCache.set(key, html);
+        for (const el of document.querySelectorAll("pre > code[data-lang]:not([data-hl])")) {
+          if (el.dataset.lang === lang && el.textContent === text) {
+            if (html !== null) el.innerHTML = html;
+            el.dataset.hl = "1";
+          }
+        }
+      });
+    }
+  };
+
+  // The CLI never dumps a whole network chunk onto the screen at once — it
+  // reveals it at a steady pace (`typewriter_ms_per_char`, 4ms/char, clamped
+  // to 30-1000ms per chunk) so text always looks like it's being typed,
+  // however big the underlying delta was. The web page received the exact
+  // same envelopes just as fast, but rendered them instantly, which read as
+  // "batches" next to the CLI. This mirrors that same reveal algorithm
+  // client-side, keyed per message node so several streaming messages (e.g.
+  // thinking + assistant text) animate independently.
+  const TYPEWRITER_MS_PER_CHAR = 4;
+  const TYPEWRITER_MIN_MS = 30;
+  const TYPEWRITER_MAX_MS = 1000;
+  const typewriterNodes = new Set();
+  let typewriterRunning = false;
+  const runTypewriter = () => {
+    const now = performance.now();
+    for (const node of [...typewriterNodes]) {
+      if (!node.isConnected) { typewriterNodes.delete(node); continue; }
+      const progress = Math.min(1, (now - node._twStart) / node._twDuration);
+      const shown = Math.round(node._twFrom + (node._twTo - node._twFrom) * progress);
+      if (shown !== node._twVisible) {
+        node._twVisible = shown;
+        node._twRender(node.dataset.raw.slice(0, shown));
+      }
+      if (progress >= 1) typewriterNodes.delete(node);
+    }
+    autoScroll();
+    if (typewriterNodes.size) requestAnimationFrame(runTypewriter);
+    else typewriterRunning = false;
+  };
+  // Feeds more text into a node's reveal, extending its animation the same
+  // way the CLI's typewriter does: retarget from wherever it currently is
+  // toward the new full length, over a duration sized to what's unrevealed.
+  const pushTypewriter = (node, renderFn) => {
+    node._twRender = renderFn;
+    node._twVisible = node._twVisible ?? 0;
+    node._twFrom = node._twVisible;
+    node._twTo = node.dataset.raw.length;
+    const unrevealed = node._twTo - node._twFrom;
+    node._twDuration = Math.min(TYPEWRITER_MAX_MS, Math.max(TYPEWRITER_MIN_MS, unrevealed * TYPEWRITER_MS_PER_CHAR));
+    node._twStart = performance.now();
+    typewriterNodes.add(node);
+    if (!typewriterRunning) { typewriterRunning = true; requestAnimationFrame(runTypewriter); }
+  };
+
+  // A user message may carry images (vision attachments, rendered as
+  // thumbnails) and a "save"-mode upload leaves a plain "Uploaded file at
+  // NAME" line in its own text — turned into a link into the file panel
+  // instead of dead text, since NAME is already a path relative to cwd.
+  const UPLOAD_LINE_RE = /^Uploaded file at (.+)$/gm;
+  const renderUserMessage = (event) => {
+    const wrap = document.createElement("div");
+    wrap.className = "msg user";
+    const text = String(event.text || "");
+    let last = 0;
+    let m;
+    UPLOAD_LINE_RE.lastIndex = 0;
+    while ((m = UPLOAD_LINE_RE.exec(text))) {
+      wrap.appendChild(document.createTextNode(text.slice(last, m.index)));
+      const path = m[1];
+      const link = document.createElement("a");
+      link.href = "#";
+      link.className = "upload-link";
+      link.textContent = `📎 ${path}`;
+      link.onclick = (ev) => { ev.preventDefault(); openFilesPanel(); openFile(path); };
+      wrap.appendChild(link);
+      last = UPLOAD_LINE_RE.lastIndex;
+    }
+    wrap.appendChild(document.createTextNode(text.slice(last)));
+    for (const src of event.images || []) {
+      wrap.appendChild(document.createElement("br"));
+      const link = document.createElement("a");
+      link.href = src;
+      link.target = "_blank";
+      link.rel = "noopener";
+      const img = document.createElement("img");
+      img.className = "upload-thumb";
+      img.src = src;
+      link.appendChild(img);
+      wrap.appendChild(link);
+    }
+    log.appendChild(wrap);
+  };
+
+  const renderEvent = (event) => {
+    switch (event.type) {
+      case "text_delta": {
+        const last = log.lastElementChild;
+        const node = (last && last.dataset.kind === "assistant") ? last : (() => {
+          const n = el("msg assistant", "");
+          n.dataset.kind = "assistant";
+          n.dataset.raw = "";
+          log.appendChild(n);
+          return n;
+        })();
+        node.dataset.raw = (node.dataset.raw || "") + event.text;
+        pushTypewriter(node, (visible) => { node.innerHTML = renderMarkdown(visible); highlightCodeBlocks(node); });
+        break;
+      }
+      case "thinking_delta": {
+        const last = log.lastElementChild;
+        const node = (last && last.dataset.kind === "thinking") ? last : (() => {
+          const n = el("msg thinking", "");
+          n.dataset.kind = "thinking";
+          n.dataset.raw = "";
+          log.appendChild(n);
+          return n;
+        })();
+        node.dataset.raw = (node.dataset.raw || "") + event.text;
+        pushTypewriter(node, (visible) => { node.textContent = visible; });
+        break;
+      }
+      case "tool_start": {
+        toolCard(event);
+        // The `question` tool opens a native TUI form the web has no way to
+        // drive (it isn't a fixed-shape prompt like permissions — it's an
+        // arbitrary interactive Lua window), so the run is genuinely stuck
+        // here until someone answers at the actual terminal. Surfacing what's
+        // being asked, and paging whoever's watching remotely, at least means
+        // that's not a silent, unexplained hang.
+        if (event.tool === "question") {
+          notify("maki — question", questionPreview(event.input) || "needs your input at the terminal");
+        }
+        break;
+      }
+      case "tool_output": {
+        const details = toolById(event.id);
+        if (details) details.querySelector(".out").textContent = event.content;
+        break;
+      }
+      case "tool_done": {
+        const details = toolById(event.id);
+        if (details) {
+          details.classList.remove("running");
+          const out = details.querySelector(".out");
+          if (!event.is_error && event.output && event.output.Image) {
+            const { source, text } = event.output.Image;
+            out.textContent = "";
+            const link = document.createElement("a");
+            link.href = `data:${source.media_type};base64,${source.data}`;
+            link.target = "_blank";
+            link.rel = "noopener";
+            const img = document.createElement("img");
+            img.className = "tool-thumb";
+            img.src = link.href;
+            img.alt = text || "";
+            link.appendChild(img);
+            out.appendChild(link);
+            out.appendChild(el("tool-thumb-caption", text || ""));
+          } else {
+            const text = typeof event.output === "string"
+              ? event.output
+              : (event.output && event.output.Plain && event.output.Plain.text) || JSON.stringify(event.output);
+            out.textContent = event.is_error ? `[error] ${text}` : text;
+          }
+        }
+        break;
+      }
+      // Both end the run outright, so the stop button must go with them —
+      // relying only on a separate "status" SSE frame left it stuck showing
+      // on a run that had, in fact, already finished (a status frame lost to
+      // a phone backgrounding the tab, or a reconnect that missed it).
+      case "error": {
+        log.appendChild(el("msg error", event.message));
+        setStatus("idle");
+        notify("maki — stopped", event.message || "the run ended with an error");
+        break;
+      }
+      case "done": {
+        log.appendChild(el("msg system", `— done (${event.num_turns ?? "?"} turns)`));
+        setStats({ context_size: event.context_size, context_window: event.context_window, cost: event.cost });
+        setStatus("idle");
+        notify("maki — done", `${titleEl.textContent || "session"} finished (${event.num_turns ?? "?"} turns)`);
+        break;
+      }
+      case "turn_complete": {
+        if (event.usage) setStats({ token_usage: event.usage, cost: event.cost });
+        break;
+      }
+      case "permission_request": {
+        pendingPermission = event;
+        document.getElementById("perm-tool").textContent = event.tool;
+        document.getElementById("perm-scopes").textContent = (event.scopes || []).join(", ");
+        denyGuidance.value = "";
+        denyGuidance.style.display = "none";
+        permEl.style.display = "block";
+        notify("maki — permission needed", event.tool ? `wants to run ${event.tool}` : "needs your input");
+        break;
+      }
+      case "permission_resolved": {
+        if (pendingPermission && pendingPermission.id === event.id) {
+          pendingPermission = null;
+          permEl.style.display = "none";
+        }
+        break;
+      }
+      case "user_message": renderUserMessage(event); break;
+      case "assistant_text": {
+        const node = el("msg assistant", "");
+        node.dataset.kind = "assistant";
+        node.dataset.raw = event.text;
+        node.innerHTML = renderMarkdown(event.text);
+        highlightCodeBlocks(node);
+        log.appendChild(node);
+        break;
+      }
+    }
+    autoScroll();
+  };
+
+  // One pass over the snapshot's message list: the same shapes live events
+  // use, so rendering is the same code path.
+  const renderSnapshot = (snap) => {
+    usageHistory = [];
+    log.replaceChildren();
+    if (snap.error) {
+      const bare = "/" + SHARE_TOKEN + "/";
+      const note = el("msg system", "this link points at a tab that is no longer live");
+      log.appendChild(note);
+      if (location.pathname.replace(/\/$/, "") !== bare.replace(/\/$/, "")) {
+        const back = document.createElement("a");
+        back.href = bare;
+        back.textContent = "open the whole instance instead";
+        note.appendChild(document.createElement("br"));
+        note.appendChild(back);
+      }
+      return;
+    }
+    replaying = true;
+    for (const event of snap.messages || []) renderEvent(event);
+    // Snapshot tool cards arrive as start+result pairs; close them.
+    for (const details of log.querySelectorAll(".tool.running")) {
+      details.classList.remove("running");
+    }
+    if (snap.pending_permission) {
+      renderEvent({ type: "permission_request", id: snap.pending_permission.id, tool: "resuming" });
+    }
+    replaying = false;
+    setHeader(snap);
+    // A reconnect (phone screen waking up, a hard refresh) needs to see an
+    // already-open focused window again — window_open/window_update only
+    // fire on the next change, and some windows (the question tool's form)
+    // have no redraw loop of their own to ever produce one.
+    if (snap.window) renderWindow(snap.window);
+    else if (currentWindowId !== null) closeWindow(currentWindowId);
+    if (Array.isArray(snap.queue) && snap.queue.length) {
+      log.appendChild(el("msg system", `— ${snap.queue.length} queued prompt(s)`));
+    }
+    // A fresh snapshot (first load or reconnect) always starts pinned to the
+    // bottom, same as opening the page; only later live updates respect scroll.
+    pinned = true;
+    scrollDown();
+  };
+
+  const setStatus = (status) => {
+    statusEl.dataset.status = status;
+    statusEl.textContent = status;
+    stopBtn.style.display = status === "working" ? "inline-block" : "none";
+  };
+
+  const connect = () => {
+    const es = new EventSource("events");
+    es.onopen = () => { connEl.dataset.conn = "live"; connEl.textContent = "live"; };
+    es.onerror = () => {
+      connEl.dataset.conn = "down";
+      connEl.textContent = "reconnecting";
+      es.close();
+      // Reconnect with a short delay. On a phone whose screen slept, the
+      // socket is gone but the page is still open; re-fetching the snapshot
+      // on reconnect restores the chat without a hard refresh.
+      setTimeout(() => { connect(); refreshSnapshot(); }, 2000);
+    };
+    for (const kind of ["snapshot", "event", "status", "permission", "permission_resolved", "window_open", "window_update", "window_close"]) {
+      es.addEventListener(kind, (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          if (kind === "snapshot") renderSnapshot(data);
+          else if (kind === "event") renderEvent(data);
+          else if (kind === "status") setStatus(data);
+          else if (kind === "permission") renderEvent({ type: "permission_request", ...data });
+          else if (kind === "permission_resolved") renderEvent({ type: "permission_resolved", ...data });
+          else if (kind === "window_open" || kind === "window_update") renderWindow(data);
+          else if (kind === "window_close") closeWindow(data.id);
+        } catch {}
+      });
+    }
+  };
+
+  // Re-fetch the current snapshot so a reconnect (e.g. after the phone screen
+  // slept) restores the full chat without a hard refresh.
+  const refreshSnapshot = async () => {
+    const snap = await fetchJson("snapshot");
+    if (snap) renderSnapshot(snap);
+  };
+
+  const submit = async (path, body, quiet) => {
+    try {
+      const res = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok && !quiet) {
+        try { const j = await res.json(); if (j.error) toast(j.error); } catch {}
+      }
+      return res.ok;
+    } catch { return false; }
+  };
+
+  const fetchJson = async (path) => {
+    try { const r = await fetch(path); if (!r.ok) return null; return await r.json(); } catch { return null; }
+  };
+
+  const postJson = async (path, body) => {
+    try {
+      const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      return await r.json().catch(() => (r.ok ? {} : { error: "failed" }));
+    } catch { return { error: "network" }; }
+  };
+
+  // ---- window bridge --------------------------------------------------
+  // A plugin's maki.ui.open_win() float — /tasks, /sessions, /memory, the
+  // question tool's form, anything else built on that primitive — mirrored
+  // here as a generic modal. Input always targets whichever window is
+  // focused server-side, same as a local keypress, so there is no explicit
+  // window id to send on the way out; window_open/window_update/window_close
+  // all carry the window's own id, so a stale frame for a window this tab
+  // already replaced can be told apart from the current one.
+  const winBackdrop = document.getElementById("win-backdrop");
+  const winTitleText = document.getElementById("win-title-text");
+  const winBody = document.getElementById("win-body");
+  const winFooter = document.getElementById("win-footer");
+  const winCloseBtn = document.getElementById("win-close");
+  let currentWindowId = null;
+
+  // Each keystroke is its own POST; firing them all concurrently (the
+  // ordinary fire-and-forget `submit`) lets a slower request land after a
+  // later one and reorder fast typing at the server. Chaining onto one
+  // promise makes every request wait for the last to finish before it
+  // starts, so keys always arrive in the order they were typed.
+  let winInputChain = Promise.resolve();
+  const submitWindowInput = (body) => {
+    // quiet: true — a key can legitimately race a window closing (Enter on
+    // a picker row closes it server-side right as the keystroke lands), and
+    // that is not a fault worth a toast.
+    winInputChain = winInputChain.then(() => submit("window/input", body, true));
+    return winInputChain;
+  };
+  const submitWindowKey = (key) => submitWindowInput({ key });
+  const submitWindowPaste = (text) => submitWindowInput({ paste: text });
+
+  // Only a window that actually holds local focus is shown here — a
+  // background one (todo_write's panel, the memory plugin's toast, both
+  // opened with focus = false) is real window state a browser tab still
+  // hears about, but never worth a blocking modal: nothing local is
+  // dismissing it by hand either, and forward_key_str only ever reaches the
+  // focused window, so a modal for an unfocused one would have no way to
+  // close short of a page reload.
+  const renderWindow = (w) => {
+    if (!w.focus) {
+      // A window that just lost focus (e.g. a second one opened over it)
+      // must not leave its own now-stale modal on screen.
+      if (currentWindowId === w.id) closeWindow(w.id);
+      return;
+    }
+    currentWindowId = w.id;
+    winTitleText.textContent = (w.title || "").trim();
+    winBody.innerHTML = w.html || "";
+    winFooter.innerHTML = "";
+    for (const [key, label] of w.footer || []) {
+      const span = document.createElement("span");
+      span.textContent = `${key} ${label}`;
+      winFooter.appendChild(span);
+    }
+    const visible = w.visible !== false;
+    winBackdrop.hidden = !visible;
+    if (visible) {
+      winBody.focus();
+      // innerHTML above reset scrollTop to 0; without this, arrow-key
+      // navigation past the visible area leaves the selection off-screen
+      // with nothing on screen ever following it.
+      winBody.querySelector(".win-cursor")?.scrollIntoView({ block: "nearest" });
+    }
+  };
+
+  const closeWindow = (id) => {
+    if (currentWindowId !== id) return;
+    currentWindowId = null;
+    winBackdrop.hidden = true;
+  };
+
+  // Esc is the universal float dismissal everywhere in this app (local
+  // keybinding, permission card, ...); reusing it here means "close" needs
+  // no separate server-side concept — the plugin's own esc handling, which
+  // already runs locally, decides what closing means.
+  winCloseBtn.onclick = () => submitWindowKey("esc");
+  winBackdrop.addEventListener("click", (ev) => {
+    if (ev.target === winBackdrop) submitWindowKey("esc");
+  });
+
+  // Mirrors maki-ui's key_event_to_string exactly (components/keybindings.rs)
+  // so a browser keypress reaches the same WinEvent::Key a local one would.
+  const winKeyString = (ev) => {
+    let prefix = "";
+    if (ev.ctrlKey) prefix += "ctrl+";
+    if (ev.altKey) prefix += "alt+";
+    const isChar = ev.key.length === 1 && ev.key !== " ";
+    if (ev.shiftKey && !isChar) prefix += "shift+";
+    switch (ev.key) {
+      case " ": return prefix + "space";
+      case "Enter": return prefix + "enter";
+      case "Escape": return prefix + "esc";
+      case "Tab": return prefix + "tab";
+      case "Backspace": return prefix + "backspace";
+      case "Delete": return prefix + "delete";
+      case "ArrowUp": return prefix + "up";
+      case "ArrowDown": return prefix + "down";
+      case "ArrowLeft": return prefix + "left";
+      case "ArrowRight": return prefix + "right";
+      case "Home": return prefix + "home";
+      case "End": return prefix + "end";
+      case "PageUp": return prefix + "pageup";
+      case "PageDown": return prefix + "pagedown";
+      case "Insert": return prefix + "insert";
+      default:
+        if (/^F([1-9]|1[0-9]|2[0-4])$/.test(ev.key)) return prefix + ev.key.toLowerCase();
+        return isChar ? prefix + ev.key : "";
+    }
+  };
+
+  winBody.addEventListener("keydown", (ev) => {
+    const key = winKeyString(ev);
+    if (!key) return;
+    ev.preventDefault();
+    submitWindowKey(key);
+  });
+  winBody.addEventListener("paste", (ev) => {
+    const text = ev.clipboardData?.getData("text");
+    if (text) {
+      ev.preventDefault();
+      submitWindowPaste(text);
+    }
+  });
+
+  // ---- file panel ---------------------------------------------------------
+  // Slides out from the left: a gitignore-aware tree (server-side, jailed to
+  // the session's cwd), a viewer/editor per file (markdown renders through
+  // the same renderer the transcript uses), and a diff view against HEAD.
+  // Reading needs only the link's own rights; saving is a plain POST, so a
+  // view-only link gets the same 403-and-toast every other write does.
+  const filesBtn = document.getElementById("files-btn");
+  const filesBackdrop = document.getElementById("files-backdrop");
+  const filesPanel = document.getElementById("files-panel");
+  const filesTree = document.getElementById("files-tree");
+  const filesSearchRow = document.getElementById("files-search-row");
+  const filesView = document.getElementById("files-view");
+  const filesViewBody = document.getElementById("files-view-body");
+  const filesViewPath = document.getElementById("files-view-path");
+  const filesBranchEl = document.getElementById("files-branch");
+  const filesSaveBtn = document.getElementById("files-save");
+  const filesDiffBtn = document.getElementById("files-toggle-diff");
+  const filesBackBtn = document.getElementById("files-back");
+  const filesResize = document.getElementById("files-resize");
+
+  try {
+    const savedWidth = localStorage.getItem("maki_files_width");
+    if (savedWidth) filesPanel.style.width = savedWidth + "px";
+  } catch {}
+  (() => {
+    let startX = 0;
+    let startWidth = 0;
+    const onMove = (ev) => {
+      const x = ev.touches ? ev.touches[0].clientX : ev.clientX;
+      const w = Math.min(window.innerWidth * 0.92, Math.max(260, startWidth + (x - startX)));
+      filesPanel.style.width = w + "px";
+    };
+    const onUp = () => {
+      filesPanel.classList.remove("resizing");
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      try { localStorage.setItem("maki_files_width", String(filesPanel.getBoundingClientRect().width)); } catch {}
+    };
+    filesResize.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      startX = ev.clientX;
+      startWidth = filesPanel.getBoundingClientRect().width;
+      filesPanel.classList.add("resizing");
+      document.addEventListener("pointermove", onMove);
+      document.addEventListener("pointerup", onUp);
+    });
+  })();
+
+  let filesOpen = false;
+  let currentFile = null; // { path, content, binary, tooLarge, editing }
+  let showingDiff = false;
+  // The fuzzy finder's flat file list, fetched once and reused across
+  // keystrokes; invalidated on refresh and on any create/rename/delete.
+  let filesFlatCache = null;
+
+  const isMarkdownPath = (p) => /\.(md|markdown)$/i.test(p);
+
+  // Every inline editor (new file/dir, rename) shares one "only one open at
+  // a time" slot instead of a native prompt()/confirm() — those block the
+  // whole tab until dismissed, which is worse on a phone and, not
+  // incidentally, doesn't play well with anything scripting this page.
+  let activeInlineCancel = null;
+  const cancelActiveInline = () => {
+    if (activeInlineCancel) {
+      const fn = activeInlineCancel;
+      activeInlineCancel = null;
+      fn();
+    }
+  };
+
+  const filesInlineCreate = (isDir) => {
+    cancelActiveInline();
+    const row = document.createElement("div");
+    row.className = "files-row files-inline";
+    row.innerHTML = `<span class="files-icon">${isDir ? "▸" : "·"}</span>`;
+    const input = document.createElement("input");
+    input.className = "files-inline-input";
+    input.placeholder = isDir ? "new-folder/name" : "new-file.ext";
+    row.appendChild(input);
+    filesTree.prepend(row);
+    input.focus();
+    let done = false;
+    const cancel = () => { if (done) return; done = true; row.remove(); };
+    activeInlineCancel = cancel;
+    input.onkeydown = async (ev) => {
+      if (ev.key === "Escape") { cancel(); return; }
+      if (ev.key !== "Enter") return;
+      const path = input.value.trim();
+      if (!path) return;
+      input.disabled = true;
+      const r = await postJson("file/create", { path, is_dir: isDir });
+      if (r && r.error) { toast(r.error); input.disabled = false; return; }
+      toast("created");
+      filesFlatCache = null;
+      done = true;
+      activeInlineCancel = null;
+      row.remove();
+      delete filesTree.dataset.loaded;
+      loadFilesTree();
+      if (!isDir) openFile(r.path);
+    };
+    input.onblur = () => setTimeout(cancel, 150);
+  };
+  document.getElementById("files-new-file").onclick = () => filesInlineCreate(false);
+  document.getElementById("files-new-dir").onclick = () => filesInlineCreate(true);
+
+  const filesSearchEl = document.getElementById("files-search");
+  const renderFlatMatches = (paths) => {
+    filesTree.innerHTML = "";
+    if (!paths.length) {
+      filesTree.innerHTML = `<div class="files-empty">no matches</div>`;
+      return;
+    }
+    for (const p of paths.slice(0, 200)) {
+      const row = document.createElement("div");
+      row.className = "files-row";
+      row.innerHTML = `<span class="files-icon">·</span><span class="files-name">${escHtml(p)}</span>`;
+      row.onclick = () => openFile(p);
+      filesTree.appendChild(row);
+    }
+  };
+  filesSearchEl.oninput = async () => {
+    const q = filesSearchEl.value.trim().toLowerCase();
+    if (!q) {
+      delete filesTree.dataset.loaded;
+      loadFilesTree();
+      return;
+    }
+    if (!filesFlatCache) {
+      const data = await fetchJson("files/flat");
+      filesFlatCache = (data && data.paths) || [];
+    }
+    renderFlatMatches(filesFlatCache.filter((p) => p.toLowerCase().includes(q)));
+  };
+
+  const openFilesPanel = () => {
+    filesOpen = true;
+    filesPanel.classList.add("open");
+    filesPanel.setAttribute("aria-hidden", "false");
+    filesBackdrop.hidden = false;
+    if (!filesTree.dataset.loaded) loadFilesTree();
+    fetchJson("git/status").then((status) => {
+      filesBranchEl.textContent = status && status.is_repo && status.branch ? `⎇ ${status.branch}` : "";
+    });
+  };
+  const closeFilesPanel = () => {
+    filesOpen = false;
+    filesPanel.classList.remove("open");
+    filesPanel.setAttribute("aria-hidden", "true");
+    filesBackdrop.hidden = true;
+  };
+  filesBtn.onclick = () => (filesOpen ? closeFilesPanel() : openFilesPanel());
+  document.getElementById("files-close").onclick = closeFilesPanel;
+  filesBackdrop.onclick = closeFilesPanel;
+
+  const gitBadge = (code) => code
+    ? `<span class="files-git" data-code="${escHtml(code)}">${escHtml(code)}</span>`
+    : "";
+
+  // Each row is built fresh per directory fetch; a directory's `<div>` of
+  // children is lazy — nothing under it loads until it's actually expanded.
+  // Rename edits the row's own name in place; delete arms on a first click
+  // and only acts on a second one (auto-disarming after a few seconds),
+  // rather than a confirm() dialog. Both refresh just the row's own
+  // container afterward, not the whole tree.
+  const filesRenameOrDelete = (entry, fullPath, parentPath, container, nameEl) => {
+    const renameBtn = document.createElement("button");
+    renameBtn.className = "mini";
+    renameBtn.textContent = "✎";
+    renameBtn.title = "Rename";
+    renameBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      cancelActiveInline();
+      const original = nameEl.textContent;
+      const input = document.createElement("input");
+      input.className = "files-inline-input";
+      input.value = original;
+      nameEl.replaceWith(input);
+      input.focus();
+      input.select();
+      let done = false;
+      const cancel = () => {
+        if (done) return;
+        done = true;
+        input.replaceWith(nameEl);
+      };
+      activeInlineCancel = cancel;
+      input.onkeydown = async (kev) => {
+        if (kev.key === "Escape") { cancel(); return; }
+        if (kev.key !== "Enter") return;
+        const next = input.value.trim();
+        if (!next || next === original) { cancel(); return; }
+        const to = parentPath ? `${parentPath}/${next}` : next;
+        input.disabled = true;
+        const r = await postJson("file/rename", { from: fullPath, to });
+        if (r && r.error) { toast(r.error); input.disabled = false; return; }
+        toast("renamed");
+        filesFlatCache = null;
+        done = true;
+        activeInlineCancel = null;
+        loadFilesInto(container, parentPath);
+      };
+      input.onblur = () => setTimeout(cancel, 150);
+    };
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "mini";
+    deleteBtn.title = entry.is_dir ? "Delete (must be empty)" : "Delete";
+    deleteBtn.textContent = "🗑";
+    let armed = false;
+    let armTimer = null;
+    deleteBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      if (!armed) {
+        armed = true;
+        deleteBtn.textContent = "sure?";
+        deleteBtn.classList.add("danger");
+        armTimer = setTimeout(() => {
+          armed = false;
+          deleteBtn.textContent = "🗑";
+          deleteBtn.classList.remove("danger");
+        }, 3000);
+        return;
+      }
+      clearTimeout(armTimer);
+      postJson("file/delete", { path: fullPath }).then((r) => {
+        if (r && r.error) {
+          toast(r.error);
+          armed = false;
+          deleteBtn.textContent = "🗑";
+          deleteBtn.classList.remove("danger");
+          return;
+        }
+        toast("deleted");
+        filesFlatCache = null;
+        loadFilesInto(container, parentPath);
+      });
+    };
+    const actions = document.createElement("span");
+    actions.className = "files-actions";
+    actions.append(renameBtn, deleteBtn);
+    return actions;
+  };
+
+  const filesRow = (entry, parentPath, container) => {
+    const row = document.createElement("div");
+    row.className = "files-row";
+    row.setAttribute("role", "treeitem");
+    const fullPath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
+    row.innerHTML = `<span class="files-icon">${entry.is_dir ? "▸" : "·"}</span>` +
+      `<span class="files-name">${escHtml(entry.name)}</span>${gitBadge(entry.git)}`;
+    const nameEl = row.querySelector(".files-name");
+    row.appendChild(filesRenameOrDelete(entry, fullPath, parentPath, container, nameEl));
+    if (!entry.is_dir) {
+      row.onclick = () => openFile(fullPath);
+      return [row];
+    }
+    const children = document.createElement("div");
+    children.className = "files-children";
+    row.onclick = () => {
+      const icon = row.querySelector(".files-icon");
+      const isOpen = children.classList.toggle("open");
+      icon.textContent = isOpen ? "▾" : "▸";
+      if (isOpen && !children.dataset.loaded) {
+        children.dataset.loaded = "1";
+        loadFilesInto(children, fullPath);
+      }
+    };
+    return [row, children];
+  };
+
+  const loadFilesInto = async (container, path) => {
+    container.innerHTML = `<div class="files-empty">loading…</div>`;
+    const data = await fetchJson(`files?path=${encodeURIComponent(path)}`);
+    container.innerHTML = "";
+    if (!data || !Array.isArray(data.entries) || !data.entries.length) {
+      container.innerHTML = `<div class="files-empty">${data ? "empty" : "failed to load"}</div>`;
+      return;
+    }
+    for (const entry of data.entries) {
+      for (const el of filesRow(entry, path, container)) container.appendChild(el);
+    }
+  };
+
+  const loadFilesTree = () => {
+    filesTree.dataset.loaded = "1";
+    loadFilesInto(filesTree, "");
+  };
+  document.getElementById("files-refresh").onclick = () => {
+    delete filesTree.dataset.loaded;
+    filesFlatCache = null;
+    loadFilesTree();
+  };
+
+  const diffLineClass = (line) => {
+    if (line.startsWith("+") && !line.startsWith("+++")) return "add";
+    if (line.startsWith("-") && !line.startsWith("---")) return "del";
+    if (line.startsWith("@@")) return "hunk";
+    return "";
+  };
+
+  const renderFileBody = () => {
+    if (!currentFile) return;
+    filesDiffBtn.hidden = false;
+    filesDiffBtn.textContent = showingDiff ? "content" : "diff";
+    filesSaveBtn.hidden = showingDiff || currentFile.binary || currentFile.tooLarge;
+    if (showingDiff) {
+      filesViewBody.innerHTML = `<div class="files-note">loading diff…</div>`;
+      fetchJson(`git/diff?path=${encodeURIComponent(currentFile.path)}`).then((d) => {
+        if (!d || !d.diff) {
+          filesViewBody.innerHTML = `<div class="files-note">no changes against HEAD</div>`;
+          return;
+        }
+        const lines = d.diff.split("\n")
+          .map((line) => `<div class="${diffLineClass(line)}">${escHtml(line) || " "}</div>`)
+          .join("");
+        filesViewBody.innerHTML = `<div class="files-diff">${lines}</div>`;
+      });
+      return;
+    }
+    if (currentFile.binary) {
+      filesViewBody.innerHTML = `<div class="files-note">binary file — not shown</div>`;
+      return;
+    }
+    if (currentFile.tooLarge) {
+      filesViewBody.innerHTML = `<div class="files-note">file too large to display here (over 1.5MB)</div>`;
+      return;
+    }
+    if (isMarkdownPath(currentFile.path) && !currentFile.editing) {
+      const node = el("msg assistant", "");
+      node.innerHTML = renderMarkdown(currentFile.content);
+      highlightCodeBlocks(node);
+      const editBtn = document.createElement("button");
+      editBtn.className = "mini";
+      editBtn.textContent = "edit source";
+      editBtn.style.marginTop = "8px";
+      editBtn.onclick = () => { currentFile.editing = true; renderFileBody(); };
+      filesViewBody.replaceChildren(node, editBtn);
+      return;
+    }
+    if (currentFile.html && !currentFile.editing) {
+      const pre = document.createElement("div");
+      pre.className = "files-highlight";
+      pre.innerHTML = currentFile.html;
+      const editBtn = document.createElement("button");
+      editBtn.className = "mini";
+      editBtn.textContent = "edit source";
+      editBtn.style.marginTop = "8px";
+      editBtn.onclick = () => { currentFile.editing = true; renderFileBody(); };
+      filesViewBody.replaceChildren(pre, editBtn);
+      return;
+    }
+    const ta = document.createElement("textarea");
+    ta.value = currentFile.content;
+    ta.spellcheck = false;
+    ta.oninput = () => { currentFile.content = ta.value; };
+    filesViewBody.replaceChildren(ta);
+  };
+
+  const openFile = async (path) => {
+    filesViewPath.textContent = path;
+    filesViewBody.innerHTML = `<div class="files-note">loading…</div>`;
+    filesTree.hidden = true;
+    filesSearchRow.hidden = true;
+    filesView.hidden = false;
+    showingDiff = false;
+    const data = await fetchJson(`file?path=${encodeURIComponent(path)}`);
+    if (!data) {
+      filesViewBody.innerHTML = `<div class="files-note">failed to load</div>`;
+      currentFile = null;
+      return;
+    }
+    currentFile = {
+      path,
+      content: data.content || "",
+      html: data.html || "",
+      binary: !!data.binary,
+      tooLarge: !!data.too_large,
+      editing: false,
+    };
+    renderFileBody();
+  };
+
+  filesBackBtn.onclick = () => {
+    filesView.hidden = true;
+    filesTree.hidden = false;
+    filesSearchRow.hidden = false;
+    currentFile = null;
+    // A search still active from before opening this file should keep
+    // filtering, not silently fall back to the unfiltered tree.
+    if (filesSearchEl.value.trim()) filesSearchEl.oninput();
+  };
+  filesDiffBtn.onclick = () => { showingDiff = !showingDiff; renderFileBody(); };
+  filesSaveBtn.onclick = async () => {
+    if (!currentFile) return;
+    const r = await postJson("file", { path: currentFile.path, content: currentFile.content });
+    toast(r && r.error ? r.error : "saved");
+  };
+
+  const sendPrompt = async () => {
+    const text = promptEl.value.trim();
+    if (!text && !pendingFiles.length) return;
+    const files = pendingFiles.splice(0).map(f => ({ name: f.name, media_type: f.mediaType, data: f.data, mode: f.mode }));
+    promptEl.value = "";
+    autoGrowPrompt();
+    renderChips();
+    if (await submit("prompt", { text, files })) {
+      // Optimistic render: attached images are known in full right now (we
+      // hold the bytes), so show them immediately rather than waiting on a
+      // reload. A "save" upload's final name isn't known until the backend
+      // resolves a collision, so it gets a plain note here; the real,
+      // clickable "Uploaded file at ..." line takes over once history
+      // (snapshot/reload) reflects what actually landed on disk.
+      let label = text;
+      const images = [];
+      for (const f of files) {
+        if (f.mode === "attach") images.push(`data:${f.media_type};base64,${f.data}`);
+        else label += `${label ? "\n" : ""}📎 saved ${f.name}`;
+      }
+      renderUserMessage({ text: label, images });
+    }
+  };
+
+  const answerPermission = async (answer) => {
+    if (!pendingPermission) return;
+    if (answer === "deny" && denyGuidance.value.trim()) {
+      answer = "deny:" + denyGuidance.value.trim();
+    }
+    const requestId = pendingPermission.id;
+    pendingPermission = null;
+    permEl.style.display = "none";
+    await submit("answer", { request_id: requestId, answer });
+  };
+
+  const runCommand = async () => {
+    const cmdline = cmdInput.value.trim();
+    if (!cmdline) return;
+    const ok = await submit("command", { cmdline });
+    if (ok) { toast(`ran ${cmdline}`); cmdInput.value = ""; setTimeout(() => { refreshOptions(); refreshSessions(); }, 600); }
+  };
+  const setModel = async (spec) => {
+    if (!spec) return;
+    const j = await postJson("model", { spec });
+    if (j && j.spec) { toast(`model → ${j.spec}`); modelEl.textContent = j.spec; reflectModel(j.spec); }
+    else toast((j && j.error) || "model change failed");
+  };
+  const refreshSessions = async () => {
+    const data = await fetchJson("sessions");
+    if (!data || !Array.isArray(data.sessions)) return;
+    sessionsBar.replaceChildren();
+    const label = document.createElement("span");
+    label.textContent = "sessions:";
+    sessionsBar.appendChild(label);
+    // Page lives at /{token}/ or /{token}/s/{id}/; buttons open the target
+    // session's own scoped page, which pins every request to it.
+    const token = location.pathname.split('/')[1] || "";
+    for (const s of data.sessions) {
+      const b = document.createElement("button");
+      b.className = "sess mini" + (s.focused ? " focused" : "");
+      b.textContent = `${s.title || s.id.slice(0,8)} · ${s.model || ""}`;
+      b.title = s.id;
+      b.onclick = () => { location.href = `/${token}/s/${s.id}/`; };
+      sessionsBar.appendChild(b);
+    }
+    // A single-session roster is just the tab you're already looking at —
+    // showing it wastes a whole row, especially on a phone.
+    sessionsBar.style.display = data.sessions.length > 1 ? "flex" : "none";
+  };
+
+  // The model <select> is filtered by the provider <select> but always keeps
+  // the current spec, even when it belongs to a provider now filtered out.
+  const reflectModel = (spec) => {
+    if (!spec) return;
+    const want = providerSelect.value;
+    if (!want) modelSelect.value = spec;
+    if (modelSelect.value !== spec) {
+      const opt = document.createElement("option");
+      opt.value = spec; opt.textContent = spec; opt.dataset.current = "1";
+      modelSelect.prepend(opt);
+      modelSelect.value = spec;
+    }
+  };
+
+  const rebuildModelSelect = () => {
+    const current = modelEl.textContent;
+    const want = providerSelect.value;
+    modelSelect.replaceChildren();
+    for (const spec of allModels) {
+      if (want && !spec.startsWith(want + "/")) continue;
+      const o = document.createElement("option");
+      o.value = spec; o.textContent = spec;
+      modelSelect.appendChild(o);
+    }
+    if (current && ![...modelSelect.options].some((o) => o.value === current)) {
+      const o = document.createElement("option");
+      o.value = current; o.textContent = current; o.dataset.current = "1";
+      modelSelect.prepend(o);
+    }
+    if (current) modelSelect.value = current;
+  };
+
+  const refreshOptions = async () => {
+    const o = await fetchJson("options");
+    if (!o) return;
+    allModels = Array.isArray(o.models) ? o.models : allModels;
+    const known = [...new Set(allModels.map((s) => s.split("/")[0]))];
+    const keep = providerSelect.value;
+    providerSelect.replaceChildren();
+    const all = document.createElement("option");
+    all.value = ""; all.textContent = "all providers";
+    providerSelect.appendChild(all);
+    for (const p of (o.providers || known)) {
+      const opt = document.createElement("option");
+      opt.value = p; opt.textContent = p;
+      providerSelect.appendChild(opt);
+    }
+    providerSelect.value = keep;
+    modelEl.textContent = o.model || modelEl.textContent;
+    rebuildModelSelect();
+    if (o.mode) modeSelect.value = o.mode;
+    if (typeof o.yolo === "boolean") yoloCheck.checked = o.yolo;
+  };
+
+  const refreshCommands = async () => {
+    const list = await fetchJson("commands");
+    if (!Array.isArray(list)) return;
+    cmdList.replaceChildren();
+    for (const c of list) {
+      const o = document.createElement("option");
+      o.value = c.name;
+      o.label = c.description || "";
+      o.textContent = `${c.name} — ${c.description || ""}`;
+      cmdList.appendChild(o);
+    }
+  };
+
+  document.getElementById("send").onclick = sendPrompt;
+  document.getElementById("cmd-run").onclick = runCommand;
+  // ---- uploads ----------------------------------------------------------
+  const pendingFiles = [];
+  const MAX_UPLOAD = 16 * 1024 * 1024;
+  const chipsEl = document.getElementById("chips");
+  const fileInput = document.getElementById("file-input");
+  document.getElementById("btn-attach").onclick = () => fileInput.click();
+  const toBase64 = (file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",")[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+  const renderChips = () => {
+    chipsEl.innerHTML = "";
+    for (const [i, f] of pendingFiles.entries()) {
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      const name = document.createElement("span");
+      name.textContent = f.name;
+      const mode = document.createElement("select");
+      mode.title = "attach: send it to the model · save: drop it in the session's directory";
+      for (const [value, label] of [["attach", "attach"], ["save", "save"]]) {
+        const opt = document.createElement("option");
+        opt.value = value; opt.textContent = label; opt.selected = f.mode === value;
+        mode.appendChild(opt);
+      }
+      mode.onchange = () => { f.mode = mode.value; };
+      const drop = document.createElement("button");
+      drop.textContent = "×";
+      drop.onclick = () => { pendingFiles.splice(i, 1); renderChips(); };
+      chip.append(name, mode, drop);
+      chipsEl.appendChild(chip);
+    }
+  };
+  const addFiles = async (files) => {
+    for (const file of files) {
+      if (file.size > MAX_UPLOAD) { toast(`${file.name} is over 16MB`); continue; }
+      try {
+        pendingFiles.push({
+          name: file.name,
+          mediaType: file.type || "application/octet-stream",
+          data: await toBase64(file),
+          mode: (file.type || "").startsWith("image/") ? "attach" : "save",
+        });
+      } catch { toast(`could not read ${file.name}`); }
+    }
+    renderChips();
+  };
+  fileInput.onchange = async () => {
+    await addFiles(fileInput.files);
+    fileInput.value = "";
+  };
+  // A screenshot pasted straight into the composer attaches the same way a
+  // picked file would — the common case on a desktop far outweighs anyone
+  // pasting an image while actually meaning to paste text over it.
+  promptEl.addEventListener("paste", (ev) => {
+    const items = [...(ev.clipboardData?.items || [])].filter((i) => i.kind === "file");
+    if (!items.length) return;
+    ev.preventDefault();
+    const files = items.map((i) => i.getAsFile()).filter(Boolean);
+    if (files.length) addFiles(files);
+  });
+
+  // ---- control center ---------------------------------------------------
+  const centerBtn = document.getElementById("center-btn");
+  const centerEl = document.getElementById("center");
+  let centerData = null;
+
+  const loadCenter = async () => {
+    const inst = await fetchJson("center");
+    let anchor = null;
+    if (isSharePage) {
+      try {
+        const r = await fetch(`/api/center?link=${SHARE_TOKEN}`, { headers: { accept: "application/json" } });
+        if (r.ok) anchor = await r.json();
+      } catch {}
+    }
+    centerData = { inst, anchor };
+    renderCenter();
+  };
+
+  // A minimal inline-SVG line chart — no library worth pulling in for one
+  // sparkline. `min` forces the baseline to 0 (cost/percent never sensibly
+  // start elsewhere); omitted, the chart auto-fits its own value range.
+  const renderSparkline = (values, min) => {
+    if (values.length < 2) return "";
+    const w = 240, h = 32, pad = 2;
+    const lo = min ?? Math.min(...values);
+    const hi = Math.max(...values, lo + 0.0001);
+    const pts = values.map((v, i) => {
+      const x = pad + (i / (values.length - 1)) * (w - pad * 2);
+      const y = h - pad - ((v - lo) / (hi - lo)) * (h - pad * 2);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(" ");
+    return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">` +
+      `<polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5"/></svg>`;
+  };
+
+  const renderCenter = () => {
+    if (!centerData) { centerEl.innerHTML = "loading…"; return; }
+    const { inst, anchor } = centerData;
+    const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    let html = "";
+    if (usageHistory.length > 1) {
+      const costs = usageHistory.map((p) => p.cost);
+      const pcts = usageHistory.map((p) => p.contextWindow ? (p.contextSize / p.contextWindow * 100) : 0);
+      html += `<h3>Usage this session</h3>`;
+      html += `<div class="row" style="color:var(--muted);font-size:11px;">cost — $${costs[costs.length - 1].toFixed(3)}</div>`;
+      html += renderSparkline(costs, 0);
+      html += `<div class="row" style="color:var(--muted);font-size:11px;margin-top:4px;">context fill — ${Math.round(pcts[pcts.length - 1])}%</div>`;
+      html += renderSparkline(pcts, 0);
+    }
+    const viewers = (inst && inst.viewers) || [];
+    html += `<h3>Watchers</h3>`;
+    if (!viewers.length) {
+      html += `<div class="row bad">nobody watching this instance right now</div>`;
+    } else {
+      for (const v of viewers) {
+        html += `<div class="row"><span class="ok">${esc(v.tag)}</span> <span style="color:var(--muted)">on ${v.session ? esc(v.session.slice(0, 8)) : "all tabs"}</span></div>`;
+      }
+    }
+    if (anchor) {
+      html += `<h3>Instance</h3><div class="row"><b>${esc(anchor.instance.name)}</b> <span class="${anchor.online ? "ok" : "bad"}">${anchor.online ? "online" : "offline"}</span> · you: ${esc(anchor.me ? anchor.me.name : "?")} (${esc(anchor.rights)})</div>`;
+      const tabs = [];
+      if (anchor.links) for (const l of anchor.links) {
+        const who = l.session ? `tab ${esc(l.session.slice(0, 8))}` : "all tabs";
+        const href = l.token ? `/${l.token}/${l.session ? "s/" + encodeURIComponent(l.session) + "/" : ""}` : "";
+        tabs.push(`<tr><td>${esc(l.rights)} · ${who}</td><td>${href ? `<a href="${href}" target="_blank">open</a>` : "—"}</td><td>${anchor.can_manage && l.hash ? `<button class="mini" data-revoke="${esc(l.hash)}">revoke</button>` : ""}</td></tr>`);
+      }
+      if (anchor.can_manage) {
+        html += `<h3>Invite</h3><div class="row"><select id="c-rights"><option value="view">view</option><option value="control">control</option></select><input id="c-hours" type="number" min="1" value="2" style="width:52px"><button class="mini" id="c-mint">create link</button></div><div id="c-invite"></div>`;
+        html += `<h3>Live links</h3><table>${tabs.join("")}</table><div class="row"><button class="mini" id="c-close">close this link</button> <button class="mini" id="c-qr">show QR</button></div>`;
+      } else {
+        html += `<div class="row" style="color:var(--muted)">signed in without manage rights</div>`;
+      }
+      html += `<div id="c-qr-slot"></div>`;
+    } else if (isSharePage) {
+      html += `<div class="row" style="color:var(--muted)">management needs an anchor sign-in; you are on a share link</div><div class="row"><button class="mini" id="c-qr">show QR</button></div><div id="c-qr-slot"></div>`;
+    } else {
+      html += `<div class="row" style="color:var(--muted)">this is not an anchor share page</div>`;
+    }
+    centerEl.innerHTML = html;
+    for (const b of centerEl.querySelectorAll("[data-revoke]")) {
+      b.onclick = async () => {
+        const r = await postJson("/api/links/revoke", { token_hash: b.dataset.revoke, link: SHARE_TOKEN });
+        if (r.error) toast(r.error); else loadCenter();
+      };
+    }
+    const mint = centerEl.querySelector("#c-mint");
+    if (mint) mint.onclick = async () => {
+      const rights = centerEl.querySelector("#c-rights").value;
+      const hours = Number(centerEl.querySelector("#c-hours").value || 2);
+      const r = await postJson("/api/links/mint", { link: SHARE_TOKEN, rights, hours });
+      if (r.error) { toast(r.error); return; }
+      const url = location.origin + r.path;
+      centerEl.querySelector("#c-invite").innerHTML = `<div class="row"><a href="${r.path}" target="_blank">${esc(r.path)}</a></div><img class="qr" src="/qr?text=${encodeURIComponent(url)}" width="120" height="120">`;
+    };
+    const close = centerEl.querySelector("#c-close");
+    if (close) close.onclick = async () => {
+      if (!confirm("Close this share link? Current viewers are dropped.")) return;
+      const r = await postJson("/api/links/close", { link: SHARE_TOKEN });
+      if (r.error) toast(r.error); else { centerEl.innerHTML = "<h3>Closed</h3><div class='row'>this link no longer works</div>"; }
+    };
+    for (const b of centerEl.querySelectorAll("#c-qr")) b.onclick = () => {
+      const slot = centerEl.querySelector("#c-qr-slot");
+      if (slot.firstChild) { slot.innerHTML = ""; return; }
+      const img = document.createElement("img");
+      img.className = "qr"; img.width = 140; img.height = 140;
+      img.src = `qr?text=${encodeURIComponent(location.href)}`;
+      slot.appendChild(img);
+    };
+  };
+
+  const qrPop = document.getElementById("qr-pop");
+  document.getElementById("qr-btn").onclick = (ev) => {
+    ev.stopPropagation();
+    if (!qrPop.hidden) { qrPop.hidden = true; return; }
+    qrPop.innerHTML = "";
+    const img = document.createElement("img");
+    img.className = "qr"; img.width = 168; img.height = 168;
+    img.src = `qr?text=${encodeURIComponent(location.href)}`;
+    const link = document.createElement("a");
+    link.href = location.href; link.textContent = location.pathname;
+    qrPop.append(img, link);
+    qrPop.hidden = false;
+  };
+  document.addEventListener("click", (ev) => {
+    if (!qrPop.hidden && !qrPop.contains(ev.target)) qrPop.hidden = true;
+  });
+
+  centerBtn.onclick = () => {
+    centerEl.hidden = !centerEl.hidden;
+    if (!centerEl.hidden) loadCenter();
+  };
+  document.addEventListener("click", (ev) => {
+    if (!centerEl.hidden && !centerEl.contains(ev.target) && ev.target !== centerBtn) centerEl.hidden = true;
+  });
+
+  document.getElementById("btn-fast").onclick = () => submit("command", { cmdline: "/fast" }).then(ok => ok && toast("toggled /fast"));
+  document.getElementById("btn-thinking").onclick = () => {
+    const v = prompt("thinking: off / adaptive / high / low (blank toggles)", "");
+    if (v !== null) submit("command", { cmdline: "/thinking " + v }).then(ok => ok && toast("thinking updated"));
+  };
+  document.getElementById("btn-new").onclick = () => submit("command", { cmdline: "/new" }).then(ok => ok && toast("new session"));
+  document.getElementById("btn-compact").onclick = () => submit("command", { cmdline: "/compact" }).then(ok => ok && toast("compact queued"));
+  cmdInput.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); runCommand(); } });
+  providerSelect.onchange = rebuildModelSelect;
+  modelSelect.onchange = () => { if (modelSelect.value) setModel(modelSelect.value); };
+  modeSelect.onchange = async () => {
+    const j = await postJson("options", { mode: modeSelect.value });
+    if (j && !j.error) toast(`mode: ${modeSelect.value}`); else { toast((j && j.error) || "mode change failed"); refreshOptions(); }
+  };
+  yoloCheck.onchange = async () => {
+    const j = await postJson("options", { yolo: yoloCheck.checked });
+    if (j && !j.error) toast(`yolo ${yoloCheck.checked ? "on" : "off"}`); else refreshOptions();
+  };
+  promptEl.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      // slash at start → route to command endpoint so autocomplete, model, etc. work from the main box too
+      const t = promptEl.value.trim();
+      if (t.startsWith("/")) { cmdInput.value = t; promptEl.value = ""; autoGrowPrompt(); runCommand(); return; }
+      sendPrompt();
+    }
+  });
+  stopBtn.onclick = () => submit("stop", {});
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && statusEl.dataset.status === "working") submit("stop", {});
+  });
+  permEl.addEventListener("click", (ev) => {
+    const answer = ev.target?.dataset?.answer;
+    if (!answer) return;
+    if (answer === "deny") {
+      denyGuidance.style.display = denyGuidance.style.display === "none" ? "block" : "none";
+      if (!denyGuidance.value.trim()) return;
+    }
+    answerPermission(answer);
+  });
+
+  connect();
+  refreshOptions();
+  refreshCommands();
+  refreshSessions();
+  setInterval(() => { refreshSessions(); refreshOptions(); }, 8000);
+  promptEl.focus();
+  // Installability only (no offline cache) — lets a phone add this share
+  // link to its home screen as its own app instead of a browser tab.
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  }
+})();
+</script>
+</body>
+</html>

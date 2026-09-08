@@ -1,5 +1,99 @@
 <img src="./banner.png">
 
+## About this fork
+
+I've used the remote-control features in Claude Code and in Oh My Pi (OMP)
+and found both genuinely useful — being able to walk away from my computer
+and still drive a session, or hand it off entirely, is a real workflow
+upgrade. What I kept running into with OMP was that its terminal proxy
+server isn't something you can self-host, which bugged me on both privacy
+and safety grounds: a session with control over my machine, brokered by
+infrastructure I don't run. So this fork adds the same kind of remote
+control to maki, plus a self-hosted proxy (what we call the anchor) so the
+whole path stays under your own roof.
+
+This fork adds remote control over the web, built for running maki on many
+hosts with one shared entry point:
+
+* **`/rc` standalone** - run `/rc` in the TUI and it prints a tokenized web URL
+  (behind your own reverse proxy for TLS). The web view mirrors the live
+  session: full transcript, thinking, tool calls with results, model, context
+  and cost stats. You can prompt, answer permission requests, and stop runs
+  from the browser.
+* **File explorer** - a git-aware file panel slides out from the terminal
+  page: gitignore-respecting tree, per-file status badges, markdown
+  rendering with a raw-source toggle, unified diffs (tracked or untracked),
+  and a save path straight back to disk over the same tunnel.
+* **`maki-anchor`** - a central server for many instances. Instances dial out
+  over a WebSocket, so they need no inbound ports. One domain, one dashboard,
+  one login:
+  * OIDC single sign-on (Authelia, Authentik, Keycloak, Pocket ID, ...), first
+    login becomes admin.
+  * Per-user, per-instance grants: `viewer` (read) or `controller` (prompt and
+    approve).
+  * Share links with rights and expiry: `view` / `control`, default 2 hours.
+  * Fleet dashboard: all instances, their sessions, costs, and status.
+    Login is mandatory (first run walks you through creating the admin), and
+    the link to your instance reconnects itself when the network blinks.
+  * Full session transcripts are persisted on the anchor for fast reload and
+    search, with per-session delete, off-the-record (OTR, never persisted),
+    and a configurable pruning timeline.
+* **Signed Windows binaries** - releases ship an Authenticode-signed `.exe`
+  (Azure Trusted Signing), so SmartScreen stays quiet, next to static Linux
+  (x86_64 + arm64) and macOS builds.
+
+Quick start for the anchor:
+
+```sh
+# On the server: install or update maki-anchor as a systemd service.
+# As root it writes a system unit; as a user, a user unit with linger.
+curl -fsSL https://raw.githubusercontent.com/wmantly/maki/main/install-anchor.sh | sh
+
+# Register an instance and copy the printed one-liner for its host.
+maki-anchor tokens add work-laptop
+
+# A CLI-minted instance has no grants yet, so it's invisible on a non-admin's
+# dashboard until you grant one. Either do it in one step:
+maki-anchor tokens add work-laptop --user-id 2 --rights control
+# ...or grant it after the fact (see `maki-anchor users list` for ids):
+maki-anchor grants set 2 work-laptop control
+```
+
+```sh
+# Or skip systemd and run in the foreground
+# (reverse proxy handles TLS and forwards WebSocket upgrades).
+maki-anchor serve --bind 0.0.0.0:8688
+```
+
+```lua
+-- In ~/.config/maki/init.lua on the instance host.
+maki.setup {
+  anchor = {
+    url = "https://maki.example.com",
+    name = "work-laptop",
+    token = "<token from tokens add>",
+  },
+}
+```
+
+Now `/rc` prints an anchor link instead of binding a local port. See the
+[anchor docs](https://maki.sh/docs/anchor/) for SSO setup, grants, and share
+links.
+
+### Screenshots
+
+| | |
+|---|---|
+| ![Anchor dashboard](./screenshots/anchor-dashboard.jpg) Fleet dashboard: live shares and sessions, each with a search box over titles and full transcripts. | ![Remote terminal](./screenshots/remote-terminal.jpg) The remote terminal: full transcript, model/provider pickers, and the command toolbar. |
+| ![File explorer panel](./screenshots/remote-terminal-files.jpg) The file panel: create, rename, delete, and fuzzy-find files from a gitignore-aware tree. | ![Syntax-highlighted file in the file panel](./screenshots/remote-terminal-files-highlight.jpg) Non-markdown files render with full syntax highlighting. |
+| ![Markdown file rendered in the file panel](./screenshots/remote-terminal-files-markdown.jpg) Markdown renders in place, with a toggle to edit the raw source. | ![Compact mobile view](./screenshots/remote-terminal-compact.jpg) Compact mode with the toolbar tucked away, for a phone screen. |
+| ![Anchor live shares with bulk revoke](./screenshots/anchor-links.jpg) Live shares, each proxied through the tunnel, with a one-click revoke-all. | ![Anchor instances with bulk session delete](./screenshots/anchor-instances.jpg) Every connected instance, with a bulk "delete all sessions" per host. |
+| ![Anchor webhooks admin](./screenshots/anchor-webhooks.jpg) Webhooks fire to Slack, Discord, ntfy, or a generic JSON endpoint whenever a session finishes. | ![QR code popup](./screenshots/remote-terminal-qr.jpg) One tap to flash the page's own link as a QR code. |
+
+Everything below is upstream's README.
+
+---
+
 An AI coding agent optimized for minimal use of context tokens, while providing a great user experience.
 
 ## Features

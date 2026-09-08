@@ -352,6 +352,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
+                remote_control: stack.config.remote_control.clone(),
+                anchor: (stack.config.anchor.complete().is_some())
+                    .then(|| stack.config.anchor.clone()),
                 input_history_size: stack.config.storage.input_history_size,
                 permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
                     stack.config.permissions.clone(),

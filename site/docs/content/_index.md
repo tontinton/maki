@@ -62,6 +62,7 @@ The docs are sorted by what you came here to do:
     <a class="card" href="/docs/packages/"><span class="card-title">Lua Packages</span><span class="card-desc">Load external Lua plugins from Neovim-style package directories.</span></a>
     <a class="card" href="/docs/cli/"><span class="card-title">CLI</span><span class="card-desc">Flags and subcommands (auth, models, acp, prompt, ...).</span></a>
     <a class="card" href="/docs/telemetry/"><span class="card-title">Telemetry</span><span class="card-desc">Opt-in OpenTelemetry metrics and events, to a collector you run.</span></a>
+    <a class="card" href="/docs/anchor/"><span class="card-title">Anchor</span><span class="card-desc">One domain, login and dashboard for many maki instances.</span></a>
   </div>
 </div>
 
