@@ -3239,7 +3239,18 @@ fn proxy_remote(
     }
 
     let method = request.method().to_owned();
-    let write = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+    // A POST is "write" by default, but /highlight has no side effect (it
+    // just renders code the viewer is already looking at) — without this
+    // carve-out every view-only share link would 403 on every code block,
+    // silently, since the client has no notion of its own rights to
+    // self-suppress the request. `maki-remote` (owner of the real route
+    // table, `Route::Highlight`) is only a dev-dependency here, so this
+    // matches the route's own path directly instead of pulling in a real
+    // dependency edge for one carve-out — keep this in sync with the
+    // `("highlight", "POST")` arm of `Route::from_tail` in
+    // `maki-remote/src/dispatch.rs` if that route's path ever changes.
+    let write = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE")
+        && tail_under_session(scope_tail) != "highlight";
     // Grants raise the floor, never lower it: a controller grant upgrades a
     // view link for the logged-in user.
     let rights = if write

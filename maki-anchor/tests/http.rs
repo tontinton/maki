@@ -755,6 +755,44 @@ fn scoped_and_view_links_are_enforced_end_to_end() {
 }
 
 #[test]
+fn highlight_is_exempt_from_the_view_link_write_gate() {
+    // /highlight is a POST (the code has to go somewhere), but it has no
+    // side effect — it just renders code the viewer is already looking at.
+    // Without this carve-out every view-only share link 403s on every code
+    // block, silently: the client has no notion of its own rights to
+    // self-suppress the request, so it just never colors anything.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db.sqlite3");
+    let anchor = spawn_anchor(&db);
+    thread::sleep(Duration::from_millis(300));
+    let reg = cli(&db, &["tokens", "add", "hl-host"]);
+    let view = cli(&db, &["tokens", "link", "hl-host", "view"]);
+    thread::spawn(move || fake_instance_serving(anchor.port, "hl-host", &reg));
+    wait_online(anchor.port, &view);
+
+    let (status, _) = http(
+        anchor.port,
+        "POST",
+        &format!("/{view}/highlight"),
+        br#"{"lang":"rust","code":"fn x() {}"}"#,
+    );
+    assert_eq!(
+        status, 200,
+        "a view link must be able to highlight code, not just control links"
+    );
+
+    // A genuine write on the same view link is still refused — the
+    // carve-out is /highlight-specific, not a blanket exemption for POST.
+    let (status, _) = http(
+        anchor.port,
+        "POST",
+        &format!("/{view}/prompt"),
+        br#"{"text":"hi"}"#,
+    );
+    assert_eq!(status, 403, "view link must still refuse an actual write");
+}
+
+#[test]
 fn local_login_locks_out_after_five_failures() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("db.sqlite3");

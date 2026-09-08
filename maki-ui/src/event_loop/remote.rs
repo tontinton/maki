@@ -215,6 +215,15 @@ pub(crate) struct RemoteSlot {
     /// When a reconnect was last actually shown, to debounce a flapping
     /// network's burst of real reconnects into one transcript line.
     link_shown_at: Option<Instant>,
+    /// Whether the *last thing actually narrated* was "up" — distinct from
+    /// `link_up`, which tracks reality regardless of what got shown. Lost
+    /// notices are never debounced, so `link_up` alone would make every
+    /// post-flap Link "the one that follows a shown Lost" and defeat the
+    /// debounce above entirely; this instead backs `catch_up_link_notice`,
+    /// so a reconnect suppressed mid-flap that then just stays up still
+    /// gets its own line once things go quiet, instead of staying silent
+    /// forever because nothing else will ever prompt a fresh report.
+    shown_up: bool,
     /// The anchor's latest link, kept so `/rc down` can ask for its revocation.
     link_token: Option<String>,
     link_url: Option<String>,
@@ -231,6 +240,7 @@ impl RemoteSlot {
             link_up: false,
             link_shown: false,
             link_shown_at: None,
+            shown_up: false,
             link_token: None,
             link_url: None,
         }
@@ -264,6 +274,7 @@ impl RemoteSlot {
         self.link_up = false;
         self.link_shown = false;
         self.link_shown_at = None;
+        self.shown_up = false;
         self.link_token = None;
         self.link_url = None;
         let (control, url) = RemoteControl::start(config, anchor, self.requests_tx.clone())?;
@@ -327,18 +338,20 @@ impl RemoteSlot {
                     self.link_up = true;
                     self.link_token = Some(token.clone());
                     let url = control.full_link_url(&token);
+                    let url_changed = self.link_url.as_deref() != Some(url.as_str());
                     self.link_url = Some(url.clone());
                     let first = !self.link_shown;
                     self.link_shown = true;
                     let quiet_enough = self
                         .link_shown_at
                         .is_none_or(|at| at.elapsed() >= RECONNECT_QUIET);
-                    if !first && !quiet_enough {
+                    if !first && !quiet_enough && !url_changed {
                         // The link above is still current; only the
                         // transcript line for this reconnect is suppressed.
                         continue;
                     }
                     self.link_shown_at = Some(Instant::now());
+                    self.shown_up = true;
                     break Some(TunnelHappen::Link {
                         url,
                         reconnected: !first,
@@ -346,10 +359,12 @@ impl RemoteSlot {
                 }
                 Some(TunnelReport::Lost(message)) => {
                     self.link_up = false;
+                    self.shown_up = false;
                     break Some(TunnelHappen::Notice(message));
                 }
                 Some(TunnelReport::Refused(reason)) => {
                     self.link_up = false;
+                    self.shown_up = false;
                     break Some(TunnelHappen::Notice(format!(
                         "anchor refused the tunnel: {reason}"
                     )));
@@ -357,6 +372,7 @@ impl RemoteSlot {
                 Some(TunnelReport::Links(value)) => break Some(TunnelHappen::Links(value)),
                 None if control.thread_done() => {
                     self.link_up = false;
+                    self.shown_up = false;
                     break Some(TunnelHappen::Notice(REMOTE_TUNNEL_STOPPED.to_owned()));
                 }
                 None => break None,
@@ -368,6 +384,31 @@ impl RemoteSlot {
             self.control = Some(control);
         }
         happen
+    }
+
+    /// A reconnect suppressed mid-flap (see `poll_tunnel`'s `Link` arm) that
+    /// then simply stays up produces no further report ever, so nothing else
+    /// would prompt a fresh Link line — the transcript would be stuck
+    /// forever on the last thing it said, "the link is down". Called once
+    /// per tick after the report drain finds nothing left: once the quiet
+    /// window has genuinely elapsed with the link still up and unnarrated,
+    /// this manufactures the line `poll_tunnel` swallowed.
+    pub(crate) fn catch_up_link_notice(&mut self) -> Option<TunnelHappen> {
+        if !self.link_up || self.shown_up {
+            return None;
+        }
+        let quiet_enough = self
+            .link_shown_at
+            .is_none_or(|at| at.elapsed() >= RECONNECT_QUIET);
+        if !quiet_enough {
+            return None;
+        }
+        self.link_shown_at = Some(Instant::now());
+        self.shown_up = true;
+        Some(TunnelHappen::Link {
+            url: self.link_url.clone()?,
+            reconnected: true,
+        })
     }
 
     /// Whether link management (`/rc link new|rm`) is wired to an anchor.
@@ -784,7 +825,11 @@ mod tests {
         };
         assert_eq!(message, "anchor closed the link");
         assert!(!slot.link_up(), "a lost link must dim the indicator");
-        tx.send(TunnelReport::Link("b".repeat(32))).unwrap();
+        // Same token: the control link was reused (still within its TTL),
+        // which is the realistic shape of a quick flap — a genuinely new
+        // token is covered separately below, since that must never be
+        // suppressed regardless of timing.
+        tx.send(TunnelReport::Link("a".repeat(32))).unwrap();
         assert!(
             slot.poll_tunnel().is_none(),
             "a reconnect this soon after the last one is debounced"
@@ -792,7 +837,7 @@ mod tests {
         assert!(slot.link_up(), "the link itself is still live underneath");
         assert!(
             slot.url().unwrap().starts_with("https://maki.example.com/"),
-            "and it updates to the new one even while the line is suppressed"
+            "and it stays current even while the line is suppressed"
         );
     }
 
@@ -812,6 +857,61 @@ mod tests {
         assert!(
             reconnected,
             "a link after the quiet window reads as a reconnect"
+        );
+    }
+
+    #[test]
+    fn a_reconnect_that_changes_the_url_is_never_suppressed() {
+        // Past the control link's TTL, a fresh mint really is a different
+        // URL — swallowing that one would leave a dead link in the
+        // transcript and the clipboard with no word it rotated, even
+        // though this is exactly the case the user most needs to see.
+        let (mut slot, tx, _shutdown, _out) = tunnel_slot();
+        tx.send(TunnelReport::Link("a".repeat(32))).unwrap();
+        slot.poll_tunnel().expect("first link");
+        tx.send(TunnelReport::Lost("anchor closed the link".into()))
+            .unwrap();
+        slot.poll_tunnel().expect("notice");
+        tx.send(TunnelReport::Link("b".repeat(32))).unwrap();
+        let TunnelHappen::Link { url, reconnected } = slot.poll_tunnel().expect("link") else {
+            panic!("a changed url must never be suppressed, even inside the quiet window");
+        };
+        assert!(reconnected);
+        assert!(url.contains(&"b".repeat(32)));
+    }
+
+    #[test]
+    fn a_suppressed_reconnect_that_then_stays_up_still_gets_caught_up() {
+        // The debounce above must not mean "silent forever": a reconnect
+        // that lands inside the quiet window and then simply stays
+        // connected produces no further report to hang a line on, so
+        // catch_up_link_notice is what report_tunnel polls every tick to
+        // eventually say so once things go quiet.
+        let (mut slot, tx, _shutdown, _out) = tunnel_slot();
+        tx.send(TunnelReport::Link("a".repeat(32))).unwrap();
+        slot.poll_tunnel().expect("first link");
+        tx.send(TunnelReport::Lost("anchor closed the link".into()))
+            .unwrap();
+        slot.poll_tunnel().expect("notice");
+        tx.send(TunnelReport::Link("a".repeat(32))).unwrap();
+        assert!(
+            slot.poll_tunnel().is_none(),
+            "suppressed: too soon after the notice above"
+        );
+        assert!(
+            slot.catch_up_link_notice().is_none(),
+            "and not yet due either"
+        );
+        slot.link_shown_at = Some(Instant::now() - RECONNECT_QUIET);
+        let TunnelHappen::Link { reconnected, .. } =
+            slot.catch_up_link_notice().expect("catch-up notice")
+        else {
+            panic!("expected a link report");
+        };
+        assert!(reconnected);
+        assert!(
+            slot.catch_up_link_notice().is_none(),
+            "only narrated once, not on every subsequent tick"
         );
     }
 

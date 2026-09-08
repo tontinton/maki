@@ -1979,21 +1979,7 @@ impl<'t> EventLoop<'t> {
             match self.remote.poll_tunnel() {
                 None => break,
                 Some(remote::TunnelHappen::Link { url, reconnected }) => {
-                    let copy = self.focused_app().clipboard.copy_text(&url);
-                    let prefix = if reconnected {
-                        "remote reconnected: "
-                    } else {
-                        REMOTE_URL_MSG
-                    };
-                    let app = self.focused_app();
-                    app.main_chat().push(DisplayMessage::new(
-                        DisplayRole::Done,
-                        format!("{prefix}{url}"),
-                    ));
-                    app.flash(url);
-                    if let Err(e) = copy {
-                        app.flash(format!("{REMOTE_COPY_ERR}: {e}"));
-                    }
+                    self.narrate_link(url, reconnected);
                 }
                 Some(remote::TunnelHappen::Notice(message)) => {
                     self.focused_app().flash(format!("remote: {message}"));
@@ -2002,6 +1988,34 @@ impl<'t> EventLoop<'t> {
                     self.show_link_roster(&value);
                 }
             }
+        }
+        // A reconnect the drain above suppressed as part of a burst, which
+        // then just stayed up, would otherwise never get its own line —
+        // nothing else ever prompts a fresh report once the connection
+        // simply sits there working. Catch that up once the quiet window
+        // has genuinely passed with nothing further to report.
+        if let Some(remote::TunnelHappen::Link { url, reconnected }) =
+            self.remote.catch_up_link_notice()
+        {
+            self.narrate_link(url, reconnected);
+        }
+    }
+
+    fn narrate_link(&mut self, url: String, reconnected: bool) {
+        let copy = self.focused_app().clipboard.copy_text(&url);
+        let prefix = if reconnected {
+            "remote reconnected: "
+        } else {
+            REMOTE_URL_MSG
+        };
+        let app = self.focused_app();
+        app.main_chat().push(DisplayMessage::new(
+            DisplayRole::Done,
+            format!("{prefix}{url}"),
+        ));
+        app.flash(url);
+        if let Err(e) = copy {
+            app.flash(format!("{REMOTE_COPY_ERR}: {e}"));
         }
     }
 

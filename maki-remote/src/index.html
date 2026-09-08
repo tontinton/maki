@@ -866,29 +866,38 @@
   // way. A late reply patches every currently-unhighlighted block that still
   // matches, not just the one that triggered the fetch — the node that asked
   // may already have been replaced by a later re-render by the time it lands.
+  //
+  // A failure (empty fence, code past the server's own limit, a wedged event
+  // loop, ...) is cached too, as `null` — every unhighlighted block gets
+  // reattempted on essentially every typewriter frame until it is marked
+  // `data-hl`, so leaving a failing key retryable turns one bad block into a
+  // retry storm for the rest of that message's reveal. `HIGHLIGHT_CODE_LIMIT`
+  // mirrors dispatch.rs so an oversized block is never even sent.
+  const HIGHLIGHT_CODE_LIMIT = 200_000;
   const highlightCache = new Map();
   const highlightPending = new Set();
   const highlightCodeBlocks = (root) => {
     for (const code of root.querySelectorAll("pre > code[data-lang]:not([data-hl])")) {
       const lang = code.dataset.lang;
       const text = code.textContent;
+      if (!text) { code.dataset.hl = "1"; continue; }
       const key = `${lang}\0${text}`;
-      const cached = highlightCache.get(key);
-      if (cached !== undefined) {
-        code.innerHTML = cached;
+      if (highlightCache.has(key)) {
+        const html = highlightCache.get(key);
+        if (html !== null) code.innerHTML = html;
         code.dataset.hl = "1";
         continue;
       }
+      if (text.length > HIGHLIGHT_CODE_LIMIT) { highlightCache.set(key, null); code.dataset.hl = "1"; continue; }
       if (highlightPending.has(key)) continue;
       highlightPending.add(key);
       postJson("highlight", { lang, code: text }).then((res) => {
         highlightPending.delete(key);
         const html = res && typeof res.html === "string" ? res.html : null;
-        if (html === null) return;
         highlightCache.set(key, html);
         for (const el of document.querySelectorAll("pre > code[data-lang]:not([data-hl])")) {
           if (el.dataset.lang === lang && el.textContent === text) {
-            el.innerHTML = html;
+            if (html !== null) el.innerHTML = html;
             el.dataset.hl = "1";
           }
         }

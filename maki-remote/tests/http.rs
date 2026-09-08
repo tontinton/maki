@@ -200,13 +200,15 @@ fn prompt_post_reaches_request_channel() {
     );
 }
 
-/// Regression: `reads_body` (server.rs) gates which routes the standalone
-/// HTTP handler bothers reading a body for before calling into dispatch;
-/// FileWrite, FileCreate, FileDelete, FileRename, WindowInput, and Highlight
-/// were all missing from it at one point, so their POST bodies never made it
-/// past an empty string and every one 400'd as "invalid json" — a request
-/// that never even reached the channel below, not a rejection from it. The
-/// tunneled (anchor) path has no such gap, since the whole HTTP request
+/// Regression: the standalone HTTP handler used to decide whether to even
+/// read a POST body from a hand-maintained allowlist of routes (server.rs's
+/// `reads_body`), which silently fell out of sync — FileWrite, FileCreate,
+/// FileDelete, FileRename, and WindowInput were all missing from it at one
+/// point, so their POST bodies never made it past an empty string and every
+/// one 400'd as "invalid json" — a request that never even reached the
+/// channel below, not a rejection from it. Fixed by reading the body for
+/// any POST, full stop, so this class of gap can't recur. The tunneled
+/// (anchor) path never had this problem, since the whole HTTP request
 /// (body included) always arrives forwarded wholesale; this only ever broke
 /// standalone `/rc`.
 #[test]
@@ -214,9 +216,14 @@ fn write_body_routes_are_actually_read_in_standalone_mode() {
     let server = spawn_server();
     let token = server.url.rsplit('/').next().unwrap().to_owned();
     let port = server.port();
+    // `Connection: close` so the server drops the socket right after
+    // replying instead of idling it open for keep-alive — six requests
+    // through `http_exchange`'s read-to-EOF otherwise means six full
+    // `HTTP_TIMEOUT` waits (~49s) for nothing, since nothing here reuses
+    // the connection anyway.
     let post = |path: &str, json: &str| {
         format!(
-            "POST /{token}/{path} HTTP/1.1\r\nHost: {RC_TEST_DOMAIN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json}",
+            "POST /{token}/{path} HTTP/1.1\r\nHost: {RC_TEST_DOMAIN}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json}",
             json.len()
         )
     };
