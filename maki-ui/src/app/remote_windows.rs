@@ -30,10 +30,10 @@ impl App {
 
     /// The full snapshot for `window_open`/`window_update` SSE frames, or
     /// `None` if the window has already closed. `focus` tells the browser
-    /// whether to actually show this as its modal overlay — a background
-    /// panel or toast (`todo_write`, the memory toast) is tracked but never
-    /// rendered, since nothing would be able to dismiss a modal that never
-    /// took local focus either.
+    /// whether to show this as its modal overlay or as a non-modal side
+    /// panel — a background panel/toast (`todo_write`, the memory toast) is
+    /// opened with `focus = false` and never becomes a modal, since nothing
+    /// would be able to dismiss a modal that never took local focus either.
     pub(crate) fn remote_window_snapshot(&self, id: u32) -> Option<Value> {
         let parts = self.float_mgr.window_remote_parts(id)?;
         Some(json!({
@@ -55,6 +55,21 @@ impl App {
     pub(crate) fn remote_focused_window_snapshot(&self) -> Option<Value> {
         let id = self.float_mgr.focused_window_id()?;
         self.remote_window_snapshot(id)
+    }
+
+    /// Snapshots of every open background panel (`todo_write`'s Todos box,
+    /// the memory toast, ...), for `remote_snapshot()` to include alongside
+    /// the focused window. `window_open`/`window_update` already mirror
+    /// these live regardless of focus (see `event_loop::tick`); this is
+    /// only for the case those frames miss — a tab that connects after the
+    /// panel already opened, same reconnect gap `remote_focused_window_snapshot`
+    /// exists to close for the focused window.
+    pub(crate) fn remote_panel_snapshots(&self) -> Vec<Value> {
+        self.float_mgr
+            .panel_window_ids()
+            .into_iter()
+            .filter_map(|id| self.remote_window_snapshot(id))
+            .collect()
     }
 
     /// Forwards a browser key or paste event to the focused window, exactly

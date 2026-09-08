@@ -477,6 +477,32 @@ impl FloatManager {
         self.render_window(frame, idx, rect);
     }
 
+    /// Ids of currently open background panels (`todo_write`'s Todos box,
+    /// the memory toast, ...) — Panel-split windows are always opened with
+    /// `focus = false`, so `focused_id` never points at one, but the filter
+    /// is explicit here rather than assumed. For the remote bridge's session
+    /// snapshot to include alongside the focused modal window, so a browser
+    /// tab that connects (or reconnects) after the panel already opened
+    /// still sees it instead of waiting for the next content change.
+    pub(crate) fn panel_window_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self
+            .windows
+            .iter()
+            .filter(|w| {
+                w.config.split == Split::Panel && w.visible && Some(w.id) != self.focused_id
+            })
+            .map(|w| w.id)
+            .collect();
+        ids.sort_by_key(|id| {
+            self.windows
+                .iter()
+                .find(|w| w.id == *id)
+                .map(|w| w.config.order)
+                .unwrap_or(u16::MAX)
+        });
+        ids
+    }
+
     pub fn panel_reqs(&self) -> Vec<(usize, u16)> {
         let mut reqs: Vec<(usize, u16)> = self
             .windows
@@ -2234,6 +2260,50 @@ mod tests {
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0].1, 3, "order=10 should come first");
         assert_eq!(reqs[1].1, 5, "order=20 should come second");
+    }
+
+    #[test]
+    fn panel_window_ids_sorted_by_order_excludes_hidden_and_non_panel() {
+        let mut mgr = FloatManager::new();
+        let (tx1, rx1, _, _) = make_channels();
+        let (tx2, rx2, _, _) = make_channels();
+        let (tx3, rx3, _, _) = make_channels();
+        let (tx_modal, rx_modal, _, _) = make_channels();
+
+        let cfg1 = FloatConfig {
+            split: Split::Panel,
+            order: 20,
+            ..FloatConfig::default()
+        };
+        let cfg2 = FloatConfig {
+            split: Split::Panel,
+            order: 10,
+            ..FloatConfig::default()
+        };
+        let hidden_cfg = FloatConfig {
+            split: Split::Panel,
+            visible: false,
+            ..FloatConfig::default()
+        };
+
+        let id1 = mgr.open(make_buf(&["a"]), cfg1, false, tx1, rx1);
+        let id2 = mgr.open(make_buf(&["b"]), cfg2, false, tx2, rx2);
+        mgr.open(make_buf(&["hidden"]), hidden_cfg, false, tx3, rx3);
+        // A focused, non-Panel window should never show up alongside the
+        // background panels — it's already covered by the modal snapshot.
+        mgr.open(
+            make_buf(&["modal"]),
+            make_config(),
+            true,
+            tx_modal,
+            rx_modal,
+        );
+
+        assert_eq!(
+            mgr.panel_window_ids(),
+            vec![id2, id1],
+            "order=10 before order=20, hidden and modal windows excluded"
+        );
     }
 
     #[test]

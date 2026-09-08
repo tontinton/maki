@@ -920,7 +920,11 @@ impl App {
             // question tool's form, have no redraw loop of their own to
             // self-heal on the next content change and would otherwise
             // hang with no way for the browser to ever show it again.
+            // Background panels (todo_write's Todos box, the memory toast)
+            // have the same gap: they may have opened long before this tab
+            // connected, with no live window_open frame left to catch.
             "window": self.remote_focused_window_snapshot(),
+            "panels": self.remote_panel_snapshots(),
         })
     }
 
