@@ -252,6 +252,7 @@ fn subagent_info_with_tx(
         prompt: None,
         model: None,
         answer_tx,
+        detached: false,
     }
 }
 
@@ -4785,6 +4786,47 @@ fn app_with_active_subagent() -> App {
     app.run_builtin(BuiltinAction::NextChat);
     assert_eq!(app.active_chat, 1);
     app
+}
+
+#[test]
+fn detached_subagent_survives_main_cancel_and_stays_cancellable() {
+    let mut app = streaming_app();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.detached = true;
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta { text: "x".into() },
+        subagent: Some(info.clone()),
+        run_id: maki_agent::DETACHED_RUN_ID,
+    })));
+    assert!(!app.chats[1].is_finished());
+
+    finish_subagent_task(&mut app, false);
+    assert!(
+        !app.chats[1].is_finished(),
+        "the spawning tool returning must not finish a detached chat"
+    );
+
+    app.last_esc = Some(Instant::now());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
+    assert!(!app.chats[1].is_finished());
+    assert!(app.chat_index.contains_key(TASK_ID));
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta { text: "y".into() },
+        subagent: Some(info),
+        run_id: maki_agent::DETACHED_RUN_ID,
+    })));
+    assert_eq!(app.chats.len(), 2);
+
+    app.active_chat = 1;
+    app.last_esc = Some(Instant::now());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(matches!(
+        &actions[0],
+        Action::CancelSubagent { tool_use_id } if tool_use_id == TASK_ID
+    ));
+    assert!(app.chats[1].is_finished());
 }
 
 #[test]

@@ -99,9 +99,8 @@ end
 
 `joblist(nil)` lists the jobs of your plugin across sessions, and each entry
 carries its own `session`. Calling it at load time is fine. `maki.session.current()`
-answers over the UI event loop instead, so a call made before the loop starts
-draining (cold startup, not a `/reload`) returns `(nil, err)` rather than the
-focused session.
+answers over the UI event loop instead, so a call made at plugin load
+returns `(nil, err)` rather than the focused session.
 
 This only finds jobs started with a session `scope`: `can_access` matches a
 `"task"`-scoped job only while the same task call is still on the stack, so
