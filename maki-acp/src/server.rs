@@ -1023,6 +1023,7 @@ mod tests {
                     prompt: None,
                     model: None,
                     answer_tx: None,
+                    detached: false,
                 }),
                 run_id: 0,
             })

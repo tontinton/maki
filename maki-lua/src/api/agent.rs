@@ -18,15 +18,15 @@ use maki_agent::tools::{
     ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
-    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
-    EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, McpSession, RunLedger,
-    SessionEvents, SubagentInfo, ToolDoneEvent, event_stream,
+    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DETACHED_RUN_ID,
+    DoneReason, EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, McpSession,
+    RunLedger, SessionEvents, SubagentInfo, ToolDoneEvent, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{ContentBlock, Model, ModelError, Role, ThinkingConfig, TokenUsage, add_cost};
-use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::id::MakiId;
 use maki_storage::sessions::StoredThinking;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
@@ -41,8 +41,8 @@ use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
-const SCOPE_TABLE_ERR: &str = "scope must be { session = \"<id>\" }";
-const SCOPE_SESSION_MISMATCH_ERR: &str = "scope.session must be the caller's own session id";
+const SCOPE_ERR: &str = "scope must be \"session\"";
+const SCOPE_NESTED_ERR: &str = "scope = \"session\" is only valid on the main session";
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
     let Some(tier_str) = tier else {
@@ -432,13 +432,12 @@ async fn call_tool(
 ///     `"max"`), or a budget integer (token count). Inherits parent setting
 ///     if omitted.
 ///   `fast` (boolean?) - use fast mode. Inherits parent setting if omitted.
-///   `scope` (table?) - `{ session = "<id>" }` detaches the session from the
-///     call that spawned it: it survives the call returning and the turn
-///     ending, instead of being cancelled the moment either does. `<id>`
-///     must be the caller's own session (`ctx:session_id()`). Only cancel-all
-///     and a targeted cancel of this session's tool call id can stop it from
-///     here on; keep the returned handle (or its id) if you need to reach it
-///     later. Omit for the default: tied to the call that spawned it.
+///   `scope` (string?) - `"session"` detaches the session from the call that
+///     spawned it: it survives the call returning and the turn ending,
+///     instead of being cancelled the moment either does. Esc on its chat
+///     still cancels it. Keep the returned handle to `prompt` and `close`.
+///     Omit for the default: tied to the call that spawned it. Invalid
+///     inside a subagent.
 /// @return (Session?, string?) Session handle, or `(nil, err)` on failure.
 /// @example
 /// local tools = maki.agent.tools(ctx, { audience = "general_sub" })
@@ -463,22 +462,12 @@ async fn session(
     drop(ctx);
     let detached: bool = match opts.get::<LuaValue>("scope")? {
         LuaValue::Nil => false,
-        LuaValue::Table(scope) => {
-            let Ok(LuaValue::String(raw)) = scope.get::<LuaValue>("session") else {
-                return Ok(err_pair(SCOPE_TABLE_ERR));
-            };
-            let session: MakiId = try_pair!(
-                raw.to_str()?
-                    .parse()
-                    .map_err(|e: maki_storage::id::MakiIdParseError| e.to_string())
-            );
-            if agent_ctx.session_id.as_ref().map(SessionRef::id) != Some(session) {
-                return Ok(err_pair(SCOPE_SESSION_MISMATCH_ERR));
-            }
-            true
-        }
-        _ => return Ok(err_pair(SCOPE_TABLE_ERR)),
+        LuaValue::String(s) if s.to_str()?.as_ref() == "session" => true,
+        _ => return Ok(err_pair(SCOPE_ERR)),
     };
+    if detached && agent_ctx.task_id.is_some() {
+        return Ok(err_pair(SCOPE_NESTED_ERR));
+    }
     let model_spec: Option<String> = opts.get("model_spec")?;
     let system: Option<String> = opts.get("system")?;
     let tools_val: Option<LuaValue> = opts.get("tools")?;
@@ -577,8 +566,12 @@ async fn session(
     };
 
     let (stream_guard, sub_events) = event_stream();
-    let sub_event_tx = stream_guard.sender(agent_ctx.event_tx.run_id());
-    let parent_tx = agent_ctx.event_tx.clone();
+    let parent_tx = if detached {
+        agent_ctx.event_tx.with_run_id(DETACHED_RUN_ID)
+    } else {
+        agent_ctx.event_tx.clone()
+    };
+    let sub_event_tx = stream_guard.sender(parent_tx.run_id());
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
@@ -673,6 +666,7 @@ async fn session(
         usage_rx,
         start: Instant::now(),
         closed: false,
+        detached,
     };
 
     let sess = lua.create_userdata(LuaSession {
@@ -798,6 +792,7 @@ struct SessionState {
     usage_rx: flume::Receiver<TokenUsage>,
     start: Instant,
     closed: bool,
+    detached: bool,
 }
 
 impl SessionState {
@@ -879,6 +874,7 @@ async fn prompt(
             prompt: Some(message.clone()),
             model: Some(s.params.model.spec()),
             answer_tx: s.answer_tx.take(),
+            detached: s.detached,
         });
     }
 
@@ -1084,6 +1080,7 @@ mod tests {
             prompt: None,
             model: None,
             answer_tx: None,
+            detached: false,
         })
         .unwrap();
         info

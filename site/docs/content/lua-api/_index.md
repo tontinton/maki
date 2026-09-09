@@ -1270,13 +1270,12 @@ and tool set.
     `"max"`), or a budget integer (token count). Inherits parent setting
     if omitted.
   - `fast` (`boolean?`) use fast mode. Inherits parent setting if omitted.
-  - `scope` (`table?`) `{ session = "<id>" }` detaches the session from the
-    call that spawned it: it survives the call returning and the turn
-    ending, instead of being cancelled the moment either does. `<id>`
-    must be the caller's own session (`ctx:session_id()`). Only cancel-all
-    and a targeted cancel of this session's tool call id can stop it from
-    here on; keep the returned handle (or its id) if you need to reach it
-    later. Omit for the default: tied to the call that spawned it.
+  - `scope` (`string?`) `"session"` detaches the session from the call that
+    spawned it: it survives the call returning and the turn ending,
+    instead of being cancelled the moment either does. Esc on its chat
+    still cancels it. Keep the returned handle to `prompt` and `close`.
+    Omit for the default: tied to the call that spawned it. Invalid
+    inside a subagent.
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
 

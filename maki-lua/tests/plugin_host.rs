@@ -3928,6 +3928,7 @@ fn register_command_nargs_values(nargs_field: &str) -> usize {
 #[test_case::test_case("", "|" ; "empty_args")]
 fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
     let host = PluginHost::new(fresh_registry()).unwrap();
+    host.ui_attachment().attach();
     host.load_source(
         "p",
         r#"
@@ -3961,6 +3962,7 @@ const RUN_COMMAND_NO_ACTION: &str = "run_command did not reach the UI";
 #[test_case::test_case(Err("unknown command".into()), "nil|unknown command" ; "rejected")]
 fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash: &str) {
     let host = PluginHost::new(fresh_registry()).unwrap();
+    host.ui_attachment().attach();
     host.load_source(
         "p",
         r#"
@@ -5926,12 +5928,12 @@ fn session_close_idempotent_and_prompt_after_close_errors() {
 #[test_case::test_case("{ audience = 'wurkflow' }", "unknown audience: wurkflow" ; "unknown_audience")]
 #[test_case::test_case("{ local_tools = { foo = { handler = function() return '' end } } }", "local_tools.foo: 'description' is required" ; "local_tool_missing_description")]
 #[test_case::test_case("{ local_tools = { foo = { description = 'd' } } }", "local_tools.foo: 'handler' is required" ; "local_tool_missing_handler")]
-#[test_case::test_case("{ scope = 'session' }", "scope must be" ; "scope_wrong_type")]
-#[test_case::test_case("{ scope = {} }", "scope must be" ; "scope_table_missing_session")]
+#[test_case::test_case("{ scope = 'plugin' }", "scope must be" ; "scope_wrong_string")]
+#[test_case::test_case("{ scope = {} }", "scope must be" ; "scope_table")]
 #[test_case::test_case(
     "{ scope = { session = '01965087-4c71-7f00-8000-000000000000' } }",
-    "scope.session must be the caller's own session id"
-    ; "scope_session_mismatch"
+    "scope must be"
+    ; "scope_table_session_id"
 )]
 fn session_opts_validation_rejects(opts: &str, expected: &str) {
     let reg = fresh_registry();
@@ -5966,7 +5968,7 @@ fn session_scope_accepts_the_callers_own_session() {
             audiences = {{ "main" }},
             handler = function(input, ctx)
                 local id = ctx:session_id()
-                local sess, err = maki.agent.session(ctx, {{ scope = {{ session = id }} }})
+                local sess, err = maki.agent.session(ctx, {{ scope = "session" }})
                 if err ~= nil then return "err:" .. err end
                 sess:close()
                 return "ok"
@@ -5981,6 +5983,30 @@ fn session_scope_accepts_the_callers_own_session() {
     ctx.session_id = Some(session);
     let out = exec_with_ctx(&reg, "detach_probe", json!({}), &ctx).unwrap();
     assert_eq!(out, "ok");
+}
+
+#[test]
+fn session_scope_rejected_from_inside_a_subagent() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "nested_detach_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local sess, err = maki.agent.session(ctx, {{ scope = "session" }})
+                if sess ~= nil then return "unexpected session" end
+                return err or "no error"
+            end
+        }})"#
+    );
+    host.load_source("nested_detach_plugin", &src).unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.task_id = Some(Arc::from("child"));
+    let out = exec_with_ctx(&reg, "nested_detach_probe", json!({}), &ctx).unwrap();
+    assert!(out.contains("only valid on the main session"), "got: {out}");
 }
 
 fn load_img_tool(host: &PluginHost) {
@@ -6227,6 +6253,7 @@ fn interpreter_bridge_flattens_image_with_visibility_note() {
 #[test]
 fn async_run_from_parked_command_handler_runs_promptly() {
     let host = PluginHost::new(fresh_registry()).unwrap();
+    host.ui_attachment().attach();
     host.load_source(
         "p",
         r#"
@@ -6258,6 +6285,7 @@ fn async_run_from_parked_command_handler_runs_promptly() {
 #[test]
 fn job_callbacks_fire_while_command_handler_parked() {
     let host = PluginHost::new(fresh_registry()).unwrap();
+    host.ui_attachment().attach();
     host.load_source(
         "p",
         r#"

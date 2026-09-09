@@ -1002,7 +1002,16 @@ pub struct SubagentInfo {
     pub model: Option<String>,
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
+    /// Outlives the run that spawned it. The UI keeps the chat cancellable
+    /// and does not drop its events when `run_id` bumps.
+    #[serde(skip)]
+    pub detached: bool,
 }
+
+/// Events from a subagent that outlives the run that spawned it. The UI
+/// does not drop these when `run_id` bumps. Distinct from restore
+/// snapshots, which use `u64::MAX`.
+pub const DETACHED_RUN_ID: u64 = u64::MAX - 1;
 
 #[derive(Debug, Clone)]
 pub struct EventSender {
