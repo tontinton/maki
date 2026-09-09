@@ -2,6 +2,100 @@ use std::sync::Arc;
 
 use crate::store::{Store, UserRow};
 
+/// Installing from the dashboard is a separate, deliberately distinct thing
+/// from installing a single session (maki-remote/src/dispatch.rs's own
+/// PWA_MANIFEST, scoped to that session's token path and reachable without
+/// any anchor login at all — a share link recipient never touches this
+/// one). This is "maki, the whole account" — `start_url`/`scope` are the
+/// bare root, so the installed icon always reopens the dashboard, and the
+/// dashboard itself is already login-gated (`route_authorized` in
+/// server.rs), same as visiting "/" in a normal tab.
+pub(crate) const DASHBOARD_MANIFEST: &str = r##"{
+  "name": "maki anchor",
+  "short_name": "maki",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#0f172a",
+  "icons": [
+    {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"},
+    {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable"}
+  ]
+}"##;
+
+/// No caching, no offline shell — just enough (a registered worker with a
+/// fetch handler) to satisfy install criteria. Mirrors maki-remote's own
+/// service worker exactly, and the same reasoning: a real offline cache
+/// would need its own staleness story, not worth the risk for what it buys
+/// a page this simple.
+pub(crate) const DASHBOARD_SW_JS: &str = "\
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
+self.addEventListener('fetch', () => {});
+";
+
+/// Same icon as maki-remote's installed sessions — one "maki" mark for
+/// both installable surfaces, distinguished by name/short_name instead.
+pub(crate) const DASHBOARD_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect width="100" height="100" rx="18" fill="#16181d"/>
+  <text x="50" y="68" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="56" font-weight="700" fill="#7aa2f7" text-anchor="middle">m</text>
+</svg>"##;
+
+/// Mirrors maki-remote's own install banner (maki-remote/src/index.html),
+/// scaled down for a classic server-rendered page with no other JS: no
+/// notification opt-in here (there's nothing running to notify you about
+/// on the dashboard itself), just the beforeinstallprompt flow and the iOS
+/// Share-sheet text fallback (iOS Safari never fires that event).
+const INSTALL_JS: &str = r#"<script>
+(() => {
+  const banner = document.getElementById('install-banner');
+  const text = document.getElementById('install-banner-text');
+  const action = document.getElementById('install-banner-action');
+  const dismissBtn = document.getElementById('install-banner-dismiss');
+  let deferred = null;
+  const isStandalone = () =>
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) ||
+    window.navigator.standalone === true;
+  const isIosSafari = () => /iphone|ipad|ipod/i.test(navigator.userAgent) && !window.MSStream;
+  const dismissed = () => { try { return localStorage.getItem('maki_anchor_install_dismissed') === '1'; } catch { return false; } };
+  const dismiss = () => {
+    banner.hidden = true;
+    try { localStorage.setItem('maki_anchor_install_dismissed', '1'); } catch {}
+  };
+  const update = () => {
+    if (dismissed() || isStandalone()) { banner.hidden = true; return; }
+    if (deferred) {
+      text.textContent = 'Install maki for quick access to your sessions.';
+      action.hidden = false;
+      banner.hidden = false;
+    } else if (isIosSafari()) {
+      text.textContent = 'Add maki to your Home Screen: Share → Add to Home Screen.';
+      action.hidden = true;
+      banner.hidden = false;
+    } else {
+      banner.hidden = true;
+    }
+  };
+  window.addEventListener('beforeinstallprompt', (ev) => {
+    ev.preventDefault();
+    deferred = ev;
+    update();
+  });
+  window.addEventListener('appinstalled', () => { deferred = null; dismiss(); });
+  action.onclick = async () => {
+    if (!deferred) return;
+    deferred.prompt();
+    try { await deferred.userChoice; } catch {}
+    deferred = null;
+    update();
+  };
+  dismissBtn.onclick = dismiss;
+  update();
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+})();
+</script>"#;
+
 fn base_style() -> &'static str {
     r#"*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;margin:0;background:#f8fafc;color:#0f172a;line-height:1.5}
 a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}
@@ -36,6 +130,11 @@ button.primary,a.btn{background:#0f172a;color:#fff;border-color:#0f172a}
 a.btn{display:inline-block;padding:.45rem .8rem;border-radius:8px;text-decoration:none}
 a.btn:hover{filter:brightness(1.35);text-decoration:none}
 button.danger{border-color:#fca5a5;color:#b91c1c;background:#fef2f2;padding:.25rem .55rem;font-size:.8rem}
+#install-banner{display:none;align-items:center;gap:.8rem;padding:.5rem 1.2rem;background:#eff6ff;border-bottom:1px solid #bfdbfe;font-size:.85rem}
+#install-banner:not([hidden]){display:flex}
+#install-banner span{flex:1;color:#1e40af}
+#install-banner button{flex:none}
+#install-banner-dismiss{background:none;border:none;cursor:pointer;color:#64748b;font-size:1rem;padding:0 .3rem}
 @media (prefers-color-scheme: dark){
  body{background:#0b1220;color:#e2e8f0}
  header{background:#0f172a;border-color:#1e293b}
@@ -49,6 +148,8 @@ button.danger{border-color:#fca5a5;color:#b91c1c;background:#fef2f2;padding:.25r
  .badge.on{background:#052e16;border-color:#14532d;color:#86efac}
  .badge.off{background:#450a0a;border-color:#7f1d1d;color:#fca5a5}
  footer{border-color:#1e293b}
+ #install-banner{background:#0c1e3d;border-color:#1e3a5f}
+ #install-banner span{color:#93c5fd}
 }
 @media (max-width:680px){
  .card{margin:.8rem .5rem;padding:.9rem .8rem}
@@ -66,7 +167,16 @@ pub(crate) fn layout_start(title: &str, user: Option<&UserRow>, page: &str) -> S
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>",
     );
     s.push_str(&html_escape(title));
-    s.push_str("</title><style>");
+    s.push_str(
+        "</title>\
+         <link rel=\"manifest\" href=\"/manifest.json\">\
+         <link rel=\"icon\" href=\"/icon.svg\" type=\"image/svg+xml\">\
+         <link rel=\"apple-touch-icon\" href=\"/icon.svg\">\
+         <meta name=\"theme-color\" content=\"#0f172a\">\
+         <meta name=\"apple-mobile-web-app-capable\" content=\"yes\">\
+         <meta name=\"apple-mobile-web-app-status-bar-style\" content=\"black-translucent\">\
+         <style>",
+    );
     s.push_str(base_style());
     s.push_str("</style></head><body><header><h1>maki anchor</h1><nav class=\"nav\">");
     let item = |href: &str, label: &str, id: &str| -> String {
@@ -98,7 +208,15 @@ pub(crate) fn layout_start(title: &str, user: Option<&UserRow>, page: &str) -> S
     } else {
         s.push_str("<span class=\"user\"><a href=\"/login\">log in</a></span>");
     }
-    s.push_str("</header><main style=\"padding:0 1rem\">");
+    s.push_str(
+        "</header>\
+         <div id=\"install-banner\" hidden>\
+         <span id=\"install-banner-text\"></span>\
+         <button class=\"primary\" id=\"install-banner-action\" hidden>Install</button>\
+         <button id=\"install-banner-dismiss\" title=\"Dismiss\">×</button>\
+         </div>\
+         <main style=\"padding:0 1rem\">",
+    );
     s
 }
 
@@ -114,7 +232,7 @@ const FOOTER: &str = concat!(
 );
 
 pub(crate) fn layout_end() -> String {
-    format!("{FOOTER}</main></body></html>")
+    format!("{FOOTER}{INSTALL_JS}</main></body></html>")
 }
 
 /// A page without the nav (setup, login, refusals): same skin, centered card,

@@ -479,6 +479,42 @@ fn route(
         let text = query_param(query, "text").unwrap_or_default();
         return buffered(qr_svg(&text), request);
     }
+    // The dashboard's own PWA assets — installs "maki, the whole account"
+    // (start_url "/") as distinct from a single session's own installable
+    // manifest (maki-remote/src/dispatch.rs, scoped to that session's
+    // token path). Public like /install.sh above: the content isn't
+    // sensitive, and the <link rel="manifest"> that references this only
+    // ever appears in the already-login-gated dashboard HTML anyway.
+    if path == "/manifest.json" {
+        return buffered(
+            (
+                200,
+                "application/manifest+json".to_string(),
+                crate::dashboard::DASHBOARD_MANIFEST.as_bytes().to_vec(),
+            ),
+            request,
+        );
+    }
+    if path == "/sw.js" {
+        return buffered(
+            (
+                200,
+                "application/javascript".to_string(),
+                crate::dashboard::DASHBOARD_SW_JS.as_bytes().to_vec(),
+            ),
+            request,
+        );
+    }
+    if path == "/icon.svg" {
+        return buffered(
+            (
+                200,
+                "image/svg+xml".to_string(),
+                crate::dashboard::DASHBOARD_ICON_SVG.as_bytes().to_vec(),
+            ),
+            request,
+        );
+    }
     // Split on the full URL, not the query-stripped `path`: the tail is
     // forwarded to the instance verbatim, and routes like `qr?text=...`
     // need their query string to survive the trip.
