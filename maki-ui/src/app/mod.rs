@@ -1826,13 +1826,6 @@ impl App {
         self.sync_subagents();
     }
 
-    /// Keeps only the detached (background) subagents routable across the turn
-    /// boundary; their items are still live while newer turns already ran.
-    /// Prunes silently: the janitor already synced the persisted set.
-    fn retain_detached_subagents(&mut self) {
-        self.drop_attached_subagents();
-    }
-
     pub fn flush_all_chats(&mut self) {
         for chat in &mut self.chats {
             chat.flush();

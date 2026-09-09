@@ -382,14 +382,6 @@ impl Chat {
         self.detached
     }
 
-    pub(crate) fn mark_detached(&mut self) {
-        self.detached = true;
-    }
-
-    pub(crate) fn is_detached(&self) -> bool {
-        self.detached
-    }
-
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
         self.messages_panel.update_tool_summary(tool_id, summary);
     }
