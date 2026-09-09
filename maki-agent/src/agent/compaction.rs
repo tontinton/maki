@@ -415,10 +415,7 @@ mod tests {
     }
 
     fn overflow_error() -> AgentError {
-        AgentError::Api {
-            status: OVERFLOW_STATUS,
-            message: OVERFLOW_MESSAGE.into(),
-        }
+        AgentError::api(OVERFLOW_STATUS, OVERFLOW_MESSAGE)
     }
 
     fn text_response(stop_reason: StopReason) -> StreamResponse {

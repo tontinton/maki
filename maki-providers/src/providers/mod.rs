@@ -94,9 +94,11 @@ pub(crate) fn refreshed_tokens(
     refresh: impl FnOnce(&OAuthTokens) -> Result<OAuthTokens, AgentError>,
 ) -> Result<OAuthTokens, AgentError> {
     let _lock = lock_tokens(dir, provider);
-    let current = load_tokens(dir, provider).ok_or_else(|| AgentError::Api {
-        status: UNAUTHORIZED_STATUS,
-        message: format!("{provider} OAuth tokens not found on disk"),
+    let current = load_tokens(dir, provider).ok_or_else(|| {
+        AgentError::api(
+            UNAUTHORIZED_STATUS,
+            format!("{provider} OAuth tokens not found on disk"),
+        )
     })?;
     if rejected.is_none_or(|stale| current.access != stale) && !current.is_expired() {
         return Ok(current);
@@ -322,10 +324,7 @@ impl SseErrorPayload {
                     .and_then(|m| sse_error_status(&m.error_type))
             })
             .unwrap_or(UNMAPPED_SSE_ERROR_STATUS);
-        AgentError::Api {
-            status,
-            message: self.error.message,
-        }
+        AgentError::api(status, self.error.message)
     }
 }
 

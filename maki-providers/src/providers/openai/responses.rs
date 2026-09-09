@@ -245,10 +245,7 @@ pub(crate) async fn parse_sse(
                 .as_str()
                 .unwrap_or("unknown error")
                 .to_string();
-            return Err(AgentError::Api {
-                status: 500,
-                message,
-            });
+            return Err(AgentError::api(500, message));
         }
 
         let parsed_event = if current_event.is_empty() {
@@ -489,7 +486,7 @@ pub(crate) async fn parse_sse(
                     .as_str()
                     .and_then(sse_error_status)
                     .unwrap_or(FAILED_RESPONSE_STATUS);
-                return Err(AgentError::Api { status, message });
+                return Err(AgentError::api(status, message));
             }
 
             _ => {}

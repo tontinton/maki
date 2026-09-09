@@ -581,10 +581,10 @@ async fn fetch_remote_catalog_async(
     if status != 200 {
         // Drain the body so isahc can reuse the connection
         let _ = resp.text().await;
-        return Err(AgentError::Api {
+        return Err(AgentError::api(
             status,
-            message: format!("catalog fetch returned HTTP {status}"),
-        });
+            format!("catalog fetch returned HTTP {status}"),
+        ));
     }
 
     let text = resp

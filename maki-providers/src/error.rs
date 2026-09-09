@@ -2,6 +2,8 @@
 //! Retryable: 429, 5xx, IO, HTTP transport. Non-retryable: other 4xx, JSON parse, config,
 //! channel closed, user cancel. `user_message()` returns human-readable text for each variant.
 
+use std::time::Duration;
+
 use isahc::AsyncReadResponseExt;
 
 use crate::providers::opencode::{self, NonLoginError};
@@ -85,7 +87,12 @@ fn budget_overflow(m: &str) -> Option<Overflow> {
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     #[error("API error ({status}): {message}")]
-    Api { status: u16, message: String },
+    Api {
+        status: u16,
+        message: String,
+        /// What the server's `Retry-After` header asked for, when it sent one.
+        retry_after: Option<Duration>,
+    },
     #[error("{message}")]
     Config { message: String },
     #[error("tool error in {tool}: {message}")]
@@ -109,6 +116,16 @@ pub enum AgentError {
 }
 
 impl AgentError {
+    /// An API error with no `Retry-After` behind it. Everything that is not a
+    /// response we read the headers of lands here, SSE error frames included.
+    pub fn api(status: u16, message: impl Into<String>) -> Self {
+        Self::Api {
+            status,
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
     pub fn is_retryable(&self) -> bool {
         if self.is_context_overflow() || self.is_quota_exhausted() {
             return false;
@@ -149,7 +166,10 @@ impl AgentError {
     /// - OpenRouter: 400 "endpoint's maximum context length is X tokens"  <https://openrouter.ai/docs/api/reference/errors-and-debugging.mdx>
     /// - Synthetic:  400 pass-through from upstream models (OpenAI-compatible)  <https://synthetic.new>
     pub fn overflow(&self) -> Option<Overflow> {
-        let Self::Api { status, message } = self else {
+        let Self::Api {
+            status, message, ..
+        } = self
+        else {
             return None;
         };
         if !matches!(status, 400 | 413) {
@@ -193,7 +213,10 @@ impl AgentError {
     /// OpenCode serves billing and plan failures on the statuses we otherwise
     /// read as a stale token, and only that provider knows its error types.
     fn non_login_error(&self) -> Option<NonLoginError> {
-        let Self::Api { status, message } = self else {
+        let Self::Api {
+            status, message, ..
+        } = self
+        else {
             return None;
         };
         opencode::non_login_error(*status, message)
@@ -223,7 +246,9 @@ impl AgentError {
             Self::Api { status: 401, .. } => {
                 "authentication failed, run `maki auth login` or check your API key".into()
             }
-            Self::Api { status, message } => format!("API error ({status}): {message}"),
+            Self::Api {
+                status, message, ..
+            } => format!("API error ({status}): {message}"),
             Self::Tool { tool, message } => format!("{tool}: {message}"),
             Self::Io(e) => format!("I/O error: {e}"),
             Self::Http(_) => "connection error, check your network".into(),
@@ -238,11 +263,31 @@ impl AgentError {
 
     pub async fn from_response(mut response: isahc::Response<isahc::AsyncBody>) -> Self {
         let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after);
         let message = response
             .text()
             .await
             .unwrap_or_else(|_| "unable to read error body".into());
-        Self::Api { status, message }
+        Self::Api {
+            status,
+            message,
+            retry_after,
+        }
+    }
+
+    /// How long the server asked us to wait, when it bothered to say. Always a
+    /// positive duration: only [`Self::from_response`] ever reads headers, and
+    /// an error built any other way answers `None` and the caller falls back on
+    /// its own backoff.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Api { retry_after, .. } => *retry_after,
+            _ => None,
+        }
     }
 
     pub fn retry_message(&self) -> String {
@@ -271,11 +316,21 @@ impl From<maki_storage::StorageError> for AgentError {
         match e {
             maki_storage::StorageError::Io(io) => Self::Io(io),
             maki_storage::StorageError::Json(j) => Self::Json(j),
-            other => Self::Api {
-                status: 0,
-                message: other.to_string(),
-            },
+            other => Self::api(0, other.to_string()),
         }
+    }
+}
+
+/// Only the delta-seconds form ("30", "60"). The HTTP-date form is legal but
+/// providers do not send it, and guessing a backoff beats parsing dates.
+///
+/// `0` is not a hint. Anthropic's own usage endpoint answers a persistent 429
+/// with `Retry-After: 0`, and sleeping for zero seconds before asking the same
+/// rate limiter again is a tight loop, not a backoff.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    match value.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => Some(Duration::from_secs(secs)),
+        _ => None,
     }
 }
 
@@ -292,17 +347,11 @@ mod tests {
     const RATE_LIMITED_RETRY_MESSAGE: &str = "Rate limited";
 
     fn api(status: u16) -> AgentError {
-        AgentError::Api {
-            status,
-            message: String::new(),
-        }
+        AgentError::api(status, "")
     }
 
     fn api_msg(status: u16, message: &str) -> AgentError {
-        AgentError::Api {
-            status,
-            message: message.into(),
-        }
+        AgentError::api(status, message)
     }
 
     fn opencode_body(error_type: &str, message: &str) -> String {
@@ -401,16 +450,24 @@ mod tests {
     #[test_case(401, "authentication failed, run `maki auth login` or check your API key" ; "user_msg_401")]
     #[test_case(400, "API error (400): bad input"                                         ; "user_msg_400")]
     fn user_message_api(status: u16, expected: &str) {
-        let err = AgentError::Api {
-            status,
-            message: "bad input".into(),
-        };
+        let err = AgentError::api(status, "bad input");
         assert_eq!(err.user_message(), expected);
     }
 
     #[test]
     fn timeout_is_retryable() {
         assert!(AgentError::Timeout { secs: 30 }.is_retryable());
+    }
+
+    #[test_case("30", Some(Duration::from_secs(30)) ; "delta_seconds")]
+    #[test_case(" 5 ", Some(Duration::from_secs(5))  ; "whitespace")]
+    #[test_case("Wed, 21 Oct 2015 07:28:00 GMT", None ; "http_date")]
+    #[test_case("", None                             ; "empty")]
+    #[test_case("-3", None                           ; "negative")]
+    // A zero would be slept on and come straight back with the same 429.
+    #[test_case("0", None                            ; "zero")]
+    fn retry_after_header_is_read_as_seconds(value: &str, expected: Option<Duration>) {
+        assert_eq!(parse_retry_after(value), expected);
     }
 
     // llama.cpp: https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-context.cpp

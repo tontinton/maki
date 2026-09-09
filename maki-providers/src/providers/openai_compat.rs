@@ -1096,7 +1096,9 @@ data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\
                 .unwrap_err();
 
             match err {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 529);
                     assert_eq!(message, "Server overloaded");
                 }

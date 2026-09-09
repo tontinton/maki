@@ -466,7 +466,7 @@ fn decode_eventstream_frame(buf: &[u8]) -> Result<(usize, Option<Vec<u8>>), Agen
             "ValidationException" => 400,
             _ => 500,
         };
-        return Err(AgentError::Api { status, message });
+        return Err(AgentError::api(status, message));
     }
 
     let payload = if event_type.as_deref() == Some("chunk") && !payload_bytes.is_empty() {
@@ -876,7 +876,9 @@ mod tests {
         let frame = build_eventstream_frame(":exception-type", exc_type, msg.as_bytes());
         let err = decode_eventstream_frame(&frame).unwrap_err();
         match err {
-            AgentError::Api { status, message } => {
+            AgentError::Api {
+                status, message, ..
+            } => {
                 assert_eq!(status, expected_status);
                 assert_eq!(message, msg);
             }

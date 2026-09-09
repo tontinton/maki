@@ -1029,7 +1029,9 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
                 .await
                 .unwrap_err();
             match err {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 529);
                     assert_eq!(message, "Overloaded");
                 }
@@ -1047,7 +1049,9 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
                 .await
                 .unwrap_err();
             match err {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 400);
                     assert_eq!(message, "not-json");
                 }

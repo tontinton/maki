@@ -379,10 +379,7 @@ impl EventParser {
                     return Err(ev.into_agent_error());
                 }
                 warn!(raw = %data, "unparseable SSE error event");
-                return Err(AgentError::Api {
-                    status: 400,
-                    message: data.to_string(),
-                });
+                return Err(AgentError::api(400, data.to_string()));
             }
             "message_stop" => return Ok(ControlFlow::Break(())),
             _ => {}

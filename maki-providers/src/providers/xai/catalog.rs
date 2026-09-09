@@ -137,10 +137,7 @@ fn select_models(access: Option<&str>, force: bool) -> Result<Vec<CachedModel>, 
             save_cache(&models, now);
             Ok(models)
         }
-        FetchOutcome::Auth => Err(AgentError::Api {
-            status: 401,
-            message: CATALOG_UNAUTHORIZED.into(),
-        }),
+        FetchOutcome::Auth => Err(AgentError::api(401, CATALOG_UNAUTHORIZED)),
         FetchOutcome::Permanent => {
             warn!("xAI catalog refresh rejected, using curated fallback");
             invalidate();

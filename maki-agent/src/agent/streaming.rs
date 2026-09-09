@@ -556,10 +556,7 @@ mod tests {
 
     #[test]
     fn a_reported_api_error_leaves_the_provider_body_behind() {
-        let error = AgentError::Api {
-            status: 400,
-            message: SECRET_BODY.into(),
-        };
+        let error = AgentError::api(400, SECRET_BODY);
         let reported = error_description(&error);
         assert!(!reported.contains("private"));
         assert_eq!(reported, "API error (400)");
@@ -591,14 +588,14 @@ mod tests {
                 let asked = model.output_tokens().unwrap_or(0);
                 self.requests.lock().unwrap().push(asked);
                 if prompt + asked > self.window {
-                    return Err(AgentError::Api {
-                        status: 400,
-                        message: format!(
+                    return Err(AgentError::api(
+                        400,
+                        format!(
                             "This model's maximum context length is {} tokens. However, you requested {} tokens ({prompt} in the messages, {asked} in the completion).",
                             self.window,
                             prompt + asked
                         ),
-                    });
+                    ));
                 }
                 Ok(StreamResponse {
                     message: Message::user("ok".into()),

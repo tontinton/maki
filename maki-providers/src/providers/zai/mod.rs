@@ -369,15 +369,13 @@ impl Provider for Zai {
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
             {
-                Err(AgentError::Api { status, message })
-                    if (status == 429 || status >= 500)
-                        && (message.contains("1113") || message.contains("nsufficien")) =>
+                Err(AgentError::Api {
+                    status, message, ..
+                }) if (status == 429 || status >= 500)
+                    && (message.contains("1113") || message.contains("nsufficien")) =>
                 {
                     warn!(status, "insufficient funds, bailing out");
-                    Err(AgentError::Api {
-                        status: 402,
-                        message,
-                    })
+                    Err(AgentError::api(402, message))
                 }
                 result => result,
             }

@@ -810,10 +810,7 @@ mod tests {
                     trigger.cancel();
                 }
                 match self.fail_status {
-                    Some(status) => Err(AgentError::Api {
-                        status,
-                        message: "stub".into(),
-                    }),
+                    Some(status) => Err(AgentError::api(status, "stub")),
                     None => futures_lite::future::pending().await,
                 }
             })
@@ -1389,10 +1386,7 @@ mod tests {
                 match remaining.checked_sub(1) {
                     Some(rest) => {
                         *remaining = rest;
-                        Err(AgentError::Api {
-                            status: OVERFLOW_STATUS,
-                            message: OVERFLOW_MESSAGE.into(),
-                        })
+                        Err(AgentError::api(OVERFLOW_STATUS, OVERFLOW_MESSAGE))
                     }
                     None => Ok(text_response(StopReason::EndTurn)),
                 }
