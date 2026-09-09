@@ -221,6 +221,7 @@ fn load_task_host_with_opts(
 ) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.ui_attachment().attach();
     let prelude = STUB_PRELUDE
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
         .replace("@RECOVERED_TEXT@", RECOVERED_TEXT)
@@ -607,7 +608,7 @@ fn background_returns_receipt_and_delivers_by_notify() {
 
 /// A background subagent must not be a child of the call that spawned it, or
 /// it dies the moment that call's turn ends instead of outliving it. With a
-/// real session id this now spawns `scope = { session = sid }`; confirm that
+/// real session id this now spawns `scope = "session"`; confirm that
 /// still reaches a receipt instead of tripping the scope validation.
 #[test]
 fn background_with_a_real_session_detaches_and_still_delivers() {

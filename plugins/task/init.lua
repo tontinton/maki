@@ -278,7 +278,7 @@ local function handler(input, ctx)
   -- with a real session to tie it to; without one (headless/one-shot) it
   -- falls back to the call-scoped default.
   if input.background and sid then
-    session_opts.scope = { session = sid }
+    session_opts.scope = "session"
   end
 
   if not input.background then
