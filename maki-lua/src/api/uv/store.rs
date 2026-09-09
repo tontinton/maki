@@ -307,6 +307,10 @@ struct UvMeta {
     owner: Arc<str>,
     events: (Sender<UvEvent>, Receiver<UvEvent>),
     on_close: Option<RegistryKey>,
+    /// Receiver of the previous delivery task still running for this handle:
+    /// deliveries spawn as chained tasks so one handle's callbacks keep
+    /// event order.
+    chain: Option<Receiver<()>>,
     kind: Kind,
 }
 
@@ -316,6 +320,7 @@ impl UvMeta {
             owner,
             events: flume::unbounded(),
             on_close: None,
+            chain: None,
             kind,
         }
     }
@@ -699,6 +704,32 @@ impl UvStore {
         Some((id, rx.try_recv().ok()?))
     }
 
+    /// Whether a delivery task for `id` is still alive: its token receiver
+    /// sits on the handle, connected from the moment the token is minted
+    /// until the task's own sender drops.
+    fn delivery_in_flight(&self, id: u32) -> bool {
+        self.handles
+            .get(&id)
+            .and_then(|meta| meta.chain.as_ref())
+            .is_some_and(|rx| !rx.is_disconnected())
+    }
+
+    /// Pops the next deliverable event. Timer ticks of a handle whose
+    /// previous delivery is still running are dropped: a repeating timer
+    /// queues a tick per interval, and replaying all of them when the
+    /// callback finishes is a catch-up burst libuv does not have. Ticks are
+    /// droppable; read and write events are not, bytes and writer state ride
+    /// on them.
+    pub(crate) fn next_delivery(&mut self) -> Option<(u32, UvEvent)> {
+        while let Some((id, event)) = self.next_event() {
+            if matches!(event, UvEvent::TimerTick { .. }) && self.delivery_in_flight(id) {
+                continue;
+            }
+            return Some((id, event));
+        }
+        None
+    }
+
     /// State transitions for one delivered event, plus the callback (if any)
     /// converted out of the registry. Runs on the runtime thread with exclusive
     /// store access, so it is the only place handles change shape.
@@ -885,6 +916,17 @@ impl UvStore {
         }
     }
 
+    /// Mints the ordering token for the next delivery task of `id`: the task
+    /// waits on the previous one, and its own token releases the one after it.
+    pub(crate) fn chain(&mut self, id: u32) -> CallbackChain {
+        let (done, rx) = flume::bounded(0);
+        let prev = self
+            .handles
+            .get_mut(&id)
+            .and_then(|meta| meta.chain.replace(rx));
+        CallbackChain { prev, _done: done }
+    }
+
     /// Starts the next queued write, or sends a shutdown that waited for the
     /// queue. Runs from the pump after each Write event, so one writer task
     /// is out at a time and pipelined writes keep their order. A failed
@@ -943,6 +985,24 @@ pub(crate) fn with_uv<R>(lua: &Lua, f: impl FnOnce(&mut UvStore) -> R) -> R {
         .app_data_mut::<UvStore>()
         .expect("uv store was just installed");
     f(&mut store)
+}
+
+/// Orders one handle's deliveries: a task waits on the previous one and, held
+/// to its end, the token's drop releases the next, so a panicked predecessor
+/// still unwedges the chain. Flume over a per-handle async mutex: drop must
+/// release, and a mutex hands the lock to its waiters in no fixed order,
+/// while a linked token has one waiter.
+pub(crate) struct CallbackChain {
+    prev: Option<Receiver<()>>,
+    _done: Sender<()>,
+}
+
+impl CallbackChain {
+    pub(crate) async fn wait(&self) {
+        if let Some(prev) = &self.prev {
+            let _ = prev.recv_async().await;
+        }
+    }
 }
 
 /// Delivers one event: state transitions first, then the handle's callback in

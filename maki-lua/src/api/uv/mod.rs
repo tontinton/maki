@@ -9,7 +9,7 @@ mod store;
 mod tcp;
 mod timer;
 
-pub(crate) use store::{UvEvent, UvStore, deliver_uv_event, with_uv};
+pub(crate) use store::{UvStore, deliver_uv_event, with_uv};
 pub(crate) use tcp::TCP_DOCS;
 pub(crate) use timer::TIMER_DOCS;
 
@@ -96,6 +96,7 @@ mod tests {
     use mlua::Value;
 
     use super::*;
+    use crate::runtime::deliver_uv_pending;
 
     const TEST_PLUGIN: &str = "test-plugin";
     /// The allowlist is a process global; uv tests run on threads under plain
@@ -114,6 +115,9 @@ mod tests {
     const PUMP_POLL: Duration = Duration::from_millis(1);
     const SETTLE_WINDOW: Duration = Duration::from_millis(120);
     const TICK_MS: u64 = 20;
+    /// A quarter interval: long enough for a replay burst, short of the next
+    /// regular tick.
+    const REPLAY_WINDOW: Duration = Duration::from_millis(TICK_MS / 4);
     const ECHO_PAYLOAD: &str = "ping";
     const TIMER_STOPPED: &str = "timer stopped ticking";
     const CONNECT_EXPECTED_ERR: &str = "connect error never arrived";
@@ -133,16 +137,23 @@ mod tests {
         )
         .unwrap();
         lua.globals().set("uv", uv).unwrap();
+        let async_tbl = crate::api::r#async::create_async_table(&lua).unwrap();
+        let maki = lua.create_table().unwrap();
+        maki.set("async", async_tbl).unwrap();
+        lua.globals().set("maki", maki).unwrap();
         lua
     }
 
     /// Drains and delivers queued uv events until {done} turns true.
-    async fn pump_until(lua: &Lua, done: impl Fn() -> bool, what: &str) {
+    async fn pump_until(
+        ex: &smol::LocalExecutor<'_>,
+        lua: &Lua,
+        done: impl Fn() -> bool,
+        what: &str,
+    ) {
         let deadline = Instant::now() + TEST_DEADLINE;
         while !done() {
-            while let Some((id, event)) = with_uv(lua, |store| store.next_event()) {
-                deliver_uv_event(lua, id, event).await.unwrap();
-            }
+            deliver_uv_pending(lua, ex).await;
             assert!(Instant::now() < deadline, "{what}");
             smol::Timer::after(PUMP_POLL).await;
         }
@@ -162,7 +173,8 @@ mod tests {
         });
 
         let _guard = test_guard();
-        smol::block_on(async {
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
             let lua = fresh_lua(true, &[format!("127.0.0.1:{}", addr.port())]);
             let script = format!(
                 r#"
@@ -197,6 +209,7 @@ mod tests {
             );
             let results: mlua::Table = lua.load(script).eval().unwrap();
             pump_until(
+                &ex,
                 &lua,
                 || {
                     results.get::<bool>("eof").unwrap_or(false)
@@ -209,13 +222,14 @@ mod tests {
                 results.get::<String>("data").unwrap().as_str(),
                 ECHO_PAYLOAD
             );
-        });
+        }));
     }
 
     #[test]
     fn one_shot_timer_fires_once() {
         let _guard = test_guard();
-        smol::block_on(async {
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
             let lua = fresh_lua(false, &[]);
             lua.load(
                 r#"
@@ -227,6 +241,7 @@ mod tests {
             .exec()
             .unwrap();
             pump_until(
+                &ex,
                 &lua,
                 || {
                     lua.globals()
@@ -245,13 +260,14 @@ mod tests {
             }
             let results = lua.globals().get::<mlua::Table>("results").unwrap();
             assert_eq!(results.get::<u64>("ticks").unwrap(), 1, "{TIMER_ONE_TICK}");
-        });
+        }));
     }
 
     #[test]
     fn repeating_timer_stops() {
         let _guard = test_guard();
-        smol::block_on(async {
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
             let lua = fresh_lua(false, &[]);
             lua.load(format!(
                 r#"
@@ -264,6 +280,7 @@ mod tests {
             .exec()
             .unwrap();
             pump_until(
+                &ex,
                 &lua,
                 || {
                     lua.globals()
@@ -288,14 +305,15 @@ mod tests {
                 before,
                 "{TIMER_STOPPED}"
             );
-        });
+        }));
     }
 
     #[test]
     fn connect_failure_reaches_the_callback() {
         // Port 1 on loopback: nothing listens there, so the kernel refuses.
         let _guard = test_guard();
-        smol::block_on(async {
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
             let lua = fresh_lua(true, &["127.0.0.1:1".to_owned()]);
             lua.load(
                 r#"
@@ -307,6 +325,7 @@ mod tests {
             .exec()
             .unwrap();
             pump_until(
+                &ex,
                 &lua,
                 || {
                     lua.globals()
@@ -322,7 +341,7 @@ mod tests {
             let results = lua.globals().get::<mlua::Table>("results").unwrap();
             let err = results.get::<String>("err").unwrap();
             assert!(err.starts_with("ECONNREFUSED"), "{REFUSED_ERR}, got: {err}");
-        });
+        }));
     }
 
     /// A failed attempt costs the handle only its connect callback: options
@@ -339,7 +358,8 @@ mod tests {
         });
 
         let _guard = test_guard();
-        smol::block_on(async {
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
             // Port 1 on loopback: nothing listens there, so the kernel refuses.
             let lua = fresh_lua(
                 true,
@@ -373,6 +393,7 @@ mod tests {
             lua.load(script).exec().unwrap();
             let results = || lua.globals().get::<mlua::Table>("results").unwrap();
             pump_until(
+                &ex,
                 &lua,
                 || results().get::<Value>("data").unwrap() != Value::Nil,
                 PARKED_READ_ERR,
@@ -392,13 +413,14 @@ mod tests {
             assert_eq!(results.get::<Value>("second_err").unwrap(), Value::Nil);
             // The read armed before the failed attempt never had to be re-armed.
             assert_eq!(results.get::<String>("data").unwrap().as_str(), GREETING);
-        });
+        }));
     }
 
     #[test]
     fn closing_a_plugin_closes_its_handles() {
         let _guard = test_guard();
-        smol::block_on(async {
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
             let lua = fresh_lua(false, &[]);
             lua.load(
                 r#"
@@ -421,6 +443,209 @@ mod tests {
             assert!(!closed, "close callbacks must not fire after unload");
             let ticked: bool = lua.globals().get("ticked").unwrap();
             assert!(!ticked, "pending ticks must not fire after unload");
+        }));
+    }
+
+    /// A callback that parks on a gate no one calls must not stall the pump:
+    /// another handle's callback still runs, which inline delivery broke.
+    #[test]
+    fn suspended_callback_does_not_stall_other_handles() {
+        let _guard = test_guard();
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
+            let lua = fresh_lua(false, &[]);
+            lua.globals().set("TICK_MS", TICK_MS).unwrap();
+            lua.load(
+                r#"
+                results = {}
+                local ta = uv.new_timer()
+                ta:start(TICK_MS, 0, function()
+                    maki.async.await(2, function(gate) results.gate = gate end)
+                    results.a_done = true
+                end)
+                local tb = uv.new_timer()
+                tb:start(2 * TICK_MS, 0, function() results.b_done = true end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+            let results: mlua::Table = lua.globals().get("results").unwrap();
+            pump_until(
+                &ex,
+                &lua,
+                || results.get::<Value>("gate").unwrap() != Value::Nil,
+                "A never parked",
+            )
+            .await;
+            pump_until(
+                &ex,
+                &lua,
+                || results.get::<bool>("b_done").unwrap(),
+                "B stalled behind parked A",
+            )
+            .await;
+            results
+                .get::<mlua::Function>("gate")
+                .unwrap()
+                .call::<()>(())
+                .unwrap();
+            pump_until(
+                &ex,
+                &lua,
+                || results.get::<bool>("a_done").unwrap(),
+                "A never resumed after its gate fired",
+            )
+            .await;
+        }));
+    }
+
+    /// A read event queues behind a parked read callback of the same socket
+    /// and is delivered in arrival order once the callback finishes. Reads
+    /// are never coalesced, so this is the test for the per-handle chain.
+    #[test]
+    fn queued_read_waits_behind_a_parked_read_callback() {
+        let _guard = test_guard();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            if stream.write_all(b"AB").is_err() {
+                return;
+            }
+            std::thread::sleep(SETTLE_WINDOW);
+            let _ = stream.write_all(b"CD");
+            std::thread::sleep(SETTLE_WINDOW * 3);
         });
+
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
+            let lua = fresh_lua(true, &[format!("127.0.0.1:{}", addr.port())]);
+            lua.globals().set("PORT", addr.port()).unwrap();
+            lua.load(
+                r#"
+                results = { chunks = {} }
+                local tcp = uv.new_tcp()
+                tcp:connect("127.0.0.1", PORT, function(err)
+                    if err then
+                        results.err = err
+                        return
+                    end
+                    tcp:read_start(function(e, data)
+                        if e then
+                            results.err = e
+                            return
+                        end
+                        if data then
+                            results.chunks[#results.chunks + 1] = data
+                            if #results.chunks == 1 then
+                                maki.async.await(2, function(gate) results.gate = gate end)
+                            end
+                        end
+                    end)
+                end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+            let results: mlua::Table = lua.globals().get("results").unwrap();
+            pump_until(
+                &ex,
+                &lua,
+                || results.get::<Value>("gate").unwrap() != Value::Nil,
+                "first read callback never parked",
+            )
+            .await;
+            // Let the second chunk arrive and queue behind the parked
+            // callback. A slow machine delays the writer thread, never
+            // reorders it.
+            let settle = Instant::now() + SETTLE_WINDOW * 2;
+            while Instant::now() < settle {
+                deliver_uv_pending(&lua, &ex).await;
+                smol::Timer::after(PUMP_POLL).await;
+            }
+            results
+                .get::<mlua::Function>("gate")
+                .unwrap()
+                .call::<()>(())
+                .unwrap();
+            pump_until(
+                &ex,
+                &lua,
+                || results.get::<mlua::Table>("chunks").unwrap().raw_len() == 2,
+                "the queued read never arrived",
+            )
+            .await;
+            let chunks: Vec<String> = results
+                .get::<mlua::Table>("chunks")
+                .unwrap()
+                .sequence_values()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                results.get::<Option<String>>("err").unwrap(),
+                None,
+                "the socket reported an error"
+            );
+            assert_eq!(
+                chunks,
+                vec!["AB".to_string(), "CD".to_string()],
+                "the second read must wait for the parked first read"
+            );
+        }));
+    }
+
+    /// Ticks that arrive while a timer callback is still running are dropped,
+    /// not replayed. The release fires at 5.5 intervals, half an interval
+    /// before the next tick, so a replay burst would land inside the short
+    /// check window after it.
+    #[test]
+    fn timer_ticks_coalesce_while_the_callback_runs() {
+        let _guard = test_guard();
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
+            let lua = fresh_lua(false, &[]);
+            lua.globals().set("TICK_MS", TICK_MS).unwrap();
+            lua.load(
+                r#"
+                results = { count = 0, released = false }
+                local t = uv.new_timer()
+                t:start(TICK_MS, TICK_MS, function()
+                    results.count = results.count + 1
+                    if results.count == 1 then
+                        maki.async.await(2, function(gate) results.gate = gate end)
+                    end
+                end)
+                local release = uv.new_timer()
+                release:start(TICK_MS * 5 + TICK_MS / 2, 0, function()
+                    if results.gate then
+                        results.gate()
+                        results.released = true
+                    end
+                end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+            let results: mlua::Table = lua.globals().get("results").unwrap();
+            pump_until(
+                &ex,
+                &lua,
+                || results.get::<bool>("released").unwrap_or(false),
+                "the release never fired",
+            )
+            .await;
+            let window = Instant::now() + REPLAY_WINDOW;
+            while Instant::now() < window {
+                deliver_uv_pending(&lua, &ex).await;
+                smol::Timer::after(PUMP_POLL).await;
+            }
+            // A replay would add the four ticks dropped during the park. One
+            // regular tick may land inside the window on a slow machine; that
+            // is not a replay.
+            let count: i64 = results.get("count").unwrap();
+            assert!(count <= 2, "missed ticks replayed after the park: {count}");
+        }));
     }
 }
