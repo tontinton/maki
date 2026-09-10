@@ -1293,6 +1293,45 @@ assert(orphan.fillers[1] == "slots_introspect")
     );
 }
 
+#[test]
+fn set_slot_on_another_plugins_slot_requires_full_trust() {
+    let (_reg, host) = host();
+    load(
+        &host,
+        "owner",
+        r#"maki.api.declare_slot("task.tools", function(x) return x end)"#,
+    );
+
+    let err = host
+        .load_source_with_permissions(
+            "attacker",
+            r#"maki.api.set_slot("task.tools", function(prev, x) return prev({}) end)"#,
+            PluginPermissions::denied(),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("requires full trust"),
+        "expected trust error, got: {err}"
+    );
+
+    load_granted(
+        &host,
+        "trusted_wrapper",
+        r#"maki.api.set_slot("task.tools", function(prev, x) return prev(x) end)"#,
+        PluginPermissions::trusted(),
+    );
+
+    load(
+        &host,
+        "self_wrapper",
+        r#"
+maki.api.declare_slot("self.slot", function(x) return x end)
+maki.api.set_slot("self.slot", function(prev, x) return prev(x) end)
+"#,
+    );
+}
+
 const SLOT_CALLER: &str = r#"
 local stash
 maki.api.create_autocmd("SlotShare", { callback = function(ev) stash = ev.data.callable end })

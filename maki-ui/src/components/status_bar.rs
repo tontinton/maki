@@ -31,6 +31,12 @@ pub struct UsageStats {
     pub global_cost: Option<f64>,
     pub context_size: u32,
     pub cost: Option<f64>,
+    /// What this chat's turns would have cost at the provider's published list
+    /// price, shown next to `cost` only when the model is subsidised.
+    pub list_cost: Option<f64>,
+    /// Name of the subscription covering the bill (e.g. `"Max"`). `None`
+    /// on every non-subsidised model, which keeps the list-price figure hidden.
+    pub subsidy_source: Option<std::sync::Arc<str>>,
     pub context_window: u32,
     pub show_global: bool,
 }
@@ -216,9 +222,16 @@ impl StatusBar {
                     format_tokens(ctx.stats.context_window),
                     pct,
                 );
-                let rest_text = match ctx.stats.cost {
-                    Some(cost) => format!("{context_text} ${cost:.3} "),
-                    None => format!("{context_text} "),
+                let rest_text = match (
+                    ctx.stats.cost,
+                    ctx.stats.list_cost,
+                    &ctx.stats.subsidy_source,
+                ) {
+                    (Some(cost), Some(list), Some(source)) if list > 0.0 => {
+                        format!("{context_text} ${cost:.3} (~${list:.3} {source}) ")
+                    }
+                    (Some(cost), _, _) => format!("{context_text} ${cost:.3} "),
+                    (None, _, _) => format!("{context_text} "),
                 };
                 rest_spans.push(Span::styled(
                     rest_text,
@@ -398,6 +411,8 @@ mod tests {
                 global_cost,
                 context_size: CONTEXT_SIZE,
                 cost: Some(CHAT_COST),
+                list_cost: None,
+                subsidy_source: None,
                 context_window: crate::components::TEST_CONTEXT_WINDOW,
                 show_global,
             },

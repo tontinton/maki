@@ -955,6 +955,7 @@ mod tests {
             usage: TokenUsage::default(),
             model: SELECTED_SPEC.to_owned(),
             cost: Some(cost),
+            list_cost: None,
             context_size: None,
             context_window: CONTEXT_WINDOW,
         })

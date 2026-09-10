@@ -129,16 +129,14 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
     let per_token =
         |p: &Value| -> Option<f64> { Some(p.as_str()?.parse::<f64>().ok()? * PER_MILLION) };
     let pricing = m["pricing"].as_object().and_then(|p| {
-        Some(ModelPricing {
-            input: per_token(p.get("prompt")?)?,
-            output: per_token(p.get("completion")?)?,
-            cache_write: p
-                .get("input_cache_write")
+        Some(ModelPricing::per_token(
+            per_token(p.get("prompt")?)?,
+            per_token(p.get("completion")?)?,
+            p.get("input_cache_write")
                 .and_then(per_token)
                 .unwrap_or(0.0),
-            cache_read: p.get("input_cache_read").and_then(per_token).unwrap_or(0.0),
-            fast: None,
-        })
+            p.get("input_cache_read").and_then(per_token).unwrap_or(0.0),
+        ))
     });
 
     let reasoning = m

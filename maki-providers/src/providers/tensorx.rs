@@ -161,19 +161,16 @@ impl Provider for TensorX {
                             let output_cost = info["output_cost_per_token"].as_f64();
                             let pricing = if input_cost.is_some() || output_cost.is_some() {
                                 let per_million = 1_000_000.0;
-                                Some(ModelPricing {
-                                    input: input_cost.unwrap_or(0.0) * per_million,
-                                    output: output_cost.unwrap_or(0.0) * per_million,
-                                    cache_write: info["cache_creation_input_token_cost"]
+                                Some(ModelPricing::per_token(
+                                    input_cost.unwrap_or(0.0) * per_million,
+                                    output_cost.unwrap_or(0.0) * per_million,
+                                    info["cache_creation_input_token_cost"]
                                         .as_f64()
                                         .unwrap_or(0.0)
                                         * per_million,
-                                    cache_read: info["cache_read_input_token_cost"]
-                                        .as_f64()
-                                        .unwrap_or(0.0)
+                                    info["cache_read_input_token_cost"].as_f64().unwrap_or(0.0)
                                         * per_million,
-                                    fast: None,
-                                })
+                                ))
                             } else {
                                 None
                             };

@@ -47,6 +47,10 @@ Notes:
 4. Tell it to return concise summaries with file:line refs, not full file contents.
 ]]
 
+-- Extension points, wrapped via maki.api.set_slot; each returns the shape
+-- it received (resolve_model the (model, err) pair).
+local resolve_model_slot, system_prompt_slot, tools_slot
+
 local opts = maki.api.register_options({
   max_concurrent = { default = 8, min = 1, desc = "Max concurrently running subagents." },
   allow_model = {
@@ -54,6 +58,21 @@ local opts = maki.api.register_options({
     desc = "Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves.",
   },
 })
+
+resolve_model_slot = maki.api.declare_slot("task.resolve_model", function(ctx, input)
+  return maki.agent.resolve_model(ctx, {
+    tier = input.model_tier,
+    spec = opts.allow_model and input.model or nil,
+  })
+end)
+
+system_prompt_slot = maki.api.declare_slot("task.system_prompt", function(system, _ctx, _input, _subagent_type)
+  return system
+end)
+
+tools_slot = maki.api.declare_slot("task.tools", function(tool_defs, _ctx, _input, _subagent_type)
+  return tool_defs
+end)
 
 local schema = {
   type = "object",
@@ -129,10 +148,7 @@ local function handler(input, ctx)
     end
   end
 
-  local model, model_err = maki.agent.resolve_model(ctx, {
-    tier = input.model_tier,
-    spec = opts.allow_model and input.model or nil,
-  })
+  local model, model_err = resolve_model_slot(ctx, input)
   if model_err then
     return { llm_output = model_err, is_error = true }
   end
@@ -146,11 +162,15 @@ local function handler(input, ctx)
   if system_err then
     return { llm_output = system_err, is_error = true }
   end
+  system = system_prompt_slot(system, ctx, input, subagent_type)
 
   local tool_defs, tools_err = maki.agent.tools(ctx, {
     audience = audience,
     spec = model.spec,
   })
+  if not tools_err then
+    tool_defs = tools_slot(tool_defs, ctx, input, subagent_type)
+  end
   if tools_err then
     return { llm_output = tools_err, is_error = true }
   end

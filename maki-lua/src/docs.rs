@@ -75,6 +75,8 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::log::DOCS,
         &api::model::DOCS,
         &api::net::DOCS,
+        &api::plan::DOCS,
+        &api::plan::PLAN_ACTION_DOCS,
         &api::session::DOCS,
         &api::top::DOCS,
         &api::top::TIMER_DOCS,
@@ -140,6 +142,7 @@ mod tests {
         let (ui_tx, _ui_rx) = flume::unbounded();
         let maki = create_maki_global(
             &lua,
+            Arc::default(),
             Arc::default(),
             Arc::default(),
             Arc::from("docs-test"),

@@ -52,7 +52,7 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
 });
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
+    const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &[
                 "mistral-medium-latest",
@@ -64,13 +64,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Generic,
             vision: true,
             default: true,
-            pricing: ModelPricing {
-                input: 1.5,
-                output: 7.5,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(1.5, 7.5, 0.00, 0.00),
             max_output_tokens: None,
             context_window: 262_144,
         },
@@ -80,13 +74,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Glm,
             vision: false,
             default: false,
-            pricing: ModelPricing {
-                input: 1.40,
-                output: 4.40,
-                cache_write: 0.00,
-                cache_read: 0.14,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(1.40, 4.40, 0.00, 0.14),
             max_output_tokens: None,
             context_window: 1_000_000,
         },
@@ -96,13 +84,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Generic,
             vision: true,
             default: true,
-            pricing: ModelPricing {
-                input: 0.15,
-                output: 0.60,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(0.15, 0.60, 0.00, 0.00),
             max_output_tokens: None,
             context_window: 262_144,
         },
@@ -112,17 +94,12 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Generic,
             vision: false,
             default: true,
-            pricing: ModelPricing {
-                input: 0.20,
-                output: 0.20,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(0.20, 0.20, 0.00, 0.00),
             max_output_tokens: None,
             context_window: 262_144,
         },
-    ]
+    ];
+    MODELS
 }
 
 pub struct Mistral {

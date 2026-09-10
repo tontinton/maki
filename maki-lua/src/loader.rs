@@ -13,6 +13,7 @@ use maki_config::{PluginsConfig, RawConfig};
 
 use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
+use crate::api::plan::PlanActionReader;
 use crate::api::util::command::{HintReader, LuaCommandReader, UiAction, UiAttachment};
 use crate::error::PluginError;
 use crate::pack::DiscoveredPackage;
@@ -904,6 +905,10 @@ impl PluginHost {
         self.inner.hint_reader.clone()
     }
 
+    pub fn plan_action_reader(&self) -> PlanActionReader {
+        self.inner.plan_action_reader.clone()
+    }
+
     pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
         self.inner.ui_action_rx.clone()
     }
@@ -963,6 +968,23 @@ impl EventHandle {
             command,
             args,
             depth,
+        });
+    }
+
+    pub fn run_plan_action(
+        &self,
+        plugin: Arc<str>,
+        name: Arc<str>,
+        path: String,
+        parallel: bool,
+        selected: usize,
+    ) {
+        let _ = self.prio_tx.try_send(Request::RunPlanAction {
+            plugin,
+            name,
+            path,
+            parallel,
+            selected,
         });
     }
 
@@ -1050,10 +1072,13 @@ impl EventHandle {
         });
     }
 
-    /// Headless drivers install their own provider so `maki.session.read` has
-    /// something to answer with instead of "no interactive UI attached". The UI
-    /// leaves the slot empty and answers through its event loop, which owns the
-    /// live session runtimes.
+    /// Install the per-driver `SessionSnapshotFn` that answers
+    /// `maki.session.read`. Headless drivers (`maki -p`, sdk mode)
+    /// install one that reads their own accumulator so goal loops don't
+    /// hit `nil, "no interactive UI attached"`. UI mode leaves the slot
+    /// unset and relies on `session::read`'s `UiAction` fallback so the
+    /// App can resolve `id` against its live session runtimes. Setting
+    /// again replaces the previous provider.
     pub fn install_session_snapshot(&self, provider: crate::api::session::SessionSnapshotFn) {
         let _ = self
             .tx
@@ -1137,6 +1162,22 @@ impl EventHandle {
 
 #[cfg(test)]
 mod tests {
+    /// A bundled plugin missing from `DEFAULT_BUILTINS` ships
+    /// unconfigurable; `lib` is the intentional exception.
+    #[test]
+    fn every_bundled_plugin_is_a_default_builtin() {
+        for plugin in super::BUNDLED_PLUGINS {
+            if plugin.name == "lib" {
+                continue;
+            }
+            assert!(
+                maki_config::DEFAULT_BUILTINS.contains(&plugin.name),
+                "bundled plugin {} is missing from maki_config::DEFAULT_BUILTINS",
+                plugin.name
+            );
+        }
+    }
+
     use super::*;
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
     use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
