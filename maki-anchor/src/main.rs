@@ -11,6 +11,7 @@ mod dashboard;
 mod http;
 mod hub;
 mod oidc;
+mod push;
 mod server;
 mod store;
 mod webhooks;

@@ -25,14 +25,27 @@ pub(crate) const DASHBOARD_MANIFEST: &str = r##"{
 }"##;
 
 /// No caching, no offline shell — just enough (a registered worker with a
-/// fetch handler) to satisfy install criteria. Mirrors maki-remote's own
-/// service worker exactly, and the same reasoning: a real offline cache
-/// would need its own staleness story, not worth the risk for what it buys
-/// a page this simple.
+/// fetch handler) to satisfy install criteria, same as maki-remote's own.
+/// The one real difference: a `push` handler, since this is the surface
+/// Web Push notifications actually arrive on (see push.rs) — this is what
+/// lets one fire even with every tab and the installed app fully closed,
+/// unlike maki-remote's in-page-only Notification API usage.
 pub(crate) const DASHBOARD_SW_JS: &str = "\
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', () => {});
+self.addEventListener('push', (event) => {
+  let data = { title: 'maki', body: '' };
+  try { data = event.data.json(); } catch {}
+  event.waitUntil(self.registration.showNotification(data.title || 'maki', {
+    body: data.body || '',
+    icon: '/icon.svg',
+  }));
+});
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  event.waitUntil(clients.openWindow('/'));
+});
 ";
 
 /// Same icon as maki-remote's installed sessions — one "maki" mark for
@@ -52,6 +65,7 @@ const INSTALL_JS: &str = r#"<script>
   const banner = document.getElementById('install-banner');
   const text = document.getElementById('install-banner-text');
   const action = document.getElementById('install-banner-action');
+  const notifyBtn = document.getElementById('install-banner-notify');
   const dismissBtn = document.getElementById('install-banner-dismiss');
   let deferred = null;
   const isStandalone = () =>
@@ -63,26 +77,29 @@ const INSTALL_JS: &str = r#"<script>
     banner.hidden = true;
     try { localStorage.setItem('maki_anchor_install_dismissed', '1'); } catch {}
   };
+  const canPush = () =>
+    'serviceWorker' in navigator && 'PushManager' in window && typeof Notification !== 'undefined';
   const update = () => {
     if (dismissed() || isStandalone()) { banner.hidden = true; return; }
-    if (deferred) {
-      text.textContent = 'Install maki for quick access to your sessions.';
-      action.hidden = false;
-      banner.hidden = false;
-    } else if (isIosSafari()) {
-      text.textContent = 'Add maki to your Home Screen: Share → Add to Home Screen.';
-      action.hidden = true;
-      banner.hidden = false;
-    } else {
-      banner.hidden = true;
-    }
+    const canInstall = !!deferred;
+    const iosHint = !canInstall && isIosSafari();
+    const canNotify = canPush() && Notification.permission === 'default';
+    if (!canInstall && !iosHint && !canNotify) { banner.hidden = true; return; }
+    text.textContent = canInstall
+      ? 'Install maki for quick access to your sessions.'
+      : iosHint
+      ? 'Add maki to your Home Screen: Share → Add to Home Screen.'
+      : 'Get notified the moment a session needs you — even with the app closed.';
+    action.hidden = !canInstall;
+    notifyBtn.hidden = !canNotify;
+    banner.hidden = false;
   };
   window.addEventListener('beforeinstallprompt', (ev) => {
     ev.preventDefault();
     deferred = ev;
     update();
   });
-  window.addEventListener('appinstalled', () => { deferred = null; dismiss(); });
+  window.addEventListener('appinstalled', () => { deferred = null; update(); });
   action.onclick = async () => {
     if (!deferred) return;
     deferred.prompt();
@@ -90,9 +107,51 @@ const INSTALL_JS: &str = r#"<script>
     deferred = null;
     update();
   };
+  // The raw bytes pushManager.subscribe() wants for applicationServerKey,
+  // from the base64url string /api/push/vapid-key hands back (push.rs
+  // encodes the VAPID public key the same way).
+  const urlBase64ToUint8Array = (base64) => {
+    const padding = '='.repeat((4 - (base64.length % 4)) % 4);
+    const raw = atob((base64 + padding).replace(/-/g, '+').replace(/_/g, '/'));
+    return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
+  };
+  // Subscribes this device if Notification permission is already granted
+  // but no live pushManager subscription exists yet — covers both the
+  // banner's own click flow and a permission granted some other way (a
+  // browser's own site-settings UI, a previous install that predates this
+  // subscription step, ...), so notifications self-heal on any page load
+  // rather than only ever registering once from one specific button.
+  const ensureSubscribed = async () => {
+    if (!canPush() || Notification.permission !== 'granted') return;
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        const { key } = await fetch('/api/push/vapid-key').then((r) => r.json());
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(key),
+        });
+        await fetch('/api/push/subscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(sub.toJSON()),
+        });
+      }
+    } catch (err) {
+      console.error('push subscribe failed', err);
+    }
+  };
+  notifyBtn.onclick = async () => {
+    if (!canPush()) return;
+    const perm = await Notification.requestPermission();
+    if (perm === 'granted') await ensureSubscribed();
+    update();
+  };
   dismissBtn.onclick = dismiss;
-  update();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+  ensureSubscribed();
+  update();
 })();
 </script>"#;
 
@@ -213,6 +272,7 @@ pub(crate) fn layout_start(title: &str, user: Option<&UserRow>, page: &str) -> S
          <div id=\"install-banner\" hidden>\
          <span id=\"install-banner-text\"></span>\
          <button class=\"primary\" id=\"install-banner-action\" hidden>Install</button>\
+         <button class=\"primary\" id=\"install-banner-notify\" hidden>Enable notifications</button>\
          <button id=\"install-banner-dismiss\" title=\"Dismiss\">×</button>\
          </div>\
          <main style=\"padding:0 1rem\">",

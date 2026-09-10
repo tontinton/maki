@@ -27,6 +27,16 @@ num-bigint = "0.4"
 ureq = { workspace = true }
 url = { workspace = true }
 toml = { workspace = true }
+# Only the crypto/message-building half (VAPID signing, RFC8291 payload
+# encryption) — default-features = false drops the isahc HTTP client
+# entirely, since sending goes through the `ureq` agent already used for
+# webhook delivery instead (see push.rs: request_builder::build_request
+# yields a plain http::Request this project sends itself).
+web-push = { version = "0.11", default-features = false }
+# For VAPID key generation only (ES256KeyPair::generate/to_bytes) — matches
+# web-push's own dependency exactly (version, default-features, features),
+# so cargo resolves one shared copy rather than two.
+jwt-simple = { version = "0.12.11", default-features = false, features = ["pure-rust"] }
 
 [dev-dependencies]
 test-case = { workspace = true }

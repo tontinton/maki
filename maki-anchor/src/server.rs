@@ -2712,6 +2712,15 @@ fn route_authorized(
     if path == "/api/sessions" {
         return buffered(json_list_sessions_for(store, user.as_ref()), request);
     }
+    if path == "/api/push/vapid-key" {
+        return handle_api_push_vapid_key(request, store);
+    }
+    if path == "/api/push/subscribe" {
+        return handle_api_push_subscribe(request, store, user.as_ref());
+    }
+    if path == "/api/push/unsubscribe" {
+        return handle_api_push_unsubscribe(request, store, user.as_ref());
+    }
     if path == "/api/sessions/search" {
         let query = request.url().split_once('?').map(|(_, q)| q).unwrap_or("");
         let q = query_param(query, "q").unwrap_or_default();
@@ -3036,6 +3045,82 @@ fn can_mutate_session(
     }
 }
 
+/// GET /api/push/vapid-key: the base64url-encoded VAPID public key the
+/// dashboard's install banner needs as `pushManager.subscribe()`'s
+/// `applicationServerKey`. No login check — the key isn't sensitive (every
+/// subscribing browser receives it anyway), and gating it would only mean
+/// the JS has to special-case a 401 for no real benefit.
+fn handle_api_push_vapid_key(request: http::Request, store: &Arc<Store>) -> RouteOutcome {
+    let Some(key) = crate::push::vapid_public_key(store) else {
+        return json_error(request, 500, "vapid key unavailable");
+    };
+    buffered(center_json(200, serde_json::json!({ "key": key })), request)
+}
+
+/// POST /api/push/subscribe {endpoint, keys: {p256dh, auth}}: registers one
+/// browser's Push API subscription for the logged-in user — the same shape
+/// `PushSubscription.toJSON()` already produces client-side, so the
+/// dashboard's JS can POST it verbatim.
+fn handle_api_push_subscribe(
+    mut request: http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method() != "POST" {
+        return json_error(request, 405, "method not allowed");
+    }
+    let Some(user) = user else {
+        return json_error(request, 401, "login required");
+    };
+    let value = match read_json(&mut request) {
+        Ok(v) => v,
+        Err(e) => return json_error(request, 400, &e),
+    };
+    let (Some(endpoint), Some(p256dh), Some(auth)) = (
+        value.get("endpoint").and_then(|v| v.as_str()),
+        value
+            .get("keys")
+            .and_then(|k| k.get("p256dh"))
+            .and_then(|v| v.as_str()),
+        value
+            .get("keys")
+            .and_then(|k| k.get("auth"))
+            .and_then(|v| v.as_str()),
+    ) else {
+        return json_error(request, 400, "endpoint and keys.p256dh/auth required");
+    };
+    match store.add_push_subscription(user.id, endpoint, p256dh, auth) {
+        Ok(()) => buffered(center_json(200, serde_json::json!({"ok": true})), request),
+        Err(err) => json_error(request, 500, &err.to_string()),
+    }
+}
+
+/// POST /api/push/unsubscribe {endpoint}: the user's own "turn off
+/// notifications" action.
+fn handle_api_push_unsubscribe(
+    mut request: http::Request,
+    store: &Arc<Store>,
+    user: Option<&crate::store::UserRow>,
+) -> RouteOutcome {
+    if request.method() != "POST" {
+        return json_error(request, 405, "method not allowed");
+    }
+    let Some(user) = user else {
+        return json_error(request, 401, "login required");
+    };
+    let value = match read_json(&mut request) {
+        Ok(v) => v,
+        Err(e) => return json_error(request, 400, &e),
+    };
+    let Some(endpoint) = value.get("endpoint").and_then(|v| v.as_str()) else {
+        return json_error(request, 400, "endpoint required");
+    };
+    match store.remove_push_subscription_for_user(user.id, endpoint) {
+        Ok(()) => buffered(center_json(200, serde_json::json!({"ok": true})), request),
+        Err(err) => json_error(request, 500, &err.to_string()),
+    }
+}
+
 fn handle_api_session_delete(
     mut request: http::Request,
     store: &Arc<Store>,
@@ -3203,6 +3288,7 @@ fn handle_push(store: &Arc<Store>, hub: &Hub, instance_id: i64, push: TunnelPush
                 .instance_name(instance_id)
                 .unwrap_or_else(|_| "instance".to_owned());
             crate::webhooks::notify_run_finished(store, instance_id, &instance_name, &row.title);
+            crate::push::notify_run_finished(store, instance_id, &instance_name, &row.title);
         }
     }
     // Opportunistic pruning: a busy anchor clears expired transcripts as it

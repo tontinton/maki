@@ -189,6 +189,16 @@ pub struct WebhookRow {
     pub created_at: i64,
 }
 
+/// One browser/device's Web Push registration — the three fields a
+/// `PushSubscription.toJSON()` gives the client, needed to address and
+/// encrypt a message to it (see `crate::push`).
+#[derive(Debug, Clone)]
+pub struct PushSubscriptionRow {
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Arc<Self>, StoreError> {
         let conn = Connection::open(path)?;
@@ -257,6 +267,18 @@ impl Store {
                   instance_id INTEGER REFERENCES instances(id) ON DELETE CASCADE,
                   kind TEXT NOT NULL,
                   url TEXT NOT NULL,
+                  created_at INTEGER NOT NULL
+              );
+              -- One row per subscribed browser/device (a user can install on
+              -- several). `endpoint` is unique per the Push API spec (the
+              -- browser mints a fresh one per subscription), so re-subscribing
+              -- the same device is an upsert rather than a duplicate row.
+              CREATE TABLE IF NOT EXISTS push_subscriptions (
+                  id INTEGER PRIMARY KEY,
+                  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  endpoint TEXT NOT NULL UNIQUE,
+                  p256dh TEXT NOT NULL,
+                  auth TEXT NOT NULL,
                   created_at INTEGER NOT NULL
               );
               CREATE INDEX IF NOT EXISTS instances_registration_token
@@ -1240,6 +1262,86 @@ impl Store {
                     kind: row.get(3)?,
                     url: row.get(4)?,
                     created_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Registers (or re-registers, on conflict — a browser re-subscribing the
+    /// same device sends the same endpoint) one device's Push API
+    /// subscription for `user_id`.
+    pub fn add_push_subscription(
+        &self,
+        user_id: i64,
+        endpoint: &str,
+        p256dh: &str,
+        auth: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth",
+            rusqlite::params![user_id, endpoint, p256dh, auth, now_unix()],
+        )?;
+        Ok(())
+    }
+
+    /// Drops one device's subscription by endpoint alone — how
+    /// `crate::push` retires an endpoint the push service reports as gone
+    /// (410) or unknown (404), where there is no requesting user to scope
+    /// to. Not for the user-facing unsubscribe route; see
+    /// `remove_push_subscription_for_user` for that.
+    pub fn remove_push_subscription(&self, endpoint: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM push_subscriptions WHERE endpoint = ?1",
+            [endpoint],
+        )?;
+        Ok(())
+    }
+
+    /// The user's own "turn off notifications" action — scoped to
+    /// `user_id` so one user can never drop another's device even if they
+    /// somehow learned its endpoint URL.
+    pub fn remove_push_subscription_for_user(
+        &self,
+        user_id: i64,
+        endpoint: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM push_subscriptions WHERE endpoint = ?1 AND user_id = ?2",
+            rusqlite::params![endpoint, user_id],
+        )?;
+        Ok(())
+    }
+
+    /// Every subscribed device belonging to a user who can actually see
+    /// `instance_id` — an admin (every instance) or a user with a `grants`
+    /// row on it, the same visibility `sessions_for_user`/`instances_for_user`
+    /// already enforce for the dashboard itself. A push notification is
+    /// exactly a proactive version of what that user could already see by
+    /// opening the dashboard, so it uses the same rule.
+    pub fn push_subscriptions_for_instance(
+        &self,
+        instance_id: i64,
+    ) -> Result<Vec<PushSubscriptionRow>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ps.endpoint, ps.p256dh, ps.auth
+             FROM push_subscriptions ps
+             JOIN users u ON u.id = ps.user_id
+             WHERE u.is_admin = 1
+                OR EXISTS (SELECT 1 FROM grants g WHERE g.user_id = ps.user_id AND g.instance_id = ?1)",
+        )?;
+        let rows = stmt
+            .query_map([instance_id], |row| {
+                Ok(PushSubscriptionRow {
+                    endpoint: row.get(0)?,
+                    p256dh: row.get(1)?,
+                    auth: row.get(2)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
