@@ -805,14 +805,21 @@ mod tests {
         assert_eq!(tail, "the-end");
 
         let (window, err): (String, mlua::Value) =
-            smol::block_on(read.call_async((file.to_str().unwrap(), make_opts(5, Some(4))))).unwrap();
-        assert!(matches!(err, mlua::Value::Nil), "offset from start with len");
+            smol::block_on(read.call_async((file.to_str().unwrap(), make_opts(5, Some(4)))))
+                .unwrap();
+        assert!(
+            matches!(err, mlua::Value::Nil),
+            "offset from start with len"
+        );
         assert_eq!(window, "tail");
 
         let (past, err): (String, mlua::Value) =
             smol::block_on(read.call_async((file.to_str().unwrap(), make_opts(-10_000, None))))
                 .unwrap();
-        assert!(matches!(err, mlua::Value::Nil), "window larger than the file");
+        assert!(
+            matches!(err, mlua::Value::Nil),
+            "window larger than the file"
+        );
         assert_eq!(past, std::fs::read_to_string(&file).unwrap());
     }
 

@@ -4953,6 +4953,95 @@ mod tests {
         );
     }
 
+    /// An abandoned `maki.async.run` task must still deliver a verdict through
+    /// {on_finish}: `until_abandoned` drops the coroutine mid-await, so the
+    /// pcall wrapper alone can never call `finish` — the cancel hook has to.
+    /// A backgrounded subagent that dies with its turn may not leave its
+    /// receipt stuck at "working" forever.
+    #[test]
+    fn run_on_finish_delivers_the_reason_when_the_parent_cancels() {
+        let lua = enqueue_test_lua();
+        lua.globals()
+            .set(
+                "async",
+                crate::api::r#async::create_async_table(&lua).unwrap(),
+            )
+            .unwrap();
+        let (trigger, parent) = live_scope(&lua);
+
+        let code = r#"
+            finished = nil
+            async.run(function()
+                return async.await(1, function(cb) parked_cb = cb end)
+            end, {
+                deadline_ms = false,
+                on_finish = function(err, result) finished = { err = err, result = result } end,
+            })
+        "#;
+        let ex = Rc::new(smol::LocalExecutor::new());
+        block_on_or_fail(ex.run(async {
+            parent
+                .scope_future(async {
+                    lua.load(code).exec().unwrap();
+                })
+                .await;
+            let task = {
+                let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
+                queue.rx.try_recv().unwrap()
+            };
+            spawn_async_task(&lua, &ex, &Rc::new(gate()), task);
+            for _ in 0..100 {
+                smol::future::yield_now().await;
+                if lua
+                    .globals()
+                    .get::<LuaValue>("parked_cb")
+                    .unwrap()
+                    .is_function()
+                {
+                    break;
+                }
+            }
+            assert!(
+                lua.globals()
+                    .get::<LuaValue>("parked_cb")
+                    .unwrap()
+                    .is_function(),
+                "the task must be parked before the cancel lands"
+            );
+
+            trigger.cancel();
+            for _ in 0..100 {
+                smol::future::yield_now().await;
+                if lua.globals().get::<LuaValue>("finished").unwrap() != LuaValue::Nil {
+                    break;
+                }
+            }
+            let finished: Table = lua.globals().get("finished").unwrap();
+            let err = finished.get::<String>("err").unwrap();
+            assert_eq!(
+                err, CANCELLED_MSG,
+                "the abandonment reason must reach on_finish"
+            );
+            assert!(
+                finished.get::<LuaValue>("result").unwrap().is_nil(),
+                "an abandoned task has no result"
+            );
+
+            // The work still completes later; the verdict must not be
+            // overwritten by the second finish.
+            lua.load(r#"parked_cb("done")"#).exec().unwrap();
+            for _ in 0..100 {
+                smol::future::yield_now().await;
+            }
+            let finished: Table = lua.globals().get("finished").unwrap();
+            assert_eq!(
+                finished.get::<String>("err").unwrap(),
+                CANCELLED_MSG,
+                "on_finish must run exactly once"
+            );
+        }));
+    }
+
     const DISPATCH_TEST_JOB: &str = "sleep 1";
     const DISPATCH_TEST_PLUGIN: &str = "shell";
     const DISPATCH_TEST_TOOL: &str = "run";

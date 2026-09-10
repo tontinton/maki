@@ -96,8 +96,12 @@ lua_class! {
 /// {deadline_ms} to change that, or `false` to remove the cap for
 /// genuinely long work.
 ///
+/// A task abandoned by its deadline or a cancel it inherited still reports
+/// through {on_finish} exactly once, with the reason (`"timeout"` or
+/// `"cancelled"`) as the error, so background work cannot vanish silently.
+///
 /// @param fn function Zero-argument function to execute.
-/// @param opts table? {on_finish} is `function(err, result)`, called once {fn} completes. {deadline_ms} is integer milliseconds, or `false` for no deadline.
+/// @param opts table? {on_finish} is `function(err, result)`, called once {fn} completes or the task is abandoned. {deadline_ms} is integer milliseconds, or `false` for no deadline.
 /// @example
 /// maki.async.run(function()
 ///   local data = expensive_fetch()
@@ -126,20 +130,36 @@ fn run(lua: &Lua, r#fn: Function, opts: Option<Table>) -> LuaResult<()> {
         }
     };
     let actual_work = if let Some(cb) = on_finish {
+        let register_hook =
+            lua.create_function(|lua, r#fn: Function| register_cancel_hook(lua, r#fn))?;
         lua.load(
             r#"
-                local work, finish = ...
+                local work, finish, on_cancel = ...
+                local done = false
+                local function finish_once(err, result)
+                    if done then
+                        return
+                    end
+                    done = true
+                    finish(err, result)
+                end
                 return function()
+                    on_cancel(function(reason)
+                        finish_once(reason)
+                    end)
+                    if done then
+                        return
+                    end
                     local ok, result = pcall(work)
                     if ok then
-                        finish(nil, result)
+                        finish_once(nil, result)
                     else
-                        finish(result)
+                        finish_once(result)
                     end
                 end
             "#,
         )
-        .call::<Function>((r#fn, cb))?
+        .call::<Function>((r#fn, cb, register_hook))?
     } else {
         r#fn
     };

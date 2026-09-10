@@ -770,7 +770,10 @@ fn background_receipts_resolve_from_disk_in_a_fresh_host() {
         Some(session.clone()),
     )
     .expect("task_result failed");
-    assert_eq!(out, format!("task {id}{BG_WORKING_PREFIX}{BG_DISK_SCENARIO}"));
+    assert_eq!(
+        out,
+        format!("task {id}{BG_WORKING_PREFIX}{BG_DISK_SCENARIO}")
+    );
 
     wait_flash(&host);
 

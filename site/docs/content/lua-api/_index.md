@@ -1395,10 +1395,14 @@ A spawned task must finish within 60 seconds by default; pass
 {deadline_ms} to change that, or `false` to remove the cap for
 genuinely long work.
 
+A task abandoned by its deadline or a cancel it inherited still reports
+through {on_finish} exactly once, with the reason (`"timeout"` or
+`"cancelled"`) as the error, so background work cannot vanish silently.
+
 **Parameters:**
 
 - `{fn}` (`function`) Zero-argument function to execute.
-- `{opts?}` (`table?`) {on_finish} is `function(err, result)`, called once {fn} completes. {deadline_ms} is integer milliseconds, or `false` for no deadline.
+- `{opts?}` (`table?`) {on_finish} is `function(err, result)`, called once {fn} completes or the task is abandoned. {deadline_ms} is integer milliseconds, or `false` for no deadline.
 
 **Example:**
 
