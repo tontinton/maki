@@ -50,13 +50,17 @@ const RESTORED_FAST: bool = false;
 /// session cannot match a request of the session that replaced it.
 static NEXT_OUTGOING_REQUEST_ID: AtomicI64 = AtomicI64::new(FIRST_OUTGOING_REQUEST_ID);
 
-/// What the client still owes us. `ask` is the one outstanding request that
-/// blocks a tool (permission or elicitation): there can only be one, because
-/// both wait on the agent's single answer channel.
+/// Each agent waits on its own answer channel, so child permissions may be
+/// outstanding alongside a main-agent permission or elicitation.
 #[derive(Default)]
 struct Pending {
     prompt: Option<RequestId>,
-    ask: Option<(i64, AskKind)>,
+    asks: HashMap<i64, PendingAsk>,
+}
+
+struct PendingAsk {
+    kind: AskKind,
+    answer_tx: Option<Sender<String>>,
 }
 
 enum AskKind {
@@ -382,16 +386,20 @@ fn start_session(
     session_ref
 }
 
-/// Sends a request the client must answer and records it as the outstanding
-/// ask, registered before sending so the response can never race past us.
+/// Registers each ask before sending so a response cannot race past it.
 fn ask_client(
     out_tx: &Sender<Value>,
     pending: &PendingState,
     kind: AskKind,
+    answer_tx: Option<Sender<String>>,
     request: AgentRequest,
 ) -> i64 {
     let id = NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    pending.lock().unwrap().ask = Some((id, kind));
+    pending
+        .lock()
+        .unwrap()
+        .asks
+        .insert(id, PendingAsk { kind, answer_tx });
     send(
         out_tx,
         Request {
@@ -405,7 +413,7 @@ fn ask_client(
 
 /// Shadows the Lua `question` tool: sends `elicitation/create` to the client
 /// and blocks the tool call until the form comes back. Serializes on the same
-/// answer channel as permissions, so at most one ask is in flight.
+/// answer channel as main-agent permissions.
 /// Weak, because `LocalTools` is captured verbatim by every `LuaCtx` a tool
 /// call parks and an idle VM never collects it. A strong clone here outlives
 /// `serve()` and leaves `writer_task` waiting on a sender nobody will drop.
@@ -431,15 +439,11 @@ fn question_tool(out_tx: WeakSender<Value>, pending: PendingState) -> LocalTool 
 
             let guard = rx.lock().await;
             let request = AgentRequest::CreateElicitationRequest(request);
-            let id = ask_client(&out_tx, &pending, AskKind::Elicitation, request);
+            let id = ask_client(&out_tx, &pending, AskKind::Elicitation, None, request);
             let response = ctx.cancel.race(guard.recv_async()).await;
             // Cleared while still holding the channel, so a stale id cannot
             // clobber whatever ask comes next.
-            let _ = pending
-                .lock()
-                .unwrap()
-                .ask
-                .take_if(|(ask_id, _)| *ask_id == id);
+            pending.lock().unwrap().asks.remove(&id);
             drop(guard);
 
             Ok(match response {
@@ -657,8 +661,8 @@ fn handle_notification(srv: &Server, method: &str) {
         "session/cancel" => {
             if let Some(session) = &srv.session {
                 // Any answer still in flight belongs to the cancelled turn, so
-                // forget its id and let it be dropped on arrival.
-                session.pending.lock().unwrap().ask = None;
+                // forget their ids and let them be dropped on arrival.
+                session.pending.lock().unwrap().asks.clear();
                 let _ = session.handle.cancel_tx.try_send(());
             }
         }
@@ -671,17 +675,12 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
     let Some(id) = raw.get("id").and_then(Value::as_i64) else {
         return;
     };
-    let ask = session
-        .pending
-        .lock()
-        .unwrap()
-        .ask
-        .take_if(|(ask_id, _)| *ask_id == id);
-    let Some((_, kind)) = ask else {
+    let ask = session.pending.lock().unwrap().asks.remove(&id);
+    let Some(ask) = ask else {
         warn!(id, "response for an unknown request id");
         return;
     };
-    let answer = match kind {
+    let answer = match ask.kind {
         AskKind::Permission => permission_answer(raw).encode(),
         // The waiting question tool parses this; an error response decodes to
         // nothing and counts as a dismissal.
@@ -691,7 +690,8 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
             .unwrap_or(Value::Null)
             .to_string(),
     };
-    let _ = session.handle.answer_tx.send(answer);
+    let answer_tx = ask.answer_tx.as_ref().unwrap_or(&session.handle.answer_tx);
+    let _ = answer_tx.send(answer);
 }
 
 /// A response we cannot read still has to answer the agent, or the tool waits
@@ -770,7 +770,7 @@ fn start_event_pump(
             if let AgentEvent::TurnComplete(tc) = &event {
                 add_cost(&mut cost_total, tc.cost);
             }
-            if subagent.is_some() {
+            if subagent.is_some() && !matches!(&event, AgentEvent::PermissionRequest { .. }) {
                 continue;
             }
 
@@ -785,15 +785,36 @@ fn start_event_pump(
                 AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::PermissionRequest { id, tool, scopes } => {
-                    let fields =
-                        ToolCallUpdateFields::new().title(format!("{tool}: {}", scopes.join(", ")));
+                    let ask = format!("{tool}: {}", scopes.join(", "));
+                    // The child's own tool call never reached the client, so the
+                    // permission rides on the `task` call the client can see.
+                    let (id, title, answer_tx) = match subagent {
+                        Some(info) => {
+                            let Some(answer_tx) = info.answer_tx else {
+                                warn!(
+                                    subagent = info.name,
+                                    parent_tool_use_id = info.parent_tool_use_id,
+                                    tool_use_id = id,
+                                    ask,
+                                    "dropping subagent permission with no answer channel"
+                                );
+                                continue;
+                            };
+                            let title = format!("{}: {ask}", info.name);
+                            (info.parent_tool_use_id, title, Some(answer_tx))
+                        }
+                        None => (id, ask, None),
+                    };
                     let request =
                         AgentRequest::RequestPermissionRequest(RequestPermissionRequest::new(
                             sid.clone(),
-                            ToolCallUpdate::new(ToolCallId::from(id), fields),
+                            ToolCallUpdate::new(
+                                ToolCallId::from(id),
+                                ToolCallUpdateFields::new().title(title),
+                            ),
                             permissions::permission_options(),
                         ));
-                    ask_client(&out_tx, &pending, AskKind::Permission, request);
+                    ask_client(&out_tx, &pending, AskKind::Permission, answer_tx, request);
                     continue;
                 }
                 AgentEvent::Done { reason, .. } => {
@@ -855,6 +876,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 mod tests {
     use maki_agent::permissions::PermissionManager;
     use maki_agent::{DoneReason, SubagentInfo, TurnCompleteEvent};
+    use maki_config::ToolKey;
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::sessions::Session;
@@ -889,7 +911,7 @@ mod tests {
         assert_eq!(permission_answer(&raw), expected);
     }
 
-    fn server_with_ask(kind: AskKind) -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
+    fn test_server() -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
         let (answer_tx, answer_rx) = flume::unbounded();
         let (out_tx, out_rx) = flume::unbounded();
         let handle = InteractiveHandle {
@@ -918,12 +940,29 @@ mod tests {
                 mcp: None,
                 current_mode: AgentMode::Build,
                 current_model: String::new(),
-                pending: Arc::new(Mutex::new(Pending {
-                    prompt: None,
-                    ask: Some((ANSWERED_ID, kind)),
-                })),
+                pending: Arc::default(),
             }),
         };
+        (server, answer_rx, out_rx)
+    }
+
+    fn server_with_ask(kind: AskKind) -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
+        let (server, answer_rx, out_rx) = test_server();
+        server
+            .session
+            .as_ref()
+            .expect("a session is installed")
+            .pending
+            .lock()
+            .unwrap()
+            .asks
+            .insert(
+                ANSWERED_ID,
+                PendingAsk {
+                    kind,
+                    answer_tx: None,
+                },
+            );
         (server, answer_rx, out_rx)
     }
 
@@ -935,6 +974,10 @@ mod tests {
     const CONTEXT_WINDOW: u32 = 200_000;
     const PARENT_TOOL_USE_ID: &str = "toolu_1";
     const SUBAGENT_NAME: &str = "task";
+    const CHILD_TOOL_USE_IDS: [&str; 2] = ["child_write_1", "child_write_2"];
+    const PERMISSION_TOOL: &str = "write";
+    const MAIN_PERMISSION_TITLE: &str = "write: /project";
+    const CHILD_PERMISSION_TITLE: &str = "task: write: /project";
 
     fn spawn_pump(srv: &Server, events: SessionEvents, initial_cost: Option<f64>) -> Task<()> {
         let session = srv.session.as_ref().expect("a session is installed");
@@ -958,6 +1001,144 @@ mod tests {
             context_size: None,
             context_window: CONTEXT_WINDOW,
         })
+    }
+
+    fn pump_permission_requests(srv: &Server) -> [flume::Receiver<String>; 2] {
+        let (guard, events) = maki_agent::event_stream();
+        let sender = guard.sender(0);
+        let pump = spawn_pump(srv, events, None);
+        let children = [flume::unbounded(), flume::unbounded()];
+        for ((answer_tx, _), tool_id) in children.iter().zip(CHILD_TOOL_USE_IDS) {
+            let subagent = SubagentInfo {
+                parent_tool_use_id: PARENT_TOOL_USE_ID.to_owned(),
+                name: SUBAGENT_NAME.to_owned(),
+                prompt: None,
+                model: None,
+                answer_tx: Some(answer_tx.clone()),
+            };
+            for event in [
+                AgentEvent::TextDelta {
+                    text: QUEUED_TEXT.to_owned(),
+                },
+                AgentEvent::PermissionRequest {
+                    id: tool_id.to_owned(),
+                    tool: ToolKey::native(PERMISSION_TOOL),
+                    scopes: vec![PUMP_CWD.to_owned()],
+                },
+            ] {
+                sender
+                    .send_envelope(Envelope {
+                        event,
+                        subagent: Some(subagent.clone()),
+                        run_id: 0,
+                    })
+                    .unwrap();
+            }
+        }
+        sender
+            .send(AgentEvent::PermissionRequest {
+                id: PARENT_TOOL_USE_ID.to_owned(),
+                tool: ToolKey::native(PERMISSION_TOOL),
+                scopes: vec![PUMP_CWD.to_owned()],
+            })
+            .unwrap();
+        drop(guard);
+        smol::block_on(pump);
+        children.map(|(_, rx)| rx)
+    }
+
+    #[test_case(false ; "responses_reach_the_requesting_agents_in_reverse_order")]
+    #[test_case(true ; "cancel_drops_all_outstanding_responses")]
+    fn concurrent_subagent_permissions(cancel: bool) {
+        let (srv, main_rx, out_rx) = test_server();
+        let child_rx = pump_permission_requests(&srv);
+        let requests: Vec<_> = out_rx.try_iter().collect();
+        assert_eq!(
+            requests.len(),
+            3,
+            "only permission requests reach the client"
+        );
+        for (request, title) in requests.iter().zip([
+            CHILD_PERMISSION_TITLE,
+            CHILD_PERMISSION_TITLE,
+            MAIN_PERMISSION_TITLE,
+        ]) {
+            assert_eq!(request["method"], "session/request_permission");
+            let call = &request["params"]["toolCall"];
+            assert_eq!(
+                call["toolCallId"], PARENT_TOOL_USE_ID,
+                "a child permission rides on the task call the client knows"
+            );
+            assert_eq!(call["title"], title);
+        }
+        if cancel {
+            handle_notification(&srv, "session/cancel");
+        }
+        for (request, option) in requests
+            .iter()
+            .zip(["reject_once", "allow_once", "allow_always"])
+            .rev()
+        {
+            handle_incoming_response(
+                &srv,
+                &serde_json::json!({
+                    "id": request["id"],
+                    "result": {"outcome": {"outcome": "selected", "optionId": option}},
+                }),
+            );
+        }
+        for (rx, expected) in child_rx.iter().chain([&main_rx]).zip([
+            PermissionAnswer::Deny,
+            PermissionAnswer::AllowOnce,
+            PermissionAnswer::AllowSession,
+        ]) {
+            assert_eq!(rx.try_recv().ok(), (!cancel).then(|| expected.encode()));
+            assert!(rx.is_empty(), "each answer is delivered only once");
+        }
+    }
+
+    /// Without a channel of its own a child's answer would land in the main
+    /// agent's, and the main agent's next wait would eat it as its own.
+    #[test]
+    fn a_subagent_permission_without_an_answer_channel_is_never_asked() {
+        let (srv, main_rx, out_rx) = test_server();
+        let (guard, events) = maki_agent::event_stream();
+        let sender = guard.sender(0);
+        let pump = spawn_pump(&srv, events, None);
+
+        sender
+            .send_envelope(Envelope {
+                event: AgentEvent::PermissionRequest {
+                    id: CHILD_TOOL_USE_IDS[0].to_owned(),
+                    tool: ToolKey::native(PERMISSION_TOOL),
+                    scopes: vec![PUMP_CWD.to_owned()],
+                },
+                subagent: Some(SubagentInfo {
+                    parent_tool_use_id: PARENT_TOOL_USE_ID.to_owned(),
+                    name: SUBAGENT_NAME.to_owned(),
+                    prompt: None,
+                    model: None,
+                    answer_tx: None,
+                }),
+                run_id: 0,
+            })
+            .unwrap();
+        drop(guard);
+        smol::block_on(pump);
+
+        assert!(out_rx.is_empty(), "the client is never asked");
+        assert!(main_rx.is_empty(), "the main agent keeps its own turn");
+        assert!(
+            srv.session
+                .as_ref()
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .asks
+                .is_empty(),
+            "nothing is left waiting for an answer"
+        );
     }
 
     /// The close marker rides the same FIFO as the events, so a turn that was
