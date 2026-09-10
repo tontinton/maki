@@ -42,6 +42,10 @@ local BG_WAIT_MAX_MS = 600000
 local BG_WAIT_MIN_ERR = "timeout_ms must be >= 1"
 local BG_NOTIFY_MAX_CHARS = 2000
 local BG_UNKNOWN_ID_PREFIX = "unknown task id: "
+-- Receipt ids embed a per-host epoch so a /reload between the receipt and the
+-- result cannot hand a new task the same id as one still running under the
+-- old plugin instance.
+local BG_EPOCH = string.format("%x-%04x", os.time(), math.random(0, 0xffff))
 -- Mirrors maki_agent::TASK_HANDOFF_ANNOTATION: the receipt annotation tells
 -- the UI the subagent keeps running after this tool call ends.
 local TASK_HANDOFF_ANNOTATION = "backgrounded"
@@ -122,6 +126,48 @@ local semaphore = maki.async.semaphore(opts.max_concurrent)
 -- Background receipts: task_id -> { description, status, is_error, result }.
 local bg_tasks = {}
 local bg_seq = 0
+
+-- Finished receipts are also written under the session's log dir, so
+-- task_result and task_wait keep answering after a /reload replaces this
+-- plugin instance and wipes bg_tasks. Headless runs have no log dir and
+-- stay memory-only.
+local function bg_store_dir(sid)
+  local root = maki.env.logs_dir()
+  if not root or not sid then
+    return nil
+  end
+  return maki.fs.joinpath(root, sid, "bg-tasks")
+end
+
+local function persist_bg(sid, task_id, entry)
+  local dir = bg_store_dir(sid)
+  if not dir then
+    return
+  end
+  maki.fs.mkdir(dir, { parents = true })
+  maki.fs.atomic_write(
+    maki.fs.joinpath(dir, task_id .. ".json"),
+    maki.json.encode({
+      description = entry.description,
+      status = entry.status,
+      is_error = entry.is_error,
+      result = entry.result,
+    })
+  )
+end
+
+-- A memory entry mutates in place, so it is live; a disk entry is re-read on
+-- every call, which is what lets a waiter notice a finish written by an
+-- instance this one replaced.
+local function resolve_bg(sid, task_id)
+  local entry = bg_tasks[task_id]
+  if entry then
+    return entry
+  end
+  local dir = bg_store_dir(sid)
+  local text = dir and maki.fs.read(maki.fs.joinpath(dir, task_id .. ".json")) or nil
+  return text and maki.json.decode(text) or nil
+end
 
 local function bounded_errors(errors)
   local out = {}
@@ -312,9 +358,10 @@ local function handler(input, ctx)
   end
 
   bg_seq = bg_seq + 1
-  local task_id = (sid or "session") .. ":" .. bg_seq
+  local task_id = (sid or "session") .. ":" .. BG_EPOCH .. ":" .. bg_seq
   local entry = { description = input.description, status = BG_WORKING, is_error = false }
   bg_tasks[task_id] = entry
+  persist_bg(sid, task_id, entry)
 
   maki.async.run(function()
     return finish_subagent(sess, message, validator, state)
@@ -329,6 +376,7 @@ local function handler(input, ctx)
       else
         entry.status, entry.result = BG_DONE, out.llm_output
       end
+      persist_bg(sid, task_id, entry)
       notify_bg(task_id, entry, sid)
     end,
   })
@@ -390,8 +438,8 @@ maki.api.register_tool({
   kind = "read",
   audiences = { "main", "workflow" },
   schema = task_id_schema,
-  handler = function(input, _ctx)
-    local entry = bg_tasks[input.task_id]
+  handler = function(input, ctx)
+    local entry = resolve_bg(ctx:session_id(), input.task_id)
     if not entry then
       return { llm_output = BG_UNKNOWN_ID_PREFIX .. input.task_id, is_error = true }
     end
@@ -419,25 +467,28 @@ maki.api.register_tool({
       },
     },
   },
-  handler = function(input, _ctx)
-    local entry = bg_tasks[input.task_id]
-    if not entry then
-      return { llm_output = BG_UNKNOWN_ID_PREFIX .. input.task_id, is_error = true }
-    end
+  handler = function(input, ctx)
+    local sid = ctx:session_id()
     local timeout_ms = input.timeout_ms or BG_WAIT_DEFAULT_MS
     if timeout_ms < 1 then
       return { llm_output = BG_WAIT_MIN_ERR, is_error = true }
     end
     timeout_ms = math.min(timeout_ms, BG_WAIT_MAX_MS)
     local waited = 0
-    while entry.status == BG_WORKING and waited < timeout_ms do
+    while true do
+      local entry = resolve_bg(sid, input.task_id)
+      if not entry then
+        return { llm_output = BG_UNKNOWN_ID_PREFIX .. input.task_id, is_error = true }
+      end
+      if entry.status ~= BG_WORKING then
+        return task_output(entry, input.task_id)
+      end
+      if waited >= timeout_ms then
+        return { llm_output = "task " .. input.task_id .. " still working after " .. timeout_ms .. "ms" }
+      end
       local tick = math.min(BG_TICK_MS, timeout_ms - waited)
       maki.async.sleep(tick)
       waited = waited + tick
     end
-    if entry.status == BG_WORKING then
-      return { llm_output = "task " .. input.task_id .. " still working after " .. timeout_ms .. "ms" }
-    end
-    return task_output(entry, input.task_id)
   end,
 })

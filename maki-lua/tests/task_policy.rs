@@ -2,6 +2,7 @@
 //! source, real `maki.json` / `maki.async`, with model I/O replaced by
 //! scriptable Lua stubs.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +33,8 @@ const TASK_TOOL_WAIT: &str = "task_wait";
 const PROBE_TOOL: &str = "probe";
 const BG_FLASH: &str = "bg-done";
 const BG_UNKNOWN_PREFIX: &str = "unknown task id: ";
+const BG_WORKING_PREFIX: &str = " still working: ";
+const BG_DISK_SCENARIO: &str = "bg_disk";
 const BG_WAIT_MIN_ERR: &str = "timeout_ms must be >= 1";
 /// Generous vs the background work, which finishes in well under a second.
 const BG_TEST_WAIT: Duration = Duration::from_secs(5);
@@ -153,12 +156,24 @@ behaviors.bg_slow = function(sess, msg)
   return { text = "@PLAIN_TEXT@" }
 end
 
+behaviors.bg_disk = function(sess, msg)
+  maki.async.sleep(1200)
+  return { text = "@PLAIN_TEXT@" }
+end
+
 -- The real notify touches a live mailbox, which the stub ctx lacks. Record
 -- instead, and flash so tests get a deterministic completion signal on the
 -- UI action channel.
 maki.session.notify = function(text, opts)
   recorder.notifies[#recorder.notifies + 1] = { text = text, opts = opts }
   maki.ui.flash("@BG_FLASH@")
+end
+
+-- The real logs dir is the user's machine, so receipts default to
+-- memory-only (also the headless shape). Persistence tests re-stub this
+-- with a tempdir through the @LOGS_DIR@ token.
+maki.env.logs_dir = function()
+  return @LOGS_DIR@
 end
 
 maki.agent.session = function(ctx, opts)
@@ -219,9 +234,21 @@ fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
 fn load_task_host_with_opts(
     opts: serde_json::Map<String, serde_json::Value>,
 ) -> (Arc<ToolRegistry>, PluginHost) {
+    load_task_host_with(opts, None)
+}
+
+fn load_task_host_with_logs_dir(dir: &Path) -> (Arc<ToolRegistry>, PluginHost) {
+    load_task_host_with(serde_json::Map::new(), Some(dir))
+}
+
+fn load_task_host_with(
+    opts: serde_json::Map<String, serde_json::Value>,
+    logs_dir: Option<&Path>,
+) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.ui_attachment().attach();
+    let logs_dir = logs_dir.map(|dir| format!("{dir:?}"));
     let prelude = STUB_PRELUDE
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
         .replace("@RECOVERED_TEXT@", RECOVERED_TEXT)
@@ -229,7 +256,8 @@ fn load_task_host_with_opts(
         .replace("@RAISE_MSG@", RAISE_MSG)
         .replace("@PARTIAL_TEXT@", PARTIAL_TEXT)
         .replace("@CANCELLED_ERR@", CANCELLED_ERR)
-        .replace("@BG_FLASH@", BG_FLASH);
+        .replace("@BG_FLASH@", BG_FLASH)
+        .replace("@LOGS_DIR@", logs_dir.as_deref().unwrap_or("nil"));
     host.load_source_with_opts(
         "task_policy",
         &format!("{prelude}\n{TASK_PLUGIN_SRC}"),
@@ -700,6 +728,48 @@ fn task_wait_times_out_while_working_then_the_result_lands() {
     let result =
         exec_tool(&reg, TASK_TOOL_RESULT, json!({ "task_id": id })).expect("task_result failed");
     assert_eq!(result, PLAIN_TEXT);
+}
+
+/// A receipt must keep resolving in a plugin instance that never saw the
+/// spawn: the on-disk copy carries the working state across a reload-shaped
+/// replacement, and the finish written by the old instance wakes a disk
+/// waiter in the new one.
+#[test]
+fn background_receipts_resolve_from_disk_in_a_fresh_host() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
+        .parse()
+        .expect("valid session id");
+    let (reg, host) = load_task_host_with_logs_dir(tmp.path());
+    let receipt = exec_tool_with_session(
+        &reg,
+        TASK_TOOL,
+        bg_input(BG_DISK_SCENARIO),
+        Some(session.clone()),
+    )
+    .expect("background task failed");
+    let id = bg_task_id(&receipt);
+
+    let (fresh_reg, _fresh_host) = load_task_host_with_logs_dir(tmp.path());
+    let out = exec_tool_with_session(
+        &fresh_reg,
+        TASK_TOOL_RESULT,
+        json!({ "task_id": id }),
+        Some(session.clone()),
+    )
+    .expect("task_result failed");
+    assert_eq!(out, format!("task {id}{BG_WORKING_PREFIX}{BG_DISK_SCENARIO}"));
+
+    wait_flash(&host);
+
+    let out = exec_tool_with_session(
+        &fresh_reg,
+        TASK_TOOL_WAIT,
+        json!({ "task_id": id, "timeout_ms": BG_TEST_WAIT.as_millis() as u64 }),
+        Some(session),
+    )
+    .expect("task_wait failed");
+    assert_eq!(out, PLAIN_TEXT);
 }
 
 #[test]
