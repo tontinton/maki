@@ -406,6 +406,10 @@ local function handler(input, ctx)
   maki.async.run(function()
     return finish_subagent(sess, message, validator, state)
   end, {
+    -- The tool call returns before the runner does, so inheriting its
+    -- cancellation would abandon the runner at turn end and strand the
+    -- receipt as "working".
+    scope = "session",
     deadline_ms = false,
     on_finish = function(err, out)
       permit:release()

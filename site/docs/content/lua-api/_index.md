@@ -1395,6 +1395,12 @@ A spawned task must finish within 60 seconds by default; pass
 {deadline_ms} to change that, or `false` to remove the cap for
 genuinely long work.
 
+By default the task inherits the caller's cancellation, so ending the
+calling tool call ends it too. Pass {scope = "session"} for work that
+must outlive the calling turn, such as a background subagent waiting
+on a session: the task then only ends on its deadline or when its
+function returns.
+
 A task abandoned by its deadline or a cancel it inherited still reports
 through {on_finish} exactly once, with the reason (`"timeout"` or
 `"cancelled"`) as the error, so background work cannot vanish silently.
@@ -1402,7 +1408,7 @@ through {on_finish} exactly once, with the reason (`"timeout"` or
 **Parameters:**
 
 - `{fn}` (`function`) Zero-argument function to execute.
-- `{opts?}` (`table?`) {on_finish} is `function(err, result)`, called once {fn} completes or the task is abandoned. {deadline_ms} is integer milliseconds, or `false` for no deadline.
+- `{opts?}` (`table?`) {on_finish} is `function(err, result)`, called once {fn} completes or the task is abandoned. {deadline_ms} is integer milliseconds, or `false` for no deadline. {scope} is `"session"` to escape the caller's cancellation.
 
 **Example:**
 
@@ -1593,7 +1599,8 @@ still call `ctx:finish`; the host prefers that reply over the generic
 cancelled/timeout error. Mark it `is_error = true` and end it with a
 marker, so the model knows the output it gets is cut short.
 
-The callback runs outside your coroutine, so it must not yield. It
+The callback runs on its own coroutine on the runtime executor, outside
+your handler's stack, so it may await host calls (`ctx:finish`). It
 fires at most once, immediately if the task is already cancelled. An
 error inside it is logged and never reaches your handler, and the
 other hooks still run.

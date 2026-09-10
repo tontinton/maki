@@ -91,6 +91,10 @@ pub const KILL_GRACE: Duration = Duration::from_millis(500);
 /// enough for cleanup that waits on children, short enough that the next
 /// prompt is not stuck behind abandoned work.
 const CANCEL_ABANDON_AFTER: Duration = Duration::from_secs(5);
+/// How long the kill path waits for a cancel hook to queue its reply
+/// before falling back to the generic error. A hook that finishes queues
+/// within a poll; the cap only binds a hook parked forever.
+const CANCEL_HOOK_REPLY_GRACE: Duration = Duration::from_secs(2);
 const OPT_LEVEL_JIT: u8 = 2;
 const OPT_LEVEL_DEBUGGABLE: u8 = 1;
 const DEBUG_INFO_FULL: u8 = 2;
@@ -632,9 +636,9 @@ pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCe
 }
 
 /// Backs `maki.async.on_cancel`. An already cancelled task has no
-/// transition left for [`ScopedFuture::poll`] to ride, so it fires inline,
-/// and only after registering, so a raising hook is contained either way
-/// instead of blowing up whoever armed it.
+/// transition left for [`ScopedFuture::poll`] to ride, so it fires right
+/// away, and only after registering, so a raising hook is contained
+/// either way instead of blowing up whoever armed it.
 pub(crate) fn register_cancel_hook(lua: &Lua, callback: Function) -> Result<(), mlua::Error> {
     let handle = active_task(lua);
     let key = lua.create_registry_value(callback)?;
@@ -644,27 +648,99 @@ pub(crate) fn register_cancel_hook(lua: &Lua, callback: Function) -> Result<(), 
         cell.cancel.is_cancelled()
     };
     if cancelled {
-        fire_cancel_hooks(lua, &handle, KillReason::Cancelled);
+        // The caller armed cleanup on a task that is already doomed: run
+        // the deliveries right here, so they land before the handler's
+        // next line (batch sweeps its children before gather sees them).
+        // block_on still drives each hook on its own coroutine, so a hook
+        // that awaits works too.
+        for d in fire_cancel_hooks(lua, &handle, KillReason::Cancelled) {
+            smol::block_on(d);
+        }
     }
     Ok(())
 }
 
-fn fire_cancel_hooks(lua: &Lua, handle: &TaskHandle, reason: KillReason) {
+/// One hook on its way out. The future runs the callback on a fresh Lua
+/// coroutine under the firing task's scope, so a hook that awaits a host
+/// call (`ctx:finish`, `maki.session.notify`) suspends its own thread
+/// instead of trying to yield across the C frame of whoever armed it.
+type CancelHookDelivery = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+// The dispatcher's executor, for firing cancel hooks nobody waits on.
+// Set once the runtime loop starts; empty in unit tests, which run the
+// deliveries inline.
+thread_local! {
+    static DISPATCH_EX: RefCell<Option<Rc<smol::LocalExecutor<'static>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Takes the task's cancel hooks and hands back one delivery per hook.
+/// Firing twice is free: the hooks drain under the lock, so a second fire
+/// finds nothing. Registry keys are freed up front, so a delivery that
+/// never runs leaks nothing but the future.
+fn fire_cancel_hooks(
+    lua: &Lua,
+    handle: &TaskHandle,
+    reason: KillReason,
+) -> Vec<CancelHookDelivery> {
     // Hooks word their partial-output marker from this string.
     let reason = match reason {
         KillReason::Cancelled => CANCELLED_MSG,
         KillReason::Deadline => HANDLER_TIMEOUT_MSG,
     };
-    let hooks = std::mem::take(&mut lock_cell(handle).cancel_hooks);
-    for key in hooks {
-        if let Err(e) = lua
-            .registry_value::<Function>(&key)
-            .and_then(|f| f.call::<()>(reason))
-        {
-            tracing::warn!(error = %strip_traceback(&e), "cancel hook failed");
+    std::mem::take(&mut lock_cell(handle).cancel_hooks)
+        .into_iter()
+        .map(|key| {
+            Box::pin(deliver_cancel_hook(
+                lua.clone(),
+                Arc::clone(handle),
+                key,
+                reason.to_owned(),
+            )) as _
+        })
+        .collect()
+}
+
+async fn deliver_cancel_hook(lua: Lua, handle: TaskHandle, key: RegistryKey, reason: String) {
+    let Ok(f) = lua.registry_value::<Function>(&key) else {
+        let _ = lua.remove_registry_value(key);
+        return;
+    };
+    let _ = lua.remove_registry_value(key);
+    let run = {
+        let lua = lua.clone();
+        async move {
+            match lua
+                .create_thread(f)
+                .and_then(|t| t.into_async::<()>(reason))
+            {
+                Ok(run) => {
+                    if let Err(e) = run.await {
+                        tracing::warn!(error = %strip_traceback(&e), "cancel hook failed");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %strip_traceback(&e), "cancel hook failed"),
+            }
         }
-        lua.remove_registry_value(key).ok();
-    }
+    };
+    ScopedFuture::new(lua, handle, run).await;
+}
+
+/// Fires hooks for callers nobody waits on: spawned on the runtime
+/// executor when this thread has one, inline otherwise (unit tests).
+fn detach_cancel_hooks(deliveries: Vec<CancelHookDelivery>) {
+    DISPATCH_EX.with(|ex| match ex.borrow().as_ref() {
+        Some(ex) => {
+            for d in deliveries {
+                ex.spawn(d).detach();
+            }
+        }
+        None => {
+            for d in deliveries {
+                smol::block_on(d);
+            }
+        }
+    });
 }
 
 /// The buf whose click handler owns this task's clicks: the explicit root
@@ -1328,7 +1404,11 @@ impl<F: Future> Future for ScopedFuture<F> {
             && wait.as_mut().poll(cx).is_ready()
         {
             *this.cancel_wait = None;
-            fire_cancel_hooks(this.lua, this.handle, KillReason::Cancelled);
+            detach_cancel_hooks(fire_cancel_hooks(
+                this.lua,
+                this.handle,
+                KillReason::Cancelled,
+            ));
         }
         let result = this.inner.poll(cx);
         match prev {
@@ -1397,25 +1477,61 @@ pub(crate) fn block_on_or_fail<T>(fut: impl Future<Output = T>) -> T {
     }))
 }
 
+/// Installs a dispatcher executor for the current thread and removes it on
+/// drop, so a test that needs the production hook delivery path (concurrent
+/// executor spawns) does not leak it into tests relying on the inline one.
+#[cfg(test)]
+pub(crate) struct DispatchExGuard(Rc<smol::LocalExecutor<'static>>);
+
+#[cfg(test)]
+impl DispatchExGuard {
+    pub(crate) fn install() -> Self {
+        let ex = Rc::new(smol::LocalExecutor::new());
+        DISPATCH_EX.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&ex)));
+        Self(ex)
+    }
+
+    pub(crate) fn ex(&self) -> Rc<smol::LocalExecutor<'static>> {
+        Rc::clone(&self.0)
+    }
+}
+
+#[cfg(test)]
+impl Drop for DispatchExGuard {
+    fn drop(&mut self) {
+        DISPATCH_EX.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Option<R> {
     let handle = lua.app_data_ref::<TaskHandle>()?;
     lock_cell(&handle).live.as_ref().map(f)
 }
 
-/// A `deadline` of `None` removes the cap entirely, for genuinely long work.
+/// A `deadline` of `None` removes the cap entirely, for genuinely long
+/// work. `detached` (`scope = "session"`) drops the inherited cancel
+/// token, so the task outlives the spawning turn's end and its
+/// abandonment grace; only its deadline or its own completion ends it.
 pub(crate) fn enqueue_async_task_deadline(
     lua: &Lua,
     work_fn: RegistryKey,
     deadline: Option<Duration>,
+    detached: bool,
 ) -> Result<(), mlua::Error> {
     let handle = lua.app_data_ref::<TaskHandle>();
-    let (cancel, live_ctx, command_depth) = match &handle {
-        Some(h) => {
+    let (cancel, live_ctx, command_depth) = match (&handle, detached) {
+        (Some(h), false) => {
             let cell = lock_cell(h);
             (cell.cancel.clone(), cell.live.clone(), cell.command_depth)
         }
-        None => (CancelToken::none(), None, 0),
+        // Live context and command depth stay: render events and
+        // permission context still belong to the spawning tool call.
+        (Some(h), true) => {
+            let cell = lock_cell(h);
+            (CancelToken::none(), cell.live.clone(), cell.command_depth)
+        }
+        (None, _) => (CancelToken::none(), None, 0),
     };
 
     let mut task = PendingAsyncTask {
@@ -2871,13 +2987,32 @@ fn extract_restore_reply(ret: &LuaValue) -> Option<RestoreReply> {
 /// The last slice a doomed handler gets: its cancel hooks run (firing twice
 /// is free, they drain once), and a reply they queue through `ctx:finish`
 /// wins, because it carries the output the user already watched stream by.
-fn cancel_hook_reply(
+/// A hook needs a poll of its own coroutine before its reply lands, so
+/// this waits for a reply or for the deliveries to drain, whichever comes
+/// first, capped at [`CANCEL_HOOK_REPLY_GRACE`].
+async fn cancel_hook_reply(
     lua: &Lua,
     handle: &TaskHandle,
     finish_rx: &flume::Receiver<ToolCallReply>,
     reason: KillReason,
 ) -> Option<ToolCallReply> {
-    fire_cancel_hooks(lua, handle, reason);
+    let deliveries = fire_cancel_hooks(lua, handle, reason);
+    futures_lite::future::or(
+        futures_lite::future::or(
+            async {
+                for d in deliveries {
+                    d.await;
+                }
+            },
+            async {
+                let _ = finish_rx.recv_async().await;
+            },
+        ),
+        async {
+            smol::Timer::after(CANCEL_HOOK_REPLY_GRACE).await;
+        },
+    )
+    .await;
     finish_rx.try_recv().ok()
 }
 
@@ -2906,7 +3041,7 @@ async fn dispatch_async(
         // before `timeout_reply`, which locks the same cell.
         let kill = lock_cell(&handle).doomed(Instant::now());
         if let Some(reason) = kill {
-            if let Some(reply) = cancel_hook_reply(lua, &handle, &finish_rx, reason) {
+            if let Some(reply) = cancel_hook_reply(lua, &handle, &finish_rx, reason).await {
                 return reply;
             }
             return match reason {
@@ -3246,7 +3381,11 @@ async fn run_tool_call(
             // hooks run: they lock the same cell.
             Err(e) => {
                 let kill = lock_cell(&handle).doomed(Instant::now());
-                match kill.and_then(|reason| cancel_hook_reply(&lua, &handle, &finish_rx, reason)) {
+                let hook_reply = match kill {
+                    Some(reason) => cancel_hook_reply(&lua, &handle, &finish_rx, reason).await,
+                    None => None,
+                };
+                match hook_reply {
                     // The reply wins, but a doom-window error is still the
                     // only trace of a plugin bug that raised on its way out.
                     Some(reply) => {
@@ -3348,6 +3487,7 @@ pub fn spawn(
             };
 
             let ex = Rc::new(smol::LocalExecutor::new());
+            DISPATCH_EX.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&ex)));
             {
                 let lua = rt.lua.clone();
                 ex.spawn(async move {
@@ -4193,7 +4333,7 @@ mod tests {
     }
 
     fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
-        enqueue_async_task_deadline(lua, work_fn, Some(ASYNC_RUN_DEFAULT_DEADLINE))
+        enqueue_async_task_deadline(lua, work_fn, Some(ASYNC_RUN_DEFAULT_DEADLINE), false)
     }
 
     fn set_active(lua: &Lua, cell: TaskCell) -> TaskScope {
@@ -4263,6 +4403,32 @@ mod tests {
         assert!(
             queued.cancel.is_cancelled(),
             "async task should inherit parent cancel"
+        );
+    }
+
+    /// `scope = "session"` drops the inherited token: the spawning turn
+    /// ending, including its abandonment grace, must not reach the task, or
+    /// a background runner dies mid-flight and its receipt sticks.
+    #[test]
+    fn enqueue_async_task_session_scope_outlives_parent_cancel() {
+        let lua = enqueue_test_lua();
+        let (trigger, token) = CancelToken::new();
+        let _h = set_active(&lua, TaskCell::new(token, None, None));
+        enqueue_async_task_deadline(
+            &lua,
+            enqueue_dummy(&lua),
+            Some(ASYNC_RUN_DEFAULT_DEADLINE),
+            true,
+        )
+        .unwrap();
+
+        let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
+        let queued = queue.rx.try_recv().unwrap();
+        assert!(!queued.cancel.is_cancelled());
+        trigger.cancel();
+        assert!(
+            !queued.cancel.is_cancelled(),
+            "session scope must not inherit the parent's cancel"
         );
     }
 
@@ -4616,6 +4782,45 @@ mod tests {
     const HOOK_INNER_OUTPUT: u8 = 7;
     const HOOK_NEVER_FIRED: &str = "cancel hook never fired";
     const HOOK_SKIPPED_MSG: &str = "a hook registered after the bad one never fired";
+    const HOOK_TICK_FN: &str = "tick";
+    /// Short enough to wait on, long enough that a hook completing without
+    /// suspending would be a different failure.
+    const HOOK_TICK: Duration = Duration::from_millis(20);
+
+    /// The live failure this replaces: a hook that waits on a host call
+    /// behind the C frame of whoever fired it used to die to `attempt to
+    /// yield across metamethod/C-call boundary`. On its own coroutine it
+    /// suspends and completes instead.
+    #[test]
+    fn cancel_hook_survives_awaiting_a_host_call() {
+        let lua = Lua::new();
+        let (trigger, scope) = live_scope(&lua);
+        let (fired_tx, fired_rx) = flume::bounded(1);
+        let tick = lua
+            .create_async_function(|_, ()| async {
+                smol::Timer::after(HOOK_TICK).await;
+                Ok(())
+            })
+            .unwrap();
+        lua.globals().set(HOOK_TICK_FN, tick).unwrap();
+        let record = lua
+            .create_function(move |_, ()| {
+                fired_tx.send(()).ok();
+                Ok(())
+            })
+            .unwrap();
+        lua.globals().set("record", record).unwrap();
+        let hook = lua
+            .load(format!("return function() {HOOK_TICK_FN}() record() end"))
+            .call::<Function>(())
+            .unwrap();
+        register_cancel_hook(&lua, hook).unwrap();
+        trigger.cancel();
+
+        poll_cancelled_scope_once(&scope);
+
+        fired_rx.try_recv().expect(HOOK_NEVER_FIRED);
+    }
 
     fn recording_hook(lua: &Lua, tx: &flume::Sender<&'static str>, mark: &'static str) {
         let tx = tx.clone();
