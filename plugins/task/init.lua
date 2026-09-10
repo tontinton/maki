@@ -248,12 +248,21 @@ local function handler(input, ctx)
 
   -- Compile early: a bad schema costs zero tokens.
   local validator
+  local output_schema
   if input.output_schema then
-    if type(input.output_schema) ~= "table" or input.output_schema.type ~= "object" then
+    -- The tool schema cannot declare a free-form object for this input, so
+    -- the host hands it over as whatever the model wrote: usually the JSON
+    -- text of the schema itself.
+    local schema = input.output_schema
+    if type(schema) == "string" then
+      schema = maki.json.decode(schema)
+    end
+    if type(schema) ~= "table" or schema.type ~= "object" then
       return { llm_output = SCHEMA_ROOT_ERROR, is_error = true }
     end
+    output_schema = schema
     local compile_err
-    validator, compile_err = maki.json.schema_validator(input.output_schema)
+    validator, compile_err = maki.json.schema_validator(schema)
     if compile_err then
       return { llm_output = SCHEMA_COMPILE_ERROR .. ": " .. compile_err, is_error = true }
     end
@@ -291,7 +300,7 @@ local function handler(input, ctx)
     local_tools = {
       [STRUCTURED_OUTPUT_NAME] = {
         description = STRUCTURED_OUTPUT_DESCRIPTION,
-        input_schema = input.output_schema,
+        input_schema = output_schema,
         handler = function(value)
           local errs = validator:validate(value)
           if errs then

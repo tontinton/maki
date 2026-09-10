@@ -427,12 +427,24 @@ fn structured_happy_path_returns_validated_json() {
     assert_eq!(snap["has_local_tools"], json!(true));
     assert!(snap["first_ack"].is_string(), "valid input must be acked");
     assert!(snap.get("first_err").is_none_or(Value::is_null));
-    let prompt = snap["prompts"][0].as_str().expect("prompt missing");
-    assert!(prompt.starts_with(TASK_PROMPT), "got: {prompt}");
-    assert!(
-        prompt.contains(STRUCTURED_OUTPUT_TOOL),
-        "prompt must point at the structured_output tool: {prompt}"
-    );
+}
+
+/// The tool schema cannot declare a free-form object, so the host hands the
+/// model's output_schema over as raw JSON text; the plugin must decode it
+/// before compiling the validator and before wiring the subagent's
+/// structured_output input_schema.
+#[test]
+fn structured_accepts_json_encoded_schema_text() {
+    let (reg, _host) = load_task_host();
+    let encoded = serde_json::to_string(&answer_schema()).unwrap();
+    let out = exec_tool(
+        &reg,
+        TASK_TOOL,
+        task_input(SCENARIO_HAPPY, Some(Value::String(encoded))),
+    )
+    .expect("structured task with encoded schema failed");
+    let parsed: Value = serde_json::from_str(&out).expect("result is not json");
+    assert_eq!(parsed, json!({ "answer": "42" }));
 }
 
 #[test]
