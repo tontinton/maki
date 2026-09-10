@@ -4,6 +4,8 @@
 
 use isahc::AsyncReadResponseExt;
 
+use crate::providers::opencode::{self, NonLoginError};
+
 /// Request fields that cap the *output*. A 400 naming one of them is about the
 /// cap we sent, never about the prompt being too big.
 const OUTPUT_CAP_FIELDS: [&str; 3] = ["max_tokens", "max_completion_tokens", "max_output_tokens"];
@@ -36,7 +38,7 @@ pub enum AgentError {
 
 impl AgentError {
     pub fn is_retryable(&self) -> bool {
-        if self.is_context_overflow() {
+        if self.is_context_overflow() || self.is_quota_exhausted() {
             return false;
         }
         match self {
@@ -99,14 +101,34 @@ impl AgentError {
     }
 
     pub fn is_auth_error(&self) -> bool {
-        matches!(self, Self::Api { status: 401, .. })
+        matches!(self, Self::Api { status: 401, .. }) && self.non_login_error().is_none()
+    }
+
+    /// OpenCode serves billing and plan failures on the statuses we otherwise
+    /// read as a stale token, and only that provider knows its error types.
+    fn non_login_error(&self) -> Option<NonLoginError> {
+        let Self::Api { status, message } = self else {
+            return None;
+        };
+        opencode::non_login_error(*status, message)
+    }
+
+    /// A plan quota that resets on a weekly or monthly boundary: retrying just
+    /// reprints the same message until the user cancels.
+    fn is_quota_exhausted(&self) -> bool {
+        self.non_login_error().is_some_and(|error| error.is_quota)
     }
 
     pub fn should_rotate_key(&self) -> bool {
-        matches!(self, Self::Api { status, .. } if *status == 429 || *status == 401 || *status == 403)
+        // A plan quota is per-account, so the user's other keys are just as spent.
+        !self.is_quota_exhausted()
+            && matches!(self, Self::Api { status, .. } if *status == 429 || *status == 401 || *status == 403)
     }
 
     pub fn user_message(&self) -> String {
+        if let Some(error) = self.non_login_error() {
+            return error.message;
+        }
         match self {
             Self::Config { message } => message.clone(),
             Self::Api { status: 429, .. } => "rate limited, try again in a moment".into(),
@@ -138,6 +160,9 @@ impl AgentError {
     }
 
     pub fn retry_message(&self) -> String {
+        if let Some(error) = self.non_login_error() {
+            return error.message;
+        }
         match self {
             Self::Api { status: 429, .. } => "Rate limited".into(),
             Self::Api { status: 529, .. } => "Provider is overloaded".into(),
@@ -170,8 +195,15 @@ impl From<maki_storage::StorageError> for AgentError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use serde_json::{Value, json};
     use test_case::test_case;
+
+    use super::*;
+    use crate::providers::opencode::{NON_LOGIN_FALLBACK_MESSAGE, QUOTA_FALLBACK_MESSAGE};
+
+    const QUOTA_MESSAGE: &str = "Weekly usage limit reached. Resets in 3 hours.";
+    const MODEL_MESSAGE: &str = "Your trial has ended.";
+    const RATE_LIMITED_RETRY_MESSAGE: &str = "Rate limited";
 
     fn api(status: u16) -> AgentError {
         AgentError::Api {
@@ -185,6 +217,10 @@ mod tests {
             status,
             message: message.into(),
         }
+    }
+
+    fn opencode_body(error_type: &str, message: &str) -> String {
+        json!({"error": {"type": error_type, "message": message}}).to_string()
     }
 
     #[test_case(429, true  ; "rate_limit")]
@@ -202,7 +238,71 @@ mod tests {
         assert_eq!(api(status).is_auth_error(), expected);
     }
 
-    #[test_case(429, "Rate limited"        ; "rate_limited")]
+    #[test_case("CreditsError", 401 ; "credits")]
+    #[test_case("MonthlyLimitError", 401 ; "monthly_limit")]
+    #[test_case("UserLimitError", 401 ; "user_limit")]
+    #[test_case("GoUsageLimitError", 401 ; "go_unauthorized")]
+    #[test_case("GoUsageLimitError", 429 ; "go_rate_limit")]
+    #[test_case("BlackUsageLimitError", 429 ; "black_rate_limit")]
+    #[test_case("FreeUsageLimitError", 429 ; "free_rate_limit")]
+    fn opencode_usage_limits_preserve_details(error_type: &str, status: u16) {
+        let err = api_msg(status, &opencode_body(error_type, QUOTA_MESSAGE));
+
+        assert!(!err.is_auth_error());
+        assert_eq!(err.user_message(), QUOTA_MESSAGE);
+        assert_eq!(err.retry_message(), QUOTA_MESSAGE);
+        // A weekly cap outlives any backoff, and every key on the account
+        // shares it.
+        assert!(!err.is_retryable());
+        assert!(!err.should_rotate_key());
+    }
+
+    /// Not a usage cap: "trial ended", "model disabled", "no provider
+    /// available". Logging in fixes none of them, but the normal status rules
+    /// still apply.
+    #[test_case(401, false ; "unauthorized")]
+    #[test_case(429, true  ; "rate_limited")]
+    fn opencode_model_error_is_not_a_login_problem(status: u16, retryable: bool) {
+        let err = api_msg(status, &opencode_body("ModelError", MODEL_MESSAGE));
+
+        assert!(!err.is_auth_error());
+        assert_eq!(err.user_message(), MODEL_MESSAGE);
+        assert_eq!(err.is_retryable(), retryable);
+        assert!(err.should_rotate_key());
+    }
+
+    #[test_case(json!({"type": "GoUsageLimitError"}), QUOTA_FALLBACK_MESSAGE    ; "quota_missing_message")]
+    #[test_case(json!({"type": "GoUsageLimitError", "message": " "}), QUOTA_FALLBACK_MESSAGE ; "quota_empty_message")]
+    #[test_case(json!({"type": "ModelError"}), NON_LOGIN_FALLBACK_MESSAGE       ; "model_missing_message")]
+    fn non_login_error_without_message_does_not_request_login(error: Value, expected: &str) {
+        let err = api_msg(401, &json!({"error": error}).to_string());
+
+        assert!(!err.is_auth_error());
+        assert_eq!(err.user_message(), expected);
+    }
+
+    #[test_case(r#"{"error":{"type":"AuthError","message":"Invalid API key"}}"# ; "auth_error")]
+    #[test_case(r#"{"error":{"type":"UnknownError","message":"quota"}}"# ; "unknown_type")]
+    #[test_case(r#"{"message":"quota exceeded"}"# ; "untyped_message")]
+    #[test_case("not JSON" ; "malformed_body")]
+    fn other_unauthorized_errors_still_request_login(body: &str) {
+        assert!(api_msg(401, body).is_auth_error());
+    }
+
+    // OpenCode's per-minute cap is a different type, and other providers ship
+    // their own JSON envelopes on 429. Neither may lose its backoff.
+    #[test_case(r#"{"error":{"type":"RateLimitError","message":"too many requests"}}"# ; "opencode_per_minute")]
+    #[test_case(r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#       ; "anthropic_envelope")]
+    #[test_case(r#"{"error":{"code":429,"message":"quota exceeded"}}"#                 ; "untyped_envelope")]
+    fn other_rate_limits_stay_retryable(body: &str) {
+        let err = api_msg(429, body);
+
+        assert!(err.is_retryable());
+        assert!(err.should_rotate_key());
+        assert_eq!(err.retry_message(), RATE_LIMITED_RETRY_MESSAGE);
+    }
+
+    #[test_case(429, RATE_LIMITED_RETRY_MESSAGE ; "rate_limited")]
     #[test_case(529, "Provider is overloaded" ; "overloaded")]
     #[test_case(500, "Server error (500)"  ; "server_error")]
     fn retry_message_api(status: u16, expected: &str) {

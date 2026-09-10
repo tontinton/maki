@@ -33,6 +33,26 @@ pub(crate) const QUIRKS: ProviderQuirks = ProviderQuirks {
     session_header: Some(SESSION_HEADER),
 };
 
+/// Plan quotas, served on 401 as well as 429. They clear on a weekly or monthly
+/// boundary, so retrying or rotating keys only burns time. OpenCode's genuinely
+/// short-lived per-minute cap is `RateLimitError` and is deliberately absent.
+const QUOTA_ERROR_TYPES: [&str; 6] = [
+    "CreditsError",
+    "MonthlyLimitError",
+    "UserLimitError",
+    "FreeUsageLimitError",
+    "GoUsageLimitError",
+    "BlackUsageLimitError",
+];
+
+/// Types that arrive on 401 without the token being stale: `ModelError` covers
+/// "trial ended", "model disabled" and "no provider available", none of which a
+/// fresh login fixes and none of which is a usage cap.
+const NON_LOGIN_ERROR_TYPES: [&str; 1] = ["ModelError"];
+
+pub(crate) const QUOTA_FALLBACK_MESSAGE: &str = "provider usage limit reached";
+pub(crate) const NON_LOGIN_FALLBACK_MESSAGE: &str = "model unavailable, check your OpenCode plan";
+
 pub struct Opencode {
     transport: CatalogTransport,
     auth: Option<Arc<Mutex<ResolvedAuth>>>,
@@ -155,4 +175,40 @@ impl Provider for Opencode {
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async { Ok(()) })
     }
+}
+
+/// An OpenCode failure that re-authenticating cannot clear.
+pub(crate) struct NonLoginError {
+    pub(crate) message: String,
+    /// Plan quota, so also not worth a retry or a key rotation.
+    pub(crate) is_quota: bool,
+}
+
+/// OpenCode wraps billing and plan failures in `{"error":{"type","message"}}`
+/// and serves them on the same statuses as a genuinely expired token, so the
+/// shared error type has to ask us before it tells the user to log in again.
+pub(crate) fn non_login_error(status: u16, body: &str) -> Option<NonLoginError> {
+    if !matches!(status, 401 | 429) {
+        return None;
+    }
+    let body: Value = serde_json::from_str(body).ok()?;
+    let error_type = body.pointer("/error/type")?.as_str()?;
+    let is_quota = QUOTA_ERROR_TYPES.contains(&error_type);
+    if !is_quota && !NON_LOGIN_ERROR_TYPES.contains(&error_type) {
+        return None;
+    }
+    let fallback = if is_quota {
+        QUOTA_FALLBACK_MESSAGE
+    } else {
+        NON_LOGIN_FALLBACK_MESSAGE
+    };
+    Some(NonLoginError {
+        message: body
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or(fallback)
+            .to_owned(),
+        is_quota,
+    })
 }
