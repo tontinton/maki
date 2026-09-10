@@ -157,7 +157,8 @@ published price contributes nothing.
 Claude Code counts decisions only for edit tools. Maki's permission model
 covers every tool, so `maki.tool.decision` carries a `tool_name` and a
 `source` saying where the decision came from: `rule`, `yolo`, `user_once`,
-`user_session`, `user_always`, or `user_abort` when the prompt never got an
+`user_session`, `user_always`, `user_abort` when the prompt never got an
+answer, or `detached` when the session runs unattended and no one could
 answer.
 
 `maki.active_time.total` measures how long the agent was working, from the

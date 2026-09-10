@@ -366,6 +366,9 @@ pub struct ToolContext {
     pub registry: Arc<ToolRegistry>,
     pub workflow: bool,
     pub audience: ToolAudience,
+    /// No interactive answer channel is watched for this session (a detached
+    /// background run), so a permission that would prompt is denied instead.
+    pub unattended: bool,
     pub local_tools: LocalTools,
     /// Streams a dispatched child's live bufs and annotations back to the
     /// caller (`maki.agent.call_tool` with `on_live_buf`/`on_annotation`).
@@ -592,6 +595,7 @@ pub fn interpreter_ctx(
         registry,
         workflow: false,
         audience: ToolAudience::MAIN,
+        unattended: false,
         local_tools: LocalTools::default(),
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
