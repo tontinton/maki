@@ -133,14 +133,16 @@ jobs:
           tool: just
       # openssl-sys vendors (builds OpenSSL from source) on Windows -- see
       # the OPENSSL_NO_VENDOR comment on the lint job above. Its build
-      # script shells out to `perl`, and whichever perl resolves first on
-      # PATH matters: some other tool on the runner's PATH can put a
-      # minimal perl ahead of the runner's full Strawberry Perl install,
-      # and that minimal one is missing CPAN modules openssl-sys needs
-      # (fails with "Can't locate Locale/Maketext/Simple.pm"). Put
-      # Strawberry Perl's bin dirs first so its perl always wins.
+      # script (openssl-src) shells out to `perl`, and PATH resolution
+      # picks a minimal perl missing CPAN modules it needs (fails with
+      # "Can't locate Locale/Maketext/Simple.pm") -- prepending Strawberry
+      # Perl's bin dir to PATH did not change which perl actually got
+      # invoked. openssl-src has a dedicated override for exactly this
+      # (used by its own CI, see alexcrichton/openssl-src-rs's workflow)
+      # that sidesteps PATH resolution entirely: point it straight at the
+      # runner's Strawberry Perl install.
       - shell: pwsh
-        run: echo "C:\Strawberry\c\bin;C:\Strawberry\perl\site\bin;C:\Strawberry\perl\bin" >> $env:GITHUB_PATH
+        run: echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl" >> $env:GITHUB_ENV
       - run: just lint
       - run: just build
 
