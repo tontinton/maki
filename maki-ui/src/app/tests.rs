@@ -1402,7 +1402,7 @@ fn handoff_subagent(app: &mut App, id: &str) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: id.into(),
         tool: "task".into(),
-        output: ToolOutput::Plain("receipt".into()),
+        output: Arc::new(ToolOutput::Plain("receipt".into())),
         is_error: false,
         annotation: Some(maki_agent::tools::TASK_HANDOFF_ANNOTATION.into()),
         written_path: None,
