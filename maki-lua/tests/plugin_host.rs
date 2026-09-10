@@ -3617,6 +3617,71 @@ fn builtin_opts_flow_from_setup_plugins() {
     assert!(!limit.desc.is_empty(), "declared desc surfaces");
 }
 
+/// The websearch tool's provider option picks the backend, and the tool
+/// description tells the model which one it is talking to. Default stays
+/// exa; `provider = "youcom"` switches the wording without touching the
+/// schema, so existing sessions see no change unless they opt in.
+#[test]
+fn websearch_provider_option_selects_the_backend() {
+    for (provider, expected) in [("exa", "Exa AI"), ("youcom", "You.com")] {
+        let reg = fresh_registry();
+        let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        let config = PluginsConfig {
+            enabled: true,
+            names: vec!["websearch".to_owned()],
+            packages: Vec::new(),
+            opts: HashMap::from([(
+                "websearch".to_owned(),
+                json_obj(serde_json::json!({ "provider": provider })),
+            )]),
+        };
+        host.load_builtins(&config)
+            .unwrap_or_else(|e| panic!("{provider} should load: {e}"));
+
+        let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let filter = ToolFilter::from_config(&maki_config::AgentConfig::default(), &model, &[]);
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+            mcp: false,
+        };
+        let defs = reg.definitions(&Vars::new(), &ctx, false);
+        let websearch = defs
+            .as_array()
+            .expect("definitions returns an array")
+            .iter()
+            .find(|def| def["name"] == "websearch")
+            .expect("websearch tool registered");
+        let description = websearch["description"].as_str().unwrap();
+        assert!(
+            description.contains(expected),
+            "{provider} description should name {expected}, got: {description}"
+        );
+    }
+}
+
+/// A provider value outside the two backends fails the plugin load loudly,
+/// the same register_options contract every other option follows.
+#[test]
+fn websearch_unknown_provider_fails_the_load() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let config = PluginsConfig {
+        enabled: true,
+        names: vec!["websearch".to_owned()],
+        packages: Vec::new(),
+        opts: HashMap::from([(
+            "websearch".to_owned(),
+            json_obj(serde_json::json!({ "provider": "altavista" })),
+        )]),
+    };
+    let err = host
+        .load_builtins(&config)
+        .expect_err("unknown provider should fail");
+    assert!(err.to_string().contains("unknown provider"), "got: {err}");
+}
+
 #[test_case::test_case(
     serde_json::json!({}),
     &["edit", "multiedit", "edit_lines"], &["insert_lines"]
