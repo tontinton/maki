@@ -3268,6 +3268,7 @@ dependencies = [
  "maki-storage",
  "maki-ui",
  "open",
+ "openssl-sys",
  "serde",
  "serde_json",
  "smol",

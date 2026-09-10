@@ -40,6 +40,15 @@ uuid = { workspace = true }
 flume = { workspace = true }
 open = { workspace = true }
 
+# isahc's `static-ssl` feature is supposed to make curl-sys build a vendored
+# (bundled-source) OpenSSL, which is required on Windows (no system OpenSSL
+# there, and CI doesn't set one up via vcpkg -- see rust.yml's
+# OPENSSL_NO_VENDOR comment). The feature chain (isahc -> curl -> curl-sys ->
+# openssl-sys/vendored) doesn't reliably activate in practice, so force it
+# directly for the Windows target.
+[target.'cfg(windows)'.dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"] }
+
 [dev-dependencies]
 test-case = { workspace = true }
 
