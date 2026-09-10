@@ -131,6 +131,16 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
+      # openssl-sys vendors (builds OpenSSL from source) on Windows -- see
+      # the OPENSSL_NO_VENDOR comment on the lint job above. Its build
+      # script shells out to `perl`, and whichever perl resolves first on
+      # PATH matters: some other tool on the runner's PATH can put a
+      # minimal perl ahead of the runner's full Strawberry Perl install,
+      # and that minimal one is missing CPAN modules openssl-sys needs
+      # (fails with "Can't locate Locale/Maketext/Simple.pm"). Put
+      # Strawberry Perl's bin dirs first so its perl always wins.
+      - shell: pwsh
+        run: echo "C:\Strawberry\c\bin;C:\Strawberry\perl\site\bin;C:\Strawberry\perl\bin" >> $env:GITHUB_PATH
       - run: just lint
       - run: just build
 
