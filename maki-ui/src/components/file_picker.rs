@@ -809,6 +809,14 @@ mod tests {
         let _ = tick_until(&mut picker, |s| !s.matching && s.matches.len() == 1)
             .expect(NEVER_CONVERGED);
 
+        // An idle tick can still owe a poll while the worker drains the last
+        // answer, so "settled" has to pin down both sides of the cadence.
+        let deadline = Instant::now() + CONVERGE_TIMEOUT;
+        while picker.cadence() != Cadence::IDLE {
+            assert!(Instant::now() < deadline, "the picker never stopped");
+            std::thread::yield_now();
+        }
+
         assert_eq!(picker.tick(), (Dirty::NO, None), "{QUIET}");
         assert_eq!(picker.cadence(), Cadence::IDLE);
     }

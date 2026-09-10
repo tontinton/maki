@@ -51,13 +51,33 @@ async fn focus(
     roundtrip(lua, tx, TaskRequest::Focus { id }).await
 }
 
+/// Deletes a finished task and its transcript, so a reload cannot bring it
+/// back. The main chat and still-running tasks are refused.
+///
+/// If the deleted task was the focused one, focus falls back to the previous
+/// chat (or the main chat if the deleted task was first). Callers that need
+/// a specific focus should call `maki.task.focus()` afterwards.
+///
+/// @param id string Task id, as returned by `list()`.
+/// @return (boolean|nil, string|nil) true on success, or nil and an error.
+/// @example
+/// local _, err = maki.task.remove("toolu_01")
+#[lua_fn]
+async fn remove(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    id: String,
+) -> LuaResult<Pair<Value>> {
+    roundtrip(lua, tx, TaskRequest::Remove { id }).await
+}
+
 lua_table! {
     /// The subagents of the focused session and their transcripts. Tasks are
     /// spawned by the `task` tool and addressed by an id that survives a reload.
     /// Without an interactive UI every function returns
     /// `nil, "no interactive UI attached"`.
     "maki.task" => pub(crate) fn create_task_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), focus(tx)]
+    DOCS [list(tx), focus(tx), remove(tx)]
 }
 
 #[cfg(test)]
@@ -83,6 +103,7 @@ mod tests {
     const NO_REQUEST_ERR: &str = "expected a task request";
     const LIST_CALL: &str = "return task.list()";
     const FOCUS_CALL: &str = "return task.focus('toolu_01')";
+    const REMOVE_CALL: &str = "return task.remove('toolu_01')";
     const LIST_SCRIPT: &str = "
         local tasks = task.list()
         local ids, statuses = {}, {}
@@ -115,6 +136,7 @@ mod tests {
 
     #[test_case(LIST_CALL ; "list")]
     #[test_case(FOCUS_CALL ; "focus")]
+    #[test_case(REMOVE_CALL ; "remove")]
     fn without_ui_returns_error_pair(code: &str) {
         let lua = lua_with_task(None);
         let (val, err): (Value, Option<String>) =
@@ -127,6 +149,7 @@ mod tests {
     /// as the `(nil, err)` pair, word for word, without raising into the plugin.
     #[test_case(LIST_CALL ; "list")]
     #[test_case(FOCUS_CALL ; "focus")]
+    #[test_case(REMOVE_CALL ; "remove")]
     fn host_error_reply_surfaces_as_error_pair(code: &str) {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_task(Some(tx));
@@ -191,5 +214,29 @@ mod tests {
         .unwrap();
         assert_eq!(err, None);
         assert_eq!(val.get::<String>("focused").unwrap(), TASK_ID);
+    }
+
+    #[test]
+    fn remove_roundtrips_through_ui_channel() {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_task(Some(tx));
+        std::thread::spawn(move || {
+            let Ok(UiAction::Task {
+                req: TaskRequest::Remove { id },
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected remove request");
+            };
+            reply_tx.send(Ok(json!(true))).unwrap();
+            assert_eq!(id, TASK_ID);
+        });
+        let (val, err): (bool, Option<String>) = smol::block_on(
+            lua.load(format!("return task.remove('{TASK_ID}')"))
+                .eval_async(),
+        )
+        .unwrap();
+        assert!(val);
+        assert_eq!(err, None);
     }
 }

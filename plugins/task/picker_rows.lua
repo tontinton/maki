@@ -43,6 +43,13 @@ function M.build(tasks, query)
   return { rows = rows, sections = { running = #running, finished = #finished } }
 end
 
+-- Only a finished subagent may leave the list: the main chat is the session
+-- itself, and dropping a running task would orphan its transcript. The host
+-- refuses these too; this check only decides who gets to ask.
+function M.deletable(task)
+  return task.status ~= nil and task.status ~= "working"
+end
+
 -- Position of {id} among {rows}, or nil. The selection is kept as an id and
 -- resolved here at render time, so a task moving between sections never drags
 -- the cursor with it.

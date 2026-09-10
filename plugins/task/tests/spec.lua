@@ -124,4 +124,13 @@ case("a_filter_that_empties_a_section_zeroes_its_count_and_header", function()
   eq(nothing.sections.finished, 0)
 end)
 
+-- The picker refuses on its own before ever round-tripping to the host, and
+-- the rule lives in Rows so it can be exercised without a UI.
+case("only_finished_subagents_are_deletable", function()
+  eq(Rows.deletable(MAIN), false, "the main chat has no status and stays")
+  eq(Rows.deletable(RESEARCH), false, "a running task stays")
+  eq(Rows.deletable(BUILD), true, "a done task goes")
+  eq(Rows.deletable(BENCH), true, "an errored task still counts as finished")
+end)
+
 th.report()
