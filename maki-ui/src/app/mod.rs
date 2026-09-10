@@ -1792,9 +1792,11 @@ impl App {
     }
 
     fn drop_attached_subagents(&mut self) {
+        // Do not sync: `retain_resolved_subagents` already persisted the
+        // finished attached children. Re-syncing from the pruned index
+        // would wipe them.
         self.chat_index
             .retain(|id, _| self.detached_subagents.contains(id));
-        self.sync_subagents();
     }
 
     /// Terminalizes every tool left in progress when a turn ends, sparing
