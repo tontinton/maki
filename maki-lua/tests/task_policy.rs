@@ -33,8 +33,9 @@ const TASK_TOOL_WAIT: &str = "task_wait";
 const PROBE_TOOL: &str = "probe";
 const BG_FLASH: &str = "bg-done";
 const BG_UNKNOWN_PREFIX: &str = "unknown task id: ";
-const BG_WORKING_PREFIX: &str = " still working: ";
 const BG_DISK_SCENARIO: &str = "bg_disk";
+const BG_ORPHANED_ERROR: &str = "task lost: the host restarted or the plugin reloaded while it ran";
+const BG_ORPHAN_SEED_DESCRIPTION: &str = "orphaned probe";
 const BG_WAIT_MIN_ERR: &str = "timeout_ms must be >= 1";
 /// Generous vs the background work, which finishes in well under a second.
 const BG_TEST_WAIT: Duration = Duration::from_secs(5);
@@ -762,28 +763,20 @@ fn background_receipts_resolve_from_disk_in_a_fresh_host() {
     .expect("background task failed");
     let id = bg_task_id(&receipt);
 
+    // The subagent finishes before the fresh host reads: a fresh VM can never
+    // observe a genuinely running task (a reload takes in-flight coroutines
+    // down with the old VM), so disk fallback only matters for resolved
+    // receipts; the working case is the orphan sweep's.
+    wait_flash(&host);
+
     let (fresh_reg, _fresh_host) = load_task_host_with_logs_dir(tmp.path());
     let out = exec_tool_with_session(
         &fresh_reg,
         TASK_TOOL_RESULT,
         json!({ "task_id": id }),
-        Some(session.clone()),
-    )
-    .expect("task_result failed");
-    assert_eq!(
-        out,
-        format!("task {id}{BG_WORKING_PREFIX}{BG_DISK_SCENARIO}")
-    );
-
-    wait_flash(&host);
-
-    let out = exec_tool_with_session(
-        &fresh_reg,
-        TASK_TOOL_WAIT,
-        json!({ "task_id": id, "timeout_ms": BG_TEST_WAIT.as_millis() as u64 }),
         Some(session),
     )
-    .expect("task_wait failed");
+    .expect("task_result failed");
     assert_eq!(out, PLAIN_TEXT);
 }
 
@@ -799,4 +792,63 @@ fn task_wait_rejects_non_positive_timeout() {
     )
     .unwrap_err();
     assert_eq!(err, BG_WAIT_MIN_ERR);
+}
+
+/// The first task call of a fresh VM must resolve every disk receipt still
+/// marked "working": its coroutine died with the previous process or reload,
+/// so nothing will ever finish it. Finished receipts stay untouched.
+#[test]
+fn first_call_marks_disk_working_receipts_as_lost() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
+        .parse()
+        .expect("valid session id");
+    // The plugin keys receipts by the canonical id the Lua ctx exposes.
+    let sid = session.id().to_string();
+    let dir = tmp.path().join(&sid).join("bg-tasks");
+    std::fs::create_dir_all(&dir).unwrap();
+    let orphan_id = format!("{sid}:dead:1");
+    let done_id = format!("{sid}:dead:2");
+    std::fs::write(
+        dir.join(format!("{orphan_id}.json")),
+        json!({ "description": BG_ORPHAN_SEED_DESCRIPTION, "status": "working", "is_error": false })
+            .to_string(),
+    )
+    .unwrap();
+    let done_receipt = json!({
+        "description": BG_ORPHAN_SEED_DESCRIPTION,
+        "status": "done",
+        "is_error": false,
+        "result": PLAIN_TEXT,
+    });
+    std::fs::write(
+        dir.join(format!("{done_id}.json")),
+        done_receipt.to_string(),
+    )
+    .unwrap();
+
+    let (reg, _host) = load_task_host_with_logs_dir(tmp.path());
+
+    let out = exec_tool_with_session(
+        &reg,
+        TASK_TOOL_RESULT,
+        json!({ "task_id": orphan_id }),
+        Some(session.clone()),
+    )
+    .expect_err("the lost receipt must surface as a tool error");
+    assert_eq!(out, BG_ORPHANED_ERROR);
+
+    let orphan: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(format!("{orphan_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(orphan["status"], "error");
+    assert_eq!(orphan["is_error"], true);
+    assert_eq!(orphan["result"], BG_ORPHANED_ERROR);
+
+    let done: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(format!("{done_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(done, done_receipt);
 }

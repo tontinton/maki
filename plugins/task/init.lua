@@ -42,6 +42,7 @@ local BG_WAIT_MAX_MS = 600000
 local BG_WAIT_MIN_ERR = "timeout_ms must be >= 1"
 local BG_NOTIFY_MAX_CHARS = 2000
 local BG_UNKNOWN_ID_PREFIX = "unknown task id: "
+local BG_ORPHANED_ERROR = "task lost: the host restarted or the plugin reloaded while it ran"
 -- Receipt ids embed a per-host epoch so a /reload between the receipt and the
 -- result cannot hand a new task the same id as one still running under the
 -- old plugin instance.
@@ -232,6 +233,35 @@ local function notify_bg(task_id, entry, session_id)
   )
 end
 
+-- A disk receipt still "working" at the first call of a fresh VM is an
+-- orphan: its coroutine died with the previous process or reload, and
+-- nothing else will ever finish it.
+local orphans_swept = false
+local function sweep_orphaned_tasks(sid)
+  if orphans_swept then
+    return
+  end
+  orphans_swept = true
+  local dir = bg_store_dir(sid)
+  if not dir then
+    return
+  end
+  local paths, glob_err = maki.fs.glob("*.json", { path = dir, gitignore = false })
+  if glob_err or not paths then
+    return
+  end
+  for _, path in ipairs(paths) do
+    local task_id = maki.fs.basename(path):gsub("%.json$", "")
+    local entry = resolve_bg(sid, task_id)
+    if entry and entry.status == BG_WORKING then
+      entry.status, entry.is_error, entry.result = BG_ERROR, true, BG_ORPHANED_ERROR
+      bg_tasks[task_id] = entry
+      persist_bg(sid, task_id, entry)
+      notify_bg(task_id, entry, sid)
+    end
+  end
+end
+
 local function task_output(entry, task_id)
   if entry.status == BG_WORKING then
     return { llm_output = "task " .. task_id .. " still working: " .. entry.description }
@@ -241,6 +271,7 @@ end
 
 local function handler(input, ctx)
   local sid = ctx:session_id()
+  sweep_orphaned_tasks(sid)
   local subagent_type = input.subagent_type or "research"
   if subagent_type ~= "research" and subagent_type ~= "general" then
     return { llm_output = "unknown subagent type: " .. subagent_type, is_error = true }
@@ -448,6 +479,7 @@ maki.api.register_tool({
   audiences = { "main", "workflow" },
   schema = task_id_schema,
   handler = function(input, ctx)
+    sweep_orphaned_tasks(ctx:session_id())
     local entry = resolve_bg(ctx:session_id(), input.task_id)
     if not entry then
       return { llm_output = BG_UNKNOWN_ID_PREFIX .. input.task_id, is_error = true }
@@ -478,6 +510,7 @@ maki.api.register_tool({
   },
   handler = function(input, ctx)
     local sid = ctx:session_id()
+    sweep_orphaned_tasks(sid)
     local timeout_ms = input.timeout_ms or BG_WAIT_DEFAULT_MS
     if timeout_ms < 1 then
       return { llm_output = BG_WAIT_MIN_ERR, is_error = true }
