@@ -1,7 +1,9 @@
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use futures_lite::io::AsyncReadExt;
@@ -31,6 +33,9 @@ const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
 const DNS_ATTEMPTS: u32 = 3;
 const DNS_RETRY_DELAY: Duration = Duration::from_millis(150);
+const MAX_POOLED_CLIENTS: usize = 8;
+const POLL_STATE_TTL: Duration = Duration::from_secs(600);
+const MAX_POLL_STATES: usize = 64;
 const ALLOWLIST_HINT: &str = "add it to `net.allowed_private_hosts` in your init.lua to allow it";
 /// Reserved IPv4 ranges the standard library has no predicate for. Carrier
 /// grade NAT is the one that bites: Alibaba Cloud parks its instance metadata
@@ -178,7 +183,7 @@ fn split_host_port(authority: &str) -> (&str, Option<u16>) {
 /// Without it the name is looked up twice, once by the guard and once by curl
 /// at connect time, and a record with a zero TTL can answer public to the
 /// first and 169.254.169.254 to the second.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DnsPin {
     host: String,
     port: u16,
@@ -193,6 +198,9 @@ struct RequestParams {
     timeout: Duration,
     max_bytes: usize,
     retries: u32,
+    /// Keep only response lines starting with one of these. Empty disables
+    /// the filter.
+    line_prefixes: Vec<String>,
     /// `None` when the guard reached its verdict without DNS.
     pin: Option<DnsPin>,
 }
@@ -215,6 +223,9 @@ struct ResponseData {
 ///   `timeout` (integer) Timeout in seconds, max 120 (default 30).
 ///   `max_bytes` (integer) Max response size in bytes (default 5 MB).
 ///   `retry` (integer) Retries on 5xx errors (default 3).
+///   `line_prefixes` (table) Array of strings. Keep only the response
+///   lines that start with one of them. Filtering happens after the body
+///   is read, so `max_bytes` still caps the transfer.
 ///
 /// The response table has three fields: `body` (string), `status`
 /// (integer), and `content_type` (string).
@@ -240,6 +251,51 @@ async fn request(lua: Lua, url: String, opts: Option<Table>) -> LuaResult<Pair<T
     Ok((Some(tbl), None))
 }
 
+/// Fetch an endpoint in a shape meant for polling loops. One call is one
+/// fetch, exactly like `request`; repeating it stays the caller's job, say
+/// from a `maki.defer_fn` loop. What the name buys is that the repeats are
+/// cheap: clients are pooled, so consecutive calls share one keep-alive
+/// connection instead of paying a fresh connect every time, and the
+/// response carries `changed`, false when the status and (filtered) body
+/// match the previous call to the same URL, letting the caller skip
+/// re-parsing what has not moved. Options, URL rules, SSRF guard, and
+/// redirects behave exactly as in `request`.
+///
+/// Pair it with `line_prefixes` to fetch only the lines of a large
+/// text endpoint the loop cares about.
+///
+/// @param url string URL starting with `http://` or `https://`.
+/// @param opts table? Same fields as `request`.
+/// @return (table?, string?) Response table with a `changed` field
+///   added, or nil plus an error string.
+/// @example
+/// local function poll_metrics()
+///   maki.defer_fn(poll_metrics, 2000)
+///   local res, err = maki.net.poll("http://localhost:8000/metrics", {
+///     line_prefixes = { "vllm:generation_tokens_total", "vllm:prompt_tokens_total" },
+///     retry = 0,
+///   })
+///   if err then
+///     maki.log.warn("metrics poll failed: " .. err)
+///   elseif res.changed then
+///     print(res.body)
+///   end
+/// end
+/// maki.defer_fn(poll_metrics, 0)
+#[lua_fn(guard = Net)]
+async fn poll(lua: Lua, url: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
+    let params = try_pair!(extract_request_params(&url, opts.as_ref()).await);
+    let key = poll_key(&url, &params.method, &params.line_prefixes);
+    let resp = try_pair!(do_request(params).await);
+    let changed = poll_changed(&key, resp.status, resp.body.as_bytes());
+    let tbl = lua.create_table()?;
+    tbl.set("body", resp.body)?;
+    tbl.set("status", resp.status)?;
+    tbl.set("content_type", resp.content_type)?;
+    tbl.set("changed", changed)?;
+    Ok((Some(tbl), None))
+}
+
 lua_table! {
     /// HTTP client for fetching web content. All traffic goes over HTTPS
     /// (plain HTTP is upgraded). Private and metadata IP addresses are
@@ -253,6 +309,7 @@ lua_table! {
     /// ```
     "maki.net" => pub(crate) fn create_net_table(perms: &PluginPermissions), DOCS [
         request(perms),
+        poll(perms),
     ]
 }
 
@@ -295,6 +352,16 @@ async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<Reque
         .and_then(|o| o.get::<u32>("retry").ok())
         .unwrap_or(MAX_RETRIES);
 
+    let line_prefixes = opts
+        .and_then(|o| o.get::<Table>("line_prefixes").ok())
+        .map(|tbl| {
+            tbl.sequence_values::<String>()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("invalid line_prefixes: {e}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+
     Ok(RequestParams {
         url,
         method,
@@ -303,6 +370,7 @@ async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<Reque
         timeout,
         max_bytes,
         retries,
+        line_prefixes,
         pin,
     })
 }
@@ -425,9 +493,99 @@ fn build_client(params: &RequestParams) -> Result<HttpClient, String> {
     builder.build().map_err(|e| format!("client error: {e}"))
 }
 
+/// What identifies the client a request can reuse: the pin is baked into
+/// the client's resolve map, and the timeout is a client option. Everything
+/// else varies per request, not per client.
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct ClientKey {
+    timeout: Duration,
+    pin: Option<(String, u16, IpAddr)>,
+}
+
+type PooledClient = (Arc<HttpClient>, Instant);
+
+/// The curl thread and the keep-alive connection cache live inside the
+/// client, so rebuilding one per call pays a thread and a handshake every
+/// poll. A loop fetching the same endpoint hits the same key every time.
+/// When the pool is full only the least recently used client pays for the
+/// newcomer, so a set of endpoints slightly larger than the pool stays warm.
+static CLIENT_POOL: LazyLock<Mutex<HashMap<ClientKey, PooledClient>>> =
+    LazyLock::new(Mutex::default);
+
+fn pooled_client(params: &RequestParams) -> Result<Arc<HttpClient>, String> {
+    let key = ClientKey {
+        timeout: params.timeout,
+        pin: params
+            .pin
+            .as_ref()
+            .map(|p| (p.host.clone(), p.port, p.addr)),
+    };
+    let mut pool = CLIENT_POOL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((client, seen)) = pool.get_mut(&key) {
+        *seen = Instant::now();
+        return Ok(Arc::clone(client));
+    }
+    let client = Arc::new(build_client(params)?);
+    if pool.len() == MAX_POOLED_CLIENTS
+        && let Some(lru) = pool
+            .iter()
+            .min_by_key(|(_, (_, seen))| *seen)
+            .map(|(lru, _)| lru.clone())
+    {
+        pool.remove(&lru);
+    }
+    pool.insert(key, (Arc::clone(&client), Instant::now()));
+    Ok(client)
+}
+
+/// Keeps only the lines that start with one of the prefixes, so a poll loop
+/// never carries the lines it discards into the Lua VM.
+fn keep_matching_lines(body: &[u8], prefixes: &[String]) -> Vec<u8> {
+    let mut kept = Vec::new();
+    for line in body.split_inclusive(|byte| *byte == b'\n') {
+        if prefixes.iter().any(|p| line.starts_with(p.as_bytes())) {
+            kept.extend_from_slice(line);
+        }
+    }
+    kept
+}
+
+/// What a poller must not do is re-parse a body that has not moved, and the
+/// comparison is cheapest here, before the bytes become a Lua string.
+static POLL_STATES: LazyLock<Mutex<HashMap<String, (u64, Instant)>>> =
+    LazyLock::new(Mutex::default);
+
+fn poll_key(url: &str, method: &str, prefixes: &[String]) -> String {
+    let mut key = format!("{method}\0{url}");
+    for prefix in prefixes {
+        key.push('\0');
+        key.push_str(prefix);
+    }
+    key
+}
+
+fn poll_changed(key: &str, status: u16, body: &[u8]) -> bool {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    status.hash(&mut hasher);
+    body.hash(&mut hasher);
+    let digest = hasher.finish();
+    let mut states = POLL_STATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if states.len() == MAX_POLL_STATES {
+        states.retain(|_, (_, seen)| seen.elapsed() < POLL_STATE_TTL);
+    }
+    let changed = states.get(key).is_none_or(|(last, _)| *last != digest);
+    states.insert(key.to_string(), (digest, Instant::now()));
+    changed
+}
+
 async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
-    let mut response = send_with_retries(&build_client(&params)?, &params).await?;
+    let client = pooled_client(&params)?;
+    let mut response = send_with_retries(&client, &params).await?;
 
     for _ in 0..MAX_REDIRECTS {
         let Some(location) = redirect_location(&response) else {
@@ -436,7 +594,8 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
         params
             .follow_redirect(response.status().as_u16(), &location, &allowed)
             .await?;
-        response = send_with_retries(&build_client(&params)?, &params).await?;
+        let client = pooled_client(&params)?;
+        response = send_with_retries(&client, &params).await?;
     }
     if redirect_location(&response).is_some() {
         return Err(format!("gave up after {MAX_REDIRECTS} redirects"));
@@ -473,6 +632,11 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
         return Err(format!("response too large: {} bytes", bytes.len()));
     }
 
+    let bytes = if params.line_prefixes.is_empty() {
+        bytes
+    } else {
+        keep_matching_lines(&bytes, &params.line_prefixes)
+    };
     let body = String::from_utf8_lossy(&bytes).into_owned();
     Ok(ResponseData {
         body,
@@ -816,6 +980,7 @@ mod tests {
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_bytes: DEFAULT_MAX_BYTES,
             retries: 0,
+            line_prefixes: Vec::new(),
             pin: None,
         }
     }
@@ -1104,5 +1269,141 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == ACCEPT_HEADER && v == ACCEPT_VALUE)
         );
+    }
+
+    #[test]
+    fn extract_params_line_prefixes_default_empty() {
+        assert!(
+            request_params(PUBLIC_URL, None)
+                .unwrap()
+                .line_prefixes
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn extract_params_line_prefixes_collected() {
+        let lua = Lua::new();
+        let prefixes = lua.create_sequence_from([KEEP_PREFIX, "other"]).unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("line_prefixes", prefixes).unwrap();
+        let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
+        assert_eq!(params.line_prefixes, [KEEP_PREFIX, "other"]);
+    }
+
+    #[test]
+    fn extract_params_line_prefixes_non_string_errors() {
+        let lua = Lua::new();
+        let prefixes = lua.create_sequence_from([true]).unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("line_prefixes", prefixes).unwrap();
+        let Err(err) = request_params(PUBLIC_URL, Some(&opts)) else {
+            panic!("non-string line_prefixes accepted");
+        };
+        assert!(err.contains("line_prefixes"), "{err}");
+    }
+
+    const KEEP_PREFIX: &str = "vllm:generation_tokens_total";
+
+    #[test_case("vllm:a 1\nvllm:generation_tokens_total{e=\"0\"} 2.0\nvllm:b 3\n", "vllm:generation_tokens_total{e=\"0\"} 2.0\n" ; "lf_terminated")]
+    #[test_case("vllm:a 1\r\nvllm:generation_tokens_total 2.0\r\n", "vllm:generation_tokens_total 2.0\r\n" ; "crlf_terminated")]
+    #[test_case("vllm:generation_tokens_total 2.0", "vllm:generation_tokens_total 2.0" ; "no_trailing_newline")]
+    fn keep_matching_lines_keeps_only_prefixed_lines(body: &str, expected: &str) {
+        let kept = keep_matching_lines(body.as_bytes(), &[KEEP_PREFIX.to_string()]);
+        assert_eq!(String::from_utf8(kept).unwrap(), expected);
+    }
+
+    #[test]
+    fn poll_changed_reports_only_moves() {
+        let key = "poll_changed_reports_only_moves";
+        assert!(poll_changed(key, 200, b"a"));
+        assert!(!poll_changed(key, 200, b"a"));
+        assert!(
+            poll_changed(key, 200, b"b"),
+            "new body must read as changed"
+        );
+        assert!(
+            poll_changed(key, 500, b"b"),
+            "new status must read as changed"
+        );
+    }
+
+    #[test]
+    fn poll_key_separates_method_prefixes_and_url() {
+        let with_prefix = poll_key(PUBLIC_URL, "GET", &[KEEP_PREFIX.to_string()]);
+        let without = poll_key(PUBLIC_URL, "GET", &[]);
+        let post = poll_key(PUBLIC_URL, "POST", &[KEEP_PREFIX.to_string()]);
+        let other = poll_key(OTHER_PUBLIC_URL, "GET", &[KEEP_PREFIX.to_string()]);
+        assert_ne!(with_prefix, without);
+        assert_ne!(with_prefix, post);
+        assert_ne!(with_prefix, other);
+        assert_eq!(
+            with_prefix,
+            poll_key(PUBLIC_URL, "GET", &[KEEP_PREFIX.to_string()])
+        );
+    }
+
+    fn params_with_timeout(secs: u64) -> RequestParams {
+        RequestParams {
+            timeout: Duration::from_secs(secs),
+            ..redirect_params(PUBLIC_URL)
+        }
+    }
+
+    #[test]
+    fn the_pool_evicts_the_least_recently_used_client_when_full() {
+        let timeouts: Vec<u64> = (101..101 + MAX_POOLED_CLIENTS as u64).collect();
+        let clients: Vec<Arc<HttpClient>> = timeouts
+            .iter()
+            .map(|secs| pooled_client(&params_with_timeout(*secs)).unwrap())
+            .collect();
+        assert!(
+            Arc::ptr_eq(
+                &pooled_client(&params_with_timeout(timeouts[0])).unwrap(),
+                &clients[0]
+            ),
+            "a hit must return the pooled client and refresh its age"
+        );
+        let _ninth = pooled_client(&params_with_timeout(200)).unwrap();
+        assert!(
+            !Arc::ptr_eq(
+                &pooled_client(&params_with_timeout(timeouts[1])).unwrap(),
+                &clients[1]
+            ),
+            "the least recently used client should have been evicted"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &pooled_client(&params_with_timeout(timeouts[0])).unwrap(),
+                &clients[0]
+            ),
+            "a touched client must outlive an untouched one"
+        );
+    }
+
+    #[test]
+    fn pooled_client_is_reused_for_the_same_key() {
+        let params = redirect_params(PUBLIC_URL);
+        let first = pooled_client(&params).unwrap();
+        let second = pooled_client(&params).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "repeat call built a new client"
+        );
+    }
+
+    #[test]
+    fn pooled_client_is_keyed_on_the_pin() {
+        let unpinned = redirect_params(PUBLIC_URL);
+        let mut pinned = redirect_params(PUBLIC_URL);
+        pinned.pin = Some(DnsPin {
+            host: "example.com".to_string(),
+            port: HTTPS_PORT,
+            addr: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        });
+        assert!(!Arc::ptr_eq(
+            &pooled_client(&unpinned).unwrap(),
+            &pooled_client(&pinned).unwrap()
+        ));
     }
 }

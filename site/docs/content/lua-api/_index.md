@@ -3320,6 +3320,9 @@ listed in `net.allowed_private_hosts`.
   `timeout` (integer) Timeout in seconds, max 120 (default 30).
   `max_bytes` (integer) Max response size in bytes (default 5 MB).
   `retry` (integer) Retries on 5xx errors (default 3).
+  `line_prefixes` (table) Array of strings. Keep only the response
+  lines that start with one of them. Filtering happens after the body
+  is read, so `max_bytes` still caps the transfer.
 
 The response table has three fields: `body` (string), `status`
 (integer), and `content_type` (string).
@@ -3342,6 +3345,55 @@ if err then
 else
   print(res.status, res.body)
 end
+```
+
+---
+
+### `maki.net.poll()` {#maki-net-poll}
+
+```lua
+maki.net.poll({url}, {opts?})
+```
+
+Fetch an endpoint in a shape meant for polling loops. One call is one
+fetch, exactly like `request`; repeating it stays the caller's job, say
+from a `maki.defer_fn` loop. What the name buys is that the repeats are
+cheap: clients are pooled, so consecutive calls share one keep-alive
+connection instead of paying a fresh connect every time, and the
+response carries `changed`, false when the status and (filtered) body
+match the previous call to the same URL, letting the caller skip
+re-parsing what has not moved. Options, URL rules, SSRF guard, and
+redirects behave exactly as in `request`.
+
+Pair it with `line_prefixes` to fetch only the lines of a large
+text endpoint the loop cares about.
+
+Requires the `net` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{url}` (`string`) URL starting with `http://` or `https://`.
+- `{opts?}` (`table?`) Same fields as `request`.
+
+**Returns:** (`table?`, `string?`) Response table with a `changed` field
+  added, or nil plus an error string.
+
+**Example:**
+
+```lua
+local function poll_metrics()
+  maki.defer_fn(poll_metrics, 2000)
+  local res, err = maki.net.poll("http://localhost:8000/metrics", {
+    line_prefixes = { "vllm:generation_tokens_total", "vllm:prompt_tokens_total" },
+    retry = 0,
+  })
+  if err then
+    maki.log.warn("metrics poll failed: " .. err)
+  elseif res.changed then
+    print(res.body)
+  end
+end
+maki.defer_fn(poll_metrics, 0)
 ```
 
 
