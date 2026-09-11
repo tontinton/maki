@@ -269,6 +269,15 @@ pub(crate) struct SseErrorDetail {
     #[serde(default)]
     pub code: Value,
     pub message: String,
+    #[serde(default)]
+    pub metadata: Option<SseErrorMetadata>,
+}
+
+/// OpenRouter puts its machine-readable tag here rather than in `type`.
+#[derive(Deserialize)]
+pub(crate) struct SseErrorMetadata {
+    #[serde(default)]
+    pub error_type: String,
 }
 
 /// A streamed error rides inside a plain 200 response, so this tag is the only clue we get about
@@ -276,7 +285,8 @@ pub(crate) struct SseErrorDetail {
 pub(crate) fn sse_error_status(tag: &str) -> Option<u16> {
     Some(match tag {
         "overloaded_error" | "server_is_overloaded" => 529,
-        "service_unavailable_error" => 503,
+        "service_unavailable_error" | "provider_overloaded" => 503,
+        "provider_unavailable" => 502,
         "api_error" | "server_error" => 500,
         "rate_limit_error" | "rate_limit_exceeded" | "tokens" => 429,
         "request_too_large" => 413,
@@ -288,10 +298,28 @@ pub(crate) fn sse_error_status(tag: &str) -> Option<u16> {
     })
 }
 
+/// A numeric `code` is a literal HTTP status, which some routers (OpenRouter) send instead of a
+/// tag. Reading it as a tag would discard the only signal about whether a retry can help.
+fn code_status(code: &Value) -> Option<u16> {
+    let status = match code {
+        Value::Number(n) => u16::try_from(n.as_u64()?).ok()?,
+        Value::String(s) => s.parse().ok()?,
+        _ => return None,
+    };
+    (100..600).contains(&status).then_some(status)
+}
+
 impl SseErrorPayload {
     pub fn into_agent_error(self) -> AgentError {
         let status = sse_error_status(self.error.code.as_str().unwrap_or_default())
+            .or_else(|| code_status(&self.error.code))
             .or_else(|| sse_error_status(&self.error.r#type))
+            .or_else(|| {
+                self.error
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| sse_error_status(&m.error_type))
+            })
             .unwrap_or(UNMAPPED_SSE_ERROR_STATUS);
         AgentError::Api {
             status,
@@ -500,6 +528,12 @@ mod tests {
     #[test_case(r#""type":"service_unavailable_error""#,                               503, true  ; "absent_code")]
     #[test_case(r#""type":"service_unavailable_error","code":null"#,                   503, true  ; "null_code")]
     #[test_case(r#""type":"rate_limit_error","code":429"#,                             429, true  ; "numeric_code")]
+    #[test_case(r#""code":429"#,                                                       429, true  ; "numeric_code_alone")]
+    #[test_case(r#""code":502,"metadata":{"error_type":"provider_unavailable"}"#,      502, true  ; "openrouter_provider_unavailable")]
+    #[test_case(r#""code":null,"metadata":{"error_type":"provider_unavailable"}"#,     502, true  ; "metadata_provider_unavailable")]
+    #[test_case(r#""code":null,"metadata":{"error_type":"provider_overloaded"}"#,      503, true  ; "metadata_provider_overloaded")]
+    #[test_case(r#""code":null,"metadata":{"error_type":"rate_limit_exceeded"}"#,      429, true  ; "metadata_rate_limit")]
+    #[test_case(r#""code":401"#,                                                       401, false ; "numeric_auth_status")]
     #[test_case(r#""type":"invalid_request_error","code":"invalid_value""#,            400, false ; "unknown_tags")]
     fn sse_error_payload_status(tags: &str, status: u16, retryable: bool) {
         let payload: SseErrorPayload = serde_json::from_str(&format!(
