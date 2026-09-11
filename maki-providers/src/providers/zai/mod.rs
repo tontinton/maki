@@ -115,9 +115,14 @@ inventory::submit!(BuiltInProvider {
     needs_url: false,
 });
 
-/// Rates come from the pay as you go table on docs.z.ai. models.dev looks like
-/// a good source but still lists the launch promo for the GLM-5 line, which
-/// expired, so copying from there halves the numbers below.
+/// Rates come from the pay as you go table on docs.z.ai, not models.dev, which
+/// carries a launch promo past its expiry and so halves the GLM-5 line. A later
+/// `glm-5.x` nobody has curated yet still reads models.dev: a promo rate is the
+/// wrong number, but it beats the zero an unpriced model gets, which renders as
+/// free.
+///
+/// The coding plan (`zai-coding-plan`) is blocked from the catalog instead. The
+/// plan already paid for those models, so every row in it really is zero.
 pub(crate) const fn models() -> &'static [ModelEntry] {
     &[
         ModelEntry {

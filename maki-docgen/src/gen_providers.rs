@@ -99,7 +99,17 @@ If the model name is unique across providers, the prefix can be omitted.
 
 The tables above list the models Maki curates. Any other id a provider accepts works too: type it into `/model` or pass it to `--model`. The picker also lists what the provider's own model endpoint reports, so same-day releases are selectable there.
 
-Rates, context window, vision and thinking support for a model missing from the tables come from [models.dev](https://models.dev/), refreshed daily (`maki models --refresh` forces it). Curated entries win where they exist, because they are checked against each provider's pricing page. A model neither source knows still runs, with the provider's default limits and no cost estimate.
+For an id no table covers, rates, context window, vision and thinking support come from [models.dev](https://models.dev/), refreshed daily (`maki models --refresh` forces it). Maki reads each field on its own, so a row that lists a price but no context window still leaves the window to the sources below.
+
+Sources rank by how sure they are to describe the exact model you asked for:
+
+1. What the provider's own model endpoint reported this session.
+2. A curated row for that id, including its dated snapshots. `claude-sonnet-4-5-20250929` reads the `claude-sonnet-4-5` row.
+3. models.dev.
+4. A curated row for a close relative, reached by shared prefix. `glm-5.4` falls back to `glm-5` here, and takes its family and tier from it either way.
+5. The provider's defaults, with no cost estimate.
+
+A curated row is checked against the provider's own pricing page, so it wins for the id it names. For a relative it loses to models.dev, because a rate nobody checked against the id you typed is only a guess.
 
 New models start at the **medium** tier until you assign one in the picker."#;
 

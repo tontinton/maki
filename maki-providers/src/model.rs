@@ -124,18 +124,6 @@ impl ModelPricing {
     }
 }
 
-impl From<&CatalogMeta> for ModelPricing {
-    fn from(meta: &CatalogMeta) -> Self {
-        Self {
-            input: meta.input_price,
-            output: meta.output_price,
-            cache_write: meta.cache_write,
-            cache_read: meta.cache_read,
-            fast: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFamily {
     Claude,
@@ -218,14 +206,73 @@ pub(crate) fn lookup_entry<'a>(
         .ok_or_else(|| ModelError::UnknownModel(model_id.to_string()))
 }
 
-/// How a release newer than our static tables still gets real rates, limits and
-/// capabilities instead of provider-wide defaults. Curated entries win, and the
-/// catalog is read only when already warm, so this is `None` on a cold start.
-fn catalog_meta_for_unlisted(manifest: &ProviderManifest, model_id: &str) -> Option<CatalogMeta> {
-    if lookup_entry(manifest.models, model_id).is_ok() {
-        return None;
+const SNAPSHOT_DATE_DIGITS: usize = 8;
+
+/// A provider pins a release by stamping a date on an id it already ships,
+/// either `claude-sonnet-4-5-20250929` or `gpt-5.4-2026-03-11`. Both are the
+/// same model as the row they extend, unlike a version bump such as
+/// `claude-opus-5-2`, and the digit count is what tells the two apart.
+fn is_snapshot_suffix(suffix: &str) -> bool {
+    let Some(date) = suffix.strip_prefix('-') else {
+        return false;
+    };
+    date.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+        && date.bytes().filter(u8::is_ascii_digit).count() == SNAPSHOT_DATE_DIGITS
+}
+
+/// Whether a curated row names *this* model rather than merely sharing a prefix
+/// with it. [`lookup_entry`] matches by prefix so dated snapshots resolve to
+/// their base row, which also means `glm-5` answers for `glm-5.4`, a model it
+/// has never been checked against.
+fn names_exactly(entry: &ModelEntry, model_id: &str) -> bool {
+    entry.prefixes.iter().any(|prefix| {
+        model_id
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || is_snapshot_suffix(rest))
+    })
+}
+
+/// Everything that can describe one model, ranked by how sure it is to be about
+/// that model and not its neighbour.
+struct ModelSources<'a> {
+    /// The curated row [`lookup_entry`] reached, exact or not.
+    entry: Option<&'a ModelEntry>,
+    /// `entry` names this id. Such a row was checked against the provider's own
+    /// pricing page, so nothing outranks it but live discovery. A row reached
+    /// by prefix is still the right family and a usable guess at the rest, but
+    /// nobody ever checked it against the id we were handed.
+    exact: bool,
+    /// models.dev, which lists releases our tables have not caught up to. Read
+    /// only when already warm, so this is `None` on a cold start.
+    catalog: Option<CatalogMeta>,
+}
+
+impl<'a> ModelSources<'a> {
+    fn resolve(manifest: &'a ProviderManifest, model_id: &str) -> Self {
+        let entry = lookup_entry(manifest.models, model_id).ok();
+        let exact = entry.is_some_and(|entry| names_exactly(entry, model_id));
+        Self {
+            entry,
+            exact,
+            catalog: (!exact)
+                .then(|| catalog::model_meta_if_available(manifest.slug, model_id))
+                .flatten(),
+        }
     }
-    catalog::model_meta_if_available(manifest.slug, model_id)
+
+    /// Exact row, then the catalog, then the same row as a mere relative, so
+    /// the last rung only ever answers when the first was skipped.
+    fn pick<T>(
+        &self,
+        from_entry: impl Fn(&ModelEntry) -> Option<T>,
+        from_catalog: impl Fn(&CatalogMeta) -> Option<T>,
+    ) -> Option<T> {
+        self.entry
+            .filter(|_| self.exact)
+            .and_then(&from_entry)
+            .or_else(|| self.catalog.as_ref().and_then(from_catalog))
+            .or_else(|| self.entry.and_then(&from_entry))
+    }
 }
 
 impl ModelFamily {
@@ -290,35 +337,39 @@ pub struct Model {
 }
 
 impl Model {
-    /// When no static entry matches (a freshly released model the table has not
-    /// caught up to yet), rates and limits come from the models.dev catalog and
-    /// then from the provider defaults, so the spec resolves either way.
+    /// Rates and limits come from the most specific source that names this
+    /// model: live discovery, then [`ModelSources`], then provider defaults.
+    /// Family and tier are about which dialect a model speaks and what role it
+    /// plays, which a relative answers just as well, so they read the curated
+    /// row whether or not it was an exact match.
     fn from_base(manifest: &ProviderManifest, slug: &str, model_id: &str) -> Self {
-        let static_entry = lookup_entry(manifest.models, model_id).ok();
+        let sources = ModelSources::resolve(manifest, model_id);
+        let entry = sources.entry;
         let spec = format!("{slug}/{model_id}");
         // Discovery keys `known_models` by the builtin slug, so a dynamic or
         // custom slug reads positional tiers and metadata through its base.
         let discovered = model_registry::discovered(manifest.slug, model_id);
         let discovered = discovered.as_ref();
-        let catalog = catalog_meta_for_unlisted(manifest, model_id);
-        let tier = model_registry::tier_for(&spec, manifest.slug, static_entry.map(|e| e.tier));
-        let family = static_entry.map_or(manifest.family, |entry| entry.family);
+        let tier = model_registry::tier_for(&spec, manifest.slug, entry.map(|e| e.tier));
+        let family = entry.map_or(manifest.family, |entry| entry.family);
         let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
         let pricing = discovered_pricing
-            .or_else(|| static_entry.map(|entry| &entry.pricing))
             .cloned()
-            .or_else(|| catalog.as_ref().map(ModelPricing::from))
+            .or_else(|| {
+                sources.pick(
+                    |entry| Some(entry.pricing.clone()),
+                    |meta| meta.pricing.clone(),
+                )
+            })
             .unwrap_or_default();
         let max_output_tokens = discovered
             .and_then(|info| info.max_output_tokens)
-            .or_else(|| static_entry.and_then(|entry| entry.max_output_tokens))
-            .or_else(|| catalog.as_ref().map(|meta| meta.output))
+            .or_else(|| sources.pick(|entry| entry.max_output_tokens, |meta| meta.output))
             .or(manifest.fallback_max_output);
         let context_window = discovered
             .and_then(|info| info.context_window)
             .or_else(|| anthropic::shared::long_context_window(model_id))
-            .or_else(|| static_entry.map(|entry| entry.context_window))
-            .or_else(|| catalog.as_ref().map(|meta| meta.context))
+            .or_else(|| sources.pick(|entry| Some(entry.context_window), |meta| meta.context))
             .unwrap_or(manifest.fallback_context_window);
         Self {
             id: model_id.to_string(),
@@ -342,18 +393,19 @@ impl Model {
     /// the `Model` so `supports_thinking`/`supports_vision` do not need a live
     /// catalog lookup.
     fn from_catalog(slug: &str, model_id: &str, meta: CatalogMeta) -> Self {
+        let (context_window, max_output_tokens) = (meta.context_window(), meta.max_output());
         Self {
             id: model_id.to_string(),
             provider: Arc::from(slug),
             tier: ModelTier::Medium,
             family: ModelFamily::Generic,
             supports_tool_examples_override: None,
-            thinking_override: ThinkingSupport::from_flags(Some(meta.supports_thinking), false),
-            supports_vision_override: Some(meta.supports_vision),
-            pricing: ModelPricing::from(&meta),
+            thinking_override: ThinkingSupport::from_flags(meta.supports_thinking, false),
+            supports_vision_override: meta.supports_vision,
+            pricing: meta.pricing.unwrap_or_default(),
             discovered_free: false,
-            max_output_tokens: Some(meta.output),
-            context_window: meta.context,
+            max_output_tokens: Some(max_output_tokens),
+            context_window,
             thinking_fields: None,
         }
     }
@@ -370,7 +422,9 @@ impl Model {
         model_registry::discovered(manifest.slug, &self.id)
             .and_then(|d| d.supports_thinking)
             .or_else(|| {
-                catalog_meta_for_unlisted(manifest, &self.id).map(|meta| meta.supports_thinking)
+                ModelSources::resolve(manifest, &self.id)
+                    .catalog?
+                    .supports_thinking
             })
             .unwrap_or(manifest.supports_thinking)
     }
@@ -379,12 +433,8 @@ impl Model {
         self.thinking_override == Some(ThinkingSupport::Required)
     }
 
-    /// Vision support, most specific first:
-    /// 1. per-model override
-    /// 2. discovery
-    /// 3. manifest entry
-    /// 4. warm models.dev metadata for a model no manifest entry claims
-    /// 5. the family default
+    /// Vision support, most specific first: per-model override, discovery,
+    /// [`ModelSources`], the family default.
     pub fn supports_vision(&self) -> bool {
         if let Some(vision) = self.supports_vision_override {
             return vision;
@@ -395,11 +445,9 @@ impl Model {
         model_registry::discovered(manifest.slug, &self.id)
             .and_then(|d| d.supports_vision)
             .or_else(|| {
-                lookup_entry(manifest.models, &self.id)
-                    .ok()
-                    .map(|e| e.vision)
+                ModelSources::resolve(manifest, &self.id)
+                    .pick(|entry| Some(entry.vision), |meta| meta.supports_vision)
             })
-            .or_else(|| catalog_meta_for_unlisted(manifest, &self.id).map(|m| m.supports_vision))
             .unwrap_or_else(|| self.family.supports_vision())
     }
 
@@ -729,6 +777,7 @@ mod tests {
     ];
 
     const EPSILON: f64 = 1e-10;
+
     /// The only builtin whose rates move with the wall clock.
     const SCHEDULED_PROVIDERS: [&str; 1] = ["deepseek"];
     const DEEPSEEK_SPEC: &str = "deepseek/deepseek-v4-pro";
@@ -760,6 +809,48 @@ mod tests {
         cache_read: 0.0,
         fast: None,
     };
+
+    #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5"; "the id itself")]
+    #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5-20250929"; "anthropic snapshot")]
+    #[test_case(&["gpt-5.4"], "gpt-5.4-2026-03-11"; "openai snapshot")]
+    fn a_curated_row_names_its_own_dated_snapshots(
+        prefixes: &'static [&'static str],
+        model_id: &str,
+    ) {
+        assert!(names_exactly(&entry_named(prefixes), model_id));
+    }
+
+    /// Each of these is a different model that merely starts with the row's id.
+    /// Letting the row answer for them is how `glm-5.4` would bill at `glm-5`
+    /// rates forever, silently, rather than reading models.dev.
+    #[test_case(&["glm-5"], "glm-5.4"; "version bump")]
+    #[test_case(&["glm-5"], "glm-5-code"; "named variant")]
+    #[test_case(&["claude-opus-5"], "claude-opus-5-2"; "version bump behind a dash")]
+    #[test_case(&["deepseek-flash"], "deepseek-flash-preview"; "preview of a relative")]
+    fn a_curated_row_does_not_name_its_relatives(
+        prefixes: &'static [&'static str],
+        model_id: &str,
+    ) {
+        let entry = entry_named(prefixes);
+        assert!(!names_exactly(&entry, model_id));
+        assert!(
+            lookup_entry(std::slice::from_ref(&entry), model_id).is_ok(),
+            "still the right row for family and tier, just not for rates"
+        );
+    }
+
+    fn entry_named(prefixes: &'static [&'static str]) -> ModelEntry {
+        ModelEntry {
+            prefixes,
+            tier: ModelTier::Medium,
+            family: ModelFamily::Generic,
+            vision: false,
+            default: false,
+            pricing: ModelPricing::default(),
+            max_output_tokens: None,
+            context_window: 0,
+        }
+    }
 
     #[test_case(999, "999"         ; "under_thousand")]
     #[test_case(1_000, "1.0k"      ; "thousand")]

@@ -35,7 +35,14 @@ use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, 
 const MESSAGES_PATH: &str = "/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-const BLOCKED_PROVIDER_IN_CATALOG: &[&str] = &["zai", "zai-coding-plan", "github-copilot"];
+/// Priced per subscription, so every model in it reads as free. The `zai` entry
+/// carries the pay as you go rates for the same models.
+const BLOCKED_PROVIDER_IN_CATALOG: &[&str] = &["zai-coding-plan"];
+
+/// models.dev ids for providers we ship a client for under another name, so
+/// their metadata lands under the slug a model spec is written with.
+const BUILTIN_CATALOG_IDS: &[(&str, &str)] =
+    &[("github-copilot", "copilot"), ("regolo-ai", "regolo")];
 
 /// Builtins with no native client of their own, so [`builtin_provider`]
 /// knowing them must not drop them from the catalog.
@@ -49,6 +56,13 @@ const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
 const CATALOG_CACHE_TTL: Duration = Duration::from_secs(86400);
 
 const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic"];
+
+const IMAGE_MODALITY: &str = "image";
+
+/// Used only where the catalog is the whole story. A builtin has its manifest
+/// fallbacks to reach for instead, which are per provider and so beat a guess.
+const DEFAULT_CONTEXT: u32 = 128_000;
+const DEFAULT_OUTPUT: u32 = 64_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointType {
@@ -109,8 +123,13 @@ pub struct ProviderData {
     pub quirks: ProviderQuirks,
 }
 
+/// An unpriced entry counts as free, the same reading `enable_free_models` has
+/// always had. Only catalog providers reach this, and a free tier is the one
+/// place models.dev is reliably explicit about a zero.
 fn is_free_model(meta: &CatalogMeta) -> bool {
-    meta.input_price == 0.0 && meta.output_price == 0.0
+    meta.pricing
+        .as_ref()
+        .is_none_or(|pricing| pricing.input == 0.0 && pricing.output == 0.0)
 }
 
 impl ProviderData {
@@ -258,33 +277,37 @@ impl ProviderData {
     }
 }
 
-#[derive(Clone, Debug)]
+/// What models.dev publishes about one model. Every field is `Option` because
+/// "the catalog says no" and "the catalog does not say" have to stay apart: a
+/// builtin has a manifest and a curated table to fall through to, and collapsing
+/// the two here would let a thin upstream row shrink a 1M window to 128k, or
+/// turn thinking off for a model we know reasons.
+#[derive(Clone, Debug, Default)]
 pub struct CatalogMeta {
-    pub context: u32,
-    pub output: u32,
-    pub input_price: f64,
-    pub output_price: f64,
-    pub cache_read: f64,
-    pub cache_write: f64,
-    pub supports_thinking: bool,
-    pub supports_vision: bool,
+    pub context: Option<u32>,
+    pub output: Option<u32>,
+    pub pricing: Option<ModelPricing>,
+    pub supports_thinking: Option<bool>,
+    pub supports_vision: Option<bool>,
 }
 
 impl CatalogMeta {
+    pub(crate) fn context_window(&self) -> u32 {
+        self.context.unwrap_or(DEFAULT_CONTEXT)
+    }
+
+    pub(crate) fn max_output(&self) -> u32 {
+        self.output.unwrap_or(DEFAULT_OUTPUT)
+    }
+
     fn model_info(&self, model_id: &str) -> ModelInfo {
         ModelInfo {
             id: model_id.to_string(),
-            context_window: Some(self.context),
-            max_output_tokens: Some(self.output),
-            pricing: Some(ModelPricing {
-                input: self.input_price,
-                output: self.output_price,
-                cache_read: self.cache_read,
-                cache_write: self.cache_write,
-                fast: None,
-            }),
-            supports_thinking: Some(self.supports_thinking),
-            supports_vision: Some(self.supports_vision),
+            context_window: Some(self.context_window()),
+            max_output_tokens: Some(self.max_output()),
+            pricing: Some(self.pricing.clone().unwrap_or_default()),
+            supports_thinking: self.supports_thinking,
+            supports_vision: self.supports_vision,
             tier: None,
             provider_info: None,
         }
@@ -325,96 +348,26 @@ impl CatalogData {
         let mut builtin_models = HashMap::new();
 
         for (provider_id, provider) in index {
-            if !ALLOWED_NPM.contains(&provider.npm.as_str()) {
-                debug!(npm = %provider.npm, "skipping provider: unsupported npm package");
-                continue;
-            }
-            if BLOCKED_PROVIDER_IN_CATALOG.contains(&provider_id.as_str()) {
-                debug!(
-                    provider = &provider_id,
-                    "skipping providers from the catalog"
-                );
-                continue;
-            }
-
-            let Some(_base_url) = &provider.api else {
-                debug!(provider = %provider_id, "skipping: no API URL in catalog");
-                continue;
-            };
-
-            let api_format = determine_catalog_format(&provider.npm);
-
-            let mut models = HashMap::new();
-            for (model_id, model_data) in &provider.models {
-                let input_price = model_data
-                    .cost
-                    .as_ref()
-                    .and_then(|c| c.input)
-                    .unwrap_or(0.0);
-                let output_price = model_data
-                    .cost
-                    .as_ref()
-                    .and_then(|c| c.output)
-                    .unwrap_or(0.0);
-
-                let context = model_data
-                    .limit
-                    .as_ref()
-                    .and_then(|l| l.context)
-                    .unwrap_or(128_000);
-                let output = model_data
-                    .limit
-                    .as_ref()
-                    .and_then(|l| l.output)
-                    .unwrap_or(64_000);
-
-                let cache_read = model_data
-                    .cost
-                    .as_ref()
-                    .and_then(|c| c.cache_read)
-                    .unwrap_or(0.0);
-                let cache_write = model_data
-                    .cost
-                    .as_ref()
-                    .and_then(|c| c.cache_write)
-                    .unwrap_or(0.0);
-
-                let supports_vision = model_data.attachment
-                    || model_data
-                        .modalities
-                        .as_ref()
-                        .is_some_and(|m| m.input.iter().any(|s| s == "image"));
-                let supports_thinking = model_data.reasoning;
-
-                models.insert(
-                    model_id.clone(),
-                    CatalogMeta {
-                        context,
-                        output,
-                        input_price,
-                        output_price,
-                        cache_read,
-                        cache_write,
-                        supports_thinking,
-                        supports_vision,
-                    },
-                );
-            }
-
-            let model_count = models.len();
-
-            if builtin_provider(&provider_id).is_some()
-                && !CATALOG_BACKED_BUILTINS.contains(&provider_id.as_str())
-            {
+            let slug = builtin_slug(&provider_id);
+            if builtin_provider(slug).is_some() && !CATALOG_BACKED_BUILTINS.contains(&slug) {
+                let models = parse_models(&provider.models);
                 debug!(
                     provider = %provider_id,
-                    models = model_count,
+                    slug,
+                    models = models.len(),
                     "built-in provider: keeping catalog metadata only"
                 );
-                builtin_models.insert(provider_id, models);
+                builtin_models.insert(slug.to_string(), models);
                 continue;
             }
 
+            if !is_servable(&provider_id, &provider) {
+                continue;
+            }
+
+            let models = parse_models(&provider.models);
+            let model_count = models.len();
+            let api_format = determine_catalog_format(&provider.npm);
             let provider_data =
                 ProviderData::new(provider_id.clone(), &provider, api_format, models);
             providers.insert(provider_id.clone(), provider_data);
@@ -650,6 +603,63 @@ fn determine_catalog_format(npm: &str) -> EndpointType {
     }
 }
 
+fn builtin_slug(catalog_id: &str) -> &str {
+    BUILTIN_CATALOG_IDS
+        .iter()
+        .find(|(id, _)| *id == catalog_id)
+        .map_or(catalog_id, |(_, slug)| slug)
+}
+
+/// Whether we could stream from this provider ourselves: one of the two
+/// protocols we speak, at a base URL the catalog publishes. Built-ins are
+/// checked first and never come through here, since they bring their own
+/// client and only need the metadata.
+fn is_servable(provider_id: &str, provider: &schema::CatalogProvider) -> bool {
+    if !ALLOWED_NPM.contains(&provider.npm.as_str()) {
+        debug!(provider = %provider_id, npm = %provider.npm, "skipping provider: unsupported npm package");
+        return false;
+    }
+    if BLOCKED_PROVIDER_IN_CATALOG.contains(&provider_id) {
+        debug!(provider = %provider_id, "skipping provider: blocked");
+        return false;
+    }
+    if provider.api.is_none() {
+        debug!(provider = %provider_id, "skipping provider: no API URL in catalog");
+        return false;
+    }
+    true
+}
+
+fn parse_models(models: &HashMap<String, schema::CatalogModel>) -> HashMap<String, CatalogMeta> {
+    models
+        .iter()
+        .map(|(model_id, model)| (model_id.clone(), parse_model(model)))
+        .collect()
+}
+
+fn parse_model(model: &schema::CatalogModel) -> CatalogMeta {
+    let limit = model.limit.as_ref();
+    // A published `modalities` answers the vision question on its own; only a
+    // row that lists none falls back to the coarser `attachment` flag.
+    let supports_vision = match model.modalities.as_ref() {
+        Some(modalities) => Some(modalities.input.iter().any(|input| input == IMAGE_MODALITY)),
+        None => model.attachment,
+    };
+    CatalogMeta {
+        context: limit.and_then(|l| l.context),
+        output: limit.and_then(|l| l.output),
+        pricing: model.cost.as_ref().map(|cost| ModelPricing {
+            input: cost.input.unwrap_or(0.0),
+            output: cost.output.unwrap_or(0.0),
+            cache_write: cost.cache_write.unwrap_or(0.0),
+            cache_read: cost.cache_read.unwrap_or(0.0),
+            fast: None,
+        }),
+        supports_thinking: model.reasoning,
+        supports_vision,
+    }
+}
+
 fn catalog_client() -> HttpClient {
     isahc::HttpClient::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -842,8 +852,8 @@ impl Provider for CatalogProvider {
                 })?;
             let stream_model = Model {
                 id: model.id.clone(),
-                max_output_tokens: Some(meta.output),
-                context_window: meta.context,
+                max_output_tokens: Some(meta.max_output()),
+                context_window: meta.context_window(),
                 ..model.clone()
             };
             self.transport
@@ -1001,6 +1011,7 @@ mod tests {
         Authentication, CatalogData, CatalogMeta, EndpointType, ProviderData, ProviderQuirks,
         SessionRef, StateDir, available_if_warm, determine_catalog_format, quirks_for,
     };
+    use crate::manifest::ManifestRegistry;
     use crate::model::{Model, ModelInfo, ModelPricing};
     use crate::provider::Provider;
     use crate::providers::{ResolvedAuth, Timeouts, deepseek, opencode};
@@ -1011,8 +1022,16 @@ mod tests {
     const OPT_IN_HINT: &str = "providers.opencode.enable_free_models = true";
     /// A builtin with a static model table, so it is never a catalog provider.
     const BUILTIN_SLUG: &str = "deepseek";
-    /// Stands in for a model released after our tables were written.
-    const UNLISTED_MODEL: &str = "deepseek-v9-turbo";
+    /// Stands in for a model released after our tables were written, so no
+    /// curated row of any provider starts with it.
+    const UNLISTED_MODEL: &str = "v9-turbo";
+    /// A release that starts with a curated id without being it, the shape
+    /// `lookup_entry` cannot tell apart from the row it belongs to.
+    const SIBLING_SUFFIX: &str = "-preview";
+    /// Same shape, but the catalog row publishes nothing beyond a price.
+    const QUIET_SIBLING_SUFFIX: &str = "-quiet";
+    /// A release the curated row does cover, only date-stamped.
+    const SNAPSHOT_SUFFIX: &str = "-20260401";
     const UNLISTED_INPUT_PRICE: f64 = 1.5;
     const UNLISTED_OUTPUT_PRICE: f64 = 4.5;
     const UNLISTED_CACHE_READ: f64 = 0.15;
@@ -1020,6 +1039,10 @@ mod tests {
     const UNLISTED_OUTPUT: u32 = 96_000;
     /// Nothing like any real rate, so whichever source a model read is obvious.
     const STALE_CATALOG_PRICE: f64 = 99.0;
+    const ZAI_PLAN_ID: &str = "zai-coding-plan";
+    const PAID_INPUT_PRICE: f64 = 1.0;
+    const PAID_CONTEXT: u32 = 128_000;
+    const PAID_OUTPUT: u32 = 64_000;
 
     #[test]
     fn new_rejects_no_auth() {
@@ -1061,6 +1084,22 @@ mod tests {
         assert_eq!(header, expected.then(|| session.to_string()).as_deref());
     }
 
+    /// Limits are published so nothing under test reads a default; only the
+    /// price separates the two rows.
+    fn priced(input: f64) -> CatalogMeta {
+        CatalogMeta {
+            context: Some(PAID_CONTEXT),
+            output: Some(PAID_OUTPUT),
+            pricing: Some(ModelPricing {
+                input,
+                output: input * 2.0,
+                ..ModelPricing::default()
+            }),
+            supports_thinking: Some(false),
+            supports_vision: Some(false),
+        }
+    }
+
     fn opencode_go_provider_data(env_key: &str) -> ProviderData {
         ProviderData {
             quirks: opencode::QUIRKS,
@@ -1071,32 +1110,8 @@ mod tests {
             npm: "@ai-sdk/openai-compatible".into(),
             api_format: EndpointType::ChatCompletions,
             models: HashMap::from([
-                (
-                    "paid-model".into(),
-                    CatalogMeta {
-                        context: 128_000,
-                        output: 64_000,
-                        input_price: 1.0,
-                        output_price: 2.0,
-                        cache_read: 0.0,
-                        cache_write: 0.0,
-                        supports_thinking: false,
-                        supports_vision: false,
-                    },
-                ),
-                (
-                    "free-model".into(),
-                    CatalogMeta {
-                        context: 128_000,
-                        output: 64_000,
-                        input_price: 0.0,
-                        output_price: 0.0,
-                        cache_read: 0.0,
-                        cache_write: 0.0,
-                        supports_thinking: false,
-                        supports_vision: false,
-                    },
-                ),
+                ("paid-model".into(), priced(PAID_INPUT_PRICE)),
+                ("free-model".into(), priced(0.0)),
             ]),
         }
     }
@@ -1609,7 +1624,7 @@ mod tests {
             (
                 "vision-model".into(),
                 CatalogModel {
-                    attachment: true,
+                    attachment: Some(true),
                     ..Default::default()
                 },
             ),
@@ -1632,10 +1647,9 @@ mod tests {
     }
 
     /// models.dev lists every model a provider ships, so it can answer for the
-    /// ones our table has never seen. Builtins are kept out of the catalog's
-    /// provider map (they have a client of their own), and that must not cost
-    /// them the metadata. Curated entries are checked against the provider's
-    /// pricing page, so they still beat a catalog that may be stale.
+    /// ones our table has never seen. Curated rows are checked against the
+    /// provider's own pricing page, so they still beat a catalog that may be
+    /// carrying a stale rate.
     #[test]
     fn catalog_answers_only_for_models_the_static_table_misses() {
         let (_tmp, state_dir) = temp_state_dir();
@@ -1654,65 +1668,243 @@ mod tests {
         );
 
         let curated = &deepseek::models()[0];
-        let listed = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", curated.prefixes[0])).unwrap();
+        let listed = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", curated_flash())).unwrap();
         assert_eq!(listed.pricing.input, curated.pricing.input);
         assert_eq!(listed.context_window, curated.context_window);
     }
 
+    /// Curated rows match by prefix, so `deepseek-flash` answers for every id
+    /// starting with it. That guess loses to models.dev naming the exact model,
+    /// or the next release in an existing family bills at its predecessor's
+    /// rates forever without ever looking stale. A date stamp is the exception:
+    /// it names the same model, so the curated row keeps it.
     #[test]
-    fn builtin_keeps_its_metadata_without_becoming_a_catalog_provider() {
+    fn a_relative_matched_by_prefix_loses_to_the_catalog_naming_the_model() {
         let (_tmp, state_dir) = temp_state_dir();
-        let data = CatalogData::from_index(builtin_catalog(), &state_dir);
+        super::seed_catalog_for_tests(builtin_catalog(), state_dir);
+        let curated = &deepseek::models()[0];
 
-        assert!(data.provider(BUILTIN_SLUG).is_none());
-        assert!(data.model_meta(BUILTIN_SLUG, UNLISTED_MODEL).is_some());
+        let sibling = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", sibling_model())).unwrap();
+        assert_eq!(sibling.pricing.input, UNLISTED_INPUT_PRICE);
+        assert_eq!(sibling.context_window, UNLISTED_CONTEXT);
+        assert_eq!(sibling.max_output_tokens, Some(UNLISTED_OUTPUT));
+        assert!(
+            !sibling.supports_vision(),
+            "the curated relative has vision"
+        );
+        assert_eq!(
+            sibling.family, curated.family,
+            "which dialect a model speaks is still the relative's answer to give"
+        );
+
+        let snapshot = Model::from_spec(&format!(
+            "{BUILTIN_SLUG}/{}{SNAPSHOT_SUFFIX}",
+            curated_flash()
+        ))
+        .unwrap();
+        assert_eq!(snapshot.pricing.input, curated.pricing.input);
     }
 
-    fn builtin_catalog() -> CatalogIndex {
-        let stale_cost = Some(CatalogCost {
-            input: Some(STALE_CATALOG_PRICE),
-            output: Some(STALE_CATALOG_PRICE),
-            cache_read: None,
-            cache_write: None,
-        });
-        let models = HashMap::from([
-            (
-                UNLISTED_MODEL.into(),
-                CatalogModel {
-                    limit: Some(CatalogLimits {
-                        context: Some(UNLISTED_CONTEXT),
-                        input: None,
-                        output: Some(UNLISTED_OUTPUT),
-                    }),
-                    cost: Some(CatalogCost {
-                        input: Some(UNLISTED_INPUT_PRICE),
-                        output: Some(UNLISTED_OUTPUT_PRICE),
-                        cache_read: Some(UNLISTED_CACHE_READ),
-                        cache_write: None,
-                    }),
-                    attachment: true,
-                    reasoning: false,
-                    ..Default::default()
-                },
-            ),
-            (
-                deepseek::models()[0].prefixes[0].into(),
-                CatalogModel {
-                    cost: stale_cost,
-                    ..Default::default()
-                },
-            ),
-        ]);
+    /// The catalog only outranks a relative where it has something to say.
+    /// Every field it leaves out keeps falling through, first to the relative
+    /// and then to the manifest, or reading models.dev would cost a model the
+    /// metadata it already had.
+    #[test]
+    fn fields_the_catalog_omits_fall_through() {
+        let (_tmp, state_dir) = temp_state_dir();
+        super::seed_catalog_for_tests(builtin_catalog(), state_dir);
+        let curated = &deepseek::models()[0];
+        let manifest = ManifestRegistry::for_slug(BUILTIN_SLUG).unwrap();
+
+        let quiet = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", quiet_sibling_model())).unwrap();
+        assert_eq!(
+            quiet.pricing.input, UNLISTED_INPUT_PRICE,
+            "the catalog priced it, so it has to be the one answering below"
+        );
+        assert_eq!(quiet.context_window, curated.context_window);
+        assert_eq!(quiet.max_output_tokens, curated.max_output_tokens);
+        assert_eq!(quiet.supports_vision(), curated.vision);
+        assert_eq!(quiet.supports_thinking(), manifest.supports_thinking);
+    }
+
+    /// models.dev leaves `limit` off plenty of entries, and a builtin manifest
+    /// carries a real number for its provider (DeepSeek serves 1M context)
+    /// against the 128k/64k the catalog guesses for everyone else. An
+    /// unpublished limit must not read as a published one, or every gap in the
+    /// catalog silently shrinks the window we paid for.
+    #[test]
+    fn a_limit_the_catalog_omits_falls_through_to_the_manifest() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let index = single_provider_catalog(
+            BUILTIN_SLUG,
+            "@ai-sdk/openai-compatible",
+            Some("https://api.deepseek.com"),
+        );
+        super::seed_catalog_for_tests(index, state_dir);
+
+        let manifest = ManifestRegistry::for_slug(BUILTIN_SLUG).unwrap();
+        let model = Model::from_spec(&format!("{BUILTIN_SLUG}/{UNLISTED_MODEL}")).unwrap();
+
+        assert_eq!(
+            model.pricing.input, UNLISTED_INPUT_PRICE,
+            "the catalog entry has to be the one answering, or the limits below prove nothing"
+        );
+        assert_eq!(model.context_window, manifest.fallback_context_window);
+        assert_eq!(model.max_output_tokens, manifest.fallback_max_output);
+    }
+
+    /// Every builtin the catalog covers reaches its metadata, whichever SDK it
+    /// publishes, whether it lists a base URL at all, and whatever id it goes by
+    /// there. None of them may reach the provider map: they have a client of
+    /// their own, so a second entry would show up twice in the login pickers.
+    #[test_case("anthropic", "anthropic", "@ai-sdk/anthropic", None; "sdk we speak but no base url")]
+    #[test_case("deepseek", "deepseek", "@ai-sdk/openai-compatible", Some("https://api.deepseek.com"); "everything it takes to be servable")]
+    #[test_case("openai", "openai", "@ai-sdk/openai", Some("https://api.openai.com/v1"); "sdk we do not speak")]
+    #[test_case("google", "google", "@ai-sdk/google", None; "sdk we do not speak and no base url")]
+    #[test_case("openrouter", "openrouter", "@openrouter/ai-sdk-provider", Some("https://openrouter.ai/api/v1"); "vendor sdk")]
+    #[test_case("zai", "zai", "@ai-sdk/openai-compatible", Some("https://api.z.ai/api/paas/v4"); "pay as you go rates")]
+    #[test_case("github-copilot", "copilot", "@ai-sdk/openai-compatible", Some("https://api.githubcopilot.com"); "renamed")]
+    #[test_case("regolo-ai", "regolo", "@ai-sdk/openai-compatible", Some("https://api.regolo.ai/v1"); "renamed too")]
+    fn builtins_keep_their_catalog_metadata(
+        catalog_id: &str,
+        slug: &str,
+        npm: &str,
+        api: Option<&str>,
+    ) {
+        let (_tmp, state_dir) = temp_state_dir();
+        let data =
+            CatalogData::from_index(single_provider_catalog(catalog_id, npm, api), &state_dir);
+
+        assert!(data.model_meta(slug, UNLISTED_MODEL).is_some());
+        assert!(data.provider(slug).is_none());
+        assert!(data.provider(catalog_id).is_none());
+    }
+
+    /// Its models are covered by the pay as you go `zai` entry, and are priced
+    /// at zero here because the plan already paid for them.
+    #[test]
+    fn plan_priced_provider_is_dropped_entirely() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let index = single_provider_catalog(
+            ZAI_PLAN_ID,
+            "@ai-sdk/openai-compatible",
+            Some("https://api.z.ai/api/coding/paas/v4"),
+        );
+        let data = CatalogData::from_index(index, &state_dir);
+
+        assert!(data.provider(ZAI_PLAN_ID).is_none());
+        assert!(data.model_meta(ZAI_PLAN_ID, UNLISTED_MODEL).is_none());
+        assert!(data.model_meta("zai", UNLISTED_MODEL).is_none());
+    }
+
+    /// A renamed builtin only reaches its metadata while both halves hold: the
+    /// slug is one we ship, and the catalog id is not (or the alias is dead
+    /// weight, since the plain path would already have matched).
+    #[test]
+    fn renamed_builtins_map_a_foreign_id_onto_a_slug_we_ship() {
+        for (catalog_id, slug) in super::BUILTIN_CATALOG_IDS {
+            assert!(super::builtin_provider(slug).is_some(), "{slug}");
+            assert!(
+                super::builtin_provider(catalog_id).is_none(),
+                "{catalog_id}"
+            );
+        }
+    }
+
+    /// Rates, limits and both capability flags, the shape of a fully
+    /// documented models.dev row.
+    fn documented_row(vision: bool) -> CatalogModel {
+        CatalogModel {
+            limit: Some(CatalogLimits {
+                context: Some(UNLISTED_CONTEXT),
+                input: None,
+                output: Some(UNLISTED_OUTPUT),
+            }),
+            cost: Some(CatalogCost {
+                input: Some(UNLISTED_INPUT_PRICE),
+                output: Some(UNLISTED_OUTPUT_PRICE),
+                cache_read: Some(UNLISTED_CACHE_READ),
+                cache_write: None,
+            }),
+            attachment: Some(vision),
+            reasoning: Some(false),
+            ..Default::default()
+        }
+    }
+
+    /// A price and nothing else, the shape models.dev really ships for a chunk
+    /// of its catalog, so a test can tell "the catalog answered" apart from
+    /// "the catalog had nothing to say about this field".
+    fn priced_row(input: f64, output: f64) -> CatalogModel {
+        CatalogModel {
+            cost: Some(CatalogCost {
+                input: Some(input),
+                output: Some(output),
+                cache_read: None,
+                cache_write: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn catalog_index(
+        catalog_id: &str,
+        npm: &str,
+        api: Option<&str>,
+        models: HashMap<String, CatalogModel>,
+    ) -> CatalogIndex {
         HashMap::from([(
-            BUILTIN_SLUG.into(),
+            catalog_id.into(),
             CatalogProvider {
-                name: "DeepSeek".into(),
-                env: vec!["DEEPSEEK_API_KEY".into()],
-                npm: "@ai-sdk/openai-compatible".into(),
-                api: Some("https://api.deepseek.com".into()),
+                name: catalog_id.into(),
+                env: Vec::new(),
+                npm: npm.into(),
+                api: api.map(Into::into),
                 models,
             },
         )])
+    }
+
+    fn single_provider_catalog(catalog_id: &str, npm: &str, api: Option<&str>) -> CatalogIndex {
+        let models = HashMap::from([(
+            UNLISTED_MODEL.into(),
+            priced_row(UNLISTED_INPUT_PRICE, UNLISTED_OUTPUT_PRICE),
+        )]);
+        catalog_index(catalog_id, npm, api, models)
+    }
+
+    fn curated_flash() -> &'static str {
+        deepseek::models()[0].prefixes[0]
+    }
+
+    fn sibling_model() -> String {
+        format!("{}{SIBLING_SUFFIX}", curated_flash())
+    }
+
+    fn quiet_sibling_model() -> String {
+        format!("{}{QUIET_SIBLING_SUFFIX}", curated_flash())
+    }
+
+    /// One row per rung of the order: a model the table misses, the curated id,
+    /// its dated snapshot, a relative, and a relative the catalog only prices.
+    fn builtin_catalog() -> CatalogIndex {
+        let stale = || priced_row(STALE_CATALOG_PRICE, STALE_CATALOG_PRICE);
+        let models = HashMap::from([
+            (UNLISTED_MODEL.into(), documented_row(true)),
+            (curated_flash().into(), stale()),
+            (format!("{}{SNAPSHOT_SUFFIX}", curated_flash()), stale()),
+            (sibling_model(), documented_row(false)),
+            (
+                quiet_sibling_model(),
+                priced_row(UNLISTED_INPUT_PRICE, UNLISTED_OUTPUT_PRICE),
+            ),
+        ]);
+        catalog_index(
+            BUILTIN_SLUG,
+            "@ai-sdk/openai-compatible",
+            Some("https://api.deepseek.com"),
+            models,
+        )
     }
 
     #[test]
@@ -1733,7 +1925,7 @@ mod tests {
         let models = HashMap::from([(
             "omen-alpha".into(),
             CatalogModel {
-                attachment: true,
+                attachment: Some(true),
                 ..Default::default()
             },
         )]);
@@ -2376,8 +2568,8 @@ mod tests {
 
         let (meta, provider_data) = data.lookup("opencode", "gpt-5.1-codex-mini").unwrap();
         assert_eq!(provider_data.slug, "opencode");
-        assert_eq!(meta.context, 128_000);
-        assert_eq!(meta.output, 16_384);
+        assert_eq!(meta.context_window(), 128_000);
+        assert_eq!(meta.max_output(), 16_384);
     }
 
     #[test]
@@ -2465,10 +2657,10 @@ pub(crate) mod schema {
         pub cost: Option<CatalogCost>,
         #[serde(default)]
         pub provider: Option<CatalogShape>,
-        #[serde(default)]
-        pub attachment: bool,
-        #[serde(default)]
-        pub reasoning: bool,
+        /// `None` where the row omits the flag, so a builtin keeps its manifest
+        /// default instead of reading an absent field as a published "no".
+        pub attachment: Option<bool>,
+        pub reasoning: Option<bool>,
         #[serde(default)]
         pub modalities: Option<CatalogModalities>,
     }
