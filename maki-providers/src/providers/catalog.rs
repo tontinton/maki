@@ -303,6 +303,11 @@ pub enum Authentication {
 
 pub(crate) struct CatalogData {
     providers: HashMap<String, ProviderData>,
+    /// Kept aside for providers that ship a built-in client, since listing them
+    /// in `providers` would show them twice in the login pickers. The catalog is
+    /// still the only source that keeps up with what they release, so a model
+    /// missing from our static tables can read its rates and limits here.
+    builtin_models: HashMap<String, HashMap<String, CatalogMeta>>,
     pub(crate) state_dir: StateDir,
 }
 
@@ -310,12 +315,14 @@ impl CatalogData {
     fn empty(state_dir: StateDir) -> Self {
         Self {
             providers: HashMap::new(),
+            builtin_models: HashMap::new(),
             state_dir,
         }
     }
 
     fn from_index(index: schema::CatalogIndex, state_dir: &StateDir) -> Self {
         let mut providers = HashMap::new();
+        let mut builtin_models = HashMap::new();
 
         for (provider_id, provider) in index {
             if !ALLOWED_NPM.contains(&provider.npm.as_str()) {
@@ -334,16 +341,6 @@ impl CatalogData {
                 debug!(provider = %provider_id, "skipping: no API URL in catalog");
                 continue;
             };
-
-            if builtin_provider(&provider_id).is_some()
-                && !CATALOG_BACKED_BUILTINS.contains(&provider_id.as_str())
-            {
-                debug!(
-                    provider = &provider_id,
-                    "skipping providers supported by built-in providers"
-                );
-                continue;
-            }
 
             let api_format = determine_catalog_format(&provider.npm);
 
@@ -405,6 +402,19 @@ impl CatalogData {
             }
 
             let model_count = models.len();
+
+            if builtin_provider(&provider_id).is_some()
+                && !CATALOG_BACKED_BUILTINS.contains(&provider_id.as_str())
+            {
+                debug!(
+                    provider = %provider_id,
+                    models = model_count,
+                    "built-in provider: keeping catalog metadata only"
+                );
+                builtin_models.insert(provider_id, models);
+                continue;
+            }
+
             let provider_data =
                 ProviderData::new(provider_id.clone(), &provider, api_format, models);
             providers.insert(provider_id.clone(), provider_data);
@@ -419,12 +429,20 @@ impl CatalogData {
 
         Self {
             providers,
+            builtin_models,
             state_dir: state_dir.clone(),
         }
     }
 
     pub(crate) fn provider(&self, slug: &str) -> Option<&ProviderData> {
         self.providers.get(slug)
+    }
+
+    fn model_meta(&self, slug: &str, model_id: &str) -> Option<&CatalogMeta> {
+        self.providers
+            .get(slug)
+            .and_then(|data| data.models.get(model_id))
+            .or_else(|| self.builtin_models.get(slug)?.get(model_id))
     }
 
     pub(crate) fn lookup(
@@ -954,23 +972,12 @@ pub fn try_create(slug: &str, timeouts: Timeouts) -> Option<Result<Box<dyn Provi
 }
 
 /// Look up a single model's metadata in the models.dev catalog, only if the
-/// catalog has already been downloaded. Never triggers a fetch — callers
+/// catalog has already been downloaded. Never triggers a fetch, so callers
 /// (e.g. `Model::from_spec`) must tolerate `None` and fall through, since
 /// the catalog may still be warming in the background.
-pub fn model_meta_if_available(slug: &str, model_id: &str) -> Option<CatalogMetaView> {
-    with_provider_if_available(slug, |data| {
-        data.models.get(model_id).map(|meta| CatalogMetaView {
-            context: meta.context,
-            output: meta.output,
-            input_price: meta.input_price,
-            output_price: meta.output_price,
-            cache_read: meta.cache_read,
-            cache_write: meta.cache_write,
-            supports_thinking: meta.supports_thinking,
-            supports_vision: meta.supports_vision,
-        })
-    })
-    .flatten()
+pub(crate) fn model_meta_if_available(slug: &str, model_id: &str) -> Option<CatalogMeta> {
+    let guard = SHARED_CATALOG.get()?.lock().ok()?;
+    guard.model_meta(slug, model_id).cloned()
 }
 
 /// True when the model belongs to a provider with a [`FreeTier`] and is free
@@ -981,21 +988,6 @@ pub(crate) fn free_model_if_available(slug: &str, model_id: &str) -> bool {
         data.quirks.free_tier.is_some() && data.models.get(model_id).is_some_and(is_free_model)
     })
     .unwrap_or(false)
-}
-
-/// Metadata shape `Model::from_spec` consumes when a spec resolves to a catalog
-/// sub-provider. Public so `maki-providers/src/model.rs` can name it without
-/// depending on the catalog-internal `CatalogMeta` struct.
-#[derive(Debug, Clone, Copy)]
-pub struct CatalogMetaView {
-    pub context: u32,
-    pub output: u32,
-    pub input_price: f64,
-    pub output_price: f64,
-    pub cache_read: f64,
-    pub cache_write: f64,
-    pub supports_thinking: bool,
-    pub supports_vision: bool,
 }
 
 #[cfg(test)]
@@ -1011,12 +1003,23 @@ mod tests {
     };
     use crate::model::{Model, ModelInfo, ModelPricing};
     use crate::provider::Provider;
-    use crate::providers::{ResolvedAuth, Timeouts, opencode};
+    use crate::providers::{ResolvedAuth, Timeouts, deepseek, opencode};
     use crate::{AgentError, ModelFamily, ModelTier, RequestOptions};
     use test_case::test_case;
 
     const SESSION_HEADER: &str = "x-opencode-session";
     const OPT_IN_HINT: &str = "providers.opencode.enable_free_models = true";
+    /// A builtin with a static model table, so it is never a catalog provider.
+    const BUILTIN_SLUG: &str = "deepseek";
+    /// Stands in for a model released after our tables were written.
+    const UNLISTED_MODEL: &str = "deepseek-v9-turbo";
+    const UNLISTED_INPUT_PRICE: f64 = 1.5;
+    const UNLISTED_OUTPUT_PRICE: f64 = 4.5;
+    const UNLISTED_CACHE_READ: f64 = 0.15;
+    const UNLISTED_CONTEXT: u32 = 512_000;
+    const UNLISTED_OUTPUT: u32 = 96_000;
+    /// Nothing like any real rate, so whichever source a model read is obvious.
+    const STALE_CATALOG_PRICE: f64 = 99.0;
 
     #[test]
     fn new_rejects_no_auth() {
@@ -1626,6 +1629,90 @@ mod tests {
 
         let model = super::Model::from_spec(&format!("opencode-go/{model_id}")).unwrap();
         assert_eq!(model.supports_vision(), expected);
+    }
+
+    /// models.dev lists every model a provider ships, so it can answer for the
+    /// ones our table has never seen. Builtins are kept out of the catalog's
+    /// provider map (they have a client of their own), and that must not cost
+    /// them the metadata. Curated entries are checked against the provider's
+    /// pricing page, so they still beat a catalog that may be stale.
+    #[test]
+    fn catalog_answers_only_for_models_the_static_table_misses() {
+        let (_tmp, state_dir) = temp_state_dir();
+        super::seed_catalog_for_tests(builtin_catalog(), state_dir);
+
+        let unlisted = Model::from_spec(&format!("{BUILTIN_SLUG}/{UNLISTED_MODEL}")).unwrap();
+        assert_eq!(unlisted.pricing.input, UNLISTED_INPUT_PRICE);
+        assert_eq!(unlisted.pricing.output, UNLISTED_OUTPUT_PRICE);
+        assert_eq!(unlisted.pricing.cache_read, UNLISTED_CACHE_READ);
+        assert_eq!(unlisted.context_window, UNLISTED_CONTEXT);
+        assert_eq!(unlisted.max_output_tokens, Some(UNLISTED_OUTPUT));
+        assert!(unlisted.supports_vision());
+        assert!(
+            !unlisted.supports_thinking(),
+            "the manifest default is true, so only the catalog can say no"
+        );
+
+        let curated = &deepseek::models()[0];
+        let listed = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", curated.prefixes[0])).unwrap();
+        assert_eq!(listed.pricing.input, curated.pricing.input);
+        assert_eq!(listed.context_window, curated.context_window);
+    }
+
+    #[test]
+    fn builtin_keeps_its_metadata_without_becoming_a_catalog_provider() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let data = CatalogData::from_index(builtin_catalog(), &state_dir);
+
+        assert!(data.provider(BUILTIN_SLUG).is_none());
+        assert!(data.model_meta(BUILTIN_SLUG, UNLISTED_MODEL).is_some());
+    }
+
+    fn builtin_catalog() -> CatalogIndex {
+        let stale_cost = Some(CatalogCost {
+            input: Some(STALE_CATALOG_PRICE),
+            output: Some(STALE_CATALOG_PRICE),
+            cache_read: None,
+            cache_write: None,
+        });
+        let models = HashMap::from([
+            (
+                UNLISTED_MODEL.into(),
+                CatalogModel {
+                    limit: Some(CatalogLimits {
+                        context: Some(UNLISTED_CONTEXT),
+                        input: None,
+                        output: Some(UNLISTED_OUTPUT),
+                    }),
+                    cost: Some(CatalogCost {
+                        input: Some(UNLISTED_INPUT_PRICE),
+                        output: Some(UNLISTED_OUTPUT_PRICE),
+                        cache_read: Some(UNLISTED_CACHE_READ),
+                        cache_write: None,
+                    }),
+                    attachment: true,
+                    reasoning: false,
+                    ..Default::default()
+                },
+            ),
+            (
+                deepseek::models()[0].prefixes[0].into(),
+                CatalogModel {
+                    cost: stale_cost,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        HashMap::from([(
+            BUILTIN_SLUG.into(),
+            CatalogProvider {
+                name: "DeepSeek".into(),
+                env: vec!["DEEPSEEK_API_KEY".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://api.deepseek.com".into()),
+                models,
+            },
+        )])
     }
 
     #[test]

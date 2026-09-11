@@ -18,7 +18,7 @@ use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
 
 const PAD: &str = "";
-const V4_MARKER: &str = "deepseek-v4";
+const REASONER_ID: &str = "deepseek-reasoner";
 const BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
@@ -36,7 +36,7 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
     protocol: maki_config::providers::Protocol::Openai,
     default_base_url: "https://api.deepseek.com",
     default_api_key_env: "DEEPSEEK_API_KEY",
-    default_model: "deepseek/deepseek-v4-flash",
+    default_model: "deepseek/deepseek-flash",
     plans: None,
     login_url: Some("https://platform.deepseek.com/api_keys"),
     needs_url: false,
@@ -53,17 +53,19 @@ const PEAK_MULTIPLIER: f64 = 2.0;
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     &[
+        // `deepseek-flash` is V4.1 Flash. `deepseek-v4-flash` is the retired
+        // name the API still accepts, served by V4.1 Flash at its rates.
         ModelEntry {
-            prefixes: &["deepseek-v4-flash"],
+            prefixes: &["deepseek-flash", "deepseek-v4-flash"],
             tier: ModelTier::Medium,
             family: ModelFamily::Generic,
-            vision: false,
+            vision: true,
             default: true,
             pricing: ModelPricing {
-                input: 0.22,
-                output: 0.66,
+                input: 0.15,
+                output: 0.60,
                 cache_write: 0.00,
-                cache_read: 0.007,
+                cache_read: 0.003,
                 fast: None,
             },
             max_output_tokens: Some(384_000),
@@ -234,15 +236,26 @@ impl Provider for DeepSeek {
     }
 }
 
-/// DeepSeek's two reasoning models disagree about `reasoning_content`: V4 in
-/// thinking mode wants it on every assistant turn (missing = 400), R1 refuses
-/// it as input. So we gate on the V4 substring, same trick Vercel's AI SDK
-/// uses, and back-fill the turns that have none (plain replies, tool-only
-/// turns). The API only checks the field exists, so `""` is enough.
+/// Whether a model speaks the thinking protocol DeepSeek introduced with V4:
+/// an explicit toggle, and `reasoning_content` echoed back on input. Only
+/// `deepseek-reasoner` (R1) sits outside it, reasoning unconditionally and
+/// refusing the field as input, so we name that one id rather than match a
+/// version marker the next rename would break. Providers that resell DeepSeek
+/// share the gate, after stripping their vendor prefix.
 ///
 /// Ref: <https://api-docs.deepseek.com/guides/thinking_mode>
+pub(crate) fn uses_v4_thinking_protocol(model_id: &str) -> bool {
+    !model_id.starts_with(REASONER_ID)
+}
+
+/// V4 and later want `reasoning_content` on every assistant turn of a request
+/// carrying `tools` (missing = 400), so we back-fill the turns that have none:
+/// plain replies and tool-only turns. The API only checks the field exists, so
+/// `""` is enough. Requests without tools are left alone, since nothing asks
+/// for the field there and this runs for any id a DeepSeek-based custom
+/// provider is pointed at.
 fn pad_reasoning_content(model_id: &str, body: &mut Value) {
-    if !model_id.contains(V4_MARKER) {
+    if !uses_v4_thinking_protocol(model_id) || body.get("tools").is_none() {
         return;
     }
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
@@ -266,9 +279,10 @@ mod tests {
     use super::*;
     use crate::manifest::ManifestRegistry;
     use serde_json::json;
+    use test_case::test_case;
 
-    const V4: &str = "deepseek-v4-pro";
-    const R1: &str = "deepseek-reasoner";
+    /// No version marker in the id, which is what the old substring gate missed.
+    const FLASH: &str = "deepseek-flash";
     /// The hours, days and surcharge as the pricing page states them.
     const PUBLISHED_PEAK_HOURS: &str = "2x during 01:00-04:00, 06:00-10:00 UTC, Mon-Fri";
 
@@ -286,16 +300,23 @@ mod tests {
         assert_eq!(PEAK_HOURS.to_string(), PUBLISHED_PEAK_HOURS);
     }
 
+    fn tool_call_body() -> Value {
+        json!({
+            "tools": [{"type": "function", "function": {"name": "read"}}],
+            "messages": [
+                {"role": "system",    "content": "sys"},
+                {"role": "user",      "content": "hi"},
+                {"role": "assistant", "content": "ok", "reasoning_content": "kept"},
+                {"role": "assistant", "content": "",   "tool_calls": [{"id": "c1"}]},
+                {"role": "tool",      "tool_call_id": "c1", "content": "out"},
+            ],
+        })
+    }
+
     #[test]
-    fn v4_pads_only_assistant_turns_without_reasoning() {
-        let mut body = json!({"messages": [
-            {"role": "system",    "content": "sys"},
-            {"role": "user",      "content": "hi"},
-            {"role": "assistant", "content": "ok", "reasoning_content": "kept"},
-            {"role": "assistant", "content": "",   "tool_calls": [{"id": "c1"}]},
-            {"role": "tool",      "tool_call_id": "c1", "content": "out"},
-        ]});
-        pad_reasoning_content(V4, &mut body);
+    fn pads_only_assistant_turns_without_reasoning() {
+        let mut body = tool_call_body();
+        pad_reasoning_content(FLASH, &mut body);
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[2]["reasoning_content"], "kept");
         assert_eq!(msgs[3]["reasoning_content"], PAD);
@@ -304,14 +325,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn non_v4_model_is_untouched() {
-        let input = json!({"messages": [
-            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
-            {"role": "assistant", "content": "hi"},
-        ]});
+    /// Padding exists for one 400, raised on requests that carry `tools`, by
+    /// models that echo the field. Everything else has to come back byte for
+    /// byte, and the tool-less case matters because the gate now lets through
+    /// any id a DeepSeek-based custom provider is pointed at.
+    #[test_case(REASONER_ID, true; "the one model that refuses the field")]
+    #[test_case(FLASH, false; "a request that never carried tools")]
+    fn bodies_outside_the_workaround_are_untouched(model_id: &str, tools: bool) {
+        let mut input = tool_call_body();
+        if !tools {
+            input.as_object_mut().unwrap().remove("tools");
+        }
         let mut body = input.clone();
-        pad_reasoning_content(R1, &mut body);
+        pad_reasoning_content(model_id, &mut body);
         assert_eq!(body, input);
+    }
+
+    /// The gate the rename broke once already: it has to key off the one id that
+    /// refuses the field, never off a version marker in the others.
+    #[test_case(FLASH, true; "current flash")]
+    #[test_case("deepseek-v9-turbo", true; "a release the table has never seen")]
+    #[test_case(REASONER_ID, false; "the one model that refuses it")]
+    fn only_the_legacy_reasoner_is_outside_the_v4_protocol(model_id: &str, expected: bool) {
+        assert_eq!(uses_v4_thinking_protocol(model_id), expected);
     }
 }

@@ -19,7 +19,7 @@ pub use providers::Timeouts;
 pub use providers::catalog::ProviderData;
 pub use providers::catalog::{
     catalog_provider, catalog_provider_if_available, catalog_providers,
-    catalog_providers_if_available, model_meta_if_available, refresh_catalog, warm_catalog,
+    catalog_providers_if_available, refresh_catalog, warm_catalog,
 };
 pub use providers::copilot::auth as copilot_auth;
 pub use providers::dynamic;

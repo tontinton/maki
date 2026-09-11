@@ -220,10 +220,10 @@ Defaults: glm-5-code (strong), glm-4.7-flash (weak), glm-4.7 (medium)
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
-| Medium | **deepseek-v4-flash** (default) | $0.22 / $0.66 | 1000K ctx / 384K out |
+| Medium | **deepseek-flash, deepseek-v4-flash** (default) | $0.15 / $0.60 | 1000K ctx / 384K out |
 | Strong | **deepseek-v4-pro** (default) | $0.66 / $1.98 | 1000K ctx / 384K out |
 
-Defaults: deepseek-v4-flash (medium), deepseek-v4-pro (strong)
+Defaults: deepseek-flash (medium), deepseek-v4-pro (strong)
 
 ### OpenRouter
 
@@ -335,6 +335,14 @@ zai/glm-4.7
 ```
 
 If the model name is unique across providers, the prefix can be omitted.
+
+### Models newer than your Maki version
+
+The tables above list the models Maki curates. Any other id a provider accepts works too: type it into `/model` or pass it to `--model`. The picker also lists what the provider's own model endpoint reports, so same-day releases are selectable there.
+
+Rates, context window, vision and thinking support for a model missing from the tables come from [models.dev](https://models.dev/), refreshed daily (`maki models --refresh` forces it). Curated entries win where they exist, because they are checked against each provider's pricing page. A model neither source knows still runs, with the provider's default limits and no cost estimate.
+
+New models start at the **medium** tier until you assign one in the picker.
 
 ## providers.toml
 

@@ -125,7 +125,7 @@ Run `maki acp` or configure your ACP supporting editor to use maki, e.g. in [Zed
 "agent_servers": {
   "Maki": {
     "default_config_options": {
-      "model": "deepseek/deepseek-v4-flash"
+      "model": "deepseek/deepseek-flash"
     },
     "type": "custom",
     "command": "maki",

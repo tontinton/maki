@@ -21,7 +21,7 @@ Add Maki as a custom agent in Zed's `settings.json`:
 "agent_servers": {
   "Maki": {
     "default_config_options": {
-      "model": "deepseek/deepseek-v4-flash"
+      "model": "deepseek/deepseek-flash"
     },
     "type": "custom",
     "command": "maki",

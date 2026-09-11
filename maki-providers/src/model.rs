@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model_registry;
+use crate::providers::catalog::{self, CatalogMeta};
 use crate::providers::{anthropic, custom, dynamic};
 use crate::types::ThinkingFields;
 
@@ -123,6 +124,18 @@ impl ModelPricing {
     }
 }
 
+impl From<&CatalogMeta> for ModelPricing {
+    fn from(meta: &CatalogMeta) -> Self {
+        Self {
+            input: meta.input_price,
+            output: meta.output_price,
+            cache_write: meta.cache_write,
+            cache_read: meta.cache_read,
+            fast: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFamily {
     Claude,
@@ -205,6 +218,16 @@ pub(crate) fn lookup_entry<'a>(
         .ok_or_else(|| ModelError::UnknownModel(model_id.to_string()))
 }
 
+/// How a release newer than our static tables still gets real rates, limits and
+/// capabilities instead of provider-wide defaults. Curated entries win, and the
+/// catalog is read only when already warm, so this is `None` on a cold start.
+fn catalog_meta_for_unlisted(manifest: &ProviderManifest, model_id: &str) -> Option<CatalogMeta> {
+    if lookup_entry(manifest.models, model_id).is_ok() {
+        return None;
+    }
+    catalog::model_meta_if_available(manifest.slug, model_id)
+}
+
 impl ModelFamily {
     pub fn supports_tool_examples(self) -> bool {
         match self {
@@ -268,7 +291,8 @@ pub struct Model {
 
 impl Model {
     /// When no static entry matches (a freshly released model the table has not
-    /// caught up to yet), fall back to the provider defaults so it still resolves.
+    /// caught up to yet), rates and limits come from the models.dev catalog and
+    /// then from the provider defaults, so the spec resolves either way.
     fn from_base(manifest: &ProviderManifest, slug: &str, model_id: &str) -> Self {
         let static_entry = lookup_entry(manifest.models, model_id).ok();
         let spec = format!("{slug}/{model_id}");
@@ -276,21 +300,25 @@ impl Model {
         // custom slug reads positional tiers and metadata through its base.
         let discovered = model_registry::discovered(manifest.slug, model_id);
         let discovered = discovered.as_ref();
+        let catalog = catalog_meta_for_unlisted(manifest, model_id);
         let tier = model_registry::tier_for(&spec, manifest.slug, static_entry.map(|e| e.tier));
         let family = static_entry.map_or(manifest.family, |entry| entry.family);
         let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
         let pricing = discovered_pricing
             .or_else(|| static_entry.map(|entry| &entry.pricing))
             .cloned()
+            .or_else(|| catalog.as_ref().map(ModelPricing::from))
             .unwrap_or_default();
         let max_output_tokens = discovered
             .and_then(|info| info.max_output_tokens)
             .or_else(|| static_entry.and_then(|entry| entry.max_output_tokens))
+            .or_else(|| catalog.as_ref().map(|meta| meta.output))
             .or(manifest.fallback_max_output);
         let context_window = discovered
             .and_then(|info| info.context_window)
             .or_else(|| anthropic::shared::long_context_window(model_id))
             .or_else(|| static_entry.map(|entry| entry.context_window))
+            .or_else(|| catalog.as_ref().map(|meta| meta.context))
             .unwrap_or(manifest.fallback_context_window);
         Self {
             id: model_id.to_string(),
@@ -313,11 +341,7 @@ impl Model {
     /// builtin; metadata is read once from the models.dev catalog and cached on
     /// the `Model` so `supports_thinking`/`supports_vision` do not need a live
     /// catalog lookup.
-    fn from_catalog(
-        slug: &str,
-        model_id: &str,
-        meta: crate::providers::catalog::CatalogMetaView,
-    ) -> Self {
+    fn from_catalog(slug: &str, model_id: &str, meta: CatalogMeta) -> Self {
         Self {
             id: model_id.to_string(),
             provider: Arc::from(slug),
@@ -326,13 +350,7 @@ impl Model {
             supports_tool_examples_override: None,
             thinking_override: ThinkingSupport::from_flags(Some(meta.supports_thinking), false),
             supports_vision_override: Some(meta.supports_vision),
-            pricing: ModelPricing {
-                input: meta.input_price,
-                output: meta.output_price,
-                cache_write: meta.cache_write,
-                cache_read: meta.cache_read,
-                fast: None,
-            },
+            pricing: ModelPricing::from(&meta),
             discovered_free: false,
             max_output_tokens: Some(meta.output),
             context_window: meta.context,
@@ -351,6 +369,9 @@ impl Model {
         };
         model_registry::discovered(manifest.slug, &self.id)
             .and_then(|d| d.supports_thinking)
+            .or_else(|| {
+                catalog_meta_for_unlisted(manifest, &self.id).map(|meta| meta.supports_thinking)
+            })
             .unwrap_or(manifest.supports_thinking)
     }
 
@@ -362,26 +383,23 @@ impl Model {
     /// 1. per-model override
     /// 2. discovery
     /// 3. manifest entry
-    /// 4. warm models.dev metadata (builtins skip the catalog in from_spec)
+    /// 4. warm models.dev metadata for a model no manifest entry claims
     /// 5. the family default
     pub fn supports_vision(&self) -> bool {
         if let Some(vision) = self.supports_vision_override {
             return vision;
         }
-        let manifest = ManifestRegistry::for_slug(&self.provider);
-        manifest
-            .and_then(|m| {
-                model_registry::discovered(m.slug, &self.id).and_then(|d| d.supports_vision)
-            })
+        let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
+            return self.family.supports_vision();
+        };
+        model_registry::discovered(manifest.slug, &self.id)
+            .and_then(|d| d.supports_vision)
             .or_else(|| {
-                manifest
-                    .and_then(|m| lookup_entry(m.models, &self.id).ok())
+                lookup_entry(manifest.models, &self.id)
+                    .ok()
                     .map(|e| e.vision)
             })
-            .or_else(|| {
-                crate::providers::catalog::model_meta_if_available(&self.provider, &self.id)
-                    .map(|meta| meta.supports_vision)
-            })
+            .or_else(|| catalog_meta_for_unlisted(manifest, &self.id).map(|m| m.supports_vision))
             .unwrap_or_else(|| self.family.supports_vision())
     }
 
@@ -551,7 +569,7 @@ impl Model {
             return Ok(model);
         }
 
-        if let Some(meta) = crate::providers::catalog::model_meta_if_available(slug, model_id) {
+        if let Some(meta) = catalog::model_meta_if_available(slug, model_id) {
             return Ok(Self::from_catalog(slug, model_id, meta));
         }
 
@@ -567,8 +585,7 @@ impl Model {
     /// reflect catalog prices when discovery hasn't seeded the registry, and
     /// which reads zero for "price unknown" too.
     pub fn is_free(&self) -> bool {
-        self.discovered_free
-            || crate::providers::catalog::free_model_if_available(&self.provider, &self.id)
+        self.discovered_free || catalog::free_model_if_available(&self.provider, &self.id)
     }
 }
 
