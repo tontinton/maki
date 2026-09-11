@@ -93,6 +93,7 @@ pub(crate) struct LuaCtx {
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Caps {
     Handler {
         agent: Box<AgentContext>,
@@ -169,6 +170,15 @@ impl LuaCtx {
             task_id: ctx.task_id,
             finish_tx: None,
         }
+    }
+
+    /// Sandbox is active only for tool handlers whose context carries the
+    /// live agent config; start and restore caps have none.
+    pub(crate) fn sandbox_enabled(&self) -> bool {
+        matches!(
+            &self.caps,
+            Caps::Handler { agent, .. } if agent.config.sandbox_enabled
+        )
     }
 
     /// Dispatch capability: only handler ctxs can call `maki.agent.*`.

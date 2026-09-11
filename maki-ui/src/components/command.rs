@@ -141,6 +141,18 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 1,
         bang: true,
     },
+    BuiltinCommand {
+        name: "/sandbox",
+        description: "Open sandbox environment info, file browser, and shell",
+        max_args: 0,
+        bang: false,
+    },
+    BuiltinCommand {
+        name: "/add-dir",
+        description: "Bind-mount a host directory into the sandbox workspace",
+        max_args: 1,
+        bang: false,
+    },
 ];
 
 pub struct ParsedCommand {
@@ -756,6 +768,8 @@ mod tests {
     #[test_case("/cd ~/foo", true   ; "one_arg_cmd_mid_arg")]
     #[test_case("/cd  ~/foo", true  ; "one_arg_cmd_double_space")]
     #[test_case("/cd ~/foo ", false ; "one_arg_cmd_second_space")]
+    #[test_case("/add-dir ", true   ; "add_dir_one_arg")]
+    #[test_case("/add-dir /home/u/src/x", true ; "add_dir_mid_arg")]
     #[test_case("/btw hello world", true ; "btw_stays_active_with_many_args")]
     fn sync_respects_nargs(input: &str, expect_active: bool) {
         let p = synced(input);

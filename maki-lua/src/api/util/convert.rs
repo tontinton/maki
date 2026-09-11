@@ -18,7 +18,7 @@ pub(crate) fn opt_bool(tbl: &Table, key: &str) -> Option<bool> {
     tbl.get::<Option<bool>>(key).ok().flatten()
 }
 
-pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String> {
+pub fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String> {
     let mut iter = values.into_iter();
     match iter.next() {
         Some(Value::String(s)) => Ok(s.to_string_lossy()),
@@ -40,7 +40,7 @@ pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String
 /// serializes as a little tagged struct instead of a plain scalar, so plugins
 /// end up with a Lua table where they asked for a number. We walk the tree
 /// ourselves to keep numbers as numbers.
-pub(crate) fn json_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
+pub fn json_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
     Ok(match value {
         JsonValue::Null => Value::Nil,
         JsonValue::Bool(b) => Value::Boolean(*b),
@@ -72,7 +72,7 @@ pub(crate) fn json_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
 ///
 /// Symmetric counterpart to [`json_to_lua`]. We avoid mlua's `from_value`
 /// for the same `arbitrary_precision` reason documented above.
-pub(crate) fn lua_to_json(lua: &Lua, val: &Value) -> LuaResult<JsonValue> {
+pub fn lua_to_json(lua: &Lua, val: &Value) -> LuaResult<JsonValue> {
     within_template(lua, val, None)
 }
 

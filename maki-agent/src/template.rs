@@ -14,7 +14,7 @@ pub fn env_vars() -> Vars {
         .set("{date}", date)
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Vars(Vec<(&'static str, String)>);
 
 impl Vars {

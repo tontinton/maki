@@ -1,0 +1,29 @@
+[package]
+name = "maki-tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["sandbox"]
+sandbox = []
+
+[dependencies]
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+futures-lite = { workspace = true }
+include_dir = { workspace = true }
+maki-agent = { workspace = true }
+maki-interpreter = { workspace = true }
+maki-lua = { workspace = true }
+maki-sandbox = { workspace = true }
+mlua = { workspace = true }
+smol = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
