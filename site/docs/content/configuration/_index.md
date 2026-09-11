@@ -165,6 +165,21 @@ maki.setup({
 
 An entry with no port covers every port. A name you list is allowed whatever it resolves to. A name you did not list stays blocked when DNS lands it on a private address, unless that address falls in a range you allowed, so keep ranges as small as the service needs. Every redirect hop is checked against the same list. [Permissions](/docs/permissions/#network-addresses) covers what the guard protects.
 
+### `trust`
+
+Answers the folder trust question in advance. Read from the global `~/.config/maki/init.lua` only, since a project file that could set it would be trusting itself:
+
+```lua
+maki.setup({
+    trust = {
+        paths = { "~/src/me/*", "/workspace" },
+        prompt = false,
+    },
+})
+```
+
+`paths` is a list of globs matched against the project root, empty by default. `prompt` is a bool, `true` by default. Setting it to `false` drops the startup card and leaves the folder restricted unless a `paths` entry matches. [Folder Trust](/docs/folder-trust/#trust-policy) covers glob syntax and which run modes apply the policy.
+
 ### `telemetry`
 
 | Field | Type | Default | Env | Description |

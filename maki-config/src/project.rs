@@ -66,10 +66,10 @@ impl GatedFile {
     pub const fn describes(self) -> &'static str {
         match self {
             GatedFile::Env => {
-                "sets environment variables, including secrets, for maki and every process it starts"
+                "sets environment variables, including secrets, for Maki and every process it starts"
             }
             GatedFile::Permissions => "decides which tools run without asking",
-            GatedFile::InitLua => "runs Lua inside maki's own process at startup",
+            GatedFile::InitLua => "runs Lua inside Maki's own process at startup",
             GatedFile::Mcp => "starts MCP servers as child processes",
         }
     }

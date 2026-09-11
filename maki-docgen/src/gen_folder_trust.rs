@@ -1,4 +1,10 @@
-+++
+//! Ordinary prose, split into pieces around the two parts that are filled in.
+
+use std::fmt::Write;
+
+use maki_config::GatedFile;
+
+const INTRO: &str = r#"+++
 title = "Folder Trust"
 weight = 7
 [extra]
@@ -8,16 +14,9 @@ group = "Reference"
 # Folder Trust
 
 A project `.maki` directory can run code on your machine before you type
-anything. Maki loads none of it until you trust the folder.
+anything. Maki loads none of it until you trust the folder."#;
 
-| Gated file | What it can do |
-|------------|----------------|
-| `.maki/.env` | sets environment variables, including secrets, for Maki and every process it starts |
-| `.maki/permissions.toml` | decides which tools run without asking |
-| `.maki/init.lua` | runs Lua inside Maki's own process at startup |
-| `.maki/mcp.toml` | starts MCP servers as child processes |
-
-The first interactive start in an untrusted project draws a card before the
+const BODY: &str = r#"The first interactive start in an untrusted project draws a card before the
 main UI opens, listing the gated files it found. It takes three answers:
 
 | Answer | Effect |
@@ -84,18 +83,19 @@ project adds while Maki runs is asked about on the next start.
 
 ## Trust Policy
 
-Answer in advance for paths you already trust:
+Answer in advance for paths you already trust:"#;
 
-```lua
+/// The configuration page prints this same block, so the two cannot drift.
+pub const POLICY_EXAMPLE: &str = r#"```lua
 maki.setup({
     trust = {
         paths = { "~/src/me/*", "/workspace" },
         prompt = false,
     },
 })
-```
+```"#;
 
-Maki reads `trust` from the global `~/.config/maki/init.lua` only. A project
+const REST: &str = r#"Maki reads `trust` from the global `~/.config/maki/init.lua` only. A project
 `.maki/init.lua` that sets it has the table stripped and gets a warning, since a
 project shipping one would be granting itself trust.
 
@@ -148,4 +148,20 @@ later adds a kind you were never asked about asks again.
 
 Maki records the file names rather than their contents, so Lua that changes in a
 later pull runs under the answer you already gave. Run `maki trust remove` when
-that stops being what you want.
+that stops being what you want."#;
+
+/// Rows come from the enum the gate itself walks, so a new gated kind cannot
+/// ship undocumented.
+fn gated_table() -> String {
+    let mut table =
+        String::from("| Gated file | What it can do |\n|------------|----------------|");
+    for file in GatedFile::ALL {
+        write!(table, "\n| `{file}` | {} |", file.describes()).unwrap();
+    }
+    table
+}
+
+pub fn generate() -> String {
+    let table = gated_table();
+    format!("{INTRO}\n\n{table}\n\n{BODY}\n\n{POLICY_EXAMPLE}\n\n{REST}\n")
+}

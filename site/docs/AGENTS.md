@@ -28,4 +28,4 @@ Fine when genuine: anaphora in scannable checklists ("No prompt text / No model 
 
 - [Diátaxis](https://diataxis.fr/): guides for goals, reference for lookup, concepts for understanding.
 - One canonical home per topic; link instead of duplicating.
-- Generated pages (tools, providers, configuration, lua-api, plugins, keybindings, commands) come from `maki-docgen`: edit the source, run `just gen-docs`, never edit output by hand.
+- Generated pages (tools, providers, configuration, lua-api, plugins, keybindings, commands, folder-trust) come from `maki-docgen`: edit the source, run `just gen-docs`, never edit output by hand.

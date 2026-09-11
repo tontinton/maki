@@ -1,5 +1,6 @@
 mod gen_commands;
 mod gen_config;
+mod gen_folder_trust;
 mod gen_keybindings;
 mod gen_lua_api;
 mod gen_plugins;
@@ -19,7 +20,7 @@ type Page = (&'static str, fn() -> String);
 /// One entry per generated page. Every generator is a slow, self-contained
 /// string build (it boots a Lua host, walks the tool registry, and so on), so
 /// they each get a thread.
-const PAGES: [Page; 7] = [
+const PAGES: [Page; 8] = [
     ("tools", gen_tools::generate),
     ("plugins", gen_plugins::generate),
     ("providers", gen_providers::generate),
@@ -27,6 +28,7 @@ const PAGES: [Page; 7] = [
     ("lua-api", gen_lua_api::generate),
     ("keybindings", gen_keybindings::generate),
     ("commands", gen_commands::generate),
+    ("folder-trust", gen_folder_trust::generate),
 ];
 
 fn page_path(section: &str) -> PathBuf {

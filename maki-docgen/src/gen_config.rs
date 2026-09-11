@@ -9,6 +9,8 @@ use maki_config::{
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
+use crate::gen_folder_trust::POLICY_EXAMPLE;
+
 type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
 
 fn write_table(out: &mut String, fields: &[ConfigField]) {
@@ -199,6 +201,30 @@ maki.setup({{
     .unwrap();
 }
 
+/// `paths` is a `Vec<String>`, which the `ConfigValue` table cannot describe,
+/// so this section is prose like `net.allowed_private_hosts`.
+fn write_trust_section(out: &mut String) {
+    writeln!(out, "### `trust`\n").unwrap();
+    writeln!(
+        out,
+        "Answers the folder trust question in advance. Read from the global \
+         `~/.config/maki/init.lua` only, since a project file that could set \
+         it would be trusting itself:\n"
+    )
+    .unwrap();
+    writeln!(out, "{POLICY_EXAMPLE}\n").unwrap();
+    writeln!(
+        out,
+        "`paths` is a list of globs matched against the project root, empty by \
+         default. `prompt` is a bool, `true` by default. Setting it to `false` \
+         drops the startup card and leaves the folder restricted unless a \
+         `paths` entry matches. \
+         [Folder Trust](/docs/folder-trust/#trust-policy) covers glob syntax \
+         and which run modes apply the policy.\n"
+    )
+    .unwrap();
+}
+
 fn write_telemetry_section(out: &mut String) {
     write_section(out, "[telemetry]", TelemetryConfig::FIELDS);
     writeln!(
@@ -312,6 +338,7 @@ All fields are optional. Typos in field names cause an error right away.
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
     write_net_section(&mut out);
+    write_trust_section(&mut out);
     write_telemetry_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
