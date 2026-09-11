@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
@@ -16,6 +17,8 @@ const STREAM_DONE: &str = "[DONE]";
 /// `tool_calls[].index` comes straight off the wire; a bogus huge value must
 /// not size the accumulator vec.
 const MAX_TOOL_CALLS_PER_MESSAGE: usize = 512;
+const UNNAMED_TOOL_ID_PREFIX: &str = "maki_unnamed_";
+static NEXT_UNNAMED_TOOL_ID: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct OpenAiCompatConfig {
     pub slug: &'static str,
@@ -510,6 +513,25 @@ struct ToolAccumulator {
     arguments: String,
 }
 
+impl ToolAccumulator {
+    /// Plenty of providers never send a tool call id, so we hand out our own the
+    /// moment the call shows up instead of at the end of the stream, which is
+    /// what lets `ToolUseStart` carry an id the agent can match against the
+    /// finished call. The counter is process wide because a parent turn and a
+    /// subagent turn stream side by side, and numbering per response had both of
+    /// them mint `maki_unnamed_0`.
+    fn new() -> Self {
+        Self {
+            id: format!(
+                "{UNNAMED_TOOL_ID_PREFIX}{}",
+                NEXT_UNNAMED_TOOL_ID.fetch_add(1, Ordering::Relaxed)
+            ),
+            name: String::new(),
+            arguments: String::new(),
+        }
+    }
+}
+
 pub async fn parse_sse(
     reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
@@ -653,15 +675,12 @@ pub async fn parse_sse(
                     continue;
                 }
                 while tool_accumulators.len() <= tc.index {
-                    tool_accumulators.push(ToolAccumulator {
-                        id: String::new(),
-                        name: String::new(),
-                        arguments: String::new(),
-                    });
+                    tool_accumulators.push(ToolAccumulator::new());
                 }
                 let acc = &mut tool_accumulators[tc.index];
                 let was_unnamed = acc.name.is_empty();
-                if let Some(id) = tc.id {
+                // An "" id off the wire is no id at all, and it must not wipe ours.
+                if let Some(id) = tc.id.filter(|id| !id.is_empty()) {
                     acc.id = id;
                 }
                 // GLM-5.2 via Mistral sends "" names in subsequent chunks; skip to keep the accumulated name.
@@ -700,7 +719,7 @@ pub async fn parse_sse(
         content_blocks.push(ContentBlock::Text { text });
     }
 
-    for (idx, acc) in tool_accumulators.into_iter().enumerate() {
+    for acc in tool_accumulators {
         let input: Value = match serde_json::from_str(&acc.arguments) {
             Ok(v) => {
                 debug!(tool = %acc.name, json = %acc.arguments, "tool input JSON");
@@ -711,19 +730,13 @@ pub async fn parse_sse(
                 Value::Object(Default::default())
             }
         };
-        let id = if acc.id.is_empty() {
-            warn!(raw_name = %acc.name, raw_args = %acc.arguments, "provider sent empty tool_use id; substituting placeholder");
-            format!("maki_unnamed_{idx}")
-        } else {
-            acc.id
-        };
         let name = if acc.name.is_empty() {
-            warn!(%id, raw_args = %acc.arguments, "provider sent empty tool_use name; substituting placeholder");
+            warn!(id = %acc.id, raw_args = %acc.arguments, "provider sent empty tool_use name; substituting placeholder");
             "maki_unknown_tool".to_owned()
         } else {
             acc.name
         };
-        content_blocks.push(ContentBlock::tool_use(id, name, input));
+        content_blocks.push(ContentBlock::tool_use(acc.id, name, input));
     }
 
     Ok(StreamResponse {
@@ -749,6 +762,18 @@ mod tests {
     const TOOL_NAME: &str = "word_count";
     const TOOL_DESCRIPTION: &str = "Count words.";
     const TOOL_MUST_SURVIVE: &str = "a tool without a schema still belongs in the request";
+    const RESPONSES: usize = 2;
+    const TOOLS_PER_RESPONSE: usize = 2;
+    const TWO_UNNAMED_TOOL_CALLS_SSE: &str = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}},{\"index\":1,\"function\":{\"name\":\"glob\",\"arguments\":\"{}\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\
+\n\
+data: [DONE]\n";
+    const IDS_MUST_DIFFER: &str =
+        "two turns streaming at once must not land on the same synthetic id";
+    const PENDING_ID_MUST_MATCH: &str =
+        "the id streamed as the call starts must match the finished tool call";
 
     #[test_case(json!({"name": TOOL_NAME, "description": TOOL_DESCRIPTION}) ; "missing_schema")]
     #[test_case(json!({"name": TOOL_NAME, "description": TOOL_DESCRIPTION, "input_schema": null}) ; "null_schema")]
@@ -1093,6 +1118,44 @@ data: [DONE]\n";
             assert_eq!(tools.len(), 1);
             assert!(!tools[0].0.is_empty(), "id must be non-empty for Bedrock");
             assert!(!tools[0].1.is_empty(), "name must be non-empty for Bedrock");
+        })
+    }
+
+    #[test]
+    fn parse_sse_unnamed_tool_ids_never_repeat() {
+        smol::block_on(async {
+            let mut minted = Vec::new();
+            for _ in 0..RESPONSES {
+                let (tx, rx) = flume::unbounded();
+                let resp = parse_sse(
+                    Cursor::new(TWO_UNNAMED_TOOL_CALLS_SSE.as_bytes()),
+                    &tx,
+                    TEST_STREAM_TIMEOUT,
+                )
+                .await
+                .unwrap();
+
+                let ids: Vec<String> = resp
+                    .message
+                    .tool_uses()
+                    .map(|(id, _, _)| id.to_owned())
+                    .collect();
+                assert_eq!(ids.len(), TOOLS_PER_RESPONSE);
+                let started: Vec<String> = rx
+                    .drain()
+                    .filter_map(|e| match e {
+                        ProviderEvent::ToolUseStart { id, .. } => Some(id),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(started, ids, "{PENDING_ID_MUST_MATCH}");
+                minted.extend(ids);
+            }
+
+            let total = minted.len();
+            minted.sort();
+            minted.dedup();
+            assert_eq!(minted.len(), total, "{IDS_MUST_DIFFER}");
         })
     }
 

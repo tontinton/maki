@@ -993,8 +993,9 @@ mod tests {
     const MAIN_PERMISSION_TITLE: &str = "write: /project";
     const CHILD_PERMISSION_TITLE: &str = "task: write: /project";
     const TURN_ERROR: &str = "provider returned 500";
-    /// What `openai_compat` substitutes when a provider sends a tool call with
-    /// no id, so two runs of the same session can land on it at once.
+    /// One tool id arriving from two runs of the same session. `openai_compat`
+    /// mints unique ids now, but a provider can still repeat one, and the pump
+    /// has to keep the runs apart either way.
     const COLLIDING_TOOL_USE_ID: &str = "maki_unnamed_0";
 
     /// Feeds a turn and waits for the pump to drain it, so no assertion has to
