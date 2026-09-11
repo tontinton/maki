@@ -67,6 +67,17 @@ impl AgentError {
     /// - Mistral:    400 "too large for model with X maximum context length"  <https://docs.mistral.ai/resources/known-limitations>
     /// - OpenRouter: 400 "endpoint's maximum context length is X tokens"  <https://openrouter.ai/docs/api/reference/errors-and-debugging.mdx>
     /// - Synthetic:  400 pass-through from upstream models (OpenAI-compatible)  <https://synthetic.new>
+    /// - OpenCode Go: 400 `MissingSessionID`, worded as a missing-header
+    ///   problem rather than a size one -- in practice this is what their
+    ///   gateway does with a compaction request for a very large session
+    ///   (megabytes of previously-cached history sent in one uncached body),
+    ///   not a genuine header bug: maki always sets `x-opencode-session` (see
+    ///   `providers::opencode::QUIRKS`), and the same session id keeps
+    ///   working for every ordinary turn right up until compaction has to
+    ///   send the whole history at once. Treating it as overflow lets
+    ///   compaction's existing shrink-and-retry handle this the same way it
+    ///   already does every other provider's real overflow error, instead of
+    ///   surfacing a confusing dead end. <https://github.com/tontinton/maki/issues/935>
     pub fn is_context_overflow(&self) -> bool {
         match self {
             Self::Api { status: 413, .. } => true,
@@ -76,6 +87,9 @@ impl AgentError {
                 ..
             } => {
                 let m = message.to_lowercase();
+                if m.contains("missingsessionid") {
+                    return true;
+                }
                 // `Invalid 'max_tokens': integer above maximum value` reads as
                 // "token" plus "maximum" and would sail through the sniff
                 // below, but the caller answers an overflow by summarizing the
@@ -362,6 +376,10 @@ mod tests {
     #[test_case(400, "Invalid 'max_tokens': integer above maximum value. Expected a value <= 32768", false ; "openai_max_tokens_cap")]
     #[test_case(400, "max_completion_tokens is too large: 100000", false                                  ; "openai_max_completion_tokens_cap")]
     #[test_case(400, "max_output_tokens exceeds the model maximum", false                                 ; "max_output_tokens_cap")]
+    // OpenCode Go: https://github.com/tontinton/maki/issues/935 -- worded as
+    // a missing-header error, but the header is always sent; this is their
+    // gateway's response to a compaction request too large to route.
+    #[test_case(400, r#"{"type":"error","error":{"type":"MissingSessionID","message":"Error from provider (Console Go): Request is missing x-opencode-session and cannot be routed efficiently. Please see https://opencode.ai/docs/go/#where-can-i-use-it"}}"#, true ; "opencode_missing_session_id")]
     fn is_context_overflow(status: u16, message: &str, expected: bool) {
         assert_eq!(api_msg(status, message).is_context_overflow(), expected);
     }
