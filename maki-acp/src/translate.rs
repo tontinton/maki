@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol_schema::{
@@ -11,6 +12,10 @@ use maki_agent::types::{ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteE
 use maki_providers::{ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole};
 
 const MIN_FENCE_LEN: usize = 3;
+const WRITE_TOOL: &str = "write";
+/// One task pumps every session update, so reading a giant file to render a
+/// diff nobody can read would stall the whole stream.
+const MAX_DIFF_OLD_TEXT_BYTES: u64 = 256 * 1024;
 /// Model pricing is quoted in US dollars, so that is the reported currency.
 const CURRENCY: &str = "USD";
 
@@ -106,6 +111,64 @@ pub fn tool_start(event: &ToolStartEvent, cwd: &Path, home: Option<&Path>) -> Se
         ToolCallId::from(event.id.clone()),
         fields,
     ))
+}
+
+/// Zed merges a permission request into the `tool_call_update` we sent a
+/// moment earlier, so it already shows the file. JetBrains renders the request
+/// on its own, which is why we repeat the context here. Without a raw input
+/// (nothing was cached for this call) the dialog stays what it always was: a
+/// title built from the permission scopes.
+pub fn permission_update(
+    id: String,
+    title: String,
+    tool: &str,
+    raw_input: Option<&serde_json::Value>,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> ToolCallUpdate {
+    let mut fields = ToolCallUpdateFields::new().title(title);
+
+    if let Some(raw_input) = raw_input {
+        fields = fields.kind(tool_kind(tool)).raw_input(raw_input.clone());
+
+        let locations = tool_locations(tool, Some(raw_input), cwd, home);
+        if !locations.is_empty() {
+            fields = fields.locations(locations);
+        }
+
+        if let Some(diff) = write_diff(tool, raw_input, cwd, home) {
+            fields = fields.content(vec![ToolCallContent::Diff(diff)]);
+        }
+    }
+
+    ToolCallUpdate::new(ToolCallId::from(id), fields)
+}
+
+/// `write` replaces the whole file, so its input is the new text and disk still
+/// holds the old one: the write lock is only taken once permission is granted.
+/// `edit` gets no diff on purpose, applying its old_string/new_string here
+/// would be a second copy of the plugin's logic, free to drift.
+fn write_diff(
+    tool: &str,
+    raw_input: &serde_json::Value,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> Option<Diff> {
+    if tool != WRITE_TOOL {
+        return None;
+    }
+    let new_text = raw_input.get("content")?.as_str()?;
+    let path = resolve_path(input_path(raw_input)?, cwd, home)?;
+
+    let old_text = match fs::metadata(&path) {
+        // The model picks this path, and a FIFO reports a length of zero, walks
+        // past the cap and then blocks the read until someone writes to it,
+        // which would freeze every update this session still has to send.
+        Ok(meta) if meta.len() > MAX_DIFF_OLD_TEXT_BYTES || !meta.is_file() => return None,
+        Ok(_) => fs::read_to_string(&path).ok(),
+        Err(_) => None,
+    };
+    Some(Diff::new(path, new_text.to_string()).old_text(old_text))
 }
 
 /// File locations the tool call touches, per ACP "Following the Agent". The
@@ -407,12 +470,20 @@ mod tests {
 
     use maki_providers::ImageSource;
     use serde_json::json;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
 
     const CWD: &str = "/home/user/project";
     const HOME: &str = "/home/user";
+    const EDIT_TOOL: &str = "edit";
+    const PERMISSION_ID: &str = "tu-perm";
+    const PERMISSION_TITLE: &str = "write: src/main.rs";
+    const REL_PATH: &str = "src/main.rs";
+    const ABS_PATH: &str = "/home/user/project/src/main.rs";
+    const OLD_TEXT: &str = "fn main() {}\n";
+    const NEW_TEXT: &str = "fn main() { run() }\n";
 
     #[test_case("1: mod render\n2: mod segment", "```\n1: mod render\n2: mod segment\n```" ; "plain_text_gets_default_fence")]
     #[test_case("has ```rust\ncode\n``` inside", "````\nhas ```rust\ncode\n``` inside\n````" ; "fence_longer_than_inner_backticks")]
@@ -787,5 +858,105 @@ mod tests {
         let event = turn_event(None, 200_000, None);
         let json = serde_json::to_value(usage_update(&event, None)).unwrap();
         assert_eq!(json["used"], 51_200);
+    }
+
+    fn permission_json(
+        tool: &str,
+        raw_input: Option<&serde_json::Value>,
+        cwd: &Path,
+    ) -> serde_json::Value {
+        let update = permission_update(
+            PERMISSION_ID.to_string(),
+            PERMISSION_TITLE.to_string(),
+            tool,
+            raw_input,
+            cwd,
+            Some(Path::new(HOME)),
+        );
+        serde_json::to_value(update).unwrap()
+    }
+
+    fn write_permission_json(dir: &Path) -> serde_json::Value {
+        permission_json(
+            WRITE_TOOL,
+            Some(&json!({"path": REL_PATH, "content": NEW_TEXT})),
+            dir,
+        )
+    }
+
+    #[test_case(WRITE_TOOL, json!({"path": REL_PATH, "content": NEW_TEXT}), true ; "write_input_gets_a_diff")]
+    #[test_case(EDIT_TOOL, json!({"path": REL_PATH, "old_string": "a", "new_string": "b"}), false ; "edit_input_has_no_diff")]
+    fn permission_update_carries_file_context(
+        tool: &str,
+        raw_input: serde_json::Value,
+        has_diff: bool,
+    ) {
+        let json = permission_json(tool, Some(&raw_input), Path::new(CWD));
+        assert_eq!(json["toolCallId"], PERMISSION_ID);
+        assert_eq!(json["title"], PERMISSION_TITLE);
+        assert_eq!(json["rawInput"], raw_input);
+        assert_eq!(json["locations"], json!([{"path": ABS_PATH}]));
+        assert_eq!(!json["content"].is_null(), has_diff, "{json}");
+        // The registry is empty in unit tests, so every kind resolves to
+        // "other" and presence is all there is to check.
+        assert!(!json["kind"].is_null(), "{json}");
+    }
+
+    /// The old text is read at permission time and is still the pre-write
+    /// version, because the write lock is taken after the permission gate.
+    #[test_case(None, None ; "a_new_file_has_no_old_text")]
+    #[test_case(Some(OLD_TEXT.to_string()), Some(OLD_TEXT) ; "an_existing_file_diffs_against_disk")]
+    fn write_permission_diffs_against_the_file_on_disk(
+        on_disk: Option<String>,
+        expected_old: Option<&str>,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(REL_PATH);
+        if let Some(contents) = on_disk {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, contents).unwrap();
+        }
+
+        let json = write_permission_json(dir.path());
+        assert_eq!(json["content"][0]["type"], "diff");
+        assert_eq!(json["content"][0]["path"], path.to_str().unwrap());
+        assert_eq!(json["content"][0]["newText"], NEW_TEXT);
+        assert_eq!(json["content"][0]["oldText"], json!(expected_old));
+    }
+
+    #[test]
+    fn write_permission_skips_the_diff_for_an_oversized_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(REL_PATH);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "x".repeat(MAX_DIFF_OLD_TEXT_BYTES as usize + 1)).unwrap();
+
+        let json = write_permission_json(dir.path());
+        assert!(json["content"].is_null(), "{json}");
+        assert_eq!(json["rawInput"]["content"], NEW_TEXT);
+    }
+
+    /// A FIFO reads as empty metadata and then blocks until someone writes to
+    /// it, and no test can create one on Windows, so a directory stands in for
+    /// everything that is not a regular file.
+    #[test]
+    fn write_permission_skips_the_diff_for_a_path_that_is_not_a_regular_file() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(REL_PATH)).unwrap();
+
+        let json = write_permission_json(dir.path());
+        assert!(json["content"].is_null(), "{json}");
+    }
+
+    /// A cache miss must not regress the dialog: it keeps the scope title it
+    /// has always had.
+    #[test]
+    fn permission_update_without_cached_input_is_title_only() {
+        let json = permission_json(WRITE_TOOL, None, Path::new(CWD));
+        assert_eq!(json["toolCallId"], PERMISSION_ID);
+        assert_eq!(json["title"], PERMISSION_TITLE);
+        for field in ["kind", "locations", "rawInput", "content"] {
+            assert!(json[field].is_null(), "{field} must stay unset: {json}");
+        }
     }
 }

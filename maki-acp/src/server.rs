@@ -12,8 +12,7 @@ use agent_client_protocol_schema::{
     Notification, PromptRequest, PromptResponse, Request, RequestId, RequestPermissionRequest,
     RequestPermissionResponse, Response, SessionId, SessionModeId, SessionNotification,
     SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, ToolCallId,
-    ToolCallUpdate, ToolCallUpdateFields,
+    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
 };
 use color_eyre::eyre::Context;
 use flume::{Sender, WeakSender};
@@ -753,6 +752,11 @@ fn start_event_pump(
     smol::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
         let mut cost_total = initial_cost;
+        // A permission request only carries scopes, which are matching keys and
+        // not always paths, so the file context a client needs has to come from
+        // the tool call that asked for permission. Kept for the turn, like
+        // sdk_mode does: the history holds these inputs anyway.
+        let mut tool_inputs: HashMap<String, Value> = HashMap::new();
 
         while let Some(Envelope {
             event, subagent, ..
@@ -766,10 +770,18 @@ fn start_event_pump(
 
             let update = match event {
                 AgentEvent::PermissionRequest { id, tool, scopes } => {
+                    let tool = tool.to_string();
                     let scope = format!("{tool}: {}", scopes.join(", "));
-                    // A child's own tool call never reached the client, so its
-                    // permission rides on the `task` call the client can see,
-                    // and only the child's channel may take the answer.
+                    // The cache is keyed by the call that asked for permission,
+                    // so look it up before the remap below. A subagent is left
+                    // out on purpose: nothing makes a child's ids unique
+                    // against the parent's, and naming the wrong file in a
+                    // security prompt is worse than naming none.
+                    let raw_input = subagent.is_none().then(|| tool_inputs.get(&id)).flatten();
+                    // A child's own tool call never reached the client, nor
+                    // this cache, so its permission rides on the `task` call
+                    // the client can see, only the child's channel may take the
+                    // answer, and the title is all the dialog gets.
                     let (id, title, answer_tx) = match subagent {
                         Some(info) => {
                             let Some(answer_tx) = info.answer_tx else {
@@ -790,9 +802,13 @@ fn start_event_pump(
                     let request =
                         AgentRequest::RequestPermissionRequest(RequestPermissionRequest::new(
                             sid.clone(),
-                            ToolCallUpdate::new(
-                                ToolCallId::from(id),
-                                ToolCallUpdateFields::new().title(title),
+                            translate::permission_update(
+                                id,
+                                title,
+                                &tool,
+                                raw_input,
+                                &cwd,
+                                home.as_deref(),
                             ),
                             permissions::permission_options(),
                         ));
@@ -804,12 +820,17 @@ fn start_event_pump(
                 AgentEvent::ThinkingDelta { text } => translate::thinking_delta(&text),
                 AgentEvent::ToolPending { id, name } => translate::tool_pending(&id, &name),
                 AgentEvent::ToolStart(event) => {
-                    translate::tool_start(&event, &cwd, home.as_deref())
+                    let update = translate::tool_start(&event, &cwd, home.as_deref());
+                    if let Some(raw_input) = event.raw_input {
+                        tool_inputs.insert(event.id, raw_input);
+                    }
+                    update
                 }
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
                 AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::Done { reason, .. } => {
+                    tool_inputs.clear();
                     if let Some(id) = pending.lock().unwrap().prompt.take() {
                         let resp = PromptResponse::new(translate::map_done_reason(reason));
                         send(
@@ -820,6 +841,10 @@ fn start_event_pump(
                     continue;
                 }
                 AgentEvent::Error { message } => {
+                    // A turn that dies on a provider 500 never reaches `Done`,
+                    // and the pump outlives the session, so without this the
+                    // whole file a `write` was carrying stays pinned forever.
+                    tool_inputs.clear();
                     if let Some(id) = pending.lock().unwrap().prompt.take() {
                         let error = AcpError::internal_error().data(Value::String(message));
                         send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
@@ -867,7 +892,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 #[cfg(test)]
 mod tests {
     use maki_agent::permissions::PermissionManager;
-    use maki_agent::{DoneReason, EventSender, SubagentInfo, TurnCompleteEvent};
+    use maki_agent::{DoneReason, EventSender, SubagentInfo, ToolStartEvent, TurnCompleteEvent};
     use maki_config::ToolKey;
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
@@ -967,6 +992,10 @@ mod tests {
     const PERMISSION_TOOL: &str = "write";
     const MAIN_PERMISSION_TITLE: &str = "write: /project";
     const CHILD_PERMISSION_TITLE: &str = "task: write: /project";
+    const TURN_ERROR: &str = "provider returned 500";
+    /// What `openai_compat` substitutes when a provider sends a tool call with
+    /// no id, so two runs of the same session can land on it at once.
+    const COLLIDING_TOOL_USE_ID: &str = "maki_unnamed_0";
 
     /// Feeds a turn and waits for the pump to drain it, so no assertion has to
     /// wait on a clock. `sender` outlives the guard on purpose: that is the ACP
@@ -1010,6 +1039,31 @@ mod tests {
             opts: None,
             answer_tx,
         }
+    }
+
+    fn done_event() -> AgentEvent {
+        AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: CONTEXT_WINDOW,
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        }
+    }
+
+    fn write_tool_start(tool_use_id: &str) -> AgentEvent {
+        AgentEvent::ToolStart(Box::new(ToolStartEvent {
+            id: tool_use_id.to_owned(),
+            tool: Arc::from(PERMISSION_TOOL),
+            summary: String::new(),
+            render_header: None,
+            annotation: None,
+            input: None,
+            raw_input: Some(serde_json::json!({"path": PUMP_CWD, "content": QUEUED_TEXT})),
+            output: None,
+        }))
     }
 
     fn permission_request(tool_use_id: &str) -> AgentEvent {
@@ -1129,17 +1183,7 @@ mod tests {
                     text: QUEUED_TEXT.to_owned(),
                 })
                 .unwrap();
-            sender
-                .send(AgentEvent::Done {
-                    usage: TokenUsage::default(),
-                    cost: None,
-                    list_cost: None,
-                    context_size: 0,
-                    context_window: CONTEXT_WINDOW,
-                    num_turns: 1,
-                    reason: DoneReason::EndTurn,
-                })
-                .unwrap();
+            sender.send(done_event()).unwrap();
         });
 
         let chunk = out_rx.try_recv().expect("the queued text reaches the wire");
@@ -1151,6 +1195,68 @@ mod tests {
         assert_eq!(answer["id"], PROMPT_ID);
         assert_eq!(answer["result"]["stopReason"], "end_turn");
         assert!(pending(&srv).lock().unwrap().prompt.is_none());
+    }
+
+    /// A cached input holds the whole file a `write` is about to lay down, and
+    /// this pump lives as long as the session does, so a turn that died on a
+    /// provider error has to let go of it just like a turn that finished.
+    #[test_case(None, true ; "a_live_turn_shows_the_file_its_tool_call_named")]
+    #[test_case(Some(done_event()), false ; "a_finished_turn_releases_its_tool_inputs")]
+    #[test_case(Some(AgentEvent::Error { message: TURN_ERROR.to_owned() }), false ; "a_failed_turn_releases_its_tool_inputs")]
+    fn a_terminal_event_releases_the_turns_tool_inputs(
+        terminal: Option<AgentEvent>,
+        keeps_input: bool,
+    ) {
+        let (srv, .., out_rx) = test_server();
+        run_pump(&srv, None, |sender| {
+            sender.send(write_tool_start(PARENT_TOOL_USE_ID)).unwrap();
+            if let Some(event) = terminal {
+                sender.send(event).unwrap();
+            }
+            sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
+        });
+
+        let request = out_rx
+            .try_iter()
+            .last()
+            .expect("the permission request reaches the client");
+        let call = &request["params"]["toolCall"];
+        assert_eq!(request["method"], "session/request_permission");
+        assert_eq!(call["title"], MAIN_PERMISSION_TITLE);
+        assert_eq!(!call["rawInput"].is_null(), keeps_input, "{request}");
+    }
+
+    /// Ids are only unique inside one run, so a child can ask about a call whose
+    /// id the parent already cached. The dialog has to stay title only, or it
+    /// would name a file the subagent is not touching.
+    #[test]
+    fn a_subagent_permission_ignores_a_colliding_cached_input() {
+        let (srv, .., out_rx) = test_server();
+        let (answer_tx, _answer_rx) = flume::unbounded();
+        run_pump(&srv, None, |sender| {
+            sender
+                .send(write_tool_start(COLLIDING_TOOL_USE_ID))
+                .unwrap();
+            sender
+                .send_envelope(Envelope {
+                    event: permission_request(COLLIDING_TOOL_USE_ID),
+                    subagent: Some(subagent(Some(answer_tx))),
+                    run_id: 0,
+                })
+                .unwrap();
+        });
+
+        let request = out_rx
+            .try_iter()
+            .last()
+            .expect("the permission request reaches the client");
+        let call = &request["params"]["toolCall"];
+        assert_eq!(request["method"], "session/request_permission");
+        assert_eq!(call["toolCallId"], PARENT_TOOL_USE_ID);
+        assert_eq!(call["title"], CHILD_PERMISSION_TITLE);
+        for field in ["kind", "locations", "rawInput", "content"] {
+            assert!(call[field].is_null(), "{field} must stay unset: {request}");
+        }
     }
 
     /// A resumed session opens with a bill, and subagent turns spend against it
