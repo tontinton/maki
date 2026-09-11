@@ -173,7 +173,8 @@ async fn read(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<St
         };
         file.seek(SeekFrom::Start(start))?;
         let mut buf = Vec::new();
-        file.take(len.min(MAX_READ_BYTES + 1)).read_to_end(&mut buf)?;
+        file.take(len.min(MAX_READ_BYTES + 1))
+            .read_to_end(&mut buf)?;
         if buf.len() as u64 > MAX_READ_BYTES {
             return Err(too_large());
         }

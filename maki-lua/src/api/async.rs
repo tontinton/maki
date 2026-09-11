@@ -17,6 +17,8 @@ const AWAIT_MIN_ARGS: usize = 2;
 const RUN_ON_FINISH_TYPE_ERR: &str = "on_finish must be a function";
 const RUN_DEADLINE_NEGATIVE_ERR: &str = "deadline_ms must be >= 0";
 const RUN_DEADLINE_TYPE_ERR: &str = "deadline_ms must be an integer (milliseconds) or false";
+const RUN_SCOPE_TYPE_ERR: &str = "scope must be \"session\" if set";
+const SCOPE_SESSION: &str = "session";
 const PERMIT_RELEASED_ERR: &str = "permit already released";
 const SLEEP_NEGATIVE_ERR: &str = "maki.async.sleep: ms must be >= 0";
 
@@ -96,12 +98,18 @@ lua_class! {
 /// {deadline_ms} to change that, or `false` to remove the cap for
 /// genuinely long work.
 ///
+/// By default the task inherits the caller's cancellation, so ending the
+/// calling tool call ends it too. Pass {scope = "session"} for work that
+/// must outlive the calling turn, such as a background subagent waiting
+/// on a session: the task then only ends on its deadline or when its
+/// function returns.
+///
 /// A task abandoned by its deadline or a cancel it inherited still reports
 /// through {on_finish} exactly once, with the reason (`"timeout"` or
 /// `"cancelled"`) as the error, so background work cannot vanish silently.
 ///
 /// @param fn function Zero-argument function to execute.
-/// @param opts table? {on_finish} is `function(err, result)`, called once {fn} completes or the task is abandoned. {deadline_ms} is integer milliseconds, or `false` for no deadline.
+/// @param opts table? {on_finish} is `function(err, result)`, called once {fn} completes or the task is abandoned. {deadline_ms} is integer milliseconds, or `false` for no deadline. {scope} is `"session"` to escape the caller's cancellation.
 /// @example
 /// maki.async.run(function()
 ///   local data = expensive_fetch()
@@ -109,8 +117,8 @@ lua_class! {
 /// end, { deadline_ms = false })
 #[lua_fn]
 fn run(lua: &Lua, r#fn: Function, opts: Option<Table>) -> LuaResult<()> {
-    let (on_finish, deadline) = match &opts {
-        None => (None, Some(ASYNC_RUN_DEFAULT_DEADLINE)),
+    let (on_finish, deadline, detached) = match &opts {
+        None => (None, Some(ASYNC_RUN_DEFAULT_DEADLINE), false),
         Some(opts) => {
             let on_finish = match opts.raw_get::<Value>("on_finish")? {
                 Value::Nil => None,
@@ -126,7 +134,12 @@ fn run(lua: &Lua, r#fn: Function, opts: Option<Table>) -> LuaResult<()> {
                 }
                 _ => return Err(mlua::Error::runtime(RUN_DEADLINE_TYPE_ERR)),
             };
-            (on_finish, deadline)
+            let detached = match opts.raw_get::<Value>("scope")? {
+                Value::Nil => false,
+                Value::String(s) if s.to_str()?.as_ref() == SCOPE_SESSION => true,
+                _ => return Err(mlua::Error::runtime(RUN_SCOPE_TYPE_ERR)),
+            };
+            (on_finish, deadline, detached)
         }
     };
     let actual_work = if let Some(cb) = on_finish {
@@ -164,7 +177,7 @@ fn run(lua: &Lua, r#fn: Function, opts: Option<Table>) -> LuaResult<()> {
         r#fn
     };
     let work_key = lua.create_registry_value(actual_work)?;
-    enqueue_async_task_deadline(lua, work_key, deadline)?;
+    enqueue_async_task_deadline(lua, work_key, deadline, detached)?;
     Ok(())
 }
 
@@ -179,7 +192,8 @@ fn run(lua: &Lua, r#fn: Function, opts: Option<Table>) -> LuaResult<()> {
 /// cancelled/timeout error. Mark it `is_error = true` and end it with a
 /// marker, so the model knows the output it gets is cut short.
 ///
-/// The callback runs outside your coroutine, so it must not yield. It
+/// The callback runs on its own coroutine on the runtime executor, outside
+/// your handler's stack, so it may await host calls (`ctx:finish`). It
 /// fires at most once, immediately if the task is already cancelled. An
 /// error inside it is logged and never reaches your handler, and the
 /// other hooks still run.
@@ -494,7 +508,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::runtime::{CANCELLED_MSG, TaskCell, TaskScope, block_on_or_fail};
+    use crate::runtime::{CANCELLED_MSG, DispatchExGuard, TaskCell, TaskScope, block_on_or_fail};
 
     const ERR_TOO_FEW_ARGS: &str = "maki.async.await requires at least 2 arguments: argc, fun, ...";
     const ERR_ARGC_GE_1: &str = "argc must be >= 1";
@@ -807,8 +821,17 @@ mod tests {
     const HOOK_RAW_YIELD: &str = "coroutine.yield()";
     const HOOK_AWAIT: &str = "async_tbl.await(1, function() end)";
     const HOOK_LATE_MSG: &str = "the hook must fire while the wait is still parked, not after it";
-    const HOOK_SURVIVED_MSG: &str = "a hook that waits from outside its coroutine must fail there";
+    const HOOK_SETTLE_MSG: &str = "the waiting hook must settle exactly as far as its body allows";
     const TASK_SURVIVED_MSG: &str = "the task must keep working after a hook blew up";
+    /// Cheap polling of a flag another executor task sets; bounded by the
+    /// wake timeout, never by a sleep assumption.
+    const FLAG_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+    async fn wait_for_flag(lua: &Lua, name: &str) {
+        while !lua.globals().get::<bool>(name).unwrap() {
+            smol::Timer::after(FLAG_POLL_INTERVAL).await;
+        }
+    }
 
     fn install_notify(lua: &Lua) -> flume::Receiver<()> {
         let (fired_tx, fired_rx) = flume::bounded(1);
@@ -831,14 +854,17 @@ mod tests {
     }
 
     /// The composition `plugins/batch` leans on, and the one thing the
-    /// runtime's own hook tests cannot show: the handler is parked deep inside
-    /// a real `gather` whose child never finishes, so the hook runs on a VM
-    /// whose coroutine is suspended. Waiting from there is a plugin bug, raw
-    /// or through `maki.async`, and neither may cost the hooks behind it nor
-    /// the task's own result.
-    #[test_case(HOOK_RAW_YIELD ; "raw_yield")]
-    #[test_case(HOOK_AWAIT ; "awaiting")]
-    fn on_cancel_hook_fires_while_gather_is_still_parked(bad_hook_body: &str) {
+    /// runtime's own hook tests cannot show: the handler is parked deep
+    /// inside a real `gather` whose child never finishes, so the hook fires
+    /// while the task's coroutine is suspended. Deliveries race on the
+    /// runtime executor, so a hook that waits — raw yield or `maki.async`
+    /// await, even one parked forever — must not cost the hooks behind it
+    /// nor the task's own result.
+    #[test_case(HOOK_RAW_YIELD, true ; "raw_yield")]
+    #[test_case(HOOK_AWAIT, false ; "awaiting")]
+    fn on_cancel_hook_fires_while_gather_is_still_parked(bad_hook_body: &str, settles: bool) {
+        let guard = DispatchExGuard::install();
+        let ex = guard.ex();
         let (lua, _tbl) = setup();
         let (trigger, scope) = live_scope(&lua);
         let fired_rx = install_notify(&lua);
@@ -858,7 +884,7 @@ mod tests {
             "#
         );
 
-        let vals: Vec<Value> = block_on_or_fail(or(
+        let vals: Vec<Value> = block_on_or_fail(ex.run(or(
             scope.scope_future(lua.load(&code).eval_async::<MultiValue>()),
             async {
                 trigger.cancel();
@@ -867,14 +893,13 @@ mod tests {
                     !lua.globals().get::<bool>("gather_returned").unwrap(),
                     "{HOOK_LATE_MSG}"
                 );
-                assert!(
-                    !lua.globals().get::<bool>("bad_hook_finished").unwrap(),
-                    "{HOOK_SURVIVED_MSG}"
-                );
+                if settles {
+                    wait_for_flag(&lua, "bad_hook_finished").await;
+                }
                 lua.load(RELEASE_PARKED_CHILD).exec().unwrap();
                 std::future::pending().await
             },
-        ))
+        )))
         .unwrap()
         .into_vec();
 
@@ -883,6 +908,11 @@ mod tests {
             vals[1].as_string().unwrap().to_string_lossy(),
             CHILD_VALUE,
             "{TASK_SURVIVED_MSG}"
+        );
+        assert_eq!(
+            lua.globals().get::<bool>("bad_hook_finished").unwrap(),
+            settles,
+            "{HOOK_SETTLE_MSG}"
         );
     }
 
@@ -941,6 +971,14 @@ mod tests {
     #[test_case(
         r#"return async_tbl.run(function() end, { deadline_ms = true })"#,
         RUN_DEADLINE_TYPE_ERR ; "deadline_true_invalid"
+    )]
+    #[test_case(
+        r#"return async_tbl.run(function() end, { scope = "turn" })"#,
+        RUN_SCOPE_TYPE_ERR ; "scope_unknown_value"
+    )]
+    #[test_case(
+        r#"return async_tbl.run(function() end, { scope = 42 })"#,
+        RUN_SCOPE_TYPE_ERR ; "scope_not_string"
     )]
     fn run_validation(code: &str, expected_err: &str) {
         smol::block_on(async {
