@@ -18,6 +18,9 @@ const STREAM_DONE: &str = "[DONE]";
 /// not size the accumulator vec.
 const MAX_TOOL_CALLS_PER_MESSAGE: usize = 512;
 const UNNAMED_TOOL_ID_PREFIX: &str = "maki_unnamed_";
+/// The listing every OpenAI compatible API serves, relative to the base URL.
+/// Providers with a second catalog pass their own path instead.
+pub(crate) const MODELS_PATH: &str = "/models";
 static NEXT_UNNAMED_TOOL_ID: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct OpenAiCompatConfig {
@@ -206,13 +209,16 @@ impl OpenAiCompatProvider {
         }
     }
 
+    /// Parses the `data` array served at `{base}{path}`, keeping the entries
+    /// `parse_fn` accepts. `path` is [`MODELS_PATH`] for most providers.
     pub async fn fetch_and_parse_models(
         &self,
         auth: &ResolvedAuth,
+        path: &str,
         parse_fn: impl Fn(&Value) -> Option<crate::model::ModelInfo>,
     ) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
         let base = self.base_url(auth);
-        let url = format!("{base}/models");
+        let url = format!("{base}{path}");
         let body_text = self.get_text(auth, &url).await?;
         let body: Value = serde_json::from_str(&body_text)?;
 
@@ -273,7 +279,7 @@ impl OpenAiCompatProvider {
         &self,
         auth: &ResolvedAuth,
     ) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
-        self.fetch_and_parse_models(auth, Self::default_model_parser)
+        self.fetch_and_parse_models(auth, MODELS_PATH, Self::default_model_parser)
             .await
     }
 }

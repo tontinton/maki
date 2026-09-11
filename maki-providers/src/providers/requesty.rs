@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_storage::id::SessionRef;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
@@ -10,19 +9,16 @@ use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
-use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use super::openai_compat::{MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
 
 const REFERER: &str = "https://maki.sh";
 const APP_TITLE: &str = "maki";
 const PER_MILLION: f64 = 1_000_000.0;
-/// Curated, Requesty-maintained routing policies. Short stable ids
-/// (`claude-sonnet-4-5`, `gpt-5.4-mini`, `gpt-5-mini@eu`) that route across
-/// several upstream providers; listed first so users see them before the
-/// raw `<vendor>/<model>` catalog.
+/// Requesty's own curated routing policies, with short stable ids like
+/// `claude-sonnet-4-5` that spread across several upstream providers. Listed
+/// before the raw `<vendor>/<model>` catalog at [`MODELS_PATH`].
 const MANAGED_MODELS_PATH: &str = "/models/managed";
-/// Full `<vendor>/<model>` catalog.
-const MODELS_PATH: &str = "/models";
 const CHAT_API: &str = "chat";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
@@ -48,31 +44,6 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     &[]
-}
-
-/// The subset of a Requesty `/models` entry maki cares about. Both the managed
-/// and the full catalog share this shape. Prices are USD per token.
-#[derive(Debug, Deserialize)]
-struct RequestyModel {
-    id: String,
-    #[serde(default)]
-    api: Option<String>,
-    #[serde(default)]
-    context_window: Option<u32>,
-    #[serde(default)]
-    max_output_tokens: Option<u32>,
-    #[serde(default)]
-    input_price: Option<f64>,
-    #[serde(default)]
-    output_price: Option<f64>,
-    #[serde(default)]
-    cached_price: Option<f64>,
-    #[serde(default)]
-    caching_price: Option<f64>,
-    #[serde(default)]
-    supports_reasoning: Option<bool>,
-    #[serde(default)]
-    supports_vision: Option<bool>,
 }
 
 pub struct Requesty {
@@ -109,63 +80,81 @@ impl Requesty {
         self.system_prefix = prefix;
         self
     }
+}
 
-    async fn fetch_models(
-        &self,
-        auth: &ResolvedAuth,
-        path: &str,
-    ) -> Result<Vec<ModelInfo>, AgentError> {
-        let base = self.compat.base_url(auth);
-        let body_text = self.compat.get_text(auth, &format!("{base}{path}")).await?;
-        let body: Value = serde_json::from_str(&body_text)?;
-        let mut models: Vec<ModelInfo> = body["data"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(parse_model).collect())
-            .unwrap_or_default();
-        models.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(models)
+/// A catalog entry, read one field at a time. A missing or `null` field is the
+/// normal "Requesty does not say" and stays quiet, while a field that is there
+/// in a shape we cannot read is upstream drift: it gets a log line and costs us
+/// that one value instead of the whole model.
+struct Entry<'a> {
+    id: &'a str,
+    raw: &'a Value,
+}
+
+impl Entry<'_> {
+    fn read<T>(&self, name: &str, parse: impl Fn(&Value) -> Option<T>) -> Option<T> {
+        let value = self.raw.get(name).filter(|v| !v.is_null())?;
+        let parsed = parse(value);
+        if parsed.is_none() {
+            warn!(model = self.id, field = name, value = %value, "requesty: unreadable field, ignoring it");
+        }
+        parsed
+    }
+
+    /// Requesty sends `0` for a limit it does not know. Left as `Some(0)` it
+    /// would beat the manifest fallback and go out as `"max_tokens": 0`.
+    fn limit(&self, name: &str) -> Option<u32> {
+        self.read(name, |v| u32::try_from(v.as_u64()?).ok())
+            .filter(|n| *n > 0)
+    }
+
+    /// Prices arrive per token, `ModelPricing` wants $/M.
+    fn price(&self, name: &str) -> Option<f64> {
+        self.read(name, Value::as_f64).map(|v| v * PER_MILLION)
+    }
+
+    fn flag(&self, name: &str) -> bool {
+        self.read(name, Value::as_bool) == Some(true)
     }
 }
 
+/// Managed policies and the full catalog share this shape, so one parser reads
+/// both.
 fn parse_model(m: &Value) -> Option<ModelInfo> {
-    let model: RequestyModel = serde_json::from_value(m.clone()).ok()?;
+    let id = m["id"].as_str()?;
 
-    // Only chat models: the catalog also lists embedding and other APIs.
-    if model.api.as_deref().is_some_and(|api| api != CHAT_API) {
+    // The catalog also lists embedding and other non chat APIs.
+    if m["api"].as_str().is_some_and(|api| api != CHAT_API) {
         return None;
     }
 
-    // Requesty reports per-token prices; scale to $/M as `ModelPricing`
-    // expects. A missing price stays `None` so it never reads as free.
-    let per_million = |p: Option<f64>| p.map(|v| v * PER_MILLION);
-    let pricing = match (
-        per_million(model.input_price),
-        per_million(model.output_price),
-    ) {
+    let entry = Entry { id, raw: m };
+
+    // Half a price is no price: without both sides it would read as free.
+    let pricing = match (entry.price("input_price"), entry.price("output_price")) {
         (Some(input), Some(output)) => Some(ModelPricing {
             input,
             output,
-            cache_write: per_million(model.caching_price).unwrap_or(0.0),
-            cache_read: per_million(model.cached_price).unwrap_or(0.0),
+            cache_write: entry.price("caching_price").unwrap_or(0.0),
+            cache_read: entry.price("cached_price").unwrap_or(0.0),
             fast: None,
         }),
         _ => None,
     };
 
     Some(ModelInfo {
-        id: model.id,
-        context_window: model.context_window,
-        max_output_tokens: model.max_output_tokens,
+        id: id.to_string(),
+        context_window: entry.limit("context_window"),
+        max_output_tokens: entry.limit("max_output_tokens"),
         pricing,
-        supports_thinking: Some(model.supports_reasoning == Some(true)),
-        supports_vision: Some(model.supports_vision == Some(true)),
+        supports_thinking: Some(entry.flag("supports_reasoning")),
+        supports_vision: Some(entry.flag("supports_vision")),
         tier: None,
         provider_info: None,
     })
 }
 
-/// Managed policies first, then the full catalog, deduplicated by id. Either
-/// list alone is still a usable answer, so one failing does not fail the other.
+/// Managed policies first, then the full catalog, deduplicated by id.
 fn merge_models(managed: Vec<ModelInfo>, catalog: Vec<ModelInfo>) -> Vec<ModelInfo> {
     let mut merged = managed;
     for model in catalog {
@@ -212,8 +201,15 @@ impl Provider for Requesty {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
-            let managed = self.fetch_models(&auth, MANAGED_MODELS_PATH).await;
-            let catalog = self.fetch_models(&auth, MODELS_PATH).await;
+            // Both listings at once: the picker only shows up once the slowest
+            // provider answers, so back to back round trips here cost everyone.
+            let (managed, catalog) = futures_lite::future::zip(
+                self.compat
+                    .fetch_and_parse_models(&auth, MANAGED_MODELS_PATH, parse_model),
+                self.compat
+                    .fetch_and_parse_models(&auth, MODELS_PATH, parse_model),
+            )
+            .await;
             match (managed, catalog) {
                 (Ok(managed), Ok(catalog)) => Ok(merge_models(managed, catalog)),
                 (Ok(managed), Err(e)) => {
@@ -245,54 +241,50 @@ mod tests {
 
     use super::*;
 
+    const SONNET_ID: &str = "anthropic/claude-sonnet-4-5";
     const UNKNOWN_PRICE_STAYS_UNKNOWN: &str = "a price we cannot read must not become a zero price";
+    const EPSILON: f64 = 1e-9;
 
     fn sonnet_json() -> Value {
         json!({
-            "id": "anthropic/claude-sonnet-4-5",
+            "id": SONNET_ID,
             "api": "chat",
-            "object": "model",
             "context_window": 200_000,
             "max_output_tokens": 64_000,
             "input_price": 0.000003,
             "output_price": 0.000015,
+            "caching_price": 0.00000375,
             "cached_price": 0.0000003,
             "supports_reasoning": true,
             "supports_vision": true,
-            "supports_tool_calling": true,
         })
     }
 
+    fn assert_price(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < EPSILON,
+            "expected ${expected}/M, got ${actual}/M"
+        );
+    }
+
     #[test]
-    fn parse_model_scales_pricing_to_per_million() {
+    fn parse_model_reads_an_entry_and_scales_prices_to_per_million() {
         let info = parse_model(&sonnet_json()).expect("model should parse");
 
-        assert_eq!(info.id, "anthropic/claude-sonnet-4-5");
+        assert_eq!(info.id, SONNET_ID);
         assert_eq!(info.context_window, Some(200_000));
         assert_eq!(info.max_output_tokens, Some(64_000));
         assert_eq!(info.supports_vision, Some(true));
         assert_eq!(info.supports_thinking, Some(true));
         let pricing = info.pricing.expect("pricing should be parsed");
-        assert!((pricing.input - 3.0).abs() < 1e-9);
-        assert!((pricing.output - 15.0).abs() < 1e-9);
-        assert!((pricing.cache_read - 0.3).abs() < 1e-9);
-        assert_eq!(pricing.cache_write, 0.0);
+        assert_price(pricing.input, 3.0);
+        assert_price(pricing.output, 15.0);
+        assert_price(pricing.cache_write, 3.75);
+        assert_price(pricing.cache_read, 0.3);
     }
 
-    #[test]
-    fn parse_model_scales_cache_write() {
-        let mut m = sonnet_json();
-        m["caching_price"] = json!(0.00000375);
-
-        let pricing = parse_model(&m)
-            .expect("model should parse")
-            .pricing
-            .expect("pricing should be parsed");
-        assert!((pricing.cache_write - 3.75).abs() < 1e-9);
-    }
-
-    /// A price we cannot read must not collapse to an all-zero `ModelPricing`,
-    /// which downstream reads as "free". Unknown has to stay unknown.
+    /// Half a price is no price: an all-zero `ModelPricing` reads as free
+    /// everywhere downstream.
     #[test_case(json!(null), json!(null)     ; "no_prices")]
     #[test_case(json!(0.000003), json!(null) ; "no_output_price")]
     #[test_case(json!(null), json!(0.000015) ; "no_input_price")]
@@ -303,6 +295,33 @@ mod tests {
 
         let info = parse_model(&m).expect("model should parse");
         assert!(info.pricing.is_none(), "{UNKNOWN_PRICE_STAYS_UNKNOWN}");
+    }
+
+    /// Requesty reports `0` for a limit it does not know. Kept as `Some(0)`
+    /// it would win over the manifest fallback and go out as `"max_tokens": 0`.
+    #[test]
+    fn parse_model_reads_zero_limits_as_unknown() {
+        let mut m = sonnet_json();
+        m["context_window"] = json!(0);
+        m["max_output_tokens"] = json!(0);
+
+        let info = parse_model(&m).expect("model should parse");
+        assert_eq!(info.context_window, None);
+        assert_eq!(info.max_output_tokens, None);
+    }
+
+    /// One field changing shape upstream costs that field, not the model.
+    #[test]
+    fn parse_model_keeps_model_when_one_field_is_unreadable() {
+        let mut m = sonnet_json();
+        m["input_price"] = json!("0.000003");
+        m["max_output_tokens"] = json!("64000");
+
+        let info = parse_model(&m).expect("model should still parse");
+        assert_eq!(info.context_window, Some(200_000));
+        assert_eq!(info.max_output_tokens, None);
+        assert!(info.pricing.is_none(), "{UNKNOWN_PRICE_STAYS_UNKNOWN}");
+        assert_eq!(info.supports_thinking, Some(true));
     }
 
     #[test]
@@ -316,21 +335,14 @@ mod tests {
         assert_eq!(info.supports_vision, Some(false));
     }
 
-    #[test_case("embedding" ; "embedding")]
-    #[test_case("image"     ; "image")]
-    fn parse_model_skips_non_chat_apis(api: &str) {
+    #[test_case(json!("embedding"), false ; "embedding_is_skipped")]
+    #[test_case(json!("image"), false     ; "image_is_skipped")]
+    #[test_case(json!(null), true         ; "unlabelled_is_kept")]
+    fn parse_model_keeps_only_chat_entries(api: Value, kept: bool) {
         let mut m = sonnet_json();
-        m["api"] = json!(api);
+        m["api"] = api;
 
-        assert!(parse_model(&m).is_none());
-    }
-
-    #[test]
-    fn parse_model_without_api_field_is_kept() {
-        let mut m = sonnet_json();
-        m["api"] = json!(null);
-
-        assert!(parse_model(&m).is_some());
+        assert_eq!(parse_model(&m).is_some(), kept);
     }
 
     #[test]
@@ -348,7 +360,7 @@ mod tests {
             ModelInfo::id_only("gpt-5.4-mini".into()),
         ];
         let catalog = vec![
-            ModelInfo::id_only("anthropic/claude-sonnet-4-5".into()),
+            ModelInfo::id_only(SONNET_ID.into()),
             ModelInfo::id_only("gpt-5.4-mini".into()),
             ModelInfo::id_only("openai/gpt-4o-mini".into()),
         ];
@@ -362,7 +374,7 @@ mod tests {
             [
                 "claude-sonnet-4-5",
                 "gpt-5.4-mini",
-                "anthropic/claude-sonnet-4-5",
+                SONNET_ID,
                 "openai/gpt-4o-mini",
             ]
         );

@@ -8,7 +8,7 @@ use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, Thin
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
-use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use super::openai_compat::{MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
@@ -235,7 +235,7 @@ impl Provider for Mistral {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             self.compat
-                .fetch_and_parse_models(&auth, |m| {
+                .fetch_and_parse_models(&auth, MODELS_PATH, |m| {
                     // Filter: only completion_chat capable models
                     let has_completion_chat = m
                         .get("capabilities")
