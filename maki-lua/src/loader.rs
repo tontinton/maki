@@ -9,7 +9,7 @@ use include_dir::{Dir, File, include_dir};
 use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
-use maki_config::{PluginsConfig, RawConfig};
+use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 
 use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
@@ -37,11 +37,27 @@ pub const PERMISSION_NAME_WARNING: &str = "inherits maki's permission rules for 
 
 /// How far user `init.lua` may reach. `--no-plugins` turns it off, and a
 /// project folder nobody vouched for stops at the global file.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The project variant carries the path instead of a trust verdict, so the only
+/// way to build one is a `Some` out of [`ProjectConfig::gated_path`] and
+/// "trusted" cannot disagree with "which file".
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InitFiles {
     Disabled,
-    GlobalOnly,
-    GlobalAndProject,
+    Global,
+    GlobalAndProject(PathBuf),
+}
+
+impl InitFiles {
+    pub fn resolve(project_config: &ProjectConfig, no_plugins: bool) -> Self {
+        if no_plugins {
+            return InitFiles::Disabled;
+        }
+        match project_config.gated_path(GatedFile::InitLua) {
+            Some(path) => InitFiles::GlobalAndProject(path),
+            None => InitFiles::Global,
+        }
+    }
 }
 
 struct BundledPlugin {
@@ -311,12 +327,10 @@ impl PluginHost {
     pub fn load_init_files(
         &self,
         init_files: InitFiles,
-        cwd: &Path,
         warnings: &mut Vec<String>,
     ) -> Result<Option<RawConfig>, PluginError> {
         self.load_init_files_from_dirs(
             init_files,
-            cwd,
             maki_storage::paths::config_search_dirs(),
             warnings,
         )
@@ -325,7 +339,6 @@ impl PluginHost {
     fn load_init_files_from_dirs(
         &self,
         init_files: InitFiles,
-        cwd: &Path,
         global_dirs: impl IntoIterator<Item = PathBuf>,
         warnings: &mut Vec<String>,
     ) -> Result<Option<RawConfig>, PluginError> {
@@ -346,13 +359,8 @@ impl PluginHost {
                 break;
             }
         }
-        if init_files == InitFiles::GlobalAndProject {
-            self.run_init_file(
-                &cwd.join(".maki/init.lua"),
-                ConfigScope::Project,
-                &mut merged,
-                warnings,
-            )?;
+        if let InitFiles::GlobalAndProject(path) = &init_files {
+            self.run_init_file(path, ConfigScope::Project, &mut merged, warnings)?;
         }
 
         Ok(merged)
@@ -1439,16 +1447,15 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
 
         let mut warnings = Vec::new();
-        for scope in [InitFiles::Disabled, InitFiles::GlobalOnly] {
+        for scope in [InitFiles::Disabled, InitFiles::Global] {
             let skipped = host
-                .load_init_files_from_dirs(scope, dir.path(), [], &mut warnings)
+                .load_init_files_from_dirs(scope, [], &mut warnings)
                 .expect("scope skips broken project init.lua");
             assert!(skipped.is_none());
         }
 
         let ran = host.load_init_files_from_dirs(
-            InitFiles::GlobalAndProject,
-            dir.path(),
+            InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
             [],
             &mut warnings,
         );
@@ -1478,12 +1485,7 @@ mod tests {
         let mut warnings = Vec::new();
         let global_host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let global_only = global_host
-            .load_init_files_from_dirs(
-                InitFiles::GlobalOnly,
-                dir.path(),
-                [global.clone()],
-                &mut warnings,
-            )
+            .load_init_files_from_dirs(InitFiles::Global, [global.clone()], &mut warnings)
             .unwrap()
             .unwrap();
         assert_eq!(global_only.always_yolo, Some(false));
@@ -1492,8 +1494,7 @@ mod tests {
         let project_host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let merged = project_host
             .load_init_files_from_dirs(
-                InitFiles::GlobalAndProject,
-                dir.path(),
+                InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
                 [global],
                 &mut warnings,
             )

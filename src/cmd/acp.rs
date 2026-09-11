@@ -7,10 +7,9 @@ use color_eyre::eyre::Context;
 use maki_agent::tools::ToolRegistry;
 use maki_config::load_env_files;
 use maki_config::project::{self, TrustMode};
-use maki_lua::PluginHost;
+use maki_lua::{InitFiles, PluginHost};
 use maki_storage::StateDir;
 
-use crate::project_trust;
 use crate::setup;
 
 pub fn run(
@@ -39,8 +38,7 @@ pub fn run(
             warnings.extend(trust.warning.clone());
             let config = host
                 .load_init_files(
-                    project_trust::init_files(&trust.project_config, no_plugins),
-                    trust.project_config.config_root(),
+                    InitFiles::resolve(&trust.project_config, no_plugins),
                     warnings,
                 )
                 .context("load init.lua files")?

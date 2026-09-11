@@ -14,7 +14,7 @@ use maki_config::providers::{
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
 use maki_config::{Config, load_env_files, load_permissions};
-use maki_lua::PluginHost;
+use maki_lua::{InitFiles, PluginHost};
 use maki_providers::provider::fetch_all_models;
 use maki_providers::{ProviderData, catalog_providers};
 use maki_providers::{copilot_auth, dynamic, openai_auth, xai_auth};
@@ -25,7 +25,6 @@ use maki_storage::auth::{
 };
 use maki_storage::model::persist_model;
 
-use crate::project_trust;
 
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
@@ -593,8 +592,7 @@ fn load_effective_config(
     warnings.extend(trust.warning.clone());
     let raw_config = host
         .load_init_files(
-            project_trust::init_files(&trust.project_config, no_plugins),
-            trust.project_config.config_root(),
+            InitFiles::resolve(&trust.project_config, no_plugins),
             warnings,
         )
         .context("load init.lua files")?;

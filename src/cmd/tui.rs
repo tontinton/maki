@@ -19,7 +19,6 @@ use maki_storage::id::MakiId;
 use maki_ui::{AppSession, RunOutcome};
 
 use crate::cli::{Cli, normalize_tool_name};
-use crate::project_trust;
 use crate::setup;
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
@@ -93,7 +92,7 @@ fn load_config(
     warnings: &mut Vec<String>,
 ) -> Result<Config> {
     let raw_config = plugin_host
-        .load_init_files(init_files, project_config.config_root(), warnings)
+        .load_init_files(init_files, warnings)
         .context("load init.lua files")?;
 
     let mut config = raw_config
@@ -166,7 +165,7 @@ fn build_stack(
             let loaded = load_config(
                 host,
                 cli,
-                project_trust::init_files(&trust.project_config, cli.no_plugins),
+                InitFiles::resolve(&trust.project_config, cli.no_plugins),
                 &trust.project_config,
                 names,
                 warnings,
@@ -647,7 +646,7 @@ mod tests {
         match load_config(
             &plugin_host,
             &cli,
-            InitFiles::GlobalAndProject,
+            InitFiles::GlobalAndProject(maki_dir.join("init.lua")),
             &ProjectConfig::for_project(dir.path()),
             &no_names,
             &mut Vec::new(),

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use super::error::McpError;
 use crate::tools::is_builtin_tool;
-use maki_config::{ProjectConfig, expand_env, is_valid_server_name};
+use maki_config::{GatedFile, ProjectConfig, expand_env, is_valid_server_name};
 use serde::Deserialize;
 use toml_edit::DocumentMut;
 
@@ -383,11 +383,7 @@ fn load_config_inner(
     if let Some(global_path) = global_path {
         merge_config(&mut merged, &mut errors, global_path);
     }
-    if project_config.is_trusted() {
-        let project_path = project_config
-            .config_root()
-            .join(".maki")
-            .join(MCP_CONFIG_FILE);
+    if let Some(project_path) = project_config.gated_path(GatedFile::Mcp) {
         merge_config(&mut merged, &mut errors, &project_path);
     }
     (merged, errors)

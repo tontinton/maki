@@ -1268,8 +1268,11 @@ fn incompatible_plugin_warns_instead_of_aborting_startup() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let mut warnings = Vec::new();
-    host.load_init_files(InitFiles::GlobalAndProject, tmp.path(), &mut warnings)
-        .expect("an incompatible plugin must not abort startup");
+    host.load_init_files(
+        InitFiles::GlobalAndProject(maki_dir.join("init.lua")),
+        &mut warnings,
+    )
+    .expect("an incompatible plugin must not abort startup");
 
     assert!(!reg.has("echo_"));
     let warning = warnings
@@ -1304,8 +1307,11 @@ fn init_file_taking_a_permission_keyed_tool_name_warns(tool: &str, expected: usi
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let mut warnings = Vec::new();
-    host.load_init_files(InitFiles::GlobalAndProject, tmp.path(), &mut warnings)
-        .expect("init.lua must load");
+    host.load_init_files(
+        InitFiles::GlobalAndProject(maki_dir.join("init.lua")),
+        &mut warnings,
+    )
+    .expect("init.lua must load");
 
     assert!(reg.has(tool));
     assert_eq!(

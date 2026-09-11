@@ -989,8 +989,12 @@ mod tests {
         );
 
         let folder = CanonicalFolder::resolve(project.path()).unwrap();
+        let present: Vec<&str> = maki_config::project::gated_files(project.path())
+            .iter()
+            .map(|file| file.file_name())
+            .collect();
         TrustedFolders::new(&storage)
-            .add(&folder, &maki_config::project::gated_files(project.path()))
+            .add(&folder, &present)
             .unwrap();
 
         let trusted = trusted_project_config(project.path(), &storage, TrustMode::Skip);

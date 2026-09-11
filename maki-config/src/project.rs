@@ -5,14 +5,11 @@ use std::path::{Path, PathBuf};
 use maki_storage::StateDir;
 use maki_storage::paths::{canonicalize_clean, home};
 use maki_storage::trusted_folders::{CanonicalFolder, TrustDecision, TrustedFolders};
+use strum::VariantArray;
 use tracing::{info, warn};
 
 use crate::PROJECT_DIR;
 
-/// `config.toml` is deliberately absent. Maki stopped reading it, so it can do
-/// nothing, and asking about a file that has no powers is a question with no
-/// honest answer.
-const SHARED_PROJECT_FILES: &[&str] = &[".env", "permissions.toml", "init.lua", "mcp.toml"];
 const SKIPPED: &str = "shared project config was skipped for this process";
 const TRUST_NOT_SAVED: &str =
     "folder trust was not saved, but shared project config is enabled for this process";
@@ -28,6 +25,56 @@ const DECLINED: &str = "Shared project config was skipped.";
 const HOW_TO_TRUST: &str =
     "run `maki trust add --yes PATH` and restart Maki, or pass `--trust` to load it for one run";
 const REJECTION_NOT_SAVED: &str = "folder rejection was not saved";
+
+/// A file under `.maki/` that only a trusted folder may hand to Maki.
+///
+/// `config.toml` is deliberately absent. Maki stopped reading it, so it can do
+/// nothing, and asking about a file that has no powers is a question with no
+/// honest answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, VariantArray)]
+pub enum GatedFile {
+    Env,
+    Permissions,
+    InitLua,
+    Mcp,
+}
+
+impl GatedFile {
+    /// Derived from the enum, because the trust store, the question and the
+    /// docs all walk this, and a hand-written list is the one place a new
+    /// variant gets forgotten.
+    pub const ALL: &'static [GatedFile] = <GatedFile as VariantArray>::VARIANTS;
+
+    /// The name recorded in the trust store and shown in the question. One
+    /// spelling on purpose: a yes recorded under a different name than the one
+    /// compared against would silently never match.
+    pub const fn file_name(self) -> &'static str {
+        match self {
+            GatedFile::Env => ".env",
+            GatedFile::Permissions => "permissions.toml",
+            GatedFile::InitLua => "init.lua",
+            GatedFile::Mcp => "mcp.toml",
+        }
+    }
+
+    /// What the file can do, in the words the question and the docs use.
+    pub const fn describes(self) -> &'static str {
+        match self {
+            GatedFile::Env => {
+                "sets environment variables, including secrets, for maki and every process it starts"
+            }
+            GatedFile::Permissions => "decides which tools run without asking",
+            GatedFile::InitLua => "runs Lua inside maki's own process at startup",
+            GatedFile::Mcp => "starts MCP servers as child processes",
+        }
+    }
+}
+
+impl std::fmt::Display for GatedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{PROJECT_DIR}/{}", self.file_name())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectConfig {
@@ -78,6 +125,19 @@ impl ProjectConfig {
 
     pub fn is_trusted(&self) -> bool {
         self.trusted
+    }
+
+    /// The only route to a gated project file. `None` unless the folder is
+    /// trusted, so a consumer cannot read one by forgetting a check.
+    pub fn gated_path(&self, file: GatedFile) -> Option<PathBuf> {
+        self.trusted.then(|| self.project_file(file))
+    }
+
+    /// Ungated, and private for that reason: `.maki/permissions.toml` is read
+    /// at any trust level so a repository can narrow the agent inside it, and
+    /// [`crate::load_permissions`] is the only place that exception belongs.
+    pub(crate) fn project_file(&self, file: GatedFile) -> PathBuf {
+        self.config_root.join(PROJECT_DIR).join(file.file_name())
     }
 
     pub(crate) fn with_trust(mut self, trusted: bool) -> Self {
@@ -207,7 +267,7 @@ where
     };
     let trusted_folders = TrustedFolders::new(storage);
     let present = gated_files(project_config.config_root());
-    let decision = match trusted_folders.decide(&folder, &present, &project_root) {
+    let decision = match trusted_folders.decide(&folder, &store_names(&present), &project_root) {
         Ok(decision) => decision,
         Err(error) => {
             return ProjectDecision::skip(project_config, format!("{error}; {SKIPPED}"));
@@ -277,7 +337,7 @@ where
 
 fn not_trusted_warning(folder: &CanonicalFolder, added: &[String]) -> String {
     let folder = folder.path().display();
-    match name_list(added) {
+    match name_list(added.iter().map(String::as_str)) {
         Some(files) => format!(
             "skipped shared project config in {folder} because the project added {files} {ADDED_SINCE_TRUSTED}; {HOW_TO_TRUST}"
         ),
@@ -290,13 +350,13 @@ fn not_trusted_warning(folder: &CanonicalFolder, added: &[String]) -> String {
 fn record_trust(
     trusted_folders: &TrustedFolders,
     folder: &CanonicalFolder,
-    files: &[&str],
+    files: &[GatedFile],
     project_config: ProjectConfig,
 ) -> ProjectDecision {
     ProjectDecision {
         project_config: project_config.with_trust(true),
         warning: trusted_folders
-            .add(folder, files)
+            .add(folder, &store_names(files))
             .err()
             .map(|error| format!("{error}; {TRUST_NOT_SAVED}")),
     }
@@ -336,12 +396,12 @@ pub fn confirm_trust(
         "Maki can load shared project configuration from {}.",
         folder.path().display()
     )?;
-    match name_list(added) {
+    match name_list(added.iter().map(String::as_str)) {
         Some(files) => writeln!(
             output,
             "This project added {files} {ADDED_SINCE_TRUSTED}, {SHARED_FILE_POWERS}."
         )?,
-        None => match name_list(&gated_files(folder.path())) {
+        None => match name_list(gated_files(folder.path()).iter().map(|f| f.file_name())) {
             Some(files) => writeln!(output, "This project ships {files}, {SHARED_FILE_POWERS}.")?,
             None => writeln!(output, "{NO_SHARED_FILES_YET}")?,
         },
@@ -360,19 +420,26 @@ pub fn confirm_trust(
 /// Which gated files a project ships right now. This is the set a trust answer
 /// is recorded against, so `maki trust add` and `resolve` agree on what an
 /// answer covers.
-pub fn gated_files(config_root: &Path) -> Vec<&'static str> {
+pub fn gated_files(config_root: &Path) -> Vec<GatedFile> {
     let project_dir = config_root.join(PROJECT_DIR);
-    SHARED_PROJECT_FILES
+    GatedFile::ALL
         .iter()
         .copied()
-        .filter(|file| project_dir.join(file).exists())
+        .filter(|file| project_dir.join(file.file_name()).exists())
         .collect()
 }
 
-fn name_list<S: AsRef<str>>(files: &[S]) -> Option<String> {
+/// The trust store keeps plain names on disk: it is a wire format, and a name
+/// written by a newer Maki must load and simply never match. Conversion happens
+/// here and nowhere else.
+fn store_names(files: &[GatedFile]) -> Vec<&'static str> {
+    files.iter().copied().map(GatedFile::file_name).collect()
+}
+
+fn name_list<'a>(files: impl IntoIterator<Item = &'a str>) -> Option<String> {
     let names: Vec<String> = files
-        .iter()
-        .map(|file| format!("{PROJECT_DIR}/{}", file.as_ref()))
+        .into_iter()
+        .map(|file| format!("{PROJECT_DIR}/{file}"))
         .collect();
     match names.split_last()? {
         (last, []) => Some(last.clone()),
@@ -439,6 +506,35 @@ mod tests {
     const SOURCE_DIR: &str = "src";
     const NO_FILES: &[&str] = &[];
 
+    /// Invariant 1, structurally: every gated kind is reachable only through a
+    /// trusted config. Table-driven over the enum, so a new variant is covered
+    /// the day it is added.
+    #[test]
+    fn gated_paths_exist_only_for_a_trusted_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let trusted = ProjectConfig::for_project(dir.path());
+        let untrusted = ProjectConfig::discover(dir.path());
+
+        for file in GatedFile::ALL.iter().copied() {
+            assert_eq!(untrusted.gated_path(file), None, "{file}");
+            assert_eq!(
+                trusted.gated_path(file),
+                Some(trusted.project_file(file)),
+                "{file}"
+            );
+        }
+    }
+
+    /// The store keys on these names, so a rename would silently orphan every
+    /// recorded answer.
+    #[test_case(GatedFile::Env, ".env" ; "env")]
+    #[test_case(GatedFile::Permissions, "permissions.toml" ; "permissions")]
+    #[test_case(GatedFile::InitLua, "init.lua" ; "init_lua")]
+    #[test_case(GatedFile::Mcp, "mcp.toml" ; "mcp")]
+    fn gated_file_names_are_the_wire_format(file: GatedFile, expected: &str) {
+        assert_eq!(file.file_name(), expected);
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum Marker {
         None,
@@ -487,7 +583,9 @@ mod tests {
         match prior {
             Prior::Nothing => {}
             Prior::Trusted => {
-                store.add(folder, &gated_files(folder.path())).unwrap();
+                store
+                    .add(folder, &store_names(&gated_files(folder.path())))
+                    .unwrap();
             }
             Prior::Rejected => {
                 store.reject(folder).unwrap();

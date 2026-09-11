@@ -20,7 +20,7 @@ pub const UNTRUSTED_PROJECT_WRITE: &str =
     "folder is not trusted, so nothing was saved to .maki/permissions.toml";
 
 pub mod project;
-pub use project::ProjectConfig;
+pub use project::{GatedFile, ProjectConfig};
 
 pub mod providers;
 
@@ -2075,14 +2075,8 @@ fn load_env_files_with_global(global_env: Option<&Path>, project_config: &Projec
     if let Some(path) = global_env {
         collect_env_vars(path, &mut vars);
     }
-    if project_config.is_trusted() {
-        collect_env_vars(
-            &project_config
-                .config_root()
-                .join(PROJECT_DIR)
-                .join(ENV_FILE),
-            &mut vars,
-        );
+    if let Some(path) = project_config.gated_path(GatedFile::Env) {
+        collect_env_vars(&path, &mut vars);
     }
 
     for (key, value) in vars {
@@ -2117,11 +2111,11 @@ fn load_permissions_inner(
         }
     }
 
+    // The one deliberate exception to the gate: read at any trust level so a
+    // repository can narrow the agent inside it, then stripped down to its deny
+    // scopes when nobody vouched for the folder.
     let mut project_perms = read_permissions_file(
-        &project_config
-            .config_root()
-            .join(PROJECT_DIR)
-            .join(PERMISSIONS_FILE),
+        &project_config.project_file(GatedFile::Permissions),
         project_config.is_trusted(),
     )
     .unwrap_or_default();
@@ -2363,13 +2357,9 @@ fn append_project_permission(
 ) -> Result<(), String> {
     // Declining to trust a repository must not leave Maki editing files in it,
     // and an allow rule saved here would be stripped again on the next start.
-    if !project_config.is_trusted() {
+    let Some(path) = project_config.gated_path(GatedFile::Permissions) else {
         return Err(UNTRUSTED_PROJECT_WRITE.to_string());
-    }
-    let path = project_config
-        .config_root()
-        .join(PROJECT_DIR)
-        .join(PERMISSIONS_FILE);
+    };
     let existing = fs::read_to_string(&path).ok();
     let mut doc: toml_edit::DocumentMut = existing
         .as_deref()

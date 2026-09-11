@@ -6,28 +6,20 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 use maki_config::ProjectConfig;
 use maki_config::project::{self, confirm_trust};
-use maki_lua::InitFiles;
 use maki_storage::StateDir;
 use maki_storage::trusted_folders::{
     CanonicalFolder, Change, TrustDecision, TrustStatus, TrustedFolders,
 };
-
-pub fn init_files(project_config: &ProjectConfig, no_plugins: bool) -> InitFiles {
-    if no_plugins {
-        InitFiles::Disabled
-    } else if project_config.is_trusted() {
-        InitFiles::GlobalAndProject
-    } else {
-        InitFiles::GlobalOnly
-    }
-}
 
 pub fn add(storage: &StateDir, path: Option<&Path>, yes: bool) -> Result<()> {
     let path = resolve_argument(path)?;
     let project = ProjectConfig::discover(&path);
     let folder = CanonicalFolder::resolve(project.config_root())?;
     let trusted_folders = TrustedFolders::new(storage);
-    let present = project::gated_files(project.config_root());
+    let present: Vec<&str> = project::gated_files(project.config_root())
+        .iter()
+        .map(|file| file.file_name())
+        .collect();
     // A folder that gained a kind of gated file since it was trusted still has
     // a question to answer, so it is not simply "already trusted".
     let added = match trusted_folders.decide(&folder, &present, &project::project_root)? {
