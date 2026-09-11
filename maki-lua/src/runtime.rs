@@ -94,7 +94,7 @@ const CANCEL_ABANDON_AFTER: Duration = Duration::from_secs(5);
 const OPT_LEVEL_JIT: u8 = 2;
 const OPT_LEVEL_DEBUGGABLE: u8 = 1;
 const DEBUG_INFO_FULL: u8 = 2;
-const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
+pub(crate) const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
 /// Async tasks spawned during restore may spawn further tasks; cap the rounds.
 const RESTORE_SPAWN_ROUNDS: usize = 8;
 /// Keeps a buggy plugin's restore task from freezing the lua loop.
@@ -1403,7 +1403,12 @@ pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Opti
     lock_cell(&handle).live.as_ref().map(f)
 }
 
-pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
+/// A `deadline` of `None` removes the cap entirely, for genuinely long work.
+pub(crate) fn enqueue_async_task_deadline(
+    lua: &Lua,
+    work_fn: RegistryKey,
+    deadline: Option<Duration>,
+) -> Result<(), mlua::Error> {
     let handle = lua.app_data_ref::<TaskHandle>();
     let (cancel, live_ctx, command_depth) = match &handle {
         Some(h) => {
@@ -1416,7 +1421,7 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
     let mut task = PendingAsyncTask {
         work_fn,
         cancel,
-        deadline: Some(Instant::now() + ASYNC_RUN_DEFAULT_DEADLINE),
+        deadline: deadline.map(|d| Instant::now() + d),
         live_ctx,
         owner: None,
         command_depth,
@@ -4176,6 +4181,10 @@ mod tests {
 
     const SPAWN_QUEUE_NOT_INIT: &str = "spawn queue not initialized";
 
+    fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
+        enqueue_async_task_deadline(lua, work_fn, Some(ASYNC_RUN_DEFAULT_DEADLINE))
+    }
+
     fn enqueue_test_lua() -> Lua {
         let lua = Lua::new();
         lua.set_app_data(SpawnQueue::new());
@@ -4289,6 +4298,145 @@ mod tests {
             task_deadline > before,
             "async task should get a fresh deadline, not inherit expired parent"
         );
+    }
+
+    fn run_table_lua() -> Lua {
+        let lua = enqueue_test_lua();
+        let tbl = crate::api::r#async::create_async_table(&lua).unwrap();
+        lua.globals().set("async_tbl", tbl).unwrap();
+        lua
+    }
+
+    #[test]
+    fn async_run_defaults_to_the_sixty_second_deadline() {
+        let lua = run_table_lua();
+        lua.load("async_tbl.run(function() end)").exec().unwrap();
+
+        let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
+        let deadline = queue.rx.try_recv().unwrap().deadline.unwrap();
+        let left = deadline.duration_since(Instant::now());
+        assert!(
+            left <= ASYNC_RUN_DEFAULT_DEADLINE
+                && left >= ASYNC_RUN_DEFAULT_DEADLINE - Duration::from_secs(1),
+            "default deadline should be about 60s, got {left:?}"
+        );
+    }
+
+    #[test]
+    fn async_run_honors_deadline_override() {
+        let lua = run_table_lua();
+        lua.load("async_tbl.run(function() end, { deadline_ms = 5000 })")
+            .exec()
+            .unwrap();
+
+        let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
+        let deadline = queue.rx.try_recv().unwrap().deadline.unwrap();
+        let left = deadline.duration_since(Instant::now());
+        assert!(
+            left <= Duration::from_secs(5) && left >= Duration::from_secs(4),
+            "deadline override should be about 5s, got {left:?}"
+        );
+    }
+
+    #[test]
+    fn async_run_false_deadline_clears_the_cap() {
+        let lua = run_table_lua();
+        lua.load("async_tbl.run(function() end, { deadline_ms = false })")
+            .exec()
+            .unwrap();
+
+        let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
+        assert!(
+            queue.rx.try_recv().unwrap().deadline.is_none(),
+            "deadline_ms = false must remove the cap"
+        );
+    }
+
+    /// An abandoned `maki.async.run` task must still deliver a verdict through
+    /// {on_finish}: `until_abandoned` drops the coroutine mid-await, so the
+    /// pcall wrapper alone can never call `finish` — the cancel hook has to.
+    #[test]
+    fn run_on_finish_delivers_the_reason_when_the_parent_cancels() {
+        let lua = enqueue_test_lua();
+        lua.globals()
+            .set(
+                "async",
+                crate::api::r#async::create_async_table(&lua).unwrap(),
+            )
+            .unwrap();
+        let (trigger, parent) = live_scope(&lua);
+
+        let code = r#"
+            finished = nil
+            async.run(function()
+                return async.await(1, function(cb) parked_cb = cb end)
+            end, {
+                deadline_ms = false,
+                on_finish = function(err, result) finished = { err = err, result = result } end,
+            })
+        "#;
+        let ex = Rc::new(smol::LocalExecutor::new());
+        block_on_or_fail(ex.run(async {
+            parent
+                .scope_future(async {
+                    lua.load(code).exec().unwrap();
+                })
+                .await;
+            let task = {
+                let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
+                queue.rx.try_recv().unwrap()
+            };
+            spawn_async_task(&lua, &ex, &Rc::new(gate()), task);
+            for _ in 0..100 {
+                smol::future::yield_now().await;
+                if lua
+                    .globals()
+                    .get::<LuaValue>("parked_cb")
+                    .unwrap()
+                    .is_function()
+                {
+                    break;
+                }
+            }
+            assert!(
+                lua.globals()
+                    .get::<LuaValue>("parked_cb")
+                    .unwrap()
+                    .is_function(),
+                "the task must be parked before the cancel lands"
+            );
+
+            trigger.cancel();
+            for _ in 0..100 {
+                smol::future::yield_now().await;
+                if lua.globals().get::<LuaValue>("finished").unwrap() != LuaValue::Nil {
+                    break;
+                }
+            }
+            let finished: Table = lua.globals().get("finished").unwrap();
+            let err = finished.get::<String>("err").unwrap();
+            assert_eq!(
+                err, CANCELLED_MSG,
+                "the abandonment reason must reach on_finish"
+            );
+            assert!(
+                finished.get::<LuaValue>("result").unwrap().is_nil(),
+                "an abandoned task has no result"
+            );
+
+            // The work still completes later; the verdict must not be
+            // overwritten by the second finish.
+            lua.load(r#"parked_cb("done")"#).exec().unwrap();
+            for _ in 0..100 {
+                smol::future::yield_now().await;
+            }
+            let finished: Table = lua.globals().get("finished").unwrap();
+            assert_eq!(
+                finished.get::<String>("err").unwrap(),
+                CANCELLED_MSG,
+                "on_finish must run exactly once"
+            );
+        }));
     }
 
     #[test]
