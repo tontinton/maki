@@ -23,6 +23,12 @@ use crate::model::Model;
 
 const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
 
+/// The two thinking modes that are neither an effort level nor a token count.
+/// `Display` and [`Model::thinking_options`] both spell them from here, so the
+/// picker offers exactly the strings the parser accepts.
+pub(crate) const THINKING_OFF: &str = "off";
+pub(crate) const THINKING_ADAPTIVE: &str = "adaptive";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMediaType {
     Png,
@@ -418,7 +424,7 @@ pub const THINKING_USAGE: &str =
 /// Effort levels are percentages, so they need a ceiling even when the model
 /// never told us its output window. 32k matches common frontier thinking
 /// caps. Explicit user budgets never go through this.
-const FALLBACK_MAX_THINKING_BUDGET: u32 = 32_768;
+pub(crate) const FALLBACK_MAX_THINKING_BUDGET: u32 = 32_768;
 
 /// First Claude version that speaks adaptive thinking. Opus got there a
 /// generation early, at 4.7; the other families joined at 5.
@@ -776,12 +782,28 @@ impl ThinkingConfig {
         }
     }
 
+    /// The status bar already wraps this in brackets, so a level just names
+    /// itself. A raw count keeps its unit, or it reads like any other number
+    /// up there.
+    /// What the model will really run, so stored state can never disagree with
+    /// the request. Clamps both ways: down to `Off` where thinking is
+    /// unsupported, up to minimal effort where it is mandatory.
+    pub fn clamped(self, model: &Model) -> Self {
+        if !model.supports_thinking() {
+            return Self::Off;
+        }
+        if model.requires_thinking() && !self.is_enabled() {
+            return Self::Effort(Effort::Minimal);
+        }
+        self
+    }
+
     pub fn status_label(self) -> Option<Cow<'static, str>> {
         match self {
             Self::Off => None,
-            Self::Adaptive => Some(Cow::Borrowed("thinking")),
-            Self::Effort(e) => Some(Cow::Owned(format!("thinking: {e}"))),
-            Self::Budget(n) => Some(Cow::Owned(format!("thinking: {n}"))),
+            Self::Adaptive => Some(Cow::Borrowed(THINKING_ADAPTIVE)),
+            Self::Effort(e) => Some(Cow::Borrowed(e.as_str())),
+            Self::Budget(n) => Some(Cow::Owned(format!("{n} tokens"))),
         }
     }
 }
@@ -789,8 +811,8 @@ impl ThinkingConfig {
 impl std::fmt::Display for ThinkingConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Off => f.write_str("off"),
-            Self::Adaptive => f.write_str("adaptive"),
+            Self::Off => f.write_str(THINKING_OFF),
+            Self::Adaptive => f.write_str(THINKING_ADAPTIVE),
             Self::Effort(e) => f.write_str(e.as_str()),
             Self::Budget(n) => write!(f, "{n}"),
         }
@@ -838,17 +860,10 @@ pub struct RequestOptions {
 impl RequestOptions {
     /// Reconciles options with the model's capabilities. Called once before
     /// every request so UI state, restored sessions, and subagent flags all go
-    /// through the same gate. Despite the name, thinking clamps both ways:
-    /// down to `Off` when unsupported, up to minimal effort when required.
-    pub fn clamped(self, model: &crate::model::Model) -> Self {
+    /// through the same gate.
+    pub fn clamped(self, model: &Model) -> Self {
         Self {
-            thinking: if !model.supports_thinking() {
-                ThinkingConfig::Off
-            } else if model.requires_thinking() && !self.thinking.is_enabled() {
-                ThinkingConfig::Effort(Effort::Minimal)
-            } else {
-                self.thinking
-            },
+            thinking: self.thinking.clamped(model),
             fast: self.fast && model.supports_fast(),
         }
     }
@@ -1186,6 +1201,16 @@ mod tests {
             Some(e) => assert_eq!(body["reasoning_effort"], e),
             None => assert!(body.get("reasoning_effort").is_none()),
         }
+    }
+
+    /// The badge reads as whatever the session is set to, and stays quiet when
+    /// thinking is off.
+    #[test_case(ThinkingConfig::Off, None ; "off_shows_no_badge")]
+    #[test_case(ThinkingConfig::Adaptive, Some("adaptive") ; "adaptive")]
+    #[test_case(ThinkingConfig::Effort(High), Some("high") ; "effort_names_the_level")]
+    #[test_case(ThinkingConfig::Budget(8192), Some("8192 tokens") ; "budget_keeps_its_unit")]
+    fn thinking_status_label(config: ThinkingConfig, expected: Option<&str>) {
+        assert_eq!(config.status_label().as_deref(), expected);
     }
 
     #[test_case(ThinkingConfig::Off,             Some(4096), Budgeted::Off            ; "off")]

@@ -12,7 +12,7 @@ pub use error::AgentError;
 pub use maki_storage::sessions::add_cost;
 pub use model::{
     FastPricing, Model, ModelEntry, ModelError, ModelFamily, ModelInfo, ModelPricing, ModelTier,
-    ThinkingSupport, TokenUsage, format_tokens,
+    ThinkingOption, ThinkingSupport, TokenUsage, format_tokens,
 };
 pub use pricing::{model_cost, settle_session};
 pub use providers::Timeouts;

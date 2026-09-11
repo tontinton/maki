@@ -1225,8 +1225,8 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// Lua acts on the focused session, the same target the model picker and
-    /// `/thinking` write to.
+    /// Lua acts on the focused session, the same target the model picker
+    /// writes to.
     fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
         match req {
             ModelRequest::Get => Ok(self.focused_app().model_state()),

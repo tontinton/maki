@@ -367,6 +367,7 @@ pub fn style_by_name(name: &str) -> Style {
         "tool_error" => t.tool_error,
         "tool_annotation" => t.tool_annotation,
         "spinner" => t.spinner,
+        "thinking" => t.thinking,
         "error" => t.error,
         "bold" => t.bold,
         "italic" => t.italic,
@@ -1368,6 +1369,7 @@ diff_new_line_nr = { fg = "red" }
         assert_eq!(style_by_name("warning"), t.todo_in_progress);
         assert_eq!(style_by_name("match"), t.item_match);
         assert_eq!(style_by_name("match_selected"), t.item_match_selected);
+        assert_eq!(style_by_name("thinking"), t.thinking);
     }
 
     #[test_case("nonexistent_style")]

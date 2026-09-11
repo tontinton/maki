@@ -410,14 +410,18 @@ impl App {
         );
     }
 
-    /// Takes the spelling both `/thinking` and `maki.model.set` accept; a
-    /// blank {input} toggles.
+    /// Takes the spelling `maki.model.set` accepts, which is what the
+    /// `/thinking` plugin passes through. A blank {input} toggles.
+    ///
+    /// Stores the clamped value rather than the typed one, so the status bar
+    /// can never read `off` on a model that is really sending minimal effort.
     pub(crate) fn set_thinking(&mut self, input: &str) -> Result<ThinkingConfig, String> {
         if !self.state.model.supports_thinking() {
             return Err(THINKING_UNSUPPORTED_MSG.into());
         }
-        self.state.thinking =
-            ThinkingConfig::parse(input.trim(), self.state.thinking).map_err(str::to_owned)?;
+        self.state.thinking = ThinkingConfig::parse(input.trim(), self.state.thinking)
+            .map_err(str::to_owned)?
+            .clamped(&self.state.model);
         Ok(self.state.thinking)
     }
 
@@ -437,6 +441,7 @@ impl App {
             "id": model.id,
             "provider": model.provider.to_string(),
             "thinking": self.state.thinking.to_string(),
+            "thinking_options": model.thinking_options(),
             "fast": self.state.fast,
             "supports_thinking": model.supports_thinking(),
             "supports_fast": model.supports_fast(),
@@ -1422,13 +1427,6 @@ impl App {
                     "YOLO mode disabled"
                 };
                 self.flash(msg.into());
-                vec![]
-            }
-            "/thinking" => {
-                match self.set_thinking(&cmd.args) {
-                    Ok(thinking) => self.flash(format!("Thinking: {thinking}")),
-                    Err(msg) => self.flash(msg),
-                }
                 vec![]
             }
             "/fast" => {

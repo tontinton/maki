@@ -56,6 +56,7 @@ const RESUMED_PROMPT: &str = "carry me over";
 const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
 const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
 const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
+const THINKING_OPTIONS: &str = "thinking_options";
 const MODEL_CHANGED_EVENT: &str = "ModelChanged";
 const PLAN_READY_EVENT: &str = "PlanReady";
 const PLAN_DRAFT_PATH: &str = "/tmp/plan.md";
@@ -4225,53 +4226,6 @@ fn bash_prefix_overrides_mode() {
 }
 
 #[test]
-fn thinking_toggle_cycles_off_adaptive() {
-    let mut app = test_app();
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-
-    app.execute_command(cmd("/thinking"), 0);
-    assert_eq!(app.state.thinking, ThinkingConfig::Adaptive);
-
-    app.execute_command(cmd("/thinking"), 0);
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-}
-
-#[test]
-fn thinking_explicit_args() {
-    let mut app = test_app();
-
-    app.execute_command(
-        ParsedCommand {
-            name: "/thinking".into(),
-            args: "8192".into(),
-            bang: false,
-        },
-        0,
-    );
-    assert_eq!(app.state.thinking, ThinkingConfig::Budget(8192));
-
-    app.execute_command(
-        ParsedCommand {
-            name: "/thinking".into(),
-            args: "high".into(),
-            bang: false,
-        },
-        0,
-    );
-    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
-}
-
-#[test]
-fn thinking_unsupported_model_flashes_error() {
-    let mut app = test_app();
-    app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::No);
-
-    app.execute_command(cmd("/thinking"), 0);
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-    assert_eq!(app.status_bar.flash_text(), Some(THINKING_UNSUPPORTED_MSG));
-}
-
-#[test]
 fn package_commands_are_user_only_and_preserve_update_bang() {
     let mut app = test_app();
     let typed = || ParsedCommand {
@@ -4488,7 +4442,7 @@ fn model_state_reports_the_model_and_what_it_supports() {
     let mut app = test_app();
     app.state.model = maki_providers::Model::from_spec(PLAIN_MODEL_SPEC).unwrap();
     assert_eq!(
-        app.model_state(),
+        model_state_scalars(&app),
         serde_json::json!({
             "spec": PLAIN_MODEL_SPEC,
             "id": "qwen3",
@@ -4504,7 +4458,7 @@ fn model_state_reports_the_model_and_what_it_supports() {
     app.set_thinking("high").unwrap();
     app.set_fast(true).unwrap();
     assert_eq!(
-        app.model_state(),
+        model_state_scalars(&app),
         serde_json::json!({
             "spec": OPUS_SPEC,
             "id": "claude-opus-4-8",
@@ -4515,6 +4469,53 @@ fn model_state_reports_the_model_and_what_it_supports() {
             "supports_fast": true,
         })
     );
+}
+
+/// The ladder moves with the model table, so it gets its own test and the
+/// pinned payloads stay on the fields that do not.
+fn model_state_scalars(app: &App) -> serde_json::Value {
+    let mut state = app.model_state();
+    state
+        .as_object_mut()
+        .expect("model_state is an object")
+        .remove(THINKING_OPTIONS);
+    state
+}
+
+/// The `/thinking` picker draws its rows from this payload alone, so the state
+/// has to carry the ladder, named rows with their budgets, and an empty one
+/// where there is nothing to pick from. Which rows there are is
+/// `Model::thinking_options`'s business.
+#[test]
+fn model_state_carries_the_thinking_ladder() {
+    let mut app = test_app();
+    set_opus_model(&mut app);
+
+    let ladder = app.model_state()[THINKING_OPTIONS].clone();
+    assert_eq!(ladder[0]["name"], "off");
+    assert!(
+        ladder
+            .as_array()
+            .expect("the ladder is an array")
+            .iter()
+            .any(|option| option["tokens"].is_u64()),
+        "an effort row carries what it costs: {ladder}"
+    );
+
+    app.state.model = maki_providers::Model::from_spec(PLAIN_MODEL_SPEC).unwrap();
+    assert_eq!(app.model_state()[THINKING_OPTIONS], serde_json::json!([]));
+}
+
+/// `Off` is not a state a model that requires thinking can be in, so storing it
+/// would report one level while the request sent another.
+#[test]
+fn set_thinking_clamps_to_what_the_model_will_run() {
+    let mut app = test_app();
+    app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::Required);
+
+    let lifted = ThinkingConfig::Effort(Effort::Minimal);
+    assert_eq!(app.set_thinking("off").unwrap(), lifted);
+    assert_eq!(app.state.thinking, lifted);
 }
 
 /// A plugin redraws its badge from the payload alone, and only when the model

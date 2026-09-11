@@ -12,11 +12,22 @@ const LUA_CONTEXT_BINDS: &[(&str, &str, &str)] = &[
     ("Session Picker", "`Ctrl+N`", "New session"),
     ("Session Picker", "`Ctrl+R`", "Rename session"),
     ("Session Picker", "`Ctrl+D`", "Delete session (press twice)"),
+    ("Thinking Picker", "`↑`/`↓`", "Move between effort levels"),
+    ("Thinking Picker", "`0`-`9`", "Type a token budget"),
+    ("Thinking Picker", "`Enter`", "Apply and close"),
+    (
+        "Thinking Picker",
+        "`Esc`",
+        "Close without changing anything",
+    ),
 ];
 
 // Built-in plugins own these globally, so they never reach `KEYBINDS`.
-const PLUGIN_BINDS: &[(&str, &str)] =
-    &[("`Ctrl+P`", "Browse sessions"), ("`Ctrl+X`", "Open tasks")];
+const PLUGIN_BINDS: &[(&str, &str)] = &[
+    ("`Ctrl+P`", "Browse sessions"),
+    ("`Ctrl+X`", "Open tasks"),
+    ("`Alt+T`", "Thinking effort"),
+];
 
 const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::General,

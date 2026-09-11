@@ -11,14 +11,14 @@ use std::sync::Arc;
 
 use jiff::Timestamp;
 use maki_config::ModelPolicy;
-use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredTokenUsage};
+use maki_storage::sessions::{Effort, MIN_THINKING_BUDGET, StoredTokenUsage};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model_registry;
 use crate::providers::catalog::{self, CatalogMeta};
 use crate::providers::{anthropic, custom, dynamic};
-use crate::types::ThinkingFields;
+use crate::types::{FALLBACK_MAX_THINKING_BUDGET, THINKING_ADAPTIVE, THINKING_OFF, ThinkingFields};
 
 const PER_MILLION: f64 = 1_000_000.0;
 
@@ -314,6 +314,18 @@ impl ThinkingSupport {
     }
 }
 
+/// One row of the thinking ladder: a value this model accepts, and what it
+/// costs here. Frontends render the ladder from this instead of keeping their
+/// own copy of the levels.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ThinkingOption {
+    pub name: &'static str,
+    /// The budget maki would send for this row, already floored and capped.
+    /// Absent on rows that are not a token budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Model {
     pub id: String,
@@ -463,6 +475,29 @@ impl Model {
     pub fn max_thinking_budget(&self) -> Option<u32> {
         self.max_output_tokens
             .map(|n| (n / 2).max(MIN_THINKING_BUDGET))
+    }
+
+    /// Every thinking value this model accepts, cheapest first, with the budget
+    /// each effort level resolves to here. Empty exactly when the model has no
+    /// thinking support, so an empty list is the one check a caller needs
+    /// before offering the ladder.
+    pub fn thinking_options(&self) -> Vec<ThinkingOption> {
+        if !self.supports_thinking() {
+            return Vec::new();
+        }
+        let max = self
+            .max_thinking_budget()
+            .unwrap_or(FALLBACK_MAX_THINKING_BUDGET);
+        (!self.requires_thinking())
+            .then_some(THINKING_OFF)
+            .into_iter()
+            .chain([THINKING_ADAPTIVE])
+            .map(|name| ThinkingOption { name, tokens: None })
+            .chain(Effort::ALL.map(|level| ThinkingOption {
+                name: level.as_str(),
+                tokens: Some(level.budget(max)),
+            }))
+            .collect()
     }
 
     /// A model supports fast mode exactly when it carries fast-tier pricing, so
@@ -1396,5 +1431,64 @@ mod tests {
             }
         );
         assert_eq!(COUNTERS.billed(None).cost, None);
+    }
+
+    /// Twice [`FALLBACK_MAX_THINKING_BUDGET`], so a declared window and a
+    /// missing one land on the same ceiling.
+    const ROOMY_OUTPUT: u32 = 65_536;
+    /// Halves to 1024, the floor, so every level collapses onto it.
+    const TINY_OUTPUT: u32 = 2_048;
+    /// 10% to 100% of 32k.
+    const CEILING_BUDGETS: [u32; 6] = [3_276, 6_553, 13_107, 19_660, 26_214, 32_768];
+    const LADDER: [&str; 8] = [
+        "off", "adaptive", "minimal", "low", "medium", "high", "xhigh", "max",
+    ];
+
+    fn ladder_model(support: ThinkingSupport, max_output_tokens: Option<u32>) -> Model {
+        Model {
+            id: "test-model".into(),
+            provider: Arc::from("anthropic"),
+            tier: ModelTier::Medium,
+            family: ModelFamily::Claude,
+            supports_tool_examples_override: None,
+            thinking_override: Some(support),
+            supports_vision_override: None,
+            pricing: ModelPricing::default(),
+            discovered_free: false,
+            max_output_tokens,
+            context_window: 200_000,
+            thinking_fields: None,
+        }
+    }
+
+    /// The Lua picker draws its rows straight from this list, so the shape is
+    /// the contract: no thinking means no rows, and a model that refuses to
+    /// turn thinking off never offers `off`.
+    #[test_case(ThinkingSupport::No, &[] ; "no_support_no_rows")]
+    #[test_case(ThinkingSupport::Yes, &LADDER ; "the_whole_ladder")]
+    #[test_case(ThinkingSupport::Required, &LADDER[1..] ; "required_thinking_drops_off")]
+    fn thinking_options_list_what_the_model_accepts(support: ThinkingSupport, expected: &[&str]) {
+        let options = ladder_model(support, Some(ROOMY_OUTPUT)).thinking_options();
+        let names: Vec<&str> = options.iter().map(|option| option.name).collect();
+        assert_eq!(names, expected);
+    }
+
+    /// The numbers are [`Effort::budget`]'s, so what this pins is which ceiling
+    /// the ladder hands it: the declared window, the fallback when there is
+    /// none, and the floor when the window is too small to split.
+    #[test_case(Some(ROOMY_OUTPUT), CEILING_BUDGETS ; "declared_ceiling")]
+    #[test_case(None, CEILING_BUDGETS ; "missing_ceiling_falls_back")]
+    #[test_case(Some(TINY_OUTPUT), [MIN_THINKING_BUDGET; 6] ; "tiny_ceiling_collapses_onto_the_floor")]
+    fn thinking_options_resolve_budgets_against_the_ceiling(
+        max_output_tokens: Option<u32>,
+        levels: [u32; 6],
+    ) {
+        let tokens: Vec<Option<u32>> = ladder_model(ThinkingSupport::Yes, max_output_tokens)
+            .thinking_options()
+            .into_iter()
+            .map(|option| option.tokens)
+            .collect();
+        let expected: Vec<Option<u32>> = [None, None].into_iter().chain(levels.map(Some)).collect();
+        assert_eq!(tokens, expected);
     }
 }
