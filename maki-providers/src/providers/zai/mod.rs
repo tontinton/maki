@@ -115,6 +115,9 @@ inventory::submit!(BuiltInProvider {
     needs_url: false,
 });
 
+/// Rates come from the pay as you go table on docs.z.ai. models.dev looks like
+/// a good source but still lists the launch promo for the GLM-5 line, which
+/// expired, so copying from there halves the numbers below.
 pub(crate) const fn models() -> &'static [ModelEntry] {
     &[
         ModelEntry {
@@ -172,17 +175,33 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             vision: false,
             default: false,
             pricing: ModelPricing {
-                input: 1.00,
-                output: 3.20,
+                input: 1.40,
+                output: 4.40,
                 cache_write: 0.00,
-                cache_read: 0.20,
+                cache_read: 0.26,
                 fast: None,
             },
             max_output_tokens: Some(131072),
             context_window: 1_000_000,
         },
         ModelEntry {
-            prefixes: &["glm-5.1", "glm-5"],
+            prefixes: &["glm-5.1"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Glm,
+            vision: false,
+            default: false,
+            pricing: ModelPricing {
+                input: 1.40,
+                output: 4.40,
+                cache_write: 0.00,
+                cache_read: 0.26,
+                fast: None,
+            },
+            max_output_tokens: Some(131072),
+            context_window: 200_000,
+        },
+        ModelEntry {
+            prefixes: &["glm-5"],
             tier: ModelTier::Strong,
             family: ModelFamily::Glm,
             vision: false,
@@ -450,6 +469,19 @@ mod tests {
         let flash = Model::from_spec("zai/glm-5.3-flash").unwrap();
         assert_eq!(flash.tier, ModelTier::Weak);
         assert!(flash.supports_vision());
+    }
+
+    /// These two shared `glm-5`'s row and so billed at its cheaper rate. That
+    /// hurt: `glm-5.1` is the provider default, so a plain session under-
+    /// reported what it spent.
+    #[test_case("zai/glm-5.1" ; "glm_5_1_bills_above_glm_5")]
+    #[test_case("zai/glm-5.2" ; "glm_5_2_bills_above_glm_5")]
+    fn glm_5_x_does_not_ride_the_glm_5_entry(spec: &str) {
+        let glm_5 = Model::from_spec("zai/glm-5").unwrap().pricing;
+        let pricing = Model::from_spec(spec).unwrap().pricing;
+        assert!(pricing.input > glm_5.input);
+        assert!(pricing.output > glm_5.output);
+        assert!(pricing.cache_read > glm_5.cache_read);
     }
 
     #[test]

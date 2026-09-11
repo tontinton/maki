@@ -205,8 +205,9 @@ Defaults: mistral-medium-latest (strong), mistral-small-latest (medium), ministr
 | Medium | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
 | Strong | **glm-5-code** (default) | $1.20 / $5.00 | 200K ctx / 131K out |
 | Strong | glm-5.3 | $1.40 / $4.40 | 1000K ctx / 131K out |
-| Strong | glm-5.2 | $1.00 / $3.20 | 1000K ctx / 131K out |
-| Strong | glm-5.1, glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
+| Strong | glm-5.2 | $1.40 / $4.40 | 1000K ctx / 131K out |
+| Strong | glm-5.1 | $1.40 / $4.40 | 200K ctx / 131K out |
+| Strong | glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
 
 Defaults: glm-5-code (strong), glm-4.7-flash (weak), glm-4.7 (medium)
 
