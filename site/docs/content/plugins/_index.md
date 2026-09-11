@@ -83,9 +83,11 @@ in [the reference](/docs/lua-api/#plugin-permissions). Set
 runs, an edited plugin is still the old one.
 
 To debug, add `maki.log.info|warn|error(...)` calls. They write to `maki.log`
-in the dir `maki.env.logs_dir()` returns (Linux: `~/.local/logs/maki/`). When
-a backtrace comes out useless, start maki with `--no-jit`: plugins then run on
-the interpreter, with full debug info.
+in the dir `maki.env.logs_dir()` returns (Linux: `~/.local/logs/maki/`). The
+log keeps `info` and above. Set `MAKI_LOG=debug` to also keep `maki.log.debug`,
+or `MAKI_LOG=maki_lua=trace` to narrow it to one target. When a backtrace comes
+out useless, start maki with `--no-jit`: plugins then run on the interpreter,
+with full debug info.
 
 ## Conventions
 
