@@ -10,7 +10,7 @@ use color_eyre::eyre::Context;
 
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
-use maki_config::project::{self, ProjectDecision, TrustMode, TrustState};
+use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::{InitFiles, Interaction, PackPlan, PackReport, PluginHost};
 use maki_providers::model::Model;
@@ -26,6 +26,7 @@ const STALE_PROJECT_CONFIG: &str = ".maki/config.toml";
 const STALE_GLOBAL_CONFIG: &str = "config.toml";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
+const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
 
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
 /// Dropping it joins the Lua thread via `PluginHost::drop`.
@@ -340,33 +341,49 @@ pub fn run(mut cli: Cli) -> Result<()> {
 
     // The card owns the terminal, so it is drawn before logging, telemetry and
     // the panic hook claim it, and while the process is still single-threaded.
+    // Every mode settles the question here, so a policy grant reaches `-p` and
+    // the SDK exactly as it reaches the UI; only the card is TUI-only.
     let can_ask = !headless && io::stdin().is_terminal() && io::stderr().is_terminal();
-    let question = match &trust.state {
-        TrustState::Unanswered(question) if can_ask => Some(question.clone()),
+    // Declared before the early returns so a policy grant can name its pattern
+    // in the UI's first frame. A headless run returns before the UI exists and
+    // drops it; its grant is already visible through `maki trust list`.
+    let mut notice = None;
+    // `unanswered` rather than `question`: a recorded `Never` is an answer, and
+    // neither the card nor the policy may overturn one.
+    let answer = trust.state.unanswered().and_then(|question| {
+        policy_grant(question, &stack.config.trust)
+            .map(|pattern| {
+                notice = Some(format!("{POLICY_GRANT_NOTICE} {pattern}"));
+                TrustAnswer::Trust
+            })
+            // `prompt = false` silences the card only: a `paths` match is an
+            // answer given in advance, not a prompt.
+            .or_else(|| {
+                (can_ask && stack.config.trust.prompt).then(|| maki_ui::ask_trust(question))
+            })
+    });
+    match answer {
+        Some(answer) => {
+            let was_trusted = trust.project_config.is_trusted();
+            trust = project::apply_answer(&storage, trust, answer);
+            if should_load_project_env(was_trusted, trust.project_config.is_trusted()) {
+                // The untrusted build's warnings describe a config this run no
+                // longer uses, and `build_stack` reports `trust.warning` itself.
+                (stack, startup_warnings, _) = rebuild(
+                    &launch,
+                    stack,
+                    &mut teardown,
+                    &trust,
+                    was_trusted,
+                    None,
+                    None,
+                )?;
+            } else {
+                startup_warnings.extend(trust.warning.clone());
+            }
+        }
         // A run that cannot ask says so instead of silently dropping the files.
-        state => {
-            startup_warnings.extend(state.restricted_warning());
-            None
-        }
-    };
-    if let Some(question) = question {
-        let was_trusted = trust.project_config.is_trusted();
-        trust = project::apply_answer(&storage, trust, maki_ui::ask_trust(&question));
-        if should_load_project_env(was_trusted, trust.project_config.is_trusted()) {
-            // The untrusted build's warnings describe a config this run no
-            // longer uses, and `build_stack` reports `trust.warning` itself.
-            (stack, startup_warnings, _) = rebuild(
-                &launch,
-                stack,
-                &mut teardown,
-                &trust,
-                was_trusted,
-                None,
-                None,
-            )?;
-        } else {
-            startup_warnings.extend(trust.warning.clone());
-        }
+        None => startup_warnings.extend(trust.state.restricted_warning()),
     }
 
     setup::init_logging(&stack.config.storage);
@@ -434,7 +451,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
     )?];
     let mut focused = 0;
     let mut warnings = startup_warnings;
-    let mut notice = None;
     let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
     let launch = Launch {
         cli: &cli,

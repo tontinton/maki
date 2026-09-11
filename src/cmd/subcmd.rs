@@ -540,6 +540,9 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
 
 pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMode) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    // The `trust.paths` policy deliberately stops at the session entry points
+    // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
+    // user never saw, for a session it never runs.
     let trust = project::resolve_noninteractive(&cwd, trust_mode);
     load_env_files(&trust.project_config);
 
@@ -605,6 +608,9 @@ fn load_effective_config(
 
 pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    // The `trust.paths` policy deliberately stops at the session entry points
+    // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
+    // user never saw, for a session it never runs.
     let trust = project::resolve_noninteractive(&cwd, trust_mode);
     load_env_files(&trust.project_config);
 
@@ -705,6 +711,9 @@ pub fn prompt(
     }
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    // The `trust.paths` policy deliberately stops at the session entry points
+    // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
+    // user never saw, for a session it never runs.
     let trust = project::resolve_noninteractive(&cwd, trust_mode);
 
     let vars = template::env_vars();

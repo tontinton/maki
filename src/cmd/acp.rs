@@ -78,6 +78,7 @@ pub fn run(
         model_policy: Arc::new(config.provider.model_policy.clone()),
         plugin_rules: plugin_host.plugin_rules(),
         trust_mode,
+        trust_policy: Arc::new(config.trust),
         on_session_end: Some(Arc::new(move |id, reason| {
             let handle = event_handle.clone();
             Box::pin(async move { handle.end_session_async(id, reason).await })

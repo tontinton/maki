@@ -34,6 +34,8 @@ pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
 /// Tests assert on this exact text, so a wording tweak here updates them too.
 pub const PERMISSION_NAME_WARNING: &str = "inherits maki's permission rules for the builtin \
      tool of the same name, together with any \"always allow\" you saved";
+pub const TRUST_SCOPE_WARNING: &str =
+    "trust is only read from the global init.lua; ignoring the trust table in";
 
 /// How far user `init.lua` may reach. `--no-plugins` turns it off, and a
 /// project folder nobody vouched for stops at the global file.
@@ -386,7 +388,17 @@ impl PluginHost {
             return Ok(());
         }
         let owner = scope.label().to_owned();
-        if let Some(raw) = self.send_config_lua(source, scope, plugin_dir)? {
+        let global = matches!(scope, ConfigScope::Global);
+        if let Some(mut raw) = self.send_config_lua(source, scope, plugin_dir)? {
+            // A folder cannot vouch for itself: ACP resolves many
+            // client-chosen cwds against the config it read once at startup,
+            // so one trusted project's `trust.paths` would reach folders
+            // nobody ever trusted. Stripped rather than rejected, because
+            // there is no fallback config at this point and a hard error would
+            // brick the folder the user just trusted over an ignored setting.
+            if !global && std::mem::take(&mut raw.trust).is_set() {
+                warnings.push(format!("{TRUST_SCOPE_WARNING} {owner}"));
+            }
             match merged {
                 Some(existing) => existing.merge(raw),
                 None => *merged = Some(raw),
@@ -1172,6 +1184,9 @@ mod tests {
     use std::time::Instant;
     use test_case::test_case;
 
+    const GLOBAL_TRUST_PATH: &str = "~/src/me/*";
+    const PROJECT_TRUST_PATH: &str = "**";
+
     /// Closing the queue and reading it are one message. A Lua task can record
     /// an activation between a separate read and close, and a close that threw
     /// the queue away would strand exactly the request that was about to be
@@ -1502,6 +1517,50 @@ mod tests {
             .unwrap();
         assert_eq!(merged.always_yolo, Some(true));
         assert_eq!(merged.always_fast, Some(true));
+    }
+
+    #[test]
+    fn project_scope_cannot_set_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        fs::create_dir_all(dir.path().join(".maki")).unwrap();
+        fs::create_dir(&global).unwrap();
+        fs::write(
+            global.join("init.lua"),
+            format!(
+                "maki.setup({{ trust = {{ paths = {{ \"{GLOBAL_TRUST_PATH}\" }}, prompt = false }} }})"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".maki/init.lua"),
+            format!("maki.setup({{ trust = {{ paths = {{ \"{PROJECT_TRUST_PATH}\" }} }} }})"),
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let merged = host
+            .load_init_files_from_dirs(
+                InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
+                [global],
+                &mut warnings,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            merged.trust.paths.expect("the global trust table survives"),
+            [GLOBAL_TRUST_PATH]
+        );
+        assert_eq!(merged.trust.prompt, Some(false));
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.starts_with(TRUST_SCOPE_WARNING)
+                    && warning.contains(ConfigScope::Project.label())
+            }),
+            "{warnings:?}"
+        );
     }
 
     #[test]

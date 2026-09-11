@@ -8,7 +8,7 @@ use maki_storage::trusted_folders::{CanonicalFolder, TrustDecision, TrustedFolde
 use strum::VariantArray;
 use tracing::{info, warn};
 
-use crate::PROJECT_DIR;
+use crate::{PROJECT_DIR, TrustConfig};
 
 const SKIPPED: &str = "shared project config was skipped for this process";
 const TRUST_NOT_SAVED: &str =
@@ -214,6 +214,19 @@ impl TrustState {
         match self {
             TrustState::Unanswered(question) | TrustState::Declined(question) => Some(question),
             TrustState::Trusted | TrustState::Inert => None,
+        }
+    }
+
+    /// The question an answer may still be given to. `None` for a recorded
+    /// `Never`, which is why this exists next to [`TrustState::question`]: a
+    /// permanent no is a stored decision, and [`grant`] replaces a rejection in
+    /// the store, so a card or a `trust.paths` match keyed off `question` would
+    /// erase the very answer the user gave on purpose. Only `/trust` and
+    /// `maki trust add`, where typing the command is the consent, overturn one.
+    pub fn unanswered(&self) -> Option<&TrustQuestion> {
+        match self {
+            TrustState::Unanswered(question) => Some(question),
+            TrustState::Trusted | TrustState::Inert | TrustState::Declined(_) => None,
         }
     }
 
@@ -428,6 +441,21 @@ pub fn grant(storage: &StateDir, question: &TrustQuestion) -> Result<(), String>
         .map_err(|error| format!("{error}; {TRUST_NOT_SAVED}"))
 }
 
+/// Answers a question from policy alone, returning the `trust.paths` pattern
+/// that matched. `None` when nothing matched; the caller then asks, or stays
+/// restricted if it cannot.
+///
+/// The answer is only half of it: a caller that gets a pattern back records it
+/// through [`grant`] like any other yes, so `maki trust list` stays the single
+/// source of truth and no later start has to evaluate globs before it can read
+/// the store.
+pub fn policy_grant<'policy>(
+    question: &TrustQuestion,
+    policy: &'policy TrustConfig,
+) -> Option<&'policy str> {
+    policy.matched_pattern(question.folder.path())
+}
+
 /// Records a permanent no. The counterpart to [`grant`]; "not now" records
 /// nothing and so goes through neither.
 pub fn deny(storage: &StateDir, question: &TrustQuestion) -> Result<(), String> {
@@ -608,6 +636,8 @@ mod tests {
     use maki_storage::sessions::{SESSIONS_DIR, Session, TitleSource};
     use maki_storage::trusted_folders::TrustStatus;
     use serde::{Deserialize, Serialize};
+
+    use crate::TrustFileConfig;
     use test_case::test_case;
 
     use super::*;
@@ -641,6 +671,9 @@ mod tests {
     const NESTED_CWD: &str = "work/src";
     const SOURCE_DIR: &str = "src";
     const NO_FILES: &[&str] = &[];
+    /// The documented blanket form: every folder trusted, spelled out.
+    const BLANKET_GLOB: &str = "**";
+    const UNRELATED_GLOB: &str = "/nowhere/*";
 
     /// Invariant 1, structurally: every gated kind is reachable only through a
     /// trusted config. Table-driven over the enum, so a new variant is covered
@@ -820,6 +853,31 @@ mod tests {
 
     fn question_at(path: &Path) -> TrustQuestion {
         TrustQuestion::for_folder(&CanonicalFolder::resolve(path).unwrap())
+    }
+
+    fn trust_policy(paths: &[&str], prompt: Option<bool>) -> TrustConfig {
+        TrustConfig::from_file(TrustFileConfig {
+            paths: Some(paths.iter().map(|p| (*p).to_owned()).collect()),
+            prompt,
+        })
+        .expect("valid trust patterns")
+    }
+
+    #[test_case(&[], None, None ; "an_empty_policy_answers_nothing")]
+    #[test_case(&[UNRELATED_GLOB], None, None ; "no_pattern_matches")]
+    #[test_case(&[UNRELATED_GLOB, BLANKET_GLOB], None, Some(BLANKET_GLOB) ; "the_matching_pattern_is_named")]
+    #[test_case(&[BLANKET_GLOB], Some(false), Some(BLANKET_GLOB) ; "a_match_grants_with_the_card_off")]
+    fn policy_grant_answers_only_on_a_match(
+        paths: &[&str],
+        prompt: Option<bool>,
+        expected: Option<&str>,
+    ) {
+        let (_state, project, _storage) = setup();
+        let policy = trust_policy(paths, prompt);
+
+        let answer = policy_grant(&question_at(project.path()), &policy);
+
+        assert_eq!(answer, expected);
     }
 
     #[test]
@@ -1045,6 +1103,26 @@ mod tests {
             TrustState::Unanswered(_)
         ));
         assert!(!again.config.is_trusted());
+    }
+
+    /// The split between the two accessors, pinned on the one state where they
+    /// disagree. Everything automatic (the card, `trust.paths`) keys off
+    /// `unanswered`, so a `Never` is never granted over; the indicator, `/trust`
+    /// and the restriction notice key off `question`, so a rejected folder
+    /// still says so and can still be recovered by hand.
+    #[test]
+    fn a_rejection_is_reported_but_never_answered_again() {
+        let (_state, project, storage) = setup();
+        deny(&storage, &question_at(project.path())).unwrap();
+
+        let decision = resolve_recorded(&storage, project_at(project.path()));
+
+        assert!(matches!(decision.state, TrustState::Declined(_)));
+        assert_eq!(decision.state.unanswered(), None);
+        assert!(decision.state.question().is_some());
+        let notices = decision.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains(CLEAR_THE_REJECTION), "{notices:?}");
     }
 
     /// A run that cannot ask reports through `notices`, and the reason it is

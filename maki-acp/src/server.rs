@@ -25,8 +25,8 @@ use maki_agent::types::AgentEvent;
 use maki_agent::{
     AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, SessionEndReason, SessionEvents,
 };
-use maki_config::project::{self, TrustMode};
-use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults};
+use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
+use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{Message, TokenUsage, add_cost, settle_session};
@@ -37,7 +37,7 @@ use serde::Serialize;
 use serde_json::Value;
 use smol::Task;
 use smol::io::AsyncBufReadExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{AcpParams, SessionEndHook, elicitation, methods, permissions, translate};
 
@@ -267,7 +267,12 @@ async fn new_session(
 ) -> Result<AgentResponse, AcpError> {
     let req: NewSessionRequest = parse_params(raw)?;
     close_session(srv, SessionEndReason::Replaced).await;
-    let project_config = trusted_project_config(&req.cwd, &params.storage, params.trust_mode);
+    let project_config = trusted_project_config(
+        &req.cwd,
+        &params.storage,
+        params.trust_mode,
+        &params.trust_policy,
+    );
     let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone()).await;
     let session_ref = start_session(
         srv,
@@ -299,7 +304,12 @@ async fn load_session(
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
     let mut restored = load_history(session_ref.id())?;
     close_session(srv, SessionEndReason::Replaced).await;
-    let project_config = trusted_project_config(&req.cwd, &params.storage, params.trust_mode);
+    let project_config = trusted_project_config(
+        &req.cwd,
+        &params.storage,
+        params.trust_mode,
+        &params.trust_policy,
+    );
     let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone()).await;
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
@@ -533,8 +543,26 @@ async fn start_mcp(
     handle
 }
 
-fn trusted_project_config(cwd: &Path, storage: &StateDir, mode: TrustMode) -> ProjectConfig {
-    let decision = project::resolve(storage, cwd, mode);
+fn trusted_project_config(
+    cwd: &Path,
+    storage: &StateDir,
+    mode: TrustMode,
+    policy: &TrustConfig,
+) -> ProjectConfig {
+    let mut decision = project::resolve(storage, cwd, mode);
+    let matched = decision
+        .state
+        .unanswered()
+        .and_then(|question| policy_grant(question, policy));
+    if let Some(pattern) = matched {
+        // ACP has no card, so policy is the only yes a cwd with no stored
+        // decision can get. Recorded like any other yes so `maki trust list`
+        // shows what this server trusted on the client's behalf. `unanswered`
+        // and not `question`: a recorded `Never` is a stored decision, and
+        // granting over it would wipe the rejection out of the store.
+        info!(%pattern, cwd = %cwd.display(), "ACP folder trusted by trust.paths policy");
+        decision = project::apply_answer(storage, decision, TrustAnswer::Trust);
+    }
     // ACP never asks, so the restriction notice is part of what it reports.
     for warning in decision.notices() {
         warn!(%warning, "ACP project configuration trust warning");
@@ -933,11 +961,11 @@ mod tests {
     use maki_agent::permissions::PermissionManager;
     use maki_agent::{DoneReason, EventSender, SubagentInfo, ToolStartEvent, TurnCompleteEvent};
     use maki_config::project::TrustQuestion;
-    use maki_config::{Effect, ToolKey};
+    use maki_config::{Effect, ToolKey, TrustFileConfig};
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::sessions::Session;
-    use maki_storage::trusted_folders::CanonicalFolder;
+    use maki_storage::trusted_folders::{CanonicalFolder, TrustStatus, TrustedFolders};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -958,6 +986,9 @@ mod tests {
     const STDIN_DEADLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const DENY_SCOPE: &str = "acp-session-trust-boundary-test-deny";
     const ALLOW_SCOPE: &str = "acp-session-trust-boundary-test-allow";
+    const POLICY_MATCH_GLOB: &str = "**";
+    const POLICY_MISS_GLOB: &str = "/nowhere/*";
+    const GATED_INIT_SOURCE: &str = "return {}";
 
     /// The client picks the session cwd, so that folder's stored trust decides
     /// whether its `.maki` may widen permissions. Its deny rules need no trust:
@@ -976,7 +1007,12 @@ mod tests {
         .unwrap();
         let storage = StateDir::from_path(state.path().to_path_buf());
 
-        let untrusted = trusted_project_config(project.path(), &storage, TrustMode::Consult);
+        let untrusted = trusted_project_config(
+            project.path(),
+            &storage,
+            TrustMode::Consult,
+            &TrustConfig::default(),
+        );
         assert!(!untrusted.is_trusted());
         let rules = maki_config::load_permissions(&untrusted).rules;
         assert!(
@@ -993,7 +1029,12 @@ mod tests {
         let folder = CanonicalFolder::resolve(project.path()).unwrap();
         project::grant(&storage, &TrustQuestion::for_folder(&folder)).unwrap();
 
-        let trusted = trusted_project_config(project.path(), &storage, TrustMode::Consult);
+        let trusted = trusted_project_config(
+            project.path(),
+            &storage,
+            TrustMode::Consult,
+            &TrustConfig::default(),
+        );
         assert!(trusted.is_trusted());
         assert_eq!(
             trusted.config_root(),
@@ -1030,7 +1071,8 @@ mod tests {
         let held = std::io::stdin().lock();
         let (done_tx, done_rx) = flume::bounded(1);
         let worker = std::thread::spawn(move || {
-            let config = trusted_project_config(&cwd, &storage, TrustMode::Consult);
+            let config =
+                trusted_project_config(&cwd, &storage, TrustMode::Consult, &TrustConfig::default());
             let _ = done_tx.send(config.is_trusted());
         });
 
@@ -1042,6 +1084,72 @@ mod tests {
             finished,
             Ok(false),
             "a non-interactive trust resolution must not touch stdin"
+        );
+    }
+
+    /// A session cwd shipping one gated file, so a start there has a real
+    /// question for the policy to answer.
+    fn gated_project(project: &Path) {
+        std::fs::create_dir(project.join(".git")).unwrap();
+        std::fs::create_dir(project.join(".maki")).unwrap();
+        std::fs::write(project.join(".maki/init.lua"), GATED_INIT_SOURCE).unwrap();
+    }
+
+    fn trust_policy(pattern: &str) -> TrustConfig {
+        TrustConfig::from_file(TrustFileConfig {
+            paths: Some(vec![pattern.to_owned()]),
+            prompt: Some(false),
+        })
+        .expect("valid trust pattern")
+    }
+
+    /// The container image's global `init.lua` is the only thing that can
+    /// answer for an ACP run, and its answer has to reach the store: the next
+    /// start consults that alone, and `maki trust list` has to show it.
+    #[test_case(POLICY_MATCH_GLOB, true ; "a_matching_pattern_grants_without_asking")]
+    #[test_case(POLICY_MISS_GLOB, false ; "a_non_matching_pattern_leaves_the_folder_untrusted")]
+    fn policy_answers_a_session_cwd(pattern: &str, expected_trusted: bool) {
+        let state = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        gated_project(project.path());
+        let storage = StateDir::from_path(state.path().to_path_buf());
+
+        let config = trusted_project_config(
+            project.path(),
+            &storage,
+            TrustMode::Consult,
+            &trust_policy(pattern),
+        );
+
+        assert_eq!(config.is_trusted(), expected_trusted);
+        let recorded = project::resolve(&storage, project.path(), TrustMode::Consult);
+        assert_eq!(recorded.project_config.is_trusted(), expected_trusted);
+    }
+
+    /// A recorded `Never` is an answer, and `grant` replaces a rejection in the
+    /// store. A policy that overturned one would delete the decision the user
+    /// went out of their way to give, on every session the client opens.
+    #[test]
+    fn policy_does_not_overturn_a_recorded_rejection() {
+        let state = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        gated_project(project.path());
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let folder = CanonicalFolder::resolve(project.path()).unwrap();
+        project::deny(&storage, &TrustQuestion::for_folder(&folder)).unwrap();
+
+        let config = trusted_project_config(
+            project.path(),
+            &storage,
+            TrustMode::Consult,
+            &trust_policy(POLICY_MATCH_GLOB),
+        );
+
+        assert!(!config.is_trusted());
+        assert_eq!(
+            TrustedFolders::new(&storage).status(&folder).unwrap(),
+            TrustStatus::Rejected,
+            "the rejection must survive a matching policy"
         );
     }
 

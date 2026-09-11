@@ -20,7 +20,7 @@ pub const UNTRUSTED_PROJECT_WRITE: &str =
     "folder is not trusted, so nothing was saved to .maki/permissions.toml";
 
 pub mod project;
-pub use project::{GatedFile, ProjectConfig};
+pub use project::{GatedFile, ProjectConfig, policy_grant};
 
 pub mod providers;
 
@@ -288,6 +288,12 @@ pub enum ConfigError {
         #[source]
         source: globset::Error,
     },
+    #[error("invalid config: trust.paths contains invalid glob pattern `{pattern}`: {source}")]
+    InvalidTrustPattern {
+        pattern: String,
+        #[source]
+        source: globset::Error,
+    },
 }
 
 fn check(
@@ -375,6 +381,7 @@ pub struct RawConfig {
     pub provider: ProviderFileConfig,
     pub storage: StorageFileConfig,
     pub net: NetFileConfig,
+    pub trust: TrustFileConfig,
     pub telemetry: TelemetryConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
     /// Renamed to `plugins`; kept so old configs fail with a pointer to the
@@ -397,6 +404,7 @@ impl RawConfig {
         self.provider.merge(overlay.provider);
         self.storage.merge(overlay.storage);
         self.net.merge(overlay.net);
+        self.trust.merge(overlay.trust);
         self.telemetry.merge(overlay.telemetry);
         for (name, plugin) in overlay.plugins {
             let entry = self.plugins.entry(name).or_default();
@@ -429,6 +437,7 @@ impl RawConfig {
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
             net: NetConfig::from_file(self.net),
+            trust: TrustConfig::from_file(self.trust)?,
             telemetry: self.telemetry,
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_plugins_and_packages(self.plugins, packages),
@@ -692,6 +701,28 @@ pub struct NetFileConfig {
 impl NetFileConfig {
     fn merge(&mut self, overlay: NetFileConfig) {
         merge_option!(self, overlay, allowed_private_hosts);
+    }
+}
+
+/// Folder trust answered ahead of time. Only the global `init.lua` may set
+/// this: a folder cannot vouch for itself, and `maki-lua` strips the table
+/// from every other scope before it reaches here.
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrustFileConfig {
+    pub paths: Option<Vec<String>>,
+    pub prompt: Option<bool>,
+}
+
+impl TrustFileConfig {
+    fn merge(&mut self, overlay: TrustFileConfig) {
+        merge_option!(self, overlay, paths, prompt);
+    }
+
+    /// Whether the file mentioned trust at all, so the scope that is not
+    /// allowed to set it can warn about exactly the configs that tried.
+    pub fn is_set(&self) -> bool {
+        self.paths.is_some() || self.prompt.is_some()
     }
 }
 
@@ -1010,6 +1041,7 @@ pub struct Config {
     pub provider: ProviderConfig,
     pub storage: StorageConfig,
     pub net: NetConfig,
+    pub trust: TrustConfig,
     pub telemetry: TelemetryConfig,
     pub permissions: PermissionsConfig,
     pub plugins: PluginsConfig,
@@ -1479,6 +1511,88 @@ impl NetConfig {
         Self {
             allowed_private_hosts: f.allowed_private_hosts.unwrap_or_default(),
         }
+    }
+}
+
+/// Compiled `trust.paths`, matched against the canonical project root the
+/// trust store keys on. The patterns are kept next to the [`GlobSet`] so a
+/// grant can name the one that produced it.
+///
+/// Reading this from the global `init.lua` adds no power: that file already
+/// runs arbitrary Lua in this process. Ask through
+/// [`project::policy_grant`](crate::project::policy_grant) so a match is
+/// recorded like any other yes.
+#[derive(Debug, Clone)]
+pub struct TrustConfig {
+    matcher: GlobSet,
+    patterns: Vec<String>,
+    pub prompt: bool,
+}
+
+impl Default for TrustConfig {
+    fn default() -> Self {
+        Self {
+            matcher: GlobSet::empty(),
+            patterns: Vec::new(),
+            prompt: true,
+        }
+    }
+}
+
+impl TrustConfig {
+    pub fn from_file(f: TrustFileConfig) -> Result<Self, ConfigError> {
+        let patterns = f.paths.unwrap_or_default();
+        Ok(Self {
+            matcher: Self::compile(&patterns)?,
+            patterns,
+            prompt: f.prompt.unwrap_or(true),
+        })
+    }
+
+    /// `literal_separator` is on, unlike [`ModelPolicy`]: a path is segmented,
+    /// so `~/src/*` must mean the projects directly under it and `~/src/**`
+    /// the whole tree.
+    fn compile(patterns: &[String]) -> Result<GlobSet, ConfigError> {
+        let mut globset = GlobSetBuilder::new();
+        for pattern in patterns {
+            let glob = GlobBuilder::new(&expand_home(pattern))
+                .literal_separator(true)
+                .build()
+                .map_err(|source| ConfigError::InvalidTrustPattern {
+                    pattern: pattern.clone(),
+                    source,
+                })?;
+            globset.add(glob);
+        }
+        globset
+            .build()
+            .map_err(|source| ConfigError::InvalidTrustPattern {
+                pattern: String::new(),
+                source,
+            })
+    }
+
+    /// The pattern as the user wrote it, not the expanded form, since it is
+    /// what they would search their `init.lua` for.
+    pub(crate) fn matched_pattern(&self, root: &Path) -> Option<&str> {
+        let matched = *self.matcher.matches(root).first()?;
+        self.patterns.get(matched).map(String::as_str)
+    }
+}
+
+/// Globs are matched against absolute canonical paths, so a leading `~` has to
+/// become one. An unknown home leaves the pattern alone, where it simply
+/// matches nothing. `~user` is not a home reference and is left alone too.
+fn expand_home(pattern: &str) -> String {
+    let Some(rest) = pattern
+        .strip_prefix('~')
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+    else {
+        return pattern.to_owned();
+    };
+    match paths::home() {
+        Some(home) => format!("{}{rest}", home.display()),
+        None => pattern.to_owned(),
     }
 }
 
@@ -2430,6 +2544,11 @@ mod tests {
 
     const GLOBAL_ALLOWED_HOST: &str = "ollama.lan";
     const PROJECT_ALLOWED_HOST: &str = "searx.lan:8888";
+    const HOME_GLOB: &str = "~/src/me/*";
+    const HOME_TREE_GLOB: &str = "~/src/me/**";
+    const BLANKET_GLOB: &str = "**";
+    const ABSOLUTE_PATH: &str = "/workspace";
+    const BROKEN_GLOB: &str = "[";
 
     /// The temp directory a test builds its project in, with its parent
     /// standing in for the home directory. Plain discovery would read the real
@@ -2684,6 +2803,77 @@ mod tests {
         ));
     }
 
+    fn trust_config(paths: &[&str], prompt: Option<bool>) -> TrustConfig {
+        RawConfig {
+            trust: TrustFileConfig {
+                paths: Some(paths.iter().map(|p| (*p).to_owned()).collect()),
+                prompt,
+            },
+            ..Default::default()
+        }
+        .into_config(&[])
+        .expect("valid trust patterns")
+        .trust
+    }
+
+    #[test_case(HOME_GLOB, "src/me/proj", true ; "star_matches_one_segment_under_home")]
+    #[test_case(HOME_GLOB, "src/me/proj/nested", false ; "star_does_not_cross_a_separator")]
+    #[test_case(HOME_TREE_GLOB, "src/me/proj/nested", true ; "double_star_crosses_separators")]
+    #[test_case(BLANKET_GLOB, "anywhere/at/all", true ; "blanket_matches_everything")]
+    #[test_case(ABSOLUTE_PATH, "workspace", false ; "absolute_pattern_is_not_relative_to_home")]
+    fn trust_paths_expand_home(pattern: &str, under_home: &str, matches: bool) {
+        let root = paths::home()
+            .expect("test environment has a home directory")
+            .join(under_home);
+
+        assert_eq!(
+            trust_config(&[pattern], None).matched_pattern(&root),
+            matches.then_some(pattern)
+        );
+    }
+
+    #[test_case(ABSOLUTE_PATH, true ; "exact_root")]
+    #[test_case("/workspace/*", false ; "parent_of_the_matched_children")]
+    #[test_case("/work*", true ; "star_inside_a_segment")]
+    #[test_case(BLANKET_GLOB, true ; "blanket")]
+    fn trust_paths_match_an_absolute_root(pattern: &str, matches: bool) {
+        assert_eq!(
+            trust_config(&[pattern], None).matched_pattern(Path::new(ABSOLUTE_PATH)),
+            matches.then_some(pattern)
+        );
+    }
+
+    #[test]
+    fn invalid_trust_pattern_is_a_config_error() {
+        let result = RawConfig {
+            trust: TrustFileConfig {
+                paths: Some(vec![BROKEN_GLOB.into()]),
+                prompt: None,
+            },
+            ..Default::default()
+        }
+        .into_config(&[]);
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidTrustPattern { pattern, .. }) if pattern == BROKEN_GLOB
+        ));
+    }
+
+    #[test_case(None, true ; "unset_draws_the_card")]
+    #[test_case(Some(false), false ; "false_suppresses_the_card")]
+    fn trust_prompt_defaults_to_asking(prompt: Option<bool>, expected: bool) {
+        assert_eq!(trust_config(&[], prompt).prompt, expected);
+    }
+
+    #[test]
+    fn default_trust_policy_matches_nothing_and_asks() {
+        let policy = TrustConfig::default();
+
+        assert!(policy.prompt);
+        assert_eq!(policy.matched_pattern(Path::new(ABSOLUTE_PATH)), None);
+    }
+
     #[test]
     fn merge_always_flags_overlay_wins() {
         let mut base = RawConfig {
@@ -2836,6 +3026,7 @@ mod tests {
             provider: ProviderConfig::default(),
             storage: StorageConfig::default(),
             net: NetConfig::default(),
+            trust: TrustConfig::default(),
             telemetry: TelemetryConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::default(),
