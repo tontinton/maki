@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
 use maki_agent::agent::tool_dispatch;
-use maki_agent::cancel::{CancelMap, CancelSlot};
+use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
@@ -18,9 +18,9 @@ use maki_agent::tools::{
     ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
-    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
-    EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, McpSession, RunLedger,
-    SessionEvents, SubagentInfo, ToolDoneEvent, event_stream,
+    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DETACHED_RUN_ID,
+    DoneReason, EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, McpSession,
+    RunLedger, SessionEvents, SubagentInfo, ToolDoneEvent, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -43,6 +43,8 @@ use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
+const SCOPE_ERR: &str = "scope must be \"session\"";
+const SCOPE_NESTED_ERR: &str = "scope = \"session\" is only valid on the main session";
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
     let Some(tier_str) = tier else {
@@ -432,6 +434,12 @@ async fn call_tool(
 ///     `"max"`), or a budget integer (token count). Inherits the parent
 ///     setting if omitted, and is capped at it otherwise.
 ///   `fast` (boolean?) - use fast mode. Inherits parent setting if omitted.
+///   `scope` (string?) - `"session"` detaches the session from the call that
+///     spawned it: it survives the call returning and the turn ending,
+///     instead of being cancelled the moment either does. Esc on its chat
+///     still cancels it. Keep the returned handle to `prompt` and `close`.
+///     Omit for the default: tied to the call that spawned it. Invalid
+///     inside a subagent.
 /// @return (Session?, string?) Session handle, or `(nil, err)` on failure.
 /// @example
 /// local tools = maki.agent.tools(ctx, { audience = "general_sub" })
@@ -454,6 +462,14 @@ async fn session(
 ) -> LuaResult<Pair<mlua::AnyUserData>> {
     let agent_ctx = try_pair!(dispatch_ctx(&ctx, "session")).clone();
     drop(ctx);
+    let detached: bool = match opts.get::<LuaValue>("scope")? {
+        LuaValue::Nil => false,
+        LuaValue::String(s) if s.to_str()?.as_ref() == "session" => true,
+        _ => return Ok(err_pair(SCOPE_ERR)),
+    };
+    if detached && agent_ctx.task_id.is_some() {
+        return Ok(err_pair(SCOPE_NESTED_ERR));
+    }
     let model_spec: Option<String> = opts.get("model_spec")?;
     let system: Option<String> = opts.get("system")?;
     let tools_val: Option<LuaValue> = opts.get("tools")?;
@@ -564,8 +580,12 @@ async fn session(
     let opts = RequestOptions { thinking, fast }.clamped(&model);
 
     let (stream_guard, sub_events) = event_stream();
-    let sub_event_tx = stream_guard.sender(agent_ctx.event_tx.run_id());
-    let parent_tx = agent_ctx.event_tx.clone();
+    let parent_tx = if detached {
+        agent_ctx.event_tx.with_run_id(DETACHED_RUN_ID)
+    } else {
+        agent_ctx.event_tx.clone()
+    };
+    let sub_event_tx = stream_guard.sender(parent_tx.run_id());
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
@@ -588,8 +608,15 @@ async fn session(
         .clone()
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
     // Registered before the session runs so the child token does not fire
-    // on drop and kill the subagent at birth.
-    let (child_trigger, child_cancel) = agent_ctx.cancel.child();
+    // on drop and kill the subagent at birth. A detached child stands on
+    // its own token instead of the caller's: it must outlive the call (and
+    // the turn) that spawned it, only stopped by a targeted cancel or
+    // cancel-all from here on.
+    let (child_trigger, child_cancel) = if detached {
+        CancelToken::new()
+    } else {
+        agent_ctx.cancel.child()
+    };
     // Several sessions can share one `ui_id`, so keep the slot and retire
     // only ours on close instead of clearing the whole key.
     let cancel_slot = agent_ctx
@@ -652,6 +679,7 @@ async fn session(
         usage_rx,
         start: Instant::now(),
         closed: false,
+        detached,
     };
 
     let sess = lua.create_userdata(LuaSession {
@@ -771,6 +799,10 @@ struct SessionState {
     cancel_slot: CancelSlot,
     parent_event_tx: EventSender,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
+    /// Set at creation from `scope = "session"`; echoed on every
+    /// [`SubagentInfo`] so the UI knows to keep the chat cancellable after
+    /// the spawning run ends.
+    detached: bool,
     local_tools: LocalTools,
     name: String,
     usage: TokenUsage,
@@ -859,6 +891,7 @@ async fn prompt(
             model: Some(s.params.model.spec()),
             opts: Some(s.opts),
             answer_tx: s.answer_tx.take(),
+            detached: s.detached,
         });
     }
 
@@ -1065,6 +1098,7 @@ mod tests {
             model: None,
             opts: None,
             answer_tx: None,
+            detached: false,
         })
         .unwrap();
         info
