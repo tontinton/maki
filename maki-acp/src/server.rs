@@ -535,7 +535,8 @@ async fn start_mcp(
 
 fn trusted_project_config(cwd: &Path, storage: &StateDir, mode: TrustMode) -> ProjectConfig {
     let decision = project::resolve(storage, cwd, mode);
-    if let Some(warning) = decision.warning {
+    // ACP never asks, so the restriction notice is part of what it reports.
+    for warning in decision.notices() {
         warn!(%warning, "ACP project configuration trust warning");
     }
     decision.project_config
@@ -931,11 +932,12 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 mod tests {
     use maki_agent::permissions::PermissionManager;
     use maki_agent::{DoneReason, EventSender, SubagentInfo, ToolStartEvent, TurnCompleteEvent};
+    use maki_config::project::TrustQuestion;
     use maki_config::{Effect, ToolKey};
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::sessions::Session;
-    use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
+    use maki_storage::trusted_folders::CanonicalFolder;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -974,7 +976,7 @@ mod tests {
         .unwrap();
         let storage = StateDir::from_path(state.path().to_path_buf());
 
-        let untrusted = trusted_project_config(project.path(), &storage, TrustMode::Skip);
+        let untrusted = trusted_project_config(project.path(), &storage, TrustMode::Consult);
         assert!(!untrusted.is_trusted());
         let rules = maki_config::load_permissions(&untrusted).rules;
         assert!(
@@ -989,15 +991,9 @@ mod tests {
         );
 
         let folder = CanonicalFolder::resolve(project.path()).unwrap();
-        let present: Vec<&str> = maki_config::project::gated_files(project.path())
-            .iter()
-            .map(|file| file.file_name())
-            .collect();
-        TrustedFolders::new(&storage)
-            .add(&folder, &present)
-            .unwrap();
+        project::grant(&storage, &TrustQuestion::for_folder(&folder)).unwrap();
 
-        let trusted = trusted_project_config(project.path(), &storage, TrustMode::Skip);
+        let trusted = trusted_project_config(project.path(), &storage, TrustMode::Consult);
         assert!(trusted.is_trusted());
         assert_eq!(
             trusted.config_root(),
@@ -1034,7 +1030,7 @@ mod tests {
         let held = std::io::stdin().lock();
         let (done_tx, done_rx) = flume::bounded(1);
         let worker = std::thread::spawn(move || {
-            let config = trusted_project_config(&cwd, &storage, TrustMode::Skip);
+            let config = trusted_project_config(&cwd, &storage, TrustMode::Consult);
             let _ = done_tx.send(config.is_trusted());
         });
 

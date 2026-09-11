@@ -27,9 +27,11 @@ use maki_providers::{
     ContentBlock, Effort, Message, RequestOptions, Role, THINKING_USAGE, TokenUsage,
 };
 use maki_storage::sessions::{SessionMeta, StoredMode, StoredThinking};
+use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -75,6 +77,8 @@ const PERMISSIONS_CWD: &str = "/tmp";
 const SMALL_HISTORY: u32 = 1_000;
 const AGENT_ERROR_MSG: &str = "boom";
 const MULTIBYTE_ERROR_CHAR: &str = "é";
+const TRUST: &str = "/trust";
+const GATED_INIT_SOURCE: &str = "-- shipped by the project";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -5467,6 +5471,54 @@ fn turn_end_keeps_only_the_subagents_that_finished() {
         .map(|sa| sa.tool_use_id.as_str())
         .collect();
     assert_eq!(ids, [FINISHED_TASK_ID]);
+}
+
+/// A folder that ships exactly one gated file, plus the question a start in it
+/// would pose. Written into a tempdir so the grant is about a path nothing else
+/// on the machine owns.
+fn question_about_a_gated_folder(project: &Path) -> TrustQuestion {
+    let gated = project.join(GatedFile::InitLua.to_string());
+    fs::create_dir_all(gated.parent().unwrap()).unwrap();
+    fs::write(&gated, GATED_INIT_SOURCE).unwrap();
+    TrustQuestion::for_folder(&CanonicalFolder::resolve(project).unwrap())
+}
+
+/// `/trust` is `maki trust add --yes` from inside the TUI, so it has to leave
+/// the same record on disk. The reload is the other half: the project config it
+/// just granted only loads on a fresh start.
+#[test]
+fn trust_command_records_the_folder_and_reloads() {
+    let (_state, storage, _writer, mut app) = tempdir_app();
+    let project = TempDir::new().unwrap();
+    let question = question_about_a_gated_folder(project.path());
+    app.trust_question = Some(question.clone());
+
+    app.execute_command(cmd(TRUST), 0);
+
+    assert!(
+        TrustedFolders::new(&storage)
+            .contains(&question.folder)
+            .unwrap(),
+        "the grant must outlive the process"
+    );
+    assert_eq!(app.exit_request, ExitRequest::Reload);
+    assert_eq!(
+        app.status_bar.flash_text().unwrap(),
+        format!("{TRUSTED_PREFIX}{}", GatedFile::InitLua)
+    );
+}
+
+/// Nothing to grant is not a reason to tear the session down: the user would
+/// lose the chat to a no-op.
+#[test]
+fn trust_command_without_a_question_flashes_and_stays() {
+    let (_state, _storage, _writer, mut app) = tempdir_app();
+
+    let actions = app.execute_command(cmd(TRUST), 0);
+
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(NOTHING_TO_TRUST_MSG));
+    assert_eq!(app.exit_request, ExitRequest::None);
 }
 
 #[test]

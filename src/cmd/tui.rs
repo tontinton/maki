@@ -10,9 +10,9 @@ use color_eyre::eyre::Context;
 
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
-use maki_config::project::{self, ProjectDecision, TrustMode};
+use maki_config::project::{self, ProjectDecision, TrustMode, TrustState};
 use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
-use maki_lua::{InitFiles, Interaction, PluginHost};
+use maki_lua::{InitFiles, Interaction, PackPlan, PackReport, PluginHost};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
@@ -136,17 +136,23 @@ fn config_or_fallback(
         (Err(e), None) => Err(e),
     }
 }
+/// What every generation is built from, unchanged for the life of the process.
+struct Launch<'a> {
+    cli: &'a Cli,
+    cwd: &'a Path,
+    storage: &'a StateDir,
+    interaction: Interaction,
+}
+
 /// The one construction path for a generation: first startup passes
 /// `fallback: None` (fail-fast); `/reload` passes the last-good config and
 /// model so a broken config reopens the UI with a warning instead of exiting.
 fn build_stack(
-    cli: &Cli,
-    cwd: &Path,
-    storage: &StateDir,
-    interaction: Interaction,
+    launch: &Launch<'_>,
     trust: &ProjectDecision,
     fallback: Option<(Config, Model)>,
 ) -> Result<(Stack, Vec<String>)> {
+    let cli = launch.cli;
     let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
         .context("initialize lua plugin host")?;
 
@@ -159,7 +165,7 @@ fn build_stack(
         } else {
             super::BuiltinFailure::Fatal
         },
-        interaction,
+        launch.interaction,
         |host, names, warnings| {
             warnings.extend(trust.warning.clone());
             let loaded = load_config(
@@ -174,9 +180,9 @@ fn build_stack(
         },
     )?;
 
-    let commands = discover_commands(cli.no_commands, cwd);
+    let commands = discover_commands(cli.no_commands, launch.cwd);
 
-    let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, storage);
+    let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage);
     let (model, needs_login) = match (model_result, fallback_model) {
         (Ok(m), _) => (m, false),
         (Err(e), Some(last_model)) => {
@@ -248,17 +254,54 @@ fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
     }
 }
 
-/// `--trust` answers the question up front, so it holds wherever Maki runs.
-/// Without it only a mode that can both ask and be answered may prompt, and
-/// every other start skips what it cannot ask about.
-fn trust_mode(cli: &Cli, headless: bool) -> TrustMode {
-    if cli.trust {
-        TrustMode::Session
-    } else if !headless && io::stdin().is_terminal() && io::stderr().is_terminal() {
-        TrustMode::Ask
+/// A project `.env` is loaded exactly once, when a folder that was not trusted
+/// becomes trusted. Every other rebuild must leave the process env alone.
+fn should_load_project_env(was_trusted: bool, now_trusted: bool) -> bool {
+    !was_trusted && now_trusted
+}
+
+/// Replaces a generation's stack. The only site in the binary that loads the
+/// project environment, because the ordering is the whole safety argument: the
+/// old plugin host's thread must be joined before `load_env_files` touches the
+/// process env, and the env must be in place before the new host reads config.
+fn rebuild(
+    launch: &Launch<'_>,
+    mut stack: Stack,
+    teardown: &mut Teardown,
+    trust: &ProjectDecision,
+    was_trusted: bool,
+    pack: Option<PackPlan>,
+    fallback: Option<(Config, Model)>,
+) -> Result<(Stack, Vec<String>, Option<PackReport>)> {
+    // Shut the old host down first so nothing can repopulate the registry after
+    // the clear: its senders disconnect, the watchdog aborts in-flight
+    // callbacks, and only this thread issues loads.
+    stack.plugin_host.begin_shutdown();
+    ToolRegistry::global().clear_lua();
+
+    let load_env = should_load_project_env(was_trusted, trust.project_config.is_trusted());
+    // A package plan has to wait for the old revision leases to close, and an
+    // env load may not run beside a thread that can read the env; an ordinary
+    // reload does neither and drops the stack in the background.
+    if pack.is_some() || load_env {
+        teardown.join();
+        drop(stack);
     } else {
-        TrustMode::Skip
+        teardown.defer(move || drop(stack));
     }
+    let pack_report = pack.map(maki_lua::apply_pack_plan);
+
+    if load_env {
+        // This calls `std::env::set_var`. On the startup grant path nothing
+        // long-lived exists yet, so the join above is the whole story. The only
+        // site that reaches it with threads alive is `/trust`, a rare explicit
+        // action, and only after the join: smol's worker pool and any telemetry
+        // exporter may still be parked.
+        load_env_files(&trust.project_config);
+    }
+
+    let (stack, warnings) = build_stack(launch, trust, fallback)?;
+    Ok((stack, warnings, pack_report))
 }
 
 pub fn run(mut cli: Cli) -> Result<()> {
@@ -276,11 +319,55 @@ pub fn run(mut cli: Cli) -> Result<()> {
     } else {
         Interaction::Tty
     };
-    let trust = project::resolve(&storage, &cwd, trust_mode(&cli, headless));
+    // `--trust` answers the question up front, so it holds wherever Maki runs.
+    // Without it the store is the only source of an answer this early.
+    let mode = if cli.trust {
+        TrustMode::Session
+    } else {
+        TrustMode::Consult
+    };
+    let mut trust = project::resolve(&storage, &cwd, mode);
     load_env_files(&trust.project_config);
     warn_stale_config_toml(&trust.project_config);
-    let (mut stack, startup_warnings) =
-        build_stack(&cli, &cwd, &storage, interaction, &trust, None)?;
+    let mut teardown = Teardown::default();
+    let launch = Launch {
+        cli: &cli,
+        cwd: &cwd,
+        storage: &storage,
+        interaction,
+    };
+    let (mut stack, mut startup_warnings) = build_stack(&launch, &trust, None)?;
+
+    // The card owns the terminal, so it is drawn before logging, telemetry and
+    // the panic hook claim it, and while the process is still single-threaded.
+    let can_ask = !headless && io::stdin().is_terminal() && io::stderr().is_terminal();
+    let question = match &trust.state {
+        TrustState::Unanswered(question) if can_ask => Some(question.clone()),
+        // A run that cannot ask says so instead of silently dropping the files.
+        state => {
+            startup_warnings.extend(state.restricted_warning());
+            None
+        }
+    };
+    if let Some(question) = question {
+        let was_trusted = trust.project_config.is_trusted();
+        trust = project::apply_answer(&storage, trust, maki_ui::ask_trust(&question));
+        if should_load_project_env(was_trusted, trust.project_config.is_trusted()) {
+            // The untrusted build's warnings describe a config this run no
+            // longer uses, and `build_stack` reports `trust.warning` itself.
+            (stack, startup_warnings, _) = rebuild(
+                &launch,
+                stack,
+                &mut teardown,
+                &trust,
+                was_trusted,
+                None,
+                None,
+            )?;
+        } else {
+            startup_warnings.extend(trust.warning.clone());
+        }
+    }
 
     setup::init_logging(&stack.config.storage);
     setup::init_telemetry(&stack.config.telemetry);
@@ -349,7 +436,12 @@ pub fn run(mut cli: Cli) -> Result<()> {
     let mut warnings = startup_warnings;
     let mut notice = None;
     let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
-    let mut teardown = Teardown::default();
+    let launch = Launch {
+        cli: &cli,
+        cwd: &cwd,
+        storage: &storage,
+        interaction,
+    };
 
     loop {
         for session in &mut tabs {
@@ -399,6 +491,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
                 project_config: trust.project_config.clone(),
+                trust_question: trust.state.question().cloned(),
             },
             initial_prompt.take(),
         )
@@ -431,24 +524,19 @@ pub fn run(mut cli: Cli) -> Result<()> {
             } => {
                 let started = Instant::now();
                 let last_good = (stack.config.clone(), stack.model.clone());
-                // Shut the old host down first so nothing can repopulate the
-                // registry after the clear: its senders disconnect, the watchdog
-                // aborts in-flight callbacks, and only this thread issues loads.
-                // A package plan then has to wait for the old revision leases to
-                // close, while an ordinary reload can drop the stack in the
-                // background.
-                stack.plugin_host.begin_shutdown();
-                ToolRegistry::global().clear_lua();
-                let pack_report = if let Some(plan) = pack {
-                    teardown.join();
-                    drop(stack);
-                    Some(maki_lua::apply_pack_plan(plan))
-                } else {
-                    teardown.defer(move || drop(stack));
-                    None
-                };
-                let (new_stack, new_warnings) =
-                    build_stack(&cli, &cwd, &storage, interaction, &trust, Some(last_good))?;
+                let was_trusted = trust.project_config.is_trusted();
+                // Re-read the store: a `/trust` grant, or a `maki trust add`
+                // run in another terminal, only takes effect from here.
+                trust = project::resolve(&storage, &cwd, mode);
+                let (new_stack, new_warnings, pack_report) = rebuild(
+                    &launch,
+                    stack,
+                    &mut teardown,
+                    &trust,
+                    was_trusted,
+                    pack,
+                    Some(last_good),
+                )?;
                 tabs = reloaded;
                 if tabs.is_empty() {
                     let session = AppSession::new(&new_stack.model.spec(), &cwd_str);
@@ -498,9 +586,18 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use test_case::test_case;
 
     fn no_names(_: &PluginHost) -> Result<Vec<String>> {
         Ok(Vec::new())
+    }
+
+    #[test_case(false, false, false ; "untrusted reload leaves the env alone")]
+    #[test_case(true, true, false ; "ordinary reload of a trusted folder does not reload the env")]
+    #[test_case(true, false, false ; "a revoked folder does not reload the env")]
+    #[test_case(false, true, true ; "a fresh grant loads the project env")]
+    fn project_env_loads_only_on_the_grant(was_trusted: bool, now_trusted: bool, expected: bool) {
+        assert_eq!(should_load_project_env(was_trusted, now_trusted), expected);
     }
 
     /// `second_saw_first` requires both joins: `defer` joining the first

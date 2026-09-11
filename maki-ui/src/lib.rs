@@ -24,7 +24,9 @@ pub mod splash;
 mod storage_writer;
 mod text_buffer;
 mod theme;
+mod trust_card;
 pub use theme::BUNDLED_THEMES;
+pub use trust_card::ask_trust;
 pub mod update;
 pub mod wrap;
 

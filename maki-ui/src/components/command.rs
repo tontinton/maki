@@ -124,6 +124,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         bang: false,
     },
     BuiltinCommand {
+        name: "/trust",
+        description: "Trust this folder and load its shared project config",
+        max_args: 0,
+        bang: false,
+    },
+    BuiltinCommand {
         name: "/packupdate",
         description: "Update packages (++lockfile, ! skips review)",
         max_args: 2,

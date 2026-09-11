@@ -22,6 +22,7 @@ const TRUNCATE_PREFIX: &str = "..";
 const CWD_MODEL_SEPARATOR: &str = "  ";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
+const RESTRICTED_LABEL: &str = " [restricted]";
 const YOLO_LABEL: &str = " [yolo]";
 const YOLO_DIM_FACTOR: f32 = 0.15;
 
@@ -47,6 +48,10 @@ pub struct StatusBarContext<'a> {
     pub thinking_label: Option<Cow<'static, str>>,
     pub fast: bool,
     pub workflow: bool,
+    /// The folder has a trust question nobody answered with a yes. Sourced from
+    /// the question, not from `!is_trusted()`, which is true in every folder
+    /// with no `.maki` at all.
+    pub restricted: bool,
     pub yolo: bool,
     pub restoring: bool,
 }
@@ -207,6 +212,9 @@ impl StatusBar {
                 }
                 if ctx.workflow {
                     rest_spans.push(Span::styled(WORKFLOW_LABEL, theme::current().status_dim));
+                }
+                if ctx.restricted {
+                    rest_spans.push(Span::styled(RESTRICTED_LABEL, theme::current().status_dim));
                 }
                 rest_spans.extend(yolo_span);
 
@@ -386,10 +394,24 @@ mod tests {
         show_global: bool,
         yolo: bool,
     ) -> String {
+        draw(&context(status, global_cost, show_global, yolo))
+    }
+
+    fn draw(ctx: &StatusBarContext<'_>) -> String {
         let bar = StatusBar::new(FLASH_TTL);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
-        let ctx = StatusBarContext {
+        terminal.draw(|f| bar.view(f, f.area(), ctx)).unwrap();
+        crate::components::buffer_text(terminal.backend().buffer())
+    }
+
+    fn context<'a>(
+        status: &'a Status,
+        global_cost: Option<f64>,
+        show_global: bool,
+        yolo: bool,
+    ) -> StatusBarContext<'a> {
+        StatusBarContext {
             status,
             mode_label: "build".into(),
             mode_style: Style::new(),
@@ -407,11 +429,22 @@ mod tests {
             thinking_label: None,
             fast: false,
             workflow: false,
+            restricted: false,
             yolo,
             restoring: false,
-        };
-        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
-        crate::components::buffer_text(terminal.backend().buffer())
+        }
+    }
+
+    /// A restricted folder says so for the whole session: the startup card is
+    /// long gone by the time the user wonders why their project config did
+    /// nothing.
+    #[test_case(true  => true  ; "a_restricted_folder_says_so")]
+    #[test_case(false => false ; "a_trusted_folder_stays_quiet")]
+    fn the_bar_advertises_restricted(restricted: bool) -> bool {
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.restricted = restricted;
+
+        draw(&ctx).contains(RESTRICTED_LABEL.trim())
     }
 
     /// The sigma is the whole session's bill, and only the session can hand it

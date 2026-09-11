@@ -61,6 +61,7 @@ use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
     SharedMessages, SubagentInfo,
 };
+use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader,
@@ -98,6 +99,8 @@ const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
+pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
+const TRUSTED_PREFIX: &str = "Trusted this folder: ";
 const PACK_CHANGES_DECLINED: &str = "Package changes declined";
 const PACK_USER_ONLY_SUFFIX: &str = " can only be run by you";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
@@ -245,6 +248,11 @@ pub struct App {
     pub(super) last_esc: Option<Instant>,
 
     pub(crate) storage: StateDir,
+    /// The folder trust question this run was started with, `None` when the
+    /// folder is trusted or has nothing to ask about. Frozen at startup on
+    /// purpose: a kind the project adds mid-session is not something the user
+    /// was shown, so `/trust` must not cover it and the next start asks.
+    pub(crate) trust_question: Option<TrustQuestion>,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
@@ -343,6 +351,7 @@ impl App {
             clipboard: ClipboardState::new(),
             last_esc: None,
             storage,
+            trust_question: None,
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             btw_system: None,
@@ -1016,6 +1025,22 @@ impl App {
         self.quit_with(ExitRequest::Success)
     }
 
+    /// `maki trust` lives outside the TUI, so without this a "not now" or a
+    /// `.maki/` created mid-session is unrecoverable without quitting.
+    fn trust_folder(&mut self) -> Vec<Action> {
+        let Some(question) = self.trust_question.clone() else {
+            self.flash(NOTHING_TO_TRUST_MSG.into());
+            return Vec::new();
+        };
+        if let Err(error) = project::grant(&self.storage, &question) {
+            self.flash(error);
+            return Vec::new();
+        }
+        let covered: Vec<String> = question.present.iter().map(GatedFile::to_string).collect();
+        self.flash(format!("{TRUSTED_PREFIX}{}", covered.join(", ")));
+        self.quit_with(ExitRequest::Reload)
+    }
+
     fn quit_with(&mut self, req: ExitRequest) -> Vec<Action> {
         self.save_input_history();
         self.exit_request = req;
@@ -1451,6 +1476,9 @@ impl App {
             }
             "/exit" => self.quit(),
             "/reload" => self.quit_with(ExitRequest::Reload),
+            // Typing `/trust` is the consent, exactly like `maki trust add
+            // --yes`, so there is no second question to ask here.
+            "/trust" => self.trust_folder(),
             name @ ("/packupdate" | "/packdel") => {
                 if depth > 0 {
                     self.flash(format!("{name}{PACK_USER_ONLY_SUFFIX}"));

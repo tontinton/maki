@@ -25,7 +25,6 @@ use maki_storage::auth::{
 };
 use maki_storage::model::persist_model;
 
-
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
         Some("openai") => openai_auth::login(storage)?,
@@ -589,7 +588,9 @@ fn load_effective_config(
     names: &super::KnownNames<'_>,
     warnings: &mut Vec<String>,
 ) -> Result<Config> {
-    warnings.extend(trust.warning.clone());
+    // `notices`, not `warning`: these commands never ask, so the skipped path
+    // and how to undo it are the only sign the project config did nothing.
+    warnings.extend(trust.notices());
     let raw_config = host
         .load_init_files(
             InitFiles::resolve(&trust.project_config, no_plugins),
@@ -648,7 +649,7 @@ pub fn mcp_auth(server: &str, storage: &StateDir, trust_mode: TrustMode) -> Resu
     smol::block_on(async {
         let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
         let trust = project::resolve(storage, &cwd, trust_mode);
-        super::report_warnings(trust.warning.into_iter().collect());
+        super::report_warnings(trust.notices());
         let (config, _) = mcp_config::load_config(&cwd, trust.project_config);
         let raw = config
             .mcp

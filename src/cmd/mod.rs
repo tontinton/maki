@@ -122,7 +122,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     let trust_mode = if cli.trust {
         TrustMode::Session
     } else {
-        TrustMode::Skip
+        TrustMode::Consult
     };
     match cli.command {
         Some(Command::Auth { action }) => {

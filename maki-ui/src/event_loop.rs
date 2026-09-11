@@ -23,6 +23,7 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
+use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
 use maki_lua::session_snapshot::{
     MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
@@ -105,6 +106,9 @@ pub struct EventLoopParams {
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
     pub project_config: ProjectConfig,
+    /// What `/trust` would grant and what the `[restricted]` indicator reports.
+    /// `None` when the folder is trusted or has nothing to ask about.
+    pub trust_question: Option<TrustQuestion>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -380,6 +384,7 @@ struct SpawnCtx {
     available_models: Arc<ArcSwapOption<Vec<String>>>,
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
+    trust_question: Option<TrustQuestion>,
 }
 
 impl SpawnCtx {
@@ -417,6 +422,7 @@ impl SpawnCtx {
             self.lua_event_handle.clone(),
             Arc::clone(&self.model_policy),
         );
+        app.trust_question = self.trust_question.clone();
         handles.apply_to_app(&mut app);
         if resumed {
             app.restore_resumed_session();
@@ -572,6 +578,7 @@ impl<'t> EventLoop<'t> {
             lua_event_handle,
             model_policy,
             project_config,
+            trust_question,
         } = params;
         // A `/reload` generation inherits the handles of the one before it,
         // so every loop has to claim the UI back for itself.
@@ -632,6 +639,7 @@ impl<'t> EventLoop<'t> {
             available_models: bg.available,
             storage_writer,
             model_policy,
+            trust_question,
         };
 
         let mut runtimes: Vec<SessionRuntime> = sessions

@@ -5,51 +5,48 @@ use std::path::{Path, PathBuf};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 use maki_config::ProjectConfig;
-use maki_config::project::{self, confirm_trust};
+use maki_config::project::{self, TrustMode, TrustQuestion, confirm_trust};
 use maki_storage::StateDir;
-use maki_storage::trusted_folders::{
-    CanonicalFolder, Change, TrustDecision, TrustStatus, TrustedFolders,
-};
+use maki_storage::trusted_folders::{CanonicalFolder, Change, TrustStatus, TrustedFolders};
+
+const NEEDS_A_TERMINAL: &str = "trust add needs a terminal confirmation or --yes";
 
 pub fn add(storage: &StateDir, path: Option<&Path>, yes: bool) -> Result<()> {
     let path = resolve_argument(path)?;
-    let project = ProjectConfig::discover(&path);
-    let folder = CanonicalFolder::resolve(project.config_root())?;
-    let trusted_folders = TrustedFolders::new(storage);
-    let present: Vec<&str> = project::gated_files(project.config_root())
-        .iter()
-        .map(|file| file.file_name())
-        .collect();
-    // A folder that gained a kind of gated file since it was trusted still has
-    // a question to answer, so it is not simply "already trusted".
-    let added = match trusted_folders.decide(&folder, &present, &project::project_root)? {
-        TrustDecision::Trusted | TrustDecision::Unrecorded => {
-            println!("Already trusted: {}", folder.path().display());
-            return Ok(());
-        }
-        TrustDecision::Widened { added } => added,
-        // A folder that predates folder trust has no stored answer yet, so this
-        // is the command that finally writes one down.
-        TrustDecision::Grandfathered | TrustDecision::Rejected | TrustDecision::Unknown => {
-            Vec::new()
-        }
-    };
+    let folder = CanonicalFolder::resolve(ProjectConfig::discover(&path).config_root())?;
+    // The same resolve a start in that folder would do, so the command and the
+    // question agree on what is already covered and what changed.
+    let decision = project::resolve(storage, &path, TrustMode::Consult);
+    if let Some(warning) = decision.warning {
+        bail!("{warning}");
+    }
+    if decision.project_config.is_trusted() {
+        println!("Already trusted: {}", folder.path().display());
+        return Ok(());
+    }
+    // A folder shipping nothing gated poses no question, but this is also how
+    // you vouch for one before it ships anything, so it records either way.
+    let question = decision
+        .state
+        .question()
+        .cloned()
+        .unwrap_or_else(|| TrustQuestion::for_folder(&folder));
 
     if !yes {
         if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-            bail!("trust add needs a terminal confirmation or --yes");
+            bail!(NEEDS_A_TERMINAL);
         }
         let stdin = io::stdin();
         let mut input = stdin.lock();
         let stderr = io::stderr();
         let mut output = stderr.lock();
-        if !confirm_trust(&mut input, &mut output, &folder, &added)? {
+        if !confirm_trust(&mut input, &mut output, &question)? {
             println!("Project was not trusted.");
             return Ok(());
         }
     }
 
-    trusted_folders.add(&folder, &present)?;
+    project::grant(storage, &question).map_err(|error| color_eyre::eyre::eyre!("{error}"))?;
     println!("Trusted: {}", folder.path().display());
     Ok(())
 }

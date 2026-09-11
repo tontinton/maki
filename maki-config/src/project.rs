@@ -13,17 +13,22 @@ use crate::PROJECT_DIR;
 const SKIPPED: &str = "shared project config was skipped for this process";
 const TRUST_NOT_SAVED: &str =
     "folder trust was not saved, but shared project config is enabled for this process";
-const TRUST_QUESTION: &str = "Trust this folder? [y/N]";
+pub const TRUST_QUESTION: &str = "Trust this folder?";
+const TERMINAL_TRUST_QUESTION: &str = "Trust this folder? [y/N]";
 const SHARED_FILE_POWERS: &str =
     "which can change the environment, start processes, and run Lua code";
 const NO_SHARED_FILES_YET: &str =
     "This project ships no .maki files yet, but any added later would ask again.";
 const ADDED_SINCE_TRUSTED: &str = "since you trusted it";
+/// An answer given without knowing what the question covers is not consent, and
+/// the card is too small to explain the whole gate.
+pub const TRUST_DOCS: &str = "Learn more: https://maki.sh/docs/folder-trust/";
 const DECLINED: &str = "Shared project config was skipped.";
 /// Every skip says how to undo itself. `--trust` is here because the runs that
-/// cannot answer a prompt are the ones that see these warnings.
+/// cannot answer a question are the ones that see these warnings.
 const HOW_TO_TRUST: &str =
     "run `maki trust add --yes PATH` and restart Maki, or pass `--trust` to load it for one run";
+const CLEAR_THE_REJECTION: &str = "or `maki trust remove PATH` to clear the decision";
 const REJECTION_NOT_SAVED: &str = "folder rejection was not saved";
 
 /// A file under `.maki/` that only a trusted folder may hand to Maki.
@@ -151,49 +156,153 @@ impl ProjectConfig {
     }
 }
 
+/// The question a folder poses, and the only thing an answer is recorded
+/// against. Passing it whole rather than loose arguments is what keeps a
+/// recorded yes covering exactly the file kinds the user was shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustQuestion {
+    pub folder: CanonicalFolder,
+    /// The kinds present now; what a yes is recorded against.
+    pub present: Vec<GatedFile>,
+    /// Kinds gained since a previous yes; empty when there is no decision yet.
+    pub added: Vec<GatedFile>,
+}
+
+impl TrustQuestion {
+    /// What a folder would be asked about right now, with no stored answer
+    /// consulted. `maki trust add` grants against this.
+    pub fn for_folder(folder: &CanonicalFolder) -> Self {
+        Self {
+            present: gated_files(folder.path()),
+            folder: folder.clone(),
+            added: Vec::new(),
+        }
+    }
+
+    /// The files the question is really about: what the project added since it
+    /// was trusted, or everything it ships when there is no answer yet.
+    fn named(&self) -> &[GatedFile] {
+        if self.added.is_empty() {
+            &self.present
+        } else {
+            &self.added
+        }
+    }
+}
+
+/// The whole answer about a folder. Every derived fact reads off this, so
+/// "trusted" and "why" cannot drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustState {
+    /// Project config loads: a recorded yes, a grandfathered or v1 folder just
+    /// written down, or `--trust`.
+    Trusted,
+    /// Nothing loads and nothing to ask: the home directory, a folder shipping
+    /// no gated file, or a store this run could not read.
+    Inert,
+    /// Gated files present, no answer recorded. This is what the card asks.
+    Unanswered(TrustQuestion),
+    /// A recorded `Never`. Indicator and `/trust`, no card.
+    Declined(TrustQuestion),
+}
+
+impl TrustState {
+    /// `Some` for both restricted variants, which is what the status-bar
+    /// indicator and `/trust` key off. Deliberately not `!is_trusted()`: that
+    /// is true in every folder with no `.maki` at all.
+    pub fn question(&self) -> Option<&TrustQuestion> {
+        match self {
+            TrustState::Unanswered(question) | TrustState::Declined(question) => Some(question),
+            TrustState::Trusted | TrustState::Inert => None,
+        }
+    }
+
+    /// What a run that cannot draw the card prints instead. Separate from
+    /// [`ProjectDecision::warning`], which means "something broke": conflating
+    /// the two is why a UI that shows the card would also print a redundant
+    /// line about being restricted.
+    pub fn restricted_warning(&self) -> Option<String> {
+        let question = self.question()?;
+        let folder = question.folder.path().display();
+        let added = name_list(question.added.iter().map(|file| file.file_name()));
+        let reason = match (self, added) {
+            (TrustState::Declined(_), _) => {
+                format!("folder trust was rejected; {HOW_TO_TRUST}, {CLEAR_THE_REJECTION}")
+            }
+            (_, Some(files)) => {
+                format!("the project added {files} {ADDED_SINCE_TRUSTED}; {HOW_TO_TRUST}")
+            }
+            (_, None) => format!("the folder is not trusted; {HOW_TO_TRUST}"),
+        };
+        Some(format!(
+            "skipped shared project config in {folder} because {reason}"
+        ))
+    }
+}
+
+/// The three answers the card offers. "Not now" is a no that records nothing,
+/// not a session grant: `--trust` stays the only way to load project config
+/// without writing a decision down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustAnswer {
+    Trust,
+    NotNow,
+    Never,
+}
+
 #[derive(Debug)]
 pub struct ProjectDecision {
     pub project_config: ProjectConfig,
-    /// At most one thing can go wrong per decision, and the callers only log it.
+    pub state: TrustState,
+    /// Failures only: store unreadable, folder unresolvable, answer not saved.
     pub warning: Option<String>,
 }
 
 impl ProjectDecision {
-    fn quiet(project_config: ProjectConfig) -> Self {
+    /// The one site that decides whether a config is trusted, derived from the
+    /// state so the verdict and the reason cannot disagree.
+    fn new(project_config: ProjectConfig, state: TrustState, warning: Option<String>) -> Self {
+        let trusted = matches!(state, TrustState::Trusted);
         Self {
-            project_config,
-            warning: None,
+            project_config: project_config.with_trust(trusted),
+            state,
+            warning,
         }
     }
 
-    fn skip(project_config: ProjectConfig, warning: String) -> Self {
-        Self {
-            project_config,
-            warning: Some(warning),
-        }
+    fn inert(project_config: ProjectConfig, warning: String) -> Self {
+        Self::new(project_config, TrustState::Inert, Some(warning))
+    }
+
+    /// Everything a run that cannot ask has to report: what broke, and the
+    /// restriction it was left with. One route on purpose, because a caller
+    /// that reports [`ProjectDecision::warning`] alone skips an untrusted
+    /// folder in complete silence. The UI takes the two apart instead, since it
+    /// showed the card and does not need to be told the answer it just got.
+    pub fn notices(&self) -> Vec<String> {
+        self.warning
+            .iter()
+            .cloned()
+            .chain(self.state.restricted_warning())
+            .collect()
     }
 }
 
-/// What a start does about a folder the store has no answer for.
+/// How a run reaches its trust answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustMode {
-    /// Ask on the terminal and record the answer.
-    Ask,
-    /// Skip the shared project config and say so.
-    Skip,
+    /// Read the store and report what it says. Whether the resulting question
+    /// can be asked is the caller's business, not this module's.
+    Consult,
     /// Trust for this process only. `--trust`.
     Session,
 }
 
 pub fn resolve(storage: &StateDir, cwd: &Path, mode: TrustMode) -> ProjectDecision {
-    if mode == TrustMode::Session {
-        return session_grant(ProjectConfig::discover(cwd));
+    match mode {
+        TrustMode::Session => session_grant(ProjectConfig::discover(cwd)),
+        TrustMode::Consult => resolve_recorded(storage, ProjectConfig::discover(cwd)),
     }
-    resolve_with_prompt(
-        storage,
-        ProjectConfig::discover(cwd),
-        (mode == TrustMode::Ask).then_some(ask_on_terminal),
-    )
 }
 
 /// For commands that never open the state directory for anything else: a state
@@ -205,7 +314,7 @@ pub fn resolve_noninteractive(cwd: &Path, mode: TrustMode) -> ProjectDecision {
     }
     match StateDir::resolve() {
         Ok(storage) => resolve(&storage, cwd, mode),
-        Err(error) => ProjectDecision::skip(
+        Err(error) => ProjectDecision::inert(
             ProjectConfig::discover(cwd),
             format!("cannot resolve folder trust state: {error}; {SKIPPED}"),
         ),
@@ -222,34 +331,15 @@ pub fn resolve_noninteractive(cwd: &Path, mode: TrustMode) -> ProjectDecision {
 fn session_grant(project_config: ProjectConfig) -> ProjectDecision {
     // `~/.maki` is the user's own global config, already loaded as global. No
     // flag turns that into a project, or it would load twice.
-    let trusted = !project_config.at_home;
-    ProjectDecision::quiet(project_config.with_trust(trusted))
+    let state = if project_config.at_home {
+        TrustState::Inert
+    } else {
+        TrustState::Trusted
+    };
+    ProjectDecision::new(project_config, state, None)
 }
 
-/// Takes stdin only here, where a question is really about to be asked. ACP
-/// resolves trust from its dispatch loop while another thread owns stdin for
-/// the whole of a read, so locking it on a path that never prompts parks the
-/// loop until the client sends bytes it is waiting on the answer to send.
-fn ask_on_terminal(folder: &CanonicalFolder, added: &[String]) -> io::Result<bool> {
-    let stdin = io::stdin();
-    let mut input = stdin.lock();
-    let stderr = io::stderr();
-    let mut output = stderr.lock();
-    let trusted = confirm_trust(&mut input, &mut output, folder, added)?;
-    if !trusted {
-        writeln!(output, "{DECLINED}")?;
-    }
-    Ok(trusted)
-}
-
-fn resolve_with_prompt<P>(
-    storage: &StateDir,
-    project_config: ProjectConfig,
-    prompt: Option<P>,
-) -> ProjectDecision
-where
-    P: FnOnce(&CanonicalFolder, &[String]) -> io::Result<bool>,
-{
+fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> ProjectDecision {
     // Every config that leaves here carries the store its answer came from,
     // trusted or not, so a later write can find the same answer again.
     let project_config = project_config.with_trust_store(storage);
@@ -257,21 +347,17 @@ where
     // a start there has nothing a project shipped. Asking would be a question
     // about the user's own files, and a yes would load that config twice.
     if project_config.at_home {
-        return ProjectDecision::quiet(project_config);
+        return ProjectDecision::new(project_config, TrustState::Inert, None);
     }
     let folder = match CanonicalFolder::resolve(project_config.config_root()) {
         Ok(folder) => folder,
-        Err(error) => {
-            return ProjectDecision::skip(project_config, format!("{error}; {SKIPPED}"));
-        }
+        Err(error) => return ProjectDecision::inert(project_config, format!("{error}; {SKIPPED}")),
     };
     let trusted_folders = TrustedFolders::new(storage);
     let present = gated_files(project_config.config_root());
     let decision = match trusted_folders.decide(&folder, &store_names(&present), &project_root) {
         Ok(decision) => decision,
-        Err(error) => {
-            return ProjectDecision::skip(project_config, format!("{error}; {SKIPPED}"));
-        }
+        Err(error) => return ProjectDecision::inert(project_config, format!("{error}; {SKIPPED}")),
     };
 
     // Nothing to load means nothing to ask about, so report whatever the store
@@ -279,26 +365,25 @@ where
     // exception: writing its record down even with nothing to load is what
     // bounds the grant to today's files.
     if present.is_empty() && decision != TrustDecision::Grandfathered {
-        let trusted = matches!(decision, TrustDecision::Trusted | TrustDecision::Unrecorded);
-        return ProjectDecision::quiet(project_config.with_trust(trusted));
+        let state = match decision {
+            TrustDecision::Trusted | TrustDecision::Unrecorded => TrustState::Trusted,
+            _ => TrustState::Inert,
+        };
+        return ProjectDecision::new(project_config, state, None);
     }
 
-    let added = match decision {
-        TrustDecision::Trusted => return ProjectDecision::quiet(project_config.with_trust(true)),
+    let question = |added: Vec<GatedFile>| TrustQuestion {
+        folder: folder.clone(),
+        present: present.clone(),
+        added,
+    };
+    match decision {
+        TrustDecision::Trusted => ProjectDecision::new(project_config, TrustState::Trusted, None),
         // An answer given before Maki recorded file sets stays good, and
         // writing down what the folder ships today bounds it from here on.
         TrustDecision::Unrecorded => {
             info!(folder = %folder.path().display(), "recording what an older trust decision covers");
-            return record_trust(&trusted_folders, &folder, &present, project_config);
-        }
-        TrustDecision::Rejected => {
-            return ProjectDecision::skip(
-                project_config,
-                format!(
-                    "skipped shared project config in {} because folder trust was rejected; {HOW_TO_TRUST}, or `maki trust remove PATH` to clear the decision",
-                    folder.path().display()
-                ),
-            );
+            record_trust(storage, &question(Vec::new()), project_config)
         }
         // A folder the user was already working in before folder trust existed
         // loaded its shared config without a question, and re-asking there only
@@ -310,56 +395,88 @@ where
         // more, and a file added after this asks like any other.
         TrustDecision::Grandfathered => {
             info!(folder = %folder.path().display(), "trusting folder that was in use before folder trust existed");
-            return record_trust(&trusted_folders, &folder, &present, project_config);
+            record_trust(storage, &question(Vec::new()), project_config)
         }
-        TrustDecision::Unknown => Vec::new(),
-        TrustDecision::Widened { added } => added,
-    };
-
-    let Some(prompt) = prompt else {
-        return ProjectDecision::skip(project_config, not_trusted_warning(&folder, &added));
-    };
-    match prompt(&folder, &added) {
-        Ok(true) => record_trust(&trusted_folders, &folder, &present, project_config),
-        Ok(false) => ProjectDecision {
+        TrustDecision::Rejected => ProjectDecision::new(
             project_config,
-            warning: trusted_folders
-                .reject(&folder)
-                .err()
-                .map(|error| format!("{error}; {REJECTION_NOT_SAVED}")),
-        },
-        Err(error) => ProjectDecision::skip(
+            TrustState::Declined(question(Vec::new())),
+            None,
+        ),
+        TrustDecision::Unknown => ProjectDecision::new(
             project_config,
-            format!("could not read the folder trust answer: {error}; {SKIPPED}"),
+            TrustState::Unanswered(question(Vec::new())),
+            None,
+        ),
+        TrustDecision::Widened { added } => ProjectDecision::new(
+            project_config,
+            TrustState::Unanswered(question(from_store_names(&added))),
+            None,
         ),
     }
 }
 
-fn not_trusted_warning(folder: &CanonicalFolder, added: &[String]) -> String {
-    let folder = folder.path().display();
-    match name_list(added.iter().map(String::as_str)) {
-        Some(files) => format!(
-            "skipped shared project config in {folder} because the project added {files} {ADDED_SINCE_TRUSTED}; {HOW_TO_TRUST}"
-        ),
-        None => format!(
-            "skipped shared project config in {folder} because the folder is not trusted; {HOW_TO_TRUST}"
-        ),
+/// Records a yes. One of two writers of an interactive decision, shared by the
+/// card, the `trust.paths` auto-grant, `/trust` and `maki trust add`, so what
+/// gets recorded can never drift from what was shown.
+///
+/// A failure is reported, not fatal: the folder stays trusted for this process,
+/// which is what the user just asked for, and is asked again next start.
+pub fn grant(storage: &StateDir, question: &TrustQuestion) -> Result<(), String> {
+    TrustedFolders::new(storage)
+        .add(&question.folder, &store_names(&question.present))
+        .map(drop)
+        .map_err(|error| format!("{error}; {TRUST_NOT_SAVED}"))
+}
+
+/// Records a permanent no. The counterpart to [`grant`]; "not now" records
+/// nothing and so goes through neither.
+pub fn deny(storage: &StateDir, question: &TrustQuestion) -> Result<(), String> {
+    TrustedFolders::new(storage)
+        .reject(&question.folder)
+        .map(drop)
+        .map_err(|error| format!("{error}; {REJECTION_NOT_SAVED}"))
+}
+
+/// Records an answer and returns the decision the rest of the run uses. The
+/// card and the policy auto-grant both land here, so what was written down and
+/// what this process does cannot disagree.
+///
+/// A store that refused the write keeps the grant the user just gave for this
+/// process and reports it, which is the one documented exception to "any
+/// failure leaves the folder untrusted".
+pub fn apply_answer(
+    storage: &StateDir,
+    decision: ProjectDecision,
+    answer: TrustAnswer,
+) -> ProjectDecision {
+    let Some(question) = decision.state.question() else {
+        return decision;
+    };
+    match answer {
+        TrustAnswer::Trust => {
+            let warning = grant(storage, question).err();
+            ProjectDecision::new(decision.project_config, TrustState::Trusted, warning)
+        }
+        TrustAnswer::Never => {
+            let question = question.clone();
+            let warning = deny(storage, &question).err();
+            ProjectDecision::new(
+                decision.project_config,
+                TrustState::Declined(question),
+                warning,
+            )
+        }
+        TrustAnswer::NotNow => decision,
     }
 }
 
 fn record_trust(
-    trusted_folders: &TrustedFolders,
-    folder: &CanonicalFolder,
-    files: &[GatedFile],
+    storage: &StateDir,
+    question: &TrustQuestion,
     project_config: ProjectConfig,
 ) -> ProjectDecision {
-    ProjectDecision {
-        project_config: project_config.with_trust(true),
-        warning: trusted_folders
-            .add(folder, &store_names(files))
-            .err()
-            .map(|error| format!("{error}; {TRUST_NOT_SAVED}")),
-    }
+    let warning = grant(storage, question).err();
+    ProjectDecision::new(project_config, TrustState::Trusted, warning)
 }
 
 /// Maki writing a gated file into a trusted project is not the project
@@ -381,40 +498,48 @@ fn record_written_file_in(storage: &StateDir, project_config: &ProjectConfig, fi
     }
 }
 
-/// The one trust prompt: every entry point asks with these words, so what the
-/// user agreed to never depends on which one they came through. `added` names
-/// the gated files a folder gained since it was trusted, and is empty when the
-/// folder has no decision yet.
+/// The body of the trust question: every entry point shows these words, so what
+/// the user agreed to never depends on which one they came through.
+pub fn trust_question_lines(question: &TrustQuestion) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Maki can load shared project configuration from {}.",
+        question.folder.path().display()
+    )];
+    lines.push(
+        match name_list(question.named().iter().map(|file| file.file_name())) {
+            Some(files) if question.added.is_empty() => {
+                format!("This project ships {files}, {SHARED_FILE_POWERS}.")
+            }
+            Some(files) => {
+                format!("This project added {files} {ADDED_SINCE_TRUSTED}, {SHARED_FILE_POWERS}.")
+            }
+            None => NO_SHARED_FILES_YET.to_owned(),
+        },
+    );
+    lines.push(String::new());
+    lines.push(TRUST_DOCS.to_owned());
+    lines
+}
+
+/// The terminal form of the question, for `maki trust add` outside the UI.
 pub fn confirm_trust(
     input: &mut impl BufRead,
     output: &mut impl Write,
-    folder: &CanonicalFolder,
-    added: &[String],
+    question: &TrustQuestion,
 ) -> io::Result<bool> {
-    writeln!(
-        output,
-        "Maki can load shared project configuration from {}.",
-        folder.path().display()
-    )?;
-    match name_list(added.iter().map(String::as_str)) {
-        Some(files) => writeln!(
-            output,
-            "This project added {files} {ADDED_SINCE_TRUSTED}, {SHARED_FILE_POWERS}."
-        )?,
-        None => match name_list(gated_files(folder.path()).iter().map(|f| f.file_name())) {
-            Some(files) => writeln!(output, "This project ships {files}, {SHARED_FILE_POWERS}.")?,
-            None => writeln!(output, "{NO_SHARED_FILES_YET}")?,
-        },
+    for line in trust_question_lines(question) {
+        writeln!(output, "{line}")?;
     }
-    write!(output, "{TRUST_QUESTION} ")?;
+    write!(output, "{TERMINAL_TRUST_QUESTION} ")?;
     output.flush()?;
 
     let mut answer = String::new();
     input.read_line(&mut answer)?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
+    let trusted = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    if !trusted {
+        writeln!(output, "{DECLINED}")?;
+    }
+    Ok(trusted)
 }
 
 /// Which gated files a project ships right now. This is the set a trust answer
@@ -434,6 +559,16 @@ pub fn gated_files(config_root: &Path) -> Vec<GatedFile> {
 /// here and nowhere else.
 fn store_names(files: &[GatedFile]) -> Vec<&'static str> {
     files.iter().copied().map(GatedFile::file_name).collect()
+}
+
+/// The other direction. A name a newer Maki wrote has no variant here and is
+/// dropped, which is the same "never matches" the store already relies on.
+fn from_store_names(names: &[String]) -> Vec<GatedFile> {
+    GatedFile::ALL
+        .iter()
+        .copied()
+        .filter(|file| names.iter().any(|name| name == file.file_name()))
+        .collect()
 }
 
 fn name_list<'a>(files: impl IntoIterator<Item = &'a str>) -> Option<String> {
@@ -470,8 +605,6 @@ fn git_checkout_boundary(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-
     use maki_storage::sessions::{SESSIONS_DIR, Session, TitleSource};
     use maki_storage::trusted_folders::TrustStatus;
     use serde::{Deserialize, Serialize};
@@ -488,8 +621,11 @@ mod tests {
     const PERMISSIONS_FILE: &str = ".maki/permissions.toml";
     const INIT_NAME: &str = "init.lua";
     const PERMISSIONS_NAME: &str = "permissions.toml";
-    const NO_ADDED_FILES: &[String] = &[];
     const DECLINE: &[u8] = b"n\n";
+    /// A run with no question to answer; whatever is passed is never reached.
+    const ANSWER_UNUSED: Option<TrustAnswer> = None;
+    /// A run that cannot ask at all: headless, ACP, a utility subcommand.
+    const CANNOT_ASK: Option<TrustAnswer> = None;
     const MODEL: &str = "test-model";
     const PROJECTS_DIR: &str = "projects";
     const PROJECT_STATE_DIR: &str = "project-cbf29ce484222325";
@@ -609,35 +745,59 @@ mod tests {
         ProjectConfig::rooted(&path, path.parent())
     }
 
-    /// Stands in for the terminal prompt. A non-interactive run passes `None`,
-    /// which is the whole point: nothing on that path can reach for stdin.
-    fn resolve_io(
+    struct Answered {
+        config: ProjectConfig,
+        /// The question this run put to the user, `None` when nothing was
+        /// asked.
+        asked: Option<TrustQuestion>,
+        warning: String,
+    }
+
+    impl Answered {
+        fn asked_about(&self, file: GatedFile) -> bool {
+            self.asked
+                .as_ref()
+                .is_some_and(|question| question.named().contains(&file))
+        }
+    }
+
+    /// Stands in for the card. `resolve` only reports the question now, so the
+    /// test plays the caller that can ask, and records through the same
+    /// `grant`/`deny` every other entry point uses. `answer: None` is a run
+    /// that cannot ask at all, which is where `restricted_warning` is the whole
+    /// output.
+    fn answer_question(
         storage: &StateDir,
         project: ProjectConfig,
-        interactive: bool,
-        answer: &str,
-    ) -> (ProjectConfig, String, String) {
-        let output = Cell::new(Vec::new());
-        let decision = resolve_with_prompt(
-            storage,
-            project,
-            interactive.then_some(|folder: &CanonicalFolder, added: &[String]| {
-                let mut written = Vec::new();
-                let trusted = confirm_trust(
-                    &mut io::Cursor::new(answer.as_bytes()),
-                    &mut written,
-                    folder,
-                    added,
-                )?;
-                output.set(written);
-                Ok(trusted)
-            }),
-        );
-        (
-            decision.project_config,
-            String::from_utf8(output.into_inner()).unwrap(),
-            decision.warning.unwrap_or_default(),
-        )
+        answer: Option<TrustAnswer>,
+    ) -> Answered {
+        let decision = resolve_recorded(storage, project);
+        let pending = match &decision.state {
+            TrustState::Unanswered(question) => answer.map(|answer| (question.clone(), answer)),
+            _ => None,
+        };
+        let Some((question, answer)) = pending else {
+            return Answered {
+                config: decision.project_config,
+                asked: None,
+                warning: decision
+                    .warning
+                    .or_else(|| decision.state.restricted_warning())
+                    .unwrap_or_default(),
+            };
+        };
+        let failure = match answer {
+            TrustAnswer::Trust => grant(storage, &question).err(),
+            TrustAnswer::Never => deny(storage, &question).err(),
+            TrustAnswer::NotNow => None,
+        };
+        Answered {
+            config: decision
+                .project_config
+                .with_trust(answer == TrustAnswer::Trust),
+            asked: Some(question),
+            warning: failure.unwrap_or_default(),
+        }
     }
 
     #[test_case("y", true ; "y")]
@@ -648,29 +808,31 @@ mod tests {
     #[test_case("sure", false ; "anything_else")]
     fn confirmation_accepts_only_y_and_yes(answer: &str, expected: bool) {
         let (_state, project, _storage) = setup();
-        let folder = CanonicalFolder::resolve(project.path()).unwrap();
+        let question = question_at(project.path());
 
         let mut input = io::Cursor::new(answer.as_bytes());
 
         assert_eq!(
-            confirm_trust(&mut input, &mut Vec::new(), &folder, NO_ADDED_FILES).unwrap(),
+            confirm_trust(&mut input, &mut Vec::new(), &question).unwrap(),
             expected
         );
     }
 
+    fn question_at(path: &Path) -> TrustQuestion {
+        TrustQuestion::for_folder(&CanonicalFolder::resolve(path).unwrap())
+    }
+
     #[test]
-    fn the_prompt_names_the_files_it_would_load() {
+    fn the_question_names_the_files_it_would_load() {
         let (_state, project, _storage) = setup();
         fs::write(project.path().join(MCP_FILE), MCP_SOURCE).unwrap();
         fs::write(project.path().join(CONFIG_FILE), "").unwrap();
-        let folder = CanonicalFolder::resolve(project.path()).unwrap();
 
         let mut output = Vec::new();
         confirm_trust(
             &mut io::Cursor::new(DECLINE),
             &mut output,
-            &folder,
-            NO_ADDED_FILES,
+            &question_at(project.path()),
         )
         .unwrap();
         let prompt = String::from_utf8(output).unwrap();
@@ -679,24 +841,20 @@ mod tests {
         assert!(prompt.contains(MCP_FILE));
         assert!(
             !prompt.contains(CONFIG_FILE),
-            "config.toml is inert, so the prompt must not claim powers for it: {prompt:?}"
+            "config.toml is inert, so the question must not claim powers for it: {prompt:?}"
         );
         assert!(prompt.contains(TRUST_QUESTION));
+        assert!(
+            prompt.contains(TRUST_DOCS),
+            "the question has to say where the full rules live: {prompt:?}"
+        );
 
         fs::remove_file(project.path().join(INIT_FILE)).unwrap();
         fs::remove_file(project.path().join(MCP_FILE)).unwrap();
-        let mut empty = Vec::new();
-        confirm_trust(
-            &mut io::Cursor::new(DECLINE),
-            &mut empty,
-            &folder,
-            NO_ADDED_FILES,
-        )
-        .unwrap();
 
         assert!(
-            String::from_utf8(empty)
-                .unwrap()
+            trust_question_lines(&question_at(project.path()))
+                .join("\n")
                 .contains(NO_SHARED_FILES_YET)
         );
     }
@@ -764,16 +922,15 @@ mod tests {
         fs::write(home.join(INIT_FILE), INIT_SOURCE).unwrap();
         let storage = StateDir::from_path(state.path().to_path_buf());
 
-        let (config, output, warning) = resolve_io(
+        let answered = answer_question(
             &storage,
             ProjectConfig::rooted(&home, Some(&home)),
-            true,
-            "yes\n",
+            Some(TrustAnswer::Trust),
         );
 
-        assert!(!config.is_trusted());
-        assert!(output.is_empty(), "prompt: {output:?}");
-        assert!(warning.is_empty(), "warning: {warning:?}");
+        assert!(!answered.config.is_trusted());
+        assert!(answered.asked.is_none());
+        assert!(answered.warning.is_empty(), "{:?}", answered.warning);
         assert_eq!(
             TrustedFolders::new(&storage)
                 .status(&CanonicalFolder::resolve(&home).unwrap())
@@ -827,19 +984,19 @@ mod tests {
         assert!(!decision.project_config.is_trusted());
     }
 
-    #[test_case(Prior::Trusted, true, "", true, false, false ; "stored_trust_needs_no_question")]
-    #[test_case(Prior::Session, true, "", true, false, false ; "a_session_in_the_folder_grandfathers_it")]
-    #[test_case(Prior::ProjectState, true, "yes\n", true, true, false ; "project_state_alone_still_asks")]
-    #[test_case(Prior::ProjectState, false, "", false, false, true ; "project_state_alone_grants_nothing_headless")]
-    #[test_case(Prior::Nothing, true, "yes\n", true, true, false ; "yes_trusts_the_folder")]
-    #[test_case(Prior::Nothing, true, "no\n", false, true, false ; "no_rejects_the_folder")]
-    #[test_case(Prior::Nothing, false, "", false, false, true ; "headless_skips_and_warns")]
-    #[test_case(Prior::Rejected, true, "yes\n", false, false, true ; "a_rejection_is_not_asked_again")]
-    #[test_case(Prior::RejectedAfterUse, true, "yes\n", false, false, true ; "a_rejection_beats_prior_use")]
+    #[test_case(Prior::Trusted, ANSWER_UNUSED, true, false, false ; "stored_trust_needs_no_question")]
+    #[test_case(Prior::Session, ANSWER_UNUSED, true, false, false ; "a_session_in_the_folder_grandfathers_it")]
+    #[test_case(Prior::ProjectState, Some(TrustAnswer::Trust), true, true, false ; "project_state_alone_still_asks")]
+    #[test_case(Prior::ProjectState, CANNOT_ASK, false, false, true ; "project_state_alone_grants_nothing_headless")]
+    #[test_case(Prior::Nothing, Some(TrustAnswer::Trust), true, true, false ; "trust_records_the_folder")]
+    #[test_case(Prior::Nothing, Some(TrustAnswer::Never), false, true, false ; "never_rejects_the_folder")]
+    #[test_case(Prior::Nothing, Some(TrustAnswer::NotNow), false, true, false ; "not_now_records_nothing")]
+    #[test_case(Prior::Nothing, CANNOT_ASK, false, false, true ; "headless_skips_and_warns")]
+    #[test_case(Prior::Rejected, Some(TrustAnswer::Trust), false, false, true ; "a_rejection_is_not_asked_again")]
+    #[test_case(Prior::RejectedAfterUse, Some(TrustAnswer::Trust), false, false, true ; "a_rejection_beats_prior_use")]
     fn resolve_answers_from_what_the_state_dir_knows(
         prior: Prior,
-        interactive: bool,
-        answer: &str,
+        answer: Option<TrustAnswer>,
         trusted: bool,
         asked: bool,
         warned: bool,
@@ -848,12 +1005,16 @@ mod tests {
         let folder = CanonicalFolder::resolve(project.path()).unwrap();
         record_prior(prior, &storage, state.path(), &folder);
 
-        let (config, output, warning) =
-            resolve_io(&storage, project_at(project.path()), interactive, answer);
+        let answered = answer_question(&storage, project_at(project.path()), answer);
 
-        assert_eq!(config.is_trusted(), trusted);
-        assert_eq!(output.contains(TRUST_QUESTION), asked, "prompt: {output:?}");
-        assert_eq!(!warning.is_empty(), warned, "warning: {warning:?}");
+        assert_eq!(answered.config.is_trusted(), trusted);
+        assert_eq!(answered.asked.is_some(), asked);
+        assert_eq!(
+            !answered.warning.is_empty(),
+            warned,
+            "{:?}",
+            answered.warning
+        );
         assert_eq!(
             TrustedFolders::new(&storage).contains(&folder).unwrap(),
             trusted,
@@ -861,28 +1022,90 @@ mod tests {
         );
     }
 
+    /// "Not now" is the bug fix: one stray Enter must leave the store exactly
+    /// as it was, so the next start asks again.
+    #[test]
+    fn not_now_leaves_no_trace_and_asks_again() {
+        let (_state, project, storage) = setup();
+        let folder = CanonicalFolder::resolve(project.path()).unwrap();
+
+        answer_question(
+            &storage,
+            project_at(project.path()),
+            Some(TrustAnswer::NotNow),
+        );
+
+        assert_eq!(
+            TrustedFolders::new(&storage).status(&folder).unwrap(),
+            TrustStatus::Unknown
+        );
+        let again = answer_question(&storage, project_at(project.path()), CANNOT_ASK);
+        assert!(matches!(
+            resolve_recorded(&storage, project_at(project.path())).state,
+            TrustState::Unanswered(_)
+        ));
+        assert!(!again.config.is_trusted());
+    }
+
+    /// A run that cannot ask reports through `notices`, and the reason it is
+    /// restricted has to be in there: `warning` alone is `None` for a folder
+    /// nobody answered for, which is silence about skipped project config.
+    #[test]
+    fn notices_carry_the_restriction_a_bare_warning_omits() {
+        let (_state, project, storage) = setup();
+
+        let decision = resolve_recorded(&storage, project_at(project.path()));
+
+        assert_eq!(decision.warning, None);
+        assert_eq!(
+            decision.notices(),
+            vec![format!(
+                "skipped shared project config in {} because the folder is not trusted; {HOW_TO_TRUST}",
+                CanonicalFolder::resolve(project.path())
+                    .unwrap()
+                    .path()
+                    .display()
+            )]
+        );
+    }
+
+    /// Invariant 2: a yes covers exactly what was shown, so a kind that appears
+    /// after the question is not covered by it.
+    #[test]
+    fn a_grant_covers_exactly_the_kinds_the_question_named() {
+        let (_state, project, storage) = setup();
+        let question = question_at(project.path());
+        assert_eq!(question.present, vec![GatedFile::InitLua]);
+
+        fs::write(project.path().join(MCP_FILE), MCP_SOURCE).unwrap();
+        grant(&storage, &question).unwrap();
+
+        match resolve_recorded(&storage, project_at(project.path())).state {
+            TrustState::Unanswered(later) => assert_eq!(later.added, vec![GatedFile::Mcp]),
+            other => panic!("a kind added after the question must re-ask, got {other:?}"),
+        }
+    }
+
     /// The bypass the frozen snapshot closes. An ACP or headless run skips the
     /// shared config of an untrusted folder and still records a session in it,
     /// so a live session index would read that back as prior use and grant the
     /// folder trust on the next start with nobody ever asked.
-    #[test_case(true, "no\n", true ; "the_next_interactive_run_still_asks")]
-    #[test_case(false, "", false ; "the_next_headless_run_gains_nothing")]
+    #[test_case(Some(TrustAnswer::Never), true ; "the_next_interactive_run_still_asks")]
+    #[test_case(CANNOT_ASK, false ; "the_next_headless_run_gains_nothing")]
     fn a_session_recorded_after_the_snapshot_never_grandfathers(
-        interactive: bool,
-        answer: &str,
+        answer: Option<TrustAnswer>,
         asked: bool,
     ) {
         let (_state, project, storage) = setup();
         let folder = CanonicalFolder::resolve(project.path()).unwrap();
-        let (first, _, _) = resolve_io(&storage, project_at(project.path()), false, "");
-        assert!(!first.is_trusted());
+        let first = answer_question(&storage, project_at(project.path()), CANNOT_ASK);
+        assert!(!first.config.is_trusted());
 
         record_session(&storage, project.path());
-        let (config, output, _) =
-            resolve_io(&storage, project_at(project.path()), interactive, answer);
+        let answered = answer_question(&storage, project_at(project.path()), answer);
 
-        assert!(!config.is_trusted());
-        assert_eq!(output.contains(TRUST_QUESTION), asked, "prompt: {output:?}");
+        assert!(!answered.config.is_trusted());
+        assert_eq!(answered.asked.is_some(), asked);
         assert!(
             !TrustedFolders::new(&storage).contains(&folder).unwrap(),
             "a folder that entered the session index after the snapshot must not be trusted"
@@ -896,10 +1119,14 @@ mod tests {
     fn a_fresh_install_grandfathers_nothing() {
         let (state, project, storage) = setup();
 
-        let (config, output, _) = resolve_io(&storage, project_at(project.path()), true, "no\n");
+        let answered = answer_question(
+            &storage,
+            project_at(project.path()),
+            Some(TrustAnswer::Never),
+        );
 
-        assert!(!config.is_trusted());
-        assert!(output.contains(TRUST_QUESTION), "prompt: {output:?}");
+        assert!(!answered.config.is_trusted());
+        assert!(answered.asked.is_some());
         let snapshot =
             fs::read_to_string(state.path().join(SESSIONS_DIR).join(PRE_TRUST_FILE)).unwrap();
         assert_eq!(snapshot, EMPTY_SNAPSHOT);
@@ -922,18 +1149,18 @@ mod tests {
         let storage = StateDir::from_path(state.path().to_path_buf());
         record_session(&storage, &nested.join(SOURCE_DIR));
 
-        let (checkout, _, _) = resolve_io(&storage, project_at(&nested), false, "");
+        let checkout = answer_question(&storage, project_at(&nested), CANNOT_ASK);
         assert!(
-            checkout.is_trusted(),
+            checkout.config.is_trusted(),
             "the checkout the session ran in keeps what it always loaded"
         );
 
-        let (above, _, warning) = resolve_io(&storage, project_at(parent.path()), false, "");
+        let above = answer_question(&storage, project_at(parent.path()), CANNOT_ASK);
         assert!(
-            !above.is_trusted(),
+            !above.config.is_trusted(),
             "a directory that only holds a checkout was never in use itself"
         );
-        assert!(!warning.is_empty(), "warning: {warning:?}");
+        assert!(!above.warning.is_empty(), "{:?}", above.warning);
     }
 
     /// The home directory is nobody's project root, so a session in a project
@@ -984,10 +1211,10 @@ mod tests {
         let folder = CanonicalFolder::resolve(project.path()).unwrap();
         record_prior(Prior::ProjectState, &storage, state.path(), &folder);
 
-        let (config, _, warning) = resolve_io(&storage, project_at(project.path()), false, "");
+        let answered = answer_question(&storage, project_at(project.path()), CANNOT_ASK);
 
-        assert!(!config.is_trusted());
-        assert!(!warning.is_empty());
+        assert!(!answered.config.is_trusted());
+        assert!(!answered.warning.is_empty());
         assert_eq!(
             TrustedFolders::new(&storage).status(&folder).unwrap(),
             TrustStatus::Unknown
@@ -1007,22 +1234,22 @@ mod tests {
             .unwrap();
 
         fs::write(project.path().join(INIT_FILE), INIT_SOURCE).unwrap();
-        let (config, output, _) = resolve_io(&storage, project_at(project.path()), true, "yes\n");
-
-        assert!(config.is_trusted());
-        assert!(output.contains(INIT_FILE), "prompt: {output:?}");
-        assert!(output.contains(ADDED_SINCE_TRUSTED), "prompt: {output:?}");
-        assert!(
-            !output.contains(PERMISSIONS_FILE),
-            "the file already covered is not new: {output:?}"
+        let answered = answer_question(
+            &storage,
+            project_at(project.path()),
+            Some(TrustAnswer::Trust),
         );
 
-        let (config, output, _) = resolve_io(&storage, project_at(project.path()), true, "");
-        assert!(config.is_trusted());
+        assert!(answered.config.is_trusted());
+        assert!(answered.asked_about(GatedFile::InitLua));
         assert!(
-            output.is_empty(),
-            "the widened answer must stick: {output:?}"
+            !answered.asked_about(GatedFile::Permissions),
+            "the file already covered is not new"
         );
+
+        let again = answer_question(&storage, project_at(project.path()), ANSWER_UNUSED);
+        assert!(again.config.is_trusted());
+        assert!(again.asked.is_none(), "the widened answer must stick");
     }
 
     /// Maki writes `.maki/permissions.toml` itself the first time somebody
@@ -1040,11 +1267,11 @@ mod tests {
         let written = project_at(project.path()).with_trust(true);
         record_written_file_in(&storage, &written, PERMISSIONS_NAME);
 
-        let (config, output, warning) = resolve_io(&storage, project_at(project.path()), true, "");
+        let answered = answer_question(&storage, project_at(project.path()), ANSWER_UNUSED);
 
-        assert!(config.is_trusted());
-        assert!(output.is_empty(), "prompt: {output:?}");
-        assert!(warning.is_empty(), "warning: {warning:?}");
+        assert!(answered.config.is_trusted());
+        assert!(answered.asked.is_none());
+        assert!(answered.warning.is_empty(), "{:?}", answered.warning);
     }
 
     /// The other side of the same rule: a file Maki wrote into a folder that
@@ -1075,11 +1302,11 @@ mod tests {
             .unwrap();
 
         fs::write(project.path().join(INIT_FILE), "return { changed = true }").unwrap();
-        let (config, output, warning) = resolve_io(&storage, project_at(project.path()), true, "");
+        let answered = answer_question(&storage, project_at(project.path()), ANSWER_UNUSED);
 
-        assert!(config.is_trusted());
-        assert!(output.is_empty(), "prompt: {output:?}");
-        assert!(warning.is_empty(), "warning: {warning:?}");
+        assert!(answered.config.is_trusted());
+        assert!(answered.asked.is_none());
+        assert!(answered.warning.is_empty(), "{:?}", answered.warning);
     }
 
     /// A store written before file sets existed keeps its answers, and the
@@ -1095,15 +1322,19 @@ mod tests {
         )
         .unwrap();
 
-        let (config, output, warning) = resolve_io(&storage, project_at(project.path()), true, "");
-        assert!(config.is_trusted());
-        assert!(output.is_empty(), "prompt: {output:?}");
-        assert!(warning.is_empty(), "warning: {warning:?}");
+        let answered = answer_question(&storage, project_at(project.path()), ANSWER_UNUSED);
+        assert!(answered.config.is_trusted());
+        assert!(answered.asked.is_none());
+        assert!(answered.warning.is_empty(), "{:?}", answered.warning);
 
         fs::write(project.path().join(MCP_FILE), MCP_SOURCE).unwrap();
-        let (config, output, _) = resolve_io(&storage, project_at(project.path()), true, "no\n");
-        assert!(!config.is_trusted());
-        assert!(output.contains(MCP_FILE), "prompt: {output:?}");
+        let answered = answer_question(
+            &storage,
+            project_at(project.path()),
+            Some(TrustAnswer::Never),
+        );
+        assert!(!answered.config.is_trusted());
+        assert!(answered.asked_about(GatedFile::Mcp));
     }
 
     #[test_case(false, false ; "an_unreadable_store_warns_and_stays_untrusted")]
@@ -1118,15 +1349,19 @@ mod tests {
         }
         fs::remove_dir_all(project.path().join(PROJECT_DIR)).unwrap();
 
-        let (config, output, warning) =
-            resolve_io(&storage, project_at(project.path()), true, "y\n");
+        let answered = answer_question(
+            &storage,
+            project_at(project.path()),
+            Some(TrustAnswer::Trust),
+        );
 
-        assert_eq!(config.is_trusted(), expected);
-        assert!(output.is_empty());
+        assert_eq!(answered.config.is_trusted(), expected);
+        assert!(answered.asked.is_none());
         assert_eq!(
-            warning.is_empty(),
+            answered.warning.is_empty(),
             store_trust,
-            "a store nobody can read must be reported here too: {warning:?}"
+            "a store nobody can read must be reported here too: {:?}",
+            answered.warning
         );
     }
 
@@ -1135,15 +1370,29 @@ mod tests {
         let (state, project, storage) = setup();
         fs::write(state.path().join(TRUST_FILE), UNREADABLE_STORE).unwrap();
 
-        let (config, _, warning) = resolve_io(&storage, project_at(project.path()), true, "yes\n");
-        assert!(!config.is_trusted());
-        assert!(warning.contains(SKIPPED), "warning: {warning:?}");
+        let answered = answer_question(
+            &storage,
+            project_at(project.path()),
+            Some(TrustAnswer::Trust),
+        );
+        assert!(!answered.config.is_trusted());
+        assert!(answered.warning.contains(SKIPPED), "{:?}", answered.warning);
 
         fs::remove_file(state.path().join(TRUST_FILE)).unwrap();
         fs::create_dir(state.path().join(TRUST_LOCK)).unwrap();
 
-        let (config, _, warning) = resolve_io(&storage, project_at(project.path()), true, "yes\n");
-        assert!(config.is_trusted());
-        assert!(warning.contains(TRUST_NOT_SAVED), "warning: {warning:?}");
+        // Invariant 5's one documented exception: the grant the user just gave
+        // holds for this process, and the failure to save it is reported.
+        let answered = answer_question(
+            &storage,
+            project_at(project.path()),
+            Some(TrustAnswer::Trust),
+        );
+        assert!(answered.config.is_trusted());
+        assert!(
+            answered.warning.contains(TRUST_NOT_SAVED),
+            "{:?}",
+            answered.warning
+        );
     }
 }
