@@ -18,8 +18,7 @@ use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
 
 use self::run_cancels::RunCancels;
-use maki_providers::provider::Provider;
-use maki_providers::{Message, Model};
+use maki_providers::Message;
 use tracing::{info, warn};
 
 use crate::app::App;
@@ -27,11 +26,7 @@ use crate::app::App;
 use self::agent_loop::AgentLoop;
 pub(crate) use self::model_slots::ModelSlots;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
-
-pub(crate) struct ModelSlot {
-    pub(crate) model: Model,
-    pub(crate) provider: Arc<dyn Provider>,
-}
+pub(crate) use maki_agent::ModelSlot;
 
 /// Input channels (`answer_tx`, `queue`) are per-agent, so an old loop can
 /// never steal new input. The output channel (`agent_tx`/`agent_rx`) is
@@ -300,9 +295,9 @@ mod tests {
 
     use maki_agent::{AgentEvent, AgentInput, AgentMode};
     use maki_config::{PermissionsConfig, ProjectConfig};
-    use maki_providers::provider::BoxFuture;
+    use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        AgentError, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
+        AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
     };
 
     use super::shared_queue::{QueueItem, QueuedInput};

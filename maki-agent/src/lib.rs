@@ -15,8 +15,8 @@ pub use mcp::{
 pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
-    SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls, find_subdirectory_instructions,
-    is_instruction_file,
+    ModelSlot, RunContext, RunContextBuilder, SharedMessages, UNAVAILABLE_RESULT,
+    close_dangling_tool_calls, find_subdirectory_instructions, is_instruction_file,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use mailbox::{MailboxError, SessionMailbox};

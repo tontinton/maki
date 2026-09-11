@@ -13,4 +13,7 @@ pub use instructions::{
     CallInstructions, Instructions, LoadedInstructions, build_system_prompt,
     find_subdirectory_instructions, is_instruction_file, load_instruction_text, load_instructions,
 };
-pub use run::{Agent, AgentParams, AgentRunParams, request_tools, resolve_compaction_model};
+pub use run::{
+    Agent, AgentParams, AgentRunParams, ModelSlot, RunContext, RunContextBuilder, request_tools,
+    resolve_compaction_model,
+};
