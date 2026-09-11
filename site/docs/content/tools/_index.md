@@ -174,6 +174,7 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 | `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default) or "general" (can modify files) |
+| `thinking` | string | no | Thinking: off\|adaptive\|minimal\|low\|medium\|high\|xhigh\|max\|int budget. Omit to inherit parent; capped at parent. |
 
 ### `todo_write` {#todo_write}
 

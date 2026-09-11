@@ -753,6 +753,39 @@ impl ThinkingConfig {
             .map_err(|_| THINKING_USAGE)
     }
 
+    /// Caps this config at `parent`. A subagent's thinking request is written
+    /// by the model, not the user, so it may go down but never above what the
+    /// parent session runs with. `Adaptive` on either side means "let the model
+    /// decide" rather than a ceiling, so it never caps.
+    pub fn clamp_to(self, parent: Self) -> Self {
+        match (parent, self) {
+            (Self::Off, _) | (_, Self::Off) => Self::Off,
+            (Self::Adaptive, _) | (_, Self::Adaptive) => self,
+            (Self::Effort(parent_level), Self::Effort(level)) => {
+                Self::Effort(parent_level.min(level))
+            }
+            (Self::Budget(parent_tokens), Self::Budget(tokens)) => {
+                Self::Budget(parent_tokens.min(tokens))
+            }
+            // Mixed units compare as effort but keep their original form, so an
+            // explicit token budget is never rewritten into a level.
+            (Self::Effort(parent_level), Self::Budget(tokens)) => {
+                if parent_level <= Effort::from_budget(tokens, FALLBACK_MAX_THINKING_BUDGET) {
+                    parent
+                } else {
+                    self
+                }
+            }
+            (Self::Budget(parent_tokens), Self::Effort(level)) => {
+                if Effort::from_budget(parent_tokens, FALLBACK_MAX_THINKING_BUDGET) <= level {
+                    parent
+                } else {
+                    self
+                }
+            }
+        }
+    }
+
     pub fn status_label(self) -> Option<Cow<'static, str>> {
         match self {
             Self::Off => None,
@@ -895,6 +928,10 @@ mod tests {
 
     const INTERNED_DATA: &str = "aW50ZXJuZWQtcGF5bG9hZA==";
     const OTHER_DATA: &str = "b3RoZXItcGF5bG9hZA==";
+    /// Below `Minimal` against [`FALLBACK_MAX_THINKING_BUDGET`].
+    const SMALL_BUDGET: u32 = 2048;
+    /// Between `Medium` and `High` against [`FALLBACK_MAX_THINKING_BUDGET`].
+    const LARGE_BUDGET: u32 = 16_384;
 
     #[test_case("end_turn", StopReason::EndTurn   ; "end_turn")]
     #[test_case("tool_use", StopReason::ToolUse   ; "tool_use")]
@@ -1174,6 +1211,26 @@ mod tests {
     #[test_case(ThinkingConfig::Effort(Minimal), None,       Budgeted::Tokens(3_276)  ; "unknown_max_minimal_effort")]
     fn thinking_budget_resolver(config: ThinkingConfig, max: Option<u32>, expected: Budgeted) {
         assert_eq!(config.budget(max), expected);
+    }
+
+    #[test_case(ThinkingConfig::Off, ThinkingConfig::Effort(Max), ThinkingConfig::Off ; "parent_off_wins_over_any_request")]
+    #[test_case(ThinkingConfig::Effort(Max), ThinkingConfig::Off, ThinkingConfig::Off ; "child_may_always_turn_it_off")]
+    #[test_case(ThinkingConfig::Adaptive, ThinkingConfig::Effort(Max), ThinkingConfig::Effort(Max) ; "parent_adaptive_is_not_a_ceiling")]
+    #[test_case(ThinkingConfig::Effort(Minimal), ThinkingConfig::Adaptive, ThinkingConfig::Adaptive ; "child_adaptive_passes_through")]
+    #[test_case(ThinkingConfig::Effort(Low), ThinkingConfig::Effort(Max), ThinkingConfig::Effort(Low) ; "effort_capped_at_parent")]
+    #[test_case(ThinkingConfig::Effort(Max), ThinkingConfig::Effort(Low), ThinkingConfig::Effort(Low) ; "effort_lower_child_kept")]
+    #[test_case(ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Budget(LARGE_BUDGET), ThinkingConfig::Budget(SMALL_BUDGET) ; "budget_capped_at_parent")]
+    #[test_case(ThinkingConfig::Budget(LARGE_BUDGET), ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Budget(SMALL_BUDGET) ; "budget_lower_child_kept")]
+    #[test_case(ThinkingConfig::Effort(Minimal), ThinkingConfig::Budget(LARGE_BUDGET), ThinkingConfig::Effort(Minimal) ; "mixed_parent_effort_caps_child_budget")]
+    #[test_case(ThinkingConfig::Effort(Max), ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Budget(SMALL_BUDGET) ; "mixed_lower_child_budget_keeps_its_tokens")]
+    #[test_case(ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Effort(High), ThinkingConfig::Budget(SMALL_BUDGET) ; "mixed_parent_budget_caps_child_effort")]
+    #[test_case(ThinkingConfig::Budget(LARGE_BUDGET), ThinkingConfig::Effort(Minimal), ThinkingConfig::Effort(Minimal) ; "mixed_lower_child_effort_keeps_its_level")]
+    fn thinking_clamp_to_parent(
+        parent: ThinkingConfig,
+        child: ThinkingConfig,
+        expected: ThinkingConfig,
+    ) {
+        assert_eq!(child.clamp_to(parent), expected);
     }
 
     #[test_case(ThinkingConfig::Off,          json!({})                                                                  ; "off")]

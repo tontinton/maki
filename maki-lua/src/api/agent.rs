@@ -25,7 +25,9 @@ use maki_agent::{
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
-use maki_providers::{ContentBlock, Model, ModelError, Role, ThinkingConfig, TokenUsage, add_cost};
+use maki_providers::{
+    ContentBlock, Model, ModelError, RequestOptions, Role, ThinkingConfig, TokenUsage, add_cost,
+};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::StoredThinking;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
@@ -530,24 +532,36 @@ async fn session(
         }
     }
 
-    let thinking = match thinking_val {
+    let requested_thinking = match thinking_val {
         Some(LuaValue::String(s)) => match StoredThinking::parse_setting(&s.to_str()?) {
-            Ok(stored) => ThinkingConfig::from(stored),
+            Ok(stored) => Some(ThinkingConfig::from(stored)),
             Err(e) => return Ok(err_pair(format!("invalid thinking: {e}"))),
         },
         Some(LuaValue::Integer(n)) => match u32::try_from(n) {
-            Ok(tokens) if tokens > 0 => ThinkingConfig::Budget(tokens),
+            Ok(tokens) if tokens > 0 => Some(ThinkingConfig::Budget(tokens)),
             _ => return Ok(err_pair(format!("invalid thinking budget: {n}"))),
         },
         Some(LuaValue::Number(n)) if n >= 1.0 && n <= f64::from(u32::MAX) => {
-            ThinkingConfig::Budget(n as u32)
+            Some(ThinkingConfig::Budget(n as u32))
         }
         Some(LuaValue::Number(n)) => {
             return Ok(err_pair(format!("invalid thinking budget: {n}")));
         }
-        Some(_) => return Err(mlua::Error::runtime("thinking must be string or number")),
-        None => agent_ctx.opts.thinking,
+        Some(other) => {
+            return Ok(err_pair(format!(
+                "thinking must be string or number, got {}",
+                other.type_name()
+            )));
+        }
+        None => None,
     };
+    // Omitting inherits the parent as-is; an explicit level is capped at it
+    // first, then reconciled once with the model so the status badge,
+    // `AgentInput` and the request itself all report what this session runs.
+    let thinking = requested_thinking.map_or(agent_ctx.opts.thinking, |t| {
+        t.clamp_to(agent_ctx.opts.thinking)
+    });
+    let RequestOptions { thinking, fast } = RequestOptions { thinking, fast }.clamped(&model);
 
     let (stream_guard, sub_events) = event_stream();
     let sub_event_tx = stream_guard.sender(agent_ctx.event_tx.run_id());
@@ -735,6 +749,7 @@ struct SessionState {
     params: AgentParams,
     system: String,
     tools: RequestTools,
+    /// Already reconciled against `params.model`, so every reader agrees.
     thinking: ThinkingConfig,
     fast: bool,
     /// Fresh per session so `tool_search` loads never leak between a
@@ -844,6 +859,8 @@ async fn prompt(
             name: s.name.clone(),
             prompt: Some(message.clone()),
             model: Some(s.params.model.spec()),
+            thinking: Some(s.thinking),
+            fast: Some(s.fast),
             answer_tx: s.answer_tx.take(),
         });
     }
@@ -1049,6 +1066,8 @@ mod tests {
             name: "research".into(),
             prompt: None,
             model: None,
+            thinking: None,
+            fast: None,
             answer_tx: None,
         })
         .unwrap();

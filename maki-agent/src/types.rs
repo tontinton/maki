@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use flume::{Receiver, Sender};
 use maki_config::ToolKey;
-use maki_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage, add_cost};
+use maki_providers::{
+    AgentError, ContentBlock, Message, Role, StopReason, ThinkingConfig, TokenUsage, add_cost,
+};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
@@ -1000,6 +1002,10 @@ pub struct SubagentInfo {
     pub prompt: Option<String>,
     #[serde(rename = "parent_model", skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip)]
+    pub thinking: Option<ThinkingConfig>,
+    #[serde(skip)]
+    pub fast: Option<bool>,
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
 }

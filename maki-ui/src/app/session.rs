@@ -150,6 +150,8 @@ impl App {
                     tool_use_id: tool_id.clone(),
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
+                    thinking: chat.thinking.map(Into::into),
+                    fast: chat.fast,
                 }
             })
             .collect();
@@ -239,6 +241,8 @@ impl App {
             );
             chat.set_restore_channel(self.restore_event_tx.clone());
             chat.model_id = sa.model;
+            chat.thinking = sa.thinking.map(Into::into);
+            chat.fast = sa.fast;
             chat.load_messages(display);
             // The session file keeps the transcript but never how it ended,
             // so a reload admits that instead of guessing.

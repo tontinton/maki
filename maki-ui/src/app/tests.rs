@@ -251,6 +251,8 @@ fn subagent_info_with_tx(
         name: name.into(),
         prompt: None,
         model: None,
+        thinking: None,
+        fast: None,
         answer_tx,
     }
 }
@@ -2413,6 +2415,43 @@ fn mouse_down_in_input_creates_input_zone_selection() {
     let state = app.selection_state.as_ref().unwrap();
     assert_eq!(state.sel().zone, SelectionZone::Input);
     assert_eq!(state.sel().area, input);
+}
+
+#[test]
+fn resolve_or_create_chat_sets_subagent_fast() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let mut info = subagent_info(TASK_ID, "research");
+    info.fast = Some(false);
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta { text: "hi".into() },
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert_eq!(app.chats[1].fast, Some(false));
+}
+
+#[test]
+fn resolve_or_create_chat_sets_subagent_thinking() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let mut info = subagent_info(TASK_ID, "research");
+    info.thinking = Some(ThinkingConfig::Effort(maki_providers::Effort::High));
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta { text: "hi".into() },
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert_eq!(
+        app.chats[1].thinking,
+        Some(ThinkingConfig::Effort(maki_providers::Effort::High))
+    );
 }
 
 #[test]

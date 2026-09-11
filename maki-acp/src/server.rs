@@ -1014,6 +1014,8 @@ mod tests {
                 name: SUBAGENT_NAME.to_owned(),
                 prompt: None,
                 model: None,
+                thinking: None,
+                fast: None,
                 answer_tx: Some(answer_tx.clone()),
             };
             for event in [
@@ -1118,6 +1120,8 @@ mod tests {
                     name: SUBAGENT_NAME.to_owned(),
                     prompt: None,
                     model: None,
+                    thinking: None,
+                    fast: None,
                     answer_tx: None,
                 }),
                 run_id: 0,
@@ -1203,6 +1207,8 @@ mod tests {
                     name: SUBAGENT_NAME.to_owned(),
                     prompt: None,
                     model: None,
+                    thinking: None,
+                    fast: None,
                     answer_tx: None,
                 }),
                 run_id: 0,

@@ -415,6 +415,10 @@ pub struct StoredSubagent {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<StoredThinking>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1821,6 +1825,8 @@ mod tests {
                 tool_use_id: id.into(),
                 name: "sub".into(),
                 model: None,
+                thinking: None,
+                fast: None,
             }
         }
 

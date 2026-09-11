@@ -76,6 +76,9 @@ local schema = {
       type = "string",
       description = 'Model tier (optional, omit to use current model, capped at current tier):\n- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.\n- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.\n- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits.',
     },
+    thinking = {
+      description = "Thinking: off|adaptive|minimal|low|medium|high|xhigh|max|int budget. Omit to inherit parent; capped at parent.",
+    },
     output_schema = {
       description = "JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string.",
     },
@@ -190,6 +193,7 @@ local function handler(input, ctx)
       local_tools = local_tools,
       audience = audience,
       name = input.description,
+      thinking = input.thinking,
     })
     if sess_err then
       return { llm_output = sess_err, is_error = true }

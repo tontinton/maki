@@ -16,7 +16,7 @@ use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_N
 use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::WinView;
-use maki_providers::{ContentBlock, Message, Role};
+use maki_providers::{ContentBlock, Message, Role, ThinkingConfig};
 use maki_storage::id::MakiId;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -52,6 +52,8 @@ pub struct Chat {
     pub cost: Option<f64>,
     pub context_size: u32,
     pub model_id: Option<String>,
+    pub thinking: Option<ThinkingConfig>,
+    pub fast: Option<bool>,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     /// The ending and the index of the bubble announcing it, so a later, better
@@ -77,6 +79,8 @@ impl Chat {
             cost: None,
             context_size: 0,
             model_id: None,
+            thinking: None,
+            fast: None,
             pending_turn_usage: None,
             messages_panel,
             finish: None,
