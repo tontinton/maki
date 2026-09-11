@@ -33,6 +33,7 @@ use super::openai::OpenAi;
 use super::opencode::Opencode;
 use super::openrouter::OpenRouter;
 use super::regolo::Regolo;
+use super::requesty::Requesty;
 use super::synthetic::Synthetic;
 use super::tensorx::TensorX;
 use super::xai::Xai;
@@ -589,6 +590,10 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
         ),
         ProviderKind::OpenRouter => Box::new(
             OpenRouter::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
+        ProviderKind::Requesty => Box::new(
+            Requesty::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::TensorX => Box::new(

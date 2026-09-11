@@ -48,6 +48,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * Z.AI - `ZHIPU_API_KEY`.
 * DeepSeek - `DEEPSEEK_API_KEY`.
 * OpenRouter - `OPENROUTER_API_KEY`.
+* Requesty - `REQUESTY_API_KEY`. Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` for the EU region.
 * Synthetic - `SYNTHETIC_API_KEY`.
 * Regolo - `REGOLO_API_KEY`. EU-hosted open-weight models.
 * TensorX - `TENSORX_API_KEY`.

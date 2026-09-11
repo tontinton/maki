@@ -21,6 +21,7 @@ use super::mistral::Mistral;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::openrouter::OpenRouter;
 use super::regolo::Regolo;
+use super::requesty::Requesty;
 use super::synthetic::Synthetic;
 use super::tensorx::TensorX;
 use super::zai::Zai;
@@ -127,6 +128,7 @@ fn compat_kind(kind: ProviderKind) -> Option<ProviderKind> {
         | ProviderKind::Zai
         | ProviderKind::DeepSeek
         | ProviderKind::OpenRouter
+        | ProviderKind::Requesty
         | ProviderKind::Synthetic
         | ProviderKind::Regolo
         | ProviderKind::TensorX => Some(kind),
@@ -179,6 +181,7 @@ fn default_path_prefix(kind: Option<ProviderKind>) -> &'static str {
             | ProviderKind::Mistral
             | ProviderKind::DeepSeek
             | ProviderKind::OpenRouter
+            | ProviderKind::Requesty
             | ProviderKind::Synthetic
             | ProviderKind::Regolo
             | ProviderKind::TensorX
@@ -239,6 +242,9 @@ fn build_routed_provider(
         }
         ProviderKind::OpenRouter => {
             Box::new(OpenRouter::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+        }
+        ProviderKind::Requesty => {
+            Box::new(Requesty::with_auth(auth, timeouts).with_system_prefix(system_prefix))
         }
         ProviderKind::Synthetic => {
             Box::new(Synthetic::with_auth(auth, timeouts).with_system_prefix(system_prefix))
