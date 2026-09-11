@@ -274,6 +274,7 @@ impl AgentLoop {
                 ledger: Arc::new(RunLedger::default()),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
+                unattended: false,
                 model_policy: Arc::clone(&self.model_policy),
             },
             AgentRunParams {

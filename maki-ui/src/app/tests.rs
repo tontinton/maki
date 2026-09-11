@@ -257,6 +257,7 @@ fn subagent_info_with_tx(
         model: None,
         opts: None,
         answer_tx,
+        detached: false,
     }
 }
 

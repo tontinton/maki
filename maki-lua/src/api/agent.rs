@@ -652,6 +652,7 @@ async fn session(
             ledger: RunLedger::child(&agent_ctx.ledger),
             registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
             audience,
+            unattended: detached || agent_ctx.unattended,
             model_policy: Arc::clone(&agent_ctx.model_policy),
         },
         system: system.unwrap_or_default(),
