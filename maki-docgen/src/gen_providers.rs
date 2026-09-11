@@ -537,7 +537,7 @@ fn no_catalog_note(kind: ProviderKind) -> &'static str {
              `<vendor>/<model>` catalog (e.g. `requesty/openai/gpt-4o-mini`). \
              Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). \
              Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all \
-             traffic in the EU (`router.us.requesty.ai` and `router.ap.requesty.ai` also exist)."
+             traffic in the EU."
         }
         _ => "No hardcoded model catalog. Use any model ID supported by this provider.",
     }
