@@ -535,10 +535,15 @@ pub enum UiAction {
 pub struct UiAttachment(Arc<AtomicBool>);
 
 impl Default for UiAttachment {
-    /// Attached until a loop says otherwise. Headless runs and ACP hand Lua no
-    /// sender at all, so the bit only ever describes a loop that went away.
+    /// Detached until `EventLoop::new` calls `attach()`. Plugin load in the
+    /// TUI, ACP, and subcommands all happen before any loop drains
+    /// `UiAction`, so a roundtrip at load must fail fast. A thread that
+    /// never installed a handle still reads as attached (`ui_attached` uses
+    /// `is_none_or`), so unit tests that do not go through `PluginHost`
+    /// keep working. Tests that drain `ui_action_rx` themselves call
+    /// `attach()`.
     fn default() -> Self {
-        Self(Arc::new(AtomicBool::new(true)))
+        Self(Arc::new(AtomicBool::new(false)))
     }
 }
 

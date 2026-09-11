@@ -163,14 +163,18 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
     }
 
     /// Cancels everything under {id} and marks later siblings cancelled.
-    /// The entry stays until every registered sibling retires.
-    pub fn cancel_or_precancel(&self, id: K) {
+    /// The entry stays until every registered sibling retires. Returns
+    /// whether any live registration was cancelled; `false` means a pure
+    /// precancel, i.e. the caller addressed a session that does not exist.
+    pub fn cancel_or_precancel(&self, id: K) -> bool {
         let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.entry(id).or_default();
         entry.cancelled = true;
+        let hit = !entry.registrations.is_empty();
         for registration in &mut entry.registrations {
             drop(registration.trigger.take());
         }
+        hit
     }
 
     pub fn remove(&self, id: &K) {
@@ -279,14 +283,14 @@ mod tests {
         let (trigger, token) = CancelToken::new();
         map.insert("t1".to_owned(), trigger);
         assert!(!token.is_cancelled());
-        map.cancel_or_precancel("t1".to_owned());
+        assert!(map.cancel_or_precancel("t1".to_owned()));
         assert!(token.is_cancelled());
     }
 
     #[test]
     fn cancel_map_cancel_before_insert() {
         let map = CancelMap::new();
-        map.cancel_or_precancel("t1".to_owned());
+        assert!(!map.cancel_or_precancel("t1".to_owned()));
         let (trigger, token) = CancelToken::new();
         map.insert("t1".to_owned(), trigger);
         assert!(token.is_cancelled());
