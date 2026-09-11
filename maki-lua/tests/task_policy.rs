@@ -2,6 +2,7 @@
 //! source, real `maki.json` / `maki.async`, with model I/O replaced by
 //! scriptable Lua stubs.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +33,9 @@ const TASK_TOOL_WAIT: &str = "task_wait";
 const PROBE_TOOL: &str = "probe";
 const BG_FLASH: &str = "bg-done";
 const BG_UNKNOWN_PREFIX: &str = "unknown task id: ";
+const BG_DISK_SCENARIO: &str = "bg_disk";
+const BG_ORPHANED_ERROR: &str = "task lost: the host restarted or the plugin reloaded while it ran";
+const BG_ORPHAN_SEED_DESCRIPTION: &str = "orphaned probe";
 const BG_WAIT_MIN_ERR: &str = "timeout_ms must be >= 1";
 /// Generous vs the background work, which finishes in well under a second.
 const BG_TEST_WAIT: Duration = Duration::from_secs(5);
@@ -153,12 +157,24 @@ behaviors.bg_slow = function(sess, msg)
   return { text = "@PLAIN_TEXT@" }
 end
 
+behaviors.bg_disk = function(sess, msg)
+  maki.async.sleep(1200)
+  return { text = "@PLAIN_TEXT@" }
+end
+
 -- The real notify touches a live mailbox, which the stub ctx lacks. Record
 -- instead, and flash so tests get a deterministic completion signal on the
 -- UI action channel.
 maki.session.notify = function(text, opts)
   recorder.notifies[#recorder.notifies + 1] = { text = text, opts = opts }
   maki.ui.flash("@BG_FLASH@")
+end
+
+-- The real logs dir is the user's machine, so receipts default to
+-- memory-only (also the headless shape). Persistence tests re-stub this
+-- with a tempdir through the @LOGS_DIR@ token.
+maki.env.logs_dir = function()
+  return @LOGS_DIR@
 end
 
 maki.agent.session = function(ctx, opts)
@@ -221,9 +237,21 @@ fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
 fn load_task_host_with_opts(
     opts: serde_json::Map<String, serde_json::Value>,
 ) -> (Arc<ToolRegistry>, PluginHost) {
+    load_task_host_with(opts, None)
+}
+
+fn load_task_host_with_logs_dir(dir: &Path) -> (Arc<ToolRegistry>, PluginHost) {
+    load_task_host_with(serde_json::Map::new(), Some(dir))
+}
+
+fn load_task_host_with(
+    opts: serde_json::Map<String, serde_json::Value>,
+    logs_dir: Option<&Path>,
+) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.ui_attachment().attach();
+    let logs_dir = logs_dir.map(|dir| format!("{dir:?}"));
     let prelude = STUB_PRELUDE
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
         .replace("@RECOVERED_TEXT@", RECOVERED_TEXT)
@@ -231,7 +259,8 @@ fn load_task_host_with_opts(
         .replace("@RAISE_MSG@", RAISE_MSG)
         .replace("@PARTIAL_TEXT@", PARTIAL_TEXT)
         .replace("@CANCELLED_ERR@", CANCELLED_ERR)
-        .replace("@BG_FLASH@", BG_FLASH);
+        .replace("@BG_FLASH@", BG_FLASH)
+        .replace("@LOGS_DIR@", logs_dir.as_deref().unwrap_or("nil"));
     host.load_source_with_opts(
         "task_policy",
         &format!("{prelude}\n{TASK_PLUGIN_SRC}"),
@@ -736,6 +765,43 @@ fn task_wait_times_out_while_working_then_the_result_lands() {
     assert_eq!(result, PLAIN_TEXT);
 }
 
+/// A receipt must keep resolving in a plugin instance that never saw the
+/// spawn: the on-disk copy carries the state across a reload-shaped
+/// replacement, and the finish written by the old instance persists for the
+/// new one.
+#[test]
+fn background_receipts_resolve_from_disk_in_a_fresh_host() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
+        .parse()
+        .expect("valid session id");
+    let (reg, host) = load_task_host_with_logs_dir(tmp.path());
+    let receipt = exec_tool_with_session(
+        &reg,
+        TASK_TOOL,
+        bg_input(BG_DISK_SCENARIO),
+        Some(session.clone()),
+    )
+    .expect("background task failed");
+    let id = bg_task_id(&receipt);
+
+    // The subagent finishes before the fresh host reads: a fresh VM can never
+    // observe a genuinely running task (a reload takes in-flight coroutines
+    // down with the old VM), so disk fallback only matters for resolved
+    // receipts; the working case is the orphan sweep's.
+    wait_flash(&host);
+
+    let (fresh_reg, _fresh_host) = load_task_host_with_logs_dir(tmp.path());
+    let out = exec_tool_with_session(
+        &fresh_reg,
+        TASK_TOOL_RESULT,
+        json!({ "task_id": id }),
+        Some(session),
+    )
+    .expect("task_result failed");
+    assert_eq!(out, PLAIN_TEXT);
+}
+
 #[test]
 fn task_wait_rejects_non_positive_timeout() {
     let (reg, _host) = load_task_host();
@@ -748,4 +814,63 @@ fn task_wait_rejects_non_positive_timeout() {
     )
     .unwrap_err();
     assert_eq!(err, BG_WAIT_MIN_ERR);
+}
+
+/// The first task call of a fresh VM must resolve every disk receipt still
+/// marked "working": its coroutine died with the previous process or reload,
+/// so nothing will ever finish it. Finished receipts stay untouched.
+#[test]
+fn first_call_marks_disk_working_receipts_as_lost() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
+        .parse()
+        .expect("valid session id");
+    // The plugin keys receipts by the canonical id the Lua ctx exposes.
+    let sid = session.id().to_string();
+    let dir = tmp.path().join(&sid).join("bg-tasks");
+    std::fs::create_dir_all(&dir).unwrap();
+    let orphan_id = format!("{sid}:dead:1");
+    let done_id = format!("{sid}:dead:2");
+    std::fs::write(
+        dir.join(format!("{orphan_id}.json")),
+        json!({ "description": BG_ORPHAN_SEED_DESCRIPTION, "status": "working", "is_error": false })
+            .to_string(),
+    )
+    .unwrap();
+    let done_receipt = json!({
+        "description": BG_ORPHAN_SEED_DESCRIPTION,
+        "status": "done",
+        "is_error": false,
+        "result": PLAIN_TEXT,
+    });
+    std::fs::write(
+        dir.join(format!("{done_id}.json")),
+        done_receipt.to_string(),
+    )
+    .unwrap();
+
+    let (reg, _host) = load_task_host_with_logs_dir(tmp.path());
+
+    let out = exec_tool_with_session(
+        &reg,
+        TASK_TOOL_RESULT,
+        json!({ "task_id": orphan_id }),
+        Some(session.clone()),
+    )
+    .expect_err("the lost receipt must surface as a tool error");
+    assert_eq!(out, BG_ORPHANED_ERROR);
+
+    let orphan: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(format!("{orphan_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(orphan["status"], "error");
+    assert_eq!(orphan["is_error"], true);
+    assert_eq!(orphan["result"], BG_ORPHANED_ERROR);
+
+    let done: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(format!("{done_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(done, done_receipt);
 }
