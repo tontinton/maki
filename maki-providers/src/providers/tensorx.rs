@@ -9,7 +9,11 @@ use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyPool, ResolvedAuth};
+use super::{KeyPool, ResolvedAuth, deepseek};
+
+/// TensorX namespaces resold models by vendor, so DeepSeek ids arrive as
+/// `deepseek/deepseek-flash`.
+const DEEPSEEK_VENDOR_PREFIX: &str = "deepseek/";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "tensorx",
@@ -105,10 +109,15 @@ impl Provider for TensorX {
                 opts.thinking
                     .apply_reasoning_effort(&mut body, &dialect::TENSORX, model);
             }
-            // Fallback for deepseek models that use chat_template_kwargs
+            // DeepSeek takes the toggle through the chat template and TensorX
+            // advertises neither knob for it. Sharing DeepSeek's own predicate
+            // means a rename upstream cannot quietly turn thinking off here.
             else if !has_thinking
                 && opts.thinking.is_enabled()
-                && model.id.starts_with("deepseek/deepseek-v4")
+                && model
+                    .id
+                    .strip_prefix(DEEPSEEK_VENDOR_PREFIX)
+                    .is_some_and(deepseek::uses_v4_thinking_protocol)
             {
                 body["chat_template_kwargs"] = json!({"thinking": true});
             }
