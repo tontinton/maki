@@ -1373,6 +1373,7 @@ mod tests {
             model: None,
             opts: None,
             answer_tx,
+            detached: false,
         }
     }
 
