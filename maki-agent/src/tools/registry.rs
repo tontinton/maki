@@ -17,6 +17,7 @@ use crate::template::Vars;
 use crate::{BufferSnapshot, ToolOutput};
 
 use super::hook::ToolHook;
+use super::schema::sanitize_tool_input_schema;
 use super::{DescriptionContext, ToolContext};
 
 bitflags! {
@@ -488,7 +489,7 @@ impl ToolRegistry {
             let mut def = json!({
                 "name": entry.name(),
                 "description": description,
-                "input_schema": entry.tool.schema(),
+                "input_schema": sanitize_tool_input_schema(entry.tool.schema()),
             });
             if let Some(examples) = entry.tool.examples() {
                 if supports_examples {
@@ -547,7 +548,11 @@ mod tests {
     use crate::template::Vars;
     use test_case::test_case;
 
-    use crate::tools::test_support::mock_tool;
+    use crate::tools::test_support::{mock_tool, mock_tool_with_schema};
+
+    const ANY_TOOL_NAME: &str = "schemaless";
+    const EMPTY_SCHEMA_REJECTED: &str =
+        "strict providers reject a function whose parameters is empty";
 
     fn mock(name: &str) -> Arc<dyn Tool> {
         mock_tool(name, ToolAudience::all())
@@ -565,6 +570,30 @@ mod tests {
         reg.register(mock("dupe"), lua_source("p")).unwrap();
         let err = reg.register(mock("dupe"), lua_source("p")).unwrap_err();
         assert!(matches!(err, RegistryError::NameConflict { .. }));
+    }
+
+    #[test]
+    fn definitions_never_send_an_empty_schema() {
+        let reg = ToolRegistry::new();
+        reg.register(
+            mock_tool_with_schema(ANY_TOOL_NAME, ToolAudience::all(), json!({})),
+            lua_source("p"),
+        )
+        .unwrap();
+
+        let filter = crate::tools::ToolFilter::All;
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+            mcp: false,
+        };
+        let defs = reg.definitions(&Vars::new(), &ctx, false);
+        assert_eq!(
+            defs[0]["input_schema"],
+            json!({"type": "object", "properties": {}}),
+            "{EMPTY_SCHEMA_REJECTED}"
+        );
     }
 
     /// Tools added mid-session must show up in the next `definitions()` call.

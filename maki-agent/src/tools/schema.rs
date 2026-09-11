@@ -207,57 +207,74 @@ pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
             let items: &'static ParamSchema = try_from_json(items_val)?;
             ParamSchema::Array { items, description }
         }
-        Some("object") => {
-            let props_map = v
-                .get("properties")
-                .and_then(|p| p.as_object())
-                .ok_or("object schema missing properties")?;
-            let required: Vec<&str> = v
-                .get("required")
-                .and_then(|r| r.as_array())
-                .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect())
-                .unwrap_or_default();
-            let properties: &'static [Property] = Box::leak(
-                props_map
-                    .iter()
-                    .map(|(name, sub)| -> Result<Property, String> {
-                        let static_name: &'static str = Box::leak(name.clone().into_boxed_str());
-                        let inline_required = sub
-                            .get("required")
-                            .and_then(|r| r.as_bool())
-                            .unwrap_or(false);
-                        let static_schema: &'static ParamSchema = try_from_json(sub)?;
-                        let is_required = inline_required || required.contains(&name.as_str());
-                        let aliases: &'static [&'static str] = match sub.get("alias") {
-                            Some(Value::String(s)) => {
-                                let leaked: &'static str = Box::leak(s.clone().into_boxed_str());
-                                Box::leak(vec![leaked].into_boxed_slice())
-                            }
-                            Some(Value::Array(arr)) => Box::leak(
-                                arr.iter()
-                                    .filter_map(|v| v.as_str())
-                                    .map(|s| -> &'static str {
-                                        Box::leak(s.to_owned().into_boxed_str())
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .into_boxed_slice(),
-                            ),
-                            _ => &[],
-                        };
-                        Ok((static_name, static_schema, is_required, aliases))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_boxed_slice(),
-            );
-            ParamSchema::Object {
-                properties,
-                description,
-            }
+        Some("object") => parse_object_schema(v, description)?,
+        // A schema that spells out `properties` but forgets `type` is an object
+        // and nothing else. Reading it as "any value" used to throw the whole
+        // parameter list away, so the tool quietly arrived with no arguments.
+        // This is still only a guess though, and the plugins that forget `type`
+        // at the root are the same ones that write a sloppy nested schema, so a
+        // failure here would newly refuse a plugin that used to load and take
+        // all of its tools, commands and hooks with it. We keep the old "any
+        // value" answer in that case, which is never worse than before.
+        None if v.get("properties").is_some_and(Value::is_object) => {
+            parse_object_schema(v, description).unwrap_or_else(|error| {
+                warn!(
+                    error,
+                    "tool schema lists properties but one of them is malformed"
+                );
+                ParamSchema::Any { description }
+            })
         }
         _ => ParamSchema::Any { description },
     };
 
     Ok(Box::leak(Box::new(schema)))
+}
+
+fn parse_object_schema(v: &Value, description: &'static str) -> Result<ParamSchema, String> {
+    let props_map = v
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .ok_or("object schema missing properties")?;
+    let required: Vec<&str> = v
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    let properties: &'static [Property] = Box::leak(
+        props_map
+            .iter()
+            .map(|(name, sub)| -> Result<Property, String> {
+                let static_name: &'static str = Box::leak(name.clone().into_boxed_str());
+                let inline_required = sub
+                    .get("required")
+                    .and_then(|r| r.as_bool())
+                    .unwrap_or(false);
+                let static_schema: &'static ParamSchema = try_from_json(sub)?;
+                let is_required = inline_required || required.contains(&name.as_str());
+                let aliases: &'static [&'static str] = match sub.get("alias") {
+                    Some(Value::String(s)) => {
+                        let leaked: &'static str = Box::leak(s.clone().into_boxed_str());
+                        Box::leak(vec![leaked].into_boxed_slice())
+                    }
+                    Some(Value::Array(arr)) => Box::leak(
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| -> &'static str { Box::leak(s.to_owned().into_boxed_str()) })
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice(),
+                    ),
+                    _ => &[],
+                };
+                Ok((static_name, static_schema, is_required, aliases))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_boxed_slice(),
+    );
+    Ok(ParamSchema::Object {
+        properties,
+        description,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -676,15 +693,19 @@ fn log_coercion(
 /// schema with `properties` and `required` as an array. MCP servers and plugins
 /// can return schemas that break these rules, so this function repairs them
 /// before they are sent to a provider.
+///
+/// A root without `type` is always made an object. The root describes the named
+/// arguments of a function, so nothing else fits, and strict providers (MiniMax,
+/// Kimi) reject a function whose `parameters` is `{}`. Nested schemas keep their
+/// own shape, where an empty `{}` still means "any value".
 pub fn sanitize_tool_input_schema(mut schema: Value) -> Value {
     let original = schema.clone();
-    if let Value::Object(map) = &mut schema
-        && is_object_schema(map)
-    {
-        sanitize_object_schema(map);
+    if let Value::Object(map) = &mut schema {
+        map.entry("type").or_insert_with(|| json!("object"));
     } else {
-        sanitize_property_schema(&mut schema);
+        schema = json!({ "type": "object" });
     }
+    sanitize_property_schema(&mut schema);
     if schema != original {
         tracing::debug!(
             from = %original,
@@ -693,12 +714,6 @@ pub fn sanitize_tool_input_schema(mut schema: Value) -> Value {
         );
     }
     schema
-}
-
-fn is_object_schema(map: &serde_json::Map<String, Value>) -> bool {
-    let type_str = map.get("type").and_then(|v| v.as_str());
-    type_str == Some("object")
-        || (type_str.is_none() && map.get("properties").and_then(|v| v.as_object()).is_some())
 }
 
 fn sanitize_object_schema(map: &mut serde_json::Map<String, Value>) {
@@ -821,6 +836,18 @@ mod tests {
     const MSG_EXPECTED_ARRAY: &str = "expected array";
     const MSG_JSON_ENCODED_HINT: &str = "Pass a JSON array";
     const MSG_EXPECTED_ONE_OF: &str = "expected one of";
+
+    const ANY_DESCRIPTION: &str = "Any value";
+    const ANY_PROP: &str = "value";
+    const PATH_PROP: &str = "path";
+    const TYPELESS_KEEPS_PROPERTIES: &str =
+        "a schema that lists properties must keep them, whatever its type says";
+    const ROOT_IS_NEVER_EMPTY: &str =
+        "strict providers reject a function whose parameters is not an object schema";
+    const TYPELESS_ROOT_NEVER_FAILS: &str =
+        "guessing an object root must not fail the parse and take the whole plugin down";
+    const EXPLICIT_OBJECT_STILL_FAILS: &str =
+        "a schema that declares type object must still be rejected when it is malformed";
 
     const STR_PRIM: ParamSchema = ParamSchema::Primitive {
         kind: ParamKind::String,
@@ -1071,6 +1098,43 @@ mod tests {
     }
 
     #[test]
+    fn try_from_json_typeless_with_properties_is_an_object() {
+        let schema_json = json!({
+            "properties": { PATH_PROP: { "type": "string" } },
+            "required": [PATH_PROP],
+        });
+        let schema = try_from_json(&schema_json).unwrap();
+        assert_eq!(
+            to_json_schema(schema)["properties"][PATH_PROP]["type"],
+            json!("string"),
+            "{TYPELESS_KEEPS_PROPERTIES}"
+        );
+        assert!(validate(schema, json!({})).is_err());
+    }
+
+    #[test_case(json!({"type": "object"}) ; "nested_object_without_properties")]
+    #[test_case(json!({"type": "array"}) ; "nested_array_without_items")]
+    fn try_from_json_typeless_root_with_broken_property_degrades_to_any(broken: Value) {
+        let properties = json!({ ANY_PROP: broken });
+        let typeless = try_from_json(&json!({ "properties": properties })).unwrap();
+        assert!(
+            matches!(typeless, ParamSchema::Any { .. }),
+            "{TYPELESS_ROOT_NEVER_FAILS}"
+        );
+
+        let explicit = try_from_json(&json!({ "type": "object", "properties": properties }));
+        assert!(explicit.is_err(), "{EXPLICIT_OBJECT_STILL_FAILS}");
+    }
+
+    #[test_case(json!({}) ; "empty_schema")]
+    #[test_case(json!({"description": ANY_DESCRIPTION}) ; "description_only")]
+    fn try_from_json_without_properties_is_any(schema_json: Value) {
+        let schema = try_from_json(&schema_json).unwrap();
+        assert!(matches!(schema, ParamSchema::Any { .. }));
+        assert!(validate(schema, json!({"anything": 1})).is_ok());
+    }
+
+    #[test]
     fn coerce_stringified_array_with_unescaped_inner_quotes_via_repair() {
         let broken = r#"[{"old_string": "const x = { \"color\": 1 };", "new_string": "fixed"}]"#;
         let input = json!({"path": "/x", "edits": broken});
@@ -1146,21 +1210,32 @@ mod tests {
     #[test_case(json!({"type": "string"}) ; "type_string_root")]
     #[test_case(json!({"type": "integer"}) ; "type_integer_root")]
     #[test_case(json!({"type": "boolean"}) ; "type_boolean_root")]
-    fn sanitize_primitive_root_is_unchanged(input: Value) {
+    #[test_case(json!({"type": "array", "items": {"type": "string"}}) ; "type_array_root")]
+    fn sanitize_typed_root_is_unchanged(input: Value) {
         let result = sanitize_tool_input_schema(input.clone());
         assert_eq!(result, input);
+    }
+
+    #[test_case(json!({}), json!({"type": "object", "properties": {}}) ; "empty_root")]
+    #[test_case(json!(null), json!({"type": "object", "properties": {}}) ; "missing_root")]
+    #[test_case(json!({"description": ANY_DESCRIPTION}), json!({"description": ANY_DESCRIPTION, "type": "object", "properties": {}}) ; "description_only_root")]
+    #[test_case(json!({"required": ["path"]}), json!({"type": "object", "properties": {}, "required": []}) ; "typeless_root")]
+    #[test_case(json!({"enum": [1, 2, 3]}), json!({"enum": [1, 2, 3], "type": "object", "properties": {}}) ; "enum_root")]
+    fn sanitize_forces_object_root(input: Value, expected: Value) {
+        let result = sanitize_tool_input_schema(input);
+        assert_eq!(result, expected, "{ROOT_IS_NEVER_EMPTY}");
+    }
+
+    #[test_case(json!({}) ; "empty_schema_any")]
+    #[test_case(json!({"description": ANY_DESCRIPTION}) ; "description_only_any")]
+    fn sanitize_keeps_nested_any_open(any_schema: Value) {
+        let input = json!({"type": "object", "properties": { ANY_PROP: any_schema }});
+        assert_eq!(sanitize_tool_input_schema(input.clone()), input);
     }
 
     #[test_case(json!({"type": "object", "required": {}}), json!({"type": "object", "properties": {}, "required": []}) ; "required_object")]
     #[test_case(json!({"type": "object", "required": {"foo": true}}), json!({"type": "object", "properties": {}, "required": []}) ; "required_object_with_content")]
     fn sanitize_required_object_to_array(input: Value, expected: Value) {
-        let result = sanitize_tool_input_schema(input);
-        assert_eq!(result, expected);
-    }
-
-    #[test_case(json!({"type": "object"}), json!({"type": "object", "properties": {}}) ; "missing_properties_stays_open")]
-    #[test_case(json!({}), json!({}) ; "empty_schema_any")]
-    fn sanitize_missing_properties(input: Value, expected: Value) {
         let result = sanitize_tool_input_schema(input);
         assert_eq!(result, expected);
     }
@@ -1223,18 +1298,9 @@ mod tests {
         assert_eq!(result, input);
     }
 
-    #[test]
-    fn sanitize_leaves_description_only_as_any() {
-        let input = json!({"description": "Any value"});
-        let result = sanitize_tool_input_schema(input.clone());
-        assert_eq!(result, input);
-    }
-
-    #[test_case(json!({"enum": [1, 2, 3]}) ; "numeric_enum_without_type")]
     #[test_case(json!({"type": ["string", "null"]}) ; "type_union")]
     #[test_case(json!({"type": ["object", "null"], "properties": {}}) ; "nullable_object_union")]
     #[test_case(json!({"type": ["array", "null"], "items": {"type": "string"}}) ; "nullable_array_union")]
-    #[test_case(json!({"items": {"type": "string"}}) ; "items_without_type")]
     fn sanitize_leaves_unrecognized_untouched(input: Value) {
         let result = sanitize_tool_input_schema(input.clone());
         assert_eq!(result, input);
@@ -1246,7 +1312,8 @@ mod tests {
             "type": "object",
             "properties": {
                 "mode": {"enum": [1, 2, 3]},
-                "name": {"type": ["string", "null"]}
+                "name": {"type": ["string", "null"]},
+                "tags": {"items": {"type": "string"}}
             }
         });
         let result = sanitize_tool_input_schema(input.clone());

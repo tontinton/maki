@@ -373,6 +373,17 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
     out
 }
 
+/// A tool can reach us without a usable `input_schema`. Dropping it would take
+/// the tool away from the model behind its back, and `{}` makes strict providers
+/// (MiniMax, Kimi) reject the whole request, so it ships a schema that takes no
+/// arguments.
+pub(crate) fn tool_parameters(tool: &Value) -> Value {
+    match tool.get("input_schema") {
+        Some(schema) if schema.is_object() => schema.clone(),
+        _ => json!({ "type": "object", "properties": {} }),
+    }
+}
+
 pub fn convert_tools(anthropic_tools: &Value) -> Value {
     let Some(tools) = anthropic_tools.as_array() else {
         return json!([]);
@@ -387,7 +398,7 @@ pub fn convert_tools(anthropic_tools: &Value) -> Value {
                     "function": {
                         "name": t.get("name")?,
                         "description": t.get("description")?,
-                        "parameters": t.get("input_schema")?,
+                        "parameters": tool_parameters(t),
                     }
                 }))
             })
@@ -735,6 +746,20 @@ mod tests {
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const COUNTS_SURVIVE_A_BAD_COST: &str =
         "a price we cannot read must not take the token counts down with it";
+    const TOOL_NAME: &str = "word_count";
+    const TOOL_DESCRIPTION: &str = "Count words.";
+    const TOOL_MUST_SURVIVE: &str = "a tool without a schema still belongs in the request";
+
+    #[test_case(json!({"name": TOOL_NAME, "description": TOOL_DESCRIPTION}) ; "missing_schema")]
+    #[test_case(json!({"name": TOOL_NAME, "description": TOOL_DESCRIPTION, "input_schema": null}) ; "null_schema")]
+    fn convert_tools_defaults_missing_parameters(tool: Value) {
+        let function = &convert_tools(&json!([tool]))[0]["function"];
+        assert_eq!(function["name"], json!(TOOL_NAME), "{TOOL_MUST_SURVIVE}");
+        assert_eq!(
+            function["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+    }
 
     #[test]
     fn default_model_parser_reads_context_and_output_length() {

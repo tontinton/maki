@@ -443,6 +443,7 @@ maki.api.register_tool({
   description = "Count words in a file.",
   kind = "read",
   schema = {
+    type = "object",
     properties = { path = { type = "string", description = "File path" } },
     required = { "path" },
   },

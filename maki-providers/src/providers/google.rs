@@ -433,17 +433,28 @@ fn convert_tools(tools: &Value) -> Vec<Value> {
         .filter_map(|t| {
             let name = t.get("name")?.as_str()?;
             let description = t.get("description")?.as_str().unwrap_or("");
-            let parameters = t
-                .get("input_schema")
-                .cloned()
-                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-            Some(json!({
+            let mut decl = json!({
                 "name": name,
                 "description": description,
-                "parameters": strip_additional_properties(parameters),
-            }))
+            });
+            if let Some(parameters) = tool_parameters(t) {
+                decl["parameters"] = parameters;
+            }
+            Some(decl)
         })
         .collect()
+}
+
+/// Gemini turns down an object schema that lists no properties, while MiniMax
+/// turns down a bare `{}`, so no single payload pleases both. A tool that takes
+/// no arguments simply travels here without `parameters`.
+fn tool_parameters(tool: &Value) -> Option<Value> {
+    let schema = tool.get("input_schema")?;
+    let has_properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|props| !props.is_empty());
+    has_properties.then(|| strip_additional_properties(schema.clone()))
 }
 
 fn strip_additional_properties(value: Value) -> Value {
@@ -674,6 +685,11 @@ mod tests {
     use test_case::test_case;
 
     const GEMINI_API_KEY: &str = "test-key";
+    const TOOL_NAME: &str = "word_count";
+    const TOOL_DESCRIPTION: &str = "Count words.";
+    const PATH_PROP: &str = "path";
+    const EMPTY_PROPERTIES_REJECTED: &str =
+        "Gemini rejects a function whose parameters is an object with no properties";
 
     fn test_auth() -> Arc<Mutex<ResolvedAuth>> {
         Arc::new(Mutex::new(ResolvedAuth::for_test(
@@ -705,6 +721,41 @@ mod tests {
             context_window: 1_048_576,
             thinking_fields: None,
         }
+    }
+
+    #[test_case(json!({"type": "object", "properties": {}}) ; "empty_properties")]
+    #[test_case(json!({"type": "object"}) ; "missing_properties")]
+    fn convert_tools_omits_empty_parameters(input_schema: Value) {
+        let tools = json!([{
+            "name": TOOL_NAME,
+            "description": TOOL_DESCRIPTION,
+            "input_schema": input_schema,
+        }]);
+        let decls = convert_tools(&tools);
+        assert_eq!(decls[0]["name"], json!(TOOL_NAME));
+        assert_eq!(
+            decls[0].get("parameters"),
+            None,
+            "{EMPTY_PROPERTIES_REJECTED}"
+        );
+    }
+
+    #[test]
+    fn convert_tools_keeps_populated_parameters() {
+        let tools = json!([{
+            "name": TOOL_NAME,
+            "description": TOOL_DESCRIPTION,
+            "input_schema": {
+                "type": "object",
+                "properties": { PATH_PROP: {"type": "string"} },
+                "additionalProperties": false,
+            },
+        }]);
+        let decls = convert_tools(&tools);
+        assert_eq!(
+            decls[0]["parameters"],
+            json!({"type": "object", "properties": { PATH_PROP: {"type": "string"} }})
+        );
     }
 
     #[test]

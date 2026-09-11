@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::model::Model;
+use crate::providers::openai_compat::tool_parameters;
 use crate::providers::{ResolvedAuth, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
@@ -146,7 +147,7 @@ pub(crate) fn convert_tools(anthropic_tools: &Value) -> Value {
                     "type": "function",
                     "name": t.get("name")?,
                     "description": t.get("description")?,
-                    "parameters": t.get("input_schema")?,
+                    "parameters": tool_parameters(t),
                     "strict": false,
                 }))
             })
@@ -561,6 +562,24 @@ mod tests {
     const OVERLOAD_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
     const BAD_REQUEST_MESSAGE: &str = "Invalid value for 'model'";
     const RATE_LIMIT_MESSAGE: &str = "Rate limit hit";
+    const TOOL_NAME: &str = "word_count";
+    const TOOL_DESCRIPTION: &str = "Count words.";
+    const TOOL_MUST_SURVIVE: &str = "a tool without a schema still belongs in the request";
+
+    #[test]
+    fn convert_tools_defaults_missing_parameters() {
+        let tools = json!([{ "name": TOOL_NAME, "description": TOOL_DESCRIPTION }]);
+        let converted = convert_tools(&tools);
+        assert_eq!(
+            converted[0]["name"],
+            json!(TOOL_NAME),
+            "{TOOL_MUST_SURVIVE}"
+        );
+        assert_eq!(
+            converted[0]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+    }
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
         let (tx, rx) = flume::unbounded();

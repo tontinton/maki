@@ -630,15 +630,29 @@ pub mod test_support {
     /// Registry and routing tests care about the name and audience only, never
     /// about what the tool returns.
     pub fn mock_tool(name: &str, audience: ToolAudience) -> Arc<dyn registry::Tool> {
+        mock_tool_with_schema(
+            name,
+            audience,
+            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        )
+    }
+
+    pub fn mock_tool_with_schema(
+        name: &str,
+        audience: ToolAudience,
+        schema: Value,
+    ) -> Arc<dyn registry::Tool> {
         Arc::new(MockTool {
             name: name.to_owned(),
             audience,
+            schema,
         })
     }
 
     struct MockTool {
         name: String,
         audience: ToolAudience,
+        schema: Value,
     }
 
     struct MockInvocation;
@@ -660,7 +674,7 @@ pub mod test_support {
             "mock tool".into()
         }
         fn schema(&self) -> Value {
-            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+            self.schema.clone()
         }
         fn audience(&self) -> ToolAudience {
             self.audience
