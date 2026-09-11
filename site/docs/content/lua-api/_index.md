@@ -1375,17 +1375,31 @@ local results = maki.async.gather({
 ### `maki.async.run()` {#maki-async-run}
 
 ```lua
-maki.async.run({fn}, {on_finish?})
+maki.async.run({fn}, {opts?})
 ```
 
 Fire off a function as a new async task. It runs in the background and
 you do not wait for it. If you need the result, pass an {on_finish}
 callback.
 
+A spawned task must finish within 60 seconds by default; pass
+{deadline_ms} to change that, or `false` to remove the cap for
+genuinely long work.
+
+By default the task inherits the caller's cancellation, so ending the
+calling tool call ends it too. Pass {scope = "session"} for work that
+must outlive the calling turn, such as a background subagent waiting
+on a session: the task then only ends on its deadline or when its
+function returns.
+
+A task abandoned by its deadline or a cancel it inherited still reports
+through {on_finish} exactly once, with the reason (`"timeout"` or
+`"cancelled"`) as the error, so background work cannot vanish silently.
+
 **Parameters:**
 
 - `{fn}` (`function`) Zero-argument function to execute.
-- `{on_finish?}` (`function?`) Optional callback `function(err, result)`. Called once {fn} completes.
+- `{opts?}` (`table?`) {on_finish} is `function(err, result)`, called once {fn} completes or the task is abandoned. {deadline_ms} is integer milliseconds, or `false` for no deadline. {scope} is `"session"` to escape the caller's cancellation.
 
 **Example:**
 
@@ -1393,7 +1407,7 @@ callback.
 maki.async.run(function()
   local data = expensive_fetch()
   process(data)
-end)
+end, { deadline_ms = false })
 ```
 
 ---
@@ -1404,23 +1418,23 @@ end)
 maki.async.sleep({ms})
 ```
 
-Suspend the calling task for {ms} milliseconds. The plugin thread is
-never blocked, so other tasks and the UI keep running, and a cancel
-still lands while you sleep.
+Suspend the current coroutine for {ms} milliseconds. The timer runs on
+the async executor, so nothing spins and other tasks keep running.
+Cancelling the owning task interrupts the sleep with the cancel error.
 
 For a timer that has to outlive the tool call that started it, such
 as a toast dismissing itself, use `maki.defer_fn`.
 
 **Parameters:**
 
-- `{ms}` (`integer`) Milliseconds to sleep.
+- `{ms}` (`integer`) Milliseconds to wait. Must be >= 0.
 
 **Example:**
 
 ```lua
 maki.async.run(function()
-  maki.async.sleep(4000)
-  win:close()
+  maki.async.sleep(250)
+  retry()
 end)
 ```
 
@@ -1576,7 +1590,8 @@ still call `ctx:finish`; the host prefers that reply over the generic
 cancelled/timeout error. Mark it `is_error = true` and end it with a
 marker, so the model knows the output it gets is cut short.
 
-The callback runs outside your coroutine, so it must not yield. It
+The callback runs on its own coroutine on the runtime executor, outside
+your handler's stack, so it may await host calls (`ctx:finish`). It
 fires at most once, immediately if the task is already cancelled. An
 error inside it is logged and never reaches your handler, and the
 other hooks still run.
@@ -2184,10 +2199,10 @@ if err then return end
 ### `maki.fs.read()` {#maki-fs-read}
 
 ```lua
-maki.fs.read({path})
+maki.fs.read({path}, {opts?})
 ```
 
-Read the entire file at {path} as a UTF-8 string.
+Read the file at {path} as a UTF-8 string.
 If the file contains bytes that are not valid UTF-8, this function throws.
 Use `read_bytes` for binary files.
 
@@ -2196,17 +2211,26 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Absolute or relative file path. `~/` is expanded to the home directory.
+- `{opts?}` (`table?`) `{ offset = integer, len = integer }` window to read. A negative
+
+  `offset` counts back from the end of the file, so `{ offset = -1024 }` reads the
+
+
+  last 1024 bytes, and `len` caps how many bytes are read from `offset`. A window
+
+
+  that splits a multibyte character replaces the broken sequence. Omit `opts` to
+
+
+  read the whole file.
+
 
 **Returns:** (`string?`, `string?`) File contents, or nil plus an error message.
 
 **Example:**
 
 ```lua
-local text, err = maki.fs.read("config.toml")
-if err then
-  maki.log.warn("could not read config: " .. err)
-  return
-end
+local tail = maki.fs.read("server.log", { offset = -4096 })
 ```
 
 ---
