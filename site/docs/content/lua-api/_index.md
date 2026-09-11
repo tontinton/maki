@@ -1387,6 +1387,12 @@ and tool set.
     `"max"`), or a budget integer (token count). Inherits the parent
     setting if omitted, and is capped at it otherwise.
   - `fast` (`boolean?`) use fast mode. Inherits parent setting if omitted.
+  - `scope` (`string?`) `"session"` detaches the session from the call that
+    spawned it: it survives the call returning and the turn ending,
+    instead of being cancelled the moment either does. Esc on its chat
+    still cancels it. Keep the returned handle to `prompt` and `close`.
+    Omit for the default: tied to the call that spawned it. Invalid
+    inside a subagent.
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
 
@@ -1459,7 +1465,7 @@ print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
 ### `Session:close()` {#Session-close}
 
 ```lua
-Session:close()
+Session:close({err?})
 ```
 
 Close the session and flush its history back to the parent agent. Calling
@@ -1468,6 +1474,10 @@ it more than once is safe.
 Close on every path, error paths included. Dropping the session instead
 leaves the work to the Lua garbage collector, which may never run while
 the VM sits idle, and the subagent's event relay stays alive until it does.
+
+**Parameters:**
+
+- `{err?}` (`string?`) Pass the failure reason when the run failed, so the session's UI item ends as errored even without a following tool result.
 
 
 ## maki.async {#maki-async}
