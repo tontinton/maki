@@ -9,6 +9,78 @@ use crate::providers::opencode::{self, NonLoginError};
 /// Request fields that cap the *output*. A 400 naming one of them is about the
 /// cap we sent, never about the prompt being too big.
 const OUTPUT_CAP_FIELDS: [&str; 3] = ["max_tokens", "max_completion_tokens", "max_output_tokens"];
+/// Markers of the OpenAI/vLLM shape, which quotes the two halves separately:
+/// `you requested 10000 tokens (6000 in the messages, 4000 in the completion)`.
+const MESSAGES_HALF: &str = " in the messages";
+const COMPLETION_HALF: &str = " in the completion";
+const OPENAI_LIMIT: &str = "maximum context length is ";
+
+/// Why a provider refused a request for size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overflow {
+    /// The transcript alone does not fit. Dropping context is the only way
+    /// through.
+    Prompt,
+    /// The transcript plus the output budget does not fit, though the
+    /// transcript by itself may well. Asking for less output costs nothing, so
+    /// this must never be answered by summarizing the transcript away.
+    ///
+    /// The fields are whatever the server quoted. A server that counts the
+    /// halves out loud also hands over an exact measurement of a prompt maki
+    /// could only estimate.
+    Budget {
+        prompt: Option<u32>,
+        limit: Option<u32>,
+    },
+}
+
+fn trailing_number(text: &str) -> Option<u32> {
+    let text = text.trim_end();
+    let start = text.len() - text.bytes().rev().take_while(u8::is_ascii_digit).count();
+    text[start..].parse().ok()
+}
+
+fn leading_number(text: &str) -> Option<u32> {
+    let text = text.trim_start();
+    let end = text.bytes().take_while(u8::is_ascii_digit).count();
+    text[..end].parse().ok()
+}
+
+/// Digits just before `marker`, e.g. the `6000` of `6000 in the messages`.
+fn number_before(text: &str, marker: &str) -> Option<u32> {
+    trailing_number(text.split_once(marker)?.0)
+}
+
+/// Digits just after `marker`, e.g. the `8192` of
+/// `maximum context length is 8192 tokens`.
+fn number_after(text: &str, marker: &str) -> Option<u32> {
+    leading_number(text.split_once(marker)?.1)
+}
+
+/// Anthropic reports the condition as arithmetic:
+/// ``input length and `max_tokens` exceed context limit: 199773 + 8192 > 200000``.
+/// All three numbers have to parse, or any prose with a `+` and a `>` would
+/// match.
+fn sum_over_limit(text: &str) -> Option<Overflow> {
+    let (head, limit) = text.split_once(" > ")?;
+    let (prompt, output) = head.rsplit_once(" + ")?;
+    leading_number(output)?;
+    Some(Overflow::Budget {
+        prompt: Some(trailing_number(prompt)?),
+        limit: Some(leading_number(limit)?),
+    })
+}
+
+fn budget_overflow(m: &str) -> Option<Overflow> {
+    sum_over_limit(m).or_else(|| {
+        // A zero-token completion half means the prompt alone is the problem,
+        // and no budget is small enough to fix that.
+        (number_before(m, COMPLETION_HALF)? > 0).then(|| Overflow::Budget {
+            prompt: number_before(m, MESSAGES_HALF),
+            limit: number_after(m, OPENAI_LIMIT),
+        })
+    })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -54,11 +126,20 @@ impl AgentError {
         }
     }
 
-    /// Returns true if the error indicates a context window overflow.
+    /// Refused for size, either cause.
+    pub fn is_context_overflow(&self) -> bool {
+        self.overflow().is_some()
+    }
+
+    /// Why a provider refused the request for size, and what it said about the
+    /// numbers. The two causes have opposite remedies: one is fixed by asking
+    /// for less output, the other only by dropping context.
     ///
     /// Provider error formats:
     /// - Anthropic:  413 "prompt is too long"  <https://docs.anthropic.com/en/docs/errors>
+    /// - Anthropic:  400 "input length and `max_tokens` exceed context limit: A + B > C"
     /// - OpenAI:     400 "maximum context length is X tokens"  <https://platform.openai.com/docs/guides/error-codes>
+    /// - vLLM:       400 "... you requested N tokens (A in the messages, B in the completion)"
     /// - Gemini:     400 "input token count exceeds" / "too many tokens"  <https://ai.google.dev/gemini-api/docs/troubleshooting>
     /// - Ollama:     400 "context length exceeded"  <https://docs.ollama.com/api/errors>
     /// - llama.cpp:  400 "exceeds the available context size"  <https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-context.cpp>
@@ -67,37 +148,42 @@ impl AgentError {
     /// - Mistral:    400 "too large for model with X maximum context length"  <https://docs.mistral.ai/resources/known-limitations>
     /// - OpenRouter: 400 "endpoint's maximum context length is X tokens"  <https://openrouter.ai/docs/api/reference/errors-and-debugging.mdx>
     /// - Synthetic:  400 pass-through from upstream models (OpenAI-compatible)  <https://synthetic.new>
-    pub fn is_context_overflow(&self) -> bool {
-        match self {
-            Self::Api { status: 413, .. } => true,
-            Self::Api {
-                status: 400,
-                message,
-                ..
-            } => {
-                let m = message.to_lowercase();
-                // `Invalid 'max_tokens': integer above maximum value` reads as
-                // "token" plus "maximum" and would sail through the sniff
-                // below, but the caller answers an overflow by summarizing the
-                // whole session away, and no amount of that fixes a cap we
-                // guessed too high. Our own 100k default for unknown
-                // OpenAI-kind models is exactly how you hit this.
-                if OUTPUT_CAP_FIELDS.iter().any(|field| m.contains(field)) {
-                    return false;
-                }
-                let is_scope = m.contains("context")
-                    || m.contains("token")
-                    || m.contains("prompt")
-                    || m.contains("input");
-                let is_overflow = m.contains("exceeds")
-                    || m.contains("exceeded")
-                    || m.contains("too long")
-                    || m.contains("too many")
-                    || m.contains("maximum");
-                is_scope && is_overflow
-            }
-            _ => false,
+    pub fn overflow(&self) -> Option<Overflow> {
+        let Self::Api { status, message } = self else {
+            return None;
+        };
+        if !matches!(status, 400 | 413) {
+            return None;
         }
+        let m = message.to_lowercase();
+        // Before the output-cap guard below: servers that enforce
+        // `prompt + max_tokens <= window` name `max_tokens` while reporting a
+        // budget overflow, and reading that as "our cap was malformed" turns a
+        // one-field fix into an unrecoverable error.
+        if let Some(budget) = budget_overflow(&m) {
+            return Some(budget);
+        }
+        if *status == 413 {
+            return Some(Overflow::Prompt);
+        }
+        // `Invalid 'max_tokens': integer above maximum value` reads as "token"
+        // plus "maximum" and would sail through the sniff below. The caller
+        // answers a prompt overflow by summarizing the session away, and no
+        // amount of that fixes a cap we guessed too high. Our own 100k default
+        // for unknown OpenAI-kind models is how you hit this.
+        if OUTPUT_CAP_FIELDS.iter().any(|field| m.contains(field)) {
+            return None;
+        }
+        let is_scope = m.contains("context")
+            || m.contains("token")
+            || m.contains("prompt")
+            || m.contains("input");
+        let is_overflow = m.contains("exceeds")
+            || m.contains("exceeded")
+            || m.contains("too long")
+            || m.contains("too many")
+            || m.contains("maximum");
+        (is_scope && is_overflow).then_some(Overflow::Prompt)
     }
 
     pub fn is_auth_error(&self) -> bool {
@@ -355,6 +441,8 @@ mod tests {
     #[test_case(400, "Input is too long for requested model.", true                                                          ; "bedrock")]
     #[test_case(400, "Input is too long for the model", true                                              ; "too_long_input")]
     #[test_case(400, "Rate limit exceeded", false                                                         ; "not_context")]
+    // Arithmetic in unrelated prose must not read as a quoted budget overflow.
+    #[test_case(400, "Rate limit exceeded, 5 + 3 requests", false                                         ; "arithmetic_without_a_limit")]
     #[test_case(400, "Invalid API key", false                                                             ; "auth_error")]
     #[test_case(500, "Internal server error", false                                                       ; "server_error")]
     #[test_case(400, "The output is too long", false                                                      ; "output_not_context")]
@@ -371,5 +459,29 @@ mod tests {
         let err = api_msg(400, "request exceeds the available context size");
         assert!(err.is_context_overflow());
         assert!(!err.is_retryable());
+    }
+
+    const ANTHROPIC_BUDGET: &str = "input length and `max_tokens` exceed context limit: 199773 + 8192 > 200000, decrease input length or max_tokens and try again";
+    const VLLM_BUDGET: &str = "This model's maximum context length is 1048576 tokens. However, you requested 1051000 tokens (100000 in the messages, 951000 in the completion). Please reduce the length of the messages or completion.";
+    const VLLM_PROMPT_ONLY: &str = "This model's maximum context length is 8192 tokens. However, you requested 9000 tokens (9000 in the messages, 0 in the completion).";
+
+    /// These servers name `max_tokens` while reporting a budget overflow, which
+    /// the output-cap guard used to read as a malformed cap of our own and
+    /// report as unrecoverable.
+    #[test_case(
+        ANTHROPIC_BUDGET,
+        Overflow::Budget { prompt: Some(199_773), limit: Some(200_000) }
+        ; "anthropic_reports_the_sum"
+    )]
+    #[test_case(
+        VLLM_BUDGET,
+        Overflow::Budget { prompt: Some(100_000), limit: Some(1_048_576) }
+        ; "vllm_reports_the_halves"
+    )]
+    // No budget is small enough to fit a prompt that already overflows alone.
+    #[test_case(VLLM_PROMPT_ONLY, Overflow::Prompt ; "an_empty_completion_half_is_a_prompt_overflow")]
+    #[test_case("prompt is too long: 250000 tokens > 200000 maximum", Overflow::Prompt ; "anthropic_prompt_alone")]
+    fn overflow_kind_is_read_off_the_message(message: &str, expected: Overflow) {
+        assert_eq!(api_msg(400, message).overflow(), Some(expected));
     }
 }

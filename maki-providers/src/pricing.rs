@@ -239,6 +239,7 @@ mod tests {
             },
             discovered_free: false,
             max_output_tokens: None,
+            turn_output_tokens: None,
             context_window: 0,
             thinking_fields: None,
         }

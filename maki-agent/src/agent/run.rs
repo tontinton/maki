@@ -7,14 +7,14 @@ use tracing::{error, info, warn};
 
 use maki_providers::provider::Provider;
 use maki_providers::{
-    ContentBlock, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role, StopReason,
-    StreamResponse, TokenUsage,
+    ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
+    StopReason, StreamResponse,
 };
 
 use super::compaction;
 use super::history::{History, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
-use super::streaming::{StreamError, stream_with_retry};
+use super::streaming::{StreamError, StreamRequest, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
@@ -89,6 +89,10 @@ pub struct AgentParams {
 
 pub struct AgentRunParams<'h> {
     pub history: &'h mut History,
+    /// Borrowed from the same owner as `history`, since it describes that
+    /// transcript. A gauge rebuilt per run would forget every measurement the
+    /// session made and fall back to the estimate.
+    pub gauge: &'h mut ContextGauge,
     pub system: String,
     pub event_tx: EventSender,
     pub tools: RequestTools,
@@ -98,6 +102,7 @@ pub struct Agent<'h> {
     provider: Arc<dyn Provider>,
     model: Arc<Model>,
     history: &'h mut History,
+    gauge: &'h mut ContextGauge,
     system: String,
     event_tx: EventSender,
     tools: RequestTools,
@@ -106,7 +111,6 @@ pub struct Agent<'h> {
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     cancel: CancelToken,
     ledger: Arc<RunLedger>,
-    context_size: u32,
     num_turns: u32,
     recent_calls: RecentCalls,
     auto_compact: bool,
@@ -144,6 +148,7 @@ impl<'h> Agent<'h> {
             permissions: params.permissions,
             timeouts: params.timeouts,
             history: run.history,
+            gauge: run.gauge,
             system: run.system,
             event_tx: run.event_tx,
             tools: run.tools,
@@ -152,7 +157,6 @@ impl<'h> Agent<'h> {
             interrupt_source: None,
             cancel: CancelToken::none(),
             ledger: params.ledger,
-            context_size: 0,
             num_turns: 0,
             recent_calls: RecentCalls::new(),
             auto_compact: compaction::auto_compact_enabled(),
@@ -253,7 +257,11 @@ impl<'h> Agent<'h> {
             maki_otel::emit::user_prompt(&message);
         }
 
-        self.seed_context_size();
+        self.gauge.seed_if_empty(
+            self.history.as_slice(),
+            &self.system,
+            Self::request_tools(&self.tools, self.mcp.as_ref()).as_ref(),
+        );
 
         // Every frontend enters here, so busy time is measured here; a turn
         // that failed was still busy.
@@ -273,24 +281,6 @@ impl<'h> Agent<'h> {
         self.emit_done(reason)?;
 
         Ok(reason)
-    }
-
-    /// A resumed session can already fill the window, and the gauge only
-    /// learns the real size from a response, so without a seed the first
-    /// request goes out unguarded and comes back rejected. A chars/4 estimate
-    /// is a floor, good enough until the first response replaces it with the
-    /// provider's own count. Seeded here rather than in `new` because the MCP
-    /// schemas, the largest per-request addition on a heavy server set, are
-    /// only attached by the builder afterwards.
-    fn seed_context_size(&mut self) {
-        if self.context_size > 0 {
-            return;
-        }
-        self.context_size = estimate_prompt_tokens(
-            self.history.as_slice(),
-            &self.system,
-            self.request_tools().as_ref(),
-        );
     }
 
     fn push_input_context(&mut self, preamble: Vec<Message>) {
@@ -319,17 +309,20 @@ impl<'h> Agent<'h> {
         }
     }
 
-    /// `self.tools` holds base tools only; the MCP part is recomputed here
-    /// every turn so `tool_search` loads and late-connecting servers take
-    /// effect on the next request.
-    fn request_tools(&self) -> Cow<'_, Value> {
-        match &self.mcp {
+    /// `tools` holds base tools only. The MCP part is recomputed here every
+    /// turn, so `tool_search` loads and late-connecting servers take effect on
+    /// the next request.
+    ///
+    /// Takes the two fields rather than `&self`, so a caller can hold the
+    /// result and still reach `&mut self.gauge`.
+    fn request_tools<'t>(tools: &'t RequestTools, mcp: Option<&McpSession>) -> Cow<'t, Value> {
+        match mcp {
             Some(mcp) => {
-                let mut tools = self.tools.definitions().clone();
+                let mut tools = tools.definitions().clone();
                 mcp.extend_tools(&mut tools);
                 Cow::Owned(tools)
             }
-            None => Cow::Borrowed(self.tools.definitions()),
+            None => Cow::Borrowed(tools.definitions()),
         }
     }
 
@@ -337,18 +330,21 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        let tools = self.request_tools();
+        let tools = Self::request_tools(&self.tools, self.mcp.as_ref());
         let response = match stream_with_retry(
-            &*self.provider,
-            &self.model,
-            self.history.as_slice(),
-            &self.system,
-            tools.as_ref(),
+            StreamRequest {
+                provider: &*self.provider,
+                model: &self.model,
+                messages: self.history.as_slice(),
+                system: &self.system,
+                tools: tools.as_ref(),
+                opts: self.opts,
+                output_budget: self.config.max_turn_output,
+                session_id: self.session_id.as_ref(),
+            },
+            Some(self.gauge),
             &self.event_tx,
             &self.cancel,
-            self.opts,
-            self.context_size,
-            self.session_id.as_ref(),
         )
         .await
         {
@@ -397,14 +393,14 @@ impl<'h> Agent<'h> {
             "API response received"
         );
 
-        self.context_size = response.usage.total_input();
+        // The gauge already took the provider's own count inside the stream.
         self.emit_turn_complete(&response)?;
 
         if has_tools {
             let history_len_before = self.history.len();
             self.process_tool_calls(response).await?;
-            self.context_size +=
-                estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
+            self.gauge
+                .append(&self.history.as_slice()[history_len_before..]);
         } else {
             if response.message.first_text_content().is_some() {
                 self.history.push(response.message);
@@ -450,7 +446,7 @@ impl<'h> Agent<'h> {
         }
         self.overflow_recoveries += 1;
         warn!(
-            context_size = self.context_size,
+            context_size = self.gauge.size(),
             "prompt overflowed below the compaction threshold"
         );
         self.compact_now().await?;
@@ -494,7 +490,7 @@ impl<'h> Agent<'h> {
                 usage: response.usage,
                 model: self.model.id.clone(),
                 cost,
-                context_size: Some(self.context_size),
+                context_size: Some(self.gauge.size()),
                 context_window: self.model.context_window,
             })))
     }
@@ -512,7 +508,7 @@ impl<'h> Agent<'h> {
             usage: totals.usage,
             cost: totals.cost,
             list_cost: totals.list_cost,
-            context_size: self.context_size,
+            context_size: self.gauge.size(),
             context_window: self.model.context_window,
             num_turns: self.num_turns,
             reason,
@@ -584,25 +580,17 @@ impl<'h> Agent<'h> {
     }
 
     async fn try_auto_compact(&mut self) -> Result<(), AgentError> {
-        if !self.auto_compact
-            || !compaction::is_overflow(
-                &TokenUsage {
-                    input: self.context_size,
-                    ..Default::default()
-                },
-                &self.model,
-                self.config.compaction_buffer,
-            )
-        {
+        let context_size = self.gauge.size();
+        if !self.auto_compact || !compaction::is_overflow(context_size, &self.model, &self.config) {
             return Ok(());
         }
-        info!(context_size = self.context_size, "auto-compacting");
+        info!(context_size, "auto-compacting");
         self.compact_now().await
     }
 
     async fn compact_now(&mut self) -> Result<(), AgentError> {
         self.event_tx.send(AgentEvent::AutoCompacting {
-            context_size: self.context_size,
+            context_size: self.gauge.size(),
             context_window: self.model.context_window,
         })?;
         self.do_compact(None).await
@@ -631,7 +619,7 @@ impl<'h> Agent<'h> {
         instructions: Option<&str>,
         carry_len: usize,
     ) -> Result<(), AgentError> {
-        let context_size_before = self.context_size;
+        let context_size_before = self.gauge.size();
         let (compact_provider, compact_model) = resolve_compaction_model(
             &self.provider,
             &self.model,
@@ -657,13 +645,11 @@ impl<'h> Agent<'h> {
         let compact_list_cost = compact_model.list_cost(&compaction_usage, self.opts.fast);
         self.ledger
             .add(compaction_usage, compact_cost, compact_list_cost);
-        // The summary the model just wrote is all the next call will see, plus
-        // whatever was carried past it, which the summariser never read and so
-        // never counted.
+        // The measurement the gauge holds describes the transcript that was
+        // just summarized away, so what is left is all it may count.
+        self.gauge.reset(self.history.as_slice());
+        let context_size_after = self.gauge.size();
         let carry_from = self.history.len().saturating_sub(carry_len);
-        let context_size_after = compaction_usage.output
-            + estimate_message_tokens(&self.history.as_slice()[carry_from..]);
-        self.context_size = context_size_after;
         self.rollback_len = carry_from;
         self.carry_from = carry_from;
         self.event_tx.send(AgentEvent::CompactionDone {
@@ -715,67 +701,6 @@ impl<'h> Agent<'h> {
         Ok(true)
     }
 }
-
-const CHARS_PER_TOKEN: usize = 4;
-/// Charged flat per image, because the only thing in reach is the encoded
-/// blob, whose size tracks compression and not the tile count the provider
-/// bills. A screenshot at the sizes [`maki_providers::adapt_images_for_model`]
-/// allows lands near this; counting nothing at all made the transcripts most
-/// likely to overflow the ones the estimate understated the most.
-const TOKENS_PER_IMAGE: u32 = 1_500;
-
-/// Counts message content only. The system prompt and the tool schemas, a five
-/// figure baseline on a full tool set, stay invisible here, so never let this
-/// replace a context size the provider measured.
-pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
-    if messages.is_empty() {
-        return 0;
-    }
-    let (total_bytes, images) =
-        messages
-            .iter()
-            .flat_map(|m| &m.content)
-            .fold((0usize, 0u32), |(bytes, images), block| match block {
-                ContentBlock::Text { text } => (bytes + text.len(), images),
-                ContentBlock::ToolResult { content, .. } => (bytes + content.len(), images),
-                ContentBlock::ToolUse { input, .. } => (bytes + json_len(input), images),
-                ContentBlock::Thinking { thinking, .. } => (bytes + thinking.len(), images),
-                ContentBlock::Image { .. } => (bytes, images + 1),
-                ContentBlock::RedactedThinking { .. } => (bytes, images),
-            });
-    (total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN) as u32 + images * TOKENS_PER_IMAGE
-}
-
-/// [`estimate_message_tokens`] plus what it leaves out, the system prompt and
-/// the serialized tool schemas. A server enforcing
-/// `prompt + max_tokens <= context_window` counts those against the same
-/// budget.
-pub fn estimate_prompt_tokens(messages: &[Message], system: &str, tools: &Value) -> u32 {
-    let overhead = (system.len() + json_len(tools)) / CHARS_PER_TOKEN;
-    estimate_message_tokens(messages).saturating_add(overhead as u32)
-}
-
-/// Serialized length without the string: the estimator runs over the whole
-/// transcript plus the tool catalog before every request, and only ever wants
-/// the byte count.
-fn json_len(value: &Value) -> usize {
-    struct Counter(usize);
-    impl std::io::Write for Counter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
-    match serde_json::to_writer(&mut counter, value) {
-        Ok(()) => counter.0,
-        Err(_) => 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -940,6 +865,8 @@ mod tests {
         }
     }
 
+    /// The leaked gauge outlives the agent that borrows it, so no caller here
+    /// has to own one.
     fn make_agent(
         provider: impl Provider + 'static,
         history: &mut History,
@@ -975,6 +902,7 @@ mod tests {
             },
             AgentRunParams {
                 history,
+                gauge: Box::leak(Box::default()),
                 system: "system".into(),
                 event_tx: EventSender::new(raw_tx, 0),
                 tools: RequestTools::default(),
@@ -1360,9 +1288,9 @@ mod tests {
             };
             let mut history = History::new(vec![Message::user("go".into())]);
             let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            *agent.gauge = ContextGauge::restored(context_size);
             agent.model = Arc::new(small_context_model(200_000, 8_192));
             agent.auto_compact = enabled;
-            agent.context_size = context_size;
             agent.try_auto_compact().await.unwrap();
             drop(agent);
             assert_eq!(

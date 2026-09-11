@@ -104,6 +104,7 @@ impl ScriptModel {
             pricing: self.pricing.clone().unwrap_or_default(),
             discovered_free: false,
             max_output_tokens: Some(self.max_output_tokens),
+            turn_output_tokens: None,
             context_window: self.context_window,
             thinking_fields: self.thinking_fields.clone().map(Box::new),
         }

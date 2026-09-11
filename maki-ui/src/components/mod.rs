@@ -421,6 +421,7 @@ pub(crate) fn test_model() -> maki_providers::Model {
         pricing: test_pricing(),
         discovered_free: false,
         max_output_tokens: Some(8192),
+        turn_output_tokens: None,
         context_window: TEST_CONTEXT_WINDOW,
         thinking_fields: None,
     }

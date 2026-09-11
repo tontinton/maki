@@ -342,8 +342,13 @@ pub struct Model {
     /// Discovery reported an explicit all-zero price. Distinct from a zero
     /// `pricing`, which also covers "no price is known".
     pub discovered_free: bool,
-    /// `None` when unknown, see [`ProviderKind::fallback_max_output`].
+    /// What the model declares it can generate, `None` when unknown (see
+    /// [`ProviderKind::fallback_max_output`]). Stays the same across requests,
+    /// because [`Self::max_thinking_budget`] scales effort levels off it.
     pub max_output_tokens: Option<u32>,
+    /// What this one request may generate, when a caller trimmed the cap to a
+    /// turn budget. `None` leaves the declared cap standing.
+    pub turn_output_tokens: Option<u32>,
     pub context_window: u32,
     pub thinking_fields: Option<Box<ThinkingFields>>,
 }
@@ -394,6 +399,7 @@ impl Model {
             pricing,
             discovered_free: discovered_pricing.is_some_and(ModelPricing::is_zero),
             max_output_tokens,
+            turn_output_tokens: None,
             context_window,
             thinking_fields: None,
         }
@@ -417,6 +423,7 @@ impl Model {
             pricing: meta.pricing.unwrap_or_default(),
             discovered_free: false,
             max_output_tokens: Some(max_output_tokens),
+            turn_output_tokens: None,
             context_window,
             thinking_fields: None,
         }
@@ -468,10 +475,30 @@ impl Model {
             .unwrap_or_else(|| self.family.supports_tool_examples())
     }
 
-    /// Half the output window, so the answer always has room after the
-    /// thinking. `None` when the window is unknown: callers must then let
+    /// The `max_tokens` this request should carry.
+    ///
+    /// The turn budget is clamped on read rather than where it is set, because
+    /// providers that resolve limits per request (catalog, opencode) rewrite
+    /// `max_output_tokens` on the way out, long after the budget was sized.
+    /// Doing it here means such a provider only has to report the cap it knows,
+    /// and cannot send a budget its endpoint never offered by forgetting to
+    /// re-apply the trim.
+    pub fn output_tokens(&self) -> Option<u32> {
+        [self.turn_output_tokens, self.max_output_tokens]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// Half the *declared* output window, which is what an effort level is a
+    /// percentage of. `None` when the window is unknown: callers must then let
     /// budgets through unclamped. Providers cap further only where the API
     /// documents a hard limit (currently just Google).
+    ///
+    /// Blind to the turn budget on purpose. A turn budget is what one request
+    /// may spend, not what the model can do, so resolving `high` against it
+    /// would redefine `high` rather than bound it. [`Self::thinking_ceiling`]
+    /// does the bounding.
     pub fn max_thinking_budget(&self) -> Option<u32> {
         self.max_output_tokens
             .map(|n| (n / 2).max(MIN_THINKING_BUDGET))
@@ -498,6 +525,23 @@ impl Model {
                 tokens: Some(level.budget(max)),
             }))
             .collect()
+    }
+
+    /// This model carrying one request's output budget, leaving the declared
+    /// cap to say what the model can do.
+    pub fn with_turn_output(&self, budget: u32) -> Self {
+        Self {
+            turn_output_tokens: Some(budget),
+            ..self.clone()
+        }
+    }
+
+    /// Ceiling for the thinking one *request* may ask for: half the
+    /// `max_tokens` it carries, so the answer always has room after the
+    /// thinking, and no dialect is handed a budget its own `max_tokens` refuses
+    /// (Anthropic 400s when the two meet).
+    pub fn thinking_ceiling(&self) -> Option<u32> {
+        self.output_tokens().map(|n| n / 2)
     }
 
     /// A model supports fast mode exactly when it carries fast-tier pricing, so
@@ -933,6 +977,31 @@ mod tests {
         let error = Model::from_spec_with_policy(spec, &policy).unwrap_err();
 
         assert!(matches!(error, ModelError::NotAllowed(disallowed) if disallowed == spec));
+    }
+
+    const SMALL_CAP: u32 = 8_192;
+    const TURN_BUDGET: u32 = 32_768;
+
+    /// Providers that resolve limits per request rewrite `max_output_tokens`
+    /// after the agent sized the turn, so a budget above the cap they report
+    /// must not survive to the wire.
+    #[test_case(Some(TURN_BUDGET), Some(SMALL_CAP), Some(SMALL_CAP) ; "a_lowered_cap_clamps_the_budget")]
+    #[test_case(Some(SMALL_CAP), Some(TURN_BUDGET), Some(SMALL_CAP) ; "a_trimmed_turn_is_what_the_request_carries")]
+    #[test_case(None, Some(SMALL_CAP), Some(SMALL_CAP) ; "an_untrimmed_turn_leaves_the_cap_standing")]
+    #[test_case(Some(TURN_BUDGET), None, Some(TURN_BUDGET) ; "an_undeclared_cap_keeps_the_budget")]
+    #[test_case(None, None, None ; "nothing_to_send")]
+    fn output_tokens_never_exceeds_the_declared_cap(
+        turn_output_tokens: Option<u32>,
+        max_output_tokens: Option<u32>,
+        expected: Option<u32>,
+    ) {
+        let model = Model {
+            turn_output_tokens,
+            max_output_tokens,
+            ..Model::from_spec("openai/gpt-5.6-sol").unwrap()
+        };
+
+        assert_eq!(model.output_tokens(), expected);
     }
 
     #[test]
@@ -1456,6 +1525,7 @@ mod tests {
             pricing: ModelPricing::default(),
             discovered_free: false,
             max_output_tokens,
+            turn_output_tokens: None,
             context_window: 200_000,
             thinking_fields: None,
         }

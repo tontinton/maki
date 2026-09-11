@@ -229,7 +229,7 @@ pub(crate) fn build_request_body_with_system(
     let wire_tools = build_wire_tools(tools);
 
     let mut body = json!({
-        "max_tokens": model.max_output_tokens.unwrap_or(FALLBACK_MAX_TOKENS),
+        "max_tokens": model.output_tokens().unwrap_or(FALLBACK_MAX_TOKENS),
         "system": system_blocks,
         "messages": wire_messages,
         "tools": wire_tools,

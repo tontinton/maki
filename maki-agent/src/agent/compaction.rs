@@ -1,15 +1,15 @@
 use std::env;
 
-use maki_config::{AgentConfig, CompactionBuffer};
+use maki_config::AgentConfig;
 use maki_providers::{
-    ContentBlock, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role, StreamResponse,
-    TokenUsage,
+    ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
+    StreamResponse, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use tracing::info;
 
 use super::history::{History, remove_orphaned_tool_results};
-use super::streaming::{StreamError, stream_with_retry};
+use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry};
 use crate::cancel::CancelToken;
 use crate::prompt::COMPACTION_USER;
 use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
@@ -21,6 +21,10 @@ const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
 /// cheap ones, so one giant MCP dump could sit in the protected tail and blow
 /// the window on every retry.
 const RECENT_TOOL_RESULT_BUDGET: usize = 64 * 1024;
+/// A summary runs to a few thousand tokens. Giving compaction the full turn
+/// budget would reserve tens of thousands it cannot use, on the one request
+/// already sent under the most context pressure a session ever sees.
+const SUMMARY_OUTPUT_BUDGET: u32 = 16_384;
 
 fn normalize(text: Option<&str>) -> Option<&str> {
     text.map(str::trim).filter(|t| !t.is_empty())
@@ -84,18 +88,23 @@ pub(super) async fn compact_history(
 
     for attempt in 0..max_attempts {
         match stream_with_retry(
-            provider,
-            model,
-            &compaction_history,
-            crate::prompt::COMPACTION_SYSTEM,
-            &empty_tools,
+            StreamRequest {
+                provider,
+                model,
+                messages: &compaction_history,
+                system: crate::prompt::COMPACTION_SYSTEM,
+                tools: &empty_tools,
+                opts: RequestOptions::default(),
+                output_budget: SUMMARY_OUTPUT_BUDGET,
+                session_id,
+            },
+            // A stripped, collapsed rewrite of the transcript, far smaller than
+            // it. Sizing this request as the session would trim the
+            // summariser's budget by the weight of the messages it is deleting,
+            // and its measurement describes a prompt the session never had.
+            None,
             event_tx,
             cancel,
-            RequestOptions::default(),
-            // The compaction prompt is built here, so the estimate is all we
-            // have and the session's measured size describes other messages.
-            0,
-            session_id,
         )
         .await
         {
@@ -167,16 +176,19 @@ fn finish_compact(
     Ok(response.usage)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn compact(
     provider: &dyn maki_providers::provider::Provider,
     model: &Model,
     history: &mut History,
+    gauge: &mut ContextGauge,
     event_tx: &EventSender,
     config: &AgentConfig,
     instructions: Option<&str>,
     session_id: Option<&SessionRef>,
 ) -> Result<(), AgentError> {
     let cancel = CancelToken::none();
+    let size_before = gauge.size();
     let usage = compact_history(
         provider,
         model,
@@ -192,12 +204,13 @@ pub async fn compact(
     if let Some(post) = normalize(config.post_compaction_instructions.as_deref()) {
         history.push(Message::synthetic(post.to_string()));
     }
+    gauge.reset(history.as_slice());
 
-    // There is no running context gauge on the manual `/compact` path, so the
-    // summariser stands in for it: what it read is the size before, what it
-    // wrote is the size after.
-    let context_size_before = usage.total_input();
-    let context_size_after = usage.output;
+    // The summariser read a subset of the session's prompt, so its own count is
+    // a floor on the size before, and the only number a gauge that has not seen
+    // a turn yet can offer.
+    let context_size_before = size_before.max(usage.total_input());
+    let context_size_after = gauge.size();
     event_tx.send(AgentEvent::CompactionDone {
         context_size_before,
         context_size_after,
@@ -219,11 +232,26 @@ pub async fn compact(
     Ok(())
 }
 
-pub(super) fn is_overflow(usage: &TokenUsage, model: &Model, buffer: CompactionBuffer) -> bool {
-    let usable = model
-        .context_window
-        .saturating_sub(buffer.resolve(model.context_window));
-    usage.context_tokens() >= usable
+/// Context held back from the transcript.
+///
+/// Never below [`min_output`], the floor a request may ask for, so under this
+/// threshold the window still houses the prompt and an answer and a server
+/// checking `prompt + max_tokens <= context_window` has nothing to object to.
+/// That floor tracks the model's own cap, or a small-window model would compact
+/// itself over output tokens it could never emit.
+///
+/// Reserving a whole [`AgentConfig::max_turn_output`] would guarantee more and
+/// cost more: on a small window that is half the context, and compacting that
+/// early hurts worse than the odd turn whose output budget gets trimmed.
+pub(super) fn reserved(model: &Model, config: &AgentConfig) -> u32 {
+    config
+        .compaction_buffer
+        .resolve(model.context_window)
+        .max(min_output(model))
+}
+
+pub(super) fn is_overflow(context_tokens: u32, model: &Model, config: &AgentConfig) -> bool {
+    context_tokens >= model.context_window.saturating_sub(reserved(model, config))
 }
 
 fn strip_images(messages: &mut [Message]) {
@@ -319,6 +347,7 @@ mod tests {
 
     use super::*;
     use crate::AgentConfig;
+    use maki_config::CompactionBuffer;
 
     const CONFIG_EXTRA: &str = "Record anything that belongs in plan.md";
     const REQUEST_EXTRA: &str = "Keep the failing test names";
@@ -406,14 +435,53 @@ mod tests {
         }
     }
 
+    async fn summarize(
+        provider: &MockProvider,
+        history: &mut History,
+        gauge: &mut ContextGauge,
+        config: &AgentConfig,
+        instructions: Option<&str>,
+    ) -> Result<(), AgentError> {
+        let (raw_tx, _rx) = flume::unbounded();
+        compact(
+            provider,
+            &default_model(),
+            history,
+            gauge,
+            &EventSender::new(raw_tx, 0),
+            config,
+            instructions,
+            None,
+        )
+        .await
+    }
+
+    async fn summarize_history(
+        provider: &MockProvider,
+        history: &mut History,
+        carry_len: usize,
+        session_id: Option<&SessionRef>,
+    ) {
+        let (raw_tx, _rx) = flume::unbounded();
+        compact_history(
+            provider,
+            &default_model(),
+            history,
+            &EventSender::new(raw_tx, 0),
+            &CancelToken::none(),
+            &AgentConfig::default(),
+            None,
+            carry_len,
+            session_id,
+        )
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn compact_replaces_history_with_summary() {
         smol::block_on(async {
-            let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(MockProvider::new(
-                vec![Ok(text_response(StopReason::EndTurn))],
-            ));
-            let model = default_model();
-            let (raw_tx, _rx) = flume::unbounded();
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
             let mut history = History::new(vec![
                 Message::user("first".into()),
                 Message {
@@ -425,13 +493,11 @@ mod tests {
                 },
             ]);
 
-            compact(
-                &*provider,
-                &model,
+            summarize(
+                &provider,
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &mut ContextGauge::default(),
                 &AgentConfig::default(),
-                None,
                 None,
             )
             .await
@@ -441,6 +507,81 @@ mod tests {
             assert_eq!(msgs.len(), 2);
             assert!(matches!(msgs[0].role, Role::User));
             assert!(matches!(msgs[1].role, Role::Assistant));
+        });
+    }
+
+    const SUMMARISED_PROMPT: u32 = 150_000;
+
+    /// The measurement the gauge holds is of the transcript compaction just
+    /// deleted, so left in place it sizes every later turn against a session
+    /// that no longer exists.
+    #[test]
+    fn compact_leaves_the_gauge_describing_the_summary() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(StreamResponse {
+                usage: TokenUsage {
+                    input: SUMMARISED_PROMPT,
+                    ..Default::default()
+                },
+                ..text_response(StopReason::EndTurn)
+            })]);
+            let mut history = History::new(vec![Message::user("first".into())]);
+            let mut gauge = ContextGauge::restored(SUMMARISED_PROMPT);
+
+            summarize(
+                &provider,
+                &mut history,
+                &mut gauge,
+                &AgentConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                gauge.size() < SUMMARISED_PROMPT,
+                "the gauge still sizes the session by the transcript it summarized away"
+            );
+        });
+    }
+
+    /// The summariser reads a stripped, collapsed subset of the transcript, so
+    /// its count is well under the session's real prompt. Left in the gauge by
+    /// a compaction that then failed, it reads as a session with room to spare
+    /// and silences the threshold that would have tried again.
+    #[test]
+    fn a_failed_compaction_leaves_the_gauge_alone() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: Vec::new(),
+                    ..Default::default()
+                },
+                usage: TokenUsage {
+                    input: SUMMARISED_PROMPT / 2,
+                    ..Default::default()
+                },
+                stop_reason: Some(StopReason::EndTurn),
+            })]);
+            let mut history = History::new(vec![Message::user("first".into())]);
+            let mut gauge = ContextGauge::restored(SUMMARISED_PROMPT);
+
+            summarize(
+                &provider,
+                &mut history,
+                &mut gauge,
+                &AgentConfig::default(),
+                None,
+            )
+            .await
+            .expect_err("empty summary must fail");
+
+            assert_eq!(
+                gauge.size(),
+                SUMMARISED_PROMPT,
+                "the summariser's own prompt was written over the session's size"
+            );
         });
     }
 
@@ -459,15 +600,12 @@ mod tests {
             })]);
             const KEPT: &str = "first";
             let mut history = History::new(vec![Message::user(KEPT.into())]);
-            let (raw_tx, _rx) = flume::unbounded();
 
-            let err = compact(
+            let err = summarize(
                 &provider,
-                &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &mut ContextGauge::default(),
                 &AgentConfig::default(),
-                None,
                 None,
             )
             .await
@@ -486,21 +624,18 @@ mod tests {
         smol::block_on(async {
             let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
             let mut history = History::new(vec![Message::user("work".into())]);
-            let (raw_tx, _rx) = flume::unbounded();
             let config = AgentConfig {
                 compaction_instructions: Some(CONFIG_EXTRA.into()),
                 post_compaction_instructions: Some(POST.into()),
                 ..Default::default()
             };
 
-            compact(
+            summarize(
                 &provider,
-                &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &mut ContextGauge::default(),
                 &config,
                 Some(REQUEST_EXTRA),
-                None,
             )
             .await
             .unwrap();
@@ -570,21 +705,7 @@ mod tests {
                 ..Default::default()
             };
             let mut history = History::new(vec![orphan, chat_image]);
-            let (raw_tx, _rx) = flume::unbounded();
-
-            compact_history(
-                &provider,
-                &default_model(),
-                &mut history,
-                &EventSender::new(raw_tx, 0),
-                &CancelToken::none(),
-                &AgentConfig::default(),
-                None,
-                0,
-                None,
-            )
-            .await
-            .unwrap();
+            summarize_history(&provider, &mut history, 0, None).await;
 
             let requests = provider.requests.lock().unwrap();
             let request = &requests[0];
@@ -633,7 +754,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            is_overflow(&usage, &model, AgentConfig::default().compaction_buffer),
+            is_overflow(usage.context_tokens(), &model, &AgentConfig::default()),
             expected
         );
     }
@@ -641,13 +762,15 @@ mod tests {
     #[test_case(CompactionBuffer::Tokens(10_000), 53_999, false ; "explicit_tokens_below")]
     #[test_case(CompactionBuffer::Tokens(10_000), 54_000, true  ; "explicit_tokens_honored")]
     #[test_case(CompactionBuffer::Percent(50),    32_000, true  ; "explicit_percent_at_threshold")]
+    // A buffer under the output floor cannot leave a turn room to answer.
+    #[test_case(CompactionBuffer::Tokens(1_000),  60_000, true  ; "buffer_below_the_output_floor_is_raised")]
     fn overflow_with_explicit_buffer(buffer: CompactionBuffer, input: u32, expected: bool) {
         let model = small_context_model(64_000);
-        let usage = TokenUsage {
-            input,
-            ..Default::default()
+        let config = AgentConfig {
+            compaction_buffer: buffer,
+            ..AgentConfig::default()
         };
-        assert_eq!(is_overflow(&usage, &model, buffer), expected);
+        assert_eq!(is_overflow(input, &model, &config), expected);
     }
 
     #[test]
@@ -776,21 +899,7 @@ mod tests {
                 },
                 Message::user("prompt".into()),
             ]);
-            let (raw_tx, _rx) = flume::unbounded();
-
-            compact_history(
-                &provider,
-                &default_model(),
-                &mut history,
-                &EventSender::new(raw_tx, 0),
-                &CancelToken::none(),
-                &AgentConfig::default(),
-                None,
-                0,
-                None,
-            )
-            .await
-            .unwrap();
+            summarize_history(&provider, &mut history, 0, None).await;
 
             let requests = provider.requests.lock().unwrap();
             assert_eq!(requests.len(), 3);
@@ -826,21 +935,7 @@ mod tests {
                 Message::user("first".into()),
                 Message::user("second".into()),
             ]);
-            let (raw_tx, _rx) = flume::unbounded();
-
-            compact_history(
-                &provider,
-                &default_model(),
-                &mut history,
-                &EventSender::new(raw_tx, 0),
-                &CancelToken::none(),
-                &AgentConfig::default(),
-                None,
-                0,
-                None,
-            )
-            .await
-            .unwrap();
+            summarize_history(&provider, &mut history, 0, None).await;
 
             let requests = provider.requests.lock().unwrap();
             assert!(requests[1].len() < requests[0].len(), "{NO_COLLAPSE_MSG}");
@@ -854,22 +949,8 @@ mod tests {
         smol::block_on(async {
             let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
             let mut history = History::new(vec![Message::user("work".into())]);
-            let (raw_tx, _rx) = flume::unbounded();
             let session = SessionRef::generate();
-
-            compact_history(
-                &provider,
-                &default_model(),
-                &mut history,
-                &EventSender::new(raw_tx, 0),
-                &CancelToken::none(),
-                &AgentConfig::default(),
-                None,
-                0,
-                Some(&session),
-            )
-            .await
-            .unwrap();
+            summarize_history(&provider, &mut history, 0, Some(&session)).await;
 
             let sessions = provider.sessions.lock().unwrap();
             assert_eq!(sessions[0].as_deref(), Some(session.as_str()));
@@ -888,21 +969,7 @@ mod tests {
                 Message::user("first".into()),
                 Message::user(CARRIED.into()),
             ]);
-            let (raw_tx, _rx) = flume::unbounded();
-
-            compact_history(
-                &provider,
-                &default_model(),
-                &mut history,
-                &EventSender::new(raw_tx, 0),
-                &CancelToken::none(),
-                &AgentConfig::default(),
-                None,
-                1,
-                None,
-            )
-            .await
-            .unwrap();
+            summarize_history(&provider, &mut history, 1, None).await;
 
             let carried = |messages: &[Message]| {
                 messages
@@ -932,21 +999,7 @@ mod tests {
                     ..Default::default()
                 },
             ]);
-            let (raw_tx, _rx) = flume::unbounded();
-
-            compact_history(
-                &provider,
-                &default_model(),
-                &mut history,
-                &EventSender::new(raw_tx, 0),
-                &CancelToken::none(),
-                &AgentConfig::default(),
-                None,
-                0,
-                None,
-            )
-            .await
-            .unwrap();
+            summarize_history(&provider, &mut history, 0, None).await;
 
             let requests = provider.requests.lock().unwrap();
             assert!(requests[0][0].is_observation());

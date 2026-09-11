@@ -1247,15 +1247,23 @@ impl App {
                 .session_mut()
                 .add_model_usage(&tc.model, tc.usage.billed(tc.cost));
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
-            self.chats[chat_idx].context_size = ctx_size;
-            if chat_idx == 0 {
-                self.state.context_size = ctx_size;
-            }
+            self.set_context_size(chat_idx, ctx_size);
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
             if let Some(tool_id) = &subagent_id {
                 let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
                 self.chats[0].set_tool_turn_usage(tool_id, formatted);
             }
+        }
+
+        // Compaction is the one thing that lowers the context size with no turn
+        // behind it. The number is stored in the session meta and seeds the
+        // next run's gauge, so left stale a session compacted just before exit
+        // gets compacted again on resume.
+        if let AgentEvent::CompactionDone {
+            context_size_after, ..
+        } = envelope.event
+        {
+            self.set_context_size(chat_idx, context_size_after);
         }
 
         let plan_path = if self.state.mode == Mode::Plan {
@@ -1329,6 +1337,15 @@ impl App {
             }
         }
         vec![]
+    }
+
+    /// Chat 0 is the session itself, and its size is the one stored in the
+    /// session meta.
+    fn set_context_size(&mut self, chat_idx: usize, size: u32) {
+        self.chats[chat_idx].context_size = size;
+        if chat_idx == 0 {
+            self.state.context_size = size;
+        }
     }
 
     fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {

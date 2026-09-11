@@ -154,6 +154,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         pricing,
         discovered_free: false,
         max_output_tokens,
+        turn_output_tokens: None,
         context_window,
         thinking_fields: None,
     }

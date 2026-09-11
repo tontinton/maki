@@ -202,9 +202,9 @@ impl Google {
             body["systemInstruction"] = json!({"parts": [{"text": system}]});
         }
 
-        thinking.apply_google_thinking(&mut body, max_thinking(model));
+        thinking.apply_google_thinking(&mut body, model, max_thinking(model));
 
-        if let Some(max_output) = model.max_output_tokens {
+        if let Some(max_output) = model.output_tokens() {
             body["generationConfig"]["maxOutputTokens"] = json!(max_output);
         }
 
@@ -718,6 +718,7 @@ mod tests {
             pricing: ModelPricing::default(),
             discovered_free: false,
             max_output_tokens: Some(8192),
+            turn_output_tokens: None,
             context_window: 1_048_576,
             thinking_fields: None,
         }

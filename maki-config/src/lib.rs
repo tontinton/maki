@@ -37,6 +37,14 @@ pub const MAX_SERVER_NAME_LEN: usize = 64;
 
 pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
+/// What one turn asks to generate. A number of maki's own choosing rather than
+/// "whatever the window can spare", because the latter ties the output cap to a
+/// prompt estimate, and an estimate that reads low buys a rejection from every
+/// server enforcing `prompt + max_tokens <= context_window`.
+///
+/// An answer allowance, not a ceiling on the request: a turn asks for more
+/// where an effort level needs the room.
+pub const DEFAULT_MAX_TURN_OUTPUT: u32 = 32_768;
 
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_LOW_SPEED_TIMEOUT_SECS: u64 = 120;
@@ -50,6 +58,7 @@ pub const MIN_OUTPUT_BYTES: usize = 1024;
 pub const MIN_OUTPUT_LINES: usize = 10;
 pub const MIN_MAX_CONTINUATION_TURNS: u32 = 1;
 pub const MIN_COMPACTION_BUFFER: u32 = 1_000;
+pub const MIN_MAX_TURN_OUTPUT: u32 = 1_024;
 const MAX_COMPACTION_PERCENT: u8 = 99;
 const COMPACTION_BUFFER_EXPECTED: &str =
     r#"a token count (e.g. 12000) or a percent of the context window (e.g. "20%")"#;
@@ -642,6 +651,7 @@ pub struct AgentFileConfig {
     pub max_output_bytes: Option<usize>,
     pub max_output_lines: Option<usize>,
     pub max_continuation_turns: Option<u32>,
+    pub max_turn_output: Option<u32>,
     pub compaction_buffer: Option<CompactionBuffer>,
     pub compaction_instructions: Option<String>,
     pub post_compaction_instructions: Option<String>,
@@ -657,6 +667,7 @@ impl AgentFileConfig {
             max_output_bytes,
             max_output_lines,
             max_continuation_turns,
+            max_turn_output,
             compaction_buffer,
             compaction_instructions,
             post_compaction_instructions,
@@ -1255,6 +1266,9 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_MAX_CONTINUATION_TURNS, min = MIN_MAX_CONTINUATION_TURNS, desc = "Max automatic continuation turns")]
     pub max_continuation_turns: u32,
 
+    #[config(default = DEFAULT_MAX_TURN_OUTPUT, min = MIN_MAX_TURN_OUTPUT, desc = "Output tokens one turn asks for, raised where an effort level needs the room and capped by the model's own limit")]
+    pub max_turn_output: u32,
+
     #[config(default = DEFAULT_COMPACTION_BUFFER, ty = "u32 | string", default_doc = "20%", desc = "Context reserved for compaction: token count or percent of the context window (e.g. \"20%\")")]
     pub compaction_buffer: CompactionBuffer,
 
@@ -1304,6 +1318,7 @@ impl AgentConfig {
             max_continuation_turns: file
                 .max_continuation_turns
                 .unwrap_or(DEFAULT_MAX_CONTINUATION_TURNS),
+            max_turn_output: file.max_turn_output.unwrap_or(DEFAULT_MAX_TURN_OUTPUT),
             compaction_buffer: file.compaction_buffer.unwrap_or(DEFAULT_COMPACTION_BUFFER),
             compaction_instructions: file.compaction_instructions,
             post_compaction_instructions: file.post_compaction_instructions,

@@ -279,7 +279,7 @@ async fn new_session(
         params,
         req.cwd,
         None,
-        Vec::new(),
+        InitialHistory::default(),
         mcp,
         project_config,
         None,
@@ -331,7 +331,10 @@ async fn load_session(
         params,
         req.cwd,
         Some(session_ref),
-        restored.history,
+        InitialHistory {
+            messages: restored.history,
+            context_size: restored.context_size,
+        },
         mcp,
         project_config,
         restored_cost,
@@ -352,7 +355,7 @@ fn start_session(
     params: &AcpParams,
     cwd: PathBuf,
     session_id: Option<SessionRef>,
-    history: Vec<Message>,
+    initial: InitialHistory,
     mcp: Option<McpHandle>,
     project_config: ProjectConfig,
     initial_cost: Option<f64>,
@@ -383,7 +386,8 @@ fn start_session(
         mcp_handle: mcp.clone(),
         initial_wd: cwd.clone(),
         session_id,
-        initial_history: history,
+        initial_history: initial.messages,
+        initial_context_size: initial.context_size,
         yolo: params.yolo,
         system_prompt_override: None,
         append_system_prompt: None,
@@ -594,12 +598,22 @@ async fn close_session(srv: &mut Server, reason: SessionEndReason) {
     }
 }
 
+/// The transcript a session starts from, with the provider's own count for it.
+/// Paired so a resumed session cannot get its history while its gauge falls
+/// back to estimating that same history.
+#[derive(Default)]
+struct InitialHistory {
+    messages: Vec<Message>,
+    context_size: u32,
+}
+
 #[derive(Debug)]
 struct Restored {
     history: Vec<Message>,
     /// Only set when the session recorded an absolute cwd.
     cwd: Option<PathBuf>,
     usage: TokenUsage,
+    context_size: u32,
     by_model: HashMap<String, StoredTokenUsage>,
     model: String,
 }
@@ -632,6 +646,7 @@ fn load_history_from(
     Ok(Restored {
         cwd: recorded,
         usage: session.token_usage,
+        context_size: session.meta.context_size,
         by_model: session.usage_by_model().clone(),
         model: session.model.clone(),
         history: session.take_messages(),

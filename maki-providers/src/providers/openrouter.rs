@@ -335,6 +335,7 @@ mod tests {
             pricing: ModelPricing::default(),
             discovered_free: false,
             max_output_tokens: Some(8192),
+            turn_output_tokens: None,
             context_window: 200_000,
             thinking_fields: None,
         };

@@ -67,6 +67,7 @@ impl AgentHandles {
     pub(crate) fn spawn(
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         initial_history: Vec<Message>,
+        initial_context_size: u32,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
@@ -81,6 +82,7 @@ impl AgentHandles {
             flume::unbounded(),
             model_slot,
             initial_history,
+            initial_context_size,
             config,
             tool_output_lines,
             permissions,
@@ -154,6 +156,9 @@ impl AgentHandles {
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
             history,
+            // A respawn carries the app's last reported count across, so the
+            // next request is not left guessing at its own prompt.
+            app.state.context_size,
             config,
             tool_output_lines,
             permissions,
@@ -216,6 +221,7 @@ fn spawn_agent_internal(
     (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
     model_slot: &Arc<ArcSwap<ModelSlot>>,
     initial_history: Vec<Message>,
+    initial_context_size: u32,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     permissions: &Arc<PermissionManager>,
@@ -253,6 +259,7 @@ fn spawn_agent_internal(
         config,
         tool_output_lines,
         initial_history,
+        initial_context_size,
         Arc::clone(&shared_history),
         Arc::clone(&btw_system),
         mcp_handle.clone(),
@@ -356,6 +363,7 @@ mod tests {
         let handles = AgentHandles::spawn(
             &model_slot,
             initial_history,
+            0,
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,

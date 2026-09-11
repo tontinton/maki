@@ -26,7 +26,8 @@ use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{
-    ContentBlock, Model, ModelError, RequestOptions, Role, ThinkingConfig, TokenUsage, add_cost,
+    ContentBlock, ContextGauge, Model, ModelError, RequestOptions, Role, ThinkingConfig,
+    TokenUsage, add_cost,
 };
 use maki_storage::id::MakiId;
 use maki_storage::sessions::StoredThinking;
@@ -636,6 +637,7 @@ async fn session(
             .filter(|_| mcp_enabled)
             .map(McpSession::fresh),
         history: History::new(Vec::new()),
+        gauge: ContextGauge::default(),
         sub_event_tx,
         stream_guard: Some(stream_guard),
         child_cancel,
@@ -754,6 +756,9 @@ struct SessionState {
     /// subagent and its parent.
     mcp: Option<McpSession>,
     history: History,
+    /// Travels with `history`: a subagent session spans many runs, and a gauge
+    /// rebuilt per run would forget every measurement it made.
+    gauge: ContextGauge,
     sub_event_tx: EventSender,
     /// Dropped on close, which ends the relay task. Tool contexts keep
     /// [`EventSender`] clones alive past the run, so the relay cannot key off
@@ -867,6 +872,7 @@ async fn prompt(
         s.params.clone(),
         AgentRunParams {
             history: &mut s.history,
+            gauge: &mut s.gauge,
             system: s.system.clone(),
             event_tx: s.sub_event_tx.clone(),
             tools: s.tools.clone(),

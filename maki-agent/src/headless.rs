@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use async_lock::Mutex;
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
+use maki_providers::ContextGauge;
 use maki_providers::Message;
 use maki_providers::Timeouts;
 use maki_providers::TokenUsage;
@@ -64,9 +65,13 @@ impl SessionStore {
         }
     }
 
-    fn record_turn(&mut self, messages: &[Message], model_spec: String) {
+    /// `context_size` travels with the messages, since a resumed session seeds
+    /// its gauge from it: stored without one, the next process is back to
+    /// estimating a transcript this one had measured.
+    fn record_turn(&mut self, messages: &[Message], model_spec: String, context_size: u32) {
         self.session.replace_messages(messages.to_vec());
         self.session.set_model(model_spec);
+        self.session.meta.context_size = context_size;
         self.session.update_title_if_default();
         self.save();
     }
@@ -192,6 +197,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
             };
         let error_tx = event_tx.clone();
         let mut history = History::new(Vec::new());
+        let mut gauge = ContextGauge::default();
         let mut agent = Agent::new(
             AgentParams {
                 provider,
@@ -217,6 +223,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                 model_policy: Arc::clone(&params.model_policy),
             },
             AgentRunParams {
+                gauge: &mut gauge,
                 history: &mut history,
                 system,
                 event_tx,
@@ -266,6 +273,10 @@ pub struct InteractiveParams {
     pub initial_wd: PathBuf,
     pub session_id: Option<SessionRef>,
     pub initial_history: Vec<Message>,
+    /// What the provider last counted for `initial_history`, zero for a
+    /// transcript nobody has sent yet. Seeds the gauge so a resumed session's
+    /// first request is budgeted against a measurement rather than a floor.
+    pub initial_context_size: u32,
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
@@ -357,6 +368,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
         let mut store = SessionStore::open(session_id, &working_dir, &model.spec());
         let mut history = History::restored(params.initial_history);
+        let mut gauge = ContextGauge::restored(params.initial_context_size);
         let mut run_id: u64 = 0;
 
         while let Ok(input) = input_rx.recv_async().await {
@@ -447,6 +459,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     model_policy: Arc::clone(&params.model_policy),
                 },
                 AgentRunParams {
+                    gauge: &mut gauge,
                     history: &mut history,
                     system,
                     event_tx,
@@ -471,7 +484,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             }
 
             if let Some(store) = &mut store {
-                store.record_turn(history.as_slice(), model.spec());
+                store.record_turn(history.as_slice(), model.spec(), gauge.size());
             }
             run_id += 1;
         }
@@ -579,16 +592,22 @@ mod tests {
         assert!(loaded.messages().is_empty());
     }
 
+    const CONTEXT_SIZE: u32 = 42_000;
+
     #[test]
     fn record_turn_persists_messages_and_title() {
         let tmp = TempDir::new().unwrap();
         let mut store = store_in(&tmp);
         let messages = vec![Message::user("fix the login bug".into())];
-        store.record_turn(&messages, MODEL_SPEC.into());
+        store.record_turn(&messages, MODEL_SPEC.into(), CONTEXT_SIZE);
 
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 1);
         assert_eq!(loaded.title, generate_title(&messages));
+        assert_eq!(
+            loaded.meta.context_size, CONTEXT_SIZE,
+            "a resumed session seeds its gauge from this, so it has to be stored"
+        );
     }
 
     #[test]
@@ -601,6 +620,7 @@ mod tests {
                 Message::observation("build failed".into()),
             ],
             MODEL_SPEC.into(),
+            CONTEXT_SIZE,
         );
 
         let loaded = load(&tmp);
@@ -612,7 +632,11 @@ mod tests {
     fn reopening_resumes_existing_session() {
         let tmp = TempDir::new().unwrap();
         let mut store = store_in(&tmp);
-        store.record_turn(&[Message::user("first prompt".into())], MODEL_SPEC.into());
+        store.record_turn(
+            &[Message::user("first prompt".into())],
+            MODEL_SPEC.into(),
+            CONTEXT_SIZE,
+        );
         drop(store);
 
         let mut store = store_in(&tmp);
@@ -622,7 +646,7 @@ mod tests {
             Message::user("first prompt".into()),
             Message::user("second prompt".into()),
         ];
-        store.record_turn(&messages, "other/model".into());
+        store.record_turn(&messages, "other/model".into(), CONTEXT_SIZE);
 
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 2);

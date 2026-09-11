@@ -852,6 +852,9 @@ impl Provider for CatalogProvider {
                 })?;
             let stream_model = Model {
                 id: model.id.clone(),
+                // The turn budget the agent set rides along in `..model`, and
+                // [`Model::output_tokens`] clamps it to this cap on read, so
+                // reporting what the endpoint accepts is all this has to do.
                 max_output_tokens: Some(meta.max_output()),
                 context_window: meta.context_window(),
                 ..model.clone()
@@ -1135,6 +1138,7 @@ mod tests {
             pricing: ModelPricing::default(),
             discovered_free: false,
             max_output_tokens: None,
+            turn_output_tokens: None,
             context_window: 0,
             thinking_fields: None,
         };

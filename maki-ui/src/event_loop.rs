@@ -394,6 +394,7 @@ impl SpawnCtx {
         let handles = AgentHandles::spawn(
             &self.model_slot,
             session.messages().to_vec(),
+            session.meta.context_size,
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,

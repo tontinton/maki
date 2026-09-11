@@ -648,7 +648,7 @@ impl Copilot {
         let auth = self.auth().await?;
         let mut body = json!({
             "model": model.id,
-            "max_tokens": model.max_output_tokens.unwrap_or(shared::FALLBACK_MAX_TOKENS),
+            "max_tokens": model.output_tokens().unwrap_or(shared::FALLBACK_MAX_TOKENS),
             "system": [{"type": "text", "text": system}],
             "messages": anthropic_messages(messages),
             "tools": tools,

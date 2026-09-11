@@ -15,7 +15,7 @@ use maki_agent::{
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
-use maki_providers::{AgentError, Message, Model};
+use maki_providers::{AgentError, ContextGauge, Message, Model};
 use maki_storage::id::SessionRef;
 use tracing::error;
 
@@ -32,6 +32,9 @@ pub(super) struct AgentLoop {
     tools: RequestTools,
     mcp: Option<McpSession>,
     history: History,
+    /// Owned beside `history` because it describes that transcript and outlives
+    /// every run over it, so the provider's own counts pile up between turns.
+    gauge: ContextGauge,
     btw_system: Arc<ArcSwap<String>>,
     cancel_map: Arc<RunCancelMap>,
     init_cancel: CancelToken,
@@ -56,6 +59,7 @@ impl AgentLoop {
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         initial_history: Vec<Message>,
+        initial_context_size: u32,
         shared_history: SharedMessages,
         btw_system: Arc<ArcSwap<String>>,
         mcp_handle: Option<McpHandle>,
@@ -82,6 +86,7 @@ impl AgentLoop {
             tools: RequestTools::default(),
             mcp,
             history: History::restored(initial_history).with_mirror(shared_history),
+            gauge: ContextGauge::restored(initial_context_size),
             btw_system,
             cancel_map,
             init_cancel,
@@ -192,6 +197,7 @@ impl AgentLoop {
             &*provider,
             &model,
             &mut self.history,
+            &mut self.gauge,
             event_tx,
             &self.config,
             instructions,
@@ -278,6 +284,7 @@ impl AgentLoop {
             },
             AgentRunParams {
                 history: &mut self.history,
+                gauge: &mut self.gauge,
                 system,
                 event_tx,
                 tools: self.tools.clone(),

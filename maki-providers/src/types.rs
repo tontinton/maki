@@ -691,6 +691,40 @@ impl ThinkingConfig {
         !matches!(self, Self::Off)
     }
 
+    /// Thinking tokens this config asks for on `model` before any request-level
+    /// trim, or `None` when the provider decides (`Off`, `Adaptive`, or an
+    /// unknown output window). This is the number a caller sizing `max_tokens`
+    /// has to leave room for.
+    pub fn reserved_thinking(self, model: &Model) -> Option<u32> {
+        match self.budget(model.max_thinking_budget()) {
+            Budgeted::Tokens(n) => Some(n),
+            Budgeted::Off | Budgeted::Adaptive => None,
+        }
+    }
+
+    /// What [`Self::reserved_thinking`] comes out as once the `max_tokens` on
+    /// the wire has had its say.
+    pub fn request_thinking(self, model: &Model) -> Option<u32> {
+        let asked = self.reserved_thinking(model)?;
+        Some(model.thinking_ceiling().map_or(asked, |c| asked.min(c)))
+    }
+
+    /// The budget one request carries: the level the user picked resolved
+    /// against what the model declares (`declared`), then cut to what the
+    /// `max_tokens` on the wire can house.
+    ///
+    /// Resolve then cut, never resolve against the cut. An effort level is a
+    /// percentage, so handing it a trimmed ceiling redefines what the user
+    /// picked, and an explicit budget read back through [`Effort::from_budget`]
+    /// comes out as a *higher* level than it went in as. Cutting afterwards
+    /// lowers the thinking exactly as far as the window forces and no further.
+    fn request_budget(self, model: &Model, declared: Option<u32>) -> Budgeted {
+        match (self.budget(declared), model.thinking_ceiling()) {
+            (Budgeted::Tokens(asked), Some(ceiling)) => Budgeted::Tokens(asked.min(ceiling)),
+            (budgeted, _) => budgeted,
+        }
+    }
+
     /// The effort string to send, snapped to the dialect's supported levels
     /// here and nowhere else (never chain snaps). `None` means send nothing:
     /// `Off` without an explicit off string, or `Adaptive` on APIs with their
@@ -744,7 +778,7 @@ impl ThinkingConfig {
             }
             return;
         }
-        match self.budget(model.max_thinking_budget()) {
+        match self.request_budget(model, model.max_thinking_budget()) {
             Budgeted::Off => {}
             Budgeted::Adaptive => body["thinking"] = json!({"type": "adaptive"}),
             Budgeted::Tokens(n) => {
@@ -773,8 +807,10 @@ impl ThinkingConfig {
         }
     }
 
-    pub fn apply_google_thinking(self, body: &mut Value, max: u32) {
-        match self.budget(Some(max)) {
+    /// `max` is Google's own documented ceiling on thinking, which is a
+    /// capability and so part of resolving the level, not a trim.
+    pub fn apply_google_thinking(self, body: &mut Value, model: &Model, max: u32) {
+        match self.request_budget(model, Some(max)) {
             Budgeted::Off => {}
             Budgeted::Adaptive => {
                 body["generationConfig"]["thinkingConfig"] = json!({"includeThoughts": true});
@@ -792,14 +828,14 @@ impl ThinkingConfig {
             && let Some(object) = body.as_object_mut()
         {
             merge_body(object, fragment);
-            if keep_budget && let Budgeted::Tokens(budget) = self.budget(max) {
+            if keep_budget && let Budgeted::Tokens(budget) = self.request_budget(model, max) {
                 body[LOCAL_BUDGET_FIELD] = json!(budget);
             }
             return;
         }
         // No fragment means the model has no way to spell this mode, so the
         // budget field takes over: a request must never end up saying nothing.
-        let budget = match self.budget(max) {
+        let budget = match self.request_budget(model, max) {
             Budgeted::Off => 0,
             Budgeted::Adaptive => -1,
             Budgeted::Tokens(n) => i64::from(n),
@@ -1291,6 +1327,32 @@ mod tests {
         assert_eq!(body, expected);
     }
 
+    const TRIMMED_TURN: u32 = 8_192;
+    const REWRITTEN_CAP: u32 = 131_072;
+
+    /// Providers that resolve limits per request rewrite `max_output_tokens`
+    /// after the agent sized the turn (catalog, opencode). Cutting the budget
+    /// to what the `max_tokens` on the wire can house means no rewrite leaves a
+    /// request asking to think for longer than it may answer, which Anthropic
+    /// refuses outright and every other dialect answers with nothing but
+    /// thinking.
+    #[test_case(ThinkingConfig::Effort(Max) ; "the_top_effort_level")]
+    #[test_case(ThinkingConfig::Effort(Minimal) ; "the_lowest")]
+    #[test_case(ThinkingConfig::Budget(LARGE_BUDGET) ; "an_explicit_budget")]
+    fn a_provider_that_rewrites_the_output_cap_cannot_unbound_the_thinking(config: ThinkingConfig) {
+        let model = crate::model::Model {
+            turn_output_tokens: Some(TRIMMED_TURN),
+            max_output_tokens: Some(REWRITTEN_CAP),
+            ..thinking_model("claude-sonnet-4-20250514")
+        };
+        let budget = config.request_thinking(&model).expect("a budget is sent");
+
+        assert!(
+            budget * 2 <= TRIMMED_TURN,
+            "{budget} thinking tokens under a {TRIMMED_TURN} token cap"
+        );
+    }
+
     #[test_case(&dialect::STANDARD, ThinkingConfig::Off,             None            ; "standard_off_noop")]
     #[test_case(&dialect::STANDARD, ThinkingConfig::Adaptive,        Some("medium")  ; "standard_adaptive")]
     #[test_case(&dialect::STANDARD, ThinkingConfig::Effort(Minimal), Some("minimal") ; "standard_minimal_passthrough")]
@@ -1372,13 +1434,30 @@ mod tests {
         assert_eq!(child.clamp_to(parent), expected);
     }
 
-    #[test_case(ThinkingConfig::Off,          json!({})                                                                  ; "off")]
-    #[test_case(ThinkingConfig::Adaptive,     json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}}) ; "adaptive")]
-    #[test_case(ThinkingConfig::Budget(4096), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096}}}) ; "budget")]
-    #[test_case(ThinkingConfig::Budget(10000), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 8192}}}) ; "budget_clamped")]
-    fn thinking_apply_google_thinking(config: ThinkingConfig, expected: Value) {
+    /// Google's own documented ceiling on thinking, which is a capability and
+    /// so part of resolving the level.
+    const GOOGLE_CAP: u32 = 8192;
+    /// Roomy enough that the request ceiling is not what binds.
+    const ROOMY_OUTPUT: Option<u32> = Some(65_536);
+
+    #[test_case(ThinkingConfig::Off, ROOMY_OUTPUT, json!({})                                                                  ; "off")]
+    #[test_case(ThinkingConfig::Adaptive, ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}}) ; "adaptive")]
+    #[test_case(ThinkingConfig::Budget(4096), ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096}}}) ; "budget")]
+    #[test_case(ThinkingConfig::Budget(10000), ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 8192}}}) ; "budget_clamped_to_googles_cap")]
+    // Half the `maxOutputTokens` the same request carries, or the answer has
+    // nowhere to land.
+    #[test_case(ThinkingConfig::Budget(10000), Some(GOOGLE_CAP), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096}}}) ; "budget_cut_to_what_the_request_can_house")]
+    fn thinking_apply_google_thinking(
+        config: ThinkingConfig,
+        max_output_tokens: Option<u32>,
+        expected: Value,
+    ) {
         let mut body = json!({});
-        config.apply_google_thinking(&mut body, 8192);
+        let model = crate::model::Model {
+            max_output_tokens,
+            ..thinking_model("gemini-2.5-pro")
+        };
+        config.apply_google_thinking(&mut body, &model, GOOGLE_CAP);
         assert_eq!(body, expected);
     }
 
@@ -1476,6 +1555,7 @@ mod tests {
             pricing: crate::model::ModelPricing::default(),
             discovered_free: false,
             max_output_tokens: Some(8192),
+            turn_output_tokens: None,
             context_window: 200_000,
             thinking_fields: None,
         }

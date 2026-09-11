@@ -6,9 +6,8 @@ use crate::app::tasks::TaskOutcome;
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{Action, LoadedSession};
-use maki_agent::agent::estimate_message_tokens;
 use maki_lua::SessionEndReason;
-use maki_providers::{Model, RequestOptions, TokenUsage};
+use maki_providers::{Model, RequestOptions, TokenUsage, estimate_message_tokens};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionMeta, StoredSubagent};
 

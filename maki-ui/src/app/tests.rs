@@ -3083,6 +3083,26 @@ fn rewind_recomputes_context_size(measured: u32, floor: u32) {
     assert_eq!(app.chats[0].context_size, size);
 }
 
+/// Left at the pre-compaction value, a session compacted just before exit
+/// compacts itself again on resume.
+#[test]
+fn compaction_lowers_the_stored_context_size() {
+    const AFTER: u32 = SMALL_HISTORY;
+    let mut app = test_app();
+    app.run_id = 1;
+    app.state.context_size = MEASURED_CONTEXT;
+    app.chats[0].context_size = MEASURED_CONTEXT;
+
+    app.update(agent_msg(AgentEvent::CompactionDone {
+        context_size_before: MEASURED_CONTEXT,
+        context_size_after: AFTER,
+        context_window: 0,
+    }));
+
+    assert_eq!(app.state.context_size, AFTER);
+    assert_eq!(app.chats[0].context_size, AFTER);
+}
+
 #[test]
 fn rewind_to_first_turn_clears_everything() {
     let mut app = build_rewind_app();
