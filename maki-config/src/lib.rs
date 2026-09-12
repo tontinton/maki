@@ -76,6 +76,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "batch",
     "code_execution",
     "edit",
+    "file_mention",
     "glob",
     "grep",
     "index",

@@ -279,6 +279,19 @@ fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResu
     Ok(())
 }
 
+/// Inserts text into the prompt input at the cursor, as if typed. The
+/// input keeps focus; nothing is submitted.
+///
+/// @param text string Text to insert.
+/// @return
+/// @example
+/// maki.ui.insert_input("@src/main.rs ")
+#[lua_fn]
+fn insert_input(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, text: String) -> LuaResult<()> {
+    let _ = tx.try_send(UiAction::InsertInput(text));
+    Ok(())
+}
+
 /// Sets the terminal emulator's window title. Pass an empty string to
 /// clear it.
 ///
@@ -509,7 +522,7 @@ lua_table! {
         buf, theme_color, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title,
+        manual set_window_title, manual insert_input,
     ]
 }
 
@@ -523,6 +536,7 @@ pub(crate) fn create_ui_table(
 
     if let Some(tx) = ui_action_tx {
         flash__register(&t, lua, tx.clone())?;
+        insert_input__register(&t, lua, tx.clone())?;
         set_window_title__register(&t, lua, tx.clone())?;
         action__register(&t, lua, tx.clone())?;
         open_editor__register(&t, lua, tx.clone())?;

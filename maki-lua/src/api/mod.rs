@@ -2,6 +2,7 @@ pub(crate) mod agent;
 pub(crate) mod r#async;
 pub(crate) mod autocmd;
 pub(crate) mod base64;
+pub(crate) mod completer;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
@@ -58,6 +59,7 @@ pub(crate) fn create_maki_global(
     )?;
     autocmd::add_autocmd_methods(&api, lua, Arc::clone(&plugin))?;
     slot::add_slot_methods(&api, lua, Arc::clone(&plugin))?;
+    completer::add_completer_methods(&api, lua, Arc::clone(&plugin))?;
     maki.set("api", api)?;
     maki.set("env", env::create_env_table(lua, permissions)?)?;
     maki.set("fs", fs::create_fs_table(lua, permissions)?)?;

@@ -134,7 +134,17 @@ impl InputBox {
         self.buffer.insert_text(text);
         InputAction::PaletteSync(self.buffer.value())
     }
+}
 
+/// True when {c} sits flush against word content — a word char, `_`, or a
+/// closer like `)]}>`. Shared by paste (add a space so the insert doesn't
+/// glue on) and completion (a trigger only opens when the char before it is
+/// NOT flush against a word).
+pub(crate) fn is_word_adjacent(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || ")]}>".contains(c)
+}
+
+impl InputBox {
     /// Inserting a file path mid-word looks broken ("read/tmp/x" instead of
     /// "read /tmp/x"). This adds spaces around the paste only when needed.
     pub fn handle_paste_with_spaces(&mut self, text: &str) -> InputAction {
@@ -144,11 +154,8 @@ impl InputBox {
         let char_before = line[..bx].chars().next_back();
         let char_after = line[bx..].chars().next();
 
-        let is_word_boundary =
-            |c: char| -> bool { c.is_alphanumeric() || c == '_' || ")]}>".contains(c) };
-
-        let needs_leading = char_before.is_some_and(&is_word_boundary) && !text.starts_with(' ');
-        let needs_trailing = char_after.is_some_and(&is_word_boundary) && !text.ends_with(' ');
+        let needs_leading = char_before.is_some_and(is_word_adjacent) && !text.starts_with(' ');
+        let needs_trailing = char_after.is_some_and(is_word_adjacent) && !text.ends_with(' ');
 
         if !needs_leading && !needs_trailing {
             return self.handle_paste(text);
