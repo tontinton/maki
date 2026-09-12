@@ -2,11 +2,14 @@ local SKILL_FILE = "SKILL.md"
 local NOT_FOUND = "skill not found: "
 local REFERENCE_FILE = "lua-api.md"
 local REFERENCE_UNAVAILABLE = "(unavailable; full reference inlined below)"
+local ListPicker = require("maki.list_picker")
 local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
+local build_picker_items = helpers.build_picker_items
+local build_skill_marker = helpers.build_skill_marker
 
 local PROJECT_SKILL_DIRS = {
   ".maki/skills",
@@ -131,6 +134,7 @@ end
 
 local boot_skills = discover_skills()
 local description = "Load a skill that provides instructions and workflows for specific tasks."
+  .. " If the user writes $skill:name in their message, load the skill named name first."
   .. build_skill_list(boot_skills)
 
 maki.api.register_tool({
@@ -162,11 +166,12 @@ maki.api.register_tool({
       return { llm_output = "error: name is required", is_error = true }
     end
 
+    local name = input.name:gsub("^%$skill:", "")
     local skills = discover_skills()
-    local skill = skills[input.name]
+    local skill = skills[name]
     if not skill then
       local available = build_skill_list(skills)
-      return { llm_output = NOT_FOUND .. input.name .. available, is_error = true }
+      return { llm_output = NOT_FOUND .. name .. available, is_error = true }
     end
     if skill.resolve then
       skill.content = skill.resolve()
@@ -207,3 +212,29 @@ maki.api.register_tool({
     }
   end,
 })
+
+local function insert_skill_marker()
+  local items = build_picker_items(discover_skills())
+  if #items == 0 then
+    maki.ui.flash("No skills available")
+    return
+  end
+  local event = ListPicker.open(items, {
+    title = " Skills ",
+    footer = {
+      { "Enter", "select" },
+      { "Esc", "cancel" },
+    },
+  })
+  if event.type == "choice" then
+    maki.ui.insert_input(build_skill_marker(items[event.index].label))
+  end
+end
+
+maki.api.register_command({
+  name = "/skill",
+  description = "Pick a skill and insert a visible $skill:name marker into the prompt (Alt+S)",
+  handler = insert_skill_marker,
+})
+
+maki.keymap.set("n", "<M-s>", insert_skill_marker, { desc = "Insert skill marker" })

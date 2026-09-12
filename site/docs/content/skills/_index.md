@@ -55,7 +55,9 @@ The frontmatter is optional. Without it, the directory name is the skill name an
 
 The `skill` tool lists every skill it found, the agent calls it with a name and gets the body back. A wrong name errors and reprints the list so the model can pick again.
 
-Skills are not slash commands: typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands). Ask the agent to use a skill, or let it pick one on its own.
+To point at one yourself, run `/skill` or press `Alt+S`. Pick from the list and maki inserts a `$skill:name` marker at the cursor, highlighted so you can see what the prompt pulls in. The marker is plain text in your message, and the tool description tells the model to load that skill first, so keep typing the rest of the prompt around it. Asking in words ("use the git-release skill") works just as well, and if you say nothing the agent picks on its own.
+
+A skill name is not a slash command of its own. Typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands).
 
 ## The builtin: maki-plugin-dev
 

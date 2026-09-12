@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crossterm::event::{KeyCode, KeyModifiers};
 use maki_agent::ToolOutput;
 use maki_agent::template::Vars;
 use maki_agent::tools::{
@@ -5021,6 +5022,21 @@ fn builtin_plugins_register_their_commands() {
     for command in BUILTIN_COMMANDS {
         assert!(names.contains(command), "missing {command} in {names:?}");
     }
+}
+
+/// The key and its description are copied into `PLUGIN_BINDS` in maki-docgen,
+/// which the keybinding page is generated from. Change one, change the other.
+#[test]
+fn skill_plugin_registers_alt_s_keymap() {
+    let (_reg, host) = builtins_host();
+    let snap = host.keymap_reader().load();
+    let entry = snap
+        .entries
+        .iter()
+        .find(|entry| entry.key == KeyCode::Char('s') && entry.modifiers == KeyModifiers::ALT)
+        .expect("missing Alt+S skill keymap");
+    assert_eq!(entry.plugin.as_ref(), "skill");
+    assert_eq!(entry.desc, "Insert skill marker");
 }
 
 #[test]
