@@ -686,6 +686,21 @@ mod tests {
     }
 
     #[test]
+    fn extract_excludes_scrollbar_rail_column() {
+        let area = Rect::new(0, 0, 10, 3);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "hello     ", Style::default());
+        buf[(9, 0)].set_symbol("▐");
+
+        let region = ContentRegion {
+            area: Rect::new(0, 0, area.width.saturating_sub(1), 3),
+            ..Default::default()
+        };
+        let text = extract_selected_text(&buf, &ss(0, 0, 2, 8), &[region]);
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
     fn extract_skips_uncovered_rows() {
         let area = Rect::new(0, 0, 10, 5);
         let mut buf = Buffer::empty(area);
