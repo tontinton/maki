@@ -218,12 +218,12 @@ impl StatusBar {
                     rest_spans.push(Span::styled(RESTRICTED_LABEL, theme::current().status_dim));
                 }
                 if ctx.running_jobs > 0 {
-                    let monitors = format!(
-                        " {} monitor{}",
+                    let jobs = format!(
+                        " {} job{}",
                         ctx.running_jobs,
                         if ctx.running_jobs == 1 { "" } else { "s" }
                     );
-                    rest_spans.push(Span::styled(monitors, theme::current().status_notice));
+                    rest_spans.push(Span::styled(jobs, theme::current().status_notice));
                 }
                 rest_spans.extend(yolo_span);
 
@@ -448,19 +448,6 @@ mod tests {
         draw(&ctx).contains(RESTRICTED_LABEL.trim())
     }
 
-    /// The counter sits on the right with the other mode labels, so it has to
-    /// read as a count with correct plural, and stay out of the error arm that
-    /// owns the whole bar.
-    #[test_case(0 => false ; "no_jobs_no_label")]
-    #[test_case(1 => true  ; "singular")]
-    #[test_case(3 => true  ; "plural")]
-    fn monitors_label_matches_the_running_count(running_jobs: usize) -> bool {
-        let mut ctx = context(&Status::Idle, None, false, false);
-        ctx.running_jobs = running_jobs;
-
-        draw(&ctx).contains("monitor")
-    }
-
     /// The sigma is the whole session's bill, and only the session can hand it
     /// over. Pricing the focused chat's counters instead (what the bar used to
     /// do) tells the user a paid session was free, or bills another chat's
@@ -497,30 +484,32 @@ mod tests {
             message: "something went wrong".into(),
             since: Instant::now(),
         };
-        let text = render_status(&status, None, false, true, 0);
+        let text = draw(&context(&status, None, false, true));
         assert!(text.contains(YOLO_LABEL.trim()), "{text}");
     }
 
     /// The counter sits on the right with the other mode labels, so it has to
     /// read as a count with correct plural, and stay out of the error arm that
-    /// owns the whole bar.
+    /// owns the whole bar. Any session job counts, whatever plugin spawned it.
     #[test_case(0, false           ; "no_jobs_no_label")]
     #[test_case(1, true            ; "singular")]
     #[test_case(3, true            ; "plural")]
-    fn monitors_label_matches_the_running_count(running_jobs: usize, shown: bool) {
-        let text = render_status(&Status::Idle, None, false, false, running_jobs);
-        assert_eq!(text.contains("monitor"), shown, "{text}");
+    fn jobs_label_matches_the_running_count(running_jobs: usize, shown: bool) {
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.running_jobs = running_jobs;
+        let text = draw(&ctx);
+        assert_eq!(text.contains("job"), shown, "{text}");
     }
 
     #[test]
-    fn plural_monitors_label() {
+    fn plural_jobs_label() {
         let mut ctx = context(&Status::Idle, None, false, false);
         ctx.running_jobs = 2;
         let text = draw(&ctx);
-        assert!(text.contains(" 2 monitors"), "{text}");
+        assert!(text.contains(" 2 jobs"), "{text}");
         ctx.running_jobs = 1;
         let one = draw(&ctx);
-        assert!(one.contains(" 1 monitor"), "{one}");
+        assert!(one.contains(" 1 job"), "{one}");
     }
 
     #[test_case("/home/user/projects/app", "/home/user", "~/projects/app" ; "inside_home")]

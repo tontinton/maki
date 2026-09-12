@@ -10,20 +10,19 @@ local OK_ICON = "✓ "
 local BAD_ICON = "✗ "
 
 local RUNNING_SECTION = "Running"
-local MONITORS_SECTION = "Monitors"
+local JOBS_SECTION = "Jobs"
 local FINISHED_SECTION = "Finished"
 
 local M = {}
 
 -- The main chat comes first and has no status. The subagents follow, running
 -- ones above finished ones so a long job never gets buried under the ones that
--- already returned. Monitors sit between: the session's live command jobs,
--- running ones first, whatever plugin started them. Within a section, chat
--- order.
+-- already returned. The Jobs section sits between: the session's command jobs
+-- from any plugin, running ones first. Within a section, chat order.
 --
 -- Returns { rows, sections }. A row carries a section header only when it opens
 -- one, and `sections` counts what survived the filter.
-function M.build(tasks, monitors, query)
+function M.build(tasks, jobs, query)
   local words = ListPicker.split_words(query)
   local main, running, finished = nil, {}, {}
   for _, task in ipairs(tasks) do
@@ -38,13 +37,13 @@ function M.build(tasks, monitors, query)
     end
   end
 
-  local live_monitors, exited_monitors = {}, {}
-  for _, job in ipairs(monitors or {}) do
+  local live_jobs, exited_jobs = {}, {}
+  for _, job in ipairs(jobs or {}) do
     if ListPicker.matches(job.name or job.command, words) then
       if job.status == "running" then
-        live_monitors[#live_monitors + 1] = job
+        live_jobs[#live_jobs + 1] = job
       else
-        exited_monitors[#exited_monitors + 1] = job
+        exited_jobs[#exited_jobs + 1] = job
       end
     end
   end
@@ -55,10 +54,10 @@ function M.build(tasks, monitors, query)
   end
   for _, group in ipairs({
     { header = RUNNING_SECTION, items = running, key = "task" },
-    { header = MONITORS_SECTION, items = live_monitors, key = "monitor" },
+    { header = JOBS_SECTION, items = live_jobs, key = "job" },
     -- Same section as the live ones, so the header repeats only when a
     -- filter emptied the live half.
-    { header = #live_monitors == 0 and MONITORS_SECTION or nil, items = exited_monitors, key = "monitor" },
+    { header = #live_jobs == 0 and JOBS_SECTION or nil, items = exited_jobs, key = "job" },
     { header = FINISHED_SECTION, items = finished, key = "task" },
   }) do
     for i, item in ipairs(group.items) do
@@ -69,7 +68,7 @@ function M.build(tasks, monitors, query)
     rows = rows,
     sections = {
       running = #running,
-      monitors = #live_monitors + #exited_monitors,
+      jobs = #live_jobs + #exited_jobs,
       finished = #finished,
     },
   }
@@ -77,7 +76,7 @@ end
 
 -- Same glyph language as the task rows: the live spinner, then check or
 -- cross by exit code.
-function M.monitor_icon(job)
+function M.job_icon(job)
   if job.status == "running" then
     return RUN_ICON, "accent", true
   elseif job.exit_code == 0 then
@@ -87,14 +86,14 @@ function M.monitor_icon(job)
 end
 
 function M.row_id(row)
-  return row.task and row.task.id or row.monitor.id
+  return row.task and row.task.id or row.job.id
 end
 
 function M.row_name(row)
   if row.task then
     return row.task.name
   end
-  return row.monitor.name or row.monitor.command
+  return row.job.name or row.job.command
 end
 
 -- Position of {id} among {rows}, or nil. The selection is kept as an id and

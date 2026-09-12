@@ -1,5 +1,6 @@
--- The /tasks picker: the subagents of the focused session, running ones first.
--- The tool in init.lua spawns them, this file only shows them.
+-- The /tasks picker: the focused session's activity — its subagents, plus the
+-- command jobs any plugin left running in it. Running ones first.
+-- The task tool in init.lua spawns the subagents; this file only shows both.
 --
 -- The host keeps the transcripts, so there is no task state here. Every
 -- refresh rebuilds the rows from maki.task.list(), and previewing is just
@@ -65,8 +66,8 @@ local function icon_of(task)
   return icon[1], icon[2], icon[3]
 end
 
-local function icon_of_monitor(job)
-  return Rows.monitor_icon(job)
+local function icon_of_job(job)
+  return Rows.job_icon(job)
 end
 
 -- The counts describe the rows on screen, so a filter that hides half the list
@@ -89,7 +90,7 @@ end
 -- falls to whatever row took over the old position.
 local function rebuild()
   local previous = Rows.index_of(board.rows, board.sel_id) or 1
-  local built = Rows.build(board.tasks, board.monitors, board.input:value())
+  local built = Rows.build(board.tasks, board.jobs, board.input:value())
   board.rows = built.rows
   local idx = Rows.index_of(board.rows, board.sel_id) or math.min(previous, math.max(#board.rows, 1))
   board.sel_id = board.rows[idx] and Rows.row_id(board.rows[idx]) or nil
@@ -112,7 +113,7 @@ local function render()
     if row.task then
       icon, icon_style, spinning = icon_of(row.task)
     else
-      icon, icon_style, spinning = icon_of_monitor(row.monitor)
+      icon, icon_style, spinning = icon_of_job(row.job)
     end
     if selected then
       icon_style = "selected"
@@ -158,9 +159,9 @@ local function refresh()
     maki.ui.flash(err)
     return
   end
-  -- Monitor jobs belong to whatever plugin started them, but a session
-  -- filter lists the whole session, so the picker sees the monitor
-  -- plugin's jobs too.
+  -- Command jobs belong to whatever plugin started them, but a session
+  -- filter lists the whole session, so the picker sees every plugin's
+  -- jobs too.
   local jobs, jobs_err = maki.fn.joblist(maki.session.current())
   if board ~= this_board then
     return
@@ -170,7 +171,7 @@ local function refresh()
     jobs = nil
   end
   board.tasks = tasks
-  board.monitors = jobs
+  board.jobs = jobs
   rebuild()
   render()
 end
@@ -207,7 +208,7 @@ local function move_sel(delta, wrap)
   local row = board.rows[idx]
   board.sel_id = Rows.row_id(row)
   render()
-  -- A monitor has no transcript to preview.
+  -- A job has no transcript to preview.
   if not row.task then
     return
   end
@@ -227,7 +228,7 @@ local function open_selected()
   end
   local row = board.rows[Rows.index_of(board.rows, board.sel_id)]
   if not row.task then
-    maki.ui.flash("a monitor has no transcript to open")
+    maki.ui.flash("a job has no transcript to open")
     return
   end
   local _, err = maki.task.focus(board.sel_id)
@@ -288,7 +289,7 @@ local function open()
     -- ended up once it wrapped.
     reserved = 0,
     tasks = {},
-    monitors = {},
+    jobs = {},
     rows = {},
   }
   refresh()
