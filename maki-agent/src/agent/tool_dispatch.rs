@@ -23,7 +23,7 @@ use maki_config::ToolKey;
 use maki_storage::id::SessionRef;
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
-const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
+const DOOM_LOOP_MESSAGE: &str = "You have called this tool with the same (or nearly identical) input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
 
@@ -60,7 +60,13 @@ impl RecentCalls {
         Self(VecDeque::new())
     }
 
+    /// Sorts keys and trims strings first, so key reordering and whitespace
+    /// churn around a value do not dodge the guard. Interior whitespace is
+    /// kept, it can matter inside a command or pattern.
     fn hash_input(input: &Value) -> u64 {
+        let mut input = input.clone();
+        input.sort_all_objects();
+        trim_strings(&mut input);
         let mut h = DefaultHasher::new();
         input.to_string().hash(&mut h);
         h.finish()
@@ -82,6 +88,15 @@ impl RecentCalls {
         if self.0.len() > DOOM_LOOP_THRESHOLD {
             self.0.pop_front();
         }
+    }
+}
+
+fn trim_strings(value: &mut Value) {
+    match value {
+        Value::String(s) => *s = s.trim().to_owned(),
+        Value::Array(items) => items.iter_mut().for_each(trim_strings),
+        Value::Object(map) => map.values_mut().for_each(trim_strings),
+        _ => {}
     }
 }
 
@@ -1062,6 +1077,7 @@ mod tests {
     #[test_case("read", &[("read", "/a"), ("read", "/b")], false ; "different_input_breaks_chain")]
     #[test_case("grep", &[("glob", "/a"), ("glob", "/a")], false ; "different_tool_name")]
     #[test_case("bash", &[("bash", "/a"), ("bash", "/b"), ("bash", "/a")], false ; "interrupted_chain")]
+    #[test_case("bash", &[("bash", "/a"), ("bash", "/a ")], true  ; "near_duplicate_whitespace_triggers")]
     fn doom_loop_detection(name: &str, history: &[(&str, &str)], expected: bool) {
         let entries: Vec<_> = history
             .iter()
@@ -1069,6 +1085,17 @@ mod tests {
             .collect();
         let input = serde_json::json!({"path": "/a"});
         assert_eq!(recent_calls(&entries).is_doom_loop(name, &input), expected);
+    }
+
+    #[test_case(json!({"path": "/a "}), json!({"path": "\n/a"}), true ; "trimmed_whitespace")]
+    #[test_case(json!({"path": "/a", "offset": 1}), json!({"offset": 1, "path": "/a"}), true ; "reordered_keys")]
+    #[test_case(json!({"command": "grep \"a  b\""}), json!({"command": "grep \"a b\""}), false ; "interior_whitespace_kept")]
+    #[test_case(json!({"path": "/a", "offset": 1}), json!({"path": "/a", "offset": 201}), false ; "paginated_read")]
+    fn doom_loop_input_normalization(a: Value, b: Value, same: bool) {
+        assert_eq!(
+            RecentCalls::hash_input(&a) == RecentCalls::hash_input(&b),
+            same
+        );
     }
 
     fn local_ctx(
