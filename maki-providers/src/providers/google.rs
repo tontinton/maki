@@ -105,6 +105,11 @@ fn resolve_google_base_url() -> Option<String> {
     maki_config::providers::resolve_base_url("google", config.get("google"))
 }
 
+fn resolve_google_top_p() -> Option<f64> {
+    let config = maki_config::providers::ProvidersConfig::load();
+    maki_config::providers::resolve_top_p(config.get("google"))
+}
+
 fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> Result<ResolvedAuth, AgentError> {
     Ok(
         ResolvedAuth::new("google", vec![(API_KEY_HEADER.into(), key.to_string())])?
@@ -119,6 +124,7 @@ pub struct Google {
     stream_timeout: Duration,
     /// Env / `providers.toml` / inventory default, resolved once at construction.
     resolved_base_url: Option<String>,
+    top_p: Option<f64>,
 }
 
 impl Google {
@@ -132,12 +138,14 @@ impl Google {
             key_pool: Some(pool),
             stream_timeout: timeouts.stream,
             resolved_base_url,
+            top_p: resolve_google_top_p(),
         })
     }
 
     pub(crate) fn with_auth(
         auth: Arc<Mutex<super::ResolvedAuth>>,
         timeouts: super::Timeouts,
+        top_p: Option<f64>,
     ) -> Self {
         let resolved_base_url = auth.lock().unwrap().base_url.clone();
         Self {
@@ -146,6 +154,7 @@ impl Google {
             key_pool: None,
             stream_timeout: timeouts.stream,
             resolved_base_url,
+            top_p,
         }
     }
 
@@ -206,6 +215,9 @@ impl Google {
 
         if let Some(max_output) = model.output_tokens() {
             body["generationConfig"]["maxOutputTokens"] = json!(max_output);
+        }
+        if let Some(top_p) = self.top_p {
+            body["generationConfig"]["topP"] = json!(top_p);
         }
 
         let tool_decls = convert_tools(tools);
@@ -761,7 +773,7 @@ mod tests {
 
     #[test]
     fn google_build_body_basic() {
-        let google = Google::with_auth(test_auth(), test_timeouts());
+        let google = Google::with_auth(test_auth(), test_timeouts(), None);
         let model = test_model();
         let messages = vec![Message::user("hello".into())];
         let body = google.build_body(
@@ -776,11 +788,26 @@ mod tests {
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be helpful");
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 8192);
         assert!(body.get("tools").is_none());
+        assert!(body["generationConfig"].get("topP").is_none());
+    }
+
+    #[test]
+    fn google_build_body_sends_top_p_when_configured() {
+        let google = Google::with_auth(test_auth(), test_timeouts(), Some(0.8));
+        let messages = vec![Message::user("hello".into())];
+        let body = google.build_body(
+            &test_model(),
+            &messages,
+            "",
+            &json!([]),
+            ThinkingConfig::Off,
+        );
+        assert_eq!(body["generationConfig"]["topP"], 0.8);
     }
 
     #[test]
     fn google_build_body_thinking_adaptive() {
-        let google = Google::with_auth(test_auth(), test_timeouts());
+        let google = Google::with_auth(test_auth(), test_timeouts(), None);
         let messages = vec![Message::user("think".into())];
         let body = google.build_body(
             &test_model(),
@@ -798,7 +825,7 @@ mod tests {
 
     #[test]
     fn google_build_body_thinking_budget() {
-        let google = Google::with_auth(test_auth(), test_timeouts());
+        let google = Google::with_auth(test_auth(), test_timeouts(), None);
         let messages = vec![Message::user("think hard".into())];
         let body = google.build_body(
             &test_model(),

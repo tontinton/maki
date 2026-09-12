@@ -550,14 +550,26 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
 
     let inner: Box<dyn Provider> = match meta.base {
         ProviderKind::Anthropic => Box::new(
-            Anthropic::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
+            Anthropic::with_auth(
+                auth.clone(),
+                timeouts,
+                maki_config::providers::resolve_top_p(
+                    maki_config::providers::ProvidersConfig::load().get(slug),
+                ),
+            )
+            .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::OpenAi => Box::new(
             OpenAi::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
-        ProviderKind::Google => Box::new(Google::with_auth(auth.clone(), timeouts)),
+        ProviderKind::Google => Box::new(Google::with_auth(
+            auth.clone(),
+            timeouts,
+            maki_config::providers::resolve_top_p(
+                maki_config::providers::ProvidersConfig::load().get(slug),
+            ),
+        )),
         ProviderKind::Copilot => Box::new(
             Copilot::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),

@@ -727,10 +727,14 @@ impl CatalogTransport {
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
         opts: &RequestOptions,
+        top_p: Option<f64>,
     ) -> Result<StreamResponse, AgentError> {
         match api_format {
             EndpointType::ChatCompletions => {
                 let mut body = self.chat_compat.build_body(model, messages, system, tools);
+                if let Some(top_p) = top_p {
+                    body["top_p"] = serde_json::json!(top_p);
+                }
                 opts.thinking
                     .apply_reasoning_effort(&mut body, &dialect::PREFER_HIGH, model);
                 self.chat_compat
@@ -749,6 +753,7 @@ impl CatalogTransport {
                     &system_blocks,
                     tools,
                     opts.thinking,
+                    top_p,
                 );
                 body["model"] = serde_json::json!(model.id);
                 body["stream"] = serde_json::json!(true);
@@ -869,6 +874,9 @@ impl Provider for CatalogProvider {
                     event_tx,
                     &auth,
                     &opts,
+                    maki_config::providers::resolve_top_p(
+                        ProvidersConfig::load().get(&self.data.slug),
+                    ),
                 )
                 .await
         })

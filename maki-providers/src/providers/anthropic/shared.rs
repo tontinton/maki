@@ -224,6 +224,7 @@ pub(crate) fn build_request_body_with_system(
     system_blocks: &[SystemBlock<'_>],
     tools: &Value,
     thinking: ThinkingConfig,
+    top_p: Option<f64>,
 ) -> Value {
     let wire_messages = build_wire_messages(messages);
     let wire_tools = build_wire_tools(tools);
@@ -234,6 +235,9 @@ pub(crate) fn build_request_body_with_system(
         "messages": wire_messages,
         "tools": wire_tools,
     });
+    if let Some(top_p) = top_p {
+        body["top_p"] = json!(top_p);
+    }
 
     thinking.apply_to_body(&mut body, model);
     body

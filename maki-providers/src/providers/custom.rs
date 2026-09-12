@@ -77,14 +77,21 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
 
     match kind {
         ProviderKind::Anthropic => Ok(Box::new(super::anthropic::Anthropic::with_auth(
-            auth, timeouts,
+            auth,
+            timeouts,
+            maki_config::providers::resolve_top_p(config.get(slug)),
         ))),
         ProviderKind::OpenAi => Ok(Box::new(CustomOpenAiProvider {
             compat: OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, timeouts),
             auth,
             protocol,
+            top_p: maki_config::providers::resolve_top_p(config.get(slug)),
         })),
-        ProviderKind::Google => Ok(Box::new(super::google::Google::with_auth(auth, timeouts))),
+        ProviderKind::Google => Ok(Box::new(super::google::Google::with_auth(
+            auth,
+            timeouts,
+            maki_config::providers::resolve_top_p(config.get(slug)),
+        ))),
         _ => Err(AgentError::Config {
             message: format!(
                 "unsupported protocol for custom provider '{slug}', only openai/anthropic/google are supported"
@@ -269,6 +276,7 @@ struct CustomOpenAiProvider {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
     protocol: Protocol,
+    top_p: Option<f64>,
 }
 
 impl Provider for CustomOpenAiProvider {
@@ -300,6 +308,9 @@ impl Provider for CustomOpenAiProvider {
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
+            if let Some(top_p) = self.top_p {
+                body["top_p"] = serde_json::json!(top_p);
+            }
             if matches!(opts.thinking, ThinkingConfig::Off) {
                 body["thinking"] = serde_json::json!({"type": "disabled"});
             }

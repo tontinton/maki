@@ -245,6 +245,11 @@ fn resolve_anthropic_base_url() -> Option<String> {
     maki_config::providers::resolve_base_url("anthropic", config.get("anthropic"))
 }
 
+fn resolve_anthropic_top_p() -> Option<f64> {
+    let config = maki_config::providers::ProvidersConfig::load();
+    maki_config::providers::resolve_top_p(config.get("anthropic"))
+}
+
 fn resolve_auth_from_key(
     key: &str,
     base_url: Option<String>,
@@ -264,6 +269,7 @@ pub struct Anthropic {
     /// Env / `providers.toml` / inventory default, resolved once at construction.
     /// Reused by key rotation / reload so they do not re-parse providers.toml.
     resolved_base_url: Option<String>,
+    top_p: Option<f64>,
 }
 
 impl Anthropic {
@@ -279,12 +285,14 @@ impl Anthropic {
             system_prefix: None,
             stream_timeout: timeouts.stream,
             resolved_base_url,
+            top_p: resolve_anthropic_top_p(),
         })
     }
 
     pub(crate) fn with_auth(
         auth: Arc<Mutex<super::ResolvedAuth>>,
         timeouts: super::Timeouts,
+        top_p: Option<f64>,
     ) -> Self {
         Self {
             client: super::http_client(timeouts),
@@ -296,6 +304,7 @@ impl Anthropic {
             // anthropic override would make every third-party endpoint look
             // first party and poll `/api/oauth/usage` against it.
             resolved_base_url: None,
+            top_p,
         }
     }
 
@@ -428,6 +437,7 @@ impl Provider for Anthropic {
                 &system_blocks,
                 tools,
                 opts.thinking,
+                self.top_p,
             );
             body["model"] = json!(shared::strip_long_context(&model.id));
             body["stream"] = json!(true);
@@ -646,6 +656,7 @@ mod tests {
         let provider = Anthropic::with_auth(
             Arc::new(Mutex::new(auth)),
             crate::providers::Timeouts::default(),
+            None,
         );
         assert!(provider.resolved_base_url.is_none());
         assert!(!usage_eligible(
