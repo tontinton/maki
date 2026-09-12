@@ -30,6 +30,7 @@ semver = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 smol = { workspace = true }
+futures-timer = { workspace = true }
 strum = { workspace = true }
 event-listener = { workspace = true }
 flume = { workspace = true }
