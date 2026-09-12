@@ -54,6 +54,7 @@ pub struct StatusBarContext<'a> {
     pub restricted: bool,
     pub yolo: bool,
     pub restoring: bool,
+    pub running_jobs: usize,
 }
 
 pub struct StatusBar {
@@ -215,6 +216,14 @@ impl StatusBar {
                 }
                 if ctx.restricted {
                     rest_spans.push(Span::styled(RESTRICTED_LABEL, theme::current().status_dim));
+                }
+                if ctx.running_jobs > 0 {
+                    let jobs = format!(
+                        " {} job{}",
+                        ctx.running_jobs,
+                        if ctx.running_jobs == 1 { "" } else { "s" }
+                    );
+                    rest_spans.push(Span::styled(jobs, theme::current().status_notice));
                 }
                 rest_spans.extend(yolo_span);
 
@@ -385,16 +394,7 @@ mod tests {
     const SIGMA: char = '\u{03a3}';
 
     fn render(global_cost: Option<f64>, show_global: bool, yolo: bool) -> String {
-        render_status(&Status::Idle, global_cost, show_global, yolo)
-    }
-
-    fn render_status(
-        status: &Status,
-        global_cost: Option<f64>,
-        show_global: bool,
-        yolo: bool,
-    ) -> String {
-        draw(&context(status, global_cost, show_global, yolo))
+        draw(&context(&Status::Idle, global_cost, show_global, yolo))
     }
 
     fn draw(ctx: &StatusBarContext<'_>) -> String {
@@ -432,6 +432,7 @@ mod tests {
             restricted: false,
             yolo,
             restoring: false,
+            running_jobs: 0,
         }
     }
 
@@ -483,8 +484,32 @@ mod tests {
             message: "something went wrong".into(),
             since: Instant::now(),
         };
-        let text = render_status(&status, None, false, true);
+        let text = draw(&context(&status, None, false, true));
         assert!(text.contains(YOLO_LABEL.trim()), "{text}");
+    }
+
+    /// The counter sits on the right with the other mode labels, so it has to
+    /// read as a count with correct plural, and stay out of the error arm that
+    /// owns the whole bar. Any session job counts, whatever plugin spawned it.
+    #[test_case(0, false           ; "no_jobs_no_label")]
+    #[test_case(1, true            ; "singular")]
+    #[test_case(3, true            ; "plural")]
+    fn jobs_label_matches_the_running_count(running_jobs: usize, shown: bool) {
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.running_jobs = running_jobs;
+        let text = draw(&ctx);
+        assert_eq!(text.contains("job"), shown, "{text}");
+    }
+
+    #[test]
+    fn plural_jobs_label() {
+        let mut ctx = context(&Status::Idle, None, false, false);
+        ctx.running_jobs = 2;
+        let text = draw(&ctx);
+        assert!(text.contains(" 2 jobs"), "{text}");
+        ctx.running_jobs = 1;
+        let one = draw(&ctx);
+        assert!(one.contains(" 1 job"), "{one}");
     }
 
     #[test_case("/home/user/projects/app", "/home/user", "~/projects/app" ; "inside_home")]

@@ -1858,6 +1858,10 @@ Requires the `run` [plugin permission](#plugin-permissions).
     (default 20, 0 disables, max 1024).
   - `name` (`string?`) handle for `jobfind`, unique among the live jobs this
     plugin can see. Starting a second job under a live name is an error.
+    Also the display name: the session's UI (the /tasks picker, the
+    transcript items, the status-bar count) shows it when present and
+    falls back to the command, so name long-running work even when you
+    never look it up.
 
 **Returns:** (`integer`) Job id.
 

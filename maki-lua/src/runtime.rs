@@ -37,7 +37,7 @@ use maki_storage::id::{MakiId, SessionRef};
 
 use crate::api::autocmd::AutocmdStore;
 use crate::api::create_maki_global;
-use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
+use crate::api::r#fn::{JobEvent, JobOwner, JobStore, JobUiEvent, deliver_job_event};
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
@@ -1351,7 +1351,7 @@ pub(crate) fn active_task(lua: &Lua) -> TaskHandle {
 
 pub(crate) fn with_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
     if lua.app_data_ref::<JobStore>().is_none() {
-        lua.set_app_data(JobStore::new());
+        lua.set_app_data(JobStore::new(None));
     }
     let mut store = lua
         .app_data_mut::<JobStore>()
@@ -1968,6 +1968,7 @@ impl LuaRuntime {
         shutdown: Arc<AtomicBool>,
         bundled_dirs: &'static [&'static Dir<'static>],
         ui_action_tx: Option<flume::Sender<UiAction>>,
+        job_ui_tx: Option<flume::Sender<JobUiEvent>>,
         command_writer: LuaCommandWriter,
         keymap_writer: KeymapWriter,
         hint_writer: HintWriter,
@@ -2001,7 +2002,7 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(CommandHandlerMap::new());
-        lua.set_app_data(JobStore::new());
+        lua.set_app_data(JobStore::new(job_ui_tx));
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
         lua.set_app_data(crate::api::top::NotifyHandler::default());
@@ -3293,6 +3294,7 @@ pub(crate) struct LuaThread {
     pub hint_reader: crate::api::util::command::HintReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub ui_attachment: UiAttachment,
+    pub job_ui_rx: flume::Receiver<JobUiEvent>,
 }
 
 /// Lua lives on its own OS thread (no Send needed). `smol::block_on`
@@ -3310,6 +3312,7 @@ pub fn spawn(
     let shutdown_thread = Arc::clone(&shutdown);
     let (init_tx, init_rx) = flume::bounded::<Result<(), PluginError>>(1);
     let (ui_action_tx, ui_action_rx) = flume::unbounded::<UiAction>();
+    let (job_ui_tx, job_ui_rx) = flume::unbounded::<JobUiEvent>();
     let ui_attachment = UiAttachment::default();
     let ui_attachment_thread = ui_attachment.clone();
     let (command_writer, command_reader) = LuaCommandWriter::new();
@@ -3326,6 +3329,7 @@ pub fn spawn(
                 shutdown_thread,
                 bundled_dirs,
                 Some(ui_action_tx),
+                Some(job_ui_tx),
                 command_writer,
                 keymap_writer,
                 hint_writer,
@@ -3843,6 +3847,7 @@ pub fn spawn(
         hint_reader,
         ui_action_rx,
         ui_attachment,
+        job_ui_rx,
     })
 }
 

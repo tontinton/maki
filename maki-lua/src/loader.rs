@@ -11,6 +11,7 @@ use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 
+use crate::api::r#fn::JobUiEvent;
 use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::util::command::{HintReader, LuaCommandReader, UiAction, UiAttachment};
@@ -946,6 +947,12 @@ impl PluginHost {
 
     pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
         self.inner.ui_action_rx.clone()
+    }
+
+    /// Job lifecycle events for the interactive transcript: the receiver the
+    /// event loop registers, so session jobs surface as monitor chat items.
+    pub fn job_ui_rx(&self) -> flume::Receiver<JobUiEvent> {
+        self.inner.job_ui_rx.clone()
     }
 
     /// The bit every `maki.ui` and `maki.fn` roundtrip consults. The event
