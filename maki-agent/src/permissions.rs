@@ -803,7 +803,14 @@ pub fn scope_matches(pattern: &str, value: &str) -> bool {
         return true;
     }
     if let Some(prefix) = pattern.strip_suffix(" *") {
-        return value == prefix || value.starts_with(&format!("{prefix} "));
+        // The separator between command and arguments can be any whitespace,
+        // not just a space: `rm *` must cover `rm\t-rf /` too.
+        if value == prefix {
+            return true;
+        }
+        return value
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace));
     }
     if let Some(prefix) = pattern.strip_suffix('*') {
         return value.starts_with(prefix);
@@ -977,6 +984,9 @@ mod tests {
     #[test_case("pwd *", "pwd" => true ; "space_star_matches_bare_command")]
     #[test_case("pwd *", "pwd -L" => true ; "space_star_matches_with_args")]
     #[test_case("pwd *", "pwdx" => false ; "space_star_no_partial_token")]
+    #[test_case("rm *", "rm\t-rf /" => true ; "space_star_tab_separator")]
+    #[test_case("rm *", "rm\n-rf /" => true ; "space_star_newline_separator")]
+    #[test_case("rm *", "rm\r-rf /" => true ; "space_star_crlf_separator")]
     #[test_case("src/**", "src/main.rs" => true ; "glob")]
     #[test_case("src/**", "src/deep/nested/file.rs" => true ; "glob_deep_nested")]
     #[test_case("src/**", "src" => true ; "glob_exact_prefix")]
@@ -1405,6 +1415,93 @@ mod tests {
         let mgr = mgr_with(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
         let check = mgr.check(&ToolKey::native("bash"), "rm -rf /tmp; sudo x", None);
         assert!(matches!(check, PermissionCheck::Denied), "got {check:?}");
+    }
+
+    /// The bash plugin emits a block's inner commands as additional scopes, so
+    /// a deny rule reaches a command the loop body runs.
+    #[test]
+    fn deny_rule_reaches_commands_inside_a_block() {
+        let mgr = mgr_with(
+            make_config(vec![deny_rule("sudo *")]),
+            PathBuf::from("/tmp"),
+        );
+        assert!(matches!(
+            mgr.check_multi(
+                &ToolKey::native("bash"),
+                &["while true; do sudo x; done", "true", "sudo x"],
+                false,
+                None,
+            ),
+            PermissionCheck::Denied
+        ));
+    }
+
+    /// The loop's condition is a scope too, so a deny rule on the header
+    /// command denies the whole block, no prompt.
+    #[test]
+    fn deny_rule_reaches_loop_header_command() {
+        let mgr = mgr_with(
+            make_config(vec![deny_rule("true *")]),
+            PathBuf::from("/tmp"),
+        );
+        assert!(matches!(
+            mgr.check_multi(
+                &ToolKey::native("bash"),
+                &["while true; do echo hi; done", "true", "echo hi"],
+                false,
+                None,
+            ),
+            PermissionCheck::Denied
+        ));
+    }
+
+    /// One denied inner scope denies the whole block, even when every other
+    /// scope is allowed.
+    #[test]
+    fn one_denied_inner_scope_denies_whole_block() {
+        let mgr = mgr_with(
+            make_config(vec![
+                allow_rule("true *"),
+                allow_rule("echo *"),
+                deny_rule("sudo *"),
+            ]),
+            PathBuf::from("/tmp"),
+        );
+        assert!(matches!(
+            mgr.check_multi(
+                &ToolKey::native("bash"),
+                &[
+                    "while true; do echo hi && sudo x; done",
+                    "true",
+                    "echo hi",
+                    "sudo x"
+                ],
+                false,
+                None,
+            ),
+            PermissionCheck::Denied
+        ));
+    }
+
+    /// An allow rule on a block's inner command claims just that scope: the
+    /// block scope stays unclaimed, so the loop itself is never approved by it.
+    #[test]
+    fn allow_rule_on_inner_command_does_not_claim_block() {
+        let mgr = mgr_with(
+            make_config(vec![allow_rule("true *"), allow_rule("sudo *")]),
+            PathBuf::from("/tmp"),
+        );
+        match mgr.check_multi(
+            &ToolKey::native("bash"),
+            &["while true; do sudo x; done", "true", "sudo x"],
+            false,
+            None,
+        ) {
+            PermissionCheck::NeedsPrompt { scopes, .. } => {
+                assert_eq!(scopes, vec!["while true; do sudo x; done"]);
+            }
+            other => panic!("expected NeedsPrompt, got {other:?}"),
+        }
     }
 
     #[test]

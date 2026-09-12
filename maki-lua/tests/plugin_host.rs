@@ -5338,8 +5338,8 @@ fn bash_permission_scopes_never_falls_back_to_json(command: &str) {
 )]
 #[test_case::test_case(
     "if [ -f x ]; then rm x; fi",
-    &["if [ -f x ]; then rm x; fi"]
-    ; "block_stays_one_scope"
+    &["if [ -f x ]; then rm x; fi", "[ -f x ]", "rm x"]
+    ; "block_scope_kept_and_inner_commands_added"
 )]
 #[test_case::test_case(
     "cd /tmp && > log",
@@ -5347,6 +5347,173 @@ fn bash_permission_scopes_never_falls_back_to_json(command: &str) {
     ; "bodiless_redirect_is_its_own_scope"
 )]
 fn bash_permission_scopes_split_per_command(command: &str, expected: &[&str]) {
+    let (reg, _host) = builtins_host();
+
+    let input = serde_json::json!({ "command": command });
+    let entry = reg.get("bash").expect("bash registered");
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    let scopes = smol::block_on(inv.permission_scopes()).expect("permission_scopes returned None");
+
+    assert!(!scopes.force_prompt, "command: {command}");
+    assert_eq!(scopes.scopes, expected, "command: {command}");
+}
+
+/// A block stays one scope, but the commands it runs come along as additional
+/// scopes: deny reaches inside, and an allow on one can't claim the block.
+#[test_case::test_case(
+    "for f in *.rs; do wc -l $f; done",
+    &["for f in *.rs; do wc -l $f; done", "wc -l $f"]
+    ; "for_loop_body"
+)]
+#[test_case::test_case(
+    "while true; do sudo x; done",
+    &["while true; do sudo x; done", "true", "sudo x"]
+    ; "while_loop_head_and_body"
+)]
+#[test_case::test_case(
+    "until cargo test; do sleep 1; done",
+    &["until cargo test; do sleep 1; done", "cargo test", "sleep 1"]
+    ; "until_loop_head_and_body"
+)]
+#[test_case::test_case(
+    "case $x in a) rm -rf / ;; esac",
+    &["case $x in a) rm -rf / ;; esac", "rm -rf /"]
+    ; "case_body"
+)]
+#[test_case::test_case(
+    "{ rm -rf ~; }",
+    &["{ rm -rf ~; }", "rm -rf ~"]
+    ; "brace_group_body"
+)]
+#[test_case::test_case(
+    "for ((i=0;i<5;i++)); do rm $i; done",
+    &["for ((i=0;i<5;i++)); do rm $i; done", "rm $i"]
+    ; "c_style_for_body"
+)]
+#[test_case::test_case(
+    "if a; then if b; then c; fi; fi",
+    &["if a; then if b; then c; fi; fi", "a", "b", "c"]
+    ; "nested_blocks"
+)]
+#[test_case::test_case(
+    "while true; do echo hi && sudo x; done",
+    &["while true; do echo hi && sudo x; done", "true", "echo hi", "sudo x"]
+    ; "while_list_body"
+)]
+fn bash_block_scopes_include_inner_commands(command: &str, expected: &[&str]) {
+    let (reg, _host) = builtins_host();
+
+    let input = serde_json::json!({ "command": command });
+    let entry = reg.get("bash").expect("bash registered");
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    let scopes = smol::block_on(inv.permission_scopes()).expect("permission_scopes returned None");
+
+    assert!(!scopes.force_prompt, "command: {command}");
+    assert_eq!(scopes.scopes, expected, "command: {command}");
+}
+
+/// `time`/`nohup`/`env`/`exec`/`stdbuf` wrap a command without changing what
+/// runs, and `!` only inverts the exit status: scope the wrapped command.
+#[test_case::test_case("time cargo test", &["cargo test"] ; "time")]
+#[test_case::test_case("nohup cargo test", &["cargo test"] ; "nohup")]
+#[test_case::test_case("env FOO=1 cargo test", &["FOO=1 cargo test"] ; "env_with_assignment")]
+#[test_case::test_case("exec sudo x", &["sudo x"] ; "exec")]
+#[test_case::test_case("stdbuf -o0 cargo test", &["cargo test"] ; "stdbuf_flags")]
+#[test_case::test_case("stdbuf cargo test", &["cargo test"] ; "stdbuf_bare")]
+#[test_case::test_case("! rm -rf /", &["rm -rf /"] ; "negated")]
+#[test_case::test_case("! time rm -rf /", &["rm -rf /"] ; "negated_then_prefix")]
+#[test_case::test_case("time nohup cargo test", &["cargo test"] ; "chained_prefixes")]
+#[test_case::test_case("rm time", &["rm time"] ; "prefix_word_as_argument")]
+#[test_case::test_case("time", &["time"] ; "bare_prefix_word")]
+fn bash_scopes_unwrap_prefix_commands(command: &str, expected: &[&str]) {
+    let (reg, _host) = builtins_host();
+
+    let input = serde_json::json!({ "command": command });
+    let entry = reg.get("bash").expect("bash registered");
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    let scopes = smol::block_on(inv.permission_scopes()).expect("permission_scopes returned None");
+
+    assert!(!scopes.force_prompt, "command: {command}");
+    assert_eq!(scopes.scopes, expected, "command: {command}");
+}
+
+/// A leading `!` before a compound statement mis-parses in tree-sitter, so it
+/// is stripped before parsing: the negation changes nothing about what runs.
+#[test_case::test_case("! { rm x; }", &["{ rm x; }", "rm x"] ; "negated_brace_group")]
+#[test_case::test_case(
+    "! if a; then rm x; fi",
+    &["if a; then rm x; fi", "a", "rm x"]
+    ; "negated_if"
+)]
+#[test_case::test_case(
+    "! while true; do sudo x; done",
+    &["while true; do sudo x; done", "true", "sudo x"]
+    ; "negated_loop"
+)]
+#[test_case::test_case("! ls | grep x", &["ls", "grep x"] ; "negated_pipeline")]
+fn bash_scopes_strip_leading_negation(command: &str, expected: &[&str]) {
+    let (reg, _host) = builtins_host();
+
+    let input = serde_json::json!({ "command": command });
+    let entry = reg.get("bash").expect("bash registered");
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    let scopes = smol::block_on(inv.permission_scopes()).expect("permission_scopes returned None");
+
+    assert!(!scopes.force_prompt, "command: {command}");
+    assert_eq!(scopes.scopes, expected, "command: {command}");
+}
+
+/// A `!` that is not the command's leading token only wraps a simple command
+/// (a `negated_command`), which `command_scope` already unwraps, so nested
+/// negation of a simple command scopes the wrapped command as usual.
+#[test_case::test_case(
+    "if a; then ! rm x; fi",
+    &["if a; then ! rm x; fi", "a", "rm x"]
+    ; "negated_simple_in_if"
+)]
+fn bash_scopes_nested_negation(command: &str, expected: &[&str]) {
+    let (reg, _host) = builtins_host();
+
+    let input = serde_json::json!({ "command": command });
+    let entry = reg.get("bash").expect("bash registered");
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    let scopes = smol::block_on(inv.permission_scopes()).expect("permission_scopes returned None");
+
+    assert!(!scopes.force_prompt, "command: {command}");
+    assert_eq!(scopes.scopes, expected, "command: {command}");
+}
+
+/// A `!` before a compound statement mis-parses anywhere it begins a pipeline,
+/// so it is stripped before parsing (as it is when leading): the negation
+/// changes nothing about what runs. The scopes reflect the stripped command.
+#[test_case::test_case(
+    "if a; then ! { rm x; }; fi",
+    &["if a; then { rm x; }; fi", "a", "rm x"]
+    ; "negated_compound_in_if"
+)]
+#[test_case::test_case(
+    "a && ! { rm x; }",
+    &["a", "{ rm x; }", "rm x"]
+    ; "negated_compound_in_list"
+)]
+fn bash_scopes_strip_nested_compound_negation(command: &str, expected: &[&str]) {
+    let (reg, _host) = builtins_host();
+
+    let input = serde_json::json!({ "command": command });
+    let entry = reg.get("bash").expect("bash registered");
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    let scopes = smol::block_on(inv.permission_scopes()).expect("permission_scopes returned None");
+
+    assert!(!scopes.force_prompt, "command: {command}");
+    assert_eq!(scopes.scopes, expected, "command: {command}");
+}
+
+/// A `!` that does not negate a compound statement — inside quotes, or an
+/// argument rather than a pipeline head — is left in place: stripping it would
+/// rewrite the command's scope.
+#[test_case::test_case("echo \"a; ! if b\"", &["echo \"a; ! if b\""] ; "in_quotes")]
+#[test_case::test_case("echo ! if", &["echo ! if"] ; "as_argument")]
+fn bash_scopes_leaves_non_negating_bang(command: &str, expected: &[&str]) {
     let (reg, _host) = builtins_host();
 
     let input = serde_json::json!({ "command": command });

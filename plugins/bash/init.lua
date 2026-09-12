@@ -210,20 +210,202 @@ local WALK_THROUGH_TYPES = {
   redirected_statement = true,
 }
 
+-- Block forms: kept as one scope, plus their inner commands as scopes, so a
+-- deny rule reaches inside and an allow on one can't claim the block.
+local BLOCK_TYPES = {
+  if_statement = true,
+  for_statement = true,
+  while_statement = true,
+  c_style_for_statement = true,
+  case_statement = true,
+  compound_statement = true,
+}
+
+-- The smallest command nodes a rule can be about.
+local ATOMIC_COMMAND_TYPES = {
+  command = true,
+  negated_command = true,
+  test_command = true,
+  declaration_command = true,
+  unset_command = true,
+}
+
 local function node_text(node, source)
   return maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
 end
 
--- Anything we don't walk through becomes one scope, its own text. That covers
--- plain commands and the block forms (`if`, `while`, subshells) we deliberately
--- keep whole, plus any node type we never thought of, which is what we want:
--- an unknown node has to end up in front of the user, not get dropped.
-local function collect_commands(node, source)
-  if not WALK_THROUGH_TYPES[node:type()] then
-    local text = node_text(node, source)
-    return text ~= "" and { text } or {}
-  end
+-- `time`/`nohup`/`env`/`exec`/`stdbuf` wrap a command, so scope what runs.
+-- Tried one at a time: the LuaU runtime we ship never matches `|` alternation.
+local PREFIX_WORDS = { "time", "nohup", "env", "exec" }
 
+-- stdbuf's own flags (`-o0`, ...) are not part of the command it runs.
+local function strip_flags(text)
+  while true do
+    local rest = text:match("^%-%S+%s+(.+)$")
+    if rest then
+      text = rest
+    else
+      return text
+    end
+  end
+end
+
+local function unwrap_prefixes(text)
+  while true do
+    local rest
+    for _, p in ipairs(PREFIX_WORDS) do
+      rest = text:match("^" .. p .. "%s+(.+)$")
+      if rest then
+        break
+      end
+    end
+    if rest then
+      text = rest
+    else
+      local body = text:match("^stdbuf%s+(.+)$")
+      if body then
+        text = strip_flags(body)
+      else
+        return text
+      end
+    end
+  end
+end
+
+-- The scope for a command leaf. `!` only inverts the exit status, so scope
+-- the wrapped command, not the negation.
+local function command_scope(node, source)
+  local kind = node:type()
+  if kind == "negated_command" then
+    for child in node:iter_children() do
+      if child:named() and child:type() == "command" then
+        local inner = node_text(child, source)
+        if inner ~= "" then
+          return unwrap_prefixes(inner)
+        end
+      end
+    end
+  end
+  local text = node_text(node, source)
+  if text == "" then
+    return nil
+  end
+  return kind == "command" and unwrap_prefixes(text) or text
+end
+
+-- tree-sitter's `!` only negates a simple command; before a compound statement
+-- it mis-parses into garbage scopes. `!` only inverts the exit status, so drop
+-- any `!` that negates a compound statement, wherever it begins a pipeline
+-- (not just the leading one). A `!` before a simple command is left alone (it
+-- parses as a `negated_command`), and so is a `!` inside quotes or one that
+-- does not start a pipeline (e.g. an argument like `echo ! if`).
+local COMPOUND_KEYWORDS = { "{", "if", "while", "until", "for", "case" }
+local PIPELINE_START_KEYWORDS = { "then", "do", "else", "elif" }
+
+local function at_pipeline_start(command, i)
+  local j = i - 1
+  while j >= 1 and command:sub(j, j):match("%s") do
+    j = j - 1
+  end
+  if j < 1 then
+    return true
+  end
+  local c = command:sub(j, j)
+  if c == ";" or c == "|" or c == "&" or c == "(" or c == "{" then
+    return true
+  end
+  for _, kw in ipairs(PIPELINE_START_KEYWORDS) do
+    local start = j - #kw + 1
+    if start >= 1 and command:sub(start, j) == kw then
+      local before = start > 1 and command:sub(start - 1, start - 1) or ""
+      if before == "" or before:match("%s") then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function strip_compound_negations(command)
+  local out = {}
+  local n = #command
+  local i = 1
+  while i <= n do
+    local c = command:sub(i, i)
+    if c == "'" then
+      out[#out + 1] = c
+      i = i + 1
+      while i <= n and command:sub(i, i) ~= "'" do
+        out[#out + 1] = command:sub(i, i)
+        i = i + 1
+      end
+      if i <= n then
+        out[#out + 1] = command:sub(i, i)
+        i = i + 1
+      end
+    elseif c == '"' then
+      out[#out + 1] = c
+      i = i + 1
+      while i <= n do
+        local q = command:sub(i, i)
+        out[#out + 1] = q
+        if q == "\\" and i < n then
+          out[#out + 1] = command:sub(i + 1, i + 1)
+          i = i + 2
+        else
+          i = i + 1
+          if q == '"' then
+            break
+          end
+        end
+      end
+    elseif c == "!" then
+      local rest = command:sub(i + 1)
+      local ws, after_ws = rest:match("^(%s+)(.*)$")
+      local negates = false
+      if ws and at_pipeline_start(command, i) then
+        for _, kw in ipairs(COMPOUND_KEYWORDS) do
+          if after_ws:sub(1, #kw) == kw then
+            local after = after_ws:sub(#kw + 1, #kw + 1)
+            if after == "" or after:match("^%s$") or after == ";" or after == "(" then
+              negates = true
+              break
+            end
+          end
+        end
+      end
+      if negates then
+        i = i + 1 + #ws
+      else
+        out[#out + 1] = c
+        i = i + 1
+      end
+    else
+      out[#out + 1] = c
+      i = i + 1
+    end
+  end
+  return table.concat(out)
+end
+
+-- Redirects attach to the last command of the chain, the one bash would
+-- actually apply it to. A bodiless `> log` has no such command and becomes a
+-- scope of its own instead of vanishing: it still truncates the file.
+local function attach_redirects(out, redirects)
+  if #redirects == 0 then
+    return
+  end
+  local text = table.concat(redirects, " ")
+  if #out > 0 then
+    out[#out] = out[#out] .. " " .. text
+  else
+    out[1] = text
+  end
+end
+
+-- The shared child walk: named, non-comment children yield their scopes
+-- through {recurse}, redirects are handled by attach_redirects.
+local function walk_children(node, source, recurse)
   local out, redirects = {}, {}
   for child in node:iter_children() do
     local kind = child:type()
@@ -231,22 +413,46 @@ local function collect_commands(node, source)
       if REDIRECT_TYPES[kind] then
         redirects[#redirects + 1] = node_text(child, source)
       else
-        for _, cmd in ipairs(collect_commands(child, source)) do
+        for _, cmd in ipairs(recurse(child, source)) do
           out[#out + 1] = cmd
         end
       end
     end
   end
+  attach_redirects(out, redirects)
+  return out
+end
 
-  -- The redirect belongs to the last command of the chain, the one bash would
-  -- actually apply it to. A bodiless `> log` has no such command and still
-  -- truncates the file, so it becomes a scope of its own instead of vanishing.
-  if #redirects > 0 then
-    local text = table.concat(redirects, " ")
-    if #out > 0 then
-      out[#out] = out[#out] .. " " .. text
-    else
-      out[1] = text
+-- The commands a block runs, through nested pipelines, lists, redirects and
+-- blocks. Non-command words (loop variables, `case` patterns) yield nothing.
+local function inner_commands(node, source)
+  if ATOMIC_COMMAND_TYPES[node:type()] then
+    local scope = command_scope(node, source)
+    return scope and { scope } or {}
+  end
+  return walk_children(node, source, inner_commands)
+end
+
+-- Anything we don't walk through becomes a scope of its own text, so an
+-- unknown node reaches the user instead of getting dropped. Blocks add their
+-- inner commands as scopes too.
+local function collect_commands(node, source)
+  if WALK_THROUGH_TYPES[node:type()] then
+    return walk_children(node, source, collect_commands)
+  end
+
+  local scope = command_scope(node, source)
+  if scope == nil then
+    return {}
+  end
+  local out = { scope }
+  if BLOCK_TYPES[node:type()] then
+    local seen = {}
+    for _, inner in ipairs(inner_commands(node, source)) do
+      if not seen[inner] then
+        seen[inner] = true
+        out[#out + 1] = inner
+      end
     end
   end
   return out
@@ -296,7 +502,11 @@ maki.api.register_tool({
       return nil
     end
 
-    local parser = maki.treesitter.get_parser(command, "bash")
+    -- A `!` mis-parses the compound statement it negates, so drop such
+    -- negations before parsing: they change nothing about what runs.
+    local parse = strip_compound_negations(command)
+
+    local parser = maki.treesitter.get_parser(parse, "bash")
     if not parser then
       return { scopes = { command }, force_prompt = true }
     end
@@ -306,7 +516,7 @@ maki.api.register_tool({
       return { scopes = { command }, force_prompt = true }
     end
 
-    local segments = collect_commands(root, command)
+    local segments = collect_commands(root, parse)
     if #segments == 0 then
       segments = { command }
     end
