@@ -494,6 +494,7 @@ pub enum UiAction {
     },
     Flash(String),
     SetWindowTitle(String),
+    InsertInput(String),
     OpenEditor {
         path: PathBuf,
         reply_tx: flume::Sender<i32>,

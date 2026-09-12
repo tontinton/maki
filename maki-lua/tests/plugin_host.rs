@@ -3972,6 +3972,34 @@ fn register_command_nargs_values(nargs_field: &str) -> usize {
     host.command_reader().load().commands[0].max_args
 }
 
+#[test]
+fn command_handler_can_insert_prompt_text() {
+    const MARKER: &str = "$skill:beads ";
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        &format!(
+            r#"
+        maki.api.register_command({{
+            name = "/mention",
+            handler = function()
+                maki.ui.insert_input("{MARKER}")
+            end,
+        }})
+        "#
+        ),
+    )
+    .unwrap();
+    let rx = host.ui_action_rx();
+    host.event_handle()
+        .run_command(Arc::from("p"), Arc::from("/mention"), String::new(), 0);
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("command handler did not run");
+    assert!(matches!(action, maki_lua::UiAction::InsertInput(text) if text == MARKER));
+}
+
 #[test_case::test_case("a  b c", "a  b c|a,b,c" ; "raw_text_and_split_list")]
 #[test_case::test_case("", "|" ; "empty_args")]
 fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
