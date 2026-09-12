@@ -1,6 +1,8 @@
 local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
+local build_picker_items = helpers.build_picker_items
+local build_skill_marker = helpers.build_skill_marker
 
 local failures = {}
 
@@ -100,6 +102,25 @@ case("build_skill_list_sorted_alphabetically", function()
   local zebra_pos = result:find("zebra")
   assert(alpha_pos < middle_pos, "alpha should come before middle")
   assert(middle_pos < zebra_pos, "middle should come before zebra")
+end)
+
+case("build_picker_items_sorted_with_description_as_detail", function()
+  local items = build_picker_items({
+    z = { name = "zebra", description = "Z skill" },
+    a = { name = "alpha", description = "A skill" },
+    x = { name = "xray", description = "" },
+  })
+  eq(items[1].label, "alpha")
+  eq(items[1].detail, "A skill")
+  eq(items[2].label, "xray")
+  eq(items[2].detail, nil)
+  eq(items[3].label, "zebra")
+end)
+
+-- The prefix has to stay in step with SKILL_MARKER_PREFIX in maki-ui, or the
+-- inserted marker renders as plain text.
+case("build_skill_marker", function()
+  eq(build_skill_marker("release"), "$skill:release ")
 end)
 
 -- ── builtin plugin_dev skill ──

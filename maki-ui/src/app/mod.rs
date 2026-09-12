@@ -392,6 +392,18 @@ impl App {
         self.active_chat == 0
     }
 
+    /// Lua keymaps are dispatched before `handle_key` checks the active chat, so
+    /// a plugin can ask for this while a subagent chat is up, where the input box
+    /// is not even drawn. Dropping the text beats parking it out of sight.
+    pub(crate) fn insert_into_prompt(&mut self, text: &str) {
+        if !self.is_main_chat() {
+            return;
+        }
+        if let InputAction::PaletteSync(val) = self.input_box.handle_paste_with_spaces(text) {
+            self.command_palette.sync(&val);
+        }
+    }
+
     fn plan_form_active(&self) -> bool {
         self.state.mode == Mode::Plan && self.plan_form.is_visible()
     }
@@ -720,11 +732,7 @@ impl App {
                 FilePickerModalAction::Consumed => vec![],
                 FilePickerModalAction::Select(path) => {
                     self.file_picker.close();
-                    if let InputAction::PaletteSync(val) =
-                        self.input_box.handle_paste_with_spaces(&path)
-                    {
-                        self.command_palette.sync(&val);
-                    }
+                    self.insert_into_prompt(&path);
                     vec![]
                 }
                 FilePickerModalAction::Close => {

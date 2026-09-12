@@ -926,6 +926,9 @@ impl<'t> EventLoop<'t> {
                     warn!(%error, "failed to set window title");
                 }
             }
+            UiAction::InsertInput(text) => {
+                self.focused_app().insert_into_prompt(&text);
+            }
             UiAction::OpenEditor { path, reply_tx } => {
                 let code = self.open_editor(self.focused, &path);
                 let _ = reply_tx.send(code);
