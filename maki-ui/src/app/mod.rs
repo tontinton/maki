@@ -64,8 +64,8 @@ use maki_agent::{
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader,
-    PackCommand, PackPreparation, WinView,
+    BuiltinAction, EventHandle, HintReader, HintSnapshot, JobUiEvent, KeymapReader,
+    LuaCommandReader, PackCommand, PackPreparation, WinView,
 };
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
@@ -386,6 +386,12 @@ impl App {
 
     pub(crate) fn main_chat(&mut self) -> &mut Chat {
         &mut self.chats[0]
+    }
+
+    /// A job of this session spawned or exited; the event loop only routes
+    /// events for the owning session, so no filtering happens here.
+    pub(crate) fn handle_job_event(&mut self, event: &JobUiEvent) {
+        self.main_chat().apply_job_event(event);
     }
 
     fn is_main_chat(&self) -> bool {

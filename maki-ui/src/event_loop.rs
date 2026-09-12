@@ -30,7 +30,7 @@ use maki_lua::session_snapshot::{
     SessionSnapshot,
 };
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, PackCommand,
+    EventHandle, HintReader, JobUiEvent, KeymapReader, LuaCommandReader, ModelRequest, PackCommand,
     PackPreparation, SessionEndReason, SessionRequest, TaskRequest, UiAction, UiAttachment,
     UiReply,
 };
@@ -103,6 +103,7 @@ pub struct EventLoopParams {
     pub hint_reader: HintReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub ui_attachment: UiAttachment,
+    pub job_ui_rx: flume::Receiver<JobUiEvent>,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
     pub project_config: ProjectConfig,
@@ -455,6 +456,7 @@ pub(crate) struct EventLoop<'t> {
     warn_tx: flume::Sender<String>,
     ui_action_rx: flume::Receiver<UiAction>,
     ui_attachment: UiAttachment,
+    job_ui_rx: flume::Receiver<JobUiEvent>,
     pack_tx: flume::Sender<Box<PackPreparation>>,
     pack_rx: flume::Receiver<Box<PackPreparation>>,
     /// One package command at a time. The work runs on its own thread, so
@@ -474,6 +476,7 @@ enum Wake {
     Shell(usize, ShellEvent),
     Warn(String),
     Pack(Box<PackPreparation>),
+    Job(Box<JobUiEvent>),
 }
 
 struct BackgroundModels {
@@ -576,6 +579,7 @@ impl<'t> EventLoop<'t> {
             hint_reader,
             ui_action_rx,
             ui_attachment,
+            job_ui_rx,
             lua_event_handle,
             model_policy,
             project_config,
@@ -681,6 +685,7 @@ impl<'t> EventLoop<'t> {
             warn_tx: bg.warn_tx,
             ui_action_rx,
             ui_attachment,
+            job_ui_rx,
             pack_tx,
             pack_rx,
             pack_running: false,
@@ -790,6 +795,11 @@ impl<'t> EventLoop<'t> {
         }
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
         sel = sel.recv(&self.pack_rx, |res| res.ok().map(Wake::Pack));
+        if !self.job_ui_rx.is_disconnected() {
+            sel = sel.recv(&self.job_ui_rx, |res| {
+                res.ok().map(|ev| Wake::Job(Box::new(ev)))
+            });
+        }
         for (i, rt) in self.sessions.iter().enumerate() {
             if !rt.handles.agent_rx.is_disconnected() {
                 sel = sel.recv(&rt.handles.agent_rx, move |res| {
@@ -812,6 +822,16 @@ impl<'t> EventLoop<'t> {
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Pack(preparation) => self.finish_pack(*preparation),
+            Wake::Job(event) => {
+                let session = event.session_id();
+                if let Some(rt) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|rt| rt.app.state.session.id == session)
+                {
+                    rt.app.handle_job_event(&event);
+                }
+            }
         }
         Ok(())
     }

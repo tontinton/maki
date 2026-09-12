@@ -13,9 +13,11 @@ use crate::markdown::truncate_output;
 
 use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
-use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use maki_agent::{
+    AgentEvent, BufferSnapshot, TextOutput, ToolDoneEvent, ToolOutput, ToolStartEvent,
+};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
-use maki_lua::WinView;
+use maki_lua::{JobUiEvent, WinView};
 use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
 use maki_storage::id::MakiId;
 use ratatui::Frame;
@@ -30,6 +32,10 @@ pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
 /// One notice per streak: a wedged model can spend twenty nudges, and twenty
 /// identical bubbles bury the conversation they are about.
 const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
+const JOB_TOOL_NAME: &str = "job";
+const JOB_TOOL_ID_PREFIX: &str = "job-";
+const JOB_EXITED_TEXT: &str = "exited";
+const JOB_FAILED_TEXT: &str = "failed";
 
 pub enum ChatEventResult {
     Continue,
@@ -395,6 +401,43 @@ impl Chat {
         self.messages_panel.update_tool_summary(tool_id, summary);
     }
 
+    /// Session jobs (monitors) surface in the transcript as tool-shaped
+    /// items: a spinner on spawn, a terminal status once the process exits.
+    pub(crate) fn apply_job_event(&mut self, event: &JobUiEvent) {
+        match event {
+            JobUiEvent::Started {
+                job_id,
+                name,
+                command,
+                ..
+            } => {
+                self.messages_panel.tool_start(ToolStartEvent {
+                    id: job_tool_id(*job_id),
+                    tool: Arc::from(JOB_TOOL_NAME),
+                    summary: name.clone().unwrap_or_else(|| command.clone()),
+                    render_header: None,
+                    annotation: None,
+                    input: None,
+                    raw_input: None,
+                    output: None,
+                });
+            }
+            JobUiEvent::Exited { job_id, code, .. } => {
+                let id = job_tool_id(*job_id);
+                self.messages_panel
+                    .update_tool_summary(&id, &job_exit_summary(*code));
+                self.messages_panel.tool_done(ToolDoneEvent {
+                    id,
+                    tool: Arc::from(JOB_TOOL_NAME),
+                    output: Arc::new(ToolOutput::Plain(TextOutput::from(String::new()))),
+                    is_error: *code != 0,
+                    annotation: None,
+                    written_path: None,
+                });
+            }
+        }
+    }
+
     pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
         self.messages_panel.update_tool_model(tool_id, model);
     }
@@ -709,6 +752,19 @@ fn user_images(msg: &Message) -> Vec<ImageSource> {
         .collect()
 }
 
+fn job_tool_id(job_id: u32) -> String {
+    format!("{JOB_TOOL_ID_PREFIX}{job_id}")
+}
+
+fn job_exit_summary(code: i32) -> String {
+    let verb = if code == 0 {
+        JOB_EXITED_TEXT
+    } else {
+        JOB_FAILED_TEXT
+    };
+    format!("{verb} (code {code})")
+}
+
 fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
     let mut map = HashMap::new();
     for msg in messages {
@@ -908,6 +964,11 @@ mod tests {
     const TASK_ID: &str = "toolu_01";
     const USER_TEXT: &str = "one more thing";
     const REPLY_TEXT: &str = "on it";
+    const TEST_JOB_PLUGIN: &str = "test-plugin";
+    const TEST_JOB_NAME: &str = "watcher";
+    const TEST_JOB_COMMAND: &str = "sleep 30";
+    const JOB_ITEM_MISSING: &str = "the job item must be a tool-shaped message";
+    const JOB_SUMMARY_TEXT: &str = "the running item summarizes the job by name";
 
     fn chat() -> Chat {
         Chat::new(
@@ -1466,5 +1527,74 @@ mod tests {
         assert!(sub.is_finished());
         assert_eq!(sub.task_status(), TaskStatus::Error);
         assert_eq!(sub.task_id().map(|id| &**id), Some(TASK_ID));
+    }
+
+    fn job_started_event(session: MakiId, job_id: u32) -> JobUiEvent {
+        JobUiEvent::Started {
+            job_id,
+            session,
+            plugin: Arc::from(TEST_JOB_PLUGIN),
+            name: Some(TEST_JOB_NAME.into()),
+            command: TEST_JOB_COMMAND.into(),
+        }
+    }
+
+    fn job_exited_event(session: MakiId, job_id: u32, code: i32) -> JobUiEvent {
+        JobUiEvent::Exited {
+            job_id,
+            session,
+            plugin: Arc::from(TEST_JOB_PLUGIN),
+            code,
+        }
+    }
+
+    fn job_item_status(chat: &Chat) -> (ToolStatus, String) {
+        let msg = chat.message_at(0).expect("job item exists");
+        match &msg.role {
+            DisplayRole::Tool(t) => (t.status, msg.text.clone()),
+            _ => panic!("{JOB_ITEM_MISSING}"),
+        }
+    }
+
+    #[test]
+    fn job_start_appends_running_monitor_item() {
+        let mut chat = chat();
+        chat.apply_job_event(&job_started_event(MakiId::generate(), 7));
+
+        let (status, text) = job_item_status(&chat);
+        assert_eq!(status, ToolStatus::InProgress);
+        assert_eq!(text, TEST_JOB_NAME, "{JOB_SUMMARY_TEXT}");
+    }
+
+    #[test]
+    fn job_exit_updates_item_with_exit_code() {
+        let session = MakiId::generate();
+        let mut chat = chat();
+        chat.apply_job_event(&job_started_event(session, 7));
+        chat.apply_job_event(&job_exited_event(session, 7, 0));
+
+        let (status, text) = job_item_status(&chat);
+        assert_eq!(status, ToolStatus::Success);
+        assert_eq!(text, format!("{JOB_EXITED_TEXT} (code 0)"));
+    }
+
+    #[test]
+    fn job_nonzero_exit_marks_item_failed() {
+        const EXIT_CODE: i32 = 2;
+        let session = MakiId::generate();
+        let mut chat = chat();
+        chat.apply_job_event(&job_started_event(session, 7));
+        chat.apply_job_event(&job_exited_event(session, 7, EXIT_CODE));
+
+        let (status, text) = job_item_status(&chat);
+        assert_eq!(status, ToolStatus::Error);
+        assert_eq!(text, format!("{JOB_FAILED_TEXT} (code {EXIT_CODE})"));
+    }
+
+    #[test]
+    fn job_exit_without_start_is_ignored() {
+        let mut chat = chat();
+        chat.apply_job_event(&job_exited_event(MakiId::generate(), 9, 0));
+        assert_eq!(chat.message_count(), 0);
     }
 }

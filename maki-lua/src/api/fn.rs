@@ -36,8 +36,37 @@ const JOB_NOT_FOUND_ERR: &str = "job: not found";
 const BLANK_NAME_ERR: &str = "jobstart: name must be non-blank";
 const EMPTY_ARGV_ERR: &str = "jobstart: argv table must not be empty";
 const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv table";
+/// The wait thread reports unreapable children as -1; a killed job reuses it.
+const JOB_KILLED_EXIT_CODE: i32 = -1;
 
-#[derive(Clone)]
+/// Job lifecycle pushed to the interactive UI so monitors show up in the
+/// transcript. Only [`JobOwner::Session`] jobs produce these; task and plugin
+/// jobs are transient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobUiEvent {
+    Started {
+        job_id: u32,
+        session: MakiId,
+        plugin: Arc<str>,
+        name: Option<String>,
+        command: String,
+    },
+    Exited {
+        job_id: u32,
+        session: MakiId,
+        plugin: Arc<str>,
+        code: i32,
+    },
+}
+
+impl JobUiEvent {
+    pub fn session_id(&self) -> MakiId {
+        match self {
+            Self::Started { session, .. } | Self::Exited { session, .. } => *session,
+        }
+    }
+}
+
 pub(crate) enum JobEvent {
     Stdout(String),
     Stderr(String),
@@ -215,6 +244,31 @@ impl JobMeta {
     fn has_pending(&self) -> bool {
         self.replay_exit.is_some() || self.event_rx.as_ref().is_some_and(|rx| !rx.is_empty())
     }
+
+    fn ui_started(&self, job_id: u32) -> Option<JobUiEvent> {
+        let JobOwner::Session { session, plugin } = &self.owner else {
+            return None;
+        };
+        Some(JobUiEvent::Started {
+            job_id,
+            session: *session,
+            plugin: Arc::clone(plugin),
+            name: self.name.clone(),
+            command: self.command.clone(),
+        })
+    }
+
+    fn ui_exit(&self, job_id: u32, code: i32) -> Option<JobUiEvent> {
+        let JobOwner::Session { session, plugin } = &self.owner else {
+            return None;
+        };
+        Some(JobUiEvent::Exited {
+            job_id,
+            session: *session,
+            plugin: Arc::clone(plugin),
+            code,
+        })
+    }
 }
 
 /// What a `jobattach` opts table says about one callback slot.
@@ -246,9 +300,8 @@ pub(crate) struct CallbackUpdates {
 pub(crate) struct JobStore {
     jobs: HashMap<u32, JobMeta>,
     next_id: u32,
-    /// Id served by the last [`JobStore::next_matching`], so the next scan
-    /// starts past it.
     scan_cursor: u32,
+    ui_tx: Option<flume::Sender<JobUiEvent>>,
 }
 
 struct CheckedOutReceiver {
@@ -258,11 +311,12 @@ struct CheckedOutReceiver {
 }
 
 impl JobStore {
-    pub fn new() -> Self {
+    pub fn new(ui_tx: Option<flume::Sender<JobUiEvent>>) -> Self {
         Self {
             jobs: HashMap::new(),
             next_id: 1,
             scan_cursor: 0,
+            ui_tx,
         }
     }
 
@@ -390,6 +444,12 @@ impl JobStore {
             },
         );
 
+        if let Some(job) = self.jobs.get(&id)
+            && let Some(event) = job.ui_started(id)
+        {
+            self.emit_ui(event);
+        }
+
         Ok(id)
     }
 
@@ -498,8 +558,12 @@ impl JobStore {
         }
         job.exit_code = Some(code);
         job.elapsed_secs = Some(job.started.elapsed().as_secs());
+        let ui_event = job.ui_exit(job_id, code);
         let session_plugin = job.session_plugin().cloned();
         drop_callbacks(lua, job);
+        if let Some(event) = ui_event {
+            self.emit_ui(event);
+        }
         match session_plugin {
             Some(plugin) => self.evict_completed(lua, &plugin),
             None => self.finish(lua, job_id),
@@ -661,6 +725,13 @@ impl JobStore {
             if kill {
                 kill_job(&job);
             }
+            // A killed or forgotten job never runs [`Self::complete`], so the
+            // UI item would spin forever; already-booked exits were reported.
+            if job.exit_code.is_none()
+                && let Some(event) = job.ui_exit(job_id, JOB_KILLED_EXIT_CODE)
+            {
+                self.emit_ui(event);
+            }
             for key in [job.on_stdout, job.on_stderr, job.on_exit]
                 .into_iter()
                 .flatten()
@@ -673,6 +744,12 @@ impl JobStore {
     fn kill_all(&self) {
         for job in self.jobs.values() {
             kill_job(job);
+        }
+    }
+
+    fn emit_ui(&self, event: JobUiEvent) {
+        if let Some(tx) = &self.ui_tx {
+            let _ = tx.try_send(event);
         }
     }
 }
@@ -1423,6 +1500,7 @@ mod tests {
     const EXIT_WITHOUT_REAP: &str =
         "an exit event must mean the child was reaped, or a later kill can signal a recycled pid";
     const NEVER_EXITED: &str = "job never reported its exit";
+    const TEST_JOB_NAME: &str = "watcher";
 
     /// Pull events until {id} reports its exit, so assertions run against a
     /// job that is certainly done.
@@ -1448,7 +1526,7 @@ mod tests {
     }
 
     fn make_store() -> JobStore {
-        JobStore::new()
+        JobStore::new(None)
     }
 
     fn task_owner(id: u64) -> JobOwner {
@@ -1802,7 +1880,7 @@ mod tests {
     #[test]
     fn exit_cleanup_runs_before_a_failing_callback() {
         let lua = Lua::new();
-        lua.set_app_data(JobStore::new());
+        lua.set_app_data(JobStore::new(None));
         let callback = lua
             .create_function(|_, ()| Err::<(), _>(mlua::Error::runtime("callback failed")))
             .unwrap();
@@ -2344,5 +2422,74 @@ mod tests {
             "exited session job must stay listed"
         );
         store.kill_session(&lua, session);
+    }
+
+    fn make_ui_store() -> (JobStore, flume::Receiver<JobUiEvent>) {
+        let (tx, rx) = flume::unbounded();
+        (JobStore::new(Some(tx)), rx)
+    }
+
+    fn ui_started(store: &mut JobStore, session: MakiId) -> u32 {
+        let mut spec = JobSpec::new(session_owner(session), "echo hi");
+        spec.name = Some(TEST_JOB_NAME.into());
+        store.start(spec).unwrap()
+    }
+
+    #[test]
+    fn session_job_reports_started_and_exited_to_ui() {
+        let lua = Lua::new();
+        let (mut store, ui_rx) = make_ui_store();
+        let session = MakiId::generate();
+
+        let id = ui_started(&mut store, session);
+        assert_eq!(
+            ui_rx.try_recv().unwrap(),
+            JobUiEvent::Started {
+                job_id: id,
+                session,
+                plugin: Arc::from(TEST_PLUGIN),
+                name: Some(TEST_JOB_NAME.into()),
+                command: "echo hi".into(),
+            }
+        );
+
+        store.complete(&lua, id, 3);
+        assert_eq!(
+            ui_rx.try_recv().unwrap(),
+            JobUiEvent::Exited {
+                job_id: id,
+                session,
+                plugin: Arc::from(TEST_PLUGIN),
+                code: 3,
+            }
+        );
+        assert!(ui_rx.try_recv().is_err(), "exit must be reported once");
+    }
+
+    #[test]
+    fn transient_jobs_never_report_to_ui() {
+        let (mut store, ui_rx) = make_ui_store();
+        start_echo(&mut store);
+        assert!(ui_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn killed_session_job_reports_exit_without_complete() {
+        let lua = Lua::new();
+        let (mut store, ui_rx) = make_ui_store();
+        let session = MakiId::generate();
+        let id = ui_started(&mut store, session);
+        let _ = ui_rx.try_recv();
+
+        store.remove(&lua, id, true);
+        assert_eq!(
+            ui_rx.try_recv().unwrap(),
+            JobUiEvent::Exited {
+                job_id: id,
+                session,
+                plugin: Arc::from(TEST_PLUGIN),
+                code: JOB_KILLED_EXIT_CODE,
+            }
+        );
     }
 }
