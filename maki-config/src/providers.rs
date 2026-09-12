@@ -8,6 +8,8 @@ use std::str::FromStr;
 use tracing::debug;
 
 use maki_storage::paths;
+use maki_storage::sessions::Effort;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 const PROVIDERS_FILE: &str = "providers.toml";
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
@@ -42,6 +44,10 @@ pub struct ModelDef {
     pub supports_thinking: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_thinking: Option<bool>,
+    /// Per-model thinking fragments, typed so a typo'd level key fails the
+    /// whole `providers.toml` parse (exit 2) instead of silently dropping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_fields: Option<ThinkingFields>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,6 +75,62 @@ impl ModelDef {
 
     pub fn has_fast_pricing(&self) -> bool {
         self.pricing_fast_input.is_some() || self.pricing_fast_output.is_some()
+    }
+}
+
+/// How one model spells thinking on the wire: each mode carries the JSON
+/// fragment merged into the request body, so any shape a chat template needs
+/// works without a schema per provider. Typed (not `Value`) so a typo'd level
+/// key fails the `providers.toml` parse instead of silently dropping.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ThinkingFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub off: Option<JsonMap<String, JsonValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive: Option<JsonMap<String, JsonValue>>,
+    /// Keyed by [`Effort`]; the declared keys are the levels the model accepts.
+    #[serde(flatten)]
+    pub levels: BTreeMap<Effort, JsonMap<String, JsonValue>>,
+}
+
+/// Provider-agnostic thinking request, so [`ThinkingFields::fragment`] can
+/// live next to the config type instead of depending on maki-providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingRequest {
+    Off,
+    Adaptive,
+    Effort(Effort),
+    Budget(u32),
+}
+
+impl ThinkingFields {
+    /// Levels snap to the declared ones, so a level the model never advertised
+    /// is never sent. `Off`/`Adaptive` need explicit keys and never snap. A
+    /// token budget picks the level it corresponds to; models that declare no
+    /// levels fall back to `adaptive` and keep the count (the returned flag
+    /// tells the caller to still send the budget field).
+    pub fn fragment(
+        &self,
+        thinking: ThinkingRequest,
+        max: Option<u32>,
+    ) -> Option<(&JsonMap<String, JsonValue>, bool)> {
+        const FALLBACK_MAX: u32 = 32_768;
+        let level = match thinking {
+            ThinkingRequest::Off => return self.off.as_ref().map(|f| (f, false)),
+            ThinkingRequest::Adaptive => return self.adaptive.as_ref().map(|f| (f, false)),
+            ThinkingRequest::Effort(level) => level,
+            ThinkingRequest::Budget(n) => {
+                if self.levels.is_empty() {
+                    return self.adaptive.as_ref().map(|f| (f, true));
+                }
+                Effort::from_budget(n, max.unwrap_or(FALLBACK_MAX))
+            }
+        };
+        let declared: Vec<Effort> = self.levels.keys().copied().collect();
+        self.levels
+            .get(&level.snap(&declared))
+            .or(self.adaptive.as_ref())
+            .map(|f| (f, false))
     }
 }
 
@@ -357,7 +419,13 @@ pub fn resolve_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String>
 /// built-ins keep their compiled protocol, model catalog and auth wiring.
 /// Callers decide what counts as built-in (the inventory misses the `opencode`
 /// slugs) and when to report it.
+///
+/// The `ollama` and `llama-cpp` slugs are exempt for thinking keys only:
+/// per-model `supports_thinking` / `requires_thinking` / `thinking_fields`
+/// overlay onto the builtin instead of being ignored, so an `OLLAMA_HOST`
+/// setup gets the same thinking behavior as a file-configured one.
 pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str> {
+    const LOCAL_SLUGS: [&str; 2] = ["ollama", "llama-cpp"];
     let mut ignored = Vec::new();
     if def.protocol.is_some() {
         ignored.push("protocol");
@@ -368,7 +436,7 @@ pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str
     if def.discover_models {
         ignored.push("discover_models");
     }
-    if !def.models.is_empty() {
+    if !def.models.is_empty() && !LOCAL_SLUGS.contains(&slug) {
         ignored.push("models");
     }
     if def.enable_free_models.is_some() && slug != OPENCODE_SLUG {
@@ -619,6 +687,32 @@ tier = "{input}"
         assert_eq!(
             ignored_builtin_fields("openrouter", &def),
             ["enable_free_models"]
+        );
+    }
+
+    #[test]
+    fn ignored_builtin_fields_exempts_ollama_thinking_models() {
+        let def: ProviderDef = toml::from_str(
+            r#"models = [{ id = "qwen", thinking_fields = { high = { reasoning_effort = "xhigh" } } }]"#,
+        )
+        .unwrap();
+        assert!(ignored_builtin_fields("ollama", &def).is_empty());
+        assert!(ignored_builtin_fields("llama-cpp", &def).is_empty());
+        assert_eq!(ignored_builtin_fields("anthropic", &def), ["models"]);
+    }
+
+    const BAD_FIELDS_MSG: &str = "unknown thinking level";
+    const GOOD_FIELDS_TOML: &str =
+        r#"models = [{ id = "m", thinking_fields = { high = { reasoning_effort = "xhigh" } } }]"#;
+    const BAD_FIELDS_TOML: &str =
+        r#"models = [{ id = "m", thinking_fields = { hight = { reasoning_effort = "xhigh" } } }]"#;
+
+    #[test]
+    fn thinking_fields_typo_fails_parse() {
+        assert!(toml::from_str::<ProviderDef>(GOOD_FIELDS_TOML).is_ok());
+        assert!(
+            toml::from_str::<ProviderDef>(BAD_FIELDS_TOML).is_err(),
+            "{BAD_FIELDS_MSG}"
         );
     }
 

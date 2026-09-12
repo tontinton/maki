@@ -15,7 +15,6 @@ use crate::manifest::ManifestRegistry;
 use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
-use crate::types::ThinkingConfig;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
@@ -121,12 +120,15 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         .or_else(|| discovered.and_then(|d| d.context_window))
         .unwrap_or_else(|| kind.fallback_context_window());
     let supports_tool_examples_override = declared.and_then(|m| m.supports_tool_examples);
+    // No manifest fallback: a custom `openai` entry speaks for itself, so a
+    // plain gateway stays silent instead of inheriting `openai`'s thinking.
     let thinking_override = ThinkingSupport::from_flags(
-        declared
-            .and_then(|m| m.supports_thinking)
-            .or_else(|| ManifestRegistry::get(&kind.to_string()).map(|m| m.supports_thinking)),
+        declared.and_then(|m| m.supports_thinking),
         declared.and_then(|m| m.requires_thinking).unwrap_or(false),
     );
+    let thinking_fields = declared
+        .and_then(|m| m.thinking_fields.clone())
+        .map(Box::new);
     let supports_vision_override = declared.and_then(|m| m.supports_vision);
     let pricing = declared
         .filter(|m| m.has_pricing())
@@ -157,7 +159,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         max_output_tokens,
         turn_output_tokens: None,
         context_window,
-        thinking_fields: None,
+        thinking_fields,
     }
 }
 
@@ -300,9 +302,7 @@ impl Provider for CustomOpenAiProvider {
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
-            if matches!(opts.thinking, ThinkingConfig::Off) {
-                body["thinking"] = serde_json::json!({"type": "disabled"});
-            }
+            opts.thinking.apply_custom_thinking(&mut body, model);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
@@ -386,5 +386,59 @@ mod tests {
         overlay_declared_tiers(&def, &mut models);
         assert_eq!(models[0].tier, Some(ModelTier::Strong));
         assert_eq!(models[1].tier, None);
+    }
+
+    #[test]
+    fn plain_gateway_model_carries_no_thinking() {
+        let model = model_from_def(
+            &openai_def("plain"),
+            ProviderKind::OpenAi,
+            "plain-gw",
+            "plain",
+        );
+        assert!(model.thinking_fields.is_none());
+        assert!(!model.supports_thinking());
+        let mut body = serde_json::json!({"model": "plain"});
+        RequestOptions {
+            thinking: crate::types::ThinkingConfig::Effort(maki_storage::sessions::Effort::High),
+            fast: false,
+        }
+        .thinking
+        .apply_custom_thinking(&mut body, &model);
+        assert_eq!(body, serde_json::json!({"model": "plain"}));
+    }
+
+    #[test]
+    fn declared_fields_merge_onto_custom_body() {
+        let def: ProviderDef = serde_json::from_str(
+            r#"{"protocol":"openai","models":[{"id":"m","thinking_fields":{"high":{"reasoning_effort":"xhigh"}}}]}"#,
+        )
+        .unwrap();
+        let model = model_from_def(&def, ProviderKind::OpenAi, "custom-fields", "m");
+        let mut body = serde_json::json!({"model": "m"});
+        RequestOptions {
+            thinking: crate::types::ThinkingConfig::Effort(maki_storage::sessions::Effort::High),
+            fast: false,
+        }
+        .thinking
+        .apply_custom_thinking(&mut body, &model);
+        assert_eq!(body["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn partial_fields_go_quiet_on_undeclared_modes() {
+        let def: ProviderDef = serde_json::from_str(
+            r#"{"protocol":"openai","models":[{"id":"m","thinking_fields":{"high":{"reasoning_effort":"xhigh"}}}]}"#,
+        )
+        .unwrap();
+        let model = model_from_def(&def, ProviderKind::OpenAi, "custom-partial", "m");
+        let mut body = serde_json::json!({"model": "m"});
+        RequestOptions {
+            thinking: crate::types::ThinkingConfig::Off,
+            fast: false,
+        }
+        .thinking
+        .apply_custom_thinking(&mut body, &model);
+        assert_eq!(body, serde_json::json!({"model": "m"}));
     }
 }
