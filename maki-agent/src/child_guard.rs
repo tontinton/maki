@@ -112,12 +112,7 @@ mod tests {
     fn spawn_sleep() -> Child {
         let mut std_cmd = std::process::Command::new("sleep");
         std_cmd.arg("60");
-        unsafe {
-            std_cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
+        std_cmd.process_group(0);
         let mut cmd: async_process::Command = std_cmd.into();
         cmd.spawn().expect("failed to spawn sleep")
     }
