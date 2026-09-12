@@ -15,7 +15,7 @@ use crate::manifest::ManifestRegistry;
 use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
-use crate::types::ThinkingConfig;
+use crate::types::{ThinkingConfig, dialect};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
@@ -269,6 +269,21 @@ struct CustomOpenAiProvider {
     protocol: Protocol,
 }
 
+impl CustomOpenAiProvider {
+    fn build_request_body(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        thinking: ThinkingConfig,
+    ) -> Value {
+        let mut body = self.compat.build_body(model, messages, system, tools);
+        thinking.apply_reasoning_effort(&mut body, &dialect::OPENAI_COMPAT, model);
+        body
+    }
+}
+
 impl Provider for CustomOpenAiProvider {
     fn stream_message<'a>(
         &'a self,
@@ -297,10 +312,7 @@ impl Provider for CustomOpenAiProvider {
                 .await;
             }
 
-            let mut body = self.compat.build_body(model, messages, system, tools);
-            if matches!(opts.thinking, ThinkingConfig::Off) {
-                body["thinking"] = serde_json::json!({"type": "disabled"});
-            }
+            let body = self.build_request_body(model, messages, system, tools, opts.thinking);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
@@ -384,5 +396,32 @@ mod tests {
         overlay_declared_tiers(&def, &mut models);
         assert_eq!(models[0].tier, Some(ModelTier::Strong));
         assert_eq!(models[1].tier, None);
+    }
+
+    #[test_case::test_case(ThinkingConfig::Off, None ; "body_omits_effort_when_off")]
+    #[test_case::test_case(ThinkingConfig::Adaptive, Some("medium") ; "body_uses_medium_for_adaptive")]
+    #[test_case::test_case(ThinkingConfig::Effort(maki_storage::sessions::Effort::Minimal), Some("low") ; "body_snaps_minimal_to_low")]
+    #[test_case::test_case(ThinkingConfig::Effort(maki_storage::sessions::Effort::Low), Some("low") ; "body_sends_low")]
+    #[test_case::test_case(ThinkingConfig::Effort(maki_storage::sessions::Effort::Medium), Some("medium") ; "body_sends_medium")]
+    #[test_case::test_case(ThinkingConfig::Effort(maki_storage::sessions::Effort::High), Some("high") ; "body_sends_high")]
+    #[test_case::test_case(ThinkingConfig::Effort(maki_storage::sessions::Effort::Max), Some("high") ; "body_snaps_max_to_high")]
+    fn custom_openai_request_body_reasoning_effort(
+        thinking: ThinkingConfig,
+        expected: Option<&str>,
+    ) {
+        let def = openai_def("test-model");
+        let model = model_from_def(&def, ProviderKind::OpenAi, "custom", "test-model");
+        let auth = Arc::new(Mutex::new(ResolvedAuth::bearer("custom", "token").unwrap()));
+        let provider = CustomOpenAiProvider {
+            compat: OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, Timeouts::default()),
+            auth,
+            protocol: Protocol::Openai,
+        };
+        let body = provider.build_request_body(&model, &[], "", &Value::Null, thinking);
+        assert_eq!(
+            body.get("reasoning_effort").and_then(Value::as_str),
+            expected
+        );
+        assert!(body.get("thinking").is_none());
     }
 }
