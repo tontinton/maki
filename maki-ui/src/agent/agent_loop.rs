@@ -11,11 +11,12 @@ use maki_agent::tools::{FileAccess, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, History, Instructions,
-    McpCommand, PromptRole, RunLedger, SessionMailbox, SharedMessages, ToolOutputLines,
+    McpCommand, PromptRole, RunContext, RunContextBuilder, RunLedger, SessionMailbox,
+    SharedMessages, ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
-use maki_providers::{AgentError, ContextGauge, Message, Model};
+use maki_providers::{AgentError, ContextGauge, Message};
 use maki_storage::id::SessionRef;
 use tracing::error;
 
@@ -29,7 +30,6 @@ pub(super) struct AgentLoop {
     tool_output_lines: ToolOutputLines,
     vars: Vars,
     instructions: Instructions,
-    tools: RequestTools,
     mcp: Option<McpSession>,
     history: History,
     /// Owned beside `history` because it describes that transcript and outlives
@@ -83,7 +83,6 @@ impl AgentLoop {
             tool_output_lines,
             vars: Vars::default(),
             instructions: Instructions::default(),
-            tools: RequestTools::default(),
             mcp,
             history: History::restored(initial_history).with_mirror(shared_history),
             gauge: ContextGauge::restored(initial_context_size),
@@ -168,8 +167,6 @@ impl AgentLoop {
         }
         self.publish_btw_system(&maki_agent::prompt::ResolvedSlots::default());
 
-        let slot = self.model_slot.load();
-        self.tools = self.build_tools(&slot.model, false);
         if let Some(ref mcp) = self.mcp {
             // The queue is drained right after this, and a prompt typed during
             // startup must still carry the MCP tools.
@@ -212,14 +209,11 @@ impl AgentLoop {
         event_tx: EventSender,
         run_id: u64,
     ) -> Result<(), AgentError> {
-        let slot = self.model_slot.load();
-
         let old_cwd = self.vars.apply("{cwd}").into_owned();
         self.vars = template::env_vars();
         if *self.vars.apply("{cwd}") != old_cwd {
             self.reload_instructions().await;
         }
-        self.rebuild_tools(&slot.model, input.workflow);
 
         if let Some(ref prompt_ref) = input.prompt {
             let Some(ref mcp) = self.mcp else {
@@ -249,14 +243,29 @@ impl AgentLoop {
             }
         }
 
-        let prompt_slots = self.lua_handle.collect_prompt_slots_async().await;
-        let system = agent::build_system_prompt(
-            &self.vars,
-            &input.mode,
-            &self.instructions.text,
-            &prompt_slots,
-            &slot.model,
-        );
+        let prompt_slots = Arc::new(self.lua_handle.collect_prompt_slots_async().await);
+        let vars = self.vars.clone();
+        let instructions = self.instructions.text.clone();
+        let slots = Arc::clone(&prompt_slots);
+        let config = self.config.clone();
+        let has_mcp = self.mcp.is_some();
+        let run_builder: RunContextBuilder = Arc::new(move |model, mode, workflow| RunContext {
+            system: agent::build_system_prompt(&vars, mode, &instructions, &slots, model),
+            tools: RequestTools::build(
+                ToolRegistry::global(),
+                &vars,
+                model,
+                &config,
+                &[],
+                workflow,
+                has_mcp,
+            ),
+        });
+        // Read after the awaits above, not before: a switch can land while the
+        // run is still starting up, and prompt, tools and request all have to
+        // name the model that is current now.
+        let slot = self.model_slot.load();
+        let RunContext { system, tools } = run_builder(&slot.model, &input.mode, input.workflow);
         self.publish_btw_system(&prompt_slots);
         let (trigger, cancel) = CancelToken::new();
         self.set_cancel_trigger(run_id, trigger);
@@ -275,7 +284,7 @@ impl AgentLoop {
                 mailbox: self.mailbox.clone(),
                 timeouts: self.timeouts,
                 file_access: Arc::clone(&self.file_access),
-                prompt_slots: Arc::new(prompt_slots),
+                prompt_slots: Arc::clone(&prompt_slots),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
                 ledger: Arc::new(RunLedger::default()),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
@@ -287,13 +296,14 @@ impl AgentLoop {
                 gauge: &mut self.gauge,
                 system,
                 event_tx,
-                tools: self.tools.clone(),
+                tools,
             },
         )
         .with_loaded_instructions(self.instructions.loaded.clone())
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn maki_agent::InterruptSource>)
         .with_cancel(cancel)
+        .with_model_sync(Arc::clone(&self.model_slot), run_builder)
         .with_mcp(self.mcp.clone());
 
         let result = agent.run(input).await;
@@ -306,24 +316,6 @@ impl AgentLoop {
         }
 
         result.map(|_| ())
-    }
-
-    /// Base tools only. MCP definitions are injected per request by
-    /// `Agent::request_tools`; baking them here would freeze the catalog.
-    fn rebuild_tools(&mut self, model: &Model, workflow: bool) {
-        self.tools = self.build_tools(model, workflow);
-    }
-
-    fn build_tools(&self, model: &Model, workflow: bool) -> RequestTools {
-        RequestTools::build(
-            ToolRegistry::global(),
-            &self.vars,
-            model,
-            &self.config,
-            &[],
-            workflow,
-            self.mcp.is_some(),
-        )
     }
 
     async fn reload_instructions(&mut self) {

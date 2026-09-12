@@ -18,8 +18,7 @@ use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
 
 use self::cancel_map::new_run_cancel_map;
-use maki_providers::provider::Provider;
-use maki_providers::{Message, Model};
+use maki_providers::Message;
 use tracing::{info, warn};
 
 use crate::app::App;
@@ -27,11 +26,7 @@ use crate::app::App;
 use self::agent_loop::AgentLoop;
 use self::command_router::spawn_command_router;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
-
-pub(crate) struct ModelSlot {
-    pub(crate) model: Model,
-    pub(crate) provider: Arc<dyn Provider>,
-}
+pub(crate) use maki_agent::ModelSlot;
 
 pub(crate) enum AgentCommand {
     Cancel { run_id: u64 },
@@ -303,8 +298,10 @@ mod tests {
 
     use maki_agent::AgentEvent;
     use maki_config::{PermissionsConfig, ProjectConfig};
-    use maki_providers::provider::BoxFuture;
-    use maki_providers::{AgentError, ModelInfo, ProviderEvent, RequestOptions, StreamResponse};
+    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::{
+        AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
+    };
 
     use super::*;
 
