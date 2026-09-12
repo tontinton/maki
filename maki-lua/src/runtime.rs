@@ -54,6 +54,7 @@ use crate::api::util::command::{
 use crate::api::util::convert::{json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::setup::ConfigStore;
+use crate::api::uv::{UvStore, close_plugin_handles, deliver_uv_event, with_uv};
 use crate::docs_render;
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
@@ -1256,6 +1257,33 @@ async fn deliver_pending(
     }
 }
 
+/// Same drain for uv handle events: tcp reads, connect and write completions,
+/// timer ticks. Each callback runs as its own task on `ex`, chained per
+/// handle so deliveries keep event order, and a callback that suspends can
+/// no longer park the pump. The state transition stays glued to its callback
+/// in [`deliver_uv_event`], so a close, read_stop or timer stop issued while
+/// a callback runs still silences the events queued behind it.
+pub(crate) async fn deliver_uv_pending(lua: &Lua, ex: &smol::LocalExecutor<'_>) {
+    while let Some((id, event)) = with_uv(lua, |store| store.next_delivery()) {
+        let chain = with_uv(lua, |store| store.chain(id));
+        let task_lua = lua.clone();
+        ex.spawn(async move {
+            chain.wait().await;
+            let scope = TaskScope::delivery(&task_lua);
+            if let Err(e) = scope
+                .scope_future(deliver_uv_event(&task_lua, id, event))
+                .await
+            {
+                tracing::warn!(handle_id = id, error = %strip_traceback(&e), "uv callback failed");
+            }
+        })
+        .detach();
+        // Yield between spawns so a flood of ready events cannot outrun the
+        // tasks it just spawned.
+        smol::future::yield_now().await;
+    }
+}
+
 impl Drop for TaskScope {
     fn drop(&mut self) {
         let task_id = {
@@ -2002,6 +2030,7 @@ impl LuaRuntime {
 
         lua.set_app_data(CommandHandlerMap::new());
         lua.set_app_data(JobStore::new());
+        lua.set_app_data(UvStore::new());
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
         lua.set_app_data(crate::api::top::NotifyHandler::default());
@@ -2089,6 +2118,7 @@ impl LuaRuntime {
             store.kill_owner(&self.lua, &JobOwner::Plugin(Arc::from(name)));
             store.detach_plugin_callbacks(&self.lua, name);
         });
+        close_plugin_handles(&self.lua, name);
         if let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>() {
             store.remove(name);
         }
@@ -3343,6 +3373,7 @@ pub fn spawn(
             };
 
             let ex = Rc::new(smol::LocalExecutor::new());
+            let uv_ex = Rc::downgrade(&ex);
             {
                 let lua = rt.lua.clone();
                 ex.spawn(async move {
@@ -3363,6 +3394,13 @@ pub fn spawn(
                                 }))
                                 .await;
                             drop(scope);
+                        }
+                        // Upgrade per pass: the pump must not own a strong
+                        // Rc for good, or executor -> pump -> executor pins
+                        // both past shutdown. The drain holds one while it
+                        // runs; idle passes hold nothing.
+                        if let Some(ex) = uv_ex.upgrade() {
+                            deliver_uv_pending(&lua, &ex).await;
                         }
                         smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
                     }

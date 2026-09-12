@@ -32,6 +32,28 @@ const HTTPS_PORT: u16 = 443;
 const DNS_ATTEMPTS: u32 = 3;
 const DNS_RETRY_DELAY: Duration = Duration::from_millis(150);
 const ALLOWLIST_HINT: &str = "add it to `net.allowed_private_hosts` in your init.lua to allow it";
+pub(crate) const EACCES_NAME: &str = "EACCES";
+const EAFNOSUPPORT: &str = "EAFNOSUPPORT";
+pub(crate) const EAI_NONAME_NAME: &str = "EAI_NONAME";
+
+/// Address family accepted at `new_tcp` time and enforced at connect time.
+#[derive(Clone, Copy)]
+pub(crate) enum Family {
+    Any,
+    V4,
+    V6,
+}
+
+impl Family {
+    fn matches(self, addr: SocketAddr) -> bool {
+        match self {
+            Self::Any => true,
+            Self::V4 => addr.is_ipv4(),
+            Self::V6 => addr.is_ipv6(),
+        }
+    }
+}
+
 /// Reserved IPv4 ranges the standard library has no predicate for. Carrier
 /// grade NAT is the one that bites: Alibaba Cloud parks its instance metadata
 /// service on it at 100.100.100.200. Then protocol assignments, benchmarking,
@@ -612,6 +634,108 @@ async fn check_ssrf(url: &str, allowed: &HostAllowlist) -> Result<Option<DnsPin>
     }))
 }
 
+/// The connect-target half of the [`check_ssrf`] policy, for raw sockets. An
+/// allowlisted name is trusted the same way `net.request` trusts it: whatever
+/// it resolves to, the user put it on the list. Everything else must be a
+/// public literal or resolve to public addresses only, and the address that
+/// passed the check is the one the caller dials, so a second lookup can never
+/// redirect the connection. Unlike [`check_ssrf`], which judges every resolved
+/// address, only the first one matching the handle's family is judged here:
+/// it is the exact address the caller dials, so the others can never be
+/// reached.
+pub(crate) async fn vet_connect_for(
+    host: &str,
+    port: u16,
+    family: Family,
+) -> Result<SocketAddr, (&'static str, String)> {
+    vet_connect_with(host, port, &ALLOWED_PRIVATE_HOSTS.load_full(), family).await
+}
+
+/// The call-time half of `Tcp connect`: literal addresses vet immediately,
+/// with no lookup to block the caller on. `None` means {host} is a name; the
+/// caller resolves and vets it in the background task instead.
+pub(crate) fn vet_literal(
+    host: &str,
+    port: u16,
+    family: Family,
+) -> Result<Option<SocketAddr>, (&'static str, String)> {
+    match vet_literal_with(host, port, family, &ALLOWED_PRIVATE_HOSTS.load_full()) {
+        Some(Ok(addr)) => Ok(Some(addr)),
+        Some(Err(err)) => Err(err),
+        None => Ok(None),
+    }
+}
+
+/// Vets a literal address against the guard: family fit, then the
+/// private/metadata verdict. `None` when {host} is not a literal address.
+fn vet_literal_with(
+    host: &str,
+    port: u16,
+    family: Family,
+    allowed: &HostAllowlist,
+) -> Option<Result<SocketAddr, (&'static str, String)>> {
+    let ip = host.parse::<IpAddr>().ok()?;
+    let addr = SocketAddr::new(ip, port);
+    Some(if !family.matches(addr) {
+        Err((
+            EAFNOSUPPORT,
+            format!("{ip} does not match the handle's address family"),
+        ))
+    } else if is_private_ip(&ip) && !allowed.allows_ip(ip, port) {
+        Err((
+            EACCES_NAME,
+            format!("blocked: {ip} is a private/metadata address ({ALLOWLIST_HINT})"),
+        ))
+    } else {
+        Ok(addr)
+    })
+}
+
+async fn vet_connect_with(
+    host: &str,
+    port: u16,
+    allowed: &HostAllowlist,
+    family: Family,
+) -> Result<SocketAddr, (&'static str, String)> {
+    let guard_err = |msg: String| (EACCES_NAME, msg);
+    let resolve_err = |msg: String| (EAI_NONAME_NAME, msg);
+    fn first_fitting(
+        host: &str,
+        family: Family,
+        mut addrs: impl Iterator<Item = SocketAddr>,
+    ) -> Result<SocketAddr, (&'static str, String)> {
+        addrs.find(|sa| family.matches(*sa)).ok_or_else(|| {
+            (
+                EAFNOSUPPORT,
+                format!("{host} has no matching address family"),
+            )
+        })
+    }
+
+    if allowed.allows_host(host, port) {
+        let addrs = resolve(host, port)
+            .await
+            .map_err(|e| resolve_err(format!("cannot resolve {host}: {e}")))?;
+        return first_fitting(host, family, addrs.into_iter());
+    }
+
+    if let Some(vetted) = vet_literal_with(host, port, family, allowed) {
+        return vetted;
+    }
+
+    let addrs = resolve(host, port)
+        .await
+        .map_err(|e| resolve_err(format!("cannot resolve {host}: {e}")))?;
+    let sa = first_fitting(host, family, addrs.into_iter())?;
+    if is_private_ip(&sa.ip()) && !allowed.allows_ip(sa.ip(), port) {
+        return Err(guard_err(format!(
+            "blocked: {host} resolves to private address {} ({ALLOWLIST_HINT})",
+            sa.ip()
+        )));
+    }
+    Ok(sa)
+}
+
 fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -696,6 +820,7 @@ mod tests {
     const LOOPBACK_CIDR_ENTRY: &str = "127.0.0.0/8";
     const IPV6_LOOPBACK_ENTRY: &str = "::1/128";
     const ALLOWED_PORT: u16 = 8888;
+    const OTHER_PORT: u16 = 443;
     /// An address rather than a name, so no test needs a DNS answer.
     const PUBLIC_URL: &str = "https://8.8.8.8/";
     const PUBLIC_HTTP_URL: &str = "http://8.8.8.8/";
@@ -776,6 +901,85 @@ mod tests {
             allowed,
             "{url} with {entries:?}: {result:?}"
         );
+    }
+
+    /// The raw-socket half of the policy, mirroring `check_ssrf_cases`.
+    #[test_case(&[], "8.8.8.8", ALLOWED_PORT, true ; "public_literal_passes")]
+    #[test_case(&[], "127.0.0.1", ALLOWED_PORT, false ; "loopback_literal_blocked")]
+    #[test_case(&[], "10.0.0.1", ALLOWED_PORT, false ; "rfc1918_10_blocked")]
+    #[test_case(&[], "169.254.169.254", ALLOWED_PORT, false ; "metadata_blocked")]
+    #[test_case(&[], "::1", ALLOWED_PORT, false ; "ipv6_loopback_blocked")]
+    #[test_case(&[], "0.0.0.0", ALLOWED_PORT, false ; "unspecified_blocked")]
+    #[test_case(&[], "localhost", ALLOWED_PORT, false ; "name_resolving_to_loopback_blocked")]
+    #[test_case(&[LOOPBACK_PORT_ENTRY], "127.0.0.1", ALLOWED_PORT, true ; "ip_with_port_allowed")]
+    #[test_case(&[LOOPBACK_PORT_ENTRY], "127.0.0.1", OTHER_PORT, false ; "same_ip_other_port_still_blocked")]
+    #[test_case(&[LOCALHOST_ENTRY], "localhost", ALLOWED_PORT, true ; "name_allowed_whatever_it_resolves_to")]
+    #[test_case(&[LOOPBACK_CIDR_ENTRY], "127.0.0.1", OTHER_PORT, true ; "cidr_range_allowed")]
+    #[test_case(&[PRIVATE_CIDR_ENTRY], "10.1.2.3", ALLOWED_PORT, true ; "rfc1918_cidr_allowed")]
+    #[test_case(&[PRIVATE_CIDR_ENTRY], "192.168.1.1", ALLOWED_PORT, false ; "outside_cidr_still_blocked")]
+    #[test_case(&[IPV6_LOOPBACK_ENTRY], "::1", ALLOWED_PORT, true ; "ipv6_cidr_allowed")]
+    fn vet_connect_cases(entries: &[&str], host: &str, port: u16, allowed: bool) {
+        let result = smol::block_on(vet_connect_with(
+            host,
+            port,
+            &allowlist(entries),
+            Family::Any,
+        ));
+        assert_eq!(
+            result.is_ok(),
+            allowed,
+            "{host}:{port} with {entries:?}: {result:?}"
+        );
+    }
+
+    /// The handle's family filters resolution instead of rejecting the first
+    /// address, so `new_tcp("inet")` still reaches a dual-stacked name.
+    #[test]
+    fn vet_connect_filters_by_address_family() {
+        let err = smol::block_on(vet_connect_with(
+            "8.8.8.8",
+            ALLOWED_PORT,
+            &HostAllowlist::default(),
+            Family::V6,
+        ))
+        .unwrap_err();
+        assert_eq!(err.0, EAFNOSUPPORT, "got: {:?}", err);
+        let err = smol::block_on(vet_connect_with(
+            "::1",
+            ALLOWED_PORT,
+            &HostAllowlist::default(),
+            Family::V4,
+        ))
+        .unwrap_err();
+        assert_eq!(err.0, EAFNOSUPPORT, "got: {:?}", err);
+    }
+
+    /// A host with a NUL never parses as an address or a resolver query, so
+    /// glibc refuses it before any DNS round trip: the EAI_NONAME mapping is
+    /// tested without touching a resolver.
+    #[test]
+    fn vet_connect_maps_resolution_failures_to_eai_noname() {
+        let err = smol::block_on(vet_connect_with(
+            "bad\0host",
+            ALLOWED_PORT,
+            &HostAllowlist::default(),
+            Family::Any,
+        ))
+        .unwrap_err();
+        assert_eq!(err.0, EAI_NONAME_NAME, "got: {:?}", err);
+    }
+
+    #[test]
+    fn vet_connect_refuses_private_literals_with_eacces() {
+        let err = smol::block_on(vet_connect_with(
+            "127.0.0.1",
+            ALLOWED_PORT,
+            &HostAllowlist::default(),
+            Family::Any,
+        ))
+        .unwrap_err();
+        assert_eq!(err.0, EACCES_NAME);
+        assert!(err.1.starts_with(BLOCKED_PREFIX), "got: {:?}", err.1);
     }
 
     /// Spellings glibc rejects but curl normalises, so the guard has to read
