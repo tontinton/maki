@@ -219,5 +219,11 @@ debug = false
 # multiline paste submits at the first newline (#336). Pinned to the head of
 # crossterm-rs/crossterm#1030, which lives in refs/pull/1030/head on the upstream repo.
 # Remove once the PR ships in a crossterm release.
+#
+# syntect 5.3.0 spins forever on a JavaScript line like `x /*`: two rules match
+# empty at the same byte and `set` each other back, which is neither the push nor
+# the pop its loop guard watches, so one such line pins a core at 100% for good.
+# Pinned to a v5.3.0 backport of trishume/syntect#706, remove once that ships.
 [patch.crates-io]
 crossterm = { git = "https://github.com/crossterm-rs/crossterm", rev = "3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77" }
+syntect = { git = "https://github.com/tontinton/syntect", rev = "01df275f6f25da670e5ba5b7128cb89d03795119" }
