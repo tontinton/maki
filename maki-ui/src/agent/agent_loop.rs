@@ -202,6 +202,7 @@ impl AgentLoop {
             &self.config,
             instructions,
             self.session_id.as_ref(),
+            self.timeouts.retry,
         )
         .await
     }

@@ -567,17 +567,12 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Timeouts;
     use super::*;
-
-    const TEST_TIMEOUTS: super::super::Timeouts = super::super::Timeouts {
-        connect: std::time::Duration::from_secs(10),
-        low_speed: std::time::Duration::from_secs(30),
-        stream: std::time::Duration::from_secs(300),
-    };
 
     #[test]
     fn from_env_without_host_or_api_key_errors() {
-        match LocalEndpoint::build(&OLLAMA, TEST_TIMEOUTS, None, None, None) {
+        match LocalEndpoint::build(&OLLAMA, Timeouts::default(), None, None, None) {
             Err(AgentError::Config { message }) => {
                 assert_eq!(message, "OLLAMA_HOST not set");
             }
@@ -589,7 +584,7 @@ mod tests {
     fn from_env_with_host_builds_auth() {
         let ep = LocalEndpoint::build(
             &OLLAMA,
-            TEST_TIMEOUTS,
+            Timeouts::default(),
             None,
             Some("http://x:1234".into()),
             None,
@@ -603,7 +598,8 @@ mod tests {
     #[test]
     fn from_env_with_api_key_uses_cloud_for_ollama() {
         let pool = KeyPool::from_keys(vec!["test-key".into()]);
-        let ep = LocalEndpoint::build(&OLLAMA, TEST_TIMEOUTS, Some(pool), None, None).unwrap();
+        let ep =
+            LocalEndpoint::build(&OLLAMA, Timeouts::default(), Some(pool), None, None).unwrap();
         let auth = ep.auth.lock().unwrap();
         assert_eq!(auth.base_url.as_deref(), Some("https://ollama.com/v1"));
         assert_eq!(auth.headers.len(), 1);
@@ -615,7 +611,7 @@ mod tests {
         let pool = KeyPool::from_keys(vec!["test-key".into()]);
         let ep = LocalEndpoint::build(
             &OLLAMA,
-            TEST_TIMEOUTS,
+            Timeouts::default(),
             Some(pool),
             Some("http://local:1234".into()),
             None,
@@ -629,7 +625,7 @@ mod tests {
 
     #[test]
     fn llamacpp_without_host_errors() {
-        match LocalEndpoint::build(&LLAMACPP, TEST_TIMEOUTS, None, None, None) {
+        match LocalEndpoint::build(&LLAMACPP, Timeouts::default(), None, None, None) {
             Err(AgentError::Config { message }) => {
                 assert_eq!(message, "LLAMA_CPP_HOST not set");
             }
@@ -641,7 +637,7 @@ mod tests {
     fn llamacpp_with_host_builds_auth() {
         let ep = LocalEndpoint::build(
             &LLAMACPP,
-            TEST_TIMEOUTS,
+            Timeouts::default(),
             None,
             Some("http://x:1234".into()),
             None,
@@ -655,7 +651,7 @@ mod tests {
     #[test]
     fn llamacpp_no_cloud_fallback() {
         let pool = KeyPool::from_keys(vec!["key".into()]);
-        match LocalEndpoint::build(&LLAMACPP, TEST_TIMEOUTS, Some(pool), None, None) {
+        match LocalEndpoint::build(&LLAMACPP, Timeouts::default(), Some(pool), None, None) {
             Err(AgentError::Config { message }) => {
                 assert_eq!(message, "LLAMA_CPP_HOST not set");
             }
@@ -667,7 +663,7 @@ mod tests {
     fn ollama_uses_ollama_discovery() {
         let ep = LocalEndpoint::build(
             &OLLAMA,
-            TEST_TIMEOUTS,
+            Timeouts::default(),
             None,
             Some("http://x:1234".into()),
             None,
@@ -680,7 +676,7 @@ mod tests {
     fn llamacpp_uses_llamacpp_discovery() {
         let ep = LocalEndpoint::build(
             &LLAMACPP,
-            TEST_TIMEOUTS,
+            Timeouts::default(),
             None,
             Some("http://x:1234".into()),
             None,

@@ -1,6 +1,7 @@
 use std::env;
 
 use maki_config::AgentConfig;
+use maki_providers::retry::RetryPolicy;
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
     StreamResponse, TokenUsage,
@@ -72,6 +73,7 @@ pub(super) async fn compact_history(
     instructions: Option<&str>,
     carry_len: usize,
     session_id: Option<&SessionRef>,
+    retry: RetryPolicy,
 ) -> Result<TokenUsage, AgentError> {
     let compact_start = std::time::Instant::now();
     let summarized = history.len().saturating_sub(carry_len);
@@ -97,6 +99,7 @@ pub(super) async fn compact_history(
                 opts: RequestOptions::default(),
                 output_budget: SUMMARY_OUTPUT_BUDGET,
                 session_id,
+                retry,
             },
             // A stripped, collapsed rewrite of the transcript, far smaller than
             // it. Sizing this request as the session would trim the
@@ -186,6 +189,7 @@ pub async fn compact(
     config: &AgentConfig,
     instructions: Option<&str>,
     session_id: Option<&SessionRef>,
+    retry: RetryPolicy,
 ) -> Result<(), AgentError> {
     let cancel = CancelToken::none();
     let size_before = gauge.size();
@@ -199,6 +203,7 @@ pub async fn compact(
         instructions,
         0,
         session_id,
+        retry,
     )
     .await?;
     if let Some(post) = normalize(config.post_compaction_instructions.as_deref()) {
@@ -449,6 +454,7 @@ mod tests {
             config,
             instructions,
             None,
+            RetryPolicy::default(),
         )
         .await
     }
@@ -470,6 +476,7 @@ mod tests {
             None,
             carry_len,
             session_id,
+            RetryPolicy::default(),
         )
         .await
         .unwrap();

@@ -40,11 +40,7 @@ struct Stack {
 
 impl Stack {
     fn timeouts(&self) -> maki_providers::Timeouts {
-        maki_providers::Timeouts {
-            connect: self.config.provider.connect_timeout,
-            low_speed: self.config.provider.low_speed_timeout,
-            stream: self.config.provider.stream_timeout,
-        }
+        maki_providers::Timeouts::from(&self.config.provider)
     }
 }
 

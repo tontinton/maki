@@ -15,6 +15,7 @@ use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, load_tokens, lock_tokens, save_tokens};
 
 use crate::AgentError;
+use crate::retry::RetryPolicy;
 
 pub(crate) mod anthropic;
 pub(crate) mod aperture;
@@ -64,6 +65,7 @@ pub struct Timeouts {
     pub connect: Duration,
     pub stream: Duration,
     pub low_speed: Duration,
+    pub retry: RetryPolicy,
 }
 
 impl Default for Timeouts {
@@ -72,6 +74,18 @@ impl Default for Timeouts {
             connect: Duration::from_secs(10),
             stream: Duration::from_secs(300),
             low_speed: Duration::from_secs(30),
+            retry: RetryPolicy::default(),
+        }
+    }
+}
+
+impl From<&maki_config::ProviderConfig> for Timeouts {
+    fn from(config: &maki_config::ProviderConfig) -> Self {
+        Self {
+            connect: config.connect_timeout,
+            stream: config.stream_timeout,
+            low_speed: config.low_speed_timeout,
+            retry: config.into(),
         }
     }
 }

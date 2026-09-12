@@ -51,11 +51,7 @@ pub fn run(
     )?;
     super::report_warnings(warnings);
 
-    let timeouts = maki_providers::Timeouts {
-        connect: config.provider.connect_timeout,
-        low_speed: config.provider.low_speed_timeout,
-        stream: config.provider.stream_timeout,
-    };
+    let timeouts = maki_providers::Timeouts::from(&config.provider);
 
     let model = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
 

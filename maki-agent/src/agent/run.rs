@@ -341,6 +341,7 @@ impl<'h> Agent<'h> {
                 opts: self.opts,
                 output_budget: self.config.max_turn_output,
                 session_id: self.session_id.as_ref(),
+                retry: self.timeouts.retry,
             },
             Some(self.gauge),
             &self.event_tx,
@@ -636,6 +637,7 @@ impl<'h> Agent<'h> {
             instructions,
             carry_len,
             self.session_id.as_ref(),
+            self.timeouts.retry,
         )
         .await?;
         // The summariser can be a different model, so price this with

@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use maki_providers::provider::Provider;
-use maki_providers::retry::{MAX_TIMEOUT_RETRIES, RetryState};
+use maki_providers::retry::{RetryPolicy, RetryState};
 use maki_providers::{
     ContentBlock, ContextGauge, Message, Model, Overflow, ProviderEvent, RequestOptions,
     StreamResponse, estimate_prompt_tokens,
@@ -172,6 +172,7 @@ pub(crate) struct StreamRequest<'a> {
     /// than a coding turn, so the caller decides.
     pub output_budget: u32,
     pub session_id: Option<&'a SessionRef>,
+    pub retry: RetryPolicy,
 }
 
 /// `gauge` is `None` for a request whose messages are not the session's, as
@@ -192,6 +193,7 @@ pub(crate) async fn stream_with_retry(
         opts,
         output_budget,
         session_id,
+        retry,
     } = req;
     let opts = opts.clamped(model);
     // The session's own size wins where it is larger, being a count a provider
@@ -215,7 +217,7 @@ pub(crate) async fn stream_with_retry(
     )
     .await?;
     let messages = &*adapted;
-    let mut retry = RetryState::new();
+    let mut retry = RetryState::new(retry);
     loop {
         // The turn budget is all that moves. What the model declares stays put:
         // the thinking a request may spend is read off the `max_tokens` this
@@ -249,17 +251,51 @@ pub(crate) async fn stream_with_retry(
                 return Ok(r);
             }
             Err(AgentError::Cancelled) => return Err(StreamError::Cancelled { streamed }),
-            Err(e) if e.is_retryable() => {
+            Err(e) => {
                 emit_api_error(model, &e, retry.attempts() + 1, started.elapsed());
+                let Some(kind) = e.retry_kind() else {
+                    // A budget overflow is the one rejection maki caused itself, by
+                    // asking for more output than the prompt left room for. Asking
+                    // for less costs nothing, so it happens here instead of falling
+                    // through to the caller, whose only remedy is to summarize the
+                    // session away.
+                    if let Some(
+                        overflow @ Overflow::Budget {
+                            prompt: measured, ..
+                        },
+                    ) = e.overflow()
+                    {
+                        // The server counted the prompt maki could only estimate.
+                        if let Some(gauge) = gauge.as_deref_mut() {
+                            gauge.record(measured.unwrap_or(0));
+                        }
+                        if budget_retries < MAX_BUDGET_RETRIES
+                            && let Some(next) =
+                                shrunk_budget(budget, overflow, model.context_window, floor)
+                        {
+                            budget_retries += 1;
+                            warn!(
+                                model = %model.id,
+                                from = budget,
+                                to = next,
+                                measured_prompt = measured,
+                                "output budget did not fit the window, retrying smaller"
+                            );
+                            budget = next;
+                            continue;
+                        }
+                    }
+                    return Err(e.into());
+                };
                 if e.should_rotate_key()
                     && let Ok(true) = provider.rotate_key().await
                 {
                     warn!("rotated API key after error: {e}");
                 }
-                let (attempt, delay) = retry.next_delay();
-                if matches!(e, AgentError::Timeout { .. }) && attempt > MAX_TIMEOUT_RETRIES {
+                let Some(delay) = retry.next_delay(kind, e.retry_after()) else {
                     return Err(e.into());
-                }
+                };
+                let attempt = retry.attempts();
                 let delay_ms = delay.as_millis() as u64;
                 warn!(attempt, delay_ms, error = %e, "retryable, will retry");
                 event_tx.send(AgentEvent::Retry {
@@ -279,41 +315,6 @@ pub(crate) async fn stream_with_retry(
                         streamed: String::new(),
                     });
                 }
-            }
-            Err(e) => {
-                emit_api_error(model, &e, retry.attempts() + 1, started.elapsed());
-                // A budget overflow is the one rejection maki caused itself, by
-                // asking for more output than the prompt left room for. Asking
-                // for less costs nothing, so it happens here instead of falling
-                // through to the caller, whose only remedy is to summarize the
-                // session away.
-                if let Some(
-                    overflow @ Overflow::Budget {
-                        prompt: measured, ..
-                    },
-                ) = e.overflow()
-                {
-                    // The server counted the prompt maki could only estimate.
-                    if let Some(gauge) = gauge.as_deref_mut() {
-                        gauge.record(measured.unwrap_or(0));
-                    }
-                    if budget_retries < MAX_BUDGET_RETRIES
-                        && let Some(next) =
-                            shrunk_budget(budget, overflow, model.context_window, floor)
-                    {
-                        budget_retries += 1;
-                        warn!(
-                            model = %model.id,
-                            from = budget,
-                            to = next,
-                            measured_prompt = measured,
-                            "output budget did not fit the window, retrying smaller"
-                        );
-                        budget = next;
-                        continue;
-                    }
-                }
-                return Err(e.into());
             }
         }
     }
@@ -651,6 +652,7 @@ mod tests {
                 opts: RequestOptions::default(),
                 output_budget: TURN_BUDGET,
                 session_id: None,
+                retry: RetryPolicy::default(),
             },
             Some(gauge),
             &EventSender::new(tx, 0),

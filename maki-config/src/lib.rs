@@ -50,6 +50,17 @@ pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_LOW_SPEED_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 300;
 
+pub const DEFAULT_RETRY_BASE_MS: u64 = 2_000;
+/// Server errors are retried for as long as they last, so this cap sets the
+/// pace of a long outage: a minute between tries is around 180 requests over
+/// three hours, where the old eight seconds would have sent around 1350.
+pub const DEFAULT_RETRY_MAX_MS: u64 = 60_000;
+pub const DEFAULT_MAX_TIMEOUT_RETRIES: u32 = 10;
+/// Spent only on rate limits the server sent no `Retry-After` for, which is how
+/// a spend cap reads, and that one does not clear for the rest of the billing
+/// period.
+pub const DEFAULT_MAX_RETRIES: u32 = 5;
+
 pub const DEFAULT_MAX_LOG_BYTES_MB: u64 = 200;
 pub const DEFAULT_MAX_LOG_FILES: u32 = 10;
 pub const DEFAULT_INPUT_HISTORY_SIZE: usize = 100;
@@ -70,6 +81,9 @@ pub const MIN_INPUT_HISTORY_SIZE: usize = 10;
 pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
 pub const MIN_LOW_SPEED_TIMEOUT_SECS: u64 = 1;
 pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
+
+pub const MIN_RETRY_BASE_MS: u64 = 1;
+pub const MIN_RETRY_MAX_MS: u64 = 1;
 
 pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
@@ -686,6 +700,10 @@ pub struct ProviderFileConfig {
     pub connect_timeout_secs: Option<u64>,
     pub low_speed_timeout_secs: Option<u64>,
     pub stream_timeout_secs: Option<u64>,
+    pub retry_base_ms: Option<u64>,
+    pub retry_max_ms: Option<u64>,
+    pub max_retries: Option<u32>,
+    pub max_timeout_retries: Option<u32>,
 }
 
 impl ProviderFileConfig {
@@ -698,7 +716,11 @@ impl ProviderFileConfig {
             excluded_models,
             connect_timeout_secs,
             low_speed_timeout_secs,
-            stream_timeout_secs
+            stream_timeout_secs,
+            retry_base_ms,
+            retry_max_ms,
+            max_retries,
+            max_timeout_retries
         );
     }
 }
@@ -1371,6 +1393,24 @@ pub struct ProviderConfig {
              min = MIN_STREAM_TIMEOUT_SECS, val = "self.stream_timeout.as_secs()",
              desc = "Streaming response timeout (seconds)")]
     pub stream_timeout: Duration,
+
+    #[config(key = "retry_base_ms", ty = "u64", default = DEFAULT_RETRY_BASE_MS,
+             min = MIN_RETRY_BASE_MS,
+             desc = "Base delay between retries (milliseconds, grows per attempt)")]
+    pub retry_base_ms: u64,
+
+    #[config(key = "retry_max_ms", ty = "u64", default = DEFAULT_RETRY_MAX_MS,
+             min = MIN_RETRY_MAX_MS,
+             desc = "Cap on the guessed retry backoff (milliseconds)")]
+    pub retry_max_ms: u64,
+
+    #[config(key = "max_retries", ty = "u32", default = DEFAULT_MAX_RETRIES,
+             desc = "Max retries on a rate limit the server sent no Retry-After for, 0 to never retry them")]
+    pub max_retries: u32,
+
+    #[config(key = "max_timeout_retries", ty = "u32", default = DEFAULT_MAX_TIMEOUT_RETRIES,
+             desc = "Max retries on stream timeouts")]
+    pub max_timeout_retries: u32,
 }
 
 impl Default for ProviderConfig {
@@ -1383,6 +1423,10 @@ impl Default for ProviderConfig {
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
             low_speed_timeout: Duration::from_secs(DEFAULT_LOW_SPEED_TIMEOUT_SECS),
             stream_timeout: Duration::from_secs(DEFAULT_STREAM_TIMEOUT_SECS),
+            retry_base_ms: DEFAULT_RETRY_BASE_MS,
+            retry_max_ms: DEFAULT_RETRY_MAX_MS,
+            max_retries: DEFAULT_MAX_RETRIES,
+            max_timeout_retries: DEFAULT_MAX_TIMEOUT_RETRIES,
         }
     }
 }
@@ -1408,6 +1452,10 @@ impl ProviderConfig {
             stream_timeout: Duration::from_secs(
                 f.stream_timeout_secs.unwrap_or(DEFAULT_STREAM_TIMEOUT_SECS),
             ),
+            retry_base_ms: f.retry_base_ms.unwrap_or(DEFAULT_RETRY_BASE_MS),
+            retry_max_ms: f.retry_max_ms.unwrap_or(DEFAULT_RETRY_MAX_MS),
+            max_retries: f.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
+            max_timeout_retries: f.max_timeout_retries.unwrap_or(DEFAULT_MAX_TIMEOUT_RETRIES),
         })
     }
 }
@@ -2762,6 +2810,32 @@ mod tests {
         assert_eq!(provider.excluded_models, ["*/*-preview"]);
         assert!(provider.model_policy.allows("openai/gpt-5"));
         assert!(!provider.model_policy.allows("openai/gpt-5-preview"));
+    }
+
+    /// `ProviderConfig::default()` is written by hand while a config file goes
+    /// through `into_config`, and the two once disagreed on what an omitted
+    /// `max_retries` meant: five on one path, retry forever on the other.
+    #[test]
+    fn an_omitted_max_retries_is_bounded_on_every_path() {
+        let from_file = RawConfig::default().into_config(&[]).unwrap().provider;
+        assert_eq!(from_file.max_retries, DEFAULT_MAX_RETRIES);
+        assert_eq!(from_file.max_retries, ProviderConfig::default().max_retries);
+    }
+
+    #[test]
+    fn retry_knobs_read_what_the_file_asked_for() {
+        let config = RawConfig {
+            provider: ProviderFileConfig {
+                max_retries: Some(3),
+                retry_base_ms: Some(50),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .into_config(&[])
+        .unwrap();
+        assert_eq!(config.provider.max_retries, 3);
+        assert_eq!(config.provider.retry_base_ms, 50);
     }
 
     #[test]

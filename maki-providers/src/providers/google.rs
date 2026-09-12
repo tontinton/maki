@@ -701,8 +701,7 @@ mod tests {
     fn test_timeouts() -> super::super::Timeouts {
         super::super::Timeouts {
             connect: Duration::from_secs(5),
-            low_speed: Duration::from_secs(30),
-            stream: Duration::from_secs(300),
+            ..Default::default()
         }
     }
 
