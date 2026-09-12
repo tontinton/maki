@@ -17,6 +17,14 @@ end
 maki.api.register_tool({
   name = "glob",
   kind = "search",
+  -- Read tools are otherwise never permission checked at all: without a scope
+  -- the prompt never runs, so a refusal from Maki's guard over its own files
+  -- would be the end of it. The callback answers only for those paths, so an
+  -- ordinary read still goes through with nobody asked.
+  permission = "fs_read",
+  permission_scopes = function(input)
+    return maki.api.protected_scopes({ input.path }, "read")
+  end,
   description = [[Find files by glob pattern.
 
 - Respects .gitignore.

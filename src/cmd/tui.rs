@@ -100,7 +100,7 @@ fn load_config(
         .unwrap_or_default()
         .into_config(&names(plugin_host)?)
         .context("invalid config")?;
-    config.permissions = load_permissions(project_config);
+    config.permissions = load_permissions(project_config).context("invalid permissions")?;
 
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;

@@ -232,6 +232,48 @@ limits which APIs the file reaches rather than sandboxing the file.
 
 To reach a service on your own machine or network, list it in [`net.allowed_private_hosts`](/docs/configuration/#net). An allowed host also keeps plain `http://` instead of being upgraded to `https://`, since a service on your LAN rarely has a certificate.
 
+## Maki's Own Files
+
+The file tools and every plugin that calls `maki.fs` go through one guard. Maki's state, data, cache and log directories are closed, so provider tokens, session history and logs stay out of reach of `read`, `glob`, `grep` and the rest. Closing the directories covers whatever Maki stores there next.
+
+A few paths inside them stay open, because features need them:
+
+- Memory notes, the skill reference and plan files: read and write.
+- Package checkouts: read only. Reading a package is how you review one, and Maki loads those files as Lua on the next start.
+
+`glob` and `grep` prune the closed paths while walking, so a search started above them returns the same results as one started inside.
+
+In a config directory, `.env`, `providers.toml` and `mcp.toml` are closed because they hold keys in plaintext. Maki reads them itself, so nothing stops working, and the refusal names the file for you to open. `permissions.toml` is readable and never writable, since it is where you write down what Maki may do. The rest of the directory stays reachable, `config.toml`, skills and Lua modules included. Whether the agent may write there is the permission layer's question, and it already prompts for paths outside the folder you opened. What a repository may tell Maki to do is [folder trust](/docs/folder-trust/).
+
+All of this holds only while `bash` is gated. A shell command reads these files directly, and only an OS sandbox can stop that.
+
+### Opening one of them
+
+Sometimes you want the agent to read `<logs>/maki.log`, or a session file. Those refusals turn into a permission prompt: `read`, `glob` and `grep` ask for the path, and your answer opens it. An ordinary path never asks, so reads stay free.
+
+An approval holds for the session. Answering "always" writes it to your own `permissions.toml`, under one reserved section:
+
+```toml
+[maki_files]
+read  = ["/home/you/.local/state/maki/logs"]
+write = []
+```
+
+`read` makes the path readable. `write` makes it readable and writable. Both accept a file or a directory, and a directory covers everything under it.
+
+Some paths never ask, and no entry opens them:
+
+- The credentials: `auth/` in the state directory, and `.env`, `providers.toml` and `mcp.toml` in a config directory.
+- `pack-approvals.json`, which records the packages you let Maki run as code.
+- `permissions.toml`, for writes. A policy the agent can edit is no policy.
+- Package checkouts, for writes. Maki loads them as Lua on the next start.
+
+An entry naming one of those fails the load and names the line, rather than sitting in the file looking effective. So does an entry for a path nothing refuses. A file with one bad line opens none of its paths.
+
+Only your own config is read. A `[maki_files]` section in a repository's `.maki/permissions.toml` is ignored at every trust level, and `maki_files` is a reserved name that no tool may register under.
+
+YOLO mode changes none of this. It skips prompts, so no answer is recorded, and the guard still refuses. A standing `allow` rule for `read` does the same. Where the prompt is skipped the refusal itself names the `[maki_files]` entry that would open the path, so the agent can tell you what to add.
+
 ## Session Persistence
 
 When you save a session, its permission rules are saved too. Loading the session restores them.

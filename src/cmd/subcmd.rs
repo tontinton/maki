@@ -624,7 +624,8 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
         maki_lua::Interaction::None,
         |host, names, warnings| {
             let mut config = load_effective_config(host, no_plugins, &trust, names, warnings)?;
-            config.permissions = load_permissions(&trust.project_config);
+            config.permissions =
+                load_permissions(&trust.project_config).context("invalid permissions")?;
             Ok(config)
         },
     )?;

@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bitflags::bitflags;
-use maki_config::Permission;
+use maki_config::{MAKI_FILES_SECTION, Permission};
 use serde_json::{Value, json};
 
 use crate::template::Vars;
@@ -282,6 +282,20 @@ impl Default for ToolRegistry {
 pub enum RegistryError {
     #[error("tool '{name}' is already registered (existing source: {existing})")]
     NameConflict { name: String, existing: String },
+    /// `permissions.toml` keeps one section that is not a tool. Rules written
+    /// for a tool of the same name would be read as the list of Maki's own files
+    /// the user opened, so the name is refused at the door rather than quietly
+    /// shadowed at load.
+    #[error(
+        "tool '{name}' is a reserved name: [{name}] in permissions.toml lists the files of Maki's own that the user opened to the agent"
+    )]
+    ReservedName { name: String },
+}
+
+fn reserved(name: &str) -> Option<RegistryError> {
+    (name == MAKI_FILES_SECTION).then(|| RegistryError::ReservedName {
+        name: name.to_owned(),
+    })
 }
 
 impl ToolRegistry {
@@ -326,6 +340,9 @@ impl ToolRegistry {
 
     pub fn register(&self, tool: Arc<dyn Tool>, source: ToolSource) -> Result<(), RegistryError> {
         let name = tool.name().to_owned();
+        if let Some(e) = reserved(&name) {
+            return Err(e);
+        }
         let mut conflict = None;
         self.tools.rcu(|current| {
             conflict = None;
@@ -354,6 +371,9 @@ impl ToolRegistry {
         entries: impl IntoIterator<Item = (Arc<dyn Tool>, ToolSource)>,
     ) -> Result<(), RegistryError> {
         let entries: Vec<_> = entries.into_iter().collect();
+        if let Some(e) = entries.iter().find_map(|(tool, _)| reserved(tool.name())) {
+            return Err(e);
+        }
         let mut conflict = None;
         self.tools.rcu(|current| {
             conflict = None;
@@ -397,6 +417,12 @@ impl ToolRegistry {
         plugin: &str,
         new_entries: Vec<(Arc<dyn Tool>, ToolSource)>,
     ) -> Result<(), RegistryError> {
+        if let Some(e) = new_entries
+            .iter()
+            .find_map(|(tool, _)| reserved(tool.name()))
+        {
+            return Err(e);
+        }
         let mut conflict = None;
         self.tools.rcu(|current| {
             conflict = None;
@@ -562,6 +588,24 @@ mod tests {
         ToolSource::Lua {
             plugin: plugin.into(),
         }
+    }
+
+    /// `permissions.toml` keeps this name for the list of Maki's own files the
+    /// user opened. A tool under it would have every rule written for it read as
+    /// that list, so it is refused however it arrives.
+    #[test]
+    fn a_tool_cannot_take_the_reserved_name() {
+        let reg = ToolRegistry::new();
+        let reserved = || (mock(MAKI_FILES_SECTION), lua_source("p"));
+
+        for err in [
+            reg.register(reserved().0, reserved().1).unwrap_err(),
+            reg.register_many([reserved()]).unwrap_err(),
+            reg.replace_plugin("p", vec![reserved()]).unwrap_err(),
+        ] {
+            assert!(matches!(err, RegistryError::ReservedName { .. }), "{err}");
+        }
+        assert!(!reg.has(MAKI_FILES_SECTION));
     }
 
     #[test]

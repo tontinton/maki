@@ -9,7 +9,9 @@ use tracing::debug;
 
 use crate::{StateDir, StorageError, atomic_write_permissions};
 
-const AUTH_DIR: &str = "auth";
+/// Referenced by the rule in `paths` that closes it, so the directory holding
+/// the credentials and the rule protecting it can only ever be one name.
+pub(crate) const AUTH_DIR: &str = "auth";
 const AUTH_FILE_MODE: u32 = 0o600;
 const REFRESH_BUFFER_SECS: u64 = 60;
 const LOCK_SUFFIX: &str = ".lock";
@@ -114,7 +116,7 @@ pub fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn auth_path(dir: &StateDir, filename: &str) -> PathBuf {
+pub(crate) fn auth_path(dir: &StateDir, filename: &str) -> PathBuf {
     dir.path().join(AUTH_DIR).join(format!("{filename}.json"))
 }
 

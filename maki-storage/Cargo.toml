@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 getrandom = { workspace = true }
 isahc = { workspace = true }
 serde = { workspace = true }

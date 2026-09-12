@@ -23,6 +23,7 @@ use maki_agent::{
 };
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_storage::paths::Access;
 use mlua::{
     Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table,
     Value as LuaValue,
@@ -828,6 +829,57 @@ fn register_permission_rule(
     Ok(())
 }
 
+/// Which of `paths` the user has to be asked about before a tool may touch
+/// them, in the shape a `permission_scopes` callback returns.
+///
+/// `nil` for every ordinary path, which is the whole point: a read tool that
+/// answered with a scope for every call would put a permission prompt in front
+/// of every file read. A path answers here only where Maki's guard over its own
+/// files refuses it and an explicit approval is a legal answer to that refusal.
+/// The credentials, the package approval store, the permission policy and
+/// installed package code never answer, so no prompt can hand those over.
+///
+/// The scope is the canonical path, resolved the way `maki.fs` resolves it, so
+/// the answer the user gives is recorded against the file the call will open
+/// rather than against the spelling that reached the tool.
+///
+/// @param paths string[] The paths the call is about. Relative paths and `~` resolve the same way they do in `maki.fs`.
+/// @param access string `"read"` or `"write"`, matching what the call will do. Anything else throws.
+/// @return table|nil `{ scopes = { "<canonical path>", ... } }`, or nil when nothing about this call needs asking.
+/// @example
+/// maki.api.register_tool({
+///   name = "read",
+///   permission = "fs_read",
+///   permission_scopes = function(input)
+///     return maki.api.protected_scopes({ input.path }, "read")
+///   end,
+///   -- ...
+/// })
+#[lua_fn]
+fn protected_scopes(lua: &Lua, paths: Vec<String>, access: String) -> LuaResult<Option<Table>> {
+    // A misspelling is a programmer error, so it throws rather than picking an
+    // access: guessing `read` would skip a question, guessing `write` would ask
+    // the user to hand over more than the call needs.
+    let access = Access::parse(&access).ok_or_else(|| {
+        mlua::Error::runtime(format!(
+            "protected_scopes: access must be one of {:?}, got {access:?}",
+            Access::ALL.map(Access::as_str)
+        ))
+    })?;
+    // The computation lives beside `guarded` in `api::fs`, so the accessor and
+    // the call it escalates for resolve a spelling through one function.
+    let scopes: Vec<String> = paths
+        .iter()
+        .filter_map(|path| crate::api::fs::escalation_scope(path, access))
+        .collect();
+    if scopes.is_empty() {
+        return Ok(None);
+    }
+    let table = lua.create_table()?;
+    table.set("scopes", scopes)?;
+    Ok(Some(table))
+}
+
 /// Turns the rules a load declared into the rules that take effect. Runs once,
 /// at the commit point of that load, so the answer never depends on which
 /// plugin happened to run first and the plugin's own tools already exist.
@@ -1143,7 +1195,7 @@ lua_table! {
     extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, permissions: PluginPermissions, plugin: Arc<str>, opts: PluginOpts), DOCS [
         register_tool(pending, permissions), register_permission_rule(pending_rules), register_command(plugin),
         register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
-        get_tools, get_tool,
+        get_tools, get_tool, protected_scopes,
         manual run_command,
     ]
 }

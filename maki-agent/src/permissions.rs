@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use maki_config::{
     DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionRule, PermissionTarget, PermissionsConfig,
-    ProjectConfig, ToolKey, append_permission_rule,
+    ProjectConfig, ToolKey, append_maki_file_override, append_permission_rule,
 };
+use maki_storage::paths::{self, Access};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -572,7 +573,94 @@ impl PermissionManager {
         }
     }
 
-    pub fn apply_decision(&self, tool: &ToolKey, scopes: &[String], answer: &PermissionAnswer) {
+    /// Records the approval the user just gave over any of Maki's own files the
+    /// prompt named.
+    ///
+    /// Such an approval is two grants, not one, and they answer different
+    /// questions. The tool rule decides whether the tool asks again, which is
+    /// what an "always" answer means; the override decides whether the guard
+    /// hands the path over at all. So this records the override and leaves the
+    /// rule to [`PermissionManager::apply_decision`], which records it for
+    /// every other scope too. Claiming the scope instead left an "always"
+    /// answer prompting again on the next call, and a rule is no way past the
+    /// guard regardless of how broadly it was aimed.
+    ///
+    /// Every allow answer lands here, `AllowOnce` included. The guard holds no
+    /// per-call state, so the session is the narrowest grant it can express, and
+    /// the alternative is a call the user just approved failing from inside the
+    /// tool with a refusal they have no way to act on.
+    ///
+    /// The scopes are the ones the prompt showed, never the generalized ones: a
+    /// write scope generalizes to `<parent>/**`, which names no file and would
+    /// record an override that opens nothing.
+    fn claim_maki_files(
+        &self,
+        tool: &ToolKey,
+        scopes: &[String],
+        answer: &PermissionAnswer,
+        access: Option<Access>,
+    ) {
+        let guard = paths::guard();
+        let Some(access) = access else {
+            // A tool that declares no filesystem capability cannot be handed
+            // one here, and guessing an access for it would grant what nobody
+            // asked about. Loud where a scope names one of Maki's own files,
+            // because then the approval cannot do what the user just asked for
+            // and the tool refuses again from inside.
+            for scope in scopes {
+                if Access::ALL
+                    .iter()
+                    .any(|a| guard.override_candidate(Path::new(scope), *a).is_some())
+                {
+                    warn!(
+                        tool = %tool,
+                        scope = %scope,
+                        "the prompt named one of Maki's own files, but this tool declares no filesystem access, so the approval opens nothing"
+                    );
+                }
+            }
+            return;
+        };
+        for scope in scopes {
+            let path = Path::new(scope);
+            if guard.override_candidate(path, access).is_none() {
+                continue;
+            }
+            if let Err(e) = guard.add_override(path, access) {
+                warn!(tool = %tool, scope = %scope, error = %e, "an approval did not open the path");
+                continue;
+            }
+            match answer {
+                // Only the user's own config carries these.
+                PermissionAnswer::AllowAlwaysGlobal => {
+                    if let Err(e) = append_maki_file_override(scope, access) {
+                        warn!(error = %e, "failed to persist the override, so it holds for this session only");
+                    }
+                }
+                // A project's copy is ignored on load, so saving one there would
+                // look like a grant that quietly stops working after a restart.
+                // Said out loud, because the user answered "always" and will be
+                // asked again on the next start.
+                PermissionAnswer::AllowAlwaysProject => info!(
+                    tool = %tool,
+                    scope = %scope,
+                    "an always-answer over one of Maki's own files holds for this session only: the durable grant lives in the user's own config"
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    pub fn apply_decision(
+        &self,
+        tool: &ToolKey,
+        scopes: &[String],
+        answer: &PermissionAnswer,
+        access: Option<Access>,
+    ) {
+        if answer.is_allow() {
+            self.claim_maki_files(tool, scopes, answer, access);
+        }
         let resolved = if answer.is_allow() || tool.is_mcp() {
             // MCP scopes are always wildcarded — both allow and deny generalize to "*".
             // This makes session and persisted rules consistent: a deny on an MCP tool
@@ -637,6 +725,9 @@ impl PermissionManager {
         request_id: &str,
         cancel: &crate::CancelToken,
         plan_path: Option<&Path>,
+        // What the tool exposes, for the one decision that turns an approval
+        // into an override over Maki's own files.
+        access: Option<Access>,
     ) -> Result<(), PermissionError> {
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
         let tool_string = tool.to_string();
@@ -706,7 +797,7 @@ impl PermissionManager {
         let Some(answer) = PermissionAnswer::decode(&answer) else {
             return Err(deny(DECISION_SOURCE_USER_ABORT, None));
         };
-        self.apply_decision(&t2, &s2, &answer);
+        self.apply_decision(&t2, &s2, &answer, access);
         let source = answer.decision_source();
         if answer.is_allow() {
             allowed(source)
@@ -893,6 +984,7 @@ fn generalize_scope(tool: &ToolKey, scope: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     const PLAN_FILE: &str = "/home/user/.local/state/maki/plans/test.md";
@@ -903,6 +995,18 @@ mod tests {
     const READ_TOOL: &str = "read";
     const READ_SCOPE: &str = "/home/user/project/src/main.rs";
 
+    /// What a tool that touches no file declares, so its approval can never turn
+    /// into an override over Maki's own files.
+    const NO_FS_ACCESS: Option<Access> = None;
+
+    const STATE_ROLE: &str = "state";
+    const CLOSED_STATE_FILE: &str = "sessions.json";
+    const GUARD_ALREADY_RESOLVED: &str =
+        "the rules were already resolved, so this test is asking the wrong guard";
+    const ALWAYS_MEANS_NO_SECOND_PROMPT: &str =
+        "the answer has to record the rule as well, or the next call asks again";
+    const YOLO_IS_NOT_A_GRANT: &str = "yolo skips prompts, it does not hand over Maki's own files";
+    const RAW_INPUT_FALLBACK: &str = "{\"path\":\"/somewhere\",\"offset\":1}";
     const ALLOWED: &str = "allowed";
     const DENIED: &str = "denied";
     const PROMPTS: &str = "prompts";
@@ -1163,6 +1267,7 @@ mod tests {
             &ToolKey::native("bash"),
             &["cargo test --all".into()],
             &PermissionAnswer::AllowSession,
+            NO_FS_ACCESS,
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo build", None),
@@ -1178,6 +1283,7 @@ mod tests {
             &ToolKey::native("bash"),
             &["cargo test".into()],
             &PermissionAnswer::DenyAlwaysProject,
+            NO_FS_ACCESS,
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo test", None),
@@ -1215,7 +1321,12 @@ mod tests {
             Arc::default(),
         );
 
-        mgr.apply_decision(&ToolKey::native("bash"), &["cargo test".into()], &answer);
+        mgr.apply_decision(
+            &ToolKey::native("bash"),
+            &["cargo test".into()],
+            &answer,
+            NO_FS_ACCESS,
+        );
 
         assert_eq!(mgr.session_rules_snapshot().len(), 1);
         assert_eq!(project.path().join(PROJECT_DIR).exists(), trusted);
@@ -1414,6 +1525,7 @@ mod tests {
             &ToolKey::native("bash"),
             &["cargo test".into(), "git status".into()],
             &PermissionAnswer::AllowSession,
+            NO_FS_ACCESS,
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo build", None),
@@ -1499,6 +1611,7 @@ mod tests {
             &ToolKey::parse("myfetch.search").unwrap(),
             &["{\"url\":\"https://a\"}".into()],
             &PermissionAnswer::AllowSession,
+            NO_FS_ACCESS,
         );
         // Same tool, different arguments -> allowed without reprompting.
         assert!(matches!(
@@ -1570,6 +1683,7 @@ mod tests {
             &tool,
             &["{\"q\":\"dangerous\"}".into()],
             &PermissionAnswer::DenyAlwaysProject,
+            NO_FS_ACCESS,
         );
         // Different arguments: still denied.
         assert!(matches!(
@@ -1661,7 +1775,12 @@ mod tests {
     #[test_case(PermissionAnswer::Deny ; "deny_once")]
     fn once_decisions_add_no_session_rules(answer: PermissionAnswer) {
         let mgr = default_mgr();
-        mgr.apply_decision(&ToolKey::native("bash"), &["cargo test".into()], &answer);
+        mgr.apply_decision(
+            &ToolKey::native("bash"),
+            &["cargo test".into()],
+            &answer,
+            NO_FS_ACCESS,
+        );
         assert!(mgr.session_rules_snapshot().is_empty());
     }
 
@@ -1978,5 +2097,107 @@ mod tests {
             ),
             PermissionCheck::NeedsPrompt { .. }
         ));
+    }
+
+    /// A layout the test owns, installed process-wide because the guard the
+    /// decision site asks is the process one. nextest gives every test its own
+    /// process, so the install always lands; asserted rather than assumed,
+    /// because a tempdir is in nobody's state dir and a guard that quietly
+    /// stayed the real one would leave this passing for the wrong reason.
+    fn install_own_files() -> (TempDir, PathBuf) {
+        let root = TempDir::new().unwrap();
+        let state = root.path().join(STATE_ROLE);
+        std::fs::create_dir_all(&state).unwrap();
+        let installed = paths::install_guard(paths::Guard::for_layout(&paths::Layout {
+            state: Some(&state),
+            data: None,
+            cache: None,
+            logs: None,
+            config_dirs: &[],
+            home: None,
+        }));
+        assert!(installed, "{GUARD_ALREADY_RESOLVED}");
+        (root, state)
+    }
+
+    /// An approval over one of Maki's own files records both halves of itself:
+    /// the override that opens the path, and the ordinary rule that says the
+    /// tool need not ask again. Recording only the override left an "always"
+    /// answer prompting on the very next call, since the rule is what the
+    /// prompt is decided by, and a rule alone is no way past the guard however
+    /// broadly it was aimed.
+    #[test]
+    fn an_approval_over_makis_own_files_records_the_override_and_the_rule() {
+        let (_root, state) = install_own_files();
+        let kept = state.join(CLOSED_STATE_FILE);
+        let scope = kept.to_string_lossy().into_owned();
+        let mgr = default_mgr();
+
+        mgr.apply_decision(
+            &native_key(),
+            std::slice::from_ref(&scope),
+            &PermissionAnswer::AllowSession,
+            Some(Access::Read),
+        );
+
+        assert!(
+            !paths::guard().is_unreachable(&kept, Access::Read),
+            "the approval has to reach the file"
+        );
+        assert_eq!(
+            outcome(mgr.check(&native_key(), &scope, None)),
+            ALLOWED,
+            "{ALWAYS_MEANS_NO_SECOND_PROMPT}"
+        );
+    }
+
+    /// The other half: a scope that names none of Maki's own files is recorded
+    /// the way it always was.
+    ///
+    /// The second case is what a failed `permission_scopes` callback produces.
+    /// It force-prompts with the raw tool input, which names no file, so an
+    /// approval for it opens nothing and the guard keeps refusing.
+    #[test_case(|root| root.join(CLOSED_STATE_FILE).to_string_lossy().into_owned(); "a_file_of_the_users_own")]
+    #[test_case(|_| RAW_INPUT_FALLBACK.to_owned(); "the_raw_input_a_failed_callback_falls_back_to")]
+    fn an_approval_over_an_ordinary_scope_is_still_a_rule(spell: fn(&Path) -> String) {
+        let (root, _state) = install_own_files();
+        let scope = spell(root.path());
+        let mgr = default_mgr();
+
+        mgr.apply_decision(
+            &native_key(),
+            std::slice::from_ref(&scope),
+            &PermissionAnswer::AllowSession,
+            Some(Access::Read),
+        );
+
+        assert!(
+            mgr.session_rules_snapshot()
+                .iter()
+                .any(|rule| rule.scope.as_deref() == Some(scope.as_str())),
+            "an ordinary approval is still a tool rule"
+        );
+    }
+
+    /// YOLO skips prompts; it does not hand over Maki's own files. The check
+    /// comes back allowed with nobody asked, so no answer is ever recorded, and
+    /// the guard refuses the call from inside the tool with today's message.
+    ///
+    /// This is the hole any design that read overrides off "the check passed"
+    /// would have: yolo returns `Allowed` before `force_prompt` is even honoured.
+    #[test]
+    fn yolo_opens_none_of_makis_own_files() {
+        let (_root, state) = install_own_files();
+        let kept = state.join(CLOSED_STATE_FILE);
+        let mgr = default_mgr();
+        mgr.toggle_yolo();
+
+        let check = mgr.check(&native_key(), &kept.to_string_lossy(), None);
+
+        assert_eq!(outcome(check), ALLOWED, "yolo skips the prompt");
+        assert!(
+            paths::guard().is_unreachable(&kept, Access::Read),
+            "{YOLO_IS_NOT_A_GRANT}"
+        );
     }
 }

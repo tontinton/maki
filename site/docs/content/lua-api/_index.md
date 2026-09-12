@@ -712,6 +712,48 @@ end
 
 ---
 
+### `maki.api.protected_scopes()` {#maki-api-protected_scopes}
+
+```lua
+maki.api.protected_scopes({paths}, {access})
+```
+
+Which of `paths` the user has to be asked about before a tool may touch
+them, in the shape a `permission_scopes` callback returns.
+
+`nil` for every ordinary path, which is the whole point: a read tool that
+answered with a scope for every call would put a permission prompt in front
+of every file read. A path answers here only where Maki's guard over its own
+files refuses it and an explicit approval is a legal answer to that refusal.
+The credentials, the package approval store, the permission policy and
+installed package code never answer, so no prompt can hand those over.
+
+The scope is the canonical path, resolved the way `maki.fs` resolves it, so
+the answer the user gives is recorded against the file the call will open
+rather than against the spelling that reached the tool.
+
+**Parameters:**
+
+- `{paths}` (`string[]`) The paths the call is about. Relative paths and `~` resolve the same way they do in `maki.fs`.
+- `{access}` (`string`) `"read"` or `"write"`, matching what the call will do. Anything else throws.
+
+**Returns:** table|nil `{ scopes = { "<canonical path>", ... } }`, or nil when nothing about this call needs asking.
+
+**Example:**
+
+```lua
+maki.api.register_tool({
+  name = "read",
+  permission = "fs_read",
+  permission_scopes = function(input)
+    return maki.api.protected_scopes({ input.path }, "read")
+  end,
+  -- ...
+})
+```
+
+---
+
 ### `maki.api.run_command()` {#maki-api-run_command}
 
 ```lua

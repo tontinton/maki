@@ -2996,6 +2996,7 @@ dependencies = [
 name = "maki-storage"
 version = "0.5.3"
 dependencies = [
+ "arc-swap",
  "bs58",
  "etcetera",
  "fs4",
