@@ -772,10 +772,10 @@ fn extract_prompt_content(blocks: &[ContentBlock]) -> (String, Vec<ImageSource>)
             ContentBlock::Text(TextContent { text: t, .. }) => append(&mut text, t),
             ContentBlock::Image(ImageContent {
                 data, mime_type, ..
-            }) => images.push(ImageSource {
-                media_type: image_media_type(mime_type),
-                data: Arc::from(data.as_str()),
-            }),
+            }) => images.push(ImageSource::new(
+                image_media_type(mime_type),
+                Arc::from(data.as_str()),
+            )),
             ContentBlock::Resource(res) => {
                 if let EmbeddedResourceResource::TextResourceContents(trc) = &res.resource {
                     append(&mut text, &format!("--- {} ---\n{}", trc.uri, trc.text));

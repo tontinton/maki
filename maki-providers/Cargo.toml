@@ -17,6 +17,7 @@ futures-lite = { workspace = true }
 futures = { workspace = true }
 isahc = { workspace = true }
 base64 = { workspace = true }
+image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 wait-timeout = { workspace = true }

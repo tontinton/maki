@@ -137,8 +137,20 @@ pub(crate) async fn stream_with_retry(
         }
     });
     let model = fitted.as_ref().unwrap_or(model);
-    let messages = maki_providers::adapt_images_for_model(model, messages);
-    let messages = &*messages;
+    // Rebuilding images a provider would refuse can take real time on the
+    // first request of a session full of screenshots, and it all happens
+    // before anything below can observe a cancel.
+    let adapted = futures_lite::future::race(
+        async { Ok(maki_providers::adapt_images_for_model(model, messages).await) },
+        async {
+            cancel.cancelled().await;
+            Err(StreamError::Cancelled {
+                streamed: String::new(),
+            })
+        },
+    )
+    .await?;
+    let messages = &*adapted;
     let mut retry = RetryState::new();
     loop {
         let started = Instant::now();

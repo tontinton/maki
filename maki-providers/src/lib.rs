@@ -1,4 +1,5 @@
 pub(crate) mod error;
+pub(crate) mod image;
 pub mod manifest;
 pub mod model;
 pub mod model_registry;
@@ -26,8 +27,9 @@ pub use providers::dynamic;
 pub use providers::openai::auth as openai_auth;
 pub use providers::xai::auth as xai_auth;
 pub use types::{
-    ContentBlock, EMPTY_RESPONSE_MARKER, Effort, EffortDialect, IMAGE_OMITTED_NOTE,
-    IMAGE_PLACEHOLDER, ImageMediaType, ImageSource, Message, MessageKind, ModelUsageRow,
-    ProviderEvent, ProviderUsage, RequestOptions, Role, StopReason, StreamResponse, THINKING_USAGE,
-    ThinkingConfig, UsageLimit, adapt_images_for_model, dialect,
+    ContentBlock, EMPTY_RESPONSE_MARKER, Effort, EffortDialect, IMAGE_EVICTED_NOTE,
+    IMAGE_OMITTED_NOTE, IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource,
+    Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions, Role,
+    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, UsageLimit, adapt_images_for_model,
+    dialect,
 };

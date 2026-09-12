@@ -74,7 +74,7 @@ async fn run_btw(
 ) {
     let (event_tx, event_rx) = flume::unbounded();
     let tools = Value::Array(vec![]);
-    let messages = maki_providers::adapt_images_for_model(&model, &messages);
+    let messages = maki_providers::adapt_images_for_model(&model, &messages).await;
 
     let stream_fut = provider.stream_message(
         &model,

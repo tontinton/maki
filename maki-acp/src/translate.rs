@@ -609,10 +609,10 @@ mod tests {
     fn replay_user_image_keeps_mime_type() {
         let msg = Message::user_with_images(
             String::new(),
-            vec![ImageSource {
-                media_type: ImageMediaType::Png,
-                data: std::sync::Arc::from("b64data"),
-            }],
+            vec![ImageSource::new(
+                ImageMediaType::Png,
+                std::sync::Arc::from("b64data"),
+            )],
         );
         let json = updates_json(&[msg]);
         assert_eq!(json.len(), 1);

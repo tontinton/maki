@@ -159,10 +159,10 @@ mod tests {
         let pixels = RgbaImage::from_fn(8, 12, |_, y| Rgba([y as u8 * 20, 80, 160, 255]));
         let mut png = Cursor::new(Vec::new());
         DynamicImage::ImageRgba8(pixels).write_to(&mut png, ImageFormat::Png)?;
-        let source = ImageSource {
-            media_type: ImageMediaType::Png,
-            data: STANDARD.encode(png.into_inner()).into(),
-        };
+        let source = ImageSource::new(
+            ImageMediaType::Png,
+            STANDARD.encode(png.into_inner()).into(),
+        );
         let mut image = InlineImage::new_prepared(source, &picker, VIEWPORT.width)?;
         assert_eq!(image.height(), IMAGE_HEIGHT);
         let mut terminal = Terminal::new(TestBackend::new(8, 8))?;

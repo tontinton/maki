@@ -307,16 +307,16 @@ mod tests {
         let mut png = Cursor::new(Vec::new());
         DynamicImage::new_rgb8(IMAGE_WIDTH.into(), IMAGE_HEIGHT.into())
             .write_to(&mut png, ImageFormat::Png)?;
-        let source = ImageSource {
-            media_type: ImageMediaType::Png,
-            data: STANDARD
+        let source = ImageSource::new(
+            ImageMediaType::Png,
+            STANDARD
                 .encode(if malformed {
                     MALFORMED_IMAGE
                 } else {
                     png.get_ref()
                 })
                 .into(),
-        };
+        );
         #[allow(deprecated)]
         let mut picker = Picker::from_fontsize(FontSize::new(1, 1));
         picker.set_protocol_type(ProtocolType::Halfblocks);
