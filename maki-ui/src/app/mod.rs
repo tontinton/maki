@@ -4,6 +4,8 @@
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
 
+use std::collections::HashSet;
+
 mod btw;
 mod image_paste;
 pub(crate) mod mode;
@@ -274,6 +276,7 @@ pub struct App {
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
+    running_jobs: HashSet<u32>,
 }
 
 impl App {
@@ -370,6 +373,7 @@ impl App {
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
+            running_jobs: HashSet::new(),
         };
         app.model_picker.set_recents(
             maki_storage::model::read_recents(&app.storage)
@@ -391,6 +395,10 @@ impl App {
     /// A job of this session spawned or exited; the event loop only routes
     /// events for the owning session, so no filtering happens here.
     pub(crate) fn handle_job_event(&mut self, event: &JobUiEvent) {
+        match event {
+            JobUiEvent::Started { job_id, .. } => self.running_jobs.insert(*job_id),
+            JobUiEvent::Exited { job_id, .. } => self.running_jobs.remove(job_id),
+        };
         self.main_chat().apply_job_event(event);
     }
 

@@ -324,6 +324,7 @@ impl App {
             workflow: self.state.workflow,
             restricted: self.trust_question.is_some(),
             yolo: self.permissions.is_yolo(),
+            running_jobs: self.running_jobs.len(),
             restoring: self.restoring.load(Ordering::Relaxed),
         };
         self.status_bar.view(frame, status_area, &ctx);
