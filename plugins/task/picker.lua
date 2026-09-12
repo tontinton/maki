@@ -65,6 +65,10 @@ local function icon_of(task)
   return icon[1], icon[2], icon[3]
 end
 
+local function icon_of_monitor(job)
+  return Rows.monitor_icon(job)
+end
+
 -- The counts describe the rows on screen, so a filter that hides half the list
 -- has to retally them.
 local function update_footer(counts)
@@ -85,10 +89,10 @@ end
 -- falls to whatever row took over the old position.
 local function rebuild()
   local previous = Rows.index_of(board.rows, board.sel_id) or 1
-  local built = Rows.build(board.tasks, board.input:value())
+  local built = Rows.build(board.tasks, board.monitors, board.input:value())
   board.rows = built.rows
   local idx = Rows.index_of(board.rows, board.sel_id) or math.min(previous, math.max(#board.rows, 1))
-  board.sel_id = board.rows[idx] and board.rows[idx].task.id or nil
+  board.sel_id = board.rows[idx] and Rows.row_id(board.rows[idx]) or nil
   update_footer(built.sections)
 end
 
@@ -102,10 +106,14 @@ local function render()
     if row.section then
       lines[#lines + 1] = { { "  " .. row.section, "keybind_section" } }
     end
-    local task = row.task
-    local selected = task.id == board.sel_id
+    local selected = Rows.row_id(row) == board.sel_id
     local base = selected and "selected" or "item"
-    local icon, icon_style, spinning = icon_of(task)
+    local icon, icon_style, spinning
+    if row.task then
+      icon, icon_style, spinning = icon_of(row.task)
+    else
+      icon, icon_style, spinning = icon_of_monitor(row.monitor)
+    end
     if selected then
       icon_style = "selected"
     end
@@ -114,14 +122,15 @@ local function render()
     if spinning then
       icon_style = "spinner:" .. icon_style
     end
+    local name = Rows.row_name(row)
     local line = { { "  ", base }, { icon, icon_style } }
     local match_style = selected and "match_selected" or "match"
-    for _, span in ipairs(ListPicker.highlight_spans(task.name, words, base, match_style)) do
+    for _, span in ipairs(ListPicker.highlight_spans(name, words, base, match_style)) do
       line[#line + 1] = span
     end
     -- Rows with nothing on the right would otherwise end short of the border
     -- and read as padding on one side only, so the bar runs the full width.
-    local trail = board.width - 2 - dispw(icon) - dispw(task.name)
+    local trail = board.width - 2 - dispw(icon) - dispw(name)
     if trail > 0 then
       line[#line + 1] = { string.rep(" ", trail), base }
     end
@@ -149,7 +158,19 @@ local function refresh()
     maki.ui.flash(err)
     return
   end
+  -- Monitor jobs belong to whatever plugin started them, but a session
+  -- filter lists the whole session, so the picker sees the monitor
+  -- plugin's jobs too.
+  local jobs, jobs_err = maki.fn.joblist(maki.session.current())
+  if board ~= this_board then
+    return
+  end
+  if jobs_err then
+    maki.ui.flash(jobs_err)
+    jobs = nil
+  end
   board.tasks = tasks
+  board.monitors = jobs
   rebuild()
   render()
 end
@@ -183,8 +204,13 @@ local function move_sel(delta, wrap)
   else
     idx = math.min(math.max(cur + delta, 1), n)
   end
-  board.sel_id = board.rows[idx].task.id
+  local row = board.rows[idx]
+  board.sel_id = Rows.row_id(row)
   render()
+  -- A monitor has no transcript to preview.
+  if not row.task then
+    return
+  end
   local _, err = maki.task.focus(board.sel_id)
   if err then
     maki.ui.flash(err)
@@ -197,6 +223,11 @@ end
 
 local function open_selected()
   if not board.sel_id then
+    return
+  end
+  local row = board.rows[Rows.index_of(board.rows, board.sel_id)]
+  if not row.task then
+    maki.ui.flash("a monitor has no transcript to open")
     return
   end
   local _, err = maki.task.focus(board.sel_id)
@@ -257,6 +288,7 @@ local function open()
     -- ended up once it wrapped.
     reserved = 0,
     tasks = {},
+    monitors = {},
     rows = {},
   }
   refresh()

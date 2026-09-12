@@ -671,6 +671,11 @@ impl JobStore {
     /// List jobs this plugin can see. Task and plugin jobs leave the map on
     /// exit; session-owned jobs stay so exited ids stay findable. Tails live
     /// on `snapshot` / `jobinfo`.
+    ///
+    /// A session filter lists every job owned by that session, whatever
+    /// plugin started it: the session's UI (the /tasks picker) needs to see
+    /// monitor jobs the monitor plugin owns. Without a filter, ownership
+    /// applies as usual.
     pub fn list(
         &self,
         session: Option<MakiId>,
@@ -679,8 +684,10 @@ impl JobStore {
     ) -> Vec<JobSnapshot> {
         self.jobs
             .iter()
-            .filter(|(_, job)| job.can_access(task_id, plugin))
-            .filter(|(_, job)| session.is_none_or(|s| job.session() == Some(s)))
+            .filter(|(_, job)| match session {
+                Some(s) => job.session() == Some(s),
+                None => job.can_access(task_id, plugin),
+            })
             .map(|(&id, job)| JobSnapshot::from_job(id, job, false))
             .collect()
     }
@@ -1979,6 +1986,50 @@ mod tests {
             .collect();
         assert_eq!(live, [plugin]);
         assert!(store.snapshot(task, Some(1), TEST_PLUGIN).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_filter_lists_session_jobs_across_owning_plugins() {
+        let session = MakiId::generate();
+        let other = MakiId::generate();
+        let mut store = make_store();
+        let monitor = store
+            .start(JobSpec::new(
+                JobOwner::Session {
+                    session,
+                    plugin: Arc::from("monitor"),
+                },
+                "sleep 0",
+            ))
+            .unwrap();
+        let foreign_session = store
+            .start(JobSpec::new(
+                JobOwner::Session {
+                    session: other,
+                    plugin: Arc::from("monitor"),
+                },
+                "sleep 0",
+            ))
+            .unwrap();
+
+        let from_task_plugin: Vec<u32> = store
+            .list(Some(session), None, "task")
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(
+            from_task_plugin,
+            [monitor],
+            "session filter crosses plugins"
+        );
+
+        let from_monitor: Vec<u32> = store
+            .list(Some(other), None, "monitor")
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(from_monitor, [foreign_session]);
     }
 
     #[cfg(unix)]
