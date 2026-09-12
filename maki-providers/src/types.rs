@@ -7,7 +7,6 @@
 //! belongs in model context, and must never be mistaken for the user talking.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
@@ -519,46 +518,16 @@ pub struct EffortDialect<'a> {
     pub off: Option<&'static str>,
 }
 
-/// How a local model spells thinking on the wire, in place of a token budget.
-/// Each mode carries the JSON fragment merged into the request body, so any
-/// shape a chat template needs works without a schema per provider.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct ThinkingFields {
-    #[serde(default)]
-    off: Option<Map<String, Value>>,
-    #[serde(default)]
-    adaptive: Option<Map<String, Value>>,
-    /// Keyed by [`Effort`]; the declared keys are the levels the model accepts.
-    #[serde(flatten)]
-    levels: BTreeMap<Effort, Map<String, Value>>,
-}
+pub use maki_config::providers::{ThinkingFields, ThinkingRequest};
 
-impl ThinkingFields {
-    /// Levels snap to the declared ones, so a level the model never advertised
-    /// is never sent. A token budget picks the level it corresponds to; models
-    /// that declare no levels fall back to `adaptive` and keep the count
-    /// (the returned flag tells the caller to still send the budget field).
-    fn fragment(
-        &self,
-        thinking: ThinkingConfig,
-        max: Option<u32>,
-    ) -> Option<(&Map<String, Value>, bool)> {
-        let level = match thinking {
-            ThinkingConfig::Off => return self.off.as_ref().map(|f| (f, false)),
-            ThinkingConfig::Adaptive => return self.adaptive.as_ref().map(|f| (f, false)),
-            ThinkingConfig::Effort(level) => level,
-            ThinkingConfig::Budget(n) => {
-                if self.levels.is_empty() {
-                    return self.adaptive.as_ref().map(|f| (f, true));
-                }
-                Effort::from_budget(n, max.unwrap_or(FALLBACK_MAX_THINKING_BUDGET))
-            }
-        };
-        let declared: Vec<Effort> = self.levels.keys().copied().collect();
-        self.levels
-            .get(&level.snap(&declared))
-            .or(self.adaptive.as_ref())
-            .map(|f| (f, false))
+impl ThinkingConfig {
+    fn as_request(self) -> ThinkingRequest {
+        match self {
+            Self::Off => ThinkingRequest::Off,
+            Self::Adaptive => ThinkingRequest::Adaptive,
+            Self::Effort(e) => ThinkingRequest::Effort(e),
+            Self::Budget(n) => ThinkingRequest::Budget(n),
+        }
     }
 }
 
@@ -667,9 +636,11 @@ pub mod dialect {
         adaptive: Some(High),
         off: None,
     };
-    /// Ollama's OpenAI-compat /v1/chat/completions. Omitted effort
-    /// auto-enables thinking on capable models, so Off sends "none"
-    /// explicitly. Only use behind `Model::supports_thinking`.
+    /// Ollama's OpenAI-compat /v1/chat/completions: unknown effort levels are
+    /// per-model (a small model may take only low/medium while a large one
+    /// takes xhigh), so the dialect accepts the full ladder and the model
+    /// snaps down. Omitted effort auto-enables thinking on capable models, so
+    /// Off sends "none" explicitly. Only use behind `Model::supports_thinking`.
     pub const OLLAMA: EffortDialect = EffortDialect {
         supported: &[Low, Medium, High, Max],
         adaptive: Some(Medium),
@@ -815,6 +786,39 @@ impl ThinkingConfig {
         }
     }
 
+    /// Fields-only: merges the declared fragment when one spells this mode,
+    /// otherwise sends nothing. A generic `openai` entry never guesses a
+    /// dialect, so plain gateways stay byte-identical.
+    pub fn apply_custom_thinking(self, body: &mut Value, model: &Model) {
+        if let Some(fields) = &model.thinking_fields {
+            let max = model.max_thinking_budget();
+            if let Some((fragment, _)) = fields.fragment(self.as_request(), max)
+                && let Some(object) = body.as_object_mut()
+            {
+                merge_body(object, fragment);
+            }
+        }
+    }
+
+    /// Ollama OpenAI-compat: declared fragments win, otherwise the dialect
+    /// sends effort for thinking-capable models, since Ollama ignores the
+    /// numeric budget field. A partial declaration that never spells this
+    /// mode falls back to the dialect rather than going silent.
+    pub fn apply_ollama_thinking(self, body: &mut Value, model: &Model, dialect: &EffortDialect) {
+        if let Some(fields) = &model.thinking_fields {
+            let max = model.max_thinking_budget();
+            if let Some((fragment, _)) = fields.fragment(self.as_request(), max)
+                && let Some(object) = body.as_object_mut()
+            {
+                merge_body(object, fragment);
+                return;
+            }
+        }
+        if model.supports_thinking() {
+            self.apply_reasoning_effort(body, dialect, model);
+        }
+    }
+
     /// Declared fragments win over the dialect; otherwise the dialect sends
     /// effort only for thinking-capable models, so plain gateways stay quiet.
     /// Fragments are the only openai-compat spelling: when no fragment spells
@@ -823,7 +827,7 @@ impl ThinkingConfig {
     pub fn apply_openai_thinking(self, body: &mut Value, model: &Model, dialect: &EffortDialect) {
         if let Some(fields) = &model.thinking_fields {
             let max = model.max_thinking_budget();
-            if let Some((fragment, _)) = fields.fragment(self, max)
+            if let Some((fragment, _)) = fields.fragment(self.as_request(), max)
                 && let Some(object) = body.as_object_mut()
             {
                 merge_body(object, fragment);
@@ -850,7 +854,7 @@ impl ThinkingConfig {
     pub fn apply_local_thinking(self, body: &mut Value, model: &Model) {
         let max = model.max_thinking_budget();
         if let Some(fields) = &model.thinking_fields
-            && let Some((fragment, keep_budget)) = fields.fragment(self, max)
+            && let Some((fragment, keep_budget)) = fields.fragment(self.as_request(), max)
             && let Some(object) = body.as_object_mut()
         {
             merge_body(object, fragment);
@@ -1425,15 +1429,55 @@ mod tests {
     fn openai_thinking_prefers_declared_fields_over_dialect() {
         let model = native_effort_model();
         let mut body = json!({"model": "test"});
-        ThinkingConfig::Effort(XHigh).apply_openai_thinking(&mut body, &model, &dialect::OLLAMA);
+        ThinkingConfig::Effort(XHigh).apply_openai_thinking(&mut body, &model, &dialect::STANDARD);
         assert_eq!(body["reasoning_effort"], "xhigh");
     }
 
     #[test]
     fn openai_thinking_sends_nothing_without_a_matching_fragment() {
-        let model = native_thinking_model("fields-model", json!({"high": {"reasoning_effort": "xhigh"}}));
+        let model = native_thinking_model(
+            "fields-model",
+            json!({"high": {"reasoning_effort": "xhigh"}}),
+        );
         let mut body = json!({"model": "test"});
-        ThinkingConfig::Off.apply_openai_thinking(&mut body, &model, &dialect::OLLAMA);
+        ThinkingConfig::Off.apply_openai_thinking(&mut body, &model, &dialect::STANDARD);
+        assert_eq!(body, json!({"model": "test"}));
+    }
+
+    #[test]
+    fn ollama_fields_win_over_dialect() {
+        let model = native_effort_model();
+        let mut body = json!({"model": "test"});
+        ThinkingConfig::Effort(XHigh).apply_ollama_thinking(&mut body, &model, &dialect::OLLAMA);
+        assert_eq!(body["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn ollama_partial_fields_fall_back_to_dialect() {
+        let model = native_thinking_model(
+            "fields-model",
+            json!({"high": {"reasoning_effort": "xhigh"}}),
+        );
+        let mut body = json!({"model": "test"});
+        ThinkingConfig::Off.apply_ollama_thinking(&mut body, &model, &dialect::OLLAMA);
+        assert_eq!(body["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn ollama_plain_model_uses_dialect_behind_thinking_support() {
+        let mut plain = thinking_model("ollama-model");
+        plain.thinking_override = Some(Support::Yes);
+        let mut body = json!({"model": "test"});
+        ThinkingConfig::Off.apply_ollama_thinking(&mut body, &plain, &dialect::OLLAMA);
+        assert_eq!(body["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn ollama_model_without_thinking_support_stays_quiet() {
+        let mut no_thinking = thinking_model("no-thinking");
+        no_thinking.thinking_override = Some(Support::No);
+        let mut body = json!({"model": "test"});
+        ThinkingConfig::Off.apply_ollama_thinking(&mut body, &no_thinking, &dialect::OLLAMA);
         assert_eq!(body, json!({"model": "test"}));
     }
 

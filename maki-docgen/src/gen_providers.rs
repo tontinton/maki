@@ -236,8 +236,8 @@ supports_vision = false
 | `max_output_tokens` | u32 | protocol default | Max completion tokens |
 | `supports_tool_examples` | bool | protocol default | |
 | `supports_thinking` | bool | protocol default | |
-| `requires_thinking` | bool | false | For APIs that reject requests with thinking disabled. Implies `supports_thinking` and raises thinking to minimal effort when off (including compaction) |
-| `thinking_fields` | table | unset | Per-model thinking modes as wire fragments. Replaces the reasoning-effort dialect for that model |
+| `requires_thinking` | bool | false | For APIs that reject requests with thinking disabled. Implies `supports_thinking` and raises thinking to minimal effort when off (including compaction). On generic `openai` entries without `thinking_fields` it has no wire effect |
+| `thinking_fields` | table | unset | Per-model thinking modes as wire fragments; the only thinking control on generic `openai` entries. A typo'd level key fails the parse (exit 2) |
 | `supports_vision` | bool | protocol default | When false, image input and `view_image` are off |
 | `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
 | `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
@@ -245,14 +245,14 @@ supports_vision = false
 
 Custom slugs must not reuse a built-in provider name. A bad TOML parse exits with code 2 at startup so a typo cannot silently empty the registry.
 
-Custom `openai`-protocol models get the same thinking controls as builtin ones. A model that declares only `supports_thinking` or `requires_thinking` sends `reasoning_effort` snapped to the openai reasoning-effort dialect (off sends `none`, off with `requires_thinking` raises to the lowest supported level). A model that declares `thinking_fields` replaces that dialect entirely, letting it express levels the dialect never could:
+Custom `openai`-protocol models send thinking only through declared `thinking_fields`: each key is a thinking mode whose JSON fragment merges into the request body. Models without `thinking_fields` send nothing, so plain gateways stay byte-identical. `off` and `adaptive` need explicit keys (they never snap); effort levels snap to the nearest declared level below, or up to the lowest one when below every key:
 
 ```toml
-[[ollama-local.models]]
+[[my-ollama.models]]
 id = "qwen3.8-coder-27b-mlx:latest"
 supports_thinking = true
 
-[ollama-local.models.thinking_fields]
+[my-ollama.models.thinking_fields]
 off = {{ reasoning_effort = "none" }}
 adaptive = {{ reasoning_effort = "medium" }}
 low = {{ reasoning_effort = "low" }}
@@ -261,7 +261,7 @@ high = {{ reasoning_effort = "xhigh" }}
 max = {{ reasoning_effort = "xhigh" }}
 ```
 
-Each declared key is a thinking mode the model accepts; a session level snaps to the nearest declared level below it, or up to the lowest one when below every key. Named modes send only their fragment, no token budget.
+A partial declaration that never spells a mode sends nothing for that mode. To get Ollama's effort dialect (`low`/`medium`/`high`, off sends `none`) instead of spelling every fragment, use the built-in `ollama` slug: set `[ollama].base_url` (or `OLLAMA_HOST`) and declare `[[ollama.models]]` thinking keys, which overlay onto the builtin.
 
 You can also create a custom provider interactively with `maki auth login` and choosing the custom option. That writes a starter entry to this file.
 
@@ -336,7 +336,7 @@ A `llama-cpp`, `ollama`, or `openai` base model can replace Maki's token-budget 
 }}]
 ```
 
-`off` is used when thinking is off, `adaptive` when thinking is on without a chosen level. Any other key is an effort level, one of {}. The levels you declare are the ones the model accepts: whatever you ask for snaps into them, downwards first, so a level the model never advertised is never sent. Every part is optional.
+`off` is used when thinking is off, `adaptive` when thinking is on without a chosen level. Any other key is an effort level, one of {}. The levels you declare are the ones the model accepts: whatever you ask for snaps into them, downwards first, so a level the model never advertised is never sent. Every part is optional, but `off` and `adaptive` never snap: a mode you left undeclared sends nothing on the generic `openai` path, and falls back to the base provider's mapping on `llama-cpp` and `ollama`.
 
 Fragments are merged into the body, so nesting works too. A template toggle is just a fragment:
 
@@ -347,7 +347,7 @@ Fragments are merged into the body, so nesting works too. A template toggle is j
 }}
 ```
 
-Named modes send only these fields, no token budget. An explicit `/thinking <budget>` snaps into the levels you declared; a model that declares none gets the `adaptive` fragment plus `thinking_budget_tokens`. Any mode you left undeclared falls back to the usual `thinking_budget_tokens` mapping, so no request ever ends up saying nothing. Models without `thinking_fields` keep the base provider's behavior.
+Named modes send only these fields, no token budget. An explicit `/thinking <budget>` snaps into the levels you declared; a model that declares none gets the `adaptive` fragment plus `thinking_budget_tokens`. Any other undeclared effort level falls back to the usual `thinking_budget_tokens` mapping, so no request ever ends up saying nothing. Models without `thinking_fields` keep the base provider's behavior.
 
 Dynamic provider models are namespaced as `{{slug}}/{{model_id}}` (e.g. `myproxy/claude-sonnet-4-6`).
 
