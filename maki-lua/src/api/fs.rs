@@ -84,11 +84,16 @@ fn collect_dir_entries(
     }
 }
 
-/// Read the entire file at {path} as a UTF-8 string.
+/// Read the file at {path} as a UTF-8 string.
 /// If the file contains bytes that are not valid UTF-8, this function throws.
 /// Use `read_bytes` for binary files.
 ///
 /// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
+/// @param opts table? `{ offset = integer, len = integer }` window to read. A negative
+///   `offset` counts back from the end of the file, so `{ offset = -1024 }` reads the
+///   last 1024 bytes, and `len` caps how many bytes are read from `offset`. A window
+///   that splits a multibyte character replaces the broken sequence. Omit `opts` to
+///   read the whole file.
 /// @return (string?, string?) File contents, or nil plus an error message.
 /// @example
 /// local text, err = maki.fs.read("config.toml")
@@ -96,14 +101,44 @@ fn collect_dir_entries(
 ///   maki.log.warn("could not read config: " .. err)
 ///   return
 /// end
+/// @example
+/// local tail = maki.fs.read("server.log", { offset = -4096 })
 #[lua_fn(guard = FsRead)]
-async fn read(_lua: Lua, path: String) -> LuaResult<Pair<String>> {
+async fn read(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<String>> {
     let abs = make_absolute(&path)?;
-    match smol::fs::read_to_string(&abs).await {
-        Ok(s) => Ok((Some(s), None)),
-        Err(e) if e.kind() == ErrorKind::InvalidData => {
-            Err(mlua::Error::runtime("non-utf8 content; use read_bytes"))
+    let window = match opts.as_ref() {
+        Some(t) => {
+            let offset: Option<i64> = t.get("offset")?;
+            let len: Option<u64> = t.get("len")?;
+            Some((offset.unwrap_or(0), len.unwrap_or(u64::MAX)))
         }
+        None => None,
+    };
+    let Some((offset, len)) = window else {
+        return match smol::fs::read_to_string(&abs).await {
+            Ok(s) => Ok((Some(s), None)),
+            Err(e) if e.kind() == ErrorKind::InvalidData => {
+                Err(mlua::Error::runtime("non-utf8 content; use read_bytes"))
+            }
+            Err(e) => Ok(err_pair(e)),
+        };
+    };
+    let text = smol::unblock(move || -> std::io::Result<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(&abs)?;
+        let start = if offset < 0 {
+            file.metadata()?.len().saturating_sub(offset.unsigned_abs())
+        } else {
+            offset as u64
+        };
+        file.seek(SeekFrom::Start(start))?;
+        let mut buf = Vec::new();
+        file.take(len).read_to_end(&mut buf)?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    })
+    .await;
+    match text {
+        Ok(s) => Ok((Some(s), None)),
         Err(e) => Ok(err_pair(e)),
     }
 }
@@ -744,6 +779,34 @@ mod tests {
                 "{func_name} should return error"
             );
         }
+    }
+
+    const WINDOW_LOG_CONTENT: &str = "head-tail-IGNORED\nmiddle\nthe-end";
+    const WINDOW_LOG_TAIL: &str = "the-end";
+    const WINDOW_LOG_WINDOW: &str = "tail";
+
+    #[test_case(-7, None, WINDOW_LOG_TAIL; "negative_offset_reads_from_end")]
+    #[test_case(5, Some(4), WINDOW_LOG_WINDOW; "offset_and_len_read_a_window")]
+    #[test_case(-10_000, None, WINDOW_LOG_CONTENT; "window_larger_than_file_reads_all")]
+    fn read_window(offset: i64, len: Option<u64>, expected: &str) {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("log.txt");
+        std::fs::write(&file, WINDOW_LOG_CONTENT).unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let read: mlua::Function = tbl.get("read").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("offset", offset).unwrap();
+        if let Some(len) = len {
+            opts.set("len", len).unwrap();
+        }
+
+        let (text, err): (String, mlua::Value) =
+            smol::block_on(read.call_async((file.to_str().unwrap(), opts))).unwrap();
+        assert!(matches!(err, mlua::Value::Nil), "windowed read succeeds");
+        assert_eq!(text, expected);
     }
 
     #[test]

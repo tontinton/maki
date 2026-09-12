@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tracing::warn;
+
 use maki_agent::CancelMap;
 
 use super::AgentCommand;
@@ -14,14 +16,18 @@ pub(super) fn spawn_command_router(
         while let Ok(cmd) = cmd_rx.recv_async().await {
             match cmd {
                 AgentCommand::Cancel { run_id } => {
-                    cancel_map.cancel_or_precancel(run_id);
+                    if !cancel_map.cancel_or_precancel(run_id) {
+                        warn!(run_id, "cancel matched no active run");
+                    }
                 }
                 AgentCommand::CancelAll => {
                     cancel_map.cancel_all();
                     subagent_cancels.cancel_all();
                 }
                 AgentCommand::CancelSubagent { tool_use_id } => {
-                    subagent_cancels.cancel_or_precancel(tool_use_id);
+                    if !subagent_cancels.cancel_or_precancel(tool_use_id.clone()) {
+                        warn!(tool_use_id = %tool_use_id, "subagent cancel matched no active session");
+                    }
                 }
             }
         }

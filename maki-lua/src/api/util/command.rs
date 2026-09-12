@@ -537,6 +537,10 @@ pub struct UiAttachment(Arc<AtomicBool>);
 impl Default for UiAttachment {
     /// Attached until a loop says otherwise. Headless runs and ACP hand Lua no
     /// sender at all, so the bit only ever describes a loop that went away.
+    /// A test harness (or other embedder) that drains `ui_action_rx` itself
+    /// without ever building an `EventLoop` relies on this default too, so it
+    /// stays `true`; real cold-start plugin load closes its own gap instead
+    /// by detaching explicitly before `EventLoop::new` reattaches.
     fn default() -> Self {
         Self(Arc::new(AtomicBool::new(true)))
     }

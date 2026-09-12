@@ -17,7 +17,7 @@ pub(crate) mod tasks;
 pub(crate) mod tests;
 pub(crate) mod view;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -214,6 +214,10 @@ pub struct App {
     pub(super) chats: Vec<Chat>,
     pub(super) active_chat: usize,
     pub(super) chat_index: HashMap<String, usize>,
+    /// Subagent chats that outlive the run that spawned them. Esc on the
+    /// main chat must not finish or drop these; Esc on the chat itself
+    /// still sends `CancelSubagent`.
+    detached_subagents: HashSet<String>,
     pub(crate) input_box: InputBox,
     pub(super) command_palette: CommandPalette,
     pub(super) theme_picker: ThemePicker,
@@ -274,6 +278,10 @@ pub struct App {
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
+    /// Receipts whose annotated ToolDone beat the session's first envelope:
+    /// the chat does not exist yet, so the handoff is parked here until the
+    /// chat is born.
+    detached_receipts: HashSet<String>,
 }
 
 impl App {
@@ -314,6 +322,7 @@ impl App {
             )],
             active_chat: 0,
             chat_index: HashMap::new(),
+            detached_subagents: HashSet::new(),
             input_box,
             command_palette: CommandPalette::new(
                 custom_commands,
@@ -370,6 +379,7 @@ impl App {
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
+            detached_receipts: HashSet::new(),
         };
         app.model_picker.set_recents(
             maki_storage::model::read_recents(&app.storage)
@@ -1091,11 +1101,15 @@ impl App {
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
-        self.subagent_answers.clear();
+        self.subagent_answers
+            .retain(|id, _| self.detached_subagents.contains(id));
         self.shell.cancel_all();
-        for chat in &mut self.chats {
+        let detached_chats = self.detached_chat_indices();
+        for (i, chat) in self.chats.iter_mut().enumerate() {
             chat.flush();
-            chat.cancel_in_progress();
+            if i == 0 || !detached_chats.contains(&i) {
+                chat.cancel_in_progress();
+            }
         }
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
@@ -1150,7 +1164,38 @@ impl App {
             }
             return vec![];
         }
-        if envelope.run_id != self.run_id {
+
+        // A backgrounded session closes long after its spawning run ended,
+        // so the close verdict and transcript skip the stale-run gate.
+        if let AgentEvent::SubagentHistory {
+            tool_use_id,
+            messages,
+            failed,
+        } = envelope.event
+        {
+            // Workflow sessions use synthetic ids that no ToolDone will match,
+            // so we finish them here on SubagentHistory. Without a verdict it
+            // only knows that the transcript closed, so say Unknown and leave
+            // the outcome to the ToolDone that follows elsewhere; a detached
+            // (background) session closes with its own verdict.
+            if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
+                let outcome = if failed {
+                    TaskOutcome::Error
+                } else if self.chats[sub_idx].is_detached() {
+                    TaskOutcome::Done
+                } else {
+                    TaskOutcome::Unknown
+                };
+                self.chats[sub_idx].mark_finished(outcome, DONE_TEXT);
+            }
+            self.detached_subagents.remove(&tool_use_id);
+            self.state
+                .session_mut()
+                .set_subagent_messages(tool_use_id, messages);
+            return vec![];
+        }
+
+        if envelope.run_id != self.run_id && envelope.run_id != maki_agent::DETACHED_RUN_ID {
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
             | AgentEvent::ToolHeaderSnapshot { id, .. }
@@ -1163,24 +1208,6 @@ impl App {
                     "tool render event dropped: stale run_id"
                 );
             }
-            return vec![];
-        }
-
-        if let AgentEvent::SubagentHistory {
-            tool_use_id,
-            messages,
-        } = envelope.event
-        {
-            // Workflow sessions use synthetic ids that no ToolDone will match,
-            // so we finish them here on SubagentHistory. This event only knows
-            // that the transcript closed, so say Unknown and leave the verdict
-            // to the ToolDone that follows elsewhere.
-            if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
-                self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
-            }
-            self.state
-                .session_mut()
-                .set_subagent_messages(tool_use_id, messages);
             return vec![];
         }
 
@@ -1210,7 +1237,19 @@ impl App {
             self.state
                 .session_mut()
                 .insert_tool_output(e.id.clone(), e.output.clone());
-            if let Some(&sub_idx) = self.chat_index.get(&e.id) {
+            if e.annotation.as_deref() == Some(maki_agent::tools::TASK_HANDOFF_ANNOTATION) {
+                match self.chat_index.get(&e.id) {
+                    Some(&sub_idx) => {
+                        self.chats[sub_idx].mark_detached();
+                        self.detached_subagents.insert(e.id.clone());
+                    }
+                    None => {
+                        self.detached_receipts.insert(e.id.clone());
+                    }
+                }
+            } else if let Some(&sub_idx) = self.chat_index.get(&e.id)
+                && !self.detached_subagents.contains(&e.id)
+            {
                 let (outcome, text) = if e.is_error {
                     (TaskOutcome::Error, ERROR_TEXT)
                 } else {
@@ -1307,8 +1346,9 @@ impl App {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
                     self.terminalize_turn(MISSING_TOOL_COMPLETION);
-                    self.chat_index.clear();
-                    self.subagent_answers.clear();
+                    self.drop_attached_subagents();
+                    self.subagent_answers
+                        .retain(|id, _| self.detached_subagents.contains(id));
                     self.status = Status::Idle;
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
@@ -1321,11 +1361,12 @@ impl App {
                         DisplayRole::Error,
                         cap_error_text(&message),
                     ));
-                    self.subagent_answers.clear();
+                    self.subagent_answers
+                        .retain(|id, _| self.detached_subagents.contains(id));
                     self.terminalize_turn(&message);
                     self.recoverable_queue = self.queue.text_messages();
                     self.queue.clear();
-                    self.chat_index.clear();
+                    self.drop_attached_subagents();
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
                     }
@@ -1350,7 +1391,13 @@ impl App {
 
     fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {
         let id = &subagent.parent_tool_use_id;
+        if subagent.detached {
+            self.detached_subagents.insert(id.clone());
+        }
         if let Some(&idx) = self.chat_index.get(id.as_str()) {
+            if subagent.detached {
+                self.chats[idx].mark_detached();
+            }
             return idx;
         }
         let idx = self.chats.len();
@@ -1374,6 +1421,10 @@ impl App {
         chat.opts = subagent.opts;
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
+        }
+        if subagent.detached || self.detached_receipts.remove(id) {
+            chat.mark_detached();
+            self.detached_subagents.insert(id.clone());
         }
         self.chats.push(chat);
         self.sync_subagents();
@@ -1791,7 +1842,22 @@ impl App {
 
     fn finish_subagents(&mut self, outcome: TaskOutcome, text: &str) {
         self.retain_resolved_subagents(outcome, text);
-        self.chat_index.clear();
+        self.drop_attached_subagents();
+    }
+
+    fn detached_chat_indices(&self) -> HashSet<usize> {
+        self.detached_subagents
+            .iter()
+            .filter_map(|id| self.chat_index.get(id).copied())
+            .collect()
+    }
+
+    fn drop_attached_subagents(&mut self) {
+        // Do not sync: `retain_resolved_subagents` already persisted the
+        // finished attached children. Re-syncing from the pruned index
+        // would wipe them.
+        self.chat_index
+            .retain(|id, _| self.detached_subagents.contains(id));
     }
 
     /// Terminalizes every tool left in progress when a turn ends, sparing
@@ -1800,15 +1866,19 @@ impl App {
         self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
         self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
         for chat in self.chats.iter_mut().skip(1) {
-            chat.fail_in_progress_with_message(message.into());
+            if !chat.is_detached() {
+                chat.fail_in_progress_with_message(message.into());
+            }
         }
     }
 
-    /// Marks unfinished subagent chats as ended and drops them from
-    /// `chat_index`, so the session records only the children that really
-    /// completed.
+    /// Marks unfinished attached subagent chats as ended. Detached chats
+    /// stay in `chat_index` so Esc on them can still cancel.
     fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str) {
-        self.chat_index.retain(|_, &mut sub_idx| {
+        self.chat_index.retain(|id, &mut sub_idx| {
+            if self.detached_subagents.contains(id) || self.chats[sub_idx].is_detached() {
+                return true;
+            }
             if self.chats[sub_idx].is_finished() {
                 true
             } else {

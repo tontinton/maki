@@ -25,6 +25,11 @@ pub const DECISION_SOURCE_USER_ONCE: &str = "user_once";
 pub const DECISION_SOURCE_USER_SESSION: &str = "user_session";
 pub const DECISION_SOURCE_USER_ALWAYS: &str = "user_always";
 pub const DECISION_SOURCE_USER_ABORT: &str = "user_abort";
+pub const DECISION_SOURCE_DETACHED: &str = "detached";
+
+/// Guidance carried by the detached deny: the session has no one to answer a
+/// prompt, so the tool needs a permission rule (or an attended run) instead.
+pub const DETACHED_PROMPT_UNAVAILABLE: &str = "this session runs unattended, so interactive approval is unavailable; allow the tool with a permission rule to use it there";
 
 const TASK_TOOL: &str = "task";
 const BASH_TOOL: &str = "bash";
@@ -637,6 +642,7 @@ impl PermissionManager {
         request_id: &str,
         cancel: &crate::CancelToken,
         plan_path: Option<&Path>,
+        unattended: bool,
     ) -> Result<(), PermissionError> {
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
         let tool_string = tool.to_string();
@@ -672,6 +678,15 @@ impl PermissionManager {
                     force_prompt,
                 } => (tool, scopes, force_prompt),
             };
+
+        // A prompt can only ever be answered by an attended session; denying
+        // here is what keeps a detached run from parking forever.
+        if unattended {
+            return Err(deny(
+                DECISION_SOURCE_DETACHED,
+                Some(DETACHED_PROMPT_UNAVAILABLE.to_owned()),
+            ));
+        }
 
         let Some(rx) = user_response_rx else {
             warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
@@ -1722,6 +1737,53 @@ mod tests {
             mgr.check(&ToolKey::native("bash"), "cargo test", None),
             PermissionCheck::NeedsPrompt { .. }
         ));
+    }
+
+    /// An unattended session has no one to answer a prompt, so the ask must
+    /// become a documented deny instead of a park — even with a channel wired.
+    #[test]
+    fn unattended_denies_prompt_without_parking() {
+        let mgr = default_mgr();
+        let (event_tx, _event_rx) = flume::unbounded();
+        let (_trigger, cancel) = crate::CancelToken::new();
+        let (_answer_tx, answer_rx) = flume::unbounded();
+        let answer_rx = Arc::new(async_lock::Mutex::new(answer_rx));
+
+        let err = smol::block_on(mgr.enforce(
+            &ToolKey::native(BASH_TOOL),
+            &crate::tools::PermissionScopes::single("cargo test".to_owned()),
+            &EventSender::new(event_tx, 0),
+            Some(&answer_rx),
+            "req-detached",
+            &cancel,
+            None,
+            true,
+        ))
+        .unwrap_err();
+
+        assert_eq!(err.guidance.as_deref(), Some(DETACHED_PROMPT_UNAVAILABLE));
+    }
+
+    /// Attended runs keep the old semantics: a missing channel is a user abort.
+    #[test]
+    fn attended_without_channel_denies_as_user_abort() {
+        let mgr = default_mgr();
+        let (event_tx, _event_rx) = flume::unbounded();
+        let (_trigger, cancel) = crate::CancelToken::new();
+
+        let err = smol::block_on(mgr.enforce(
+            &ToolKey::native(BASH_TOOL),
+            &crate::tools::PermissionScopes::single("cargo test".to_owned()),
+            &EventSender::new(event_tx, 0),
+            None,
+            "req-attended",
+            &cancel,
+            None,
+            false,
+        ))
+        .unwrap_err();
+
+        assert_eq!(err.guidance, None);
     }
 
     #[test]

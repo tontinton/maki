@@ -220,6 +220,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                 ledger: Arc::new(RunLedger::default()),
                 registry: Arc::clone(ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
+                unattended: false,
                 model_policy: Arc::clone(&params.model_policy),
             },
             AgentRunParams {
@@ -456,6 +457,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     ledger: Arc::new(RunLedger::default()),
                     registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
+                    unattended: false,
                     model_policy: Arc::clone(&params.model_policy),
                 },
                 AgentRunParams {

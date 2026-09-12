@@ -664,6 +664,10 @@ pub enum AgentEvent {
     SubagentHistory {
         tool_use_id: String,
         messages: Vec<Message>,
+        /// True when the session closed knowing it failed. `false` leaves the
+        /// verdict to the `ToolDone` that follows in the blocking flow.
+        #[serde(default)]
+        failed: bool,
     },
     ToolSnapshot {
         id: String,
@@ -1010,7 +1014,16 @@ pub struct SubagentInfo {
     pub opts: Option<RequestOptions>,
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
+    /// Outlives the run that spawned it. The UI keeps the chat cancellable
+    /// and does not drop its events when `run_id` bumps.
+    #[serde(skip)]
+    pub detached: bool,
 }
+
+/// Events from a subagent that outlives the run that spawned it. The UI
+/// does not drop these when `run_id` bumps. Distinct from restore
+/// snapshots, which use `u64::MAX`.
+pub const DETACHED_RUN_ID: u64 = u64::MAX - 1;
 
 #[derive(Debug, Clone)]
 pub struct EventSender {

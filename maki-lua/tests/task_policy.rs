@@ -2,12 +2,15 @@
 //! source, real `maki.json` / `maki.async`, with model I/O replaced by
 //! scriptable Lua stubs.
 
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use maki_agent::tools::ToolRegistry;
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::{AgentMode, ToolOutput};
 use maki_lua::PluginHost;
+use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
@@ -25,7 +28,17 @@ const UNKNOWN_SUBAGENT_ERR: &str = "unknown subagent type: bogus";
 const SUB_AGENT_ERROR_PREFIX: &str = "sub-agent error: ";
 
 const TASK_TOOL: &str = "task";
+const TASK_TOOL_RESULT: &str = "task_result";
+const TASK_TOOL_WAIT: &str = "task_wait";
 const PROBE_TOOL: &str = "probe";
+const BG_FLASH: &str = "bg-done";
+const BG_UNKNOWN_PREFIX: &str = "unknown task id: ";
+const BG_DISK_SCENARIO: &str = "bg_disk";
+const BG_ORPHANED_ERROR: &str = "task lost: the host restarted or the plugin reloaded while it ran";
+const BG_ORPHAN_SEED_DESCRIPTION: &str = "orphaned probe";
+const BG_WAIT_MIN_ERR: &str = "timeout_ms must be >= 1";
+/// Generous vs the background work, which finishes in well under a second.
+const BG_TEST_WAIT: Duration = Duration::from_secs(5);
 const TASK_PROMPT: &str = "do the thing";
 const PLAIN_TEXT: &str = "plain text result";
 const RECOVERED_TEXT: &str = "summary after nudge";
@@ -52,7 +65,7 @@ const SCENARIO_NO_SUMMARY_THEN_RECOVER: &str = "no_summary_then_recover";
 /// Stubs keyed by `opts.name` (the task's `description`). `maki.json` and
 /// `maki.async` stay real so schema validation and semaphore behavior are tested.
 const STUB_PRELUDE: &str = r#"
-recorder = { prompts = {}, closed = 0, sessions = 0, acquired = 0, released = 0 }
+recorder = { prompts = {}, closed = 0, sessions = 0, acquired = 0, released = 0, notifies = {} }
 
 -- Spy wrapper: the real semaphore does the work, counters track that every
 -- permit is explicitly released (gc would silently hide a leak).
@@ -139,6 +152,31 @@ behaviors.raise = function(sess, msg)
   error("@RAISE_MSG@")
 end
 
+behaviors.bg_slow = function(sess, msg)
+  maki.async.sleep(400)
+  return { text = "@PLAIN_TEXT@" }
+end
+
+behaviors.bg_disk = function(sess, msg)
+  maki.async.sleep(1200)
+  return { text = "@PLAIN_TEXT@" }
+end
+
+-- The real notify touches a live mailbox, which the stub ctx lacks. Record
+-- instead, and flash so tests get a deterministic completion signal on the
+-- UI action channel.
+maki.session.notify = function(text, opts)
+  recorder.notifies[#recorder.notifies + 1] = { text = text, opts = opts }
+  maki.ui.flash("@BG_FLASH@")
+end
+
+-- The real logs dir is the user's machine, so receipts default to
+-- memory-only (also the headless shape). Persistence tests re-stub this
+-- with a tempdir through the @LOGS_DIR@ token.
+maki.env.logs_dir = function()
+  return @LOGS_DIR@
+end
+
 maki.agent.session = function(ctx, opts)
   recorder.sessions = recorder.sessions + 1
   recorder.has_local_tools = opts.local_tools ~= nil
@@ -148,8 +186,9 @@ maki.agent.session = function(ctx, opts)
     recorder.prompts[#recorder.prompts + 1] = msg
     return behaviors[opts.name](self, msg)
   end
-  function sess:close()
+  function sess:close(is_err)
     recorder.closed = recorder.closed + 1
+    recorder.close_failed = is_err
   end
   return sess
 end
@@ -180,6 +219,12 @@ maki.api.register_tool({
     if #recorder.prompts > 0 then
       snap.prompts = recorder.prompts
     end
+    if recorder.close_failed ~= nil then
+      snap.close_failed = recorder.close_failed
+    end
+    if #recorder.notifies > 0 then
+      snap.notifies = recorder.notifies
+    end
     return (maki.json.encode(snap))
   end,
 })
@@ -192,15 +237,30 @@ fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
 fn load_task_host_with_opts(
     opts: serde_json::Map<String, serde_json::Value>,
 ) -> (Arc<ToolRegistry>, PluginHost) {
+    load_task_host_with(opts, None)
+}
+
+fn load_task_host_with_logs_dir(dir: &Path) -> (Arc<ToolRegistry>, PluginHost) {
+    load_task_host_with(serde_json::Map::new(), Some(dir))
+}
+
+fn load_task_host_with(
+    opts: serde_json::Map<String, serde_json::Value>,
+    logs_dir: Option<&Path>,
+) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.ui_attachment().attach();
+    let logs_dir = logs_dir.map(|dir| format!("{dir:?}"));
     let prelude = STUB_PRELUDE
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
         .replace("@RECOVERED_TEXT@", RECOVERED_TEXT)
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
         .replace("@RAISE_MSG@", RAISE_MSG)
         .replace("@PARTIAL_TEXT@", PARTIAL_TEXT)
-        .replace("@CANCELLED_ERR@", CANCELLED_ERR);
+        .replace("@CANCELLED_ERR@", CANCELLED_ERR)
+        .replace("@BG_FLASH@", BG_FLASH)
+        .replace("@LOGS_DIR@", logs_dir.as_deref().unwrap_or("nil"));
     host.load_source_with_opts(
         "task_policy",
         &format!("{prelude}\n{TASK_PLUGIN_SRC}"),
@@ -211,11 +271,21 @@ fn load_task_host_with_opts(
 }
 
 fn exec_tool(reg: &ToolRegistry, name: &str, input: Value) -> Result<String, String> {
+    exec_tool_with_session(reg, name, input, None)
+}
+
+fn exec_tool_with_session(
+    reg: &ToolRegistry,
+    name: &str,
+    input: Value,
+    session: Option<SessionRef>,
+) -> Result<String, String> {
     let entry = reg
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
-    let ctx = stub_ctx(&AgentMode::Build);
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.session_id = session;
     smol::block_on(async { inv.execute(&ctx).await })
         .output
         .map(|out| match out {
@@ -235,6 +305,27 @@ fn task_input(scenario: &str, output_schema: Option<Value>) -> Value {
         input["output_schema"] = schema;
     }
     input
+}
+
+fn bg_input(scenario: &str) -> Value {
+    let mut input = task_input(scenario, None);
+    input["background"] = json!(true);
+    input
+}
+
+fn bg_task_id(receipt: &str) -> String {
+    receipt
+        .split("Background task ")
+        .nth(1)
+        .and_then(|rest| rest.split(" started").next())
+        .expect("receipt must contain a task id")
+        .to_string()
+}
+
+fn wait_flash(host: &PluginHost) -> maki_lua::UiAction {
+    host.ui_action_rx()
+        .recv_timeout(BG_TEST_WAIT)
+        .expect("on_finish must flash the UI")
 }
 
 const FULL_MODEL_SPEC: &str = "aperture/ollama/glm-5.2";
@@ -359,12 +450,24 @@ fn structured_happy_path_returns_validated_json() {
     assert_eq!(snap["has_local_tools"], json!(true));
     assert!(snap["first_ack"].is_string(), "valid input must be acked");
     assert!(snap.get("first_err").is_none_or(Value::is_null));
-    let prompt = snap["prompts"][0].as_str().expect("prompt missing");
-    assert!(prompt.starts_with(TASK_PROMPT), "got: {prompt}");
-    assert!(
-        prompt.contains(STRUCTURED_OUTPUT_TOOL),
-        "prompt must point at the structured_output tool: {prompt}"
-    );
+}
+
+/// The tool schema cannot declare a free-form object, so the host hands the
+/// model's output_schema over as raw JSON text; the plugin must decode it
+/// before compiling the validator and before wiring the subagent's
+/// structured_output input_schema.
+#[test]
+fn structured_accepts_json_encoded_schema_text() {
+    let (reg, _host) = load_task_host();
+    let encoded = serde_json::to_string(&answer_schema()).unwrap();
+    let out = exec_tool(
+        &reg,
+        TASK_TOOL,
+        task_input(SCENARIO_HAPPY, Some(Value::String(encoded))),
+    )
+    .expect("structured task with encoded schema failed");
+    let parsed: Value = serde_json::from_str(&out).expect("result is not json");
+    assert_eq!(parsed, json!({ "answer": "42" }));
 }
 
 #[test]
@@ -517,4 +620,257 @@ fn raising_prompt_does_not_leak_semaphore_permit() {
     // Pool is full again (released == acquired), so this cannot block.
     let out = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();
     assert_eq!(out, PLAIN_TEXT);
+}
+
+// --- background tasks ---
+
+/// The receipt must come back before the subagent finishes, and the outcome
+/// must reach the session mailbox with wake set, carrying the full result.
+#[test]
+fn background_returns_receipt_and_delivers_by_notify() {
+    let (reg, host) = load_task_host();
+    let receipt =
+        exec_tool(&reg, TASK_TOOL, bg_input(SCENARIO_PLAIN)).expect("background task failed");
+    let id = bg_task_id(&receipt);
+    assert!(
+        receipt.contains(&format!("Background task {id} started ({SCENARIO_PLAIN})")),
+        "got: {receipt}"
+    );
+
+    assert!(
+        matches!(wait_flash(&host), maki_lua::UiAction::Flash(msg) if msg == BG_FLASH),
+        "flash must carry the completion marker"
+    );
+
+    let snap = probe(&reg);
+    assert_eq!(snap["closed"], json!(1));
+    assert_eq!(
+        snap["released"],
+        json!(1),
+        "permit not released in on_finish"
+    );
+    assert!(
+        snap.get("close_failed").is_none_or(Value::is_null),
+        "success must close without a verdict, got {:?}",
+        snap.get("close_failed")
+    );
+    let notifies = snap["notifies"].as_array().expect("notify must fire");
+    assert_eq!(notifies.len(), 1);
+    let text = notifies[0]["text"].as_str().expect("notify text");
+    assert!(
+        text.contains(&format!("Background task {id} ({SCENARIO_PLAIN}) finished"))
+            && text.contains(PLAIN_TEXT),
+        "got: {text}"
+    );
+    assert_eq!(notifies[0]["opts"]["wake"], json!(true));
+
+    let out =
+        exec_tool(&reg, TASK_TOOL_RESULT, json!({ "task_id": id })).expect("task_result failed");
+    assert_eq!(out, PLAIN_TEXT);
+}
+
+/// A background subagent must not be a child of the call that spawned it, or
+/// it dies the moment that call's turn ends instead of outliving it. With a
+/// real session id this now spawns `scope = "session"`; confirm that
+/// still reaches a receipt instead of tripping the scope validation.
+#[test]
+fn background_with_a_real_session_detaches_and_still_delivers() {
+    let (reg, host) = load_task_host();
+    let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
+        .parse()
+        .expect("valid session id");
+    let receipt = exec_tool_with_session(
+        &reg,
+        TASK_TOOL,
+        bg_input(SCENARIO_PLAIN),
+        Some(session.clone()),
+    )
+    .expect("background task failed");
+    let id = bg_task_id(&receipt);
+
+    assert!(
+        matches!(wait_flash(&host), maki_lua::UiAction::Flash(msg) if msg == BG_FLASH),
+        "flash must carry the completion marker"
+    );
+
+    let out = exec_tool_with_session(
+        &reg,
+        TASK_TOOL_RESULT,
+        json!({ "task_id": id }),
+        Some(session),
+    )
+    .expect("task_result failed");
+    assert_eq!(out, PLAIN_TEXT);
+}
+
+#[test]
+fn background_error_lands_in_result_and_releases_the_permit() {
+    let (reg, host) = load_task_host();
+    let receipt =
+        exec_tool(&reg, TASK_TOOL, bg_input(SCENARIO_PROMPT_ERROR)).expect("receipt failed");
+    let id = bg_task_id(&receipt);
+    wait_flash(&host);
+
+    let snap = probe(&reg);
+    assert_eq!(snap["released"], json!(1), "error path must still release");
+    assert_eq!(
+        snap["close_failed"],
+        json!(format!("{SUB_AGENT_ERROR_PREFIX}{PROMPT_ERR_MSG}")),
+        "failure must hand close the verdict"
+    );
+    let err = exec_tool(&reg, TASK_TOOL_RESULT, json!({ "task_id": id })).unwrap_err();
+    assert_eq!(err, format!("{SUB_AGENT_ERROR_PREFIX}{PROMPT_ERR_MSG}"));
+}
+
+#[test]
+fn task_result_unknown_id_errors() {
+    let (reg, _host) = load_task_host();
+    let err = exec_tool(&reg, TASK_TOOL_RESULT, json!({ "task_id": "nope" })).unwrap_err();
+    assert!(err.starts_with(BG_UNKNOWN_PREFIX), "got: {err}");
+}
+
+#[test]
+fn task_wait_returns_the_result_once_the_task_finishes() {
+    let (reg, _host) = load_task_host();
+    let receipt = exec_tool(&reg, TASK_TOOL, bg_input(SCENARIO_PLAIN)).expect("receipt failed");
+    let id = bg_task_id(&receipt);
+    let out = exec_tool(
+        &reg,
+        TASK_TOOL_WAIT,
+        json!({ "task_id": id, "timeout_ms": BG_TEST_WAIT.as_millis() as u64 }),
+    )
+    .expect("task_wait failed");
+    assert_eq!(out, PLAIN_TEXT);
+}
+
+/// The wait must give up at the timeout with a still-working note, and the
+/// task must still complete afterwards.
+#[test]
+fn task_wait_times_out_while_working_then_the_result_lands() {
+    let (reg, host) = load_task_host();
+    let receipt = exec_tool(&reg, TASK_TOOL, bg_input("bg_slow")).expect("receipt failed");
+    let id = bg_task_id(&receipt);
+
+    let out = exec_tool(
+        &reg,
+        TASK_TOOL_WAIT,
+        json!({ "task_id": id, "timeout_ms": 50 }),
+    )
+    .expect("task_wait failed");
+    assert!(out.contains("still working after 50ms"), "got: {out}");
+
+    wait_flash(&host);
+    let result =
+        exec_tool(&reg, TASK_TOOL_RESULT, json!({ "task_id": id })).expect("task_result failed");
+    assert_eq!(result, PLAIN_TEXT);
+}
+
+/// A receipt must keep resolving in a plugin instance that never saw the
+/// spawn: the on-disk copy carries the state across a reload-shaped
+/// replacement, and the finish written by the old instance persists for the
+/// new one.
+#[test]
+fn background_receipts_resolve_from_disk_in_a_fresh_host() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
+        .parse()
+        .expect("valid session id");
+    let (reg, host) = load_task_host_with_logs_dir(tmp.path());
+    let receipt = exec_tool_with_session(
+        &reg,
+        TASK_TOOL,
+        bg_input(BG_DISK_SCENARIO),
+        Some(session.clone()),
+    )
+    .expect("background task failed");
+    let id = bg_task_id(&receipt);
+
+    // The subagent finishes before the fresh host reads: a fresh VM can never
+    // observe a genuinely running task (a reload takes in-flight coroutines
+    // down with the old VM), so disk fallback only matters for resolved
+    // receipts; the working case is the orphan sweep's.
+    wait_flash(&host);
+
+    let (fresh_reg, _fresh_host) = load_task_host_with_logs_dir(tmp.path());
+    let out = exec_tool_with_session(
+        &fresh_reg,
+        TASK_TOOL_RESULT,
+        json!({ "task_id": id }),
+        Some(session),
+    )
+    .expect("task_result failed");
+    assert_eq!(out, PLAIN_TEXT);
+}
+
+#[test]
+fn task_wait_rejects_non_positive_timeout() {
+    let (reg, _host) = load_task_host();
+    let receipt = exec_tool(&reg, TASK_TOOL, bg_input(SCENARIO_PLAIN)).expect("receipt failed");
+    let id = bg_task_id(&receipt);
+    let err = exec_tool(
+        &reg,
+        TASK_TOOL_WAIT,
+        json!({ "task_id": id, "timeout_ms": 0 }),
+    )
+    .unwrap_err();
+    assert_eq!(err, BG_WAIT_MIN_ERR);
+}
+
+/// The first task call of a fresh VM must resolve every disk receipt still
+/// marked "working": its coroutine died with the previous process or reload,
+/// so nothing will ever finish it. Finished receipts stay untouched.
+#[test]
+fn first_call_marks_disk_working_receipts_as_lost() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
+        .parse()
+        .expect("valid session id");
+    // The plugin keys receipts by the canonical id the Lua ctx exposes.
+    let sid = session.id().to_string();
+    let dir = tmp.path().join(&sid).join("bg-tasks");
+    std::fs::create_dir_all(&dir).unwrap();
+    let orphan_id = format!("{sid}:dead:1");
+    let done_id = format!("{sid}:dead:2");
+    std::fs::write(
+        dir.join(format!("{orphan_id}.json")),
+        json!({ "description": BG_ORPHAN_SEED_DESCRIPTION, "status": "working", "is_error": false })
+            .to_string(),
+    )
+    .unwrap();
+    let done_receipt = json!({
+        "description": BG_ORPHAN_SEED_DESCRIPTION,
+        "status": "done",
+        "is_error": false,
+        "result": PLAIN_TEXT,
+    });
+    std::fs::write(
+        dir.join(format!("{done_id}.json")),
+        done_receipt.to_string(),
+    )
+    .unwrap();
+
+    let (reg, _host) = load_task_host_with_logs_dir(tmp.path());
+
+    let out = exec_tool_with_session(
+        &reg,
+        TASK_TOOL_RESULT,
+        json!({ "task_id": orphan_id }),
+        Some(session.clone()),
+    )
+    .expect_err("the lost receipt must surface as a tool error");
+    assert_eq!(out, BG_ORPHANED_ERROR);
+
+    let orphan: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(format!("{orphan_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(orphan["status"], "error");
+    assert_eq!(orphan["is_error"], true);
+    assert_eq!(orphan["result"], BG_ORPHANED_ERROR);
+
+    let done: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(format!("{done_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(done, done_receipt);
 }
