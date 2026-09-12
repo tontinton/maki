@@ -217,7 +217,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Bool(false),
         min: None,
         env: None,
-        description: "Start every session with extended thinking (true/\"adaptive\", \"off\", an effort level (\"minimal\" to \"max\"), or a token budget)",
+        description: "Start every session with extended thinking (true/\"adaptive\", \"off\", an effort level (\"minimal\" to \"max\"), or a token budget). Unset, a fresh session starts at the level `/thinking` last set",
     },
 ];
 

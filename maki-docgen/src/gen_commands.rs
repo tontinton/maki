@@ -83,7 +83,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker of the effort levels with what each one costs in tokens; `Enter` applies the selected level and `Esc` closes without changing anything. With an argument it sets the level directly: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`."
+        "- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker of the effort levels with what each one costs in tokens; `Enter` applies the selected level and `Esc` closes without changing anything. With an argument it sets the level directly: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. The level is remembered across runs; `always_thinking` pins it instead."
     )
     .unwrap();
     writeln!(

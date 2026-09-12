@@ -5,11 +5,12 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
+use maki_config::SessionDefaults;
 use maki_providers::manifest::ManifestRegistry;
 use maki_providers::model::{Model, ModelError, ModelTier};
 use maki_storage::StateDir;
 use maki_storage::log::RotatingFileWriter;
-use maki_storage::model::read_model;
+use maki_storage::model::{read_model, read_thinking};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
@@ -72,6 +73,15 @@ pub fn resolve_model(
             "no provider available - set an API key (e.g. ANTHROPIC_API_KEY), run `maki auth login`, or use -m to specify a model{policy_note}\n\nSee https://maki.sh/docs/providers/ for setup instructions"
         )
     })
+}
+
+/// `always_thinking` pins the level. Without it, a fresh session starts at
+/// whatever `/thinking` last set, the way the model comes back too; a model
+/// that cannot run that level clamps it when the session loads.
+pub fn remember_thinking(defaults: &mut SessionDefaults, storage: &StateDir) {
+    if defaults.thinking.is_none() {
+        defaults.thinking = read_thinking(storage);
+    }
 }
 
 /// An unknown slug may just mean the models.dev catalog has not been loaded

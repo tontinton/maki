@@ -55,6 +55,8 @@ const ARCHIVE_KEEP: usize = 3;
 const ARCHIVE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// A `msg` line starts with this. Matching the prefix beats parsing the log.
 const MSG_PREFIX: &[u8] = br#"{"t":"msg""#;
+const THINKING_OFF: &str = "off";
+const THINKING_ADAPTIVE: &str = "adaptive";
 
 /// Hands out the token that tags one append-only run of a message list.
 /// Process wide, so two runs never pick the same number.
@@ -395,8 +397,8 @@ impl StoredThinking {
     /// config, and the Lua agent API all delegate here.
     pub fn parse_setting(input: &str) -> Result<Self, ThinkingParseError> {
         match input.trim() {
-            "off" => Ok(Self::Off),
-            "adaptive" => Ok(Self::Adaptive),
+            THINKING_OFF => Ok(Self::Off),
+            THINKING_ADAPTIVE => Ok(Self::Adaptive),
             other => {
                 if let Ok(level) = other.parse::<Effort>() {
                     return Ok(Self::Effort { level });
@@ -407,6 +409,18 @@ impl StoredThinking {
                     Err(_) => Err(ThinkingParseError::Unknown(other.to_string())),
                 }
             }
+        }
+    }
+}
+
+/// Inverse of [`StoredThinking::parse_setting`].
+impl fmt::Display for StoredThinking {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Off => f.write_str(THINKING_OFF),
+            Self::Adaptive => f.write_str(THINKING_ADAPTIVE),
+            Self::Effort { level } => f.write_str(level.as_str()),
+            Self::Budget { tokens } => write!(f, "{tokens}"),
         }
     }
 }

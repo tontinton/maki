@@ -69,7 +69,7 @@ use maki_lua::{
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
-use maki_storage::model::persist_model;
+use maki_storage::model::{persist_model, persist_thinking};
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::Position;
@@ -415,6 +415,11 @@ impl App {
     ///
     /// Stores the clamped value rather than the typed one, so the status bar
     /// can never read `off` on a model that is really sending minimal effort.
+    ///
+    /// The value is also written to disk here, and only here: the next run
+    /// seeds its sessions from it (`SessionDefaults`), the same way the model
+    /// is remembered. A clamp on model change is not the user's choice, so it
+    /// does not overwrite the file.
     pub(crate) fn set_thinking(&mut self, input: &str) -> Result<ThinkingConfig, String> {
         if !self.state.model.supports_thinking() {
             return Err(THINKING_UNSUPPORTED_MSG.into());
@@ -422,6 +427,7 @@ impl App {
         self.state.thinking = ThinkingConfig::parse(input.trim(), self.state.thinking)
             .map_err(str::to_owned)?
             .clamped(&self.state.model);
+        persist_thinking(&self.storage, self.state.thinking.into());
         Ok(self.state.thinking)
     }
 

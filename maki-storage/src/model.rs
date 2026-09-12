@@ -2,10 +2,12 @@ use std::fs;
 
 use serde::{Deserialize, Serialize};
 
+use crate::sessions::StoredThinking;
 use crate::{StateDir, atomic_write};
 
 const MODEL_FILE: &str = "model";
 const RECENT_FILE: &str = "recent-models";
+const THINKING_FILE: &str = "thinking";
 const MAX_RECENTS: usize = 4;
 
 pub fn persist_model(dir: &StateDir, spec: &str) {
@@ -16,6 +18,20 @@ pub fn read_model(dir: &StateDir) -> Option<String> {
     let raw = fs::read_to_string(dir.path().join(MODEL_FILE)).ok()?;
     let spec = raw.trim();
     (!spec.is_empty()).then(|| spec.to_owned())
+}
+
+/// Written in the `/thinking` spelling so the file reads like the command
+/// that produced it, and a hand-edited or stale value just fails to parse.
+pub fn persist_thinking(dir: &StateDir, thinking: StoredThinking) {
+    let _ = atomic_write(
+        &dir.path().join(THINKING_FILE),
+        thinking.to_string().as_bytes(),
+    );
+}
+
+pub fn read_thinking(dir: &StateDir) -> Option<StoredThinking> {
+    let raw = fs::read_to_string(dir.path().join(THINKING_FILE)).ok()?;
+    StoredThinking::parse_setting(&raw).ok()
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -55,7 +71,9 @@ fn write_recents(dir: &StateDir, recents: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sessions::Effort;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     #[test]
     fn round_trip() {
@@ -84,6 +102,31 @@ mod tests {
 
         fs::write(dir.path().join(MODEL_FILE), "").unwrap();
         assert!(read_model(&dir).is_none());
+    }
+
+    #[test_case(StoredThinking::Off)]
+    #[test_case(StoredThinking::Adaptive)]
+    #[test_case(StoredThinking::Effort { level: Effort::High })]
+    #[test_case(StoredThinking::Budget { tokens: 8192 })]
+    fn thinking_round_trip(thinking: StoredThinking) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+
+        assert!(read_thinking(&dir).is_none());
+        persist_thinking(&dir, thinking);
+        assert_eq!(read_thinking(&dir), Some(thinking));
+    }
+
+    #[test_case("" ; "empty")]
+    #[test_case("  \n" ; "whitespace")]
+    #[test_case("turbo" ; "unknown level")]
+    #[test_case("0" ; "zero budget")]
+    fn read_thinking_ignores_invalid(raw: &str) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+
+        fs::write(dir.path().join(THINKING_FILE), raw).unwrap();
+        assert!(read_thinking(&dir).is_none());
     }
 
     #[test]
