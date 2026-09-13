@@ -21,7 +21,8 @@ use crossterm::event::{
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
+    AgentConfig, AgentEvent, CancelToken, DoneReason, Envelope, McpCommand, McpConfigErrors,
+    McpHandle, mcp,
 };
 use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
@@ -146,6 +147,13 @@ impl RunNotificationState {
 
     fn on_done(&mut self, event: &AgentEvent) {
         let notification = match event {
+            AgentEvent::Done {
+                reason: DoneReason::MaxTurns,
+                num_turns,
+                ..
+            } => Notification::TurnLimit {
+                num_turns: *num_turns,
+            },
             AgentEvent::Done { .. } => Notification::TurnComplete {
                 response: self.response_candidate.take(),
             },
@@ -1820,7 +1828,6 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_agent::DoneReason;
     use maki_providers::TokenUsage;
     use test_case::test_case;
 
@@ -1864,6 +1871,31 @@ mod tests {
             Some(Notification::TurnComplete {
                 response: Some("done".into())
             })
+        );
+    }
+
+    #[test]
+    fn turn_limit_stop_is_announced() {
+        let mut state = RunNotificationState::default();
+        let mut event = done_event();
+        if let AgentEvent::Done {
+            reason, num_turns, ..
+        } = &mut event
+        {
+            *reason = DoneReason::MaxTurns;
+            *num_turns = 200;
+        }
+        state.on_done(&event);
+        state.on_drain();
+        let notification = state
+            .reconcile(None, SessionStatus::Idle, true)
+            .expect("expected a turn-limit notification");
+        assert!(
+            notification
+                .message()
+                .contains("Turn limit reached after 200 turns"),
+            "unexpected message: {}",
+            notification.message()
         );
     }
 

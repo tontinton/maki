@@ -296,9 +296,7 @@ impl<'h> Agent<'h> {
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
         loop {
-            if let Some(max) = self.config.max_turns
-                && self.num_turns >= max
-            {
+            if self.num_turns >= self.config.max_turns {
                 return Ok(DoneReason::MaxTurns);
             }
             self.try_auto_compact().await?;
@@ -408,7 +406,6 @@ impl<'h> Agent<'h> {
             } else if self.recover_stalled_turn()? {
                 return Ok(TurnOutcome::Continue);
             }
-
             if stop_reason == Some(StopReason::MaxTokens)
                 && self.num_turns <= self.config.max_continuation_turns
             {
@@ -722,6 +719,7 @@ mod tests {
     use crate::Envelope;
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
+    use maki_config::DEFAULT_MAX_TURNS;
 
     const QUEUED_MESSAGES: [&str; 3] = ["first", "second", "third"];
     const ONE_GAUGE_MSG: &str =
@@ -1010,7 +1008,7 @@ mod tests {
     async fn run_agent(provider: MockProvider, max_turns: Option<u32>) -> (u32, DoneReason) {
         let mut history = History::new(Vec::new());
         let (mut agent, event_rx) = make_agent(provider, &mut history);
-        agent.config.max_turns = max_turns;
+        agent.config.max_turns = max_turns.unwrap_or(DEFAULT_MAX_TURNS);
         let _ = agent.run(default_input()).await;
         drain_events(&event_rx)
             .into_iter()
@@ -1721,6 +1719,32 @@ mod tests {
                 .filter(|e| matches!(e.event, AgentEvent::Nudge))
                 .count();
             assert_eq!(nudges, MAX_NUDGES as usize + 1);
+        });
+    }
+
+    /// The run hard-stops at the default turn budget even when the caller never
+    /// set `max_turns` and the model keeps producing tool calls that would
+    /// otherwise loop forever.
+    #[test]
+    fn default_turn_budget_hard_stops_infinite_run() {
+        smol::block_on(async {
+            let responses = (0..DEFAULT_MAX_TURNS)
+                .map(|i| tool_call_response("bash", &format!("t{i}")))
+                .collect();
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let reason = agent.run(default_input()).await.unwrap();
+            drop(agent);
+            assert_eq!(reason, DoneReason::MaxTurns);
+            let events = drain_events(&event_rx);
+            let done = events
+                .iter()
+                .find_map(|e| match &e.event {
+                    AgentEvent::Done { num_turns, .. } => Some(*num_turns),
+                    _ => None,
+                })
+                .expect("expected Done event");
+            assert_eq!(done, DEFAULT_MAX_TURNS);
         });
     }
 

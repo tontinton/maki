@@ -36,6 +36,8 @@ pub const MIN_MAX_INPUT_LINES: u32 = 1;
 pub const MAX_SERVER_NAME_LEN: usize = 64;
 
 pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
+pub const DEFAULT_MAX_TURNS: u32 = 200;
+pub const MIN_MAX_TURNS: u32 = 1;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
 /// What one turn asks to generate. A number of maki's own choosing rather than
 /// "whatever the window can spare", because the latter ties the output cap to a
@@ -666,6 +668,7 @@ pub struct AgentFileConfig {
     pub max_output_lines: Option<usize>,
     pub max_continuation_turns: Option<u32>,
     pub max_turn_output: Option<u32>,
+    pub max_turns: Option<u32>,
     pub compaction_buffer: Option<CompactionBuffer>,
     pub compaction_instructions: Option<String>,
     pub post_compaction_instructions: Option<String>,
@@ -682,6 +685,7 @@ impl AgentFileConfig {
             max_output_lines,
             max_continuation_turns,
             max_turn_output,
+            max_turns,
             compaction_buffer,
             compaction_instructions,
             post_compaction_instructions,
@@ -1320,8 +1324,12 @@ pub struct AgentConfig {
     )]
     pub rtk: bool,
 
-    #[config(skip, default = "None")]
-    pub max_turns: Option<u32>,
+    #[config(
+        default = "DEFAULT_MAX_TURNS",
+        min = MIN_MAX_TURNS,
+        desc = "Hard cap on agent turns before the run is cut short"
+    )]
+    pub max_turns: u32,
 
     #[config(skip, default = "Vec::new()")]
     pub allowed_tools: Vec<String>,
@@ -1346,7 +1354,7 @@ impl AgentConfig {
             post_compaction_instructions: file.post_compaction_instructions,
             stale_read_check: file.stale_read_check.unwrap_or(true),
             rtk: file.rtk.unwrap_or(true),
-            max_turns: None,
+            max_turns: file.max_turns.unwrap_or(DEFAULT_MAX_TURNS),
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),
         }

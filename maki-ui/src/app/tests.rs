@@ -5021,6 +5021,7 @@ fn turn_response_stops_after_bounded_large_input() {
 #[test_case(Notification::QuestionRequested, "Question requested", true ; "question")]
 #[test_case(Notification::PlanReady, "Plan ready", true ; "plan")]
 #[test_case(Notification::error_completion(), "Agent stopped with an error", false ; "error_completion")]
+#[test_case(Notification::TurnLimit { num_turns: 200 }, "Turn limit reached after 200 turns.", true ; "turn_limit")]
 fn notification_message_and_urgency(
     notification: Notification,
     expected_message: &str,

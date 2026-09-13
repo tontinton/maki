@@ -123,6 +123,7 @@ pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (ali
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Notification {
     TurnComplete { response: Option<String> },
+    TurnLimit { num_turns: u32 },
     PermissionRequested { tool: Option<String> },
     AuthenticationRequired,
     QuestionRequested,
@@ -130,7 +131,9 @@ pub(crate) enum Notification {
 }
 
 impl Notification {
-    /// Prompts blocking the agent outrank turn completions.
+    /// Prompts and run-aborting conditions outrank turn completions. A turn
+    /// limit is a run-terminating stop, not a normal completion, so the user
+    /// must learn why the agent went quiet even while focused.
     pub(crate) fn is_urgent(&self) -> bool {
         !matches!(self, Self::TurnComplete { .. })
     }
@@ -140,6 +143,9 @@ impl Notification {
             Self::TurnComplete { response } => response
                 .clone()
                 .unwrap_or_else(|| "Agent turn complete".into()),
+            Self::TurnLimit { num_turns } => {
+                format!("Turn limit reached after {num_turns} turns.")
+            }
             Self::PermissionRequested { tool: Some(tool) } => {
                 format!("Permission requested: {tool}")
             }

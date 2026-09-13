@@ -540,7 +540,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
-        config.max_turns = Some(max);
+        config.max_turns = max;
     }
     let permission_mode = PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
 

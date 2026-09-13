@@ -1,7 +1,5 @@
 use std::borrow::Cow;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,7 +19,7 @@ use maki_config::ToolKey;
 use maki_storage::id::SessionRef;
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
-const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
+const DOOM_LOOP_MESSAGE: &str = "You have called this tool with the same (or nearly identical) input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
 
@@ -51,35 +49,73 @@ const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 /// gives up".
 const HOOK_CHAIN_MAX: Duration = Duration::from_secs(60);
 
-pub(super) struct RecentCalls(VecDeque<(String, u64)>);
+pub(super) struct RecentCalls(VecDeque<(String, String)>);
 
 impl RecentCalls {
     pub(super) fn new() -> Self {
         Self(VecDeque::new())
     }
 
-    fn hash_input(input: &Value) -> u64 {
-        let mut h = DefaultHasher::new();
-        input.to_string().hash(&mut h);
-        h.finish()
-    }
-
-    fn is_doom_loop(&self, name: &str, input: &Value) -> bool {
-        let hash = Self::hash_input(input);
+    fn is_similar(&self, name: &str, input: &Value) -> bool {
+        let canonical = canonicalize(input);
         self.0.len() >= DOOM_LOOP_THRESHOLD - 1
             && self
                 .0
                 .iter()
                 .rev()
                 .take(DOOM_LOOP_THRESHOLD - 1)
-                .all(|(n, h)| n == name && *h == hash)
+                .all(|(n, i)| n == name && *i == canonical)
     }
 
     fn record(&mut self, name: String, input: &Value) {
-        self.0.push_back((name, Self::hash_input(input)));
+        self.0.push_back((name, canonicalize(input)));
         if self.0.len() > DOOM_LOOP_THRESHOLD {
             self.0.pop_front();
         }
+    }
+}
+
+/// Trims leading and trailing whitespace so values differing only in that churn
+/// (trailing space, newline padding) compare equal. Interior whitespace is kept:
+/// it can be meaningful inside a command or pattern, so collapsing it could
+/// treat two distinct calls as repeats and block a real task. O(n).
+fn collapse_ws(s: &str) -> String {
+    s.trim().to_string()
+}
+
+/// Canonical serialization of a tool input: object keys sorted recursively and
+/// string values trimmed, so semantically-equivalent inputs (key reordering,
+/// trailing-whitespace churn) compare equal while staying O(n) — no quadratic
+/// diff in this hot path.
+fn canonicalize(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = String::from("{");
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&format!("{:?}:", k));
+                out.push_str(&canonicalize(&map[*k]));
+            }
+            out.push('}');
+            out
+        }
+        Value::Array(items) => {
+            let mut out = String::from("[");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&canonicalize(item));
+            }
+            out.push(']');
+            out
+        }
+        Value::String(s) => format!("{:?}", collapse_ws(s)),
+        other => other.to_string(),
     }
 }
 
@@ -822,7 +858,7 @@ pub(super) async fn process_tool_calls(
             input_preview = %crate::tools::schema::preview(&input.to_string()),
             "parsing tool call"
         );
-        if recent_calls.is_doom_loop(&name, &input) {
+        if recent_calls.is_similar(&name, &input) {
             warn!(tool = %name, "doom loop detected, skipping execution");
             immediate_errors.push(ToolDoneEvent::error(id.clone(), DOOM_LOOP_MESSAGE));
         } else {
@@ -1023,13 +1059,79 @@ mod tests {
     #[test_case("read", &[("read", "/a"), ("read", "/b")], false ; "different_input_breaks_chain")]
     #[test_case("grep", &[("glob", "/a"), ("glob", "/a")], false ; "different_tool_name")]
     #[test_case("bash", &[("bash", "/a"), ("bash", "/b"), ("bash", "/a")], false ; "interrupted_chain")]
+    #[test_case("bash", &[("bash", "/a"), ("bash", "/a ")], true  ; "near_duplicate_whitespace_triggers")]
     fn doom_loop_detection(name: &str, history: &[(&str, &str)], expected: bool) {
         let entries: Vec<_> = history
             .iter()
             .map(|(n, p)| (*n, serde_json::json!({"path": p})))
             .collect();
         let input = serde_json::json!({"path": "/a"});
-        assert_eq!(recent_calls(&entries).is_doom_loop(name, &input), expected);
+        assert_eq!(recent_calls(&entries).is_similar(name, &input), expected);
+    }
+
+    /// Near-duplicate commands (trailing space) must trip the guard even though
+    /// no two are byte-identical.
+    #[test]
+    fn near_duplicate_command_triggers() {
+        let mut rc = RecentCalls::new();
+        let cmd = |c: &str| serde_json::json!({"command": c});
+        rc.record(
+            "bash".into(),
+            &cmd("grep -rn \"TNS_BIND_\" src/main/kotlin"),
+        );
+        rc.record(
+            "bash".into(),
+            &cmd("grep -rn \"TNS_BIND_\" src/main/kotlin "),
+        );
+        assert!(rc.is_similar("bash", &cmd("grep -rn \"TNS_BIND_\" src/main/kotlin")));
+    }
+
+    /// Key reordering in the JSON object must not dodge the guard.
+    #[test]
+    fn reordered_keys_trigger() {
+        let mut rc = RecentCalls::new();
+        let a = || serde_json::json!({"path": "/a", "offset": 1});
+        let b = || serde_json::json!({"offset": 1, "path": "/a"});
+        rc.record("read".into(), &a());
+        rc.record("read".into(), &b());
+        assert!(rc.is_similar("read", &a()));
+    }
+
+    #[test]
+    fn near_duplicate_dissimilar_input_does_not_trigger() {
+        let mut rc = RecentCalls::new();
+        let cmd = |c: &str| serde_json::json!({"command": c});
+        rc.record("bash".into(), &cmd("grep -rn A one"));
+        rc.record("bash".into(), &cmd("touch totally/unrelated/file"));
+        assert!(!rc.is_similar("bash", &cmd("grep -rn A one")));
+    }
+
+    /// Interior whitespace can be meaningful inside a command or pattern (e.g.
+    /// `grep "a  b"` vs `grep "a b"`), so it must not make two distinct calls
+    /// match.
+    #[test]
+    fn interior_whitespace_does_not_trigger() {
+        let mut rc = RecentCalls::new();
+        let cmd = |c: &str| serde_json::json!({"command": c});
+        rc.record("bash".into(), &cmd("grep -rn \"a  b\" src"));
+        rc.record("bash".into(), &cmd("grep -rn \"a b\" src"));
+        assert!(!rc.is_similar("bash", &cmd("grep -rn \"a  b\" src")));
+    }
+
+    /// A paginated read differs in `offset`, so it must not be treated as a
+    /// repeat of the previous page.
+    #[test]
+    fn paginated_read_does_not_trigger() {
+        let mut rc = RecentCalls::new();
+        rc.record(
+            "read".into(),
+            &serde_json::json!({"path": "/a", "offset": 1}),
+        );
+        rc.record(
+            "read".into(),
+            &serde_json::json!({"path": "/a", "offset": 201}),
+        );
+        assert!(!rc.is_similar("read", &serde_json::json!({"path": "/a", "offset": 401})));
     }
 
     fn local_ctx(
