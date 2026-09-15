@@ -37,7 +37,7 @@ use maki_storage::id::{MakiId, SessionRef};
 
 use crate::api::autocmd::AutocmdStore;
 use crate::api::create_maki_global;
-use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
+use crate::api::r#fn::{JobEvent, JobLifecycle, JobOwner, JobStore, deliver_job_event};
 use crate::api::fs::publish_walks;
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeybindTicket, KeymapStore, KeymapWriter};
@@ -1420,7 +1420,7 @@ pub(crate) fn active_task(lua: &Lua) -> TaskHandle {
 
 pub(crate) fn with_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
     if lua.app_data_ref::<JobStore>().is_none() {
-        lua.set_app_data(JobStore::new());
+        lua.set_app_data(JobStore::new(None));
     }
     let mut store = lua
         .app_data_mut::<JobStore>()
@@ -2115,6 +2115,7 @@ impl LuaRuntime {
         jit: bool,
         plugin_rules: Arc<PluginRuleStore>,
         layered: Arc<LayeredTools>,
+        job_lifecycle_tx: Option<flume::Sender<(u32, JobLifecycle)>>,
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
         let compiler = install_compiler(&lua, jit);
@@ -2143,7 +2144,7 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(CommandHandlerMap::new());
-        lua.set_app_data(JobStore::new());
+        lua.set_app_data(JobStore::new(job_lifecycle_tx));
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
         lua.set_app_data(crate::api::top::NotifyHandler::default());
@@ -3671,6 +3672,7 @@ pub fn spawn(
     // The file index outlives any one plugin host, so the walks a host
     // rebuilt by `/reload` is waiting on are the ones the old host started.
     publish_walks(EventHandle::from_tx(tx.clone()));
+    let (job_lifecycle_tx, job_lifecycle_rx) = flume::unbounded::<(u32, JobLifecycle)>();
 
     let handle = thread::Builder::new()
         .name("maki-lua".to_owned())
@@ -3688,6 +3690,7 @@ pub fn spawn(
                 jit,
                 plugin_rules,
                 layered_thread,
+                Some(job_lifecycle_tx),
             ) {
                 Ok(r) => {
                     let _ = init_tx.send(Ok(()));
@@ -3797,7 +3800,18 @@ pub fn spawn(
                                     spawn_deferred_callback(&rt.lua, &ex, &gate, cb);
                                     Ok(None)
                                 },
-                                async { rx.recv_async().await.map(Some) },
+                                smol::future::or(
+                                    async {
+                                        let (job_id, lifecycle) =
+                                            job_lifecycle_rx.recv_async().await?;
+                                        let _ = hook_tx.send(HostHook::Autocmd {
+                                            event: lifecycle.event().to_owned(),
+                                            data: lifecycle.to_json(job_id),
+                                        });
+                                        Ok(None)
+                                    },
+                                    async { rx.recv_async().await.map(Some) },
+                                ),
                             ),
                         ),
                     )
