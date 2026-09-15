@@ -1,7 +1,14 @@
+use std::sync::LazyLock;
+use std::time::Instant;
+
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult};
 
 use crate::plugin_permissions::PluginPermissions;
+
+/// Epoch for `hrtime`. Like libuv's, it is arbitrary: only differences
+/// between two readings mean anything.
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// Return the current working directory as an absolute path. Like `vim.uv.cwd`.
 ///
@@ -38,6 +45,22 @@ fn os_getenv(_lua: &Lua, name: String) -> LuaResult<Option<String>> {
     Ok(std::env::var(&name).ok())
 }
 
+/// Return a monotonic clock reading in nanoseconds. Like `vim.uv.hrtime`.
+/// The epoch is arbitrary, so this is only useful for measuring how much
+/// time passed between two readings; unlike `os.time` it never jumps when
+/// the wall clock is adjusted.
+///
+/// @return (integer) Nanoseconds since an unspecified, fixed point in time.
+/// @example
+/// local start = maki.uv.hrtime()
+/// local elapsed_ms = (maki.uv.hrtime() - start) / 1e6
+#[lua_fn]
+fn hrtime(_lua: &Lua) -> LuaResult<u64> {
+    // u64 nanoseconds covers 584 years of uptime, so the cast cannot wrap in
+    // any process that could still be running.
+    Ok(EPOCH.elapsed().as_nanos() as u64)
+}
+
 lua_table! {
     /// System and environment utilities, modelled after `vim.uv`.
     ///
@@ -52,6 +75,6 @@ lua_table! {
     /// local home = maki.uv.os_homedir()
     /// ```
     "maki.uv" => pub(crate) fn create_uv_table(perms: &PluginPermissions), DOCS [
-        cwd(perms), os_homedir(perms), os_getenv(perms),
+        cwd(perms), os_homedir(perms), os_getenv(perms), hrtime,
     ]
 }

@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{BinaryHeap, HashSet};
 use std::fs::FileType;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
@@ -579,17 +579,31 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
             .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()));
 
         let paths: Vec<String> = if sort_mtime {
-            let mut entries: Vec<_> = iter
-                .filter_map(|e| {
-                    let p = e.into_path();
-                    let mt = maki_agent::tools::mtime(&p);
-                    p.to_str().map(|s| (mt, s.to_owned()))
-                })
-                .collect();
-            entries.sort_unstable_by_key(|e| Reverse(e.0));
-            if let Some(lim) = limit {
-                entries.truncate(lim);
-            }
+            let stamped = iter.filter_map(|e| {
+                let p = e.into_path();
+                let mt = maki_agent::tools::mtime(&p);
+                p.to_str().map(|s| (mt, s.to_owned()))
+            });
+            // Ranking by mtime has to see every match, but it does not have
+            // to hold them: with a limit, keep a heap of the newest `lim` and
+            // let the rest go. A repo-wide glob then costs the limit in
+            // memory rather than the whole tree.
+            let mut entries: Vec<(_, String)> = match limit {
+                Some(lim) => {
+                    let mut heap = BinaryHeap::with_capacity(lim + 1);
+                    for entry in stamped {
+                        // Reverse makes this a min-heap on mtime, so the
+                        // oldest of the kept entries is the one popped.
+                        heap.push(Reverse(entry));
+                        if heap.len() > lim {
+                            heap.pop();
+                        }
+                    }
+                    heap.into_iter().map(|Reverse(e)| e).collect()
+                }
+                None => stamped.collect(),
+            };
+            entries.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
             entries.into_iter().map(|(_, s)| s).collect()
         } else {
             let bounded: Box<dyn Iterator<Item = _>> = match limit {
@@ -1490,6 +1504,52 @@ mod tests {
         let second: String = result.get(2).unwrap();
         assert!(first.ends_with("new.rs"));
         assert!(second.ends_with("old.rs"));
+    }
+
+    /// The limit is a ranking cut, not a walk cut: the newest files win no
+    /// matter where the walker meets them, even though only `limit` of them
+    /// are ever held.
+    #[test]
+    fn glob_mtime_limit_keeps_the_newest_not_the_first_seen() {
+        let tmp = TempDir::new().unwrap();
+        let now = SystemTime::now();
+        // Named so alphabetical order is the reverse of mtime order, which
+        // is roughly the order the walker yields them in.
+        for (name, age_secs) in [
+            ("a_oldest.rs", 180),
+            ("b_middle.rs", 120),
+            ("c_newest.rs", 60),
+        ] {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, "").unwrap();
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - Duration::from_secs(age_secs))
+                .unwrap();
+        }
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let glob: mlua::Function = tbl.get("glob").unwrap();
+
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        opts.set("sort", "mtime").unwrap();
+        opts.set("limit", 2).unwrap();
+
+        let (result, err): (Table, mlua::Value) =
+            smol::block_on(glob.call_async::<(Table, mlua::Value)>(("*.rs", opts))).unwrap();
+        assert!(matches!(err, mlua::Value::Nil));
+
+        let got: Vec<String> = result
+            .sequence_values::<String>()
+            .map(|p| p.unwrap())
+            .collect();
+        assert_eq!(got.len(), 2, "limit must cap the result: {got:?}");
+        assert!(got[0].ends_with("c_newest.rs"), "{got:?}");
+        assert!(got[1].ends_with("b_middle.rs"), "{got:?}");
     }
 
     #[test]

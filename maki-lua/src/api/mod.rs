@@ -5,6 +5,7 @@ pub(crate) mod base64;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
+pub(crate) mod fuzzy;
 pub(crate) mod image;
 pub(crate) mod interpreter;
 pub(crate) mod json;

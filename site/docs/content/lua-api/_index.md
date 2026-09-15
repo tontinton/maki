@@ -1803,7 +1803,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 Process and environment helpers, modeled after Neovim's `vim.fn` job
 control. Use these to run shell commands, wait for output, and check
-whether programs are installed.
+whether programs are installed, plus the `matchfuzzy` list filters.
 
 ```lua
 local id = maki.fn.jobstart("git status", {
@@ -2164,6 +2164,72 @@ the bottom re-pins it so streaming output keeps following.
 
 ```lua
 maki.fn.winrestview({ topline = 1 })
+```
+
+---
+
+### `maki.fn.matchfuzzy()` {#maki-fn-matchfuzzy}
+
+```lua
+maki.fn.matchfuzzy({list}, {needle}, {opts?})
+```
+
+Filter {list} down to the entries that fuzzy-match {needle}, best match
+first. Mirrors Neovim's `vim.fn.matchfuzzy`.
+
+Matching is nucleo's: the needle's characters must appear in order but
+need not be adjacent, so `"fmini"` finds `"plugins/file_mention/init.lua"`.
+Scoring rewards matches on word starts and, with `path`, on the basename.
+
+**Parameters:**
+
+- `{list}` (`table`) List of strings, or of tables when `key` is set.
+- `{needle}` (`string`) Text to search for. An empty needle returns {list} unchanged.
+- `{opts?}` (`table?`) Optional settings:
+  - `key` (`string?`) field to match on when {list} holds tables.
+  - `limit` (`integer?`) keep at most this many matches.
+  - `path` (`boolean?`) score the entries as file paths: favour the basename
+
+  and characters right after a `/`.
+
+
+**Returns:** (`table`) The matching entries, best match first.
+
+**Example:**
+
+```lua
+maki.fn.matchfuzzy({ "src/main.rs", "docs/readme.md" }, "srmn", { path = true })
+-- { "src/main.rs" }
+```
+
+---
+
+### `maki.fn.matchfuzzypos()` {#maki-fn-matchfuzzypos}
+
+```lua
+maki.fn.matchfuzzypos({list}, {needle}, {opts?})
+```
+
+Like `matchfuzzy`, but also reports where each entry matched. Mirrors
+Neovim's `vim.fn.matchfuzzypos`: returns `{ matches, positions, scores }`,
+three parallel lists.
+
+Positions are 0-based character offsets into the matched text, ascending —
+the shape a renderer needs to highlight the matched characters.
+
+**Parameters:**
+
+- `{list}` (`table`) List of strings, or of tables when `key` is set.
+- `{needle}` (`string`) Text to search for. An empty needle returns {list} unchanged, with no positions.
+- `{opts?}` (`table?`) Same settings as `matchfuzzy`: `key`, `limit`, `path`.
+
+**Returns:** (`table`) `{ matches, positions, scores }`.
+
+**Example:**
+
+```lua
+local matches, positions = unpack(maki.fn.matchfuzzypos({ "init.lua" }, "iua"))
+-- matches = { "init.lua" }, positions = { { 0, 6, 7 } }
 ```
 
 
@@ -5801,6 +5867,28 @@ Requires the `env` [plugin permission](#plugin-permissions).
 
 ```lua
 local editor = maki.uv.os_getenv("EDITOR") or "vi"
+```
+
+---
+
+### `maki.uv.hrtime()` {#maki-uv-hrtime}
+
+```lua
+maki.uv.hrtime()
+```
+
+Return a monotonic clock reading in nanoseconds. Like `vim.uv.hrtime`.
+The epoch is arbitrary, so this is only useful for measuring how much
+time passed between two readings; unlike `os.time` it never jumps when
+the wall clock is adjusted.
+
+**Returns:** (`integer`) Nanoseconds since an unspecified, fixed point in time.
+
+**Example:**
+
+```lua
+local start = maki.uv.hrtime()
+local elapsed_ms = (maki.uv.hrtime() - start) / 1e6
 ```
 
 

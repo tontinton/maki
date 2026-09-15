@@ -15,6 +15,9 @@ use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use shell_words::join as shell_join;
 
+use super::fuzzy::{
+    matchfuzzy__doc, matchfuzzy__register, matchfuzzypos__doc, matchfuzzypos__register,
+};
 use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
@@ -1390,7 +1393,7 @@ fn winrestview(
 lua_table! {
     /// Process and environment helpers, modeled after Neovim's `vim.fn` job
     /// control. Use these to run shell commands, wait for output, and check
-    /// whether programs are installed.
+    /// whether programs are installed, plus the `matchfuzzy` list filters.
     ///
     /// ```lua
     /// local id = maki.fn.jobstart("git status", {
@@ -1408,6 +1411,7 @@ lua_table! {
         jobattach(perms, plugin), jobfind(perms, plugin),
         executable(perms),
         winsaveview(tx), winrestview(tx),
+        matchfuzzy, matchfuzzypos,
     ]
 }
 
