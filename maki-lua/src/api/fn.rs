@@ -968,6 +968,8 @@ fn kill_job(job: &JobMeta) {
 ///     (default 20, 0 disables, max 1024).
 ///   `name` (string?) handle for `jobfind`, unique among the live jobs this
 ///     plugin can see. Starting a second job under a live name is an error.
+///     Session jobs also show it in the /tasks picker and on the `JobStart`
+///     autocmd, so name long-running work even when you never look it up.
 /// @return (integer) Job id.
 /// @example
 /// local id = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
@@ -2573,7 +2575,11 @@ mod tests {
             .iter()
             .map(|s| s.id)
             .collect();
-        assert_eq!(from_task_plugin, [monitor], "session filter crosses plugins");
+        assert_eq!(
+            from_task_plugin,
+            [monitor],
+            "session filter crosses plugins"
+        );
 
         let from_monitor: Vec<u32> = store
             .list(Some(other), None, "monitor")

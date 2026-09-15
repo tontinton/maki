@@ -13,9 +13,11 @@ use crate::markdown::truncate_output;
 
 use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
-use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use maki_agent::{
+    AgentEvent, BufferSnapshot, TextOutput, ToolDoneEvent, ToolOutput, ToolStartEvent,
+};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
-use maki_lua::WinView;
+use maki_lua::{ChatItem, ChatItemStatus, WinView};
 use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
 use maki_storage::id::MakiId;
 use ratatui::Frame;
@@ -401,6 +403,39 @@ impl Chat {
 
     pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
         self.messages_panel.update_tool_model(tool_id, model);
+    }
+
+    /// A plugin-owned transcript item: `running` creates or re-titles a
+    /// spinner item, `done` / `failed` closes it. Missing items close quietly:
+    /// a plugin may update a chat item after the transcript was rebuilt.
+    pub(crate) fn apply_chat_item(&mut self, item: &ChatItem) {
+        match item.status {
+            ChatItemStatus::Running => {
+                self.messages_panel.tool_start(ToolStartEvent {
+                    id: item.id.to_string(),
+                    tool: Arc::clone(&item.label),
+                    summary: item.title.clone(),
+                    render_header: None,
+                    annotation: None,
+                    input: None,
+                    raw_input: None,
+                    output: None,
+                });
+            }
+            ChatItemStatus::Done | ChatItemStatus::Failed => {
+                if let Some(detail) = &item.detail {
+                    self.messages_panel.update_tool_summary(&item.id, detail);
+                }
+                self.messages_panel.tool_done(ToolDoneEvent {
+                    id: item.id.to_string(),
+                    tool: Arc::clone(&item.label),
+                    output: Arc::new(ToolOutput::Plain(TextOutput::from(String::new()))),
+                    is_error: item.status == ChatItemStatus::Failed,
+                    annotation: None,
+                    written_path: None,
+                });
+            }
+        }
     }
 
     pub fn set_tool_turn_usage(&mut self, tool_id: &str, usage: String) {
@@ -1471,5 +1506,71 @@ mod tests {
         assert!(sub.is_finished());
         assert_eq!(sub.task_status(), TaskStatus::Error);
         assert_eq!(sub.task_id().map(|id| &**id), Some(TASK_ID));
+    }
+
+    const TEST_ITEM_LABEL: &str = "monitor";
+    const TEST_ITEM_TITLE: &str = "watch tests";
+    const TEST_ITEM_DETAIL: &str = "exited (code 0)";
+
+    fn chat_item(status: ChatItemStatus, detail: Option<String>) -> ChatItem {
+        ChatItem {
+            id: format!("{TEST_ITEM_LABEL}:1").into(),
+            label: TEST_ITEM_LABEL.into(),
+            title: TEST_ITEM_TITLE.into(),
+            status,
+            detail,
+        }
+    }
+
+    fn tool_role(chat: &Chat, index: usize) -> (&ToolRole, &str) {
+        let msg = chat.messages_panel.message_at(index).unwrap();
+        let DisplayRole::Tool(t) = &msg.role else {
+            panic!("expected a tool-shaped message");
+        };
+        (t, &msg.text)
+    }
+
+    #[test]
+    fn chat_item_running_creates_a_tool_shaped_item() {
+        let mut chat = chat();
+        chat.apply_chat_item(&chat_item(ChatItemStatus::Running, None));
+        let (role, text) = tool_role(&chat, 0);
+        assert_eq!(&*role.name, TEST_ITEM_LABEL);
+        assert_eq!(role.status, ToolStatus::InProgress);
+        assert_eq!(text, TEST_ITEM_TITLE);
+    }
+
+    #[test]
+    fn chat_item_done_closes_with_the_detail() {
+        let mut chat = chat();
+        chat.apply_chat_item(&chat_item(ChatItemStatus::Running, None));
+        chat.apply_chat_item(&chat_item(
+            ChatItemStatus::Done,
+            Some(TEST_ITEM_DETAIL.into()),
+        ));
+        assert_eq!(
+            chat.messages_panel.message_count(),
+            1,
+            "done updates in place"
+        );
+        let (role, text) = tool_role(&chat, 0);
+        assert_eq!(role.status, ToolStatus::Success);
+        assert_eq!(text, TEST_ITEM_DETAIL);
+    }
+
+    #[test]
+    fn chat_item_failed_marks_the_item_as_error() {
+        let mut chat = chat();
+        chat.apply_chat_item(&chat_item(ChatItemStatus::Running, None));
+        chat.apply_chat_item(&chat_item(ChatItemStatus::Failed, None));
+        let (role, _) = tool_role(&chat, 0);
+        assert_eq!(role.status, ToolStatus::Error);
+    }
+
+    #[test]
+    fn closing_an_unknown_chat_item_stays_quiet() {
+        let mut chat = chat();
+        chat.apply_chat_item(&chat_item(ChatItemStatus::Done, None));
+        assert_eq!(chat.messages_panel.message_count(), 0);
     }
 }

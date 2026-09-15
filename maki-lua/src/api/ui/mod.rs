@@ -12,8 +12,9 @@ use strum::VariantNames;
 
 use crate::api::keymap::{parse_key_notation, reject_reserved};
 use crate::api::util::command::{
-    Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
-    InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_send,
+    Anchor, Border, BuiltinAction, ChatItem, ChatItemStatus, Dimension, FloatConfig, HintEntries,
+    HintWriter, InputEdit, InputRequest, Split, StatusSegment, TitlePos, UiAction, WinCommand,
+    WinEvent, ui_json_roundtrip, ui_send,
 };
 use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, try_pair};
@@ -21,6 +22,13 @@ use crate::docs::{FnDoc, ParamDoc};
 pub(crate) mod blit;
 pub(crate) mod buf;
 pub(crate) mod win;
+
+const CHAT_ITEM_ID_ERR: &str = "chat_item: id must be a non-blank string";
+const CHAT_ITEM_STATUS_ERR: &str = "chat_item: status must be \"running\", \"done\", or \"failed\"";
+const CHAT_ITEM_DEFAULT_LABEL: &str = "item";
+const STATUS_SEGMENT_ID_ERR: &str = "status_segment: id must be a non-blank string";
+const STATUS_SEGMENT_TEXT_ERR: &str = "status_segment: text is required";
+const STATUS_SEGMENT_DEFAULT_STYLE: &str = "status_dim";
 
 use crate::runtime::with_task_bufs;
 use win::WinHandle;
@@ -390,6 +398,105 @@ fn set_window_title(
     Ok(())
 }
 
+/// Adds or updates a plugin-owned item in the chat transcript. Call it with
+/// `status = "running"` to surface the item with a spinner, then with
+/// `status = "done"` or `"failed"` to close it with a terminal status.
+/// Re-calling `chat_item` with the same `id` updates the item in place, so
+/// the title can track progress while the item runs.
+///
+/// The id is scoped to the calling plugin: two plugins may use the same id
+/// without colliding.
+///
+/// @param opts table `id` (string, unique within the plugin), `title`
+///   (string, headline shown while the item runs), `label` (string, item
+///   kind shown next to the status, e.g. `"monitor"`, default `"item"`),
+///   `status` (`"running"` default, `"done"`, or `"failed"`), `detail`
+///   (string, terminal text for `done` / `failed`, e.g. `"exited (code 0)"`).
+/// @return
+/// @example
+/// maki.ui.chat_item({ id = id, label = "monitor", title = cmd, status = "running" })
+/// maki.ui.chat_item({ id = id, status = "done", detail = "exited (code 0)" })
+#[lua_fn]
+fn chat_item(
+    _lua: &Lua,
+    #[ctx] tx: flume::Sender<UiAction>,
+    #[ctx] plugin: Arc<str>,
+    opts: Table,
+) -> LuaResult<()> {
+    let id: String = opts
+        .get::<Option<String>>("id")?
+        .ok_or_else(|| mlua::Error::runtime(CHAT_ITEM_ID_ERR))?;
+    if id.trim().is_empty() {
+        return Err(mlua::Error::runtime(CHAT_ITEM_ID_ERR));
+    }
+    let title: Option<String> = opts.get("title")?;
+    let label: Option<String> = opts.get("label")?;
+    let detail: Option<String> = opts.get("detail")?;
+    let status = match opts.get::<Option<String>>("status")? {
+        None => ChatItemStatus::Running,
+        Some(s) => match s.as_str() {
+            "running" => ChatItemStatus::Running,
+            "done" => ChatItemStatus::Done,
+            "failed" => ChatItemStatus::Failed,
+            _ => return Err(mlua::Error::runtime(CHAT_ITEM_STATUS_ERR)),
+        },
+    };
+    let _ = tx.try_send(UiAction::ChatItem(ChatItem {
+        id: format!("{plugin}:{id}").into(),
+        label: label
+            .unwrap_or_else(|| CHAT_ITEM_DEFAULT_LABEL.to_string())
+            .into(),
+        title: title.unwrap_or_default(),
+        status,
+        detail,
+    }));
+    Ok(())
+}
+
+/// Adds, updates, or removes one of the plugin's status bar segments, the
+/// short text spans shown on the right side of the bar. Pass `nil` instead
+/// of `opts` to drop every segment the plugin owns.
+///
+/// @param opts table|nil `id` (string, unique within the plugin), `text`
+///   (string, segment text, rendered as `[ text ]`), `style` (string, theme
+///   style name, default `"status_dim"`). `nil` drops every segment the
+///   plugin owns.
+/// @return
+/// @example
+/// maki.ui.status_segment({ id = "jobs", text = "3 running" })
+/// maki.ui.status_segment({ id = "jobs" }) -- remove it
+/// maki.ui.status_segment(nil) -- remove all of this plugin's
+#[lua_fn]
+fn status_segment(
+    _lua: &Lua,
+    #[ctx] tx: flume::Sender<UiAction>,
+    #[ctx] plugin: Arc<str>,
+    opts: Option<Table>,
+) -> LuaResult<()> {
+    let Some(opts) = opts else {
+        let _ = tx.try_send(UiAction::ClearStatusSegments {
+            plugin: Arc::clone(&plugin),
+        });
+        return Ok(());
+    };
+    let id: String = opts
+        .get::<Option<String>>("id")?
+        .ok_or_else(|| mlua::Error::runtime(STATUS_SEGMENT_ID_ERR))?;
+    if id.trim().is_empty() {
+        return Err(mlua::Error::runtime(STATUS_SEGMENT_ID_ERR));
+    }
+    let text: String = opts
+        .get::<Option<String>>("text")?
+        .ok_or_else(|| mlua::Error::runtime(STATUS_SEGMENT_TEXT_ERR))?;
+    let style: Option<String> = opts.get("style")?;
+    let _ = tx.try_send(UiAction::StatusSegment(StatusSegment {
+        id: format!("{plugin}:{id}").into(),
+        text,
+        style: style.unwrap_or_else(|| STATUS_SEGMENT_DEFAULT_STYLE.to_string()),
+    }));
+    Ok(())
+}
+
 /// Runs a built-in UI action by name, exactly as its default keybinding
 /// would. Handy when a default key never reaches maki because tmux or
 /// your terminal grabs it first: bind a new key with `maki.keymap.set`
@@ -740,7 +847,8 @@ lua_table! {
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title, manual input, manual input_edit,
+        manual set_window_title, manual input, manual input_edit, manual chat_item,
+        manual status_segment,
     ]
 }
 
@@ -755,6 +863,8 @@ pub(crate) fn create_ui_table(
     if let Some(tx) = ui_action_tx {
         flash__register(&t, lua, tx.clone())?;
         set_window_title__register(&t, lua, tx.clone())?;
+        chat_item__register(&t, lua, tx.clone(), Arc::clone(&plugin))?;
+        status_segment__register(&t, lua, tx.clone(), Arc::clone(&plugin))?;
         action__register(&t, lua, tx.clone())?;
         open_editor__register(&t, lua, tx.clone())?;
         input__register(&t, lua, tx.clone())?;

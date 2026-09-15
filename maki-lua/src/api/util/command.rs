@@ -668,6 +668,37 @@ pub enum UiAction {
         depth: u8,
         reply_tx: flume::Sender<Result<(), String>>,
     },
+    /// A plugin-owned transcript item: `running` creates or re-titles it,
+    /// `done` / `failed` closes it. The `id` is already plugin-scoped.
+    ChatItem(ChatItem),
+    StatusSegment(StatusSegment),
+    ClearStatusSegments {
+        plugin: Arc<str>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatItemStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatItem {
+    pub id: Arc<str>,
+    pub label: Arc<str>,
+    pub title: String,
+    pub status: ChatItemStatus,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StatusSegment {
+    /// Already plugin-scoped.
+    pub id: Arc<str>,
+    pub text: String,
+    pub style: String,
 }
 
 /// Whether an event loop is draining `UiAction`. The channel cannot answer
