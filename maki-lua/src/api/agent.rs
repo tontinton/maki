@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
-use maki_agent::agent::tool_dispatch;
+use maki_agent::agent::{LoadedInstructions, tool_dispatch};
 use maki_agent::cancel::{CancelMap, CancelSlot};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
@@ -39,7 +39,7 @@ use crate::api::tool::{audiences_to_lua, parse_audience};
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
-use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
@@ -346,6 +346,8 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 ///   `on_usage` (function?) - called with a formatted cumulative token usage
 ///     string. Must not yield.
 /// @return (string?, string?) Tool output text, or `(nil, err)` on failure.
+///   Instruction files the child picks up (a subdirectory `AGENTS.md`) are
+///   not in the text: they land on the calling tool's own result.
 /// @example
 /// local out, err = maki.agent.call_tool(ctx, "bash", {
 ///   command = "ls -la",
@@ -398,10 +400,7 @@ async fn call_tool(
     if let Some(a) = annotation {
         cbs.deliver(ToolLive::Annotation(a)).await;
     }
-    match interpreter_bridge::flatten(&done) {
-        Ok(text) => Ok((Some(text), None)),
-        Err(err) => Ok((None, Some(err))),
-    }
+    Ok(pair(interpreter_bridge::flatten(&done)))
 }
 
 /// Create a new subagent session. The session inherits the parent model and
@@ -638,6 +637,7 @@ async fn session(
             .map(McpSession::fresh),
         history: History::new(Vec::new()),
         gauge: ContextGauge::default(),
+        loaded_instructions: LoadedInstructions::new(),
         sub_event_tx,
         stream_guard: Some(stream_guard),
         child_cancel,
@@ -759,6 +759,10 @@ struct SessionState {
     /// Travels with `history`: a subagent session spans many runs, and a gauge
     /// rebuilt per run would forget every measurement it made.
     gauge: ContextGauge,
+    /// Fresh per session, not per prompt: the parent's set would hide files
+    /// this model never saw, and a per-run set would inject the same file on
+    /// every turn.
+    loaded_instructions: LoadedInstructions,
     sub_event_tx: EventSender,
     /// Dropped on close, which ends the relay task. Tool contexts keep
     /// [`EventSender`] clones alive past the run, so the relay cannot key off
@@ -879,6 +883,7 @@ async fn prompt(
         },
     )
     .with_user_response_rx(Arc::clone(&s.answer_rx))
+    .with_loaded_instructions(s.loaded_instructions.clone())
     .with_cancel(s.child_cancel.clone())
     .with_mcp(s.mcp.clone())
     .with_local_tools(Arc::clone(&s.local_tools));

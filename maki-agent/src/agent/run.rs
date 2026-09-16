@@ -13,7 +13,7 @@ use maki_providers::{
 
 use super::compaction;
 use super::history::{History, sanitize_cancelled_history};
-use super::instructions::LoadedInstructions;
+use super::instructions::{CallInstructions, LoadedInstructions};
 use super::streaming::{StreamError, StreamRequest, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
@@ -541,6 +541,7 @@ impl<'h> Agent<'h> {
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
             loaded_instructions: self.loaded_instructions.clone(),
+            call_instructions: CallInstructions::default(),
             cancel: self.cancel.clone(),
             mcp: self.mcp.clone(),
             deadline: Deadline::None,

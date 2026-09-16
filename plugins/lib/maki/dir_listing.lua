@@ -1,6 +1,6 @@
--- Shared directory listing for index and list plugins.
--- Lists entries, filters instruction files, sorts dirs before files, and
--- renders the listing so every caller shows a directory the same way.
+-- Shared directory listing for index and list plugins, so every caller
+-- shows a directory the same way. Listing also loads the directory's
+-- instruction files onto the call.
 
 local ToolView = require("maki.tool_view")
 
@@ -30,17 +30,13 @@ function M.list(path, ctx)
     dirs[#dirs + 1] = f
   end
 
-  local instructions = ctx:find_instructions(path)
+  ctx:load_instructions(path)
 
-  local result = {
+  return {
     names = dirs,
     text = table.concat(dirs, "\n"),
     count = #dirs,
   }
-  if #instructions > 0 then
-    result.instructions = instructions
-  end
-  return result
 end
 
 function M.view(text, ctx)

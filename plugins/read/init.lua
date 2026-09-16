@@ -130,19 +130,9 @@ local function read_file(path, offset, limit, ctx)
   local prefix = start > 1 and table.concat(all_lines, "\n", 1, math.min(start - 1, total_lines)) or nil
 
   local basename = path:match("([^/]+)$")
-  if not ctx:is_instruction_file(basename) then
-    local parent = maki.fs.dirname(path)
-    if parent then
-      local instructions = ctx:find_instructions(parent)
-      if #instructions > 0 then
-        return {
-          llm_output = llm_output,
-          body = build_file_view(lines, start, total_lines, path, ctx, prefix),
-          annotation = annotation,
-          instructions = instructions,
-        }
-      end
-    end
+  local parent = maki.fs.dirname(path)
+  if parent and not ctx:is_instruction_file(basename) then
+    ctx:load_instructions(parent)
   end
 
   return {

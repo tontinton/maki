@@ -31,6 +31,7 @@ const GLOBAL_PACK_ONLY_ERR: &str = "only available in the global init.lua";
 const USAGE_TOOL_NAME: &str = "usage_child";
 const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
 const USAGE_OUTPUT: &str = "usage_done";
+const INSTRUCTION_CONTENT: &str = "sub rules";
 const FLOORED_PACKAGE: &str = "future_pack";
 const SIBLING_PACKAGE: &str = "sibling_pack";
 const MALFORMED_FLOOR: &str = "min_maki_version = 12\n";
@@ -2330,6 +2331,72 @@ maki.api.register_tool({{
             "child_done/5 items stream_done/streamed line/1 lines \
              {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil"
         )
+    );
+}
+
+#[test]
+fn nested_load_instructions_surface_once_on_model_call() {
+    // `find_subdirectory_instructions` only walks directories under cwd.
+    let sub = tempfile::Builder::new()
+        .prefix(".load-instructions-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    std::fs::write(sub.path().join("AGENTS.md"), INSTRUCTION_CONTENT).unwrap();
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"
+maki.api.register_tool({{
+    name = "instructed_child",
+    description = "loads a subdirectory's instructions",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function(input, ctx)
+        assert(ctx:load_instructions([[{dir}]]))
+        return "child_done"
+    end
+}})
+maki.api.register_tool({{
+    name = "driver",
+    description = "forwards the child's text verbatim",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function(input, ctx)
+        return (maki.agent.call_tool(ctx, "instructed_child", {{}}))
+    end
+}})
+"#,
+        dir = sub.path().display(),
+    );
+    host.load_source("load_instructions", &src).unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.registry = Arc::clone(&reg);
+    let dispatch = || {
+        smol::block_on(maki_agent::agent::tool_dispatch::run(
+            String::new(),
+            "driver",
+            &json!({}),
+            &ctx,
+            maki_agent::tools::CallOrigin::Model,
+        ))
+    };
+
+    let first = dispatch();
+    let text = first.output.as_text();
+    assert!(!first.is_error, "{text}");
+    assert_eq!(first.output.instructions().map(<[_]>::len), Some(1));
+    assert_eq!(
+        text.matches(INSTRUCTION_CONTENT).count(),
+        1,
+        "a block in the child's text would show twice"
+    );
+
+    let second = dispatch();
+    assert!(!second.is_error);
+    assert!(
+        second.output.instructions().is_none(),
+        "seen this session already"
     );
 }
 

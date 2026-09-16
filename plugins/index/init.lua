@@ -194,15 +194,11 @@ Return a compact overview of a source file: imports, type definitions, function 
       if not listing then
         return { llm_output = "error: " .. tostring(err), is_error = true }
       end
-      local output = {
+      return {
         llm_output = listing.text,
         body = dir_listing.view(listing.text, ctx),
         annotation = listing.count .. " entries",
       }
-      if listing.instructions then
-        output.instructions = listing.instructions
-      end
-      return output
     end
 
     local filename = path:match("([^/]+)$")

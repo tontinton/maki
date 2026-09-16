@@ -10,14 +10,17 @@ local rmtree = th.rmtree
 
 local PATH_REQUIRED_MSG = "error: path is required"
 
-local function mock_ctx(instructions)
+local function mock_ctx(loaded)
   return {
     is_instruction_file = function(_self, name)
       local set = { ["AGENTS.md"] = true, ["CLAUDE.md"] = true, ["COPILOT.md"] = true }
       return set[name] or false
     end,
-    find_instructions = function()
-      return instructions or {}
+    load_instructions = function(_self, dir)
+      if loaded then
+        loaded[#loaded + 1] = dir
+      end
+      return true
     end,
   }
 end
@@ -59,17 +62,17 @@ case("handler_lists_sorted_and_filtered", function()
   eq(result.is_error, nil)
   eq(result.llm_output, "adir/\nzdir/\na.txt\nb.txt")
   eq(result.annotation, "4 entries")
-  eq(result.instructions, nil)
   rmtree(tmpdir)
 end)
 
-case("handler_propagates_instructions", function()
+case("handler_loads_instructions_for_listed_dir", function()
   local tmpdir = mktmpdir()
   maki.fs.write(maki.fs.joinpath(tmpdir, "a.txt"), "")
-  local instructions = { maki.fs.joinpath(tmpdir, "AGENTS.md") }
-  local result = list_helpers.handler({ path = tmpdir }, mock_ctx(instructions))
+  local loaded = {}
+  local result = list_helpers.handler({ path = tmpdir }, mock_ctx(loaded))
   eq(result.is_error, nil)
-  eq(result.instructions, instructions)
+  eq(#loaded, 1)
+  eq(loaded[1], tmpdir)
   rmtree(tmpdir)
 end)
 

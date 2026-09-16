@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use maki_agent::agent::LoadedInstructions;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{Deadline, FileKey, MAIN_TASK_ID, ToolAudience, ToolContext, ToolLive};
 use maki_config::{AgentConfig, ToolOutputLines};
@@ -39,7 +38,8 @@ fn send_live_buf(lua: &mlua::Lua, buf: &mlua::AnyUserData) -> mlua::Result<()> {
 }
 
 /// Captured snapshot of the parent `ToolContext`. Per-call state (deadline,
-/// instructions, output lines) is reset so child calls start clean.
+/// output lines) is reset so child calls start clean. The instruction handles
+/// stay: a nested call is still the same session and the same model call.
 ///
 /// Routing state is kept verbatim, `local_tools` included: a name a Lua tool
 /// dispatches must land where the same name lands when the model calls it, or
@@ -51,7 +51,6 @@ pub(crate) struct AgentContext(ToolContext);
 impl From<&ToolContext> for AgentContext {
     fn from(ctx: &ToolContext) -> Self {
         let mut c = ctx.clone();
-        c.loaded_instructions = LoadedInstructions::new();
         c.deadline = Deadline::None;
         c.tool_output_lines = ToolOutputLines::default();
         Self(c)
@@ -96,9 +95,6 @@ pub(crate) struct LuaCtx {
 enum Caps {
     Handler {
         agent: Box<AgentContext>,
-        /// Kept apart from `agent`, which resets its copy so child calls
-        /// start with a clean instruction set.
-        loaded_instructions: LoadedInstructions,
     },
     /// `start` runs before permission checks: it reads config and publishes
     /// previews, but dispatching tools is structurally impossible.
@@ -141,7 +137,6 @@ impl LuaCtx {
             ctx,
             Caps::Handler {
                 agent: Box::new(AgentContext::from(ctx)),
-                loaded_instructions: ctx.loaded_instructions.clone(),
             },
         )
     }
@@ -174,14 +169,14 @@ impl LuaCtx {
     /// Dispatch capability: only handler ctxs can call `maki.agent.*`.
     pub(crate) fn agent(&self) -> Option<&AgentContext> {
         match &self.caps {
-            Caps::Handler { agent, .. } => Some(agent),
+            Caps::Handler { agent } => Some(agent),
             _ => None,
         }
     }
 
     fn config(&self) -> Option<&AgentConfig> {
         match &self.caps {
-            Caps::Handler { agent, .. } => Some(&agent.config),
+            Caps::Handler { agent } => Some(&agent.config),
             Caps::Start { config, .. } => Some(config),
             Caps::Restore { .. } => None,
         }
@@ -189,7 +184,7 @@ impl LuaCtx {
 
     fn workflow(&self) -> Option<bool> {
         match &self.caps {
-            Caps::Handler { agent, .. } => Some(agent.workflow),
+            Caps::Handler { agent } => Some(agent.workflow),
             Caps::Start { workflow, .. } => Some(*workflow),
             Caps::Restore { .. } => None,
         }
@@ -197,7 +192,7 @@ impl LuaCtx {
 
     fn audience(&self) -> Option<ToolAudience> {
         match &self.caps {
-            Caps::Handler { agent, .. } => Some(agent.audience),
+            Caps::Handler { agent } => Some(agent.audience),
             Caps::Start { audience, .. } => Some(*audience),
             Caps::Restore { .. } => None,
         }
@@ -212,16 +207,6 @@ impl LuaCtx {
 
     fn task_id(&self) -> &str {
         self.task_id.as_deref().unwrap_or(MAIN_TASK_ID)
-    }
-
-    fn loaded_instructions(&self) -> Option<&LoadedInstructions> {
-        match &self.caps {
-            Caps::Handler {
-                loaded_instructions,
-                ..
-            } => Some(loaded_instructions),
-            _ => None,
-        }
     }
 
     fn state(&self) -> Option<&serde_json::Value> {
@@ -354,29 +339,25 @@ impl UserData for LuaCtx {
         });
 
         methods.add_async_method(
-            "find_instructions",
-            |lua, this, dir_path: String| async move {
-                let Some(loaded) = this.loaded_instructions().cloned() else {
-                    return Ok(this.cap_err_pair("find_instructions"));
+            "load_instructions",
+            |_, this, dir_path: String| async move {
+                let Some(agent) = this.agent() else {
+                    return Ok(this.cap_err_pair("load_instructions"));
                 };
+                let loaded = agent.loaded_instructions.clone();
+                let call = agent.call_instructions.clone();
                 // Nothing may hold the ctx borrow across the wait: a cancel
                 // hook firing meanwhile needs `ctx:finish`, which takes it
                 // mutably.
                 drop(this);
-                let results = smol::unblock(move || {
+                let blocks = smol::unblock(move || {
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let abs = resolve_abs_with_cwd(dir_path, &cwd);
                     maki_agent::find_subdirectory_instructions(&abs, &cwd, &loaded)
                 })
                 .await;
-                let tbl = lua.create_table()?;
-                for (i, (path, content)) in results.into_iter().enumerate() {
-                    let entry = lua.create_table()?;
-                    entry.set("path", path)?;
-                    entry.set("content", content)?;
-                    tbl.set(i + 1, entry)?;
-                }
-                Ok((Some(tbl), None))
+                call.record(blocks);
+                Ok((Some(true), None))
             },
         );
 
@@ -414,9 +395,9 @@ fn resolve_abs_with_cwd(path: String, cwd: &Path) -> PathBuf {
 mod tests {
     use std::collections::HashMap;
 
-    use maki_agent::AgentMode;
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::tools::{LocalTool, ToolAudience};
+    use maki_agent::{AgentMode, InstructionBlock};
     use test_case::test_case;
 
     use super::*;
@@ -444,6 +425,10 @@ mod tests {
             !ctx.loaded_instructions
                 .contains_or_insert(PathBuf::from(INSTRUCTION_PATH))
         );
+        ctx.call_instructions.record(vec![InstructionBlock {
+            path: INSTRUCTION_PATH.into(),
+            content: String::new(),
+        }]);
         let mut tools: HashMap<String, LocalTool> = HashMap::new();
         tools.insert(
             LOCAL_TOOL_NAME.into(),
@@ -472,10 +457,15 @@ mod tests {
             "a nested call must route names exactly like the model's own call"
         );
         assert!(
-            !agent
+            agent
                 .loaded_instructions
                 .contains_or_insert(PathBuf::from(INSTRUCTION_PATH)),
-            "loaded_instructions must be a fresh set, not a shared clone"
+            "session state, shared with nested calls"
+        );
+        assert_eq!(
+            agent.call_instructions.take().len(),
+            1,
+            "per model call, shared with nested calls"
         );
     }
 
@@ -544,16 +534,5 @@ mod tests {
         );
         assert_eq!(LuaCtx::handler(&ctx).restore_reason(), None);
         assert_eq!(LuaCtx::start(&ctx).restore_reason(), None);
-    }
-
-    #[test]
-    fn handler_ctx_keeps_parent_instruction_set() {
-        let ctx = LuaCtx::handler(&populated_ctx());
-        assert!(
-            ctx.loaded_instructions()
-                .expect("handler has instructions")
-                .contains_or_insert(PathBuf::from(INSTRUCTION_PATH)),
-            "handler must share the parent's set; AgentContext resets its own copy"
-        );
     }
 }

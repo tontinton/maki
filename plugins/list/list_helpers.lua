@@ -23,14 +23,10 @@ function M.handler(input, ctx)
     return { llm_output = "error: " .. tostring(err), is_error = true }
   end
 
-  local result = {
+  return {
     llm_output = listing.text,
     annotation = listing.count .. " entries",
   }
-  if listing.instructions then
-    result.instructions = listing.instructions
-  end
-  return result
 end
 
 return M

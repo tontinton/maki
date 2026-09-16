@@ -21,8 +21,8 @@ local function mock_ctx(path)
       local set = { ["AGENTS.md"] = true, ["CLAUDE.md"] = true, ["COPILOT.md"] = true }
       return set[name] or false
     end,
-    find_instructions = function()
-      return {}
+    load_instructions = function()
+      return true
     end,
   }
 end

@@ -2,12 +2,14 @@ use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
+use crate::agent::CallInstructions;
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
@@ -84,8 +86,9 @@ impl RecentCalls {
 }
 
 /// Every tool call in maki lands here (native, Lua, MCP, subagents, batch
-/// children), which makes it the one place telemetry has to wrap and the one
-/// place [hooks] fire.
+/// children), which makes it the one place telemetry has to wrap, the one
+/// place [hooks] fire, and the one place a model call's [`CallInstructions`]
+/// are drained onto its output.
 ///
 /// [hooks]: crate::tools::hook
 pub async fn run(
@@ -127,10 +130,40 @@ pub async fn run(
     if let Some(hook) = &hook {
         hook.filter_output(&mut done).await;
     }
+    if origin.is_model() {
+        attach_call_instructions(ctx, &mut done);
+    }
     if let Some((source, started)) = telemetry {
         report(&done, name, &source, &input, started.elapsed());
     }
     done
+}
+
+/// A file counts as seen only once its block is on an output the model reads,
+/// and the insert is what settles which of two sibling calls that found the
+/// same file in one turn carries it.
+fn attach_call_instructions(ctx: &ToolContext, done: &mut ToolDoneEvent) {
+    let found = ctx.call_instructions.take();
+    if found.is_empty() {
+        return;
+    }
+    let Some(slot) = Arc::make_mut(&mut done.output).instructions_slot() else {
+        warn!(
+            count = found.len(),
+            "output shape cannot carry instruction blocks, dropping them"
+        );
+        return;
+    };
+    let blocks: Vec<_> = found
+        .into_iter()
+        .filter(|block| {
+            !ctx.loaded_instructions
+                .contains_or_insert(PathBuf::from(&block.path))
+        })
+        .collect();
+    if !blocks.is_empty() {
+        *slot = Some(blocks);
+    }
 }
 
 /// The hook installed on this registry, bound to one call. `None` when nobody
@@ -842,6 +875,7 @@ pub(super) async fn process_tool_calls(
         let event_tx_clone = ctx.event_tx.clone();
         let tool_ctx = ToolContext {
             tool_use_id: Some(id.clone()),
+            call_instructions: CallInstructions::default(),
             ..ctx.clone()
         };
         set.spawn(async move {
@@ -960,7 +994,6 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::AgentMode;
     use crate::cancel::CancelToken;
     use crate::mcp::test_support::stub_session;
     use crate::mcp::tool_names;
@@ -976,6 +1009,7 @@ mod tests {
         PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience, ToolExecResult,
         ToolHook, local_tool,
     };
+    use crate::{AgentMode, InstructionBlock};
 
     const TEST_ID: &str = "t1";
     const PROBE_WIRE: &str = "srv__probe";
@@ -987,6 +1021,11 @@ mod tests {
     const TEST_PLUGIN: &str = "test";
     const HOOK_TOOL_NAME: &str = "hook_probe";
     const HOOK_FIELD: &str = "command";
+    const INSTRUCTED_TOOL: &str = "instructed";
+    const PARENT_TOOL: &str = "parent";
+    const CHILD_TEXT: &str = "child_done";
+    const INSTRUCTION_PATH: &str = "/repo/sub/AGENTS.md";
+    const INSTRUCTION_CONTENT: &str = "sub rules";
     const HOOK_PLAIN: &str = "ls";
     const HOOK_REWRITTEN_FROM: &str = "grep -r x .";
     const HOOK_REWRITTEN_TO: &str = "rg x";
@@ -1673,6 +1712,85 @@ mod tests {
             let done = dispatch(&ctx, "boom", &serde_json::json!({})).await;
             assert!(done.is_error);
             assert_eq!(done.output.as_text(), "nope");
+        });
+    }
+
+    #[test]
+    fn nested_call_instructions_surface_once_on_the_model_call() {
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.local_tools = Arc::new(HashMap::from([
+                (
+                    INSTRUCTED_TOOL.to_owned(),
+                    local_tool(ToolAudience::all(), |_, ctx| {
+                        Box::pin(async move {
+                            ctx.call_instructions.record(vec![InstructionBlock {
+                                path: INSTRUCTION_PATH.into(),
+                                content: INSTRUCTION_CONTENT.into(),
+                            }]);
+                            Ok(CHILD_TEXT.into())
+                        })
+                    }),
+                ),
+                (
+                    PARENT_TOOL.to_owned(),
+                    local_tool(ToolAudience::all(), |_, ctx| {
+                        Box::pin(async move {
+                            let child =
+                                dispatch_nested(&ctx, INSTRUCTED_TOOL, &serde_json::json!({}))
+                                    .await;
+                            Ok(child.output.as_text())
+                        })
+                    }),
+                ),
+            ]));
+
+            let done = dispatch(&ctx, PARENT_TOOL, &serde_json::json!({})).await;
+            let text = done.output.as_text();
+            assert_eq!(done.output.instructions().map(<[_]>::len), Some(1));
+            assert!(text.starts_with(CHILD_TEXT));
+            assert_eq!(
+                text.matches(INSTRUCTION_CONTENT).count(),
+                1,
+                "the parent forwards the child's text verbatim, so a block in it would show twice"
+            );
+            assert!(ctx.call_instructions.take().is_empty());
+            assert!(
+                ctx.loaded_instructions
+                    .contains(&PathBuf::from(INSTRUCTION_PATH)),
+                "attaching is what marks the file seen"
+            );
+        });
+    }
+
+    #[test]
+    fn sibling_model_calls_carry_a_found_file_once() {
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.local_tools = Arc::new(HashMap::from([(
+                INSTRUCTED_TOOL.to_owned(),
+                local_tool(ToolAudience::all(), |_, ctx| {
+                    Box::pin(async move {
+                        ctx.call_instructions.record(vec![InstructionBlock {
+                            path: INSTRUCTION_PATH.into(),
+                            content: INSTRUCTION_CONTENT.into(),
+                        }]);
+                        Ok(CHILD_TEXT.into())
+                    })
+                }),
+            )]));
+            let sibling = |ctx: &ToolContext| ToolContext {
+                call_instructions: CallInstructions::default(),
+                ..ctx.clone()
+            };
+
+            let first = dispatch(&sibling(&ctx), INSTRUCTED_TOOL, &serde_json::json!({})).await;
+            let second = dispatch(&sibling(&ctx), INSTRUCTED_TOOL, &serde_json::json!({})).await;
+            assert_eq!(first.output.instructions().map(<[_]>::len), Some(1));
+            assert!(
+                second.output.instructions().is_none(),
+                "both found the file before either was marked; only the first attaches"
+            );
         });
     }
 

@@ -365,24 +365,23 @@ impl ToolOutput {
     }
 
     pub fn as_text(&self) -> String {
-        match self {
+        let mut out = match self {
             Self::Diff { summary, .. } => summary.clone(),
             Self::TodoList(_) => "ok".into(),
-            Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => {
-                let mut out = t.text.clone();
-                if let Some(blocks) = &t.instructions {
-                    append_instructions(&mut out, blocks);
-                }
-                out
-            }
-            Self::ReadCode { instructions, .. } => {
-                let mut out = self.as_display_text();
-                if let Some(blocks) = instructions {
-                    append_instructions(&mut out, blocks);
-                }
-                out
-            }
             _ => self.as_display_text(),
+        };
+        if let Some(blocks) = self.instructions() {
+            append_instructions(&mut out, blocks);
+        }
+        out
+    }
+
+    /// `None` for images and diffs, which have no slot for blocks.
+    pub fn instructions_slot(&mut self) -> Option<&mut Option<Vec<InstructionBlock>>> {
+        match self {
+            Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => Some(&mut t.instructions),
+            Self::ReadCode { instructions, .. } => Some(instructions),
+            _ => None,
         }
     }
 

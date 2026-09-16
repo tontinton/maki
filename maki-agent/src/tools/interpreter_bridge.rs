@@ -1,5 +1,6 @@
 use serde_json::Value;
 
+use crate::ToolOutput;
 use crate::agent::tool_dispatch;
 
 use super::{CallOrigin, ToolContext};
@@ -19,7 +20,7 @@ pub async fn dispatch(ctx: &ToolContext, name: &str, input: &Value) -> Result<St
 pub fn flatten(done: &crate::ToolDoneEvent) -> Result<String, String> {
     let text = match done.output.as_ref() {
         // The pixels are dropped here; say so instead of implying they were seen.
-        crate::ToolOutput::Image { text, .. } if !done.is_error => {
+        ToolOutput::Image { text, .. } if !done.is_error => {
             format!("{text} ({IMAGE_NOT_VISIBLE_NOTE})")
         }
         out => out.as_text(),

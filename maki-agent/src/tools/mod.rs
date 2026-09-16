@@ -32,7 +32,7 @@ use ignore::WalkBuilder;
 use maki_config::ProjectConfig;
 use serde_json::Value;
 
-use crate::agent::LoadedInstructions;
+use crate::agent::{CallInstructions, LoadedInstructions};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
@@ -344,7 +344,10 @@ pub struct ToolContext {
     pub task_id: Option<Arc<str>>,
     pub tool_use_id: Option<String>,
     pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    /// Session-wide: a file the model has already seen is never injected again.
     pub loaded_instructions: LoadedInstructions,
+    /// Per model call, shared with its nested calls.
+    pub call_instructions: CallInstructions,
     pub cancel: CancelToken,
     pub mcp: Option<McpSession>,
     pub deadline: Deadline,
@@ -573,6 +576,7 @@ pub fn interpreter_ctx(
         tool_use_id: None,
         user_response_rx,
         loaded_instructions: LoadedInstructions::new(),
+        call_instructions: CallInstructions::default(),
         cancel,
         mcp: None,
         deadline: Deadline::None,

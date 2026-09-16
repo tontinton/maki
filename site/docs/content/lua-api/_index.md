@@ -420,7 +420,6 @@ string or a table with richer output fields.
     - `diff_before` (`string`) Before text of the diff.
     - `diff_after` (`string`) After text of the diff.
     - `image` (`table`) { media_type: string, data: string } base64 image.
-    - `instructions` (`table`) Array of { path, content } blocks injected as context.
     - `state` (`any`) Serializable state forwarded to restore.
   - `audiences` (`string[]`) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
   - `kind` (`string`) Optional grouping label (e.g. "filesystem").
@@ -1220,6 +1219,8 @@ through optional callbacks while the tool runs.
     string. Must not yield.
 
 **Returns:** (`string?`, `string?`) Tool output text, or `(nil, err)` on failure.
+  Instruction files the child picks up (a subdirectory `AGENTS.md`) are
+  not in the text: they land on the calling tool's own result.
 
 **Example:**
 
@@ -5898,9 +5899,9 @@ return M
 ### `require("maki.dir_listing")`
 
 ```lua
--- Shared directory listing for index and list plugins.
--- Lists entries, filters instruction files, sorts dirs before files, and
--- renders the listing so every caller shows a directory the same way.
+-- Shared directory listing for index and list plugins, so every caller
+-- shows a directory the same way. Listing also loads the directory's
+-- instruction files onto the call.
 function M.list(path, ctx)
 function M.view(text, ctx)
 ```

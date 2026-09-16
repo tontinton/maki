@@ -18,8 +18,7 @@ use maki_agent::tools::{
     is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
-    AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
-    TextOutput, ToolOutput,
+    AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, SharedBuf, TextOutput, ToolOutput,
 };
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
@@ -533,7 +532,6 @@ impl ToolInvocation for LuaToolInvocation {
                         .emit(id, None, &ctx.event_tx);
                     }
                     let format = reply.format;
-                    let instructions = reply.instructions;
                     let image = reply.image;
                     let state = reply.state;
                     ToolExecResult {
@@ -549,9 +547,8 @@ impl ToolInvocation for LuaToolInvocation {
                                 }
                             } else {
                                 let inner = TextOutput {
-                                    text: s,
-                                    instructions: instructions.filter(|b| !b.is_empty()),
                                     state,
+                                    ..TextOutput::from(s)
                                 };
                                 match format {
                                     LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
@@ -678,7 +675,6 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///                                diff_before (string)  Before text of the diff.
 ///                                diff_after  (string)  After text of the diff.
 ///                                image       (table)   { media_type: string, data: string } base64 image.
-///                                instructions (table)  Array of { path, content } blocks injected as context.
 ///                                state       (any)     Serializable state forwarded to restore.
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
@@ -1665,7 +1661,6 @@ pub(crate) struct ToolCallReply {
     pub live_buf: Option<Arc<SharedBuf>>,
     pub format: LuaOutputFormat,
     pub annotation: Option<String>,
-    pub instructions: Option<Vec<InstructionBlock>>,
     pub written_path: Option<String>,
     pub diff: Option<DiffPayload>,
     /// Set via `image = { media_type = "image/png", data = <base64> }` in the
@@ -1687,7 +1682,6 @@ impl ToolCallReply {
             .and_then(|v| Self::extract_snapshot(&v));
         let format = extract_format(t);
         let annotation = t.get::<String>("annotation").ok();
-        let instructions = extract_instructions(t);
         let written_path = t.get::<String>("written_path").ok();
         let diff = t.get::<String>("diff_path").ok().map(|path| DiffPayload {
             path,
@@ -1716,7 +1710,6 @@ impl ToolCallReply {
             live_buf,
             format,
             annotation,
-            instructions,
             written_path,
             diff,
             image,
@@ -1749,7 +1742,6 @@ impl ToolCallReply {
             live_buf: None,
             format: LuaOutputFormat::default(),
             annotation: None,
-            instructions: None,
             written_path: None,
             diff: None,
             image: None,
@@ -1809,30 +1801,6 @@ fn extract_image(t: &mlua::Table) -> Result<Option<ImageSource>, String> {
         .decode(data.as_bytes())
         .map_err(|e| format!("tool image 'data' is not valid base64: {e}"))?;
     Ok(Some(ImageSource::new(media_type, Arc::from(data))))
-}
-
-fn extract_instructions(t: &mlua::Table) -> Option<Vec<InstructionBlock>> {
-    let Ok(LuaValue::Table(arr)) = t.get::<LuaValue>("instructions") else {
-        return None;
-    };
-    let mut blocks = Vec::new();
-    for pair in arr.sequence_values::<LuaValue>() {
-        let Ok(LuaValue::Table(entry)) = pair else {
-            continue;
-        };
-        let Ok(path) = entry.get::<String>("path") else {
-            continue;
-        };
-        let Ok(content) = entry.get::<String>("content") else {
-            continue;
-        };
-        blocks.push(InstructionBlock { path, content });
-    }
-    if blocks.is_empty() {
-        None
-    } else {
-        Some(blocks)
-    }
 }
 
 pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
@@ -2249,28 +2217,6 @@ mod tests {
         let bool_reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Boolean(true));
         assert_eq!(bool_reply.result, Err(TOOL_HANDLER_RETURN_ERR.to_string()));
         assert_eq!(bool_reply.format, LuaOutputFormat::Plain);
-    }
-
-    #[test]
-    fn from_lua_value_extracts_instructions() {
-        let lua = Lua::new();
-        let t = lua.create_table().unwrap();
-        t.set("llm_output", "file contents").unwrap();
-
-        let inst1 = lua.create_table().unwrap();
-        inst1.set("path", "AGENTS.md").unwrap();
-        inst1.set("content", "be nice").unwrap();
-
-        let instructions = lua.create_table().unwrap();
-        instructions.set(1, inst1).unwrap();
-        t.set("instructions", instructions).unwrap();
-
-        let reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(t));
-        assert_eq!(reply.result, Ok("file contents".to_string()));
-        let blocks = reply.instructions.expect("instructions should be Some");
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].path, "AGENTS.md");
-        assert_eq!(blocks[0].content, "be nice");
     }
 
     #[test]
