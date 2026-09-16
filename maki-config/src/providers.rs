@@ -14,6 +14,10 @@ const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
 const OPENCODE_SLUG: &str = "opencode";
 
+/// Valid `top_p` is in the open interval exclusive of 0, up to 1 inclusive.
+const TOP_P_MIN: f64 = 0.0;
+const TOP_P_MAX: f64 = 1.0;
+
 /// Coarse capability classification used by maki-providers to dispatch tiered
 /// requests. Mirrors `maki_providers::ModelTier` shape but lives here so the
 /// config layer can validate inputs without depending on maki-providers.
@@ -179,6 +183,15 @@ pub struct ProviderDef {
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Nucleus sampling threshold sent as `top_p` in the request body to this
+    /// provider. When unset, no `top_p` is sent (the provider's own default
+    /// applies). Must be in `(0, 1]`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_top_p"
+    )]
+    pub top_p: Option<f64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub discover_models: bool,
     /// Extra HTTP headers sent with every request to this provider. Values
@@ -434,6 +447,27 @@ pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
     builtin_provider(slug).and_then(|b| b.login_url.map(|u| u.to_string()))
 }
 
+/// The `top_p` to send for a provider: the value from `providers.toml`, or
+/// `None` when unset (send nothing, let the provider use its own default).
+pub fn resolve_top_p(def: Option<&ProviderDef>) -> Option<f64> {
+    def.and_then(|d| d.top_p)
+}
+
+fn de_top_p<'de, D>(de: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(de)?;
+    if let Some(v) = value
+        && (v <= TOP_P_MIN || v > TOP_P_MAX)
+    {
+        return Err(serde::de::Error::custom(format!(
+            "top_p must be in ({TOP_P_MIN}, {TOP_P_MAX}], got {v}"
+        )));
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +654,37 @@ tier = "{input}"
             ignored_builtin_fields("openrouter", &def),
             ["enable_free_models"]
         );
+    }
+
+    #[test]
+    fn resolve_top_p_is_none_when_unset() {
+        assert_eq!(resolve_top_p(None), None);
+        assert_eq!(resolve_top_p(Some(&ProviderDef::default())), None);
+    }
+
+    #[test]
+    fn resolve_top_p_uses_provider_value() {
+        let def = ProviderDef {
+            top_p: Some(0.8),
+            ..Default::default()
+        };
+        assert_eq!(resolve_top_p(Some(&def)), Some(0.8));
+    }
+
+    #[test_case(0.0; "zero")]
+    #[test_case(-0.1; "negative")]
+    #[test_case(1.5; "above_one")]
+    fn top_p_out_of_range_rejected(value: f64) {
+        let res = toml::from_str::<ProviderDef>(&format!("top_p = {value}"));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn top_p_boundaries_accepted() {
+        let def: ProviderDef = toml::from_str("top_p = 1.0").unwrap();
+        assert_eq!(def.top_p, Some(1.0));
+        let def2: ProviderDef = toml::from_str("top_p = 0.0000001").unwrap();
+        assert!(def2.top_p.unwrap() > 0.0);
     }
 
     #[test_case("MyProvider", "myprovider"; "mixed_case")]

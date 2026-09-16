@@ -256,9 +256,9 @@ fn build_routed_provider(
             Box::new(Regolo::with_auth(auth, timeouts).with_system_prefix(system_prefix))
         }
         ProviderKind::Anthropic => {
-            Box::new(Anthropic::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+            Box::new(Anthropic::with_auth(auth, timeouts, None).with_system_prefix(system_prefix))
         }
-        ProviderKind::Google => Box::new(Google::with_auth(auth, timeouts)),
+        ProviderKind::Google => Box::new(Google::with_auth(auth, timeouts, None)),
         // Excluded by `compat_kind`: routing to native OpenAI would bypass the
         // gateway for codex models, and the rest have no clean proxy story. A
         // new kind must pick a side here.

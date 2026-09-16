@@ -221,6 +221,7 @@ supports_vision = false
 | `api_key` | string | Inline key (prefer the env var or `maki auth login`) |
 | `headers` | table | Extra HTTP headers sent on every request to this provider. Values expand `${{VAR}}` from the environment; an unset or empty variable fails the provider instead of sending a half-filled header. A same-name header (case-insensitive) replaces the built-in auth header and survives key rotation |
 | `default_model` | string | Used after login when no model is saved yet |
+| `top_p` | f64 | Nucleus sampling probability, sent as `top_p` in the request body. Only sent when set; the provider's own default applies otherwise. Must be in `(0, 1]` |
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
 | `models` | array | Declared models for custom providers (see below) |

@@ -165,6 +165,9 @@ impl Provider for Opencode {
                     event_tx,
                     &auth,
                     &opts,
+                    maki_config::providers::resolve_top_p(
+                        maki_config::providers::ProvidersConfig::load().get(sub_provider),
+                    ),
                 )
                 .await
         })
