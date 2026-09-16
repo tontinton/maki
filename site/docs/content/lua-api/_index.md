@@ -63,6 +63,7 @@ permission raises `permission denied: '<name>' not granted for this plugin`.
 - `net`: outbound network requests
 - `run`: starting processes
 - `env`: reading the process environment, where secrets live
+- `reviewers`: registering reviewers that intercept permission prompts
 
 Grants come from a `plugin.toml` next to the Lua file (for
 `~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
@@ -76,6 +77,7 @@ fs_write = true
 net = true
 run = true
 env = true
+reviewers = true
 ```
 
 The rules:
@@ -503,6 +505,137 @@ maki.api.register_permission_rule({
   tool = "write",
   scope = notes_dir .. "/**",
 })
+```
+
+---
+
+### `maki.api.register_reviewer()` {#maki-api-register_reviewer}
+
+```lua
+maki.api.register_reviewer({spec})
+```
+
+Register a reviewer for permission prompts. When a tool call would
+prompt the human, registered reviewers are asked first, in chain
+order: each answers ALLOW (run it), DENY (block it, with the reason
+shown to the agent), or ASK (escalate to the next reviewer, then the
+human). Under yolo mode an unresolved chain denies with retry guidance
+instead of prompting, so the agent never stalls on a question.
+
+A link is either a model (`model` + `policy`: maki calls the model and
+parses its verdict) or a `handler` (your function computes the verdict:
+rulebooks, quotas, external approval systems, custom prompts). The
+handler receives one table — `tool`, `input` (decoded), `scopes` (for
+bash: the parsed command segments), `parseable`, `cwd`,
+`opening_user_message` (how the conversation started), `task_user_message`
+(the most recent substantive request, which short follow-ups continue),
+`last_user_message`, `recent_user_messages` (trailing user messages,
+oldest first; answers the user gave to the `question` tool count),
+`assistant_intent` (the agent's last text before the call: its own
+claim, not the user's), `attempt` (`{ count, history }` on repeats) — and
+returns `"ALLOW"|"DENY"|"ASK"` plus an optional reason; anything else
+escalates. Handlers may block (e.g. on `maki.ui.picker`); the outer
+chain waits at most `timeout_ms` and cancels the handler when the wait
+ends, so a slow handler cannot outlive its caller.
+
+One rule governs visibility: reviewers see the tools they name.
+Tools that never reach the permission layer (`question`, `todo_write`)
+are therefore only seen by reviewers naming them with a real pattern —
+the `"*"` default does not reach them — and for those calls anything
+short of a DENY (allow, timeout, exhausted escalation) lets the tool
+run as usual. A goal plugin can e.g. deny the question tool while a
+goal is active, so the agent decides instead of stalling on the human.
+
+Registration is live: it takes effect immediately and re-registering
+the same `name` replaces the earlier entry, so a toggle command can
+re-register on enable and `unregister_reviewer` on disable. A
+`/reload` drops the plugin's reviewers before the plugin runs again.
+
+The reviewer model receives the raw tool input, the permission scopes
+maki derived, the working directory, and the latest user message.
+
+**Parameters:**
+
+- `{spec}` (`table`) Reviewer specification:
+  - `name` (`string`) Required. Unique per plugin; same name replaces.
+  - `model` (`string`) Required. Model spec `provider/model-id`, e.g.
+    "anthropic/claude-haiku-4-5-20251001".
+  - `policy` (`string`) Required with `model`. System-prompt policy text
+    the reviewer judges calls against.
+  - `handler` (`function`) Alternative to `model`/`policy`: computes the
+    verdict itself. `function(call) -> verdict, reason?`
+  - `tools` (`table`) Optional. Tool filters matched against the tool
+    key (`"bash"`, `"server.tool"`); `*` globs, e.g.
+    `{ "bash", "myserver.*" }`. Default `{ "*" }`.
+    Real patterns also opt permission-free tools
+    into review (see above); the default does not.
+  - `timeout_ms` (`integer`) Optional. Per-call timeout; default 5000 for
+    model links, 300000 for handler links (they may
+    wait on a human). Handlers also receive the full
+    untruncated input, unlike model links.
+  - `order` (`integer`) Optional. Chain position, lowest first; default 0.
+  - `redirect_guidance` (`string`) Optional. Replaces the built-in "try a
+    different approach" text when an unresolved chain
+    denies under yolo, so the agent hears your
+    plugin's voice (e.g. restate the goal).
+
+**Example:**
+
+```lua
+maki.api.register_reviewer({
+  name = "cheap",
+  model = "anthropic/claude-haiku-4-5-20251001",
+  policy = "ALLOW clearly read-only commands. Otherwise ASK.",
+})
+maki.api.register_reviewer({
+  name = "rulebook",
+  order = -1,
+  handler = function(call)
+    if call.tool == "bash" and call.scopes[1]:find("^git ") then
+      return "ALLOW"
+    end
+    return "ASK"
+  end,
+})
+```
+
+---
+
+### `maki.api.unregister_reviewer()` {#maki-api-unregister_reviewer}
+
+```lua
+maki.api.unregister_reviewer({name})
+```
+
+Remove one of this plugin's reviewers by name. Unknown names are a
+no-op, so a toggle can call it unconditionally; `clear_reviewers`
+drops all of the plugin's reviewers at once.
+
+**Parameters:**
+
+- `{name}` (`string`) The `name` the reviewer was registered under.
+
+**Example:**
+
+```lua
+maki.api.unregister_reviewer("goal-no-questions")
+```
+
+---
+
+### `maki.api.clear_reviewers()` {#maki-api-clear_reviewers}
+
+```lua
+maki.api.clear_reviewers()
+```
+
+Drop every reviewer this plugin registered, effective immediately.
+The counterpart of `register_reviewer` for disable toggles.
+
+**Example:**
+
+```lua
+maki.api.clear_reviewers()
 ```
 
 ---

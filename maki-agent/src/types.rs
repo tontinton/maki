@@ -617,6 +617,7 @@ pub enum AgentEvent {
         content: String,
     },
     ToolDone(Box<ToolDoneEvent>),
+    ReviewerVerdict(Box<ReviewerVerdictEvent>),
     TurnComplete(Box<TurnCompleteEvent>),
     ToolResultsSubmitted {
         message: Box<Message>,
@@ -925,6 +926,32 @@ pub struct InlineStyle {
     pub dim: bool,
     pub strikethrough: bool,
     pub reversed: bool,
+}
+
+/// `resolution`: `allowed`, `denied`, `escalated` (passed to the next
+/// link), `prompted` (chain exhausted), or `redirected` (yolo deny).
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewerVerdictEvent {
+    pub tool: ToolKey,
+    pub reviewer: String,
+    pub model: String,
+    pub verdict: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub resolution: String,
+    pub usage: TokenUsage,
+    #[serde(skip)]
+    pub billed_cost: Option<f64>,
+    #[serde(skip)]
+    pub list_cost: Option<f64>,
+    /// The exact request the link was shown, so a plugin can audit a
+    /// verdict against what the reviewer actually knew. Empty for the
+    /// synthetic `prompted`/`redirected` events, which had no link.
+    #[serde(skip)]
+    pub request: Arc<str>,
+    /// The permission scopes maki derived for the call.
+    #[serde(skip)]
+    pub scopes: Arc<[String]>,
 }
 
 #[derive(Debug, Serialize)]

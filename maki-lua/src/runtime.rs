@@ -286,6 +286,15 @@ pub enum Request {
         run: HookRun,
         reply: flume::Sender<Verdict>,
     },
+    CallReviewHandler {
+        plugin: Arc<str>,
+        name: Arc<str>,
+        request: Value,
+        /// Fires when the caller's timeout/cancel wins the outer race, so the
+        /// detached Lua handler can drop its RegistryKey and skip the reply.
+        cancel: CancelToken,
+        reply: flume::Sender<Option<(String, Option<String>)>>,
+    },
     ClearPlugin {
         plugin: Arc<str>,
         reply: flume::Sender<()>,
@@ -2001,6 +2010,8 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(CommandHandlerMap::new());
+        lua.set_app_data(crate::api::tool::ReviewHandlerMap::default());
+        lua.set_app_data(crate::api::tool::ReviewerRequestTx(tx.clone()));
         lua.set_app_data(JobStore::new());
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
@@ -2124,6 +2135,17 @@ impl LuaRuntime {
                     && let Err(e) = self.lua.remove_registry_value(sk)
                 {
                     tracing::warn!(plugin = name, error = %e, "failed to drop lua describe key");
+                }
+            }
+        }
+        if let Some(mut review_map) = self
+            .lua
+            .app_data_mut::<crate::api::tool::ReviewHandlerMap>()
+            && let Some(handlers) = review_map.0.remove(name)
+        {
+            for (_, key) in handlers {
+                if let Err(e) = self.lua.remove_registry_value(key) {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop review handler key");
                 }
             }
         }
@@ -2363,6 +2385,7 @@ impl LuaRuntime {
             &self.lua,
             Arc::clone(&self.pending),
             Arc::clone(&pending_rules),
+            Arc::clone(&self.plugin_rules),
             Arc::clone(&name),
             self.ui_action_tx.clone(),
             &permissions,
@@ -3605,6 +3628,63 @@ pub fn spawn(
                             ex.spawn(async move {
                                 let verdict = run_hook(&lua, &plugins, &gate, run).await;
                                 let _ = reply.send(verdict);
+                            })
+                            .detach();
+                        }
+                        Request::CallReviewHandler {
+                            plugin,
+                            name,
+                            request,
+                            cancel,
+                            reply,
+                        } => {
+                            let func = rt
+                                .lua
+                                .app_data_ref::<crate::api::tool::ReviewHandlerMap>()
+                                .and_then(|m| {
+                                    let key = m.0.get(&plugin)?.get(&name)?;
+                                    rt.lua.registry_value::<Function>(key).ok()
+                                });
+                            let Some(func) = func else {
+                                let _ = reply.send(None);
+                                continue;
+                            };
+                            // Deliberately not gate-tracked: a handler may
+                            // park on a human prompt, and reload must not
+                            // wait for it. Cancellation is what ends a
+                            // handler whose caller has walked away, so the
+                            // detached task cannot outlive the outer race.
+                            let lua = rt.lua.clone();
+                            ex.spawn(async move {
+                                let run = run_detached(&lua, async {
+                                    let arg =
+                                        crate::api::util::convert::json_to_lua(&lua, &request)?;
+                                    let thread = lua.create_thread(func)?;
+                                    thread
+                                        .into_async::<(Option<String>, Option<String>)>(arg)?
+                                        .await
+                                });
+                                let raced = cancel.race(run).await;
+                                match raced {
+                                    Err(_) => {
+                                        tracing::info!(
+                                            plugin = %plugin,
+                                            reviewer = %name,
+                                            "review handler dropped after caller cancel"
+                                        );
+                                    }
+                                    Ok(result) => {
+                                        let out = match result {
+                                            Ok((Some(verdict), reason)) => Some((verdict, reason)),
+                                            Ok((None, _)) => None,
+                                            Err(e) => {
+                                                tracing::warn!(plugin = %plugin, reviewer = %name, error = %e, "review handler failed");
+                                                None
+                                            }
+                                        };
+                                        let _ = reply.send(out);
+                                    }
+                                }
                             })
                             .detach();
                         }

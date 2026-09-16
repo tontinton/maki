@@ -142,6 +142,7 @@ mod tests {
             &lua,
             Arc::default(),
             Arc::default(),
+            Arc::default(),
             Arc::from("docs-test"),
             Some(ui_tx),
             &PluginPermissions::trusted(),
