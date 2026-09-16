@@ -108,6 +108,13 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "write",
 ];
 
+/// Bundled plugins that ship switched off, because running them costs money or
+/// surprises somebody who never asked for them. They are absent from
+/// `DEFAULT_BUILTINS` on purpose, so the config layer names them separately;
+/// without this, `plugins.automode = { enabled = true }` would be rejected as a
+/// typo and there would be no way to turn one on.
+pub const OPT_IN_BUILTINS: &[&str] = &["automode"];
+
 /// These used to be their own `tools.<name>` tables and are now edit plugin
 /// options; the config layer uses this list to reject the old form with a
 /// pointer to the new one.
@@ -483,14 +490,17 @@ impl RawConfig {
                 return Err(ConfigError::RemovedEditSubTool { tool: name });
             }
         }
+        let known =
+            |name: &str| DEFAULT_BUILTINS.contains(&name) || OPT_IN_BUILTINS.contains(&name);
         let mut unknown: Vec<&String> = self
             .plugins
             .keys()
-            .filter(|name| !DEFAULT_BUILTINS.contains(&name.as_str()) && !packages.contains(name))
+            .filter(|name| !known(name) && !packages.contains(name))
             .collect();
         unknown.sort();
         if let Some(&plugin) = unknown.first() {
             let mut valid: Vec<&str> = DEFAULT_BUILTINS.to_vec();
+            valid.extend(OPT_IN_BUILTINS);
             valid.extend(packages.iter().map(String::as_str));
             valid.sort_unstable();
             return Err(ConfigError::UnknownPlugin {
@@ -4004,6 +4014,37 @@ mod tests {
             msg.contains("named \"gerp\"") && msg.contains("grep"),
             "error should name the typo and list what is available, got: {msg}"
         );
+    }
+
+    /// A bundled plugin that ships off is still a real name, and turning it on
+    /// is the only way to use it.
+    #[test]
+    fn opt_in_builtin_can_be_enabled() {
+        for &name in OPT_IN_BUILTINS {
+            let raw: RawConfig =
+                toml::from_str(&format!("[plugins.{name}]\nenabled = true\n")).unwrap();
+            let config = raw
+                .into_config(&[])
+                .unwrap_or_else(|e| panic!("plugins.{name} should be configurable: {e}"));
+            assert!(
+                config.plugins.names.iter().any(|n| n == name),
+                "{name} should load once it is enabled"
+            );
+        }
+    }
+
+    /// Off by default means off: naming it without `enabled = true` (to set an
+    /// option, say) must not be what switches it on.
+    #[test]
+    fn opt_in_builtin_stays_off_until_asked_for() {
+        for &name in OPT_IN_BUILTINS {
+            let raw: RawConfig = toml::from_str(&format!("[plugins.{name}]\n")).unwrap();
+            let config = raw.into_config(&[]).unwrap();
+            assert!(
+                !config.plugins.names.iter().any(|n| n == name),
+                "{name} must not load just because it was mentioned"
+            );
+        }
     }
 
     #[test]

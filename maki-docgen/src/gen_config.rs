@@ -4,8 +4,9 @@ use std::sync::Arc;
 use maki_agent::tools::ToolRegistry;
 use maki_config::{
     AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig, ProviderConfig, StorageConfig,
-    TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
+    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig, OPT_IN_BUILTINS,
+    PluginFileConfig, PluginsConfig, ProviderConfig, StorageConfig, TOP_LEVEL_FIELDS,
+    TelemetryConfig, ToolOutputLines, UiConfig,
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
@@ -69,6 +70,9 @@ fn write_section(out: &mut String, heading: &str, fields: &[ConfigField]) {
 fn write_plugin_options(out: &mut String, specs: &PluginOptionSpecs) {
     for (plugin, options) in specs {
         writeln!(out, "### `plugins.{plugin}`\n").unwrap();
+        if OPT_IN_BUILTINS.contains(&&**plugin) {
+            writeln!(out, "Off by default. Set `enabled = true` to load it.\n").unwrap();
+        }
         writeln!(out, "| Field | Type | Default | Min | Description |").unwrap();
         writeln!(out, "|-------|------|---------|-----|-------------|").unwrap();
         for o in options {
@@ -90,9 +94,24 @@ fn write_plugin_options(out: &mut String, specs: &PluginOptionSpecs) {
     }
 }
 
+/// The opt-in builtins are loaded too: they ship switched off, so their options
+/// are the only documentation of how to switch them on.
 fn collect_plugin_options() -> PluginOptionSpecs {
-    let host =
-        PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).expect("loading builtins");
+    let entries = OPT_IN_BUILTINS
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_owned(),
+                PluginFileConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).expect("starting the lua host");
+    host.load_builtins(&PluginsConfig::from_plugins(entries))
+        .expect("loading builtins");
     let specs = host.plugin_options().expect("collecting plugin options");
     assert!(
         !specs.is_empty(),
@@ -345,8 +364,9 @@ All fields are optional. Typos in field names cause an error right away.
     writeln!(
         out,
         "The `plugins` table turns plugins on or off and passes options to \
-         them. All bundled plugins are on by default. Set \
-         `enabled = false` to turn one off.\n\n\
+         them. Bundled plugins are on by default, with the exception of the \
+         few marked below as off by default. Set `enabled = false` to turn one \
+         off, or `enabled = true` to turn one of those on.\n\n\
          A plugin that is off never loads, so its tool name is free for one \
          of your own plugins to take. Permission rules are keyed by the tool \
          name alone, and names such as `bash`, `write`, and `task` already \

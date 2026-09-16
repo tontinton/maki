@@ -32,6 +32,7 @@ Type `/` in the input box to open the command palette.
 | `/trust` | Trust this folder and load its shared project config |
 | `/packupdate` | Update packages (++lockfile, ! skips review) |
 | `/packdel` | Remove undeclared packages (++all, or a name) |
+| `/automode` | Toggle automode; 'status' counters, 'model' edits the chain, 'inspect' shows verdicts with what each reviewer saw |
 | `/memory` | View, edit, and delete memory files |
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |

@@ -67,8 +67,10 @@ struct BundledPlugin {
     dir: Dir<'static>,
 }
 
-/// `lib` is not a default builtin; it exists so plugins can
-/// `require()` shared modules across boundaries.
+/// Two entries here are bundled without being default builtins. `lib` exists
+/// so plugins can `require()` shared modules across boundaries and never loads
+/// on its own; `automode` spends money on a reviewer model per tool call, so it
+/// waits for `plugins.automode = { enabled = true }`.
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "sessions",
@@ -155,6 +157,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "list",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
+    },
+    BundledPlugin {
+        name: "automode",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/automode"),
     },
 ];
 
@@ -1220,6 +1226,35 @@ mod tests {
         assert!(reg.has("glob"));
     }
 
+    /// A bundled plugin that ships off is never reached by the default load,
+    /// so without this nothing would notice its `init.lua` failing to parse.
+    #[test]
+    fn opt_in_builtins_load_when_they_are_enabled() {
+        let entries = maki_config::OPT_IN_BUILTINS
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_owned(),
+                    maki_config::PluginFileConfig {
+                        enabled: Some(true),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let config = PluginsConfig::from_plugins(entries);
+        for &name in maki_config::OPT_IN_BUILTINS {
+            assert!(
+                config.names.iter().any(|n| n == name),
+                "{name} should be in the load list once enabled"
+            );
+        }
+
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_builtins(&config)
+            .expect("every opt-in builtin loads");
+    }
+
     /// The second call sends `Shutdown` on a sender that is already
     /// disconnected; it must swallow that error and keep rejecting work.
     #[test]
@@ -1964,7 +1999,7 @@ mod bundled_manifests {
 
     use include_dir::{Dir, DirEntry, File};
     use maki_agent::tools::{ToolRegistry, ToolSource};
-    use maki_config::{DEFAULT_BUILTINS, PluginsConfig};
+    use maki_config::PluginsConfig;
 
     use super::{Arc, BUNDLED_PLUGINS, HashMap, PluginHost, bundled_permissions, lib_dir};
     use crate::docs::{DocKind, api_docs};
@@ -1973,6 +2008,15 @@ mod bundled_manifests {
     const TEST_DIR: &str = "tests";
     const LUA_EXT: &str = "lua";
     const REQUIRE_CALL: &str = "require(";
+
+    /// The reviewer registry arrives as a `#[ctx]` argument and checks itself,
+    /// which the `lua_fn` macro forbids combining with `guard = …`, so these
+    /// three carry no guard for `api_docs` to report.
+    const CTX_GUARDED: &[&str] = &[
+        "maki.api.register_reviewer",
+        "maki.api.unregister_reviewer",
+        "maki.api.clear_reviewers",
+    ];
 
     /// Every guarded `maki.*` function under the dotted name lua calls it by.
     fn guarded_calls() -> Vec<(String, Permission)> {
@@ -1985,6 +2029,11 @@ mod bundled_manifests {
                     Some((format!("{}.{}", module.name, func.name), permission))
                 })
             })
+            .chain(
+                CTX_GUARDED
+                    .iter()
+                    .map(|name| ((*name).to_owned(), Permission::Reviewers)),
+            )
             .collect()
     }
 
@@ -2083,10 +2132,8 @@ mod bundled_manifests {
         let mut drift = Vec::new();
         // `lib` is the one bundled directory that never loads on its own, so it
         // ships no manifest and its modules answer to whoever requires them.
-        for plugin in BUNDLED_PLUGINS
-            .iter()
-            .filter(|p| DEFAULT_BUILTINS.contains(&p.name))
-        {
+        // Everything else is checked whether or not it is on by default.
+        for plugin in BUNDLED_PLUGINS.iter().filter(|p| p.name != "lib") {
             let declared = bundled_permissions(plugin).expect("every builtin ships a plugin.toml");
             // Each permission paired with the usage demanding it, so a failure
             // points at something to go look at.

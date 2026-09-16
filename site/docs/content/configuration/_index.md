@@ -224,7 +224,7 @@ Every field also has an environment variable, shown in the Env column, and the v
 
 ## Plugins
 
-The `plugins` table turns plugins on or off and passes options to them. All bundled plugins are on by default. Set `enabled = false` to turn one off.
+The `plugins` table turns plugins on or off and passes options to them. Bundled plugins are on by default, with the exception of the few marked below as off by default. Set `enabled = false` to turn one off, or `enabled = true` to turn one of those on.
 
 A plugin that is off never loads, so its tool name is free for one of your own plugins to take. Permission rules are keyed by the tool name alone, and names such as `bash`, `write`, and `task` already have rules in maki. A plugin that takes one of them inherits those rules, together with any "always allow" you saved. Maki warns you at load when this happens.
 
@@ -242,6 +242,15 @@ maki.setup({
     },
 })
 ```
+
+### `plugins.automode`
+
+Off by default. Set `enabled = true` to load it.
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `chain` | string | `""` | - | Reviewer models, comma-separated and cheapest first (e.g. "anthropic/claude-haiku-4-5-20251001"). Empty leaves automode inert. |
+| `timeout_ms` | integer | `15000` | 1 | How long a reviewer link has to answer before the call escalates to the next one. |
 
 ### `plugins.bash`
 

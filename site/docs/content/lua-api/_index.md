@@ -3576,7 +3576,7 @@ status. Reads the focused session, or the one you name in `session` when
 you act on a background tab.
 
 The returned table:
-```
+```text
 {
   id, cwd, model, mode = "build" | "plan",
   status = "idle" | "working" | "needs_input",
