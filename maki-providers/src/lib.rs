@@ -4,6 +4,7 @@ pub(crate) mod image;
 pub(crate) mod manifest;
 pub mod model;
 pub mod model_registry;
+pub mod models_cache;
 pub mod pricing;
 pub mod provider;
 pub(crate) mod providers;
