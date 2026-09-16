@@ -9,7 +9,8 @@ use std::iter;
 use std::mem;
 
 use maki_highlight::{CodeHighlighter, SegmentColor, StyledSegment};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     Block, BlockKind, Emphasis, InlineSpan, LineBlock, SpanKind, block_prefix, parse, parse_inline,
@@ -420,16 +421,25 @@ fn ensure_blank_line(lines: &mut Vec<Line>) {
     }
 }
 
+/// Clusters, not chars: `⚠` + U+FE0F is two columns together but 1 + 0 apart,
+/// and callers charge back the width of the whole slice, so counting per char
+/// underflows their budget.
 fn fit_width(text: &str, max_width: usize) -> usize {
     let mut width = 0;
-    for (i, ch) in text.char_indices() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+    for (i, cluster) in text.grapheme_indices(true) {
+        let cw = cluster.width();
         if width + cw > max_width {
             return i;
         }
         width += cw;
     }
     text.len()
+}
+
+/// Callers use this to force progress when nothing fits. Taking a whole
+/// cluster keeps a base character with its selector and combining marks.
+fn first_grapheme_len(text: &str) -> usize {
+    text.graphemes(true).next().map_or(1, str::len)
 }
 
 fn wrap_code_lines(lines: &mut Vec<Line>, start: usize, width: u16) {
@@ -478,13 +488,13 @@ fn split_line_with_bar(line: Line, width: usize) -> Vec<Line> {
                     remaining = cont_avail;
                     continue;
                 }
-                let ch_len = text.chars().next().map_or(1, char::len_utf8);
+                let head = first_grapheme_len(text);
                 current_spans.push(Span::with_emphasis(
-                    text[..ch_len].to_owned(),
+                    text[..head].to_owned(),
                     style.clone(),
                     emphasis,
                 ));
-                text = &text[ch_len..];
+                text = &text[head..];
                 result.push(Line {
                     kind: LineKind::Code,
                     spans: mem::take(&mut current_spans),
@@ -551,7 +561,7 @@ fn constrain_col_widths(col_widths: &mut [usize], available: usize) {
     }
 }
 
-/// Soft-break on spaces, hard-break on char boundaries for long runs.
+/// Soft-break on spaces, hard-break on cluster boundaries for long runs.
 fn wrap_spans(spans: Vec<Span>, max_width: usize) -> Vec<Vec<Span>> {
     if max_width == 0 {
         return vec![spans];
@@ -569,13 +579,13 @@ fn wrap_spans(spans: Vec<Span>, max_width: usize) -> Vec<Vec<Span>> {
             let fits = fit_width(text, remaining);
             if fits == 0 {
                 if current.is_empty() {
-                    let ch_len = text.chars().next().map_or(1, char::len_utf8);
+                    let head = first_grapheme_len(text);
                     current.push(Span::with_emphasis(
-                        text[..ch_len].to_owned(),
+                        text[..head].to_owned(),
                         style.clone(),
                         emphasis,
                     ));
-                    text = &text[ch_len..];
+                    text = &text[head..];
                 }
                 result.push(mem::take(&mut current));
                 remaining = max_width;
@@ -814,6 +824,16 @@ mod tests {
     const NARROW_WIDTH: u16 = 24;
     const COLORED_THEME: &str = "base16-ocean.dark";
 
+    const WARNING_CLUSTER: &str = "\u{26a0}\u{fe0f}";
+    const WARNING_CELL: &str = "\u{26a0}\u{fe0f} partly";
+    /// Narrower than this and a two column table drops the box layout.
+    const TABLE_MIN_WIDTH: u16 = 17;
+    const TABLE_MAX_WIDTH: u16 = 48;
+
+    const RAGGED_TABLE: &str = "every table line must be exactly as wide as the widest one";
+    const OVER_BUDGET: &str = "nothing may exceed the width it was wrapped to";
+    const CLUSTER_SPLIT: &str = "wrapping must not split a grapheme cluster";
+
     /// The code bodies wrap at [`NARROW_WIDTH`], so the reuse tests below can
     /// interleave widths and mean it.
     const SAME_BODY_AS_RUST: &str = "```rust\nfn x() { let y = 1; let z = y + 2; }\n```";
@@ -852,6 +872,10 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect())
             .collect()
+    }
+
+    fn joined(rows: &[Vec<Span>]) -> String {
+        rows.iter().flatten().map(|s| s.text.as_str()).collect()
     }
 
     fn find_span<'a>(lines: &'a [Line], text: &str) -> Option<&'a Span> {
@@ -1304,13 +1328,75 @@ mod tests {
         let long_word = "x".repeat(30);
         let wrapped = wrap_spans(vec![Span::new(long_word.clone(), StyleToken::Text)], 10);
         assert!(wrapped.len() >= 3);
-        let reassembled: String = wrapped
-            .iter()
-            .flat_map(|row| row.iter())
-            .map(|s| s.text.as_str())
-            .collect();
-        assert_eq!(reassembled, long_word);
+        assert_eq!(joined(&wrapped), long_word);
         assert!(wrapped.iter().all(|row| spans_width(row) <= 10));
+    }
+
+    #[test_case(WARNING_CELL ; "emoji_presentation_sequence")]
+    #[test_case("\u{2714}\u{fe0f} yes" ; "text_default_symbol_with_selector")]
+    #[test_case("\u{1f1fa}\u{1f1f8} flag" ; "regional_indicator_pair")]
+    #[test_case("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f466} family" ; "zwj_sequence")]
+    #[test_case("\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30ad}\u{30b9}\u{30c8}" ; "cjk")]
+    #[test_case("cafe\u{301} cre\u{301}me" ; "combining_marks")]
+    #[test_case("plain ascii cell" ; "ascii")]
+    fn table_lines_all_share_one_width(cell: &str) {
+        let text = format!("| Col1 | Col2 |\n| --- | --- |\n| x {cell} tail | plain |");
+        for width in TABLE_MIN_WIDTH..=TABLE_MAX_WIDTH {
+            let widths: Vec<usize> = render(&text, width)
+                .iter()
+                .filter(|l| matches!(l.kind, LineKind::TableBorder | LineKind::TableRow))
+                .map(Line::width)
+                .collect();
+            let max = widths.iter().copied().max().unwrap_or(0);
+            assert!(
+                widths.iter().all(|w| *w == max),
+                "{RAGGED_TABLE} (cell={cell:?}, width={width}): {widths:?}"
+            );
+            assert!(
+                max <= width as usize,
+                "{OVER_BUDGET} (cell={cell:?}, width={width}): {max}"
+            );
+        }
+    }
+
+    #[test_case(WARNING_CLUSTER, 1, 0 ; "sequence_does_not_fit_in_one_column")]
+    #[test_case(WARNING_CLUSTER, 2, WARNING_CLUSTER.len() ; "sequence_fits_in_two_columns")]
+    #[test_case("a\u{26a0}\u{fe0f}", 2, 1 ; "stops_before_sequence")]
+    #[test_case("\u{2705}", 1, 0 ; "wide_emoji_needs_two")]
+    #[test_case("abc", 2, 2 ; "ascii_counts_columns")]
+    fn fit_width_measures_grapheme_clusters(text: &str, max_width: usize, expected: usize) {
+        assert_eq!(fit_width(text, max_width), expected);
+    }
+
+    #[test_case(WARNING_CLUSTER ; "emoji_presentation_sequence")]
+    #[test_case("cafe\u{301}" ; "combining_marks")]
+    #[test_case("\u{1f1fa}\u{1f1f8}" ; "regional_indicator_pair")]
+    fn wrap_spans_never_splits_a_cluster(cluster: &str) {
+        let text = format!("word {cluster} word");
+        for max_width in cluster.width()..=text.width() + 1 {
+            let rows = wrap_spans(vec![Span::new(text.clone(), StyleToken::Text)], max_width);
+            assert!(
+                rows.iter().all(|row| spans_width(row) <= max_width),
+                "{OVER_BUDGET} (max_width={max_width})"
+            );
+            let reassembled = joined(&rows);
+            assert!(
+                reassembled.contains(cluster),
+                "{CLUSTER_SPLIT} (max_width={max_width}): {reassembled:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_block_wrapping_fits_emoji_clusters() {
+        let text = format!("```rust\nlet warn = \"{WARNING_CELL}\"; let tail = 1;\n```");
+        for width in 4..=NARROW_WIDTH {
+            let lines = render(&text, width);
+            assert!(
+                lines.iter().all(|l| l.width() <= width as usize),
+                "{OVER_BUDGET} (code block, width={width})"
+            );
+        }
     }
 
     #[test]

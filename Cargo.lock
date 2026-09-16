@@ -2924,6 +2924,7 @@ dependencies = [
  "maki-highlight",
  "syntect",
  "test-case",
+ "unicode-segmentation",
  "unicode-width",
 ]
 
