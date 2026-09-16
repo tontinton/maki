@@ -59,7 +59,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SharedMessages, SubagentInfo,
+    ReviewerVerdictEvent, SharedMessages, SubagentInfo,
 };
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
@@ -455,6 +455,23 @@ impl App {
             "supports_thinking": model.supports_thinking(),
             "supports_fast": model.supports_fast(),
         })
+    }
+
+    /// Accounting only; the `ToolReviewed` autocmd fires from
+    /// `agent_autocmd::dispatch`, so `-p` and sdk mode see the verdict too.
+    /// A reviewer spends real tokens on a real model, so it is billed and
+    /// attributed like any other call rather than disappearing into the turn
+    /// it gated.
+    fn handle_reviewer_verdict(&mut self, event: &ReviewerVerdictEvent) {
+        self.state.token_usage += event.usage;
+        add_cost(&mut self.state.cost, event.billed_cost);
+        // The synthetic `prompted` and `redirected` verdicts had no model
+        // behind them and nothing to attribute.
+        if !event.model.is_empty() {
+            self.state
+                .session_mut()
+                .add_model_usage(&event.model, event.usage.billed(event.billed_cost));
+        }
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
@@ -1239,6 +1256,10 @@ impl App {
         }
 
         self.retry_info = None;
+
+        if let AgentEvent::ReviewerVerdict(event) = &envelope.event {
+            self.handle_reviewer_verdict(event);
+        }
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.state.token_usage += tc.usage;

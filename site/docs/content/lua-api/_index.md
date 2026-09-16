@@ -905,8 +905,8 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-`"TaskFocusChanged"`, and `"ModelChanged"`. Plugins can also fire their
-own events with `exec_autocmds`.
+`"TaskFocusChanged"`, `"ModelChanged"`, and `"ToolReviewed"`. Plugins can
+also fire their own events with `exec_autocmds`.
 
 Every host event carries `data.session_id`. For `"SessionReset"` and
 `"SessionEnd"` that is the session being left behind, the other events
@@ -941,6 +941,15 @@ name the session now running or focused. What each event adds:
 - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
   plus `data.previous_spec`. Picking the model already in use stays
   quiet, and so does startup.
+- `"ToolReviewed"`: one per reviewer link that answered, with `data.tool`,
+  `data.reviewer`, `data.model`, `data.verdict` (`"ALLOW"`, `"DENY"`,
+  `"ASK"`), `data.reason`, `data.cost`, `data.scopes`, and
+  `data.resolution` — what the chain did with the answer: `"allowed"`,
+  `"denied"`, `"escalated"` to the next link, `"prompted"` because the
+  chain ran out, or `"redirected"`. `data.request` is the exact text the
+  link was shown, so an audit plugin can check a verdict against what the
+  reviewer actually knew; it is empty for the synthetic `"prompted"` and
+  `"redirected"` events, which had no link behind them.
 
 `"TurnEnd"` fires once per turn and only for the main session, so
 subagent turns never show up. A manual `/compact` ends its run without
