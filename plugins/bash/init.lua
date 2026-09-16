@@ -214,7 +214,7 @@ local function node_text(node, source)
   return maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
 end
 
--- Anything we don't walk through becomes one scope, its own text. That covers
+-- Anything we do not walk through becomes one scope, its own text. That covers
 -- plain commands and the block forms (`if`, `while`, subshells) we deliberately
 -- keep whole, plus any node type we never thought of, which is what we want:
 -- an unknown node has to end up in front of the user, not get dropped.
@@ -292,8 +292,10 @@ maki.api.register_tool({
   permission = "run",
   permission_scopes = function(input)
     local command = input.command
+    -- nil scopes means "nothing to ask about", which is fine for a file read
+    -- but not for an empty or missing shell command. Ask about it as given.
     if not command or command:match("^%s*$") then
-      return nil
+      return { scopes = { command or "" }, force_prompt = true }
     end
 
     local parser = maki.treesitter.get_parser(command, "bash")

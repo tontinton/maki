@@ -69,7 +69,9 @@ These tools have no builtin allow rule, so they prompt (or follow your `default`
 - `websearch` - Web search queries
 - `webfetch` - URL fetching
 
-Tools that never declare permission scopes (for example `read`, `glob`, `grep`, `index`, `memory`, `skill`, `todo_write`) **skip** the permission manager entirely. They always run. If you need to block one of them, turn the plugin off in `init.lua` (`plugins.read = { enabled = false }`) rather than using `permissions.toml`.
+Tools that declare no permission scopes (for example `memory`, `skill`, `todo_write`) **skip** the permission manager entirely. They always run. If you need to block one of them, turn the plugin off in `init.lua` (`plugins.read = { enabled = false }`) rather than using `permissions.toml`.
+
+The read tools (`read`, `index`, `list`, `view_image`, `glob`, `grep`) declare a scope only when the path is one of [Maki's own files](#maki-s-own-files). Every other read skips the manager the same way.
 
 Container tools like `batch` and `code_execution` prompt for each inner tool individually.
 
@@ -231,6 +233,42 @@ limits which APIs the file reaches rather than sandboxing the file.
 `webfetch`, `websearch` and every plugin that calls `maki.net` go through one guard. A request to a private, loopback or link-local address is refused, and so is a redirect that lands on one. The model picks these URLs, so a page it reads could otherwise talk it into fetching `http://169.254.169.254/` or an admin panel on your LAN.
 
 To reach a service on your own machine or network, list it in [`net.allowed_private_hosts`](/docs/configuration/#net). An allowed host also keeps plain `http://` instead of being upgraded to `https://`, since a service on your LAN rarely has a certificate.
+
+## Maki's Own Files
+
+The file tools and every plugin that calls `maki.fs` go through one guard. Maki's state, data, cache and log directories are closed to it, so provider tokens, session history and logs stay out of reach of `read`, `glob`, `grep` and the rest. A read there is one approval away. A write is refused for good, since Maki trusts what it finds in those directories the next time it starts.
+
+Memory notes, plan files and plugin state stay open both ways, and [package checkouts](/docs/packages/) are readable. `glob` and `grep` prune the closed paths while walking.
+
+Your config directory and every `.maki` directory, wherever it sits, carry rules of their own:
+
+| File | `~/.config/maki` | `.maki` |
+|------|------------------|---------|
+| `.env`, `mcp.toml` | Closed | Closed |
+| `providers.toml` | Closed | Ordinary file |
+| `permissions.toml` | Read only, never writable | Read only, never writable |
+| `init.lua` | Read and write | Read, writable after you approve |
+| Everything else (`config.toml`, skills, commands, Lua modules) | Ordinary file | Ordinary file |
+
+The closed files hold keys in plaintext, and Maki reads them itself. `.maki/init.lua` asks because Maki runs it as Lua on its next start.
+
+All of this holds only while `bash` is gated. A shell command reads these files directly, and only an OS sandbox stops that.
+
+### Opening a Closed Path
+
+`read`, `index`, `list`, `view_image`, `glob` and `grep` turn these refusals into a permission prompt, so you can let the agent read `<logs>/maki.log` or an old session. Ordinary paths never prompt, and this prompt comes up even where a standing `allow` rule for the tool would skip it.
+
+An approval holds for the session. Answering allow-always (all projects) writes it to your global `permissions.toml`:
+
+```toml
+[maki_files]
+read  = ["/home/you/.local/logs/maki"]
+write = ["/home/you/work/repo/.maki/init.lua"]
+```
+
+`read` makes the path readable, `write` makes it readable and writable, and a directory covers everything under it. Project files cannot carry the section, so allow-always (project) holds for the session only. Credentials, `pack-approvals.json` and any write the tables refuse stay closed, and an entry naming one of them rejects the whole section at load.
+
+YOLO mode skips the prompt, so the guard still refuses.
 
 ## Session Persistence
 

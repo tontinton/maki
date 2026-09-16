@@ -152,6 +152,11 @@ maki.api.register_prompt_hint({
 maki.api.register_tool({
   name = "read",
   kind = "read",
+  -- Prompts only for Maki's own files.
+  permission = "fs_read",
+  permission_scopes = function(input)
+    return maki.api.protected_scopes({ input.path }, "read")
+  end,
   description = DESCRIPTION,
 
   schema = {

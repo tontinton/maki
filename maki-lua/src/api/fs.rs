@@ -6,17 +6,23 @@ use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_storage::paths;
 use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 
 use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
 
+const RECURSIVE_REFUSAL: &str =
+    "removing this whole tree would take files with it that are out of reach";
+
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
-    maki_storage::paths::expand_tilde(Path::new(path))
+    paths::expand_tilde(Path::new(path))
 }
 
-fn make_absolute(path: &str) -> LuaResult<PathBuf> {
+/// The one resolver every guarded call goes through, `escalation_scope`
+/// included. See the note there for what two resolvers would cost.
+pub(crate) fn make_absolute(path: &str) -> LuaResult<PathBuf> {
     let p = expand_tilde(path);
     if p.is_absolute() {
         Ok(p)
@@ -25,6 +31,34 @@ fn make_absolute(path: &str) -> LuaResult<PathBuf> {
             .map(|cwd| cwd.join(&p))
             .map_err(|e| mlua::Error::runtime(format!("cannot resolve cwd: {e}")))
     }
+}
+
+/// Resolve `path`, refusing what only the user may have: Maki's own state, the
+/// config files holding provider keys, and writes to code Maki loads on its
+/// next start. `maki_storage::paths::Guard` owns the rules and the wording.
+/// Everything else, the rest of a config dir included, is the permission
+/// layer's call.
+fn guarded(path: &str, access: paths::Access) -> Result<PathBuf, String> {
+    let abs = make_absolute(path).map_err(|e| e.to_string())?;
+    match paths::guard().refusal_message(&abs, access, path) {
+        Some(message) => Err(message),
+        None => Ok(abs),
+    }
+}
+
+/// The scope an approval for `path` would be recorded under, or `None` when
+/// there is nothing to ask about: an ordinary path, one the guard already hands
+/// over, or one only the user may ever have.
+///
+/// Resolves through the same function as `guarded` on purpose. If the two
+/// disagreed about which file a spelling names, the user would be prompted,
+/// approve, and watch the call fail anyway.
+pub(crate) fn escalation_scope(path: &str, access: paths::Access) -> Option<String> {
+    let abs = make_absolute(path).ok()?;
+    paths::guard().override_candidate(&abs, access)?;
+    paths::canonical_key(&abs)
+        .to_str()
+        .map(|scope| scope.to_owned())
 }
 
 fn path_to_string(p: &Path) -> LuaResult<String> {
@@ -45,11 +79,16 @@ fn filetype_str(ft: &FileType) -> &'static str {
     }
 }
 
+/// `dir_key` is `dir` with every symlink resolved, so an entry's key costs one
+/// join instead of a `realpath` per component and the listing can still ask the
+/// guard about every name it finds. The walkers in `maki_agent::tools` make the
+/// same trade: `read_dir` yields real names and `file_type` says which of them
+/// is a link.
 fn collect_dir_entries(
     base: &Path,
     dir: &Path,
-    depth: u32,
-    max_depth: u32,
+    dir_key: &Path,
+    levels_left: u32,
     visited: &mut HashSet<PathBuf>,
     out: &mut Vec<(String, &'static str)>,
 ) {
@@ -57,29 +96,37 @@ fn collect_dir_entries(
         Ok(e) => e,
         Err(_) => return,
     };
+    let guard = paths::guard();
     for entry in entries.flatten() {
         let path = entry.path();
         let name = match path.strip_prefix(base).ok().and_then(|p| p.to_str()) {
             Some(s) => s.to_owned(),
             None => continue,
         };
-        let (type_str, is_dir) = match entry.file_type() {
+        let file_type = entry.file_type();
+        let (type_str, is_dir) = match &file_type {
             Ok(ft) if ft.is_symlink() => match std::fs::metadata(&path) {
                 Ok(meta) => (filetype_str(&meta.file_type()), meta.is_dir()),
                 Err(_) => ("link", false),
             },
-            Ok(ft) => (filetype_str(&ft), ft.is_dir()),
+            Ok(ft) => (filetype_str(ft), ft.is_dir()),
             Err(_) => ("unknown", false),
         };
-        out.push((name, type_str));
-        if is_dir && depth < max_depth {
-            let canonical = match path.canonicalize() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            if visited.insert(canonical) {
-                collect_dir_entries(base, &path, depth + 1, max_depth, visited, out);
-            }
+        // A link name says nothing about where it points, so it is the one
+        // case the cheap key cannot answer.
+        let key = match &file_type {
+            Ok(ft) if !ft.is_symlink() => dir_key.join(entry.file_name()),
+            _ => paths::canonical_key(&path),
+        };
+        // Naming an entry the guard would refuse to open is no use to the
+        // caller, so the listing drops it, the way a search does.
+        if !guard.is_unreachable_key(&key, paths::Access::Read) {
+            out.push((name, type_str));
+        }
+        // Descend whenever anything under the entry is readable, even when the
+        // entry itself is not: `Guard::may_skip_key` says why.
+        if is_dir && levels_left > 1 && !guard.may_skip_key(&key) && visited.insert(key.clone()) {
+            collect_dir_entries(base, &path, &key, levels_left - 1, visited, out);
         }
     }
 }
@@ -98,7 +145,7 @@ fn collect_dir_entries(
 /// end
 #[lua_fn(guard = FsRead)]
 async fn read(_lua: Lua, path: String) -> LuaResult<Pair<String>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(guarded(&path, paths::Access::Read));
     match smol::fs::read_to_string(&abs).await {
         Ok(s) => Ok((Some(s), None)),
         Err(e) if e.kind() == ErrorKind::InvalidData => {
@@ -119,7 +166,7 @@ async fn read(_lua: Lua, path: String) -> LuaResult<Pair<String>> {
 /// local encoded = maki.base64.encode(buf)
 #[lua_fn(guard = FsRead)]
 async fn read_bytes(lua: Lua, path: String) -> LuaResult<Pair<Buffer>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(guarded(&path, paths::Access::Read));
     let bytes = try_pair!(smol::fs::read(&abs).await);
     Ok((Some(lua.create_buffer(bytes)?), None))
 }
@@ -139,7 +186,7 @@ async fn read_bytes(lua: Lua, path: String) -> LuaResult<Pair<Buffer>> {
 /// end
 #[lua_fn(guard = FsRead)]
 async fn metadata(lua: Lua, path: String) -> LuaResult<Pair<Table>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(guarded(&path, paths::Access::Read));
     match smol::fs::metadata(&abs).await {
         Ok(meta) => {
             let tbl = lua.create_table()?;
@@ -297,7 +344,11 @@ async fn root(_lua: Lua, source: String, marker: Value) -> LuaResult<Option<Stri
             start
         };
 
-        let mut dir = make_absolute(start.to_str().unwrap_or_default())?;
+        // No error slot in the signature, so a refused start answers like a
+        // search that found nothing.
+        let Ok(mut dir) = guarded(start.to_str().unwrap_or_default(), paths::Access::Read) else {
+            return Ok(None);
+        };
 
         loop {
             for m in &markers {
@@ -371,7 +422,7 @@ fn ext(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
 /// end
 #[lua_fn(guard = FsRead)]
 async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(guarded(&path, paths::Access::Read));
     let max_depth: u32 = match &opts {
         Some(t) => t.get::<u32>("depth").unwrap_or(1),
         None => 1,
@@ -386,7 +437,8 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
         }
         let mut out = Vec::new();
         let mut visited = HashSet::new();
-        collect_dir_entries(&abs, &abs, 1, max_depth, &mut visited, &mut out);
+        let key = paths::canonical_key(&abs);
+        collect_dir_entries(&abs, &abs, &key, max_depth, &mut visited, &mut out);
         Ok(out)
     })
     .await;
@@ -413,7 +465,7 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 /// if err then print("write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
 async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(guarded(&path, paths::Access::Write));
     Ok(pair(smol::fs::write(&abs, content).await.map(|()| true)))
 }
 
@@ -428,7 +480,7 @@ async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>
 /// if err then print("append failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
 async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(guarded(&path, paths::Access::Write));
     // `smol::fs::File` writes through a background task and answers before
     // the bytes reach the file, so a plain `unblock` keeps append ordered.
     let result = smol::unblock(move || {
@@ -455,7 +507,7 @@ async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool
 /// if err then print("atomic write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
 async fn atomic_write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(guarded(&path, paths::Access::Write));
     let result = smol::unblock(move || maki_storage::atomic_write(&abs, content.as_bytes())).await;
     Ok(pair(result.map(|()| true)))
 }
@@ -474,7 +526,7 @@ async fn atomic_write(_lua: Lua, path: String, content: String) -> LuaResult<Pai
 /// maki.fs.rm("stale_dir", { recursive = true, force = true })
 #[lua_fn(guard = FsWrite)]
 async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(guarded(&path, paths::Access::Write));
     let recursive = opts
         .as_ref()
         .and_then(|t| opt_bool(t, "recursive"))
@@ -483,6 +535,14 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
         .as_ref()
         .and_then(|t| opt_bool(t, "force"))
         .unwrap_or(false);
+    // `guarded` only looked at the path it was handed, and a recursive
+    // removal reaches everything below it without naming any of it.
+    if recursive && paths::guard().contains_unwritable(&abs) {
+        return Ok(err_pair(format!(
+            "{}: {path}: {RECURSIVE_REFUSAL}",
+            paths::REFUSED
+        )));
+    }
     let result = smol::unblock(move || -> std::io::Result<()> {
         let meta = match std::fs::symlink_metadata(&abs) {
             Ok(m) => m,
@@ -517,7 +577,7 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
 /// maki.fs.mkdir("a/b/c", { parents = true })
 #[lua_fn(guard = FsWrite)]
 async fn mkdir(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(guarded(&path, paths::Access::Write));
     let parents = opts
         .as_ref()
         .and_then(|t| opt_bool(t, "parents"))
@@ -704,10 +764,11 @@ lua_table! {
 #[cfg(test)]
 mod tests {
     use std::fs::OpenOptions;
+    use std::sync::OnceLock;
     use std::time::{Duration, SystemTime};
 
     use super::*;
-    use crate::plugin_permissions::PluginPermissions;
+    use crate::plugin_permissions::{Permission, PluginPermissions};
     use mlua::Lua;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -715,6 +776,29 @@ mod tests {
     const FIRST_CONTENT: &str = "first";
     const REPLACEMENT_CONTENT: &str = "replacement";
     const FS_WRITE_PERMISSION: &str = "fs_write";
+    const STATE_FILE: &str = "kept.json";
+    const INIT_LUA: &str = "init.lua";
+    const PERMISSIONS_TOML: &str = "permissions.toml";
+    const ENV_FILE: &str = ".env";
+    const PROVIDERS_TOML: &str = "providers.toml";
+    const MCP_TOML: &str = "mcp.toml";
+    const PROJECT_INIT_LUA: &str = ".maki/init.lua";
+    const CONFIG_TOML: &str = "config.toml";
+    const SUBDIR: &str = "sub";
+    const NOTE_FILE: &str = "note.md";
+    const SECRET_NOTE: &str = "ledger.md";
+    const NOTES_GLOB: &str = "**/*.md";
+    const ROUND_TRIP_DIR: &str = "round_trip";
+    const PRUNED_SEARCH_DIR: &str = "pruned_search";
+    const REMOVED_DIR: &str = "removed";
+    const STATE_ROLE: &str = "state";
+    const DATA_ROLE: &str = "data";
+    const CONFIG_ROLE: &str = "config";
+    const REFUSAL_EXPECTED: &str = "a protected path must be refused";
+    const PACKAGE_MODULE: &str = "site/lua/browser.lua";
+    const GIT_MARKER: &str = ".git";
+    const ANY_PATTERN: &str = "x";
+    const ROOT_MARKER: &str = ".root_marker";
 
     #[test]
     fn read_file_ok() {
@@ -1630,5 +1714,566 @@ mod tests {
         let (val, err) = grep_call(&tbl, "[invalid", opts);
         assert_eq!(val, mlua::Value::Nil);
         assert!(matches!(err, mlua::Value::String(_)));
+    }
+
+    /// A layout these tests own, standing in for the real state, data and
+    /// config dirs.
+    ///
+    /// Installed process-wide rather than held beside the real one, because a
+    /// `maki.fs` call and the walkers it hands work to live in different crates
+    /// and have to answer alike. With a second `Guard` here, a search root came
+    /// back refused in this file while the walk underneath was still asking
+    /// about the developer's real home directory.
+    ///
+    /// nextest gives each test its own process, so the install always lands. A
+    /// tempdir is in nobody's state dir, so a guard that quietly stayed the
+    /// real one would leave everything below passing for the wrong reason.
+    static FIXTURE: OnceLock<TempDir> = OnceLock::new();
+
+    fn fixture() -> &'static TempDir {
+        FIXTURE.get_or_init(|| {
+            let root = TempDir::new().unwrap();
+            let dir = |role: &str| {
+                let path = root.path().join(role);
+                std::fs::create_dir_all(&path).unwrap();
+                path
+            };
+            let guard = paths::Guard::for_layout(&paths::Layout {
+                state: Some(&dir(STATE_ROLE)),
+                data: Some(&dir(DATA_ROLE)),
+                config_dirs: &[dir(CONFIG_ROLE)],
+                cache: None,
+                logs: None,
+                home: None,
+            });
+            assert!(
+                paths::install_guard(guard),
+                "something asked for the process rule set before this layout was installed"
+            );
+            root
+        })
+    }
+
+    fn fixture_dir(role: &str) -> PathBuf {
+        fixture().path().join(role)
+    }
+
+    /// One of the state-dir subtrees a feature depends on, read out of the rules
+    /// so a rename cannot leave a case asking about a closed directory.
+    fn open_state_subtree() -> &'static str {
+        paths::open_state_subtrees()
+            .next()
+            .expect("the state dir keeps at least one open subtree")
+    }
+
+    fn state_path(rel: &str) -> String {
+        path_string(&fixture_dir(STATE_ROLE).join(rel))
+    }
+
+    fn path_string(path: &Path) -> String {
+        path.to_str().unwrap().to_owned()
+    }
+
+    fn fs_table(lua: &Lua) -> Table {
+        create_fs_table(lua, &PluginPermissions::trusted()).unwrap()
+    }
+
+    fn call<R: mlua::FromLuaMulti>(
+        tbl: &Table,
+        func_name: &str,
+        args: impl mlua::IntoLuaMulti,
+    ) -> R {
+        let f: mlua::Function = tbl.get(func_name).unwrap();
+        smol::block_on(f.call_async(args)).unwrap()
+    }
+
+    /// Asks for the reason too, because "some error came back" passes just as
+    /// well when the path was refused under the wrong rule or a write failed on
+    /// its own. The refusal is looked for inside the message rather than at the
+    /// front of it, since a search names the tool first and the rule that
+    /// refused its root is reported from the walk underneath.
+    fn assert_refused(
+        tbl: &Table,
+        func_name: &str,
+        args: impl mlua::IntoLuaMulti,
+        expected: paths::Refusal,
+    ) {
+        let (value, err): (mlua::Value, Option<String>) = call(tbl, func_name, args);
+        assert_eq!(
+            value,
+            mlua::Value::Nil,
+            "{func_name} must not return a value"
+        );
+        let message = err.expect(REFUSAL_EXPECTED);
+        assert!(
+            message.contains(paths::REFUSED) && message.contains(expected.as_str()),
+            "{func_name} refused with the wrong error: {message}"
+        );
+    }
+
+    /// The other half of `assert_refused`: a call that must go through. Asks for
+    /// the error slot rather than the value, so a refusal is reported as itself
+    /// instead of as a failed conversion three frames away.
+    fn assert_allowed(tbl: &Table, func_name: &str, args: impl mlua::IntoLuaMulti) {
+        let (_, err): (mlua::Value, Option<String>) = call(tbl, func_name, args);
+        assert_eq!(err, None, "{func_name} must be allowed");
+    }
+
+    /// `<state>/<first open subtree>/{name}`: where the memory plugin keeps
+    /// its notes. A directory per test, so the tests cannot see each other's
+    /// files if they ever share a process.
+    fn note_dir(name: &str) -> PathBuf {
+        fixture_dir(STATE_ROLE)
+            .join(open_state_subtree())
+            .join(name)
+    }
+
+    fn entry_names(listed: &Table) -> Vec<String> {
+        listed
+            .sequence_values::<Table>()
+            .flatten()
+            .filter_map(|entry| entry.get::<String>(1).ok())
+            .collect()
+    }
+
+    /// The files a search came back with, for either shape `maki.fs` answers
+    /// in: `glob` a list of paths, `grep` a list of entries keyed by `path`.
+    fn found_paths(found: &Table) -> Vec<String> {
+        found
+            .sequence_values::<Value>()
+            .flatten()
+            .filter_map(|value| match value {
+                Value::String(s) => s.to_str().ok().map(|s| s.to_owned()),
+                Value::Table(entry) => entry.get::<String>("path").ok(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A symlink to the state dir, so a path spelled through it only lands on a
+    /// rule once the link is resolved.
+    #[cfg(unix)]
+    fn state_link(tmp: &TempDir) -> PathBuf {
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(fixture_dir(STATE_ROLE), &link).unwrap();
+        link
+    }
+
+    /// How a guarded `maki.fs` function is handed the path it touches, so one
+    /// case can put every one of them in front of the same refused path.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Call {
+        /// The path is the only argument.
+        Path,
+        /// The path, then what to write.
+        Write,
+        /// The path is `opts.path` and the pattern matches anything.
+        Search,
+        /// No error slot in the signature, so a refused path answers the way a
+        /// search that found nothing does.
+        Silent,
+    }
+
+    /// Every function behind the `fs_read` and `fs_write` guards, and how to
+    /// call it. [`every_guarded_function_is_covered`] holds the registrations to
+    /// this list, so a new function cannot arrive without saying here what it
+    /// does with a path Maki keeps for itself.
+    const GUARDED_CALLS: [(&str, Call); 12] = [
+        ("read", Call::Path),
+        ("read_bytes", Call::Path),
+        ("metadata", Call::Path),
+        ("dir", Call::Path),
+        ("mkdir", Call::Path),
+        ("rm", Call::Path),
+        ("write", Call::Write),
+        ("append", Call::Write),
+        ("atomic_write", Call::Write),
+        ("glob", Call::Search),
+        ("grep", Call::Search),
+        ("root", Call::Silent),
+    ];
+
+    /// The guard is consulted by each function rather than by the table around
+    /// them, so this is what says every function consults it. One `maki.fs`
+    /// call that resolved a path and went straight to the filesystem would hand
+    /// the agent the provider credentials, and nothing else in this file would
+    /// notice: the other cases name the functions they test.
+    #[test_case(Call::Path ; "one_path")]
+    #[test_case(Call::Write ; "a_path_and_content")]
+    #[test_case(Call::Search ; "a_search_root")]
+    #[test_case(Call::Silent ; "a_walk_up_with_no_error_slot")]
+    fn every_guarded_fs_function_refuses_makis_own_files(shape: Call) {
+        let lua = Lua::new();
+        let tbl = fs_table(&lua);
+        let file = state_path(STATE_FILE);
+        let dir = path_string(&fixture_dir(STATE_ROLE));
+        std::fs::write(fixture_dir(STATE_ROLE).join(ROOT_MARKER), "").unwrap();
+
+        for (name, _) in GUARDED_CALLS.iter().filter(|(_, c)| *c == shape) {
+            match shape {
+                Call::Path => assert_refused(&tbl, name, file.clone(), paths::Refusal::OwnState),
+                Call::Write => assert_refused(
+                    &tbl,
+                    name,
+                    (file.clone(), FIRST_CONTENT),
+                    paths::Refusal::OwnState,
+                ),
+                Call::Search => {
+                    let opts = lua.create_table().unwrap();
+                    opts.set("path", dir.clone()).unwrap();
+                    assert_refused(&tbl, name, (ANY_PATTERN, opts), paths::Refusal::OwnState);
+                }
+                // The marker sits beside the refused start, so an unguarded
+                // walk up would answer with Maki's own state dir.
+                Call::Silent => assert_eq!(
+                    call::<Option<String>>(&tbl, name, (file.clone(), ROOT_MARKER)),
+                    None,
+                    "{name} walked up out of Maki's own state"
+                ),
+            }
+        }
+    }
+
+    /// The list above is written by hand, because no two of these functions take
+    /// their path the same way. The guard declarations decide who belongs on it,
+    /// so adding a function under `fs_read` or `fs_write` fails here until the
+    /// list covers it.
+    #[test]
+    fn every_guarded_function_is_covered() {
+        let guarded: Vec<&str> = DOCS
+            .fns
+            .iter()
+            .filter(|f| {
+                f.guard == Some(Permission::FsRead.manifest_key())
+                    || f.guard == Some(Permission::FsWrite.manifest_key())
+            })
+            .map(|f| f.name)
+            .collect();
+
+        for name in &guarded {
+            assert!(
+                GUARDED_CALLS.iter().any(|(covered, _)| covered == name),
+                "maki.fs.{name} sits behind a filesystem guard and no case here says what it does with a path Maki keeps for itself"
+            );
+        }
+        for (name, _) in GUARDED_CALLS {
+            assert!(
+                guarded.contains(&name),
+                "maki.fs.{name} is on the list but declares no filesystem guard, so the list describes something that moved"
+            );
+        }
+    }
+
+    /// The files Maki loads as code or as policy on its next start. Reading
+    /// them is the agent's job, since explaining a repository's own setup is
+    /// half of what people ask for, and the write is the side that would hand
+    /// the next session away.
+    ///
+    /// Which of the two `access` a function passes to `guarded` is only visible
+    /// where the answers differ, so this is the case that catches a write
+    /// asking the read question.
+    #[test_case(
+        |_, config| config.join(PERMISSIONS_TOML),
+        paths::Refusal::PermissionPolicy,
+        false;
+        "the_rules_maki_runs_under"
+    )]
+    #[test_case(
+        |project, _| project.join(PROJECT_INIT_LUA),
+        paths::Refusal::StartupCode,
+        true;
+        "the_lua_a_repository_runs_at_startup"
+    )]
+    #[test_case(
+        |_, _| fixture_dir(DATA_ROLE).join(PACKAGE_MODULE),
+        paths::Refusal::PackageCode,
+        false;
+        "a_module_from_an_installed_package"
+    )]
+    fn reads_what_only_the_user_may_change_and_never_writes_it(
+        spell: fn(&Path, &Path) -> PathBuf,
+        reason: paths::Refusal,
+        escalatable: bool,
+    ) {
+        let project = TempDir::new().unwrap();
+        let path = path_string(&spell(project.path(), &fixture_dir(CONFIG_ROLE)));
+        std::fs::create_dir_all(Path::new(&path).parent().unwrap()).unwrap();
+        std::fs::write(&path, FIRST_CONTENT).unwrap();
+        let lua = Lua::new();
+        let tbl = fs_table(&lua);
+
+        assert_eq!(call::<String>(&tbl, "read", path.clone()), FIRST_CONTENT);
+        assert_refused(&tbl, "write", (path.clone(), FIRST_CONTENT), reason);
+        assert_eq!(
+            escalation_scope(&path, paths::Access::Write).is_some(),
+            escalatable,
+            "{path}: a prompt opens this one exactly where it should"
+        );
+    }
+
+    /// A listing that stopped at the closed state dir would hide the notes the
+    /// memory plugin keeps in an open subtree of it, so one note was listed or
+    /// not depending on where the listing started. What it must still never do
+    /// is name the files Maki keeps for itself.
+    #[test]
+    fn dir_walks_past_makis_state_into_the_open_subtrees() {
+        let state = fixture_dir(STATE_ROLE);
+        let open = state.join(open_state_subtree());
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::write(open.join(NOTE_FILE), FIRST_CONTENT).unwrap();
+        std::fs::write(state.join(STATE_FILE), FIRST_CONTENT).unwrap();
+
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("depth", 3).unwrap();
+        let listed: Table = call(
+            &fs_table(&lua),
+            "dir",
+            (path_string(fixture().path()), opts),
+        );
+        let names = entry_names(&listed);
+
+        assert!(
+            names.iter().any(|name| name.ends_with(NOTE_FILE)),
+            "an open subtree must survive the listing of its closed parent: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.ends_with(STATE_FILE)),
+            "the listing named a file Maki keeps for itself: {names:?}"
+        );
+    }
+
+    /// `guarded` has to resolve the path rather than match its text, or a link
+    /// in a directory the agent writes is a way around every rule here.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_spelled_path_into_makis_state() {
+        let tmp = TempDir::new().unwrap();
+        let spelled = state_link(&tmp).join(STATE_FILE);
+        assert!(
+            !paths::normalize_path(&spelled).starts_with(fixture_dir(STATE_ROLE)),
+            "a lexical spelling must not decide the rule"
+        );
+
+        let lua = Lua::new();
+        assert_refused(
+            &fs_table(&lua),
+            "read",
+            path_string(&spelled),
+            paths::Refusal::OwnState,
+        );
+    }
+
+    /// `rm -r` never names the files it destroys, so checking the path it was
+    /// handed says nothing: the parent of the state dir is an ordinary path.
+    #[test]
+    fn refuses_a_recursive_remove_that_reaches_makis_files() {
+        let lua = Lua::new();
+        let tbl = fs_table(&lua);
+        let opts = lua.create_table().unwrap();
+        opts.set("recursive", true).unwrap();
+        opts.set("force", true).unwrap();
+
+        let (value, err): (mlua::Value, Option<String>) =
+            call(&tbl, "rm", (path_string(fixture().path()), opts));
+        assert_eq!(value, mlua::Value::Nil, "rm must not report success");
+        assert!(
+            err.expect(REFUSAL_EXPECTED).contains(RECURSIVE_REFUSAL),
+            "rm refused for the wrong reason"
+        );
+        assert!(
+            fixture_dir(STATE_ROLE).is_dir(),
+            "the refusal must leave the tree alone"
+        );
+    }
+
+    /// `root` has no error slot, so a refused start answers like a search that
+    /// found nothing. The marker beside the link is what an unguarded walk up
+    /// out of the state dir would have returned.
+    #[cfg(unix)]
+    #[test]
+    fn root_finds_nothing_from_inside_makis_state() {
+        let tmp = TempDir::new().unwrap();
+        let start = state_link(&tmp).join(STATE_FILE);
+        std::fs::write(tmp.path().join(GIT_MARKER), "").unwrap();
+
+        let lua = Lua::new();
+        let found: Option<String> =
+            call(&fs_table(&lua), "root", (path_string(&start), GIT_MARKER));
+        assert_eq!(found, None);
+    }
+
+    /// The memory plugin's whole round trip: make the note's directory, write
+    /// the note, read it back. A rule that turned the open subtrees read-only
+    /// would pass everything else here while memory notes and plan mode quietly
+    /// stopped saving anything.
+    #[test_case("write")]
+    #[test_case("append")]
+    #[test_case("atomic_write")]
+    fn writes_and_reads_back_a_note_in_an_open_state_subtree(func_name: &str) {
+        let dir = note_dir(ROUND_TRIP_DIR);
+        let note = path_string(&dir.join(format!("{func_name}_{NOTE_FILE}")));
+
+        let lua = Lua::new();
+        let tbl = fs_table(&lua);
+        let opts = lua.create_table().unwrap();
+        opts.set("parents", true).unwrap();
+
+        assert_allowed(&tbl, "mkdir", (path_string(&dir), opts));
+        assert_allowed(&tbl, func_name, (note.clone(), FIRST_CONTENT));
+        assert_eq!(call::<String>(&tbl, "read", note), FIRST_CONTENT);
+    }
+
+    /// A search started above Maki's state has to walk into it for the notes
+    /// and still come back without the files beside them, which takes
+    /// `may_skip_key` and the per-entry drop together rather than either alone.
+    /// Both files are notes with the same contents, so the pattern that finds
+    /// one would find the other.
+    ///
+    /// Also the one place the two crates have to agree on a path that is
+    /// *reachable*. `glob` and `grep` hand the walk to `maki_agent::tools`,
+    /// which resolves the root against the same rules, and agreeing on a
+    /// refusal would prove less: a guard refusing everything does that too.
+    #[test_case("glob", NOTES_GLOB ; "glob")]
+    #[test_case("grep", FIRST_CONTENT ; "grep")]
+    fn a_search_across_makis_state_keeps_the_open_notes_and_drops_the_rest(
+        func_name: &str,
+        pattern: &str,
+    ) {
+        let dir = note_dir(PRUNED_SEARCH_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(NOTE_FILE), FIRST_CONTENT).unwrap();
+        std::fs::write(fixture_dir(STATE_ROLE).join(SECRET_NOTE), FIRST_CONTENT).unwrap();
+        let note = path_string(&dir.join(NOTE_FILE));
+
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("path", path_string(fixture().path())).unwrap();
+        let found: Table = call(&fs_table(&lua), func_name, (pattern, opts));
+        let paths = found_paths(&found);
+
+        assert!(
+            paths.iter().any(|path| path.ends_with(&note)),
+            "{func_name} must reach an open subtree through the closed dir around it: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.ends_with(SECRET_NOTE)),
+            "{func_name} returned a file Maki keeps for itself: {paths:?}"
+        );
+    }
+
+    /// Deleting a note is a recursive remove of the directory holding it, so the
+    /// extra check `rm` does for `recursive` decides whether memory can forget
+    /// anything. A stricter `contains_unwritable` would refuse this and nothing
+    /// else here would notice, since the other `rm` test wants a refusal anyway.
+    #[test]
+    fn removes_a_note_tree_inside_an_open_state_subtree() {
+        let dir = note_dir(REMOVED_DIR);
+        let nested = dir.join(SUBDIR);
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join(NOTE_FILE), FIRST_CONTENT).unwrap();
+
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("recursive", true).unwrap();
+
+        assert_allowed(&fs_table(&lua), "rm", (path_string(&dir), opts));
+        assert!(!dir.exists(), "the note tree must be gone");
+    }
+
+    /// A config dir is where dropping entries by name matters. The files holding
+    /// keys sit right beside the user's own config, so the listing has to leave
+    /// three names out of the middle of one directory and keep the rest, where
+    /// the state dir test only ever drops a whole branch.
+    #[test]
+    fn dir_over_a_config_dir_names_the_users_files_and_not_the_keys() {
+        let config = fixture_dir(CONFIG_ROLE);
+        for name in [ENV_FILE, PROVIDERS_TOML, MCP_TOML, CONFIG_TOML, INIT_LUA] {
+            std::fs::write(config.join(name), FIRST_CONTENT).unwrap();
+        }
+
+        let lua = Lua::new();
+        let listed: Table = call(&fs_table(&lua), "dir", path_string(&config));
+        let names = entry_names(&listed);
+
+        for own in [CONFIG_TOML, INIT_LUA] {
+            assert!(
+                names.iter().any(|name| name == own),
+                "the user's own {own} must be listed: {names:?}"
+            );
+        }
+        for credentials in [ENV_FILE, PROVIDERS_TOML, MCP_TOML] {
+            assert!(
+                !names.iter().any(|name| name == credentials),
+                "the listing named {credentials}, which holds keys: {names:?}"
+            );
+        }
+    }
+
+    /// The approved-but-refused failure, which nobody can debug from the
+    /// message. If `protected_scopes` and `maki.fs` disagreed about which file a
+    /// spelling names, the user would be prompted, approve, and watch the call
+    /// come back refused anyway. So every spelling of one file is asked for
+    /// both: the escalation is offered exactly where the call is refused, and
+    /// the scope it offers is the canonical path the answer is recorded against.
+    #[test_case(|state, _| state.join(STATE_FILE); "absolute")]
+    #[test_case(|state, _| state.join(SUBDIR).join("..").join(STATE_FILE); "back_out_of_a_subdir")]
+    #[test_case(|state, _| state.join(".").join(STATE_FILE); "with_a_dot_component")]
+    #[cfg_attr(unix, test_case(|_, link| link.join(STATE_FILE); "through_a_symlink"))]
+    fn an_escalation_names_the_file_the_call_would_open(spell: fn(&Path, &Path) -> PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let state = fixture_dir(STATE_ROLE);
+        std::fs::create_dir_all(state.join(SUBDIR)).unwrap();
+        #[cfg(unix)]
+        let link = state_link(&tmp);
+        #[cfg(not(unix))]
+        let link = tmp.path().to_path_buf();
+        let spelled = path_string(&spell(&state, &link));
+
+        let scope = escalation_scope(&spelled, paths::Access::Read);
+
+        assert!(
+            guarded(&spelled, paths::Access::Read).is_err(),
+            "{spelled}: an escalation is offered exactly where the call is refused"
+        );
+        assert_eq!(
+            scope.as_deref(),
+            paths::canonical_key(&state.join(STATE_FILE)).to_str(),
+            "{spelled}: the answer is recorded against the file the call opens, not the spelling that reached it"
+        );
+    }
+
+    /// The regression guard for "the agent suddenly prompts on every file read".
+    /// An ordinary path answers with nothing, so a read tool returns no scope and
+    /// the permission layer is never reached.
+    #[test_case(|tmp, _| tmp.join(NOTE_FILE); "a_file_of_the_users_own")]
+    #[test_case(|_, state| state.join(open_state_subtree()).join(NOTE_FILE); "an_open_state_subtree")]
+    fn an_ordinary_path_asks_nothing(spell: fn(&Path, &Path) -> PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let spelled = path_string(&spell(tmp.path(), &fixture_dir(STATE_ROLE)));
+
+        assert_eq!(
+            escalation_scope(&spelled, paths::Access::Read),
+            None,
+            "{spelled}: an ordinary path must not put a permission prompt in front of a read"
+        );
+        assert!(guarded(&spelled, paths::Access::Read).is_ok());
+    }
+
+    /// No prompt can hand these over, so the accessor offers no scope for them
+    /// and the refusal the call already gives is the whole answer.
+    #[test_case(STATE_ROLE, paths::APPROVALS_FILE, paths::Access::Read; "the_approval_store")]
+    #[test_case(CONFIG_ROLE, ENV_FILE, paths::Access::Read; "an_env_file")]
+    #[test_case(CONFIG_ROLE, PERMISSIONS_TOML, paths::Access::Write; "the_permission_policy")]
+    #[test_case(DATA_ROLE, PACKAGE_MODULE, paths::Access::Write; "package_code")]
+    fn a_sealed_path_offers_no_escalation(role: &str, rel: &str, access: paths::Access) {
+        let spelled = path_string(&fixture_dir(role).join(rel));
+
+        assert_eq!(
+            escalation_scope(&spelled, access),
+            None,
+            "{spelled}: no prompt hands over what only the user may have"
+        );
+        assert!(guarded(&spelled, access).is_err(), "{spelled}");
     }
 }

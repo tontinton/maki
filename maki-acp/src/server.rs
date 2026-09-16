@@ -294,7 +294,7 @@ async fn new_session(
         mcp,
         project_config,
         None,
-    );
+    )?;
     maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(session_ref.as_str()));
     let spec = params.model.spec();
     let resp = methods::new_session_response(session_ref.as_str())
@@ -349,7 +349,7 @@ async fn load_session(
         mcp,
         project_config,
         restored_cost,
-    );
+    )?;
     maki_otel::emit::session_started(maki_otel::emit::START_RESUME, Some(started.as_str()));
     let spec = params.model.spec();
     let resp = methods::load_session_response()
@@ -370,7 +370,7 @@ fn start_session(
     mcp: Option<McpHandle>,
     project_config: ProjectConfig,
     initial_cost: Option<f64>,
-) -> SessionRef {
+) -> Result<SessionRef, AcpError> {
     let pending = PendingState::default();
     // Without form elicitation the question tool would spin forever waiting
     // for a TUI that does not exist, so it is dropped and the model asks in
@@ -386,7 +386,10 @@ fn start_session(
     // picks the session cwd. So permissions, where a saved answer lands, and
     // MCP config all follow the session's project, not ours.
     let project_trusted = project_config.is_trusted();
-    let permissions_config = maki_config::load_permissions(&project_config);
+    // Fail the session rather than start one whose permissions.toml lies
+    // about what the guard actually does.
+    let permissions_config = maki_config::load_permissions(&project_config)
+        .map_err(|e| AcpError::internal_error().data(json_str(&e.to_string())))?;
     let (handle, events) = headless::spawn_interactive(InteractiveParams {
         model: params.model.clone(),
         config: params.config.clone(),
@@ -428,7 +431,7 @@ fn start_session(
         current_model: params.model.spec(),
         pending,
     });
-    session_ref
+    Ok(session_ref)
 }
 
 /// Registers each ask before sending so a response cannot race past it.
@@ -1066,6 +1069,7 @@ mod tests {
     const STDIN_DEADLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const DENY_SCOPE: &str = "acp-session-trust-boundary-test-deny";
     const ALLOW_SCOPE: &str = "acp-session-trust-boundary-test-allow";
+    const PERMISSIONS_LOAD: &str = "the fixture writes no [maki_files] entries";
     const POLICY_MATCH_GLOB: &str = "**";
     const POLICY_MISS_GLOB: &str = "/nowhere/*";
     const GATED_INIT_SOURCE: &str = "return {}";
@@ -1100,7 +1104,9 @@ mod tests {
             &TrustConfig::default(),
         );
         assert!(!untrusted.is_trusted());
-        let rules = maki_config::load_permissions(&untrusted).rules;
+        let rules = maki_config::load_permissions(&untrusted)
+            .expect(PERMISSIONS_LOAD)
+            .rules;
         assert!(
             rules
                 .iter()
@@ -1126,7 +1132,9 @@ mod tests {
             trusted.config_root(),
             ProjectConfig::for_project(project.path()).config_root()
         );
-        let rules = maki_config::load_permissions(&trusted).rules;
+        let rules = maki_config::load_permissions(&trusted)
+            .expect(PERMISSIONS_LOAD)
+            .rules;
         assert!(
             rules
                 .iter()
@@ -1551,6 +1559,7 @@ mod tests {
             Some(&rx),
             request_id,
             &CancelToken::none(),
+            None,
             None,
         ))
     }

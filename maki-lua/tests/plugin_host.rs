@@ -6707,3 +6707,71 @@ maki.api.register_tool({{
         "VM must stay usable, got: {again}"
     );
 }
+
+/// A read tool asks about its paths and gets `nil` back for every ordinary
+/// one. That `nil` used to be treated the same as a broken callback, which
+/// forced a prompt in front of every file read. Checked against the real
+/// plugins, not a stub, since that is exactly what regressed.
+#[test]
+fn an_ordinary_read_is_not_permission_checked() {
+    let (reg, _host) = builtins_host();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let entry = reg.get("read").expect("read is a bundled plugin");
+
+    let inv = entry
+        .tool
+        .parse(&json!({"path": file.path().to_str().unwrap(), "offset": 1, "limit": 1}))
+        .expect("parse failed");
+
+    assert!(
+        smol::block_on(inv.permission_scopes()).is_none(),
+        "nobody is asked about an ordinary file"
+    );
+}
+
+/// The other half: a path the guard refuses and a human answer can open asks
+/// outright, past every standing allow. A repository's `.maki/init.lua` is the
+/// case with no layout in it, since the rule follows the directory's name.
+const PROBE_TOOL_SRC: &str = r#"maki.api.register_tool({
+    name = "probe",
+    description = "writes where it is told",
+    schema = { type = "object", properties = { path = { type = "string" } }, required = { "path" } },
+    permission = "fs_write",
+    permission_scopes = function(input)
+        return maki.api.protected_scopes({ input.path }, "write")
+    end,
+    mutable_path = "path",
+    handler = function() return "" end,
+})"#;
+
+#[test]
+fn a_write_to_a_repositorys_startup_lua_asks_the_user() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("probe", PROBE_TOOL_SRC).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let path = project.path().join(".maki").join("init.lua");
+
+    let inv = reg
+        .get("probe")
+        .unwrap()
+        .tool
+        .parse(&json!({"path": path.to_str().unwrap()}))
+        .expect("parse failed");
+    let scopes = smol::block_on(inv.permission_scopes()).expect("this one needs an answer");
+
+    assert_eq!(
+        scopes.scopes,
+        vec![
+            maki_storage::paths::canonical_key(&path)
+                .to_str()
+                .unwrap()
+                .to_owned()
+        ],
+        "the answer is recorded against the file the call will open"
+    );
+    assert!(
+        scopes.force_prompt,
+        "a standing allow for the tool is no answer to this refusal"
+    );
+}

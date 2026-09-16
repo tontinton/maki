@@ -6,6 +6,9 @@ use std::time::Duration;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use maki_config_macro::ConfigSection;
 use maki_storage::paths;
+// Re-exported from maki_storage so this crate and the guard never drift on these names.
+pub use maki_storage::paths::MAKI_FILES_SECTION;
+use maki_storage::paths::{ENV_FILE, PERMISSIONS_FILE};
 use maki_storage::sessions::{SessionMeta, StoredThinking, ThinkingParseError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -14,10 +17,20 @@ use thiserror::Error;
 use tracing::warn;
 
 const PROJECT_DIR: &str = ".maki";
-const PERMISSIONS_FILE: &str = "permissions.toml";
-const ENV_FILE: &str = ".env";
 pub const UNTRUSTED_PROJECT_WRITE: &str =
     "folder is not trusted, so nothing was saved to .maki/permissions.toml";
+
+/// The `permissions.toml` keys that mean something other than a tool.
+const MCP_SECTION: &str = "mcp";
+const DEFAULT_KEY: &str = "default";
+const ALLOW_ALL_KEY: &str = "allow_all";
+
+/// Every top-level key of `permissions.toml` that is not a tool name.
+///
+/// A tool registered under one of these names would have its rules read as
+/// this section instead of as a tool, so the tool registry refuses them too.
+pub const RESERVED_PERMISSION_SECTIONS: [&str; 4] =
+    [MAKI_FILES_SECTION, MCP_SECTION, DEFAULT_KEY, ALLOW_ALL_KEY];
 
 pub mod project;
 pub use project::{GatedFile, ProjectConfig, policy_grant};
@@ -159,6 +172,17 @@ impl Permission {
             Permission::Net => "net",
             Permission::Run => "run",
             Permission::Env => "env",
+        }
+    }
+
+    /// Maps a permission to the matching guard access, or `None` if it has
+    /// nothing to do with files. A new `Permission` variant forces a match arm
+    /// here instead of silently falling through.
+    pub const fn access(self) -> Option<paths::Access> {
+        match self {
+            Permission::FsRead => Some(paths::Access::Read),
+            Permission::FsWrite => Some(paths::Access::Write),
+            Permission::Net | Permission::Run | Permission::Env => None,
         }
     }
 
@@ -316,6 +340,15 @@ pub enum ConfigError {
         pattern: String,
         #[source]
         source: globset::Error,
+    },
+    /// Refused rather than ignored: the user believes this path is open, and a
+    /// log warning is not how they would find out otherwise.
+    #[error("invalid {PERMISSIONS_FILE}: [{MAKI_FILES_SECTION}] {key} entry \"{entry}\": {source}")]
+    MakiFiles {
+        key: &'static str,
+        entry: String,
+        #[source]
+        source: paths::OverrideError,
     },
 }
 
@@ -785,6 +818,7 @@ struct PermissionsFileConfig {
     tools: HashMap<String, ToolPermissions>,
     mcp_rules: Vec<PermissionRule>,
     mcp_defaults: HashMap<ToolKey, DefaultEffect>,
+    maki_files: Vec<MakiFileOverride>,
 }
 
 impl PermissionsFileConfig {
@@ -802,15 +836,89 @@ impl PermissionsFileConfig {
     }
 }
 
+/// One path the user opened to the agent, and how far. Kept exactly as
+/// written so an error can quote it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MakiFileOverride {
+    pub path: String,
+    pub access: paths::Access,
+}
+
+/// Reads `[maki_files]`. Its two keys are the two accesses. A `write` entry
+/// grants reading too, since nothing is writable but not readable.
+fn parse_maki_files(table: &toml::Table) -> Vec<MakiFileOverride> {
+    let mut out = Vec::new();
+    for access in paths::Access::ALL {
+        let key = access.as_str();
+        let Some(value) = table.get(key) else {
+            continue;
+        };
+        let Some(entries) = value.as_array() else {
+            warn!(
+                key,
+                "[{MAKI_FILES_SECTION}].{key} is not an array of paths — skipping"
+            );
+            continue;
+        };
+        for entry in entries {
+            match entry.as_str() {
+                Some(path) => out.push(MakiFileOverride {
+                    path: path.to_owned(),
+                    access,
+                }),
+                None => warn!(
+                    key,
+                    "[{MAKI_FILES_SECTION}].{key} holds a non-string entry — skipping"
+                ),
+            }
+        }
+    }
+    out
+}
+
+/// Stages every entry through the guard's validator before installing any of
+/// them: a bad line fails the whole load, so a running Maki never ends up with
+/// half of a rejected config in effect. Installing replaces the whole section
+/// rather than adding to it, so deleting a line and reloading closes that path
+/// again.
+fn install_maki_files(
+    guard: &paths::Guard,
+    entries: &[MakiFileOverride],
+) -> Result<(), ConfigError> {
+    let mut staged = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match guard.stage(Path::new(&entry.path), entry.access) {
+            Ok(ok) => staged.push(ok),
+            // The path is already reachable, so this entry asks for nothing new.
+            // Not fatal: Maki writes these entries itself, and an old one must
+            // not block startup once a newer rule already covers it.
+            Err(paths::OverrideError::Unnecessary { path, access }) => warn!(
+                path = %path.display(),
+                access = access.as_str(),
+                "[{MAKI_FILES_SECTION}] entry grants nothing: the agent may already reach this path"
+            ),
+            Err(source) => {
+                return Err(ConfigError::MakiFiles {
+                    key: entry.access.as_str(),
+                    entry: entry.path.clone(),
+                    source,
+                });
+            }
+        }
+    }
+    guard.install_config(staged);
+    Ok(())
+}
+
 impl<'de> Deserialize<'de> for PermissionsFileConfig {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let table = toml::Table::deserialize(deserializer)?;
         let default = table
-            .get("default")
+            .get(DEFAULT_KEY)
             .and_then(|v| DefaultEffect::deserialize(v.clone()).ok())
             .or_else(|| {
                 table
-                    .get("allow_all")?
+                    .get(ALLOW_ALL_KEY)?
                     .as_bool()?
                     .then_some(DefaultEffect::Allow)
             });
@@ -818,12 +926,21 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
         let mut tools = HashMap::new();
         let mut mcp_rules = Vec::new();
         let mut mcp_defaults = HashMap::new();
+        let mut maki_files = Vec::new();
 
         for (k, v) in table.iter() {
-            if k.is_empty() || k == "allow_all" || k == "default" {
+            if k.is_empty() || k == ALLOW_ALL_KEY || k == DEFAULT_KEY {
                 continue;
             }
-            if k == "mcp" {
+            if k == MAKI_FILES_SECTION {
+                match v.as_table() {
+                    Some(t) => maki_files = parse_maki_files(t),
+                    None => tracing::warn!(
+                        "[{MAKI_FILES_SECTION}] is not a table (got {}) — skipping",
+                        v.type_str()
+                    ),
+                }
+            } else if k == MCP_SECTION {
                 // TOML [mcp.server] creates nested table: mcp → {server → {...}}
                 if let Some(mcp_table) = v.as_table() {
                     for (server_name, server_value) in mcp_table {
@@ -861,6 +978,7 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
             tools,
             mcp_rules,
             mcp_defaults,
+            maki_files,
         })
     }
 }
@@ -1063,6 +1181,10 @@ pub struct PermissionsConfig {
     pub tool_defaults: HashMap<ToolKey, DefaultEffect>,
     pub rules: Vec<PermissionRule>,
     pub yolo: bool,
+    /// The global `[maki_files]` entries, as written. [`load_permissions`]
+    /// hands them to the guard, which is what decides. Nothing else reads this
+    /// field.
+    pub maki_files: Vec<MakiFileOverride>,
 }
 
 #[derive(Clone)]
@@ -2240,10 +2362,21 @@ fn build_permissions(
         tool_defaults,
         rules,
         yolo: false,
+        maki_files: global.maki_files,
     }
 }
 
+/// Loads `.env` for this run: the global one first, then the project one.
+///
+/// `freeze` runs first on purpose. An `.env` file can set `HOME`, and `HOME`
+/// is also where Maki finds its own config, state and permission rules.
+/// Freezing the layout before loading `.env` means a project's `.env` still
+/// reaches the tools Maki runs, but cannot redirect where Maki reads its own
+/// files from.
 pub fn load_env_files(project_config: &ProjectConfig) {
+    // Errors are reported later by `dispatch`, once there is a user to tell
+    // them to. This call only needs the ordering.
+    let _ = paths::freeze();
     load_env_files_with_global(paths::find_config_path(ENV_FILE).as_deref(), project_config);
 }
 
@@ -2273,8 +2406,15 @@ fn collect_env_vars(path: &Path, vars: &mut HashMap<String, String>) {
     }
 }
 
-pub fn load_permissions(project_config: &ProjectConfig) -> PermissionsConfig {
-    load_permissions_inner(&paths::config_search_dirs(), project_config)
+/// Loads `permissions.toml` and installs whatever `[maki_files]` opened.
+///
+/// Installing here turns a bad entry into a startup error instead of a rule
+/// that looks active but silently does nothing: naming the credentials or the
+/// approval store fails the load.
+pub fn load_permissions(project_config: &ProjectConfig) -> Result<PermissionsConfig, ConfigError> {
+    let config = load_permissions_inner(&paths::config_search_dirs(), project_config);
+    install_maki_files(paths::guard(), &config.maki_files)?;
+    Ok(config)
 }
 
 fn load_permissions_inner(
@@ -2298,6 +2438,16 @@ fn load_permissions_inner(
     .unwrap_or_default();
     if !project_config.is_trusted() {
         project_perms.restrict_to_deny_scopes();
+    }
+    // A repository cannot open Maki's own files at any trust level: that would
+    // let a checkout hand itself the agent's state. Only the user's own config
+    // can grant that.
+    if !project_perms.maki_files.is_empty() {
+        warn!(
+            entries = project_perms.maki_files.len(),
+            "ignoring [{MAKI_FILES_SECTION}] in a project {PERMISSIONS_FILE}: only the user's own config may open Maki's files"
+        );
+        project_perms.maki_files.clear();
     }
 
     build_permissions(global_perms, project_perms)
@@ -2369,10 +2519,10 @@ fn migrate_permissions_file(path: &Path, persist: bool) -> Option<String> {
     };
     let mut migrated = false;
 
-    if let Some(item) = doc.remove("allow_all") {
+    if let Some(item) = doc.remove(ALLOW_ALL_KEY) {
         migrated = true;
         if item.as_bool() == Some(true) {
-            doc.insert("default", toml_edit::value("allow"));
+            doc.insert(DEFAULT_KEY, toml_edit::value("allow"));
         }
     }
 
@@ -2508,6 +2658,49 @@ fn append_global_permission(
     effect: Effect,
     global: Option<PathBuf>,
 ) -> Result<(), String> {
+    edit_global_permissions(global, |doc| {
+        insert_permission_entry(doc, tool, scope, effect)
+    })
+}
+
+/// Saves an opened-file answer to the user's own config, never a project's:
+/// the loader ignores a repository's entries, so saving one there would look
+/// like a grant that silently does nothing.
+///
+/// Takes the staged override, not a raw path, because the saved path must be
+/// the canonical one the guard matched, not whatever the model sent. A
+/// relative path would resolve differently on the next start and could name
+/// the wrong file.
+pub fn append_maki_file_override(staged: &paths::StagedOverride) -> Result<(), String> {
+    let path = staged
+        .path()
+        .to_str()
+        .ok_or_else(|| format!("path is not valid UTF-8: {}", staged.path().display()))?;
+    append_maki_file_override_with_global(
+        path,
+        staged.access(),
+        paths::config_search_dirs().into_iter().last(),
+    )
+}
+
+fn append_maki_file_override_with_global(
+    path: &str,
+    access: paths::Access,
+    global: Option<PathBuf>,
+) -> Result<(), String> {
+    edit_global_permissions(global, |doc| {
+        let table = child_table(doc.as_table_mut(), MAKI_FILES_SECTION)?;
+        push_unique(table, access.as_str(), path)
+    })
+}
+
+/// Reads, edits and writes back the user's own `permissions.toml`. The guard's
+/// `ReadOnly` rule on this file gates `maki.fs`, which is the agent's way in.
+/// This writer is Maki itself, so that rule has nothing to say about it.
+fn edit_global_permissions(
+    global: Option<PathBuf>,
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
+) -> Result<(), String> {
     let path = global
         .ok_or_else(|| "cannot determine home directory".to_string())?
         .join(PERMISSIONS_FILE);
@@ -2516,7 +2709,7 @@ fn append_global_permission(
         .parse()
         .map_err(|e| format!("failed to parse permissions: {e}"))?;
 
-    insert_permission_entry(&mut doc, tool, scope, effect)?;
+    edit(&mut doc)?;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("cannot create config dir: {e}"))?;
@@ -2612,6 +2805,20 @@ mod tests {
     const BLANKET_GLOB: &str = "**";
     const ABSOLUTE_PATH: &str = "/workspace";
     const BROKEN_GLOB: &str = "[";
+    const STATE_ROLE: &str = "state";
+    const LOGS_ROLE: &str = "logs";
+    const LOG_FILE: &str = "maki.log";
+    const PROJECT_ROLE: &str = "project";
+    const ENTRY_MUST_NOT_BE_IGNORED: &str = "an entry only the user's own answer could never give is a config error, never an ignored line";
+    const AUTH_DIR: &str = "auth";
+
+    /// A state-dir subtree the rules already open, read from them so a rename
+    /// elsewhere cannot leave this test naming a closed path.
+    fn open_state_subtree() -> &'static str {
+        paths::open_state_subtrees()
+            .next()
+            .expect("the state dir keeps at least one open subtree")
+    }
 
     /// The temp directory a test builds its project in, with its parent
     /// standing in for the home directory. Plain discovery would read the real
@@ -3747,6 +3954,49 @@ mod tests {
         }
     }
 
+    /// A repository must not redirect Maki's own directories by setting
+    /// `XDG_CONFIG_HOME` in its `.env`. That var is usually unset, so without
+    /// freezing first, `etcetera` would resolve Maki's config, state and
+    /// permission dirs from whatever the repo set. Freezing means the var
+    /// still reaches the tools Maki runs, but not Maki's own path lookup.
+    #[test]
+    fn env_file_cannot_move_maki_config_dirs() {
+        const XDG_CONFIG_HOME: &str = "XDG_CONFIG_HOME";
+
+        let hostile = TempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
+        let maki_dir = dir.path().join(PROJECT_DIR);
+        fs::create_dir_all(&maki_dir).unwrap();
+        fs::write(
+            maki_dir.join(ENV_FILE),
+            format!("{XDG_CONFIG_HOME}={}", hostile.path().display()),
+        )
+        .unwrap();
+
+        let previous = std::env::var_os(XDG_CONFIG_HOME);
+        // SAFETY: see the note on environment variables at the top of this module.
+        unsafe { std::env::remove_var(XDG_CONFIG_HOME) };
+
+        load_env_files(&untrusted_project(dir.path()).with_trust(true));
+
+        let reached = std::env::var_os(XDG_CONFIG_HOME);
+        let search_dirs = paths::config_search_dirs();
+
+        // SAFETY: see the note on environment variables at the top of this module.
+        unsafe {
+            match &previous {
+                Some(value) => std::env::set_var(XDG_CONFIG_HOME, value),
+                None => std::env::remove_var(XDG_CONFIG_HOME),
+            }
+        }
+
+        assert_eq!(reached.as_deref(), Some(hostile.path().as_os_str()));
+        assert!(
+            !search_dirs.iter().any(|d| d.starts_with(hostile.path())),
+            "project .env moved Maki's config search path: {search_dirs:?}"
+        );
+    }
+
     #[test]
     fn merge_plugins_overlay_wins_per_key() {
         let mut base: RawConfig = toml::from_str(
@@ -4434,6 +4684,227 @@ mod tests {
         assert_eq!(
             expand_env("Bearer ${MAKI_TEST_HDR_EMPTY_71535}"),
             Err("MAKI_TEST_HDR_EMPTY_71535".to_string())
+        );
+    }
+
+    /// A throwaway layout so tests can name paths that are nobody's real state
+    /// dir, while `for_layout` still builds the real rules around them.
+    struct OwnFiles {
+        _root: TempDir,
+        state: PathBuf,
+        logs: PathBuf,
+        /// A repository's own `.maki`: the one path a write entry can
+        /// actually open (its `init.lua`).
+        project_maki: PathBuf,
+    }
+
+    impl OwnFiles {
+        fn new() -> Self {
+            let root = TempDir::new().unwrap();
+            Self {
+                state: root.path().join(STATE_ROLE),
+                logs: root.path().join(LOGS_ROLE),
+                project_maki: root.path().join(PROJECT_ROLE).join(PROJECT_DIR),
+                _root: root,
+            }
+        }
+
+        fn guard(&self) -> paths::Guard {
+            paths::Guard::for_layout(&paths::Layout {
+                state: Some(&self.state),
+                logs: Some(&self.logs),
+                data: None,
+                cache: None,
+                config_dirs: &[],
+                home: None,
+            })
+        }
+
+        fn entry(&self, path: &Path, access: paths::Access) -> Vec<MakiFileOverride> {
+            vec![MakiFileOverride {
+                path: path.to_string_lossy().into_owned(),
+                access,
+            }]
+        }
+    }
+
+    /// An entry over a path no answer opens fails the load instead of sitting
+    /// there looking effective. The credentials and the approval store are
+    /// nobody's to hand over, and a write anywhere in Maki's own directories is
+    /// the same story: Maki trusts what it finds there on its next start.
+    #[test_case(|own| own.state.join(AUTH_DIR), paths::Access::Read ; "reading_the_credentials")]
+    #[test_case(|own| own.state.join(paths::APPROVALS_FILE), paths::Access::Write ; "writing_the_approval_store")]
+    #[test_case(|own| own.logs.clone(), paths::Access::Write ; "writing_maki_s_own_logs")]
+    fn a_maki_files_entry_over_a_sealed_path_fails_the_load(
+        spell: fn(&OwnFiles) -> PathBuf,
+        access: paths::Access,
+    ) {
+        let own = OwnFiles::new();
+        let guard = own.guard();
+        let path = spell(&own);
+
+        let err = install_maki_files(&guard, &own.entry(&path, access))
+            .expect_err(ENTRY_MUST_NOT_BE_IGNORED);
+
+        assert!(
+            err.to_string()
+                .contains(&path.to_string_lossy().into_owned()),
+            "the error has to name the entry it refused: {err}"
+        );
+        assert!(
+            matches!(
+                err,
+                ConfigError::MakiFiles {
+                    source: paths::OverrideError::NeverOverridable { .. },
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(
+            guard.is_unreachable(&path, access),
+            "{ENTRY_MUST_NOT_BE_IGNORED}"
+        );
+    }
+
+    /// An entry naming an already-open path asks for nothing new, and that
+    /// must never be fatal: Maki writes these entries itself, so an old one
+    /// cannot block startup once a newer rule already covers it. It also opens
+    /// nothing else, since only the rules decide what's open.
+    #[test]
+    fn a_maki_files_entry_that_grants_nothing_loads_and_opens_nothing() {
+        let own = OwnFiles::new();
+        let guard = own.guard();
+        let already_open = own.state.join(open_state_subtree());
+
+        install_maki_files(&guard, &own.entry(&already_open, paths::Access::Write)).expect(
+            "an entry asking for what the agent already has must not stop Maki from starting",
+        );
+
+        assert!(
+            guard.is_unreachable(&own.state.join(LOG_FILE), paths::Access::Read),
+            "an entry the guard refused to stage must leave every other path as it was"
+        );
+    }
+
+    /// The user opens their own log directory for reading, and the write half
+    /// stays refused since they never granted it. A write entry is the wider of
+    /// the two and carries the read with it, so nobody has to write two lines.
+    /// It gets a repository's `init.lua` because that is the only kind of path
+    /// a write entry can open at all.
+    #[test_case(|own| own.logs.clone(), paths::Access::Read, false ; "a_read_over_makis_own_logs")]
+    #[test_case(|own| own.project_maki.join(paths::INIT_LUA), paths::Access::Write, true ; "a_write_over_a_repositorys_startup_lua")]
+    fn a_maki_files_entry_opens_what_it_names(
+        spell: fn(&OwnFiles) -> PathBuf,
+        access: paths::Access,
+        writable: bool,
+    ) {
+        let own = OwnFiles::new();
+        let guard = own.guard();
+        let path = spell(&own);
+
+        install_maki_files(&guard, &own.entry(&path, access)).unwrap();
+
+        assert!(!guard.is_unreachable(&path, paths::Access::Read));
+        assert_eq!(!guard.is_unreachable(&path, paths::Access::Write), writable);
+    }
+
+    /// A tool rule is about what a tool may do, not about Maki's own files,
+    /// even a wildcard one that happens to overlap every guarded root.
+    #[test]
+    fn a_broad_tool_rule_opens_nothing() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "[read]\nallow = [\"~/**\"]\n");
+
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &untrusted_project(dir.path()),
+        );
+
+        assert!(
+            !perms.rules.is_empty(),
+            "the tool rule itself still applies"
+        );
+        assert!(
+            perms.maki_files.is_empty(),
+            "a tool rule says nothing about which of Maki's own files are open"
+        );
+    }
+
+    /// A repository cannot hand itself Maki's own state at any trust level.
+    /// Only the user's own config can grant that.
+    #[test_case(true ; "trusted")]
+    #[test_case(false ; "untrusted")]
+    fn a_project_cannot_open_makis_files(trusted: bool) {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_project_permissions(
+            dir.path(),
+            &format!("[{MAKI_FILES_SECTION}]\nwrite = [\"/anywhere\"]\n"),
+        );
+
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &ProjectConfig::discover(dir.path()).with_trust(trusted),
+        );
+
+        assert!(
+            perms.maki_files.is_empty(),
+            "a repository cannot open Maki's own files"
+        );
+    }
+
+    /// The round trip an "always allow" answer makes: written to the user's
+    /// config, then read back on the next start and reaching the same file
+    /// without asking again.
+    #[test]
+    fn an_always_answer_is_read_back_as_the_same_grant() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        let own = OwnFiles::new();
+        let log = own.logs.join(LOG_FILE);
+        let scope = log.to_string_lossy().into_owned();
+
+        append_maki_file_override_with_global(&scope, paths::Access::Read, Some(global.clone()))
+            .unwrap();
+
+        let perms = load_permissions_inner(
+            std::slice::from_ref(&global),
+            &untrusted_project(dir.path()),
+        );
+        assert_eq!(
+            perms.maki_files,
+            vec![MakiFileOverride {
+                path: scope,
+                access: paths::Access::Read
+            }]
+        );
+
+        let guard = own.guard();
+        install_maki_files(&guard, &perms.maki_files).unwrap();
+        assert!(!guard.is_unreachable(&log, paths::Access::Read));
+    }
+
+    /// A file with one bad line opens none of its paths. Both `/reload` and an
+    /// ACP session keep running on the last-good config after a failed load,
+    /// so a partial install would leave them holding half of a rejected file.
+    #[test]
+    fn a_rejected_maki_files_section_installs_none_of_itself() {
+        let own = OwnFiles::new();
+        let guard = own.guard();
+        let log = own.logs.join(LOG_FILE);
+        let entries = [
+            own.entry(&own.logs, paths::Access::Read),
+            own.entry(&own.state.join(AUTH_DIR), paths::Access::Read),
+        ]
+        .concat();
+
+        install_maki_files(&guard, &entries).expect_err(ENTRY_MUST_NOT_BE_IGNORED);
+
+        assert!(
+            guard.is_unreachable(&log, paths::Access::Read),
+            "a file the load rejected must leave the guard as it was"
         );
     }
 }

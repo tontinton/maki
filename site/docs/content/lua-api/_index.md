@@ -430,6 +430,7 @@ string or a table with richer output fields.
   - `describe` (`function`) Optional. Returns a custom description string for the current context.
   - `examples` (`table`) Optional. Array of example input objects for documentation.
   - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
+    A scope naming one of Maki's own files forces the prompt. The string form works that out itself, and a callback gets it from `maki.api.protected_scopes`.
   - `permission` (`string`) Required with `permission_scopes`. The capability the tool exposes to the model: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves this tool.
   - `mutable_path` (`string`) Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
@@ -707,6 +708,45 @@ local t = maki.api.get_tool("bash")
 if t then
   print("bash audiences:", table.concat(t.audiences, ", "))
 end
+```
+
+---
+
+### `maki.api.protected_scopes()` {#maki-api-protected_scopes}
+
+```lua
+maki.api.protected_scopes({paths}, {access})
+```
+
+Which of `paths` the user has to be asked about before a tool may touch
+them, in the shape a `permission_scopes` callback returns.
+
+`nil` for an ordinary path, so a read tool using this prompts only for
+[Maki's own files](/docs/permissions/#maki-s-own-files), and only for the
+ones an approval can open. Scopes come back canonical, so the answer is
+recorded against the file the call opens.
+
+`force_prompt` is set, so the prompt runs even where a standing allow for
+the tool would skip it. Only an answer lifts these refusals.
+
+**Parameters:**
+
+- `{paths}` (`string[]`) The paths the call is about. Relative paths and `~` resolve the same way they do in `maki.fs`.
+- `{access}` (`string`) `"read"` or `"write"`, matching what the call will do. Anything else throws.
+
+**Returns:** table|nil `{ scopes = { "<canonical path>", ... }, force_prompt = true }`, or nil when nothing about this call needs asking.
+
+**Example:**
+
+```lua
+maki.api.register_tool({
+  name = "read",
+  permission = "fs_read",
+  permission_scopes = function(input)
+    return maki.api.protected_scopes({ input.path }, "read")
+  end,
+  -- ...
+})
 ```
 
 ---
@@ -1732,6 +1772,9 @@ maki.env.state_dir()
 Return the directory where maki stores runtime state (sessions, auth tokens, etc.).
 Typically something like `~/.local/state/maki`.
 
+Most of it is closed to `maki.fs`. Keep your plugin's files under the
+`plugins` subdirectory, which is open for reading and writing.
+
 Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Returns:** (`string?`) State directory path, or nil if it cannot be determined.
@@ -1740,6 +1783,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 ```lua
 local dir = maki.env.state_dir()
+local mine = maki.fs.joinpath(dir, "plugins", "my_plugin")
 ```
 
 ---

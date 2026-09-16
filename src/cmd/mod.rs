@@ -117,6 +117,9 @@ fn declared_packages(host: &PluginHost) -> Result<Vec<maki_lua::Declared>> {
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {
+    // Run before any subcommand: every one of them reads Maki's own dirs, and
+    // failing once here beats each file tool failing later without saying why.
+    maki_storage::paths::freeze().context("locate Maki's own directories")?;
     // `--trust` is a grant for this process, so every entry point under it
     // reads the same shared project config the TUI would.
     let trust_mode = if cli.trust {

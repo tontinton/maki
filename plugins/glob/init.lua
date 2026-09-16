@@ -17,6 +17,11 @@ end
 maki.api.register_tool({
   name = "glob",
   kind = "search",
+  -- Prompts only for Maki's own files.
+  permission = "fs_read",
+  permission_scopes = function(input)
+    return maki.api.protected_scopes({ input.path }, "read")
+  end,
   description = [[Find files by glob pattern.
 
 - Respects .gitignore.

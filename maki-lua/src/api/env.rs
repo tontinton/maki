@@ -12,9 +12,13 @@ fn utf8(p: PathBuf) -> Option<String> {
 /// Return the directory where maki stores runtime state (sessions, auth tokens, etc.).
 /// Typically something like `~/.local/state/maki`.
 ///
+/// Most of it is closed to `maki.fs`. Keep your plugin's files under the
+/// `plugins` subdirectory, which is open for reading and writing.
+///
 /// @return (string?) State directory path, or nil if it cannot be determined.
 /// @example
 /// local dir = maki.env.state_dir()
+/// local mine = maki.fs.joinpath(dir, "plugins", "my_plugin")
 #[lua_fn(guard = FsRead)]
 fn state_dir(_lua: &Lua) -> mlua::Result<Option<String>> {
     Ok(maki_storage::paths::state_dir().ok().and_then(utf8))

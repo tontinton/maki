@@ -159,10 +159,14 @@ every guarded call it makes fails. The
 gates.
 
 An approval applies only to the same package name and source. Maki keeps
-approvals in `<maki-data>/site/pack-approvals.json`, where `<maki-data>` is the
-data directory from the
+approvals in `<maki-state>/pack-approvals.json`, where `<maki-state>` is the
+state directory from the
 [directory layout](/docs/configuration/#directory-layout). Approvals describe
 trust on this machine and must not be committed with `pack-lock.json`.
+
+The agent can read a checkout, which is how you review one. Writes to it and
+any read of the approvals file are refused. See
+[Maki's own files](/docs/permissions/#maki-s-own-files).
 
 Only the interactive UI can ask. `--print`, SDK mode, the ACP server, and the
 other subcommands never prompt, so a package waiting for a decision comes back

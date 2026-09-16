@@ -22,6 +22,7 @@ use maki_agent::{
 };
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_storage::paths::Access;
 use mlua::{
     Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table,
     Value as LuaValue,
@@ -39,7 +40,8 @@ use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions};
 use crate::runtime::{
-    HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request, command_depth,
+    FORCE_PROMPT_FIELD, HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request,
+    SCOPES_FIELD, ScopeAnswer, command_depth,
 };
 
 const TOOL_NAME_MAX: usize = 64;
@@ -214,6 +216,21 @@ pub(crate) struct LuaTool {
     pub(crate) has_describe_fn: bool,
 }
 
+impl LuaTool {
+    /// Whether this call has to reach the user, whatever the rules say.
+    ///
+    /// A refusal from the guard over Maki's own files can only be lifted by a
+    /// human answer, never by a standing allow or an open project folder. So
+    /// any tool with a path field gets this check for free, without each
+    /// plugin having to ask for it.
+    fn needs_an_answer(&self, scope: &str) -> bool {
+        let Some(access) = self.permission.as_ref().and_then(|p| p.permission.access()) else {
+            return false;
+        };
+        crate::api::fs::escalation_scope(scope, access).is_some()
+    }
+}
+
 impl Tool for LuaTool {
     fn name(&self) -> &str {
         &self.name
@@ -280,7 +297,10 @@ impl Tool for LuaTool {
             Some(PermissionScopeKind::Field(field)) => {
                 let scope = validated.get(field.as_ref()).and_then(|v| v.as_str());
                 PermissionState::Ready(Some(match scope {
-                    Some(s) => PermissionScopes::single(s.to_owned()),
+                    Some(s) => PermissionScopes {
+                        scopes: vec![s.to_owned()],
+                        force_prompt: self.needs_an_answer(s),
+                    },
                     None => PermissionScopes::force_prompt(validated.to_string()),
                 }))
             }
@@ -422,9 +442,15 @@ impl ToolInvocation for LuaToolInvocation {
                     {
                         return Some(PermissionScopes::force_prompt(fallback));
                     }
+                    // The one place the fail-closed policy lives: a callback
+                    // that could not be consulted prompts with the raw input,
+                    // and one that answered "nothing" is taken at its word.
                     match reply_rx.recv_async().await {
-                        Ok(Some(scopes)) => Some(scopes),
-                        _ => Some(PermissionScopes::force_prompt(fallback)),
+                        Ok(ScopeAnswer::Nothing) => None,
+                        Ok(ScopeAnswer::Ask(scopes)) => Some(scopes),
+                        Ok(ScopeAnswer::Unavailable) | Err(_) => {
+                            Some(PermissionScopes::force_prompt(fallback))
+                        }
                     }
                 })
             }
@@ -685,6 +711,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   describe        (function) Optional. Returns a custom description string for the current context.
 ///   examples        (table)    Optional. Array of example input objects for documentation.
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
+///                                A scope naming one of Maki's own files forces the prompt. The string form works that out itself, and a callback gets it from `maki.api.protected_scopes`.
 ///   permission      (string)   Required with `permission_scopes`. The capability the tool exposes to the model: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves this tool.
 ///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
@@ -822,6 +849,52 @@ fn register_permission_rule(
             effect,
         });
     Ok(())
+}
+
+/// Which of `paths` the user has to be asked about before a tool may touch
+/// them, in the shape a `permission_scopes` callback returns.
+///
+/// `nil` for an ordinary path, so a read tool using this prompts only for
+/// [Maki's own files](/docs/permissions/#maki-s-own-files), and only for the
+/// ones an approval can open. Scopes come back canonical, so the answer is
+/// recorded against the file the call opens.
+///
+/// `force_prompt` is set, so the prompt runs even where a standing allow for
+/// the tool would skip it. Only an answer lifts these refusals.
+///
+/// @param paths string[] The paths the call is about. Relative paths and `~` resolve the same way they do in `maki.fs`.
+/// @param access string `"read"` or `"write"`, matching what the call will do. Anything else throws.
+/// @return table|nil `{ scopes = { "<canonical path>", ... }, force_prompt = true }`, or nil when nothing about this call needs asking.
+/// @example
+/// maki.api.register_tool({
+///   name = "read",
+///   permission = "fs_read",
+///   permission_scopes = function(input)
+///     return maki.api.protected_scopes({ input.path }, "read")
+///   end,
+///   -- ...
+/// })
+#[lua_fn]
+fn protected_scopes(lua: &Lua, paths: Vec<String>, access: String) -> LuaResult<Option<Table>> {
+    // A bad access value is a programmer error: throw rather than guess, since
+    // guessing "write" would ask the user for more than the call needs.
+    let access = Access::parse(&access).ok_or_else(|| {
+        mlua::Error::runtime(format!(
+            "protected_scopes: access must be one of {:?}, got {access:?}",
+            Access::ALL.map(Access::as_str)
+        ))
+    })?;
+    let scopes: Vec<String> = paths
+        .iter()
+        .filter_map(|path| crate::api::fs::escalation_scope(path, access))
+        .collect();
+    if scopes.is_empty() {
+        return Ok(None);
+    }
+    let table = lua.create_table()?;
+    table.set(SCOPES_FIELD, scopes)?;
+    table.set(FORCE_PROMPT_FIELD, true)?;
+    Ok(Some(table))
 }
 
 /// Turns the rules a load declared into the rules that take effect. Runs once,
@@ -1139,7 +1212,7 @@ lua_table! {
     extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, permissions: PluginPermissions, plugin: Arc<str>, opts: PluginOpts), DOCS [
         register_tool(pending, permissions), register_permission_rule(pending_rules), register_command(plugin),
         register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
-        get_tools, get_tool,
+        get_tools, get_tool, protected_scopes,
         manual run_command,
     ]
 }
@@ -1976,6 +2049,25 @@ mod tests {
         assert_eq!(scopes.scopes, vec![input.to_string()]);
     }
 
+    const PROJECT_STARTUP_LUA: &str = ".maki/init.lua";
+    const ORDINARY_TARGET: &str = "note.md";
+
+    /// A tool with a path field asks the user before it trips over a refusal
+    /// only they can lift, without the plugin remembering to ask for it.
+    #[test_case::test_case(ORDINARY_TARGET => false ; "an_ordinary_path_is_left_to_the_rules")]
+    #[test_case::test_case(PROJECT_STARTUP_LUA => true ; "a_repositorys_startup_lua_asks")]
+    fn a_field_scope_asks_where_only_an_answer_opens_the_path(rel: &str) -> bool {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(rel);
+        let inv = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from("url"))))
+            .parse(&serde_json::json!({"url": path.to_str().unwrap()}))
+            .unwrap();
+
+        smol::block_on(inv.permission_scopes())
+            .expect("a field scope is always checked")
+            .force_prompt
+    }
+
     #[test]
     fn permission_scope_none_when_unconfigured() {
         let unconfigured = make_lua_tool(None)
@@ -2034,77 +2126,55 @@ mod tests {
         assert_eq!(extract_format(&t), LuaOutputFormat::Plain);
     }
 
-    #[test]
-    fn needs_compute_fallback_on_failure() {
-        // Closed channel → fallback to force_prompt
-        let (tx, rx) = flume::bounded(0);
-        drop(rx);
-        let inv = LuaToolInvocation {
-            tool: Arc::from("bash"),
-            plugin: Arc::from("test"),
-            has_header_fn: false,
-            input: serde_json::json!({"command": "ls"}),
-            tx,
-            permission_state: PermissionState::NeedsCompute,
-            mutable_path_field: None,
-            timeout: None,
-            start_annotation: None,
-            has_start_fn: false,
-        };
-        let scopes = smol::block_on(inv.permission_scopes()).expect("should fallback");
-        assert!(scopes.force_prompt);
-        assert!(!scopes.scopes.is_empty());
+    const RAW_INPUT: &str = r#"{"command":"echo hi"}"#;
+    const NAMED_SCOPE: &str = "cargo";
+    const OTHER_SCOPE: &str = "test";
 
-        // Callback returns None → fallback to force_prompt
-        let (tx2, rx2) = flume::bounded(1);
-        let inv2 = LuaToolInvocation {
+    fn needs_compute(tx: Sender<Request>) -> LuaToolInvocation {
+        LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
             has_header_fn: false,
             input: serde_json::json!({"command": "echo hi"}),
-            tx: tx2,
-            permission_state: PermissionState::NeedsCompute,
-            mutable_path_field: None,
-            timeout: None,
-            start_annotation: None,
-            has_start_fn: false,
-        };
-        std::thread::spawn(move || {
-            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx2.recv() {
-                let _ = reply.send(None);
-            }
-        });
-        let scopes2 = smol::block_on(inv2.permission_scopes()).expect("should fallback");
-        assert!(scopes2.force_prompt);
-    }
-
-    #[test]
-    fn needs_compute_returns_callback_result() {
-        let (tx, rx) = flume::bounded(1);
-        let inv = LuaToolInvocation {
-            tool: Arc::from("bash"),
-            plugin: Arc::from("test"),
-            has_header_fn: false,
-            input: serde_json::json!({"command": "cargo test"}),
             tx,
             permission_state: PermissionState::NeedsCompute,
             mutable_path_field: None,
             timeout: None,
             start_annotation: None,
             has_start_fn: false,
-        };
-        std::thread::spawn(move || {
-            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {
-                let _ = reply.send(Some(PermissionScopes {
-                    scopes: vec!["cargo".into(), "test".into()],
-                    force_prompt: false,
-                }));
+        }
+    }
+
+    fn named_scopes() -> ScopeAnswer {
+        ScopeAnswer::Ask(PermissionScopes {
+            scopes: vec![NAMED_SCOPE.to_owned(), OTHER_SCOPE.to_owned()],
+            force_prompt: false,
+        })
+    }
+
+    /// `Nothing` means the call is not checked at all, the other failure cases
+    /// fall back to a forced prompt over the raw input.
+    #[test_case::test_case(None => Some((vec![RAW_INPUT.to_owned()], true)) ; "no_request_loop_left_to_ask")]
+    #[test_case::test_case(Some(|| ScopeAnswer::Unavailable) => Some((vec![RAW_INPUT.to_owned()], true)) ; "a_callback_that_could_not_answer")]
+    #[test_case::test_case(Some(|| ScopeAnswer::Nothing) => None ; "nothing_to_ask_about")]
+    #[test_case::test_case(Some(named_scopes as fn() -> ScopeAnswer) => Some((vec![NAMED_SCOPE.to_owned(), OTHER_SCOPE.to_owned()], false)) ; "the_scopes_it_named")]
+    fn the_answer_decides_whether_the_call_is_checked(
+        answer: Option<fn() -> ScopeAnswer>,
+    ) -> Option<(Vec<String>, bool)> {
+        let (tx, rx) = flume::bounded(1);
+        match answer {
+            None => drop(rx),
+            Some(answer) => {
+                std::thread::spawn(move || {
+                    if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {
+                        let _ = reply.send(answer());
+                    }
+                });
             }
-        });
-        let result = smol::block_on(inv.permission_scopes());
-        let scopes = result.unwrap();
-        assert_eq!(scopes.scopes, vec!["cargo", "test"]);
-        assert!(!scopes.force_prompt);
+        }
+
+        smol::block_on(needs_compute(tx).permission_scopes())
+            .map(|scopes| (scopes.scopes, scopes.force_prompt))
     }
 
     fn timeout_spec(lua: &Lua, value: LuaValue) -> Table {

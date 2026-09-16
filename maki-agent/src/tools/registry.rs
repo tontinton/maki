@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bitflags::bitflags;
-use maki_config::Permission;
+use maki_config::{Permission, RESERVED_PERMISSION_SECTIONS};
 use serde_json::{Value, json};
 
 use crate::template::Vars;
@@ -282,6 +282,26 @@ impl Default for ToolRegistry {
 pub enum RegistryError {
     #[error("tool '{name}' is already registered (existing source: {existing})")]
     NameConflict { name: String, existing: String },
+    /// `permissions.toml` reserves these top-level keys for itself. A tool
+    /// using one would have its rules silently read as that section instead.
+    #[error(
+        "tool '{name}' is a reserved name: [{name}] in permissions.toml means something other than a tool"
+    )]
+    ReservedName { name: String },
+}
+
+/// Checks a whole batch before registering any of it, so a reserved name
+/// cannot sneak in alongside valid tools.
+fn reject_reserved<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<(), RegistryError> {
+    match names
+        .into_iter()
+        .find(|name| RESERVED_PERMISSION_SECTIONS.contains(name))
+    {
+        Some(name) => Err(RegistryError::ReservedName {
+            name: name.to_owned(),
+        }),
+        None => Ok(()),
+    }
 }
 
 impl ToolRegistry {
@@ -326,6 +346,7 @@ impl ToolRegistry {
 
     pub fn register(&self, tool: Arc<dyn Tool>, source: ToolSource) -> Result<(), RegistryError> {
         let name = tool.name().to_owned();
+        reject_reserved([name.as_str()])?;
         let mut conflict = None;
         self.tools.rcu(|current| {
             conflict = None;
@@ -354,6 +375,7 @@ impl ToolRegistry {
         entries: impl IntoIterator<Item = (Arc<dyn Tool>, ToolSource)>,
     ) -> Result<(), RegistryError> {
         let entries: Vec<_> = entries.into_iter().collect();
+        reject_reserved(entries.iter().map(|(tool, _)| tool.name()))?;
         let mut conflict = None;
         self.tools.rcu(|current| {
             conflict = None;
@@ -397,6 +419,7 @@ impl ToolRegistry {
         plugin: &str,
         new_entries: Vec<(Arc<dyn Tool>, ToolSource)>,
     ) -> Result<(), RegistryError> {
+        reject_reserved(new_entries.iter().map(|(tool, _)| tool.name()))?;
         let mut conflict = None;
         self.tools.rcu(|current| {
             conflict = None;
@@ -561,6 +584,25 @@ mod tests {
     fn lua_source(plugin: &str) -> ToolSource {
         ToolSource::Lua {
             plugin: plugin.into(),
+        }
+    }
+
+    /// Reserved names are refused however a tool arrives. Iterates the actual
+    /// list, so a section added there is covered automatically.
+    #[test]
+    fn a_tool_cannot_take_a_reserved_name() {
+        for name in RESERVED_PERMISSION_SECTIONS {
+            let reg = ToolRegistry::new();
+            let reserved = || (mock(name), lua_source("p"));
+
+            for err in [
+                reg.register(reserved().0, reserved().1).unwrap_err(),
+                reg.register_many([reserved()]).unwrap_err(),
+                reg.replace_plugin("p", vec![reserved()]).unwrap_err(),
+            ] {
+                assert!(matches!(err, RegistryError::ReservedName { .. }), "{err}");
+            }
+            assert!(!reg.has(name));
         }
     }
 

@@ -11,6 +11,13 @@ pub enum PluginError {
     },
     #[error("plugin {plugin} attempted to shadow existing tool '{tool}'")]
     NameConflict { plugin: String, tool: String },
+    /// `permissions.toml` already uses this name for the list of Maki's own
+    /// files the user opened, so a tool cannot claim it too.
+    #[error(
+        "plugin {plugin} registers '{tool}', which is reserved: [{tool}] in permissions.toml \
+         lists the files of Maki's own that the user opened to the agent"
+    )]
+    ReservedToolName { plugin: String, tool: String },
     #[error("io error loading plugin {path}: {source}")]
     Io {
         path: PathBuf,

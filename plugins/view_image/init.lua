@@ -117,6 +117,11 @@ end
 maki.api.register_tool({
   name = "view_image",
   kind = "read",
+  -- Prompts only for Maki's own files.
+  permission = "fs_read",
+  permission_scopes = function(input)
+    return maki.api.protected_scopes({ input.path }, "read")
+  end,
   description = DESCRIPTION,
   -- No interpreter audience: the code_execution bridge flattens tool output
   -- to text, so the pixels could never reach the model from there.

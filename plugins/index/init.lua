@@ -154,6 +154,11 @@ maki.api.register_prompt_hint({
 maki.api.register_tool({
   name = "index",
   kind = "read",
+  -- Prompts only for Maki's own files.
+  permission = "fs_read",
+  permission_scopes = function(input)
+    return maki.api.protected_scopes({ input.path }, "read")
+  end,
   description = [[
 Return a compact overview of a source file: imports, type definitions, function signatures, and structure with their line numbers surrounded by []. ~70-90% more efficient than reading the full file.
 

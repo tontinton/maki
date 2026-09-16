@@ -42,6 +42,7 @@ use maki_providers::Model;
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
 use maki_storage::id::SessionRef;
+use maki_storage::paths::{Access, Guard};
 
 pub(crate) const TOOL_NAME_FIELD: &str = "name";
 /// What `maki.task` calls the session's own chat.
@@ -438,16 +439,81 @@ fn format_rel(prefix: &str, fallback: &str, rel: &Path) -> String {
 }
 
 /// Convenience wrapper that always respects gitignore.
-pub fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder, String> {
+pub fn walk_builder(root: &str, patterns: &[&str]) -> Result<GuardedWalk, String> {
     walk_builder_opts(root, patterns, true)
 }
 
-/// `.git` is always excluded, even when `gitignore` is false.
+/// A walk with the guard over Maki's own files already wired into it.
+///
+/// Opaque on purpose. `ignore` keeps one filter predicate per builder, so a
+/// caller handed the raw builder could drop the guard's filter by installing
+/// its own and nothing would say so.
+#[derive(Debug)]
+pub struct GuardedWalk(WalkBuilder);
+
+impl GuardedWalk {
+    pub fn build(self) -> ignore::Walk {
+        self.0.build()
+    }
+
+    pub fn build_parallel(self) -> ignore::WalkParallel {
+        self.0.build_parallel()
+    }
+}
+
+/// The key for a walk entry, without a `canonicalize` per path component.
+///
+/// `ignore` does not follow symlinks, so every entry it yields is the walk root
+/// plus a chain of real directory names, never `.`, never `..`, never a step
+/// through a link. Canonicalizing the root once and pasting that chain back on
+/// gives the same answer as resolving component by component, for one join and
+/// no syscall. A walk sees hundreds of thousands of entries and full resolution
+/// costs a `realpath` per component on each, so the difference shows.
+///
+/// A link name says nothing about where it points, so those are resolved
+/// properly. There are few of them and the walk stops at each one anyway.
+fn walk_entry_key(root: &Path, root_key: &Path, entry: &ignore::DirEntry) -> PathBuf {
+    let is_link = entry.file_type().is_none_or(|kind| kind.is_symlink());
+    match entry.path().strip_prefix(root) {
+        Ok(rest) if !is_link => root_key.join(rest),
+        _ => maki_storage::paths::canonical_key(entry.path()),
+    }
+}
+
+/// `.git` is always excluded, even when `gitignore` is false. So is everything
+/// `maki_storage::paths::Guard` marks unreachable: a refused root fails the
+/// call and the rest is dropped mid-walk, so a credential file is never opened
+/// at all.
 pub fn walk_builder_opts(
     root: &str,
     patterns: &[&str],
     gitignore: bool,
-) -> Result<WalkBuilder, String> {
+) -> Result<GuardedWalk, String> {
+    walk_builder_guarded(maki_storage::paths::guard(), root, patterns, gitignore)
+}
+
+/// The same walk against a rule set the caller names, so a test can aim one at
+/// a layout it owns instead of at the developer's real state dir.
+fn walk_builder_guarded(
+    guard: &'static Guard,
+    root: &str,
+    patterns: &[&str],
+    gitignore: bool,
+) -> Result<GuardedWalk, String> {
+    let root_path = PathBuf::from(root);
+    let root_key = maki_storage::paths::canonical_key(&root_path);
+    // `ignore` yields the root without asking the filter, so a refused root has
+    // to be caught here. Otherwise a grep aimed straight at a credential file
+    // reads it, and a guard with no layout comes back empty rather than loud,
+    // which the agent reads as "no matches in this project".
+    if let Some(message) = guard.refusal_message(&root_path, Access::Read, root) {
+        return Err(message);
+    }
+    // A project is almost never anywhere near Maki's own directories, and then
+    // no entry under this root can be refused or opened, so the walk skips both
+    // the key and the lookup per entry.
+    let covered = guard.may_cover_subtree(&root_key);
+
     let mut ob = ignore::overrides::OverrideBuilder::new(root);
     ob.add("!.git").expect("!.git is a valid glob");
 
@@ -461,14 +527,30 @@ pub fn walk_builder_opts(
         .map_err(|e| format!("invalid glob pattern: {e}"))?;
 
     let mut wb = WalkBuilder::new(root);
-    wb.hidden(false).overrides(overrides);
+    // `follow_links` is already the default, spelled out because
+    // `walk_entry_key` may only skip the per-component resolution while it
+    // holds. `may_skip_key` and not `is_unreachable_key`, because false here
+    // prunes the whole subtree and a closed directory can still hold a readable
+    // one. Its contents get dropped one entry at a time instead.
+    //
+    // `hidden_by_shape` is asked of every entry whatever `covered` said, since
+    // a `.maki` directory turns up under any root and a project is exactly
+    // where one does. It costs a name comparison, which is why it can be asked
+    // that often.
+    wb.follow_links(false)
+        .hidden(false)
+        .overrides(overrides)
+        .filter_entry(move |entry| {
+            !guard.hidden_by_shape(entry.path())
+                && (!covered || !guard.may_skip_key(&walk_entry_key(&root_path, &root_key, entry)))
+        });
     if !gitignore {
         wb.ignore(false)
             .git_ignore(false)
             .git_global(false)
             .git_exclude(false);
     }
-    Ok(wb)
+    Ok(GuardedWalk(wb))
 }
 
 pub fn mtime(path: &Path) -> SystemTime {
@@ -800,6 +882,7 @@ pub mod test_support {
 mod tests {
     use std::fs::{self, File};
 
+    use maki_storage::paths::{Layout, REFUSED, Refusal};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -807,6 +890,31 @@ mod tests {
 
     const LINE_LIMIT: usize = 500;
     const TEST_MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
+    const ORDINARY_FILE: &str = "note.md";
+    const CLOSED_STATE_FILE: &str = "sessions.json";
+    const NESTED_DIR: &str = "nested";
+    /// One of the state-dir subtrees a feature depends on, read out of the
+    /// rules so a rename cannot leave this walking a closed directory.
+    fn open_state_subtree() -> &'static str {
+        maki_storage::paths::open_state_subtrees()
+            .next()
+            .expect("the state dir keeps at least one open subtree")
+    }
+    const STATE_ROLE: &str = "state";
+    const CONFIG_ROLE: &str = "config";
+    /// The plaintext credentials `CONFIG_ENTRIES` closes.
+    const CLOSED_CONFIG_FILES: [&str; 3] = [".env", "providers.toml", "mcp.toml"];
+    /// What the user keeps in the same directory and asks the agent to work on.
+    const OPEN_CONFIG_FILES: [&str; 2] = ["config.toml", "init.lua"];
+    const OPEN_CONFIG_DIR: &str = "skills";
+    const PROJECT_DIR: &str = ".maki";
+    /// The names in a `.maki` directory that hold keys in plaintext.
+    const CLOSED_MAKI_DIR_FILES: [&str; 2] = [".env", "mcp.toml"];
+    /// The rest of it, the two files the agent may read to explain a
+    /// repository's setup included.
+    const OPEN_MAKI_DIR_FILES: [&str; 3] = ["permissions.toml", "init.lua", "AGENTS.md"];
+    #[cfg(unix)]
+    const STATE_LINK: &str = "link";
 
     /// The array a host hands in is the whole answer, but only where names can
     /// be read out of it. Something unreadable must not quietly come out as
@@ -1079,6 +1187,322 @@ mod tests {
         assert!(!rs_only.iter().any(|p| p.starts_with(".git")));
     }
 
+    fn walk_key_tree() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join(NESTED_DIR).join(NESTED_DIR);
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join(ORDINARY_FILE), "").unwrap();
+        fs::write(tmp.path().join(ORDINARY_FILE), "").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&nested, tmp.path().join(STATE_LINK)).unwrap();
+        tmp
+    }
+
+    /// The cheap key the filter uses has to agree with resolving the entry one
+    /// component at a time, since that agreement is the whole reason the walk
+    /// may skip the expensive resolution.
+    ///
+    /// The root has to be spelled in a way that still needs resolving, or both
+    /// sides reduce to the same expression and the test asks nothing. A
+    /// `TempDir` path on its own is already canonical, so it is exactly that
+    /// case.
+    fn assert_walk_keys_agree(root: &Path) {
+        let root_path = root.to_path_buf();
+        let root_key = maki_storage::paths::canonical_key(&root_path);
+        assert_ne!(
+            root_path, root_key,
+            "the root must not already be canonical"
+        );
+
+        let entries: Vec<_> = walk_builder(&root.to_string_lossy(), &[])
+            .unwrap()
+            .build()
+            .flatten()
+            .collect();
+        assert!(entries.len() > 3, "the walk produced nothing to compare");
+        for entry in entries {
+            assert_eq!(
+                walk_entry_key(&root_path, &root_key, &entry),
+                maki_storage::paths::canonical_key(entry.path()),
+                "{}",
+                entry.path().display()
+            );
+        }
+    }
+
+    #[test]
+    fn walk_entry_key_agrees_with_full_resolution() {
+        let tmp = walk_key_tree();
+        assert_walk_keys_agree(&tmp.path().join(NESTED_DIR).join(".."));
+
+        #[cfg(unix)]
+        {
+            let elsewhere = TempDir::new().unwrap();
+            let link = elsewhere.path().join(STATE_LINK);
+            std::os::unix::fs::symlink(tmp.path(), &link).unwrap();
+            assert_walk_keys_agree(&link);
+        }
+    }
+
+    /// A tree with Maki's state dir inside it, holding one closed file and one
+    /// file in an open subtree, plus a guard that treats it as Maki's own.
+    /// The state dir sits under a root the walk can start from, because that is
+    /// the case that matters: a project is searched from above, and the
+    /// question is what the walk does on its way past Maki's own directory.
+    ///
+    /// The guard is leaked because `ignore` wants the filter to outlive the
+    /// walk, which the real one does for free. A fixture and not the real
+    /// layout, or the walk would go rummaging through the developer's own home
+    /// directory to find out whether the machine has a `~/.maki`.
+    fn state_fixture() -> (TempDir, &'static Guard, PathBuf) {
+        let root = TempDir::new().unwrap();
+        let state = root.path().join(STATE_ROLE);
+        let open = state.join(open_state_subtree());
+        fs::create_dir_all(&open).unwrap();
+        fs::write(open.join(ORDINARY_FILE), "").unwrap();
+        fs::write(state.join(CLOSED_STATE_FILE), "").unwrap();
+        fs::write(root.path().join(ORDINARY_FILE), "").unwrap();
+
+        let guard: &'static Guard = Box::leak(Box::new(Guard::for_layout(&Layout {
+            state: Some(&state),
+            data: None,
+            cache: None,
+            logs: None,
+            config_dirs: &[],
+            home: None,
+        })));
+        (root, guard, state)
+    }
+
+    /// A config dir holding both halves of `CONFIG_ENTRIES`, plus a guard that
+    /// rules it as one.
+    ///
+    /// Separate from `state_fixture` because the interesting part is the
+    /// opposite: a config dir carries no blanket rule, so the walk always starts
+    /// and every credential file rides on the mid-walk filter alone. The state
+    /// dir is named only to keep the guard out of degraded mode, which would
+    /// refuse the root and prove nothing about config.
+    fn config_fixture() -> (TempDir, &'static Guard, PathBuf) {
+        let root = TempDir::new().unwrap();
+        let config = root.path().join(CONFIG_ROLE);
+        let skills = config.join(OPEN_CONFIG_DIR);
+        fs::create_dir_all(&skills).unwrap();
+        fs::write(skills.join(ORDINARY_FILE), "").unwrap();
+        for name in CLOSED_CONFIG_FILES.iter().chain(&OPEN_CONFIG_FILES) {
+            fs::write(config.join(name), "").unwrap();
+        }
+        let state = root.path().join(STATE_ROLE);
+        fs::create_dir_all(&state).unwrap();
+
+        let dirs = [config.clone()];
+        let guard: &'static Guard = Box::leak(Box::new(Guard::for_layout(&Layout {
+            state: Some(&state),
+            config_dirs: &dirs,
+            data: None,
+            cache: None,
+            logs: None,
+            home: None,
+        })));
+        (root, guard, config)
+    }
+
+    fn walk_paths(guard: &'static Guard, root: &Path, gitignore: bool) -> Vec<PathBuf> {
+        walk_builder_guarded(guard, &root.to_string_lossy(), &[], gitignore)
+            .unwrap()
+            .build()
+            .flatten()
+            .map(|entry| entry.path().to_path_buf())
+            .collect()
+    }
+
+    /// A search from above Maki's state dir has to walk past it: drop what Maki
+    /// keeps for itself, and still hand back what its plugins keep there for
+    /// the user. Pruning at the closed directory dropped both, and a memory
+    /// note was then findable from inside the state dir and missing from the
+    /// same search one directory up.
+    ///
+    /// Both spellings of `gitignore`, because `maki.fs.glob` and `maki.fs.grep`
+    /// ask for `false` and the builder turns the ignore sources off *after* it
+    /// installs the filter. A guard that only held for the default would leave
+    /// the Lua walkers wide open.
+    #[test_case(true  ; "honouring_gitignore")]
+    #[test_case(false ; "ignoring_gitignore")]
+    fn walk_drops_makis_state_and_keeps_the_open_subtrees(gitignore: bool) {
+        let (root, guard, state) = state_fixture();
+
+        let entries = walk_paths(guard, root.path(), gitignore);
+
+        assert!(
+            entries.contains(&root.path().join(ORDINARY_FILE)),
+            "an ordinary entry must still come back: {entries:?}"
+        );
+        assert!(
+            entries.contains(&state.join(open_state_subtree()).join(ORDINARY_FILE)),
+            "an open subtree must survive the walk past its closed parent: {entries:?}"
+        );
+        assert!(
+            !entries.contains(&state.join(CLOSED_STATE_FILE)),
+            "the walk reached Maki's state: {entries:?}"
+        );
+    }
+
+    /// The attack the rules exist for: the agent is told to search its own
+    /// config dir for keys. Nothing rules the directory itself, so the walk
+    /// starts and every credential file depends on the filter alone, which has
+    /// to tell the closed names from the ones the user hands over to work on.
+    #[test]
+    fn walk_of_a_config_dir_drops_the_credentials_and_keeps_the_users_files() {
+        let (_root, guard, config) = config_fixture();
+
+        let entries = walk_paths(guard, &config, true);
+
+        for name in CLOSED_CONFIG_FILES {
+            assert!(
+                !entries.contains(&config.join(name)),
+                "the walk handed back {name}: {entries:?}"
+            );
+        }
+        for name in OPEN_CONFIG_FILES {
+            assert!(
+                entries.contains(&config.join(name)),
+                "the user's own {name} went missing: {entries:?}"
+            );
+        }
+        assert!(
+            entries.contains(&config.join(OPEN_CONFIG_DIR).join(ORDINARY_FILE)),
+            "an open config subtree must be searchable: {entries:?}"
+        );
+    }
+
+    /// The memory plugin searches the notes it keeps in an open subtree of the
+    /// closed state dir, and it searches them from that subtree. A root check
+    /// that asked about the closed parent instead of the longest matching rule
+    /// would refuse it, and memory search would stop working with every other
+    /// walk test here still passing.
+    #[test]
+    fn a_root_inside_an_open_state_subtree_walks() {
+        let (_root, guard, state) = state_fixture();
+        let open = state.join(open_state_subtree());
+
+        let entries = walk_paths(guard, &open, true);
+
+        assert!(
+            entries.contains(&open.join(ORDINARY_FILE)),
+            "an open state subtree must be searchable from inside: {entries:?}"
+        );
+    }
+
+    /// The agent writes its own memory notes, so it can drop a link beside them
+    /// pointing back at the credentials, and the open rule around that link is
+    /// the longest match on its *name*. So the filter has to resolve a link
+    /// entry instead of keying it off the walk root, or an open subtree becomes
+    /// the way to read the closed one it sits in.
+    #[cfg(unix)]
+    #[test]
+    fn walk_drops_a_link_out_of_an_open_state_subtree() {
+        let (root, guard, state) = state_fixture();
+        let open = state.join(open_state_subtree());
+        let link = open.join(STATE_LINK);
+        std::os::unix::fs::symlink(state.join(CLOSED_STATE_FILE), &link).unwrap();
+
+        let entries = walk_paths(guard, root.path(), true);
+
+        assert!(
+            entries.contains(&open.join(ORDINARY_FILE)),
+            "the open subtree must still be searchable: {entries:?}"
+        );
+        assert!(
+            !entries.contains(&link),
+            "a link named by an open rule reached Maki's state: {entries:?}"
+        );
+    }
+
+    /// What an approval buys a search. The user hands over the directory Maki
+    /// keeps its own files in, and from then on a walk both starts there and
+    /// descends into it: a prune that stopped at the closed parent would leave
+    /// the approval looking like it did nothing.
+    #[test]
+    fn a_walk_descends_into_what_an_approval_opened() {
+        let (_root, guard, state) = state_fixture();
+        let closed = state.join(CLOSED_STATE_FILE);
+
+        guard
+            .add_override(&state, maki_storage::paths::Access::Read)
+            .expect("the state dir takes an approval");
+        let entries = walk_paths(guard, &state, true);
+
+        assert!(
+            entries.contains(&closed),
+            "the file the user opened must come back: {entries:?}"
+        );
+    }
+
+    /// This root is nowhere near Maki's own directories, so the walk takes the
+    /// fast path every search of an ordinary project takes, and a `.maki`
+    /// directory still has to be caught on the way. Being asked to search a
+    /// repository for keys is the whole reason the rule exists. The rest of the
+    /// directory stays searchable, since explaining a repository's setup is the
+    /// agent's job.
+    #[test]
+    fn walk_of_a_project_drops_only_the_maki_files_that_hold_keys() {
+        let (_root, guard, _state) = state_fixture();
+        let project = TempDir::new().unwrap();
+        let maki_dir = project.path().join(PROJECT_DIR);
+        fs::create_dir_all(&maki_dir).unwrap();
+        for name in CLOSED_MAKI_DIR_FILES.iter().chain(&OPEN_MAKI_DIR_FILES) {
+            fs::write(maki_dir.join(name), "").unwrap();
+        }
+
+        let entries = walk_paths(guard, project.path(), true);
+
+        for name in CLOSED_MAKI_DIR_FILES {
+            assert!(
+                !entries.contains(&maki_dir.join(name)),
+                "the walk handed back {PROJECT_DIR}/{name}: {entries:?}"
+            );
+        }
+        for name in OPEN_MAKI_DIR_FILES {
+            assert!(
+                entries.contains(&maki_dir.join(name)),
+                "{PROJECT_DIR}/{name} went missing: {entries:?}"
+            );
+        }
+    }
+
+    /// The filter never sees the root, so a walk aimed straight at a closed
+    /// path would hand it back and `grep` would read it. A guard that lost the
+    /// layout has to fail here too. It refuses every path, and a filter
+    /// dropping every entry reads to the agent as "nothing in this project".
+    #[test_case(|| {
+        let (root, guard, state) = state_fixture();
+        (root, guard, state.join(CLOSED_STATE_FILE), Refusal::OwnState)
+    }; "a_path_maki_keeps_for_itself")]
+    #[test_case(|| {
+        let guard: &'static Guard = Box::leak(Box::new(Guard::for_layout(&Layout {
+            state: None,
+            data: None,
+            cache: None,
+            logs: None,
+            config_dirs: &[],
+            home: None,
+        })));
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        (dir, guard, root, Refusal::Degraded)
+    }; "an_ordinary_path_under_a_guard_with_no_layout")]
+    fn the_walk_fails_on_a_root_it_may_not_read(
+        setup: fn() -> (TempDir, &'static Guard, PathBuf, Refusal),
+    ) {
+        let (_dir, guard, root, reason) = setup();
+
+        let err = walk_builder_guarded(guard, &root.to_string_lossy(), &[], true)
+            .expect_err("a walk must not start on a root the guard refuses");
+
+        assert!(
+            err.starts_with(REFUSED) && err.contains(reason.as_str()),
+            "the walk refused with the wrong error: {err}"
+        );
+    }
     #[test]
     fn relative_path_cases() {
         let cwd = env::current_dir().unwrap();
@@ -1148,7 +1572,7 @@ mod tests {
 
         let root_str = root.to_string_lossy();
 
-        let collect = |wb: WalkBuilder| -> Vec<String> {
+        let collect = |wb: GuardedWalk| -> Vec<String> {
             wb.build()
                 .flatten()
                 .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))

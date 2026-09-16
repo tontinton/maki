@@ -226,6 +226,26 @@ pub(crate) struct HookRun {
     pub call: Value,
 }
 
+/// Field names of the table a `permission_scopes` callback answers with,
+/// shared between the reader here and the writer in `maki.api.protected_scopes`.
+pub(crate) const SCOPES_FIELD: &str = "scopes";
+pub(crate) const FORCE_PROMPT_FIELD: &str = "force_prompt";
+
+/// What a tool's `permission_scopes` callback answered.
+///
+/// Not an `Option`, because "nothing to ask about" and "could not be
+/// consulted" need different handling: the first skips the permission check,
+/// the second falls back to a forced prompt. Collapsing them into `None` would
+/// pick one behaviour for both.
+pub enum ScopeAnswer {
+    /// The callback ran and named no scope, same as a tool with no callback.
+    Nothing,
+    Ask(PermissionScopes),
+    /// No plugin, no registered function, a Lua error, or an answer that is
+    /// not the documented table.
+    Unavailable,
+}
+
 /// Load/clear drain in-flight tools first so we never mutate a
 /// plugin environment while a tool call is still running.
 pub enum Request {
@@ -277,7 +297,7 @@ pub enum Request {
         plugin: Arc<str>,
         tool: Arc<str>,
         input: Value,
-        reply: flume::Sender<Option<PermissionScopes>>,
+        reply: flume::Sender<ScopeAnswer>,
     },
     /// A host-owned slot chain (`tool.<name>.input`, `tool.<name>.output`).
     /// Only sent when the slot has layers, so the idle case never reaches the
@@ -2466,6 +2486,10 @@ impl LuaRuntime {
                     plugin: name.to_string(),
                     tool: n,
                 },
+                RegistryError::ReservedName { name: n } => PluginError::ReservedToolName {
+                    plugin: name.to_string(),
+                    tool: n,
+                },
             });
         }
 
@@ -2556,8 +2580,8 @@ impl LuaRuntime {
         plugin: &str,
         tool: &str,
         input: Value,
-    ) -> Option<PermissionScopes> {
-        let (func, lua_input) = plugin_fn(
+    ) -> ScopeAnswer {
+        let Some((func, lua_input)) = plugin_fn(
             &self.lua,
             &self.plugins,
             plugin,
@@ -2565,28 +2589,50 @@ impl LuaRuntime {
             "permission_scopes",
             |tk| tk.permission_scopes.as_ref(),
             &input,
-        )?;
+        ) else {
+            return ScopeAnswer::Unavailable;
+        };
         let result: LuaValue = match run_detached(&self.lua, func.call_async(lua_input)).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(plugin, tool, error = %e, "permission_scopes callback failed");
-                return None;
+                return ScopeAnswer::Unavailable;
             }
         };
+        // `nil` means the callback found nothing to ask about. Anything else
+        // that is not a table breaks its contract, so we fail closed.
         let table = match result {
+            LuaValue::Nil => return ScopeAnswer::Nothing,
             LuaValue::Table(t) => t,
-            _ => return None,
+            other => {
+                tracing::warn!(
+                    plugin,
+                    tool,
+                    got = other.type_name(),
+                    "permission_scopes must answer with a table of scopes or nil"
+                );
+                return ScopeAnswer::Unavailable;
+            }
         };
-        let scopes_table: mlua::Table = table.get("scopes").ok()?;
+        let Ok(scopes_table) = table.get::<mlua::Table>(SCOPES_FIELD) else {
+            tracing::warn!(
+                plugin,
+                tool,
+                field = SCOPES_FIELD,
+                "permission_scopes answered without its scopes"
+            );
+            return ScopeAnswer::Unavailable;
+        };
         let mut scopes = Vec::new();
         for (_, s) in scopes_table.pairs::<usize, String>().flatten() {
             scopes.push(s);
         }
         if scopes.is_empty() {
-            return None;
+            tracing::warn!(plugin, tool, "permission_scopes answered with no scopes");
+            return ScopeAnswer::Unavailable;
         }
-        let force_prompt: bool = table.get("force_prompt").unwrap_or(false);
-        Some(PermissionScopes {
+        let force_prompt: bool = table.get(FORCE_PROMPT_FIELD).unwrap_or(false);
+        ScopeAnswer::Ask(PermissionScopes {
             scopes,
             force_prompt,
         })

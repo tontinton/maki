@@ -9,7 +9,7 @@ use tracing::debug;
 
 use maki_storage::paths;
 
-const PROVIDERS_FILE: &str = "providers.toml";
+use maki_storage::paths::PROVIDERS_FILE;
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
 const OPENCODE_SLUG: &str = "opencode";
