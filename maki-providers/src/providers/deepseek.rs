@@ -52,7 +52,10 @@ const PEAK_WINDOWS: &[PricingWindow] = &[PricingWindow::hours(1, 4), PricingWind
 const PEAK_MULTIPLIER: f64 = 2.0;
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
+    // Bound through a `const` item rather than returned as a promoted
+    // `&[...]`: rvalue promotion refuses both const fn calls and drop glue,
+    // and `ModelPricing` carries an `Option<Arc<str>>` subsidy tag.
+    const MODELS: &[ModelEntry] = &[
         // `deepseek-flash` is V4.1 Flash. `deepseek-v4-flash` is the retired
         // name the API still accepts, served by V4.1 Flash at its rates.
         ModelEntry {
@@ -61,13 +64,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Generic,
             vision: true,
             default: true,
-            pricing: ModelPricing {
-                input: 0.15,
-                output: 0.60,
-                cache_write: 0.00,
-                cache_read: 0.003,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(0.15, 0.60, 0.00, 0.003),
             max_output_tokens: Some(384_000),
             context_window: 1_000_000,
         },
@@ -77,17 +74,12 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Generic,
             vision: false,
             default: true,
-            pricing: ModelPricing {
-                input: 0.66,
-                output: 1.98,
-                cache_write: 0.00,
-                cache_read: 0.022,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(0.66, 1.98, 0.00, 0.022),
             max_output_tokens: Some(384_000),
             context_window: 1_000_000,
         },
-    ]
+    ];
+    MODELS
 }
 
 #[derive(Deserialize)]

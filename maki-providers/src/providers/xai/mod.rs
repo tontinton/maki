@@ -23,20 +23,14 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
 });
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
+    const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["grok-4.6"],
             tier: ModelTier::Strong,
             family: ModelFamily::Generic,
             vision: true,
             default: true,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 6.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(2.00, 6.00, 0.00, 0.50),
             max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
             context_window: GROK_CONTEXT_WINDOW,
         },
@@ -46,13 +40,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Generic,
             vision: true,
             default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 6.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(2.00, 6.00, 0.00, 0.50),
             max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
             context_window: GROK_CONTEXT_WINDOW,
         },
@@ -62,17 +50,12 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Generic,
             vision: true,
             default: true,
-            pricing: ModelPricing {
-                input: 1.25,
-                output: 2.50,
-                cache_write: 0.00,
-                cache_read: 0.20,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(1.25, 2.50, 0.00, 0.20),
             max_output_tokens: Some(GROK_MAX_OUTPUT_TOKENS),
             context_window: GROK_4_3_CONTEXT_WINDOW,
         },
-    ]
+    ];
+    MODELS
 }
 
 #[cfg(test)]

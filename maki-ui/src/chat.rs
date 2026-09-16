@@ -50,6 +50,9 @@ pub enum ChatEventResult {
 pub struct Chat {
     pub name: String,
     pub cost: Option<f64>,
+    /// This chat's slice of the session's list-price reference cost; mirrors
+    /// `cost`, but only ever set for subsidised models.
+    pub list_cost: Option<f64>,
     pub context_size: u32,
     pub model_id: Option<String>,
     /// A subagent's own settings; `None` on the main chat, which reads the
@@ -78,6 +81,7 @@ impl Chat {
         Self {
             name,
             cost: None,
+            list_cost: None,
             context_size: 0,
             model_id: None,
             opts: None,
@@ -832,6 +836,7 @@ mod tests {
                 usage: Default::default(),
                 model: String::new(),
                 cost: None,
+                list_cost: None,
                 context_size: None,
                 context_window: 0,
             })),

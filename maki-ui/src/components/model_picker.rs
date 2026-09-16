@@ -643,13 +643,7 @@ mod tests {
 
     const OX_SPEC: &str = "openrouter/stealth/ox-alpha";
     const PAID_ID: &str = "vendor/paid-model";
-    const PAID_PRICING: ModelPricing = ModelPricing {
-        input: 3.0,
-        output: 15.0,
-        cache_write: 0.0,
-        cache_read: 0.0,
-        fast: None,
-    };
+    const PAID_PRICING: ModelPricing = ModelPricing::per_token(3.0, 15.0, 0.0, 0.0);
 
     fn register_openrouter_models() {
         model_registry::set_known_models(

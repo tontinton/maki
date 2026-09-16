@@ -124,20 +124,14 @@ inventory::submit!(BuiltInProvider {
 /// The coding plan (`zai-coding-plan`) is blocked from the catalog instead. The
 /// plan already paid for those models, so every row in it really is zero.
 pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
+    const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["glm-5-code"],
             tier: ModelTier::Strong,
             family: ModelFamily::Glm,
             vision: false,
             default: true,
-            pricing: ModelPricing {
-                input: 1.20,
-                output: 5.00,
-                cache_write: 0.00,
-                cache_read: 0.30,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(1.20, 5.00, 0.00, 0.30),
             max_output_tokens: Some(131072),
             context_window: 200_000,
         },
@@ -153,6 +147,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_write: 0.00,
                 cache_read: 0.26,
                 fast: None,
+                subsidised_by: None,
             },
             max_output_tokens: Some(131072),
             context_window: 1_000_000,
@@ -169,6 +164,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_write: 0.00,
                 cache_read: 0.03,
                 fast: None,
+                subsidised_by: None,
             },
             max_output_tokens: Some(131072),
             context_window: 1_000_000,
@@ -179,13 +175,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Glm,
             vision: false,
             default: false,
-            pricing: ModelPricing {
-                input: 1.40,
-                output: 4.40,
-                cache_write: 0.00,
-                cache_read: 0.26,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(1.40, 4.40, 0.00, 0.26),
             max_output_tokens: Some(131072),
             context_window: 1_000_000,
         },
@@ -201,6 +191,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_write: 0.00,
                 cache_read: 0.26,
                 fast: None,
+                subsidised_by: None,
             },
             max_output_tokens: Some(131072),
             context_window: 200_000,
@@ -211,13 +202,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Glm,
             vision: false,
             default: false,
-            pricing: ModelPricing {
-                input: 1.00,
-                output: 3.20,
-                cache_write: 0.00,
-                cache_read: 0.20,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(1.00, 3.20, 0.00, 0.20),
             max_output_tokens: Some(131072),
             context_window: 200_000,
         },
@@ -227,13 +212,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Glm,
             vision: false,
             default: true,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(0.00, 0.00, 0.00, 0.00),
             max_output_tokens: Some(131072),
             context_window: 200_000,
         },
@@ -243,13 +222,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Glm,
             vision: false,
             default: true,
-            pricing: ModelPricing {
-                input: 0.60,
-                output: 2.20,
-                cache_write: 0.00,
-                cache_read: 0.11,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(0.60, 2.20, 0.00, 0.11),
             max_output_tokens: Some(131072),
             context_window: 200_000,
         },
@@ -259,13 +232,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Glm,
             vision: false,
             default: false,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(0.00, 0.00, 0.00, 0.00),
             max_output_tokens: Some(98304),
             context_window: 131_072,
         },
@@ -275,13 +242,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Glm,
             vision: false,
             default: false,
-            pricing: ModelPricing {
-                input: 0.20,
-                output: 1.10,
-                cache_write: 0.00,
-                cache_read: 0.03,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(0.20, 1.10, 0.00, 0.03),
             max_output_tokens: Some(98304),
             context_window: 131_072,
         },
@@ -291,17 +252,12 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Glm,
             vision: false,
             default: false,
-            pricing: ModelPricing {
-                input: 0.60,
-                output: 2.20,
-                cache_write: 0.00,
-                cache_read: 0.11,
-                fast: None,
-            },
+            pricing: ModelPricing::per_token(0.60, 2.20, 0.00, 0.11),
             max_output_tokens: Some(98304),
             context_window: 131_072,
         },
-    ]
+    ];
+    MODELS
 }
 
 pub struct Zai {

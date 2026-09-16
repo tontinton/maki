@@ -466,7 +466,12 @@ impl<'h> Agent<'h> {
 
     fn emit_turn_complete(&self, response: &StreamResponse) -> Result<(), AgentError> {
         let cost = self.model.billed_cost(&response.usage, self.opts.fast);
-        let list_cost = self.model.list_cost(&response.usage, self.opts.fast);
+        // Ledger and TurnComplete both use the subsidised list price so a
+        // plugin summing per-turn `list_cost` from events lands on the same
+        // total the ledger later hands to `Done`.
+        let list_cost = self
+            .model
+            .subsidised_list_cost(&response.usage, self.opts.fast);
         self.ledger.add(response.usage, cost, list_cost);
         self.event_tx
             .send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
@@ -474,6 +479,7 @@ impl<'h> Agent<'h> {
                 usage: response.usage,
                 model: self.model.id.clone(),
                 cost,
+                list_cost,
                 context_size: Some(self.gauge.size()),
                 context_window: self.model.context_window,
             })))

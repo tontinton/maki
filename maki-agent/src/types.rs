@@ -933,6 +933,12 @@ pub struct TurnCompleteEvent {
     pub model: String,
     #[serde(skip)]
     pub cost: Option<f64>,
+    /// What the same turn would have cost at the provider's published list
+    /// price, `Some` only when the model is subsidised by a flat
+    /// subscription and `cost` is therefore always `$0`. See
+    /// [`maki_providers::Model::subsidised_list_cost`].
+    #[serde(skip)]
+    pub list_cost: Option<f64>,
     /// Tokens the next request would carry. This is the one context number
     /// the host reports, so `Done` and the compaction trigger agree with it.
     #[serde(skip_serializing_if = "Option::is_none")]

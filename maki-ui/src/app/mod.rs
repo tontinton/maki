@@ -1238,9 +1238,12 @@ impl App {
             self.state.token_usage += tc.usage;
             add_cost(&mut self.state.cost, tc.cost);
             add_cost(&mut self.chats[chat_idx].cost, tc.cost);
-            self.state
-                .session_mut()
-                .add_model_usage(&tc.model, tc.usage.billed(tc.cost));
+            add_cost(&mut self.state.list_cost, tc.list_cost);
+            add_cost(&mut self.chats[chat_idx].list_cost, tc.list_cost);
+            self.state.session_mut().add_model_usage(
+                &tc.model,
+                tc.usage.billed_with_list_cost(tc.cost, tc.list_cost),
+            );
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.set_context_size(chat_idx, ctx_size);
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
