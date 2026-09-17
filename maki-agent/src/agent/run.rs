@@ -466,20 +466,25 @@ impl<'h> Agent<'h> {
 
     fn emit_turn_complete(&self, response: &StreamResponse) -> Result<(), AgentError> {
         let cost = self.model.billed_cost(&response.usage, self.opts.fast);
-        // Ledger and TurnComplete both use the subsidised list price so a
-        // plugin summing per-turn `list_cost` from events lands on the same
-        // total the ledger later hands to `Done`.
-        let list_cost = self
-            .model
-            .subsidised_list_cost(&response.usage, self.opts.fast);
-        self.ledger.add(response.usage, cost, list_cost);
+        // The ledger banks the un-subsidised list price for every model, not
+        // just subsidised ones, so `Done.list_cost` is a real total on a
+        // metered run instead of the auto-compaction turns alone. The two
+        // agree on a subsidised model, which is why the event can narrow to
+        // the reference figure the UI shows beside its `$0` bill.
+        self.ledger.add(
+            response.usage,
+            cost,
+            self.model.list_cost(&response.usage, self.opts.fast),
+        );
         self.event_tx
             .send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
                 message: response.message.clone(),
                 usage: response.usage,
                 model: self.model.id.clone(),
                 cost,
-                list_cost,
+                list_cost: self
+                    .model
+                    .subsidised_list_cost(&response.usage, self.opts.fast),
                 context_size: Some(self.gauge.size()),
                 context_window: self.model.context_window,
             })))
@@ -632,7 +637,8 @@ impl<'h> Agent<'h> {
         .await?;
         // The summariser can be a different model, so price this with
         // `compact_model` and not `self.model`. `list_cost` gates `fast`
-        // against whichever one it gets.
+        // against whichever one it gets, and is the un-subsidised price the
+        // ledger wants either way.
         let compact_cost = compact_model.billed_cost(&compaction_usage, self.opts.fast);
         let compact_list_cost = compact_model.list_cost(&compaction_usage, self.opts.fast);
         self.ledger
@@ -1284,6 +1290,47 @@ mod tests {
                 })
                 .collect();
             assert_eq!(reported, vec![expected, expected], "{ONE_GAUGE_MSG}");
+        });
+    }
+
+    /// The ledger banks the un-subsidised list price for metered models too,
+    /// so `Done.list_cost` is the whole run rather than whatever subset of
+    /// turns happened to be subsidised. `TurnComplete` stays narrow: it only
+    /// carries the reference figure shown beside a `$0` bill, and a metered
+    /// model has none.
+    #[test]
+    fn ledger_banks_list_cost_on_a_metered_model() {
+        smol::block_on(async {
+            let mut response = text_response(StopReason::EndTurn);
+            response.usage = TokenUsage {
+                input: 1_000,
+                output: 400,
+                cache_read: 250,
+                cache_creation: 50,
+                ..Default::default()
+            };
+            let usage = response.usage;
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (mut agent, event_rx) = make_agent(MockProvider::new(vec![response]), &mut history);
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            let expected = default_model()
+                .list_cost(&usage, false)
+                .expect("the curated table prices this model");
+            assert!(expected > 0.0);
+
+            let events = drain_events(&event_rx);
+            let turn_list_cost = events.iter().find_map(|e| match &e.event {
+                AgentEvent::TurnComplete(tc) => Some(tc.list_cost),
+                _ => None,
+            });
+            let done_list_cost = events.iter().find_map(|e| match &e.event {
+                AgentEvent::Done { list_cost, .. } => Some(*list_cost),
+                _ => None,
+            });
+            assert_eq!(turn_list_cost, Some(None));
+            assert_eq!(done_list_cost, Some(Some(expected)));
         });
     }
 

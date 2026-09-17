@@ -629,7 +629,10 @@ pub enum AgentEvent {
         usage: TokenUsage,
         /// Billed cost for the whole run, `None` while nothing was priced.
         cost: Option<f64>,
-        /// List-price reference cost, for subsidised models.
+        /// What the run would have billed at the provider's published list
+        /// price, un-subsidised. Equals `cost` on an ordinary metered run and
+        /// stands beside a `$0` one, so a budget plugin can charge against
+        /// either. `None` only when no model in the run had a price table.
         list_cost: Option<f64>,
         context_size: u32,
         context_window: u32,
@@ -935,8 +938,10 @@ pub struct TurnCompleteEvent {
     pub cost: Option<f64>,
     /// What the same turn would have cost at the provider's published list
     /// price, `Some` only when the model is subsidised by a flat
-    /// subscription and `cost` is therefore always `$0`. See
-    /// [`maki_providers::Model::subsidised_list_cost`].
+    /// subscription and `cost` is therefore always `$0`. Narrower than the
+    /// ledger's `list_cost`, which banks the list price on every model: this
+    /// one exists to be shown beside a `$0` bill, so a metered turn has
+    /// nothing to add. See [`maki_providers::Model::subsidised_list_cost`].
     #[serde(skip)]
     pub list_cost: Option<f64>,
     /// Tokens the next request would carry. This is the one context number
@@ -953,6 +958,9 @@ pub struct TurnCompleteEvent {
 pub struct RunTotals {
     pub usage: TokenUsage,
     pub cost: Option<f64>,
+    /// Un-subsidised list price, banked for metered and subsidised models
+    /// alike so the total is never a partial sum of whichever turns happened
+    /// to be subsidised.
     pub list_cost: Option<f64>,
 }
 
