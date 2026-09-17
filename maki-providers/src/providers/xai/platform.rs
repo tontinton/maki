@@ -307,6 +307,7 @@ mod tests {
             supports_vision_override: Some(true),
             supports_fast_override: None,
             pricing: ModelPricing::ZERO,
+            subsidised_by: None,
             discovered_free: false,
             max_output_tokens: Some(131_072),
             turn_output_tokens: None,

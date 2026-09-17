@@ -258,7 +258,7 @@ impl OpenAiCompatProvider {
             .as_array()
             .map(|mods| mods.iter().any(|v| v.as_str() == Some("image")));
         let pricing = m["pricing"].as_object().and_then(|p| {
-            Some(crate::model::ModelPricing::per_token(
+            Some(crate::model::ModelPricing::per_million(
                 p.get("prompt")?.as_str()?.parse().ok()?,
                 p.get("completion")?.as_str()?.parse().ok()?,
                 p.get("cache_creation")?

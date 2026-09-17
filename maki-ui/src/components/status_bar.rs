@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::env;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::{RetryInfo, Status};
@@ -37,7 +38,7 @@ pub struct UsageStats {
     pub list_cost: Option<f64>,
     /// Name of the subscription covering the bill (e.g. `"Max"`). `None`
     /// on every non-subsidised model, which keeps the list-price figure hidden.
-    pub subsidy_source: Option<std::sync::Arc<str>>,
+    pub subsidy_source: Option<Arc<str>>,
     pub context_window: u32,
     pub show_global: bool,
 }

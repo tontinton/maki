@@ -43,21 +43,16 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
 /// its `max_tokens` (input plus output) which would let a session grow past
 /// what the upstream accepts.
 pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
+    // Bound to a `const` rather than returned inline: `ModelPricing::per_million`
+    // is a call, and a call blocks const-promotion of the array literal.
+    const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["qwen3.5-122b"],
             tier: ModelTier::Strong,
             family: ModelFamily::Generic,
             vision: true,
             default: true,
-            pricing: ModelPricing {
-                input: 1.00,
-                output: 4.20,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-                subsidised_by: None,
-            },
+            pricing: ModelPricing::per_million(1.00, 4.20, 0.00, 0.00),
             max_output_tokens: Some(120_000),
             context_window: 120_000,
         },
@@ -67,14 +62,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Generic,
             vision: false,
             default: true,
-            pricing: ModelPricing {
-                input: 0.50,
-                output: 2.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-                subsidised_by: None,
-            },
+            pricing: ModelPricing::per_million(0.50, 2.00, 0.00, 0.00),
             max_output_tokens: Some(120_000),
             context_window: 120_000,
         },
@@ -84,21 +72,15 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             family: ModelFamily::Generic,
             vision: false,
             default: true,
-            pricing: ModelPricing {
-                input: 0.07,
-                output: 0.35,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-                subsidised_by: None,
-            },
+            pricing: ModelPricing::per_million(0.07, 0.35, 0.00, 0.00),
             // The group advertises 120k output against an 80k input window;
             // capped so a tier default never promises more output than the
             // window it has to fit in.
             max_output_tokens: Some(80_000),
             context_window: 80_000,
         },
-    ]
+    ];
+    MODELS
 }
 
 #[derive(Deserialize)]
@@ -254,14 +236,12 @@ fn join_model_info(ids: Vec<String>, groups: Vec<ModelGroup>) -> Vec<crate::mode
         .filter_map(|id| {
             let group = by_group.get(id.as_str())?;
             let pricing = match (group.input_cost_per_token, group.output_cost_per_token) {
-                (Some(input), Some(output)) => Some(ModelPricing {
-                    input: input * PER_MILLION,
-                    output: output * PER_MILLION,
-                    cache_write: 0.00,
-                    cache_read: 0.00,
-                    fast: None,
-                    subsidised_by: None,
-                }),
+                (Some(input), Some(output)) => Some(ModelPricing::per_million(
+                    input * PER_MILLION,
+                    output * PER_MILLION,
+                    0.00,
+                    0.00,
+                )),
                 _ => None,
             };
             Some(crate::model::ModelInfo {

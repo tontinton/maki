@@ -132,14 +132,12 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
 
     // Half a price is no price: without both sides it would read as free.
     let pricing = match (entry.price("input_price"), entry.price("output_price")) {
-        (Some(input), Some(output)) => Some(ModelPricing {
+        (Some(input), Some(output)) => Some(ModelPricing::per_million(
             input,
             output,
-            cache_write: entry.price("caching_price").unwrap_or(0.0),
-            cache_read: entry.price("cached_price").unwrap_or(0.0),
-            fast: None,
-            subsidised_by: None,
-        }),
+            entry.price("caching_price").unwrap_or(0.0),
+            entry.price("cached_price").unwrap_or(0.0),
+        )),
         _ => None,
     };
 

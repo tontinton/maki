@@ -377,7 +377,7 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
                 context_window: ov.context_window,
                 max_output_tokens: ov.max_output_tokens,
                 pricing: m["pricing"].as_object().map(|p| {
-                    ModelPricing::per_token(
+                    ModelPricing::per_million(
                         price_per_m(p.get("input")),
                         price_per_m(p.get("output")),
                         0.0,

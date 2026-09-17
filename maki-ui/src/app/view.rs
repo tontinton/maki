@@ -315,7 +315,7 @@ impl App {
                 context_size: chat.context_size,
                 cost: chat.cost,
                 list_cost: chat.list_cost,
-                subsidy_source: self.state.model.subsidy_source().map(std::sync::Arc::from),
+                subsidy_source: self.state.model.subsidised_by.clone(),
                 context_window: self.state.model.context_window,
                 show_global: self.chats.len() > 1,
             },

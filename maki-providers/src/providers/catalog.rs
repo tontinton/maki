@@ -658,13 +658,13 @@ fn parse_model(model: &schema::CatalogModel) -> CatalogMeta {
     CatalogMeta {
         context: published_limit(limit.and_then(|l| l.context)),
         output: published_limit(limit.and_then(|l| l.output)),
-        pricing: model.cost.as_ref().map(|cost| ModelPricing {
-            input: cost.input.unwrap_or(0.0),
-            output: cost.output.unwrap_or(0.0),
-            cache_write: cost.cache_write.unwrap_or(0.0),
-            cache_read: cost.cache_read.unwrap_or(0.0),
-            fast: None,
-            subsidised_by: None,
+        pricing: model.cost.as_ref().map(|cost| {
+            ModelPricing::per_million(
+                cost.input.unwrap_or(0.0),
+                cost.output.unwrap_or(0.0),
+                cost.cache_write.unwrap_or(0.0),
+                cost.cache_read.unwrap_or(0.0),
+            )
         }),
         supports_thinking: model.reasoning,
         supports_vision,
@@ -1148,6 +1148,7 @@ mod tests {
             supports_vision_override: None,
             supports_fast_override: None,
             pricing: ModelPricing::default(),
+            subsidised_by: None,
             discovered_free: false,
             max_output_tokens: None,
             turn_output_tokens: None,

@@ -53,14 +53,6 @@ pub struct ModelPricing {
     /// back to standard rates instead of overcharging.
     #[serde(default)]
     pub fast: Option<FastPricing>,
-    /// Set when the model's per-token cost is prepaid via a flat subscription
-    /// (e.g. Claude Max through cliproxy), so the billed cost is always `$0`
-    /// even though the rates above still reflect the provider's published
-    /// list price. Holds the subscription's display name (e.g. `"Max"`),
-    /// shown next to the list-price reference. `Arc<str>` because it is
-    /// cloned into every turn's cost event.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subsidised_by: Option<std::sync::Arc<str>>,
 }
 
 /// Metadata discovered at runtime from a provider's `/models` endpoint.
@@ -97,24 +89,23 @@ pub struct FastPricing {
 }
 
 impl ModelPricing {
-    /// Per-token rates with no fast tier and no subsidy -- the shape of
+    /// Rates in USD per 1M tokens, with no fast tier and no subsidy -- the shape of
     /// every static catalog entry. `const` so provider catalogs can call it;
     /// it also spares each entry from spelling out fields it never sets.
-    pub const fn per_token(input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
+    pub const fn per_million(input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
         Self {
             input,
             output,
             cache_write,
             cache_read,
             fast: None,
-            subsidised_by: None,
         }
     }
 
-    /// Like [`per_token`](Self::per_token), with a fast-tier price. A flat
+    /// Like [`per_million`](Self::per_million), with a fast-tier price. A flat
     /// constructor rather than a `with_fast(self)` builder: consuming `self`
     /// in a `const fn` trips E0493 because `ModelPricing` carries drop glue.
-    pub const fn per_token_with_fast(
+    pub const fn per_million_with_fast(
         input: f64,
         output: f64,
         cache_write: f64,
@@ -131,7 +122,6 @@ impl ModelPricing {
                 input: fast_input,
                 output: fast_output,
             }),
-            subsidised_by: None,
         }
     }
 
@@ -141,7 +131,6 @@ impl ModelPricing {
         cache_write: 0.0,
         cache_read: 0.0,
         fast: None,
-        subsidised_by: None,
     };
 
     pub fn is_zero(&self) -> bool {
@@ -463,6 +452,15 @@ pub struct Model {
     pub supports_vision_override: Option<bool>,
     pub supports_fast_override: Option<FastSupport>,
     pub pricing: ModelPricing,
+    /// Set when this route to the model is prepaid via a flat subscription
+    /// (e.g. Claude Max through cliproxy), so the billed cost is always `$0`
+    /// even though [`Self::pricing`] still reflects the provider's published
+    /// list price. Holds the subscription's display name (e.g. `"Max"`),
+    /// shown next to the list-price reference. It lives on the model rather
+    /// than the rate table because it describes the route to the provider,
+    /// not a per-token rate. `Arc<str>` so the status bar can clone the name
+    /// into its per-frame stats without allocating a fresh string.
+    pub subsidised_by: Option<Arc<str>>,
     /// Discovery reported an explicit all-zero price. Distinct from a zero
     /// `pricing`, which also covers "no price is known".
     pub discovered_free: bool,
@@ -523,6 +521,7 @@ impl Model {
             supports_vision_override: None,
             supports_fast_override: None,
             pricing,
+            subsidised_by: None,
             discovered_free: discovered_pricing.is_some_and(ModelPricing::is_zero),
             max_output_tokens,
             turn_output_tokens: None,
@@ -548,6 +547,7 @@ impl Model {
             supports_vision_override: meta.supports_vision,
             supports_fast_override: None,
             pricing: meta.pricing.unwrap_or_default(),
+            subsidised_by: None,
             discovered_free: false,
             max_output_tokens: Some(max_output_tokens),
             turn_output_tokens: None,
@@ -712,7 +712,7 @@ impl Model {
     /// of zero, which is all a free model ever sends, and free has always shown
     /// no cost rather than "$0.000".
     pub fn billed_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
-        if self.pricing.subsidised_by.is_some() {
+        if self.subsidised_by.is_some() {
             // Prepaid via a flat subscription: the turn ran, but nothing was
             // billed per-token. Still require a real price table so an
             // unpriced model does not report a false "$0.000".
@@ -745,8 +745,7 @@ impl Model {
     /// actually billed. `None` for every model that is not subsidised, so
     /// callers do not show a redundant list-price figure next to a real bill.
     pub fn subsidised_list_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
-        self.pricing
-            .subsidised_by
+        self.subsidised_by
             .is_some()
             .then(|| self.list_cost(usage, fast))
             .flatten()
@@ -755,7 +754,7 @@ impl Model {
     /// Name of the subscription covering this model's cost (e.g. `"Max"`),
     /// or `None` when the model is billed per-token as usual.
     pub fn subsidy_source(&self) -> Option<&str> {
-        self.pricing.subsidised_by.as_deref()
+        self.subsidised_by.as_deref()
     }
 
     pub fn provider_display_name(&self) -> &'static str {
@@ -870,13 +869,40 @@ impl Model {
     /// Free public models surfaced through the OpenCode provider (Zen/Go),
     /// using the catalog's definition of free (zero input and output price),
     /// the same one that gates `enable_free_models`, plus models a provider's
-    /// `/models` call reported at an explicit zero price.
+    /// `/models` call reported at an explicit zero price, plus a curated row
+    /// that quotes zero for this exact id.
     ///
     /// Queries the live catalog rather than `self.pricing`, which may not yet
     /// reflect catalog prices when discovery hasn't seeded the registry, and
     /// which reads zero for "price unknown" too.
     pub fn is_free(&self) -> bool {
-        self.discovered_free || catalog::free_model_if_available(&self.provider, &self.id)
+        self.discovered_free
+            || catalog::free_model_if_available(&self.provider, &self.id)
+            || self.curated_free()
+    }
+
+    /// A curated row that names this id was checked against the provider's own
+    /// pricing page, so its zero is a real `$0` (zai's free glm rows) and not
+    /// an empty table. A row reached by prefix prices a relative and says
+    /// nothing about this id.
+    fn curated_free(&self) -> bool {
+        let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
+            return false;
+        };
+        let sources = ModelSources::resolve(manifest, &self.id);
+        sources.exact && sources.entry.is_some_and(|entry| entry.pricing.is_zero())
+    }
+
+    /// Free, metered, or unknown. Three states rather than [`Self::is_free`]'s
+    /// two, because a zero [`Self::pricing`] covers both "$0" and "nobody ever
+    /// quoted a rate": a caller that has to render the difference (the Lua
+    /// model table) would otherwise publish "not free" for a model it knows
+    /// nothing about.
+    pub fn free(&self) -> Option<bool> {
+        if self.is_free() {
+            return Some(true);
+        }
+        (!self.pricing.is_zero()).then_some(false)
     }
 }
 
@@ -1061,7 +1087,7 @@ mod tests {
     const FREE_MEANS_A_KNOWN_ZERO: &str = "only a price discovery reported as zero means free";
     const TABLE_MUST_NOT_AGREE_BY_LUCK: &str =
         "the table has to disagree, or preferring the bill proves nothing";
-    const PAID_PRICING: ModelPricing = ModelPricing::per_token(3.0, 15.0, 0.0, 0.0);
+    const PAID_PRICING: ModelPricing = ModelPricing::per_million(3.0, 15.0, 0.0, 0.0);
 
     #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5"; "the id itself")]
     #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5-20250929"; "anthropic snapshot")]
@@ -1233,7 +1259,7 @@ mod tests {
 
     #[test]
     fn estimate_computes_all_token_types() {
-        let pricing = ModelPricing::per_token(3.00, 15.00, 3.75, 0.30);
+        let pricing = ModelPricing::per_million(3.00, 15.00, 3.75, 0.30);
         let usage = TokenUsage {
             input: 1_000_000,
             output: 100_000,
@@ -1283,7 +1309,7 @@ mod tests {
 
     #[test]
     fn fast_mode_applies_premium_rates() {
-        let pricing = ModelPricing::per_token_with_fast(5.00, 25.00, 6.25, 0.50, 30.00, 150.00);
+        let pricing = ModelPricing::per_million_with_fast(5.00, 25.00, 6.25, 0.50, 30.00, 150.00);
         let usage = TokenUsage {
             input: 1_000_000,
             output: 1_000_000,
@@ -1299,7 +1325,7 @@ mod tests {
 
     #[test]
     fn fast_flag_ignored_without_fast_tier() {
-        let pricing = ModelPricing::per_token(3.00, 15.00, 3.75, 0.30);
+        let pricing = ModelPricing::per_million(3.00, 15.00, 3.75, 0.30);
         let usage = TokenUsage {
             input: 1_000_000,
             output: 1_000_000,
@@ -1654,6 +1680,15 @@ mod tests {
         assert_eq!(model.is_free(), expected, "{FREE_MEANS_A_KNOWN_ZERO}");
     }
 
+    /// The tri-state is the public one: a plugin has to be able to tell a `$0`
+    /// model from one nothing ever priced, which the boolean collapses.
+    #[test_case("zai/glm-4.7-flash",                   Some(true)  ; "curated_zero_is_free")]
+    #[test_case(DEEPSEEK_SPEC,                         Some(false) ; "priced_is_not_free")]
+    #[test_case(UNPRICED_DEEPSEEK_SPEC,                None        ; "no_price_table_is_unknown")]
+    fn free_separates_zero_from_unknown(spec: &str, expected: Option<bool>) {
+        assert_eq!(Model::from_spec(spec).unwrap().free(), expected);
+    }
+
     /// A schedule hung on the wrong manifest silently doubles every turn of a
     /// provider that bills flat.
     #[test]
@@ -1751,6 +1786,7 @@ mod tests {
             supports_vision_override: None,
             supports_fast_override: None,
             pricing: ModelPricing::default(),
+            subsidised_by: None,
             discovered_free: false,
             max_output_tokens,
             turn_output_tokens: None,
@@ -1795,10 +1831,8 @@ mod tests {
     #[test]
     fn subsidised_pricing_bills_zero_and_keeps_the_list_price() {
         let mut model = Model::from_spec(UNPRICED_DEEPSEEK_SPEC).unwrap();
-        model.pricing = ModelPricing {
-            subsidised_by: Some(Arc::from("Max")),
-            ..PAID_PRICING
-        };
+        model.pricing = PAID_PRICING;
+        model.subsidised_by = Some(Arc::from("Max"));
         let list = model.list_cost(&INPUT_ONLY, false).unwrap();
         assert!(list > 0.0);
         assert_eq!(model.billed_cost(&INPUT_ONLY, false), Some(0.0));
@@ -1812,7 +1846,7 @@ mod tests {
     fn subsidised_but_unpriced_model_stays_unpriced() {
         let mut model = Model::from_spec(UNPRICED_DEEPSEEK_SPEC).unwrap();
         assert!(model.pricing.is_zero());
-        model.pricing.subsidised_by = Some(Arc::from("Max"));
+        model.subsidised_by = Some(Arc::from("Max"));
         assert_eq!(model.billed_cost(&INPUT_ONLY, false), None);
         assert_eq!(model.subsidised_list_cost(&INPUT_ONLY, false), None);
     }

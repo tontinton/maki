@@ -1727,6 +1727,7 @@ mod tests {
             supports_vision_override: Some(provider.family().supports_vision()),
             supports_fast_override: None,
             pricing: crate::model::ModelPricing::default(),
+            subsidised_by: None,
             discovered_free: false,
             max_output_tokens: Some(8192),
             turn_output_tokens: None,

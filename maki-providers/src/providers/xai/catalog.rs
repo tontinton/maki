@@ -57,7 +57,7 @@ impl From<CachedModel> for ModelInfo {
             id: model.id,
             context_window: Some(model.context_window),
             max_output_tokens: Some(model.max_tokens),
-            pricing: Some(ModelPricing::per_token(
+            pricing: Some(ModelPricing::per_million(
                 model.pricing.input,
                 model.pricing.output,
                 model.pricing.cache_write,

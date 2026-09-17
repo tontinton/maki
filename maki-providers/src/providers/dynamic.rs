@@ -104,6 +104,7 @@ impl ScriptModel {
             supports_vision_override: self.supports_vision,
             supports_fast_override: None,
             pricing: self.pricing.clone().unwrap_or_default(),
+            subsidised_by: None,
             discovered_free: false,
             max_output_tokens: Some(self.max_output_tokens),
             turn_output_tokens: None,

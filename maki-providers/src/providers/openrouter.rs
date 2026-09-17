@@ -129,7 +129,7 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
     let per_token =
         |p: &Value| -> Option<f64> { Some(p.as_str()?.parse::<f64>().ok()? * PER_MILLION) };
     let pricing = m["pricing"].as_object().and_then(|p| {
-        Some(ModelPricing::per_token(
+        Some(ModelPricing::per_million(
             per_token(p.get("prompt")?)?,
             per_token(p.get("completion")?)?,
             p.get("input_cache_write")
@@ -333,6 +333,7 @@ mod tests {
             supports_vision_override: None,
             supports_fast_override: None,
             pricing: ModelPricing::default(),
+            subsidised_by: None,
             discovered_free: false,
             max_output_tokens: Some(8192),
             turn_output_tokens: None,
