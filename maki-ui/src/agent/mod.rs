@@ -1,4 +1,5 @@
 mod agent_loop;
+mod model_slots;
 mod run_cancels;
 pub(crate) mod shared_queue;
 
@@ -24,6 +25,7 @@ use tracing::{info, warn};
 use crate::app::App;
 
 use self::agent_loop::AgentLoop;
+pub(crate) use self::model_slots::ModelSlots;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
 
 pub(crate) struct ModelSlot {
@@ -296,11 +298,14 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
-    use maki_agent::AgentEvent;
+    use maki_agent::{AgentEvent, AgentInput, AgentMode};
     use maki_config::{PermissionsConfig, ProjectConfig};
     use maki_providers::provider::BoxFuture;
-    use maki_providers::{AgentError, ModelInfo, ProviderEvent, RequestOptions, StreamResponse};
+    use maki_providers::{
+        AgentError, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
+    };
 
+    use super::shared_queue::{QueueItem, QueuedInput};
     use super::*;
 
     const LONG_TIMEOUT: Duration = Duration::from_secs(60);
@@ -308,6 +313,15 @@ mod tests {
     const PROBE_TEXT: &str = "probe-through-old-sender";
     const RESTORED_TEXT: &str = "restored-queued-message";
     const RESUMED_HISTORY_TEXT: &str = "resumed-conversation";
+    const MODEL_A: &str = "model-a";
+    const MODEL_B: &str = "model-b";
+    const FIRST_PROMPT: &str = "first-turn";
+    const SECOND_PROMPT: &str = "second-turn";
+    const RECORDER_TOOL: &str = "recording-provider";
+    const TURN_OVER: &str = "model recorded, nothing left to stream";
+    const NO_CALL: &str = "the agent never reached the provider";
+    const NO_TURN_END: &str = "the run never reported that it was over";
+    const GATE_CLOSED: &str = "the in-flight call is no longer waiting to be released";
 
     struct StubProvider;
 
@@ -349,6 +363,14 @@ mod tests {
             model: crate::components::test_model(),
             provider: Arc::new(StubProvider),
         }));
+        let (handles, permissions) = spawn_on(&model_slot, initial_history);
+        (handles, model_slot, permissions)
+    }
+
+    fn spawn_on(
+        model_slot: &Arc<ArcSwap<ModelSlot>>,
+        initial_history: Vec<Message>,
+    ) -> (AgentHandles, Arc<PermissionManager>) {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
@@ -356,7 +378,7 @@ mod tests {
             Arc::default(),
         ));
         let handles = AgentHandles::spawn(
-            &model_slot,
+            model_slot,
             initial_history,
             0,
             AgentConfig::default(),
@@ -369,7 +391,7 @@ mod tests {
             McpConfigErrors::new(PathBuf::new()),
             Arc::new(ModelPolicy::default()),
         );
-        (handles, model_slot, permissions)
+        (handles, permissions)
     }
 
     fn respawn(
@@ -386,6 +408,188 @@ mod tests {
             permissions,
             app,
             EventHandle::disconnected_for_test(),
+        );
+    }
+
+    /// Reports which model the agent handed it, then ends the turn with a
+    /// non-retryable error so no stream has to be faked. `gate` parks a call in
+    /// flight until the test lets it go, one permit per call.
+    struct RecordingProvider {
+        calls: flume::Sender<String>,
+        gate: Option<flume::Receiver<()>>,
+    }
+
+    impl Provider for RecordingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a serde_json::Value,
+            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            let id = model.id.clone();
+            Box::pin(async move {
+                let _ = self.calls.send(id);
+                if let Some(ref gate) = self.gate {
+                    gate.recv_async().await.expect(GATE_CLOSED);
+                }
+                Err(AgentError::Tool {
+                    tool: RECORDER_TOOL.into(),
+                    message: TURN_OVER.into(),
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn recorder() -> (Arc<dyn Provider>, flume::Receiver<String>) {
+        let (calls, reported) = flume::unbounded();
+        (Arc::new(RecordingProvider { calls, gate: None }), reported)
+    }
+
+    fn gated_recorder() -> (
+        Arc<dyn Provider>,
+        flume::Receiver<String>,
+        flume::Sender<()>,
+    ) {
+        let (calls, reported) = flume::unbounded();
+        let (release, gate) = flume::unbounded();
+        (
+            Arc::new(RecordingProvider {
+                calls,
+                gate: Some(gate),
+            }),
+            reported,
+            release,
+        )
+    }
+
+    fn slot(model_id: &str, provider: &Arc<dyn Provider>) -> Arc<ModelSlot> {
+        Arc::new(ModelSlot {
+            model: Model {
+                id: model_id.into(),
+                ..crate::components::test_model()
+            },
+            provider: Arc::clone(provider),
+        })
+    }
+
+    fn push_prompt(handles: &AgentHandles, run_id: u64, text: &str) {
+        handles.queue.push(QueueItem::Message(QueuedInput {
+            text: text.into(),
+            input: AgentInput {
+                message: text.into(),
+                mode: AgentMode::default(),
+                images: Vec::new(),
+                preamble: Vec::new(),
+                thinking: ThinkingConfig::default(),
+                fast: false,
+                workflow: false,
+                prompt: None,
+            },
+            run_id,
+            displayed: true,
+        }));
+    }
+
+    /// The failed turn's `Error` is what says the run is over. Queue the next
+    /// prompt before it and the running turn swallows it as an interrupt, so
+    /// the second request never happens.
+    fn await_turn_end(handles: &AgentHandles) {
+        loop {
+            let envelope = handles
+                .agent_rx
+                .recv_timeout(LONG_TIMEOUT)
+                .expect(NO_TURN_END);
+            if matches!(envelope.event, AgentEvent::Error { .. }) {
+                return;
+            }
+        }
+    }
+
+    fn drive_turn(
+        handles: &AgentHandles,
+        reported: &flume::Receiver<String>,
+        run_id: u64,
+        text: &str,
+    ) -> String {
+        push_prompt(handles, run_id, text);
+        let model_id = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
+        await_turn_end(handles);
+        model_id
+    }
+
+    /// The regression the per-runtime cell fixed. With one process-wide slot,
+    /// picking a model in one tab dragged every other tab onto it.
+    #[test]
+    fn a_model_swap_in_one_tab_leaves_the_other_tab_alone() {
+        let (provider_one, reported_one) = recorder();
+        let (provider_two, reported_two) = recorder();
+        let cell_one = Arc::new(ArcSwap::new(slot(MODEL_A, &provider_one)));
+        let cell_two = Arc::new(ArcSwap::new(slot(MODEL_A, &provider_two)));
+        let (handles_one, _permissions_one) = spawn_on(&cell_one, Vec::new());
+        let (handles_two, _permissions_two) = spawn_on(&cell_two, Vec::new());
+
+        cell_one.store(slot(MODEL_B, &provider_one));
+
+        assert_eq!(
+            drive_turn(&handles_one, &reported_one, 1, FIRST_PROMPT),
+            MODEL_B
+        );
+        assert_eq!(
+            drive_turn(&handles_two, &reported_two, 1, SECOND_PROMPT),
+            MODEL_A,
+            "a swap on one runtime's cell must not move another runtime's model"
+        );
+    }
+
+    /// `respawn` hands the new loop the cell, not the model inside it. Captured
+    /// by value, a `/model` pick after a `/new` or a session load would be
+    /// ignored until something respawned the agent again.
+    #[test]
+    fn a_swap_after_respawn_still_reaches_the_new_agent() {
+        let (provider, reported) = recorder();
+        let cell = Arc::new(ArcSwap::new(slot(MODEL_A, &provider)));
+        let (mut handles, permissions) = spawn_on(&cell, Vec::new());
+        let mut app = crate::app::tests::test_app();
+        respawn(&mut handles, &cell, &permissions, &mut app);
+
+        cell.store(slot(MODEL_B, &provider));
+        assert_eq!(
+            drive_turn(&handles, &reported, app.run_id, FIRST_PROMPT),
+            MODEL_B
+        );
+    }
+
+    /// The loop reads its cell at the start of every run rather than keeping
+    /// the model it spawned with, so a pick made mid-flight leaves the running
+    /// turn alone and still shows up on the next one.
+    #[test]
+    fn a_swap_during_a_turn_only_applies_to_the_following_turn() {
+        let (provider, reported, release) = gated_recorder();
+        let cell = Arc::new(ArcSwap::new(slot(MODEL_A, &provider)));
+        let (handles, _permissions) = spawn_on(&cell, Vec::new());
+
+        push_prompt(&handles, 1, FIRST_PROMPT);
+        let in_flight = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
+        cell.store(slot(MODEL_B, &provider));
+        release.send(()).expect(GATE_CLOSED);
+        await_turn_end(&handles);
+        assert_eq!(in_flight, MODEL_A);
+
+        push_prompt(&handles, 2, SECOND_PROMPT);
+        let next = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
+        release.send(()).expect(GATE_CLOSED);
+        await_turn_end(&handles);
+        assert_eq!(
+            next, MODEL_B,
+            "a swap stored mid-flight must still land on the next turn"
         );
     }
 

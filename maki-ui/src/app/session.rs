@@ -4,10 +4,10 @@ use std::time::{Duration, Instant};
 
 use crate::app::tasks::TaskOutcome;
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
+use crate::components::Action;
 use crate::components::rewind_picker::RewindEntry;
-use crate::components::{Action, LoadedSession};
 use maki_lua::SessionEndReason;
-use maki_providers::{Model, RequestOptions, TokenUsage, estimate_message_tokens};
+use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionMeta, StoredSubagent};
 
@@ -290,12 +290,9 @@ impl App {
     /// agent did not give it (rewind, load, new session), the mirror handle
     /// goes away in the same breath, so no later checkpoint can bring the
     /// agent's stale copy back. Only `respawn_agent` hands a live mirror in.
-    fn install_local_history(&mut self) -> LoadedSession {
+    fn install_local_history(&mut self) -> Vec<Message> {
         self.shared_history = None;
-        LoadedSession {
-            messages: self.state.session.messages().to_vec(),
-            model_spec: self.state.session.model.clone(),
-        }
+        self.state.session.messages().to_vec()
     }
 
     /// `/new` swaps a fresh session under this tab, `Ctrl-N` spawns a new tab
@@ -345,8 +342,7 @@ impl App {
             maki_otel::emit::START_FRESH,
             Some(&self.state.session.id.to_string()),
         );
-        self.install_local_history();
-        vec![Action::NewSession]
+        vec![Action::RestartAgent(self.install_local_history())]
     }
 
     pub(super) fn open_rewind_picker(&mut self) -> Vec<Action> {
@@ -382,19 +378,20 @@ impl App {
         self.input_box.set_input(entry.prompt_text);
         self.input_box.buffer.move_to_end();
 
-        vec![Action::LoadSession(Box::new(self.install_local_history()))]
+        vec![Action::RestartAgent(self.install_local_history())]
     }
 
+    /// The event loop owns the policy and the providers, so it resolves the
+    /// model and this only adopts it.
     pub(crate) fn apply_loaded_session(
         &mut self,
         session: AppSession,
-        fallback_model: &Model,
-    ) -> LoadedSession {
+        model: &Model,
+    ) -> Vec<Message> {
         let previous = self.state.session.id;
         self.checkpoint_now();
         self.apply_stored_permissions(&session.meta);
-        self.state =
-            SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
+        self.state = SessionState::from_session(session, model, &self.storage);
         if previous != self.state.session.id {
             self.lua_event_handle
                 .end_session(previous, SessionEndReason::Load);
@@ -406,19 +403,6 @@ impl App {
         self.restore_display();
 
         self.install_local_history()
-    }
-
-    pub(crate) fn load_session(&mut self, session_id: MakiId) -> Vec<Action> {
-        let session = match AppSession::load(session_id, &self.storage) {
-            Ok(s) => s,
-            Err(e) => {
-                self.status_bar
-                    .flash(format!("Failed to load session: {e}"));
-                return vec![];
-            }
-        };
-        let loaded = self.apply_loaded_session(session, &self.state.model.clone());
-        vec![Action::LoadSession(Box::new(loaded))]
     }
 }
 
@@ -454,7 +438,7 @@ mod tests {
 
         let mut model = app.state.model.clone();
         model.supports_fast_override = Some(FastSupport::Supported);
-        app.update_model(&model);
+        app.state.update_model(&model);
         assert_eq!(app.state.fast, !cancel);
         assert!(!app.state.pending_fast);
         assert_eq!(app.build_meta().fast, !cancel);

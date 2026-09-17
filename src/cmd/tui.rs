@@ -209,22 +209,44 @@ fn resolve_session(
     continue_session: bool,
     session_id: Option<&str>,
     model: &str,
+    explicit_model: bool,
     cwd: &str,
     storage: &StateDir,
 ) -> Result<AppSession> {
+    if let Some(mut session) = stored_session(continue_session, session_id, cwd, storage)? {
+        // An explicit `--model` is a choice about the session being opened,
+        // and a session's own spec is what every later switch reads.
+        if explicit_model {
+            session.set_model(model.to_owned());
+        }
+        return Ok(session);
+    }
+    let session = AppSession::new(model, cwd);
+    setup::report_session_start(maki_otel::emit::START_FRESH, Some(session.id));
+    Ok(session)
+}
+
+/// The session the flags point at, if there is one. A missing `--continue`
+/// history is not an error, the caller just starts fresh.
+fn stored_session(
+    continue_session: bool,
+    session_id: Option<&str>,
+    cwd: &str,
+    storage: &StateDir,
+) -> Result<Option<AppSession>> {
     if let Some(raw) = session_id {
         let id: MakiId = raw
             .parse()
             .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
         let session = AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         setup::report_session_start(maki_otel::emit::START_RESUME, Some(session.id));
-        return Ok(session);
+        return Ok(Some(session));
     }
     if continue_session {
         match AppSession::latest(cwd, storage) {
             Ok(Some(session)) => {
                 setup::report_session_start(maki_otel::emit::START_CONTINUE, Some(session.id));
-                return Ok(session);
+                return Ok(Some(session));
             }
             Ok(None) => {
                 tracing::info!("no previous session found for this directory, starting new");
@@ -234,9 +256,7 @@ fn resolve_session(
             }
         }
     }
-    let session = AppSession::new(model, cwd);
-    setup::report_session_start(maki_otel::emit::START_FRESH, Some(session.id));
-    Ok(session)
+    Ok(None)
 }
 
 fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
@@ -442,6 +462,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         cli.continue_session,
         cli.session.as_deref(),
         &stack.model.spec(),
+        cli.model.is_some(),
         &cwd_str,
         &storage,
     )?];
@@ -461,22 +482,14 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 stack.config.session_defaults.seed(&mut session.meta);
             }
         }
-        let focused_tab = &tabs[focused];
-        let model = if focused_tab.messages().is_empty()
-            || !stack
-                .config
-                .provider
-                .model_policy
-                .allows(&focused_tab.model)
-        {
-            stack.model.clone()
-        } else {
-            Model::from_spec(&focused_tab.model).unwrap_or_else(|_| stack.model.clone())
-        };
 
         let outcome = maki_ui::run(
             maki_ui::EventLoopParams {
-                model,
+                // The startup default only (`--model`, then last-used, then
+                // config). It seeds `ModelSlots` and catches a session whose
+                // model will not resolve. Otherwise each tab runs on its own
+                // recorded spec.
+                model: stack.model.clone(),
                 needs_login: stack.needs_login,
                 commands: std::mem::take(&mut stack.commands),
                 sessions: std::mem::take(&mut tabs),
@@ -595,10 +608,21 @@ mod tests {
     use super::*;
     use color_eyre::eyre::eyre;
     use maki_config::RawConfig;
+    use maki_providers::Message;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tempfile::{TempDir, tempdir};
     use test_case::test_case;
+
+    const STARTUP_SPEC: &str = "anthropic/claude-sonnet-4-5";
+    const STORED_SPEC: &str = "zai/glm-4.6";
+    const DECOY_SPEC: &str = "openai/gpt-5";
+    const STORED_MESSAGE: &str = "the turn the stored session already had";
+    const DECOY_MESSAGE: &str = "an older session in the same directory";
+    const MALFORMED_SESSION_ID: &str = "not-a-session-id";
+    const INVALID_ID_ERROR: &str = "invalid session id";
+    const NOT_FOUND_ERROR: &str = "not found";
 
     fn no_names(_: &PluginHost) -> Result<Vec<String>> {
         Ok(Vec::new())
@@ -765,5 +789,109 @@ mod tests {
         }
 
         plugin_host.begin_shutdown();
+    }
+
+    fn save_session(storage: &StateDir, cwd: &str, spec: &str, text: &str) -> MakiId {
+        let mut session = AppSession::new(spec, cwd);
+        session.push_message(Message::user(text.to_owned()));
+        session.save(storage).expect("write session to disk");
+        session.id
+    }
+
+    /// Two sessions in one cwd, so `--continue` has to actually pick instead of
+    /// taking the only one there is. Saving claims the cwd index `latest` reads
+    /// first, so saving the target last pins the order rather than leaning on a
+    /// one second `updated_at`.
+    fn storage_with_stored_session() -> (TempDir, StateDir, String, MakiId) {
+        let dir = tempdir().expect("tempdir");
+        let storage = StateDir::from_path(dir.path().join("state"));
+        let cwd = dir.path().to_string_lossy().into_owned();
+        save_session(&storage, &cwd, DECOY_SPEC, DECOY_MESSAGE);
+        let id = save_session(&storage, &cwd, STORED_SPEC, STORED_MESSAGE);
+        (dir, storage, cwd, id)
+    }
+
+    /// A session's recorded spec is the single source of truth for the model
+    /// its tab runs on, so both directions matter. An explicit `--model` used
+    /// to be quietly ignored on `--continue` and `--session`, the resumed spec
+    /// won. Without one the startup default must not overwrite that recorded
+    /// spec, or per tab models die on every restart.
+    #[test_case(false, true, false, STORED_SPEC ; "resume keeps its own spec")]
+    #[test_case(false, true, true, STARTUP_SPEC ; "explicit model wins over a resumed spec")]
+    #[test_case(true, false, false, STORED_SPEC ; "continue keeps the latest session's own spec")]
+    #[test_case(true, false, true, STARTUP_SPEC ; "explicit model wins over the latest session's spec")]
+    fn stored_session_opens_on_the_expected_spec(
+        continue_session: bool,
+        by_id: bool,
+        explicit_model: bool,
+        expected_spec: &str,
+    ) {
+        let (_dir, storage, cwd, stored_id) = storage_with_stored_session();
+        let raw_id = stored_id.to_string();
+
+        let session = resolve_session(
+            continue_session,
+            by_id.then_some(raw_id.as_str()),
+            STARTUP_SPEC,
+            explicit_model,
+            &cwd,
+            &storage,
+        )
+        .expect("stored session resolves");
+
+        assert_eq!(session.id, stored_id);
+        assert_eq!(
+            session
+                .messages()
+                .iter()
+                .filter_map(|m| m.user_text())
+                .collect::<Vec<_>>(),
+            vec![STORED_MESSAGE]
+        );
+        assert_eq!(session.model, expected_spec);
+    }
+
+    /// Without `--continue` or `--session` the stored history does not matter.
+    /// A new tab starts on the startup spec, which already folded in `--model`,
+    /// so the flag changes nothing here.
+    #[test_case(false ; "no model flag")]
+    #[test_case(true ; "explicit model flag")]
+    fn fresh_session_starts_on_the_startup_spec(explicit_model: bool) {
+        let (_dir, storage, cwd, stored_id) = storage_with_stored_session();
+
+        let session = resolve_session(false, None, STARTUP_SPEC, explicit_model, &cwd, &storage)
+            .expect("fresh session resolves");
+
+        assert_ne!(session.id, stored_id);
+        assert!(session.messages().is_empty());
+        assert_eq!(session.model, STARTUP_SPEC);
+    }
+
+    /// `--continue` in a directory nobody has worked in yet is a fresh start,
+    /// not a reason to refuse to launch.
+    #[test]
+    fn continue_without_history_falls_back_to_a_fresh_session() {
+        let dir = tempdir().expect("tempdir");
+        let storage = StateDir::from_path(dir.path().join("state"));
+        let cwd = dir.path().to_string_lossy().into_owned();
+
+        let session = resolve_session(true, None, STARTUP_SPEC, false, &cwd, &storage)
+            .expect("missing history must not be an error");
+
+        assert!(session.messages().is_empty());
+        assert_eq!(session.model, STARTUP_SPEC);
+    }
+
+    /// A `--session` that cannot be opened has to fail loudly. Starting fresh
+    /// on the same terminal looks exactly like the history was lost.
+    #[test_case(MALFORMED_SESSION_ID.to_owned(), INVALID_ID_ERROR ; "a malformed id")]
+    #[test_case(MakiId::generate().to_string(), NOT_FOUND_ERROR ; "an id nothing was written for")]
+    fn unopenable_session_id_errors(raw_id: String, expected: &str) {
+        let (_dir, storage, cwd, _) = storage_with_stored_session();
+
+        match resolve_session(false, Some(&raw_id), STARTUP_SPEC, false, &cwd, &storage) {
+            Err(e) => assert!(e.to_string().contains(expected), "{e}"),
+            Ok(s) => panic!("expected an error, got session {}", s.id),
+        }
     }
 }

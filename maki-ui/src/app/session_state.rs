@@ -1,9 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use maki_config::{Effect, ModelPolicy};
-use maki_providers::provider::adjust_model;
-use maki_providers::{Model, RequestOptions, ThinkingConfig, Timeouts, TokenUsage, settle_session};
+use maki_config::Effect;
+use maki_providers::{Model, RequestOptions, ThinkingConfig, TokenUsage, settle_session};
 use maki_storage::StateDir;
 use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule};
 
@@ -45,28 +44,13 @@ fn clamp(thinking: ThinkingConfig, fast: bool, model: &Model) -> (ThinkingConfig
 }
 
 impl SessionState {
-    pub fn from_session(
-        mut session: AppSession,
-        fallback_model: &Model,
-        storage: &StateDir,
-        model_policy: &ModelPolicy,
-    ) -> Self {
-        let mut model = model_policy
-            .allows(&session.model)
-            .then(|| Model::from_spec(&session.model))
-            .transpose()
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| {
-                session.model = fallback_model.spec();
-                fallback_model.clone()
-            });
-        // Apply the provider's per-model adjustments (e.g. ZAI's glm-5.2
-        // thinking support, or Aperture's routed-provider inheritance) so a
-        // resumed session matches one started fresh.
-        if let Err(e) = adjust_model(&mut model, Timeouts::default()) {
-            tracing::warn!(model = %model.id, error = %e, "failed to adjust resumed model");
-        }
+    /// The caller already resolved this model against the policy and the
+    /// provider. Deciding again here is exactly how the app and the agent used
+    /// to drift apart, so this adopts what it is handed and stays the only
+    /// writer of `session.model`. Drawn, sent and stored then agree for free.
+    pub fn from_session(mut session: AppSession, model: &Model, storage: &StateDir) -> Self {
+        session.set_model(model.spec());
+        let model = model.clone();
 
         let mode = match session.meta.mode {
             Some(StoredMode::Plan) => Mode::Plan,
@@ -226,7 +210,7 @@ mod tests {
     use crate::components::{test_model, test_pricing};
     use maki_providers::model::FastSupport;
     use maki_providers::{FastPricing, ModelPricing, ThinkingSupport};
-    use maki_storage::sessions::StoredThinking;
+    use maki_storage::sessions::{Effort, SessionError, SessionLog, StoredThinking};
     use test_case::test_case;
 
     const RECORDED_COST: f64 = 0.42;
@@ -246,11 +230,17 @@ mod tests {
     const FAST_FLAG_LOST: &str = "the model has fast pricing, so the flag must survive as stored";
     const THINKING_NOT_LIFTED: &str =
         "a model that requires thinking must not show, or send, thinking off";
+    const USAGE_REATTRIBUTED: &str =
+        "usage earned under another model must stay keyed to it, not move onto the adopted one";
+    const CURSOR_VOIDED_FOR_NOTHING: &str =
+        "adopting the model the session already runs on changes no header, so the cursor must live";
+    const OLD_SPEC_STAYS_ON_DISK: &str = "the model lives in the header record, which only a rewrite touches, so adopting a new one must void the append cursor";
+    const APPEND_FAILED: &str = "append failed for an unrelated reason";
 
     fn resumed(session: AppSession, model: &Model) -> SessionState {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        SessionState::from_session(session, model, &storage, &ModelPolicy::default())
+        SessionState::from_session(session, model, &storage)
     }
 
     /// An old session: counters, no per-model breakdown.
@@ -350,8 +340,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session = make_plan_session(Some(StoredMode::Plan), None);
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let state = SessionState::from_session(session, &test_model(), &storage);
         assert_eq!(state.mode, Mode::Plan);
         assert!(state.plan.path().is_some(), "plan path should be allocated");
     }
@@ -362,8 +351,7 @@ mod tests {
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session =
             make_plan_session(Some(StoredMode::Plan), Some("/nonexistent/plan.md".into()));
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let state = SessionState::from_session(session, &test_model(), &storage);
         assert_eq!(state.mode, Mode::Plan);
         let path = state.plan.path().expect("plan path should be allocated");
         assert_ne!(path, Path::new("/nonexistent/plan.md"));
@@ -381,29 +369,23 @@ mod tests {
             Some(StoredMode::Plan),
             Some(plan_file.to_string_lossy().into_owned()),
         );
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let state = SessionState::from_session(session, &test_model(), &storage);
         assert_eq!(state.mode, Mode::Plan);
         assert_eq!(state.plan.path(), Some(plan_file.as_path()));
     }
 
     #[test]
-    fn disallowed_restored_model_uses_fallback() {
+    fn from_session_adopts_the_model_it_is_given() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let fallback = test_model();
+        let resolved = test_model();
         let mut session = make_plan_session(Some(StoredMode::Build), None);
         session.model = "openai/gpt-5".into();
-        let raw: maki_config::RawConfig = serde_json::from_value(serde_json::json!({
-            "provider": {"allowed_models": [fallback.spec()]}
-        }))
-        .unwrap();
-        let policy = raw.into_config(&[]).unwrap().provider.model_policy;
 
-        let state = SessionState::from_session(session, &fallback, &storage, &policy);
+        let state = SessionState::from_session(session, &resolved, &storage);
 
-        assert_eq!(state.model.spec(), fallback.spec());
-        assert_eq!(state.session.model, fallback.spec());
+        assert_eq!(state.model.spec(), resolved.spec());
+        assert_eq!(state.session.model, resolved.spec());
     }
 
     #[test]
@@ -411,8 +393,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session = make_plan_session(Some(StoredMode::Build), None);
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let state = SessionState::from_session(session, &test_model(), &storage);
         assert_eq!(state.mode, Mode::Build);
         assert!(state.plan.path().is_none());
     }
@@ -432,24 +413,72 @@ mod tests {
         assert_ne!(state.thinking, ThinkingConfig::Off, "{THINKING_NOT_LIFTED}");
     }
 
+    /// Resume no longer re-derives the model, so the stored toggle now meets
+    /// whatever the caller resolved with no `adjust_model` behind it to paper
+    /// over a mismatch. A model that cannot think has to silence the toggle,
+    /// one that can has to keep it.
+    #[test_case(StoredThinking::Adaptive, ThinkingSupport::No => ThinkingConfig::Off ; "unsupported_silences_adaptive")]
+    #[test_case(StoredThinking::Effort { level: Effort::High }, ThinkingSupport::No => ThinkingConfig::Off ; "unsupported_silences_effort")]
+    #[test_case(StoredThinking::Adaptive, ThinkingSupport::Yes => ThinkingConfig::Adaptive ; "supported_preserves_adaptive")]
+    #[test_case(StoredThinking::Effort { level: Effort::High }, ThinkingSupport::Yes => ThinkingConfig::Effort(Effort::High) ; "supported_preserves_effort")]
+    fn resume_clamps_stored_thinking_to_the_adopted_model(
+        stored: StoredThinking,
+        support: ThinkingSupport,
+    ) -> ThinkingConfig {
+        let mut session = AppSession::new("test-model", "/tmp");
+        session.meta.thinking = Some(stored);
+        let model = Model {
+            thinking_override: Some(support),
+            ..test_model()
+        };
+
+        resumed(session, &model).thinking
+    }
+
+    /// Adoption overwrites `session.model`, so the per-model breakdown is the
+    /// only record left of who earned what. Resuming onto a different model
+    /// leaves that history where it stands instead of re-keying it.
     #[test]
-    fn from_session_applies_provider_adjust_model() {
-        // SAFETY: this test runs single-threaded; no other thread reads the env.
-        unsafe { std::env::set_var("APERTURE_HOST", "https://example.com") };
+    fn adopting_a_model_leaves_recorded_usage_with_the_model_that_earned_it() {
+        let mut session = session_with_counters();
+        session.add_model_usage(
+            UNRESOLVABLE_MODEL,
+            session.token_usage.billed(Some(RECORDED_COST)),
+        );
+
+        let state = resumed(session, &test_model());
+
+        let by_model = state.session.usage_by_model();
+        assert!(
+            by_model.len() == 1 && by_model.contains_key(UNRESOLVABLE_MODEL),
+            "{USAGE_REATTRIBUTED}"
+        );
+    }
+
+    /// The writer only starts the file over when the log reports divergence, so
+    /// a quiet `set_model` would leave the old spec in the header and the next
+    /// `maki` would resume on it. The other direction costs as well, since
+    /// voiding the cursor for an unchanged spec buys a rewrite on every resume.
+    #[test_case(false ; "same_model_keeps_the_append_cursor")]
+    #[test_case(true ; "new_model_voids_the_append_cursor")]
+    fn adopting_a_model_rewrites_the_header_only_when_the_spec_moves(adopt_other: bool) {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let mut session = AppSession::new("aperture/zai/glm-5.2", "/tmp");
-        session.meta.thinking = Some(StoredThinking::Adaptive);
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
-        assert!(
-            state.model.supports_thinking(),
-            "resumed aperture/zai/glm-5.2 should inherit thinking support from adjust_model",
-        );
-        assert_eq!(
-            state.thinking,
-            ThinkingConfig::Adaptive,
-            "resumed thinking config should be preserved when the model supports it",
-        );
+        let mut model = test_model();
+        let session = AppSession::new(&model.spec(), "/tmp");
+        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+        if adopt_other {
+            model.id = UNRESOLVABLE_MODEL.into();
+        }
+
+        let state = SessionState::from_session(session, &model, &storage);
+
+        match log.append(&state.session) {
+            Ok(()) => assert!(!adopt_other, "{OLD_SPEC_STAYS_ON_DISK}"),
+            Err(SessionError::LogDiverged { .. }) => {
+                assert!(adopt_other, "{CURSOR_VOIDED_FOR_NOTHING}")
+            }
+            Err(e) => panic!("{APPEND_FAILED}: {e}"),
+        }
     }
 }

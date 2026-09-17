@@ -25,8 +25,9 @@ use maki_lua::{
     WinCommand, WinEvent,
 };
 use maki_providers::{
-    ContentBlock, Effort, Message, RequestOptions, Role, THINKING_USAGE, TokenUsage,
+    ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, TokenUsage,
 };
+use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionMeta, StoredMode, StoredThinking};
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
@@ -125,7 +126,9 @@ fn build_app_with_session(
     session: AppSession,
     permissions: Arc<PermissionManager>,
 ) -> App {
-    let model = test_model();
+    // Mirrors the event loop, where the session's own spec decides and the
+    // startup model catches one that will not resolve.
+    let model = Model::from_spec(&session.model).unwrap_or_else(|_| test_model());
     App::new(
         &model,
         session,
@@ -208,6 +211,13 @@ fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
     let writer = Arc::new(test_writer(dir.clone()));
     let app = build_app(dir.clone(), Arc::clone(&writer));
     (tmp, dir, writer, app)
+}
+
+/// What the event loop does on a load. It reads the session, resolves its
+/// model and hands both to the app, which adopts them.
+fn load_session(app: &mut App, id: MakiId, model: &Model) {
+    let session = AppSession::load(id, &app.storage).unwrap();
+    app.apply_loaded_session(session, model);
 }
 
 fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Msg {
@@ -740,7 +750,7 @@ fn enter_executes_new_command() {
     type_slash(&mut app);
     app.update(Msg::Key(key(KeyCode::Char('n'))));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(matches!(&actions[0], Action::NewSession));
+    assert!(matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()));
     assert!(!app.command_palette.is_active());
 }
 
@@ -791,7 +801,7 @@ fn reset_session_clears_plan() {
     let (_tx, rx) = flume::bounded::<crate::components::btw_modal::BtwEvent>(1);
     app.btw_modal.open("q", rx);
     let actions = app.reset_session();
-    assert!(matches!(&actions[0], Action::NewSession));
+    assert!(matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()));
     assert_eq!(app.status, Status::Idle);
     assert_eq!(app.state.token_usage.input, 0);
     assert_eq!(app.chats[0].context_size, 0);
@@ -968,7 +978,7 @@ fn load_session_clears_plan() {
     let id = app.state.session.id;
     app.state.mode = Mode::Build;
     app.state.plan = PlanState::Ready(PathBuf::from("old-plan.md"));
-    app.load_session(id);
+    load_session(&mut app, id, &test_model());
     assert_eq!(app.state.mode, Mode::Build);
     assert_eq!(app.state.plan.path(), None);
 }
@@ -2922,7 +2932,7 @@ fn run_cmdline_executes_builtin(cmdline: &str) {
 
     let actions = app.run_cmdline(cmdline, 0).unwrap();
 
-    assert!(matches!(&actions[..], [Action::NewSession]));
+    assert!(matches!(&actions[..], [Action::RestartAgent(h)] if h.is_empty()));
 }
 
 #[test]
@@ -3043,6 +3053,8 @@ fn build_rewind_app() -> App {
     app
 }
 
+const RESTART_EXPECTED: &str = "a rewind must respawn the agent on the truncated history";
+
 fn rewind_to_second_turn() -> RewindEntry {
     RewindEntry {
         turn_index: 2,
@@ -3062,10 +3074,10 @@ fn rewind_to_middle_truncates_and_populates_input() {
     assert_eq!(app.input_box.buffer.value(), "second prompt");
     assert_eq!(app.run_id, old_run_id);
 
-    let Action::LoadSession(ref loaded) = actions[0] else {
-        panic!("expected LoadSession");
+    let Action::RestartAgent(ref history) = actions[0] else {
+        panic!("{RESTART_EXPECTED}");
     };
-    assert_eq!(loaded.messages.len(), 2);
+    assert_eq!(history.len(), 2);
 }
 
 /// Dropping two short messages may shave a few tokens off the gauge, never the
@@ -3126,7 +3138,7 @@ fn rewind_to_first_turn_clears_everything() {
     assert_eq!(app.state.token_usage.output, 200);
     assert_eq!(app.state.context_size, 0);
     assert_eq!(app.chats[0].context_size, 0);
-    assert!(matches!(&actions[0], Action::LoadSession(_)));
+    assert!(matches!(&actions[0], Action::RestartAgent(_)));
 }
 
 #[test_case(Duration::ZERO,          true  ; "keeps_fresh_error")]
@@ -3948,7 +3960,9 @@ fn plan_form_menu_options(
     assert_eq!(app.state.mode, expected_mode);
     assert_eq!(app.state.plan, PlanState::None);
     assert_eq!(
-        actions.iter().any(|a| matches!(a, Action::NewSession)),
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::RestartAgent(h) if h.is_empty())),
         has_new_session
     );
     let expected_msg = implement_msg(PlanForm::new().parallel());
@@ -4348,17 +4362,12 @@ fn thinking_restored_from_session_meta() {
     let mut session = AppSession::new("test-model", "/tmp/test");
     session.meta.thinking = Some(StoredThinking::Budget { tokens: 4096 });
 
-    let state = SessionState::from_session(
-        session,
-        &test_model(),
-        &storage,
-        &maki_config::ModelPolicy::default(),
-    );
+    let state = SessionState::from_session(session, &test_model(), &storage);
     assert_eq!(state.thinking, ThinkingConfig::Budget(4096));
 }
 
 fn set_opus_model(app: &mut App) {
-    app.state.model = maki_providers::Model::from_spec(OPUS_SPEC).unwrap();
+    app.state.model = Model::from_spec(OPUS_SPEC).unwrap();
 }
 
 #[test]
@@ -4424,7 +4433,7 @@ fn subagent_history_finishes_workflow_chat() {
 #[test_case("openai/gpt-5.5" ; "non_anthropic")]
 fn fast_flashes_error_on_ineligible_model(spec: &str) {
     let mut app = test_app();
-    app.state.model = maki_providers::Model::from_spec(spec).unwrap();
+    app.state.model = Model::from_spec(spec).unwrap();
 
     app.execute_command(cmd("/fast"), 0);
     assert!(!app.state.fast);
@@ -4435,15 +4444,11 @@ fn fast_flashes_error_on_ineligible_model(spec: &str) {
 fn fast_restored_from_session_meta() {
     let tmp = TempDir::new().unwrap();
     let storage = StateDir::from_path(tmp.path().to_path_buf());
-    let mut session = AppSession::new("anthropic/claude-opus-4-8", "/tmp/test");
+    let mut session = AppSession::new(OPUS_SPEC, "/tmp/test");
     session.meta.fast = true;
 
-    let state = SessionState::from_session(
-        session,
-        &test_model(),
-        &storage,
-        &maki_config::ModelPolicy::default(),
-    );
+    let state =
+        SessionState::from_session(session, &Model::from_spec(OPUS_SPEC).unwrap(), &storage);
     assert!(state.fast);
 }
 
@@ -4456,19 +4461,14 @@ fn fast_normalized_off_when_restored_onto_ineligible_model() {
     let mut session = AppSession::new(SONNET_SPEC, "/tmp/test");
     session.meta.fast = true;
 
-    let state = SessionState::from_session(
-        session,
-        &test_model(),
-        &storage,
-        &maki_config::ModelPolicy::default(),
-    );
+    let state = SessionState::from_session(session, &test_model(), &storage);
     assert!(!state.fast);
 }
 
 #[test]
 fn model_state_reports_the_model_and_what_it_supports() {
     let mut app = test_app();
-    app.state.model = maki_providers::Model::from_spec(PLAIN_MODEL_SPEC).unwrap();
+    app.state.model = Model::from_spec(PLAIN_MODEL_SPEC).unwrap();
     assert_eq!(
         model_state_scalars(&app),
         serde_json::json!({
@@ -4530,7 +4530,7 @@ fn model_state_carries_the_thinking_ladder() {
         "an effort row carries what it costs: {ladder}"
     );
 
-    app.state.model = maki_providers::Model::from_spec(PLAIN_MODEL_SPEC).unwrap();
+    app.state.model = Model::from_spec(PLAIN_MODEL_SPEC).unwrap();
     assert_eq!(app.model_state()[THINKING_OPTIONS], serde_json::json!([]));
 }
 
@@ -4559,7 +4559,8 @@ fn model_change_fires_once_per_real_swap() {
     app.emit_model_change();
     assert_eq!(probe.try_recv_autocmd(), None);
 
-    app.update_model(&maki_providers::Model::from_spec(OPUS_SPEC).unwrap());
+    app.state
+        .update_model(&Model::from_spec(OPUS_SPEC).unwrap());
     app.emit_model_change();
     app.emit_model_change();
 
@@ -4582,9 +4583,9 @@ fn loading_a_session_on_another_model_announces_the_swap() {
     let (_tmp, _storage, _writer, mut app) = tempdir_app();
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
-    let fallback = app.state.model.clone();
+    let resolved = Model::from_spec(OPUS_SPEC).unwrap();
 
-    app.apply_loaded_session(AppSession::new(OPUS_SPEC, "/tmp/test"), &fallback);
+    app.apply_loaded_session(AppSession::new(OPUS_SPEC, "/tmp/test"), &resolved);
     app.emit_model_change();
 
     let (event, data) = probe.try_recv_autocmd().expect(MODEL_CHANGED_EVENT);
@@ -4638,7 +4639,7 @@ fn fast_turns_off_on_a_model_that_lost_fast_support() {
     app.execute_command(cmd("/fast"), 0);
     assert!(app.state.fast);
 
-    app.state.model = maki_providers::Model::from_spec(SONNET_SPEC).unwrap();
+    app.state.model = Model::from_spec(SONNET_SPEC).unwrap();
     app.execute_command(cmd("/fast"), 0);
     assert!(!app.state.fast);
     assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
@@ -4650,7 +4651,7 @@ fn update_model_to_ineligible_resets_fast() {
     set_opus_model(&mut app);
     app.state.fast = true;
 
-    let sonnet = maki_providers::Model::from_spec(SONNET_SPEC).unwrap();
+    let sonnet = Model::from_spec(SONNET_SPEC).unwrap();
     app.state.update_model(&sonnet);
     assert!(!app.state.fast);
 }
@@ -5269,7 +5270,7 @@ fn loading_a_session_stamps_its_restores_as_a_load_of_that_session() {
     app.lua_event_handle = handle;
     app.restore_event_tx = Some(maki_agent::EventSender::new(flume::unbounded().0, 0));
 
-    app.load_session(stored.id);
+    load_session(&mut app, stored.id, &test_model());
 
     let item = probe
         .try_recv_restore_item()
@@ -5326,7 +5327,6 @@ fn checkpoint_after_rewind_persists_the_truncated_history() {
         prompt_text: "second prompt".into(),
     };
     app.rewind_to(entry);
-    assert!(app.shared_history.is_none(), "mirror handle is dropped");
     app.checkpoint();
 
     let id = app.state.session.id;
@@ -5354,6 +5354,116 @@ fn reset_session_never_writes_the_old_conversation_under_the_new_id() {
     );
 }
 
+const ONE_RESTART: &str = "the gesture must hand the loop exactly one restart";
+const RESTART_MATCHES_SESSION: &str =
+    "the respawned agent must run on the history the session now holds";
+const MIRROR_SURVIVED: &str = "a history the agent did not produce must drop the mirror with it";
+
+fn restart_history(actions: Vec<Action>) -> Vec<Message> {
+    let Ok([Action::RestartAgent(history)]) = <[Action; 1]>::try_from(actions) else {
+        panic!("{ONE_RESTART}");
+    };
+    history
+}
+
+/// A tab mid-conversation with the agent's mirror attached, the only state in
+/// which these gestures have anything to leak.
+fn live_conversation(app: &mut App) -> maki_agent::History {
+    let history = attach_live_history(
+        app,
+        vec![
+            Message::user(LIVE_AGENT_TEXT.into()),
+            tool_use_msg(SUB_TOOL_ID),
+            tool_result_msg(SUB_TOOL_ID, &tool_text(SUB_TOOL_ID)),
+        ],
+    );
+    app.checkpoint();
+    history
+}
+
+fn reset_gesture(app: &mut App) -> Vec<Message> {
+    restart_history(app.reset_session())
+}
+
+fn rewind_gesture(app: &mut App) -> Vec<Message> {
+    restart_history(app.rewind_to(RewindEntry {
+        turn_index: 1,
+        prompt_preview: LIVE_AGENT_TEXT.into(),
+        prompt_text: LIVE_AGENT_TEXT.into(),
+    }))
+}
+
+fn load_gesture(app: &mut App) -> Vec<Message> {
+    let mut stored = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
+    stored.push_message(Message::user(STORED_SESSION_TEXT.into()));
+    app.apply_loaded_session(stored, &test_model())
+}
+
+/// The three gestures that hand the agent a history it did not produce. Each
+/// restarts it on whatever the session holds right then, so the payload is the
+/// whole contract. Get it wrong and `/new` respawns the agent on the talk the
+/// user just walked away from, or a rewind brings back the messages it dropped.
+/// The mirror has to go in the same breath, or the next checkpoint hands the
+/// agent's stale copy back and writes it to disk.
+#[test_case(reset_gesture,  0, None                       ; "reset")]
+#[test_case(rewind_gesture, 1, Some(LIVE_AGENT_TEXT)      ; "rewind")]
+#[test_case(load_gesture,   1, Some(STORED_SESSION_TEXT)  ; "load")]
+fn restarting_the_agent_installs_a_local_history(
+    gesture: fn(&mut App) -> Vec<Message>,
+    kept: usize,
+    first_prompt: Option<&str>,
+) {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let _live = live_conversation(&mut app);
+    let before = app.state.session.messages().len();
+
+    let history = gesture(&mut app);
+
+    assert!(app.shared_history.is_none(), "{MIRROR_SURVIVED}");
+    assert_eq!(
+        serde_json::to_value(&history).unwrap(),
+        serde_json::to_value(app.state.session.messages()).unwrap(),
+        "{RESTART_MATCHES_SESSION}"
+    );
+    assert_eq!(history.len(), kept);
+    assert!(
+        kept < before,
+        "the gesture dropped nothing, so this proves nothing"
+    );
+    assert_eq!(history.first().and_then(|m| m.user_text()), first_prompt);
+}
+
+const RELOAD_ENDS_NOTHING: &str =
+    "only a switch to another session ends the one that was on screen";
+
+/// Plugins tear down whatever belonged to the session that ended, so firing
+/// this when the picker reopens the session already on screen would wipe the
+/// state out from under the user still sitting in it.
+#[test_case(true  ; "same_session_reopened")]
+#[test_case(false ; "switched_session")]
+fn loading_ends_the_previous_session_only_when_the_id_changes(same: bool) {
+    let mut app = test_app();
+    let previous = app.state.session.id;
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+    let session = if same {
+        (*app.state.session).clone()
+    } else {
+        AppSession::new(TEST_MODEL_SPEC, TEST_CWD)
+    };
+
+    app.apply_loaded_session(session, &test_model());
+
+    assert_eq!(
+        probe.try_recv_end_session(),
+        (!same).then_some((previous, SessionEndReason::Load)),
+        "{RELOAD_ENDS_NOTHING}"
+    );
+}
+
+const LOADED_MODEL_IGNORED: &str =
+    "a load runs on the model the caller resolved, and records it on the session";
+
 /// Two traps in one switch. `install_local_history` has to drop the mirror
 /// handle, or the old agent's messages land under the freshly loaded id. And
 /// `revision` is `#[serde(skip)]`, so the loaded session starts back at zero and
@@ -5371,8 +5481,11 @@ fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
     app.checkpoint();
     let (live_id, sent_revision) = (app.state.session.id, app.state.session.revision());
 
-    app.load_session(stored.id);
+    let resolved = Model::from_spec(OPUS_SPEC).unwrap();
+    load_session(&mut app, stored.id, &resolved);
     assert_eq!(app.state.session.id, stored.id);
+    assert_eq!(app.state.model.spec(), OPUS_SPEC, "{LOADED_MODEL_IGNORED}");
+    assert_eq!(app.state.session.model, OPUS_SPEC, "{LOADED_MODEL_IGNORED}");
     // Walk the loaded session up to the revision already sent for the live one,
     // so the checkpoint below lands on the exact collision.
     let session = app.state.session_mut();

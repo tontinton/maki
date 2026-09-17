@@ -70,7 +70,6 @@ use maki_lua::{
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
-use maki_storage::model::persist_model;
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::Position;
@@ -297,7 +296,7 @@ impl App {
         model_policy: Arc<ModelPolicy>,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
-        let state = SessionState::from_session(session, model, &storage, &model_policy);
+        let state = SessionState::from_session(session, model, &storage);
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
         let input_box = InputBox::new(
@@ -393,11 +392,6 @@ impl App {
 
     fn plan_form_active(&self) -> bool {
         self.state.mode == Mode::Plan && self.plan_form.is_visible()
-    }
-
-    pub(crate) fn update_model(&mut self, model: &Model) {
-        self.state.update_model(model);
-        persist_model(&self.storage, &self.state.session.model);
     }
 
     /// One diff per frame covers every way a model can change (the picker,

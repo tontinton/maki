@@ -179,11 +179,6 @@ impl ModalScroll {
     }
 }
 
-pub struct LoadedSession {
-    pub messages: Vec<Message>,
-    pub model_spec: String,
-}
-
 use std::path::PathBuf;
 
 pub enum Action {
@@ -200,8 +195,9 @@ pub enum Action {
     CancelSubagent {
         tool_use_id: String,
     },
-    NewSession,
-    LoadSession(Box<LoadedSession>),
+    /// The history under this runtime changed (reset, load, rewind), so the
+    /// agent has to be respawned on it.
+    RestartAgent(Vec<Message>),
     ChangeModel(String),
     RefreshProvider {
         slug: String,
