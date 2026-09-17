@@ -482,7 +482,7 @@ impl<'h> Agent<'h> {
                 usage: response.usage,
                 model: self.model.id.clone(),
                 cost,
-                list_cost: self
+                subsidised_list_cost: self
                     .model
                     .subsidised_list_cost(&response.usage, self.opts.fast),
                 context_size: Some(self.gauge.size()),
@@ -1321,15 +1321,15 @@ mod tests {
             assert!(expected > 0.0);
 
             let events = drain_events(&event_rx);
-            let turn_list_cost = events.iter().find_map(|e| match &e.event {
-                AgentEvent::TurnComplete(tc) => Some(tc.list_cost),
+            let turn_subsidised_list_cost = events.iter().find_map(|e| match &e.event {
+                AgentEvent::TurnComplete(tc) => Some(tc.subsidised_list_cost),
                 _ => None,
             });
             let done_list_cost = events.iter().find_map(|e| match &e.event {
                 AgentEvent::Done { list_cost, .. } => Some(*list_cost),
                 _ => None,
             });
-            assert_eq!(turn_list_cost, Some(None));
+            assert_eq!(turn_subsidised_list_cost, Some(None));
             assert_eq!(done_list_cost, Some(Some(expected)));
         });
     }

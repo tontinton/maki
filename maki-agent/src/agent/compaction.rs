@@ -168,7 +168,7 @@ fn finish_compact(
         usage: response.usage,
         model: model.id.clone(),
         cost: model.billed_cost(&response.usage, false),
-        list_cost: model.subsidised_list_cost(&response.usage, false),
+        subsidised_list_cost: model.subsidised_list_cost(&response.usage, false),
         context_size: Some(response.usage.output),
         context_window: model.context_window,
     })));

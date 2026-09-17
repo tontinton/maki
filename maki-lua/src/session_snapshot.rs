@@ -201,7 +201,7 @@ mod tests {
             usage: TokenUsage::default(),
             model: String::new(),
             cost: None,
-            list_cost: None,
+            subsidised_list_cost: None,
             context_size: Some(context_size),
             context_window: WINDOW,
         })))

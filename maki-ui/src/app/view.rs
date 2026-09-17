@@ -276,7 +276,7 @@ impl App {
             let ctx = UsageModalContext {
                 total: &self.state.token_usage,
                 total_cost: self.state.cost,
-                total_list_cost: self.state.list_cost,
+                total_list_cost: self.state.subsidised_list_cost,
                 by_model: self.state.session.usage_by_model(),
                 model: &self.state.model,
                 fast: self.state.fast,

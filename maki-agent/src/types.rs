@@ -943,7 +943,7 @@ pub struct TurnCompleteEvent {
     /// one exists to be shown beside a `$0` bill, so a metered turn has
     /// nothing to add. See [`maki_providers::Model::subsidised_list_cost`].
     #[serde(skip)]
-    pub list_cost: Option<f64>,
+    pub subsidised_list_cost: Option<f64>,
     /// Tokens the next request would carry. This is the one context number
     /// the host reports, so `Done` and the compaction trigger agree with it.
     #[serde(skip_serializing_if = "Option::is_none")]

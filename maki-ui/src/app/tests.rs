@@ -341,7 +341,7 @@ fn turn_complete(usage: TokenUsage, model: &str, cost: Option<f64>) -> AgentEven
         usage,
         model: model.into(),
         cost,
-        list_cost: None,
+        subsidised_list_cost: None,
         context_size: None,
         context_window: 0,
     }))

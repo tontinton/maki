@@ -77,9 +77,8 @@ async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 ///
 /// `usage` and `cost` include subagent spend. `context_size` is the main
 /// session's own, since a subagent runs its own window. There is no
-/// `list_cost` here because `cost` is re-settled from stored usage when a
-/// session resumes and list price is not stored, so per-turn list price
-/// lives on the `TurnEnd` autocmd instead.
+/// `list_cost` here: the un-subsidised total for a run arrives on the
+/// `TurnEnd` autocmd, and `maki.model.info` carries the rates behind it.
 ///
 /// @param opts table? `session` (string?) Session id; defaults to focused.
 /// @return (table|nil, string|nil) Snapshot table, or nil and an error.

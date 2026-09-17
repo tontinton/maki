@@ -947,16 +947,16 @@ impl TokenUsage {
     /// purpose: a caller that forgets the cost quietly loses money from the
     /// session total, so saying it out loud is mandatory.
     pub fn billed(&self, cost: Option<f64>) -> StoredTokenUsage {
-        self.billed_with_list_cost(cost, None)
+        self.billed_with_subsidised_list_cost(cost, None)
     }
 
     /// Like [`billed`](Self::billed), but also records what a subsidised
-    /// turn would have cost at the provider's list rates. `list_cost` is
-    /// `None` for every non-subsidised turn.
-    pub fn billed_with_list_cost(
+    /// turn would have cost at the provider's list rates. `subsidised_list_cost`
+    /// is `None` for every non-subsidised turn.
+    pub fn billed_with_subsidised_list_cost(
         &self,
         cost: Option<f64>,
-        list_cost: Option<f64>,
+        subsidised_list_cost: Option<f64>,
     ) -> StoredTokenUsage {
         StoredTokenUsage {
             input: self.input,
@@ -964,7 +964,7 @@ impl TokenUsage {
             cache_creation: self.cache_creation,
             cache_read: self.cache_read,
             cost,
-            list_cost,
+            subsidised_list_cost,
         }
     }
 
@@ -1758,7 +1758,7 @@ mod tests {
                 cache_creation: COUNTERS.cache_creation,
                 cache_read: COUNTERS.cache_read,
                 cost: Some(RECORDED_COST),
-                list_cost: None,
+                subsidised_list_cost: None,
             }
         );
         assert_eq!(COUNTERS.billed(None).cost, None);

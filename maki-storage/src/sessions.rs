@@ -106,7 +106,7 @@ pub struct StoredTokenUsage {
     /// on every ordinary turn, and on entries written before this field
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub list_cost: Option<f64>,
+    pub subsidised_list_cost: Option<f64>,
 }
 
 impl StoredTokenUsage {
@@ -128,7 +128,7 @@ impl std::ops::AddAssign for StoredTokenUsage {
         self.cache_creation = self.cache_creation.saturating_add(rhs.cache_creation);
         self.cache_read = self.cache_read.saturating_add(rhs.cache_read);
         add_cost(&mut self.cost, rhs.cost);
-        add_cost(&mut self.list_cost, rhs.list_cost);
+        add_cost(&mut self.subsidised_list_cost, rhs.subsidised_list_cost);
     }
 }
 

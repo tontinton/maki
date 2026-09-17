@@ -836,7 +836,7 @@ mod tests {
                 usage: Default::default(),
                 model: String::new(),
                 cost: None,
-                list_cost: None,
+                subsidised_list_cost: None,
                 context_size: None,
                 context_window: 0,
             })),

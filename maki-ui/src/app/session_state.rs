@@ -20,9 +20,10 @@ pub(crate) struct SessionState {
     /// re-price history at today's rates. `None` while nothing was priced.
     pub cost: Option<f64>,
     /// Sum of what subsidised turns in this session would have cost at the
-    /// provider's published list price. `None` until a subsidised turn lands;
-    /// unaffected by ordinary, per-token-billed turns.
-    pub list_cost: Option<f64>,
+    /// provider's published list price: the total restored from the session
+    /// file plus every subsidised turn since. `None` until a subsidised turn
+    /// lands; unaffected by ordinary, per-token-billed turns.
+    pub subsidised_list_cost: Option<f64>,
     pub context_size: u32,
     pub mode: Mode,
     pub plan: PlanState,
@@ -88,6 +89,15 @@ impl SessionState {
             clamp(session.meta.thinking.into(), session.meta.fast, &model);
         let token_usage = session.token_usage;
         let cost = settle_session(&token_usage, session.usage_by_model_mut(), &model, fast);
+        // Unlike `cost` there is nothing to settle: the list price was
+        // recorded per turn and never moves, so resuming just adds the rows
+        // back up. Without it a resumed subsidised session reads `$0.000`
+        // with no reference figure until the next turn lands.
+        let subsidised_list_cost = session
+            .usage_by_model()
+            .values()
+            .filter_map(|usage| usage.subsidised_list_cost)
+            .reduce(|total, cost| total + cost);
         let context_size = session.meta.context_size;
 
         Self {
@@ -99,10 +109,7 @@ impl SessionState {
             model,
             token_usage,
             cost,
-            // Not settled from storage like `cost`: subsidised sessions are
-            // new enough that resuming one always re-derives it from the
-            // per-turn stream rather than trusting old on-disk totals.
-            list_cost: None,
+            subsidised_list_cost,
             context_size,
             mode,
             plan,
@@ -222,6 +229,8 @@ mod tests {
     use test_case::test_case;
 
     const RECORDED_COST: f64 = 0.42;
+    /// What a subsidised turn would have billed; the turn itself billed `$0`.
+    const RECORDED_LIST_COST: f64 = 1.75;
     /// A round million, so a per-million rate reads straight off the bill.
     const MILLION_INPUT: TokenUsage = TokenUsage {
         input: 1_000_000,
@@ -277,6 +286,34 @@ mod tests {
         );
         let state = resumed(session, &test_model());
         assert_eq!(state.cost, Some(RECORDED_COST));
+    }
+
+    /// The list price is written per model and never re-derived, so a resumed
+    /// subsidised session has to add the stored rows back up. Dropping it left
+    /// the status bar on a bare `$0.000` until the next turn landed.
+    #[test]
+    fn resumed_session_restores_the_recorded_list_price() {
+        let mut session = session_with_counters();
+        session.add_model_usage(
+            UNRESOLVABLE_MODEL,
+            session
+                .token_usage
+                .billed_with_subsidised_list_cost(Some(0.0), Some(RECORDED_LIST_COST)),
+        );
+        let state = resumed(session, &test_model());
+        assert_eq!(state.subsidised_list_cost, Some(RECORDED_LIST_COST));
+    }
+
+    /// Nothing subsidised ever ran, so there is no reference figure to show
+    /// and the status bar must not invent one.
+    #[test]
+    fn resumed_metered_session_has_no_list_price() {
+        let mut session = session_with_counters();
+        session.add_model_usage(
+            UNRESOLVABLE_MODEL,
+            session.token_usage.billed(Some(RECORDED_COST)),
+        );
+        assert_eq!(resumed(session, &test_model()).subsidised_list_cost, None);
     }
 
     /// Older sessions kept counters only, and those are priced with the

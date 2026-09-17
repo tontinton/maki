@@ -1062,7 +1062,7 @@ mod tests {
             usage,
             model: "test-model".into(),
             cost: Some(cost),
-            list_cost: None,
+            subsidised_list_cost: None,
             context_size: None,
             context_window: 0,
         }))
