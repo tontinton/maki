@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 use crate::model::{FastSupport, Model, ModelInfo};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
-use crate::types::EffortDialect;
+use crate::types::{EffortDialect, ThinkingFallback};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
     dialect,
@@ -529,8 +529,11 @@ impl Provider for OpenAi {
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking
-                .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
+            opts.thinking.apply_thinking(
+                &mut body,
+                model,
+                ThinkingFallback::Dialect(&dialect::STANDARD),
+            );
             self.with_oauth_retry(|| async {
                 let auth = self.current_auth();
                 self.compat

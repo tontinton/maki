@@ -2,17 +2,33 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::process;
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use tracing::debug;
 
 use maki_storage::paths;
+use maki_storage::sessions::Effort;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 const PROVIDERS_FILE: &str = "providers.toml";
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
 const OPENCODE_SLUG: &str = "opencode";
+const LOCAL_OVERLAY_SLUGS: [&str; 2] = ["ollama", "llama-cpp"];
+
+/// Where the last parse came from and what the file looked like then. The
+/// config path follows the project directory, so one process can read more
+/// than one of these.
+type FileStamp = (PathBuf, Option<SystemTime>, u64);
+
+/// The parse of `providers.toml`, kept until the file changes.
+/// [`ProvidersConfig::load`] runs on nearly every model resolution, and once
+/// per row while the model picker builds its list, so without this each of
+/// those costs a read plus a full TOML parse.
+static PARSED: Mutex<Option<(FileStamp, ProvidersConfig)>> = Mutex::new(None);
 
 /// Coarse capability classification used by maki-providers to dispatch tiered
 /// requests. Mirrors `maki_providers::ModelTier` shape but lives here so the
@@ -43,6 +59,8 @@ pub struct ModelDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_thinking: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_fields: Option<ThinkingFields>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_input: Option<f64>,
@@ -70,6 +88,22 @@ impl ModelDef {
     pub fn has_fast_pricing(&self) -> bool {
         self.pricing_fast_input.is_some() || self.pricing_fast_output.is_some()
     }
+}
+
+/// How one model spells thinking on the wire: each mode carries the JSON
+/// fragment that maki-providers merges into the request body, so any shape a
+/// chat template needs works without a schema per provider. Typed rather than
+/// a free-form `Value` so a typo'd level key fails the parse and says so,
+/// instead of quietly leaving the model without thinking.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ThinkingFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub off: Option<JsonMap<String, JsonValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive: Option<JsonMap<String, JsonValue>>,
+    /// Keyed by [`Effort`]; the declared keys are the levels the model accepts.
+    #[serde(flatten)]
+    pub levels: BTreeMap<Effort, JsonMap<String, JsonValue>>,
 }
 
 /// Normalize a provider name into a lowercase, hyphen-separated slug.
@@ -240,23 +274,33 @@ impl ProvidersConfig {
 
     fn read() -> Result<Self, String> {
         let path = providers_file_path();
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
+        let meta = match fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "cannot read providers.toml");
                 return Ok(Self::default());
             }
         };
-        match toml::from_str::<ProvidersConfig>(&content) {
-            Ok(config) => {
-                debug!(path = %path.display(), "loaded providers config");
-                Ok(config)
-            }
-            Err(e) => Err(format!("invalid {}: {e}", path.display())),
+        let stamp = (path, meta.modified().ok(), meta.len());
+        let mut parsed = PARSED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached, config)) = parsed.as_ref()
+            && *cached == stamp
+        {
+            return Ok(config.clone());
         }
+        let content = match fs::read_to_string(&stamp.0) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(path = %stamp.0.display(), error = %e, "cannot read providers.toml");
+                return Ok(Self::default());
+            }
+        };
+        let config = toml::from_str::<ProvidersConfig>(&content)
+            .map_err(|e| format!("invalid {}: {e}", stamp.0.display()))?;
+        debug!(path = %stamp.0.display(), "loaded providers config");
+        *parsed = Some((stamp, config.clone()));
+        Ok(config)
     }
 
     pub fn save(&self) -> Result<(), std::io::Error> {
@@ -267,6 +311,9 @@ impl ProvidersConfig {
         let content = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         fs::write(&path, content)?;
+        // A write the cache cannot distinguish from what it holds (same length
+        // inside one mtime tick) would otherwise serve the old parse.
+        *PARSED.lock().unwrap_or_else(|e| e.into_inner()) = None;
         debug!(path = %path.display(), "saved providers config");
         Ok(())
     }
@@ -353,10 +400,56 @@ pub fn resolve_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String>
         .or_else(|| builtin_provider(slug).map(|b| b.default_base_url.to_string()))
 }
 
+/// Whether a built-in slug reads the thinking keys (`supports_thinking`,
+/// `requires_thinking`, `thinking_fields`) of its `providers.toml` models.
+/// Only the local endpoints do, and only those keys: everything else about
+/// them stays compiled in, so an `OLLAMA_HOST` setup can describe how its
+/// models think without a second slug and without touching auth wiring.
+///
+/// The list is the slugs whose request path merges those keys into the body,
+/// not every slug that serves models we cannot know (`google`, `copilot` and
+/// `mistral` also accept arbitrary models, but their paths would drop the
+/// keys on the floor). It grows when a path learns to read them.
+pub fn overlays_local_thinking(slug: &str) -> bool {
+    LOCAL_OVERLAY_SLUGS.contains(&slug)
+}
+
+/// The rest of a local `[[slug.models]]` entry, which still loses to the
+/// compiled-in catalog. Named key by key so exempting `models` from the
+/// built-in warning does not quietly swallow the other half of it. A new
+/// [`ModelDef`] field has to be classified here or in the overlay;
+/// `every_model_def_field_is_read_or_reported` stops compiling until it is.
+fn ignored_local_model_fields(models: &[ModelDef]) -> Vec<&'static str> {
+    let any = |is_set: fn(&ModelDef) -> bool| models.iter().any(is_set);
+    let mut ignored = Vec::new();
+    if any(|m| m.tier != Tier::default()) {
+        ignored.push("models.tier");
+    }
+    if any(|m| m.context_window.is_some()) {
+        ignored.push("models.context_window");
+    }
+    if any(|m| m.max_output_tokens.is_some()) {
+        ignored.push("models.max_output_tokens");
+    }
+    if any(|m| m.supports_tool_examples.is_some()) {
+        ignored.push("models.supports_tool_examples");
+    }
+    if any(|m| m.supports_vision.is_some()) {
+        ignored.push("models.supports_vision");
+    }
+    if any(|m| m.has_pricing() || m.has_fast_pricing()) {
+        ignored.push("models.pricing_*");
+    }
+    ignored
+}
+
 /// Fields a `providers.toml` entry sets that a built-in slug ignores, because
 /// built-ins keep their compiled protocol, model catalog and auth wiring.
 /// Callers decide what counts as built-in (the inventory misses the `opencode`
 /// slugs) and when to report it.
+///
+/// [`overlays_local_thinking`] slugs are the exception: their `models` table is
+/// half read, so only the keys nobody reads are named.
 pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str> {
     let mut ignored = Vec::new();
     if def.protocol.is_some() {
@@ -369,7 +462,11 @@ pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str
         ignored.push("discover_models");
     }
     if !def.models.is_empty() {
-        ignored.push("models");
+        if overlays_local_thinking(slug) {
+            ignored.extend(ignored_local_model_fields(&def.models));
+        } else {
+            ignored.push("models");
+        }
     }
     if def.enable_free_models.is_some() && slug != OPENCODE_SLUG {
         ignored.push("enable_free_models");
@@ -620,6 +717,65 @@ tier = "{input}"
             ignored_builtin_fields("openrouter", &def),
             ["enable_free_models"]
         );
+    }
+
+    const THINKING_MODEL: &str = r#"models = [{ id = "qwen", thinking_fields = { high = { reasoning_effort = "xhigh" } } }]"#;
+    const RICH_MODEL: &str = r#"models = [{ id = "qwen", tier = "strong", context_window = 131072, supports_vision = true, pricing_input = 1.0 }]"#;
+
+    /// A local slug reads the thinking keys and nothing else, so the half it
+    /// drops still has to say so: exempting the whole table would leave a user
+    /// wondering why their `tier` never took.
+    #[test_case("ollama", THINKING_MODEL, Vec::new() ; "local_slug_reads_thinking_keys")]
+    #[test_case("anthropic", THINKING_MODEL, vec!["models"] ; "other_builtins_keep_their_catalog")]
+    #[test_case("ollama", RICH_MODEL, vec!["models.tier", "models.context_window", "models.supports_vision", "models.pricing_*"] ; "local_slug_names_what_it_dropped")]
+    fn ignored_builtin_fields_on_declared_models(slug: &str, entry: &str, expected: Vec<&str>) {
+        let def: ProviderDef = toml::from_str(entry).unwrap();
+        assert_eq!(ignored_builtin_fields(slug, &def), expected);
+    }
+
+    /// The literal below stops compiling when [`ModelDef`] grows a field, which
+    /// is the one reminder to decide what a local slug does with it: read it in
+    /// the overlay, or name it here as dropped. Otherwise the warning slowly
+    /// stops covering the table it describes.
+    #[test]
+    fn every_model_def_field_is_read_or_reported() {
+        let every_field_set = ModelDef {
+            id: "qwen".to_string(),
+            tier: Tier::Strong,
+            context_window: Some(131_072),
+            max_output_tokens: Some(8192),
+            supports_tool_examples: Some(true),
+            supports_thinking: Some(true),
+            requires_thinking: Some(true),
+            thinking_fields: Some(ThinkingFields::default()),
+            supports_vision: Some(true),
+            pricing_input: Some(1.0),
+            pricing_output: Some(1.0),
+            pricing_cache_write: Some(1.0),
+            pricing_cache_read: Some(1.0),
+            pricing_fast_input: Some(1.0),
+            pricing_fast_output: Some(1.0),
+        };
+        assert_eq!(
+            ignored_local_model_fields(&[every_field_set]),
+            vec![
+                "models.tier",
+                "models.context_window",
+                "models.max_output_tokens",
+                "models.supports_tool_examples",
+                "models.supports_vision",
+                "models.pricing_*",
+            ]
+        );
+    }
+
+    /// A level key nobody reads would leave the model thinking-less with no
+    /// hint why, so a typo takes the startup down instead.
+    #[test_case(r#"{ high = { reasoning_effort = "xhigh" } }"#, true ; "known_level")]
+    #[test_case(r#"{ hight = { reasoning_effort = "xhigh" } }"#, false ; "typo")]
+    fn thinking_level_keys_are_checked_at_parse(fields: &str, parses: bool) {
+        let entry = format!(r#"models = [{{ id = "m", thinking_fields = {fields} }}]"#);
+        assert_eq!(toml::from_str::<ProviderDef>(&entry).is_ok(), parses);
     }
 
     #[test_case("MyProvider", "myprovider"; "mixed_case")]

@@ -365,16 +365,18 @@ fn build_meta(
         None => Vec::new(),
     };
 
-    // Only the llama.cpp request path reads these, so anywhere else they would
-    // vanish without a trace.
-    if !matches!(base, ProviderKind::LlamaCpp)
-        && let Some(model) = models.iter().find(|m| m.thinking_fields.is_some())
+    // Only these bases merge the fragments into the body. Anywhere else the
+    // fields would vanish without a trace.
+    if !matches!(
+        base,
+        ProviderKind::LlamaCpp | ProviderKind::Ollama | ProviderKind::OpenAi
+    ) && let Some(model) = models.iter().find(|m| m.thinking_fields.is_some())
     {
         warn!(
             slug,
             base = %info.base,
             model = model.id,
-            "thinking_fields only applies to llama-cpp models, ignoring"
+            "thinking_fields only applies to llama-cpp, ollama, and openai providers, ignoring"
         );
     }
 
@@ -950,7 +952,11 @@ mod tests {
             model.tier,
         );
         let mut body = serde_json::json!({});
-        crate::ThinkingConfig::Adaptive.apply_local_thinking(&mut body, &resolved);
+        crate::ThinkingConfig::Adaptive.apply_thinking(
+            &mut body,
+            &resolved,
+            crate::types::ThinkingFallback::BudgetField,
+        );
         assert_eq!(body, serde_json::json!({"reasoning_effort": "medium"}));
 
         let minimal: ScriptModel = serde_json::from_str(r#"{"id": "custom-v1"}"#).unwrap();

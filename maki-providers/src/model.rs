@@ -18,7 +18,8 @@ use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model_registry;
 use crate::providers::catalog::{self, CatalogMeta};
 use crate::providers::{anthropic, custom, dynamic};
-use crate::types::{FALLBACK_MAX_THINKING_BUDGET, THINKING_ADAPTIVE, THINKING_OFF, ThinkingFields};
+use crate::types::{FALLBACK_MAX_THINKING_BUDGET, THINKING_ADAPTIVE, THINKING_OFF};
+use maki_config::providers::ThinkingFields;
 
 const PER_MILLION: f64 = 1_000_000.0;
 
@@ -292,6 +293,36 @@ impl ModelFamily {
 
 const FAST_PROVIDER: &str = "anthropic";
 
+/// The thinking keys a `providers.toml` entry may lend a builtin local model
+/// (see [`maki_config::providers::overlays_local_thinking`]). Everything else
+/// about those slugs stays compiled in, so this reads no base URLs and no
+/// keys, and leaves auth wiring alone.
+fn local_thinking_overlay(
+    slug: &str,
+    model_id: &str,
+) -> (Option<ThinkingSupport>, Option<Box<ThinkingFields>>) {
+    if !maki_config::providers::overlays_local_thinking(slug) {
+        return (None, None);
+    }
+    let config = maki_config::providers::ProvidersConfig::load();
+    let Some(declared) = config
+        .get(slug)
+        .and_then(|def| def.models.iter().find(|m| m.id == model_id))
+    else {
+        return (None, None);
+    };
+    let supports = declared
+        .supports_thinking
+        // Spelling out how a model thinks is as good as saying that it does.
+        // Otherwise the ollama manifest answers "no", every request is clamped
+        // back to off, and the fragments the user wrote are dead weight.
+        .or_else(|| declared.thinking_fields.is_some().then_some(true));
+    (
+        ThinkingSupport::from_flags(supports, declared.requires_thinking.unwrap_or(false)),
+        declared.thinking_fields.clone().map(Box::new),
+    )
+}
+
 /// `Required` marks APIs that reject requests with thinking disabled;
 /// [`crate::RequestOptions::clamped`] raises `Off` to minimal effort for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,13 +427,14 @@ impl Model {
             .or_else(|| anthropic::shared::long_context_window(model_id))
             .or_else(|| sources.pick(|entry| Some(entry.context_window), |meta| meta.context))
             .unwrap_or(manifest.fallback_context_window);
+        let (thinking_override, thinking_fields) = local_thinking_overlay(slug, model_id);
         Self {
             id: model_id.to_string(),
             provider: Arc::from(slug),
             tier,
             family,
             supports_tool_examples_override: None,
-            thinking_override: None,
+            thinking_override,
             supports_vision_override: None,
             supports_fast_override: None,
             pricing,
@@ -410,7 +442,7 @@ impl Model {
             max_output_tokens,
             turn_output_tokens: None,
             context_window,
-            thinking_fields: None,
+            thinking_fields,
         }
     }
 

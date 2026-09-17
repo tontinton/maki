@@ -7,6 +7,7 @@ use maki_config::providers::{
     Protocol, ProviderDef, ProvidersConfig, resolve_api_key_env, resolve_base_url, resolve_protocol,
 };
 use maki_storage::id::SessionRef;
+use tracing::warn;
 
 use super::ResolvedAuth;
 use super::openai::responses;
@@ -15,7 +16,7 @@ use crate::manifest::ManifestRegistry;
 use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
-use crate::types::ThinkingConfig;
+use crate::types::ThinkingFallback;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
@@ -121,12 +122,35 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         .or_else(|| discovered.and_then(|d| d.context_window))
         .unwrap_or_else(|| kind.fallback_context_window());
     let supports_tool_examples_override = declared.and_then(|m| m.supports_tool_examples);
+    let declared_fields = declared.and_then(|m| m.thinking_fields.as_ref());
+    // Resolved here rather than left to `Model::supports_thinking`, which would
+    // reach the same manifest through `custom::base_kind` and so re-read
+    // providers.toml on every call, and would answer from whatever the builtin
+    // slug discovered for a colliding model id.
     let thinking_override = ThinkingSupport::from_flags(
         declared
             .and_then(|m| m.supports_thinking)
+            // Spelling out how a model thinks is as good as saying that it does.
+            .or_else(|| declared_fields.map(|_| true))
             .or_else(|| ManifestRegistry::get(&kind.to_string()).map(|m| m.supports_thinking)),
         declared.and_then(|m| m.requires_thinking).unwrap_or(false),
     );
+    // Only the openai chat path merges the fragments into the body: the
+    // responses path has no thinking wiring yet, and anthropic and google spell
+    // thinking their own way. Anywhere else they would vanish without a trace.
+    let thinking_fields = match declared_fields {
+        Some(fields) if def.protocol == Some(Protocol::Openai) => Some(Box::new(fields.clone())),
+        Some(_) => {
+            warn!(
+                slug,
+                model = model_id,
+                protocol = ?def.protocol,
+                "thinking_fields only applies to openai-protocol providers, ignoring"
+            );
+            None
+        }
+        None => None,
+    };
     let supports_vision_override = declared.and_then(|m| m.supports_vision);
     let pricing = declared
         .filter(|m| m.has_pricing())
@@ -157,7 +181,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         max_output_tokens,
         turn_output_tokens: None,
         context_window,
-        thinking_fields: None,
+        thinking_fields,
     }
 }
 
@@ -300,9 +324,8 @@ impl Provider for CustomOpenAiProvider {
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
-            if matches!(opts.thinking, ThinkingConfig::Off) {
-                body["thinking"] = serde_json::json!({"type": "disabled"});
-            }
+            opts.thinking
+                .apply_thinking(&mut body, model, ThinkingFallback::None);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
@@ -317,7 +340,15 @@ impl Provider for CustomOpenAiProvider {
 
 #[cfg(test)]
 mod tests {
+    use maki_storage::sessions::Effort::High;
+    use serde_json::json;
+    use test_case::test_case;
+
     use super::*;
+    use crate::types::ThinkingConfig;
+
+    const FIELDS_MODEL: &str =
+        r#"{"id":"m","thinking_fields":{"high":{"reasoning_effort":"xhigh"}}}"#;
 
     fn openai_def(model_id: &str) -> ProviderDef {
         serde_json::from_str(&format!(
@@ -386,5 +417,38 @@ mod tests {
         overlay_declared_tiers(&def, &mut models);
         assert_eq!(models[0].tier, Some(ModelTier::Strong));
         assert_eq!(models[1].tier, None);
+    }
+
+    /// A custom `openai` entry is the one place a user can hand us a model
+    /// with its own thinking words, so the declaration has to reach the body.
+    /// A gateway that declares nothing, LiteLLM and vLLM included, keeps
+    /// sending what it always sent.
+    #[test_case(r#"{"id":"m"}"#, json!({"model": "m"}) ; "undeclared_model_sends_nothing")]
+    #[test_case(FIELDS_MODEL, json!({"model": "m", "reasoning_effort": "xhigh"}) ; "declared_level_merges")]
+    fn custom_openai_thinking_is_fields_only(model_json: &str, expected: Value) {
+        let def: ProviderDef = serde_json::from_str(&format!(
+            r#"{{"protocol":"openai","models":[{model_json}]}}"#
+        ))
+        .unwrap();
+        let model = model_from_def(&def, ProviderKind::OpenAi, "custom-gw", "m");
+        let mut body = json!({"model": "m"});
+        ThinkingConfig::Effort(High).apply_thinking(&mut body, &model, ThinkingFallback::None);
+        assert_eq!(body, expected);
+    }
+
+    /// Only the openai chat path merges the fragments, so carrying them
+    /// anywhere else just hides them. Dropping them loudly is how the user
+    /// finds out the keys did nothing.
+    #[test_case("openai", true ; "chat_path_reads_them")]
+    #[test_case("openai-responses", false ; "responses_path_has_no_thinking_wiring")]
+    #[test_case("anthropic", false ; "anthropic_spells_thinking_its_own_way")]
+    fn thinking_fields_reach_only_the_path_that_reads_them(protocol: &str, kept: bool) {
+        let def: ProviderDef = serde_json::from_str(&format!(
+            r#"{{"protocol":"{protocol}","models":[{FIELDS_MODEL}]}}"#
+        ))
+        .unwrap();
+        let kind = protocol_kind(def.protocol.unwrap());
+        let model = model_from_def(&def, kind, "custom-gw", "m");
+        assert_eq!(model.thinking_fields.is_some(), kept);
     }
 }

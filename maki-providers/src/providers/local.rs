@@ -11,6 +11,7 @@ use maki_config::providers::Protocol;
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
+use crate::types::ThinkingFallback;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai::responses;
@@ -27,7 +28,7 @@ pub(crate) struct LocalEndpointConfig {
     pub cloud_fallback_url: Option<&'static str>,
     pub discovery_mode: DiscoveryMode,
     pub compat: OpenAiCompatConfig,
-    pub thinking_budget_field: bool,
+    pub thinking_fallback: ThinkingFallback,
 }
 
 fn resolve_protocol_for_local(slug: &str) -> Option<Protocol> {
@@ -42,7 +43,7 @@ pub(crate) struct LocalEndpoint {
     auth: Arc<Mutex<ResolvedAuth>>,
     key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
-    thinking_budget_field: bool,
+    thinking_fallback: ThinkingFallback,
     discovery_mode: DiscoveryMode,
     protocol: Option<Protocol>,
 }
@@ -76,7 +77,7 @@ impl LocalEndpoint {
             auth,
             key_pool: None,
             system_prefix: None,
-            thinking_budget_field: cfg.thinking_budget_field,
+            thinking_fallback: cfg.thinking_fallback,
             discovery_mode: cfg.discovery_mode,
             protocol: resolve_protocol_for_local(cfg.slug),
         }
@@ -117,7 +118,7 @@ impl LocalEndpoint {
             auth: Arc::new(Mutex::new(auth)),
             key_pool,
             system_prefix: None,
-            thinking_budget_field: cfg.thinking_budget_field,
+            thinking_fallback: cfg.thinking_fallback,
             discovery_mode: cfg.discovery_mode,
             protocol,
         })
@@ -159,9 +160,8 @@ impl Provider for LocalEndpoint {
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
 
-            if self.thinking_budget_field {
-                opts.thinking.apply_local_thinking(&mut body, model);
-            }
+            opts.thinking
+                .apply_thinking(&mut body, model, self.thinking_fallback);
 
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
@@ -542,7 +542,8 @@ pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
         include_stream_usage: true,
         provider_name: "Ollama",
     },
-    thinking_budget_field: false,
+    // Ollama ignores the budget field, so effort is the only thing it hears.
+    thinking_fallback: ThinkingFallback::Dialect(&crate::dialect::OLLAMA),
 };
 
 pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
@@ -562,13 +563,23 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
         include_stream_usage: true,
         provider_name: "LlamaCpp",
     },
-    thinking_budget_field: true,
+    thinking_fallback: ThinkingFallback::BudgetField,
 };
 
 #[cfg(test)]
 mod tests {
     use super::super::Timeouts;
     use super::*;
+
+    /// maki-config keeps its own list of the slugs whose thinking keys it lets
+    /// `providers.toml` set. A rename here would silently stop reading them and
+    /// start reporting them as dropped.
+    #[test]
+    fn local_slugs_read_their_declared_thinking_keys() {
+        for cfg in [OLLAMA, LLAMACPP] {
+            assert!(maki_config::providers::overlays_local_thinking(cfg.slug));
+        }
+    }
 
     #[test]
     fn from_env_without_host_or_api_key_errors() {

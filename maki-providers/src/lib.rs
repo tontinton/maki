@@ -32,6 +32,6 @@ pub use types::{
     ContentBlock, EMPTY_RESPONSE_MARKER, Effort, EffortDialect, IMAGE_EVICTED_NOTE,
     IMAGE_OMITTED_NOTE, IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource,
     Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions, Role,
-    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, UsageLimit, adapt_images_for_model,
-    dialect,
+    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, ThinkingFallback, UsageLimit,
+    adapt_images_for_model, dialect,
 };
