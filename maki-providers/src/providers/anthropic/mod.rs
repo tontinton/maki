@@ -491,9 +491,17 @@ struct ApiModelInfo {
 /// The variant pins `context_window` to [`shared::LONG_CONTEXT_WINDOW`] --
 /// that is what the suffix asserts -- while the base keeps whatever
 /// discovery reported; zero-valued fields are treated as unreported.
+///
+/// The base id deliberately drops a window at or past 1M. Reaching it needs
+/// the [`shared::LONG_CONTEXT_BETA`] header, which is gated on the `-1m`
+/// suffix, so the base id would gauge against a million tokens the request
+/// never asks for: compaction would never fire and the API would reject the
+/// turn at 200K. Unreported lets the curated entry answer instead.
 fn discovered_model_infos(m: ApiModelInfo) -> Vec<crate::model::ModelInfo> {
     let mut models = Vec::new();
-    let context_window = (m.max_input_tokens > 0).then_some(m.max_input_tokens);
+    let context_window = (m.max_input_tokens > 0
+        && m.max_input_tokens < shared::LONG_CONTEXT_WINDOW)
+        .then_some(m.max_input_tokens);
     let max_output_tokens = m.max_tokens.filter(|&v| v > 0);
     if m.max_input_tokens >= shared::LONG_CONTEXT_WINDOW {
         models.push(crate::model::ModelInfo {
@@ -1260,7 +1268,27 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         );
         assert_eq!(infos[0].context_window, Some(shared::LONG_CONTEXT_WINDOW));
         assert_eq!(infos[0].max_output_tokens, Some(64_000));
+        // Only the suffixed id may claim 1M; the base leaves the window
+        // unreported so the curated 200K stands and compaction still fires.
         assert_eq!(infos[1].id, "claude-x");
-        assert_eq!(infos[1].context_window, Some(shared::LONG_CONTEXT_WINDOW));
+        assert_eq!(infos[1].context_window, None);
+    }
+
+    /// The window the gauge trusts must match the window the request gets:
+    /// the 1M beta header is suffix-gated, so a base id that inherited a
+    /// discovered 1M would overrun the API's 200K cap with no compaction.
+    #[test]
+    fn discovered_1m_does_not_widen_the_base_id() {
+        let infos = discovered_model_infos(ApiModelInfo {
+            id: "claude-sonnet-4-5".into(),
+            max_input_tokens: shared::LONG_CONTEXT_WINDOW,
+            max_tokens: Some(64_000),
+        });
+        crate::model_registry::set_known_models("anthropic", infos);
+        let base = Model::from_spec("anthropic/claude-sonnet-4-5").unwrap();
+        assert_eq!(base.context_window, 200_000);
+        let long = Model::from_spec("anthropic/claude-sonnet-4-5-1m").unwrap();
+        assert_eq!(long.context_window, shared::LONG_CONTEXT_WINDOW);
+        crate::model_registry::set_known_models("anthropic", Vec::new());
     }
 }
