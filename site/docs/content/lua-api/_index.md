@@ -3320,18 +3320,26 @@ endpoint may never report. Purely local -- no UI round-trip, no network
 - `{spec}` (`string`) `"provider/id"`, as listed by `available()`.
 
 **Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, provider_display,
-  tier, context_window, max_output_tokens?, free?, pricing?}`, or nil and
-  an error. `pricing` is present only when rates are known:
+  tier, subsidised_by?, context_window, max_output_tokens?, free?,
+  pricing?}`, or nil and an error.
+
+  `free` has three states: `true` when the model is known to cost nothing,
+  `false` when it is metered, and nil when no source ever quoted a rate.
+  Check `~= nil` before trusting it.
+
+  `subsidised_by` names the subscription prepaying this provider (billed
+  cost is $0, the rates are the list-price reference). It sits at the top
+  level because it holds whether or not rates resolved.
+
+  `pricing` is present only when rates are known:
   `{input, output, cache_write, cache_read}` in USD per million tokens,
-  plus optional `fast = {input, output}` and `subsidised_by` -- the
-  subscription prepaying this provider (billed cost is $0; the rates are
-  the list-price reference).
+  plus optional `fast = {input, output}`.
 
 **Example:**
 
 ```lua
 local m, err = maki.model.info("anthropic/claude-opus-4-6")
-if m and m.pricing then print(m.pricing.input, m.pricing.subsidised_by) end
+if m and m.subsidised_by then print(m.subsidised_by, m.pricing.input) end
 ```
 
 
@@ -3486,9 +3494,8 @@ The returned table:
 
 `usage` and `cost` include subagent spend. `context_size` is the main
 session's own, since a subagent runs its own window. There is no
-`list_cost` here because `cost` is re-settled from stored usage when a
-session resumes and list price is not stored, so per-turn list price
-lives on the `TurnEnd` autocmd instead.
+`list_cost` here: the un-subsidised total for a run arrives on the
+`TurnEnd` autocmd, and `maki.model.info` carries the rates behind it.
 
 **Parameters:**
 
