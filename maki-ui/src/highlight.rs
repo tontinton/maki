@@ -15,18 +15,30 @@ pub(crate) fn is_ready() -> bool {
     maki_highlight::is_ready()
 }
 
+/// Also publishes every named style to Lua, behind `maki.ui.theme_style`.
 pub(crate) fn refresh_syntax_theme() {
     let theme = theme::current();
     maki_highlight::set_theme(theme.syntax.clone());
-    maki_highlight::set_ui_colors(
-        [
-            ("diff_old", theme.diff_old.bg),
-            ("diff_new", theme.diff_new.bg),
-        ]
-        .into_iter()
-        .filter_map(|(name, color)| Some((name.to_owned(), theme::segment_color(color?))))
-        .collect(),
+    maki_highlight::set_ui_styles(
+        theme::STYLE_NAMES
+            .iter()
+            .map(|name| ((*name).to_owned(), ui_style(theme::style_by_name(name))))
+            .collect(),
     );
+}
+
+fn ui_style(style: Style) -> maki_highlight::UiStyle {
+    let has = |m: Modifier| style.add_modifier.contains(m);
+    maki_highlight::UiStyle {
+        fg: style.fg.map(theme::segment_color),
+        bg: style.bg.map(theme::segment_color),
+        bold: has(Modifier::BOLD),
+        italic: has(Modifier::ITALIC),
+        underline: has(Modifier::UNDERLINED),
+        dim: has(Modifier::DIM),
+        strikethrough: has(Modifier::CROSSED_OUT),
+        reversed: has(Modifier::REVERSED),
+    }
 }
 
 pub fn highlight_line(hl: &mut maki_highlight::Highlighter, text: &str) -> Vec<Span<'static>> {

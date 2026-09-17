@@ -154,7 +154,8 @@ pub(crate) fn buf_from_reply(val: &LuaValue) -> Option<Arc<SharedBuf>> {
 /// Colors accept "#rrggbb", a terminal color name like "blue" or "light-gray",
 /// or a palette index as a string like "4". Names must be spelled exactly,
 /// hyphens included. Named and indexed colors are left for the terminal to
-/// resolve, so they follow the user's palette.
+/// resolve, so they follow the user's palette. To mix a named style with colors
+/// of your own, `maki.ui.theme_style` hands back its parts.
 ///
 /// @param line string|table Plain string, or a sequence of spans: `{ {text, style?}, ... }`.
 /// @return

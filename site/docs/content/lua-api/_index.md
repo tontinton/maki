@@ -4935,12 +4935,13 @@ toast:line("copied!")
 maki.ui.theme_color({name})
 ```
 
-Looks up a semantic color from the current theme. Use this to keep
-your plugin's colors consistent with the rest of the UI.
+Looks up a color the syntax theme names, such as "background",
+"foreground" or "accent". For the styles the UI paints with, use
+`maki.ui.theme_style`.
 
 **Parameters:**
 
-- `{name}` (`string`) Semantic color name, e.g. "accent" or "background".
+- `{name}` (`string`) Syntax theme color name, e.g. "accent" or "background".
 
 **Returns:** (`string|nil`) "#rrggbb" for a truecolor theme, a palette index as a
   string like "4" when the theme names an ANSI color, or "default" for the
@@ -4954,6 +4955,37 @@ local accent = maki.ui.theme_color("accent")
 if accent then
   buf:line({ { "note", { fg = accent, bold = true } } })
 end
+```
+
+---
+
+### `maki.ui.theme_style()` {#maki-ui-theme_style}
+
+```lua
+maki.ui.theme_style({name})
+```
+
+Looks up a named style from the current theme. The names are the ones a span
+already takes as a string ("dim", "item_selected", "keybind_section",
+"diff_old", ...), so `{ text, "dim" }` and `theme_style("dim")` paint the
+same. Reach for the table when you need the parts, say to keep a style's
+foreground over a background of your own.
+
+**Parameters:**
+
+- `{name}` (`string`) Style name, the same spelling a span accepts.
+
+**Returns:** (`table|nil`) `{fg?, bg?, bold?, italic?, underline?, dim?,
+  strikethrough?, reversed?}`, ready to use as a span style. Colors are
+  spelled as in `maki.ui.theme_color`. Nil when the name is unknown, and an
+  empty table when the theme leaves that style unset.
+
+**Example:**
+
+```lua
+local sel = maki.ui.theme_style("item_selected")
+local dim = maki.ui.theme_style("dim")
+buf:line({ { "note", { fg = dim.fg, bg = sel.bg } } })
 ```
 
 ---
@@ -5523,7 +5555,8 @@ for rich content. Style can be a named string like "bold" or
 Colors accept "#rrggbb", a terminal color name like "blue" or "light-gray",
 or a palette index as a string like "4". Names must be spelled exactly,
 hyphens included. Named and indexed colors are left for the terminal to
-resolve, so they follow the user's palette.
+resolve, so they follow the user's palette. To mix a named style with colors
+of your own, `maki.ui.theme_style` hands back its parts.
 
 **Parameters:**
 
@@ -5891,7 +5924,8 @@ function M.lerp(from, to, t)
 end
 
 function M.dim(color, factor)
-  local bg = maki.ui.theme_color("background")
+  local background = maki.ui.theme_style("background")
+  local bg = background and background.bg
   return bg and M.lerp(color, bg, factor)
 end
 
@@ -5932,13 +5966,32 @@ function M.replace(content, old_string, new_string, replace_all)
 function ListPicker.render_header(win, lines, input, prefix, inner)
 
 -- Open a fuzzy-filter picker in a floating window and block until the user
--- decides. {items} is a list of strings or { label, detail? } tables. {opts}:
--- title, footer, cursor (initial index), submit_keys (extra submit keys
--- besides enter), action_keys (keys that close the picker and report
--- themselves, like { "R" } for a refresh binding. Use uppercase keys, since
--- lowercase ones keep feeding the filter). Returns
--- { type = "choice"|"delete", index }, { type = "key", key, index? } or
--- { type = "close" }.
+-- decides.
+--
+-- {items} is a list of strings or of
+-- { label, detail?, section?, section_detail? } tables. A detail is a string, or
+-- a list of { text, style } parts when the right of a row needs more than one
+-- color. Mark one part `elastic = true` and that is the part a narrow row cuts,
+-- leaving the parts after it whole.
+--
+-- {opts}:
+--   title, footer, cursor (initial index)
+--   submit_keys: extra submit keys besides enter
+--   action_keys: keys that close the picker and report themselves, like { "R" }
+--     for a refresh binding. Use uppercase keys, lowercase ones keep feeding
+--     the filter
+--   live_keys: { [key] = function(item|nil) -> items|nil }, keys that swap the
+--     list in place, keeping the typed query. Called with the selected item, or
+--     nil when nothing matches, and returning nil leaves the list alone.
+--     Handlers run inside the render loop, so keep them cheap and hand anything
+--     slow to an action_key
+--   key: function(item) -> string|nil, a row's identity. Rows sharing the
+--     selected row's key are tinted, and the cursor follows its key across a
+--     live swap
+--
+-- Returns { type = "choice"|"delete", index, item },
+-- { type = "key", key, index?, item? } or { type = "close" }. Prefer {item},
+-- since {index} points into an {items} a live swap may have replaced.
 function ListPicker.open(items, opts)
 ListPicker.split_words = split_words
 ListPicker.matches = matches

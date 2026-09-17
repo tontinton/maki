@@ -9,6 +9,10 @@ M.NO_MEMORIES_MSG = "No memories yet."
 
 local MAX_TAG_LEN = 64
 local MAX_REJECT_DISPLAY = 64
+local SIZE_UNIT = 1024
+local DETAIL_SEP = "·"
+local TAG_STYLE = "keybind_section"
+local SIZE_STYLE = "dim"
 local WRITE_REJECT_PREFIX = "invalid tag(s) rejected: "
 local READ_REJECT_PREFIX = "warning: ignored invalid tag(s): "
 local UNREADABLE_PREFIX = "warning: unreadable memory files: "
@@ -297,25 +301,34 @@ local function matching_entries(dir, want)
   return matches, warnings
 end
 
--- Groups files under their tags, most-used tag first (name breaks ties).
--- Unreadable files land in warnings instead of a group.
-function M.grouped_tags(dir)
-  local by_tag, groups, warnings = {}, {}, {}
+-- Name-sorted, tags in frontmatter order, and unreadable files land in warnings
+-- instead of the list.
+function M.files_with_tags(dir)
+  local files, warnings = {}, {}
   for _, f in ipairs(file_entries(dir)) do
     local name, size = f[1], f[2]
     local tags, warn = cached_tags(dir, name, size, f[3])
     if warn then
       warnings[#warnings + 1] = name .. ": " .. warn
     else
-      for _, t in ipairs(tags) do
-        local g = by_tag[t]
-        if not g then
-          g = { tag = t, files = {} }
-          by_tag[t] = g
-          groups[#groups + 1] = g
-        end
-        g.files[#g.files + 1] = { name = name, size = size }
+      files[#files + 1] = { name = name, size = size, tags = tags }
+    end
+  end
+  return files, warnings
+end
+
+-- Groups files under their tags, most-used tag first (name breaks ties).
+function M.group_by_tag(files)
+  local by_tag, groups = {}, {}
+  for _, f in ipairs(files) do
+    for _, t in ipairs(f.tags) do
+      local g = by_tag[t]
+      if not g then
+        g = { tag = t, files = {} }
+        by_tag[t] = g
+        groups[#groups + 1] = g
       end
+      g.files[#g.files + 1] = { name = f.name, size = f.size }
     end
   end
   table.sort(groups, function(a, b)
@@ -324,7 +337,31 @@ function M.grouped_tags(dir)
     end
     return #a.files > #b.files
   end)
-  return groups, warnings
+  return groups
+end
+
+function M.grouped_tags(dir)
+  local files, warnings = M.files_with_tags(dir)
+  return M.group_by_tag(files), warnings
+end
+
+-- For the picker only. format_list keeps the exact "(N bytes)" the model reads.
+function M.format_size(bytes)
+  return bytes < SIZE_UNIT and bytes .. "B" or string.format("%.1fK", bytes / SIZE_UNIT)
+end
+
+-- A detail is right-aligned, so the size goes last and lands against the border
+-- on every row, and the tags are elastic so a narrow row eats tag characters
+-- and never leaves half a size behind.
+function M.detail_parts(size, tags)
+  local size_text = M.format_size(size)
+  if not tags or #tags == 0 then
+    return { { size_text, SIZE_STYLE } }
+  end
+  return {
+    { table.concat(tags, ", "), TAG_STYLE, elastic = true },
+    { " " .. DETAIL_SEP .. " " .. size_text, SIZE_STYLE },
+  }
 end
 
 function M.format_tag_line(dir, max_tags)

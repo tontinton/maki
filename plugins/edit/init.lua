@@ -133,7 +133,8 @@ end
 local function apply_highlights(view, fmt, jobs, ext)
   maki.async.run(function()
     for _, job in ipairs(jobs) do
-      local bg = maki.ui.theme_color(job.side.style)
+      local side = maki.ui.theme_style(job.side.style)
+      local bg = side and side.bg
       local highlighted = bg and maki.ui.highlight(job.text, ext)
       for i, hl_line in ipairs(highlighted or {}) do
         local idx = job.first + i - 1

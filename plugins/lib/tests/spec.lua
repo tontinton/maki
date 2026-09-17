@@ -1252,10 +1252,10 @@ case("render_lines_mixed_string_and_table", function()
   eq(#lines[2], 4, "table item with detail: label + pad + detail + right_pad")
 end)
 
-case("render_lines_trailing_omitted_when_label_fills_width", function()
-  local label = string.rep("z", 10)
-  local lines = render_lines({ label }, 1, 12)
-  eq(#lines[1], 1, "no trailing span when width - indent - label <= 0")
+case("render_lines_label_longer_than_width_is_truncated", function()
+  local lines = render_lines({ string.rep("z", 10) }, 1, 12)
+  eq(lines[1][1][1], "  " .. string.rep("z", 7) .. "…", "label gives up cells for the ellipsis")
+  eq(lines[1][2][1], "  ", "the right pad still closes the row")
 end)
 
 case("render_lines_match_highlight_selected", function()
@@ -1276,13 +1276,6 @@ case("render_lines_match_highlight_not_selected", function()
   eq(lines[1][2][2], "match")
   eq(lines[1][3][1], "a")
   eq(lines[1][3][2], "item")
-end)
-
-case("render_lines_detail_right_pad_always_present", function()
-  local items = { { label = "x", detail = "d" } }
-  local lines = render_lines(items, 1, 50)
-  local right_pad = lines[1][4][1]
-  eq(#right_pad, 2, "DETAIL_RIGHT_PAD = 2")
 end)
 
 local filter_items = ListPicker._filter_items
@@ -1395,13 +1388,13 @@ case("render_lines_sections_headers_and_item_lines", function()
   eq(#lines, 6, "two headers + blank gap + three items, header never repeats within a section")
   eq(lines[1][1][1], "  auth")
   eq(lines[1][1][2], "keybind_section")
-  eq(lines[1][2][1], " (2)", "section detail rendered after the header")
-  eq(lines[1][2][2], "dim")
+  eq(lines[1][3][1], "(2)", "section detail right-aligned like an item detail")
+  eq(lines[1][3][2], "dim")
   eq(lines[2][1][1], "  a")
   eq(lines[3][1][1], "  b")
   eq(#lines[4], 0, "blank line between sections")
   eq(lines[5][1][1], "  storage")
-  eq(#lines[5], 1, "no detail span without section_detail")
+  eq(#lines[5], 2, "label plus trailing pad without section_detail")
   eq(lines[6][1][1], "  c")
   eq(item_lines[1], 2, "cursor mapping skips the header")
   eq(item_lines[2], 3)
@@ -1434,6 +1427,204 @@ case("render_lines_nil_sections_mix_with_grouped", function()
   local _, item_lines = render_lines({ { label = "a", section = "grp" }, "b" }, 1, 40)
   eq(item_lines[1], 2, "grouped item sits under its header")
   eq(item_lines[2], 3, "nil-section item follows without a new header")
+end)
+
+local ELLIPSIS = "…"
+local MIN_DETAIL_COLS = 6
+local PEER_STYLE = { fg = "#c0caf5", bg = "#283457" }
+
+local function row_width(spans)
+  local w = 0
+  for _, s in ipairs(spans) do
+    w = w + maki.ui.display_width(s[1])
+  end
+  return w
+end
+
+local function row_text(spans)
+  local parts = {}
+  for i, s in ipairs(spans) do
+    parts[i] = s[1]
+  end
+  return table.concat(parts)
+end
+
+-- A row wider than its window breaks the float's frame, so check every shape a
+-- row can take, wide characters included.
+case("render_lines_row_fills_exactly_the_window_width", function()
+  local labels = {
+    ascii_short = "ab",
+    ascii_long = string.rep("abcdefghij", 4),
+    cjk = string.rep("中文字符", 6),
+    emoji = string.rep("🎉", 12),
+  }
+  local details = { none = nil, short = "1.2K", long = string.rep("tag-name, ", 8) }
+  for _, width in ipairs({ 3, 5, 13, 60 }) do
+    for lname, label in pairs(labels) do
+      for dname, detail in pairs(details) do
+        local lines = render_lines({ { label = label, detail = detail } }, 1, width)
+        eq(row_width(lines[1]), width, lname .. "/" .. dname .. "@" .. width)
+      end
+    end
+  end
+end)
+
+local function one_part(text)
+  return { { text, "dim" } }
+end
+
+case("fit_row_shrinks_the_detail_before_the_label", function()
+  local fit_row = ListPicker._fit_row
+  local label, detail, pad = fit_row("abcdefghij", one_part("0123456789"), 22)
+  eq(label, "abcdefghij", "the label keeps every cell while the detail can still give some up")
+  eq(detail[1][1], "012345" .. ELLIPSIS)
+  eq(pad, 1, "the two sides never touch")
+
+  label, detail = fit_row("abcdefghij", one_part("0123456789"), 18)
+  eq(maki.ui.display_width(detail[1][1]), MIN_DETAIL_COLS, "the detail stops shrinking here")
+  eq(label, "abcdef" .. ELLIPSIS, "only then does the label truncate")
+end)
+
+-- A row ending in a fixed column, a file size say, loses characters from the
+-- text before it and never from the column.
+case("fit_row_shrinks_the_elastic_part_and_keeps_the_rest", function()
+  local fit_row = ListPicker._fit_row
+  local parts = { { "gotchas, architecture", "section", elastic = true }, { " ·  1.2K", "dim" } }
+
+  local label, detail = fit_row("a.md", parts, 30)
+  eq(label, "a.md")
+  eq(detail[1][1], "gotchas, arc" .. ELLIPSIS, "the elastic part gives up the cells")
+  eq(detail[2][1], " ·  1.2K", "the trailing column stays whole")
+
+  local _, wide = fit_row("a.md", parts, 60)
+  eq(wide[1][1], "gotchas, architecture", "nothing is cut when the row is wide enough")
+
+  -- Once even the fixed parts do not fit, the tail goes, since a row wider than
+  -- its window is worse.
+  local _, tiny = fit_row("a.md", parts, 14)
+  eq(#tiny, 1)
+  eq(tiny[1][1], "gotch" .. ELLIPSIS)
+end)
+
+case("render_lines_section_header_is_fitted_like_an_item", function()
+  local items = { { label = "a", section = string.rep("long-tag-", 6), section_detail = "(1)" } }
+  local lines = render_lines(items, 1, 30)
+  eq(row_width(lines[1]), 30, "a long section name is fitted, not overflowed")
+  assert(row_text(lines[1]):find(ELLIPSIS, 1, true), "the section name marks its cut")
+end)
+
+local function peer_stub()
+  return {
+    key = function(item)
+      return item.label
+    end,
+    style = PEER_STYLE,
+    detail_style = function(role)
+      return { fg = role .. "-color", bg = PEER_STYLE.bg }
+    end,
+  }
+end
+
+case("render_lines_tints_the_rows_sharing_the_selected_key", function()
+  local items = {
+    { label = "a.md", detail = { { "1.2K", "dim" } } },
+    { label = "b.md" },
+    { label = "a.md", detail = { { "1.2K", "dim" } } },
+  }
+  local lines = render_lines(items, 1, 40, nil, peer_stub())
+  eq(lines[1][1][2], "selected", "the selected row keeps the selection style")
+  eq(lines[1][3][2], "selected", "and so does its detail")
+  eq(lines[2][1][2], "item", "a different key is an ordinary row")
+  eq(lines[3][1][2], PEER_STYLE, "the same key is tinted")
+  eq(lines[3][3][2].fg, "dim-color", "a tinted detail keeps its own color")
+  eq(lines[3][3][2].bg, PEER_STYLE.bg, "over the same tint, so the row has no hole")
+
+  eq(render_lines(items, 1, 40, nil, nil)[3][1][2], "item", "without a peer nothing is tinted")
+end)
+
+case("render_lines_peer_match_is_the_peer_style_made_bold", function()
+  local lines = render_lines({ { label = "alpha" }, { label = "alpha" } }, 1, 40, "lph", peer_stub())
+  local match = lines[2][2]
+  eq(match[1], "lph")
+  eq(match[2].bold, true, "a match on a tinted row stays visible")
+  eq(match[2].fg, PEER_STYLE.fg)
+  eq(match[2].bg, PEER_STYLE.bg)
+  eq(PEER_STYLE.bold, nil, "the caller's style table is not mutated")
+end)
+
+local function palette(styles)
+  return function(name)
+    return styles[name]
+  end
+end
+
+case("peer_palette_tints_the_row_and_keeps_detail_colors_on_it", function()
+  local background, selection, item, dim = "#000000", "#ffffff", "#c0caf5", "#565f89"
+  local styles = {
+    background = { bg = background },
+    item_selected = { bg = selection },
+    item = { fg = item },
+    dim = { fg = dim },
+  }
+  local peer = ListPicker._peer(nil, palette(styles))
+  local tint = peer.style.bg
+  assert(tint ~= background and tint ~= selection, "the tint is a blend of both")
+  eq(peer.style.fg, item, "the themed item foreground stays on top")
+  eq(peer.detail_style("dim").fg, dim, "a detail keeps its own color")
+  eq(peer.detail_style("dim").bg, tint, "over the tint, so the row has no hole")
+  eq(peer.detail_style("match").fg, nil, "a style with no foreground has no color to mix")
+  eq(peer.detail_style("match").dim, true, "so the terminal dims it over the tint instead")
+
+  local paletted = ListPicker._peer(
+    nil,
+    palette({
+      background = { bg = "4" },
+      item_selected = { bg = "5" },
+    })
+  )
+  eq(paletted.style.fg, "5", "palette colors cannot blend, so selection tints the fg")
+  eq(paletted.detail_style("dim"), "dim", "without a tint the detail keeps the plain style name")
+
+  eq(ListPicker._peer(nil, palette({})).style, nil, "a theme with neither color loses the tint")
+end)
+
+-- Callers align a trailing size by leaning on this: whatever the label
+-- measures, the detail ends against the right pad.
+case("render_lines_details_end_against_the_right_pad", function()
+  local items = {
+    { label = "a.md", detail = "12B" },
+    { label = string.rep("long-name-", 3), detail = "gotchas, auth · 1.2K" },
+  }
+  for i, spans in ipairs(render_lines(items, 1, 44)) do
+    eq(spans[#spans][1], "  ", "row " .. i .. " ends with the right pad and nothing else")
+  end
+end)
+
+case("render_lines_detail_parts_keep_their_own_styles", function()
+  local items = { { label = "a.md", detail = { { "1.2K · ", "dim" }, { "gotchas, auth", "match" } } } }
+  local lines = render_lines(items, 2, 40)
+  eq(lines[1][3][1], "1.2K · ")
+  eq(lines[1][3][2], "dim")
+  eq(lines[1][4][1], "gotchas, auth")
+  eq(lines[1][4][2], "match")
+
+  -- The cut eats the last part first, and the ellipsis stays in it.
+  local narrow = render_lines(items, 2, 22)
+  eq(narrow[1][3][2], "dim")
+  eq(narrow[1][4][1], "gotch" .. ELLIPSIS)
+  eq(narrow[1][4][2], "match")
+end)
+
+case("select_after_swap_follows_the_key_then_clamps", function()
+  local swap = ListPicker._select_after_swap
+  local key = function(item)
+    return item
+  end
+  eq(swap({ "a", "b", "c" }, key, "c", 1), 3, "the cursor follows its row")
+  eq(swap({ "a", "b" }, key, "gone", 5), 2, "a vanished key clamps the previous position")
+  eq(swap({}, key, "a", 3), 1, "an empty list selects nothing")
+  eq(swap({ "a", "b", "a" }, key, "a", 3), 1, "duplicate keys resolve to the first row")
+  eq(swap({ "a", "b" }, nil, nil, 2), 2, "without a key function the position is kept")
 end)
 
 local function mock_win()

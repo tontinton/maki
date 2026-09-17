@@ -356,58 +356,71 @@ pub fn current_theme_name() -> String {
     read_theme_name().unwrap_or_else(|| DEFAULT_THEME.to_owned())
 }
 
-pub fn style_by_name(name: &str) -> Style {
-    let t = current();
-    match name {
-        "dim" | "tool_dim" => t.tool_dim,
-        "path" | "tool_path" => t.tool_path,
-        "tool" => t.tool,
-        "tool_prefix" => t.tool_prefix,
-        "tool_success" => t.tool_success,
-        "tool_error" => t.tool_error,
-        "tool_annotation" => t.tool_annotation,
-        "spinner" => t.spinner,
-        "thinking" => t.thinking,
-        "error" => t.error,
-        "bold" => t.bold,
-        "italic" => t.italic,
-        "bold_italic" => t.bold_italic,
-        "inline_code" => t.inline_code,
-        "strikethrough" => t.strikethrough,
-        "heading" => t.heading,
-        "list_marker" => t.list_marker,
-        "horizontal_rule" => t.horizontal_rule,
-        "code_gutter" => t.code_gutter,
-        "table_border" => t.table_border,
-        "keyword" | "index_keyword" => t.index_keyword,
-        "section" | "index_section" => t.index_section,
-        "line_nr" | "index_line_nr" => t.index_line_nr,
-        "diff_old" => t.diff_old,
-        "diff_new" => t.diff_new,
-        "diff_old_sign" => t.diff_old_sign,
-        "diff_new_sign" => t.diff_new_sign,
-        "diff_line_nr" => t.diff_line_nr,
-        "diff_old_line_nr" => t.diff_old_line_nr,
-        "diff_new_line_nr" => t.diff_new_line_nr,
-        "item" => t.item,
-        "item_desc" => t.item_desc,
-        "item_selected" | "selected" => t.item_selected,
-        "item_match" | "match" => t.item_match,
-        "item_match_selected" | "match_selected" => t.item_match_selected,
-        "cursor" => t.cursor,
-        "foreground" => Style::new().fg(t.foreground),
-        "accent" => t.accent,
-        "active" => t.active,
-        "keybind_key" => t.keybind_key,
-        "keybind_desc" => t.keybind_desc,
-        "keybind_section" => t.keybind_section,
-        "success" | "todo_completed" => t.todo_completed,
-        "warning" | "todo_in_progress" => t.todo_in_progress,
-        "todo_pending" | "pending" => t.todo_pending,
-        "todo_cancelled" | "cancelled" => t.todo_cancelled,
-        _ => Style::default(),
-    }
+/// One list of names feeds both the span lookup and what Lua sees, so a name a
+/// plugin can write in a span is always one it can look up too.
+macro_rules! named_styles {
+    ($t:ident => { $($($name:literal)|+ => $style:expr),+ $(,)? }) => {
+        pub const STYLE_NAMES: &[&str] = &[$($($name),+),+];
+
+        pub fn style_by_name(name: &str) -> Style {
+            let $t = current();
+            match name {
+                $($($name)|+ => $style,)+
+                _ => Style::default(),
+            }
+        }
+    };
 }
+
+named_styles!(t => {
+    "dim" | "tool_dim" => t.tool_dim,
+    "path" | "tool_path" => t.tool_path,
+    "tool" => t.tool,
+    "tool_prefix" => t.tool_prefix,
+    "tool_success" => t.tool_success,
+    "tool_error" => t.tool_error,
+    "tool_annotation" => t.tool_annotation,
+    "spinner" => t.spinner,
+    "thinking" => t.thinking,
+    "error" => t.error,
+    "bold" => t.bold,
+    "italic" => t.italic,
+    "bold_italic" => t.bold_italic,
+    "inline_code" => t.inline_code,
+    "strikethrough" => t.strikethrough,
+    "heading" => t.heading,
+    "list_marker" => t.list_marker,
+    "horizontal_rule" => t.horizontal_rule,
+    "code_gutter" => t.code_gutter,
+    "table_border" => t.table_border,
+    "keyword" | "index_keyword" => t.index_keyword,
+    "section" | "index_section" => t.index_section,
+    "line_nr" | "index_line_nr" => t.index_line_nr,
+    "diff_old" => t.diff_old,
+    "diff_new" => t.diff_new,
+    "diff_old_sign" => t.diff_old_sign,
+    "diff_new_sign" => t.diff_new_sign,
+    "diff_line_nr" => t.diff_line_nr,
+    "diff_old_line_nr" => t.diff_old_line_nr,
+    "diff_new_line_nr" => t.diff_new_line_nr,
+    "item" => t.item,
+    "item_desc" => t.item_desc,
+    "item_selected" | "selected" => t.item_selected,
+    "item_match" | "match" => t.item_match,
+    "item_match_selected" | "match_selected" => t.item_match_selected,
+    "cursor" => t.cursor,
+    "background" => Style::new().bg(t.background),
+    "foreground" => Style::new().fg(t.foreground),
+    "accent" => t.accent,
+    "active" => t.active,
+    "keybind_key" => t.keybind_key,
+    "keybind_desc" => t.keybind_desc,
+    "keybind_section" => t.keybind_section,
+    "success" | "todo_completed" => t.todo_completed,
+    "warning" | "todo_in_progress" => t.todo_in_progress,
+    "todo_pending" | "pending" => t.todo_pending,
+    "todo_cancelled" | "cancelled" => t.todo_cancelled,
+});
 
 #[derive(Debug)]
 pub struct Theme {
@@ -984,6 +997,7 @@ fn brighten_toward(style: Style, from: Color, to: Color, t: f32) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_highlight::UiStyle;
     use test_case::test_case;
 
     #[test_case(Color::Rgb(1, 2, 3), SegmentColor::Rgb((1, 2, 3)); "truecolor")]
@@ -1408,6 +1422,44 @@ diff_new_line_nr = { fg = "red" }
             maki_highlight::theme().settings.background,
             expected_syntax_bg,
             "syntax palette must reflect the new theme once generation advances",
+        );
+    }
+
+    #[test]
+    fn set_publishes_every_named_style_to_lua() {
+        set(tokyonight());
+
+        for name in STYLE_NAMES {
+            let style = style_by_name(name);
+            let published = maki_highlight::ui_style(name)
+                .unwrap_or_else(|| panic!("{name} must be published"));
+            let has = |m: Modifier| style.add_modifier.contains(m);
+            assert_eq!(published.fg, style.fg.map(segment_color), "{name} fg");
+            assert_eq!(published.bg, style.bg.map(segment_color), "{name} bg");
+            assert_eq!(published.bold, has(Modifier::BOLD), "{name} bold");
+            assert_eq!(published.italic, has(Modifier::ITALIC), "{name} italic");
+            assert_eq!(published.dim, has(Modifier::DIM), "{name} dim");
+        }
+    }
+
+    // The Lua picker tints its peer rows out of these, so a renamed theme field
+    // breaks here and not in a plugin.
+    #[test_case("item_selected", |s: &UiStyle| s.bg ; "selection background")]
+    #[test_case("background", |s: &UiStyle| s.bg ; "window background")]
+    #[test_case("item", |s: &UiStyle| s.fg ; "item foreground")]
+    #[test_case("keybind_section", |s: &UiStyle| s.fg ; "section foreground")]
+    #[test_case("dim", |s: &UiStyle| s.fg ; "dim foreground")]
+    fn set_colors_the_styles_the_picker_reads(
+        name: &str,
+        slot: fn(&UiStyle) -> Option<SegmentColor>,
+    ) {
+        set(tokyonight());
+
+        let published =
+            maki_highlight::ui_style(name).unwrap_or_else(|| panic!("{name} must be published"));
+        assert!(
+            slot(&published).is_some(),
+            "{name} must be styled by the theme"
         );
     }
 

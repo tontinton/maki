@@ -23,6 +23,9 @@ pub(crate) mod win;
 use crate::runtime::with_task_bufs;
 use win::WinHandle;
 
+/// `fg`, `bg` and six modifiers.
+const UI_STYLE_FIELDS: usize = 8;
+
 pub(crate) struct HintStore {
     hints: BTreeMap<Arc<str>, Vec<(String, String)>>,
 }
@@ -106,10 +109,11 @@ fn buf(lua: &Lua, opts: Option<Table>) -> LuaResult<buf::BufHandle> {
     }))
 }
 
-/// Looks up a semantic color from the current theme. Use this to keep
-/// your plugin's colors consistent with the rest of the UI.
+/// Looks up a color the syntax theme names, such as "background",
+/// "foreground" or "accent". For the styles the UI paints with, use
+/// `maki.ui.theme_style`.
 ///
-/// @param name string Semantic color name, e.g. "accent" or "background".
+/// @param name string Syntax theme color name, e.g. "accent" or "background".
 /// @return (string|nil) "#rrggbb" for a truecolor theme, a palette index as a
 ///   string like "4" when the theme names an ANSI color, or "default" for the
 ///   terminal's own color. Nil only when the name is unknown. Every form can be
@@ -127,6 +131,47 @@ fn theme_color(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
     Ok(mlua::Value::String(
         lua.create_string(segment_color_to_lua(color))?,
     ))
+}
+
+/// Looks up a named style from the current theme. The names are the ones a span
+/// already takes as a string ("dim", "item_selected", "keybind_section",
+/// "diff_old", ...), so `{ text, "dim" }` and `theme_style("dim")` paint the
+/// same. Reach for the table when you need the parts, say to keep a style's
+/// foreground over a background of your own.
+///
+/// @param name string Style name, the same spelling a span accepts.
+/// @return (table|nil) `{fg?, bg?, bold?, italic?, underline?, dim?,
+///   strikethrough?, reversed?}`, ready to use as a span style. Colors are
+///   spelled as in `maki.ui.theme_color`. Nil when the name is unknown, and an
+///   empty table when the theme leaves that style unset.
+/// @example
+/// local sel = maki.ui.theme_style("item_selected")
+/// local dim = maki.ui.theme_style("dim")
+/// buf:line({ { "note", { fg = dim.fg, bg = sel.bg } } })
+#[lua_fn]
+fn theme_style(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
+    let Some(style) = maki_highlight::ui_style(&name) else {
+        return Ok(mlua::Value::Nil);
+    };
+    let tbl = lua.create_table_with_capacity(0, UI_STYLE_FIELDS)?;
+    for (key, color) in [("fg", style.fg), ("bg", style.bg)] {
+        if let Some(c) = color {
+            tbl.raw_set(key, segment_color_to_lua(c))?;
+        }
+    }
+    for (key, on) in [
+        ("bold", style.bold),
+        ("italic", style.italic),
+        ("underline", style.underline),
+        ("dim", style.dim),
+        ("strikethrough", style.strikethrough),
+        ("reversed", style.reversed),
+    ] {
+        if on {
+            tbl.raw_set(key, true)?;
+        }
+    }
+    Ok(mlua::Value::Table(tbl))
 }
 
 /// Syntax-highlights a chunk of source code. Returns a table of styled
@@ -506,7 +551,7 @@ lua_table! {
     /// local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
     /// ```
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
-        buf, theme_color, highlight, markdown, humantime, terminal_size,
+        buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
         manual set_window_title,

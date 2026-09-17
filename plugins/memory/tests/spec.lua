@@ -603,6 +603,54 @@ case("validate_input", function()
   end
 end)
 
+case_tmp("files_with_tags_lists_every_file_once", function(dir)
+  eq(#h.files_with_tags(dir), 0, "empty dir lists nothing")
+
+  write_mem(dir, "b.md", { "gotchas", "architecture" }, "body")
+  write_mem(dir, "a.md", { "architecture" }, "longer body here")
+
+  local files = h.files_with_tags(dir)
+  eq(#files, 2, "one entry per file, not per tag")
+  eq(files[1].name, "a.md", "name sorted")
+  eq(files[2].name, "b.md")
+  eq(files[1].size, #encode_frontmatter({ "architecture" }) + #"longer body here")
+  eq(table.concat(files[2].tags, ","), "gotchas,architecture", "frontmatter tag order is kept")
+end)
+
+case("group_by_tag_sorts_by_count_then_name", function()
+  local files = {
+    { name = "a.md", size = 1, tags = { "zeta", "shared" } },
+    { name = "b.md", size = 2, tags = { "alpha", "shared" } },
+  }
+  local groups = h.group_by_tag(files)
+  eq(#groups, 3)
+  eq(groups[1].tag, "shared", "most used tag first")
+  eq(#groups[1].files, 2)
+  eq(groups[1].files[1].size, 1, "a grouped row still knows its size")
+  eq(groups[2].tag, "alpha", "ties broken by tag name")
+  eq(groups[3].tag, "zeta")
+end)
+
+case("format_size_switches_unit_at_one_kib", function()
+  eq(h.format_size(1023), "1023B")
+  eq(h.format_size(1024), "1.0K")
+  eq(h.format_size(1536), "1.5K")
+end)
+
+case("detail_parts_end_with_the_size_and_truncate_the_tags", function()
+  local parts = h.detail_parts(1234, { "gotchas", "architecture" })
+  eq(parts[1][1], "gotchas, architecture")
+  eq(parts[1][2], "keybind_section", "tags wear the color the grouped view puts on its tag headers")
+  eq(parts[1].elastic, true, "tags are what a narrow row truncates")
+  eq(parts[2][1], " · 1.2K", "the size ends the row, so the picker lands it against the border")
+  eq(parts[2][2], "dim")
+  eq(parts[2].elastic, nil, "only the tags give up cells")
+
+  local bare = h.detail_parts(12, {})
+  eq(bare[1][1], "12B", "no separator without tags")
+  eq(bare[2], nil)
+end)
+
 if #failures > 0 then
   error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
 end
