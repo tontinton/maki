@@ -51,7 +51,6 @@ use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
-use crate::image;
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
@@ -767,24 +766,12 @@ impl App {
         match msg {
             Msg::Key(key) => self.handle_key(key),
             Msg::Paste(text) => {
-                let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 if text.is_empty() {
                     if self.is_main_chat() && self.image_paste_rx.is_empty() {
                         self.start_image_paste();
                     }
                 } else {
-                    let mut any_image = false;
-                    if self.is_main_chat() {
-                        for line in text.lines() {
-                            if let Some((path, mt)) = image::try_parse_image_path(line) {
-                                self.start_file_image_paste(path, mt);
-                                any_image = true;
-                            }
-                        }
-                    }
-                    if !any_image {
-                        self.route_text_paste(&text);
-                    }
+                    self.insert_pasted(text);
                 }
                 vec![]
             }
