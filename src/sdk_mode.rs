@@ -27,6 +27,7 @@ use maki_agent::{
     SessionEndReason, SessionEvents, ToolOutput,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
+use maki_lua::HeadlessMessages;
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
@@ -646,6 +647,15 @@ pub fn run(params: SdkParams) -> Result<()> {
             _ => MODE_BUILD,
         },
     );
+    // What plugins spend through `maki.model.complete` is outside the
+    // agent's ledger, and an sdk client that never sees it is billed for a
+    // run it thinks was cheaper.
+    snapshot.install_model_spend(&lua_handle);
+    HeadlessMessages {
+        id: handle.session_id.to_string(),
+        history: handle.history.clone(),
+    }
+    .install(&lua_handle);
 
     let pump = EventPump {
         writer: writer.clone(),
@@ -1013,6 +1023,7 @@ impl EventPump {
         self.tool_inputs.clear();
         self.result_text.clear();
         self.cost = None;
+        let _ = self.snapshot.take_plugin_spend();
         self.shared.lock().unwrap().permissions.forget_outstanding();
     }
 
@@ -1021,8 +1032,13 @@ impl EventPump {
         is_error: bool,
         result: String,
         num_turns: u32,
-        usage: TokenUsage,
+        mut usage: TokenUsage,
     ) -> Result<()> {
+        // Plugin model calls (`maki.model.complete`, so every reviewer that
+        // asks a model) are spend on this turn too.
+        let (plugin_usage, plugin_cost) = self.snapshot.take_plugin_spend();
+        usage += plugin_usage;
+        add_cost(&mut self.cost, plugin_cost);
         let duration_ms = self.shared.lock().unwrap().turn_start.elapsed().as_millis();
         // Zero on an unpriced model, which is what its turns reported too.
         let total_cost_usd = self.cost.unwrap_or_default();
@@ -1096,6 +1112,7 @@ impl EventPump {
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
             | AgentEvent::PromptProgress { .. }
+            | AgentEvent::ReviewerVerdict(_)
             | AgentEvent::StreamClosed => {}
             AgentEvent::Retry {
                 attempt,

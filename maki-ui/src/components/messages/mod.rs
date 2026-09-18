@@ -301,6 +301,18 @@ impl MessagesPanel {
         self.rebuild_tool_segment(tool_id);
     }
 
+    /// Marks a tool row with what a reviewer decided about it. A reviewed
+    /// call never opens the permission prompt, and that prompt is where the
+    /// user normally learns what the agent is about to do, so the row itself
+    /// has to say a reviewer stood in for them.
+    pub fn tool_reviewed(&mut self, tool_id: &str, note: &str) {
+        let Some(msg) = self.find_tool_msg_mut(tool_id) else {
+            return;
+        };
+        append_annotation(&mut msg.annotation, note);
+        self.rebuild_tool_segment(tool_id);
+    }
+
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
         let had_live_buf = self.retire_live_buf(&event.id);
         let Some(msg) = self
@@ -555,6 +567,11 @@ impl MessagesPanel {
     #[cfg(test)]
     pub fn last_message_role(&self) -> Option<&DisplayRole> {
         self.messages.last().map(|m| &m.role)
+    }
+
+    #[cfg(test)]
+    pub fn last_message_annotation(&self) -> Option<&str> {
+        self.messages.last().and_then(|m| m.annotation.as_deref())
     }
 
     #[cfg(test)]

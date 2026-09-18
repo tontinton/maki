@@ -1035,7 +1035,9 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
+    use maki_agent::permissions::{
+        PermissionCheck, PermissionError, PermissionManager, ReviewSource,
+    };
     use maki_agent::tools::PermissionScopes;
     use maki_agent::{
         CancelToken, DoneReason, EventSender, SubagentInfo, ToolStartEvent, TurnCompleteEvent,
@@ -1265,6 +1267,7 @@ mod tests {
         let (out_tx, out_rx) = flume::unbounded();
         let handle = InteractiveHandle {
             tool_names: Vec::new(),
+            history: Arc::default(),
             input_tx: flume::unbounded().0,
             answer_tx,
             cancel_tx: flume::unbounded().0,
@@ -1553,6 +1556,7 @@ mod tests {
             request_id,
             &CancelToken::none(),
             None,
+            ReviewSource::none(),
         ))
     }
 

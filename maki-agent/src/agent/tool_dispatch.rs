@@ -11,6 +11,7 @@ use tracing::{debug, error, warn};
 
 use crate::agent::CallInstructions;
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
+use crate::permissions::ReviewSource;
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
 use crate::tools::registry::{InstalledHook, RegisteredTool, ToolInvocation};
@@ -594,7 +595,7 @@ async fn run_native_tool(
 
     invocation.start(ctx).await;
 
-    if let Err(e) = enforce_permission(invocation.as_ref(), name, ctx, &id).await {
+    if let Err(e) = enforce_permission(invocation.as_ref(), name, ctx, &id, input).await {
         return done_error(e);
     }
 
@@ -744,6 +745,16 @@ async fn run_local_tool(
     }
 }
 
+/// The turn whose review budget this call spends. A subagent shares its
+/// parent's `PermissionManager`, so the task id is what tells the two
+/// budgets apart.
+fn review_turn(ctx: &ToolContext) -> crate::permissions::ReviewTurn<'_> {
+    crate::permissions::ReviewTurn {
+        session: ctx.session_id.as_ref().map(SessionRef::as_str),
+        task: ctx.task_id.as_deref(),
+    }
+}
+
 /// Enforce permission for a native tool. MCP tools bypass this — they go
 /// through `execute_mcp_tool` which handles permission checking internally.
 ///
@@ -753,12 +764,17 @@ async fn enforce_permission(
     name: &str,
     ctx: &ToolContext,
     id: &str,
+    input: &Value,
 ) -> Result<(), String> {
     if name.contains('.') {
         return Err(format!(
             "enforce_permission called with dotted name: {name}"
         ));
     }
+    let review = ReviewSource {
+        input: Some(input),
+        turn: review_turn(ctx),
+    };
     if let Some(scopes) = inv.permission_scopes().await {
         let tool_key = ToolKey::native(name);
         ctx.permissions
@@ -770,7 +786,13 @@ async fn enforce_permission(
                 id,
                 &ctx.cancel,
                 ctx.mode.plan_path(),
+                review,
             )
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        ctx.permissions
+            .veto_review(name, Some(id), review, &ctx.event_tx, &ctx.cancel)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -814,6 +836,10 @@ async fn execute_mcp_tool(
             id,
             &ctx.cancel,
             ctx.mode.plan_path(),
+            ReviewSource {
+                input: Some(input),
+                turn: review_turn(ctx),
+            },
         )
         .await
     {

@@ -100,6 +100,8 @@ pub struct HeadlessHandle {
     pub tool_names: Vec<String>,
     pub session_id: SessionRef,
     pub cwd: String,
+    /// The agent's live conversation, for `maki.session.messages`.
+    pub history: crate::SharedMessages,
     pub task: smol::Task<()>,
 }
 
@@ -180,6 +182,8 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let session_ref = SessionRef::from(session_id);
     let session_ref_clone = session_ref.clone();
     let mailbox = SessionMailbox::register(session_id);
+    let history: crate::SharedMessages = Arc::default();
+    let history_mirror = Arc::clone(&history);
     let defaults = params.defaults;
     let working_dir_path = params.initial_wd.clone();
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
@@ -196,7 +200,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                 }
             };
         let error_tx = event_tx.clone();
-        let mut history = History::new(Vec::new());
+        let mut history = History::new(Vec::new()).with_mirror(history_mirror);
         let mut gauge = ContextGauge::default();
         let mut agent = Agent::new(
             AgentParams {
@@ -256,6 +260,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
             tool_names,
             session_id: session_ref,
             cwd: working_dir,
+            history,
             task,
         },
         events,
@@ -293,6 +298,8 @@ pub struct InteractiveParams {
 
 pub struct InteractiveHandle {
     pub tool_names: Vec<String>,
+    /// The agent's live conversation, for `maki.session.messages`.
+    pub history: crate::SharedMessages,
     pub input_tx: flume::Sender<AgentInput>,
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
@@ -349,6 +356,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     let answer_rx = Arc::new(Mutex::new(answer_rx));
     let file_access = FileAccess::fresh();
+    let history: crate::SharedMessages = Arc::default();
+    let history_mirror = Arc::clone(&history);
 
     let session_ref_clone = session_ref.clone();
     let task_permissions = Arc::clone(&permissions);
@@ -367,7 +376,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             };
 
         let mut store = SessionStore::open(session_id, &working_dir, &model.spec());
-        let mut history = History::restored(params.initial_history);
+        let mut history = History::restored(params.initial_history).with_mirror(history_mirror);
         let mut gauge = ContextGauge::restored(params.initial_context_size);
         let mut run_id: u64 = 0;
 
@@ -493,6 +502,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     (
         InteractiveHandle {
             tool_names,
+            history,
             input_tx,
             answer_tx,
             cancel_tx,

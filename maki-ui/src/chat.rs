@@ -12,8 +12,13 @@ use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
 
 use crate::selection::{DocPos, RowPos, Selection};
+use maki_agent::permissions::{
+    RESOLUTION_ALLOWED, RESOLUTION_DENIED, RESOLUTION_REDIRECTED, RESOLUTION_TERMINATED,
+};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
-use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use maki_agent::{
+    AgentEvent, BufferSnapshot, ReviewerVerdictEvent, ToolDoneEvent, ToolOutput, ToolStartEvent,
+};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::WinView;
 use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
@@ -23,6 +28,25 @@ use ratatui::layout::Rect;
 use ratatui::style::Color;
 
 use crate::repaint::{Cadence, Dirty};
+
+/// A reviewed call never opens the permission prompt, and that prompt is
+/// where the user learns what the agent is about to do, so the decision that
+/// replaced it is marked on the tool row. Per-link escalations are left out
+/// as noise, and `prompted` is left out because the prompt itself follows.
+fn reviewer_note(event: &ReviewerVerdictEvent) -> Option<String> {
+    let who = if event.reviewer.is_empty() {
+        "reviewer"
+    } else {
+        &event.reviewer
+    };
+    match event.resolution.as_str() {
+        RESOLUTION_ALLOWED => Some(format!("allowed by {who}")),
+        RESOLUTION_DENIED => Some(format!("denied by {who}")),
+        RESOLUTION_REDIRECTED => Some("reviewer sent the agent elsewhere".to_owned()),
+        RESOLUTION_TERMINATED => Some("review budget spent, turn ended".to_owned()),
+        _ => None,
+    }
+}
 
 pub(crate) const DONE_TEXT: &str = "Done!";
 pub(crate) const ERROR_TEXT: &str = "Error";
@@ -128,6 +152,11 @@ impl Chat {
                 self.messages_panel.text_delta(&text);
             }
             AgentEvent::ToolPending { id, name } => self.messages_panel.tool_pending(id, &name),
+            AgentEvent::ReviewerVerdict(e) => {
+                if let (Some(id), Some(note)) = (e.tool_use_id.as_deref(), reviewer_note(&e)) {
+                    self.messages_panel.tool_reviewed(id, &note);
+                }
+            }
             AgentEvent::ToolStart(e) => self.messages_panel.tool_start(*e),
             AgentEvent::ToolOutput { id, content } => {
                 self.messages_panel.tool_output(&id, &content)
@@ -468,6 +497,11 @@ impl Chat {
     #[cfg(test)]
     pub fn last_message_role(&self) -> Option<&DisplayRole> {
         self.messages_panel.last_message_role()
+    }
+
+    #[cfg(test)]
+    pub fn last_message_annotation(&self) -> Option<&str> {
+        self.messages_panel.last_message_annotation()
     }
 
     #[cfg(test)]
@@ -944,6 +978,36 @@ mod tests {
 
     fn text_delta(chat: &mut Chat, text: &str) {
         chat.handle_event(AgentEvent::TextDelta { text: text.into() }, None);
+    }
+
+    fn verdict(tool_use_id: Option<&str>, resolution: &str) -> AgentEvent {
+        AgentEvent::ReviewerVerdict(Box::new(ReviewerVerdictEvent {
+            tool: ToolKey::native("bash"),
+            tool_use_id: tool_use_id.map(str::to_owned),
+            reviewer: "cheap".into(),
+            verdict: "ALLOW".into(),
+            reason: None,
+            resolution: resolution.to_owned(),
+            scopes: Arc::from([]),
+        }))
+    }
+
+    /// An approved call never opens the permission prompt, so without this
+    /// the user watches a gated tool run with nothing said about it.
+    #[test]
+    fn an_approved_call_is_marked_on_the_tool_row() {
+        let mut chat = chat();
+        chat.handle_event(tool_start("t1", "bash"), None);
+        chat.handle_event(verdict(Some("t1"), RESOLUTION_ALLOWED), None);
+        assert_eq!(chat.last_message_annotation(), Some("allowed by cheap"));
+    }
+
+    #[test]
+    fn a_per_link_escalation_is_not_worth_a_row_marker() {
+        let mut chat = chat();
+        chat.handle_event(tool_start("t1", "bash"), None);
+        chat.handle_event(verdict(Some("t1"), "escalated"), None);
+        assert_eq!(chat.last_message_annotation(), None);
     }
 
     #[test]

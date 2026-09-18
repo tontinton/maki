@@ -150,8 +150,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 /// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 /// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-/// `"TaskFocusChanged"`, and `"ModelChanged"`. Plugins can also fire their
-/// own events with `exec_autocmds`.
+/// `"TaskFocusChanged"`, `"ModelChanged"`, and `"ToolReviewed"`. Plugins can
+/// also fire their own events with `exec_autocmds`.
 ///
 /// Every host event carries `data.session_id`. For `"SessionReset"` and
 /// `"SessionEnd"` that is the session being left behind, the other events
@@ -186,6 +186,17 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
 ///   plus `data.previous_spec`. Picking the model already in use stays
 ///   quiet, and so does startup.
+/// - `"ToolReviewed"`: one per reviewer that answered, with `data.tool`,
+///   `data.tool_use_id`, `data.reviewer`, `data.verdict` (`"ALLOW"`,
+///   `"DENY"`, `"ASK"`), `data.reason`, `data.scopes` (the permission scopes
+///   maki derived), and `data.resolution`, which is what the chain did with
+///   the answer: `"allowed"`, `"denied"`, `"escalated"` to the next
+///   reviewer, `"prompted"` because the chain ran out, `"redirected"` under
+///   yolo, or `"terminated"` because the turn's review budget ran out and
+///   maki ended the turn. `data.reviewer` is empty for the synthetic
+///   `"prompted"`, `"redirected"` and `"terminated"` events, which no
+///   reviewer answered. Tokens a reviewer spent are reported by
+///   `maki.model.complete`, not here.
 ///
 /// `"TurnEnd"` fires once per turn and only for the main session, so
 /// subagent turns never show up. A manual `/compact` ends its run without

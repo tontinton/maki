@@ -95,6 +95,19 @@ pub fn autocmd_for(
             "TurnError",
             json!({ "session_id": sid(), "message": message }),
         )),
+        AgentEvent::ReviewerVerdict(e) => Some((
+            "ToolReviewed",
+            json!({
+                "session_id": sid(),
+                "tool": e.tool.to_string(),
+                "tool_use_id": e.tool_use_id,
+                "reviewer": e.reviewer,
+                "verdict": e.verdict,
+                "reason": e.reason,
+                "resolution": e.resolution,
+                "scopes": e.scopes,
+            }),
+        )),
         _ => None,
     }
 }
@@ -115,7 +128,8 @@ fn turn_end_reason(reason: DoneReason) -> Option<&'static str> {
 mod tests {
     use std::sync::Arc;
 
-    use maki_agent::{ToolDoneEvent, ToolOutput, ToolStartEvent};
+    use maki_agent::{ReviewerVerdictEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
+    use maki_config::ToolKey;
     use maki_providers::TokenUsage;
     use test_case::test_case;
 
@@ -172,7 +186,36 @@ mod tests {
             AgentEvent::Error {
                 message: "boom".into(),
             },
+            AgentEvent::ReviewerVerdict(Box::new(ReviewerVerdictEvent {
+                tool: ToolKey::native("bash"),
+                tool_use_id: Some("t1".into()),
+                reviewer: "guard".into(),
+                verdict: "ALLOW".into(),
+                reason: Some("safe".into()),
+                resolution: "allowed".into(),
+                scopes: Arc::from([]),
+            })),
         ]
+    }
+
+    #[test]
+    fn reviewer_verdict_shape() {
+        let event = AgentEvent::ReviewerVerdict(Box::new(ReviewerVerdictEvent {
+            tool: ToolKey::native("bash"),
+            tool_use_id: Some("t1".into()),
+            reviewer: "guard".into(),
+            verdict: "DENY".into(),
+            reason: Some("nope".into()),
+            resolution: "denied".into(),
+            scopes: Arc::from(["rm -rf build".to_owned()]),
+        }));
+        let (name, data) = autocmd_for(&event, &SESSION, false).unwrap();
+        assert_eq!(name, "ToolReviewed");
+        assert_eq!(data["tool"], "bash");
+        assert_eq!(data["scopes"][0], "rm -rf build");
+        assert_eq!(data["reviewer"], "guard");
+        assert_eq!(data["verdict"], "DENY");
+        assert_eq!(data["resolution"], "denied");
     }
 
     #[test_case(DoneReason::EndTurn, Some("finished") ; "finished")]

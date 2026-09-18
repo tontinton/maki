@@ -10,6 +10,7 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, err_pair};
+use crate::session_messages::{MessagesQuery, ROLE_ASSISTANT, ROLE_USER};
 
 /// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
 /// optional session id from Lua and returns a serialized
@@ -18,6 +19,17 @@ pub type SessionSnapshotFn =
     Box<dyn Fn(Option<&str>) -> Result<serde_json::Value, String> + Send + Sync + 'static>;
 
 pub struct SessionSnapshotSlot(pub SessionSnapshotFn);
+
+/// Answers `maki.session.messages` for a driver that has no UI to ask.
+/// Takes the optional session id and the window the caller asked for.
+pub type SessionMessagesFn = Box<
+    dyn Fn(Option<&str>, &MessagesQuery) -> Result<serde_json::Value, String>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+pub struct SessionMessagesSlot(pub SessionMessagesFn);
 
 const BLANK_NOTIFY_ERR: &str = "text must not be blank";
 const SESSION_REQUIRED_ERR: &str = "session is required";
@@ -107,6 +119,80 @@ async fn read(
     }
     ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::Session {
         req: SessionRequest::Read { id },
+        reply_tx,
+    })
+    .await
+}
+
+/// Reads the conversation: what the human said, what the agent said back,
+/// oldest first. This is how a plugin builds its own context, for a reviewer
+/// prompt or anything else, instead of taking one maki chose for it.
+///
+/// Every row is `{role, kind, text, truncated}`:
+/// ```text
+/// role     "user" | "assistant"
+/// kind     "typed"       the human typed it
+///          "answer"      the human answered the `question` tool
+///          "observation" the host or a plugin reported it
+///          "said"        the assistant's own text
+/// truncated  the row was longer than 16KB and was cut
+/// ```
+///
+/// Tool calls and tool results are left out, `question` answers aside: those
+/// are the human's words, they just arrive as a tool result.
+///
+/// Reads the focused session, or the one you name in `session`, which is
+/// what a reviewer handler passes from `call.session`.
+///
+/// @param opts table? Options:
+///   `session` (string?) Session id; defaults to focused.
+///   `limit` (integer?) Keep only the newest {limit} rows, still oldest first.
+///   `role` (string?) `"user"` or `"assistant"`; both when absent.
+/// @return (table|nil, string|nil) Array of rows, or nil and an error.
+/// @example
+/// local rows = maki.session.messages({ session = call.session, limit = 4, role = "user" })
+/// local latest = rows[#rows]
+#[lua_fn]
+async fn messages(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Value>> {
+    let (id, query) = match opts {
+        Some(t) => {
+            let role: Option<String> = t.get("role")?;
+            if let Some(role) = &role
+                && role != ROLE_USER
+                && role != ROLE_ASSISTANT
+            {
+                return Ok(err_pair(format!(
+                    "role must be \"{ROLE_USER}\" or \"{ROLE_ASSISTANT}\", got \"{role}\""
+                )));
+            }
+            (
+                t.get::<Option<String>>("session")?,
+                MessagesQuery {
+                    limit: t.get::<Option<usize>>("limit")?,
+                    role,
+                },
+            )
+        }
+        None => (None, MessagesQuery::default()),
+    };
+    // Headless drivers install a provider, the UI leaves the slot empty and
+    // answers from its event loop, which owns the live session runtimes.
+    if let Some(slot) = lua.app_data_ref::<SessionMessagesSlot>() {
+        return match (slot.0)(id.as_deref(), &query) {
+            Ok(value) => Ok((Some(json_to_lua(&lua, &value)?), None)),
+            Err(msg) => Ok(err_pair(msg)),
+        };
+    }
+    ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::Session {
+        req: SessionRequest::Messages {
+            id,
+            limit: query.limit,
+            role: query.role,
+        },
         reply_tx,
     })
     .await
@@ -257,7 +343,7 @@ lua_table! {
     /// attached"` without a UI. `notify` instead targets a live agent mailbox
     /// directly, so it also works under ACP and SDK frontends.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), live(tx), current(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_title(tx)]
+    DOCS [list(tx), live(tx), current(tx), read(tx), messages(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_title(tx)]
 }
 
 #[cfg(test)]
@@ -398,6 +484,73 @@ mod tests {
             .eval()
             .unwrap();
         assert!(invalid.is_some_and(|error| error.contains("invalid base58")));
+    }
+
+    /// A headless driver answers from the agent's live history, the same way
+    /// `read` does, so a reviewer handler can build its own context under
+    /// `maki -p` and sdk mode.
+    #[test]
+    fn messages_are_answered_by_an_installed_provider() {
+        let lua = lua_with_session(None);
+        lua.set_app_data(SessionMessagesSlot(Box::new(|id, query| {
+            Ok(json!([{
+                "role": "user",
+                "kind": "typed",
+                "text": format!("{}/{}/{}", id.unwrap_or("focused"), query.limit.unwrap_or(0), query.role.as_deref().unwrap_or("any")),
+                "truncated": false,
+            }]))
+        })));
+
+        let (rows, err): (Table, Option<String>) = smol::block_on(
+            lua.load("return session.messages({ session = 'abc', limit = 4, role = 'user' })")
+                .eval_async(),
+        )
+        .unwrap();
+        assert_eq!(err, None);
+        let first: Table = rows.get(1).unwrap();
+        assert_eq!(first.get::<String>("text").unwrap(), "abc/4/user");
+    }
+
+    /// The UI owns the live sessions, so with no provider installed the
+    /// request crosses the same channel `read` uses, targeting intact.
+    #[test]
+    fn messages_forward_the_window_to_the_ui() {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let checker = std::thread::spawn(move || {
+            let Ok(UiAction::Session {
+                req: SessionRequest::Messages { id, limit, role },
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected a messages request");
+            };
+            assert_eq!(id.as_deref(), Some("abc"));
+            assert_eq!(limit, Some(2));
+            assert_eq!(role.as_deref(), Some("assistant"));
+            reply_tx.send(Ok(json!([]))).unwrap();
+        });
+        let (_, err): (Value, Option<String>) = smol::block_on(
+            lua.load("return session.messages({ session = 'abc', limit = 2, role = 'assistant' })")
+                .eval_async(),
+        )
+        .unwrap();
+        checker.join().unwrap();
+        assert_eq!(err, None);
+    }
+
+    /// A typo in `role` would otherwise answer with the whole conversation,
+    /// which reads as "there are no assistant turns".
+    #[test]
+    fn messages_reject_an_unknown_role() {
+        let lua = lua_with_session(None);
+        let (value, err): (Value, Option<String>) = smol::block_on(
+            lua.load("return session.messages({ role = 'system' })")
+                .eval_async(),
+        )
+        .unwrap();
+        assert!(value.is_nil());
+        assert!(err.is_some_and(|e| e.contains("role must be")));
     }
 
     #[test]

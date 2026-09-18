@@ -616,6 +616,7 @@ pub enum AgentEvent {
         content: String,
     },
     ToolDone(Box<ToolDoneEvent>),
+    ReviewerVerdict(Box<ReviewerVerdictEvent>),
     TurnComplete(Box<TurnCompleteEvent>),
     ToolResultsSubmitted {
         message: Box<Message>,
@@ -927,6 +928,31 @@ pub struct InlineStyle {
     pub dim: bool,
     pub strikethrough: bool,
     pub reversed: bool,
+}
+
+/// `resolution`: `allowed`, `denied`, `escalated` (passed to the next
+/// link), `prompted` (chain exhausted), `redirected` (yolo deny), or
+/// `terminated` (the turn's review budget ran out and maki ended the turn).
+///
+/// No usage rides along: a reviewer that asks a model does it through
+/// `maki.model.complete`, which reports that spend itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewerVerdictEvent {
+    pub tool: ToolKey,
+    /// The tool call this verdict gated, so a frontend can mark the row the
+    /// user is looking at. `None` when the call had no id to gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    /// Empty for the synthetic `prompted`/`redirected`/`terminated` events,
+    /// which no link answered.
+    pub reviewer: String,
+    pub verdict: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub resolution: String,
+    /// The permission scopes maki derived for the call.
+    #[serde(skip)]
+    pub scopes: Arc<[String]>,
 }
 
 #[derive(Debug, Serialize)]

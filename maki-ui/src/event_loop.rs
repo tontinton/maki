@@ -25,6 +25,7 @@ use maki_agent::{
 };
 use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
+use maki_lua::session_messages::{self, MessagesQuery};
 use maki_lua::session_snapshot::{
     MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
     SessionSnapshot,
@@ -961,6 +962,12 @@ impl<'t> EventLoop<'t> {
             UiAction::Model { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_model_request(req));
             }
+            // The Lua thread made the call, so it has no turn to attribute
+            // to: the session the user is looking at is the one that asked
+            // for whatever the plugin was doing.
+            UiAction::ModelSpend(spend) => {
+                self.focused_app().handle_model_spend(&spend);
+            }
             UiAction::Task { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_task_request(req));
             }
@@ -1195,6 +1202,13 @@ impl<'t> EventLoop<'t> {
                 };
                 let _ = reply_tx.send(reply);
             }
+            SessionRequest::Messages { id, limit, role } => {
+                let query = MessagesQuery { limit, role };
+                let reply = self
+                    .resolve_session_index(id.as_deref())
+                    .map(|idx| self.session_messages_json(idx, &query));
+                let _ = reply_tx.send(reply);
+            }
             SessionRequest::New { prompt, focus } => {
                 let session = self.focused_app().blank_session();
                 // A blank session inherits the focused tab's model, whose slot
@@ -1314,6 +1328,17 @@ impl<'t> EventLoop<'t> {
         };
         let parsed = parse_session_id(id)?;
         self.position(parsed).ok_or_else(|| NOT_LIVE_ERR.into())
+    }
+
+    /// The live mirror is the agent's own copy, so a plugin reads the same
+    /// conversation the model is working from. A tab with no agent attached
+    /// (stored, rewound) still has its messages on the session.
+    fn session_messages_json(&self, idx: usize, query: &MessagesQuery) -> serde_json::Value {
+        let app = &self.sessions[idx].app;
+        match &app.shared_history {
+            Some(mirror) => session_messages::to_json(&mirror.load().messages, query),
+            None => session_messages::to_json(app.state.session.messages(), query),
+        }
     }
 
     /// The totals live on the session, so a plugin that reloads mid run keeps

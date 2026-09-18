@@ -18,7 +18,7 @@ use super::streaming::{StreamError, StreamRequest, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
-use crate::permissions::PermissionManager;
+use crate::permissions::{PermissionManager, ReviewTurn};
 use crate::tools::{Deadline, FileAccess, LocalTools, RequestTools, ToolAudience, ToolContext};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
@@ -227,6 +227,7 @@ impl<'h> Agent<'h> {
             workflow,
             prompt: _,
         } = input;
+        self.permissions.reset_review_turn(self.review_turn());
         self.rollback_len = self.history.len();
         self.carry_from = self.history.len();
         self.push_input_context(preamble);
@@ -385,6 +386,16 @@ impl<'h> Agent<'h> {
             self.process_tool_calls(response).await?;
             self.gauge
                 .append(&self.history.as_slice()[history_len_before..]);
+            // The results are in history before this fires, so the turn ends
+            // on a transcript the next run can resume from rather than on a
+            // tool_use nobody answered.
+            if self.permissions.review_turn_exhausted(self.review_turn()) {
+                warn!("review budget spent, ending the turn");
+                return Err(AgentError::Tool {
+                    tool: "reviewer".into(),
+                    message: crate::reviewers::BUDGET_EXHAUSTED_GUIDANCE.into(),
+                });
+            }
         } else {
             if response.message.first_text_content().is_some() {
                 self.history.push(response.message);
@@ -539,6 +550,16 @@ impl<'h> Agent<'h> {
             &ctx,
         )
         .await
+    }
+
+    /// Which turn's review budget this agent spends. A subagent shares its
+    /// parent's `PermissionManager`, so the task id is what keeps the two
+    /// budgets apart.
+    fn review_turn(&self) -> ReviewTurn<'_> {
+        ReviewTurn {
+            session: self.session_id.as_ref().map(SessionRef::as_str),
+            task: self.task_id.as_deref(),
+        }
     }
 
     fn tool_context(&self) -> ToolContext {
@@ -1069,6 +1090,18 @@ mod tests {
         }
     }
 
+    fn tool_use_response_id(tool_name: &str, tool_id: &str, input: Value) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(tool_id, tool_name, input)],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::ToolUse),
+        }
+    }
+
     fn tool_use_response(tool_name: &str, input: Value) -> StreamResponse {
         StreamResponse {
             message: Message {
@@ -1079,6 +1112,100 @@ mod tests {
             usage: TokenUsage::default(),
             stop_reason: Some(StopReason::ToolUse),
         }
+    }
+
+    /// The cap only means something if it stops the agent. Under yolo there
+    /// is nobody to prompt, so a reviewer that never approves would otherwise
+    /// redirect the model forever with nobody watching.
+    #[test]
+    fn a_spent_review_budget_ends_the_turn() {
+        use crate::permissions::{PluginRuleStore, ReviewTurn};
+        use crate::reviewers::{
+            BUDGET_EXHAUSTED_GUIDANCE, DEFAULT_REVIEW_BUDGET_PER_TURN, LinkOutcome, ReviewCall,
+            ReviewLink, ReviewerDef, Verdict,
+        };
+        use crate::tools::registry::{ToolRegistry, ToolSource};
+        use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
+        use maki_providers::provider::BoxFuture;
+
+        struct AlwaysDeny;
+
+        impl ReviewLink for AlwaysDeny {
+            fn review<'a>(&'a self, _call: &'a ReviewCall) -> BoxFuture<'a, LinkOutcome> {
+                Box::pin(async {
+                    LinkOutcome {
+                        verdict: Some((Verdict::Deny, Some("never".to_owned()))),
+                        ..Default::default()
+                    }
+                })
+            }
+        }
+
+        smol::block_on(async {
+            let store = Arc::new(PluginRuleStore::default());
+            store
+                .add_reviewer(
+                    "test",
+                    ReviewerDef {
+                        name: Arc::from("strict"),
+                        link: Arc::new(AlwaysDeny),
+                        tools: vec![GUARDED_TOOL_NAME.to_owned()],
+                        timeout_ms: 1_000,
+                        order: 0,
+                        redirect_guidance: None,
+                    },
+                )
+                .expect("one reviewer fits");
+            let registry = ToolRegistry::new();
+            registry
+                .register(
+                    Arc::new(GuardedMock) as Arc<dyn crate::tools::Tool>,
+                    ToolSource::Lua {
+                        plugin: "test".into(),
+                    },
+                )
+                .expect("guarded mock registers");
+
+            let calls: Vec<StreamResponse> = (0..DEFAULT_REVIEW_BUDGET_PER_TURN)
+                // Distinct inputs: identical ones trip the doom-loop guard
+                // before the reviewer ever sees the third call.
+                .map(|i| {
+                    tool_use_response_id(
+                        GUARDED_TOOL_NAME,
+                        &format!("t{i}"),
+                        serde_json::json!({ "n": i }),
+                    )
+                })
+                .collect();
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(MockProvider::new(calls), &mut history);
+            agent.permissions = Arc::new(PermissionManager::new(
+                maki_config::PermissionsConfig {
+                    default: maki_config::DefaultEffect::Prompt,
+                    yolo: true,
+                    ..Default::default()
+                },
+                std::path::PathBuf::from("/tmp"),
+                ProjectConfig::for_project(Path::new("/tmp")),
+                store,
+            ));
+            agent.registry = Arc::new(registry);
+
+            let err = agent
+                .run(default_input())
+                .await
+                .expect_err("the turn must end, not keep asking");
+            assert!(err.to_string().contains(BUDGET_EXHAUSTED_GUIDANCE), "{err}");
+            assert!(agent.permissions.review_turn_exhausted(ReviewTurn::MAIN));
+            drop(agent);
+            let last = history.as_slice().last().expect("history is not empty");
+            assert!(
+                last.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. })),
+                "the turn must end on an answered tool call"
+            );
+        });
     }
 
     #[test]

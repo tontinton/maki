@@ -1557,10 +1557,14 @@ mod tests {
     /// interesting case: the question is never what it asked for, but whose
     /// word turns the request into a grant.
     fn greedy(name: &str, origin: Origin) -> DiscoveredPackage {
-        let manifest = toml::from_str::<toml::Value>(
-            "[permissions]\nfs_read = true\nfs_write = true\nnet = true\nrun = true\nenv = true\n",
-        )
-        .unwrap();
+        // Built from the enum rather than spelled out, so adding a permission
+        // cannot quietly turn "asks for everything" into "asks for everything
+        // except the new one".
+        let mut src = String::from("[permissions]\n");
+        for &perm in Permission::ALL {
+            src.push_str(&format!("{perm} = true\n"));
+        }
+        let manifest = toml::from_str::<toml::Value>(&src).unwrap();
         DiscoveredPackage {
             name: name.to_owned(),
             dir: PathBuf::from("/nowhere"),

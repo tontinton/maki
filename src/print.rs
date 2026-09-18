@@ -20,6 +20,7 @@ use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig};
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
+use maki_lua::HeadlessMessages;
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::model::Model;
@@ -211,6 +212,7 @@ pub fn run(params: PrintParams) -> Result<()> {
         tool_names,
         session_id,
         cwd,
+        history,
         task,
     } = handle;
     crate::setup::report_session_start(maki_otel::emit::START_FRESH, Some(&session_id));
@@ -254,6 +256,15 @@ pub fn run(params: PrintParams) -> Result<()> {
         // (`headless::spawn` hardcodes `AgentMode::Build`).
         || MODE_BUILD,
     );
+    // What plugins spend through `maki.model.complete` is outside the
+    // agent's ledger. An unattended run is exactly where a cheap model
+    // firing on every tool call adds up unseen, so it is counted too.
+    snapshot.install_model_spend(&lua_handle);
+    HeadlessMessages {
+        id: session_id.to_string(),
+        history,
+    }
+    .install(&lua_handle);
 
     while let Some(envelope) = smol::block_on(events.next()) {
         // Folded in first, so a plugin handling `TurnEnd` finds the finished
@@ -279,7 +290,8 @@ pub fn run(params: PrintParams) -> Result<()> {
                 }
             }
             AgentEvent::ThinkingDelta { .. } => {}
-            AgentEvent::ToolPending { .. }
+            AgentEvent::ReviewerVerdict(_)
+            | AgentEvent::ToolPending { .. }
             | AgentEvent::ToolStart(_)
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
@@ -355,6 +367,9 @@ pub fn run(params: PrintParams) -> Result<()> {
                 // The agent's own ledger also counts compaction spend, which
                 // summing the turns misses.
                 cost = (*dcost).or(cost);
+                let (plugin_usage, plugin_cost) = snapshot.take_plugin_spend();
+                usage += plugin_usage;
+                add_cost(&mut cost, plugin_cost);
                 stop_reason = Some(*reason);
                 break;
             }

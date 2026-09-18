@@ -9,6 +9,7 @@ use maki_providers::{TokenUsage, add_cost};
 use serde::Serialize;
 
 use crate::EventHandle;
+use crate::api::model::ModelSpendFn;
 
 pub const MODE_BUILD: &str = "build";
 pub const MODE_PLAN: &str = "plan";
@@ -76,6 +77,12 @@ struct Totals {
     context_size: u32,
     context_window: u32,
     working: bool,
+    /// Plugin model spend the driver has not reported yet. It is already in
+    /// `usage` and `cost`; this is the same tokens again, kept apart so the
+    /// driver can fold them into the turn result it prints, which is built
+    /// from the agent's own ledger and knows nothing about them.
+    unreported_plugin_usage: TokenUsage,
+    unreported_plugin_cost: Option<f64>,
 }
 
 /// A poisoned lock only means some other run panicked mid-update. The
@@ -123,6 +130,35 @@ impl HeadlessSnapshot {
             }
             _ => {}
         }
+    }
+
+    /// Route what `maki.model.complete` spends into this session's totals.
+    /// A plugin's call is billed to the account like any other, so a driver
+    /// that left it out would under-report its own run.
+    pub fn install_model_spend(&self, handle: &EventHandle) {
+        handle.install_model_spend(self.model_spend_sink());
+    }
+
+    fn model_spend_sink(&self) -> ModelSpendFn {
+        let totals = Arc::clone(&self.0);
+        Box::new(move |spend| {
+            let mut totals = lock(&totals);
+            totals.usage += spend.usage;
+            totals.unreported_plugin_usage += spend.usage;
+            add_cost(&mut totals.cost, spend.cost);
+            add_cost(&mut totals.unreported_plugin_cost, spend.cost);
+        })
+    }
+
+    /// Plugin spend since the last call, for a driver about to report a
+    /// turn. Draining is what keeps sdk mode's per-turn result from billing
+    /// the same tokens twice.
+    pub fn take_plugin_spend(&self) -> (TokenUsage, Option<f64>) {
+        let mut totals = lock(&self.0);
+        (
+            std::mem::take(&mut totals.unreported_plugin_usage),
+            totals.unreported_plugin_cost.take(),
+        )
     }
 
     /// Install as the provider `maki.session.read` answers from. `mode`
@@ -220,6 +256,52 @@ mod tests {
             num_turns: 1,
             reason: DoneReason::EndTurn,
         })
+    }
+
+    fn spend(input: u32, cost: f64) -> crate::api::model::ModelSpend {
+        crate::api::model::ModelSpend {
+            model: "reviewer-model".into(),
+            usage: TokenUsage {
+                input,
+                ..Default::default()
+            },
+            cost: Some(cost),
+            list_cost: None,
+        }
+    }
+
+    /// A plugin's model call is spend on this session: `maki.session.read`
+    /// has to report it, and the driver has to be able to fold it into the
+    /// turn result it prints, which is built from the agent's own ledger and
+    /// knows nothing about plugins. Draining is what keeps the two from
+    /// billing the same tokens twice.
+    #[test]
+    fn plugin_spend_lands_in_the_totals_and_drains_once() {
+        let snapshot = HeadlessSnapshot::default();
+        let sink = snapshot.model_spend_sink();
+        sink(spend(FIRST_TURN_INPUT, TURN_COST));
+        sink(spend(SECOND_TURN_INPUT, TURN_COST));
+
+        assert_eq!(
+            lock(&snapshot.0).usage.input,
+            FIRST_TURN_INPUT + SECOND_TURN_INPUT,
+            "session totals carry what plugins spent"
+        );
+        assert_eq!(lock(&snapshot.0).cost, Some(TURN_COST * 2.0));
+
+        let (usage, cost) = snapshot.take_plugin_spend();
+        assert_eq!(usage.input, FIRST_TURN_INPUT + SECOND_TURN_INPUT);
+        assert_eq!(cost, Some(TURN_COST * 2.0));
+        assert_eq!(
+            snapshot.take_plugin_spend(),
+            (TokenUsage::default(), None),
+            "a second turn must not be billed the first turn's plugin calls"
+        );
+        assert_eq!(
+            lock(&snapshot.0).usage.input,
+            FIRST_TURN_INPUT + SECOND_TURN_INPUT,
+            "draining reports the delta, it does not un-bill the session"
+        );
     }
 
     /// Sdk mode serves many turns on one session, so `Done` is a turn boundary

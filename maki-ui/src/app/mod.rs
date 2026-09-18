@@ -65,7 +65,7 @@ use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader,
-    PackCommand, PackPreparation, WinView,
+    ModelSpend, PackCommand, PackPreparation, WinView,
 };
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
@@ -449,6 +449,18 @@ impl App {
             "supports_thinking": model.supports_thinking(),
             "supports_fast": model.supports_fast(),
         })
+    }
+
+    /// A `maki.model.complete` call spends real tokens on a real model, so
+    /// it is billed and attributed like any other call rather than
+    /// disappearing into whatever the plugin was doing. A reviewer firing on
+    /// every tool call is exactly the bill that must not go unseen.
+    pub(crate) fn handle_model_spend(&mut self, spend: &ModelSpend) {
+        self.state.token_usage += spend.usage;
+        add_cost(&mut self.state.cost, spend.cost);
+        self.state
+            .session_mut()
+            .add_model_usage(&spend.model, spend.usage.billed(spend.cost));
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {

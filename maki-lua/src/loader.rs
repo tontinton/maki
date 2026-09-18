@@ -1100,6 +1100,21 @@ impl EventHandle {
             .try_send(Request::InstallSessionSnapshot { provider });
     }
 
+    /// Same arrangement for `maki.session.messages`: headless drivers read
+    /// the agent's live history mirror, the UI answers from its event loop.
+    pub fn install_session_messages(&self, provider: crate::api::session::SessionMessagesFn) {
+        let _ = self
+            .tx
+            .try_send(Request::InstallSessionMessages { provider });
+    }
+
+    /// Where `maki.model.complete` reports what it spent. The UI takes it
+    /// over its action channel instead, so only headless drivers install
+    /// one.
+    pub fn install_model_spend(&self, sink: crate::api::model::ModelSpendFn) {
+        let _ = self.tx.try_send(Request::InstallModelSpend { sink });
+    }
+
     /// Queue the kill of session-owned jobs and the `SessionEnd` dispatch,
     /// then return. Call from every session-end path so a Lua monitor can
     /// stay a plugin. Process exit wants [`Self::end_sessions_blocking`].

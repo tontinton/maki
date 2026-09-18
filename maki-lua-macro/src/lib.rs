@@ -547,6 +547,7 @@ pub fn lua_table(input: TokenStream) -> TokenStream {
     );
     let body = if extend {
         quote! {
+            #[allow(clippy::too_many_arguments)]
             #vis fn #fn_ident(t: &mlua::Table, lua: &mlua::Lua #(, #params)*) -> mlua::Result<()> {
                 let t = t.clone();
                 #(#calls)*
@@ -555,6 +556,7 @@ pub fn lua_table(input: TokenStream) -> TokenStream {
         }
     } else {
         quote! {
+            #[allow(clippy::too_many_arguments)]
             #vis fn #fn_ident(lua: &mlua::Lua #(, #params)*) -> mlua::Result<mlua::Table> {
                 let t = lua.create_table()?;
                 #(#calls)*

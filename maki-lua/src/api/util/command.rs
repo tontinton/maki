@@ -420,6 +420,13 @@ pub enum SessionRequest {
     Read {
         id: Option<String>,
     },
+    /// UI-mode fallback for `maki.session.messages`, the same way `Read`
+    /// falls back: headless drivers install a `SessionMessagesSlot` instead.
+    Messages {
+        id: Option<String>,
+        limit: Option<usize>,
+        role: Option<String>,
+    },
     New {
         prompt: Option<String>,
         focus: bool,
@@ -506,6 +513,10 @@ pub enum UiAction {
         req: ModelRequest,
         reply_tx: flume::Sender<UiReply>,
     },
+    /// What a `maki.model.complete` call spent, for the session that is
+    /// paying for it. No reply: the caller already has its answer, this is
+    /// only the bill catching up.
+    ModelSpend(Box<crate::api::model::ModelSpend>),
     Task {
         req: TaskRequest,
         reply_tx: flume::Sender<UiReply>,

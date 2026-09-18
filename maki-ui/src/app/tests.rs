@@ -1378,6 +1378,32 @@ fn turn_complete_accumulates_usage_by_model() {
     assert_eq!(sub.output, 75);
 }
 
+/// A plugin's one-shot model call is spend on this session, so it lands in
+/// the status line total, the session cost, and the per-model breakdown,
+/// exactly like a turn does. A reviewer asking a model on every tool call is
+/// the bill this must not hide.
+#[test]
+fn model_spend_from_a_plugin_is_billed_to_the_session() {
+    let mut app = test_app();
+    app.handle_model_spend(&maki_lua::ModelSpend {
+        model: "reviewer-model".into(),
+        usage: TokenUsage {
+            input: 120,
+            output: 8,
+            ..Default::default()
+        },
+        cost: Some(0.5),
+        list_cost: Some(0.9),
+    });
+
+    assert_eq!(app.state.token_usage.input, 120);
+    assert_eq!(app.state.token_usage.output, 8);
+    assert_eq!(app.state.cost, Some(0.5));
+    let by_model = app.state.session.usage_by_model();
+    assert_eq!(by_model["reviewer-model"].input, 120);
+    assert_eq!(by_model["reviewer-model"].cost, Some(0.5));
+}
+
 #[test]
 fn cancel_resets_all_chats_and_indices() {
     let mut app = app_with_subagent();

@@ -7,8 +7,11 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flume::Sender;
-use maki_agent::permissions::is_universal_scope;
+use maki_agent::permissions::{PluginRuleStore, is_universal_scope};
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
+use maki_agent::reviewers::{
+    DEFAULT_HANDLER_TIMEOUT_MS, LinkOutcome, ReviewCall, ReviewLink, ReviewerDef, Verdict,
+};
 use maki_agent::tools::Tool;
 use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
@@ -27,6 +30,7 @@ use mlua::{
     Value as LuaValue,
 };
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
 use crate::api::ui::buf::{BufHandle, line_to_lua};
@@ -48,6 +52,18 @@ const TOOL_HANDLER_RETURN_ERR: &str =
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
 const NARGS_ERR: &str = r#"register_command: 'nargs' must be 0, 1, "?", "*", or "+""#;
 const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
+const REVIEWER_KEYS: &[&str] = &[
+    "name",
+    "handler",
+    "tools",
+    "timeout_ms",
+    "order",
+    "redirect_guidance",
+];
+/// Reported on the verdict event: a reviewer that is registered and never
+/// answers looks exactly like one that keeps escalating.
+const NO_RUNTIME_NOTE: &str = "the Lua runtime is gone, so the handler could not be called";
+const HANDLER_GONE_NOTE: &str = "the handler stopped without answering";
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
 const PLAIN_HEADER_STYLE: &str = "tool";
@@ -195,6 +211,122 @@ pub(crate) struct PendingRule {
 }
 
 pub(crate) type PendingRules = Arc<Mutex<Vec<PendingRule>>>;
+
+/// Lua handler functions for handler-brained reviewers, keyed plugin → name.
+#[derive(Default)]
+pub(crate) struct ReviewHandlerMap(
+    pub(crate) HashMap<Arc<str>, HashMap<Arc<str>, mlua::RegistryKey>>,
+);
+
+/// The runtime's own request sender, so a handler link can round-trip a
+/// verdict call back onto the Lua thread from the agent's enforce path.
+#[derive(Clone)]
+pub(crate) struct ReviewerRequestTx(pub(crate) flume::Sender<crate::runtime::Request>);
+
+struct LuaReviewHandler {
+    tx: flume::Sender<crate::runtime::Request>,
+    plugin: Arc<str>,
+    name: Arc<str>,
+}
+
+impl ReviewLink for LuaReviewHandler {
+    fn review<'a>(&'a self, call: &'a ReviewCall) -> BoxFuture<'a, LinkOutcome> {
+        Box::pin(async move { self.verdict(call).await })
+    }
+}
+
+impl LuaReviewHandler {
+    async fn verdict(&self, request: &ReviewCall) -> LinkOutcome {
+        {
+            let attempt = request.attempt.as_ref().map(|a| {
+                serde_json::json!({
+                    "count": a.attempts,
+                    "history": a
+                        .history
+                        .iter()
+                        .map(|(verdict, reason)| serde_json::json!({
+                            "verdict": verdict,
+                            "reason": reason,
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            });
+            let value = serde_json::json!({
+                "tool": request.tool,
+                "input": request.input,
+                "scopes": request.scopes,
+                "parseable": !request.force_prompt,
+                "cwd": request.cwd,
+                "session": request.session,
+                "task": request.task,
+                "attempt": attempt,
+            });
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            // Trigger fires on drop, so when the outer chain drops us on
+            // timeout or cancel the detached Lua thread wakes from `cancel`
+            // and stops instead of running past its caller.
+            let (_trigger, cancel) = maki_agent::cancel::CancelToken::new();
+            if self
+                .tx
+                .send(crate::runtime::Request::CallReviewHandler {
+                    plugin: Arc::clone(&self.plugin),
+                    name: Arc::clone(&self.name),
+                    request: value,
+                    cancel,
+                    reply: reply_tx,
+                })
+                .is_err()
+            {
+                return LinkOutcome {
+                    verdict: None,
+                    no_verdict: Some(NO_RUNTIME_NOTE.to_owned()),
+                };
+            }
+            let Ok(reply) = reply_rx.recv_async().await else {
+                return LinkOutcome {
+                    verdict: None,
+                    no_verdict: Some(HANDLER_GONE_NOTE.to_owned()),
+                };
+            };
+            // A handler that answered nothing is escalating on purpose; the
+            // chain has nothing to report about it.
+            let Some((verdict, reason)) = reply else {
+                return LinkOutcome::default();
+            };
+            let verdict = match verdict.as_str() {
+                "ALLOW" => Verdict::Allow,
+                "DENY" => Verdict::Deny,
+                "ASK" => Verdict::Ask,
+                other => {
+                    tracing::warn!(
+                        reviewer = %self.name,
+                        verdict = other,
+                        "handler returned an unknown verdict, escalating"
+                    );
+                    return LinkOutcome {
+                        verdict: None,
+                        no_verdict: Some(format!("handler returned an unknown verdict: {other}")),
+                    };
+                }
+            };
+            LinkOutcome {
+                verdict: Some((verdict, reason)),
+                no_verdict: None,
+            }
+        }
+    }
+}
+
+/// Writes go straight to the shared store so command handlers can register
+/// or clear reviewers at runtime, not only during load.
+#[derive(Clone)]
+pub(crate) struct ReviewerRegistry {
+    pub(crate) store: Arc<PluginRuleStore>,
+    pub(crate) plugin: Arc<str>,
+    /// Captured at plugin load; a reload rebuilds `ReviewerRegistry` from the
+    /// grant table, so the field is never re-consulted per call.
+    pub(crate) allowed: bool,
+}
 
 pub(crate) struct LuaTool {
     pub(crate) name: Arc<str>,
@@ -877,6 +1009,255 @@ fn allow_is_delegated(
         ))
 }
 
+/// Register a reviewer for permission prompts. When a tool call would
+/// prompt the human, registered reviewers are asked first, in chain
+/// order: each answers ALLOW (run it), DENY (block it, with the reason
+/// shown to the agent), or ASK (escalate to the next reviewer, then the
+/// human). Under yolo mode an unresolved chain denies with retry guidance
+/// instead of prompting, so the agent never stalls on a question.
+///
+/// A reviewer is your `handler` function and nothing else: rulebooks,
+/// quotas, external approval systems, a model you call yourself with
+/// `maki.model.complete`. It receives one table with `tool`, `input`
+/// (decoded, whole, never trimmed), `scopes` (for bash: the parsed command
+/// segments), `parseable`, `cwd`, `session` and `task` (whose turn issued
+/// the call; pass `session` to `maki.session.messages` to read the
+/// conversation behind it), and `attempt` (`{ count, history }` on
+/// repeats). It returns `"ALLOW"|"DENY"|"ASK"` plus an optional reason;
+/// anything else escalates. Handlers may block (e.g. on `maki.ui.picker`);
+/// the outer chain waits at most `timeout_ms` and cancels the handler when
+/// the wait ends, so a slow handler cannot outlive its caller.
+///
+/// A DENY reason reaches the agent as quoted data, stripped and bounded: it
+/// is text shaped by the input under review, so it is never handed over as
+/// instructions. Denials also spend the turn's review budget, and the turn
+/// ends once that budget is gone.
+///
+/// One rule governs visibility: reviewers see the tools they name.
+/// Tools that never reach the permission layer (`question`, `todo_write`)
+/// are therefore only seen by reviewers naming them with a real pattern, as
+/// the `"*"` default does not reach them, and for those calls anything
+/// short of a DENY (allow, timeout, exhausted escalation) lets the tool
+/// run as usual. A goal plugin can e.g. deny the question tool while a
+/// goal is active, so the agent decides instead of stalling on the human.
+///
+/// Registration is live: it takes effect immediately and re-registering
+/// the same `name` replaces the earlier entry, so a toggle command can
+/// re-register on enable and `unregister_reviewer` on disable. A
+/// `/reload` drops the plugin's reviewers before the plugin runs again.
+///
+/// @param spec table Reviewer specification:
+///   name       (string) Required. Unique per plugin; same name replaces.
+///   handler    (function) Required. Computes the verdict:
+///                       `function(call) -> verdict, reason?`
+///   tools      (table)  Optional. Tool filters matched against the tool
+///                       key (`"bash"`, `"server.tool"`); `*` globs, e.g.
+///                       `{ "bash", "myserver.*" }`. Default `{ "*" }`.
+///                       Real patterns also opt permission-free tools
+///                       into review (see above); the default does not.
+///   timeout_ms (integer) Optional. Per-call timeout; default 300000,
+///                       because a handler may wait on a human.
+///   order      (integer) Optional. Chain position, lowest first; default 0.
+///   redirect_guidance (string) Optional. Replaces the built-in "try a
+///                       different approach" text when an unresolved chain
+///                       denies under yolo, so the agent hears your
+///                       plugin's voice (e.g. restate the goal).
+/// @return
+/// @example
+/// maki.api.register_reviewer({
+///   name = "rulebook",
+///   order = -1,
+///   handler = function(call)
+///     if call.tool == "bash" and call.scopes[1]:find("^git ") then
+///       return "ALLOW"
+///     end
+///     return "ASK"
+///   end,
+/// })
+/// maki.api.register_reviewer({
+///   name = "cheap",
+///   handler = function(call)
+///     local answer = maki.model.complete({
+///       model = "anthropic/claude-haiku-4-5-20251001",
+///       system = "Reply ALLOW or DENY. Read-only commands are fine.",
+///       prompt = maki.json.encode(call.input),
+///       max_output_tokens = 64,
+///     })
+///     return answer and answer.text:match("^%u+") or "ASK"
+///   end,
+/// })
+#[lua_fn]
+fn register_reviewer(lua: &Lua, #[ctx] reviewers: ReviewerRegistry, spec: Table) -> LuaResult<()> {
+    if !reviewers.allowed {
+        return Err(crate::plugin_permissions::denied_error(
+            crate::plugin_permissions::Permission::Reviewers,
+        ));
+    }
+    for entry in spec.pairs::<String, LuaValue>() {
+        let (key, _) = entry
+            .map_err(|_| mlua::Error::runtime("register_reviewer: spec keys must be strings"))?;
+        if !REVIEWER_KEYS.contains(&key.as_str()) {
+            return Err(mlua::Error::runtime(format!(
+                "register_reviewer: unknown key '{key}' (valid: name, handler, tools, timeout_ms, order, redirect_guidance)"
+            )));
+        }
+    }
+    let name: String = spec
+        .get("name")
+        .map_err(|_| mlua::Error::runtime("register_reviewer: 'name' must be a string"))?;
+    if name.is_empty() {
+        return Err(mlua::Error::runtime(
+            "register_reviewer: 'name' must be non-empty",
+        ));
+    }
+    let handler: Option<Function> = spec
+        .get("handler")
+        .map_err(|_| mlua::Error::runtime("register_reviewer: 'handler' must be a function"))?;
+    let Some(handler) = handler else {
+        return Err(mlua::Error::runtime(
+            "register_reviewer: 'handler' is required",
+        ));
+    };
+    let link: Arc<dyn ReviewLink> = {
+        let name: Arc<str> = Arc::from(name.as_str());
+        let key = lua.create_registry_value(handler)?;
+        let Some(tx) = lua
+            .app_data_ref::<ReviewerRequestTx>()
+            .map(|tx| tx.0.clone())
+        else {
+            return Err(mlua::Error::runtime(
+                "register_reviewer: reviewers are unavailable in this host",
+            ));
+        };
+        let mut map = lua
+            .app_data_mut::<ReviewHandlerMap>()
+            .ok_or_else(|| mlua::Error::runtime("register_reviewer: not initialized"))?;
+        if let Some(old) = map
+            .0
+            .entry(Arc::clone(&reviewers.plugin))
+            .or_default()
+            .insert(Arc::clone(&name), key)
+        {
+            let _ = lua.remove_registry_value(old);
+        }
+        Arc::new(LuaReviewHandler {
+            tx,
+            plugin: Arc::clone(&reviewers.plugin),
+            name,
+        })
+    };
+    let tools: Vec<String> = match spec
+        .get::<Option<Vec<String>>>("tools")
+        .map_err(|_| mlua::Error::runtime("register_reviewer: 'tools' must be a list of strings"))?
+    {
+        None => vec!["*".to_owned()],
+        Some(filters) if filters.is_empty() || filters.iter().any(String::is_empty) => {
+            return Err(mlua::Error::runtime(
+                "register_reviewer: 'tools' entries must be non-empty",
+            ));
+        }
+        Some(filters) => {
+            for pat in &filters {
+                if let Err(e) = ToolKey::parse(pat) {
+                    return Err(mlua::Error::runtime(format!(
+                        "register_reviewer: invalid tool filter {pat:?} ({e}); \
+                         expected \"*\", \"<name>\", \"<server>.<tool>\", or \"<server>.*\""
+                    )));
+                }
+            }
+            filters
+        }
+    };
+    let timeout_ms = spec
+        .get::<Option<u64>>("timeout_ms")
+        .map_err(|_| mlua::Error::runtime("register_reviewer: 'timeout_ms' must be an integer"))?
+        .unwrap_or(DEFAULT_HANDLER_TIMEOUT_MS);
+    if timeout_ms == 0 {
+        return Err(mlua::Error::runtime(
+            "register_reviewer: 'timeout_ms' must be positive",
+        ));
+    }
+    let order = spec
+        .get::<Option<i64>>("order")
+        .map_err(|_| mlua::Error::runtime("register_reviewer: 'order' must be an integer"))?
+        .unwrap_or(0);
+    let redirect_guidance = spec
+        .get::<Option<String>>("redirect_guidance")
+        .map_err(|_| {
+            mlua::Error::runtime("register_reviewer: 'redirect_guidance' must be a string")
+        })?;
+    reviewers
+        .store
+        .add_reviewer(
+            &reviewers.plugin,
+            ReviewerDef {
+                name: Arc::from(name),
+                link,
+                tools,
+                timeout_ms,
+                order,
+                redirect_guidance,
+            },
+        )
+        .map_err(|e| mlua::Error::runtime(format!("register_reviewer: {e}")))?;
+    Ok(())
+}
+
+/// Drop every reviewer this plugin registered, effective immediately.
+/// The counterpart of `register_reviewer` for disable toggles.
+///
+/// @return
+/// @example
+/// maki.api.clear_reviewers()
+#[lua_fn]
+fn clear_reviewers(lua: &Lua, #[ctx] reviewers: ReviewerRegistry) -> LuaResult<()> {
+    if !reviewers.allowed {
+        return Err(crate::plugin_permissions::denied_error(
+            crate::plugin_permissions::Permission::Reviewers,
+        ));
+    }
+    reviewers
+        .store
+        .replace_reviewers(&reviewers.plugin, Vec::new());
+    if let Some(mut map) = lua.app_data_mut::<ReviewHandlerMap>()
+        && let Some(handlers) = map.0.remove(&reviewers.plugin)
+    {
+        for (_, key) in handlers {
+            let _ = lua.remove_registry_value(key);
+        }
+    }
+    Ok(())
+}
+
+/// Remove one of this plugin's reviewers by name. Unknown names are a
+/// no-op, so a toggle can call it unconditionally; `clear_reviewers`
+/// drops all of the plugin's reviewers at once.
+///
+/// @param name string The `name` the reviewer was registered under.
+/// @return
+/// @example
+/// maki.api.unregister_reviewer("goal-no-questions")
+#[lua_fn]
+fn unregister_reviewer(
+    lua: &Lua,
+    #[ctx] reviewers: ReviewerRegistry,
+    name: String,
+) -> LuaResult<()> {
+    if !reviewers.allowed {
+        return Err(crate::plugin_permissions::denied_error(
+            crate::plugin_permissions::Permission::Reviewers,
+        ));
+    }
+    reviewers.store.remove_reviewer(&reviewers.plugin, &name);
+    if let Some(mut map) = lua.app_data_mut::<ReviewHandlerMap>()
+        && let Some(handlers) = map.0.get_mut(&reviewers.plugin)
+        && let Some(old) = handlers.remove(name.as_str())
+    {
+        let _ = lua.remove_registry_value(old);
+    }
+    Ok(())
+}
+
 /// Register a slash-command that appears in the user input bar.
 ///
 /// Slash commands let the user trigger plugin actions by typing `/name` in the
@@ -1136,25 +1517,38 @@ lua_table! {
     /// maki.api.register_tool({ name = "greet", ... })
     /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
-    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, permissions: PluginPermissions, plugin: Arc<str>, opts: PluginOpts), DOCS [
-        register_tool(pending, permissions), register_permission_rule(pending_rules), register_command(plugin),
+    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, permissions: PluginPermissions, reviewers: ReviewerRegistry, plugin: Arc<str>, opts: PluginOpts), DOCS [
+        register_tool(pending, permissions), register_permission_rule(pending_rules),
+        register_reviewer(reviewers), unregister_reviewer(reviewers), clear_reviewers(reviewers),
+        register_command(plugin),
         register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
         get_tools, get_tool,
         manual run_command,
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_api_table(
     lua: &Lua,
     pending: PendingTools,
     pending_rules: PendingRules,
     permissions: PluginPermissions,
+    reviewers: ReviewerRegistry,
     plugin: Arc<str>,
     opts: PluginOpts,
     ui_action_tx: Option<flume::Sender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
-    add_tool_fns(&t, lua, pending, pending_rules, permissions, plugin, opts)?;
+    add_tool_fns(
+        &t,
+        lua,
+        pending,
+        pending_rules,
+        permissions,
+        reviewers,
+        plugin,
+        opts,
+    )?;
     run_command__register(&t, lua, ui_action_tx)?;
     Ok(t)
 }

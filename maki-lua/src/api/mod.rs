@@ -35,11 +35,14 @@ use crate::api::options::PluginOpts;
 use crate::api::tool::{PendingRules, PendingTools};
 use crate::api::util::command::UiAction;
 use crate::plugin_permissions::{Permission, PluginPermissions};
+use maki_agent::permissions::PluginRuleStore;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_maki_global(
     lua: &Lua,
     pending: PendingTools,
     pending_rules: PendingRules,
+    rule_store: Arc<PluginRuleStore>,
     plugin: Arc<str>,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     permissions: &PluginPermissions,
@@ -52,6 +55,11 @@ pub(crate) fn create_maki_global(
         pending,
         pending_rules,
         permissions.clone(),
+        tool::ReviewerRegistry {
+            store: rule_store,
+            plugin: Arc::clone(&plugin),
+            allowed: permissions.is_allowed(Permission::Reviewers),
+        },
         Arc::clone(&plugin),
         opts,
         ui_action_tx.clone(),

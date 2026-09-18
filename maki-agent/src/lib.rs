@@ -19,12 +19,15 @@ pub use agent::{
     is_instruction_file,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
+pub use completion::{Completion, CompletionRequest};
 pub use mailbox::{MailboxError, SessionMailbox};
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub mod command;
+pub mod completion;
 pub mod diff;
 pub mod permissions;
 pub mod prompt;
+pub mod reviewers;
 pub mod template;
 pub mod tools;
 pub use tools::ToolFilter;
@@ -38,9 +41,9 @@ use maki_providers::Message;
 pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
     AgentEvent, BufferSnapshot, DoneReason, Envelope, EventSender, EventStreamGuard, GrepFileEntry,
-    GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, RunLedger, RunTotals,
-    SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanColor, SpanStyle,
-    SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
+    GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, ReviewerVerdictEvent, RunLedger,
+    RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanColor,
+    SpanStyle, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
     TurnCompleteEvent, event_stream,
 };
 

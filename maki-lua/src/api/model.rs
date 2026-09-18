@@ -2,14 +2,38 @@
 //! request options, so most calls round-trip to it; `info` resolves
 //! locally and works without a UI.
 
+use maki_agent::completion::{
+    self, CompletionRequest, DEFAULT_COMPLETE_MAX_OUTPUT_TOKENS, DEFAULT_COMPLETE_TIMEOUT_MS,
+};
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::Model;
+use maki_providers::{Message, Model, Timeouts, TokenUsage};
 use mlua::{Error as LuaError, Lua, Result as LuaResult, Table, Value};
+use serde_json::json;
 
-use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
+use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip, ui_send};
+use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, err_pair};
 
 const SET_ARG_ERR: &str = "expected a model spec string or an options table";
+const MODEL_REQUIRED_ERR: &str = "complete: 'model' must be a provider/model-id spec";
+const NO_INPUT_ERR: &str = "complete: give it a 'prompt' string or a 'messages' list";
+
+/// What one [`complete`] call spent, on its way to whoever bills this
+/// session. Hosts install a sink with `EventHandle::install_model_spend`;
+/// the interactive UI takes it over its own action channel instead.
+#[derive(Debug, Clone)]
+pub struct ModelSpend {
+    /// Resolved `provider/id`, so a per-model breakdown can name it.
+    pub model: String,
+    pub usage: TokenUsage,
+    /// What the account pays, and the un-subsidised list price.
+    pub cost: Option<f64>,
+    pub list_cost: Option<f64>,
+}
+
+pub type ModelSpendFn = Box<dyn Fn(ModelSpend) + Send + Sync + 'static>;
+
+pub struct ModelSpendSlot(pub ModelSpendFn);
 
 async fn roundtrip(
     lua: Lua,
@@ -169,13 +193,140 @@ async fn set(
     roundtrip(lua, tx, req).await
 }
 
+/// Reads the message list out of the options table. A bare `prompt` is the
+/// one-liner; `messages` is the same thing with room for a prior exchange.
+fn messages_from(opts: &Table) -> Result<Vec<Message>, String> {
+    if let Some(rows) = opts
+        .get::<Option<Vec<Table>>>("messages")
+        .map_err(|_| "complete: 'messages' must be a list of {role, content} tables".to_owned())?
+    {
+        return rows
+            .iter()
+            .map(|row| {
+                let role: String = row
+                    .get("role")
+                    .map_err(|_| "complete: message 'role' must be a string".to_owned())?;
+                let content: String = row
+                    .get("content")
+                    .map_err(|_| "complete: message 'content' must be a string".to_owned())?;
+                completion::message(&role, content)
+            })
+            .collect();
+    }
+    let prompt: Option<String> = opts
+        .get("prompt")
+        .map_err(|_| "complete: 'prompt' must be a string".to_owned())?;
+    match prompt {
+        Some(prompt) => Ok(vec![completion::message("user", prompt)?]),
+        None => Err(NO_INPUT_ERR.to_owned()),
+    }
+}
+
+/// Hands the spend to whoever bills this session: a host sink when one is
+/// installed (`maki -p`, sdk mode), the UI's action channel otherwise. A
+/// call with neither is nobody's bill, so it is dropped rather than raised:
+/// the caller already has the answer it asked for.
+fn report_spend(lua: &Lua, tx: Option<&flume::Sender<UiAction>>, spend: ModelSpend) {
+    if let Some(slot) = lua.app_data_ref::<ModelSpendSlot>() {
+        (slot.0)(spend);
+        return;
+    }
+    let _ = ui_send(tx, UiAction::ModelSpend(Box::new(spend)));
+}
+
+/// Asks a model one question and hands back what it said. No system prompt
+/// of maki's, no tools, no turn: this is the plain call a plugin needs to
+/// classify, summarise, or judge something on its own.
+///
+/// The tokens are billed to the session like any other model call, so the
+/// spend shows up in the TUI status line, in `maki -p`'s result, and in sdk
+/// mode's usage. A reviewer firing on every tool call is exactly where an
+/// unnoticed bill grows, so it is never silent.
+///
+/// The call is answered on the Lua thread, so it works with or without an
+/// interactive UI.
+///
+/// @param opts table Options:
+///   `model` (string) Required. `"provider/model-id"`.
+///   `prompt` (string) The single user message to send.
+///   `messages` (table) Instead of `prompt`: `{role, content}` rows, where
+///   `role` is `"user"` or `"assistant"`.
+///   `system` (string) System prompt. You own every word of it.
+///   `max_output_tokens` (integer) Output ceiling, default 1024. Raise it for
+///   models that emit reasoning tokens whatever you ask: one that spends its
+///   whole budget thinking answers with nothing and still bills.
+///   `timeout_ms` (integer) How long to wait, default 30000.
+/// @return (table|nil, string|nil) `{text, model, usage, cost, list_cost}`,
+///   or nil and an error. `usage` carries the four token counts.
+/// @example
+/// local answer, err = maki.model.complete({
+///   model = "anthropic/claude-haiku-4-5-20251001",
+///   system = "Answer with one word.",
+///   prompt = "Is `rm -rf /` safe?",
+///   max_output_tokens = 16,
+/// })
+#[lua_fn]
+async fn complete(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    opts: Table,
+) -> LuaResult<Pair<Value>> {
+    let spec: Option<String> = opts
+        .get("model")
+        .map_err(|_| LuaError::runtime(MODEL_REQUIRED_ERR))?;
+    let Some(spec) = spec.filter(|s| s.contains('/')) else {
+        return Ok(err_pair(MODEL_REQUIRED_ERR));
+    };
+    let messages = match messages_from(&opts) {
+        Ok(messages) => messages,
+        Err(e) => return Ok(err_pair(e)),
+    };
+    let request = CompletionRequest {
+        spec,
+        system: opts.get("system").unwrap_or_default(),
+        messages,
+        max_output_tokens: opts
+            .get::<Option<u32>>("max_output_tokens")
+            .unwrap_or_default()
+            .filter(|budget| *budget > 0)
+            .unwrap_or(DEFAULT_COMPLETE_MAX_OUTPUT_TOKENS),
+        timeout_ms: opts
+            .get::<Option<u64>>("timeout_ms")
+            .unwrap_or_default()
+            .filter(|ms| *ms > 0)
+            .unwrap_or(DEFAULT_COMPLETE_TIMEOUT_MS),
+    };
+    let done = match completion::complete(request, Timeouts::default()).await {
+        Ok(done) => done,
+        Err(e) => return Ok(err_pair(e)),
+    };
+    report_spend(
+        &lua,
+        tx.as_ref(),
+        ModelSpend {
+            model: done.model.clone(),
+            usage: done.usage,
+            cost: done.billed_cost,
+            list_cost: done.list_cost,
+        },
+    );
+    let value = json!({
+        "text": done.text,
+        "model": done.model,
+        "usage": done.usage,
+        "cost": done.billed_cost,
+        "list_cost": done.list_cost,
+    });
+    Ok((Some(json_to_lua(&lua, &value)?), None))
+}
+
 lua_table! {
     /// The model behind the focused session. Good for a keybind that flips
     /// between your two go-to models, or lifts thinking for one hard question.
-    /// Without an interactive UI every function returns
-    /// `nil, "no interactive UI attached"`.
+    /// `get`, `available` and `set` return `nil, "no interactive UI attached"`
+    /// without one; `complete` needs no UI, it calls a model itself.
     "maki.model" => pub(crate) fn create_model_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [get(tx), available(tx), set(tx), info()]
+    DOCS [get(tx), available(tx), set(tx), info(), complete(tx)]
 }
 
 #[cfg(test)]
@@ -338,5 +489,95 @@ mod tests {
         let lua = lua_with_model(None);
         let err = smol::block_on(lua.load(script).eval_async::<Value>()).unwrap_err();
         assert!(err.to_string().contains(SET_ARG_ERR));
+    }
+
+    fn spend() -> ModelSpend {
+        ModelSpend {
+            model: SPEC.to_owned(),
+            usage: TokenUsage {
+                input: 40,
+                output: 2,
+                ..Default::default()
+            },
+            cost: Some(0.25),
+            list_cost: Some(0.5),
+        }
+    }
+
+    /// The ledger attribution every driver hangs off: a headless host
+    /// installs a sink and the spend goes straight to it, no UI needed.
+    #[test]
+    fn an_installed_sink_takes_the_spend() {
+        let lua = lua_with_model(None);
+        let (tx, rx) = flume::unbounded();
+        lua.set_app_data(ModelSpendSlot(Box::new(move |spend| {
+            let _ = tx.send(spend);
+        })));
+
+        report_spend(&lua, None, spend());
+
+        let billed = rx.try_recv().expect("the sink is billed");
+        assert_eq!(billed.model, SPEC);
+        assert_eq!(billed.usage.input, 40);
+        assert_eq!(billed.cost, Some(0.25));
+    }
+
+    /// The interactive UI installs no sink: it owns the session totals, so
+    /// the spend rides its action channel instead, the same way every other
+    /// `maki.model` call reaches it.
+    #[test]
+    fn without_a_sink_the_spend_goes_to_the_ui() {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_model(Some(tx.clone()));
+
+        report_spend(&lua, Some(&tx), spend());
+
+        let Ok(UiAction::ModelSpend(billed)) = rx.try_recv() else {
+            panic!("expected the spend to cross the UI channel");
+        };
+        assert_eq!(billed.model, SPEC);
+        assert_eq!(billed.usage.output, 2);
+    }
+
+    /// A call maki cannot make is an error pair, not a throw and not a
+    /// silent nothing: the caller is mid-verdict and needs to know.
+    #[test_case("return model.complete({ prompt = 'hi' })", MODEL_REQUIRED_ERR ; "no_model")]
+    #[test_case("return model.complete({ model = 'haiku', prompt = 'hi' })", MODEL_REQUIRED_ERR ; "model_is_not_a_spec")]
+    #[test_case("return model.complete({ model = 'p/m' })", NO_INPUT_ERR ; "nothing_to_say")]
+    #[test_case("return model.complete({ model = 'p/m', messages = { { role = 'system', content = 'x' } } })", "unknown message role 'system'" ; "unknown_role")]
+    fn complete_answers_bad_options_with_an_error_pair(script: &str, expected: &str) {
+        let lua = lua_with_model(None);
+        let (value, error) = eval(&lua, script);
+        assert_eq!(value, Json::Null);
+        assert!(
+            error.as_deref().is_some_and(|e| e.contains(expected)),
+            "got {error:?}"
+        );
+    }
+
+    /// `prompt` is the one-liner and `messages` the long form of the same
+    /// thing, so both have to land on the same message list.
+    #[test]
+    fn prompt_and_messages_build_the_same_request() {
+        let lua = Lua::new();
+        let bare: Table = lua
+            .load("return { model = 'p/m', prompt = 'why' }")
+            .eval()
+            .unwrap();
+        let rows: Table = lua
+            .load("return { model = 'p/m', messages = { { role = 'user', content = 'why' } } }")
+            .eval()
+            .unwrap();
+        let from_prompt = messages_from(&bare).unwrap();
+        let from_rows = messages_from(&rows).unwrap();
+        assert_eq!(from_prompt.len(), 1);
+        assert_eq!(
+            from_prompt[0].first_text_content(),
+            from_rows[0].first_text_content()
+        );
+        assert!(matches!(
+            (&from_prompt[0].role, &from_rows[0].role),
+            (maki_providers::Role::User, maki_providers::Role::User)
+        ));
     }
 }
