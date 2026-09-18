@@ -14,7 +14,7 @@ use maki_config::providers::{
 };
 use maki_providers::provider::fetch_all_models;
 use maki_providers::{ProviderData, catalog_providers};
-use maki_providers::{copilot_auth, dynamic, openai_auth, xai_auth};
+use maki_providers::{copilot_auth, openai_auth, plugin, xai_auth};
 use maki_storage::StateDir;
 use maki_storage::auth::ProviderCredentials;
 use maki_storage::auth::{
@@ -30,7 +30,7 @@ pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
         Some(slug) => {
             let slug = slugify(slug);
             if builtin_provider(&slug).is_none()
-                && dynamic::display_name(&slug).is_none()
+                && !plugin::is_registered(&slug)
                 && ProvidersConfig::load().get(&slug).is_none()
                 && let Some(provider_data) = maki_providers::catalog_provider(&slug)
             {
@@ -47,12 +47,12 @@ pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
 fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     let builtin = builtin_provider(slug);
     let is_custom = ProvidersConfig::load().get(slug).is_some();
-    if builtin.is_none() && dynamic::display_name(slug).is_none() && !is_custom {
+    if builtin.is_none() && !plugin::is_registered(slug) && !is_custom {
         bail!("unknown provider '{slug}'");
     }
 
-    if builtin.is_none() && dynamic::auth_providers().iter().any(|(s, _)| *s == slug) {
-        dynamic::login(slug)?;
+    if builtin.is_none() && plugin::auth_providers().iter().any(|(s, _)| s == slug) {
+        plugin::login(slug)?;
         return Ok(());
     }
 
@@ -423,7 +423,7 @@ pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
                 config.save().context("save providers.toml")?;
             }
             if !deleted && builtin_provider(&slug).is_none() {
-                dynamic::logout(&slug)?;
+                plugin::logout(&slug)?;
             }
         }
     }
@@ -536,6 +536,7 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
 }
 
 pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMode) -> Result<()> {
+    // Model listing calls plugin hooks, so the host outlives the fetch.
     let (_host, config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
 
     let mut refresh_failure = None;

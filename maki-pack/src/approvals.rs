@@ -51,27 +51,50 @@ pub struct Approvals {
     entries: BTreeMap<String, Entry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Entry {
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Entry {
     src: String,
     #[serde(default)]
     permissions: Vec<String>,
+    /// Hosts the package may reach, as its manifest declared them when the
+    /// user approved it, or `None` for every host: a manifest without a list,
+    /// which is also what an approved `net` meant before lists existed. So a
+    /// package that later drops its list is widening its reach and is asked
+    /// again, while one that adds a list to an old approval is narrowing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    net_hosts: Option<Vec<String>>,
+}
+
+impl Entry {
+    pub fn permissions(&self) -> &[String] {
+        &self.permissions
+    }
+
+    pub fn net_hosts(&self) -> Option<&[String]> {
+        self.net_hosts.as_deref()
+    }
 }
 
 impl Approvals {
-    /// Permissions approved for this exact package and source. A package whose
+    /// What was approved for this exact package and source. A package whose
     /// source changed has no approval, which is the point.
-    pub fn get(&self, key: &ApprovalKey) -> Option<&[String]> {
+    pub fn get(&self, key: &ApprovalKey) -> Option<&Entry> {
         let entry = self.entries.get(&key.name)?;
-        (entry.src == key.src).then_some(entry.permissions.as_slice())
+        (entry.src == key.src).then_some(entry)
     }
 
-    pub fn approve(&mut self, key: &ApprovalKey, permissions: Vec<String>) {
+    pub fn approve(
+        &mut self,
+        key: &ApprovalKey,
+        permissions: Vec<String>,
+        net_hosts: Option<Vec<String>>,
+    ) {
         self.entries.insert(
             key.name.clone(),
             Entry {
                 src: key.src.clone(),
                 permissions,
+                net_hosts,
             },
         );
     }
@@ -92,11 +115,22 @@ mod tests {
     use test_case::test_case;
 
     const SRC: &str = "https://github.com/user/repo";
+    const HOST: &str = "api.example.com";
+    const LEGACY_FILE: &str =
+        r#"{"entries":{"pkg":{"src":"https://github.com/user/repo","permissions":["net"]}}}"#;
+
+    fn approve(store: &mut Approvals, name: &str, src: &str, permissions: &[&str]) {
+        store.approve(
+            &ApprovalKey::new(name, src),
+            permissions.iter().map(|p| (*p).to_owned()).collect(),
+            None,
+        );
+    }
 
     fn approved(store: &Approvals, name: &str, src: &str) -> Option<Vec<String>> {
         store
             .get(&ApprovalKey::new(name, src))
-            .map(<[String]>::to_vec)
+            .map(|entry| entry.permissions().to_vec())
     }
 
     /// The defect this key shape exists to prevent: reusing a name must not
@@ -104,7 +138,7 @@ mod tests {
     #[test]
     fn approval_does_not_carry_over_to_a_different_source() {
         let mut store = Approvals::default();
-        store.approve(&ApprovalKey::new("pkg", SRC), vec!["run".to_owned()]);
+        approve(&mut store, "pkg", SRC, &["run"]);
         assert_eq!(
             approved(&store, "pkg", "https://github.com/attacker/repo"),
             None,
@@ -117,7 +151,7 @@ mod tests {
     #[test]
     fn whitespace_around_the_same_source_keeps_the_approval() {
         let mut store = Approvals::default();
-        store.approve(&ApprovalKey::new("pkg", SRC), vec!["net".to_owned()]);
+        approve(&mut store, "pkg", SRC, &["net"]);
         let padded = format!("  {SRC}\n");
         assert!(approved(&store, "pkg", &padded).is_some());
     }
@@ -132,7 +166,7 @@ mod tests {
     #[test_case("ssh://User@github.com/user/repo" ; "ssh_user_case")]
     fn a_differently_spelled_source_is_not_approved(variant: &str) {
         let mut store = Approvals::default();
-        store.approve(&ApprovalKey::new("pkg", SRC), vec!["net".to_owned()]);
+        approve(&mut store, "pkg", SRC, &["net"]);
         assert!(
             approved(&store, "pkg", variant).is_none(),
             "{variant} must be a fresh trust decision"
@@ -143,20 +177,33 @@ mod tests {
     #[test]
     fn a_local_path_and_its_git_suffix_are_distinct() {
         let mut store = Approvals::default();
-        store.approve(
-            &ApprovalKey::new("pkg", "/srv/repo"),
-            vec!["run".to_owned()],
-        );
+        approve(&mut store, "pkg", "/srv/repo", &["run"]);
         assert!(approved(&store, "pkg", "/srv/repo.git").is_none());
     }
 
     #[test]
     fn round_trips_through_json() {
         let mut store = Approvals::default();
-        store.approve(&ApprovalKey::new("pkg", SRC), vec!["net".to_owned()]);
+        store.approve(
+            &ApprovalKey::new("pkg", SRC),
+            vec!["net".to_owned()],
+            Some(vec![HOST.to_owned()]),
+        );
 
         let text = serde_json::to_string(&store).unwrap();
         let back: Approvals = serde_json::from_str(&text).unwrap();
-        assert_eq!(approved(&back, "pkg", SRC), Some(vec!["net".to_owned()]));
+        let entry = back.get(&ApprovalKey::new("pkg", SRC)).unwrap();
+        assert_eq!(entry.permissions(), ["net".to_owned()]);
+        assert_eq!(entry.net_hosts(), Some([HOST.to_owned()].as_slice()));
+    }
+
+    /// Files written before hosts were recorded still load, and grant what an
+    /// approved `net` meant then: every host.
+    #[test]
+    fn an_entry_saved_before_hosts_existed_still_loads() {
+        let store: Approvals = serde_json::from_str(LEGACY_FILE).unwrap();
+        let entry = store.get(&ApprovalKey::new("pkg", SRC)).unwrap();
+        assert_eq!(entry.permissions(), ["net".to_owned()]);
+        assert_eq!(entry.net_hosts(), None);
     }
 }

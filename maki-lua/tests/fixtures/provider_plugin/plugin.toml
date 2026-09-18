@@ -1,0 +1,4 @@
+[permissions]
+net = true
+env = true
+net_hosts = ["api.acme.example", "127.0.0.1"]

@@ -1,5 +1,6 @@
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use mlua::{Error as LuaError, Function, IntoLuaMulti, Lua, Result as LuaResult};
 use semver::Version;
@@ -10,25 +11,46 @@ use crate::error::PluginError;
 pub use maki_config::Permission;
 
 pub(crate) const MANIFEST_FILE: &str = "plugin.toml";
+pub(crate) const NET_HOSTS_KEY: &str = "net_hosts";
 const MIN_MAKI_VERSION: &str = "min_maki_version";
 const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The hosts a plugin declared it talks to, or `None` when it declared no
+/// list at all.
+///
+/// The two are different answers, not a list and an empty one: `net = true`
+/// with no `net_hosts` predates the allowlist and keeps meaning "any public
+/// host", while a list present means exactly those hosts. Shared because every
+/// `maki.net` call in one plugin reads the same list.
+pub type NetHosts = Option<Arc<[String]>>;
 
 #[derive(Debug, Clone)]
 pub struct PluginPermissions {
     allowed: [bool; Permission::COUNT],
+    net_hosts: NetHosts,
 }
 
 impl PluginPermissions {
     pub fn trusted() -> Self {
         Self {
             allowed: [true; Permission::COUNT],
+            net_hosts: None,
         }
     }
 
     pub fn denied() -> Self {
         Self {
             allowed: [false; Permission::COUNT],
+            net_hosts: None,
         }
+    }
+
+    pub fn net_hosts(&self) -> NetHosts {
+        self.net_hosts.clone()
+    }
+
+    pub fn set_net_hosts(&mut self, hosts: NetHosts) {
+        self.net_hosts = hosts;
     }
 
     /// Builds a set from the names an approval records.
@@ -65,7 +87,10 @@ impl PluginPermissions {
                 .and_then(toml::Value::as_bool)
                 .unwrap_or(true);
         }
-        Self { allowed }
+        Self {
+            allowed,
+            net_hosts: net_hosts_from_manifest(manifest),
+        }
     }
 
     pub fn set(&mut self, perm: Permission, value: bool) {
@@ -136,11 +161,21 @@ impl Requested {
                 .and_then(toml::Value::as_bool)
                 .unwrap_or(false);
         }
-        Self(PluginPermissions { allowed })
+        Self(PluginPermissions {
+            allowed,
+            net_hosts: net_hosts_from_manifest(manifest),
+        })
     }
 
     pub fn is_requested(&self, perm: Permission) -> bool {
         self.0.is_allowed(perm)
+    }
+
+    /// The hosts the manifest asks to reach, `None` for every host. A request,
+    /// like every other name in here, so the approval store is what decides
+    /// whether they are granted.
+    pub fn net_hosts(&self) -> Option<&[String]> {
+        self.0.net_hosts.as_deref()
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -160,13 +195,35 @@ impl Requested {
 
     /// Effective permissions for a managed package: the request and the user's
     /// approval must agree.
+    ///
+    /// The host list comes from the request alone. It is a narrowing the
+    /// package wrote about itself, and the approval it needs is the decision to
+    /// load the package at all, which the caller has already made by the time
+    /// the two are intersected.
     pub fn intersect(&self, approved: &PluginPermissions) -> PluginPermissions {
         let mut out = PluginPermissions::denied();
         for &perm in Permission::ALL {
             out.set(perm, self.0.is_allowed(perm) && approved.is_allowed(perm));
         }
+        out.set_net_hosts(self.0.net_hosts());
         out
     }
+}
+
+/// `[permissions] net_hosts = ["api.example.com", "*.example.com"]`.
+///
+/// An absent key is `None` and not an empty list: see [`NetHosts`]. Entries
+/// that are not strings are dropped, since a manifest cannot be trusted to be
+/// well formed and a malformed entry must not widen the list it appears in.
+fn net_hosts_from_manifest(manifest: &toml::Value) -> NetHosts {
+    let hosts = manifest
+        .get("permissions")?
+        .get(NET_HOSTS_KEY)?
+        .as_array()?
+        .iter()
+        .filter_map(|host| host.as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    Some(hosts.into())
 }
 
 /// Reads a package's requested permissions.
@@ -348,6 +405,35 @@ mod tests {
         assert!(!p.is_allowed(Permission::Net));
         assert!(p.is_allowed(Permission::Run));
         assert!(p.is_allowed(Permission::Env));
+    }
+
+    /// Absent and empty are different answers: only a list that is there
+    /// narrows what `net = true` already allows.
+    #[test_case("[permissions]\nnet = true\n", None ; "absent_list_stays_unrestricted")]
+    #[test_case(
+        "[permissions]\nnet = true\nnet_hosts = [\"api.example.com\", \"*.example.com\"]\n",
+        Some(vec!["api.example.com".to_owned(), "*.example.com".to_owned()])
+        ; "declared_hosts_are_carried"
+    )]
+    #[test_case("[permissions]\nnet_hosts = []\n", Some(Vec::new()) ; "an_empty_list_reaches_nothing")]
+    #[test_case("[permissions]\nnet_hosts = [1]\n", Some(Vec::new()) ; "a_malformed_entry_widens_nothing")]
+    fn net_hosts_from_a_manifest(manifest: &str, expected: Option<Vec<String>>) {
+        let value: toml::Value = toml::from_str(manifest).unwrap();
+        let hosts = PluginPermissions::from_manifest(&value).net_hosts();
+        assert_eq!(hosts.as_deref().map(<[String]>::to_vec), expected);
+    }
+
+    #[test]
+    fn a_requested_host_list_survives_intersection_with_an_approval() {
+        let value: toml::Value =
+            toml::from_str("[permissions]\nnet = true\nnet_hosts = [\"api.example.com\"]\n")
+                .unwrap();
+        let requested = Requested::from_manifest(&value);
+        let effective = requested.intersect(&PluginPermissions::trusted());
+        assert_eq!(
+            effective.net_hosts().as_deref().map(<[String]>::to_vec),
+            Some(vec!["api.example.com".to_owned()])
+        );
     }
 
     #[test]

@@ -158,6 +158,13 @@ every guarded call it makes fails. The
 [permission list](/docs/lua-api/#plugin-permissions) covers what each name
 gates.
 
+A package that declares [`net_hosts`](/docs/permissions/#plugin-egress-net-hosts)
+has those hosts recorded with its approval. Widening the list counts as a new
+request, so Maki asks again before the updated package loads. So does dropping
+the list, which reaches every host. An approval saved before egress was
+recorded grants what `net` meant then, every host, so adding a list to such a
+package only narrows it.
+
 An approval applies only to the same package name and source. Maki keeps
 approvals in `<maki-data>/site/pack-approvals.json`, where `<maki-data>` is the
 data directory from the

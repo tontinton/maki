@@ -155,6 +155,7 @@ const PLAN_FORM_AUTHORITY: Authority = Authority::Unbounded;
 pub const PLAN_ROW_HANDLER_DEADLINE: Duration = Duration::from_secs(30);
 const PLAN_HANDLERS_MISSING_ERR: &str = "plan row handlers not initialized";
 const PLAN_HANDLER_GONE_ERR: &str = "plan row handler was reaped";
+const NO_PLUGIN_HOST: &str = "no plugin host is running this code";
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.
 pub(crate) const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
@@ -329,6 +330,19 @@ pub enum Request {
         chunks: Vec<LoadChunk>,
         context: LoadContext,
         reply: flume::Sender<LoadResult>,
+    },
+    /// One call into a hook a plugin registered with `maki.provider`.
+    ///
+    /// Carries the hook handles themselves rather than a plugin name: the call
+    /// runs against the functions it started with, so an unload mid-flight
+    /// cannot swap the code out from under it. Rides the priority lane and is
+    /// spawned like a tool call, but takes no [`InflightGate`] slot: a provider
+    /// hook is not a tool, and the model is waiting on it.
+    CallProviderHook {
+        hook: Arc<crate::api::provider::LuaHookKeys>,
+        slot: crate::api::provider::HookSlot,
+        payload: Value,
+        reply: flume::Sender<Result<Value, String>>,
     },
     CallTool {
         plugin: Arc<str>,
@@ -1230,6 +1244,25 @@ impl TaskScope {
 /// [detached]: TaskScope::detached
 pub(crate) async fn run_detached<F: Future>(lua: &Lua, fut: F) -> F::Output {
     run_scoped(lua, TaskScope::detached(lua), fut).await
+}
+
+/// The priority lane, reachable from off the Lua thread.
+///
+/// Provider hooks are called from the async side of the process, so the way
+/// back in has to be something the Lua code that registers them can pick up
+/// while it runs.
+pub(crate) struct ProviderRequests(flume::Sender<Request>);
+
+/// The two ways back to the Lua thread that a provider hook handle keeps: one
+/// to ask for a call, one to hand its registry keys back when it dies. Taken
+/// together because a handle without both is of no use.
+pub(crate) fn host_senders(
+    lua: &Lua,
+) -> mlua::Result<(flume::Sender<Request>, flume::Sender<DeferredCallback>)> {
+    let no_host = || mlua::Error::runtime(NO_PLUGIN_HOST);
+    let requests = lua.app_data_ref::<ProviderRequests>().ok_or_else(no_host)?;
+    let release = lua.app_data_ref::<DeferQueue>().ok_or_else(no_host)?;
+    Ok((requests.0.clone(), release.tx.clone()))
 }
 
 /// [`run_detached`] for plugin code a host caller is blocked on, carrying every
@@ -3736,6 +3769,7 @@ pub fn spawn(
 ) -> Result<LuaThread, PluginError> {
     let (tx, rx) = flume::unbounded::<Request>();
     let (prio_tx, prio_rx) = flume::unbounded::<Request>();
+    let prio_tx_thread = prio_tx.clone();
     let tx_clone = tx.clone();
     let layered: Arc<LayeredTools> = Arc::default();
     let layered_thread = Arc::clone(&layered);
@@ -3783,6 +3817,8 @@ pub fn spawn(
                     return;
                 }
             };
+
+            rt.lua.set_app_data(ProviderRequests(prio_tx_thread));
 
             let ex = Rc::new(smol::LocalExecutor::new());
             {
@@ -3918,6 +3954,21 @@ pub fn spawn(
                                 )
                                 .await;
                             let _ = reply.send(res);
+                        }
+                        Request::CallProviderHook {
+                            hook,
+                            slot,
+                            payload,
+                            reply,
+                        } => {
+                            let lua = rt.lua.clone();
+                            ex.spawn(async move {
+                                let answer =
+                                    crate::api::provider::run_hook(&lua, &hook, slot, payload)
+                                        .await;
+                                let _ = reply.send(answer);
+                            })
+                            .detach();
                         }
                         Request::CallTool {
                             plugin,

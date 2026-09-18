@@ -123,6 +123,9 @@ pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"]
 
 pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines", "insert_lines"];
 
+const WILDCARD_LABEL: &str = "*.";
+const LABEL_SEPARATOR: char = '.';
+
 /// A capability a lua plugin can hold. Declared in `plugin.toml`, recorded in
 /// the package approval store, and named on every guarded `maki.*` function.
 ///
@@ -188,6 +191,47 @@ impl std::fmt::Display for Permission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.manifest_key())
     }
+}
+
+/// Matches a host against a plugin manifest's `net_hosts`. Lives beside
+/// [`Permission`] because the two answer the same question from the same table,
+/// and both the network sandbox and the provider registry have to give the same
+/// answer for one list.
+///
+/// A pattern is an exact host, or a single leading `*.` standing for "some
+/// subdomain of". The wildcard never covers the bare domain, and never matches
+/// across a partial label, so `*.example.com` takes `api.example.com` and leaves
+/// both `example.com` and `evilexample.com`.
+///
+/// Both sides are canonicalised first, so the two spellings of one DNS name
+/// cannot disagree: `evil.test.` and `evil.test` are the same host, and a
+/// pattern is compared as the name it resolves to rather than as the string it
+/// was typed as.
+pub fn host_allowed(host: &str, patterns: &[String]) -> bool {
+    let host = canonical_host(host);
+    patterns.iter().any(|pattern| {
+        match canonical_host(pattern).strip_prefix(WILDCARD_LABEL) {
+            // An empty domain would leave `strip_suffix` matching every host,
+            // which is a pattern that says "anywhere" while reading as a typo.
+            // Nothing is the safe answer: a list is a grant, so a rule nobody
+            // can state on purpose must grant nothing.
+            Some(domain) => !domain.is_empty() && is_subdomain_of(host, domain),
+            None => host == canonical_host(pattern),
+        }
+    })
+}
+
+/// One DNS name, one string: the root label is implied, so the trailing dot
+/// that spells it goes. Everything else about a host is already settled by the
+/// time it gets here, since both callers match against a host `url::Url`
+/// parsed, which is lowercased and punycoded.
+fn canonical_host(host: &str) -> &str {
+    host.strip_suffix(LABEL_SEPARATOR).unwrap_or(host)
+}
+
+fn is_subdomain_of(host: &str, domain: &str) -> bool {
+    host.strip_suffix(domain)
+        .is_some_and(|label| label.len() > 1 && label.ends_with(LABEL_SEPARATOR))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2625,6 +2669,26 @@ mod tests {
     const BLANKET_GLOB: &str = "**";
     const ABSOLUTE_PATH: &str = "/workspace";
     const BROKEN_GLOB: &str = "[";
+    const EXAMPLE_HOST: &str = "example.com";
+
+    #[test_case(EXAMPLE_HOST, EXAMPLE_HOST, true ; "exact")]
+    #[test_case("api.example.com", EXAMPLE_HOST, false ; "exact_rejects_subdomain")]
+    #[test_case("api.example.com", "*.example.com", true ; "wildcard_subdomain")]
+    #[test_case("a.b.example.com", "*.example.com", true ; "wildcard_nested_subdomain")]
+    #[test_case(EXAMPLE_HOST, "*.example.com", false ; "wildcard_excludes_the_bare_domain")]
+    #[test_case("evilexample.com", "*.example.com", false ; "wildcard_needs_a_label_boundary")]
+    #[test_case("evilexample.com", EXAMPLE_HOST, false ; "near_miss")]
+    // A `*.` with nothing after it used to strip an empty suffix off every
+    // host, leaving "does it end in a dot" -- which any name written as an
+    // fqdn does, and dns resolves the same either way.
+    #[test_case("evil.test.", "*.", false ; "the_empty_wildcard_grants_nothing")]
+    #[test_case(EXAMPLE_HOST, "*.", false ; "and_grants_nothing_to_a_bare_name_either")]
+    #[test_case("example.com.", EXAMPLE_HOST, true ; "the_root_label_is_the_same_name")]
+    #[test_case("api.example.com.", "*.example.com", true ; "including_under_a_wildcard")]
+    #[test_case(EXAMPLE_HOST, "example.com.", true ; "however_the_pattern_spells_it")]
+    fn host_allowed_patterns(host: &str, pattern: &str, expected: bool) {
+        assert_eq!(host_allowed(host, &[pattern.to_string()]), expected);
+    }
 
     /// The temp directory a test builds its project in, with its parent
     /// standing in for the home directory. Plain discovery would read the real

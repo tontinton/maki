@@ -88,6 +88,14 @@ The rules:
 - A package, or a plugin maki ships, is read the other way round: a key it
   does not name is not requested, so its `plugin.toml` lists everything it
   uses. Only a `plugin.toml` you wrote yourself defaults to granted.
+- `net_hosts` sits in the same table and grants nothing by itself. Left out,
+  `net = true` keeps its usual meaning of any public host the address guard
+  allows. Set to `["api.acme.com", "*.acme.dev"]`, it limits the plugin's
+  `maki.net` calls and any base URL it hands a provider codec to those hosts.
+  A pattern is either an exact host or one leading `*.` label. A plugin
+  calling `maki.provider.register` must declare a non-empty list, and widening
+  a list asks for approval again. See [Permissions](/docs/permissions/) for
+  the details.
 - `min_maki_version` is optional and takes a plain semantic version as a lower
   bound, so ranges do not work. When the field is invalid or the running
   version is older, Maki skips the Lua in that directory and warns at startup
@@ -121,6 +129,8 @@ The rules:
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
 | [`maki.model`](#maki-model) | The model behind the focused session. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
+| [`maki.provider`](#maki-provider) | Providers implemented in Lua. |
+| [`maki.provider.auth`](#maki-provider-auth) | Credentials for the providers this plugin registered, kept by maki |
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.Timer`](#maki-Timer) | Handle returned by `maki.defer_fn`. |
 | [`maki.task`](#maki-task) | The subagents of the focused session and their transcripts. |
@@ -3722,6 +3732,246 @@ if err then
 else
   print(res.status, res.body)
 end
+```
+
+
+## maki.provider {#maki-provider}
+
+Providers implemented in Lua.
+
+A registered provider is a first-class one: its models show up in the
+picker and in config, its requests go through maki's usual retry,
+pricing and usage accounting, and its credentials live where maki keeps
+every other provider's.
+
+Registration happens while the plugin loads, so it belongs at the top
+level of the plugin file rather than inside a callback.
+
+A plugin that registers a provider needs the `net` permission and a
+non-empty `net_hosts` list in its `plugin.toml`. Those hosts are the
+only origins maki sends the provider's credentials to.
+
+```lua
+maki.provider.register({
+  slug = "acme",
+  display_name = "Acme",
+  codec = "openai",
+  base_url = "https://api.acme.com/v1",
+  api_key_env = "ACME_API_KEY",
+  models = { { prefixes = { "acme-large" }, tier = "strong" } },
+})
+```
+
+---
+
+### `maki.provider.register()` {#maki-provider-register}
+
+```lua
+maki.provider.register({spec})
+```
+
+Register a provider this plugin implements. maki then treats its models like
+any other provider's: they appear in the model picker, in `/model`, and in
+`providers.toml` overrides, addressed as `<slug>/<model>`.
+
+The plugin must declare the hosts it talks to as `net_hosts` under
+`[permissions]` in its `plugin.toml`. That list is the only set of origins
+maki will send this provider's credentials to, whatever a hook returns
+later. Registering with no declared host fails.
+
+Give exactly one of `codec` (speak a wire protocol maki already knows) or
+`base` (borrow a native provider whole, including its quirks and its model
+table). `codec` is the supported choice for a new provider. `base` exists
+for a provider that needs a specific vendor adapter, and what it inherits
+changes whenever that provider does.
+
+Every callback is optional, and a registration with none is a perfectly
+good static provider. Callbacks run on maki's plugin host, so they may use
+`maki.net`, `maki.fs` and the rest of the API.
+
+An option the target cannot honour fails at registration rather than being
+ignored at request time: `build_body` needs one of the `openai` codecs, and
+`system_prefix` is refused by the `google` codec, which drops it.
+
+{spec} fields:
+  `slug` (string) Required. How the provider is addressed: `<slug>/<model>`.
+          Letters, digits, `_` and `-`, starting with a letter or digit, and
+          not a slug a built-in or `providers.toml` already owns.
+  `display_name` (string) Required. Shown in the UI.
+  `codec` (string) `"openai"`, `"openai-responses"`, `"anthropic"` or
+          `"google"`. Mutually exclusive with `base`.
+  `base` (string) A native provider slug to build on, e.g. `"anthropic"`.
+  `base_url` (string) Default origin for requests. Its host must be one of
+          the declared `net_hosts`, and it must be `https` unless it points
+          at loopback.
+  `api_key_env` (string) Environment variable holding an API key. Read at
+          registration and sent as a bearer token when set.
+  `system_prefix` (string) Text prepended to the system prompt.
+  `models` (table) List of model rows. Each row has `prefixes` (list): the
+           row answers for every model id starting with one of them,
+           longest prefix first, and `prefixes[1]` is the canonical id.
+           Also `tier` (`"weak"`, `"medium"`, `"strong"` or
+           `"compaction"`, default `"medium"`), `context_window`,
+           `max_output_tokens`, `supports_thinking`, `supports_vision`,
+           `supports_tool_examples`, `requires_thinking`, `pricing`
+           (`input`, `output`, `cache_write`, `cache_read`, in dollars per
+           million tokens) and `thinking_fields`. The three `supports_`
+           flags have three states: leaving one out asks the codec or base
+           provider, `false` turns the feature off for that model. Read
+           once, here, so this table must not depend on anything asked at
+           runtime.
+  `resolve_auth` (function) `function(purpose)` returning
+           `{ base_url = ..., headers = { ... } }`. Called once, lazily,
+           before the first request, so a provider whose credentials are
+           broken is still listed and fails when it is used. `purpose` is
+           `"resolve"`. Omitting `base_url` keeps the one in force.
+  `refresh_auth` (function) Same shape, called after a 401 with
+           `purpose = "refresh"`. Falls back to `resolve_auth`.
+  `reload_auth` (function) Same shape, called with `purpose = "reload"` to
+           re-read what a `login` wrote. Falls back to `resolve_auth`.
+  `list_models` (function) `function()` returning a list of model rows,
+           for a provider whose catalogue is only known at runtime. Rows
+           carry `id`, `context_window`, `max_output_tokens`, `pricing`,
+           `supports_thinking`, `supports_vision` and `tier`.
+  `build_body` (function) `function(body, model, opts)` returning the
+           request body to send. `opts.thinking` is the effort level as
+           rendered. Only for the `openai` codecs.
+  `map_error` (function) `function(status, message)` returning
+           `{ status = ..., message = ... }`, or nil to keep the original.
+           Those two fields are all it may change: `retry_after` comes from
+           the response header, and whether an error is retryable is
+           derived from the status.
+  `fetch_usage` (function) `function()` returning a usage summary.
+  `login` (function) `function(ctx)`. Having one is what makes the provider
+           an auth target: it then shows up in `maki auth login`. There is
+           no separate flag for it. `ctx` is a table of functions, called
+           with a dot: `ctx.print(text)`,
+           `ctx.prompt({ label = ..., secret = ... })` and
+           `ctx.open_url(url)`.
+  `logout` (function) `function(ctx)`, the `maki auth logout` side.
+
+Requires the `net` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{spec}` (`table`) Provider specification (see above).
+
+**Example:**
+
+```lua
+maki.provider.register({
+  slug = "acme",
+  display_name = "Acme",
+  codec = "openai",
+  base_url = "https://api.acme.com/v1",
+  api_key_env = "ACME_API_KEY",
+  models = {
+    { prefixes = { "acme-large" }, tier = "strong", context_window = 200000 },
+  },
+  resolve_auth = function()
+    local token = maki.provider.auth.get("acme")
+    return { headers = { Authorization = "Bearer " .. token.access } }
+  end,
+})
+```
+
+
+## maki.provider.auth {#maki-provider-auth}
+
+Credentials for the providers this plugin registered, kept by maki
+apart from its own: one file per slug at
+`~/.local/state/maki/auth/plugins/<slug>.json`, created with mode 0600,
+replaced in one atomic step, and locked against other maki processes
+while a refresh writes.
+
+The stored value is a free-form JSON object. maki owns where it lives
+and who may read it, the plugin owns what is in it.
+
+A plugin can only reach slugs it registered itself.
+
+```lua
+maki.provider.auth.set("acme", { access_token = tok, expires = when })
+local creds = maki.provider.auth.get("acme")
+maki.provider.auth.clear("acme")
+```
+
+---
+
+### `maki.provider.auth.get()` {#maki-provider-auth-get}
+
+```lua
+maki.provider.auth.get({slug})
+```
+
+Read the credentials this plugin stored for one of its providers.
+
+The value is whatever the plugin wrote. maki keeps the file, the plugin
+keeps its shape. Nothing is returned when the provider has never stored
+any, which is how a first `resolve_auth` tells a fresh install from a
+logged-in one.
+
+**Parameters:**
+
+- `{slug}` (`string`) A provider slug this plugin registered.
+
+**Returns:** (`table?`, `string?`) The stored credentials, or nil plus an error.
+
+**Example:**
+
+```lua
+local creds = maki.provider.auth.get("acme")
+if creds then print(creds.access_token) end
+```
+
+---
+
+### `maki.provider.auth.set()` {#maki-provider-auth-set}
+
+```lua
+maki.provider.auth.set({slug}, {credentials})
+```
+
+Store credentials for one of this plugin's providers.
+
+Written to `~/.local/state/maki/auth/plugins/<slug>.json` with mode 0600,
+replaced in one atomic step, and serialised against other maki processes
+touching the same provider's credentials. Any JSON-shaped table works, so a
+plugin can keep a refresh token, an expiry and whatever else its flow needs.
+
+**Parameters:**
+
+- `{slug}` (`string`) A provider slug this plugin registered.
+- `{credentials}` (`table`) Any table with string keys.
+
+**Returns:** (`boolean?`, `string?`) True, or nil plus an error string.
+
+**Example:**
+
+```lua
+local ok, err = maki.provider.auth.set("acme", { access_token = token })
+if not ok then maki.log.error(err) end
+```
+
+---
+
+### `maki.provider.auth.clear()` {#maki-provider-auth-clear}
+
+```lua
+maki.provider.auth.clear({slug})
+```
+
+Forget the credentials stored for one of this plugin's providers.
+
+**Parameters:**
+
+- `{slug}` (`string`) A provider slug this plugin registered.
+
+**Returns:** (`boolean?`, `string?`) True, or nil plus an error string.
+
+**Example:**
+
+```lua
+maki.provider.auth.clear("acme")
 ```
 
 

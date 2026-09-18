@@ -226,6 +226,35 @@ Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to th
 It runs after [folder trust](/docs/folder-trust/) has let the Lua file load, and
 limits which APIs the file reaches rather than sandboxing the file.
 
+### Plugin egress: net_hosts
+
+`net = true` lets a plugin reach any public host. A plugin can narrow that to an
+allowlist in the same `[permissions]` table:
+
+```toml
+[permissions]
+net = true
+net_hosts = ["api.acme.com", "*.acme.dev"]
+```
+
+An absent `net_hosts` and an empty one are different answers. Absent keeps the
+old meaning of `net = true`, any public host. Present means exactly the hosts
+listed, and an empty list reaches nothing.
+
+A pattern is either an exact host or one leading `*.` label. `*.acme.dev`
+matches `api.acme.dev` and leaves both `acme.dev` and `evilacme.dev` out. No
+other wildcard form is understood.
+
+The list is enforced in two places: the plugin's own `maki.net` calls, and the
+`base_url` a [plugin provider](/docs/providers/#plugin-providers) ends up using,
+so an auth hook cannot repoint credentials at a host the manifest never named. A
+plugin that calls `maki.provider.register` must declare a non-empty list, and
+registration fails without one.
+
+For an installed [package](/docs/packages/), the approved hosts are recorded
+with the approval. A package that later widens its list, or drops it and so
+reaches every host, asks again before it loads.
+
 ## Network Addresses
 
 `webfetch`, `websearch` and every plugin that calls `maki.net` go through one guard. A request to a private, loopback or link-local address is refused, and so is a redirect that lands on one. The model picks these URLs, so a page it reads could otherwise talk it into fetching `http://169.254.169.254/` or an admin panel on your LAN.

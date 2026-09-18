@@ -1,5 +1,7 @@
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -10,6 +12,11 @@ use tracing::debug;
 use crate::{StateDir, StorageError, atomic_write_permissions};
 
 const AUTH_DIR: &str = "auth";
+/// Plugin providers keep their credentials apart from everything else under
+/// [`AUTH_DIR`]: a plugin picks its own slug, and in a shared directory that
+/// name could be `mcp-<server>` or a catalog provider's slug, the file maki
+/// keeps somebody else's secret in.
+const PLUGIN_AUTH_DIR: &str = "plugins";
 const AUTH_FILE_MODE: u32 = 0o600;
 const REFRESH_BUFFER_SECS: u64 = 60;
 const LOCK_SUFFIX: &str = ".lock";
@@ -107,6 +114,66 @@ pub fn lock_tokens(dir: &StateDir, provider: &str) -> Option<File> {
     lock_exclusive(&auth_path(dir, &format!("{provider}{LOCK_SUFFIX}")))
 }
 
+/// The cross-process half of [`lock_credentials`]: a plugin provider's store,
+/// locked against every other maki process.
+pub fn lock_plugin_store(dir: &StateDir, slug: &str) -> Option<File> {
+    lock_exclusive(&plugin_auth_path(dir, &format!("{slug}{LOCK_SUFFIX}")))
+}
+
+/// The slugs this process currently holds the credential lock for.
+static HELD_CREDENTIALS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// One provider's credential lock, re-entrant within this process and released
+/// on drop.
+///
+/// A plugin's auth hook runs while the host already holds this lock, and the
+/// whole reason the host owns the store is that such a hook can persist the
+/// token it just minted. Taking the file lock again from inside it would park
+/// the write until the hook times out, so a slug this process already holds
+/// hands back a guard that locks nothing.
+///
+/// What that still guarantees is the part that matters: no *other process* can
+/// be writing meanwhile, because the outermost guard holds the exclusive file
+/// lock for as long as it lives, and the refresh gate single-flights the
+/// refresh path per slug.
+///
+/// What it does not guarantee is in-process exclusion against a write from
+/// somewhere else entirely -- a `login` hook, a timer, a user command -- which
+/// takes the re-entrant guard and writes under the outer holder's lock. That
+/// is safe rather than merely tolerated because every write replaces the file
+/// in one atomic step, so the loser of such a race loses its whole write and
+/// never half of it, and both values were minted by the same plugin.
+pub struct CredentialLock {
+    /// Set only on the guard that claimed the slug, so a re-entrant guard
+    /// releases nothing, and an early return or a panic inside a hook cannot
+    /// leak the claim either.
+    slug: Option<String>,
+    _file: Option<File>,
+}
+
+pub fn lock_credentials(dir: &StateDir, provider: &str) -> CredentialLock {
+    let claimed = HELD_CREDENTIALS.lock().unwrap().insert(provider.to_owned());
+    if !claimed {
+        return CredentialLock {
+            slug: None,
+            _file: None,
+        };
+    }
+    CredentialLock {
+        slug: Some(provider.to_owned()),
+        _file: lock_plugin_store(dir, provider),
+    }
+}
+
+impl Drop for CredentialLock {
+    fn drop(&mut self) {
+        if let Some(slug) = self.slug.take() {
+            HELD_CREDENTIALS.lock().unwrap().remove(&slug);
+        }
+    }
+}
+
 pub fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -116,6 +183,13 @@ pub fn now_millis() -> u64 {
 
 fn auth_path(dir: &StateDir, filename: &str) -> PathBuf {
     dir.path().join(AUTH_DIR).join(format!("{filename}.json"))
+}
+
+fn plugin_auth_path(dir: &StateDir, slug: &str) -> PathBuf {
+    dir.path()
+        .join(AUTH_DIR)
+        .join(PLUGIN_AUTH_DIR)
+        .join(format!("{slug}.json"))
 }
 
 fn load_auth<T: DeserializeOwned>(path: &Path) -> Option<T> {
@@ -199,6 +273,30 @@ pub fn delete_provider_credentials(dir: &StateDir, slug: &str) -> Result<bool, S
     delete_auth(&auth_path(dir, slug))
 }
 
+/// Whatever a plugin provider decided its credentials are.
+///
+/// No schema, so a plugin gets the object back exactly as it wrote it. An
+/// object rather than any JSON value so a later version of the plugin has
+/// somewhere to add a field. Lives under [`PLUGIN_AUTH_DIR`], so no slug a
+/// plugin can choose addresses a file maki writes for anything else.
+pub type PluginAuthData = serde_json::Map<String, serde_json::Value>;
+
+pub fn load_plugin_auth(dir: &StateDir, slug: &str) -> Option<PluginAuthData> {
+    load_auth(&plugin_auth_path(dir, slug))
+}
+
+pub fn save_plugin_auth(
+    dir: &StateDir,
+    slug: &str,
+    data: &PluginAuthData,
+) -> Result<(), StorageError> {
+    save_auth(&plugin_auth_path(dir, slug), data)
+}
+
+pub fn delete_plugin_auth(dir: &StateDir, slug: &str) -> Result<bool, StorageError> {
+    delete_auth(&plugin_auth_path(dir, slug))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +306,10 @@ mod tests {
     use test_case::test_case;
 
     const TEST_URL: &str = "https://mcp.example.com";
+    const PLUGIN_SLUG: &str = "acme";
+    const PLUGIN_TOKEN_KEY: &str = "access_token";
+    const PLUGIN_TOKEN: &str = "tok-1";
+    const MCP_SERVER: &str = "github";
 
     fn test_mcp_data() -> McpAuthData {
         McpAuthData {
@@ -259,6 +361,57 @@ mod tests {
         assert!(delete_tokens(&dir, "anthropic").unwrap());
         assert!(load_tokens(&dir, "anthropic").is_none());
         assert!(!delete_tokens(&dir, "anthropic").unwrap());
+    }
+
+    /// The file is the plugin's to shape: no schema, so whatever object went in
+    /// is the object that comes back.
+    #[test]
+    fn plugin_auth_keeps_the_object_as_written() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let mut data = PluginAuthData::new();
+        data.insert(PLUGIN_TOKEN_KEY.into(), serde_json::json!(PLUGIN_TOKEN));
+        data.insert("nested".into(), serde_json::json!({ "any": [1, 2] }));
+        save_plugin_auth(&dir, PLUGIN_SLUG, &data).unwrap();
+
+        assert_eq!(load_plugin_auth(&dir, PLUGIN_SLUG).unwrap(), data);
+    }
+
+    /// A plugin names its own slug, so its store must not be where maki keeps
+    /// an MCP server's tokens or a provider's key under that same name.
+    #[test_case(&format!("mcp-{MCP_SERVER}") ; "an_mcp_server")]
+    #[test_case(PLUGIN_SLUG                   ; "a_provider_key")]
+    fn plugin_auth_cannot_reach_another_owners_file(slug: &str) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        save_mcp_auth(&dir, MCP_SERVER, &test_mcp_data()).unwrap();
+        let creds = ProviderCredentials {
+            api_key: PLUGIN_TOKEN.into(),
+            host: None,
+        };
+        save_provider_credentials(&dir, PLUGIN_SLUG, &creds).unwrap();
+
+        assert!(load_plugin_auth(&dir, slug).is_none());
+        assert!(!delete_plugin_auth(&dir, slug).unwrap());
+    }
+
+    /// What a plugin's auth hook does: it writes the store while the host
+    /// already holds the same slug's lock. Taking the file lock a second time
+    /// would park the write for [`LOCK_WAIT`], so the nested guard must hold no
+    /// file, and must leave the slug to the outer one when it goes.
+    #[test]
+    fn a_nested_credential_lock_takes_no_file_lock() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let outer = lock_credentials(&dir, PLUGIN_SLUG);
+
+        let nested = lock_credentials(&dir, PLUGIN_SLUG);
+        assert!(nested._file.is_none());
+
+        drop(nested);
+        assert!(HELD_CREDENTIALS.lock().unwrap().contains(PLUGIN_SLUG));
+        drop(outer);
+        assert!(!HELD_CREDENTIALS.lock().unwrap().contains(PLUGIN_SLUG));
     }
 
     #[test]

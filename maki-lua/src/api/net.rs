@@ -8,6 +8,7 @@ use arc_swap::ArcSwap;
 use futures_lite::io::AsyncReadExt;
 use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation};
 use isahc::{AsyncBody, HttpClient, Request, Response};
+use maki_config::host_allowed;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
 use regex::bytes::Regex;
@@ -16,7 +17,7 @@ use url::Url;
 
 use crate::api::util::pair::{Pair, try_pair};
 
-use crate::plugin_permissions::PluginPermissions;
+use crate::plugin_permissions::{NetHosts, PluginPermissions};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
@@ -39,6 +40,7 @@ const MAX_POOLED_CLIENTS: usize = 8;
 const CLIENT_IDLE_TTL: Duration = Duration::from_secs(120);
 const INVALID_LINE_MATCH: &str = "invalid line_match";
 const ALLOWLIST_HINT: &str = "add it to `net.allowed_private_hosts` in your init.lua to allow it";
+const UNDECLARED_HOST_HINT: &str = "add it to `net_hosts` under `[permissions]` in plugin.toml";
 /// Reserved IPv4 ranges the standard library has no predicate for. Carrier
 /// grade NAT is the one that bites: Alibaba Cloud parks its instance metadata
 /// service on it at 100.100.100.200. Then protocol assignments, benchmarking,
@@ -204,6 +206,9 @@ struct RequestParams {
     line_match: Option<Regex>,
     /// `None` when the guard reached its verdict without DNS.
     pin: Option<DnsPin>,
+    /// Carried rather than passed, so every hop is vetted against the list the
+    /// first one was.
+    declared: NetHosts,
 }
 
 struct ResponseData {
@@ -242,8 +247,13 @@ struct ResponseData {
 ///   print(res.status, res.body)
 /// end
 #[lua_fn(guard = Net)]
-async fn request(lua: Lua, url: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
-    let params = try_pair!(extract_request_params(&url, opts.as_ref()).await);
+async fn request(
+    lua: Lua,
+    #[ctx] hosts: NetHosts,
+    url: String,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Table>> {
+    let params = try_pair!(extract_request_params(&url, hosts, opts.as_ref()).await);
     let resp = try_pair!(do_request(params).await);
     let tbl = lua.create_table()?;
     tbl.set("body", resp.body)?;
@@ -266,15 +276,51 @@ lua_table! {
     /// local res, err = maki.net.request("https://example.com")
     /// if res then print(res.body) end
     /// ```
-    "maki.net" => pub(crate) fn create_net_table(perms: &PluginPermissions), DOCS [
-        request(perms),
+    "maki.net" => pub(crate) fn create_net_table(perms: &PluginPermissions, hosts: NetHosts), DOCS [
+        request(perms, hosts),
     ]
 }
 
-async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<RequestParams, String> {
+/// The plugin's own egress allowlist, checked once the SSRF guard has settled
+/// what the URL really points at.
+///
+/// A plugin that declared no `net_hosts` is unrestricted, which is what every
+/// plugin written before the list existed relies on.
+fn check_declared_host(url: &str, hosts: Option<&[String]>) -> Result<(), String> {
+    let Some(hosts) = hosts else {
+        return Ok(());
+    };
+    let (host, _) = extract_host_port(url).ok_or("cannot extract host from URL")?;
+    if host_allowed(host, hosts) {
+        return Ok(());
+    }
+    Err(format!(
+        "blocked: {host} is not a host this plugin declared ({UNDECLARED_HOST_HINT})"
+    ))
+}
+
+/// Every URL this client is about to open goes through here: scheme, SSRF and
+/// the plugin's declared hosts, in that order, because the last one wants the
+/// address the guard settled on. One door, so a redirect cannot reach what the
+/// URL the caller wrote could not.
+async fn vet(
+    url: &str,
+    allowed: &HostAllowlist,
+    declared: Option<&[String]>,
+) -> Result<(String, Option<DnsPin>), String> {
+    let url = validate_and_upgrade_url(url, allowed)?;
+    let pin = check_ssrf(&url, allowed).await?;
+    check_declared_host(&url, declared)?;
+    Ok((url, pin))
+}
+
+async fn extract_request_params(
+    url: &str,
+    hosts: NetHosts,
+    opts: Option<&Table>,
+) -> Result<RequestParams, String> {
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
-    let url = validate_and_upgrade_url(url, &allowed)?;
-    let pin = check_ssrf(&url, &allowed).await?;
+    let (url, pin) = vet(url, &allowed, hosts.as_deref()).await?;
 
     let method = opts
         .and_then(|o| o.get::<String>("method").ok())
@@ -325,6 +371,7 @@ async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<Reque
         retries,
         line_match,
         pin,
+        declared: hosts,
     })
 }
 
@@ -607,7 +654,8 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
 
 impl RequestParams {
     /// Points the request at a redirect target after putting it through the
-    /// same scheme and SSRF rules as the URL the caller asked for.
+    /// same scheme, SSRF and declared-host rules as the URL the caller asked
+    /// for.
     async fn follow_redirect(
         &mut self,
         status: u16,
@@ -618,8 +666,7 @@ impl RequestParams {
         let target = base
             .join(location)
             .map_err(|e| format!("invalid redirect to {location}: {e}"))?;
-        let target = validate_and_upgrade_url(target.as_str(), allowed)?;
-        let pin = check_ssrf(&target, allowed).await?;
+        let (target, pin) = vet(target.as_str(), allowed, self.declared.as_deref()).await?;
 
         let landed =
             Url::parse(&target).map_err(|e| format!("invalid redirect to {location}: {e}"))?;
@@ -822,6 +869,8 @@ mod tests {
     const ALLOWED_PORT: u16 = 8888;
     /// An address rather than a name, so no test needs a DNS answer.
     const PUBLIC_URL: &str = "https://8.8.8.8/";
+    const PUBLIC_HOST: &str = "8.8.8.8";
+    const OTHER_PUBLIC_HOST: &str = "1.1.1.1";
     const PUBLIC_HTTP_URL: &str = "http://8.8.8.8/";
     const OTHER_PUBLIC_URL: &str = "https://1.1.1.1/";
     const PUBLIC_URL_OTHER_PORT: &str = "https://8.8.8.8:8443/";
@@ -855,7 +904,7 @@ mod tests {
     }
 
     fn request_params(url: &str, opts: Option<&Table>) -> Result<RequestParams, String> {
-        smol::block_on(extract_request_params(url, opts))
+        smol::block_on(extract_request_params(url, None, opts))
     }
 
     #[test_case(&[], "https://example.com/", "https://example.com/" ; "https_passthrough")]
@@ -943,6 +992,7 @@ mod tests {
             retries: 0,
             line_match: None,
             pin: None,
+            declared: None,
         }
     }
 
@@ -1158,7 +1208,7 @@ mod tests {
     #[test_case(r#"net.request("ftp://x")"# ; "invalid_url")]
     fn lua_request_error_returns_nil_and_message(expr: &str) {
         let lua = Lua::new();
-        let net = create_net_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let net = create_net_table(&lua, &PluginPermissions::trusted(), None).unwrap();
         lua.globals().set("net", net).unwrap();
         let (is_nil, has_err): (bool, bool) = lua
             .load(format!(
@@ -1168,6 +1218,36 @@ mod tests {
             .unwrap();
         assert!(is_nil);
         assert!(has_err);
+    }
+
+    fn declared(hosts: Option<&[&str]>) -> NetHosts {
+        hosts.map(|hosts| hosts.iter().map(|host| (*host).to_owned()).collect())
+    }
+
+    /// The gate sits in `extract_request_params`, so these go through it
+    /// rather than through the matcher alone. Addresses, so nothing resolves.
+    #[test_case(None, true ; "no_declared_list_reaches_any_host")]
+    #[test_case(Some(&[PUBLIC_HOST]), true ; "declared_host_is_reachable")]
+    #[test_case(Some(&[OTHER_PUBLIC_HOST]), false ; "undeclared_host_is_denied")]
+    fn declared_net_hosts_gate_requests(hosts: Option<&[&str]>, allowed: bool) {
+        let result = smol::block_on(extract_request_params(PUBLIC_URL, declared(hosts), None));
+        assert_eq!(result.is_ok(), allowed, "{hosts:?}");
+    }
+
+    /// The defect the shared `vet` exists to prevent: a declared host that
+    /// answers with a `Location` elsewhere must not carry the plugin past its
+    /// own list, however ordinary that hop looks to the SSRF guard.
+    #[test_case(Some(&[PUBLIC_HOST]), false ; "a_hop_off_the_list_is_refused")]
+    #[test_case(Some(&[PUBLIC_HOST, OTHER_PUBLIC_HOST]), true ; "a_declared_hop_is_followed")]
+    fn a_redirect_is_vetted_against_the_declared_hosts(hosts: Option<&[&str]>, allowed: bool) {
+        const MOVED: u16 = 302;
+        let mut params =
+            smol::block_on(extract_request_params(PUBLIC_URL, declared(hosts), None)).unwrap();
+        let allowlist = ALLOWED_PRIVATE_HOSTS.load_full();
+
+        let hop = smol::block_on(params.follow_redirect(MOVED, OTHER_PUBLIC_URL, &allowlist));
+
+        assert_eq!(hop.is_ok(), allowed, "{hosts:?}");
     }
 
     #[test]

@@ -440,7 +440,7 @@ impl TitleSource for Message {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ProviderEvent {
     TextDelta {
         text: String,

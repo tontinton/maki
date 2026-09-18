@@ -2856,6 +2856,7 @@ dependencies = [
  "maki-storage",
  "mlua",
  "nucleo-matcher",
+ "open",
  "pin-project-lite",
  "regex",
  "rustix 1.1.4",
@@ -2994,7 +2995,6 @@ dependencies = [
  "toml",
  "tracing",
  "url",
- "wait-timeout",
 ]
 
 [[package]]
