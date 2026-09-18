@@ -1,4 +1,5 @@
 local M = {}
+local SKILL_MARKER_PREFIX = "$skill:"
 
 function M.parse_frontmatter(content)
   local rest = content:match("^%s*%-%-%-\n(.*)")
@@ -18,7 +19,7 @@ function M.parse_frontmatter(content)
   return fm, body
 end
 
-function M.build_skill_list(skills)
+function M.sorted_skills(skills)
   local sorted = {}
   for _, s in pairs(skills) do
     sorted[#sorted + 1] = s
@@ -26,6 +27,11 @@ function M.build_skill_list(skills)
   table.sort(sorted, function(a, b)
     return a.name < b.name
   end)
+  return sorted
+end
+
+function M.build_skill_list(skills)
+  local sorted = M.sorted_skills(skills)
 
   if #sorted == 0 then
     return "\n\n<available_skills>\nNo skills available.\n</available_skills>"
@@ -36,6 +42,22 @@ function M.build_skill_list(skills)
     lines[#lines + 1] = "- " .. s.name .. ": " .. s.description
   end
   return "\n\n<available_skills>\n" .. table.concat(lines, "\n") .. "\n</available_skills>"
+end
+
+-- The label is the skill name, so the picker's choice needs no lookup table.
+function M.build_picker_items(skills)
+  local items = {}
+  for _, skill in ipairs(M.sorted_skills(skills)) do
+    items[#items + 1] = {
+      label = skill.name,
+      detail = skill.description ~= "" and skill.description or nil,
+    }
+  end
+  return items
+end
+
+function M.build_skill_marker(skill_name)
+  return SKILL_MARKER_PREFIX .. skill_name .. " "
 end
 
 return M

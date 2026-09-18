@@ -101,6 +101,7 @@ Built-in plugins register these themselves, and your own plugins can add more wi
 | `Ctrl+P` | Browse sessions |
 | `Ctrl+X` | Open tasks |
 | `Alt+T` | Thinking effort |
+| `Alt+S` | Insert skill marker |
 
 ## Context Inheritance
 

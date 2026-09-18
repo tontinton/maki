@@ -25,6 +25,7 @@ use crate::selection::LineBreaks;
 const CHEVRON: &str = super::CHEVRON;
 const NEWLINE_PAD: &str = "  ";
 const PREFIX_WIDTH: u16 = 2;
+const SKILL_MARKER_PREFIX: &str = "$skill:";
 const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
     "research how something works",
     "fix a bug",
@@ -565,6 +566,8 @@ fn wrap_line(
 ) -> (Vec<Line<'static>>, Option<Position>) {
     let chars: Vec<char> = line.chars().collect();
     let widths: Vec<usize> = chars.iter().copied().map(char_width).collect();
+    let skill_spans = shell_spans.is_none().then(|| skill_marker_spans(line));
+    let styled = shell_spans.or(skill_spans.as_deref()).unwrap_or_default();
 
     let ranges = wrap_ranges(&widths, ew, is_cursor_line);
     let row_count = ranges.len();
@@ -583,12 +586,7 @@ fn wrap_line(
             let prefix_width = prefix_span.width() as u16;
             let mut spans = vec![prefix_span];
 
-            let chunk_spans = if let Some(styled) = &shell_spans {
-                slice_styled_spans(styled, start, end)
-            } else {
-                let chunk_text: String = chars[start..end].iter().collect();
-                vec![Span::raw(chunk_text)]
-            };
+            let chunk_spans = slice_styled_spans(styled, start, end);
 
             // A cursor sitting on a wrap boundary belongs to the row that
             // starts there, otherwise both rows would draw it.
@@ -692,6 +690,35 @@ fn shell_highlight_spans(line: &str) -> Option<Vec<Span<'static>>> {
         spans.push(span);
     }
     Some(spans)
+}
+
+/// Accents every `$skill:name` token so the skills a prompt pulls in are easy
+/// to spot. Splitting on whitespace first is what keeps `$50` and `$PATH`
+/// plain: only a whole word may be a marker.
+fn skill_marker_spans(line: &str) -> Vec<Span<'static>> {
+    let marker_style = theme::current().accent.add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    let mut plain_start = 0;
+    let mut offset = 0;
+    for token in line.split_inclusive(char::is_whitespace) {
+        let word = token.trim_end();
+        let is_marker = word
+            .strip_prefix(SKILL_MARKER_PREFIX)
+            .is_some_and(|name| !name.is_empty());
+        if is_marker {
+            if plain_start < offset {
+                spans.push(Span::raw(line[plain_start..offset].to_owned()));
+            }
+            spans.push(Span::styled(word.to_owned(), marker_style));
+            plain_start = offset + word.len();
+        }
+        offset += token.len();
+    }
+
+    if plain_start < line.len() {
+        spans.push(Span::raw(line[plain_start..].to_owned()));
+    }
+    spans
 }
 
 fn slice_styled_spans(
@@ -1155,6 +1182,39 @@ mod tests {
             rendered_row(&terminal, 1),
             format!("{CHEVRON}{ASK_PREFIX}{HINT}{ASK_SUFFIX}")
         );
+    }
+
+    fn accented<'a>(spans: &'a [Span<'static>]) -> Vec<&'a str> {
+        let marker_style = theme::current().accent.add_modifier(Modifier::BOLD);
+        spans
+            .iter()
+            .filter(|span| span.style == marker_style)
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test_case("$skill:maki-plugin-dev review this", vec!["$skill:maki-plugin-dev"] ; "one_marker")]
+    #[test_case("$skill:agent-aget $skill:beads go", vec!["$skill:agent-aget", "$skill:beads"] ; "two_markers")]
+    #[test_case("spend $50 on $PATH and $beads", vec![] ; "other_dollar_words")]
+    #[test_case("$skill:", vec![] ; "prefix_without_a_name")]
+    #[test_case("cost$skill:beads", vec![] ; "prefix_inside_a_word")]
+    fn only_skill_markers_get_the_accent(line: &str, expected: Vec<&str>) {
+        let spans = skill_marker_spans(line);
+        let covered: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(
+            covered, line,
+            "spans have to cover the line, rows slice them"
+        );
+        assert_eq!(accented(&spans), expected);
+    }
+
+    #[test]
+    fn wrapping_keeps_the_marker_accented() {
+        const MARKER: &str = "$skill:beads";
+        let (rows, _) = wrap_line(MARKER, 8, false, 0, false, None);
+        assert!(rows.len() > 1, "the marker was supposed to wrap");
+        let styled: String = rows.iter().flat_map(|row| accented(&row.spans)).collect();
+        assert_eq!(styled, MARKER);
     }
 
     fn test_image() -> ImageSource {

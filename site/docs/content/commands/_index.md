@@ -35,6 +35,7 @@ Type `/` in the input box to open the command palette.
 | `/memory` | View, edit, and delete memory files |
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |
+| `/skill` | Pick a skill and insert a visible $skill:name marker into the prompt (Alt+S) |
 | `/tasks` | Browse and search tasks |
 | `/thinking` | Extended thinking: pick an effort level, or set one directly |
 
