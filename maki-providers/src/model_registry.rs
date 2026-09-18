@@ -183,7 +183,13 @@ impl ModelRegistry {
         let candidate = if tiers_from_discovery(provider) {
             self.discovered_static_candidate(provider, tier)
                 .or_else(|| self.metadata_candidate(provider, tier))
-                .or_else(|| static_candidate(provider, tier))
+                .or_else(|| {
+                    if provider == "copilot" && self.known_models.contains_key(provider) {
+                        None
+                    } else {
+                        static_candidate(provider, tier)
+                    }
+                })
                 .or_else(|| self.positional_candidate(provider, tier))
         } else {
             static_candidate(provider, tier)
@@ -441,6 +447,24 @@ mod tests {
             make_tiered(&models).spec_for_tier("copilot", ModelTier::Strong),
             make_tiered(&reversed).spec_for_tier("copilot", ModelTier::Strong)
         );
+    }
+
+    #[test_case(ModelTier::Strong)]
+    #[test_case(ModelTier::Medium)]
+    #[test_case(ModelTier::Weak)]
+    fn copilot_tier_without_metadata_stays_in_live_catalog(tier: ModelTier) {
+        let mut reg = ModelRegistry::default();
+        reg.set_known_models("copilot", vec![ModelInfo::id_only("available".into())]);
+        assert_eq!(
+            reg.spec_for_tier("copilot", tier),
+            Some("copilot/available".into())
+        );
+    }
+
+    #[test]
+    fn empty_copilot_catalog_has_no_automatic_tier_default() {
+        let reg = make_tiered(&[]);
+        assert_eq!(reg.spec_for_tier("copilot", ModelTier::Strong), None);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use tracing::{debug, warn};
 use maki_config::ModelPolicy;
 use maki_storage::id::SessionRef;
 
+use crate::manifest::ProviderManifest;
 use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
@@ -430,6 +431,20 @@ pub struct ModelBatch {
     pub warnings: Vec<String>,
 }
 
+fn static_model_specs(manifest: &ProviderManifest) -> Vec<String> {
+    // Copilot's catalog is an entitlement list, so static metadata cannot
+    // establish availability for the current credentials.
+    if manifest.slug == "copilot" {
+        return Vec::new();
+    }
+    manifest
+        .models
+        .iter()
+        .flat_map(|entry| entry.prefixes.iter())
+        .map(|prefix| format!("{}/{prefix}", manifest.slug))
+        .collect()
+}
+
 /// Offline version of model discovery: returns specs from static tables
 /// and configured dynamic providers. See [`fetch_all_models`] for live lookups.
 /// Never blocks on catalog download; catalog-backed providers appear only once
@@ -438,12 +453,7 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
     let mut specs: Vec<String> = crate::manifest::ManifestRegistry::builtins()
         .iter()
         .filter(|m| provider_available_offline(m.slug))
-        .flat_map(|m| {
-            m.models
-                .iter()
-                .flat_map(|entry| entry.prefixes.iter())
-                .map(move |p| format!("{}/{}", m.slug, p))
-        })
+        .flat_map(static_model_specs)
         .collect();
     for slug in dynamic::discovered_slugs() {
         specs.extend(dynamic::dynamic_model_specs_for(slug));
@@ -477,6 +487,43 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
     specs
 }
 
+fn builtin_model_batch(
+    manifest: &ProviderManifest,
+    result: &Result<Vec<ModelInfo>, AgentError>,
+) -> ModelBatch {
+    let slug = manifest.slug;
+    let display_name = manifest.display_name;
+    match result {
+        Ok(models) => {
+            let mut specs: Vec<String> =
+                models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
+            for spec in static_model_specs(manifest) {
+                if !specs.contains(&spec) {
+                    specs.push(spec);
+                }
+            }
+            ModelBatch {
+                models: specs,
+                warnings: Vec::new(),
+            }
+        }
+        Err(e) if slug == "copilot" => {
+            warn!(provider = slug, error = %e, "failed to list models");
+            ModelBatch {
+                models: Vec::new(),
+                warnings: vec![format!("{display_name}: {e}")],
+            }
+        }
+        Err(e) => {
+            warn!(provider = slug, error = %e, "failed to list models, using static fallback");
+            ModelBatch {
+                models: static_model_specs(manifest),
+                warnings: vec![format!("{display_name}: {e} (using static fallback)")],
+            }
+        }
+    }
+}
+
 pub async fn fetch_all_models(
     policy: &ModelPolicy,
     mut on_ready: impl FnMut(ModelBatch),
@@ -491,43 +538,13 @@ pub async fn fetch_all_models(
             warn!(provider = slug, "failed to create provider, skipping");
             continue;
         };
-        let display_name = manifest.display_name;
         let tx = tx.clone();
         smol::spawn(async move {
-            let batch = match provider.list_models().await {
-                Ok(models) => {
-                    let mut specs: Vec<String> =
-                        models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
-                    crate::model_registry::set_known_models(slug, models);
-                    for entry in manifest.models {
-                        for prefix in entry.prefixes {
-                            let spec = format!("{slug}/{prefix}");
-                            if !specs.contains(&spec) {
-                                specs.push(spec);
-                            }
-                        }
-                    }
-                    ModelBatch {
-                        models: specs,
-                        warnings: Vec::new(),
-                    }
-                }
-                Err(e) => {
-                    warn!(provider = slug, error = %e, "failed to list models, using static fallback");
-                    let fallback: Vec<String> = manifest
-                        .models
-                        .iter()
-                        .flat_map(|entry| entry.prefixes.iter())
-                        .map(|p| format!("{slug}/{p}"))
-                        .collect();
-                    ModelBatch {
-                        models: fallback,
-                        warnings: vec![format!(
-                            "{display_name}: {e} (using static fallback)"
-                        )],
-                    }
-                }
-            };
+            let result = provider.list_models().await;
+            let batch = builtin_model_batch(manifest, &result);
+            if let Ok(models) = result {
+                crate::model_registry::set_known_models(slug, models);
+            }
             let _ = tx.send_async(batch).await;
         })
         .detach();
@@ -627,6 +644,66 @@ pub async fn fetch_all_models(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::ManifestRegistry;
+    use test_case::test_case;
+
+    const CATALOG_FAILURE: &str = "model discovery failed";
+
+    #[test]
+    fn copilot_has_no_offline_model_specs() {
+        assert!(static_model_specs(ManifestRegistry::get("copilot").unwrap()).is_empty());
+    }
+
+    #[test_case(&["available"]; "live_catalog")]
+    #[test_case(&[]; "empty_catalog")]
+    fn copilot_batch_does_not_add_static_models(ids: &[&str]) {
+        let batch = builtin_model_batch(
+            ManifestRegistry::get("copilot").unwrap(),
+            &Ok(ids
+                .iter()
+                .map(|id| ModelInfo::id_only((*id).into()))
+                .collect()),
+        );
+        assert_eq!(
+            batch.models,
+            ids.iter()
+                .map(|id| format!("copilot/{id}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(batch.warnings.is_empty());
+    }
+
+    #[test]
+    fn copilot_catalog_failure_does_not_offer_static_models() {
+        let batch = builtin_model_batch(
+            ManifestRegistry::get("copilot").unwrap(),
+            &Err(AgentError::Config {
+                message: CATALOG_FAILURE.into(),
+            }),
+        );
+        assert!(batch.models.is_empty());
+        assert_eq!(batch.warnings, [format!("Copilot: {CATALOG_FAILURE}")]);
+    }
+
+    #[test]
+    fn other_providers_keep_static_discovery_fallbacks() {
+        let manifest = ManifestRegistry::get("openai").unwrap();
+        let discovered =
+            builtin_model_batch(manifest, &Ok(vec![ModelInfo::id_only("available".into())]));
+        let failed = builtin_model_batch(
+            manifest,
+            &Err(AgentError::Config {
+                message: CATALOG_FAILURE.into(),
+            }),
+        );
+        assert!(discovered.models.contains(&"openai/available".into()));
+        assert!(discovered.models.contains(&"openai/gpt-5.6-terra".into()));
+        assert!(failed.models.contains(&"openai/gpt-5.6-terra".into()));
+        assert_eq!(
+            failed.warnings,
+            [format!("OpenAI: {CATALOG_FAILURE} (using static fallback)")]
+        );
+    }
 
     fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
         ModelPolicy::new(

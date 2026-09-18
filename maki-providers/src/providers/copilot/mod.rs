@@ -504,10 +504,23 @@ impl Copilot {
         let mut guard = self.models.lock().unwrap();
         guard.clear();
         guard.extend(models.into_iter().map(|model| (model.id.clone(), model)));
-        Ok(guard
+        guard
             .get(model_id)
             .map(CopilotModel::endpoint)
-            .unwrap_or_else(|| guess_endpoint(model_id)))
+            .ok_or_else(|| {
+                let mut available = guard.keys().map(String::as_str).collect::<Vec<_>>();
+                available.sort_unstable();
+                let detail = if available.is_empty() {
+                    "No enabled chat models were returned by /models.".into()
+                } else {
+                    format!("Available models: {}", available.join(", "))
+                };
+                AgentError::Config {
+                    message: format!(
+                        "Copilot model '{model_id}' is not available for the current credentials. {detail}"
+                    ),
+                }
+            })
     }
 
     async fn fetch_models(&self) -> Result<Vec<CopilotModel>, AgentError> {
@@ -1060,16 +1073,6 @@ fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
     }
 }
 
-fn guess_endpoint(model_id: &str) -> Endpoint {
-    if model_id.starts_with("claude-") {
-        Endpoint::Messages
-    } else if model_id.contains("gpt-5") || model_id.contains("codex") {
-        Endpoint::Responses
-    } else {
-        Endpoint::ChatCompletions
-    }
-}
-
 impl Provider for Copilot {
     fn stream_message<'a>(
         &'a self,
@@ -1129,11 +1132,112 @@ impl Provider for Copilot {
 #[cfg(test)]
 mod tests {
     const OPUS_CACHE_WRITE: f64 = 6.25;
+    const AVAILABLE_MODEL: &str = "gpt-available";
+    const DISABLED_MODEL: &str = "claude-disabled";
+    const CATALOG_ERROR: &str = "catalog access denied";
 
     use super::*;
     use crate::TokenUsage;
     use crate::manifest::ManifestRegistry;
+    use crate::providers::{ResolvedAuth, Timeouts};
+    use std::io::{BufRead, BufReader as SyncBufReader, Write};
+    use std::net::TcpListener;
+    use std::thread::{self, JoinHandle};
     use test_case::test_case;
+
+    fn catalog_provider(status: u16, body: Value) -> (Copilot, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = SyncBufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "GET /models HTTP/1.1\r\n");
+            loop {
+                line.clear();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let body = body.to_string();
+            write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let auth = ResolvedAuth::for_test(
+            Some(endpoint),
+            vec![("Authorization".into(), "Bearer test-token".into())],
+        );
+        (
+            Copilot::with_auth(Arc::new(Mutex::new(auth)), Timeouts::default()),
+            server,
+        )
+    }
+
+    fn model_catalog() -> Value {
+        json!({"data": [
+            {"id": AVAILABLE_MODEL, "model_picker_enabled": true,
+             "capabilities": {"type": "chat"}, "supported_endpoints": [RESPONSES_PATH]},
+            {"id": DISABLED_MODEL, "model_picker_enabled": true,
+             "capabilities": {"type": "chat"}, "policy": {"state": "disabled"}}
+        ]})
+    }
+
+    #[test_case("gemini-3.7-flash"; "static_model_absent_from_catalog")]
+    #[test_case("unknown-model"; "unknown_model")]
+    #[test_case(DISABLED_MODEL; "disabled_model")]
+    fn unavailable_model_is_rejected(model_id: &str) {
+        let (provider, server) = catalog_provider(200, model_catalog());
+        let result = smol::block_on(provider.model_endpoint(model_id));
+        server.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(matches!(error, AgentError::Config { .. }));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Copilot model '{model_id}' is not available for the current credentials. Available models: {AVAILABLE_MODEL}"
+            )
+        );
+        assert!(error.retry_kind().is_none());
+    }
+
+    #[test]
+    fn empty_catalog_rejects_model() {
+        let (provider, server) = catalog_provider(200, json!({"data": []}));
+        let result = smol::block_on(provider.model_endpoint(AVAILABLE_MODEL));
+        server.join().unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!(
+                "Copilot model '{AVAILABLE_MODEL}' is not available for the current credentials. No enabled chat models were returned by /models."
+            )
+        );
+    }
+
+    #[test]
+    fn available_model_uses_discovered_endpoint_and_cache() {
+        let (provider, server) = catalog_provider(200, model_catalog());
+        assert_eq!(
+            smol::block_on(provider.model_endpoint(AVAILABLE_MODEL)).unwrap(),
+            Endpoint::Responses
+        );
+        server.join().unwrap();
+        assert_eq!(
+            smol::block_on(provider.model_endpoint(AVAILABLE_MODEL)).unwrap(),
+            Endpoint::Responses
+        );
+    }
+
+    #[test]
+    fn catalog_failure_preserves_api_error() {
+        let (provider, server) =
+            catalog_provider(403, json!({"error": {"message": CATALOG_ERROR}}));
+        let result = smol::block_on(provider.model_endpoint(AVAILABLE_MODEL));
+        server.join().unwrap();
+        assert!(
+            matches!(result, Err(AgentError::Api { status: 403, ref message, .. }) if message.contains(CATALOG_ERROR))
+        );
+    }
 
     #[test]
     fn endpoint_prefers_messages_then_responses_then_chat() {
