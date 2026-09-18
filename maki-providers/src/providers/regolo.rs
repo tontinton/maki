@@ -7,34 +7,86 @@ use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::Value;
 
+use maki_config::providers::Protocol;
+
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::aperture::DEFAULT_PATH_PREFIX;
+use crate::spec::{
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+};
 use crate::types::{ModelUsageRow, ProviderUsage, UsageLimit};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+
+const SLUG: &str = "regolo";
+const DISPLAY_NAME: &str = "Regolo";
+const ENV_VAR: &str = "REGOLO_API_KEY";
+const BASE_URL: &str = "https://api.regolo.ai/v1";
+const DEFAULT_MODEL: &str = "regolo/qwen3-coder-next";
+const LOGIN_URL: &str = "https://dashboard.regolo.ai";
+const MAX_TOKENS_FIELD: &str = "max_completion_tokens";
+const FEATURES: &str = "EU-hosted open-weight models with tool calling. The catalogue and prices are listed live from the API";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "regolo",
-    api_key_env: "REGOLO_API_KEY",
-    base_url: "https://api.regolo.ai/v1",
-    max_tokens_field: "max_completion_tokens",
+    slug: SLUG,
+    api_key_env: ENV_VAR,
+    base_url: BASE_URL,
+    max_tokens_field: MAX_TOKENS_FIELD,
     include_stream_usage: true,
-    provider_name: "Regolo",
+    provider_name: DISPLAY_NAME,
 };
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "regolo",
-    display_name: "Regolo",
-    protocol: maki_config::providers::Protocol::Openai,
-    default_base_url: "https://api.regolo.ai/v1",
-    default_api_key_env: "REGOLO_API_KEY",
-    default_model: "regolo/qwen3-coder-next",
-    plans: None,
-    login_url: Some("https://dashboard.regolo.ai"),
-    needs_url: false,
-});
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: false,
+    fallback_max_output: Some(120_000),
+    fallback_context_window: 120_000,
+    models: models(),
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: Some(ApertureRoute {
+            path_prefix: DEFAULT_PATH_PREFIX,
+        }),
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Openai,
+        default_base_url: BASE_URL,
+        default_model: DEFAULT_MODEL,
+        plans: None,
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[BASE_URL],
+        features: Some(FEATURES),
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Table,
+        trailing_notes: &[],
+    },
+};
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(Regolo::new(timeouts)?))
+}
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(Regolo::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
+
+inventory::submit!(SPEC.config_row());
 
 /// Curated tier defaults only: pricing, context windows and capabilities for
 /// the full catalogue come live from `/v1/models` joined with
@@ -288,7 +340,7 @@ const SECONDS_PER_DAY: i64 = 86_400;
 
 impl Regolo {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("regolo", CONFIG.api_key_env)?;
+        let pool = KeyPool::resolve(CONFIG.slug, CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
@@ -420,7 +472,7 @@ impl Provider for Regolo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::ManifestRegistry;
+    use crate::spec::ProviderRegistry;
 
     const BUDGETED_KEY_INFO: &str = r#"{"key":"abc","info":{"key_alias":"me@example.com","spend":2.5,"max_budget":10.0,"budget_reset_at":"2026-09-01T00:00:00Z"}}"#;
     const UNBUDGETED_KEY_INFO: &str =
@@ -480,10 +532,9 @@ mod tests {
 
     #[test]
     fn manifest_lists_the_catalogued_default_model() {
-        let manifest = ManifestRegistry::get(CONFIG.slug).expect("regolo is a builtin");
+        let spec = ProviderRegistry::get(CONFIG.slug).expect("regolo is a builtin");
         assert!(
-            manifest
-                .models
+            spec.models
                 .iter()
                 .any(|m| m.prefixes == ["qwen3-coder-next"])
         );

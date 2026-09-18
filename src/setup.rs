@@ -5,8 +5,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
-use maki_providers::manifest::ManifestRegistry;
 use maki_providers::model::{Model, ModelError, ModelTier};
+use maki_providers::spec::ProviderRegistry;
 use maki_storage::StateDir;
 use maki_storage::log::RotatingFileWriter;
 use maki_storage::model::read_model;
@@ -107,7 +107,7 @@ fn auto_detect_model(policy: &maki_config::ModelPolicy) -> Option<Model> {
 /// subscriber to reach.
 pub fn warn_ignored_provider_fields() {
     for (slug, def) in &maki_config::providers::ProvidersConfig::load().providers {
-        if ManifestRegistry::get(slug).is_none() {
+        if ProviderRegistry::get(slug).is_none() {
             continue;
         }
         let ignored = maki_config::providers::ignored_builtin_fields(slug, def);

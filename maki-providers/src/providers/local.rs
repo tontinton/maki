@@ -524,8 +524,11 @@ fn ollama_extract_num_ctx(params: &str) -> Option<u32> {
     None
 }
 
+const OLLAMA_SLUG: &str = "ollama";
+const LLAMACPP_SLUG: &str = "llama-cpp";
+
 pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
-    slug: "ollama",
+    slug: OLLAMA_SLUG,
     display_name: "Ollama",
     host_env: "OLLAMA_HOST",
     api_key_env: "OLLAMA_API_KEY",
@@ -534,7 +537,7 @@ pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
     cloud_fallback_url: Some("https://ollama.com/v1"),
     discovery_mode: DiscoveryMode::Ollama,
     compat: OpenAiCompatConfig {
-        slug: "ollama",
+        slug: OLLAMA_SLUG,
         api_key_env: "",
         base_url: "http://localhost:11434/v1",
         max_tokens_field: "max_tokens",
@@ -546,7 +549,7 @@ pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
 };
 
 pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
-    slug: "llama-cpp",
+    slug: LLAMACPP_SLUG,
     display_name: "LlamaCpp",
     host_env: "LLAMA_CPP_HOST",
     api_key_env: "LLAMA_CPP_API_KEY",
@@ -555,7 +558,7 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
     cloud_fallback_url: None,
     discovery_mode: DiscoveryMode::LlamaCpp,
     compat: OpenAiCompatConfig {
-        slug: "llama-cpp",
+        slug: LLAMACPP_SLUG,
         api_key_env: "",
         base_url: "http://localhost:8080/v1",
         max_tokens_field: "max_tokens",

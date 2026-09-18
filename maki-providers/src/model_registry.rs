@@ -20,8 +20,8 @@ use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use maki_storage::{StateDir, atomic_write};
 use tracing::warn;
 
-use crate::manifest::ManifestRegistry;
 use crate::model::{ModelInfo, ModelTier};
+use crate::spec::ProviderRegistry;
 
 const TIERS_FILE: &str = "model-tiers";
 
@@ -256,7 +256,7 @@ impl ModelRegistry {
 /// discovered list for tier auto-assignment; curated providers keep their
 /// static tier tables.
 fn tiers_from_discovery(provider: &str) -> bool {
-    ManifestRegistry::get(provider).is_none_or(|m| m.accepts_arbitrary_models)
+    ProviderRegistry::get(provider).is_none_or(|m| m.accepts_arbitrary_models)
 }
 
 fn static_candidate(provider: &str, tier: ModelTier) -> Option<String> {
@@ -266,9 +266,9 @@ fn static_candidate(provider: &str, tier: ModelTier) -> Option<String> {
 }
 
 fn static_prefixes(provider: &str, tier: ModelTier) -> impl Iterator<Item = &'static str> {
-    ManifestRegistry::get(provider)
+    ProviderRegistry::get(provider)
         .into_iter()
-        .flat_map(|manifest| manifest.models)
+        .flat_map(|spec| spec.models)
         .filter(move |entry| entry.default && entry.tier == tier)
         .flat_map(|entry| entry.prefixes.iter().copied())
 }

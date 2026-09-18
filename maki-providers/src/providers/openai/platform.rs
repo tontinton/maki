@@ -22,7 +22,7 @@ use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::providers::{ResolvedAuth, refreshed_tokens};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "openai",
+    slug: super::SLUG,
     api_key_env: "OPENAI_API_KEY",
     base_url: "https://api.openai.com/v1",
     max_tokens_field: "max_completion_tokens",
@@ -460,7 +460,7 @@ fn parse_usage(response: &str) -> Result<ProviderUsage, AgentError> {
 
 fn resolve_openai_base_url() -> Option<String> {
     let config = maki_config::providers::ProvidersConfig::load();
-    maki_config::providers::configured_base_url("openai", config.get("openai"))
+    maki_config::providers::configured_base_url(super::SLUG, config.get(super::SLUG))
 }
 
 // Codex models and GPT-6 drop `minimal` and never take an explicit "none", so

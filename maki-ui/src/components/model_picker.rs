@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use maki_providers::ModelTier;
 use maki_providers::dynamic;
 use maki_providers::model_registry;
-use maki_providers::provider::ProviderKind;
+use maki_providers::spec::ProviderRegistry;
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -273,19 +273,22 @@ impl Overlay for ModelPicker {
 fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
     let (provider_str, model_id) = spec.split_once('/')?;
 
-    let provider_display = if let Ok(kind) = provider_str.parse::<ProviderKind>() {
-        kind.display_name().to_string()
-    } else if let Some(name) = dynamic::display_name(provider_str) {
-        name.to_string()
-    } else if let Some(info) = maki_providers::catalog_provider_if_available(provider_str) {
-        info.display_name.clone()
-    } else if let Some(builtin) = maki_config::providers::builtin_provider(provider_str) {
-        builtin.display_name.to_string()
-    } else {
-        let config = maki_config::providers::ProvidersConfig::load();
-        config.get(provider_str)?;
-        maki_config::providers::resolve_display_name(provider_str, config.get(provider_str))
-    };
+    // `opencode-go` has a spec row but was never a `ProviderKind`, so the
+    // catalog named it and still should. That is what `is_native` filters for.
+    let provider_display =
+        if let Some(spec) = ProviderRegistry::get(provider_str).filter(|s| s.is_native()) {
+            spec.display_name.to_string()
+        } else if let Some(name) = dynamic::display_name(provider_str) {
+            name.to_string()
+        } else if let Some(info) = maki_providers::catalog_provider_if_available(provider_str) {
+            info.display_name.clone()
+        } else if let Some(builtin) = maki_config::providers::builtin_provider(provider_str) {
+            builtin.display_name.to_string()
+        } else {
+            let config = maki_config::providers::ProvidersConfig::load();
+            config.get(provider_str)?;
+            maki_config::providers::resolve_display_name(provider_str, config.get(provider_str))
+        };
 
     let override_tiers = model_registry::override_tiers(spec);
     let (tier, free) = match maki_providers::Model::from_spec(spec) {

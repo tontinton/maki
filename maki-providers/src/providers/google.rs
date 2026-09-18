@@ -9,8 +9,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
+use maki_config::providers::Protocol;
+
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::Timeouts;
+use crate::providers::aperture::GEMINI_PATH_PREFIX;
+use crate::spec::{
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+};
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
     StreamResponse, ThinkingConfig, TokenUsage,
@@ -18,8 +25,13 @@ use crate::{
 
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, http_client, next_sse_line};
 
+pub(crate) const SLUG: &str = "google";
+const DISPLAY_NAME: &str = "Google";
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const ENV_VAR: &str = "GEMINI_API_KEY";
+const DEFAULT_MODEL: &str = "google/gemini-2.5-pro";
+const LOGIN_URL: &str = "https://aistudio.google.com/apikey";
+const FEATURES: &str = "Native Gemini API with thinking support";
 const API_KEY_HEADER: &str = "x-goog-api-key";
 const FLASH_MAX_THINKING: u32 = 24_576;
 const PRO_MAX_THINKING: u32 = 32_768;
@@ -35,17 +47,56 @@ fn max_thinking(model: &Model) -> u32 {
     model.max_thinking_budget().map_or(cap, |m| m.min(cap))
 }
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "google",
-    display_name: "Google",
-    protocol: maki_config::providers::Protocol::Google,
-    default_base_url: BASE_URL,
-    default_api_key_env: ENV_VAR,
-    default_model: "google/gemini-2.5-pro",
-    plans: None,
-    login_url: Some("https://aistudio.google.com/apikey"),
-    needs_url: false,
-});
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Gemini,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(65_536),
+    fallback_context_window: 1_000_000,
+    models: models(),
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: Some(ApertureRoute {
+            path_prefix: GEMINI_PATH_PREFIX,
+        }),
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Google,
+        default_base_url: BASE_URL,
+        default_model: DEFAULT_MODEL,
+        plans: None,
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[BASE_URL],
+        features: Some(FEATURES),
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Table,
+        trailing_notes: &[],
+    },
+};
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(Google::new(timeouts)?))
+}
+
+/// Google drops the system prefix and always has. Script providers and Aperture
+/// routing do hand one over, so honouring it now would change what they send.
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    _system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(Google::with_auth(auth, timeouts))
+}
+
+inventory::submit!(SPEC.config_row());
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
@@ -85,12 +136,12 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
 
 fn resolve_google_base_url() -> Option<String> {
     let config = maki_config::providers::ProvidersConfig::load();
-    maki_config::providers::resolve_base_url("google", config.get("google"))
+    maki_config::providers::resolve_base_url(SLUG, config.get(SLUG))
 }
 
 fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> Result<ResolvedAuth, AgentError> {
     Ok(
-        ResolvedAuth::new("google", vec![(API_KEY_HEADER.into(), key.to_string())])?
+        ResolvedAuth::new(SLUG, vec![(API_KEY_HEADER.into(), key.to_string())])?
             .with_base_url(base_url),
     )
 }
@@ -106,7 +157,7 @@ pub struct Google {
 
 impl Google {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("google", ENV_VAR)?;
+        let pool = KeyPool::resolve(SLUG, ENV_VAR)?;
         let resolved_base_url = resolve_google_base_url();
         let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone())?;
         Ok(Self {
@@ -277,7 +328,7 @@ impl Provider for Google {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            let pool = KeyPool::resolve("google", ENV_VAR)?;
+            let pool = KeyPool::resolve(SLUG, ENV_VAR)?;
             *self.auth.lock().unwrap() =
                 resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
             Ok(())

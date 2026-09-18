@@ -5,12 +5,18 @@ use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
+use maki_config::providers::Protocol;
+
+use crate::model::{Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::aperture::DEFAULT_PATH_PREFIX;
+use crate::spec::{
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 
 const REFERER: &str = "https://maki.sh";
 const APP_TITLE: &str = "maki";
@@ -21,26 +27,81 @@ const PER_MILLION: f64 = 1_000_000.0;
 const MANAGED_MODELS_PATH: &str = "/models/managed";
 const CHAT_API: &str = "chat";
 
+const SLUG: &str = "requesty";
+const DISPLAY_NAME: &str = "Requesty";
+const ENV_VAR: &str = "REQUESTY_API_KEY";
+const BASE_URL: &str = "https://router.requesty.ai/v1";
+const DEFAULT_MODEL: &str = "requesty/openai/gpt-5.5";
+const LOGIN_URL: &str = "https://app.requesty.ai/api-keys";
+const MAX_TOKENS_FIELD: &str = "max_tokens";
+const FEATURES: &str = "700+ models behind one key, curated managed routing policies, EU region via `REQUESTY_BASE_URL`";
+
+const DISCOVERY_NOTE: &str = "Requesty routes 700+ models from many providers behind a single API key. \
+     Models are listed live from the API: curated managed policies first \
+     (short ids such as `requesty/claude-sonnet-4-5` or `requesty/gpt-5.4-mini`, \
+     `@eu` variants route only through EU providers), then the full \
+     `<vendor>/<model>` catalog (e.g. `requesty/openai/gpt-4o-mini`). \
+     Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). \
+     Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all \
+     traffic in the EU.";
+
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "requesty",
-    api_key_env: "REQUESTY_API_KEY",
-    base_url: "https://router.requesty.ai/v1",
-    max_tokens_field: "max_tokens",
+    slug: SLUG,
+    api_key_env: ENV_VAR,
+    base_url: BASE_URL,
+    max_tokens_field: MAX_TOKENS_FIELD,
     include_stream_usage: true,
-    provider_name: "Requesty",
+    provider_name: DISPLAY_NAME,
 };
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "requesty",
-    display_name: "Requesty",
-    protocol: maki_config::providers::Protocol::Openai,
-    default_base_url: "https://router.requesty.ai/v1",
-    default_api_key_env: "REQUESTY_API_KEY",
-    default_model: "requesty/openai/gpt-5.5",
-    plans: None,
-    login_url: Some("https://app.requesty.ai/api-keys"),
-    needs_url: false,
-});
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(128_000),
+    fallback_context_window: 200_000,
+    models: models(),
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: Some(ApertureRoute {
+            path_prefix: DEFAULT_PATH_PREFIX,
+        }),
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Openai,
+        default_base_url: BASE_URL,
+        default_model: DEFAULT_MODEL,
+        plans: None,
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[BASE_URL],
+        features: Some(FEATURES),
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Discovered(DISCOVERY_NOTE),
+        trailing_notes: &[],
+    },
+};
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(Requesty::new(timeouts)?))
+}
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(Requesty::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
+
+inventory::submit!(SPEC.config_row());
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     &[]
@@ -102,7 +163,7 @@ impl Entry<'_> {
     }
 
     /// Requesty sends `0` for a limit it does not know. Left as `Some(0)` it
-    /// would beat the manifest fallback and go out as `"max_tokens": 0`.
+    /// would beat the spec fallback and go out as `"max_tokens": 0`.
     fn limit(&self, name: &str) -> Option<u32> {
         self.read(name, |v| u32::try_from(v.as_u64()?).ok())
             .filter(|n| *n > 0)
@@ -296,7 +357,7 @@ mod tests {
     }
 
     /// Requesty reports `0` for a limit it does not know. Kept as `Some(0)`
-    /// it would win over the manifest fallback and go out as `"max_tokens": 0`.
+    /// it would win over the spec fallback and go out as `"max_tokens": 0`.
     #[test]
     fn parse_model_reads_zero_limits_as_unknown() {
         let mut m = sonnet_json();

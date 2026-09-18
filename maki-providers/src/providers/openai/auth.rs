@@ -15,7 +15,7 @@ use crate::providers::oauth_loopback::{self, LoginMethod, Loopback};
 use crate::providers::{ResolvedAuth, refreshed_tokens, urlenc};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-pub(crate) const PROVIDER: &str = "openai";
+pub(crate) const PROVIDER: &str = super::SLUG;
 const DISPLAY_NAME: &str = "OpenAI";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";

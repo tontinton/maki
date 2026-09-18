@@ -6,41 +6,93 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
+use maki_config::providers::Protocol;
+
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::pricing::{PricingSchedule, PricingWindow};
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::aperture::DEFAULT_PATH_PREFIX;
+use crate::spec::{
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+};
 use crate::types::{ProviderUsage, UsageLimit};
 use crate::{
     AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig, dialect,
 };
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 
 const PAD: &str = "";
 const REASONER_ID: &str = "deepseek-reasoner";
 const BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 
+const SLUG: &str = "deepseek";
+const DISPLAY_NAME: &str = "DeepSeek";
+const ENV_VAR: &str = "DEEPSEEK_API_KEY";
+const BASE_URL: &str = "https://api.deepseek.com";
+const DEFAULT_MODEL: &str = "deepseek/deepseek-flash";
+const LOGIN_URL: &str = "https://platform.deepseek.com/api_keys";
+const MAX_TOKENS_FIELD: &str = "max_tokens";
+const FEATURES: &str = "Thinking mode toggle (on/off), open-weight models";
+
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "deepseek",
-    api_key_env: "DEEPSEEK_API_KEY",
-    base_url: "https://api.deepseek.com",
-    max_tokens_field: "max_tokens",
+    slug: SLUG,
+    api_key_env: ENV_VAR,
+    base_url: BASE_URL,
+    max_tokens_field: MAX_TOKENS_FIELD,
     include_stream_usage: true,
-    provider_name: "DeepSeek",
+    provider_name: DISPLAY_NAME,
 };
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "deepseek",
-    display_name: "DeepSeek",
-    protocol: maki_config::providers::Protocol::Openai,
-    default_base_url: "https://api.deepseek.com",
-    default_api_key_env: "DEEPSEEK_API_KEY",
-    default_model: "deepseek/deepseek-flash",
-    plans: None,
-    login_url: Some("https://platform.deepseek.com/api_keys"),
-    needs_url: false,
-});
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: false,
+    fallback_max_output: Some(384_000),
+    fallback_context_window: 1_000_000,
+    models: models(),
+    pricing_schedule: Some(&PEAK_HOURS),
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: Some(ApertureRoute {
+            path_prefix: DEFAULT_PATH_PREFIX,
+        }),
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Openai,
+        default_base_url: BASE_URL,
+        default_model: DEFAULT_MODEL,
+        plans: None,
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[BASE_URL],
+        features: Some(FEATURES),
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Table,
+        trailing_notes: &[],
+    },
+};
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(DeepSeek::new(timeouts)?))
+}
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(DeepSeek::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
+
+inventory::submit!(SPEC.config_row());
 
 /// Peak hours double every rate, and the tables below quote the off-peak ones.
 /// The weekend stays off-peak around the clock.
@@ -140,11 +192,11 @@ pub struct DeepSeek {
 
 impl DeepSeek {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("deepseek", CONFIG.api_key_env)?;
+        let pool = KeyPool::resolve(CONFIG.slug, CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
-                "deepseek",
+                CONFIG.slug,
                 pool.current(),
             )?)),
             key_pool: Some(pool),
@@ -268,7 +320,7 @@ fn pad_reasoning_content(model_id: &str, body: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::ManifestRegistry;
+    use crate::spec::ProviderRegistry;
     use serde_json::json;
     use test_case::test_case;
 
@@ -277,13 +329,13 @@ mod tests {
     /// The hours, days and surcharge as the pricing page states them.
     const PUBLISHED_PEAK_HOURS: &str = "2x during 01:00-04:00, 06:00-10:00 UTC, Mon-Fri";
 
-    /// `PEAK_HOURS` only reaches a bill through the manifest, and a schedule
+    /// `PEAK_HOURS` only reaches a bill through the spec, and a schedule
     /// that never got hooked up looks exactly like off-peak all day. The
     /// published hours are pinned here too, since either drifting bills every
     /// DeepSeek turn at the wrong rate.
     #[test]
     fn the_manifest_bills_the_published_peak_hours() {
-        let schedule = ManifestRegistry::get(CONFIG.slug)
+        let schedule = ProviderRegistry::get(CONFIG.slug)
             .expect("deepseek is a builtin")
             .pricing_schedule
             .expect("deepseek bills by the clock");

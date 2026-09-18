@@ -25,7 +25,7 @@ const DEFAULT_EXPIRES_SECS: u64 = 3600;
 const GROK_CLI_DEFAULT_TTL_MS: u64 = 6 * 60 * 60 * 1000;
 const MS_THRESHOLD: f64 = 10_000_000_000.0;
 
-pub(crate) const PROVIDER: &str = "xai";
+pub(crate) const PROVIDER: &str = super::SLUG;
 const DISPLAY_NAME: &str = "xAI";
 pub(crate) const API_KEY_ENV: &str = "XAI_API_KEY";
 pub(crate) const TOKEN_AUTH: &str = "xai-grok-cli";

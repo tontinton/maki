@@ -4,52 +4,106 @@ use flume::Sender;
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
+use maki_config::providers::{Protocol, ProviderPlan};
+
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::aperture::DEFAULT_PATH_PREFIX;
+use crate::spec::{
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+
+const SLUG: &str = "mistral";
+const DISPLAY_NAME: &str = "Mistral";
+const ENV_VAR: &str = "MISTRAL_API_KEY";
+const BASE_URL: &str = "https://api.mistral.ai/v1";
+const DEFAULT_MODEL: &str = "mistral/mistral-medium-latest";
+const CODING_MODEL: &str = "mistral/mistral-vibe-cli-latest";
+const LOGIN_URL: &str = "https://admin.mistral.ai/organization/api-keys";
+const MAX_TOKENS_FIELD: &str = "max_tokens";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "mistral",
-    api_key_env: "MISTRAL_API_KEY",
-    base_url: "https://api.mistral.ai/v1",
-    max_tokens_field: "max_tokens",
+    slug: SLUG,
+    api_key_env: ENV_VAR,
+    base_url: BASE_URL,
+    max_tokens_field: MAX_TOKENS_FIELD,
     include_stream_usage: true,
-    provider_name: "Mistral",
+    provider_name: DISPLAY_NAME,
 };
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "mistral",
-    display_name: "Mistral",
-    protocol: maki_config::providers::Protocol::Openai,
-    default_base_url: "https://api.mistral.ai/v1",
-    default_api_key_env: "MISTRAL_API_KEY",
-    default_model: "mistral/mistral-medium-latest",
-    plans: Some(&[
-        (
-            "standard",
-            maki_config::providers::ProviderPlan {
-                display_name: "Standard",
-                base_url: "https://api.mistral.ai/v1",
-                default_model: Some("mistral/mistral-medium-latest"),
-                login_url: None,
-            }
-        ),
-        (
-            "coding",
-            maki_config::providers::ProviderPlan {
-                display_name: "Vibe / Coding",
-                base_url: "https://api.mistral.ai/v1",
-                default_model: Some("mistral/mistral-vibe-cli-latest"),
-                login_url: Some("https://console.mistral.ai/codestral/cli"),
-            }
-        ),
-    ]),
-    login_url: Some("https://admin.mistral.ai/organization/api-keys"),
-    needs_url: false,
-});
+const PLANS: &[(&str, ProviderPlan)] = &[
+    (
+        "standard",
+        ProviderPlan {
+            display_name: "Standard",
+            base_url: BASE_URL,
+            default_model: Some(DEFAULT_MODEL),
+            login_url: None,
+        },
+    ),
+    (
+        "coding",
+        ProviderPlan {
+            display_name: "Vibe / Coding",
+            base_url: BASE_URL,
+            default_model: Some(CODING_MODEL),
+            login_url: Some("https://console.mistral.ai/codestral/cli"),
+        },
+    ),
+];
+
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: None,
+    fallback_context_window: 128_000,
+    models: models(),
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: Some(ApertureRoute {
+            path_prefix: DEFAULT_PATH_PREFIX,
+        }),
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Openai,
+        default_base_url: BASE_URL,
+        default_model: DEFAULT_MODEL,
+        plans: Some(PLANS),
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[BASE_URL],
+        features: None,
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Table,
+        trailing_notes: &[],
+    },
+};
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(Mistral::new(timeouts)?))
+}
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(Mistral::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
+
+inventory::submit!(SPEC.config_row());
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[

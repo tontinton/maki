@@ -1,58 +1,101 @@
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
-use maki_config::providers::{OverrideFields, ProviderOverride};
+use maki_config::providers::{OverrideFields, Protocol, ProviderOverride};
 use serde_json::Value;
 use tracing::warn;
 
-use crate::manifest::{ManifestRegistry, ProviderManifest};
-use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
-use crate::provider::{BoxFuture, Provider, ProviderKind};
+use crate::model::{
+    Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry,
+};
+use crate::provider::{BoxFuture, Provider};
+use crate::spec::{
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderRegistry,
+    ProviderSpec,
+};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 use maki_storage::id::SessionRef;
 
-use super::anthropic::Anthropic;
-use super::deepseek::DeepSeek;
-use super::google::Google;
-use super::local::{LLAMACPP, LocalEndpoint, OLLAMA};
-use super::mistral::Mistral;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::openrouter::OpenRouter;
-use super::regolo::Regolo;
-use super::requesty::Requesty;
-use super::synthetic::Synthetic;
-use super::tensorx::TensorX;
-use super::zai::Zai;
-use super::{ResolvedAuth, Timeouts};
+use super::{ResolvedAuth, Timeouts, google};
 
 const HOST_ENV: &str = "APERTURE_HOST";
 const PER_MILLION: f64 = 1_000_000.0;
 const ALL_MODELS: &str = "*";
-const DEFAULT_PATH_PREFIX: &str = "/v1";
-const GEMINI_PATH_PREFIX: &str = "/v1beta";
+pub(crate) const DEFAULT_PATH_PREFIX: &str = "/v1";
+pub(crate) const GEMINI_PATH_PREFIX: &str = "/v1beta";
+/// For upstreams whose base url already carries its own path.
+pub(crate) const NO_PATH_PREFIX: &str = "";
+
+const SLUG: &str = "aperture";
+const DISPLAY_NAME: &str = "Aperture";
+/// Tailscale handles auth, so there is no key and no login URL.
+const NO_ENV_VAR: &str = "";
+const MAX_TOKENS_FIELD: &str = "max_tokens";
+const DOC_API_URL: &str = "Aperture gateway (set APERTURE_HOST)";
+const FEATURES: &str =
+    "Tailscale Aperture LLM gateway; set APERTURE_HOST or configure in providers.toml";
+const AUTH_DOC: &str = "`APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`)";
+const DISCOVERY_NOTE: &str = "Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailscale Aperture \
+     endpoint (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "aperture",
-    api_key_env: "",
+    slug: SLUG,
+    api_key_env: NO_ENV_VAR,
     base_url: "",
-    max_tokens_field: "max_tokens",
+    max_tokens_field: MAX_TOKENS_FIELD,
     include_stream_usage: true,
-    provider_name: "Aperture",
+    provider_name: DISPLAY_NAME,
 };
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "aperture",
-    display_name: "Aperture",
-    protocol: maki_config::providers::Protocol::Openai,
-    default_base_url: "",
-    default_api_key_env: "",
-    default_model: "",
-    plans: None,
-    login_url: None,
-    needs_url: true,
-});
+/// Aperture routes onto other providers; nothing routes onto Aperture.
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: NO_ENV_VAR,
+    family: ModelFamily::Generic,
+    supports_thinking: false,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(16_384),
+    fallback_context_window: 128_000,
+    models: models(),
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: None,
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Openai,
+        default_base_url: "",
+        default_model: "",
+        plans: None,
+        login_url: None,
+        needs_url: true,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[DOC_API_URL],
+        features: Some(FEATURES),
+        auth: AuthDoc::Custom(AUTH_DOC),
+        catalog: CatalogDoc::Discovered(DISCOVERY_NOTE),
+        trailing_notes: &[],
+    },
+};
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(Aperture::new(timeouts)?))
+}
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(Aperture::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
+
+inventory::submit!(SPEC.config_row());
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     &[]
@@ -79,7 +122,7 @@ fn validate_overrides(overrides: &Overrides) {
             .chain(po.models.iter().map(|(id, f)| (id.as_str(), f)));
         for (model, f) in fields {
             if let Some(base) = &f.base
-                && parse_compat_base(base).is_none()
+                && routed_spec(base, &OverrideFields::default()).is_none()
             {
                 warn!(
                     provider,
@@ -111,93 +154,31 @@ fn merged_override(overrides: &Overrides, provider_id: &str, model_id: &str) -> 
     }
 }
 
-/// Native providers Aperture's gateway can proxy onto. The gateway speaks
-/// OpenAI chat/responses, Anthropic messages, and Gemini generateContent, so
-/// each routes to its native provider kind and lets it build the right path.
-/// OpenAI itself is excluded: routing to the native `OpenAi` provider would
-/// hit its codex responses-API path for `gpt-*-codex` models and bypass the
-/// gateway. Copilot is excluded: its auth is GraphQL-discovered, not a clean
-/// proxy target.
-fn compat_kind(kind: ProviderKind) -> Option<ProviderKind> {
-    match kind {
-        ProviderKind::Anthropic
-        | ProviderKind::Google
-        | ProviderKind::Ollama
-        | ProviderKind::LlamaCpp
-        | ProviderKind::Mistral
-        | ProviderKind::Zai
-        | ProviderKind::DeepSeek
-        | ProviderKind::OpenRouter
-        | ProviderKind::Requesty
-        | ProviderKind::Synthetic
-        | ProviderKind::Regolo
-        | ProviderKind::TensorX => Some(kind),
-        _ => None,
-    }
-}
-
-fn parse_compat_base(s: &str) -> Option<ProviderKind> {
-    ProviderKind::from_str(s).ok().and_then(compat_kind)
-}
-
 /// Resolve the native provider an Aperture model should stream through. The
 /// override `base` wins, then the provider segment of the id if it itself names
-/// a known OpenAI-compatible provider. Lets a user remap an opaque gateway
-/// vendor (e.g. `ikora-openai`) to a real native provider (e.g. `llama-cpp`).
-/// `None` falls through to the generic OpenAI-compat path.
-fn routed_kind(provider_id: &str, merged: &OverrideFields) -> Option<ProviderKind> {
+/// a routable provider. Lets a user remap an opaque gateway vendor (e.g.
+/// `ikora-openai`) to a real native provider (e.g. `llama-cpp`). `None` falls
+/// through to the generic OpenAI-compat path.
+fn routed_spec(provider_id: &str, merged: &OverrideFields) -> Option<&'static ProviderSpec> {
     [merged.base.as_deref(), Some(provider_id)]
         .into_iter()
         .flatten()
-        .find_map(parse_compat_base)
+        .find_map(|s| ProviderRegistry::get(s).filter(|spec| aperture_route(spec).is_some()))
 }
 
-fn manifest_for_kind(kind: ProviderKind) -> Option<&'static ProviderManifest> {
-    ManifestRegistry::for_slug(&kind.to_string())
+fn aperture_route(spec: &ProviderSpec) -> Option<ApertureRoute> {
+    spec.native?.aperture
 }
 
-fn kind_supports_thinking(kind: ProviderKind) -> bool {
-    manifest_for_kind(kind).is_some_and(|m| m.supports_thinking)
-}
-
-/// Path prefix maki sends to the gateway, which appends the whole incoming
-/// request path to the upstream's configured base url. The prefix therefore
-/// follows the API format the request uses: `/v1` for OpenAI chat (and for the
-/// generic gateway path), `/v1beta` for Gemini. Anthropic gets none because its
-/// provider rebuilds `/v1/messages` from the bare origin. Zai gets none because
-/// its API has no `/v1` segment at all (`/api/paas/v4/chat/completions`), so
-/// the upstream base url must carry the full path and any prefix would double
-/// up. `path_prefix` in the overrides replaces the default per gateway
-/// provider.
-/// Exhaustive on purpose: a new `ProviderKind` must state its prefix here
-/// instead of silently inheriting `/v1` (which broke Zai once already).
-fn default_path_prefix(kind: Option<ProviderKind>) -> &'static str {
-    match kind {
-        Some(ProviderKind::Anthropic | ProviderKind::Zai) => "",
-        Some(ProviderKind::Google) => GEMINI_PATH_PREFIX,
-        Some(
-            ProviderKind::Ollama
-            | ProviderKind::LlamaCpp
-            | ProviderKind::Mistral
-            | ProviderKind::DeepSeek
-            | ProviderKind::OpenRouter
-            | ProviderKind::Requesty
-            | ProviderKind::Synthetic
-            | ProviderKind::Regolo
-            | ProviderKind::TensorX
-            | ProviderKind::OpenAi
-            | ProviderKind::Copilot
-            | ProviderKind::Opencode
-            | ProviderKind::Xai
-            | ProviderKind::Aperture,
-        )
-        | None => DEFAULT_PATH_PREFIX,
-    }
-}
-
-fn path_prefix(kind: Option<ProviderKind>, merged: &OverrideFields) -> String {
+/// A model that routes nowhere still has to reach the gateway, so it falls back
+/// to the generic path. A configured prefix replaces whatever the route asks
+/// for, empty string included.
+fn path_prefix(spec: Option<&'static ProviderSpec>, merged: &OverrideFields) -> String {
     let Some(configured) = merged.path_prefix.as_deref() else {
-        return default_path_prefix(kind).to_string();
+        return spec
+            .and_then(aperture_route)
+            .map_or(DEFAULT_PATH_PREFIX, |r| r.path_prefix)
+            .to_string();
     };
     let trimmed = configured.trim().trim_matches('/');
     if trimmed.is_empty() {
@@ -218,65 +199,13 @@ fn routed_auth(auth: &Arc<Mutex<ResolvedAuth>>, prefix: &str) -> Arc<Mutex<Resol
     Arc::new(Mutex::new(cloned))
 }
 
-fn build_routed_provider(
-    kind: ProviderKind,
-    auth: Arc<Mutex<ResolvedAuth>>,
-    timeouts: Timeouts,
-    system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    match kind {
-        ProviderKind::Ollama => Box::new(
-            LocalEndpoint::with_auth(&OLLAMA, auth, timeouts).with_system_prefix(system_prefix),
-        ),
-        ProviderKind::LlamaCpp => Box::new(
-            LocalEndpoint::with_auth(&LLAMACPP, auth, timeouts).with_system_prefix(system_prefix),
-        ),
-        ProviderKind::Mistral => {
-            Box::new(Mistral::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::Zai => {
-            Box::new(Zai::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::DeepSeek => {
-            Box::new(DeepSeek::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::OpenRouter => {
-            Box::new(OpenRouter::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::Requesty => {
-            Box::new(Requesty::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::Synthetic => {
-            Box::new(Synthetic::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::TensorX => {
-            Box::new(TensorX::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::Regolo => {
-            Box::new(Regolo::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::Anthropic => {
-            Box::new(Anthropic::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-        }
-        ProviderKind::Google => Box::new(Google::with_auth(auth, timeouts)),
-        // Excluded by `compat_kind`: routing to native OpenAI would bypass the
-        // gateway for codex models, and the rest have no clean proxy story. A
-        // new kind must pick a side here.
-        ProviderKind::OpenAi
-        | ProviderKind::Copilot
-        | ProviderKind::Opencode
-        | ProviderKind::Xai
-        | ProviderKind::Aperture => unreachable!("excluded by compat_kind"),
-    }
-}
-
 /// The model the routed provider should stream against. The gateway strips the
 /// `<vendor>/` prefix itself and uses it to pick the upstream, so every route
 /// keeps the full id. Gemini is the exception: its model id goes into the url
 /// path, where an encoded slash would not survive, so it gets the bare id.
-fn native_route_model(model: &Model, kind: ProviderKind, bare_model_id: &str) -> Model {
+fn native_route_model(model: &Model, spec: &'static ProviderSpec, bare_model_id: &str) -> Model {
     let mut m = model.clone();
-    if kind == ProviderKind::Google {
+    if spec.slug == google::SLUG {
         m.id = bare_model_id.to_string();
     }
     m
@@ -386,7 +315,7 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
                 }),
                 supports_thinking: ov
                     .supports_thinking
-                    .or_else(|| routed_kind(provider_id, &ov).map(kind_supports_thinking)),
+                    .or_else(|| routed_spec(provider_id, &ov).map(|spec| spec.supports_thinking)),
                 supports_vision: ov.supports_vision,
                 tier: None,
                 provider_info: None,
@@ -404,18 +333,15 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
         return;
     };
     let ov = merged_override(overrides, provider_id, model_id);
-    if let Some(kind) = routed_kind(provider_id, &ov) {
-        model.family = kind.family();
-        if let Some(manifest) = manifest_for_kind(kind) {
-            model.thinking_override = model
-                .thinking_override
-                .or_else(|| ThinkingSupport::from_flags(Some(manifest.supports_thinking), false));
-            if let Ok(entry) = lookup_entry(manifest.models, model_id) {
-                model.context_window = entry.context_window;
-                model.max_output_tokens = entry.max_output_tokens;
-                model.supports_vision_override =
-                    model.supports_vision_override.or(Some(entry.vision));
-            }
+    if let Some(spec) = routed_spec(provider_id, &ov) {
+        model.family = spec.family;
+        model.thinking_override = model
+            .thinking_override
+            .or_else(|| ThinkingSupport::from_flags(Some(spec.supports_thinking), false));
+        if let Ok(entry) = lookup_entry(spec.models, model_id) {
+            model.context_window = entry.context_window;
+            model.max_output_tokens = entry.max_output_tokens;
+            model.supports_vision_override = model.supports_vision_override.or(Some(entry.vision));
         }
     }
     if let Some(cw) = ov.context_window {
@@ -442,12 +368,13 @@ impl Provider for Aperture {
         Box::pin(async move {
             let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", &model.id));
             let ov = merged_override(&self.overrides, provider_id, model_id);
-            let kind = routed_kind(provider_id, &ov);
-            let auth = routed_auth(&self.auth, &path_prefix(kind, &ov));
-            if let Some(kind) = kind {
-                let provider =
-                    build_routed_provider(kind, auth, self.timeouts, self.system_prefix.clone());
-                let request_model = native_route_model(model, kind, model_id);
+            let spec = routed_spec(provider_id, &ov);
+            let auth = routed_auth(&self.auth, &path_prefix(spec, &ov));
+            if let Some(spec) = spec
+                && let Some(native) = spec.native
+            {
+                let provider = (native.with_auth)(auth, self.timeouts, self.system_prefix.clone());
+                let request_model = native_route_model(model, spec, model_id);
                 return provider
                     .stream_message(
                         &request_model,
@@ -487,10 +414,11 @@ impl Provider for Aperture {
         if let Some((provider_id, model_id)) = model.id.split_once('/') {
             let model_id = model_id.to_string();
             let ov = merged_override(&self.overrides, provider_id, &model_id);
-            if let Some(kind) = routed_kind(provider_id, &ov) {
-                let routed = build_routed_provider(
-                    kind,
-                    routed_auth(&self.auth, &path_prefix(Some(kind), &ov)),
+            if let Some(spec) = routed_spec(provider_id, &ov)
+                && let Some(native) = spec.native
+            {
+                let routed = (native.with_auth)(
+                    routed_auth(&self.auth, &path_prefix(Some(spec), &ov)),
                     self.timeouts,
                     self.system_prefix.clone(),
                 );
@@ -510,21 +438,22 @@ mod tests {
     use serde_json::json;
     use test_case::test_case;
 
-    #[test_case("zai", Some(ProviderKind::Zai) ; "known_zai")]
-    #[test_case("synthetic", Some(ProviderKind::Synthetic) ; "known_synthetic")]
+    fn spec_slug(provider_id: &str, merged: &OverrideFields) -> Option<&'static str> {
+        routed_spec(provider_id, merged).map(|spec| spec.slug)
+    }
+
+    #[test_case("zai", Some("zai") ; "known_zai")]
+    #[test_case("synthetic", Some("synthetic") ; "known_synthetic")]
     #[test_case("openai", None ; "openai_excluded")]
-    #[test_case("llama-cpp", Some(ProviderKind::LlamaCpp) ; "known_llama_cpp")]
+    #[test_case("llama-cpp", Some("llama-cpp") ; "known_llama_cpp")]
     #[test_case("ikora-openai", None ; "unknown_vendor_no_override")]
-    #[test_case("anthropic", Some(ProviderKind::Anthropic) ; "known_anthropic")]
-    #[test_case("google", Some(ProviderKind::Google) ; "known_google")]
+    #[test_case("anthropic", Some("anthropic") ; "known_anthropic")]
+    #[test_case("google", Some("google") ; "known_google")]
     #[test_case("copilot", None ; "copilot_excluded")]
     #[test_case("aperture", None ; "aperture_no_recurse")]
     #[test_case("gemini", None ; "gemini_vendor_unparsable_without_override")]
-    fn routed_kind_without_overrides(provider_id: &str, expected: Option<ProviderKind>) {
-        assert_eq!(
-            routed_kind(provider_id, &OverrideFields::default()),
-            expected
-        );
+    fn routed_spec_without_overrides(provider_id: &str, expected: Option<&str>) {
+        assert_eq!(spec_slug(provider_id, &OverrideFields::default()), expected);
     }
 
     fn base_override(base: &str) -> OverrideFields {
@@ -534,15 +463,11 @@ mod tests {
         }
     }
 
-    #[test_case("gemini", "google", Some(ProviderKind::Google) ; "remaps_vendor_the_gateway_renamed")]
-    #[test_case("ikora-openai", "llama-cpp", Some(ProviderKind::LlamaCpp) ; "remaps_unknown_vendor")]
-    #[test_case("zai", "not-a-real-provider", Some(ProviderKind::Zai) ; "invalid_base_falls_back_to_provider_id")]
-    fn routed_kind_with_base_override(
-        provider_id: &str,
-        base: &str,
-        expected: Option<ProviderKind>,
-    ) {
-        assert_eq!(routed_kind(provider_id, &base_override(base)), expected);
+    #[test_case("gemini", "google", Some("google") ; "remaps_vendor_the_gateway_renamed")]
+    #[test_case("ikora-openai", "llama-cpp", Some("llama-cpp") ; "remaps_unknown_vendor")]
+    #[test_case("zai", "not-a-real-provider", Some("zai") ; "invalid_base_falls_back_to_provider_id")]
+    fn routed_spec_with_base_override(provider_id: &str, base: &str, expected: Option<&str>) {
+        assert_eq!(spec_slug(provider_id, &base_override(base)), expected);
     }
 
     /// Mirrors `stream_message`'s routing decision: `Model::from_spec` strips the
@@ -555,23 +480,30 @@ mod tests {
         assert_eq!(provider_id, "gemini");
         assert_eq!(model_id, "gemini-pro-latest");
         assert_eq!(
-            routed_kind(provider_id, &base_override("google")),
-            Some(ProviderKind::Google)
+            spec_slug(provider_id, &base_override("google")),
+            Some("google")
         );
     }
 
-    #[test_case(ProviderKind::Google, "aperture/gemini/gemini-pro-latest", "gemini-pro-latest" ; "native_google_strips_vendor_prefix")]
-    #[test_case(ProviderKind::Anthropic, "aperture/anthropic/claude-test", "anthropic/claude-test" ; "anthropic_keeps_vendor_prefix")]
-    #[test_case(ProviderKind::Zai, "aperture/zai/glm-5.2", "zai/glm-5.2" ; "compat_zai_keeps_vendor_prefix")]
-    #[test_case(ProviderKind::Ollama, "aperture/ollama/glm-5.2", "ollama/glm-5.2" ; "compat_ollama_keeps_vendor_prefix")]
-    fn native_route_model_vendor_prefix_policy(kind: ProviderKind, spec: &str, expected_id: &str) {
+    fn route(slug: &str) -> &'static ProviderSpec {
+        ProviderRegistry::get(slug).expect("routable builtin")
+    }
+
+    #[test_case("google", "aperture/gemini/gemini-pro-latest", "gemini-pro-latest" ; "native_google_strips_vendor_prefix")]
+    #[test_case("anthropic", "aperture/anthropic/claude-test", "anthropic/claude-test" ; "anthropic_keeps_vendor_prefix")]
+    #[test_case("zai", "aperture/zai/glm-5.2", "zai/glm-5.2" ; "compat_zai_keeps_vendor_prefix")]
+    #[test_case("ollama", "aperture/ollama/glm-5.2", "ollama/glm-5.2" ; "compat_ollama_keeps_vendor_prefix")]
+    fn native_route_model_vendor_prefix_policy(slug: &str, spec: &str, expected_id: &str) {
         let model = Model::from_spec(spec).unwrap();
         let bare = model.id.split_once('/').unwrap().1;
-        assert_eq!(native_route_model(&model, kind, bare).id, expected_id);
+        assert_eq!(
+            native_route_model(&model, route(slug), bare).id,
+            expected_id
+        );
     }
 
     #[test]
-    fn routed_kind_model_base_wins_over_provider_base() {
+    fn routed_spec_model_base_wins_over_provider_base() {
         let vendor = "ikora-openai";
         let overrides = Overrides::from([(
             vendor.into(),
@@ -580,9 +512,9 @@ mod tests {
                 models: HashMap::from([("special".into(), base_override("llama-cpp"))]),
             },
         )]);
-        let kind = |model| routed_kind(vendor, &merged_override(&overrides, vendor, model));
-        assert_eq!(kind("special"), Some(ProviderKind::LlamaCpp));
-        assert_eq!(kind("other"), Some(ProviderKind::Mistral));
+        let slug = |model| spec_slug(vendor, &merged_override(&overrides, vendor, model));
+        assert_eq!(slug("special"), Some("llama-cpp"));
+        assert_eq!(slug("other"), Some("mistral"));
     }
 
     fn test_auth() -> Arc<Mutex<ResolvedAuth>> {
@@ -592,14 +524,14 @@ mod tests {
         )))
     }
 
-    #[test_case(Some(ProviderKind::Ollama), Some("https://aperture.example.com/v1") ; "ollama_appends_v1")]
-    #[test_case(Some(ProviderKind::Zai), Some("https://aperture.example.com") ; "zai_keeps_bare_host")]
-    #[test_case(Some(ProviderKind::DeepSeek), Some("https://aperture.example.com/v1") ; "deepseek_appends_v1")]
+    #[test_case(Some("ollama"), Some("https://aperture.example.com/v1") ; "ollama_appends_v1")]
+    #[test_case(Some("zai"), Some("https://aperture.example.com") ; "zai_keeps_bare_host")]
+    #[test_case(Some("deepseek"), Some("https://aperture.example.com/v1") ; "deepseek_appends_v1")]
     #[test_case(None, Some("https://aperture.example.com/v1") ; "unrouted_appends_v1")]
-    #[test_case(Some(ProviderKind::Google), Some("https://aperture.example.com/v1beta") ; "google_appends_v1beta")]
-    #[test_case(Some(ProviderKind::Anthropic), Some("https://aperture.example.com") ; "anthropic_keeps_bare_host")]
-    fn routed_auth_prefix_per_route(kind: Option<ProviderKind>, expected: Option<&str>) {
-        let prefix = path_prefix(kind, &OverrideFields::default());
+    #[test_case(Some("google"), Some("https://aperture.example.com/v1beta") ; "google_appends_v1beta")]
+    #[test_case(Some("anthropic"), Some("https://aperture.example.com") ; "anthropic_keeps_bare_host")]
+    fn routed_auth_prefix_per_route(slug: Option<&str>, expected: Option<&str>) {
+        let prefix = path_prefix(slug.map(route), &OverrideFields::default());
         let auth = routed_auth(&test_auth(), &prefix);
         assert_eq!(auth.lock().unwrap().base_url.as_deref(), expected);
     }
@@ -613,7 +545,7 @@ mod tests {
             path_prefix: configured.map(String::from),
             ..Default::default()
         };
-        let auth = routed_auth(&test_auth(), &path_prefix(Some(ProviderKind::Zai), &merged));
+        let auth = routed_auth(&test_auth(), &path_prefix(Some(route("zai")), &merged));
         assert_eq!(auth.lock().unwrap().base_url.as_deref(), expected);
     }
 
@@ -716,10 +648,7 @@ mod tests {
     #[test]
     fn apply_adjustments_uses_routed_provider_static_table() {
         let mut model = Model::from_spec("aperture/zai/glm-5.2").unwrap();
-        assert_eq!(
-            model.context_window,
-            ProviderKind::Aperture.fallback_context_window()
-        );
+        assert_eq!(model.context_window, SPEC.fallback_context_window);
         apply_adjustments(&mut model, &Overrides::new());
         assert_eq!(model.context_window, 1_000_000);
         assert_eq!(model.max_output_tokens, Some(131_072));
@@ -807,18 +736,20 @@ mod tests {
         assert!(!model.supports_thinking());
     }
 
-    #[test_case("aperture/deepseek/deepseek-chat", ProviderKind::DeepSeek ; "routed_thinking_capable")]
-    #[test_case("aperture/ollama/qwen3", ProviderKind::Ollama ; "routed_non_thinking")]
-    #[test_case("aperture/zai/glm-5.2", ProviderKind::Zai ; "routed_zai")]
-    fn apply_adjustments_thinking_follows_routed_kind(spec: &str, kind: ProviderKind) {
+    /// The routed provider answers, not Aperture, which declares no thinking of
+    /// its own. Expectations are spelled out rather than read back out of the
+    /// spec table, or the test would agree with whatever the code found.
+    #[test_case("aperture/deepseek/deepseek-chat", true ; "routed_thinking_capable")]
+    #[test_case("aperture/ollama/qwen3", false ; "routed_non_thinking")]
+    fn apply_adjustments_thinking_follows_routed_spec(spec: &str, expected: bool) {
         let mut model = Model::from_spec(spec).unwrap();
         assert!(model.thinking_override.is_none());
         apply_adjustments(&mut model, &Overrides::new());
         assert_eq!(
             model.thinking_override,
-            ThinkingSupport::from_flags(Some(kind_supports_thinking(kind)), false)
+            ThinkingSupport::from_flags(Some(expected), false)
         );
-        assert_eq!(model.supports_thinking(), kind_supports_thinking(kind));
+        assert_eq!(model.supports_thinking(), expected);
     }
 
     #[test]
@@ -882,6 +813,8 @@ mod tests {
         assert!(!model.supports_thinking());
     }
 
+    /// `ikora-openai` routes nowhere on its own, so the `true` below can only
+    /// have come from llama-cpp.
     #[test]
     fn apply_adjustments_thinking_via_base_override() {
         let mut overrides = Overrides::new();
@@ -899,10 +832,7 @@ mod tests {
         apply_adjustments(&mut model, &overrides);
         assert_eq!(
             model.thinking_override,
-            ThinkingSupport::from_flags(
-                Some(kind_supports_thinking(ProviderKind::LlamaCpp)),
-                false
-            )
+            ThinkingSupport::from_flags(Some(true), false)
         );
     }
 
@@ -927,18 +857,18 @@ supports_vision = true
         let config: maki_config::providers::ProvidersConfig = toml::from_str(toml).unwrap();
         let overrides = config.get("aperture").unwrap().overrides.clone();
         assert_eq!(
-            routed_kind(
+            spec_slug(
                 "ikora-openai",
                 &merged_override(&overrides, "ikora-openai", "gemma4")
             ),
-            Some(ProviderKind::LlamaCpp)
+            Some("llama-cpp")
         );
         let ov = merged_override(&overrides, "zai", "glm-5.2");
         assert_eq!(ov.context_window, Some(200_000));
         assert_eq!(ov.max_output_tokens, Some(8_192));
         assert_eq!(ov.supports_thinking, Some(true));
         assert_eq!(ov.supports_vision, Some(true));
-        assert_eq!(path_prefix(Some(ProviderKind::Zai), &ov), "");
+        assert_eq!(path_prefix(Some(route("zai")), &ov), "");
         let ov2 = merged_override(&overrides, "zai", "other");
         assert_eq!(ov2.context_window, Some(128_000));
     }

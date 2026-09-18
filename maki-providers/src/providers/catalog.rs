@@ -59,7 +59,7 @@ const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic"]
 
 const IMAGE_MODALITY: &str = "image";
 
-/// Used only where the catalog is the whole story. A builtin has its manifest
+/// Used only where the catalog is the whole story. A builtin has its spec
 /// fallbacks to reach for instead, which are per provider and so beat a guess.
 const DEFAULT_CONTEXT: u32 = 128_000;
 const DEFAULT_OUTPUT: u32 = 64_000;
@@ -279,7 +279,7 @@ impl ProviderData {
 
 /// What models.dev publishes about one model. Every field is `Option` because
 /// "the catalog says no" and "the catalog does not say" have to stay apart: a
-/// builtin has a manifest and a curated table to fall through to, and collapsing
+/// builtin has a spec and a curated table to fall through to, and collapsing
 /// the two here would let a thin upstream row shrink a 1M window to 128k, or
 /// turn thinking off for a model we know reasons.
 #[derive(Clone, Debug, Default)]
@@ -349,6 +349,8 @@ impl CatalogData {
 
         for (provider_id, provider) in index {
             let slug = builtin_slug(&provider_id);
+            // The second clause is dead while no Opencode slug has a login
+            // row. It says what to do if one ever gains it: keep the entry.
             if builtin_provider(slug).is_some() && !CATALOG_BACKED_BUILTINS.contains(&slug) {
                 let models = parse_models(&provider.models);
                 debug!(
@@ -1025,10 +1027,10 @@ mod tests {
         Authentication, CatalogData, CatalogMeta, EndpointType, ProviderData, ProviderQuirks,
         SessionRef, StateDir, available_if_warm, determine_catalog_format, parse_model, quirks_for,
     };
-    use crate::manifest::ManifestRegistry;
     use crate::model::{Model, ModelInfo, ModelPricing};
     use crate::provider::Provider;
     use crate::providers::{ResolvedAuth, Timeouts, deepseek, opencode};
+    use crate::spec::ProviderRegistry;
     use crate::{AgentError, ModelFamily, ModelTier, RequestOptions};
     use test_case::test_case;
 
@@ -1681,7 +1683,7 @@ mod tests {
         assert!(unlisted.supports_vision());
         assert!(
             !unlisted.supports_thinking(),
-            "the manifest default is true, so only the catalog can say no"
+            "the spec default is true, so only the catalog can say no"
         );
 
         let curated = &deepseek::models()[0];
@@ -1724,14 +1726,14 @@ mod tests {
 
     /// The catalog only outranks a relative where it has something to say.
     /// Every field it leaves out keeps falling through, first to the relative
-    /// and then to the manifest, or reading models.dev would cost a model the
+    /// and then to the spec, or reading models.dev would cost a model the
     /// metadata it already had.
     #[test]
     fn fields_the_catalog_omits_fall_through() {
         let (_tmp, state_dir) = temp_state_dir();
         super::seed_catalog_for_tests(builtin_catalog(), state_dir);
         let curated = &deepseek::models()[0];
-        let manifest = ManifestRegistry::for_slug(BUILTIN_SLUG).unwrap();
+        let spec = ProviderRegistry::for_slug(BUILTIN_SLUG).unwrap();
 
         let quiet = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", quiet_sibling_model())).unwrap();
         assert_eq!(
@@ -1741,10 +1743,10 @@ mod tests {
         assert_eq!(quiet.context_window, curated.context_window);
         assert_eq!(quiet.max_output_tokens, curated.max_output_tokens);
         assert_eq!(quiet.supports_vision(), curated.vision);
-        assert_eq!(quiet.supports_thinking(), manifest.supports_thinking);
+        assert_eq!(quiet.supports_thinking(), spec.supports_thinking);
     }
 
-    /// models.dev leaves `limit` off plenty of entries, and a builtin manifest
+    /// models.dev leaves `limit` off plenty of entries, and a builtin spec
     /// carries a real number for its provider (DeepSeek serves 1M context)
     /// against the 128k/64k the catalog guesses for everyone else. An
     /// unpublished limit must not read as a published one, or every gap in the
@@ -1759,15 +1761,15 @@ mod tests {
         );
         super::seed_catalog_for_tests(index, state_dir);
 
-        let manifest = ManifestRegistry::for_slug(BUILTIN_SLUG).unwrap();
+        let spec = ProviderRegistry::for_slug(BUILTIN_SLUG).unwrap();
         let model = Model::from_spec(&format!("{BUILTIN_SLUG}/{UNLISTED_MODEL}")).unwrap();
 
         assert_eq!(
             model.pricing.input, UNLISTED_INPUT_PRICE,
             "the catalog entry has to be the one answering, or the limits below prove nothing"
         );
-        assert_eq!(model.context_window, manifest.fallback_context_window);
-        assert_eq!(model.max_output_tokens, manifest.fallback_max_output);
+        assert_eq!(model.context_window, spec.fallback_context_window);
+        assert_eq!(model.max_output_tokens, spec.fallback_max_output);
     }
 
     /// Every builtin the catalog covers reaches its metadata, whichever SDK it
@@ -1960,7 +1962,7 @@ mod tests {
 
     /// The catalog is the last word before the family guess, so anything more
     /// specific still wins. Only discovery can be exercised here: the builtins
-    /// the catalog keeps (`opencode`, `opencode-go`) list no manifest models.
+    /// the catalog keeps (`opencode`, `opencode-go`) list no spec models.
     #[test]
     fn discovery_beats_catalog_vision() {
         let (_tmp, state_dir) = temp_state_dir();
@@ -2699,7 +2701,7 @@ pub(crate) mod schema {
         pub cost: Option<CatalogCost>,
         #[serde(default)]
         pub provider: Option<CatalogShape>,
-        /// `None` where the row omits the flag, so a builtin keeps its manifest
+        /// `None` where the row omits the flag, so a builtin keeps its spec
         /// default instead of reading an absent field as a published "no".
         pub attachment: Option<bool>,
         pub reasoning: Option<bool>,

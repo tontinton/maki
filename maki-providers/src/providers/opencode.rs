@@ -4,11 +4,14 @@ use flume::Sender;
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 
-use crate::model::{Model, ModelInfo};
+use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::catalog::{
     CatalogMeta, CatalogTransport, EndpointType, FreeTier, ProviderQuirks,
     init_shared_catalog_if_needed,
+};
+use crate::spec::{
+    AuthDoc, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs, Native, ProviderSpec,
 };
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -18,6 +21,86 @@ use super::{ResolvedAuth, Timeouts, with_prefix};
 pub(crate) const ZEN_SLUG: &str = "opencode";
 pub(crate) const GO_SLUG: &str = "opencode-go";
 pub(crate) const SLUGS: &[&str] = &[ZEN_SLUG, GO_SLUG];
+
+const ZEN_DISPLAY_NAME: &str = "Opencode Zen";
+const GO_DISPLAY_NAME: &str = "Opencode Go";
+const ENV_VAR: &str = "OPENCODE_API_KEY";
+const ZEN_API_URL: &str = "https://opencode.ai/zen/v1";
+const GO_API_URL: &str = "https://opencode.ai/zen/go/v1";
+const ZEN_FEATURES: &str = "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API";
+const GO_FEATURES: &str = "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API";
+const GO_DISCOVERY_NOTE: &str = "No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.";
+
+const FREE_MODELS_NOTE: &str = r#"By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/maki/providers.toml`:
+
+```toml
+[opencode]
+enable_free_models = true
+```
+
+The default is `false`."#;
+
+/// Neither Opencode slug is a `maki auth login` target, so neither carries a
+/// `login` row.
+pub(crate) const ZEN_SPEC: ProviderSpec = ProviderSpec {
+    slug: ZEN_SLUG,
+    display_name: ZEN_DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(128_000),
+    fallback_context_window: 256_000,
+    models: &[],
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: None,
+    }),
+    login: None,
+    docs: GeneratedDocs {
+        api_urls: &[ZEN_API_URL],
+        features: Some(ZEN_FEATURES),
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Discovered(GENERIC_DISCOVERY_NOTE),
+        trailing_notes: &[FREE_MODELS_NOTE],
+    },
+};
+
+pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
+    slug: GO_SLUG,
+    display_name: GO_DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Generic,
+    supports_thinking: false,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(64_000),
+    fallback_context_window: 128_000,
+    models: &[],
+    pricing_schedule: None,
+    native: None,
+    login: None,
+    docs: GeneratedDocs {
+        api_urls: &[GO_API_URL],
+        features: Some(GO_FEATURES),
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Discovered(GO_DISCOVERY_NOTE),
+        trailing_notes: &[],
+    },
+};
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(Opencode::new(timeouts)))
+}
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(Opencode::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
 
 /// OpenCode asked clients to send one stable ID per conversation and warned
 /// that requests without it may start failing:

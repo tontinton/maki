@@ -15,10 +15,10 @@ use maki_config::ModelPolicy;
 use maki_storage::sessions::{Effort, MIN_THINKING_BUDGET, StoredTokenUsage};
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model_registry;
 use crate::providers::catalog::{self, CatalogMeta};
 use crate::providers::{anthropic, custom, dynamic};
+use crate::spec::{ProviderRegistry, ProviderSpec};
 use crate::types::{FALLBACK_MAX_THINKING_BUDGET, THINKING_ADAPTIVE, THINKING_OFF};
 use maki_config::providers::ThinkingFields;
 
@@ -323,14 +323,14 @@ struct ModelSources<'a> {
 }
 
 impl<'a> ModelSources<'a> {
-    fn resolve(manifest: &'a ProviderManifest, model_id: &str) -> Self {
-        let entry = lookup_entry(manifest.models, model_id).ok();
+    fn resolve(spec: &'a ProviderSpec, model_id: &str) -> Self {
+        let entry = lookup_entry(spec.models, model_id).ok();
         let exact = entry.is_some_and(|entry| names_exactly(entry, model_id));
         Self {
             entry,
             exact,
             catalog: (!exact)
-                .then(|| catalog::model_meta_if_available(manifest.slug, model_id))
+                .then(|| catalog::model_meta_if_available(spec.slug, model_id))
                 .flatten(),
         }
     }
@@ -388,7 +388,7 @@ fn local_thinking_overlay(
     let supports = declared
         .supports_thinking
         // Spelling out how a model thinks is as good as saying that it does.
-        // Otherwise the ollama manifest answers "no", every request is clamped
+        // Otherwise the ollama spec answers "no", every request is clamped
         // back to off, and the fragments the user wrote are dead weight.
         .or_else(|| declared.thinking_fields.is_some().then_some(true));
     (
@@ -447,7 +447,7 @@ pub struct Model {
     pub supports_tool_examples_override: Option<bool>,
     /// Resolved thinking support, used by gateway providers (e.g. Aperture)
     /// that stream through a native provider chosen at runtime. `None` falls
-    /// back to discovery, then the provider manifest.
+    /// back to discovery, then the provider spec.
     pub thinking_override: Option<ThinkingSupport>,
     pub supports_vision_override: Option<bool>,
     pub supports_fast_override: Option<FastSupport>,
@@ -465,7 +465,7 @@ pub struct Model {
     /// `pricing`, which also covers "no price is known".
     pub discovered_free: bool,
     /// What the model declares it can generate, `None` when unknown (see
-    /// [`ProviderKind::fallback_max_output`]). Stays the same across requests,
+    /// [`ProviderSpec::fallback_max_output`]). Stays the same across requests,
     /// because [`Self::max_thinking_budget`] scales effort levels off it.
     pub max_output_tokens: Option<u32>,
     /// What this one request may generate, when a caller trimmed the cap to a
@@ -481,16 +481,16 @@ impl Model {
     /// Family and tier are about which dialect a model speaks and what role it
     /// plays, which a relative answers just as well, so they read the curated
     /// row whether or not it was an exact match.
-    fn from_base(manifest: &ProviderManifest, slug: &str, model_id: &str) -> Self {
-        let sources = ModelSources::resolve(manifest, model_id);
+    fn from_base(base: &ProviderSpec, slug: &str, model_id: &str) -> Self {
+        let sources = ModelSources::resolve(base, model_id);
         let entry = sources.entry;
         let spec = format!("{slug}/{model_id}");
         // Discovery keys `known_models` by the builtin slug, so a dynamic or
         // custom slug reads positional tiers and metadata through its base.
-        let discovered = model_registry::discovered(manifest.slug, model_id);
+        let discovered = model_registry::discovered(base.slug, model_id);
         let discovered = discovered.as_ref();
-        let tier = model_registry::tier_for(&spec, manifest.slug, entry.map(|e| e.tier));
-        let family = entry.map_or(manifest.family, |entry| entry.family);
+        let tier = model_registry::tier_for(&spec, base.slug, entry.map(|e| e.tier));
+        let family = entry.map_or(base.family, |entry| entry.family);
         let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
         let pricing = discovered_pricing
             .cloned()
@@ -504,12 +504,12 @@ impl Model {
         let max_output_tokens = discovered
             .and_then(|info| info.max_output_tokens)
             .or_else(|| sources.pick(|entry| entry.max_output_tokens, |meta| meta.output))
-            .or(manifest.fallback_max_output);
+            .or(base.fallback_max_output);
         let context_window = discovered
             .and_then(|info| info.context_window)
             .or_else(|| anthropic::shared::long_context_window(model_id))
             .or_else(|| sources.pick(|entry| Some(entry.context_window), |meta| meta.context))
-            .unwrap_or(manifest.fallback_context_window);
+            .unwrap_or(base.fallback_context_window);
         let (thinking_override, thinking_fields) = local_thinking_overlay(slug, model_id);
         Self {
             id: model_id.to_string(),
@@ -561,18 +561,18 @@ impl Model {
             return thinking != ThinkingSupport::No;
         }
         // Discovery keys `known_models` by the builtin slug; resolve dynamic
-        // and custom slugs through their base manifest before looking up.
-        let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
+        // and custom slugs through their base spec before looking up.
+        let Some(spec) = ProviderRegistry::for_slug(&self.provider) else {
             return false;
         };
-        model_registry::discovered(manifest.slug, &self.id)
+        model_registry::discovered(spec.slug, &self.id)
             .and_then(|d| d.supports_thinking)
             .or_else(|| {
-                ModelSources::resolve(manifest, &self.id)
+                ModelSources::resolve(spec, &self.id)
                     .catalog?
                     .supports_thinking
             })
-            .unwrap_or(manifest.supports_thinking)
+            .unwrap_or(spec.supports_thinking)
     }
 
     pub fn requires_thinking(&self) -> bool {
@@ -585,13 +585,13 @@ impl Model {
         if let Some(vision) = self.supports_vision_override {
             return vision;
         }
-        let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
+        let Some(spec) = ProviderRegistry::for_slug(&self.provider) else {
             return self.family.supports_vision();
         };
-        model_registry::discovered(manifest.slug, &self.id)
+        model_registry::discovered(spec.slug, &self.id)
             .and_then(|d| d.supports_vision)
             .or_else(|| {
-                ModelSources::resolve(manifest, &self.id)
+                ModelSources::resolve(spec, &self.id)
                     .pick(|entry| Some(entry.vision), |meta| meta.supports_vision)
             })
             .unwrap_or_else(|| self.family.supports_vision())
@@ -675,14 +675,14 @@ impl Model {
     /// subscription bills a flat rate, so there is no fast per-token price to
     /// read. Everyone else falls back to fast-tier pricing, so capability and
     /// billing can never disagree. The provider gate keeps that path to
-    /// Anthropic-based providers, resolved through the base manifest so oauth
+    /// Anthropic-based providers, resolved through the base spec so oauth
     /// scripts keep it; Bedrock separately ignores `opts.fast` at request time.
     pub fn supports_fast(&self) -> bool {
         match self.supports_fast_override {
             Some(support) => support == FastSupport::Supported,
             None => {
                 self.pricing.fast.is_some()
-                    && ManifestRegistry::for_slug(&self.provider)
+                    && ProviderRegistry::for_slug(&self.provider)
                         .is_some_and(|m| m.slug == FAST_PROVIDER)
             }
         }
@@ -721,7 +721,7 @@ impl Model {
         usage.cost.filter(|bill| *bill > 0.0).or_else(|| {
             let cost = self.list_cost(usage, fast)?;
             let schedule =
-                ManifestRegistry::for_slug(&self.provider).and_then(|m| m.pricing_schedule);
+                ProviderRegistry::for_slug(&self.provider).and_then(|m| m.pricing_schedule);
             Some(schedule.map_or(cost, |s| cost * s.multiplier_at(Timestamp::now())))
         })
     }
@@ -758,14 +758,14 @@ impl Model {
     }
 
     pub fn provider_display_name(&self) -> &'static str {
-        ManifestRegistry::for_slug(&self.provider).map_or("Unknown", |m| m.display_name)
+        ProviderRegistry::for_slug(&self.provider).map_or("Unknown", |m| m.display_name)
     }
 
     pub fn from_tier(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
         if let Some(spec) = model_registry::spec_for_tier(slug, tier) {
             return Self::from_spec(&spec);
         }
-        let entry = ManifestRegistry::find_default_for_tier(slug, tier)
+        let entry = ProviderRegistry::find_default_for_tier(slug, tier)
             .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
         let model_id = entry.prefixes[0];
         Self::from_spec(&format!("{slug}/{model_id}"))
@@ -782,11 +782,10 @@ impl Model {
             return Ok(model);
         }
 
-        let Some(manifest) = ManifestRegistry::for_slug(slug) else {
+        let Some(spec) = ProviderRegistry::for_slug(slug) else {
             return Err(ModelError::NoAllowedModel(slug.to_string(), tier));
         };
-        manifest
-            .models
+        spec.models
             .iter()
             .filter(|entry| entry.tier == tier)
             .flat_map(|entry| entry.prefixes)
@@ -808,20 +807,18 @@ impl Model {
         match custom::resolve_tier(slug, tier) {
             custom::TierLookup::Model(model) => return Ok(model),
             custom::TierLookup::NoModelForTier(base) => {
-                let manifest = ManifestRegistry::get(&base.to_string())
-                    .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-                let entry = manifest
+                let entry = base
                     .models
                     .iter()
                     .find(|e| e.default && e.tier == tier)
                     .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-                return Ok(Self::from_base(manifest, slug, entry.prefixes[0]));
+                return Ok(Self::from_base(base, slug, entry.prefixes[0]));
             }
             custom::TierLookup::Unknown => {}
         }
         // Builtin or dynamic slug: resolve the base default under the slug
         // (dynamic slugs route through `base_for_slug`).
-        if ManifestRegistry::get(slug).is_some() || dynamic::base_for_slug(slug).is_some() {
+        if ProviderRegistry::get(slug).is_some() || dynamic::base_for_slug(slug).is_some() {
             return Self::from_tier(slug, tier);
         }
         Err(ModelError::UnsupportedProvider(slug.to_string()))
@@ -841,18 +838,16 @@ impl Model {
         // then models.dev catalogue sub-provider.
         // Discovery drops any script slug a builtin or custom entry already owns,
         // so a script and a custom provider can never share a slug here.
-        if let Some(manifest) = ManifestRegistry::get(slug) {
-            return Ok(Self::from_base(manifest, slug, model_id));
+        if let Some(spec) = ProviderRegistry::get(slug) {
+            return Ok(Self::from_base(spec, slug, model_id));
         }
 
         if let Some(model) = dynamic::lookup_model(slug, model_id) {
             return Ok(model);
         }
 
-        if let Some(base) = dynamic::base_for_slug(slug)
-            && let Some(manifest) = ManifestRegistry::get(&base.to_string())
-        {
-            return Ok(Self::from_base(manifest, slug, model_id));
+        if let Some(base) = dynamic::base_for_slug(slug) {
+            return Ok(Self::from_base(base, slug, model_id));
         }
 
         if let Some(model) = custom::lookup_model(slug, model_id) {
@@ -886,10 +881,10 @@ impl Model {
     /// an empty table. A row reached by prefix prices a relative and says
     /// nothing about this id.
     fn curated_free(&self) -> bool {
-        let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
+        let Some(spec) = ProviderRegistry::for_slug(&self.provider) else {
             return false;
         };
-        let sources = ModelSources::resolve(manifest, &self.id);
+        let sources = ModelSources::resolve(spec, &self.id);
         sources.exact && sources.entry.is_some_and(|entry| entry.pricing.is_zero())
     }
 
@@ -1341,15 +1336,15 @@ mod tests {
 
     #[test]
     fn fast_pricing_is_always_a_premium() {
-        for manifest in ManifestRegistry::builtins() {
-            for entry in manifest.models {
+        for spec in ProviderRegistry::builtins() {
+            for entry in spec.models {
                 let Some(fast) = &entry.pricing.fast else {
                     continue;
                 };
                 assert!(
                     fast.input >= entry.pricing.input && fast.output >= entry.pricing.output,
                     "{}/{}: fast pricing must not be cheaper than standard",
-                    manifest.slug,
+                    spec.slug,
                     entry.prefixes[0],
                 );
             }
@@ -1358,11 +1353,11 @@ mod tests {
 
     #[test]
     fn spec_roundtrip() {
-        for manifest in ManifestRegistry::builtins() {
-            if manifest.accepts_arbitrary_models {
+        for spec in ProviderRegistry::builtins() {
+            if spec.accepts_arbitrary_models {
                 continue;
             }
-            let model = Model::from_tier(manifest.slug, ModelTier::Medium).unwrap();
+            let model = Model::from_tier(spec.slug, ModelTier::Medium).unwrap();
             let round = Model::from_spec(&model.spec()).unwrap();
             assert_eq!(round.id, model.id);
             assert_eq!(round.provider, model.provider);
@@ -1389,21 +1384,21 @@ mod tests {
 
     #[test]
     fn from_tier_covers_all_providers() {
-        for manifest in ManifestRegistry::builtins() {
-            if manifest.accepts_arbitrary_models {
+        for spec in ProviderRegistry::builtins() {
+            if spec.accepts_arbitrary_models {
                 continue;
             }
-            let slug: Arc<str> = Arc::from(manifest.slug);
+            let slug: Arc<str> = Arc::from(spec.slug);
             for &tier in &TIERS {
                 // DeepSeek has no Weak tier model
-                if manifest.slug == "deepseek" && tier == ModelTier::Weak {
+                if spec.slug == "deepseek" && tier == ModelTier::Weak {
                     continue;
                 }
                 // Compaction is user-assigned only, not in static registry
                 if tier == ModelTier::Compaction {
                     continue;
                 }
-                let model = Model::from_tier(manifest.slug, tier).unwrap();
+                let model = Model::from_tier(spec.slug, tier).unwrap();
                 assert_eq!(model.provider, slug);
                 assert_eq!(model.tier, tier);
                 let max_output = model.max_output_tokens.unwrap();
@@ -1471,13 +1466,13 @@ mod tests {
 
     #[test]
     fn exactly_one_default_per_provider_tier() {
-        for manifest in ManifestRegistry::builtins() {
-            if manifest.accepts_arbitrary_models {
+        for spec in ProviderRegistry::builtins() {
+            if spec.accepts_arbitrary_models {
                 continue;
             }
-            let entries = manifest.models;
+            let entries = spec.models;
             for &tier in &TIERS {
-                if manifest.slug == "deepseek" && tier == ModelTier::Weak {
+                if spec.slug == "deepseek" && tier == ModelTier::Weak {
                     continue;
                 }
                 // Compaction is user-assigned only, not in static registry
@@ -1491,7 +1486,7 @@ mod tests {
                 assert_eq!(
                     count, 1,
                     "{}/{}: expected exactly 1 default, found {count}",
-                    manifest.slug, tier
+                    spec.slug, tier
                 );
             }
         }
@@ -1508,15 +1503,15 @@ mod tests {
         let model = Model::from_spec(spec).unwrap();
         assert_eq!(model.provider, Arc::<str>::from(expected_slug));
         assert_eq!(model.id, expected_id);
-        let manifest = ManifestRegistry::get(expected_slug).unwrap();
-        assert_eq!(model.family, manifest.family);
+        let spec = ProviderRegistry::get(expected_slug).unwrap();
+        assert_eq!(model.family, spec.family);
     }
 
     #[test]
     fn from_base_unknown_model_uses_provider_fallbacks() {
         // Deliberately fake id so this stays valid when the model table changes.
         let model = Model::from_base(
-            ManifestRegistry::get("anthropic").unwrap(),
+            ProviderRegistry::get("anthropic").unwrap(),
             "anthropic",
             "claude-nonexistent-99",
         );
@@ -1555,7 +1550,7 @@ mod tests {
     #[test_case("claude-opus-99",   false ; "no_entry_at_all")]
     fn supports_fast_follows_anthropic_table(model_id: &str, expected: bool) {
         let model = Model::from_base(
-            ManifestRegistry::get("anthropic").unwrap(),
+            ProviderRegistry::get("anthropic").unwrap(),
             "anthropic",
             model_id,
         );
@@ -1597,7 +1592,7 @@ mod tests {
     #[test]
     fn fast_pricing_on_a_non_anthropic_model_stays_inert() {
         let mut model = Model::from_base(
-            ManifestRegistry::get("google").unwrap(),
+            ProviderRegistry::get("google").unwrap(),
             "google",
             "gemini-2.5-pro",
         );
@@ -1648,12 +1643,12 @@ mod tests {
             }],
         );
 
-        let model = Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id);
+        let model = Model::from_base(ProviderRegistry::get("ollama").unwrap(), "ollama", model_id);
         assert_eq!(model.context_window, expected_window);
 
         // A dynamic/custom slug shares its base provider's discovery.
         let wrapped = Model::from_base(
-            ManifestRegistry::get("ollama").unwrap(),
+            ProviderRegistry::get("ollama").unwrap(),
             "my-ollama-wrap",
             model_id,
         );
@@ -1676,7 +1671,7 @@ mod tests {
             }],
         );
 
-        let model = Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id);
+        let model = Model::from_base(ProviderRegistry::get("ollama").unwrap(), "ollama", model_id);
         assert_eq!(model.is_free(), expected, "{FREE_MEANS_A_KNOWN_ZERO}");
     }
 
@@ -1689,11 +1684,11 @@ mod tests {
         assert_eq!(Model::from_spec(spec).unwrap().free(), expected);
     }
 
-    /// A schedule hung on the wrong manifest silently doubles every turn of a
+    /// A schedule hung on the wrong spec silently doubles every turn of a
     /// provider that bills flat.
     #[test]
     fn only_deepseek_bills_by_the_clock() {
-        let scheduled: Vec<&str> = ManifestRegistry::builtins()
+        let scheduled: Vec<&str> = ProviderRegistry::builtins()
             .iter()
             .filter(|m| m.pricing_schedule.is_some())
             .map(|m| m.slug)
@@ -1702,13 +1697,13 @@ mod tests {
     }
 
     /// Nothing else pins the wiring: a real DeepSeek model has to pick the
-    /// schedule up out of its manifest, and `list_cost` has to stay out of it.
+    /// schedule up out of its spec, and `list_cost` has to stay out of it.
     /// `billed_cost` reads the real clock, so the expectation is sampled either
     /// side of the call in case the hour ticks over mid-test.
     #[test]
     fn deepseek_bills_its_peak_surcharge_on_top_of_the_table() {
         let model = Model::from_spec(DEEPSEEK_SPEC).unwrap();
-        let schedule = ManifestRegistry::for_slug(&model.provider)
+        let schedule = ProviderRegistry::for_slug(&model.provider)
             .and_then(|m| m.pricing_schedule)
             .expect("deepseek bills by the clock");
 

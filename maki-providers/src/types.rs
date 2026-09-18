@@ -1196,7 +1196,7 @@ mod tests {
 
     #[test]
     fn adapt_images_borrows_when_nothing_has_to_change() {
-        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let model = clamp_test_model(anthropic_spec());
         let with_image = vec![Message {
             role: Role::User,
             content: vec![png_block(32)],
@@ -1223,7 +1223,7 @@ mod tests {
     fn adapt_images_rebuilds_only_the_messages_that_change() {
         const CAPTION: &str = "look";
         const OVERSIZED: u32 = 2600;
-        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let model = clamp_test_model(anthropic_spec());
         let fine = ImageSource::new(
             ImageMediaType::Png,
             Arc::from(crate::image::png_base64(32, 32)),
@@ -1277,7 +1277,7 @@ mod tests {
 
     #[test]
     fn adapt_images_shrinks_what_a_provider_would_refuse() {
-        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let model = clamp_test_model(anthropic_spec());
         let oversized = ContentBlock::Image {
             source: ImageSource::new(
                 ImageMediaType::Png,
@@ -1302,7 +1302,7 @@ mod tests {
     #[test]
     fn adapt_images_evicts_the_oldest_past_the_request_cap() {
         const EXTRA: usize = 3;
-        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let model = clamp_test_model(anthropic_spec());
         let blocks = adapt(&model, (1..=MAX_IMAGES + EXTRA).map(png_block).collect());
         assert_eq!(image_count(&blocks), MAX_IMAGES);
         assert!(
@@ -1316,7 +1316,7 @@ mod tests {
     /// survivors: counting blocks instead would evict a good one in its place.
     #[test]
     fn adapt_images_drops_what_it_cannot_read_without_spending_the_cap() {
-        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let model = clamp_test_model(anthropic_spec());
         let mut content = vec![png_block(1), unreadable_block()];
         content.extend((2..=MAX_IMAGES).map(png_block));
         let blocks = adapt(&model, content);
@@ -1326,7 +1326,7 @@ mod tests {
 
     #[test]
     fn adapt_images_replaces_blocks_for_text_only_model() {
-        let mut model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let mut model = clamp_test_model(anthropic_spec());
         model.supports_vision_override = Some(false);
         let tool_result = ContentBlock::ToolResult {
             tool_use_id: "t1".into(),
@@ -1376,7 +1376,7 @@ mod tests {
     fn thinking_model(id: &str) -> crate::model::Model {
         crate::model::Model {
             id: id.into(),
-            ..clamp_test_model(crate::provider::ProviderKind::Anthropic)
+            ..clamp_test_model(anthropic_spec())
         }
     }
 
@@ -1716,15 +1716,23 @@ mod tests {
         assert_eq!(body["thinking_budget_tokens"], 16_384);
     }
 
-    fn clamp_test_model(provider: crate::provider::ProviderKind) -> crate::model::Model {
+    fn anthropic_spec() -> &'static crate::spec::ProviderSpec {
+        crate::spec::ProviderRegistry::get("anthropic").unwrap()
+    }
+
+    fn google_spec() -> &'static crate::spec::ProviderSpec {
+        crate::spec::ProviderRegistry::get("google").unwrap()
+    }
+
+    fn clamp_test_model(spec: &'static crate::spec::ProviderSpec) -> crate::model::Model {
         crate::model::Model {
             id: "test-model".into(),
-            provider: std::sync::Arc::<str>::from(provider.to_string()),
+            provider: std::sync::Arc::<str>::from(spec.slug),
             tier: crate::model::ModelTier::Medium,
-            family: provider.family(),
+            family: spec.family,
             supports_tool_examples_override: None,
             thinking_override: None,
-            supports_vision_override: Some(provider.family().supports_vision()),
+            supports_vision_override: Some(spec.family.supports_vision()),
             supports_fast_override: None,
             pricing: crate::model::ModelPricing::default(),
             subsidised_by: None,
@@ -1746,7 +1754,7 @@ mod tests {
         thinking: ThinkingConfig,
         expected: ThinkingConfig,
     ) {
-        let mut model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let mut model = clamp_test_model(anthropic_spec());
         model.thinking_override = thinking_override;
         let opts = RequestOptions {
             thinking,
@@ -1766,7 +1774,7 @@ mod tests {
 
     #[test]
     fn request_options_clamped_fast_requires_model_support() {
-        let model = clamp_test_model(crate::provider::ProviderKind::Google);
+        let model = clamp_test_model(google_spec());
         let opts = RequestOptions {
             thinking: ThinkingConfig::Off,
             fast: true,

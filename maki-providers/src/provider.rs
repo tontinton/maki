@@ -1,277 +1,22 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use flume::Sender;
 use serde_json::Value;
-use strum::{Display, EnumIter, EnumString};
 use tracing::{debug, warn};
 
 use maki_config::ModelPolicy;
 use maki_storage::id::SessionRef;
 
-use crate::model::{Model, ModelFamily, ModelInfo};
-use crate::providers::anthropic::Anthropic;
-use crate::providers::anthropic::bedrock;
-use crate::providers::aperture::Aperture;
+use crate::model::{Model, ModelInfo};
+use crate::model_registry::set_known_models;
 use crate::providers::catalog::{
-    CATALOG_BACKED_BUILTINS, available_if_warm, catalog_providers, catalog_providers_if_available,
+    available_if_warm, catalog_providers, catalog_providers_if_available, try_create,
 };
-use crate::providers::copilot::Copilot;
-use crate::providers::deepseek::DeepSeek;
-use crate::providers::dynamic;
-use crate::providers::google::Google;
-use crate::providers::local::{LLAMACPP, LocalEndpoint, OLLAMA};
-use crate::providers::mistral::Mistral;
-use crate::providers::openai::OpenAi;
-use crate::providers::opencode::Opencode;
-use crate::providers::openrouter::OpenRouter;
-use crate::providers::regolo::Regolo;
-use crate::providers::requesty::Requesty;
-use crate::providers::synthetic::Synthetic;
-use crate::providers::tensorx::TensorX;
-use crate::providers::xai::Xai;
-use crate::providers::zai::Zai;
-use crate::providers::{KeyRotation, Timeouts};
+use crate::providers::{KeyRotation, Timeouts, custom, dynamic};
+use crate::spec::{Owner, ProviderRegistry};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter)]
-#[strum(serialize_all = "kebab-case")]
-pub enum ProviderKind {
-    Anthropic,
-    #[strum(serialize = "openai")]
-    OpenAi,
-    Google,
-    Copilot,
-    Ollama,
-    LlamaCpp,
-    Mistral,
-    Zai,
-    #[strum(serialize = "deepseek")]
-    DeepSeek,
-    #[strum(serialize = "openrouter")]
-    OpenRouter,
-    Requesty,
-    Synthetic,
-    Regolo,
-    #[strum(serialize = "tensorx")]
-    TensorX,
-    #[strum(serialize = "opencode")]
-    Opencode,
-    #[strum(serialize = "xai")]
-    Xai,
-    Aperture,
-}
-
-impl ProviderKind {
-    pub const fn display_name(self) -> &'static str {
-        match self {
-            Self::Anthropic => "Anthropic",
-            Self::OpenAi => "OpenAI",
-            Self::Google => "Google",
-            Self::Copilot => "Copilot",
-            Self::Ollama => "Ollama",
-            Self::LlamaCpp => "LlamaCpp",
-            Self::Mistral => "Mistral",
-            Self::Zai => "Z.AI",
-            Self::DeepSeek => "DeepSeek",
-            Self::OpenRouter => "OpenRouter",
-            Self::Requesty => "Requesty",
-            Self::Synthetic => "Synthetic",
-            Self::Regolo => "Regolo",
-            Self::TensorX => "TensorX",
-            Self::Opencode => "Opencode Zen",
-            Self::Xai => "xAI",
-            Self::Aperture => "Aperture",
-        }
-    }
-
-    pub const fn api_key_env(self) -> &'static str {
-        match self {
-            Self::Anthropic => "ANTHROPIC_API_KEY",
-            Self::OpenAi => "OPENAI_API_KEY",
-            Self::Google => "GEMINI_API_KEY",
-            Self::Copilot => "GH_COPILOT_TOKEN",
-            Self::Ollama => "OLLAMA_API_KEY",
-            Self::LlamaCpp => "LLAMA_CPP_API_KEY",
-            Self::Mistral => "MISTRAL_API_KEY",
-            Self::Zai => "ZHIPU_API_KEY",
-            Self::DeepSeek => "DEEPSEEK_API_KEY",
-            Self::OpenRouter => "OPENROUTER_API_KEY",
-            Self::Requesty => "REQUESTY_API_KEY",
-            Self::Synthetic => "SYNTHETIC_API_KEY",
-            Self::Regolo => "REGOLO_API_KEY",
-            Self::TensorX => "TENSORX_API_KEY",
-            Self::Opencode => "OPENCODE_API_KEY",
-            Self::Xai => "XAI_API_KEY",
-            Self::Aperture => "",
-        }
-    }
-
-    pub const fn base_url(self) -> &'static str {
-        match self {
-            Self::Anthropic => "https://api.anthropic.com/v1/messages",
-            Self::OpenAi => "https://api.openai.com/v1",
-            Self::Google => "https://generativelanguage.googleapis.com/v1beta",
-            Self::Copilot => {
-                "https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)"
-            }
-            Self::Ollama => "http://localhost:11434/v1",
-            Self::LlamaCpp => "http://localhost:8080/v1",
-            Self::Mistral => "https://api.mistral.ai/v1",
-            Self::Zai => "https://api.z.ai/api/paas/v4",
-            Self::DeepSeek => "https://api.deepseek.com",
-            Self::OpenRouter => "https://openrouter.ai/api/v1",
-            Self::Requesty => "https://router.requesty.ai/v1",
-            Self::Synthetic => "https://api.synthetic.new/openai/v1",
-            Self::Regolo => "https://api.regolo.ai/v1",
-            Self::TensorX => "https://api.tensorx.ai/v1",
-            Self::Opencode => "https://opencode.ai/zen/v1",
-            Self::Xai => "https://api.x.ai/v1",
-            Self::Aperture => "Aperture gateway (set APERTURE_HOST)",
-        }
-    }
-
-    pub const fn features(self) -> Option<&'static str> {
-        match self {
-            Self::Anthropic => {
-                Some("Prompt caching, thinking mode (adaptive/budgeted), advanced tool use")
-            }
-            Self::Google => Some("Native Gemini API with thinking support"),
-            Self::Copilot => Some("Native Copilot Chat HTTP API with model endpoint discovery"),
-            Self::Ollama => {
-                Some("Local or remote inference via OLLAMA_HOST, cloud fallback via OLLAMA_API_KEY")
-            }
-            Self::LlamaCpp => Some(
-                "Local or remote inference via LLAMA_CPP_HOST, set optional key via LLAMA_CPP_API_KEY",
-            ),
-            Self::Synthetic => {
-                Some("Reasoning effort support (low/medium/high), open-weight models")
-            }
-            Self::TensorX => Some("Open-weight models, zero data retention, prompt caching"),
-            Self::Regolo => Some(
-                "EU-hosted open-weight models with tool calling. The catalogue and prices are listed live from the API",
-            ),
-            Self::DeepSeek => Some("Thinking mode toggle (on/off), open-weight models"),
-            Self::OpenRouter => {
-                Some("300+ models from all providers, prompt caching, provider routing")
-            }
-            Self::Requesty => Some(
-                "700+ models behind one key, curated managed routing policies, EU region via `REQUESTY_BASE_URL`",
-            ),
-            Self::Opencode => Some(
-                "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API",
-            ),
-            Self::Xai => Some(
-                "OAuth login, account-specific model catalog, Grok reasoning (low/medium/high/xhigh)",
-            ),
-            Self::Aperture => Some(
-                "Tailscale Aperture LLM gateway; set APERTURE_HOST or configure in providers.toml",
-            ),
-            _ => None,
-        }
-    }
-
-    pub const fn family(self) -> ModelFamily {
-        match self {
-            Self::Anthropic => ModelFamily::Claude,
-            Self::OpenAi => ModelFamily::Gpt,
-            Self::Google => ModelFamily::Gemini,
-            Self::Copilot => ModelFamily::Generic,
-            Self::Ollama => ModelFamily::Generic,
-            Self::LlamaCpp => ModelFamily::Generic,
-            Self::Mistral => ModelFamily::Generic,
-            Self::Zai => ModelFamily::Glm,
-            Self::DeepSeek => ModelFamily::Generic,
-            Self::OpenRouter => ModelFamily::Generic,
-            Self::Requesty => ModelFamily::Generic,
-            Self::Synthetic => ModelFamily::Synthetic,
-            Self::Regolo => ModelFamily::Generic,
-            Self::TensorX => ModelFamily::Generic,
-            Self::Opencode => ModelFamily::Generic,
-            Self::Xai => ModelFamily::Generic,
-            Self::Aperture => ModelFamily::Generic,
-        }
-    }
-
-    /// `None` when we honestly don't know the output window: llama.cpp
-    /// serves whatever model the user loaded, and TensorX rejects explicit
-    /// max_tokens (see tensorx.rs). Unknown means "don't limit", never
-    /// "assume small"; a `0` sentinel here once silently capped llama.cpp
-    /// thinking budgets at the floor.
-    pub const fn fallback_max_output(self) -> Option<u32> {
-        match self {
-            Self::Anthropic => Some(128_000),
-            Self::OpenAi => Some(100_000),
-            Self::Google => Some(65_536),
-            Self::Copilot => Some(100_000),
-            Self::Ollama => Some(16_384),
-            Self::LlamaCpp => None,
-            Self::Mistral => None,
-            Self::Zai => Some(16_000),
-            Self::DeepSeek => Some(384_000),
-            Self::OpenRouter => Some(128_000),
-            Self::Requesty => Some(128_000),
-            Self::Synthetic => Some(32_000),
-            Self::Regolo => Some(120_000),
-            Self::TensorX => None,
-            Self::Opencode => Some(128_000),
-            Self::Xai => Some(131_072),
-            Self::Aperture => Some(16_384),
-        }
-    }
-
-    pub const fn fallback_context_window(self) -> u32 {
-        match self {
-            Self::Anthropic => 200_000,
-            Self::OpenAi => 200_000,
-            Self::Google => 1_000_000,
-            Self::Copilot => 200_000,
-            Self::Ollama => 128_000,
-            Self::LlamaCpp => 128_000,
-            Self::Mistral => 128_000,
-            Self::Zai => 128_000,
-            Self::DeepSeek => 1_000_000,
-            Self::OpenRouter => 200_000,
-            Self::Requesty => 200_000,
-            Self::Synthetic => 128_000,
-            Self::Regolo => 120_000,
-            Self::TensorX => 200_000,
-            Self::Opencode => 256_000,
-            Self::Xai => 500_000,
-            Self::Aperture => 128_000,
-        }
-    }
-
-    pub fn create(self, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-        match self {
-            Self::Anthropic => {
-                if bedrock::is_enabled() {
-                    Ok(Box::new(bedrock::Bedrock::new(timeouts)?))
-                } else {
-                    Ok(Box::new(Anthropic::new(timeouts)?))
-                }
-            }
-            Self::OpenAi => Ok(Box::new(OpenAi::new(timeouts)?)),
-            Self::Google => Ok(Box::new(Google::new(timeouts)?)),
-            Self::Copilot => Ok(Box::new(Copilot::new(timeouts)?)),
-            Self::Ollama => Ok(Box::new(LocalEndpoint::new(&OLLAMA, timeouts)?)),
-            Self::LlamaCpp => Ok(Box::new(LocalEndpoint::new(&LLAMACPP, timeouts)?)),
-            Self::Mistral => Ok(Box::new(Mistral::new(timeouts)?)),
-            Self::Zai => Ok(Box::new(Zai::new(timeouts)?)),
-            Self::DeepSeek => Ok(Box::new(DeepSeek::new(timeouts)?)),
-            Self::OpenRouter => Ok(Box::new(OpenRouter::new(timeouts)?)),
-            Self::Requesty => Ok(Box::new(Requesty::new(timeouts)?)),
-            Self::Synthetic => Ok(Box::new(Synthetic::new(timeouts)?)),
-            Self::Regolo => Ok(Box::new(Regolo::new(timeouts)?)),
-            Self::TensorX => Ok(Box::new(TensorX::new(timeouts)?)),
-            Self::Opencode => Ok(Box::new(Opencode::new(timeouts))),
-            Self::Xai => Ok(Box::new(Xai::new(timeouts)?)),
-            Self::Aperture => Ok(Box::new(Aperture::new(timeouts)?)),
-        }
-    }
-}
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -317,21 +62,16 @@ pub trait Provider: Send + Sync {
 }
 
 pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    if let Ok(kind) = ProviderKind::from_str(slug) {
-        return kind.create(timeouts);
+    match Owner::of(slug) {
+        Owner::Builtin(new) => new(timeouts),
+        Owner::Script => dynamic::create(slug, timeouts),
+        Owner::Custom => custom::create(slug, timeouts),
+        Owner::Catalog | Owner::Unknown => try_create(slug, timeouts).unwrap_or_else(|| {
+            Err(AgentError::Config {
+                message: format!("unknown provider '{slug}'"),
+            })
+        }),
     }
-    if dynamic::display_name(slug).is_some() {
-        return dynamic::create(slug, timeouts);
-    }
-    if crate::providers::custom::base_kind(slug).is_some() {
-        return crate::providers::custom::create(slug, timeouts);
-    }
-    if let Some(catalog) = crate::providers::catalog::try_create(slug, timeouts) {
-        return catalog;
-    }
-    Err(AgentError::Config {
-        message: format!("unknown provider '{slug}'"),
-    })
 }
 
 pub fn provider_available(slug: &str) -> bool {
@@ -342,13 +82,10 @@ pub fn provider_available(slug: &str) -> bool {
 /// catalog-backed slugs consult only the already-warm catalog, so a cold cache
 /// reports them unavailable instead of blocking on a network fetch.
 fn provider_available_offline(slug: &str) -> bool {
-    if ProviderKind::from_str(slug).is_ok()
-        || dynamic::display_name(slug).is_some()
-        || crate::providers::custom::base_kind(slug).is_some()
-    {
-        return provider_available(slug);
+    match Owner::of(slug) {
+        Owner::Builtin(_) | Owner::Script | Owner::Custom => provider_available(slug),
+        Owner::Catalog | Owner::Unknown => available_if_warm(slug),
     }
-    available_if_warm(slug)
 }
 
 pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
@@ -435,7 +172,7 @@ pub struct ModelBatch {
 /// Never blocks on catalog download; catalog-backed providers appear only once
 /// the catalog has warmed in the background.
 pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
-    let mut specs: Vec<String> = crate::manifest::ManifestRegistry::builtins()
+    let mut specs: Vec<String> = ProviderRegistry::builtins()
         .iter()
         .filter(|m| provider_available_offline(m.slug))
         .flat_map(|m| {
@@ -448,17 +185,17 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
     for slug in dynamic::discovered_slugs() {
         specs.extend(dynamic::dynamic_model_specs_for(slug));
     }
-    for spec in crate::providers::custom::declared_model_specs() {
+    for spec in custom::declared_model_specs() {
         if !specs.contains(&spec) {
             specs.push(spec);
         }
     }
     if let Some(catalog) = catalog_providers_if_available() {
         for cat in catalog {
-            if ProviderKind::from_str(&cat.slug).is_ok()
-                || dynamic::base_for_slug(&cat.slug).is_some()
-                || crate::providers::custom::base_kind(&cat.slug).is_some()
-                || CATALOG_BACKED_BUILTINS.contains(&cat.slug.as_str())
+            // Any slug the registry knows was listed above; see
+            // `spec::tests::builtins_are_the_native_and_catalog_backed_slugs`.
+            if ProviderRegistry::get(&cat.slug).is_some()
+                || matches!(Owner::of(&cat.slug), Owner::Script | Owner::Custom)
             {
                 continue;
             }
@@ -485,21 +222,21 @@ pub async fn fetch_all_models(
     let (tx, rx) = flume::unbounded();
     let timeouts = Timeouts::default();
 
-    for manifest in crate::manifest::ManifestRegistry::builtins() {
-        let slug = manifest.slug;
+    for spec in ProviderRegistry::builtins() {
+        let slug = spec.slug;
         let Ok(provider) = smol::unblock(move || provider_for_slug(slug, timeouts)).await else {
             warn!(provider = slug, "failed to create provider, skipping");
             continue;
         };
-        let display_name = manifest.display_name;
+        let display_name = spec.display_name;
         let tx = tx.clone();
         smol::spawn(async move {
             let batch = match provider.list_models().await {
                 Ok(models) => {
                     let mut specs: Vec<String> =
                         models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
-                    crate::model_registry::set_known_models(slug, models);
-                    for entry in manifest.models {
+                    set_known_models(slug, models);
+                    for entry in spec.models {
                         for prefix in entry.prefixes {
                             let spec = format!("{slug}/{prefix}");
                             if !specs.contains(&spec) {
@@ -514,7 +251,7 @@ pub async fn fetch_all_models(
                 }
                 Err(e) => {
                     warn!(provider = slug, error = %e, "failed to list models, using static fallback");
-                    let fallback: Vec<String> = manifest
+                    let fallback: Vec<String> = spec
                         .models
                         .iter()
                         .flat_map(|entry| entry.prefixes.iter())
@@ -567,9 +304,10 @@ pub async fn fetch_all_models(
     smol::spawn(async move {
         let catalog = smol::unblock(catalog_providers).await;
         for cat in catalog {
-            if ProviderKind::from_str(&cat.slug).is_ok()
-                || dynamic::base_for_slug(&cat.slug).is_some()
-                || CATALOG_BACKED_BUILTINS.contains(&cat.slug.as_str())
+            // No `Owner::Custom` here, unlike `available_model_specs` above:
+            // a long-standing asymmetry, changing it is a behaviour change.
+            if ProviderRegistry::get(&cat.slug).is_some()
+                || matches!(Owner::of(&cat.slug), Owner::Script)
             {
                 continue;
             }
@@ -588,10 +326,9 @@ pub async fn fetch_all_models(
     })
     .detach();
 
-    let custom_timeouts = timeouts;
     let tx_custom = tx.clone();
     smol::spawn(async move {
-        let declared = crate::providers::custom::declared_model_specs();
+        let declared = custom::declared_model_specs();
         if !declared.is_empty() {
             let _ = tx_custom
                 .send_async(ModelBatch {
@@ -600,8 +337,7 @@ pub async fn fetch_all_models(
                 })
                 .await;
         }
-        let custom_specs =
-            smol::unblock(move || crate::providers::custom::discover_models(custom_timeouts)).await;
+        let custom_specs = smol::unblock(move || custom::discover_models(timeouts)).await;
         if !custom_specs.is_empty() {
             let _ = tx_custom
                 .send_async(ModelBatch {

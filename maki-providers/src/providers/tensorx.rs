@@ -4,37 +4,90 @@ use flume::Sender;
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
-use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
+use maki_config::providers::Protocol;
+
+use crate::model::{Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::aperture::DEFAULT_PATH_PREFIX;
+use crate::spec::{
+    ApertureRoute, AuthDoc, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs, LoginConfig, Native,
+    ProviderSpec,
+};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, deepseek};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, deepseek};
 
 /// TensorX namespaces resold models by vendor, so DeepSeek ids arrive as
 /// `deepseek/deepseek-flash`.
 const DEEPSEEK_VENDOR_PREFIX: &str = "deepseek/";
 
+const SLUG: &str = "tensorx";
+const DISPLAY_NAME: &str = "TensorX";
+const ENV_VAR: &str = "TENSORX_API_KEY";
+const BASE_URL: &str = "https://api.tensorx.ai/v1";
+const DEFAULT_MODEL: &str = "tensorx/z-ai/glm-5.2";
+const LOGIN_URL: &str = "https://tensorx.ai";
+const MAX_TOKENS_FIELD: &str = "max_tokens";
+const FEATURES: &str = "Open-weight models, zero data retention, prompt caching";
+
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "tensorx",
-    api_key_env: "TENSORX_API_KEY",
-    base_url: "https://api.tensorx.ai/v1",
-    max_tokens_field: "max_tokens",
+    slug: SLUG,
+    api_key_env: ENV_VAR,
+    base_url: BASE_URL,
+    max_tokens_field: MAX_TOKENS_FIELD,
     include_stream_usage: true,
-    provider_name: "TensorX",
+    provider_name: DISPLAY_NAME,
 };
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "tensorx",
-    display_name: "TensorX",
-    protocol: maki_config::providers::Protocol::Openai,
-    default_base_url: "https://api.tensorx.ai/v1",
-    default_api_key_env: "TENSORX_API_KEY",
-    default_model: "tensorx/z-ai/glm-5.2",
-    plans: None,
-    login_url: Some("https://tensorx.ai"),
-    needs_url: false,
-});
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: None,
+    fallback_context_window: 200_000,
+    models: models(),
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: Some(ApertureRoute {
+            path_prefix: DEFAULT_PATH_PREFIX,
+        }),
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Openai,
+        default_base_url: BASE_URL,
+        default_model: DEFAULT_MODEL,
+        plans: None,
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[BASE_URL],
+        features: Some(FEATURES),
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Discovered(GENERIC_DISCOVERY_NOTE),
+        trailing_notes: &[],
+    },
+};
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(TensorX::new(timeouts)?))
+}
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(TensorX::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
+
+inventory::submit!(SPEC.config_row());
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     &[]
@@ -55,10 +108,13 @@ pub struct TensorX {
 
 impl TensorX {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("tensorx", CONFIG.api_key_env)?;
+        let pool = KeyPool::resolve(CONFIG.slug, CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer("tensorx", pool.current())?)),
+            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
+                CONFIG.slug,
+                pool.current(),
+            )?)),
             key_pool: Some(pool),
             system_prefix: None,
         })

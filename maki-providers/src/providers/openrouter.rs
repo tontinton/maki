@@ -4,40 +4,96 @@ use flume::Sender;
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
-use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
+use maki_config::providers::Protocol;
+
+use crate::model::{Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::aperture::DEFAULT_PATH_PREFIX;
+use crate::spec::{
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+};
 use crate::{
     AgentError, Effort, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
     dialect,
 };
 
 use super::openai_compat::{MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 
 const REFERER: &str = "https://maki.sh";
 const APP_TITLE: &str = "maki";
 const PER_MILLION: f64 = 1_000_000.0;
 
+const SLUG: &str = "openrouter";
+const DISPLAY_NAME: &str = "OpenRouter";
+const ENV_VAR: &str = "OPENROUTER_API_KEY";
+const BASE_URL: &str = "https://openrouter.ai/api/v1";
+const DEFAULT_MODEL: &str = "openrouter/openai/gpt-5.5";
+const LOGIN_URL: &str = "https://openrouter.ai/keys";
+const MAX_TOKENS_FIELD: &str = "max_tokens";
+const FEATURES: &str = "300+ models from all providers, prompt caching, provider routing";
+
+const DISCOVERY_NOTE: &str = "OpenRouter aggregates models from many providers behind a single API key. \
+     Browse available models at [openrouter.ai/models](https://openrouter.ai/models). \
+     Use any model ID directly (e.g. `openrouter/anthropic/claude-sonnet-4`).";
+
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "openrouter",
-    api_key_env: "OPENROUTER_API_KEY",
-    base_url: "https://openrouter.ai/api/v1",
-    max_tokens_field: "max_tokens",
+    slug: SLUG,
+    api_key_env: ENV_VAR,
+    base_url: BASE_URL,
+    max_tokens_field: MAX_TOKENS_FIELD,
     include_stream_usage: true,
-    provider_name: "OpenRouter",
+    provider_name: DISPLAY_NAME,
 };
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "openrouter",
-    display_name: "OpenRouter",
-    protocol: maki_config::providers::Protocol::Openai,
-    default_base_url: "https://openrouter.ai/api/v1",
-    default_api_key_env: "OPENROUTER_API_KEY",
-    default_model: "openrouter/openai/gpt-5.5",
-    plans: None,
-    login_url: Some("https://openrouter.ai/keys"),
-    needs_url: false,
-});
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(128_000),
+    fallback_context_window: 200_000,
+    models: models(),
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: Some(ApertureRoute {
+            path_prefix: DEFAULT_PATH_PREFIX,
+        }),
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Openai,
+        default_base_url: BASE_URL,
+        default_model: DEFAULT_MODEL,
+        plans: None,
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[BASE_URL],
+        features: Some(FEATURES),
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Discovered(DISCOVERY_NOTE),
+        trailing_notes: &[],
+    },
+};
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(OpenRouter::new(timeouts)?))
+}
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(OpenRouter::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
+
+inventory::submit!(SPEC.config_row());
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     &[]
@@ -196,10 +252,8 @@ impl Provider for OpenRouter {
 
             body["cache_control"] = json!({"type": "ephemeral"});
 
-            let reasoning_info = crate::model_registry::provider_info::<OpenRouterModelInfo>(
-                "openrouter",
-                &model.id,
-            );
+            let reasoning_info =
+                crate::model_registry::provider_info::<OpenRouterModelInfo>(CONFIG.slug, &model.id);
 
             let effort_dialect = effort_dialect(reasoning_info.as_deref());
             if model.supports_thinking()

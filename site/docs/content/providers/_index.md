@@ -330,7 +330,6 @@ Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailsca
 
 No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
 
-
 ## Model Identifiers
 
 Models are referenced as `provider/model_id`:

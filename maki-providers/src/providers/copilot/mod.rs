@@ -17,27 +17,76 @@ use crate::model::{
     Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelTier, lookup_entry,
 };
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::{ResolvedAuth, Timeouts};
+use crate::spec::{AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
 use crate::{
     AgentError, Effort, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
     ThinkingConfig, dialect,
 };
+use maki_config::providers::Protocol;
 
 pub mod auth;
 
 const SLUG: &str = "copilot";
+const DISPLAY_NAME: &str = "Copilot";
+const ENV_VAR: &str = "GH_COPILOT_TOKEN";
 const DEFAULT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
+const DEFAULT_MODEL: &str = "copilot/gpt-5.6-terra";
+const LOGIN_URL: &str = "https://github.com/settings/copilot";
+/// Prose, not a value: the real endpoint is discovered over GraphQL.
+const DOC_API_URL: &str =
+    "https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)";
+const FEATURES: &str = "Native Copilot Chat HTTP API with model endpoint discovery";
+const AUTH_NOTE: &str = "(or run `maki auth login copilot` to import a token from gh CLI, the Copilot client, or the system keyring)";
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
+/// No Aperture route: Copilot's auth is GraphQL-discovered, not a clean proxy
+/// target.
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     slug: SLUG,
-    display_name: "Copilot",
-    protocol: maki_config::providers::Protocol::Openai,
-    default_base_url: DEFAULT_API_ENDPOINT,
-    default_api_key_env: "GH_COPILOT_TOKEN",
-    default_model: "copilot/gpt-5.6-terra",
-    plans: None,
-    login_url: Some("https://github.com/settings/copilot"),
-    needs_url: false,
-});
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Generic,
+    supports_thinking: false,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(100_000),
+    fallback_context_window: 200_000,
+    models: models(),
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: None,
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Openai,
+        default_base_url: DEFAULT_API_ENDPOINT,
+        default_model: DEFAULT_MODEL,
+        plans: None,
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[DOC_API_URL],
+        features: Some(FEATURES),
+        auth: AuthDoc::EnvVarWith(AUTH_NOTE),
+        catalog: CatalogDoc::Table,
+        trailing_notes: &[],
+    },
+};
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(Copilot::new(timeouts)?))
+}
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(Copilot::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
+
+inventory::submit!(SPEC.config_row());
 const GRAPHQL_QUERY: &str = "query { viewer { copilotEndpoints { api } } }";
 const API_VERSION_HEADER: &str = "2025-10-01";
 const EDITOR_VERSION_HEADER: &str = concat!("Maki/", env!("CARGO_PKG_VERSION"));
@@ -671,7 +720,7 @@ impl CopilotModel {
     /// `/models` reports prices in AI credits per billing batch (1 credit =
     /// $0.01), scaled to USD per 1M tokens for [`ModelPricing`]. The endpoint
     /// exposes only the default context tier and cached-input reads; cache
-    /// writes are inherited from the static manifest by id prefix so cost
+    /// writes are inherited from the static spec by id prefix so cost
     /// accounting matches the offline path.
     fn pricing(&self) -> Option<ModelPricing> {
         let token_prices = self.billing.token_prices.as_ref()?;
@@ -994,7 +1043,7 @@ mod tests {
 
     use super::*;
     use crate::TokenUsage;
-    use crate::manifest::ManifestRegistry;
+    use crate::spec::ProviderRegistry;
     use test_case::test_case;
 
     #[test]
@@ -1106,7 +1155,7 @@ mod tests {
         assert_eq!(defaults.len(), 1);
         assert_eq!(defaults[0].prefixes[0], expected_prefix);
         assert_eq!(
-            ManifestRegistry::find_default_for_tier("copilot", tier)
+            ProviderRegistry::find_default_for_tier("copilot", tier)
                 .unwrap()
                 .prefixes[0],
             expected_prefix

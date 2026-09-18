@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -12,32 +11,17 @@ use maki_storage::auth::lock_exclusive;
 use maki_storage::id::SessionRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use strum::IntoEnumIterator;
 use tracing::{debug, warn};
 
-use crate::manifest::ManifestRegistry;
 use crate::model::{Model, ModelPricing, ModelTier, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider, ProviderKind};
+use crate::provider::{BoxFuture, Provider};
+use crate::spec::{ProviderRegistry, ProviderSpec};
 use crate::types::ThinkingFields;
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
 use super::ResolvedAuth;
-use super::anthropic::Anthropic;
-use super::aperture::Aperture;
-use super::copilot::Copilot;
-use super::deepseek::DeepSeek;
-use super::google::Google;
-use super::local::{LLAMACPP, LocalEndpoint, OLLAMA};
-use super::mistral::Mistral;
-use super::openai::OpenAi;
-use super::opencode::Opencode;
-use super::openrouter::OpenRouter;
-use super::regolo::Regolo;
-use super::requesty::Requesty;
-use super::synthetic::Synthetic;
-use super::tensorx::TensorX;
-use super::xai::Xai;
-use super::zai::Zai;
+use super::local::{LLAMACPP, OLLAMA};
+use super::openai;
 
 const INFO_TIMEOUT: Duration = Duration::from_secs(5);
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,11 +29,14 @@ const PROVIDERS_DIR: &str = "providers";
 const SCRIPT_CACHE_FILE: &str = "provider-scripts.json";
 const THINKING_FIELDS_KEY: &str = "thinking_fields";
 const RELOAD_SUBCOMMAND: &str = "reload";
+/// The only bases whose codecs merge `thinking_fields` into the request body.
+/// Anywhere else the fields vanish without a trace, so `build_meta` warns.
+const THINKING_FIELDS_BASES: &[&str] = &[LLAMACPP.slug, OLLAMA.slug, openai::SLUG];
 
 struct DynamicProviderMeta {
     slug: String,
     display_name: String,
-    base: ProviderKind,
+    base: &'static ProviderSpec,
     system_prefix: Option<String>,
     has_auth: bool,
     script_path: PathBuf,
@@ -90,12 +77,18 @@ struct ScriptModel {
 }
 
 impl ScriptModel {
-    fn to_model(&self, slug: &str, base: ProviderKind, id: String, tier: ModelTier) -> Model {
+    fn to_model(
+        &self,
+        slug: &str,
+        base: &'static ProviderSpec,
+        id: String,
+        tier: ModelTier,
+    ) -> Model {
         Model {
             id,
             provider: Arc::from(slug),
             tier,
-            family: base.family(),
+            family: base.family,
             supports_tool_examples_override: self.supports_tool_examples,
             thinking_override: ThinkingSupport::from_flags(
                 self.supports_thinking,
@@ -146,8 +139,12 @@ fn is_valid_slug(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// The slugs a script may not claim. Catalog-backed builtins are left out on
+/// purpose; reserving those too would change behaviour.
 fn builtin_slugs() -> Vec<String> {
-    ProviderKind::iter().map(|k| k.to_string()).collect()
+    ProviderRegistry::native_slugs()
+        .map(str::to_string)
+        .collect()
 }
 
 fn providers_dir() -> Option<PathBuf> {
@@ -324,12 +321,9 @@ fn build_meta(
         }
     };
 
-    let base = match ProviderKind::from_str(&info.base) {
-        Ok(k) => k,
-        Err(_) => {
-            warn!(slug, base = info.base, "unknown base provider, skipping");
-            return None;
-        }
+    let Some(base) = ProviderRegistry::get(&info.base).filter(|s| s.is_native()) else {
+        warn!(slug, base = info.base, "unknown base provider, skipping");
+        return None;
     };
 
     // Entry by entry, so one bad model never costs the whole list.
@@ -366,12 +360,8 @@ fn build_meta(
         None => Vec::new(),
     };
 
-    // Only these bases merge the fragments into the body. Anywhere else the
-    // fields would vanish without a trace.
-    if !matches!(
-        base,
-        ProviderKind::LlamaCpp | ProviderKind::Ollama | ProviderKind::OpenAi
-    ) && let Some(model) = models.iter().find(|m| m.thinking_fields.is_some())
+    if !THINKING_FIELDS_BASES.contains(&base.slug)
+        && let Some(model) = models.iter().find(|m| m.thinking_fields.is_some())
     {
         warn!(
             slug,
@@ -551,71 +541,13 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
     let resolved = resolve_auth(meta)?;
     let auth = Arc::new(Mutex::new(resolved));
 
-    let inner: Box<dyn Provider> = match meta.base {
-        ProviderKind::Anthropic => Box::new(
-            Anthropic::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::OpenAi => Box::new(
-            OpenAi::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Google => Box::new(Google::with_auth(auth.clone(), timeouts)),
-        ProviderKind::Copilot => Box::new(
-            Copilot::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Ollama => Box::new(
-            LocalEndpoint::with_auth(&OLLAMA, auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::LlamaCpp => Box::new(
-            LocalEndpoint::with_auth(&LLAMACPP, auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Mistral => Box::new(
-            Mistral::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Zai => Box::new(
-            Zai::with_auth(auth.clone(), timeouts).with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Synthetic => Box::new(
-            Synthetic::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Regolo => Box::new(
-            Regolo::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::DeepSeek => Box::new(
-            DeepSeek::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::OpenRouter => Box::new(
-            OpenRouter::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Requesty => Box::new(
-            Requesty::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::TensorX => Box::new(
-            TensorX::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Opencode => Box::new(
-            Opencode::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Xai => Box::new(
-            Xai::with_auth(auth.clone(), timeouts).with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Aperture => Box::new(
-            Aperture::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
+    // `build_meta` rejects a base that is not native, so this always resolves.
+    let Some(native) = meta.base.native else {
+        return Err(AgentError::Config {
+            message: format!("base provider '{}' has no constructor", meta.base.slug),
+        });
     };
+    let inner = (native.with_auth)(auth.clone(), timeouts, meta.system_prefix.clone());
 
     Ok(Box::new(DynamicProvider {
         slug: &meta.slug,
@@ -636,10 +568,8 @@ pub fn dynamic_model_specs_for(slug: &str) -> Vec<String> {
         return Vec::new();
     };
     if meta.models.is_empty() {
-        let base_slug = meta.base.to_string();
-        ManifestRegistry::get(&base_slug)
-            .map(|m| m.models)
-            .unwrap_or(&[])
+        meta.base
+            .models
             .iter()
             .flat_map(|entry| entry.prefixes.iter())
             .map(|prefix| format!("{slug}/{prefix}"))
@@ -656,7 +586,7 @@ pub fn discovered_slugs() -> Vec<&'static str> {
     discover().iter().map(|m| m.slug.as_str()).collect()
 }
 
-pub fn base_for_slug(slug: &str) -> Option<ProviderKind> {
+pub fn base_for_slug(slug: &str) -> Option<&'static ProviderSpec> {
     find_meta(slug).map(|m| m.base)
 }
 
@@ -946,12 +876,8 @@ mod tests {
         assert_eq!(model.tier, ModelTier::Strong);
         assert_eq!(model.supports_tool_examples, Some(true));
         assert!(model.pricing.is_some());
-        let resolved = model.to_model(
-            "dynamic",
-            ProviderKind::LlamaCpp,
-            model.id.clone(),
-            model.tier,
-        );
+        let base = ProviderRegistry::get(LLAMACPP.slug).unwrap();
+        let resolved = model.to_model("dynamic", base, model.id.clone(), model.tier);
         let mut body = serde_json::json!({});
         crate::ThinkingConfig::Adaptive.apply_thinking(
             &mut body,
@@ -1015,7 +941,7 @@ mod tests {
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].slug, "test-provider");
         assert_eq!(providers[0].display_name, "Test");
-        assert_eq!(providers[0].base, ProviderKind::Anthropic);
+        assert_eq!(providers[0].base.slug, "anthropic");
         assert!(providers[0].has_auth);
         assert!(providers[0].models.is_empty());
     }
@@ -1152,20 +1078,20 @@ esac
     }
 
     #[cfg(unix)]
-    #[test_case("ollama", ProviderKind::Ollama ; "base_ollama")]
-    #[test_case("llama-cpp", ProviderKind::LlamaCpp ; "base_llama_cpp")]
-    #[test_case("mistral", ProviderKind::Mistral ; "base_mistral")]
-    #[test_case("zai", ProviderKind::Zai ; "base_zai")]
-    #[test_case("synthetic", ProviderKind::Synthetic ; "base_synthetic")]
-    #[test_case("deepseek", ProviderKind::DeepSeek ; "base_deepseek")]
-    #[test_case("opencode", ProviderKind::Opencode ; "base_opencode")]
-    #[test_case("xai", ProviderKind::Xai ; "base_xai")]
-    fn discover_accepts_all_bases(base: &str, expected: ProviderKind) {
+    #[test_case("ollama" ; "base_ollama")]
+    #[test_case("llama-cpp" ; "base_llama_cpp")]
+    #[test_case("mistral" ; "base_mistral")]
+    #[test_case("zai" ; "base_zai")]
+    #[test_case("synthetic" ; "base_synthetic")]
+    #[test_case("deepseek" ; "base_deepseek")]
+    #[test_case("opencode" ; "base_opencode")]
+    #[test_case("xai" ; "base_xai")]
+    fn discover_accepts_all_bases(base: &str) {
         let tmp = TempDir::new().unwrap();
         let info = format!(r#"{{"display_name": "Test", "base": "{base}", "has_auth": false}}"#);
         write_script(tmp.path(), "custom-test", &info);
         let providers = discover_in(tmp.path());
         assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0].base, expected);
+        assert_eq!(providers[0].base.slug, base);
     }
 }

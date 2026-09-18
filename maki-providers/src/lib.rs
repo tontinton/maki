@@ -1,12 +1,12 @@
 pub(crate) mod error;
 pub(crate) mod image;
-pub mod manifest;
 pub mod model;
 pub mod model_registry;
 pub mod pricing;
 pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
+pub mod spec;
 pub mod tokens;
 pub(crate) mod types;
 

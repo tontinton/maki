@@ -1,9 +1,7 @@
 use maki_providers::Effort;
-use maki_providers::manifest::ManifestRegistry;
 use maki_providers::model::{ModelEntry, ModelTier};
-use maki_providers::provider::ProviderKind;
+use maki_providers::spec::{AuthDoc, CatalogDoc, ProviderRegistry, ProviderSpec};
 use std::fmt::Write;
-use strum::IntoEnumIterator;
 
 const FRONT_MATTER: &str = r#"+++
 title = "Providers"
@@ -38,49 +36,6 @@ base_url = "http://xxxx:1234/v1"
 ```
 
 The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those."#;
-
-const LONG_CONTEXT_NOTE: &str = r#"Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token context window."#;
-
-const BEDROCK_NOTE: &str = r#"#### Amazon Bedrock
-
-If you already use Claude through AWS Bedrock, you can point Maki at it instead of the direct Anthropic API. Set `CLAUDE_CODE_USE_BEDROCK=1` and Maki will route all Anthropic requests through Bedrock. The same models, the same features, just a different door.
-
-You will need `AWS_REGION` and one of the following for auth:
-
-| Method | Env vars |
-|--------|----------|
-| IAM credentials | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) |
-| Credentials file | `AWS_PROFILE` (defaults to `default`), reads `~/.aws/credentials` |
-| Bearer token | `AWS_BEARER_TOKEN_BEDROCK` |
-| Gateway proxy | `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1` + `ANTHROPIC_BEDROCK_BASE_URL` (skips signing, useful behind a proxy that handles auth) |
-
-You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROPIC_BEDROCK_BASE_URL`. These env var names match Claude Code, so if you were already using Bedrock there, the same setup works here."#;
-
-const XAI_OAUTH_NOTE: &str = r#"OAuth uses the same first-party xAI client as the official Grok CLI (`maki auth login xai`). Browser login (PKCE) is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically. After login, Maki fetches your account catalog from `GET /v1/models-v2` on the Grok CLI proxy and caches it for 15 minutes. `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth proxy.
-
-If `~/.grok/auth.json` already exists, login offers to reuse it without writing that file."#;
-
-const OPENAI_OAUTH_NOTE: &str = r#"`maki auth login openai` offers browser login (PKCE, callback on `localhost:1455`) and device code login. Browser is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically.
-
-With ChatGPT OAuth the model list comes from the Codex backend's own `/models` endpoint, so a model your plan gains shows up without a Maki update, with the context window and reasoning levels the backend declares for it. The table above is the offline fallback. The endpoint hides models newer than the Codex CLI version Maki reports, so a brand new release can lag until that version is bumped."#;
-
-const OPENCODE_FREE_MODELS_NOTE: &str = r#"By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/maki/providers.toml`:
-
-```toml
-[opencode]
-enable_free_models = true
-```
-
-The default is `false`."#;
-
-const OPENCODE_GO_SECTION: &str = r#"### Opencode Go
-
-- **Env var**: `OPENCODE_API_KEY`
-- **API**: `https://opencode.ai/zen/go/v1`
-- **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API
-
-No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
-"#;
 
 const MODEL_IDENTIFIERS: &str = r#"## Model Identifiers
 
@@ -292,7 +247,9 @@ Maki sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI
 }
 
 fn dynamic_providers_section() -> String {
-    let valid_values: Vec<String> = ProviderKind::iter().map(|k| format!("`{k}`")).collect();
+    let valid_values: Vec<String> = ProviderRegistry::native_slugs()
+        .map(|slug| format!("`{slug}`"))
+        .collect();
     let efforts: Vec<String> = Effort::ALL.iter().map(|e| format!("`{e}`")).collect();
 
     format!(
@@ -384,102 +341,6 @@ fn format_context(entry: &ModelEntry) -> String {
     }
 }
 
-struct ProviderSection {
-    kind: ProviderKind,
-    name: &'static str,
-    auth_line: String,
-    urls: Vec<&'static str>,
-    features: Option<&'static str>,
-    entries: &'static [ModelEntry],
-}
-
-fn format_auth(kind: ProviderKind) -> String {
-    let env = kind.api_key_env();
-    if kind == ProviderKind::Ollama {
-        format!("`OLLAMA_HOST` for local/remote (e.g. `http://localhost:11434`), `{env}` for auth")
-    } else if kind == ProviderKind::Aperture {
-        "`APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`)".into()
-    } else {
-        format!("`{env}`")
-    }
-}
-
-fn build_sections() -> Vec<ProviderSection> {
-    let mut sections = Vec::new();
-
-    for kind in ProviderKind::iter() {
-        match kind {
-            ProviderKind::Zai => {
-                sections.push(ProviderSection {
-                    kind: ProviderKind::Zai,
-                    name: "Z.AI",
-                    auth_line: format!(
-                        "{} (shared across both endpoints)",
-                        format_auth(ProviderKind::Zai)
-                    ),
-                    urls: vec![
-                        ProviderKind::Zai.base_url(),
-                        "https://api.z.ai/api/coding/paas/v4",
-                    ],
-                    features: ProviderKind::Zai.features(),
-                    entries: ManifestRegistry::get("zai").unwrap().models,
-                });
-            }
-            ProviderKind::OpenAi => {
-                sections.push(ProviderSection {
-                    kind,
-                    name: kind.display_name(),
-                    auth_line: format!(
-                        "{} (also supports OAuth via `maki auth login openai`)",
-                        format_auth(kind)
-                    ),
-                    urls: vec![kind.base_url()],
-                    features: kind.features(),
-                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
-                });
-            }
-            ProviderKind::Xai => {
-                sections.push(ProviderSection {
-                    kind,
-                    name: kind.display_name(),
-                    auth_line: format!(
-                        "{} (also supports OAuth via `maki auth login xai`)",
-                        format_auth(kind)
-                    ),
-                    urls: vec![kind.base_url(), "https://cli-chat-proxy.grok.com/v1"],
-                    features: kind.features(),
-                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
-                });
-            }
-            ProviderKind::Copilot => {
-                sections.push(ProviderSection {
-                    kind,
-                    name: kind.display_name(),
-                    auth_line: format!(
-                        "{} (or run `maki auth login copilot` to import a token from gh CLI, the Copilot client, or the system keyring)",
-                        format_auth(kind)
-                    ),
-                    urls: vec![kind.base_url()],
-                    features: kind.features(),
-                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
-                });
-            }
-            _ => {
-                sections.push(ProviderSection {
-                    kind,
-                    name: kind.display_name(),
-                    auth_line: format_auth(kind),
-                    urls: vec![kind.base_url()],
-                    features: kind.features(),
-                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
-                });
-            }
-        }
-    }
-
-    sections
-}
-
 fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
     let _ = writeln!(
         out,
@@ -528,62 +389,31 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
     }
 }
 
-fn no_catalog_note(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::Ollama => {
-            "This provider talks the OpenAI-compatible `/v1` API, so it also works with \
-             llama.cpp's server, LocalAI, or anything else that speaks the same protocol. \
-             Just point `OLLAMA_HOST` to the right address \
-             (e.g. `http://localhost:8080` for llama.cpp)."
-        }
-        ProviderKind::LlamaCpp => {
-            "Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` \
-             to your server address (defaults to `http://localhost:8080`)."
-        }
-        ProviderKind::Aperture => {
-            "Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailscale Aperture \
-             endpoint (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth."
-        }
-        ProviderKind::OpenRouter => {
-            "OpenRouter aggregates models from many providers behind a single API key. \
-             Browse available models at [openrouter.ai/models](https://openrouter.ai/models). \
-             Use any model ID directly (e.g. `openrouter/anthropic/claude-sonnet-4`)."
-        }
-        ProviderKind::Requesty => {
-            "Requesty routes 700+ models from many providers behind a single API key. \
-             Models are listed live from the API: curated managed policies first \
-             (short ids such as `requesty/claude-sonnet-4-5` or `requesty/gpt-5.4-mini`, \
-             `@eu` variants route only through EU providers), then the full \
-             `<vendor>/<model>` catalog (e.g. `requesty/openai/gpt-4o-mini`). \
-             Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). \
-             Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all \
-             traffic in the EU."
-        }
-        _ => "No hardcoded model catalog. Use any model ID supported by this provider.",
-    }
-}
+fn write_section(out: &mut String, spec: &ProviderSpec) {
+    let docs = &spec.docs;
+    let _ = writeln!(out, "### {}\n", spec.display_name);
+    let auth_line = match docs.auth {
+        AuthDoc::EnvVar => format!("`{}`", spec.api_key_env),
+        AuthDoc::EnvVarWith(note) => format!("`{}` {note}", spec.api_key_env),
+        AuthDoc::Custom(line) => line.to_string(),
+    };
+    let _ = writeln!(out, "- **Env var**: {auth_line}");
 
-fn write_section(out: &mut String, section: &ProviderSection) {
-    let _ = writeln!(out, "### {}\n", section.name);
-    let _ = writeln!(out, "- **Env var**: {}", section.auth_line);
-
-    if section.urls.len() == 1 {
-        let _ = writeln!(out, "- **API**: `{}`", section.urls[0]);
+    if let [url] = docs.api_urls {
+        let _ = writeln!(out, "- **API**: `{url}`");
     } else {
         let _ = writeln!(out, "- **API endpoints**:");
-        for url in &section.urls {
+        for url in docs.api_urls {
             let _ = writeln!(out, "  - `{url}`");
         }
     }
 
-    if let Some(features) = section.features {
+    if let Some(features) = docs.features {
         let _ = writeln!(out, "- **Features**: {features}");
     }
 
     // Rendered from the schedule, so the docs cannot drift from what we bill.
-    if let Some(schedule) = ManifestRegistry::get(&section.kind.to_string())
-        .and_then(|manifest| manifest.pricing_schedule)
-    {
+    if let Some(schedule) = spec.pricing_schedule {
         let _ = writeln!(
             out,
             "- **Peak pricing**: the prices below are off-peak; each turn is billed as it happens, at {schedule}"
@@ -592,27 +422,15 @@ fn write_section(out: &mut String, section: &ProviderSection) {
 
     let _ = writeln!(out);
 
-    if section.entries.is_empty() {
-        let _ = writeln!(out, "{}", no_catalog_note(section.kind));
-    } else {
-        write_model_table(out, section.entries);
+    match docs.catalog {
+        CatalogDoc::Table => write_model_table(out, spec.models),
+        CatalogDoc::Discovered(note) => {
+            let _ = writeln!(out, "{note}");
+        }
     }
 
-    if section.name == "Anthropic" {
-        let _ = writeln!(out, "\n{LONG_CONTEXT_NOTE}");
-        let _ = writeln!(out, "\n{BEDROCK_NOTE}");
-    }
-
-    if section.kind == ProviderKind::OpenAi {
-        let _ = writeln!(out, "\n{OPENAI_OAUTH_NOTE}");
-    }
-
-    if section.kind == ProviderKind::Opencode {
-        let _ = writeln!(out, "\n{OPENCODE_FREE_MODELS_NOTE}");
-    }
-
-    if section.kind == ProviderKind::Xai {
-        let _ = writeln!(out, "\n{XAI_OAUTH_NOTE}");
+    for note in docs.trailing_notes {
+        let _ = writeln!(out, "\n{note}");
     }
 }
 
@@ -633,14 +451,11 @@ pub fn generate() -> String {
     let _ = writeln!(out, "{BASE_URL_OVERRIDES}\n");
     let _ = writeln!(out, "## Built-in Providers\n");
 
-    for section in &build_sections() {
-        write_section(&mut out, section);
+    // `BUILTINS` order is the documentation order, stated on the array.
+    for spec in ProviderRegistry::builtins() {
+        write_section(&mut out, spec);
         let _ = writeln!(out);
     }
-
-    // Opencode Go is catalog-backed (no ProviderKind), so it gets a static
-    // section right after Opencode Zen, which is the last built-in section.
-    let _ = writeln!(out, "{OPENCODE_GO_SECTION}\n");
 
     let _ = writeln!(out, "{MODEL_IDENTIFIERS}\n");
     let _ = writeln!(out, "{}\n", providers_toml_section());

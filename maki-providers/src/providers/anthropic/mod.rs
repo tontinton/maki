@@ -15,13 +15,19 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::model::Model;
+use maki_config::providers::Protocol;
+
+use crate::model::{Model, ModelFamily};
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::aperture::NO_PATH_PREFIX;
+use crate::spec::{
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
 };
 
-use super::{KeyHeader, KeyPool, KeyRotation};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 
 const API_VERSION: &str = "2023-06-01";
 const API_ORIGIN: &str = "https://api.anthropic.com";
@@ -34,20 +40,86 @@ const MONEY_EXPONENT: u32 = 2;
 const LABEL_SESSION: &str = "Current session";
 const LABEL_WEEK_ALL: &str = "Current week (all models)";
 
+pub(crate) const SLUG: &str = "anthropic";
+pub(crate) const DISPLAY_NAME: &str = "Anthropic";
 const ENV_VAR: &str = "ANTHROPIC_API_KEY";
 const API_KEY_HEADER: &str = "x-api-key";
+const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-6";
+const LOGIN_URL: &str = "https://console.anthropic.com/settings/keys";
+/// The messages endpoint, which is what the docs quote; the provider itself
+/// builds it from [`API_ORIGIN`] plus [`MESSAGES_PATH`].
+const DOC_API_URL: &str = "https://api.anthropic.com/v1/messages";
+const FEATURES: &str = "Prompt caching, thinking mode (adaptive/budgeted), advanced tool use";
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "anthropic",
-    display_name: "Anthropic",
-    protocol: maki_config::providers::Protocol::Anthropic,
-    default_base_url: API_ORIGIN,
-    default_api_key_env: ENV_VAR,
-    default_model: "anthropic/claude-sonnet-4-6",
-    plans: None,
-    login_url: Some("https://console.anthropic.com/settings/keys"),
-    needs_url: false,
-});
+const LONG_CONTEXT_NOTE: &str = r#"Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token context window."#;
+
+const BEDROCK_NOTE: &str = r#"#### Amazon Bedrock
+
+If you already use Claude through AWS Bedrock, you can point Maki at it instead of the direct Anthropic API. Set `CLAUDE_CODE_USE_BEDROCK=1` and Maki will route all Anthropic requests through Bedrock. The same models, the same features, just a different door.
+
+You will need `AWS_REGION` and one of the following for auth:
+
+| Method | Env vars |
+|--------|----------|
+| IAM credentials | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) |
+| Credentials file | `AWS_PROFILE` (defaults to `default`), reads `~/.aws/credentials` |
+| Bearer token | `AWS_BEARER_TOKEN_BEDROCK` |
+| Gateway proxy | `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1` + `ANTHROPIC_BEDROCK_BASE_URL` (skips signing, useful behind a proxy that handles auth) |
+
+You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROPIC_BEDROCK_BASE_URL`. These env var names match Claude Code, so if you were already using Bedrock there, the same setup works here."#;
+
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Claude,
+    supports_thinking: true,
+    accepts_arbitrary_models: false,
+    fallback_max_output: Some(128_000),
+    fallback_context_window: 200_000,
+    models: models(),
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: Some(ApertureRoute {
+            path_prefix: NO_PATH_PREFIX,
+        }),
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Anthropic,
+        default_base_url: API_ORIGIN,
+        default_model: DEFAULT_MODEL,
+        plans: None,
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[DOC_API_URL],
+        features: Some(FEATURES),
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Table,
+        trailing_notes: &[LONG_CONTEXT_NOTE, BEDROCK_NOTE],
+    },
+};
+
+inventory::submit!(SPEC.config_row());
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    if bedrock::is_enabled() {
+        Ok(Box::new(bedrock::Bedrock::new(timeouts)?))
+    } else {
+        Ok(Box::new(Anthropic::new(timeouts)?))
+    }
+}
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(Anthropic::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
 
 pub(crate) use shared::models;
 

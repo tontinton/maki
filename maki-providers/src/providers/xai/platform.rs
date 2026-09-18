@@ -18,7 +18,7 @@ use crate::{
 use super::{auth, catalog};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "xai",
+    slug: super::SLUG,
     api_key_env: auth::API_KEY_ENV,
     base_url: "https://api.x.ai/v1",
     max_tokens_field: "max_tokens",
