@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -73,6 +75,7 @@ const CONFIRM_DENY_PROJECT_SESSION_HINTS: &[(&str, &str)] = &[
 ];
 
 const DENY_GUIDANCE_HINTS: &[(&str, &str)] = &[("Enter", "Deny"), ("Esc", "Cancel")];
+const QUEUED_NOTICE: &str = "more request(s) waiting";
 
 fn aligned_hint_rows(rows: &[&[(&str, &str)]]) -> Vec<Line<'static>> {
     let t = theme::current();
@@ -117,40 +120,61 @@ pub(crate) enum PromptState {
     DenyEditing,
 }
 
-pub enum PermissionPrompt {
-    Closed,
-    Open {
-        id: String,
-        tool: ToolKey,
-        scopes: Vec<String>,
-        subagent_id: Option<String>,
-        allow_scopes: Vec<String>,
-        project_trusted: bool,
-        state: PromptState,
-        buffer: TextBuffer,
-    },
+struct Request {
+    id: String,
+    tool: ToolKey,
+    scopes: Vec<String>,
+    subagent_id: Option<String>,
+    allow_scopes: Vec<String>,
+    project_trusted: bool,
+}
+
+/// An answer carries the ask it settles: the agent only accepts one naming the
+/// request it is parked on, and the ask on screen is not always the last one in.
+#[derive(Debug)]
+pub struct AnsweredRequest {
+    pub id: String,
+    pub subagent_id: Option<String>,
+    pub answer: PermissionAnswer,
+}
+
+/// Every request parks a tool call until it is answered, so asks that arrive
+/// while one is on screen queue up behind it instead of replacing it.
+pub struct PermissionPrompt {
+    /// The front is the one on screen; `state` and `buffer` belong to it and
+    /// reset whenever it leaves.
+    queue: VecDeque<Request>,
+    state: PromptState,
+    buffer: TextBuffer,
 }
 
 impl Overlay for PermissionPrompt {
     fn is_open(&self) -> bool {
-        matches!(self, Self::Open { .. })
+        !self.queue.is_empty()
     }
 
     fn is_modal(&self) -> bool {
         false
     }
 
+    /// Only reached when the run those asks belonged to is gone (cancel,
+    /// session switch), which is what unparks their tool calls anyway.
     fn close(&mut self) {
-        *self = Self::Closed;
+        self.queue.clear();
+        self.reset_entry();
     }
 }
 
 impl PermissionPrompt {
     pub fn new() -> Self {
-        Self::Closed
+        Self {
+            queue: VecDeque::new(),
+            state: PromptState::Normal,
+            buffer: TextBuffer::new(String::new()),
+        }
     }
 
-    pub fn open(
+    pub fn push(
         &mut self,
         id: String,
         tool: ToolKey,
@@ -164,45 +188,51 @@ impl PermissionPrompt {
         } else {
             allow_scopes
         };
-        *self = Self::Open {
+        self.queue.push_back(Request {
             id,
             tool,
             scopes,
             subagent_id,
             allow_scopes,
             project_trusted,
-            state: PromptState::Normal,
-            buffer: TextBuffer::new(String::new()),
-        };
+        });
+    }
+
+    fn reset_entry(&mut self) {
+        self.state = PromptState::Normal;
+        self.buffer = TextBuffer::new(String::new());
+    }
+
+    /// A cancelled subagent has nothing left to answer with, so its asks leave
+    /// with it instead of parking the panel on a dead tool call.
+    pub fn drop_subagent(&mut self, subagent_id: &str) {
+        let owns = |request: &Request| request.subagent_id.as_deref() == Some(subagent_id);
+        if self.queue.front().is_some_and(owns) {
+            self.reset_entry();
+        }
+        self.queue.retain(|request| !owns(request));
     }
 
     pub(crate) fn tool(&self) -> Option<&ToolKey> {
-        match self {
-            Self::Open { tool, .. } => Some(tool),
-            Self::Closed => None,
-        }
+        self.queue.front().map(|request| &request.tool)
     }
 
-    /// The ask the agent is parked on. Its answer has to name it, or the agent
-    /// refuses it as one meant for some other request.
-    pub fn request_id(&self) -> Option<&str> {
-        match self {
-            Self::Open { id, .. } => Some(id),
-            Self::Closed => None,
-        }
+    pub fn handle_key(&mut self, key: KeyEvent) -> Option<AnsweredRequest> {
+        let answer = self.key_answer(key)?;
+        let request = self.queue.pop_front()?;
+        self.reset_entry();
+        Some(AnsweredRequest {
+            id: request.id,
+            subagent_id: request.subagent_id,
+            answer,
+        })
     }
 
-    pub fn subagent_id(&self) -> Option<&str> {
-        match self {
-            Self::Open { subagent_id, .. } => subagent_id.as_deref(),
-            Self::Closed => None,
-        }
-    }
-
-    pub fn handle_key(&mut self, key: KeyEvent) -> Option<PermissionAnswer> {
-        let Self::Open { state, buffer, .. } = self else {
+    fn key_answer(&mut self, key: KeyEvent) -> Option<PermissionAnswer> {
+        if !self.is_open() {
             return None;
-        };
+        }
+        let (state, buffer) = (&mut self.state, &mut self.buffer);
         if is_ctrl(&key) && key.code == KeyCode::Char('c') {
             return Some(PermissionAnswer::Deny);
         }
@@ -281,30 +311,26 @@ impl PermissionPrompt {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        let Self::Open { state, buffer, .. } = self else {
+        if !self.is_open() || self.state != PromptState::DenyEditing {
             return false;
-        };
-        if *state == PromptState::DenyEditing {
-            buffer.insert_text(text);
-            return true;
         }
-        false
+        self.buffer.insert_text(text);
+        true
     }
 
     fn build_lines(&self) -> Vec<Line<'static>> {
-        let Self::Open {
+        let Some(Request {
             tool,
             scopes,
             subagent_id,
             allow_scopes,
             project_trusted,
-            state,
-            buffer,
             ..
-        } = self
+        }) = self.queue.front()
         else {
             return vec![];
         };
+        let (state, buffer) = (&self.state, &self.buffer);
         let t = theme::current();
         let label_style = t.tool_dim;
         let value_style = Style::new().fg(t.foreground);
@@ -316,6 +342,14 @@ impl PermissionPrompt {
         tool_spans.push(Span::styled(tool.to_string(), value_style));
 
         let mut lines = vec![Line::raw(""), Line::from(tool_spans)];
+        let waiting = self.queue.len() - 1;
+        if waiting > 0 {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("queue ", label_style),
+                Span::styled(format!("{waiting} {QUEUED_NOTICE}"), t.item_desc),
+            ]));
+        }
         for (i, s) in scopes.iter().enumerate() {
             let label = if i == 0 { "scope " } else { "    + " };
             lines.push(Line::from(vec![
@@ -438,18 +472,37 @@ mod tests {
 
     use super::{
         CONFIRM_ALLOW_PROJECT_HINTS, CONFIRM_ALLOW_PROJECT_SESSION_HINTS,
-        CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS, PermissionPrompt,
-        PromptState, UNTRUSTED_DURABLE_ANSWER, UNTRUSTED_NOTICE,
+        CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS, Overlay, PermissionPrompt,
+        PromptState, QUEUED_NOTICE, UNTRUSTED_DURABLE_ANSWER, UNTRUSTED_NOTICE,
     };
 
+    const MAIN_ID: &str = "id";
+    const SUB_ID: &str = "id-2";
+    const SUB_AGENT: &str = "sub-2";
+
     fn open_trusted(prompt: &mut PermissionPrompt, project_trusted: bool) {
-        prompt.open(
-            "id".into(),
+        prompt.push(
+            MAIN_ID.into(),
             ToolKey::native("bash"),
             vec!["execute".into()],
             None,
             project_trusted,
         );
+    }
+
+    fn push_subagent_ask(prompt: &mut PermissionPrompt) {
+        prompt.push(
+            SUB_ID.into(),
+            ToolKey::native("read"),
+            vec!["/tmp/x".into()],
+            Some(SUB_AGENT.into()),
+            true,
+        );
+    }
+
+    /// Most tests only care about the answer, not the ask it came back with.
+    fn answer(prompt: &mut PermissionPrompt, key: KeyEvent) -> Option<PermissionAnswer> {
+        prompt.handle_key(key).map(|answered| answered.answer)
     }
 
     fn open_prompt() -> PermissionPrompt {
@@ -478,23 +531,19 @@ mod tests {
     #[test]
     fn ctrl_c_denies() {
         let mut prompt = open_prompt();
-        assert_eq!(prompt.handle_key(ctrl_c()), Some(PermissionAnswer::Deny));
+        assert_eq!(answer(&mut prompt, ctrl_c()), Some(PermissionAnswer::Deny));
         // Also test from editing state
         let mut prompt2 = open_prompt();
         prompt2.handle_key(key(KeyCode::Char('n')));
         prompt2.handle_key(key(KeyCode::Char('t')));
-        assert_eq!(prompt2.handle_key(ctrl_c()), Some(PermissionAnswer::Deny));
+        assert_eq!(answer(&mut prompt2, ctrl_c()), Some(PermissionAnswer::Deny));
     }
 
     #[test]
     fn n_goes_to_deny_editing() {
         let mut prompt = open_prompt();
-        assert_eq!(prompt.handle_key(key(KeyCode::Char('n'))), None);
-        if let PermissionPrompt::Open { state, .. } = &prompt {
-            assert_eq!(*state, PromptState::DenyEditing);
-        } else {
-            panic!("expected Open");
-        }
+        assert_eq!(answer(&mut prompt, key(KeyCode::Char('n'))), None);
+        assert_eq!(prompt.state, PromptState::DenyEditing);
     }
 
     #[test]
@@ -502,13 +551,9 @@ mod tests {
         let mut prompt = open_prompt();
         prompt.handle_key(key(KeyCode::Char('n')));
         prompt.handle_key(key(KeyCode::Char('t')));
-        assert_eq!(prompt.handle_key(key(KeyCode::Esc)), None);
-        if let PermissionPrompt::Open { state, buffer, .. } = &prompt {
-            assert_eq!(*state, PromptState::Normal);
-            assert!(buffer.value().is_empty());
-        } else {
-            panic!("expected Open");
-        }
+        assert_eq!(answer(&mut prompt, key(KeyCode::Esc)), None);
+        assert_eq!(prompt.state, PromptState::Normal);
+        assert!(prompt.buffer.value().is_empty());
     }
 
     #[test]
@@ -516,7 +561,7 @@ mod tests {
         let mut prompt = open_prompt();
         prompt.handle_key(key(KeyCode::Char('n')));
         assert_eq!(
-            prompt.handle_key(key(KeyCode::Enter)),
+            answer(&mut prompt, key(KeyCode::Enter)),
             Some(PermissionAnswer::Deny)
         );
     }
@@ -527,7 +572,7 @@ mod tests {
         prompt.handle_key(key(KeyCode::Char('n')));
         prompt.handle_paste("Use cat");
         assert_eq!(
-            prompt.handle_key(key(KeyCode::Enter)),
+            answer(&mut prompt, key(KeyCode::Enter)),
             Some(PermissionAnswer::DenyWithGuidance("Use cat".into()))
         );
     }
@@ -538,18 +583,64 @@ mod tests {
         assert!(!prompt.handle_paste("ignored"));
         prompt.handle_key(key(KeyCode::Char('n')));
         assert!(prompt.handle_paste("accepted"));
-        if let PermissionPrompt::Open { buffer, .. } = &prompt {
-            assert_eq!(buffer.value(), "accepted");
-        } else {
-            panic!("expected Open");
-        }
+        assert_eq!(prompt.buffer.value(), "accepted");
     }
 
     #[test]
     fn wildcard_tool_key_opens() {
         let mut prompt = PermissionPrompt::new();
-        prompt.open("id".into(), ToolKey::Wildcard, vec![], None, true);
-        assert!(matches!(prompt, PermissionPrompt::Open { .. }));
+        prompt.push(MAIN_ID.into(), ToolKey::Wildcard, vec![], None, true);
+        assert!(prompt.is_open());
+    }
+
+    /// Parallel subagents each park a tool call on their own ask. An ask that
+    /// lands while another is on screen has to wait its turn, not replace it:
+    /// the replaced one would never be answered and its tool call would hang.
+    #[test]
+    fn a_second_request_waits_behind_the_one_on_screen() {
+        let mut prompt = open_prompt();
+        push_subagent_ask(&mut prompt);
+
+        assert!(rendered(&prompt).contains(QUEUED_NOTICE));
+
+        prompt.handle_key(key(KeyCode::Char('n')));
+        prompt.handle_paste("main only");
+        let first = prompt.handle_key(key(KeyCode::Enter)).expect("an answer");
+        assert_eq!(first.id, MAIN_ID);
+        assert_eq!(first.subagent_id, None);
+        assert_eq!(
+            first.answer,
+            PermissionAnswer::DenyWithGuidance("main only".into())
+        );
+
+        assert!(prompt.is_open(), "the queued ask takes the panel");
+        assert!(!rendered(&prompt).contains(QUEUED_NOTICE));
+
+        // 'y' only answers if the half-typed deny left with the ask it was typed
+        // for, otherwise it is still landing in the buffer.
+        let second = prompt
+            .handle_key(key(KeyCode::Char('y')))
+            .expect("an answer");
+        assert_eq!(second.id, SUB_ID);
+        assert_eq!(second.subagent_id.as_deref(), Some(SUB_AGENT));
+        assert_eq!(second.answer, PermissionAnswer::AllowOnce);
+        assert!(!prompt.is_open());
+    }
+
+    #[test]
+    fn a_cancelled_subagent_takes_its_request_with_it() {
+        let mut prompt = PermissionPrompt::new();
+        push_subagent_ask(&mut prompt);
+        open_trusted(&mut prompt, true);
+        prompt.handle_key(key(KeyCode::Char('n')));
+
+        prompt.drop_subagent(SUB_AGENT);
+
+        let answered = prompt
+            .handle_key(key(KeyCode::Char('y')))
+            .expect("the ask behind it moves up with a clean entry state");
+        assert_eq!(answered.id, MAIN_ID);
+        assert!(!prompt.is_open());
     }
 
     /// The always-answers are scoped to the project, and the hint has to say so
@@ -568,12 +659,9 @@ mod tests {
         let mut prompt = PermissionPrompt::new();
         open_trusted(&mut prompt, project_trusted);
 
-        assert_eq!(prompt.handle_key(key(code)), None);
+        assert_eq!(answer(&mut prompt, key(code)), None);
 
-        let PermissionPrompt::Open { state, .. } = &prompt else {
-            panic!("expected Open");
-        };
-        assert_eq!(*state, expected);
+        assert_eq!(prompt.state, expected);
         let text = rendered(&prompt);
         assert!(text.contains(hints[0].1), "hint missing from: {text}");
     }
@@ -595,7 +683,7 @@ mod tests {
             "rendered: {text}"
         );
         assert_eq!(
-            prompt.handle_key(key(KeyCode::Char('a'))),
+            answer(&mut prompt, key(KeyCode::Char('a'))),
             None,
             "the project answer stays available either way"
         );

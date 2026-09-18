@@ -635,12 +635,9 @@ impl App {
         // With both up the permission prompt goes first: a tool is blocked on
         // it and it owns the bottom panel. The pack review waits on nothing.
         if self.permission_prompt.is_open() {
-            if let Some(answer) = self.permission_prompt.handle_key(key) {
-                let subagent_id = self.permission_prompt.subagent_id().map(str::to_owned);
-                let request_id = self.permission_prompt.request_id().unwrap_or_default();
-                let encoded = TaggedAnswer::new(request_id, answer).encode();
-                self.permission_prompt.close();
-                self.send_to_agent(subagent_id.as_deref(), encoded);
+            if let Some(answered) = self.permission_prompt.handle_key(key) {
+                let encoded = TaggedAnswer::new(&answered.id, answered.answer).encode();
+                self.send_to_agent(answered.subagent_id.as_deref(), encoded);
             }
             return Some(vec![]);
         }
@@ -1117,6 +1114,7 @@ impl App {
         self.chats[self.active_chat].cancel_in_progress();
         self.chats[self.active_chat].mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
         self.subagent_answers.remove(&tool_use_id);
+        self.permission_prompt.drop_subagent(&tool_use_id);
 
         vec![Action::CancelSubagent { tool_use_id }]
     }
@@ -1285,7 +1283,7 @@ impl App {
         if let ChatEventResult::PermissionRequest { id, tool, scopes } = result {
             let project_trusted = self.permissions.project_is_trusted();
             self.permission_prompt
-                .open(id, tool, scopes, subagent_id.clone(), project_trusted);
+                .push(id, tool, scopes, subagent_id.clone(), project_trusted);
             return vec![];
         }
 
