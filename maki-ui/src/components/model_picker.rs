@@ -20,6 +20,7 @@ const TITLE: &str = " Models ";
 const RECENT_SECTION: &str = "Recent";
 const FREE_LABEL: &str = "Free";
 const FREE_PREFIX: &str = "Free · ";
+const PRICE_SEPARATOR: &str = " · ";
 
 fn footer_line() -> Line<'static> {
     let t = theme::current();
@@ -70,7 +71,7 @@ struct ModelEntry {
     id: String,
     provider_display: String,
     suffix: Option<String>,
-    tier: String,
+    detail: Option<String>,
     override_tiers: Vec<ModelTier>,
     free: bool,
 }
@@ -85,7 +86,7 @@ impl PickerItem for ModelEntry {
     }
 
     fn detail(&self) -> Option<&str> {
-        Some(&self.tier)
+        self.detail.as_deref()
     }
 
     fn section(&self) -> Option<&str> {
@@ -270,6 +271,23 @@ impl Overlay for ModelPicker {
     }
 }
 
+fn format_pricing(model: &maki_providers::Model) -> Option<String> {
+    let pricing = model.pricing.clone();
+    if pricing.is_zero() {
+        return None;
+    }
+    let format_price = |value: f64| {
+        if value == 0.0 {
+            "$0.00".to_string()
+        } else {
+            format!("${:>6.2}", value)
+        }
+    };
+    let input = format_price(pricing.input);
+    let output = format_price(pricing.output);
+    Some(format!("{input}/{output}"))
+}
+
 fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
     let (provider_str, model_id) = spec.split_once('/')?;
 
@@ -291,23 +309,32 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         };
 
     let override_tiers = model_registry::override_tiers(spec);
-    let (tier, free) = match maki_providers::Model::from_spec(spec) {
-        Ok(m) => (m.tier.to_string(), m.is_free()),
-        Err(_) => (String::new(), false),
-    };
-    let tier = if override_tiers.is_empty() {
-        tier
-    } else {
-        override_tiers
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("/")
-    };
-    let tier = match (free, tier.is_empty()) {
-        (true, true) => FREE_LABEL.to_string(),
-        (true, false) => format!("{FREE_PREFIX}{tier}"),
-        (false, _) => tier,
+    let (free, detail) = match maki_providers::Model::from_spec(spec) {
+        Ok(m) => {
+            let tier = m.tier.to_string();
+            let tier = if override_tiers.is_empty() {
+                tier
+            } else {
+                override_tiers
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("/")
+            };
+            let tier = match (m.is_free(), tier.is_empty()) {
+                (true, true) => FREE_LABEL.to_string(),
+                (true, false) => format!("{FREE_PREFIX}{tier}"),
+                (false, _) => tier,
+            };
+            let detail = match format_pricing(&m) {
+                Some(price) if !tier.is_empty() => Some(format!("{tier}{PRICE_SEPARATOR}{price}")),
+                Some(price) => Some(price),
+                None if !tier.is_empty() => Some(tier.clone()),
+                None => None,
+            };
+            (m.is_free(), detail)
+        }
+        Err(_) => (false, None),
     };
     let id = model_id.to_string();
     Some(ModelEntry {
@@ -315,7 +342,7 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         id,
         provider_display,
         suffix: None,
-        tier,
+        detail,
         override_tiers,
         free,
     })
