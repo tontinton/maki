@@ -8,7 +8,7 @@ use tracing::warn;
 
 use maki_config::providers::Protocol;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelFamily};
 use crate::pricing::{PricingSchedule, PricingWindow};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::aperture::DEFAULT_PATH_PREFIX;
@@ -54,7 +54,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     accepts_arbitrary_models: false,
     fallback_max_output: Some(384_000),
     fallback_context_window: 1_000_000,
-    models: models(),
+    models_toml: include_str!("../../models/deepseek.toml"),
     pricing_schedule: Some(&PEAK_HOURS),
     native: Some(Native {
         new: create,
@@ -94,45 +94,14 @@ fn create_with_auth(
 
 inventory::submit!(SPEC.config_row());
 
-/// Peak hours double every rate, and the tables below quote the off-peak ones.
-/// The weekend stays off-peak around the clock.
+/// Peak hours double every rate, and `models/deepseek.toml` quotes the off-peak
+/// ones. The weekend stays off-peak around the clock.
 /// <https://api-docs.deepseek.com/quick_start/pricing/>
 pub(crate) const PEAK_HOURS: PricingSchedule =
     PricingSchedule::new(PEAK_WINDOWS, PEAK_MULTIPLIER).weekdays_only();
 
 const PEAK_WINDOWS: &[PricingWindow] = &[PricingWindow::hours(1, 4), PricingWindow::hours(6, 10)];
 const PEAK_MULTIPLIER: f64 = 2.0;
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    // Bound through a `const` item rather than returned as a promoted
-    // `&[...]`: rvalue promotion refuses both const fn calls and drop glue,
-    // and `ModelPricing` carries an `Option<Arc<str>>` subsidy tag.
-    const MODELS: &[ModelEntry] = &[
-        // `deepseek-flash` is V4.1 Flash. `deepseek-v4-flash` is the retired
-        // name the API still accepts, served by V4.1 Flash at its rates.
-        ModelEntry {
-            prefixes: &["deepseek-flash", "deepseek-v4-flash"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing::per_million(0.15, 0.60, 0.00, 0.003),
-            max_output_tokens: Some(384_000),
-            context_window: 1_000_000,
-        },
-        ModelEntry {
-            prefixes: &["deepseek-v4-pro"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing::per_million(0.66, 1.98, 0.00, 0.022),
-            max_output_tokens: Some(384_000),
-            context_window: 1_000_000,
-        },
-    ];
-    MODELS
-}
 
 #[derive(Deserialize)]
 struct BalanceResponse {

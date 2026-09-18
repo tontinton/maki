@@ -1,0 +1,238 @@
+# Curated model table for Copilot. Rates are USD per 1M tokens.
+#
+# Fallback pricing used until `/models` reports `billing.token_prices` (or for
+# offline runs). The API wins via discovered metadata; these mirror GitHub's
+# published rates (usage-based billing since June 2026,
+# docs.github.com/copilot/reference/copilot-billing/models-and-pricing), at the
+# default context tier.
+slug = "copilot"
+
+[[model]]
+prefixes = ["gpt-5-mini"]
+tier = "weak"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 0.25, output = 2.0, cache_write = 0.0, cache_read = 0.025 }
+
+[[model]]
+prefixes = ["gpt-5.4-mini"]
+tier = "weak"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 0.75, output = 4.5, cache_write = 0.0, cache_read = 0.075 }
+
+[[model]]
+prefixes = ["gpt-5.4-nano"]
+tier = "weak"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 0.2, output = 1.25, cache_write = 0.0, cache_read = 0.02 }
+
+[[model]]
+prefixes = ["claude-haiku-4.5"]
+tier = "weak"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 64000
+context_window = 200000
+pricing = { input = 1.0, output = 5.0, cache_write = 1.25, cache_read = 0.1 }
+
+[[model]]
+prefixes = ["gemini-3.5-flash"]
+tier = "weak"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 65536
+context_window = 200000
+pricing = { input = 1.5, output = 9.0, cache_write = 0.0, cache_read = 0.15 }
+
+[[model]]
+prefixes = ["gemini-3.6-flash"]
+tier = "medium"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 65536
+context_window = 200000
+pricing = { input = 0.75, output = 3.75, cache_write = 0.0, cache_read = 0.075 }
+
+[[model]]
+prefixes = ["gemini-3.7-flash"]
+tier = "medium"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 65536
+context_window = 200000
+pricing = { input = 0.75, output = 3.75, cache_write = 0.0, cache_read = 0.075 }
+
+[[model]]
+prefixes = ["mai-code-1-flash-picker"]
+tier = "weak"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 0.75, output = 4.5, cache_write = 0.0, cache_read = 0.075 }
+
+[[model]]
+prefixes = ["claude-sonnet-4.5", "claude-sonnet-4.6"]
+tier = "medium"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 64000
+context_window = 200000
+pricing = { input = 3.0, output = 15.0, cache_write = 3.75, cache_read = 0.3 }
+
+[[model]]
+prefixes = ["claude-sonnet-5"]
+tier = "medium"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 2.0, output = 10.0, cache_write = 2.5, cache_read = 0.2 }
+
+[[model]]
+prefixes = ["gpt-5.5"]
+tier = "strong"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 5.0, output = 30.0, cache_write = 0.0, cache_read = 0.5 }
+
+[[model]]
+prefixes = ["kimi-k2.7-code"]
+tier = "medium"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 0.95, output = 4.0, cache_write = 0.0, cache_read = 0.19 }
+
+[[model]]
+prefixes = ["kimi-k3"]
+tier = "strong"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 3.0, output = 15.0, cache_write = 0.0, cache_read = 0.3 }
+
+[[model]]
+prefixes = ["gemini-3.1-pro-preview"]
+tier = "medium"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 65536
+context_window = 200000
+pricing = { input = 2.0, output = 12.0, cache_write = 0.0, cache_read = 0.2 }
+
+[[model]]
+prefixes = ["gpt-5.6-luna"]
+tier = "weak"
+family = "generic"
+vision = true
+default = true
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 0.2, output = 1.2, cache_write = 0.25, cache_read = 0.02 }
+
+[[model]]
+prefixes = ["gpt-5.4"]
+tier = "strong"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 2.5, output = 15.0, cache_write = 0.0, cache_read = 0.25 }
+
+[[model]]
+prefixes = ["gpt-5.6-sol"]
+tier = "strong"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 5.0, output = 30.0, cache_write = 6.25, cache_read = 0.5 }
+
+[[model]]
+prefixes = ["gpt-5.6-terra"]
+tier = "medium"
+family = "generic"
+vision = true
+default = true
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 2.0, output = 12.0, cache_write = 2.5, cache_read = 0.2 }
+
+[[model]]
+prefixes = ["gpt-5.3-codex"]
+tier = "strong"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 1.75, output = 14.0, cache_write = 0.0, cache_read = 0.175 }
+
+[[model]]
+prefixes = ["claude-opus-5", "claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5"]
+tier = "strong"
+family = "generic"
+vision = true
+default = true
+max_output_tokens = 64000
+context_window = 200000
+pricing = { input = 5.0, output = 25.0, cache_write = 6.25, cache_read = 0.5 }
+
+[[model]]
+prefixes = ["claude-opus-4.8-fast", "claude-fable-5"]
+tier = "strong"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 10.0, output = 50.0, cache_write = 12.5, cache_read = 1.0 }
+
+[[model]]
+prefixes = ["grok-4.5"]
+tier = "medium"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 2.0, output = 6.0, cache_write = 0.0, cache_read = 0.5 }
+
+[[model]]
+prefixes = ["grok-4.6"]
+tier = "medium"
+family = "generic"
+vision = true
+default = false
+max_output_tokens = 100000
+context_window = 200000
+pricing = { input = 2.0, output = 6.0, cache_write = 0.0, cache_read = 0.5 }

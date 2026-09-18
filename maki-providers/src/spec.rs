@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
 
 use crate::AgentError;
+use crate::manifest;
 use crate::model::{ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::provider::Provider;
@@ -22,6 +23,9 @@ pub const GENERIC_DISCOVERY_NOTE: &str =
 /// mandatory in the literal, and that is the point: there is deliberately no
 /// `Default`, no `#[non_exhaustive]`, and no row uses `..`, so adding a field
 /// here breaks every row until someone answers for each one.
+///
+/// The checklist is two files: this row, and `models/<slug>.toml` next to it
+/// carrying the provider's curated table.
 #[derive(Debug)]
 pub struct ProviderSpec {
     pub slug: &'static str,
@@ -33,7 +37,11 @@ pub struct ProviderSpec {
     pub accepts_arbitrary_models: bool,
     pub fallback_max_output: Option<u32>,
     pub fallback_context_window: u32,
-    pub models: &'static [ModelEntry],
+    /// This provider's curated table, embedded from `models/<slug>.toml`. Read
+    /// it through [`ProviderSpec::models`], which serves the parsed rows.
+    /// [`NO_CURATED_MODELS`] for a provider whose ids all come from a live
+    /// catalog.
+    pub models_toml: &'static str,
     /// Set by the providers whose rates move with the wall clock, so the hours
     /// sit next to the prices they scale. Everyone else bills flat.
     pub pricing_schedule: Option<&'static PricingSchedule>,
@@ -47,6 +55,9 @@ pub struct ProviderSpec {
     pub login: Option<LoginConfig>,
     pub docs: GeneratedDocs,
 }
+
+/// For a provider whose ids all come from a live catalog.
+pub const NO_CURATED_MODELS: &str = "";
 
 pub type NewFn = fn(Timeouts) -> Result<Box<dyn Provider>, AgentError>;
 
@@ -114,13 +125,18 @@ pub enum AuthDoc {
 
 #[derive(Debug)]
 pub enum CatalogDoc {
-    /// Render `models` as the tier table.
+    /// Render [`ProviderSpec::models`] as the tier table.
     Table,
-    /// `models` is empty; say where models come from instead.
+    /// The table is empty; say where models come from instead.
     Discovered(&'static str),
 }
 
 impl ProviderSpec {
+    /// The one way to reach this provider's curated table.
+    pub fn models(&self) -> &'static [ModelEntry] {
+        manifest::table(self.slug)
+    }
+
     /// Whether maki builds this provider itself, as opposed to reading it out
     /// of the models.dev catalog.
     pub const fn is_native(&self) -> bool {
@@ -206,7 +222,7 @@ impl ProviderRegistry {
 
     pub fn find_default_for_tier(slug: &str, tier: ModelTier) -> Option<&'static ModelEntry> {
         Self::for_slug(slug)?
-            .models
+            .models()
             .iter()
             .find(|e| e.default && e.tier == tier)
     }
@@ -288,6 +304,38 @@ mod tests {
                 registered,
             );
         }
+    }
+
+    /// A malformed table is a runtime panic now, not a compile error, so this
+    /// forces every one of them in CI. Never `#[ignore]` it.
+    #[test]
+    fn every_builtin_model_table_parses() {
+        for spec in BUILTINS {
+            spec.models();
+        }
+    }
+
+    /// Closes the third side of the slug/file mapping: `include_str!` catches a
+    /// missing file, the parser catches a wrong one, and this catches an orphan
+    /// table or one written but never wired into a spec.
+    #[test]
+    fn model_files_match_curated_providers() {
+        const MODELS_DIR: &str = "maki-providers/models should hold named files";
+        let files: HashSet<String> =
+            std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/models"))
+                .expect(MODELS_DIR)
+                .map(|entry| {
+                    let path = entry.expect(MODELS_DIR).path();
+                    let stem = path.file_stem().expect(MODELS_DIR);
+                    stem.to_string_lossy().into_owned()
+                })
+                .collect();
+        let curated: HashSet<String> = BUILTINS
+            .iter()
+            .filter(|spec| spec.models_toml != NO_CURATED_MODELS)
+            .map(|spec| spec.slug.to_owned())
+            .collect();
+        assert_eq!(files, curated);
     }
 
     /// A spec row alone does not make a provider buildable. Hand `opencode-go`

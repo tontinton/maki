@@ -242,7 +242,8 @@ fn apply_plan_fast(
 }
 
 fn static_plan_models() -> Vec<ModelInfo> {
-    super::models()
+    super::SPEC
+        .models()
         .iter()
         .flat_map(|e| e.prefixes.iter())
         .filter(|id| is_codex_model(id))

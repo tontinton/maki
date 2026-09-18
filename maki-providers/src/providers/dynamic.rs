@@ -569,7 +569,7 @@ pub fn dynamic_model_specs_for(slug: &str) -> Vec<String> {
     };
     if meta.models.is_empty() {
         meta.base
-            .models
+            .models()
             .iter()
             .flat_map(|entry| entry.prefixes.iter())
             .map(|prefix| format!("{slug}/{prefix}"))

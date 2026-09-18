@@ -402,7 +402,7 @@ mod tests {
         let current = Model::from_spec(SCHEDULED_SPEC).unwrap();
         let sibling_id = ProviderRegistry::for_slug(&current.provider)
             .expect("a builtin provider")
-            .models
+            .models()
             .iter()
             .find_map(|e| (e.pricing.input != current.pricing.input).then_some(e.prefixes[0]))
             .expect("a sibling model the table prices differently");

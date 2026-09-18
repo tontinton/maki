@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use maki_config::providers::{Protocol, ProviderPlan};
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, ThinkingSupport};
+use crate::model::{Model, ModelFamily, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::aperture::DEFAULT_PATH_PREFIX;
 use crate::spec::{
@@ -65,7 +65,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     accepts_arbitrary_models: true,
     fallback_max_output: None,
     fallback_context_window: 128_000,
-    models: models(),
+    models_toml: include_str!("../../models/mistral.toml"),
     pricing_schedule: None,
     native: Some(Native {
         new: create,
@@ -104,57 +104,6 @@ fn create_with_auth(
 }
 
 inventory::submit!(SPEC.config_row());
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &[
-                "mistral-medium-latest",
-                "mistral-medium-3.5",
-                "mistral-medium-3-5",
-                "mistral-medium-2604",
-            ],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing::per_million(1.5, 7.5, 0.00, 0.00),
-            max_output_tokens: None,
-            context_window: 262_144,
-        },
-        ModelEntry {
-            prefixes: &["glm-5-2", "zai-glm-5-2"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing::per_million(1.40, 4.40, 0.00, 0.14),
-            max_output_tokens: None,
-            context_window: 1_000_000,
-        },
-        ModelEntry {
-            prefixes: &["mistral-small-latest", "mistral-small-2603"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing::per_million(0.15, 0.60, 0.00, 0.00),
-            max_output_tokens: None,
-            context_window: 262_144,
-        },
-        ModelEntry {
-            prefixes: &["ministral-14b-latest", "ministral-14b-2512"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing::per_million(0.20, 0.20, 0.00, 0.00),
-            max_output_tokens: None,
-            context_window: 262_144,
-        },
-    ];
-    MODELS
-}
 
 pub struct Mistral {
     compat: OpenAiCompatProvider,

@@ -159,7 +159,8 @@ fn select_models(access: Option<&str>, force: bool) -> Result<Vec<CachedModel>, 
 }
 
 fn curated_fallback() -> Vec<CachedModel> {
-    super::models()
+    super::SPEC
+        .models()
         .iter()
         .filter_map(|entry| {
             let id = *entry.prefixes.first()?;
@@ -336,7 +337,8 @@ fn normalize_entry(value: &serde_json::Value) -> EntryResult {
         }
     };
 
-    let known = super::models()
+    let known = super::SPEC
+        .models()
         .iter()
         .find(|entry| entry.prefixes.iter().any(|p| normalized.starts_with(p)));
     let vision = first_bool(obj, meta, &["acceptsImages"])
@@ -384,7 +386,8 @@ fn normalize_entry(value: &serde_json::Value) -> EntryResult {
 }
 
 fn known_max_tokens(model_id: &str) -> Option<u32> {
-    super::models()
+    super::SPEC
+        .models()
         .iter()
         .find(|entry| entry.prefixes.iter().any(|p| model_id.starts_with(p)))
         .and_then(|entry| entry.max_output_tokens)

@@ -176,7 +176,7 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
         .iter()
         .filter(|m| provider_available_offline(m.slug))
         .flat_map(|m| {
-            m.models
+            m.models()
                 .iter()
                 .flat_map(|entry| entry.prefixes.iter())
                 .map(move |p| format!("{}/{}", m.slug, p))
@@ -236,7 +236,7 @@ pub async fn fetch_all_models(
                     let mut specs: Vec<String> =
                         models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
                     set_known_models(slug, models);
-                    for entry in spec.models {
+                    for entry in spec.models() {
                         for prefix in entry.prefixes {
                             let spec = format!("{slug}/{prefix}");
                             if !specs.contains(&spec) {
@@ -252,7 +252,7 @@ pub async fn fetch_all_models(
                 Err(e) => {
                     warn!(provider = slug, error = %e, "failed to list models, using static fallback");
                     let fallback: Vec<String> = spec
-                        .models
+                        .models()
                         .iter()
                         .flat_map(|entry| entry.prefixes.iter())
                         .map(|p| format!("{slug}/{p}"))

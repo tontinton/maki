@@ -1,0 +1,25 @@
+# Curated model table for DeepSeek. Rates are USD per 1M tokens, off-peak:
+# peak hours double every rate, as `deepseek::PEAK_HOURS` records.
+slug = "deepseek"
+
+[[model]]
+# `deepseek-flash` is V4.1 Flash. `deepseek-v4-flash` is the retired name the
+# API still accepts, served by V4.1 Flash at its rates.
+prefixes = ["deepseek-flash", "deepseek-v4-flash"]
+tier = "medium"
+family = "generic"
+vision = true
+default = true
+max_output_tokens = 384000
+context_window = 1000000
+pricing = { input = 0.15, output = 0.6, cache_write = 0.0, cache_read = 0.003 }
+
+[[model]]
+prefixes = ["deepseek-v4-pro"]
+tier = "strong"
+family = "generic"
+vision = false
+default = true
+max_output_tokens = 384000
+context_window = 1000000
+pricing = { input = 0.66, output = 1.98, cache_write = 0.0, cache_read = 0.022 }

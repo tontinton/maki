@@ -1686,7 +1686,7 @@ mod tests {
             "the spec default is true, so only the catalog can say no"
         );
 
-        let curated = &deepseek::models()[0];
+        let curated = &deepseek::SPEC.models()[0];
         let listed = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", curated_flash())).unwrap();
         assert_eq!(listed.pricing.input, curated.pricing.input);
         assert_eq!(listed.context_window, curated.context_window);
@@ -1701,7 +1701,7 @@ mod tests {
     fn a_relative_matched_by_prefix_loses_to_the_catalog_naming_the_model() {
         let (_tmp, state_dir) = temp_state_dir();
         super::seed_catalog_for_tests(builtin_catalog(), state_dir);
-        let curated = &deepseek::models()[0];
+        let curated = &deepseek::SPEC.models()[0];
 
         let sibling = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", sibling_model())).unwrap();
         assert_eq!(sibling.pricing.input, UNLISTED_INPUT_PRICE);
@@ -1732,7 +1732,7 @@ mod tests {
     fn fields_the_catalog_omits_fall_through() {
         let (_tmp, state_dir) = temp_state_dir();
         super::seed_catalog_for_tests(builtin_catalog(), state_dir);
-        let curated = &deepseek::models()[0];
+        let curated = &deepseek::SPEC.models()[0];
         let spec = ProviderRegistry::for_slug(BUILTIN_SLUG).unwrap();
 
         let quiet = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", quiet_sibling_model())).unwrap();
@@ -1918,7 +1918,7 @@ mod tests {
     }
 
     fn curated_flash() -> &'static str {
-        deepseek::models()[0].prefixes[0]
+        deepseek::SPEC.models()[0].prefixes[0]
     }
 
     fn sibling_model() -> String {

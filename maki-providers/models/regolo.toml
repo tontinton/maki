@@ -1,0 +1,40 @@
+# Curated model table for Regolo. Rates are USD per 1M tokens.
+#
+# Tier defaults only: pricing, context windows and capabilities for the full
+# catalogue come live from `/v1/models` joined with `/model_group/info` in
+# `Regolo::list_models`. Context windows mirror the group's `max_input_tokens`,
+# the same field `join_model_info` prefers, not its `max_tokens` (input plus
+# output) which would let a session grow past what the upstream accepts.
+slug = "regolo"
+
+[[model]]
+prefixes = ["qwen3.5-122b"]
+tier = "strong"
+family = "generic"
+vision = true
+default = true
+max_output_tokens = 120000
+context_window = 120000
+pricing = { input = 1.0, output = 4.2, cache_write = 0.0, cache_read = 0.0 }
+
+[[model]]
+prefixes = ["qwen3-coder-next"]
+tier = "medium"
+family = "generic"
+vision = false
+default = true
+max_output_tokens = 120000
+context_window = 120000
+pricing = { input = 0.5, output = 2.0, cache_write = 0.0, cache_read = 0.0 }
+
+[[model]]
+# The group advertises 120k output against an 80k input window; capped so a
+# tier default never promises more output than the window it has to fit in.
+prefixes = ["qwen3.5-9b"]
+tier = "weak"
+family = "generic"
+vision = false
+default = true
+max_output_tokens = 80000
+context_window = 80000
+pricing = { input = 0.07, output = 0.35, cache_write = 0.0, cache_read = 0.0 }

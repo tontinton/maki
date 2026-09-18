@@ -42,6 +42,9 @@ pub enum ModelError {
     NotAllowed(String),
 }
 
+/// Also the shape of a rate in `models/<slug>.toml`. None of the four rates may
+/// ever gain a `#[serde(default)]`: a curated row that forgets one has to fail
+/// loudly instead of quietly billing the user zero.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ModelPricing {
     pub input: f64,
@@ -102,29 +105,6 @@ impl ModelPricing {
         }
     }
 
-    /// Like [`per_million`](Self::per_million), with a fast-tier price. A flat
-    /// constructor rather than a `with_fast(self)` builder: consuming `self`
-    /// in a `const fn` trips E0493 because `ModelPricing` carries drop glue.
-    pub const fn per_million_with_fast(
-        input: f64,
-        output: f64,
-        cache_write: f64,
-        cache_read: f64,
-        fast_input: f64,
-        fast_output: f64,
-    ) -> Self {
-        Self {
-            input,
-            output,
-            cache_write,
-            cache_read,
-            fast: Some(FastPricing {
-                input: fast_input,
-                output: fast_output,
-            }),
-        }
-    }
-
     pub const ZERO: Self = Self {
         input: 0.0,
         output: 0.0,
@@ -156,7 +136,8 @@ impl ModelPricing {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ModelFamily {
     Claude,
     Generic,
@@ -255,8 +236,17 @@ impl From<maki_config::providers::Tier> for ModelTier {
     }
 }
 
-#[derive(Debug)]
+/// One curated row, deserialized straight from `models/<slug>.toml`, so the
+/// file and this struct cannot drift apart. `max_output_tokens` is the only
+/// field allowed a serde default: TOML has no null, and an absent limit really
+/// does mean "the provider never published one". Everything else missing, or
+/// spelled wrong, is a mistake worth hearing about.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelEntry {
+    /// `'static` because the rest of the crate hands these out as model ids
+    /// that outlive any borrow; [`crate::manifest::leak_prefixes`] pays for it.
+    #[serde(deserialize_with = "crate::manifest::leak_prefixes")]
     pub prefixes: &'static [&'static str],
     pub tier: ModelTier,
     pub family: ModelFamily,
@@ -264,6 +254,7 @@ pub struct ModelEntry {
     pub vision: bool,
     pub default: bool,
     pub pricing: ModelPricing,
+    #[serde(default)]
     pub max_output_tokens: Option<u32>,
     pub context_window: u32,
 }
@@ -324,7 +315,7 @@ struct ModelSources<'a> {
 
 impl<'a> ModelSources<'a> {
     fn resolve(spec: &'a ProviderSpec, model_id: &str) -> Self {
-        let entry = lookup_entry(spec.models, model_id).ok();
+        let entry = lookup_entry(spec.models(), model_id).ok();
         let exact = entry.is_some_and(|entry| names_exactly(entry, model_id));
         Self {
             entry,
@@ -785,7 +776,7 @@ impl Model {
         let Some(spec) = ProviderRegistry::for_slug(slug) else {
             return Err(ModelError::NoAllowedModel(slug.to_string(), tier));
         };
-        spec.models
+        spec.models()
             .iter()
             .filter(|entry| entry.tier == tier)
             .flat_map(|entry| entry.prefixes)
@@ -808,7 +799,7 @@ impl Model {
             custom::TierLookup::Model(model) => return Ok(model),
             custom::TierLookup::NoModelForTier(base) => {
                 let entry = base
-                    .models
+                    .models()
                     .iter()
                     .find(|e| e.default && e.tier == tier)
                     .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
@@ -1304,7 +1295,13 @@ mod tests {
 
     #[test]
     fn fast_mode_applies_premium_rates() {
-        let pricing = ModelPricing::per_million_with_fast(5.00, 25.00, 6.25, 0.50, 30.00, 150.00);
+        let pricing = ModelPricing {
+            fast: Some(FastPricing {
+                input: 30.00,
+                output: 150.00,
+            }),
+            ..ModelPricing::per_million(5.00, 25.00, 6.25, 0.50)
+        };
         let usage = TokenUsage {
             input: 1_000_000,
             output: 1_000_000,
@@ -1337,7 +1334,7 @@ mod tests {
     #[test]
     fn fast_pricing_is_always_a_premium() {
         for spec in ProviderRegistry::builtins() {
-            for entry in spec.models {
+            for entry in spec.models() {
                 let Some(fast) = &entry.pricing.fast else {
                     continue;
                 };
@@ -1470,7 +1467,7 @@ mod tests {
             if spec.accepts_arbitrary_models {
                 continue;
             }
-            let entries = spec.models;
+            let entries = spec.models();
             for &tier in &TIERS {
                 if spec.slug == "deepseek" && tier == ModelTier::Weak {
                     continue;

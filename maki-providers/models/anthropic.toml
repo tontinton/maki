@@ -1,0 +1,125 @@
+# Curated model table for Anthropic. Rates are USD per 1M tokens.
+slug = "anthropic"
+
+[[model]]
+prefixes = ["claude-haiku-4-5"]
+tier = "weak"
+family = "claude"
+vision = true
+default = true
+max_output_tokens = 64000
+context_window = 200000
+pricing = { input = 1.0, output = 5.0, cache_write = 1.25, cache_read = 0.1 }
+
+[[model]]
+prefixes = ["claude-sonnet-4-5"]
+tier = "medium"
+family = "claude"
+vision = true
+default = false
+max_output_tokens = 64000
+context_window = 200000
+pricing = { input = 3.0, output = 15.0, cache_write = 3.75, cache_read = 0.3 }
+
+[[model]]
+prefixes = ["claude-sonnet-4-6"]
+tier = "medium"
+family = "claude"
+vision = true
+default = false
+max_output_tokens = 64000
+context_window = 200000
+pricing = { input = 3.0, output = 15.0, cache_write = 3.75, cache_read = 0.3 }
+
+[[model]]
+# Introductory rates until 2026-09-01, then 3.00 / 15.00 / 3.75 / 0.30.
+prefixes = ["claude-sonnet-5"]
+tier = "medium"
+family = "claude"
+vision = true
+default = true
+max_output_tokens = 128000
+context_window = 200000
+pricing = { input = 2.0, output = 10.0, cache_write = 2.5, cache_read = 0.2 }
+
+[[model]]
+prefixes = ["claude-sonnet-4"]
+tier = "medium"
+family = "claude"
+vision = true
+default = false
+max_output_tokens = 64000
+context_window = 200000
+pricing = { input = 3.0, output = 15.0, cache_write = 3.75, cache_read = 0.3 }
+
+[[model]]
+prefixes = ["claude-opus-4-5"]
+tier = "strong"
+family = "claude"
+vision = true
+default = false
+max_output_tokens = 64000
+context_window = 200000
+pricing = { input = 5.0, output = 25.0, cache_write = 6.25, cache_read = 0.5 }
+
+[[model]]
+# Fast mode withdrawn on 2026-06-29.
+prefixes = ["claude-opus-4-6"]
+tier = "strong"
+family = "claude"
+vision = true
+default = false
+max_output_tokens = 128000
+context_window = 200000
+pricing = { input = 5.0, output = 25.0, cache_write = 6.25, cache_read = 0.5 }
+
+[[model]]
+# Fast mode withdrawn on 2026-07-24.
+prefixes = ["claude-opus-4-7"]
+tier = "strong"
+family = "claude"
+vision = true
+default = false
+max_output_tokens = 128000
+context_window = 200000
+pricing = { input = 5.0, output = 25.0, cache_write = 6.25, cache_read = 0.5 }
+
+[[model]]
+prefixes = ["claude-opus-4-8"]
+tier = "strong"
+family = "claude"
+vision = true
+default = false
+max_output_tokens = 128000
+context_window = 200000
+pricing = { input = 5.0, output = 25.0, cache_write = 6.25, cache_read = 0.5, fast = { input = 10.0, output = 50.0 } }
+
+[[model]]
+prefixes = ["claude-opus-5"]
+tier = "strong"
+family = "claude"
+vision = true
+default = true
+max_output_tokens = 128000
+context_window = 200000
+pricing = { input = 5.0, output = 25.0, cache_write = 6.25, cache_read = 0.5, fast = { input = 10.0, output = 50.0 } }
+
+[[model]]
+prefixes = ["claude-fable-5"]
+tier = "strong"
+family = "claude"
+vision = true
+default = false
+max_output_tokens = 128000
+context_window = 200000
+pricing = { input = 10.0, output = 50.0, cache_write = 12.5, cache_read = 1.0 }
+
+[[model]]
+prefixes = ["claude-opus-4-0", "claude-opus-4-1"]
+tier = "strong"
+family = "claude"
+vision = true
+default = false
+max_output_tokens = 32000
+context_window = 200000
+pricing = { input = 15.0, output = 75.0, cache_write = 18.75, cache_read = 1.5 }

@@ -13,9 +13,7 @@ use tracing::{debug, warn};
 use super::anthropic::shared;
 use super::openai::responses;
 use super::openai_compat;
-use crate::model::{
-    Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelTier, lookup_entry,
-};
+use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ModelTier, lookup_entry};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::{ResolvedAuth, Timeouts};
 use crate::spec::{AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
@@ -50,7 +48,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     accepts_arbitrary_models: true,
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
-    models: models(),
+    models_toml: include_str!("../../../models/copilot.toml"),
     pricing_schedule: None,
     native: Some(Native {
         new: create,
@@ -97,253 +95,6 @@ const MODELS_PATH: &str = "/models";
 
 /// Scales `/models` AI-credit prices (1 credit = $0.01) to USD per 1M tokens.
 const AIC_TO_USD_PER_MILLION: f64 = 10_000.0;
-
-/// Fallback pricing used until `/models` reports `billing.token_prices` (or
-/// for offline runs). The API wins via discovered metadata; these mirror
-/// GitHub's published rates (usage-based billing since June 2026,
-/// docs.github.com/copilot/reference/copilot-billing/models-and-pricing), at
-/// the default context tier.
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &["gpt-5-mini"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(0.25, 2.00, 0.00, 0.025),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4-mini"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(0.75, 4.50, 0.00, 0.075),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4-nano"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(0.20, 1.25, 0.00, 0.02),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-haiku-4.5"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(1.00, 5.00, 1.25, 0.10),
-            max_output_tokens: Some(64_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gemini-3.5-flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(1.50, 9.00, 0.00, 0.15),
-            max_output_tokens: Some(65_536),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gemini-3.6-flash"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(0.75, 3.75, 0.00, 0.075),
-            max_output_tokens: Some(65_536),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gemini-3.7-flash"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(0.75, 3.75, 0.00, 0.075),
-            max_output_tokens: Some(65_536),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["mai-code-1-flash-picker"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(0.75, 4.50, 0.00, 0.075),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-4.5", "claude-sonnet-4.6"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(3.00, 15.00, 3.75, 0.30),
-            max_output_tokens: Some(64_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-5"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(2.00, 10.00, 2.50, 0.20),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(5.00, 30.00, 0.00, 0.50),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["kimi-k2.7-code"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(0.95, 4.00, 0.00, 0.19),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["kimi-k3"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(3.00, 15.00, 0.00, 0.30),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gemini-3.1-pro-preview"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(2.00, 12.00, 0.00, 0.20),
-            max_output_tokens: Some(65_536),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.6-luna"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing::per_million(0.20, 1.20, 0.25, 0.02),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(2.50, 15.00, 0.00, 0.25),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.6-sol"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(5.00, 30.00, 6.25, 0.50),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.6-terra"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing::per_million(2.00, 12.00, 2.50, 0.20),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.3-codex"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(1.75, 14.00, 0.00, 0.175),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &[
-                "claude-opus-5",
-                "claude-opus-4.8",
-                "claude-opus-4.7",
-                "claude-opus-4.6",
-                "claude-opus-4.5",
-            ],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing::per_million(5.00, 25.00, 6.25, 0.50),
-            max_output_tokens: Some(64_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4.8-fast", "claude-fable-5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(10.00, 50.00, 12.50, 1.00),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["grok-4.5"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(2.00, 6.00, 0.00, 0.50),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["grok-4.6"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(2.00, 6.00, 0.00, 0.50),
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-    ];
-    MODELS
-}
 
 pub struct Copilot {
     client: HttpClient,
@@ -731,7 +482,7 @@ impl CopilotModel {
         }
         let usd_per_million = AIC_TO_USD_PER_MILLION / batch_size;
         let manifest_cache_write =
-            lookup_entry(models(), &self.id).map_or(0.0, |entry| entry.pricing.cache_write);
+            lookup_entry(SPEC.models(), &self.id).map_or(0.0, |entry| entry.pricing.cache_write);
         Some(ModelPricing::per_million(
             default.input_price * usd_per_million,
             default.output_price * usd_per_million,
@@ -1148,7 +899,8 @@ mod tests {
     #[test_case(ModelTier::Medium, "gpt-5.6-terra"; "medium defaults to terra")]
     #[test_case(ModelTier::Strong, "claude-opus-5"; "strong defaults to opus")]
     fn manifest_has_exactly_one_default_per_tier(tier: ModelTier, expected_prefix: &str) {
-        let defaults: Vec<_> = models()
+        let defaults: Vec<_> = SPEC
+            .models()
             .iter()
             .filter(|entry| entry.default && entry.tier == tier)
             .collect();

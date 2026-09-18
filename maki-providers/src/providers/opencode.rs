@@ -11,7 +11,8 @@ use crate::providers::catalog::{
     init_shared_catalog_if_needed,
 };
 use crate::spec::{
-    AuthDoc, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs, Native, ProviderSpec,
+    AuthDoc, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs, NO_CURATED_MODELS, Native,
+    ProviderSpec,
 };
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -51,7 +52,7 @@ pub(crate) const ZEN_SPEC: ProviderSpec = ProviderSpec {
     accepts_arbitrary_models: true,
     fallback_max_output: Some(128_000),
     fallback_context_window: 256_000,
-    models: &[],
+    models_toml: NO_CURATED_MODELS,
     pricing_schedule: None,
     native: Some(Native {
         new: create,
@@ -77,7 +78,7 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
     accepts_arbitrary_models: true,
     fallback_max_output: Some(64_000),
     fallback_context_window: 128_000,
-    models: &[],
+    models_toml: NO_CURATED_MODELS,
     pricing_schedule: None,
     native: None,
     login: None,

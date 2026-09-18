@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, ThinkingSupport};
+use crate::model::{Model, ModelFamily, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::aperture::NO_PATH_PREFIX;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -74,7 +74,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     accepts_arbitrary_models: false,
     fallback_max_output: Some(16_000),
     fallback_context_window: 128_000,
-    models: models(),
+    models_toml: include_str!("../../../models/zai.toml"),
     pricing_schedule: None,
     native: Some(Native {
         new: create,
@@ -171,130 +171,6 @@ impl From<QuotaResponse> for ProviderUsage {
 }
 
 inventory::submit!(SPEC.config_row());
-
-/// Rates come from the pay as you go table on docs.z.ai, not models.dev, which
-/// carries a launch promo past its expiry and so halves the GLM-5 line. A later
-/// `glm-5.x` nobody has curated yet still reads models.dev: a promo rate is the
-/// wrong number, but it beats the zero an unpriced model gets, which renders as
-/// free.
-///
-/// The coding plan (`zai-coding-plan`) is blocked from the catalog instead. The
-/// plan already paid for those models, so every row in it really is zero.
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &["glm-5-code"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: true,
-            pricing: ModelPricing::per_million(1.20, 5.00, 0.00, 0.30),
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-5.3"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing::per_million(1.40, 4.40, 0.00, 0.26),
-            max_output_tokens: Some(131072),
-            context_window: 1_000_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-5.3-flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Glm,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(0.15, 0.50, 0.00, 0.03),
-            max_output_tokens: Some(131072),
-            context_window: 1_000_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-5.2"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing::per_million(1.40, 4.40, 0.00, 0.26),
-            max_output_tokens: Some(131072),
-            context_window: 1_000_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-5.1"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing::per_million(1.40, 4.40, 0.00, 0.26),
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing::per_million(1.00, 3.20, 0.00, 0.20),
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.7-flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: true,
-            pricing: ModelPricing::per_million(0.00, 0.00, 0.00, 0.00),
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.7", "glm-4.6"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: true,
-            pricing: ModelPricing::per_million(0.60, 2.20, 0.00, 0.11),
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5-flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing::per_million(0.00, 0.00, 0.00, 0.00),
-            max_output_tokens: Some(98304),
-            context_window: 131_072,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5-air"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing::per_million(0.20, 1.10, 0.00, 0.03),
-            max_output_tokens: Some(98304),
-            context_window: 131_072,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing::per_million(0.60, 2.20, 0.00, 0.11),
-            max_output_tokens: Some(98304),
-            context_window: 131_072,
-        },
-    ];
-    MODELS
-}
 
 pub struct Zai {
     compat: OpenAiCompatProvider,
@@ -424,6 +300,7 @@ fn adjust_model(model: &mut Model) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ModelTier;
     use test_case::test_case;
 
     const SAMPLE_BODY: &str = r#"{"code":200,"data":{"limits":[

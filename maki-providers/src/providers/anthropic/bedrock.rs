@@ -678,7 +678,8 @@ impl Provider for Bedrock {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async {
-            let models: Vec<crate::model::ModelInfo> = shared::models()
+            let models: Vec<crate::model::ModelInfo> = super::SPEC
+                .models()
                 .iter()
                 .map(|entry| crate::model::ModelInfo::id_only(entry.prefixes[0].to_string()))
                 .collect();

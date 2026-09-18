@@ -1,0 +1,121 @@
+# Curated model table for Z.AI. Rates are USD per 1M tokens.
+#
+# Rates come from the pay as you go table on docs.z.ai, not models.dev, which
+# carries a launch promo past its expiry and so halves the GLM-5 line. A later
+# `glm-5.x` nobody has curated yet still reads models.dev: a promo rate is the
+# wrong number, but it beats the zero an unpriced model gets, which renders as
+# free.
+#
+# The coding plan (`zai-coding-plan`) is blocked from the catalog instead. The
+# plan already paid for those models, so every row in it really is zero.
+slug = "zai"
+
+[[model]]
+prefixes = ["glm-5-code"]
+tier = "strong"
+family = "glm"
+vision = false
+default = true
+max_output_tokens = 131072
+context_window = 200000
+pricing = { input = 1.2, output = 5.0, cache_write = 0.0, cache_read = 0.3 }
+
+[[model]]
+prefixes = ["glm-5.3"]
+tier = "strong"
+family = "glm"
+vision = false
+default = false
+max_output_tokens = 131072
+context_window = 1000000
+pricing = { input = 1.4, output = 4.4, cache_write = 0.0, cache_read = 0.26 }
+
+[[model]]
+prefixes = ["glm-5.3-flash"]
+tier = "weak"
+family = "glm"
+vision = true
+default = false
+max_output_tokens = 131072
+context_window = 1000000
+pricing = { input = 0.15, output = 0.5, cache_write = 0.0, cache_read = 0.03 }
+
+[[model]]
+prefixes = ["glm-5.2"]
+tier = "strong"
+family = "glm"
+vision = false
+default = false
+max_output_tokens = 131072
+context_window = 1000000
+pricing = { input = 1.4, output = 4.4, cache_write = 0.0, cache_read = 0.26 }
+
+[[model]]
+prefixes = ["glm-5.1"]
+tier = "strong"
+family = "glm"
+vision = false
+default = false
+max_output_tokens = 131072
+context_window = 200000
+pricing = { input = 1.4, output = 4.4, cache_write = 0.0, cache_read = 0.26 }
+
+[[model]]
+prefixes = ["glm-5"]
+tier = "strong"
+family = "glm"
+vision = false
+default = false
+max_output_tokens = 131072
+context_window = 200000
+pricing = { input = 1.0, output = 3.2, cache_write = 0.0, cache_read = 0.2 }
+
+[[model]]
+prefixes = ["glm-4.7-flash"]
+tier = "weak"
+family = "glm"
+vision = false
+default = true
+max_output_tokens = 131072
+context_window = 200000
+pricing = { input = 0.0, output = 0.0, cache_write = 0.0, cache_read = 0.0 }
+
+[[model]]
+prefixes = ["glm-4.7", "glm-4.6"]
+tier = "medium"
+family = "glm"
+vision = false
+default = true
+max_output_tokens = 131072
+context_window = 200000
+pricing = { input = 0.6, output = 2.2, cache_write = 0.0, cache_read = 0.11 }
+
+[[model]]
+prefixes = ["glm-4.5-flash"]
+tier = "weak"
+family = "glm"
+vision = false
+default = false
+max_output_tokens = 98304
+context_window = 131072
+pricing = { input = 0.0, output = 0.0, cache_write = 0.0, cache_read = 0.0 }
+
+[[model]]
+prefixes = ["glm-4.5-air"]
+tier = "weak"
+family = "glm"
+vision = false
+default = false
+max_output_tokens = 98304
+context_window = 131072
+pricing = { input = 0.2, output = 1.1, cache_write = 0.0, cache_read = 0.03 }
+
+[[model]]
+prefixes = ["glm-4.5"]
+tier = "medium"
+family = "glm"
+vision = false
+default = false
+max_output_tokens = 98304
+context_window = 131072
+pricing = { input = 0.6, output = 2.2, cache_write = 0.0, cache_read = 0.11 }

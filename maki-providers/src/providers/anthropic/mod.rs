@@ -77,7 +77,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     accepts_arbitrary_models: false,
     fallback_max_output: Some(128_000),
     fallback_context_window: 200_000,
-    models: models(),
+    models_toml: include_str!("../../../models/anthropic.toml"),
     pricing_schedule: None,
     native: Some(Native {
         new: create,
@@ -120,8 +120,6 @@ fn create_with_auth(
 ) -> Box<dyn Provider> {
     Box::new(Anthropic::with_auth(auth, timeouts).with_system_prefix(system_prefix))
 }
-
-pub(crate) use shared::models;
 
 /// Returns whether the fast-mode beta header must be attached. We re-check
 /// `supports_fast()` here rather than trusting `opts.fast` alone, so a stale UI

@@ -1,0 +1,32 @@
+# Curated model table for Synthetic. Rates are USD per 1M tokens.
+slug = "synthetic"
+
+[[model]]
+prefixes = ["hf:moonshotai/Kimi-K2.5"]
+tier = "strong"
+family = "synthetic"
+vision = false
+default = true
+max_output_tokens = 131072
+context_window = 200000
+pricing = { input = 0.45, output = 3.4, cache_write = 0.0, cache_read = 0.0 }
+
+[[model]]
+prefixes = ["hf:deepseek-ai/DeepSeek-V3.2"]
+tier = "medium"
+family = "synthetic"
+vision = false
+default = true
+max_output_tokens = 131072
+context_window = 200000
+pricing = { input = 0.56, output = 1.68, cache_write = 0.0, cache_read = 0.0 }
+
+[[model]]
+prefixes = ["hf:zai-org/GLM-4.7-Flash"]
+tier = "weak"
+family = "synthetic"
+vision = false
+default = true
+max_output_tokens = 131072
+context_window = 200000
+pricing = { input = 0.1, output = 0.5, cache_write = 0.0, cache_read = 0.0 }

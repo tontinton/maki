@@ -423,7 +423,7 @@ fn write_section(out: &mut String, spec: &ProviderSpec) {
     let _ = writeln!(out);
 
     match docs.catalog {
-        CatalogDoc::Table => write_model_table(out, spec.models),
+        CatalogDoc::Table => write_model_table(out, spec.models()),
         CatalogDoc::Discovered(note) => {
             let _ = writeln!(out, "{note}");
         }

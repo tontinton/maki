@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use maki_config::providers::Protocol;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelFamily, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::aperture::DEFAULT_PATH_PREFIX;
 use crate::spec::{
@@ -48,7 +48,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     accepts_arbitrary_models: false,
     fallback_max_output: Some(120_000),
     fallback_context_window: 120_000,
-    models: models(),
+    models_toml: include_str!("../../models/regolo.toml"),
     pricing_schedule: None,
     native: Some(Native {
         new: create,
@@ -87,53 +87,6 @@ fn create_with_auth(
 }
 
 inventory::submit!(SPEC.config_row());
-
-/// Curated tier defaults only: pricing, context windows and capabilities for
-/// the full catalogue come live from `/v1/models` joined with
-/// `/model_group/info` in [`Regolo::list_models`]. Context windows mirror the
-/// group's `max_input_tokens`, the same field [`join_model_info`] prefers, not
-/// its `max_tokens` (input plus output) which would let a session grow past
-/// what the upstream accepts.
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    // Bound to a `const` rather than returned inline: `ModelPricing::per_million`
-    // is a call, and a call blocks const-promotion of the array literal.
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &["qwen3.5-122b"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing::per_million(1.00, 4.20, 0.00, 0.00),
-            max_output_tokens: Some(120_000),
-            context_window: 120_000,
-        },
-        ModelEntry {
-            prefixes: &["qwen3-coder-next"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing::per_million(0.50, 2.00, 0.00, 0.00),
-            max_output_tokens: Some(120_000),
-            context_window: 120_000,
-        },
-        ModelEntry {
-            prefixes: &["qwen3.5-9b"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing::per_million(0.07, 0.35, 0.00, 0.00),
-            // The group advertises 120k output against an 80k input window;
-            // capped so a tier default never promises more output than the
-            // window it has to fit in.
-            max_output_tokens: Some(80_000),
-            context_window: 80_000,
-        },
-    ];
-    MODELS
-}
 
 #[derive(Deserialize)]
 struct SpendLogsResponse {
@@ -534,7 +487,7 @@ mod tests {
     fn manifest_lists_the_catalogued_default_model() {
         let spec = ProviderRegistry::get(CONFIG.slug).expect("regolo is a builtin");
         assert!(
-            spec.models
+            spec.models()
                 .iter()
                 .any(|m| m.prefixes == ["qwen3-coder-next"])
         );

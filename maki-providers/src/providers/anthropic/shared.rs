@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::Model;
 use crate::{
     AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, Message, ProviderEvent, Role, StopReason,
     StreamResponse, ThinkingConfig, TokenUsage,
@@ -399,135 +399,6 @@ impl EventParser {
             stop_reason: self.stop_reason,
         }
     }
-}
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &["claude-haiku-4-5"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: true,
-            pricing: ModelPricing::per_million(1.00, 5.00, 1.25, 0.10),
-            max_output_tokens: Some(64000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-4-5"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(3.00, 15.00, 3.75, 0.30),
-            max_output_tokens: Some(64000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-4-6"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(3.00, 15.00, 3.75, 0.30),
-            max_output_tokens: Some(64000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-5"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: true,
-            // Introductory rates until 2026-09-01, then 3.00 / 15.00 / 3.75 / 0.30.
-            pricing: ModelPricing::per_million(2.00, 10.00, 2.50, 0.20),
-            max_output_tokens: Some(128000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-4"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(3.00, 15.00, 3.75, 0.30),
-            max_output_tokens: Some(64000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4-5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(5.00, 25.00, 6.25, 0.50),
-            max_output_tokens: Some(64000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4-6"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            // Fast mode withdrawn on 2026-06-29.
-            pricing: ModelPricing::per_million(5.00, 25.00, 6.25, 0.50),
-            max_output_tokens: Some(128000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4-7"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            // Fast mode withdrawn on 2026-07-24.
-            pricing: ModelPricing::per_million(5.00, 25.00, 6.25, 0.50),
-            max_output_tokens: Some(128000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4-8"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million_with_fast(5.00, 25.00, 6.25, 0.50, 10.00, 50.00),
-            max_output_tokens: Some(128000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: true,
-            pricing: ModelPricing::per_million_with_fast(5.00, 25.00, 6.25, 0.50, 10.00, 50.00),
-            max_output_tokens: Some(128000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-fable-5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(10.00, 50.00, 12.50, 1.00),
-            max_output_tokens: Some(128000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4-0", "claude-opus-4-1"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::per_million(15.00, 75.00, 18.75, 1.50),
-            max_output_tokens: Some(32000),
-            context_window: 200_000,
-        },
-    ];
-    MODELS
 }
 
 #[cfg(test)]

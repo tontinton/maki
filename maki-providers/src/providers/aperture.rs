@@ -6,13 +6,11 @@ use maki_config::providers::{OverrideFields, Protocol, ProviderOverride};
 use serde_json::Value;
 use tracing::warn;
 
-use crate::model::{
-    Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry,
-};
+use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
 use crate::provider::{BoxFuture, Provider};
 use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderRegistry,
-    ProviderSpec,
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native,
+    ProviderRegistry, ProviderSpec,
 };
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 use maki_storage::id::SessionRef;
@@ -59,7 +57,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     accepts_arbitrary_models: true,
     fallback_max_output: Some(16_384),
     fallback_context_window: 128_000,
-    models: models(),
+    models_toml: NO_CURATED_MODELS,
     pricing_schedule: None,
     native: Some(Native {
         new: create,
@@ -96,10 +94,6 @@ fn create_with_auth(
 }
 
 inventory::submit!(SPEC.config_row());
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[]
-}
 
 type Overrides = HashMap<String, ProviderOverride>;
 
@@ -338,7 +332,7 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
         model.thinking_override = model
             .thinking_override
             .or_else(|| ThinkingSupport::from_flags(Some(spec.supports_thinking), false));
-        if let Ok(entry) = lookup_entry(spec.models, model_id) {
+        if let Ok(entry) = lookup_entry(spec.models(), model_id) {
             model.context_window = entry.context_window;
             model.max_output_tokens = entry.max_output_tokens;
             model.supports_vision_override = model.supports_vision_override.or(Some(entry.vision));

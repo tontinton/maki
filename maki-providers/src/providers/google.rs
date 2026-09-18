@@ -11,7 +11,7 @@ use tracing::warn;
 
 use maki_config::providers::Protocol;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelFamily};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::Timeouts;
 use crate::providers::aperture::GEMINI_PATH_PREFIX;
@@ -56,7 +56,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     accepts_arbitrary_models: true,
     fallback_max_output: Some(65_536),
     fallback_context_window: 1_000_000,
-    models: models(),
+    models_toml: include_str!("../../models/google.toml"),
     pricing_schedule: None,
     native: Some(Native {
         new: create,
@@ -97,42 +97,6 @@ fn create_with_auth(
 }
 
 inventory::submit!(SPEC.config_row());
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &["gemini-2.5-pro"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Gemini,
-            vision: true,
-            default: true,
-            pricing: ModelPricing::per_million(1.25, 5.00, 0.00, 0.31),
-            max_output_tokens: Some(65_536),
-            context_window: 1_048_576,
-        },
-        ModelEntry {
-            prefixes: &["gemini-2.5-flash"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Gemini,
-            vision: true,
-            default: true,
-            pricing: ModelPricing::per_million(0.15, 0.60, 0.00, 0.04),
-            max_output_tokens: Some(65_536),
-            context_window: 1_048_576,
-        },
-        ModelEntry {
-            prefixes: &["gemini-2.0-flash-lite"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Gemini,
-            vision: true,
-            default: true,
-            pricing: ModelPricing::per_million(0.075, 0.30, 0.00, 0.01),
-            max_output_tokens: Some(65_536),
-            context_window: 1_048_576,
-        },
-    ];
-    MODELS
-}
 
 fn resolve_google_base_url() -> Option<String> {
     let config = maki_config::providers::ProvidersConfig::load();
@@ -714,6 +678,7 @@ async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ModelPricing, ModelTier};
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -1127,17 +1092,6 @@ mod tests {
                 .get("additionalProperties")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn models_list_has_defaults() {
-        let models = models();
-        assert!(!models.is_empty());
-        for entry in models {
-            assert!(!entry.prefixes.is_empty());
-            assert!(entry.max_output_tokens.is_some_and(|t| t > 0));
-            assert!(entry.context_window >= entry.max_output_tokens.unwrap());
-        }
     }
 
     fn mock_response(data: &'static [u8]) -> isahc::Response<isahc::AsyncBody> {

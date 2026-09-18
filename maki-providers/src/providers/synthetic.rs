@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use maki_config::providers::Protocol;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelFamily};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::aperture::DEFAULT_PATH_PREFIX;
 use crate::spec::{
@@ -44,7 +44,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     accepts_arbitrary_models: false,
     fallback_max_output: Some(32_000),
     fallback_context_window: 128_000,
-    models: models(),
+    models_toml: include_str!("../../models/synthetic.toml"),
     pricing_schedule: None,
     native: Some(Native {
         new: create,
@@ -83,42 +83,6 @@ fn create_with_auth(
 }
 
 inventory::submit!(SPEC.config_row());
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &["hf:moonshotai/Kimi-K2.5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Synthetic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing::per_million(0.45, 3.40, 0.00, 0.00),
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["hf:deepseek-ai/DeepSeek-V3.2"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Synthetic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing::per_million(0.56, 1.68, 0.00, 0.00),
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["hf:zai-org/GLM-4.7-Flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Synthetic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing::per_million(0.10, 0.50, 0.00, 0.00),
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-    ];
-    MODELS
-}
 
 pub struct Synthetic {
     compat: OpenAiCompatProvider,

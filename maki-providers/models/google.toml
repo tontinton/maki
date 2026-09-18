@@ -1,0 +1,32 @@
+# Curated model table for Google. Rates are USD per 1M tokens.
+slug = "google"
+
+[[model]]
+prefixes = ["gemini-2.5-pro"]
+tier = "strong"
+family = "gemini"
+vision = true
+default = true
+max_output_tokens = 65536
+context_window = 1048576
+pricing = { input = 1.25, output = 5.0, cache_write = 0.0, cache_read = 0.31 }
+
+[[model]]
+prefixes = ["gemini-2.5-flash"]
+tier = "medium"
+family = "gemini"
+vision = true
+default = true
+max_output_tokens = 65536
+context_window = 1048576
+pricing = { input = 0.15, output = 0.6, cache_write = 0.0, cache_read = 0.04 }
+
+[[model]]
+prefixes = ["gemini-2.0-flash-lite"]
+tier = "weak"
+family = "gemini"
+vision = true
+default = true
+max_output_tokens = 65536
+context_window = 1048576
+pricing = { input = 0.075, output = 0.3, cache_write = 0.0, cache_read = 0.01 }

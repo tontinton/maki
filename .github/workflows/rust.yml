@@ -28,6 +28,7 @@ jobs:
               - "Cargo.lock"
               - "src/**"
               - "maki-*/src/**"
+              - "maki-*/models/**"
               - "plugins/**"
               - "justfile"
               - ".github/workflows/rust.yml"

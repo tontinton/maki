@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 use maki_config::providers::Protocol;
 
 use crate::AgentError;
-use crate::model::{ModelEntry, ModelFamily};
+use crate::model::ModelFamily;
 use crate::provider::Provider;
 use crate::providers::aperture::DEFAULT_PATH_PREFIX;
 use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native,
+    ProviderSpec,
 };
 
 use super::local::{LocalEndpoint, OLLAMA};
@@ -35,7 +36,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     accepts_arbitrary_models: true,
     fallback_max_output: Some(16_384),
     fallback_context_window: 128_000,
-    models: models(),
+    models_toml: NO_CURATED_MODELS,
     pricing_schedule: None,
     native: Some(Native {
         new: create,
@@ -75,8 +76,4 @@ fn create_with_auth(
     system_prefix: Option<String>,
 ) -> Box<dyn Provider> {
     Box::new(LocalEndpoint::with_auth(&OLLAMA, auth, timeouts).with_system_prefix(system_prefix))
-}
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[]
 }

@@ -268,7 +268,7 @@ fn static_candidate(provider: &str, tier: ModelTier) -> Option<String> {
 fn static_prefixes(provider: &str, tier: ModelTier) -> impl Iterator<Item = &'static str> {
     ProviderRegistry::get(provider)
         .into_iter()
-        .flat_map(|spec| spec.models)
+        .flat_map(|spec| spec.models())
         .filter(move |entry| entry.default && entry.tier == tier)
         .flat_map(|entry| entry.prefixes.iter().copied())
 }

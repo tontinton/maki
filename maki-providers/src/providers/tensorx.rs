@@ -6,12 +6,12 @@ use serde_json::{Value, json};
 
 use maki_config::providers::Protocol;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing};
+use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::aperture::DEFAULT_PATH_PREFIX;
 use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs, LoginConfig, Native,
-    ProviderSpec,
+    ApertureRoute, AuthDoc, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs, LoginConfig,
+    NO_CURATED_MODELS, Native, ProviderSpec,
 };
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
@@ -49,7 +49,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     accepts_arbitrary_models: true,
     fallback_max_output: None,
     fallback_context_window: 200_000,
-    models: models(),
+    models_toml: NO_CURATED_MODELS,
     pricing_schedule: None,
     native: Some(Native {
         new: create,
@@ -88,10 +88,6 @@ fn create_with_auth(
 }
 
 inventory::submit!(SPEC.config_row());
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[]
-}
 
 #[derive(Debug)]
 struct TensorXModelInfo {
