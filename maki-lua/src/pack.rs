@@ -10,6 +10,8 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use maki_pack::approvals::Entry;
+
 use crate::error::PluginError;
 use crate::loader::is_bundled;
 use crate::plugin_permissions::{
@@ -23,6 +25,11 @@ const DECLARED_DELETE_REFUSAL: &str = "still declared; remove it from maki.pack.
 const UPDATE_USAGE: &str = "/packupdate: name at most one package";
 const DELETE_USAGE: &str = "/packdel: name a package, or pass ++all";
 const PLUGIN_MANIFEST: &str = "plugin.toml";
+/// Sets a host apart from the permission names it is listed beside when a
+/// package still needs approving.
+const NET_HOST_LABEL: &str = "net host";
+/// How a reach of every host is listed beside the named ones.
+const ANY_HOST: &str = "*";
 const APPROVALS_FILE: &str = "pack-approvals.json";
 const REVIEW_PROMPT_HEADER: &str = "Apply these package changes?";
 const REVIEW_DELETE_LINE: &str = "remove";
@@ -191,7 +198,8 @@ pub fn granted(
             let approved = crate::plugin_permissions::PluginPermissions::from_approved(
                 approvals
                     .get(&key)
-                    .unwrap_or(&[])
+                    .map(Entry::permissions)
+                    .unwrap_or_default()
                     .iter()
                     .map(String::as_str),
             );
@@ -253,7 +261,8 @@ fn installed_from_declared_source(
 struct Resolved {
     package: DiscoveredPackage,
     key: maki_pack::approvals::ApprovalKey,
-    /// Permissions the manifest asks for that the store has not approved.
+    /// What the manifest asks for that the store has not approved:
+    /// permissions, and the hosts the package says it talks to.
     missing: Vec<String>,
 }
 
@@ -295,7 +304,7 @@ fn resolve_declared(
         }
     };
     let key = maki_pack::approvals::ApprovalKey::new(spec.name.clone(), &spec.src);
-    let missing = missing_permissions(&requested, approvals.get(&key).unwrap_or(&[]));
+    let missing = missing_grants(&requested, approvals.get(&key));
     Some(Resolved {
         package: DiscoveredPackage {
             name: spec.name.clone(),
@@ -348,12 +357,77 @@ fn approval_required(resolved: &Resolved) -> String {
     )
 }
 
-fn missing_permissions(requested: &Requested, approved: &[String]) -> Vec<String> {
-    requested
+/// What a package asks for that its approval does not cover.
+///
+/// Hosts count the same way permissions do: an update that widens `net_hosts`,
+/// or drops the list and with it every limit, is asking for reach the user
+/// never granted.
+fn missing_grants(requested: &Requested, approved: Option<&Entry>) -> Vec<String> {
+    let permissions = approved.map(Entry::permissions).unwrap_or_default();
+    let missing_names = requested
         .names()
         .into_iter()
-        .filter(|name| !approved.iter().any(|approved| approved == name))
-        .collect()
+        .filter(|name| !permissions.contains(name));
+    let missing_hosts = Reach::requested(requested)
+        .beyond(Reach::granted(approved))
+        .into_iter()
+        .map(|host| format!("{NET_HOST_LABEL} {host}"));
+    missing_names.chain(missing_hosts).collect()
+}
+
+/// How far a package reaches over the network, on one side of an approval.
+#[derive(Clone, Copy)]
+enum Reach<'a> {
+    Offline,
+    Hosts(&'a [String]),
+    /// `net` with no `net_hosts` list, which is every host.
+    Anywhere,
+}
+
+impl<'a> Reach<'a> {
+    fn of(net: bool, hosts: Option<&'a [String]>) -> Self {
+        match (net, hosts) {
+            (false, _) => Self::Offline,
+            (true, Some(hosts)) => Self::Hosts(hosts),
+            (true, None) => Self::Anywhere,
+        }
+    }
+
+    fn requested(requested: &'a Requested) -> Self {
+        Self::of(
+            requested.is_requested(Permission::Net),
+            requested.net_hosts(),
+        )
+    }
+
+    fn granted(approved: Option<&'a Entry>) -> Self {
+        let net = Permission::Net.manifest_key();
+        approved.map_or(Self::Offline, |entry| {
+            Self::of(
+                entry.permissions().iter().any(|name| name == net),
+                entry.net_hosts(),
+            )
+        })
+    }
+
+    /// The hosts `self` reaches and `other` does not. One direction of a
+    /// diff, so the review runs it both ways. Going on or off the network at
+    /// all is the `net` permission's to report, so only a list that grows, or
+    /// gives way to every host, is named here.
+    fn beyond(self, other: Self) -> Vec<String> {
+        match (self, other) {
+            (Self::Offline, _) | (_, Self::Anywhere) | (Self::Anywhere, Self::Offline) => {
+                Vec::new()
+            }
+            (Self::Anywhere, Self::Hosts(_)) => vec![ANY_HOST.to_owned()],
+            (Self::Hosts(hosts), Self::Offline) => hosts.to_vec(),
+            (Self::Hosts(hosts), Self::Hosts(covered)) => hosts
+                .iter()
+                .filter(|host| !covered.contains(host))
+                .cloned()
+                .collect(),
+        }
+    }
 }
 
 /// The declarations that may be installed: the rest name something that
@@ -435,7 +509,15 @@ fn grant_installed(
                 report.failures.push(approval_required(&resolved));
                 continue;
             }
-            approvals.approve(&resolved.key, resolved.package.requested.names());
+            approvals.approve(
+                &resolved.key,
+                resolved.package.requested.names(),
+                resolved
+                    .package
+                    .requested
+                    .net_hosts()
+                    .map(<[String]>::to_vec),
+            );
             approvals_changed = true;
             newly_approved.insert(name.clone());
         }
@@ -879,6 +961,7 @@ enum PreparedPackOp {
 struct PendingApproval {
     src: String,
     names: Vec<String>,
+    net_hosts: Option<Vec<String>>,
 }
 
 pub fn prepare_pack_command(command: &PackCommand, context: &PackContext) -> PackPreparation {
@@ -977,11 +1060,13 @@ fn prepare_pack_ops_at(
                         ));
                         continue;
                     };
+                    // Cloned, not borrowed: the review outlives the store
+                    // read, which has to end before the git work begins.
                     Some(
                         store
                             .get(&maki_pack::approvals::ApprovalKey::new(name, &spec.src))
-                            .unwrap_or(&[])
-                            .to_vec(),
+                            .cloned()
+                            .unwrap_or_default(),
                     )
                 };
                 let proposal = match smol::block_on(manager.prepare_update(
@@ -1025,6 +1110,7 @@ fn prepare_pack_ops_at(
                     approve = Some(PendingApproval {
                         src: spec.src.clone(),
                         names: requested.names(),
+                        net_hosts: requested.net_hosts().map(<[String]>::to_vec),
                     });
                 }
                 prepared.push(PreparedPackOp::Update {
@@ -1127,6 +1213,7 @@ pub fn apply_pack_plan(plan: PackPlan) -> PackReport {
                             store.approve(
                                 &maki_pack::approvals::ApprovalKey::new(&name, &approve.src),
                                 approve.names,
+                                approve.net_hosts,
                             );
                             unsaved.push(failure);
                         }
@@ -1206,11 +1293,12 @@ fn proposed_permissions(
     requested_permissions_from_text(manifest, &path)
 }
 
-fn update_permission_diff(requested: &Requested, approved: &[String]) -> String {
+fn update_permission_diff(requested: &Requested, approved: &Entry) -> String {
     let mut additions = Vec::new();
     let mut removals = Vec::new();
     for permission in Permission::ALL {
         let is_approved = approved
+            .permissions()
             .iter()
             .any(|name| name == permission.manifest_key());
         match (is_approved, requested.is_requested(*permission)) {
@@ -1219,6 +1307,20 @@ fn update_permission_diff(requested: &Requested, approved: &[String]) -> String 
             _ => {}
         }
     }
+    let wanted = Reach::requested(requested);
+    let granted = Reach::granted(Some(approved));
+    additions.extend(
+        wanted
+            .beyond(granted)
+            .into_iter()
+            .map(|host| format!("+{NET_HOST_LABEL} {host}")),
+    );
+    removals.extend(
+        granted
+            .beyond(wanted)
+            .into_iter()
+            .map(|host| format!("-{NET_HOST_LABEL} {host}")),
+    );
     additions.extend(removals);
     if additions.is_empty() {
         "unchanged".to_owned()
@@ -1488,21 +1590,33 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use maki_pack::approvals::Entry;
+    use test_case::test_case;
+
     use crate::error::PluginError;
     use crate::plugin_permissions::{Permission, Requested};
-    use test_case::test_case;
 
     use super::{
         ACTIVE_DELETE_REFUSAL, APPROVALS_FILE, DECLARED_DELETE_REFUSAL, DiscoveredPackage,
         MANAGED_GROUP, OWNER_CONFLICT_FAILURE, Origin, PLUGIN_MANIFEST, PackPreparation, PlannedOp,
         Problem, REVIEW_DELETE_LINE, REVIEW_PROMPT_HEADER, REVIEW_REVISION_LEN,
         UNAVAILABLE_OLD_REVISION, UpdateOptions, UpdateTarget, apply_pack_plan, discover, granted,
-        installed_from_declared_source, missing_permissions, prepare_pack_ops_at,
-        read_approvals_file, read_lockfile, resolved_on_disk, sanitize_message, write_approvals_at,
-        write_lockfile,
+        installed_from_declared_source, missing_grants, prepare_pack_ops_at, read_approvals_file,
+        read_lockfile, resolved_on_disk, sanitize_message, write_approvals_at, write_lockfile,
     };
 
     const NET_MANIFEST: &str = "[permissions]\nnet = true\n";
+    const APPROVAL_SRC: &str = "https://example.com/demo";
+    const APPROVED_HOST: &str = "api.example.com";
+    const NARROW_HOSTS_MANIFEST: &str =
+        "[permissions]\nnet = true\nnet_hosts = [\"api.example.com\"]\n";
+    const WIDENED_HOSTS_MANIFEST: &str =
+        "[permissions]\nnet = true\nnet_hosts = [\"api.example.com\", \"api.other.example\"]\n";
+    /// The extra host in [`WIDENED_HOSTS_MANIFEST`], as the approval prompt
+    /// lists it.
+    const MISSING_WIDER_HOST: &str = "net host api.other.example";
+    /// What the approval prompt lists for a manifest that drops its hosts.
+    const MISSING_ANY_HOST: &str = "net host *";
     const TEST_REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OTHER_REV: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -1623,6 +1737,7 @@ mod tests {
         approvals.approve(
             &maki_pack::approvals::ApprovalKey::new("demo", src),
             vec!["run".to_owned()],
+            None,
         );
         let effective = granted(&pkg, &approvals);
 
@@ -1642,6 +1757,7 @@ mod tests {
         approvals.approve(
             &maki_pack::approvals::ApprovalKey::new("demo", "https://example.com/demo"),
             vec!["run".to_owned()],
+            None,
         );
 
         let moved = greedy(
@@ -1656,18 +1772,51 @@ mod tests {
         );
     }
 
-    #[test]
-    fn missing_permissions_reports_each_unapproved_request() {
-        let manifest = toml::from_str::<toml::Value>(
-            "[permissions]\nfs_read = true\nnet = true\nrun = true\n",
-        )
-        .unwrap();
-        let requested = Requested::from_manifest(&manifest);
+    /// What a package with this manifest would still have to be asked about,
+    /// given an approval for these permissions and these hosts, `None` being
+    /// every host.
+    fn still_missing(
+        manifest: &str,
+        permissions: &[&str],
+        net_hosts: Option<&[&str]>,
+    ) -> Vec<String> {
+        let key = maki_pack::approvals::ApprovalKey::new("demo", APPROVAL_SRC);
+        let mut store = maki_pack::approvals::Approvals::default();
+        store.approve(
+            &key,
+            permissions.iter().map(|name| (*name).to_owned()).collect(),
+            net_hosts.map(|hosts| hosts.iter().map(|host| (*host).to_owned()).collect()),
+        );
+        let requested = Requested::from_manifest(&toml::from_str::<toml::Value>(manifest).unwrap());
+        missing_grants(&requested, store.get(&key))
+    }
 
+    #[test]
+    fn every_unapproved_permission_is_reported() {
         assert_eq!(
-            missing_permissions(&requested, &["net".to_owned()]),
+            still_missing(
+                "[permissions]\nfs_read = true\nnet = true\nrun = true\n",
+                &["net"],
+                None
+            ),
             ["fs_read".to_owned(), "run".to_owned()]
         );
+    }
+
+    /// The defect `net_hosts` on an approval exists to prevent: an update that
+    /// reaches further than the answer covers must ask again rather than
+    /// inherit it, while an unchanged or narrower reach asks nothing. Dropping
+    /// the list is the widest reach of all, not the absence of one.
+    #[test_case(NARROW_HOSTS_MANIFEST, Some(&[APPROVED_HOST]), &[] ; "an_unchanged_host_list_needs_no_new_answer")]
+    #[test_case(WIDENED_HOSTS_MANIFEST, Some(&[APPROVED_HOST]), &[MISSING_WIDER_HOST] ; "a_widened_host_list_asks_again")]
+    #[test_case(NET_MANIFEST, Some(&[APPROVED_HOST]), &[MISSING_ANY_HOST] ; "a_dropped_host_list_asks_again")]
+    #[test_case(NARROW_HOSTS_MANIFEST, None, &[] ; "a_list_narrows_an_approval_for_every_host")]
+    fn net_hosts_are_approved_like_permissions(
+        manifest: &str,
+        approved: Option<&[&str]>,
+        expected: &[&str],
+    ) {
+        assert_eq!(still_missing(manifest, &["net"], approved), expected);
     }
 
     fn declared_pack(name: &str, src: &str) -> crate::api::pack::Declared {
@@ -2059,13 +2208,46 @@ mod tests {
     }
 
     fn approve(fixture: &UpdateFixture, names: &[&str]) {
+        approve_reaching(fixture, names, None);
+    }
+
+    fn approve_reaching(fixture: &UpdateFixture, names: &[&str], hosts: Option<&[&str]>) {
         let path = fixture.site.join(APPROVALS_FILE);
         let mut approvals = maki_pack::approvals::Approvals::default();
         approvals.approve(
             &maki_pack::approvals::ApprovalKey::new("demo", &fixture.declared[0].spec.src),
             names.iter().map(|name| (*name).to_owned()).collect(),
+            hosts.map(|hosts| hosts.iter().map(|host| (*host).to_owned()).collect()),
         );
         assert!(write_approvals_at(&path, &approvals));
+    }
+
+    /// Dropping `net_hosts` lifts every limit, so the review must say the
+    /// package now reaches every host rather than read like it narrowed.
+    #[test_case(NARROW_HOSTS_MANIFEST, NET_MANIFEST, "+net host *" ; "a_dropped_list_widens_to_every_host")]
+    #[test_case(NET_MANIFEST, NARROW_HOSTS_MANIFEST, "-net host *" ; "a_new_list_narrows_from_every_host")]
+    fn update_review_shows_the_reach_that_changed(
+        old_manifest: &str,
+        new_manifest: &str,
+        expected: &str,
+    ) {
+        let fixture = update_fixture_with_manifests(Some(old_manifest), Some(new_manifest));
+        let approved_hosts: &[&str] = &[APPROVED_HOST];
+        let reach = (old_manifest == NARROW_HOSTS_MANIFEST).then_some(approved_hosts);
+        approve_reaching(&fixture, &["net"], reach);
+        let (_, prompt) = finish_preparation(prepare_pack_ops_at(
+            &[update_operation(false)],
+            &fixture.declared,
+            &Default::default(),
+            &fixture.site,
+            &fixture.lock_path,
+        ));
+
+        let prompt = prompt.expect("a normal update needs review");
+        assert!(
+            prompt.contains(&format!("permissions: {expected}")),
+            "{prompt}"
+        );
     }
 
     #[test]
@@ -2280,7 +2462,13 @@ mod tests {
         let approvals = read_approvals_file(&fixture.site.join(APPROVALS_FILE))
             .expect("the approval store stays readable");
         let key = maki_pack::approvals::ApprovalKey::new("demo", &fixture.declared[0].spec.src);
-        assert_eq!(approvals.get(&key).unwrap_or(&[]), expected);
+        assert_eq!(
+            approvals
+                .get(&key)
+                .map(Entry::permissions)
+                .unwrap_or_default(),
+            expected
+        );
     }
 
     #[test]

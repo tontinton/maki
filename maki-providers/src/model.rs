@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model_registry;
 use crate::providers::catalog::{self, CatalogMeta};
-use crate::providers::{anthropic, custom, dynamic};
+use crate::providers::{anthropic, custom, plugin};
 use crate::spec::{ProviderRegistry, ProviderSpec};
 use crate::types::{FALLBACK_MAX_THINKING_BUDGET, THINKING_ADAPTIVE, THINKING_OFF};
 use maki_config::providers::ThinkingFields;
@@ -60,16 +60,29 @@ pub struct ModelPricing {
 
 /// Metadata discovered at runtime from a provider's `/models` endpoint.
 /// All fields optional -- most providers only return an ID.
-#[derive(Debug, Clone, Default)]
+///
+/// `Deserialize` is what a `list_models` hook in a Lua plugin answers with, so
+/// the shape a plugin may state is this one minus [`Self::provider_info`],
+/// which is a stash only the Rust provider that filled it can read back. Every
+/// optional field defaults, so an omitted one stays distinguishable from a
+/// published negative.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
+    #[serde(default)]
     pub context_window: Option<u32>,
+    #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    #[serde(default)]
     pub pricing: Option<ModelPricing>,
+    #[serde(default)]
     pub supports_thinking: Option<bool>,
+    #[serde(default)]
     pub supports_vision: Option<bool>,
+    #[serde(default)]
     pub tier: Option<ModelTier>,
     /// Store of additional metadata from the provider.
+    #[serde(skip)]
     pub provider_info: Option<Arc<dyn Any + Send + Sync>>,
 }
 
@@ -259,16 +272,37 @@ pub struct ModelEntry {
     pub context_window: u32,
 }
 
+/// Lets one matcher serve both model schemas: curated rows hand out `'static`
+/// prefixes, plugin-declared rows own theirs.
+pub(crate) trait Prefixed {
+    fn prefixes(&self) -> impl Iterator<Item = &str>;
+}
+
+impl Prefixed for ModelEntry {
+    fn prefixes(&self) -> impl Iterator<Item = &str> {
+        self.prefixes.iter().copied()
+    }
+}
+
+/// Longest matching prefix wins, so `glm-5-code` outranks `glm-5` for
+/// `glm-5-code-plus` however the rows happen to be ordered.
+pub(crate) fn longest_prefix_match<'a, T: Prefixed>(
+    entries: &'a [T],
+    model_id: &str,
+) -> Option<&'a T> {
+    entries
+        .iter()
+        .flat_map(|e| e.prefixes().map(move |p| (p, e)))
+        .filter(|(p, _)| model_id.starts_with(*p))
+        .max_by_key(|(p, _)| p.len())
+        .map(|(_, e)| e)
+}
+
 pub(crate) fn lookup_entry<'a>(
     entries: &'a [ModelEntry],
     model_id: &str,
 ) -> Result<&'a ModelEntry, ModelError> {
-    entries
-        .iter()
-        .flat_map(|e| e.prefixes.iter().map(move |p| (p, e)))
-        .filter(|(p, _)| model_id.starts_with(*p))
-        .max_by_key(|(p, _)| p.len())
-        .map(|(_, e)| e)
+    longest_prefix_match(entries, model_id)
         .ok_or_else(|| ModelError::UnknownModel(model_id.to_string()))
 }
 
@@ -788,7 +822,7 @@ impl Model {
     }
 
     pub fn from_tier_dynamic(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
-        if let Some(model) = dynamic::find_model_for_tier(slug, tier) {
+        if let Some(model) = plugin::find_model_for_tier(slug, tier) {
             return Ok(model);
         }
         // One providers.toml read, three answers: a model declared at this tier,
@@ -807,9 +841,9 @@ impl Model {
             }
             custom::TierLookup::Unknown => {}
         }
-        // Builtin or dynamic slug: resolve the base default under the slug
-        // (dynamic slugs route through `base_for_slug`).
-        if ProviderRegistry::get(slug).is_some() || dynamic::base_for_slug(slug).is_some() {
+        // A plugin slug has no models table of its own to default from, so it
+        // resolves through the base it borrowed.
+        if ProviderRegistry::get(slug).is_some() || plugin::base_for_slug(slug).is_some() {
             return Self::from_tier(slug, tier);
         }
         Err(ModelError::UnsupportedProvider(slug.to_string()))
@@ -825,19 +859,19 @@ impl Model {
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
         let (slug, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
 
-        // Precedence: builtin, then dynamic script, then providers.toml custom,
-        // then models.dev catalogue sub-provider.
-        // Discovery drops any script slug a builtin or custom entry already owns,
-        // so a script and a custom provider can never share a slug here.
+        // Order settles nothing between the first three: registration rejects
+        // any slug a builtin or a custom entry already owns, so they cannot
+        // collide. The models.dev catalogue comes last because it is the open
+        // ended one, and anything defined on this machine should win over it.
         if let Some(spec) = ProviderRegistry::get(slug) {
             return Ok(Self::from_base(spec, slug, model_id));
         }
 
-        if let Some(model) = dynamic::lookup_model(slug, model_id) {
+        if let Some(model) = plugin::lookup_model(slug, model_id) {
             return Ok(model);
         }
 
-        if let Some(base) = dynamic::base_for_slug(slug) {
+        if let Some(base) = plugin::base_for_slug(slug) {
             return Ok(Self::from_base(base, slug, model_id));
         }
 
@@ -1075,6 +1109,10 @@ mod tests {
         "the table has to disagree, or preferring the bill proves nothing";
     const PAID_PRICING: ModelPricing = ModelPricing::per_million(3.0, 15.0, 0.0, 0.0);
 
+    /// Two rows where one prefix extends the other, so row order cannot be
+    /// what decides the match.
+    const PREFIX_TABLE: [&[&str]; 3] = [&["glm-5"], &["glm-5-code"], &["claude-sonnet-4-5"]];
+
     #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5"; "the id itself")]
     #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5-20250929"; "anthropic snapshot")]
     #[test_case(&["gpt-5.4"], "gpt-5.4-2026-03-11"; "openai snapshot")]
@@ -1117,6 +1155,24 @@ mod tests {
         }
     }
 
+    fn curated_table() -> Vec<ModelEntry> {
+        PREFIX_TABLE.iter().map(|p| entry_named(p)).collect()
+    }
+
+    #[test_case("glm-5-code-plus", Some(1) ; "the_longer_of_two_matches")]
+    #[test_case("glm-5.4", Some(0) ; "only_the_shorter_matches")]
+    #[test_case("claude-sonnet-4-5-20250929", Some(2) ; "dated_snapshot")]
+    #[test_case("gpt-5.6", None ; "no_row_matches")]
+    fn longest_prefix_wins(model_id: &str, expected: Option<usize>) {
+        let entries = curated_table();
+
+        let matched = longest_prefix_match(&entries, model_id);
+
+        assert_eq!(
+            matched.map(|entry| entry.prefixes),
+            expected.map(|row| PREFIX_TABLE[row])
+        );
+    }
     #[test_case(999, "999"         ; "under_thousand")]
     #[test_case(1_000, "1.0k"      ; "thousand")]
     #[test_case(999_999, "1000.0k" ; "just_under_million")]

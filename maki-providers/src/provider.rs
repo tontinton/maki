@@ -14,7 +14,7 @@ use crate::model_registry::set_known_models;
 use crate::providers::catalog::{
     available_if_warm, catalog_providers, catalog_providers_if_available, try_create,
 };
-use crate::providers::{KeyRotation, Timeouts, custom, dynamic};
+use crate::providers::{KeyRotation, Timeouts, custom, plugin};
 use crate::spec::{Owner, ProviderRegistry};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
@@ -64,7 +64,7 @@ pub trait Provider: Send + Sync {
 pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
     match Owner::of(slug) {
         Owner::Builtin(new) => new(timeouts),
-        Owner::Script => dynamic::create(slug, timeouts),
+        Owner::Plugin => plugin::create(slug, timeouts),
         Owner::Custom => custom::create(slug, timeouts),
         Owner::Catalog | Owner::Unknown => try_create(slug, timeouts).unwrap_or_else(|| {
             Err(AgentError::Config {
@@ -83,7 +83,7 @@ pub fn provider_available(slug: &str) -> bool {
 /// reports them unavailable instead of blocking on a network fetch.
 fn provider_available_offline(slug: &str) -> bool {
     match Owner::of(slug) {
-        Owner::Builtin(_) | Owner::Script | Owner::Custom => provider_available(slug),
+        Owner::Builtin(_) | Owner::Plugin | Owner::Custom => provider_available(slug),
         Owner::Catalog | Owner::Unknown => available_if_warm(slug),
     }
 }
@@ -99,12 +99,6 @@ pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provi
 /// provider. Used to reconcile a resumed model so it matches one started
 /// fresh (e.g. inherited thinking support for a routed Aperture model).
 pub fn adjust_model(model: &mut Model, timeouts: Timeouts) -> Result<(), AgentError> {
-    // Script-backed providers adjust nothing but run their auth script at
-    // construction; resumed-session callers sit on the UI thread and must
-    // not wait on that.
-    if dynamic::display_name(&model.provider).is_some() {
-        return Ok(());
-    }
     provider_for_slug(&model.provider, timeouts)?.adjust_model(model);
     Ok(())
 }
@@ -168,7 +162,7 @@ pub struct ModelBatch {
 }
 
 /// Offline version of model discovery: returns specs from static tables
-/// and configured dynamic providers. See [`fetch_all_models`] for live lookups.
+/// and registered plugin providers. See [`fetch_all_models`] for live lookups.
 /// Never blocks on catalog download; catalog-backed providers appear only once
 /// the catalog has warmed in the background.
 pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
@@ -182,8 +176,8 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
                 .map(move |p| format!("{}/{}", m.slug, p))
         })
         .collect();
-    for slug in dynamic::discovered_slugs() {
-        specs.extend(dynamic::dynamic_model_specs_for(slug));
+    for slug in plugin::registered_slugs() {
+        specs.extend(plugin::plugin_model_specs_for(&slug));
     }
     for spec in custom::declared_model_specs() {
         if !specs.contains(&spec) {
@@ -195,7 +189,7 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
             // Any slug the registry knows was listed above; see
             // `spec::tests::builtins_are_the_native_and_catalog_backed_slugs`.
             if ProviderRegistry::get(&cat.slug).is_some()
-                || matches!(Owner::of(&cat.slug), Owner::Script | Owner::Custom)
+                || matches!(Owner::of(&cat.slug), Owner::Plugin | Owner::Custom)
             {
                 continue;
             }
@@ -270,22 +264,21 @@ pub async fn fetch_all_models(
         .detach();
     }
 
-    for slug in dynamic::discovered_slugs() {
+    for slug in plugin::registered_slugs() {
         let tx = tx.clone();
-        let slug = slug.to_string();
         smol::spawn(async move {
             let static_fallback = |reason: String| {
                 warn!(
                     slug,
                     error = reason,
-                    "dynamic model listing failed, using static fallback"
+                    "plugin model listing failed, using static fallback"
                 );
                 ModelBatch {
-                    models: dynamic::dynamic_model_specs_for(&slug),
+                    models: plugin::plugin_model_specs_for(&slug),
                     warnings: vec![format!("{slug}: {reason} (using static fallback)")],
                 }
             };
-            let batch = match dynamic::create(&slug, timeouts) {
+            let batch = match plugin::create(&slug, timeouts) {
                 Ok(provider) => match provider.list_models().await {
                     Ok(models) => ModelBatch {
                         models: models.iter().map(|m| format!("{slug}/{}", m.id)).collect(),
@@ -307,7 +300,7 @@ pub async fn fetch_all_models(
             // No `Owner::Custom` here, unlike `available_model_specs` above:
             // a long-standing asymmetry, changing it is a behaviour change.
             if ProviderRegistry::get(&cat.slug).is_some()
-                || matches!(Owner::of(&cat.slug), Owner::Script)
+                || matches!(Owner::of(&cat.slug), Owner::Plugin)
             {
                 continue;
             }

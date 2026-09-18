@@ -68,6 +68,11 @@ fn load_plugins(
     interaction: Interaction,
     build_config: impl FnOnce(&PluginHost, &KnownNames<'_>, &mut Vec<String>) -> Result<Config>,
 ) -> Result<(Config, Vec<String>)> {
+    // Opens the provider registration window and drops what the previous load
+    // registered: on a `/reload` this host is a new one, and an entry the old
+    // one left behind answers on a channel nobody serves.
+    maki_providers::plugin::begin_load();
+
     let discovery = maki_lua::discover_installed(no_plugins);
     // Includes the names discovery refused, so a package it could not read does
     // not become a config error pointing at the user's `plugins.<name>` table.
@@ -117,6 +122,11 @@ fn load_plugins(
     // Last, so it covers every load above. Taking empties it, so a later
     // `/reload` only reports what that load found.
     warnings.extend(host.take_key_warning());
+
+    // Publishes this load's providers in one step. Until here every reader
+    // still sees the generation that was serving, so a `/reload` never opens a
+    // window in which a registered provider answers "unknown".
+    maki_providers::plugin::commit_load();
 
     Ok((config, sanitize_warnings(&warnings)))
 }
@@ -193,6 +203,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
+            // Providers registered by a Lua plugin only reach the registry once
+            // plugin load has published them, and `login`/`logout` drive a hook
+            // that runs on the host's Lua thread, so `_host` stays bound for the
+            // whole arm.
+            let _host = cli_stack(cli.no_plugins, cli.no_jit, trust_mode)?;
             match action {
                 AuthAction::Login { provider } => {
                     subcmd::auth_login(provider.as_deref(), &storage)?

@@ -52,6 +52,14 @@ The rules:
 - A package, or a plugin maki ships, is read the other way round: a key it
   does not name is not requested, so its `plugin.toml` lists everything it
   uses. Only a `plugin.toml` you wrote yourself defaults to granted.
+- `net_hosts` sits in the same table and grants nothing by itself. Left out,
+  `net = true` keeps its usual meaning of any public host the address guard
+  allows. Set to `["api.acme.com", "*.acme.dev"]`, it limits the plugin's
+  `maki.net` calls and any base URL it hands a provider codec to those hosts.
+  A pattern is either an exact host or one leading `*.` label. A plugin
+  calling `maki.provider.register` must declare a non-empty list, and widening
+  a list asks for approval again. See [Permissions](/docs/permissions/) for
+  the details.
 - `min_maki_version` is optional and takes a plain semantic version as a lower
   bound, so ranges do not work. When the field is invalid or the running
   version is older, Maki skips the Lua in that directory and warns at startup

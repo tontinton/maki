@@ -23,6 +23,7 @@ maki-pack = { workspace = true }
 maki-providers = { workspace = true }
 mlua = { workspace = true }
 nucleo-matcher = { workspace = true }
+open = { workspace = true }
 serde = { workspace = true }
 shell-words = { workspace = true }
 serde_json = { workspace = true }

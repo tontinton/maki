@@ -8,8 +8,8 @@ use ratatui::text::{Line, Span};
 
 use maki_providers::Model;
 use maki_providers::ModelTier;
-use maki_providers::dynamic;
 use maki_providers::model_registry;
+use maki_providers::plugin;
 use maki_providers::spec::ProviderRegistry;
 
 use crate::components::Overlay;
@@ -291,8 +291,8 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
     let provider_display =
         if let Some(spec) = ProviderRegistry::get(provider_str).filter(|s| s.is_native()) {
             spec.display_name.to_string()
-        } else if let Some(name) = dynamic::display_name(provider_str) {
-            name.to_string()
+        } else if let Some(name) = plugin::display_name(provider_str) {
+            name
         } else if let Some(info) = maki_providers::catalog_provider_if_available(provider_str) {
             info.display_name.clone()
         } else if let Some(builtin) = maki_config::providers::builtin_provider(provider_str) {

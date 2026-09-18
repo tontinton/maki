@@ -28,8 +28,8 @@ pub use providers::catalog::{
 };
 pub use providers::copilot::auth as copilot_auth;
 pub use providers::custom;
-pub use providers::dynamic;
 pub use providers::openai::auth as openai_auth;
+pub use providers::plugin;
 pub use providers::xai::auth as xai_auth;
 pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};

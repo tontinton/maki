@@ -8,8 +8,8 @@ use crate::model::{ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::provider::Provider;
 use crate::providers::{
-    ResolvedAuth, Timeouts, anthropic, aperture, copilot, custom, deepseek, dynamic, google,
-    llama_cpp, mistral, ollama, openai, opencode, openrouter, regolo, requesty, synthetic, tensorx,
+    ResolvedAuth, Timeouts, anthropic, aperture, copilot, custom, deepseek, google, llama_cpp,
+    mistral, ollama, openai, opencode, openrouter, plugin, regolo, requesty, synthetic, tensorx,
     xai, zai,
 };
 
@@ -70,8 +70,8 @@ pub type WithAuthFn = fn(Arc<Mutex<ResolvedAuth>>, Timeouts, Option<String>) -> 
 pub struct Native {
     /// Built from config and env by maki itself.
     pub new: NewFn,
-    /// Build against auth someone else resolved. Used by `providers.d`
-    /// scripts and by Aperture's gateway routing.
+    /// Build against auth someone else resolved. Used by plugin providers
+    /// that extend a base slug and by Aperture's gateway routing.
     pub with_auth: WithAuthFn,
     /// `Some` iff Aperture can proxy onto this provider. Lives here on
     /// purpose: a route is only expressible for a provider that has
@@ -198,7 +198,7 @@ impl ProviderRegistry {
         BUILTINS.iter().find(|s| s.slug == slug)
     }
 
-    /// Like `get`, but a dynamic or `providers.toml` slug resolves to its base
+    /// Like `get`, but a plugin or `providers.toml` slug resolves to its base
     /// provider's spec, so thinking support, display name and tier defaults
     /// still answer for a stub that declares no models.
     ///
@@ -206,7 +206,7 @@ impl ProviderRegistry {
     /// so the lookup cannot recurse.
     pub fn for_slug(slug: &str) -> Option<&'static ProviderSpec> {
         Self::get(slug)
-            .or_else(|| dynamic::base_for_slug(slug))
+            .or_else(|| plugin::base_for_slug(slug))
             .or_else(|| custom::base_spec(slug))
     }
 
@@ -214,8 +214,8 @@ impl ProviderRegistry {
         BUILTINS
     }
 
-    /// The slugs a `providers.d` script or a `providers.toml` entry may not
-    /// claim, and the ones a dynamic script may name as its `base`.
+    /// The slugs a registered plugin or a `providers.toml` entry may not
+    /// claim, and the ones a plugin may name as its `base`.
     pub fn native_slugs() -> impl Iterator<Item = &'static str> {
         BUILTINS.iter().filter(|s| s.is_native()).map(|s| s.slug)
     }
@@ -238,8 +238,8 @@ pub enum Owner {
     /// Carries the constructor rather than the spec, so "builtin" and
     /// "buildable" cannot come apart.
     Builtin(NewFn),
-    /// `providers.d/*`
-    Script,
+    /// `maki.provider.register` from a Lua plugin
+    Plugin,
     /// `providers.toml`
     Custom,
     /// models.dev
@@ -252,8 +252,8 @@ impl Owner {
         if let Some(native) = ProviderRegistry::get(slug).and_then(|s| s.native) {
             return Self::Builtin(native.new);
         }
-        if dynamic::display_name(slug).is_some() {
-            return Self::Script;
+        if plugin::is_registered(slug) {
+            return Self::Plugin;
         }
         if custom::base_spec(slug).is_some() {
             return Self::Custom;
