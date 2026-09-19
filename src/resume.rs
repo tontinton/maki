@@ -17,6 +17,9 @@ use crate::cli::Cli;
 const NO_PREVIOUS_SESSION: &str = "no previous session found for this directory, starting new";
 const ID_IN_USE: &str = "--session-id names a session that already exists";
 const ID_IN_USE_HINT: &str = "pass -s/--session to continue it, or --fork-session to copy it";
+/// For a run that already passed `--fork-session`. Suggesting the flag they
+/// just used reads like we did not listen.
+const ID_IN_USE_FORK_HINT: &str = "pass -s/--session to continue it, or drop --session-id";
 /// Both ways out, since neither is obviously right: a copy keeps the history
 /// but splits off from it, and dropping the flag starts over here.
 const BUSY_HINT: &str = "  --fork-session  work on a copy of it
@@ -126,14 +129,14 @@ pub fn resolve(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<Resolved> {
         // fails as an id already in use, not as a clash with our own read.
         Some(Loaded { session, claim, .. }) => {
             drop(claim);
-            let claim = claim_unused(&id, storage)?;
+            let claim = claim_unused(&id, cli.fork_session, storage)?;
             let copy = copy(session, &claim, cwd, storage)?;
             (maki_otel::emit::START_FRESH, Some(copy), claim)
         }
         None => (
             maki_otel::emit::START_FRESH,
             None,
-            claim_unused(&id, storage)?,
+            claim_unused(&id, cli.fork_session, storage)?,
         ),
     };
 
@@ -175,10 +178,14 @@ fn continues_in_place(in_place: Option<&SessionRef>, id: &SessionRef) -> bool {
 /// it writes to, so finding one there is refused rather than silently emptied.
 /// The lock comes before the `exists` check, so two runs naming the same new
 /// `--session-id` cannot both pass it.
-fn claim_unused(id: &SessionRef, storage: &StateDir) -> Result<SessionClaim> {
+fn claim_unused(id: &SessionRef, forking: bool, storage: &StateDir) -> Result<SessionClaim> {
     let claim = SessionClaim::acquire(id.id(), storage).map_err(with_busy_hint)?;
     if StoredSession::exists(id.id(), storage) {
-        return Err(eyre!("{ID_IN_USE}: {id}\n{ID_IN_USE_HINT}"));
+        let hint = match forking {
+            true => ID_IN_USE_FORK_HINT,
+            false => ID_IN_USE_HINT,
+        };
+        return Err(eyre!("{ID_IN_USE}: {id}\n{hint}"));
     }
     Ok(claim)
 }
@@ -509,14 +516,15 @@ mod tests {
     /// at somebody else's session has to stop: the answer to a typo cannot be
     /// deleted history. A fork gets no exemption, it continues nothing in
     /// place, and `--fork-session` promises to leave the original alone.
-    #[test_case(&["--session-id", ID_PLACEHOLDER] ; "an id already in use")]
-    #[test_case(&["-s", ID_PLACEHOLDER, "--session-id", ID_PLACEHOLDER, "--fork-session"] ; "a fork claiming the id it forked from")]
-    fn a_claimed_session_id_is_refused(args: &[&str]) {
+    #[test_case(&["--session-id", ID_PLACEHOLDER], ID_IN_USE_HINT ; "an id already in use")]
+    #[test_case(&["-s", ID_PLACEHOLDER, "--session-id", ID_PLACEHOLDER, "--fork-session"], ID_IN_USE_FORK_HINT ; "a fork claiming the id it forked from")]
+    fn a_claimed_session_id_is_refused(args: &[&str], hint: &str) {
         let (_dir, storage, cwd, stored) = storage_with_stored_session();
 
         let error = refusal(&cli(args, stored), &cwd, &storage);
 
         assert!(error.contains(ID_IN_USE), "{error}");
+        assert!(error.contains(hint), "{error}");
         assert_eq!(stored_messages(&storage, stored), 1, "{SURVIVED}");
     }
 

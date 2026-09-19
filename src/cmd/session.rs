@@ -9,8 +9,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use maki_storage::id::MakiId;
 use maki_storage::paths;
-use maki_storage::sessions::{SessionClaim, SessionError, SessionSummary};
-use maki_storage::{StateDir, StorageError, now_epoch};
+use maki_storage::sessions::{SessionClaim, SessionSummary};
+use maki_storage::{StateDir, now_epoch};
 use maki_ui::AppSession;
 
 /// Mirrors `AGE_UNITS` in the `sessions` picker plugin.
@@ -70,9 +70,7 @@ pub fn delete(session_id: &str, force: bool, storage: &StateDir) -> Result<()> {
     let claim = SessionClaim::acquire(id, storage).context("claim session")?;
     match AppSession::delete(&claim, storage) {
         Ok(()) => println!("Deleted session {id}"),
-        Err(SessionError::Storage(StorageError::NotFound(_))) => {
-            bail!("session {session_id} not found")
-        }
+        Err(e) if e.is_not_found() => bail!("session {session_id} not found"),
         Err(e) => return Err(e).context("delete session"),
     }
     Ok(())

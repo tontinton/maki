@@ -125,9 +125,10 @@ fn declared_packages(host: &PluginHost) -> Result<Vec<maki_lua::Declared>> {
     host.declared_packages().context("read declared packages")
 }
 
-/// Everything a non-session subcommand needs before it can do work: project
-/// trust, `.env`, the plugin host, the effective config, and the log subscriber
-/// so a plugin's `maki.log.*` has somewhere to go. One function, so the next
+/// Everything a non-session subcommand needs before it can do work: the model
+/// registry, project trust, `.env`, the plugin host, the effective config, and
+/// the TUI's logging and telemetry, so a plugin's `maki.log.*` has somewhere to
+/// go. One function, so the next
 /// subcommand cannot forget a step the way all three of these did.
 ///
 /// Plugins still load before the subscriber exists, because the config that
@@ -137,6 +138,10 @@ fn cli_stack(
     no_jit: bool,
     trust_mode: TrustMode,
 ) -> Result<(PluginHost, Config)> {
+    // First, as in `cmd::tui::run`, so anything that resolves a model sees the
+    // models the TUI would.
+    let storage = StateDir::resolve().context("resolve data directory")?;
+    maki_providers::model_registry::load_from_storage(&storage);
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     // The `trust.paths` policy deliberately stops at the session entry points
     // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
@@ -171,6 +176,8 @@ fn cli_stack(
         },
     )?;
     setup::init_logging(&config.storage);
+    setup::init_telemetry(&config.telemetry);
+    setup::install_panic_log_hook();
     report_warnings(warnings);
     Ok((host, config))
 }

@@ -39,10 +39,9 @@ use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
-use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::persist_model;
-use maki_storage::sessions::{SessionError, normalize_title};
+use maki_storage::sessions::normalize_title;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
@@ -1205,9 +1204,8 @@ impl<'t> EventLoop<'t> {
                 }
                 self.ctx.storage_writer.delete(id, claim, move |res| {
                     let reply = match res {
-                        Ok(()) | Err(SessionError::Storage(StorageError::NotFound(_))) => {
-                            Ok(json!(true))
-                        }
+                        Ok(()) => Ok(json!(true)),
+                        Err(e) if e.is_not_found() => Ok(json!(true)),
                         Err(e) => Err(e.to_string()),
                     };
                     let _ = reply_tx.send(reply);
