@@ -2031,6 +2031,12 @@ impl LuaRuntime {
             });
         }
         {
+            let plugins = Rc::clone(&plugins);
+            crate::api::slot::set_layer_delegation(move |plugin, authority, slot| {
+                layer_delegation(&plugins, authority, slot)(plugin)
+            });
+        }
+        {
             let lua = lua.clone();
             let plugins = Rc::clone(&plugins);
             crate::api::tool::set_local_tool_handles(move |tool| {
@@ -3014,15 +3020,19 @@ fn run_describe(
     }
 }
 
-/// Whether a plugin may layer this host slot at all.
+/// Whether a plugin may layer this slot at all.
 ///
 /// A layer on `tool.<name>.input` rewrites the call the tool then makes, so it
 /// borrows that call's [`Authority`] and has to already hold it. Without this,
-/// a plugin denied `run` could turn any bash command into its own.
+/// a plugin denied `run` could turn any bash command into its own. A layer on
+/// a slot another plugin declared borrows a reach nobody declared, so it
+/// arrives here as [`Authority::Unbounded`] and pays every capability.
 ///
 /// Decided when the chain fires rather than when the layer is registered,
 /// because a layer may legitimately be set before its target tool exists, and
-/// permissions a reload narrows take effect on the very next call.
+/// permissions a reload narrows take effect on the very next call. Host slots
+/// reach it through [`run_host_chain`], plugin slots through the gate the
+/// runtime installs for them, so both kinds gate in one place.
 fn layer_delegation<'a>(
     plugins: &'a PluginMap,
     authority: Authority,

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::mem;
@@ -6,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use maki_agent::tools::HookStage;
+use maki_agent::tools::hook::Authority;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 
@@ -24,7 +26,9 @@ pub(crate) struct SlotLayer {
 }
 
 /// `owner: None` means orphan fillers: `set_slot` ran before the owner's
-/// `declare_slot`. They wait here and attach once the owner declares.
+/// `declare_slot`. They wait here and attach once the owner declares, and what
+/// each of them is entitled to is weighed when the chain fires, so the order
+/// the two plugins loaded in never decides anything.
 #[derive(Default)]
 pub(crate) struct SlotEntry {
     pub owner: Option<Arc<str>>,
@@ -112,6 +116,48 @@ fn take_state(cell: &PrevCell, next: PrevState) -> PrevState {
 
 fn set_state(cell: &PrevCell, state: PrevState) {
     *cell.lock().expect("prev state poisoned") = state;
+}
+
+type DelegationFn = Box<dyn Fn(&str, Authority, &str) -> bool>;
+
+thread_local! {
+    /// Lives on the Lua runtime thread, installed by the runtime because only
+    /// it knows what each loaded plugin currently holds. A thread without one
+    /// has no grants to weigh a layer against, so nothing foreign gets through.
+    static LAYER_DELEGATION: RefCell<Option<DelegationFn>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn set_layer_delegation(f: impl Fn(&str, Authority, &str) -> bool + 'static) {
+    LAYER_DELEGATION.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+}
+
+fn delegated(plugin: &str, authority: Authority, slot: &str) -> bool {
+    LAYER_DELEGATION.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|gate| gate(plugin, authority, slot))
+    })
+}
+
+/// Which layers may steer a plugin-declared chain, answered every time it
+/// fires rather than when a layer registered, so a reload that narrows a grant
+/// lands on the very next call and a layer registered before its slot existed
+/// is weighed once the slot does.
+///
+/// The owner steers its own chain for free. Anyone else borrows a reach the
+/// slot never declared, which is exactly what [`Authority::Unbounded`] prices,
+/// so a foreign layer pays the toll a layer on a tool that declares no
+/// capability pays: every permission. One denied is dropped from the chain and
+/// logged, never an error, because a layer is an opinion about a call and
+/// never a precondition for making it.
+fn entitled_layers(name: &str, owner: &str, layers: Arc<[SlotLayer]>) -> Arc<[SlotLayer]> {
+    let entitled = |layer: &SlotLayer| {
+        layer.plugin.as_ref() == owner || delegated(&layer.plugin, Authority::Unbounded, name)
+    };
+    if layers.iter().all(&entitled) {
+        return layers;
+    }
+    layers.iter().filter(|l| entitled(l)).cloned().collect()
 }
 
 fn slot_store_mut(lua: &Lua) -> LuaResult<mlua::AppDataRefMut<'_, SlotStore>> {
@@ -212,10 +258,16 @@ fn invoke_chain(
     })
 }
 
-fn snapshot(lua: &Lua, name: &str) -> Option<(Option<Function>, Arc<[SlotLayer]>)> {
+type Snapshot = (Option<Arc<str>>, Option<Function>, Arc<[SlotLayer]>);
+
+fn snapshot(lua: &Lua, name: &str) -> Option<Snapshot> {
     let store = lua.app_data_ref::<SlotStore>()?;
     let entry = store.slots.get(name)?;
-    Some((entry.default.clone(), entry.layers.as_slice().into()))
+    Some((
+        entry.owner.clone(),
+        entry.default.clone(),
+        entry.layers.as_slice().into(),
+    ))
 }
 
 /// The one way into [`invoke_chain`], so no caller can start a chain without
@@ -269,7 +321,7 @@ pub(crate) async fn run_host_chain(
     args: MultiValue,
     allow_layer: &dyn Fn(&str) -> bool,
 ) -> LuaResult<Option<MultiValue>> {
-    let Some((_, layers)) = snapshot(lua, name) else {
+    let Some((_, _, layers)) = snapshot(lua, name) else {
         return Ok(None);
     };
     let layers: Arc<[SlotLayer]> = layers
@@ -292,9 +344,10 @@ fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
     lua.create_async_function(move |lua, args: MultiValue| {
         let name = Arc::clone(&name);
         async move {
-            let (default, layers) = snapshot(&lua, &name)
-                .and_then(|(default, layers)| Some((default?, layers)))
+            let (owner, default, layers) = snapshot(&lua, &name)
+                .and_then(|(owner, default, layers)| Some((owner?, default?, layers)))
                 .ok_or_else(|| mlua::Error::runtime(format!("slot '{name}' is not declared")))?;
+            let layers = entitled_layers(&name, &owner, layers);
             run_chain(&lua, name, default, layers, args).await
         }
     })
@@ -302,8 +355,9 @@ fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
 
 /// Create a named extension point owned by your plugin. You provide a
 /// {default} function, and other plugins can wrap it with layers using
-/// `set_slot`. The returned callable runs the full chain: outermost
-/// layer first, then inward, ending at {default}.
+/// `set_slot`, though a layer from another plugin only runs while that
+/// plugin holds every permission. The returned callable runs the full
+/// chain: outermost layer first, then inward, ending at {default}.
 ///
 /// Throws if another plugin already owns a slot with the same {name}, or
 /// if {name} starts with `"tool."`, which the host fires itself.
@@ -373,6 +427,13 @@ fn declare_slot(
 /// tool declares, and a tool declaring none costs every permission. See
 /// [Hooks](/docs/hooks/).
 ///
+/// Wrapping a slot another plugin declared steers a chain that plugin's
+/// callers trust, so the layer runs only while your plugin holds every
+/// permission. Layering a slot you declared yourself is free. Like the
+/// `tool.*` slots, this is decided when the chain fires: the call skips a
+/// layer that is not entitled and carries on, and a reload that changes what
+/// you hold takes effect on the next call.
+///
 /// @param name string Slot name to wrap.
 /// @param wrapper function Layer: `function(prev, ...)`. Call `prev(...)` to continue.
 /// @return
@@ -383,7 +444,8 @@ fn declare_slot(
 #[lua_fn]
 fn set_slot(lua: &Lua, #[ctx] plugin: Arc<str>, name: String, wrapper: Function) -> LuaResult<()> {
     let mut store = slot_store_mut(lua)?;
-    store.slots.entry(name).or_default().layers.push(SlotLayer {
+    let entry = store.slots.entry(name.clone()).or_default();
+    entry.layers.push(SlotLayer {
         plugin: Arc::clone(&plugin),
         func: wrapper,
     });

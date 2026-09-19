@@ -1293,6 +1293,118 @@ assert(orphan.fillers[1] == "slots_introspect")
     );
 }
 
+/// The owner hands its callable out, because a slot is only observable from
+/// the far end of a call.
+const RENDER_OWNER: &str = r#"
+local render = maki.api.declare_slot("owner.render", function(text) return text end)
+maki.api.exec_autocmds("SlotShare", { data = { callable = render } })
+"#;
+
+/// `set_slot` before `declare_slot`, from a plugin granted nothing: the shape
+/// `init.lua` has, since a config with no `plugin.toml` beside it is denied.
+const RENDER_SELF_LAYER_FIRST: &str = r#"
+maki.api.set_slot("owner.render", function(prev, text) return prev(text) .. "+self" end)
+local render = maki.api.declare_slot("owner.render", function(text) return text end)
+maki.api.exec_autocmds("SlotShare", { data = { callable = render } })
+"#;
+
+fn render_layer(mark: &str) -> String {
+    format!(
+        r#"maki.api.set_slot("owner.render", function(prev, text) return prev(text) .. "+{mark}" end)"#
+    )
+}
+
+/// The hole: a plugin nobody trusted steering a chain the owner's callers do.
+/// Registering it is free, and the chain drops it when it fires.
+#[test]
+fn a_foreign_layer_on_a_plugin_slot_costs_full_trust() {
+    let (reg, host) = host();
+    load(&host, "caller", SLOT_CALLER);
+    load(&host, "owner", RENDER_OWNER);
+
+    load_granted(
+        &host,
+        "attacker",
+        &render_layer("attacker"),
+        PluginPermissions::denied(),
+    );
+    assert_eq!(
+        exec_tool(&reg, "call_slot"),
+        "ok:world",
+        "a layer nobody trusted never steers another plugin's chain"
+    );
+
+    load_granted(
+        &host,
+        "trusted_wrapper",
+        &render_layer("trusted"),
+        PluginPermissions::trusted(),
+    );
+    assert_eq!(
+        exec_tool(&reg, "call_slot"),
+        "ok:world+trusted",
+        "full trust buys the layer, and the skipped one stays skipped"
+    );
+}
+
+/// Fire time reads what the last load granted the plugin, so narrowing a
+/// layer's reach costs a reload rather than a restart.
+#[test]
+fn narrowing_a_layers_grant_drops_it_from_the_next_call() {
+    let (reg, host) = host();
+    load(&host, "caller", SLOT_CALLER);
+    load(&host, "owner", RENDER_OWNER);
+    load_granted(
+        &host,
+        "wrapper",
+        &render_layer("wrap"),
+        PluginPermissions::trusted(),
+    );
+    assert_eq!(exec_tool(&reg, "call_slot"), "ok:world+wrap");
+
+    load_granted(&host, "wrapper", &render_layer("wrap"), all_but_run());
+    assert_eq!(
+        exec_tool(&reg, "call_slot"),
+        "ok:world",
+        "almost all is not all, and the next call is where it shows"
+    );
+}
+
+/// Registration says nothing about entitlement, for host slots and plugin
+/// slots alike: what the plugin holds is read when the chain fires.
+#[test]
+fn a_denied_plugin_registers_a_host_slot_layer() {
+    let (_reg, host) = host();
+    load_granted(
+        &host,
+        "denied_host_layer",
+        &format!(
+            r#"
+{}
+local fillers = maki.api.get_slots()["tool.bash.input"].fillers
+assert(#fillers == 1 and fillers[1] == "denied_host_layer", tostring(fillers[1]))
+"#,
+            layer("bash", HookStage::Input, "return prev(value, ctx)")
+        ),
+        PluginPermissions::denied(),
+    );
+}
+
+/// Registration order stops mattering: by the time the chain fires, the plugin
+/// that filled the orphan owns it, and an owner steers its own chain for free.
+#[test]
+fn a_denied_plugin_wraps_the_slot_it_declares_afterwards() {
+    let (reg, host) = host();
+    load(&host, "caller", SLOT_CALLER);
+    load_granted(
+        &host,
+        "owner",
+        RENDER_SELF_LAYER_FIRST,
+        PluginPermissions::denied(),
+    );
+    assert_eq!(exec_tool(&reg, "call_slot"), "ok:world+self");
+}
+
 const SLOT_CALLER: &str = r#"
 local stash
 maki.api.create_autocmd("SlotShare", { callback = function(ev) stash = ev.data.callable end })

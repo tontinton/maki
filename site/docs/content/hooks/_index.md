@@ -198,13 +198,16 @@ skipped when its tool is called.
 This sees the tools registered so far, so run it from `init.lua`, which loads
 after the builtin plugins. It also misses MCP tools, which arrive when their
 server connects. Naming one slot directly has no such ordering rule: `set_slot`
-accepts a name before anything registers it.
+accepts a name before anything registers it, and what a layer is entitled to is
+weighed when the chain fires rather than when you register it.
 
 ## Plugin slots
 
 A plugin can define an extension point of its own with
 [`declare_slot`](/docs/lua-api/#maki-api-declare_slot). The declaring plugin
-owns the name and supplies the default, and anyone can wrap it with `set_slot`:
+owns the name and supplies the default, and wraps its own slot for free. A
+layer from any other plugin steers a chain the owner's callers trust, so it
+runs only while that plugin holds every permission:
 
 ```lua
 -- owner
@@ -212,13 +215,18 @@ local render = maki.api.declare_slot("myplugin.render", function(text)
   return text:upper()
 end)
 
--- anyone
+-- another plugin, granted every permission
 maki.api.set_slot("myplugin.render", function(prev, text)
   return "[" .. prev(text) .. "]"
 end)
 
 -- render("hi") now returns "[HI]"
 ```
+
+The rule is the one the `tool.*` slots use, and it is read the same way: every
+call re-reads what each layer's plugin holds, so a layer registered by a plugin
+without the grant is skipped and the call carries on, and a reload that narrows
+a plugin's permissions costs it the layer on the next call.
 
 Names starting with `tool.` are reserved for maki, which fires them at points
 whose ordering it guarantees.

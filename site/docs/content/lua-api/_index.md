@@ -919,8 +919,9 @@ maki.api.declare_slot({name}, {default})
 
 Create a named extension point owned by your plugin. You provide a
 {default} function, and other plugins can wrap it with layers using
-`set_slot`. The returned callable runs the full chain: outermost
-layer first, then inward, ending at {default}.
+`set_slot`, though a layer from another plugin only runs while that
+plugin holds every permission. The returned callable runs the full
+chain: outermost layer first, then inward, ending at {default}.
 
 Throws if another plugin already owns a slot with the same {name}, or
 if {name} starts with `"tool."`, which the host fires itself.
@@ -978,6 +979,13 @@ table to replace the value, nothing to leave it alone, or
 `nil, reason` to stop the call. Wrapping one costs the capability the
 tool declares, and a tool declaring none costs every permission. See
 [Hooks](/docs/hooks/).
+
+Wrapping a slot another plugin declared steers a chain that plugin's
+callers trust, so the layer runs only while your plugin holds every
+permission. Layering a slot you declared yourself is free. Like the
+`tool.*` slots, this is decided when the chain fires: the call skips a
+layer that is not entitled and carries on, and a reload that changes what
+you hold takes effect on the next call.
 
 **Parameters:**
 
