@@ -9,6 +9,7 @@ use crate::{AgentMode, InstructionBlock};
 use maki_providers::model::Model;
 
 const INSTRUCTION_FILES: &[&str] = &[
+    ".maki/AGENTS.md",
     "AGENTS.md",
     "CLAUDE.md",
     ".github/copilot-instructions.md",
@@ -340,6 +341,21 @@ mod tests {
     }
 
     #[test]
+    fn load_instructions_maki_agents_md_wins_over_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".maki")).unwrap();
+        fs::write(dir.path().join(".maki").join("AGENTS.md"), "maki rules").unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "team rules").unwrap();
+
+        let text = &load_instructions_with_home(dir.path().to_str().unwrap(), None, None).text;
+        assert!(text.contains("maki rules"));
+        assert!(
+            !text.contains("team rules"),
+            ".maki/AGENTS.md should replace AGENTS.md, got {text}"
+        );
+    }
+
+    #[test]
     fn load_instructions_local_without_project() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("AGENTS.local.md"), "solo preferences").unwrap();
@@ -445,6 +461,23 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].path.ends_with("AGENTS.md"));
         assert_eq!(results[0].content, "api rules");
+    }
+
+    #[test]
+    fn find_subdirectory_instructions_discovers_maki_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("src").join("api");
+        let maki_dir = sub.join(".maki");
+        fs::create_dir_all(&maki_dir).unwrap();
+        fs::write(maki_dir.join("AGENTS.md"), "maki api rules").unwrap();
+        fs::write(sub.join("AGENTS.md"), "api rules").unwrap();
+
+        let loaded = LoadedInstructions::new();
+        let results = find_subdirectory_instructions(&sub, dir.path(), &loaded);
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].0.ends_with(".maki/AGENTS.md"));
+        assert_eq!(results[0].1, "maki api rules");
     }
 
     #[test]
