@@ -1,0 +1,179 @@
+{
+  "outcome": {
+    "models": [
+      {
+        "context_window": 200000,
+        "id": "claude-sonnet-4-5",
+        "max_output_tokens": 64000,
+        "pricing": {
+          "cache_read": 0.3,
+          "cache_write": 3.75,
+          "fast": null,
+          "input": 3.0,
+          "output": 15.0
+        },
+        "supports_thinking": true,
+        "supports_vision": true,
+        "tier": null
+      },
+      {
+        "context_window": 1000000,
+        "id": "claude-sonnet-4-5",
+        "max_output_tokens": 64000,
+        "pricing": {
+          "cache_read": 0.0,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": 6.0,
+          "output": 22.5
+        },
+        "supports_thinking": true,
+        "supports_vision": true,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "claude-sonnet-4-5@eu",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": false,
+        "supports_vision": false,
+        "tier": null
+      },
+      {
+        "context_window": 400000,
+        "id": "gpt-5.4-mini",
+        "max_output_tokens": 128000,
+        "pricing": {
+          "cache_read": 0.024999999999999998,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": 0.25,
+          "output": 2.0
+        },
+        "supports_thinking": true,
+        "supports_vision": true,
+        "tier": null
+      },
+      {
+        "context_window": 128000,
+        "id": "openai/gpt-4o-mini",
+        "max_output_tokens": 16384,
+        "pricing": {
+          "cache_read": 0.075,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": 0.15,
+          "output": 0.6
+        },
+        "supports_thinking": false,
+        "supports_vision": true,
+        "tier": null
+      },
+      {
+        "context_window": 65536,
+        "id": "vendor/bad-price",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": false,
+        "supports_vision": false,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "vendor/floats",
+        "max_output_tokens": null,
+        "pricing": {
+          "cache_read": 0.0,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": 0.125,
+          "output": 0.375
+        },
+        "supports_thinking": false,
+        "supports_vision": false,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "vendor/half-cache",
+        "max_output_tokens": null,
+        "pricing": {
+          "cache_read": 0.0,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": 1.0,
+          "output": 2.0
+        },
+        "supports_thinking": false,
+        "supports_vision": false,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "vendor/negatives",
+        "max_output_tokens": null,
+        "pricing": {
+          "cache_read": 0.0,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": -1.0,
+          "output": 2.0
+        },
+        "supports_thinking": false,
+        "supports_vision": false,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "vendor/nulls",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": false,
+        "supports_vision": false,
+        "tier": null
+      },
+      {
+        "context_window": 32000,
+        "id": "vendor/twin",
+        "max_output_tokens": null,
+        "pricing": {
+          "cache_read": 0.0,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": 0.0,
+          "output": 0.0
+        },
+        "supports_thinking": false,
+        "supports_vision": false,
+        "tier": null
+      }
+    ]
+  },
+  "requests": [
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/v1/models"
+    },
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/v1/models/managed"
+    }
+  ]
+}

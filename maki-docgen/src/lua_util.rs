@@ -1,3 +1,20 @@
+use std::sync::Mutex;
+
+/// Runs a plugin load inside its own provider registration window.
+///
+/// Booting a host stages the providers its bundled plugins declare into one
+/// registry the whole process shares, and docgen builds each page on its own
+/// thread. Keeping a single window open at a time stops two hosts from staging
+/// over each other and fighting for the same slug.
+pub fn in_registration_window<T>(load: impl FnOnce() -> T) -> T {
+    static WINDOW: Mutex<()> = Mutex::new(());
+    let _guard = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+    maki_providers::plugin::begin_load();
+    let loaded = load();
+    maki_providers::plugin::commit_load();
+    loaded
+}
+
 pub fn find_matching_brace(s: &str, open: usize) -> Option<usize> {
     let mut depth = 0;
     for (i, ch) in s[open..].char_indices() {

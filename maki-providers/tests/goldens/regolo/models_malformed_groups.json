@@ -1,0 +1,122 @@
+{
+  "outcome": {
+    "models": [
+      {
+        "context_window": null,
+        "id": "Qwen3-Embedding-8B",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": null,
+        "supports_vision": null,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "brand-new-model",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": null,
+        "supports_vision": null,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "glm5.2",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": null,
+        "supports_vision": null,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "glm5.2",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": null,
+        "supports_vision": null,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "gpt-oss-120b",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": null,
+        "supports_vision": null,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "half-priced",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": null,
+        "supports_vision": null,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "legacy-negative",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": null,
+        "supports_vision": null,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "llama-huge",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": null,
+        "supports_vision": null,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "qwen3-coder-next",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": null,
+        "supports_vision": null,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "qwen3.5-9b",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": null,
+        "supports_vision": null,
+        "tier": null
+      }
+    ]
+  },
+  "requests": [
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/model_group/info"
+    },
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/v1/models"
+    }
+  ]
+}

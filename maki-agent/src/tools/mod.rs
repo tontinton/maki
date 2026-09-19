@@ -518,12 +518,15 @@ pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> Stri
 }
 
 pub fn is_builtin_tool(name: &str) -> bool {
-    maki_config::DEFAULT_BUILTINS.contains(&name) || maki_config::EDIT_SUB_TOOLS.contains(&name)
+    let bundled_tool = maki_config::DEFAULT_BUILTINS.contains(&name)
+        && !maki_config::PROVIDER_BUILTINS.contains(&name);
+    bundled_tool || maki_config::EDIT_SUB_TOOLS.contains(&name)
 }
 
 pub fn all_builtin_tool_names() -> Vec<&'static str> {
     maki_config::DEFAULT_BUILTINS
         .iter()
+        .filter(|name| !maki_config::PROVIDER_BUILTINS.contains(name))
         .chain(maki_config::EDIT_SUB_TOOLS.iter())
         .copied()
         .collect()
@@ -1202,6 +1205,15 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for name in &names {
             assert!(seen.insert(name), "duplicate builtin tool name: {name}");
+        }
+    }
+
+    #[test]
+    fn provider_plugins_are_not_tools() {
+        for &name in maki_config::PROVIDER_BUILTINS {
+            assert!(maki_config::DEFAULT_BUILTINS.contains(&name), "{name}");
+            assert!(!is_builtin_tool(name), "{name}");
+            assert!(!all_builtin_tool_names().contains(&name), "{name}");
         }
     }
 }

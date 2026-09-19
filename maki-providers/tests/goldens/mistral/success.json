@@ -1,0 +1,77 @@
+{
+  "events": [
+    {
+      "ThinkingDelta": {
+        "text": "weighing the options"
+      }
+    },
+    {
+      "ThinkingDelta": {
+        "text": " and a plan"
+      }
+    },
+    {
+      "TextDelta": {
+        "text": "Hello"
+      }
+    },
+    {
+      "TextDelta": {
+        "text": " there"
+      }
+    },
+    {
+      "ToolUseStart": {
+        "id": "call_9",
+        "name": "read"
+      }
+    }
+  ],
+  "outcome": {
+    "context_size": 12,
+    "message": {
+      "content": [
+        {
+          "thinking": "weighing the options and a plan",
+          "type": "thinking"
+        },
+        {
+          "text": "Hello there",
+          "type": "text"
+        },
+        {
+          "id": "call_9",
+          "input": {
+            "path": "c.txt"
+          },
+          "name": "read",
+          "type": "tool_use"
+        }
+      ],
+      "role": "assistant"
+    },
+    "stop_reason": "tool_use",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 4,
+      "input_tokens": 8,
+      "output_tokens": 5
+    }
+  },
+  "requests": [
+    {
+      "body": "{\"messages\":[{\"content\":\"You are a replay fixture.\",\"role\":\"system\"},{\"content\":\"read a.txt\",\"role\":\"user\"}],\"model\":\"mistral-medium-latest\",\"reasoning_effort\":\"high\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "content-length": "397",
+        "content-type": "application/json",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "POST",
+      "path": "/v1/chat/completions"
+    }
+  ]
+}

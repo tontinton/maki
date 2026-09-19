@@ -25,7 +25,14 @@ Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BAS
 ANTHROPIC_BASE_URL=https://my-proxy.internal maki
 ```
 
-It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. Two exceptions: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend; `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy.
+Built-in, plugin and `providers.toml` providers all read it. When more than one origin is available, the first of these that is set wins:
+
+1. An origin returned by the provider's auth hook, which is how a login flow points the provider at the endpoint it was given.
+2. `<SLUG>_BASE_URL`.
+3. `base_url` in `providers.toml`.
+4. The `base_url` the provider's own declaration carries.
+
+`ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. Two exceptions: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend; `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy.
 
 You can also set `base_url` for a built-in provider in `~/.config/maki/providers.toml`. It overrides the built-in default and loses to the env var above:
 
@@ -518,15 +525,20 @@ maki.provider.register({
 })
 ```
 
-The plugin needs the `net` permission and must name the hosts it talks to in its `plugin.toml`:
+The plugin needs the `net` permission and must name the hosts it talks to in its `plugin.toml`. Declaring `api_key_env` also needs `env`, since resolving it reads your environment and the key saved for the slug:
 
 ```toml
 [permissions]
 net = true
+env = true
 net_hosts = ["api.acme.com"]
 ```
 
-That list is the only set of origins Maki sends this provider's credentials to. Maki checks it against the plugin's own `maki.net` calls and against the `base_url` the provider ends up using, so a hook cannot repoint a token at a host the manifest never declared. A `base_url` must also be `https`, or `http` pointing at loopback: a declared host reached in cleartext still puts the token on the wire. Registering with an empty or absent list fails at load. See [plugin permissions](/docs/lua-api/#plugin-permissions) for the pattern language and how approval works.
+That list is what Maki sends this provider's credentials to. Maki checks it against both the plugin's own `maki.net` calls and the `base_url` the provider ends up using, so a hook cannot repoint a token at a host the manifest never declared. A `base_url` must also be `https`, or `http` pointing at loopback: a declared host reached in cleartext still puts the token on the wire. Registering with an empty or absent list fails at load.
+
+The origin you chose yourself is the exception. If `<SLUG>_BASE_URL` or `providers.toml` points the slug at a gateway, the provider's hooks reach that gateway too, since its requests already go there.
+
+See [plugin permissions](/docs/lua-api/#plugin-permissions) for the pattern language and how approval works.
 
 The full field reference lives in the [Lua API](/docs/lua-api/#maki-provider). This page covers what the choices mean for the provider you are building.
 
@@ -543,7 +555,7 @@ A registration sets exactly one of `codec` and `base`. Setting both, or neither,
 | `anthropic` | Anthropic messages |
 | `google` | Gemini `generateContent` |
 
-`base` names a native provider and borrows that provider's whole adapter, quirks included: DeepSeek's reasoning-content padding, Mistral's dialect, Ollama's handling of the thinking field. It exists for people moving an old provider script over, where `base` was the only way to describe a provider. A new provider is better off with a codec, because a base can change behaviour whenever the provider it names does. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `requesty`, `synthetic`, `regolo`, `tensorx`, `opencode`, `xai`, `aperture`.
+`base` names a native provider and borrows that provider's whole adapter, quirks included: Ollama's handling of the thinking field, Copilot's endpoint routing. It exists for people moving an old provider script over, where `base` was the only way to describe a provider. A new provider is better off with a codec, because a base can change behaviour whenever the provider it names does. The list of bases is fixed, and removing one is a deliberate breaking change. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `zai`, `opencode`, `xai`, `aperture`.
 
 Either choice also supplies defaults. A registration with no `models` table borrows the catalog of its codec or base.
 
@@ -614,8 +626,9 @@ The value is a free-form JSON object. Maki decides where it lives and who can re
 
 - Must start with a letter or digit
 - Only letters, digits, underscores, and hyphens after that
-- Cannot reuse a built-in slug or one defined in `providers.toml`
-- Two plugins cannot claim the same slug
+- Cannot reuse a slug defined in `providers.toml`
+- Cannot be a built-in provider's slug. A declaration inherits that provider's `api_key_env`, so the key you set for the built-in would be handed to the plugin and sent to whatever hosts its `net` permission names. Only the provider plugins Maki ships inside the binary may claim a built-in slug, and they inherit the built-in's display name, `api_key_env`, curated model table and pricing. Restating any of those is a registration error, because the built-in's row stays the one source for them
+- Two plugins cannot declare the same slug
 - Registration only works while plugins load, so it belongs at the top level of the plugin file
 
 ### Migrating from provider scripts

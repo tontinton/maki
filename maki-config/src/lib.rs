@@ -89,23 +89,42 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
     "batch",
     "code_execution",
+    "deepseek",
     "edit",
     "glob",
     "grep",
     "index",
     "list",
     "memory",
+    "mistral",
+    "openrouter",
     "question",
     "read",
+    "regolo",
+    "requesty",
     "sessions",
     "skill",
+    "synthetic",
     "task",
+    "tensorx",
     "thinking",
     "todo_write",
     "view_image",
     "webfetch",
     "websearch",
     "write",
+];
+
+/// The [`DEFAULT_BUILTINS`] that declare a provider and register no tool, so
+/// their names stay free for MCP servers and are not valid tool names.
+pub const PROVIDER_BUILTINS: &[&str] = &[
+    "deepseek",
+    "mistral",
+    "openrouter",
+    "regolo",
+    "requesty",
+    "synthetic",
+    "tensorx",
 ];
 
 /// Bundled plugins that ship switched off. They load only when a config says

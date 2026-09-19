@@ -1,0 +1,23 @@
+{
+  "events": [],
+  "outcome": {
+    "error": "Api { status: 500, retry_after: None, overflow: None, quota_exhausted: false, auth_error: false }",
+    "message": "API error (500): provider sent an error frame with no detail"
+  },
+  "requests": [
+    {
+      "body": "{\"max_tokens\":384000,\"messages\":[{\"content\":\"You are a replay fixture.\",\"role\":\"system\"},{\"content\":\"read a.txt\",\"role\":\"user\"}],\"model\":\"deepseek-flash\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"thinking\":{\"type\":\"disabled\"},\"tools\":[{\"function\":{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "content-length": "415",
+        "content-type": "application/json",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "POST",
+      "path": "/v1/chat/completions"
+    }
+  ]
+}

@@ -16,7 +16,7 @@ use crate::provider::{BoxFuture, Provider};
 use crate::providers::Timeouts;
 use crate::providers::aperture::GEMINI_PATH_PREFIX;
 use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+    ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
 };
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
@@ -32,7 +32,7 @@ const ENV_VAR: &str = "GEMINI_API_KEY";
 const DEFAULT_MODEL: &str = "google/gemini-2.5-pro";
 const LOGIN_URL: &str = "https://aistudio.google.com/apikey";
 const FEATURES: &str = "Native Gemini API with thinking support";
-const API_KEY_HEADER: &str = "x-goog-api-key";
+pub(crate) const API_KEY_HEADER: &str = "x-goog-api-key";
 const FLASH_MAX_THINKING: u32 = 24_576;
 const PRO_MAX_THINKING: u32 = 32_768;
 
@@ -58,12 +58,12 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_context_window: 1_000_000,
     models_toml: include_str!("../../models/google.toml"),
     pricing_schedule: None,
-    native: Some(Native {
+    build: Build::Native(Native {
         new: create,
         with_auth: create_with_auth,
-        aperture: Some(ApertureRoute {
-            path_prefix: GEMINI_PATH_PREFIX,
-        }),
+    }),
+    aperture: Some(ApertureRoute {
+        path_prefix: GEMINI_PATH_PREFIX,
     }),
     login: Some(LoginConfig {
         protocol: Protocol::Google,

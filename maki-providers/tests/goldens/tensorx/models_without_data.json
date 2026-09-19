@@ -1,0 +1,19 @@
+{
+  "outcome": {
+    "models": []
+  },
+  "requests": [
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/v1/model/info"
+    }
+  ]
+}

@@ -7,9 +7,10 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use futures_lite::io::AsyncReadExt;
 use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation};
+use isahc::http::HeaderMap;
 use isahc::{AsyncBody, HttpClient, Request, Response};
-use maki_config::host_allowed;
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_providers::Timeouts;
 use mlua::{Lua, Result as LuaResult, Table};
 use regex::bytes::Regex;
 use smol::{Timer, unblock};
@@ -17,7 +18,7 @@ use url::Url;
 
 use crate::api::util::pair::{Pair, try_pair};
 
-use crate::plugin_permissions::{NetHosts, PluginPermissions};
+use crate::plugin_permissions::{NetEgress, PluginPermissions};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
@@ -39,6 +40,9 @@ const MAX_POOLED_CLIENTS: usize = 8;
 /// reads any more has to give them back.
 const CLIENT_IDLE_TTL: Duration = Duration::from_secs(120);
 const INVALID_LINE_MATCH: &str = "invalid line_match";
+/// Methods whose requests carry no body at all when the caller gave none.
+const BODYLESS_METHODS: &[&str] = &["GET", "HEAD"];
+const HEADER_VALUE_SEPARATOR: &str = ", ";
 const ALLOWLIST_HINT: &str = "add it to `net.allowed_private_hosts` in your init.lua to allow it";
 const UNDECLARED_HOST_HINT: &str = "add it to `net_hosts` under `[permissions]` in plugin.toml";
 /// Reserved IPv4 ranges the standard library has no predicate for. Carrier
@@ -187,7 +191,7 @@ fn split_host_port(authority: &str) -> (&str, Option<u16>) {
 /// Without it the name is looked up twice, once by the guard and once by curl
 /// at connect time, and a record with a zero TTL can answer public to the
 /// first and 169.254.169.254 to the second.
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct DnsPin {
     host: String,
     port: u16,
@@ -199,22 +203,84 @@ struct RequestParams {
     method: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
-    timeout: Duration,
+    /// The caller's own total bound, when it stated one.
+    timeout: Option<Duration>,
     max_bytes: usize,
     retries: u32,
     /// Keep only response lines this matches. `None` disables the filter.
     line_match: Option<Regex>,
-    /// `None` when the guard reached its verdict without DNS.
-    pin: Option<DnsPin>,
-    /// Carried rather than passed, so every hop is vetted against the list the
-    /// first one was.
-    declared: NetHosts,
+    route: Route,
+    /// Carried rather than passed, so every hop is vetted against the same
+    /// reach the first one was.
+    egress: NetEgress,
+}
+
+/// Which rules a hop goes out under, settled by [`vet`] again for every hop.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum Route {
+    /// The origin of a provider this plugin registered, as the user or maki
+    /// chose it. Reached on the terms the codec's own requests there run
+    /// under: no guard, maki's user agent, and connect and stall bounds
+    /// instead of a total one.
+    Provider,
+    /// Anywhere else, behind the guard. `None` when the guard reached its
+    /// verdict without DNS, so there is no address to pin.
+    Guarded(Option<DnsPin>),
+}
+
+impl Route {
+    /// The total bound a caller that stated none gets. A provider's origin has
+    /// none, like the codec's requests: its stall bound catches a dead server.
+    fn default_timeout(&self) -> Option<Duration> {
+        match self {
+            Self::Provider => None,
+            Self::Guarded(_) => Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+        }
+    }
+
+    fn user_agents(&self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Self::Provider => (maki_providers::user_agent(), None),
+            Self::Guarded(_) => (USER_AGENT, Some(FALLBACK_USER_AGENT)),
+        }
+    }
 }
 
 struct ResponseData {
     body: String,
     status: u16,
     content_type: String,
+    headers: Vec<(String, String)>,
+}
+
+impl ResponseData {
+    fn into_table(self, lua: &Lua) -> LuaResult<Table> {
+        let tbl = lua.create_table()?;
+        tbl.set("body", self.body)?;
+        tbl.set("status", self.status)?;
+        tbl.set("content_type", self.content_type)?;
+        tbl.set("headers", lua.create_table_from(self.headers)?)?;
+        Ok(tbl)
+    }
+}
+
+/// `http` already keeps names in lowercase. A header sent more than once is
+/// joined into one value, as RFC 9110 allows, which mangles `set-cookie`
+/// because its values hold commas. Bytes that are not UTF-8 become U+FFFD
+/// rather than dropping the header, so a lookup does not quietly miss it.
+fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .keys()
+        .map(|name| {
+            let value = headers
+                .get_all(name)
+                .iter()
+                .map(|value| String::from_utf8_lossy(value.as_bytes()))
+                .collect::<Vec<_>>()
+                .join(HEADER_VALUE_SEPARATOR);
+            (name.as_str().to_owned(), value)
+        })
+        .collect()
 }
 
 /// Make an HTTP request and return the response body. Plain `http://`
@@ -222,19 +288,30 @@ struct ResponseData {
 /// or metadata IP addresses are blocked for safety, unless the host is
 /// listed in `net.allowed_private_hosts`.
 ///
+/// A request to the origin of a provider this plugin registered, as the
+/// user (`<SLUG>_BASE_URL`, `providers.toml`) or maki (a built-in's
+/// default) chose it, goes out the way the provider's chat requests do:
+/// no address check or upgrade, maki's user agent, and connect and stall
+/// timeouts instead of a total one.
+///
 /// {opts} fields:
 ///   `method` (string) HTTP verb (default `"GET"`).
 ///   `headers` (table) Header name/value pairs.
 ///   `body` (string) Request body.
-///   `timeout` (integer) Timeout in seconds, max 120 (default 30).
+///   `timeout` (integer) Total timeout in seconds, max 120 (default 30,
+///     none on a provider's origin).
 ///   `max_bytes` (integer) Max response size in bytes (default 5 MB).
 ///   `retry` (integer) Retries on 5xx errors (default 3).
 ///   `line_match` (string) Regex. Keep only the response lines it
 ///   matches. Filtering happens after the body is read, so `max_bytes`
 ///   still caps the transfer.
 ///
-/// The response table has three fields: `body` (string), `status`
-/// (integer), and `content_type` (string).
+/// The response table has `body` (string), `status` (integer),
+/// `content_type` (string) and `headers` (table). `headers` comes from the
+/// final response after redirects and is keyed by lowercase name, as in
+/// `res.headers["retry-after"]`. A header sent more than once has its values
+/// joined with `, `, which mangles `set-cookie`. Bytes that are not UTF-8
+/// become U+FFFD. The table can go straight to `maki.provider.http_error`.
 ///
 /// @param url string URL starting with `http://` or `https://`.
 /// @param opts table? Request options (see above).
@@ -249,24 +326,21 @@ struct ResponseData {
 #[lua_fn(guard = Net)]
 async fn request(
     lua: Lua,
-    #[ctx] hosts: NetHosts,
+    #[ctx] egress: NetEgress,
     url: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
-    let params = try_pair!(extract_request_params(&url, hosts, opts.as_ref()).await);
+    let params = try_pair!(extract_request_params(&url, egress, opts.as_ref()).await);
     let resp = try_pair!(do_request(params).await);
-    let tbl = lua.create_table()?;
-    tbl.set("body", resp.body)?;
-    tbl.set("status", resp.status)?;
-    tbl.set("content_type", resp.content_type)?;
-    Ok((Some(tbl), None))
+    Ok((Some(resp.into_table(&lua)?), None))
 }
 
 lua_table! {
     /// HTTP client for fetching web content. All traffic goes over HTTPS
     /// (plain HTTP is upgraded). Private and metadata IP addresses are
     /// blocked to prevent SSRF, including after a redirect. Hosts listed in
-    /// the `net.allowed_private_hosts` config option are exempt.
+    /// the `net.allowed_private_hosts` config option are exempt, and so is a
+    /// provider plugin's own origin (see `maki.net.request`).
     /// Failed requests (5xx) are retried automatically.
     ///
     /// Requests reuse a pool of clients, so calls to the same host share one
@@ -276,22 +350,17 @@ lua_table! {
     /// local res, err = maki.net.request("https://example.com")
     /// if res then print(res.body) end
     /// ```
-    "maki.net" => pub(crate) fn create_net_table(perms: &PluginPermissions, hosts: NetHosts), DOCS [
-        request(perms, hosts),
+    "maki.net" => pub(crate) fn create_net_table(perms: &PluginPermissions, egress: NetEgress), DOCS [
+        request(perms, egress),
     ]
 }
 
-/// The plugin's own egress allowlist, checked once the SSRF guard has settled
-/// what the URL really points at.
-///
-/// A plugin that declared no `net_hosts` is unrestricted, which is what every
-/// plugin written before the list existed relies on.
-fn check_declared_host(url: &str, hosts: Option<&[String]>) -> Result<(), String> {
-    let Some(hosts) = hosts else {
-        return Ok(());
-    };
+/// The plugin's own reach, checked once the SSRF guard has settled what the
+/// URL really points at. See [`NetEgress`] for what a plugin may reach and
+/// why the manifest is not the whole of it.
+fn check_declared_host(url: &str, egress: &NetEgress) -> Result<(), String> {
     let (host, _) = extract_host_port(url).ok_or("cannot extract host from URL")?;
-    if host_allowed(host, hosts) {
+    if egress.allows(host) {
         return Ok(());
     }
     Err(format!(
@@ -303,24 +372,32 @@ fn check_declared_host(url: &str, hosts: Option<&[String]>) -> Result<(), String
 /// the plugin's declared hosts, in that order, because the last one wants the
 /// address the guard settled on. One door, so a redirect cannot reach what the
 /// URL the caller wrote could not.
+///
+/// The origin of a provider the plugin registered skips all three, when the
+/// user or maki chose it: the codec already goes there unguarded.
 async fn vet(
     url: &str,
     allowed: &HostAllowlist,
-    declared: Option<&[String]>,
-) -> Result<(String, Option<DnsPin>), String> {
+    egress: &NetEgress,
+) -> Result<(String, Route), String> {
+    if let Ok(parsed) = Url::parse(url)
+        && egress.vouches(&parsed)
+    {
+        return Ok((parsed.into(), Route::Provider));
+    }
     let url = validate_and_upgrade_url(url, allowed)?;
     let pin = check_ssrf(&url, allowed).await?;
-    check_declared_host(&url, declared)?;
-    Ok((url, pin))
+    check_declared_host(&url, egress)?;
+    Ok((url, Route::Guarded(pin)))
 }
 
 async fn extract_request_params(
     url: &str,
-    hosts: NetHosts,
+    egress: NetEgress,
     opts: Option<&Table>,
 ) -> Result<RequestParams, String> {
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
-    let (url, pin) = vet(url, &allowed, hosts.as_deref()).await?;
+    let (url, route) = vet(url, &allowed, &egress).await?;
 
     let method = opts
         .and_then(|o| o.get::<String>("method").ok())
@@ -342,11 +419,9 @@ async fn extract_request_params(
         .map(|s| s.into_bytes())
         .unwrap_or_default();
 
-    let timeout = Duration::from_secs(
-        opts.and_then(|o| o.get::<u64>("timeout").ok())
-            .unwrap_or(DEFAULT_TIMEOUT_SECS)
-            .min(MAX_TIMEOUT_SECS),
-    );
+    let timeout = opts
+        .and_then(|o| o.get::<u64>("timeout").ok())
+        .map(|secs| Duration::from_secs(secs.min(MAX_TIMEOUT_SECS)));
 
     let max_bytes = opts
         .and_then(|o| o.get::<usize>("max_bytes").ok())
@@ -370,8 +445,8 @@ async fn extract_request_params(
         max_bytes,
         retries,
         line_match,
-        pin,
-        declared: hosts,
+        route,
+        egress,
     })
 }
 
@@ -391,8 +466,21 @@ fn build_request(
         builder = builder.header(k.as_str(), v.as_str());
     }
 
+    // A zero-length body is not the same as no body: isahc announces the known
+    // length, which turns a GET into an upload carrying `content-length: 0`.
+    // None of maki's other clients send that, and a plugin standing in for one
+    // of them has to look the same on the wire. Every other method keeps its
+    // `content-length: 0`, which servers answer a POST without with a 411.
+    let bodyless = BODYLESS_METHODS
+        .iter()
+        .any(|bodyless| method.eq_ignore_ascii_case(bodyless));
+    let body = if bodyless && body.is_empty() {
+        AsyncBody::empty()
+    } else {
+        AsyncBody::from(body)
+    };
     builder
-        .body(AsyncBody::from(body))
+        .body(body)
         .map_err(|e| format!("request build error: {e}"))
 }
 
@@ -401,13 +489,14 @@ async fn send_with_retries(
     params: &RequestParams,
 ) -> Result<Response<AsyncBody>, String> {
     let is_get = params.method.eq_ignore_ascii_case("GET");
+    let (user_agent, fallback_user_agent) = params.route.user_agents();
     let mut last_err = String::new();
 
     'retry: {
         for attempt in 0..=params.retries {
             let req = build_request(
                 &params.url,
-                USER_AGENT,
+                user_agent,
                 &params.method,
                 &params.headers,
                 params.body.clone(),
@@ -422,10 +511,13 @@ async fn send_with_retries(
                             .and_then(|v| v.to_str().ok())
                             .is_some_and(|v| v.contains(CF_CHALLENGE));
 
-                    if is_cf_challenge && is_get {
+                    if is_cf_challenge
+                        && is_get
+                        && let Some(fallback_user_agent) = fallback_user_agent
+                    {
                         let req = build_request(
                             &params.url,
-                            FALLBACK_USER_AGENT,
+                            fallback_user_agent,
                             &params.method,
                             &params.headers,
                             params.body.clone(),
@@ -472,9 +564,8 @@ fn redirect_location(response: &Response<AsyncBody>) -> Option<String> {
 /// One client per hop, because a DNS override is a property of the curl handle
 /// isahc builds the client around and cannot be attached to a single request.
 /// The pin changes with every redirect, so the client has to as well.
-fn build_client(params: &RequestParams) -> Result<HttpClient, String> {
+fn build_client(key: &ClientKey) -> Result<HttpClient, String> {
     let mut builder = HttpClient::builder()
-        .timeout(params.timeout)
         // Redirects are followed by hand, so every hop goes through the SSRF
         // check. Left to curl, a URL that passed the check could still bounce
         // us into 169.254.169.254.
@@ -484,22 +575,40 @@ fn build_client(params: &RequestParams) -> Result<HttpClient, String> {
         // than change how every one of them is negotiated.
         .version_negotiation(VersionNegotiation::http11());
 
-    // Connect to the address the guard vetted instead of asking DNS again and
-    // trusting whatever the second answer says.
-    if let Some(pin) = &params.pin {
-        builder = builder.dns_resolve(ResolveMap::new().add(&pin.host, pin.port, pin.addr));
+    if let Some(timeout) = key.timeout {
+        builder = builder.timeout(timeout);
+    }
+    match &key.route {
+        Route::Provider => builder = Timeouts::default().bound(builder),
+        // Connect to the address the guard vetted instead of asking DNS again
+        // and trusting whatever the second answer says.
+        Route::Guarded(Some(pin)) => {
+            builder = builder.dns_resolve(ResolveMap::new().add(&pin.host, pin.port, pin.addr));
+        }
+        Route::Guarded(None) => {}
     }
 
     builder.build().map_err(|e| format!("client error: {e}"))
 }
 
-/// What identifies the client a request can reuse: the pin is baked into
-/// the client's resolve map, and the timeout is a client option. Everything
-/// else varies per request, not per client.
+/// Everything a client is built from, and so what a request can reuse one by.
+/// [`build_client`] reads the key rather than the request, so a new client
+/// option cannot be left out of it. If it could, a provider origin's stall
+/// bounds or a pinned hop's resolve map would leak to a plain request that
+/// happens to share its timeout.
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct ClientKey {
-    timeout: Duration,
-    pin: Option<(String, u16, IpAddr)>,
+    timeout: Option<Duration>,
+    route: Route,
+}
+
+impl ClientKey {
+    fn of(params: &RequestParams) -> Self {
+        Self {
+            timeout: params.timeout.or(params.route.default_timeout()),
+            route: params.route.clone(),
+        }
+    }
 }
 
 type PooledClient = (Arc<HttpClient>, Instant);
@@ -542,13 +651,7 @@ fn make_room(pool: &mut ClientPool, now: Instant) {
 
 /// Hands out a client for `params`, reusing the pooled one when the key matches.
 fn pooled_client(params: &RequestParams) -> Result<Arc<HttpClient>, String> {
-    let key = ClientKey {
-        timeout: params.timeout,
-        pin: params
-            .pin
-            .as_ref()
-            .map(|p| (p.host.clone(), p.port, p.addr)),
-    };
+    let key = ClientKey::of(params);
     let now = Instant::now();
     {
         let mut pool = lock_pool();
@@ -561,7 +664,7 @@ fn pooled_client(params: &RequestParams) -> Result<Arc<HttpClient>, String> {
     // Built outside the lock: `build_client` starts a curl thread, and this
     // runs on the Lua thread's executor. Two callers racing the same cold key
     // each pay for a client, and the loser is dropped when its request ends.
-    let client = Arc::new(build_client(params)?);
+    let client = Arc::new(build_client(&key)?);
     let now = Instant::now();
     let mut pool = lock_pool();
     make_room(&mut pool, now);
@@ -649,6 +752,7 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
         body,
         status,
         content_type,
+        headers: collect_headers(response.headers()),
     })
 }
 
@@ -666,7 +770,7 @@ impl RequestParams {
         let target = base
             .join(location)
             .map_err(|e| format!("invalid redirect to {location}: {e}"))?;
-        let (target, pin) = vet(target.as_str(), allowed, self.declared.as_deref()).await?;
+        let (target, route) = vet(target.as_str(), allowed, &self.egress).await?;
 
         let landed =
             Url::parse(&target).map_err(|e| format!("invalid redirect to {location}: {e}"))?;
@@ -687,7 +791,7 @@ impl RequestParams {
             self.body.clear();
         }
         self.url = target;
-        self.pin = pin;
+        self.route = route;
         Ok(())
     }
 }
@@ -849,6 +953,8 @@ fn validate_and_upgrade_url(url: &str, allowed: &HostAllowlist) -> Result<String
 mod tests {
     use super::*;
     use crate::plugin_permissions::PluginPermissions;
+    use isahc::http::{HeaderName, HeaderValue};
+    use std::collections::HashMap;
     use std::net::Ipv6Addr;
     use test_case::test_case;
 
@@ -883,6 +989,18 @@ mod tests {
     const ACCEPT_HEADER: &str = "Accept";
     const ACCEPT_VALUE: &str = "text/html";
     const KEEP_PATTERN: &str = "^vllm:generation_tokens_total";
+    const RETRY_AFTER_HEADER: &str = "Retry-After";
+    const RETRY_AFTER_KEY: &str = "retry-after";
+    const RETRY_AFTER_SECS: &str = "30";
+    const VARY_HEADER: &str = "vary";
+    const VARY_FIRST: &str = "Accept";
+    const VARY_SECOND: &str = "Origin";
+    const VARY_JOINED: &str = "Accept, Origin";
+    const LATIN1_HEADER: &str = "x-name";
+    const LATIN1_BYTES: &[u8] = b"caf\xe9";
+    const LATIN1_LOSSY: &str = "caf\u{FFFD}";
+    const JSON_CONTENT_TYPE: &str = "application/json";
+    const TOO_MANY_REQUESTS: u16 = 429;
 
     fn allowlist(entries: &[&str]) -> HostAllowlist {
         HostAllowlist::parse(&entries.iter().map(|e| (*e).to_string()).collect::<Vec<_>>())
@@ -904,7 +1022,7 @@ mod tests {
     }
 
     fn request_params(url: &str, opts: Option<&Table>) -> Result<RequestParams, String> {
-        smol::block_on(extract_request_params(url, None, opts))
+        smol::block_on(extract_request_params(url, NetEgress::default(), opts))
     }
 
     #[test_case(&[], "https://example.com/", "https://example.com/" ; "https_passthrough")]
@@ -987,12 +1105,12 @@ mod tests {
             method: "GET".to_string(),
             headers: Vec::new(),
             body: Vec::new(),
-            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            timeout: None,
             max_bytes: DEFAULT_MAX_BYTES,
             retries: 0,
             line_match: None,
-            pin: None,
-            declared: None,
+            route: Route::Guarded(None),
+            egress: NetEgress::default(),
         }
     }
 
@@ -1022,11 +1140,11 @@ mod tests {
     #[test]
     fn a_followed_redirect_replaces_the_pin() {
         let mut params = redirect_params(LOOPBACK_PORT_URL);
-        params.pin = Some(DnsPin {
+        params.route = Route::Guarded(Some(DnsPin {
             host: LOCALHOST_ENTRY.to_string(),
             port: ALLOWED_PORT,
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        });
+        }));
         redirect(
             &mut params,
             302,
@@ -1034,7 +1152,11 @@ mod tests {
             &allowlist(&[LOOPBACK_PORT_ENTRY]),
         )
         .unwrap();
-        assert!(params.pin.is_none(), "{:?}", params.pin);
+        assert!(
+            matches!(params.route, Route::Guarded(None)),
+            "{:?}",
+            params.route
+        );
     }
 
     #[test]
@@ -1171,6 +1293,18 @@ mod tests {
         assert_eq!(req.headers()["User-Agent"], "agent");
     }
 
+    /// isahc sends no body, and so no `content-length`, only for an empty
+    /// body. A GET must look like every other client's; a POST without the
+    /// header gets a 411 from servers that insist on it.
+    #[test_case("GET", true ; "get_sends_no_body")]
+    #[test_case("head", true ; "head_sends_no_body")]
+    #[test_case("POST", false ; "post_keeps_its_zero_length")]
+    #[test_case("DELETE", false ; "delete_keeps_its_zero_length")]
+    fn an_empty_body_is_dropped_only_where_it_means_nothing(method: &str, dropped: bool) {
+        let req = build_request("https://example.com", "agent", method, &[], vec![]).unwrap();
+        assert_eq!(req.body().is_empty(), dropped);
+    }
+
     #[test]
     fn build_request_post_with_body_and_headers() {
         let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
@@ -1208,7 +1342,8 @@ mod tests {
     #[test_case(r#"net.request("ftp://x")"# ; "invalid_url")]
     fn lua_request_error_returns_nil_and_message(expr: &str) {
         let lua = Lua::new();
-        let net = create_net_table(&lua, &PluginPermissions::trusted(), None).unwrap();
+        let net =
+            create_net_table(&lua, &PluginPermissions::trusted(), NetEgress::default()).unwrap();
         lua.globals().set("net", net).unwrap();
         let (is_nil, has_err): (bool, bool) = lua
             .load(format!(
@@ -1220,8 +1355,8 @@ mod tests {
         assert!(has_err);
     }
 
-    fn declared(hosts: Option<&[&str]>) -> NetHosts {
-        hosts.map(|hosts| hosts.iter().map(|host| (*host).to_owned()).collect())
+    fn declared(hosts: Option<&[&str]>) -> NetEgress {
+        NetEgress::new(hosts.map(|hosts| hosts.iter().map(|host| (*host).to_owned()).collect()))
     }
 
     /// The gate sits in `extract_request_params`, so these go through it
@@ -1257,7 +1392,10 @@ mod tests {
         assert_eq!(params.method, "GET");
         assert!(params.headers.is_empty());
         assert!(params.body.is_empty());
-        assert_eq!(params.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        assert_eq!(
+            params.timeout.or(params.route.default_timeout()),
+            Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        );
         assert_eq!(params.max_bytes, DEFAULT_MAX_BYTES);
         assert_eq!(params.retries, MAX_RETRIES);
     }
@@ -1268,7 +1406,7 @@ mod tests {
         let opts = lua.create_table().unwrap();
         opts.set("timeout", MAX_TIMEOUT_SECS + 100).unwrap();
         let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
-        assert_eq!(params.timeout, Duration::from_secs(MAX_TIMEOUT_SECS));
+        assert_eq!(params.timeout, Some(Duration::from_secs(MAX_TIMEOUT_SECS)));
     }
 
     #[test]
@@ -1286,6 +1424,49 @@ mod tests {
     fn extract_params_http_upgraded_to_https() {
         let params = request_params(PUBLIC_HTTP_URL, None).unwrap();
         assert_eq!(params.url, PUBLIC_URL);
+    }
+
+    #[test_case(&[(RETRY_AFTER_HEADER, RETRY_AFTER_SECS.as_bytes())], &[(RETRY_AFTER_KEY, RETRY_AFTER_SECS)] ; "name_is_lowercased")]
+    #[test_case(&[(VARY_HEADER, VARY_FIRST.as_bytes()), (VARY_HEADER, VARY_SECOND.as_bytes())], &[(VARY_HEADER, VARY_JOINED)] ; "repeated_header_is_joined")]
+    #[test_case(&[(LATIN1_HEADER, LATIN1_BYTES)], &[(LATIN1_HEADER, LATIN1_LOSSY)] ; "non_utf8_value_is_replaced_not_dropped")]
+    fn collect_headers_cases(sent: &[(&str, &[u8])], expected: &[(&str, &str)]) {
+        let mut headers = HeaderMap::new();
+        for (name, value) in sent {
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        let collected: HashMap<String, String> = collect_headers(&headers).into_iter().collect();
+        let expected: HashMap<String, String> = expected
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn response_table_exposes_headers_by_lowercase_name() {
+        let lua = Lua::new();
+        let response = ResponseData {
+            body: PAYLOAD.to_owned(),
+            status: TOO_MANY_REQUESTS,
+            content_type: JSON_CONTENT_TYPE.to_owned(),
+            headers: vec![(RETRY_AFTER_KEY.to_owned(), RETRY_AFTER_SECS.to_owned())],
+        };
+        lua.globals()
+            .set("res", response.into_table(&lua).unwrap())
+            .unwrap();
+        let (status, body, content_type, retry_after): (u16, String, String, String) = lua
+            .load(format!(
+                r#"return res.status, res.body, res.content_type, res.headers["{RETRY_AFTER_KEY}"]"#
+            ))
+            .eval()
+            .unwrap();
+        assert_eq!(status, TOO_MANY_REQUESTS);
+        assert_eq!(body, PAYLOAD);
+        assert_eq!(content_type, JSON_CONTENT_TYPE);
+        assert_eq!(retry_after, RETRY_AFTER_SECS);
     }
 
     #[test]
@@ -1379,8 +1560,8 @@ mod tests {
 
     fn client_key(timeout_secs: u64) -> ClientKey {
         ClientKey {
-            timeout: Duration::from_secs(timeout_secs),
-            pin: None,
+            timeout: Some(Duration::from_secs(timeout_secs)),
+            route: Route::Guarded(None),
         }
     }
 
@@ -1453,7 +1634,7 @@ mod tests {
 
     fn params_with_timeout(secs: u64) -> RequestParams {
         RequestParams {
-            timeout: Duration::from_secs(secs),
+            timeout: Some(Duration::from_secs(secs)),
             ..redirect_params(PUBLIC_URL)
         }
     }
@@ -1516,20 +1697,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pooled_client_is_keyed_on_the_pin() {
-        let _guard = pool_tests_serialized();
-        clear_client_pool();
-        let unpinned = redirect_params(PUBLIC_URL);
-        let mut pinned = redirect_params(PUBLIC_URL);
-        pinned.pin = Some(DnsPin {
+    fn a_pinned_route() -> Route {
+        Route::Guarded(Some(DnsPin {
             host: "example.com".to_string(),
             port: HTTPS_PORT,
             addr: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-        });
+        }))
+    }
+
+    /// The other request states the default timeout out loud, so the route is
+    /// the only thing that tells the two apart.
+    #[test_case(a_pinned_route() ; "a_pinned_hop")]
+    #[test_case(Route::Provider ; "a_provider_origin")]
+    fn pooled_client_is_keyed_on_the_route(route: Route) {
+        let _guard = pool_tests_serialized();
+        clear_client_pool();
+        let plain = redirect_params(PUBLIC_URL);
+        let other = RequestParams {
+            route,
+            ..params_with_timeout(DEFAULT_TIMEOUT_SECS)
+        };
         assert!(!Arc::ptr_eq(
-            &pooled_client(&unpinned).unwrap(),
-            &pooled_client(&pinned).unwrap()
+            &pooled_client(&plain).unwrap(),
+            &pooled_client(&other).unwrap()
         ));
     }
 }

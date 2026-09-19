@@ -36,17 +36,31 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 use crate::api::options::PluginOpts;
 use crate::api::tool::{PendingRules, PendingTools};
 use crate::api::util::command::UiAction;
-use crate::plugin_permissions::{Permission, PluginPermissions};
+use crate::plugin_permissions::{NetEgress, Permission, PluginPermissions};
+use maki_providers::plugin::DeclAuthority;
+
+/// Who a `maki` global belongs to: the name everything it registers is filed
+/// under, and whether that code shipped inside the binary. One value, so a
+/// call site cannot hand over the name and forget the authority behind it.
+#[derive(Clone)]
+pub(crate) struct Owner {
+    pub name: Arc<str>,
+    pub authority: DeclAuthority,
+}
 
 pub(crate) fn create_maki_global(
     lua: &Lua,
     pending: PendingTools,
     pending_rules: PendingRules,
-    plugin: Arc<str>,
+    owner: Owner,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     permissions: &PluginPermissions,
     opts: PluginOpts,
 ) -> LuaResult<Table> {
+    let Owner {
+        name: plugin,
+        authority,
+    } = owner;
     let maki = lua.create_table()?;
 
     let api = tool::create_api_table(
@@ -73,14 +87,24 @@ pub(crate) fn create_maki_global(
     maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
+    // One egress value shared by the two namespaces that can open a socket, so
+    // a provider registered through `maki.provider` is reachable from
+    // `maki.net` without the manifest naming an origin only maki resolves.
+    let egress = NetEgress::new(permissions.net_hosts());
     maki.set(
         "net",
-        net::create_net_table(lua, permissions, permissions.net_hosts())?,
+        net::create_net_table(lua, permissions, egress.clone())?,
     )?;
     maki.set("plan", plan::create_plan_table(lua, ui_action_tx.clone())?)?;
     maki.set(
         "provider",
-        provider::create_provider_namespace(lua, permissions, Arc::clone(&plugin))?,
+        provider::create_provider_namespace(
+            lua,
+            permissions,
+            Arc::clone(&plugin),
+            egress,
+            authority,
+        )?,
     )?;
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set(

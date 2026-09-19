@@ -67,6 +67,8 @@ impl From<CachedModel> for ModelInfo {
             supports_vision: Some(model.vision),
             tier: None,
             provider_info: None,
+            extra: None,
+            effort: None,
         }
     }
 }

@@ -10,6 +10,7 @@ use maki_config::{
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
 use crate::gen_folder_trust::POLICY_EXAMPLE;
+use crate::lua_util::in_registration_window;
 
 type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
 
@@ -91,8 +92,9 @@ fn write_plugin_options(out: &mut String, specs: &PluginOptionSpecs) {
 }
 
 fn collect_plugin_options() -> PluginOptionSpecs {
-    let host =
-        PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).expect("loading builtins");
+    let host = in_registration_window(|| {
+        PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).expect("loading builtins")
+    });
     let specs = host.plugin_options().expect("collecting plugin options");
     assert!(
         !specs.is_empty(),

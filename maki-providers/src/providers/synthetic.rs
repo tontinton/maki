@@ -1,21 +1,10 @@
-use std::sync::{Arc, Mutex};
-
-use flume::Sender;
-use maki_storage::id::SessionRef;
-use serde_json::Value;
-
 use maki_config::providers::Protocol;
 
-use crate::model::{Model, ModelFamily};
-use crate::provider::{BoxFuture, Provider};
+use crate::model::ModelFamily;
 use crate::providers::aperture::DEFAULT_PATH_PREFIX;
 use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+    ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, ProviderSpec,
 };
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
-
-use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 
 const SLUG: &str = "synthetic";
 const DISPLAY_NAME: &str = "Synthetic";
@@ -23,17 +12,7 @@ const ENV_VAR: &str = "SYNTHETIC_API_KEY";
 const BASE_URL: &str = "https://api.synthetic.new/openai/v1";
 const DEFAULT_MODEL: &str = "synthetic/hf:moonshotai/Kimi-K2.5";
 const LOGIN_URL: &str = "https://synthetic.new";
-const MAX_TOKENS_FIELD: &str = "max_completion_tokens";
 const FEATURES: &str = "Reasoning effort support (low/medium/high), open-weight models";
-
-static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: SLUG,
-    api_key_env: ENV_VAR,
-    base_url: BASE_URL,
-    max_tokens_field: MAX_TOKENS_FIELD,
-    include_stream_usage: false,
-    provider_name: DISPLAY_NAME,
-};
 
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     slug: SLUG,
@@ -46,12 +25,9 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_context_window: 128_000,
     models_toml: include_str!("../../models/synthetic.toml"),
     pricing_schedule: None,
-    native: Some(Native {
-        new: create,
-        with_auth: create_with_auth,
-        aperture: Some(ApertureRoute {
-            path_prefix: DEFAULT_PATH_PREFIX,
-        }),
+    build: Build::Declared,
+    aperture: Some(ApertureRoute {
+        path_prefix: DEFAULT_PATH_PREFIX,
     }),
     login: Some(LoginConfig {
         protocol: Protocol::Openai,
@@ -70,92 +46,49 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     },
 };
 
-fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    Ok(Box::new(Synthetic::new(timeouts)?))
-}
-
-fn create_with_auth(
-    auth: Arc<Mutex<ResolvedAuth>>,
-    timeouts: Timeouts,
-    system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(Synthetic::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-}
-
 inventory::submit!(SPEC.config_row());
 
-pub struct Synthetic {
-    compat: OpenAiCompatProvider,
-    auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
-    system_prefix: Option<String>,
-}
+/// The recorded cases the bundled `synthetic` plugin replays.
+///
+/// Every case was recorded while the bespoke `impl Provider` this module used
+/// to hold was still here. The impl is gone and the artifacts are not, so each
+/// fixture still pins the bytes and the events that provider produced on the
+/// day it was ported.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures {
+    use crate::model::Model;
+    use crate::providers::replay::Fixture;
+    use crate::test_support::Canned;
+    use crate::{Effort, ThinkingConfig};
 
-impl Synthetic {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve(CONFIG.slug, CONFIG.api_key_env)?;
-        Ok(Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
-                CONFIG.slug,
-                pool.current(),
-            )?)),
-            key_pool: Some(pool),
-            system_prefix: None,
-        })
+    pub const MODEL_SPEC: &str = "synthetic/hf:moonshotai/Kimi-K2.5";
+    /// Reaches the wire as `reasoning_effort`, which is the one thing
+    /// the declared `thinking` dialect is there to do.
+    const EFFORT: Effort = Effort::High;
+    const UNKNOWN_MODEL: &str = "the curated table has no such model";
+
+    pub fn model() -> Model {
+        Model::from_spec(MODEL_SPEC).expect(UNKNOWN_MODEL)
     }
 
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
-        Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth,
-            key_pool: None,
-            system_prefix: None,
-        }
-    }
+    const SUCCESS_TRANSCRIPT: &str = r#"data: {"choices":[{"delta":{"reasoning_content":"weighing the options"}}]}
 
-    pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
-        self.system_prefix = prefix;
-        self
-    }
-}
+data: {"choices":[{"delta":{"content":"Hello"}}]}
 
-impl Provider for Synthetic {
-    fn stream_message<'a>(
-        &'a self,
-        model: &'a Model,
-        messages: &'a [Message],
-        system: &'a str,
-        tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
-        opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
-    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking
-                .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
-            self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
-                .await
-        })
-    }
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"path\":"}}]}}]}
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            self.compat.do_list_models(&auth).await
-        })
-    }
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.txt\"}"}}]}}]}
 
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
-    }
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":4}}}
+
+data: [DONE]
+
+"#;
+
+    pub const SUCCESS: Fixture = Fixture {
+        name: "success",
+        script: &[Canned::sse(SUCCESS_TRANSCRIPT)],
+        thinking: ThinkingConfig::Effort(EFFORT),
+        session: None,
+    };
 }

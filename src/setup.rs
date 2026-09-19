@@ -98,9 +98,9 @@ fn fallback_model(provider_config: &ProviderConfig) -> Result<Model> {
     })
 }
 
-/// A plugin provider resolves credentials on its first request, so being
-/// registered is enough here: broken credentials fail that request instead of
-/// quietly switching providers.
+/// A plugin provider that gets credentials from a hook resolves them on its
+/// first request, so being registered is enough here: broken credentials fail
+/// that request instead of quietly switching providers.
 fn provider_ready(slug: &str) -> Result<(), AgentError> {
     provider_for_slug(slug, Timeouts::default()).map(drop)
 }
@@ -137,12 +137,12 @@ fn auto_detect_model(policy: &ModelPolicy) -> Option<Model> {
         })
 }
 
-/// Lua plugin providers, then `providers.toml` entries. They come after the
-/// built-ins so a key in the environment still wins, as it always did. Sorted
-/// by slug, since the registry is a map and startup should pick the same
-/// provider every run.
+/// Lua plugin providers that claim no built-in slug, then `providers.toml`
+/// entries. They come after the built-ins so a key in the environment still
+/// wins, as it always did. Sorted by slug, since the registry is a map and
+/// startup should pick the same provider every run.
 fn user_provider_models() -> impl Iterator<Item = Model> {
-    let mut plugin_slugs = plugin::registered_slugs();
+    let mut plugin_slugs = plugin::unclaimed_slugs();
     plugin_slugs.sort_unstable();
     let plugins = plugin_slugs
         .into_iter()

@@ -10,6 +10,7 @@ use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
+use maki_providers::plugin::DeclAuthority;
 
 use crate::api::keymap::{KeybindTicket, KeymapReader};
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
@@ -162,6 +163,37 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "list",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
+    },
+    // The rest register no tool. They declare a provider maki ships, on
+    // the same surface a third-party plugin declares one with, which is what
+    // keeps that surface honest.
+    BundledPlugin {
+        name: "synthetic",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
+    },
+    BundledPlugin {
+        name: "deepseek",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/deepseek"),
+    },
+    BundledPlugin {
+        name: "mistral",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/mistral"),
+    },
+    BundledPlugin {
+        name: "tensorx",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tensorx"),
+    },
+    BundledPlugin {
+        name: "regolo",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/regolo"),
+    },
+    BundledPlugin {
+        name: "requesty",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/requesty"),
+    },
+    BundledPlugin {
+        name: "openrouter",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/openrouter"),
     },
 ];
 
@@ -502,6 +534,9 @@ impl PluginHost {
                 vec![LoadChunk::bundled(name.as_ref(), init)],
                 LoadContext {
                     opts,
+                    // The one load that ships inside the binary, and so the
+                    // one that may declare a provider under a built-in slug.
+                    authority: DeclAuthority::Bundled,
                     ..LoadContext::plain(None, permissions)
                 },
             )?;
@@ -683,6 +718,7 @@ impl PluginHost {
                     opts,
                     revision_guard: package.revision_guard.clone(),
                     package: true,
+                    authority: DeclAuthority::ThirdParty,
                 },
                 reply: reply_tx,
             })
@@ -759,6 +795,7 @@ impl PluginHost {
                 opts,
                 revision_guard,
                 package: true,
+                authority: DeclAuthority::ThirdParty,
             },
         )
     }
@@ -2302,6 +2339,22 @@ mod bundled_manifests {
                 .next()
                 .is_some_and(|c| c.is_alphanumeric() || c == '_')
         })
+    }
+
+    /// `PROVIDER_BUILTINS` is what keeps a provider plugin's name from reading
+    /// as a tool, so a bundled plugin that starts registering one must join it.
+    #[test]
+    fn provider_builtins_are_the_bundled_plugins_that_register_a_provider() {
+        const REGISTER: &str = "maki.provider.register";
+        let mut registering: Vec<&str> = BUNDLED_PLUGINS
+            .iter()
+            .filter(|p| runtime_sources(&p.dir).iter().any(|s| calls(s, REGISTER)))
+            .map(|p| p.name)
+            .collect();
+        let mut expected = maki_config::PROVIDER_BUILTINS.to_vec();
+        registering.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(registering, expected);
     }
 
     #[test]

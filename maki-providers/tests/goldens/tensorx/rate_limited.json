@@ -1,0 +1,23 @@
+{
+  "events": [],
+  "outcome": {
+    "error": "Api { status: 429, retry_after: None, overflow: None, quota_exhausted: false, auth_error: false }",
+    "message": "API error (429): {\"error\":{\"message\":\"too many requests\"}}"
+  },
+  "requests": [
+    {
+      "body": "{\"messages\":[{\"content\":\"You are a replay fixture.\",\"role\":\"system\"},{\"content\":\"read a.txt\",\"role\":\"user\"}],\"model\":\"moonshotai/kimi-k3\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "content-length": "368",
+        "content-type": "application/json",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "POST",
+      "path": "/v1/chat/completions"
+    }
+  ]
+}

@@ -8,6 +8,7 @@
 //! their own [`CatalogProvider`] instance, created from the same
 //! [`ProviderData`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -28,7 +29,9 @@ use maki_storage::id::SessionRef;
 use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::anthropic::shared;
-use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::providers::openai_compat::{
+    DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider,
+};
 use crate::providers::{ResolvedAuth, Timeouts, http_client, opencode, user_agent};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
@@ -310,6 +313,8 @@ impl CatalogMeta {
             supports_vision: self.supports_vision,
             tier: None,
             provider_info: None,
+            extra: None,
+            effort: None,
         }
     }
 }
@@ -429,12 +434,12 @@ pub(crate) fn config_error(message: String) -> AgentError {
 }
 
 static CATALOG_PROVIDER_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "",
-    api_key_env: "",
-    base_url: "",
-    max_tokens_field: "max_tokens",
+    slug: Cow::Borrowed(""),
+    api_key_env: Cow::Borrowed(""),
+    base_url: Cow::Borrowed(""),
+    max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
     include_stream_usage: true,
-    provider_name: "catalog",
+    provider_name: Cow::Borrowed("catalog"),
 };
 
 static SHARED_CATALOG: OnceLock<Mutex<CatalogData>> = OnceLock::new();

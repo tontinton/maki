@@ -21,7 +21,7 @@ use crate::model::{Model, ModelFamily};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::aperture::NO_PATH_PREFIX;
 use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+    ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
 };
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
@@ -43,7 +43,7 @@ const LABEL_WEEK_ALL: &str = "Current week (all models)";
 pub(crate) const SLUG: &str = "anthropic";
 pub(crate) const DISPLAY_NAME: &str = "Anthropic";
 const ENV_VAR: &str = "ANTHROPIC_API_KEY";
-const API_KEY_HEADER: &str = "x-api-key";
+pub(crate) const API_KEY_HEADER: &str = "x-api-key";
 const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-6";
 const LOGIN_URL: &str = "https://console.anthropic.com/settings/keys";
 /// The messages endpoint, which is what the docs quote; the provider itself
@@ -79,12 +79,12 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/anthropic.toml"),
     pricing_schedule: None,
-    native: Some(Native {
+    build: Build::Native(Native {
         new: create,
         with_auth: create_with_auth,
-        aperture: Some(ApertureRoute {
-            path_prefix: NO_PATH_PREFIX,
-        }),
+    }),
+    aperture: Some(ApertureRoute {
+        path_prefix: NO_PATH_PREFIX,
     }),
     login: Some(LoginConfig {
         protocol: Protocol::Anthropic,

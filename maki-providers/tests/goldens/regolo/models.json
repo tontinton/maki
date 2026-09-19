@@ -1,0 +1,146 @@
+{
+  "outcome": {
+    "models": [
+      {
+        "context_window": 64000,
+        "id": "glm5.2",
+        "max_output_tokens": 32000,
+        "pricing": {
+          "cache_read": 0.0,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": 2.0,
+          "output": 5.2
+        },
+        "supports_thinking": true,
+        "supports_vision": true,
+        "tier": null
+      },
+      {
+        "context_window": 64000,
+        "id": "glm5.2",
+        "max_output_tokens": 32000,
+        "pricing": {
+          "cache_read": 0.0,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": 2.0,
+          "output": 5.2
+        },
+        "supports_thinking": true,
+        "supports_vision": true,
+        "tier": null
+      },
+      {
+        "context_window": 131072,
+        "id": "gpt-oss-120b",
+        "max_output_tokens": null,
+        "pricing": {
+          "cache_read": 0.0,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": 0.125,
+          "output": 0.625
+        },
+        "supports_thinking": true,
+        "supports_vision": false,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "half-priced",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": false,
+        "supports_vision": false,
+        "tier": null
+      },
+      {
+        "context_window": 0,
+        "id": "legacy-negative",
+        "max_output_tokens": 0,
+        "pricing": {
+          "cache_read": 0.0,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": -1.0,
+          "output": 0.0
+        },
+        "supports_thinking": false,
+        "supports_vision": false,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "llama-huge",
+        "max_output_tokens": null,
+        "pricing": {
+          "cache_read": 0.0,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": 1.0,
+          "output": 1.0
+        },
+        "supports_thinking": false,
+        "supports_vision": false,
+        "tier": null
+      },
+      {
+        "context_window": 240000,
+        "id": "qwen3-coder-next",
+        "max_output_tokens": 120000,
+        "pricing": {
+          "cache_read": 0.0,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": 0.5,
+          "output": 2.0
+        },
+        "supports_thinking": false,
+        "supports_vision": true,
+        "tier": null
+      },
+      {
+        "context_window": 80000,
+        "id": "qwen3.5-9b",
+        "max_output_tokens": 120000,
+        "pricing": {
+          "cache_read": 0.0,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": 0.07,
+          "output": 0.35
+        },
+        "supports_thinking": true,
+        "supports_vision": false,
+        "tier": null
+      }
+    ]
+  },
+  "requests": [
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/model_group/info"
+    },
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/v1/models"
+    }
+  ]
+}
