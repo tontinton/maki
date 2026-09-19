@@ -6,6 +6,9 @@
 //!
 //! Discovered metadata (context windows, pricing) from `/models` endpoints is
 //! stored in `known_models` and consulted by [`crate::model::Model::from_base`].
+//! A replay of [`crate::models_cache`] lands in `cached_models` instead, so
+//! last run's metadata can fill a picker without claiming this run probed
+//! anything.
 //!
 //! The global lock never escapes this module: accessors lock internally and
 //! return owned data, so a caller can never hold a read guard across model
@@ -51,6 +54,11 @@ pub fn discovered(provider: &str, model_id: &str) -> Option<ModelInfo> {
     read().discovered(provider, model_id).cloned()
 }
 
+/// True only once this process has heard back from the provider. Callers use
+/// it to decide whether "not found" is final, so a replayed cache must never
+/// satisfy it: the cache cannot carry `provider_info`, and answering a
+/// capability question from a list fetched under yesterday's credentials is
+/// how a plan account silently loses a subscription perk for the session.
 pub fn discovery_complete(provider: &str) -> bool {
     read().known_models.contains_key(provider)
 }
@@ -73,6 +81,17 @@ pub fn set_known_models(provider: &str, models: Vec<ModelInfo>) {
     write().set_known_models(provider, models);
 }
 
+/// Seed metadata replayed from the on-disk cache. Unlike [`set_known_models`]
+/// this does not make [`discovery_complete`] true.
+pub fn set_cached_models(provider: &str, models: Vec<ModelInfo>) {
+    write().set_cached_models(provider, models);
+}
+
+/// Everything discovery has stored, cloned out for [`crate::models_cache`].
+/// Owned data, same as every accessor here.
+pub fn all_known_models() -> HashMap<String, Vec<ModelInfo>> {
+    read().known_models.clone()
+}
 /// Tiers whose override points at `spec`, in descending tier order.
 pub fn override_tiers(spec: &str) -> Vec<ModelTier> {
     read().override_tiers(spec)
@@ -111,6 +130,10 @@ struct ModelRegistry {
     /// Not persisted - rebuilt every session. Used for auto-tier assignment
     /// and discovered metadata lookup.
     known_models: HashMap<String, Vec<ModelInfo>>,
+    /// Last run's answer, replayed from the on-disk cache. Good enough to fill
+    /// a picker, which corrects itself when live discovery lands a moment
+    /// later, but kept out of `known_models` so it cannot pass for a probe.
+    cached_models: HashMap<String, Vec<ModelInfo>>,
 }
 
 impl ModelRegistry {
@@ -119,7 +142,20 @@ impl ModelRegistry {
     }
 
     fn set_known_models(&mut self, provider: &str, models: Vec<ModelInfo>) {
+        // A live listing supersedes the replay it was meant to correct.
+        self.cached_models.remove(provider);
         self.known_models.insert(provider.to_string(), models);
+    }
+
+    fn set_cached_models(&mut self, provider: &str, models: Vec<ModelInfo>) {
+        self.cached_models.insert(provider.to_string(), models);
+    }
+
+    /// Metadata for `provider`, live listing first and replayed cache second.
+    fn models_for(&self, provider: &str) -> Option<&Vec<ModelInfo>> {
+        self.known_models
+            .get(provider)
+            .or_else(|| self.cached_models.get(provider))
     }
 
     fn set(&mut self, spec: String, tier: ModelTier) {
@@ -138,10 +174,7 @@ impl ModelRegistry {
 
     /// Lookup discovered metadata for a model by ID.
     fn discovered(&self, provider: &str, model_id: &str) -> Option<&ModelInfo> {
-        self.known_models
-            .get(provider)?
-            .iter()
-            .find(|m| m.id == model_id)
+        self.models_for(provider)?.iter().find(|m| m.id == model_id)
     }
 
     fn tier_for(&self, spec: &str, provider: &str, static_tier: Option<ModelTier>) -> ModelTier {
@@ -156,7 +189,7 @@ impl ModelRegistry {
         }
         if tiers_from_discovery(provider)
             && let Some((_, model_id)) = spec.split_once('/')
-            && let Some(models) = self.known_models.get(provider)
+            && let Some(models) = self.models_for(provider)
             && let Some(pos) = models.iter().position(|model| model.id == model_id)
         {
             if let Some(tier) = models[pos].tier {
@@ -202,8 +235,7 @@ impl ModelRegistry {
 
     /// Lowest ID wins, so the tier default survives provider list reordering.
     fn metadata_candidate(&self, provider: &str, tier: ModelTier) -> Option<String> {
-        self.known_models
-            .get(provider)?
+        self.models_for(provider)?
             .iter()
             .filter(|model| model.tier == Some(tier))
             .map(|model| model.id.as_str())
@@ -212,7 +244,7 @@ impl ModelRegistry {
     }
 
     fn positional_candidate(&self, provider: &str, tier: ModelTier) -> Option<String> {
-        let models = self.known_models.get(provider).filter(|m| !m.is_empty())?;
+        let models = self.models_for(provider).filter(|m| !m.is_empty())?;
         let slot = match tier {
             ModelTier::Strong => 0,
             ModelTier::Medium => 1,
@@ -233,7 +265,7 @@ impl ModelRegistry {
         if let Some(spec) = self.overrides.get(&tier) {
             return Some(spec.clone());
         }
-        for provider in self.known_models.keys() {
+        for provider in self.known_models.keys().chain(self.cached_models.keys()) {
             if let Some(spec) = self.spec_for_tier(provider, tier) {
                 return Some(spec);
             }

@@ -468,6 +468,10 @@ pub enum ModelRequest {
         thinking: Option<String>,
         fast: Option<bool>,
     },
+    /// Re-run model discovery; `live` skips the on-disk cache (picker `R`).
+    Refresh {
+        live: bool,
+    },
 }
 
 /// The plan surface `maki.plan` drives. Plan state is per session, so every

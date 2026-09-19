@@ -205,6 +205,8 @@ pub enum Action {
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
     RefreshModels,
+    /// Live model re-discovery, bypassing the on-disk cache.
+    RefreshModelsLive,
     RefreshUsage,
     Compact(Option<String>),
     ToggleMcp(String, bool),

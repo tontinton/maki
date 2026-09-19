@@ -3440,6 +3440,32 @@ local m, err = maki.model.info("anthropic/claude-opus-4-6")
 if m and m.subsidised_by then print(m.subsidised_by, m.pricing.input) end
 ```
 
+---
+
+### `maki.model.refresh()` {#maki-model-refresh}
+
+```lua
+maki.model.refresh({opts?})
+```
+
+Re-run model discovery. The list `available()` returns and the model
+picker read from the same slot this refreshes. With `live = true` the
+on-disk discovery cache is skipped and every provider is re-probed (what
+`R` does in the picker); otherwise the cached replay-then-background-
+refresh path runs.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Optional fields: `live` (boolean) force live re-probe.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true`, or nil and an error.
+
+**Example:**
+
+```lua
+maki.model.refresh({ live = true })
+```
+
 
 ## maki.net {#maki-net}
 

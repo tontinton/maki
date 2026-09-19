@@ -1028,6 +1028,7 @@ impl App {
                 ModelPickerAction::UnassignTier(spec, tier) => {
                     vec![Action::UnassignTier(spec, tier)]
                 }
+                ModelPickerAction::Refresh => vec![Action::RefreshModelsLive],
                 ModelPickerAction::Close => vec![],
             });
         }
@@ -1037,10 +1038,10 @@ impl App {
                 LoginPickerAction::Consumed => vec![],
                 LoginPickerAction::Close => vec![],
                 LoginPickerAction::Authenticated { model_spec } => {
-                    vec![Action::ChangeModel(model_spec), Action::RefreshModels]
+                    vec![Action::ChangeModel(model_spec), Action::RefreshModelsLive]
                 }
                 LoginPickerAction::Configured { slug } => {
-                    vec![Action::RefreshProvider { slug }, Action::RefreshModels]
+                    vec![Action::RefreshProvider { slug }, Action::RefreshModelsLive]
                 }
             });
         }

@@ -35,7 +35,8 @@ use maki_lua::{
     UiAction, UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
-use maki_providers::provider::{Provider, fetch_all_models, from_model};
+use maki_providers::models_cache::fetch_all_models_cached;
+use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
@@ -529,19 +530,25 @@ fn merge_batch(
 /// thread, over a channel so the loop wakes on it instead of noticing at the
 /// next tick. The channel holds one slot, which collapses overlapping fetches
 /// into a single rebuild.
+/// `live` skips the on-disk replay (R in the picker, a provider
+/// re-authenticating). Without it the last discovery replays instantly and a
+/// real probe still corrects it in the background. The notifier fires after
+/// each, so a session built on replayed metadata is rebuilt on the real thing.
 fn fetch_models(
     available: Arc<ArcSwapOption<Vec<String>>>,
     policy: Arc<ModelPolicy>,
     warn_tx: flume::Sender<String>,
     models_tx: flume::Sender<()>,
+    live: bool,
 ) -> smol::Task<()> {
     smol::spawn(async move {
-        fetch_all_models(
+        fetch_all_models_cached(
             &policy,
             |batch| merge_batch(&available, batch, &warn_tx),
             Some(Box::new(move || {
                 let _ = models_tx.try_send(());
             })),
+            live,
         )
         .await;
     })
@@ -551,11 +558,14 @@ fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
     let available: Arc<ArcSwapOption<Vec<String>>> = Arc::new(ArcSwapOption::empty());
     let (warn_tx, warn_rx) = flume::unbounded::<String>();
     let (models_tx, models_rx) = flume::bounded::<()>(1);
+    // Startup replays the cache first so the picker is usable immediately;
+    // the live probe that follows corrects it.
     let task = fetch_models(
         Arc::clone(&available),
         policy,
         warn_tx.clone(),
         models_tx.clone(),
+        false,
     );
     BackgroundModels {
         available,
@@ -1335,6 +1345,10 @@ impl<'t> EventLoop<'t> {
                 }
                 Ok(app.model_state())
             }
+            ModelRequest::Refresh { live } => {
+                self.refresh_models(live);
+                Ok(json!(true))
+            }
         }
     }
 
@@ -1708,7 +1722,8 @@ impl<'t> EventLoop<'t> {
                 terminal::suspend(self.terminal);
                 self.focus.on_resume();
             }
-            Action::RefreshModels => self.refresh_models(),
+            Action::RefreshModels => self.refresh_models(false),
+            Action::RefreshModelsLive => self.refresh_models(true),
             Action::RefreshUsage => self.refresh_usage(),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
@@ -1762,13 +1777,17 @@ impl<'t> EventLoop<'t> {
         self.dispatch(self.focused, actions);
     }
 
-    fn refresh_models(&self) {
+    /// `live` skips the on-disk discovery cache replay (R in the picker,
+    /// provider auth changes). Without it the last discovery replays
+    /// instantly and live re-discovery still refreshes in the background.
+    fn refresh_models(&self, live: bool) {
         self.ctx.available_models.store(None);
         fetch_models(
             Arc::clone(&self.ctx.available_models),
             Arc::clone(&self.ctx.model_policy),
             self.warn_tx.clone(),
             self.models_tx.clone(),
+            live,
         )
         .detach();
     }

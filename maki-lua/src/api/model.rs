@@ -92,6 +92,29 @@ fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
     }
 }
 
+/// Re-run model discovery. The list `available()` returns and the model
+/// picker read from the same slot this refreshes. With `live = true` the
+/// on-disk discovery cache is skipped and every provider is re-probed (what
+/// `R` does in the picker); otherwise the cached replay-then-background-
+/// refresh path runs.
+///
+/// @param opts table? Optional fields: `live` (boolean) force live re-probe.
+/// @return (boolean|nil, string|nil) `true`, or nil and an error.
+/// @example
+/// maki.model.refresh({ live = true })
+#[lua_fn]
+async fn refresh(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Value>> {
+    let live = match &opts {
+        Some(t) => t.get::<Option<bool>>("live")?.unwrap_or(false),
+        None => false,
+    };
+    roundtrip(lua, tx, ModelRequest::Refresh { live }).await
+}
+
 /// Reads the focused session's model, thinking level, and fast mode.
 /// `thinking` comes back in the spelling `set` accepts, so a table from here
 /// can go straight back in.
@@ -175,7 +198,7 @@ lua_table! {
     /// Without an interactive UI every function returns
     /// `nil, "no interactive UI attached"`.
     "maki.model" => pub(crate) fn create_model_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [get(tx), available(tx), set(tx), info()]
+    DOCS [get(tx), available(tx), set(tx), info(), refresh(tx)]
 }
 
 #[cfg(test)]
@@ -229,6 +252,7 @@ mod tests {
                 thinking,
                 fast,
             } => json!({ "spec": spec, "thinking": thinking, "fast": fast }),
+            ModelRequest::Refresh { live } => json!({ "refresh": live }),
         }))
     }
 
@@ -264,6 +288,13 @@ mod tests {
             eval(&lua, "return model.get()"),
             (Json::Null, Some(expected.to_owned()))
         );
+    }
+
+    /// `refresh` forwards the live flag, defaulting to the cached path.
+    #[test_case("return model.refresh({ live = true })", json!({ "refresh": true }) ; "refresh_live")]
+    #[test_case("return model.refresh()", json!({ "refresh": false }) ; "refresh_default")]
+    fn refresh_forwards_the_live_flag(script: &str, expected: Json) {
+        assert_eq!(eval(&stub_ui(echo), script), (expected, None));
     }
 
     /// `info` resolves locally: no UI required, and a builtin model answers
