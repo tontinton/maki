@@ -3,7 +3,7 @@
 use maki_providers::{ContextGauge, Message, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
-use maki_storage::sessions::{Session, SessionClaim};
+use maki_storage::sessions::{Session, SessionClaim, SessionError};
 use tracing::warn;
 
 use crate::agent::History;
@@ -126,13 +126,25 @@ impl SessionTurn<'_> {
 }
 
 impl Drop for SessionTurn<'_> {
+    /// A turn that changed nothing writes nothing. A rewrite would move
+    /// `updated_at`, which reorders `--continue`, stamp a model no turn ran
+    /// on, and commit the restore-time repair over the only copy of the
+    /// transcript.
     fn drop(&mut self) {
         let SessionTrack {
             history,
             gauge,
             store,
         } = &mut *self.0;
-        store.record_turn(history.as_slice(), gauge.size());
+        if !history.has_unsaved() {
+            return;
+        }
+        match store.record_turn(history.as_slice(), gauge.size()) {
+            Ok(()) => history.mark_saved(),
+            Err(e) => {
+                warn!(error = %e, session_id = %store.session.id, "failed to persist session");
+            }
+        }
     }
 }
 
@@ -170,23 +182,24 @@ impl SessionStore {
     /// resolves to, so a run killed before its first turn would leave a dead
     /// entry behind for good. The same guard stops a history that sanitized
     /// down to nothing from replacing the copy it was restored from.
-    fn record_turn(&mut self, messages: &[Message], context_size: u32) {
+    fn record_turn(&mut self, messages: &[Message], context_size: u32) -> Result<(), SessionError> {
         if messages.is_empty() {
-            return;
+            return Ok(());
         }
         self.session.replace_messages(messages.to_vec());
         self.session.meta.context_size = context_size;
         self.session.update_title_if_default();
-        if let Err(e) = self.session.save(&self.claim, &self.dir) {
-            warn!(error = %e, session_id = %self.session.id, "failed to persist session");
-        }
+        self.session.save(&self.claim, &self.dir)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use maki_providers::{ContentBlock, Role};
     use maki_storage::id::MakiId;
-    use maki_storage::sessions::generate_title;
+    use maki_storage::sessions::{SESSIONS_DIR, generate_title};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -204,9 +217,46 @@ mod tests {
     const NO_EMPTY_FILE: &str = "a session with no transcript must not be on disk";
     const NO_EMPTY_LATEST: &str = "an empty session must not be what --continue resolves to";
     const NOT_WIPED: &str = "an empty history must not replace the transcript it came from";
+    const UNTOUCHED: &str = "a run that changed nothing must not rewrite the log";
+    const RETRIED: &str = "a turn a failed write dropped has to reach disk on the next one";
+    const REPAIRED: &str = "a turn that ran on the repaired transcript has to store it repaired";
+    const ORPHAN_TOOL_ID: &str = "tool-nobody-called";
+    const ORPHAN_RESULT: &str = "ok";
 
     fn session_id() -> MakiId {
         SESSION_ID.parse().unwrap()
+    }
+
+    fn log_path(tmp: &TempDir) -> PathBuf {
+        tmp.path()
+            .join(SESSIONS_DIR)
+            .join(format!("{}.jsonl", session_id()))
+    }
+
+    /// Stores a prompt followed by a tool result with no call in front of it,
+    /// which is what a transcript cut off mid-turn leaves behind, and reopens
+    /// it. [`History::restored`] drops the orphan, so the reopened run holds a
+    /// repaired copy that differs from the file.
+    fn reopen_with_orphan(tmp: &TempDir) -> SessionTrack {
+        let orphan = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: ORPHAN_TOOL_ID.to_owned(),
+                content: ORPHAN_RESULT.into(),
+                is_error: false,
+            }],
+            ..Default::default()
+        };
+        push_turn(&mut track_on(tmp), MODEL_SPEC, |params| {
+            params.history.push(Message::user(PROMPT.into()));
+            params.history.push(orphan);
+        });
+        SessionTrack::open(
+            Resumed::stored(SessionRef::from(session_id()), load(tmp)),
+            claim(tmp),
+            state_dir(tmp),
+            CWD,
+        )
     }
 
     fn state_dir(tmp: &TempDir) -> StateDir {
@@ -278,9 +328,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut track = track_on(&tmp);
         push_prompt(&mut track, MODEL_SPEC, PROMPT);
-        push_turn(&mut track, MODEL_SPEC, |params| {
-            *params.history = History::new(Vec::new())
-        });
+        push_turn(&mut track, MODEL_SPEC, |params| params.history.truncate(0));
 
         assert_eq!(load(&tmp).messages().len(), 1, "{NOT_WIPED}");
     }
@@ -318,6 +366,65 @@ mod tests {
             loaded.meta.context_size, CONTEXT_SIZE,
             "a resumed session seeds its gauge from this, so it has to be stored"
         );
+    }
+
+    /// `updated_at` counts whole seconds, so a rewrite in the same second as
+    /// the seed could leave the bytes as they were. The orphan closes that
+    /// gap: the reopened history has already dropped it, so any rewrite at
+    /// all changes the file.
+    #[test_case(0 ; "a run that took no turn")]
+    #[test_case(1 ; "a turn that changed nothing")]
+    fn a_run_that_changed_nothing_leaves_the_file_alone(turns: usize) {
+        let tmp = TempDir::new().unwrap();
+        let mut track = reopen_with_orphan(&tmp);
+        let before = std::fs::read(log_path(&tmp)).unwrap();
+
+        for _ in 0..turns {
+            push_turn(&mut track, OTHER_SPEC, |_| {});
+        }
+        drop(track);
+
+        assert_eq!(
+            std::fs::read(log_path(&tmp)).unwrap(),
+            before,
+            "{UNTOUCHED}"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_changed_something_writes_the_repair_with_it() {
+        let tmp = TempDir::new().unwrap();
+        push_prompt(&mut reopen_with_orphan(&tmp), OTHER_SPEC, "second");
+
+        let has_tool_result = load(&tmp)
+            .messages()
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+        assert!(!has_tool_result, "{REPAIRED}");
+    }
+
+    /// The second turn changes nothing, so only the flag the failed write
+    /// left set can make it save.
+    #[test]
+    fn a_failed_save_is_retried_by_the_next_turn() {
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        // A directory where the rewrite puts its temp file: `File::create`
+        // cannot replace it, so the save fails before anything lands.
+        let blocker = log_path(&tmp).with_extension("jsonl.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        push_prompt(&mut track, MODEL_SPEC, PROMPT);
+        assert!(
+            StoredSession::load(session_id(), &state_dir(&tmp)).is_err(),
+            "the blocked write cannot have landed"
+        );
+
+        std::fs::remove_dir(&blocker).unwrap();
+        push_turn(&mut track, MODEL_SPEC, |_| {});
+        drop(track);
+
+        assert_eq!(load(&tmp).messages().len(), 1, "{RETRIED}");
     }
 
     /// The next process continues the transcript instead of starting one

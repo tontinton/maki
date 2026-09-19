@@ -16,6 +16,10 @@ pub struct History {
     /// disagree and so a new run can never inherit the last one's epoch.
     snapshot: HistorySnapshot,
     mirror: Option<SharedMessages>,
+    /// Set by every change and cleared only once a save lands, so a failed
+    /// write is retried by the next turn instead of lost. [`Self::restored`]
+    /// leaves it clear: its repair alone is not worth rewriting the file for.
+    unsaved: bool,
 }
 
 impl History {
@@ -23,12 +27,21 @@ impl History {
         Self {
             snapshot: HistorySnapshot::new(messages),
             mirror: None,
+            unsaved: false,
         }
     }
 
     pub fn restored(mut messages: Vec<Message>) -> Self {
         sanitize_restored(&mut messages);
         Self::new(messages)
+    }
+
+    pub fn has_unsaved(&self) -> bool {
+        self.unsaved
+    }
+
+    pub fn mark_saved(&mut self) {
+        self.unsaved = false;
     }
 
     pub fn with_mirror(mut self, mirror: SharedMessages) -> Self {
@@ -92,8 +105,11 @@ impl History {
     }
 
     /// An append: whatever a consumer already holds of the list stays good.
+    /// Every change goes through here, [`Self::rewrite`] too, so this is the
+    /// one place that has to mark the list unsaved.
     fn edit(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
         f(Arc::make_mut(&mut self.snapshot.messages));
+        self.unsaved = true;
         self.publish();
     }
 
