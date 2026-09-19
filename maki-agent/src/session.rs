@@ -3,7 +3,7 @@
 use maki_providers::{ContextGauge, Message, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
-use maki_storage::sessions::{Session, SessionClaim, SessionError};
+use maki_storage::sessions::{SAVE_FAILED, Session, SessionClaim, SessionError};
 use tracing::warn;
 
 use crate::agent::History;
@@ -141,8 +141,11 @@ impl Drop for SessionTurn<'_> {
         }
         match store.record_turn(history.as_slice(), gauge.size()) {
             Ok(()) => history.mark_saved(),
+            // Only headless runs save through here (the TUI has its own
+            // writer), so printing cannot tear a drawn frame.
             Err(e) => {
                 warn!(error = %e, session_id = %store.session.id, "failed to persist session");
+                eprintln!("{SAVE_FAILED}{}: {e}", store.session.id);
             }
         }
     }

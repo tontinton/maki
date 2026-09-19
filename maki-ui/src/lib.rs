@@ -42,7 +42,7 @@ use color_eyre::Result;
 use maki_lua::PackPlan;
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionClaim, SessionError};
+use maki_storage::sessions::{SAVE_FAILED, SessionClaim, SessionError};
 
 /// The tabs keep their own name, but the type is the same one the drivers
 /// persist, by construction rather than by coincidence.
@@ -117,7 +117,11 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
         exit,
         tabs,
         focused,
+        unsaved,
     } = report;
+    for id in unsaved {
+        eprintln!("{SAVE_FAILED}{id}");
+    }
     Ok(match exit {
         components::ExitRequest::Reload => RunOutcome::Reload {
             tabs,

@@ -31,6 +31,8 @@ use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
 
+const SESSION_LINE_PREFIX: &str = "session: ";
+
 // Fails fast: silently dropping an image the caller explicitly attached
 // would be worse than erroring.
 fn load_images(paths: &[PathBuf]) -> Result<Vec<ImageSource>> {
@@ -237,15 +239,18 @@ pub fn run(params: PrintParams) -> Result<()> {
         _ => None,
     };
 
-    if let Some(out) = &mut verbose_out {
-        out.emit(&InitEvent {
+    match &mut verbose_out {
+        Some(out) => out.emit(&InitEvent {
             event_type: "system",
             subtype: "init",
             cwd: &cwd,
             session_id: &session_id,
             tools: &tool_names,
             model: &model.id,
-        })?;
+        })?,
+        // Text mode never says which session it wrote, and a later `-s`
+        // needs it. On stderr so a pipe reading the answer is unaffected.
+        None => eprintln!("{SESSION_LINE_PREFIX}{session_id}"),
     }
 
     let mut result_text = String::new();

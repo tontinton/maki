@@ -45,6 +45,7 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const ALL_LANDED: &str = "a drain that wrote everything reports nothing unsaved";
 const TASK_ID: &str = "task1";
 const PACKUPDATE: &str = "/packupdate";
 const PACK_NAME: &str = "demo";
@@ -3505,10 +3506,11 @@ fn checkpoint_persists_observations_without_using_them_as_title() {
 
 fn drain_writer(app: App, writer: Arc<StorageWriter>) {
     drop(app);
-    Arc::try_unwrap(writer)
+    let unsaved = Arc::try_unwrap(writer)
         .ok()
         .expect("app must hold the only other writer reference")
         .shutdown(WRITER_DRAIN_TIMEOUT);
+    assert!(unsaved.is_empty(), "{ALL_LANDED}");
 }
 
 #[test]

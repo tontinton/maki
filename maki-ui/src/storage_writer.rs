@@ -45,7 +45,7 @@ enum Entry {
 pub struct StorageWriter {
     pending: Pending,
     wake: flume::Sender<()>,
-    done_rx: flume::Receiver<()>,
+    done_rx: flume::Receiver<Vec<MakiId>>,
 }
 
 impl StorageWriter {
@@ -53,7 +53,7 @@ impl StorageWriter {
         let pending: Pending = Arc::default();
         let writer_pending = Arc::clone(&pending);
         let (wake, wake_rx) = flume::unbounded::<()>();
-        let (done_tx, done_rx) = flume::bounded::<()>(1);
+        let (done_tx, done_rx) = flume::bounded::<Vec<MakiId>>(1);
 
         std::thread::Builder::new()
             .name("storage-writer".into())
@@ -67,7 +67,7 @@ impl StorageWriter {
                     writer.flush(&writer_pending);
                 }
                 writer.flush(&writer_pending);
-                let _ = done_tx.send(());
+                let _ = done_tx.send(writer.failing.into_iter().collect());
             })
             .expect("failed to spawn storage writer thread");
 
@@ -105,11 +105,15 @@ impl StorageWriter {
         }
     }
 
-    pub fn shutdown(self, timeout: Duration) {
+    /// Returns the sessions whose last write never reached disk. The caller
+    /// reports them, since the screen is still up here.
+    #[must_use]
+    pub fn shutdown(self, timeout: Duration) -> Vec<MakiId> {
         drop(self.wake);
-        if self.done_rx.recv_timeout(timeout).is_err() {
+        self.done_rx.recv_timeout(timeout).unwrap_or_else(|_| {
             warn!("storage writer did not drain within {timeout:?}");
-        }
+            Vec::new()
+        })
     }
 }
 
@@ -128,6 +132,7 @@ struct Writer {
     warn_tx: flume::Sender<String>,
     /// Sessions whose last write failed, so a sick disk warns once instead of
     /// once per frame.
+    /// Whatever is still in here when the thread stops never reached disk.
     failing: HashSet<MakiId>,
 }
 
@@ -208,6 +213,8 @@ mod tests {
     const TITLE: &str = "renamed after reload";
     const OWED_WRITE_HOLDS: &str = "a session with a write still owed must stay claimed";
     const LANDED_RELEASES: &str = "a session let go is free once its last snapshot landed";
+    const ALL_LANDED: &str = "a drain that wrote everything reports nothing unsaved";
+    const REPORTED_UNSAVED: &str = "a transcript that never landed must be named on the way out";
 
     fn state_dir() -> (TempDir, StateDir) {
         let tmp = TempDir::new().unwrap();
@@ -218,6 +225,10 @@ mod tests {
     fn writer(dir: &StateDir) -> (StorageWriter, flume::Receiver<String>) {
         let (warn_tx, warn_rx) = flume::unbounded();
         (StorageWriter::new(dir.clone(), warn_tx), warn_rx)
+    }
+
+    fn drain(writer: StorageWriter) {
+        assert!(writer.shutdown(DRAIN_TIMEOUT).is_empty(), "{ALL_LANDED}");
     }
 
     fn fresh(dir: &StateDir) -> (AppSession, SessionClaim) {
@@ -272,7 +283,7 @@ mod tests {
         writer.send(Arc::new(b.clone()), b_claim.clone());
         b.set_title("renamed".into());
         writer.send(Arc::new(b), b_claim);
-        writer.shutdown(DRAIN_TIMEOUT);
+        drain(writer);
 
         assert!(AppSession::load(a_id, &dir).is_ok());
         assert_eq!(AppSession::load(b_id, &dir).unwrap().title, "renamed");
@@ -289,7 +300,7 @@ mod tests {
         writer.delete(id, Some(claim), move |res| {
             let _ = done_tx.send(res);
         });
-        writer.shutdown(DRAIN_TIMEOUT);
+        drain(writer);
 
         assert!(done_rx.recv().unwrap().is_ok());
         assert!(AppSession::load(id, &dir).is_err());
@@ -308,7 +319,7 @@ mod tests {
         }
         let (first, _first_warn_rx) = writer(&dir);
         first.send(Arc::new(session.clone()), claim);
-        first.shutdown(DRAIN_TIMEOUT);
+        drain(first);
 
         session.truncate_messages(2);
         session.push_message(maki_providers::Message::user(RESUMED_MSG.into()));
@@ -321,7 +332,7 @@ mod tests {
         let (second, second_warn_rx) = writer(&dir);
         let claim = SessionClaim::acquire(id, &dir).expect("the first run let go");
         second.send(Arc::new(session.clone()), claim);
-        second.shutdown(DRAIN_TIMEOUT);
+        drain(second);
 
         let loaded = AppSession::load(id, &dir).unwrap();
         assert_eq!(
@@ -365,7 +376,7 @@ mod tests {
         writer.send(session, claim);
         let recovered = warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
         assert_eq!(recovered, SAVE_RECOVERED);
-        writer.shutdown(DRAIN_TIMEOUT);
+        drain(writer);
 
         assert!(warn_rx.is_empty());
         assert!(AppSession::load(id, &dir).is_ok());
@@ -392,12 +403,32 @@ mod tests {
         );
 
         std::fs::remove_dir(blocker).unwrap();
-        writer.shutdown(DRAIN_TIMEOUT);
+        drain(writer);
 
         SessionClaim::acquire(id, &dir).expect(LANDED_RELEASES);
         assert_eq!(
             message_texts(&AppSession::load(id, &dir).unwrap()),
             [msg_text(0)]
+        );
+    }
+
+    /// The final flush runs after the status bar is gone, so the return value
+    /// is the only way a lost transcript gets reported.
+    #[test]
+    fn a_transcript_that_never_landed_is_named_at_shutdown() {
+        let (_tmp, dir) = state_dir();
+        let (mut session, claim) = fresh(&dir);
+        session.push_message(user_message(0));
+        let id = session.id;
+        let _blocker = block_log(&dir, id);
+
+        let (writer, _warn_rx) = writer(&dir);
+        writer.send(Arc::new(session), claim);
+
+        assert_eq!(
+            writer.shutdown(DRAIN_TIMEOUT),
+            vec![id],
+            "{REPORTED_UNSAVED}"
         );
     }
 
@@ -415,7 +446,7 @@ mod tests {
         writer.delete(id, Some(claim.clone()), |_| {});
         session.push_message(maki_providers::Message::user(RESUMED_MSG.into()));
         writer.send(Arc::new(session), claim);
-        writer.shutdown(DRAIN_TIMEOUT);
+        drain(writer);
 
         let loaded = AppSession::load(id, &dir).unwrap();
         assert_eq!(
@@ -441,7 +472,7 @@ mod tests {
         assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
 
         std::fs::remove_file(sessions_dir(&dir)).unwrap();
-        writer.shutdown(DRAIN_TIMEOUT);
+        drain(writer);
 
         assert!(AppSession::load(id, &dir).is_ok());
         assert_eq!(warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap(), SAVE_RECOVERED);
@@ -469,7 +500,7 @@ mod tests {
 
         session.push_message(maki_providers::Message::user(RESUMED_MSG.into()));
         writer.send(Arc::new(session), claim);
-        writer.shutdown(DRAIN_TIMEOUT);
+        drain(writer);
 
         let loaded = AppSession::load(id, &dir).unwrap();
         assert_eq!(

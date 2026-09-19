@@ -83,6 +83,10 @@ pub(crate) struct ShutdownReport {
     pub exit: ExitRequest,
     pub tabs: Vec<OpenSession>,
     pub focused: usize,
+    /// Sessions whose transcript never reached disk. The caller prints them
+    /// after dropping the terminal guard, so the line is not lost with the
+    /// alternate screen.
+    pub unsaved: Vec<MakiId>,
 }
 
 pub struct EventLoopParams {
@@ -1878,12 +1882,13 @@ impl<'t> EventLoop<'t> {
             smol::block_on(h.shutdown());
         }
         let mcp_shutdown_ms = lap();
-        match Arc::try_unwrap(self.ctx.storage_writer) {
+        let unsaved = match Arc::try_unwrap(self.ctx.storage_writer) {
             Ok(writer) => writer.shutdown(AGENT_SHUTDOWN_TIMEOUT),
             Err(_) => {
-                warn!("storage writer has outstanding references, skipping graceful shutdown")
+                warn!("storage writer has outstanding references, skipping graceful shutdown");
+                Vec::new()
             }
-        }
+        };
         let storage_drain_ms = lap();
         info!(
             session_end_ms,
@@ -1899,6 +1904,7 @@ impl<'t> EventLoop<'t> {
             exit,
             tabs,
             focused: self.focused,
+            unsaved,
         }
     }
 }

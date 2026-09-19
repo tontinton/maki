@@ -37,6 +37,10 @@ const CWD_INDEX_STEM: &str = "cwd_latest";
 const SCAN_CACHE_FILE: &str = "scan_cache.json";
 const SCAN_CACHE_STEM: &str = "scan_cache";
 const NON_SESSION_STEMS: [&str; 2] = [CWD_INDEX_STEM, SCAN_CACHE_STEM];
+/// Printed on stderr when a transcript never reached disk. Nobody reads a
+/// `warn!` in a scripted run or a status bar that is about to close, and the
+/// next `-c` would quietly continue a session missing a turn.
+pub const SAVE_FAILED: &str = "maki: failed to save session ";
 const DEFAULT_TITLE: &str = "New session";
 const MAX_TITLE_LEN: usize = 60;
 const EPOCH_CHANGED: &str = "messages were rewritten";
