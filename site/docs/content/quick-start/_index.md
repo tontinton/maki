@@ -93,7 +93,7 @@ Type what you want done, press Enter, watch it work. Worth knowing on day one:
 - **Models.** `/model` switches mid-session.
 - **Sessions.** `/new` starts a second session while the first keeps working in the background; `/sessions` jumps between them. Tomorrow, `maki --continue` resumes where you left off.
 - **Your shell.** Prefix input with `!` to run a command yourself (`!cargo test`). `!!` hides command and output from the agent.
-- **Escape hatch.** `Esc Esc` cancels a streaming response. When idle, it rewinds instead.
+- **Escape hatch.** `Ctrl+C` cancels a streaming response. When idle, `Esc Esc` rewinds. Set `ui.cancel_key = "esc"` to cancel with a double Esc instead.
 - **Help.** `Ctrl+H` lists every keybinding, or see [Keybindings](/docs/keybindings/).
 
 ## Default model (optional)

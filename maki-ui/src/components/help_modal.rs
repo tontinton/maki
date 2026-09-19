@@ -1,13 +1,15 @@
 use crate::components::ModalScroll;
 use crate::components::Overlay;
 use crate::components::keybindings::{
-    ALT_SEP, KEYBINDS, KeybindContext, ResolvedLabel, all_contexts, key,
+    ALT_SEP, CANCEL_AGENT_DESC, ESC_ESC_LABEL, KEYBINDS, KeybindContext, ResolvedLabel,
+    all_contexts, key,
 };
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
+use maki_config::CancelKey;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -115,7 +117,7 @@ impl HelpModal {
         true
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    pub fn view(&mut self, frame: &mut Frame, area: Rect, cancel_key: CancelKey) -> Rect {
         if !self.open {
             return Rect::default();
         }
@@ -150,7 +152,15 @@ impl HelpModal {
                 .iter()
                 .filter(|kb| kb.context == ctx && kb.platform.is_visible())
             {
-                let mut spans = key_spans(kb.label.resolve(), key_col_width, PREFIX_TOP);
+                let label = if ctx == KeybindContext::Streaming
+                    && kb.description == CANCEL_AGENT_DESC
+                    && cancel_key == CancelKey::Esc
+                {
+                    ResolvedLabel::Single(ESC_ESC_LABEL)
+                } else {
+                    kb.label.resolve()
+                };
+                let mut spans = key_spans(label, key_col_width, PREFIX_TOP);
                 spans.push(Span::styled(kb.description, theme.keybind_desc));
                 lines.push(Line::from(spans));
             }
@@ -237,6 +247,7 @@ mod tests {
     use super::*;
     use crate::components::key as key_ev;
     use crossterm::event::KeyCode;
+    use ratatui::layout::Rect;
     use test_case::test_case;
 
     #[test_case(key_ev(KeyCode::Esc)       ; "esc_closes")]
@@ -255,5 +266,38 @@ mod tests {
         modal.toggle();
         assert!(modal.handle_key(key_ev(KeyCode::Char('a'))));
         assert!(modal.is_open());
+    }
+
+    #[test_case(CancelKey::CtrlC, "Ctrl+C" ; "default_ctrl_c")]
+    #[test_case(CancelKey::Esc, "Esc Esc" ; "esc_mode")]
+    fn view_shows_the_configured_cancel_key(cancel_key: CancelKey, label: &str) {
+        let mut modal = HelpModal::new();
+        modal.toggle();
+        // Wide enough for the longest multi-key label plus the description.
+        let area = Rect::new(0, 0, 140, 60);
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                modal.view(frame, area, cancel_key);
+            })
+            .unwrap();
+
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(area.width as usize)
+            .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect())
+            .collect();
+        let cancel_row = rows
+            .iter()
+            .find(|row| row.contains(CANCEL_AGENT_DESC))
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            cancel_row.contains(label),
+            "cancel row must show {label}, got: {cancel_row}"
+        );
     }
 }

@@ -54,7 +54,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` | Navigate input history |
-| `Esc Esc` | Cancel agent |
+| `Ctrl+C` | Cancel agent |
 
 ## Form
 
@@ -74,6 +74,12 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Type` | Filter |
 | `PageUp` / `PageDown` | Scroll page up / down |
 | `Ctrl+U` / `Ctrl+D` | Scroll half page up / down |
+
+## Cancellation
+
+The cancel key is a setting, `ui.cancel_key` in [Configuration](/docs/configuration/). The default, `"ctrl+c"`, cancels the running turn on a single press and leaves Esc free: when idle, a double Esc still opens the rewind picker. Set it to `"esc"` to cancel with a double Esc press instead. Ctrl+C keeps cancelling alongside it.
+
+`ui.double_esc_scope` decides where the double press is required when Esc cancels. `"all"` (default) asks for it in the top level session and in every role and subagent. `"top"` asks for it in the top level only, and a single Esc cancels the role or subagent you are looking at.
 
 ## Context-Specific
 

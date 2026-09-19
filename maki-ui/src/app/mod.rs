@@ -63,7 +63,7 @@ use maki_agent::{
     SharedMessages, SubagentInfo,
 };
 use maki_config::project::{self, GatedFile, TrustQuestion};
-use maki_config::{ModelPolicy, UiConfig};
+use maki_config::{CancelKey, DoubleEscScope, ModelPolicy, UiConfig};
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, KeymapReader,
     LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
@@ -1124,7 +1124,7 @@ impl App {
             return actions;
         }
 
-        if !(self.status == Status::Streaming && is_streaming_stop_key(key))
+        if !(self.status == Status::Streaming && self.is_streaming_stop_key(key))
             && self.dispatch_override(key)
         {
             return vec![];
@@ -1148,14 +1148,13 @@ impl App {
         if !self.is_main_chat() {
             return match key.code {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
-                KeyCode::Esc if !self.chats[self.active_chat].is_finished() => {
-                    if let Some(t) = self.last_esc.take()
-                        && t.elapsed() < self.status_bar.flash_duration
-                    {
+                KeyCode::Esc
+                    if self.esc_cancels() && !self.chats[self.active_chat].is_finished() =>
+                {
+                    if !self.double_esc_required() || self.take_fresh_esc() {
                         self.handle_subagent_cancel()
                     } else {
-                        self.last_esc = Some(Instant::now());
-                        self.status_bar.flash(FLASH_CANCEL.into());
+                        self.arm_esc(FLASH_CANCEL);
                         vec![]
                     }
                 }
@@ -1242,25 +1241,19 @@ impl App {
                         vec![]
                     }
                     KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
-                    KeyCode::Esc => {
-                        if let Some(t) = self.last_esc.take()
-                            && t.elapsed() < self.status_bar.flash_duration
-                        {
+                    KeyCode::Esc if self.esc_cancels() || !streaming => {
+                        if self.take_fresh_esc() {
                             if streaming {
                                 self.handle_cancel()
                             } else {
                                 self.open_rewind_picker()
                             }
                         } else {
-                            self.last_esc = Some(Instant::now());
-                            self.status_bar.flash(
-                                if streaming {
-                                    FLASH_CANCEL
-                                } else {
-                                    FLASH_REWIND
-                                }
-                                .into(),
-                            );
+                            self.arm_esc(if streaming {
+                                FLASH_CANCEL
+                            } else {
+                                FLASH_REWIND
+                            });
                             vec![]
                         }
                     }
@@ -1332,6 +1325,27 @@ impl App {
             }];
         }
         self.submit_or_queue(sub.into())
+    }
+
+    fn esc_cancels(&self) -> bool {
+        self.ui_config.cancel_key == CancelKey::Esc
+    }
+
+    /// The double-press requirement: on by default for every session, or
+    /// confined to the top level by `double_esc_scope = "top"`.
+    fn double_esc_required(&self) -> bool {
+        self.ui_config.double_esc_scope == DoubleEscScope::All
+    }
+
+    fn take_fresh_esc(&mut self) -> bool {
+        self.last_esc
+            .take()
+            .is_some_and(|t| t.elapsed() < self.status_bar.flash_duration)
+    }
+
+    fn arm_esc(&mut self, msg: &str) {
+        self.last_esc = Some(Instant::now());
+        self.status_bar.flash(msg.into());
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
@@ -2390,10 +2404,12 @@ impl App {
         actions.extend(self.start_from_queue(&msg));
         actions
     }
-}
 
-fn is_streaming_stop_key(key: KeyEvent) -> bool {
-    key::QUIT.matches(key) || key.code == KeyCode::Esc
+    /// Keys that must reach their built-in handler while streaming, no matter
+    /// what a Lua keymap override says.
+    fn is_streaming_stop_key(&self, key: KeyEvent) -> bool {
+        key::QUIT.matches(key) || (self.esc_cancels() && key.code == KeyCode::Esc)
+    }
 }
 
 fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {

@@ -19,7 +19,10 @@ use maki_agent::{
     McpSnapshot, McpSnapshotReader, SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
     TurnCompleteEvent,
 };
-use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
+use maki_config::{
+    CancelKey, DoubleEscScope, Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
+    UiConfig,
+};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{
     BuiltinAction, Dimension, FloatConfig, HintReader, KeymapReader, LuaCommandInfo,
@@ -725,6 +728,7 @@ fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
 }
 
 pub(crate) fn cancel_app(app: &mut App) {
+    app.ui_config.cancel_key = CancelKey::Esc;
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
 }
@@ -2335,6 +2339,7 @@ fn double_esc_cancels_flushes_and_fails_tools() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
+    app.ui_config.cancel_key = CancelKey::Esc;
     app.update(agent_msg(AgentEvent::TextDelta {
         text: "partial".into(),
     }));
@@ -5090,6 +5095,7 @@ fn streaming_cancel_wins_over_esc_override() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
+    app.ui_config.cancel_key = CancelKey::Esc;
     app.status_bar.flash_duration = Duration::from_secs(3600);
     app.last_esc = Some(Instant::now());
     let probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
@@ -6091,6 +6097,7 @@ fn app_with_active_subagent() -> App {
 #[test]
 fn double_esc_in_subagent_cancels_subagent() {
     let mut app = app_with_active_subagent();
+    app.ui_config.cancel_key = CancelKey::Esc;
     app.last_esc = Some(Instant::now());
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert_eq!(actions.len(), 1);
@@ -6105,6 +6112,7 @@ fn double_esc_in_subagent_cancels_subagent() {
 #[test]
 fn single_or_stale_esc_in_subagent_flashes() {
     let mut app = app_with_active_subagent();
+    app.ui_config.cancel_key = CancelKey::Esc;
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(actions.is_empty());
     assert_eq!(app.status_bar.flash_text().unwrap(), FLASH_CANCEL);
@@ -6118,6 +6126,7 @@ fn single_or_stale_esc_in_subagent_flashes() {
 #[test]
 fn esc_in_main_chat_with_active_subagent_no_cancel() {
     let mut app = app_with_subagent();
+    app.ui_config.cancel_key = CancelKey::Esc;
     assert_eq!(app.active_chat, 0);
     app.last_esc = Some(Instant::now());
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
@@ -6129,6 +6138,7 @@ fn esc_in_main_chat_with_active_subagent_no_cancel() {
 #[test]
 fn cancel_subagent_removes_answer_sender() {
     let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
+    app.ui_config.cancel_key = CancelKey::Esc;
     assert!(!app.subagent_answers.is_empty());
     app.run_builtin(BuiltinAction::NextChat);
     assert_eq!(app.active_chat, 1);
@@ -6140,6 +6150,7 @@ fn cancel_subagent_removes_answer_sender() {
 #[test]
 fn multiple_subagents_cancel_one_other_unaffected() {
     let mut app = app_with_subagent_id(TASK_ID);
+    app.ui_config.cancel_key = CancelKey::Esc;
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "y".into() },
         "task2",
@@ -6173,6 +6184,7 @@ fn double_esc_in_finished_subagent_noop() {
 #[test]
 fn subagent_cancel_then_navigate_back_main_unaffected() {
     let mut app = app_with_active_subagent();
+    app.ui_config.cancel_key = CancelKey::Esc;
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(app.chats[1].is_finished());
@@ -6181,6 +6193,104 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     assert_eq!(app.active_chat, 0);
     assert_eq!(app.status, Status::Streaming);
     assert!(!app.chats[0].is_finished());
+}
+
+#[test]
+fn default_mode_esc_does_not_cancel() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    assert_eq!(app.ui_config.cancel_key, CancelKey::CtrlC);
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(
+        actions.is_empty(),
+        "esc must not cancel in the default mode"
+    );
+    assert_eq!(app.status, Status::Streaming);
+    assert!(
+        app.last_esc.is_none(),
+        "esc must not arm the double-press in the default mode"
+    );
+
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
+    assert_eq!(app.status, Status::Idle);
+}
+
+#[test]
+fn default_mode_esc_does_not_cancel_subagent() {
+    let mut app = app_with_active_subagent();
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(actions.is_empty());
+    assert!(!app.chats[1].is_finished());
+    assert!(app.last_esc.is_none());
+}
+
+#[test]
+fn default_mode_esc_override_fires_while_streaming() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(
+        probe.try_recv().is_some(),
+        "{OVERRIDE_DISPATCHED}: esc is a plain key again in the default mode"
+    );
+    assert_eq!(app.status, Status::Streaming);
+}
+
+#[test]
+fn top_scope_single_esc_cancels_subagent() {
+    let mut app = app_with_active_subagent();
+    app.ui_config.cancel_key = CancelKey::Esc;
+    app.ui_config.double_esc_scope = DoubleEscScope::Top;
+
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(matches!(
+        &actions[0],
+        Action::CancelSubagent { tool_use_id } if tool_use_id == TASK_ID
+    ));
+    assert!(app.status_bar.flash_text().is_none());
+}
+
+#[test]
+fn top_scope_still_requires_double_esc_at_top_level() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.ui_config.cancel_key = CancelKey::Esc;
+    app.ui_config.double_esc_scope = DoubleEscScope::Top;
+
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(actions.is_empty(), "the first esc only arms");
+    assert_eq!(app.status_bar.flash_text().unwrap(), FLASH_CANCEL);
+    assert_eq!(app.status, Status::Streaming);
+
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
+    assert_eq!(app.status, Status::Idle);
+}
+
+#[test]
+fn esc_mode_ctrl_c_still_cancels() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.ui_config.cancel_key = CancelKey::Esc;
+
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
+    assert_eq!(app.status, Status::Idle);
 }
 
 // -- Every frame checkpoints: one way in for a history, one trigger to save --

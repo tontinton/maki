@@ -76,6 +76,8 @@ All fields are optional. Typos in field names cause an error right away.
 | `scrollbar` | bool | `true` | - | Show vertical scrollbar in scrollable areas |
 | `inline_images` | bool | `true` | - | Render inline images in terminals with graphics support, falling back to an [image] line where nothing else names the image |
 | `notifications` | string | `auto` | - | Terminal notification method: auto, osc9, bell, or off |
+| `cancel_key` | string | `ctrl+c` | - | Key that cancels a running turn: "ctrl+c" or "esc". With "esc", Esc cancels like before and Ctrl+C still cancels too. With "ctrl+c", Esc never cancels |
+| `double_esc_scope` | string | `all` | - | Where a double Esc press is required to cancel: "all" (top level plus every role and subagent) or "top" (top level only, a single Esc cancels a role or subagent). Only used when cancel_key is "esc" |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |

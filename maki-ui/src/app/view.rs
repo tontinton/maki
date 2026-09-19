@@ -310,7 +310,7 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
-        let r = self.help_modal.view(frame, full);
+        let r = self.help_modal.view(frame, full, self.ui_config.cancel_key);
         if r.width > 0 {
             overlay_rect = r;
         }

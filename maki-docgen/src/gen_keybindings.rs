@@ -84,6 +84,25 @@ fn write_section(out: &mut String, ctx: KeybindContext) {
     }
 }
 
+fn write_cancellation(out: &mut String) {
+    out.push_str("\n## Cancellation\n\n");
+    out.push_str(
+        "The cancel key is a setting, `ui.cancel_key` in \
+         [Configuration](/docs/configuration/). The default, `\"ctrl+c\"`, \
+         cancels the running turn on a single press and leaves Esc free: when \
+         idle, a double Esc still opens the rewind picker. Set it to `\"esc\"` \
+         to cancel with a double Esc press instead. Ctrl+C keeps cancelling \
+         alongside it.\n\n",
+    );
+    out.push_str(
+        "`ui.double_esc_scope` decides where the double press is required when \
+         Esc cancels. `\"all\"` (default) asks for it in the top level session \
+         and in every role and subagent. `\"top\"` asks for it in the top level \
+         only, and a single Esc cancels the role or subagent you are looking \
+         at.\n",
+    );
+}
+
 fn write_context_specific(out: &mut String) {
     let child_binds: Vec<_> = KEYBINDS
         .iter()
@@ -161,6 +180,7 @@ pub fn generate() -> String {
         write_section(&mut out, ctx);
     }
 
+    write_cancellation(&mut out);
     write_context_specific(&mut out);
     write_plugin_binds(&mut out);
     write_inheritance(&mut out);

@@ -514,6 +514,8 @@ pub struct UiFileConfig {
     pub scrollbar: Option<bool>,
     pub inline_images: Option<bool>,
     pub notifications: Option<NotificationMethod>,
+    pub cancel_key: Option<CancelKey>,
+    pub double_esc_scope: Option<DoubleEscScope>,
     pub flash_duration_ms: Option<u64>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
@@ -533,6 +535,8 @@ impl UiFileConfig {
             scrollbar,
             inline_images,
             notifications,
+            cancel_key,
+            double_esc_scope,
             flash_duration_ms,
             typewriter_ms_per_char,
             mouse_scroll_lines,
@@ -557,6 +561,25 @@ pub enum NotificationMethod {
     Osc9,
     Bell,
     Off,
+}
+
+/// Key that cancels a running turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub enum CancelKey {
+    #[default]
+    #[serde(rename = "ctrl+c")]
+    CtrlC,
+    #[serde(rename = "esc")]
+    Esc,
+}
+
+/// Where a double-press Esc is required to cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DoubleEscScope {
+    #[default]
+    All,
+    Top,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -1114,6 +1137,22 @@ pub struct UiConfig {
     )]
     pub notifications: NotificationMethod,
 
+    #[config(
+        default = CancelKey::CtrlC,
+        ty = "string",
+        default_doc = "ctrl+c",
+        desc = "Key that cancels a running turn: \"ctrl+c\" or \"esc\". With \"esc\", Esc cancels like before and Ctrl+C still cancels too. With \"ctrl+c\", Esc never cancels"
+    )]
+    pub cancel_key: CancelKey,
+
+    #[config(
+        default = DoubleEscScope::All,
+        ty = "string",
+        default_doc = "all",
+        desc = "Where a double Esc press is required to cancel: \"all\" (top level plus every role and subagent) or \"top\" (top level only, a single Esc cancels a role or subagent). Only used when cancel_key is \"esc\""
+    )]
+    pub double_esc_scope: DoubleEscScope,
+
     #[config(default = DEFAULT_FLASH_DURATION_MS, desc = "Duration of flash messages (ms)")]
     pub flash_duration_ms: u64,
 
@@ -1153,6 +1192,8 @@ impl UiConfig {
             scrollbar: f.scrollbar.unwrap_or(true),
             inline_images: f.inline_images.unwrap_or(true),
             notifications: f.notifications.unwrap_or_default(),
+            cancel_key: f.cancel_key.unwrap_or_default(),
+            double_esc_scope: f.double_esc_scope.unwrap_or_default(),
             flash_duration_ms: f.flash_duration_ms.unwrap_or(DEFAULT_FLASH_DURATION_MS),
             typewriter_ms_per_char: f
                 .typewriter_ms_per_char
@@ -2709,6 +2750,40 @@ mod tests {
     fn notifications_reject_unknown_value() {
         let result: Result<RawConfig, _> = toml::from_str("[ui]\nnotifications = \"desktop\"\n");
         assert!(result.is_err());
+    }
+
+    #[test_case("ctrl+c", CancelKey::CtrlC ; "ctrl_c")]
+    #[test_case("esc", CancelKey::Esc ; "esc")]
+    fn cancel_key_deserialize(value: &str, expected: CancelKey) {
+        let raw: RawConfig = toml::from_str(&format!("[ui]\ncancel_key = \"{value}\"\n")).unwrap();
+        assert_eq!(raw.into_config(&[]).unwrap().ui.cancel_key, expected);
+    }
+
+    #[test]
+    fn cancel_key_rejects_unknown_value() {
+        let result: Result<RawConfig, _> = toml::from_str("[ui]\ncancel_key = \"ctrl+d\"\n");
+        assert!(result.is_err());
+    }
+
+    #[test_case("all", DoubleEscScope::All ; "all")]
+    #[test_case("top", DoubleEscScope::Top ; "top")]
+    fn double_esc_scope_deserialize(value: &str, expected: DoubleEscScope) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[ui]\ndouble_esc_scope = \"{value}\"\n")).unwrap();
+        assert_eq!(raw.into_config(&[]).unwrap().ui.double_esc_scope, expected);
+    }
+
+    #[test]
+    fn double_esc_scope_rejects_unknown_value() {
+        let result: Result<RawConfig, _> = toml::from_str("[ui]\ndouble_esc_scope = \"every\"\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ui_cancel_defaults() {
+        let config = RawConfig::default().into_config(&[]).unwrap();
+        assert_eq!(config.ui.cancel_key, CancelKey::CtrlC);
+        assert_eq!(config.ui.double_esc_scope, DoubleEscScope::All);
     }
 
     #[test]
