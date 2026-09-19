@@ -285,16 +285,14 @@ impl JobStore {
             .stderr(stderr.stdio()?)
             .stdin(Stdio::null());
 
+        // Keep std on the posix_spawn fast path so libmalloc's atfork child
+        // handler never runs (it prints a MallocStackLogging warning when the
+        // parent has MSL enabled; see tontinton/maki#909). pgid == pid, so
+        // kill_process_group below is unaffected.
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            // SAFETY: setsid is async-signal-safe, so it is sound to call in pre_exec.
-            unsafe {
-                command.pre_exec(|| {
-                    rustix::process::setsid()?;
-                    Ok(())
-                });
-            }
+            command.process_group(0);
         }
 
         if let Some(dir) = cwd.as_deref().map(expand_tilde) {
@@ -776,6 +774,7 @@ fn shell_command(cmd: &str) -> Command {
     {
         let mut c = Command::new("bash");
         c.arg("-c").arg(cmd);
+        maki_agent::child_env::strip_inherited_malloc_stack_logging(&mut c);
         c
     }
     #[cfg(windows)]

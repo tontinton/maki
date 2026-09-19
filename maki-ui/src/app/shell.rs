@@ -218,14 +218,12 @@ async fn run_command(
         .arg("-c")
         .arg(command)
         .env("GIT_TERMINAL_PROMPT", "0");
+    maki_agent::child_env::strip_inherited_malloc_stack_logging(&mut std_cmd);
 
+    // posix_spawn fast path: avoids fork and libmalloc's noisy atfork child
+    // handler when the parent has MallocStackLogging enabled (see #909).
     #[cfg(unix)]
-    unsafe {
-        std_cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
+    std_cmd.process_group(0);
 
     let mut cmd: Command = std_cmd.into();
     cmd.stdin(Stdio::null())
