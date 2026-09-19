@@ -188,6 +188,7 @@ const STRING_FIELD_SCHEMA: &str = r#"{
 }"#;
 
 const INVALID_PERMISSION_SCOPE_ERR: &str = "not in schema properties or not type 'string'";
+const HOST_ACCESS_TYPE_ERR: &str = "register_tool: 'host_access' must be a boolean";
 const BAD_NAME_SRC: &str = r#"name = "bad name!", description = "test""#;
 const EMPTY_DESC_SRC: &str = r#"name = "valid_name", description = """#;
 const EMPTY_AUD_SRC: &str = r#"name = "no_aud", description = "test", audiences = {}"#;
@@ -207,6 +208,8 @@ const PERMISSION_WITHOUT_SCOPES_SRC: &str =
     r#"name = "no_scopes", description = "test", permission = "fs_write""#;
 const UNKNOWN_PERMISSION_SRC: &str = r#"name = "bad_perm", description = "test", permission = "filesystem", permission_scopes = "url""#;
 const FS_WRITE_WITHOUT_MUTABLE_PATH_SRC: &str = r#"name = "no_mpath", description = "test", permission = "fs_write", permission_scopes = "url""#;
+const HOST_ACCESS_NON_BOOL_SRC: &str =
+    r#"name = "host_bad", description = "test", host_access = "yes""#;
 const NON_STRING_FIELD_SCHEMA: &str = r#"{
     type = "object",
     properties = { count = { type = "integer" } },
@@ -604,6 +607,7 @@ fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
 #[test_case::test_case(PERMISSION_WITHOUT_SCOPES_SRC, STRING_FIELD_SCHEMA, "needs 'permission_scopes'" ; "permission_without_scopes")]
 #[test_case::test_case(UNKNOWN_PERMISSION_SRC, STRING_FIELD_SCHEMA, "unknown permission 'filesystem'" ; "unknown_permission")]
 #[test_case::test_case(FS_WRITE_WITHOUT_MUTABLE_PATH_SRC, STRING_FIELD_SCHEMA, "no 'mutable_path'" ; "fs_write_without_mutable_path")]
+#[test_case::test_case(HOST_ACCESS_NON_BOOL_SRC, MINIMAL_SCHEMA, HOST_ACCESS_TYPE_ERR ; "host_access_non_bool")]
 fn registration_validation_rejects(fields: &str, schema: &str, expected_err: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -638,6 +642,24 @@ fn permission_scopes_valid_string_field_accepted() {
     );
     host.load_source("ok_scope_plugin", &src).unwrap();
     assert!(reg.has("ok_scope"));
+}
+
+#[test]
+fn host_access_true_is_accepted() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "host_opt_in",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            host_access = true,
+            handler = function() return "" end
+        }})"#,
+    );
+    host.load_source("host_access_plugin", &src).unwrap();
+    assert!(reg.has("host_opt_in"));
 }
 
 #[test]

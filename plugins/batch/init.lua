@@ -598,6 +598,7 @@ maki.api.register_tool({
   name = "batch",
   description = description,
   kind = "execute",
+  host_access = true,
   audiences = { "main", "research_sub", "general_sub" },
   schema = schema,
   examples = examples,

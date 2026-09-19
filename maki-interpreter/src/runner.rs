@@ -22,7 +22,8 @@ use crate::error::InterpreterError;
 const DEFAULT_MAX_RECURSION: usize = 100;
 const SCRIPT_NAME: &str = "agent.py";
 
-pub type ToolFn = Box<dyn Fn(&str, Vec<Value>, Vec<(String, Value)>) -> Result<Value, String>>;
+pub type ToolFn =
+    Box<dyn Fn(&str, Vec<Value>, Vec<(String, Value)>) -> Result<Value, String> + Send + Sync>;
 
 pub struct PendingCall {
     pub call_id: u32,

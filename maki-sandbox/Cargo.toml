@@ -1,0 +1,33 @@
+[package]
+name = "maki-sandbox"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "sandbox-diag"
+path = "src/bin/diag.rs"
+required-features = ["sandbox"]
+
+[[bin]]
+name = "sandbox-shell"
+path = "src/bin/sandbox-shell.rs"
+required-features = ["sandbox"]
+
+[features]
+default = ["sandbox"]
+sandbox = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+nix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+test-case = { workspace = true }

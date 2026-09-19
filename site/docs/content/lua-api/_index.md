@@ -423,6 +423,7 @@ string or a table with richer output fields.
     - `state` (`any`) Serializable state forwarded to restore.
   - `audiences` (`string[]`) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
   - `kind` (`string`) Optional grouping label (e.g. "filesystem").
+  - `host_access` (`boolean`) Optional. Run the handler on the host instead of inside the sandbox. Default false: the tool is routed into the sandbox, and the host handler is only the fallback when the sandbox cannot run it.
   - `timeout` (`number`) Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
   - `header` (`function`) Optional. Called before execution, returns a string or BufHandle for the one-line header.
   - `restore` (`function`) Optional. Called to re-render a previous tool result. Receives `(tool_name, input, output, ctx)`.
@@ -2894,9 +2895,10 @@ Stdout lines are streamed to your {on_output} callback as they are produced.
 If the Python code calls tools, those calls are dispatched to the Lua
 functions you provide in {opts}.tools.
 
-The result table has optional fields: `stdout` (string, trimmed combined
-output) and `output` (string, the final expression value). On error, the
-table is empty and the second return value is the error message.
+When a [`SandboxRunner`] callback is stored in the Lua state's app_data, the code
+runs inside an OS-level sandboxed child process (user+mount namespaces)
+instead of the in-process monty interpreter. Tool calls are transparently
+forwarded back to the parent where the Lua plugins handle them.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 

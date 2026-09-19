@@ -145,6 +145,29 @@ settings in a local table, or export a `setup(opts)` function `init.lua` calls.
 
 {PERMISSIONS}
 
+## Where tools run
+
+With the sandbox on, a registered tool is routed into the sandbox by default.
+Only a tool that declares `host_access = true` keeps its handler on the host,
+where it can reach session state, the UI, and the network:
+
+```lua
+maki.api.register_tool({
+  name = "my_host_tool",
+  description = "Needs the host.",
+  schema = { type = "object", properties = {} },
+  host_access = true,
+  handler = function(_input, ctx)
+    return maki.env.logs_dir()
+  end,
+})
+```
+
+Without the flag the tool runs inside the sandbox while it is enabled, and on
+the host when it is not. A tool the sandbox cannot run falls back to the host
+handler. Filesystem tools are the common case: keep them unsandboxed by
+omitting `host_access`.
+
 ## Development loop
 
 `/reload` rebuilds plugins and config in place, no restart needed. Until it

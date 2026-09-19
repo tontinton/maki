@@ -702,8 +702,10 @@ mod tests {
     const OTHER_PUBLIC_URL: &str = "https://1.1.1.1/";
     const PUBLIC_URL_OTHER_PORT: &str = "https://8.8.8.8:8443/";
     const BLOCKED_PREFIX: &str = "blocked:";
-    /// Reserved by RFC 6761, so every resolver answers NXDOMAIN for it.
-    const UNRESOLVABLE_HOST: &str = "maki.invalid";
+    /// Reserved by RFC 6761, so every resolver answers NXDOMAIN for it. The
+    /// trailing dot keeps it absolute: a search-domain resolver would
+    /// otherwise rewrite the bare name to something that can resolve.
+    const UNRESOLVABLE_HOST: &str = "maki.invalid.";
     const PAYLOAD: &str = "payload";
     const AUTH_HEADER: &str = "Authorization";
     const AUTH_VALUE: &str = "Bearer tok";

@@ -387,6 +387,7 @@ maki.api.register_tool({
   schema = schema,
   examples = examples,
   kind = "execute",
+  host_access = true,
   audiences = { "main", "research_sub", "general_sub" },
   start_annotation = { field = "timeout", kind = "timeout" },
   start = start,

@@ -56,6 +56,8 @@ use crate::app::tasks::{TaskStatus, diff_task_states};
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
 use crate::color_compat;
 use crate::components::input::Submission;
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+use crate::components::sandbox_modal::SandboxModalEvent;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 use crate::input::InputReader;
@@ -107,6 +109,8 @@ pub struct EventLoopParams {
     /// What `/trust` would grant and what the `[restricted]` indicator reports.
     /// `None` when the folder is trusted or has nothing to ask about.
     pub trust_question: Option<TrustQuestion>,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    pub sandbox: Option<Arc<maki_sandbox::Sandbox>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -328,6 +332,10 @@ struct SessionRuntime {
     handles: AgentHandles,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    sandbox_tx: flume::Sender<SandboxModalEvent>,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    sandbox_rx: flume::Receiver<SandboxModalEvent>,
     last_status: SessionStatus,
     /// Keyed by task id, never by position: a session reset reuses positions,
     /// so a new task would inherit the old one's status.
@@ -432,11 +440,17 @@ impl SpawnCtx {
             app.restore_resumed_session();
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        let (sandbox_tx, sandbox_rx) = flume::unbounded::<SandboxModalEvent>();
         SessionRuntime {
             app,
             handles,
             shell_tx,
             shell_rx,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            sandbox_tx,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            sandbox_rx,
             last_status: SessionStatus::Idle,
             last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
@@ -479,6 +493,8 @@ enum Wake {
     Ui(UiAction),
     Agent(usize, Box<maki_agent::Envelope>),
     Shell(usize, ShellEvent),
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    Sandbox(usize, SandboxModalEvent),
     Warn(String),
     Pack(Box<PackPreparation>),
     ModelsDiscovered,
@@ -585,6 +601,8 @@ impl<'t> EventLoop<'t> {
             model_policy,
             project_config,
             trust_question,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            sandbox,
         } = params;
         // A `/reload` generation inherits the handles of the one before it,
         // so every loop has to claim the UI back for itself.
@@ -663,6 +681,8 @@ impl<'t> EventLoop<'t> {
             return Err(eyre!("event loop needs at least one session"));
         }
         let focused = focused.min(runtimes.len() - 1);
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        let sandbox_tx = runtimes[focused].sandbox_tx.clone();
         let app = &mut runtimes[focused].app;
         app.exit_on_done = exit_on_done;
         if needs_login {
@@ -675,6 +695,16 @@ impl<'t> EventLoop<'t> {
         if let Some(notice) = startup_notice {
             app.flash(notice);
         }
+
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        {
+            app.sandbox_modal = crate::components::sandbox_modal::SandboxModal::from_config(
+                &ctx.config,
+                sandbox,
+                sandbox_tx,
+            );
+        }
+
         for warning in startup_warnings {
             app.flash(warning);
         }
@@ -817,6 +847,12 @@ impl<'t> EventLoop<'t> {
             sel = sel.recv(&rt.shell_rx, move |res| {
                 res.ok().map(|ev| Wake::Shell(i, ev))
             });
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            {
+                sel = sel.recv(&rt.sandbox_rx, move |res| {
+                    res.ok().map(|ev| Wake::Sandbox(i, ev))
+                });
+            }
         }
         sel.wait_timeout(timeout).ok().flatten()
     }
@@ -828,6 +864,12 @@ impl<'t> EventLoop<'t> {
             Wake::Ui(action) => self.handle_ui_action(action),
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            Wake::Sandbox(i, event) => {
+                let app = &mut self.sessions[i].app;
+                app.sandbox_modal.apply(event);
+                app.apply_sandbox_changes();
+            }
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Pack(preparation) => self.finish_pack(*preparation),
             Wake::ModelsDiscovered => self.rebuild_models(),

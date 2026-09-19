@@ -46,6 +46,7 @@ const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
+const HOST_ACCESS_TYPE_ERR: &str = "register_tool: 'host_access' must be a boolean";
 const NARGS_ERR: &str = r#"register_command: 'nargs' must be 0, 1, "?", "*", or "+""#;
 const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
@@ -153,6 +154,7 @@ pub(crate) struct PendingTool {
     pub(crate) description: String,
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
+    pub(crate) host_access: bool,
     pub(crate) kind: Option<Arc<str>>,
     pub(crate) handler_key: RegistryKey,
     pub(crate) header_key: Option<RegistryKey>,
@@ -678,6 +680,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///                                state       (any)     Serializable state forwarded to restore.
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
+///   host_access     (boolean)  Optional. Run the handler on the host instead of inside the sandbox. Default false: the tool is routed into the sandbox, and the host handler is only the fallback when the sandbox cannot run it.
 ///   timeout         (number)   Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
 ///   header          (function) Optional. Called before execution, returns a string or BufHandle for the one-line header.
 ///   restore         (function) Optional. Called to re-render a previous tool result. Receives `(tool_name, input, output, ctx)`.
@@ -1526,6 +1529,11 @@ fn register_tool_from_lua(
         .ok()
         .map(|s| Arc::from(s.as_str()));
     let audience = parse_audience(audiences, ToolAudience::default())?;
+    let host_access = match spec.get::<LuaValue>("host_access")? {
+        LuaValue::Nil => false,
+        LuaValue::Boolean(b) => b,
+        _ => return Err(mlua::Error::runtime(HOST_ACCESS_TYPE_ERR)),
+    };
     let timeout = parse_timeout(spec)?;
     let start_annotation = parse_start_annotation(spec, &schema_val)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
@@ -1558,6 +1566,7 @@ fn register_tool_from_lua(
             description,
             schema: param_schema,
             audience,
+            host_access,
             kind,
             handler_key,
             header_key,

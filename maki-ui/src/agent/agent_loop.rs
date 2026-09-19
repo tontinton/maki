@@ -1,3 +1,5 @@
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+use std::path::Path;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -278,7 +280,7 @@ impl AgentLoop {
 
         let prompt_slots = self.lua_handle.collect_prompt_slots_async().await;
         let system = agent::build_system_prompt(
-            &self.vars,
+            &self.prompt_vars(),
             &input.mode,
             &self.instructions.text,
             &prompt_slots,
@@ -349,6 +351,33 @@ impl AgentLoop {
         self.instructions = smol::unblock(move || agent::load_instructions(&cwd)).await;
     }
 
+    /// Vars for prompt assembly: when the sandbox is active, `{cwd}` points at
+    /// the workspace path the filesystem tools actually operate on.
+    fn prompt_vars(&self) -> template::Vars {
+        match self.sandbox_cwd() {
+            Some(cwd) => self.vars.clone().set("{cwd}", cwd),
+            None => self.vars.clone(),
+        }
+    }
+
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    fn sandbox_cwd(&self) -> Option<String> {
+        if !self.config.sandbox_enabled {
+            return None;
+        }
+        let host_cwd = self.vars.apply("{cwd}").into_owned();
+        let workspace_name = Path::new(&host_cwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Some(format!("/home/maki/workspace/{workspace_name}"))
+    }
+
+    #[cfg(not(all(feature = "sandbox", target_os = "linux")))]
+    fn sandbox_cwd(&self) -> Option<String> {
+        None
+    }
+
     fn publish_btw_system(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
         self.btw_system
             .store(Arc::new(self.system_prompt(prompt_slots)));
@@ -359,7 +388,7 @@ impl AgentLoop {
     /// the live prompt.
     fn system_prompt(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) -> String {
         agent::build_system_prompt(
-            &self.vars,
+            &self.prompt_vars(),
             &maki_agent::AgentMode::Build,
             &self.instructions.text,
             prompt_slots,
