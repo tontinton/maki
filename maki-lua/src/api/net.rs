@@ -9,6 +9,7 @@ use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation
 use isahc::{AsyncBody, HttpClient, Request, Response};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
+use regex::bytes::Regex;
 use smol::{Timer, unblock};
 use url::Url;
 
@@ -31,6 +32,7 @@ const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
 const DNS_ATTEMPTS: u32 = 3;
 const DNS_RETRY_DELAY: Duration = Duration::from_millis(150);
+const INVALID_LINE_MATCH: &str = "invalid line_match";
 const ALLOWLIST_HINT: &str = "add it to `net.allowed_private_hosts` in your init.lua to allow it";
 /// Reserved IPv4 ranges the standard library has no predicate for. Carrier
 /// grade NAT is the one that bites: Alibaba Cloud parks its instance metadata
@@ -193,6 +195,8 @@ struct RequestParams {
     timeout: Duration,
     max_bytes: usize,
     retries: u32,
+    /// Keep only response lines this matches. `None` disables the filter.
+    line_match: Option<Regex>,
     /// `None` when the guard reached its verdict without DNS.
     pin: Option<DnsPin>,
 }
@@ -215,6 +219,9 @@ struct ResponseData {
 ///   `timeout` (integer) Timeout in seconds, max 120 (default 30).
 ///   `max_bytes` (integer) Max response size in bytes (default 5 MB).
 ///   `retry` (integer) Retries on 5xx errors (default 3).
+///   `line_match` (string) Regex. Keep only the response lines it
+///   matches. Filtering happens after the body is read, so `max_bytes`
+///   still caps the transfer.
 ///
 /// The response table has three fields: `body` (string), `status`
 /// (integer), and `content_type` (string).
@@ -295,6 +302,11 @@ async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<Reque
         .and_then(|o| o.get::<u32>("retry").ok())
         .unwrap_or(MAX_RETRIES);
 
+    let line_match = opts
+        .and_then(|o| o.get::<String>("line_match").ok())
+        .map(|pattern| Regex::new(&pattern).map_err(|e| format!("{INVALID_LINE_MATCH}: {e}")))
+        .transpose()?;
+
     Ok(RequestParams {
         url,
         method,
@@ -303,6 +315,7 @@ async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<Reque
         timeout,
         max_bytes,
         retries,
+        line_match,
         pin,
     })
 }
@@ -425,6 +438,21 @@ fn build_client(params: &RequestParams) -> Result<HttpClient, String> {
     builder.build().map_err(|e| format!("client error: {e}"))
 }
 
+/// Keeps only the lines `pattern` matches, so a caller never carries the lines
+/// it discards into the Lua VM. The line terminator is not part of the match,
+/// so `$` anchors at the end of the line.
+fn keep_lines_matching(body: &[u8], pattern: &Regex) -> Vec<u8> {
+    let mut kept = Vec::new();
+    for line in body.split_inclusive(|byte| *byte == b'\n') {
+        let content = line.strip_suffix(b"\n").unwrap_or(line);
+        let content = content.strip_suffix(b"\r").unwrap_or(content);
+        if pattern.is_match(content) {
+            kept.extend_from_slice(line);
+        }
+    }
+    kept
+}
+
 async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
     let mut response = send_with_retries(&build_client(&params)?, &params).await?;
@@ -473,6 +501,10 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
         return Err(format!("response too large: {} bytes", bytes.len()));
     }
 
+    let bytes = match &params.line_match {
+        Some(pattern) => keep_lines_matching(&bytes, pattern),
+        None => bytes,
+    };
     let body = String::from_utf8_lossy(&bytes).into_owned();
     Ok(ResponseData {
         body,
@@ -709,6 +741,7 @@ mod tests {
     const AUTH_VALUE: &str = "Bearer tok";
     const ACCEPT_HEADER: &str = "Accept";
     const ACCEPT_VALUE: &str = "text/html";
+    const KEEP_PATTERN: &str = "^vllm:generation_tokens_total";
 
     fn allowlist(entries: &[&str]) -> HostAllowlist {
         HostAllowlist::parse(&entries.iter().map(|e| (*e).to_string()).collect::<Vec<_>>())
@@ -816,6 +849,7 @@ mod tests {
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_bytes: DEFAULT_MAX_BYTES,
             retries: 0,
+            line_match: None,
             pin: None,
         }
     }
@@ -1104,5 +1138,50 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == ACCEPT_HEADER && v == ACCEPT_VALUE)
         );
+    }
+
+    fn line_match_opts(lua: &Lua, pattern: &str) -> Table {
+        let opts = lua.create_table().unwrap();
+        opts.set("line_match", pattern).unwrap();
+        opts
+    }
+
+    #[test]
+    fn extract_params_line_match_default_none() {
+        assert!(
+            request_params(PUBLIC_URL, None)
+                .unwrap()
+                .line_match
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_params_line_match_compiled() {
+        let lua = Lua::new();
+        let opts = line_match_opts(&lua, KEEP_PATTERN);
+        let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
+        assert_eq!(params.line_match.unwrap().as_str(), KEEP_PATTERN);
+    }
+
+    #[test_case("(" ; "unclosed_group")]
+    #[test_case("[a-" ; "unclosed_class")]
+    fn extract_params_line_match_invalid_errors(pattern: &str) {
+        let lua = Lua::new();
+        let opts = line_match_opts(&lua, pattern);
+        let Err(err) = request_params(PUBLIC_URL, Some(&opts)) else {
+            panic!("invalid line_match accepted");
+        };
+        assert!(err.starts_with(INVALID_LINE_MATCH), "{err}");
+    }
+
+    #[test_case(KEEP_PATTERN, "vllm:a 1\nvllm:generation_tokens_total{e=\"0\"} 2.0\nvllm:b 3\n", "vllm:generation_tokens_total{e=\"0\"} 2.0\n" ; "lf_terminated")]
+    #[test_case(KEEP_PATTERN, "vllm:a 1\r\nvllm:generation_tokens_total 2.0\r\n", "vllm:generation_tokens_total 2.0\r\n" ; "crlf_terminated")]
+    #[test_case(KEEP_PATTERN, "vllm:generation_tokens_total 2.0", "vllm:generation_tokens_total 2.0" ; "no_trailing_newline")]
+    #[test_case("generation", "vllm:a 1\nvllm:generation_tokens_total 2.0\n", "vllm:generation_tokens_total 2.0\n" ; "unanchored")]
+    #[test_case(r" 2\.0$", "vllm:a 2.0 1\r\nvllm:b 2.0\r\n", "vllm:b 2.0\r\n" ; "end_anchor_skips_line_terminator")]
+    fn keep_lines_matching_keeps_only_matching_lines(pattern: &str, body: &str, expected: &str) {
+        let kept = keep_lines_matching(body.as_bytes(), &Regex::new(pattern).unwrap());
+        assert_eq!(String::from_utf8(kept).unwrap(), expected);
     }
 }

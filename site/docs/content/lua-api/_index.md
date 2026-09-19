@@ -3474,6 +3474,9 @@ listed in `net.allowed_private_hosts`.
   `timeout` (integer) Timeout in seconds, max 120 (default 30).
   `max_bytes` (integer) Max response size in bytes (default 5 MB).
   `retry` (integer) Retries on 5xx errors (default 3).
+  `line_match` (string) Regex. Keep only the response lines it
+  matches. Filtering happens after the body is read, so `max_bytes`
+  still caps the transfer.
 
 The response table has three fields: `body` (string), `status`
 (integer), and `content_type` (string).
