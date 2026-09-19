@@ -365,9 +365,9 @@ maki.api.register_command({
         key = function(item)
           return item.label
         end,
-        submit_keys = { "ctrl+o" },
+        submit_keys = { "<C-o>" },
         live_keys = {
-          tab = function()
+          ["<Tab>"] = function()
             view = view % #VIEWS + 1
             save_view(view)
             return build()

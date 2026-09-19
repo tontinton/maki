@@ -4,6 +4,8 @@ pub mod docs;
 pub mod docs_render;
 mod error;
 mod hook;
+pub mod key;
+mod key_lint;
 pub mod language;
 mod loader;
 mod pack;
@@ -11,9 +13,7 @@ pub(crate) mod plugin_permissions;
 mod runtime;
 pub mod session_snapshot;
 
-pub use api::keymap::{
-    KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot, RESERVED_KEYS, is_reserved,
-};
+pub use api::keymap::{KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use api::net::set_allowed_private_hosts;
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::pack::{Declared, PackOp};
@@ -27,6 +27,8 @@ pub use api::util::command::{
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
+pub use key::{Key, RESERVED_KEYS, is_reserved};
+pub use key_lint::KEY_WARNING;
 pub use loader::{
     EventHandle, InitFiles, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING,
 };
@@ -54,7 +56,7 @@ pub mod test_support {
         HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
     };
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crate::key::Key;
     use maki_storage::id::MakiId;
 
     const TEST_PLUGIN: &str = "test-plugin";
@@ -127,7 +129,7 @@ pub mod test_support {
         /// chat input fires an autocmd of its own on every keystroke, so a
         /// test that types cannot tell a dispatched binding from an announced
         /// edit without this.
-        pub fn try_recv_keybind(&self) -> Option<KeyEvent> {
+        pub fn try_recv_keybind(&self) -> Option<Key> {
             use crate::runtime::Request;
             while let Ok(req) = self.0.try_recv() {
                 if let Request::RunKeybindCallback { ticket } = req {
@@ -186,15 +188,15 @@ pub mod test_support {
     /// Publishes {binds} as one plugin's global keymap. The Lua state the
     /// callbacks come from is dropped here: a host test hands the binding back
     /// to a probe instead of calling it.
-    pub fn keymap_reader_with(binds: Vec<(KeyCode, KeyModifiers)>) -> KeymapReader {
+    pub fn keymap_reader_with(binds: Vec<Key>) -> KeymapReader {
         let lua = mlua::Lua::new();
         let mut store = crate::api::keymap::KeymapStore::new();
         let plugin: Arc<str> = Arc::from(TEST_PLUGIN);
-        for (key, modifiers) in binds {
+        for key in binds {
             let callback = lua
                 .create_registry_value(lua.create_function(|_, ()| Ok(())).unwrap())
                 .unwrap();
-            store.set(key, modifiers, callback, Arc::clone(&plugin), String::new());
+            store.set(key, callback, Arc::clone(&plugin), String::new());
         }
         let (writer, reader) = KeymapWriter::new();
         writer.publish(store.snapshot_entries());

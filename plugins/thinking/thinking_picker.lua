@@ -144,11 +144,11 @@ local function editor_key(state, key)
     if #state.custom < MAX_DIGITS then
       state.custom = state.custom .. key
     end
-  elseif key == "backspace" then
+  elseif key == "<BS>" then
     state.custom = state.custom:sub(1, -2)
-  elseif key == "esc" then
+  elseif key == "<Esc>" then
     state.editing = false
-  elseif key == "enter" and state.custom ~= "" then
+  elseif key == "<CR>" and state.custom ~= "" then
     state.editing = false
     return "commit"
   end
@@ -162,11 +162,11 @@ function M.handle_key(state, key)
   end
   if key:match(DIGIT) then
     state.cursor, state.custom, state.editing = state.custom_row, key, true
-  elseif key == "up" or key == "k" then
+  elseif key == "<Up>" or key == "k" then
     move(state, -1)
-  elseif key == "down" or key == "j" then
+  elseif key == "<Down>" or key == "j" then
     move(state, 1)
-  elseif key == "enter" then
+  elseif key == "<CR>" then
     -- An empty custom row has nothing to send yet, so Enter starts typing
     -- instead of committing.
     if state.cursor == state.custom_row and state.custom == "" then
@@ -174,7 +174,7 @@ function M.handle_key(state, key)
     else
       return "commit"
     end
-  elseif key == "esc" or key == "ctrl+c" then
+  elseif key == "<Esc>" or key == "<C-c>" then
     return "cancel"
   end
 end

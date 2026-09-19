@@ -65,6 +65,7 @@ use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::setup::ConfigStore;
 use crate::docs_render;
 use crate::error::PluginError;
+use crate::key_lint::KeyLint;
 use crate::loader::EventHandle;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 
@@ -182,15 +183,47 @@ pub struct LoadChunk {
     /// wrote rather than at the package.
     pub name: String,
     pub source: String,
+    origin: ChunkOrigin,
+}
+
+/// Where a chunk's source came from, which decides whether it goes through
+/// [`load_user_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkOrigin {
+    /// Shipped in the binary and checked by its tests.
+    Bundled,
+    /// Anything a user can change: a config file, a package, a plugin file.
+    User,
 }
 
 impl LoadChunk {
+    /// Source a user can change. The default, so a new load path cannot skip
+    /// the checks user source gets by forgetting to ask for them.
     pub fn new(name: impl Into<String>, source: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             source: source.into(),
+            origin: ChunkOrigin::User,
         }
     }
+
+    /// Source that ships in the binary.
+    pub(crate) fn bundled(name: impl Into<String>, source: impl Into<String>) -> Self {
+        Self {
+            origin: ChunkOrigin::Bundled,
+            ..Self::new(name, source)
+        }
+    }
+}
+
+/// Where user Lua enters the VM, for chunk loads and `require` alike, so the
+/// key lint sees every user file that runs. A new load path of user source
+/// should call this instead of `lua.load`.
+fn load_user_source<'a>(lua: &'a Lua, name: &str, source: &'a str) -> Chunk<'a> {
+    if let Some(key_lint) = lua.app_data_ref::<KeyLint>() {
+        key_lint.check(name, source);
+    }
+    lua.load(source).set_name(name)
 }
 
 /// Everything a load needs besides the code itself.
@@ -967,7 +1000,7 @@ impl ModuleLoader {
         if func.is_none() {
             for rel_path in &candidates {
                 if let Some(source) = self.plugin_source(rel_path, modname)? {
-                    func = Some(self.bind(lua.load(source.as_str()), modname)?);
+                    func = Some(self.bind(load_user_source(lua, modname, &source), modname)?);
                     break;
                 }
             }
@@ -2545,12 +2578,17 @@ impl LuaRuntime {
             PluginLoad::Chunks(chunks) => {
                 let mut result = Ok(());
                 for chunk in chunks {
-                    let main_fn = self
-                        .lua
-                        .load(chunk.source.as_str())
-                        .set_name(chunk.name.as_str())
-                        .set_environment(env.clone())
-                        .into_function();
+                    let main_fn = match chunk.origin {
+                        ChunkOrigin::Bundled => self
+                            .lua
+                            .load(chunk.source.as_str())
+                            .set_name(chunk.name.as_str()),
+                        ChunkOrigin::User => {
+                            load_user_source(&self.lua, &chunk.name, &chunk.source)
+                        }
+                    }
+                    .set_environment(env.clone())
+                    .into_function();
                     result = match main_fn {
                         Ok(function) => {
                             queue_codegen(&self.codegen_queue, &function);
@@ -3644,6 +3682,9 @@ pub(crate) struct LuaThread {
     pub hint_reader: crate::api::util::command::HintReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub ui_attachment: UiAttachment,
+    /// What [`load_user_source`] found on the Lua thread, for the host to
+    /// report.
+    pub key_lint: KeyLint,
 }
 
 /// Lua lives on its own OS thread (no Send needed). `smol::block_on`
@@ -3668,6 +3709,8 @@ pub fn spawn(
     let (command_writer, command_reader) = LuaCommandWriter::new();
     let (keymap_writer, keymap_reader) = KeymapWriter::new();
     let (hint_writer, hint_reader) = HintWriter::new();
+    let key_lint = KeyLint::default();
+    let key_lint_thread = key_lint.clone();
     // The file index outlives any one plugin host, so the walks a host
     // rebuilt by `/reload` is waiting on are the ones the old host started.
     publish_walks(EventHandle::from_tx(tx.clone()));
@@ -3690,6 +3733,7 @@ pub fn spawn(
                 layered_thread,
             ) {
                 Ok(r) => {
+                    r.lua.set_app_data(key_lint_thread);
                     let _ = init_tx.send(Ok(()));
                     r
                 }
@@ -4291,6 +4335,7 @@ pub fn spawn(
         hint_reader,
         ui_action_rx,
         ui_attachment,
+        key_lint,
     })
 }
 

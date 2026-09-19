@@ -16,7 +16,7 @@ use maki_config::{
     ToolOutputLines,
 };
 use maki_lua::{
-    InitFiles, MAX_INFLIGHT_TOOLS, PERMISSION_NAME_WARNING, PluginError, PluginHost,
+    InitFiles, KEY_WARNING, MAX_INFLIGHT_TOOLS, PERMISSION_NAME_WARNING, PluginError, PluginHost,
     SKIPPED_PLUGIN_WARNING, SessionEndReason, WARM_TOOL_CAP,
 };
 use maki_providers::Model;
@@ -6706,4 +6706,65 @@ maki.api.register_tool({{
         again.starts_with("exit:"),
         "VM must stay usable, got: {again}"
     );
+}
+
+/// A key compared inside Lua is one the host never parses, so the source lint
+/// is the only thing that can catch it, and it has to work through a real load.
+// The `legacy_spelling` case goes away with `key_lint::legacy`.
+#[test_case::test_case(
+    r#"local function on_key(ev) return ev.key == "ctrl+n" end
+return on_key"#,
+    "<C-n>" ;
+    "legacy_spelling"
+)]
+#[test_case::test_case(
+    r#"local function on_key(ev) return ev.key == "<Escc>" end
+return on_key"#,
+    "<Esc>" ;
+    "misspelling"
+)]
+fn a_wrong_key_spelling_in_plugin_source_is_reported(source: &str, expected: &str) {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source("keys_plugin", source).unwrap();
+
+    let warning = host.take_key_warning().expect("a key warning");
+
+    assert!(warning.starts_with(KEY_WARNING), "{warning}");
+    assert!(warning.contains(expected), "{warning}");
+    assert_eq!(
+        host.take_key_warning(),
+        None,
+        "taking has to empty, or a later reload reports this load's findings again"
+    );
+}
+
+/// A key comparison lives wherever a plugin handles its keys, and past a page
+/// of Lua that is a module. The hand-written config and what it `require`s
+/// load through different paths than a package, and both have to be read.
+#[test]
+fn a_config_init_lua_and_the_modules_it_requires_are_linted() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let maki_dir = tmp.path().join(".maki");
+    std::fs::create_dir_all(maki_dir.join("lua")).unwrap();
+    std::fs::write(
+        maki_dir.join("lua").join("keys.lua"),
+        "return function(ev) return ev.key == \"esc\" end\n",
+    )
+    .unwrap();
+    std::fs::write(
+        maki_dir.join("init.lua"),
+        "local on_key = require(\"keys\")\nlocal submit = \"enter\"\n",
+    )
+    .unwrap();
+
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    let mut warnings = Vec::new();
+    host.load_init_files(
+        InitFiles::GlobalAndProject(maki_dir.join("init.lua")),
+        &mut warnings,
+    )
+    .unwrap();
+
+    let warning = host.take_key_warning().expect("a key warning");
+    assert!(warning.contains("more in the log"), "both files: {warning}");
 }

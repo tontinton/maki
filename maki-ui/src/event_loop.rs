@@ -16,7 +16,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
 use crossterm::event::{
-    Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
+    Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
@@ -31,7 +31,7 @@ use maki_lua::session_snapshot::{
     SessionSnapshot,
 };
 use maki_lua::{
-    EventHandle, HintReader, InputRequest, KeymapReader, LuaCommandReader, ModelRequest,
+    EventHandle, HintReader, InputRequest, Key, KeymapReader, LuaCommandReader, ModelRequest,
     PackCommand, PackPreparation, PlanRequest, SessionEndReason, SessionRequest, TaskRequest,
     UiAction, UiAttachment, UiReply,
 };
@@ -684,13 +684,13 @@ impl<'t> EventLoop<'t> {
         }
         if !ctx.mcp_config_errors.is_empty() {
             let msg = format!("MCP config error: {}", ctx.mcp_config_errors);
-            app.flash(msg);
+            app.queue_flash(msg);
         }
         if let Some(notice) = startup_notice {
-            app.flash(notice);
+            app.queue_flash(notice);
         }
         for warning in startup_warnings {
-            app.flash(warning);
+            app.queue_flash(warning);
         }
 
         let (pack_tx, pack_rx) = flume::unbounded();
@@ -1485,9 +1485,16 @@ impl<'t> EventLoop<'t> {
                 self.focus.report(Focus::Unfocused);
                 (None, None)
             }
+            // The one place the host's view of a keypress is normalized, so
+            // it can never disagree with the identity a plugin is handed. A
+            // key no notation names passes through untouched: nothing to
+            // normalize, and `text_buffer` still reads its SUPER bit.
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 self.focus.note_input();
-                (Some(Msg::Key(key)), None)
+                (
+                    Some(Msg::Key(Key::from_event(key).map_or(key, KeyEvent::from))),
+                    None,
+                )
             }
             Event::Key(_) => (None, None),
             Event::Paste(text) => {

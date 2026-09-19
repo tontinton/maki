@@ -65,7 +65,7 @@ use maki_agent::{
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, KeymapReader,
+    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, Key, KeymapReader,
     LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
     PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, WinView, is_reserved,
 };
@@ -746,6 +746,12 @@ impl App {
         self.status_bar.flash(msg);
     }
 
+    /// For a warning the user did not ask for, so a run that produced several
+    /// shows all of them rather than whichever was reported last.
+    pub(crate) fn queue_flash(&mut self, msg: String) {
+        self.status_bar.queue_flash(msg);
+    }
+
     pub(crate) fn fire_session_autocmd(&self, event: &str, mut data: serde_json::Value) {
         if let Some(map) = data.as_object_mut() {
             map.insert(
@@ -1274,10 +1280,13 @@ impl App {
     /// the keystroke the user pressed: no binding matched, the plugin has too
     /// many callbacks in flight, or its load is gone. The built-in binding
     /// then runs below, with the UI exactly as the user left it. Nothing comes
-    /// back from the Lua thread to be replayed.
+    /// back from the Lua thread to be replayed. A key no notation names is one
+    /// no plugin could have bound, so it falls through too.
     fn dispatch_override(&self, key: KeyEvent) -> bool {
-        self.keymap_reader
-            .dispatch(key, |bind| self.lua_event_handle.run_keybind_callback(bind))
+        Key::from_event(key).is_some_and(|k| {
+            self.keymap_reader
+                .dispatch(k, |bind| self.lua_event_handle.run_keybind_callback(bind))
+        })
     }
 
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -2265,7 +2274,7 @@ impl App {
     pub fn cadence(&self) -> Cadence {
         Cadence::any([
             Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
-            StatusBar::cadence(
+            self.status_bar.cadence(
                 &self.status,
                 self.restoring.load(Ordering::Relaxed),
                 self.retry_info.is_some(),

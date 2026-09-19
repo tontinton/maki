@@ -370,7 +370,7 @@ case("the_popup_keeps_its_keys_while_a_refresh_is_in_flight", function()
 
     Events.input_changed(NEWER)
     eq(Menu.session_id(), SESSION, "the popup is still up")
-    Menu.handle_key("enter")
+    Menu.handle_key("<CR>")
 
     eq(#hh.edits, 1, "and it answered the key its footer advertises")
     eq(hh.edits[1].version, INPUT.version, "with the snapshot its rows were ranked for")
@@ -399,7 +399,7 @@ case("enter_with_nothing_to_insert_closes_the_popup_and_writes_nothing", functio
   local h = harness(function(hh)
     hh.found = { complete = true, items = {} }
     Menu.refresh(hh.input)
-    Menu.handle_key("enter")
+    Menu.handle_key("<CR>")
     eq(Menu.session_id(), nil, "the popup went")
   end)
   eq(#h.edits, 0, "and nothing was inserted")
@@ -416,7 +416,7 @@ case("enter_while_the_walk_is_still_running_holds_the_popup_open", function()
     Menu.refresh(hh.input)
     eq(row(hh, 1), " " .. SCANNING)
 
-    Menu.handle_key("enter")
+    Menu.handle_key("<CR>")
     eq(Menu.session_id(), SESSION, "the popup is still up for the rows on their way")
   end)
   eq(#h.edits, 0, "and nothing was inserted")
@@ -473,7 +473,7 @@ case("a_key_for_a_popup_that_closed_does_nothing", function()
   local h = harness(function(hh)
     Menu.refresh(hh.input)
     Menu.close()
-    Menu.handle_key("enter")
+    Menu.handle_key("<CR>")
   end)
   eq(#h.edits, 0)
   eq(Menu.session_id(), nil)
@@ -490,11 +490,9 @@ local function selected(h)
   return nil
 end
 
--- A key is claimed as `<C-n>` and delivered as `ctrl+n`, and nothing in the
--- language holds the two lists to each other: a key added to one and not the
--- other is claimed, taken from the user, and dropped. Every claim has to be
--- answered under the name the press arrives by.
-case("every_claimed_key_is_answered_under_the_name_it_is_delivered_by", function()
+-- A claim the popup never answers is a key taken from the user and dropped,
+-- so this presses every binding and checks the window claimed it too.
+case("every_claimed_key_is_answered", function()
   for _, binding in ipairs(Menu.BINDINGS) do
     harness(function(hh)
       hh.found = {
@@ -506,9 +504,9 @@ case("every_claimed_key_is_answered_under_the_name_it_is_delivered_by", function
       th.has(table.concat(hh.claimed, " "), binding.claim, "the window claims " .. binding.claim)
 
       local before = selected(hh)
-      Menu.handle_key(binding.event)
+      Menu.handle_key(binding.claim)
       local answered = Menu.session_id() == nil or selected(hh) ~= before
-      eq(answered, true, binding.event .. " reached a handler")
+      eq(answered, true, binding.claim .. " reached a handler")
     end)
   end
 end)
@@ -522,8 +520,8 @@ case("the_navigation_keys_move_the_highlight", function()
       items = { { path = MATCH }, { path = OTHER_MATCH } },
     }
     Menu.refresh(hh.input)
-    Menu.handle_key("tab")
-    Menu.handle_key("enter")
+    Menu.handle_key("<Tab>")
+    Menu.handle_key("<CR>")
   end)
   eq(h.edits[1].text, OTHER_MATCH .. " ", "Tab moved the highlight down a row")
 end)
@@ -533,7 +531,7 @@ end)
 case("esc_closes_the_popup", function()
   local h = harness(function(hh)
     Menu.refresh(hh.input)
-    Menu.handle_key("esc")
+    Menu.handle_key("<Esc>")
     eq(Menu.session_id(), nil)
   end)
   eq(h.closes, 1)
@@ -635,7 +633,7 @@ case("a_walk_that_never_lands_stops_holding_enter", function()
     eq(row(hh, 1), " " .. NO_MATCHES, "the popup stops saying rows are on their way")
     eq(hh.on_index_ready, nil, "and stops listening for a walk that is not coming")
 
-    Menu.handle_key("enter")
+    Menu.handle_key("<CR>")
     eq(Menu.session_id(), nil, "Enter closes the popup, the way it does on an empty list")
   end)
   eq(#h.edits, 0, "and nothing was inserted")

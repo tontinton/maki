@@ -13,6 +13,29 @@ local PEER_BLEND = 0.25
 local BORDER_CHROME = 2
 local NO_MATCHES_LABEL = "  (no matches)"
 
+-- A caller's spelling of a key as the host emits it, or nil with a warning
+-- when maki cannot name it: a key that would never match is worth a line in
+-- the log rather than a picker that quietly ignores one of its bindings.
+local function canonical(lhs)
+  local canon, err = maki.keymap.normalize(lhs)
+  if not canon then
+    maki.log.warn(("list_picker: dropping key %s: %s"):format(tostring(lhs), err))
+  end
+  return canon
+end
+
+-- {list} of key spellings as a set keyed by canonical notation.
+local function key_set(list)
+  local set = {}
+  for _, lhs in ipairs(list or {}) do
+    local canon = canonical(lhs)
+    if canon then
+      set[canon] = true
+    end
+  end
+  return set
+end
+
 local function split_words(query)
   local words = {}
   for w in (query or ""):lower():gmatch("%S+") do
@@ -387,7 +410,7 @@ end
 --
 -- {opts}:
 --   title, footer, cursor (initial index)
---   submit_keys: extra submit keys besides enter
+--   submit_keys: extra submit keys besides <CR>
 --   action_keys: keys that close the picker and report themselves, like { "R" }
 --     for a refresh binding. Use uppercase keys, lowercase ones keep feeding
 --     the filter
@@ -400,24 +423,24 @@ end
 --     selected row's key are tinted, and the cursor follows its key across a
 --     live swap
 --
+-- Keys you pass go through `maki.keymap.normalize`, so `"<Enter>"` and
+-- `"<CR>"` are the same binding. An invalid key is dropped with a warning.
+--
 -- Returns { type = "choice"|"delete", index, item },
 -- { type = "key", key, index?, item? } or { type = "close" }. Prefer {item},
 -- since {index} points into an {items} a live swap may have replaced.
 function ListPicker.open(items, opts)
   opts = opts or {}
-  local submit_keys = { enter = true }
-  if opts.submit_keys then
-    for _, k in ipairs(opts.submit_keys) do
-      submit_keys[k] = true
+  local submit_keys = key_set(opts.submit_keys)
+  submit_keys["<CR>"] = true
+  local action_keys = key_set(opts.action_keys)
+  local live_keys = {}
+  for lhs, handler in pairs(opts.live_keys or {}) do
+    local canon = canonical(lhs)
+    if canon then
+      live_keys[canon] = handler
     end
   end
-  local action_keys = {}
-  if opts.action_keys then
-    for _, k in ipairs(opts.action_keys) do
-      action_keys[k] = true
-    end
-  end
-  local live_keys = opts.live_keys or {}
   local key_fn = opts.key
   -- Resolved once: a theme cannot change while this float holds focus.
   local peer = key_fn and ListPicker._peer(key_fn, maki.ui.theme_style) or nil
@@ -487,18 +510,18 @@ function ListPicker.open(items, opts)
       height = ev.height
       move_cursor(cursor)
     elseif ev.type == "key" then
-      if ev.key == "up" then
+      if ev.key == "<Up>" then
         move_cursor((cursor - 2) % math.max(#filtered, 1) + 1)
-      elseif ev.key == "down" then
+      elseif ev.key == "<Down>" then
         move_cursor(cursor % math.max(#filtered, 1) + 1)
-      elseif ev.key == "pageup" then
+      elseif ev.key == "<PageUp>" then
         move_cursor(cursor - page_size())
-      elseif ev.key == "pagedown" then
+      elseif ev.key == "<PageDown>" then
         move_cursor(cursor + page_size())
-      elseif ev.key == "esc" or ev.key == "ctrl+c" then
+      elseif ev.key == "<Esc>" or ev.key == "<C-c>" then
         win:close()
         return { type = "close" }
-      elseif ev.key == "ctrl+d" then
+      elseif ev.key == "<C-d>" then
         if #filtered > 0 then
           if confirming == cursor then
             win:close()
@@ -554,5 +577,6 @@ ListPicker._render_lines = render_lines
 ListPicker._filter_items = filter_items
 ListPicker._section_rows = section_rows
 ListPicker._fit_row = fit_row
+ListPicker._key_set = key_set
 
 return ListPicker

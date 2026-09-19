@@ -72,7 +72,7 @@ fn event_table(lua: &Lua, event: WinEvent) -> LuaResult<Table> {
     match event {
         WinEvent::Key { key } => {
             let tbl = tagged(lua, "key")?;
-            tbl.set("key", key)?;
+            tbl.set("key", key.notation())?;
             Ok(tbl)
         }
         WinEvent::Resize { width, height } => {
@@ -99,7 +99,9 @@ const recv__doc: FnDoc = FnDoc {
         channel disconnects. Pass {timeout_ms} to also get `{type=\"timeout\"}` \
         events so your plugin can animate while idle.\n\n\
         Event tables by type:\n\
-        - `{type=\"key\", key}` -- keypress. Key is a string like \"q\", \"j\", or \"esc\".\n\
+        - `{type=\"key\", key}` -- keypress. {key} is in canonical \
+        `maki.keymap` notation: `\"q\"`, `\"<CR>\"`, `\"<Esc>\"`, `\"<C-n>\"`, \
+        `\"<S-Tab>\"`.\n\
         - `{type=\"resize\", width, height}` -- terminal was resized.\n\
         - `{type=\"paste\", text}` -- bracketed paste.\n\
         - `{type=\"close\"}` -- window was closed externally.\n\
@@ -111,7 +113,7 @@ const recv__doc: FnDoc = FnDoc {
     }],
     returns: "(table|nil) Event table, or nil if the window has closed.",
     guard: None,
-    example: "while true do\n  local ev = win:recv()\n  if not ev or ev.key == \"q\" then break end\n  if ev.type == \"key\" and ev.key == \"j\" then\n    -- move cursor down\n  end\nend\nwin:close()",
+    example: "while true do\n  local ev = win:recv()\n  if not ev or ev.key == \"q\" then break end\n  if ev.type == \"key\" and ev.key == \"<Down>\" then\n    -- move cursor down\n  end\nend\nwin:close()",
 };
 
 // recv() blocks until the next event; recv(timeout_ms) additionally
@@ -294,6 +296,9 @@ fn show(_lua: &Lua, this: &WinHandle) -> LuaResult<()> {
 /// Hides the window without closing it. The window keeps its state
 /// and buffer contents. Call `show()` to bring it back.
 ///
+/// A hidden window of any kind takes no space, draws nothing and claims no
+/// keys. It still accepts commands and reports events.
+///
 /// @return
 /// @example
 /// win:hide()
@@ -349,6 +354,7 @@ lua_class! {
 mod tests {
     use super::*;
     use crate::api::util::command::FloatConfig;
+    use crate::key::Key;
 
     fn make_channels() -> (
         flume::Sender<WinEvent>,
@@ -423,7 +429,7 @@ mod tests {
         let (event_tx, _cmd_rx, handle) = make_channels();
         event_tx
             .try_send(WinEvent::Key {
-                key: "enter".into(),
+                key: Key::parse("<CR>").unwrap(),
             })
             .unwrap();
         lua.globals().set("win", handle).unwrap();
@@ -432,7 +438,7 @@ mod tests {
                 .eval_async(),
         )
         .unwrap();
-        assert_eq!(got, "key:enter");
+        assert_eq!(got, "key:<CR>");
     }
 
     #[test]
@@ -451,7 +457,9 @@ mod tests {
             }
             lua.load("win:set_cursor(3)").exec_async().await.unwrap();
             event_tx
-                .send_async(WinEvent::Key { key: "x".into() })
+                .send_async(WinEvent::Key {
+                    key: Key::parse("x").unwrap(),
+                })
                 .await
                 .unwrap();
             assert_eq!(recv_task.await.unwrap(), "key");

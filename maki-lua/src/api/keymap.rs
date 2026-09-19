@@ -3,9 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use arc_swap::ArcSwap;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{AppDataRefMut, Lua, RegistryKey, Result as LuaResult, Table};
+
+use crate::api::util::pair::{Pair, pair};
+use crate::key::Key;
 
 static NEXT_KEYMAP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -16,24 +18,6 @@ const RESERVED_KEY_ERR: &str = "is reserved by the host and would never reach th
 /// keys. Each plugin is counted on its own, so one that parks in a callback
 /// costs itself its keys and nobody else theirs.
 const MAX_IN_FLIGHT: usize = 8;
-
-/// The keys the host resolves before it looks at a binding at all: quitting
-/// and suspending have to work whatever a handler is doing. Binding one would
-/// publish a mapping that can never fire, so it is refused instead.
-///
-/// One list for all three sides of that promise: the host weighs a key
-/// against [`is_reserved`] before it dispatches, `set` refuses the same
-/// entries, and so does the `keys` an unfocused window claims, so no side can
-/// grow a key the others do not know about.
-pub const RESERVED_KEYS: [(KeyCode, KeyModifiers); 2] = [
-    (KeyCode::Char('c'), KeyModifiers::CONTROL),
-    (KeyCode::Char('z'), KeyModifiers::CONTROL),
-];
-
-/// Whether the host answers {key} itself, whatever any plugin bound.
-pub fn is_reserved(key: KeyEvent) -> bool {
-    RESERVED_KEYS.contains(&(key.code, key.modifiers))
-}
 
 /// What a key resolves to, handed to the Lua thread whole. Resolving by id
 /// over there instead can find nothing, which leaves the UI having consumed a
@@ -55,7 +39,7 @@ pub struct KeybindTicket {
     in_flight: Arc<AtomicUsize>,
     live: Arc<AtomicBool>,
     plugin: Arc<str>,
-    key: KeyEvent,
+    key: Key,
 }
 
 impl KeybindTicket {
@@ -63,7 +47,7 @@ impl KeybindTicket {
     /// Both answers are the host's to act on in the same key turn: it runs the
     /// built-in binding instead, rather than handing the key to a callback
     /// that cannot answer it.
-    fn claim(entry: &KeymapEntry, key: KeyEvent) -> Option<Self> {
+    fn claim(entry: &KeymapEntry, key: Key) -> Option<Self> {
         let bind = &entry.bind;
         if !bind.live.load(Ordering::Acquire) {
             return None;
@@ -101,7 +85,7 @@ impl KeybindTicket {
 
     /// The keystroke the host consumed to get here, for the log on the one
     /// path that loses it: a callback that cannot be reached at all.
-    pub fn key(&self) -> KeyEvent {
+    pub fn key(&self) -> Key {
         self.key
     }
 }
@@ -114,8 +98,7 @@ impl Drop for KeybindTicket {
 
 #[derive(Clone, Debug)]
 pub struct KeymapEntry {
-    pub key: KeyCode,
-    pub modifiers: KeyModifiers,
+    pub key: Key,
     pub desc: String,
     pub plugin: Arc<str>,
     pub id: u64,
@@ -153,12 +136,12 @@ impl KeymapReader {
     /// popup should own only while it is on screen is not one of them: it is
     /// declared in the `keys` of `maki.ui.open_win`, and the host routes it to
     /// that window before it ever looks here.
-    pub fn dispatch(&self, key: KeyEvent, run: impl FnOnce(KeybindTicket) -> bool) -> bool {
+    pub fn dispatch(&self, key: Key, run: impl FnOnce(KeybindTicket) -> bool) -> bool {
         let snapshot = self.0.load();
         let ticket = snapshot
             .entries
             .iter()
-            .find(|e| e.key == key.code && e.modifiers == key.modifiers)
+            .find(|e| e.key == key)
             .and_then(|entry| KeybindTicket::claim(entry, key));
         ticket.is_some_and(run)
     }
@@ -192,8 +175,7 @@ impl KeymapWriter {
 
 pub(crate) struct StoredKeymap {
     id: u64,
-    key: KeyCode,
-    modifiers: KeyModifiers,
+    key: Key,
     /// Dropping the last reference hands the registry slot back to mlua, which
     /// the next binding reuses, so a callback an in-flight keystroke still
     /// holds frees itself once that keystroke is done.
@@ -245,25 +227,13 @@ impl KeymapStore {
     }
 
     /// Whether a global binding was replaced.
-    pub fn set(
-        &mut self,
-        key: KeyCode,
-        modifiers: KeyModifiers,
-        callback: RegistryKey,
-        plugin: Arc<str>,
-        desc: String,
-    ) -> bool {
+    pub fn set(&mut self, key: Key, callback: RegistryKey, plugin: Arc<str>, desc: String) -> bool {
         let state = self.plugin_state(&plugin);
-        let replaced = self
-            .globals
-            .iter()
-            .any(|b| b.key == key && b.modifiers == modifiers);
-        self.globals
-            .retain(|b| b.key != key || b.modifiers != modifiers);
+        let replaced = self.globals.iter().any(|b| b.key == key);
+        self.globals.retain(|b| b.key != key);
         self.globals.push(StoredKeymap {
             id: NEXT_KEYMAP_ID.fetch_add(1, Ordering::Relaxed),
             key,
-            modifiers,
             callback: Arc::new(callback),
             plugin,
             desc,
@@ -272,9 +242,8 @@ impl KeymapStore {
         replaced
     }
 
-    pub fn del(&mut self, key: KeyCode, modifiers: KeyModifiers) {
-        self.globals
-            .retain(|b| b.key != key || b.modifiers != modifiers);
+    pub fn del(&mut self, key: Key) {
+        self.globals.retain(|b| b.key != key);
     }
 
     /// The load is marked dead as well as emptied of keys. The snapshot loses
@@ -313,7 +282,6 @@ impl KeymapStore {
             .iter()
             .map(|b| KeymapEntry {
                 key: b.key,
-                modifiers: b.modifiers,
                 desc: b.desc.clone(),
                 plugin: Arc::clone(&b.plugin),
                 id: b.id,
@@ -327,100 +295,16 @@ impl KeymapStore {
     }
 }
 
-pub fn parse_key_notation(input: &str) -> Result<(KeyCode, KeyModifiers), String> {
-    let s = input.trim();
-    if s.is_empty() {
-        return Err("empty key notation".into());
+/// The one gate for a key a plugin binds or claims, shared by
+/// `maki.keymap.set` and a window's `keys` so a spelling that binds is exactly
+/// one that can be claimed. Reserved keys are refused here, where the plugin
+/// author sees the error, instead of becoming a binding that never fires.
+pub(crate) fn accept_key(lhs: &str) -> LuaResult<Key> {
+    let key = Key::parse(lhs).map_err(mlua::Error::runtime)?;
+    if key.is_reserved() {
+        return Err(mlua::Error::runtime(format!("{lhs} {RESERVED_KEY_ERR}")));
     }
-
-    if s.starts_with('<') && s.ends_with('>') {
-        let inner = &s[1..s.len() - 1];
-        return parse_bracketed(inner);
-    }
-
-    if s.len() == 1 {
-        let c = s.chars().next().unwrap();
-        return Ok((KeyCode::Char(c), KeyModifiers::NONE));
-    }
-
-    Err(format!("invalid key notation: {s}"))
-}
-
-fn parse_bracketed(inner: &str) -> Result<(KeyCode, KeyModifiers), String> {
-    if inner.is_empty() {
-        return Err("empty angle-bracket key notation".into());
-    }
-
-    let mut modifiers = KeyModifiers::NONE;
-    let mut rest = inner;
-
-    loop {
-        let lower = rest.to_lowercase();
-        if lower.starts_with("c-") {
-            modifiers |= KeyModifiers::CONTROL;
-            rest = &rest[2..];
-        } else if lower.starts_with("ctrl-") {
-            modifiers |= KeyModifiers::CONTROL;
-            rest = &rest[5..];
-        } else if lower.starts_with("a-") {
-            modifiers |= KeyModifiers::ALT;
-            rest = &rest[2..];
-        } else if lower.starts_with("alt-") {
-            modifiers |= KeyModifiers::ALT;
-            rest = &rest[4..];
-        } else if lower.starts_with("m-") {
-            modifiers |= KeyModifiers::ALT;
-            rest = &rest[2..];
-        } else if lower.starts_with("s-") {
-            modifiers |= KeyModifiers::SHIFT;
-            rest = &rest[2..];
-        } else if lower.starts_with("shift-") {
-            modifiers |= KeyModifiers::SHIFT;
-            rest = &rest[6..];
-        } else {
-            break;
-        }
-    }
-
-    let key = parse_key_name(rest)?;
-    Ok((key, modifiers))
-}
-
-fn parse_key_name(name: &str) -> Result<KeyCode, String> {
-    let lower = name.to_lowercase();
-    match lower.as_str() {
-        "cr" | "enter" | "return" => Ok(KeyCode::Enter),
-        "space" => Ok(KeyCode::Char(' ')),
-        "esc" | "escape" => Ok(KeyCode::Esc),
-        "tab" => Ok(KeyCode::Tab),
-        "bs" | "backspace" => Ok(KeyCode::Backspace),
-        "del" | "delete" => Ok(KeyCode::Delete),
-        "up" => Ok(KeyCode::Up),
-        "down" => Ok(KeyCode::Down),
-        "left" => Ok(KeyCode::Left),
-        "right" => Ok(KeyCode::Right),
-        "home" => Ok(KeyCode::Home),
-        "end" => Ok(KeyCode::End),
-        "pageup" => Ok(KeyCode::PageUp),
-        "pagedown" => Ok(KeyCode::PageDown),
-        "insert" => Ok(KeyCode::Insert),
-        s if s.starts_with('f') && s.len() > 1 => {
-            let n: u8 = s[1..]
-                .parse()
-                .map_err(|_| format!("invalid function key: {name}"))?;
-            if !(1..=12).contains(&n) {
-                return Err(format!("function key out of range: {name}"));
-            }
-            Ok(KeyCode::F(n))
-        }
-        _ => {
-            if name.len() == 1 {
-                Ok(KeyCode::Char(name.chars().next().unwrap()))
-            } else {
-                Err(format!("unknown key: {name}"))
-            }
-        }
-    }
+    Ok(key)
 }
 
 fn publish_keymap_snapshot(lua: &Lua) {
@@ -432,17 +316,6 @@ fn publish_keymap_snapshot(lua: &Lua) {
     if let Some(writer) = lua.app_data_ref::<KeymapWriter>() {
         writer.publish(entries);
     }
-}
-
-/// Refuses a key the host answers itself, so a binding that could never fire
-/// is an error the plugin author reads instead of a mapping that silently
-/// never runs. One list, [`RESERVED_KEYS`], answers this, the `keys` a window
-/// claims, and the host.
-pub(crate) fn reject_reserved(lhs: &str, key: KeyCode, modifiers: KeyModifiers) -> LuaResult<()> {
-    if RESERVED_KEYS.contains(&(key, modifiers)) {
-        return Err(mlua::Error::runtime(format!("{lhs} {RESERVED_KEY_ERR}")));
-    }
-    Ok(())
 }
 
 fn store_mut(lua: &Lua) -> LuaResult<AppDataRefMut<'_, KeymapStore>> {
@@ -492,14 +365,13 @@ fn set(
             "unsupported keymap mode: {mode}"
         )));
     }
-    let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
-    reject_reserved(&lhs, key, modifiers)?;
+    let key = accept_key(&lhs)?;
     let desc = opts
         .as_ref()
         .and_then(|o| o.get::<String>("desc").ok())
         .unwrap_or_default();
     let registry_key = lua.create_registry_value(rhs)?;
-    let shadowed = store_mut(lua)?.set(key, modifiers, registry_key, Arc::clone(&plugin), desc);
+    let shadowed = store_mut(lua)?.set(key, registry_key, Arc::clone(&plugin), desc);
     if shadowed {
         tracing::warn!(key = %lhs, plugin = %plugin, "keymap shadowed by plugin");
     }
@@ -517,12 +389,25 @@ fn set(
 #[lua_fn]
 fn del(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String, lhs: String) -> LuaResult<()> {
     let _ = (mode, &plugin);
-    let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
+    let key = Key::parse(&lhs).map_err(mlua::Error::runtime)?;
     if let Some(mut store) = lua.app_data_mut::<KeymapStore>() {
-        store.del(key, modifiers);
+        store.del(key);
     }
     publish_keymap_snapshot(lua);
     Ok(())
+}
+
+/// Canonical spelling of {lhs}, so no plugin has to know which of
+/// `<CR>`/`<Enter>`/`<Return>` maki prints. Every spelling `set` accepts is
+/// accepted here, and the answer is the string a `key` event carries.
+///
+/// @param lhs string Key in any accepted notation.
+/// @return (string|nil, string|nil) Canonical notation, or nil and an error.
+/// @example
+/// local canon = maki.keymap.normalize("<Enter>")  -- "<CR>"
+#[lua_fn]
+fn normalize(_lua: &Lua, lhs: String) -> LuaResult<Pair<String>> {
+    Ok(pair(Key::parse(&lhs).map(|key| key.notation())))
 }
 
 lua_table! {
@@ -539,83 +424,82 @@ lua_table! {
     ///   print("hello")
     /// end, { desc = "Say hello" })
     /// ```
+    ///
+    /// ## Key notation
+    ///
+    /// One notation covers every place maki names a key: the string `set` and
+    /// `del` read, the `keys` a window claims in `maki.ui.open_win`, and the
+    /// `key` field of a `win:recv` keypress event. `normalize` turns any
+    /// accepted spelling into the one maki prints.
+    ///
+    /// A single character stands for itself: `a`, `A`, `7`, `?`. Every other
+    /// key goes in angle brackets, behind its modifier prefixes.
+    ///
+    /// | Key | Notation | Also accepted |
+    /// | --- | --- | --- |
+    /// | Enter | `<CR>` | `<Enter>`, `<Return>` |
+    /// | Escape | `<Esc>` | `<Escape>` |
+    /// | Backspace | `<BS>` | `<Backspace>` |
+    /// | Delete | `<Del>` | `<Delete>` |
+    /// | Tab | `<Tab>` | |
+    /// | Shift+Tab | `<S-Tab>` | |
+    /// | Space | `<Space>` | |
+    /// | Arrows | `<Up>`, `<Down>`, `<Left>`, `<Right>` | |
+    /// | Navigation | `<Home>`, `<End>`, `<PageUp>`, `<PageDown>`, `<Insert>` | |
+    /// | Function keys | `<F1>` through `<F24>` | |
+    ///
+    /// Modifiers are `C-` for control, `M-` for alt and `S-` for shift,
+    /// written in that order when a key carries more than one: `<C-M-x>`.
+    /// `Ctrl-`, `Alt-`, `A-` and `Shift-` are read on the way in and never
+    /// printed.
+    ///
+    /// Terminals disagree with each other about three keys, so maki settles
+    /// each one way:
+    ///
+    /// - Control plus a letter is lowercase, so `<C-N>` is `<C-n>`, the same
+    ///   rule as Vim.
+    /// - Shift plus a letter is the uppercase letter, so `<S-a>` is `A`. Shift
+    ///   plus a digit or a punctuation mark keeps its prefix: `<S-1>`.
+    /// - Shift+Tab is `<S-Tab>` whether or not the terminal speaks the kitty
+    ///   keyboard protocol.
+    ///
+    /// Key spellings in a plugin's source, its entrypoints and every module it
+    /// `require`s, are checked as they load. Each wrong one is logged naming the file and
+    /// line, and the status bar sums them up in one line, so a typo is a
+    /// message at startup rather than a binding that quietly never fires.
+    ///
+    /// ```lua
+    /// if ev.type == "key" and ev.key == "<CR>" then submit() end
+    /// ```
+    ///
+    /// Earlier versions of maki delivered a `win:recv` key event as `"enter"`,
+    /// `"esc"`, `"ctrl+n"` or `"shift+tab"`. The same presses now arrive as
+    /// `<CR>`, `<Esc>`, `<C-n>` and `<S-Tab>`. That check reports the old
+    /// spellings by name, so a plugin written against them says so at startup
+    /// instead of going quiet.
     "maki.keymap" => pub(crate) fn create_keymap_table(plugin: Arc<str>), DOCS [
-        set(plugin), del(plugin),
+        set(plugin), del(plugin), normalize,
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
     use test_case::test_case;
-
-    #[test_case("<C-t>", KeyCode::Char('t'), KeyModifiers::CONTROL ; "ctrl_t")]
-    #[test_case("<C-T>", KeyCode::Char('T'), KeyModifiers::CONTROL ; "ctrl_shift_t")]
-    #[test_case("<A-x>", KeyCode::Char('x'), KeyModifiers::ALT ; "alt_x")]
-    #[test_case("<M-x>", KeyCode::Char('x'), KeyModifiers::ALT ; "meta_x")]
-    #[test_case("<S-Tab>", KeyCode::Tab, KeyModifiers::SHIFT ; "shift_tab")]
-    #[test_case("<CR>", KeyCode::Enter, KeyModifiers::NONE ; "enter_cr")]
-    #[test_case("<Enter>", KeyCode::Enter, KeyModifiers::NONE ; "enter_full")]
-    #[test_case("<Space>", KeyCode::Char(' '), KeyModifiers::NONE ; "space")]
-    #[test_case("<Esc>", KeyCode::Esc, KeyModifiers::NONE ; "escape")]
-    #[test_case("<Tab>", KeyCode::Tab, KeyModifiers::NONE ; "tab")]
-    #[test_case("<BS>", KeyCode::Backspace, KeyModifiers::NONE ; "backspace_short")]
-    #[test_case("<Backspace>", KeyCode::Backspace, KeyModifiers::NONE ; "backspace_full")]
-    #[test_case("<Del>", KeyCode::Delete, KeyModifiers::NONE ; "delete_short")]
-    #[test_case("<Delete>", KeyCode::Delete, KeyModifiers::NONE ; "delete_full")]
-    #[test_case("<Up>", KeyCode::Up, KeyModifiers::NONE ; "up")]
-    #[test_case("<Down>", KeyCode::Down, KeyModifiers::NONE ; "down")]
-    #[test_case("<Left>", KeyCode::Left, KeyModifiers::NONE ; "left")]
-    #[test_case("<Right>", KeyCode::Right, KeyModifiers::NONE ; "right")]
-    #[test_case("<Home>", KeyCode::Home, KeyModifiers::NONE ; "home")]
-    #[test_case("<End>", KeyCode::End, KeyModifiers::NONE ; "end_key")]
-    #[test_case("<PageUp>", KeyCode::PageUp, KeyModifiers::NONE ; "page_up")]
-    #[test_case("<PageDown>", KeyCode::PageDown, KeyModifiers::NONE ; "page_down")]
-    #[test_case("<Insert>", KeyCode::Insert, KeyModifiers::NONE ; "insert")]
-    #[test_case("<F1>", KeyCode::F(1), KeyModifiers::NONE ; "f1")]
-    #[test_case("<F12>", KeyCode::F(12), KeyModifiers::NONE ; "f12")]
-    #[test_case("a", KeyCode::Char('a'), KeyModifiers::NONE ; "plain_a")]
-    #[test_case("z", KeyCode::Char('z'), KeyModifiers::NONE ; "plain_z")]
-    #[test_case("<C-S-a>", KeyCode::Char('a'), KeyModifiers::from_bits_truncate(KeyModifiers::CONTROL.bits() | KeyModifiers::SHIFT.bits()) ; "ctrl_shift_a")]
-    #[test_case("<Ctrl-x>", KeyCode::Char('x'), KeyModifiers::CONTROL ; "ctrl_long_x")]
-    #[test_case("<Alt-j>", KeyCode::Char('j'), KeyModifiers::ALT ; "alt_long_j")]
-    #[test_case("<Shift-Tab>", KeyCode::Tab, KeyModifiers::SHIFT ; "shift_long_tab")]
-    #[test_case("<Return>", KeyCode::Enter, KeyModifiers::NONE ; "return_key")]
-    #[test_case("<Escape>", KeyCode::Esc, KeyModifiers::NONE ; "escape_full")]
-    fn parse_key_notation_cases(input: &str, code: KeyCode, mods: KeyModifiers) {
-        let (key, modifiers) = parse_key_notation(input).unwrap();
-        assert_eq!(key, code);
-        assert_eq!(modifiers, mods);
-    }
-
-    #[test]
-    fn parse_key_notation_errors() {
-        assert!(parse_key_notation("").is_err());
-        assert!(parse_key_notation("<>").is_err());
-        assert!(parse_key_notation("<F0>").is_err());
-        assert!(parse_key_notation("<F13>").is_err());
-        assert!(parse_key_notation("abc").is_err());
-    }
 
     const PLUGIN: &str = "plug";
     const OTHER_PLUGIN: &str = "other";
-    const TAB: KeyCode = KeyCode::Tab;
-    const NONE: KeyModifiers = KeyModifiers::NONE;
+    const TAB: &str = "<Tab>";
+    const ESC: &str = "<Esc>";
 
-    fn global(store: &mut KeymapStore, lua: &Lua, key: KeyCode, plugin: &str) {
-        let f = lua.create_function(|_, ()| Ok(())).unwrap();
-        let k = lua.create_registry_value(f).unwrap();
-        store.set(key, NONE, k, Arc::from(plugin), String::new());
+    fn parsed(lhs: &str) -> Key {
+        Key::parse(lhs).unwrap()
     }
 
-    fn key_event(code: KeyCode) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers: NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        }
+    fn global(store: &mut KeymapStore, lua: &Lua, lhs: &str, plugin: &str) {
+        let f = lua.create_function(|_, ()| Ok(())).unwrap();
+        let k = lua.create_registry_value(f).unwrap();
+        store.set(parsed(lhs), k, Arc::from(plugin), String::new());
     }
 
     fn published(store: &KeymapStore) -> KeymapReader {
@@ -629,8 +513,8 @@ mod tests {
         let lua = Lua::new();
         let mut store = KeymapStore::new();
 
-        global(&mut store, &lua, KeyCode::Char('t'), PLUGIN);
-        global(&mut store, &lua, KeyCode::Char('t'), OTHER_PLUGIN);
+        global(&mut store, &lua, "t", PLUGIN);
+        global(&mut store, &lua, "t", OTHER_PLUGIN);
         assert_eq!(store.globals.len(), 1);
     }
 
@@ -639,8 +523,8 @@ mod tests {
         let lua = Lua::new();
         let mut store = KeymapStore::new();
 
-        global(&mut store, &lua, KeyCode::Char('x'), PLUGIN);
-        store.del(KeyCode::Char('x'), NONE);
+        global(&mut store, &lua, "x", PLUGIN);
+        store.del(parsed("x"));
         assert!(store.globals.is_empty());
     }
 
@@ -649,8 +533,8 @@ mod tests {
         let lua = Lua::new();
         let mut store = KeymapStore::new();
 
-        global(&mut store, &lua, KeyCode::Char('t'), PLUGIN);
-        global(&mut store, &lua, KeyCode::Char('x'), OTHER_PLUGIN);
+        global(&mut store, &lua, "t", PLUGIN);
+        global(&mut store, &lua, "x", OTHER_PLUGIN);
 
         store.clear_plugin(PLUGIN);
         assert_eq!(store.globals.len(), 1);
@@ -682,13 +566,13 @@ mod tests {
         let mut store = KeymapStore::new();
         global(&mut store, &lua, TAB, PLUGIN);
 
-        published(&store).dispatch(key_event(TAB), |_| handed_off)
+        published(&store).dispatch(parsed(TAB), |_| handed_off)
     }
 
     #[test]
     fn dispatch_leaves_a_key_nobody_claimed_alone() {
         let store = KeymapStore::new();
-        assert!(!published(&store).dispatch(key_event(TAB), |_| unreachable!()));
+        assert!(!published(&store).dispatch(parsed(TAB), |_| unreachable!()));
     }
 
     /// A callback that parks holds its ticket, and the plugin that owns it
@@ -699,33 +583,33 @@ mod tests {
         let lua = Lua::new();
         let mut store = KeymapStore::new();
         global(&mut store, &lua, TAB, PLUGIN);
-        global(&mut store, &lua, KeyCode::Esc, OTHER_PLUGIN);
+        global(&mut store, &lua, ESC, OTHER_PLUGIN);
         let reader = published(&store);
 
         let parked = exhaust(&reader, TAB);
 
         assert!(
-            !reader.dispatch(key_event(TAB), |_| unreachable!()),
+            !reader.dispatch(parsed(TAB), |_| unreachable!()),
             "the parked plugin is out of budget"
         );
         assert!(
-            reader.dispatch(key_event(KeyCode::Esc), |_| true),
+            reader.dispatch(parsed(ESC), |_| true),
             "another plugin's keys still dispatch"
         );
 
         drop(parked);
         assert!(
-            reader.dispatch(key_event(TAB), |_| true),
+            reader.dispatch(parsed(TAB), |_| true),
             "finishing the callbacks gives the budget back"
         );
     }
 
     /// Fills {plugin}'s budget and returns the tickets holding it.
-    fn exhaust(reader: &KeymapReader, key: KeyCode) -> Vec<KeybindTicket> {
+    fn exhaust(reader: &KeymapReader, lhs: &str) -> Vec<KeybindTicket> {
         (0..MAX_IN_FLIGHT)
             .map(|_| {
                 let mut held = None;
-                assert!(reader.dispatch(key_event(key), |t| {
+                assert!(reader.dispatch(parsed(lhs), |t| {
                     held = Some(t);
                     true
                 }));
@@ -746,7 +630,7 @@ mod tests {
 
         let _parked = exhaust(&reader, TAB);
 
-        assert!(!reader.dispatch(key_event(TAB), |_| unreachable!()));
+        assert!(!reader.dispatch(parsed(TAB), |_| unreachable!()));
     }
 
     /// A keystroke claimed a moment before a `/reload` carries the old chunk's
@@ -760,7 +644,7 @@ mod tests {
         let reader = published(&store);
 
         let mut live = None;
-        assert!(reader.dispatch(key_event(TAB), |t| {
+        assert!(reader.dispatch(parsed(TAB), |t| {
             live = Some(t.plugin_live());
             true
         }));
@@ -768,7 +652,7 @@ mod tests {
 
         store.clear_plugin(PLUGIN);
         assert!(
-            !reader.dispatch(key_event(TAB), |_| unreachable!()),
+            !reader.dispatch(parsed(TAB), |_| unreachable!()),
             "the stale snapshot no longer claims the key"
         );
     }
@@ -783,7 +667,7 @@ mod tests {
         global(&mut store, &lua, TAB, PLUGIN);
 
         let mut held = None;
-        published(&store).dispatch(key_event(TAB), |t| {
+        published(&store).dispatch(parsed(TAB), |t| {
             held = Some(t);
             true
         });
@@ -805,11 +689,11 @@ mod tests {
         global(&mut store, &lua, TAB, PLUGIN);
 
         let mut carried = None;
-        published(&store).dispatch(key_event(TAB), |t| {
+        published(&store).dispatch(parsed(TAB), |t| {
             carried = Some(t.key());
             true
         });
-        assert_eq!(carried, Some(key_event(TAB)));
+        assert_eq!(carried, Some(parsed(TAB)));
     }
 
     /// A reserved key binds nowhere. Accepting it publishes a binding with a
@@ -818,10 +702,7 @@ mod tests {
     #[test_case("<C-c>" ; "quit")]
     #[test_case("<C-z>" ; "suspend")]
     fn a_reserved_key_is_refused_where_the_author_can_see_it(lhs: &str) {
-        let (key, modifiers) = parse_key_notation(lhs).unwrap();
-        let err = reject_reserved(lhs, key, modifiers)
-            .unwrap_err()
-            .to_string();
+        let err = accept_key(lhs).unwrap_err().to_string();
         assert!(err.contains(RESERVED_KEY_ERR), "got: {err}");
         assert!(
             err.contains(lhs),
@@ -841,14 +722,14 @@ mod tests {
         store.clear_plugin(PLUGIN);
         global(&mut store, &lua, TAB, PLUGIN);
         assert!(
-            !published(&store).dispatch(key_event(TAB), |_| unreachable!()),
+            !published(&store).dispatch(parsed(TAB), |_| unreachable!()),
             "a straggler of the torn down load publishes nothing that fires"
         );
 
         store.revive(PLUGIN);
         global(&mut store, &lua, TAB, PLUGIN);
         assert!(
-            published(&store).dispatch(key_event(TAB), |_| true),
+            published(&store).dispatch(parsed(TAB), |_| true),
             "the load that replaced it dispatches"
         );
     }

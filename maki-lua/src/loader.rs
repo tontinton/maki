@@ -301,6 +301,12 @@ impl PluginHost {
         })
     }
 
+    /// One status bar line summing up the wrong key spellings found since the
+    /// last take. Each finding is in the log already.
+    pub fn take_key_warning(&self) -> Option<String> {
+        self.inner.key_lint.take_summary()
+    }
+
     /// The store that `maki.api.register_permission_rule` writes into. Hand
     /// it to every [`maki_agent::permissions::PermissionManager`] so plugin
     /// rules apply to all sessions.
@@ -493,7 +499,7 @@ impl PluginHost {
                 .unwrap_or_default();
             self.send_load(
                 Arc::clone(&name),
-                vec![LoadChunk::new(name.as_ref(), init)],
+                vec![LoadChunk::bundled(name.as_ref(), init)],
                 LoadContext {
                     opts,
                     ..LoadContext::plain(None, permissions)
@@ -1271,7 +1277,7 @@ impl EventHandle {
 mod tests {
     use super::*;
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
-    use crossterm::event::{KeyCode, KeyEvent};
+    use crossterm::event::KeyCode;
     use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
     use maki_agent::tools::ToolRegistry;
     use std::time::Instant;
@@ -1546,7 +1552,7 @@ mod tests {
             assert_eq!(snap.entries.len(), 1, "override published to snapshot");
             let entry = &snap.entries[0];
             assert_eq!(entry.desc, "test override");
-            KeyEvent::new(entry.key, entry.modifiers)
+            entry.key
         };
         assert!(
             host.command_reader().load().commands.is_empty(),
@@ -1603,9 +1609,9 @@ mod tests {
             let entry = snap
                 .entries
                 .iter()
-                .find(|e| e.key == KeyCode::Char(code))
+                .find(|e| e.key.code() == KeyCode::Char(code))
                 .expect("both keys published");
-            KeyEvent::new(entry.key, entry.modifiers)
+            entry.key
         };
 
         assert!(reader.dispatch(key_of('g'), |t| handle.run_keybind_callback(t)));
@@ -2295,5 +2301,44 @@ mod bundled_manifests {
             }
         }
         assert!(drift.is_empty(), "plugin.toml drift:\n{}", drift.join("\n"));
+    }
+
+    fn collect_lua_files(dir: &'static Dir<'static>, out: &mut Vec<&'static File<'static>>) {
+        for entry in dir.entries() {
+            match entry {
+                DirEntry::Dir(sub) => collect_lua_files(sub, out),
+                DirEntry::File(file) if file.path().extension() == Some(LUA_EXT.as_ref()) => {
+                    out.push(file);
+                }
+                DirEntry::File(_) => {}
+            }
+        }
+    }
+
+    /// Bundled Lua ships in the binary, so it is linted here instead of at
+    /// every start. Every file counts, specs and modules too, because key
+    /// handling rarely lives in `init.lua`.
+    #[test]
+    fn bundled_lua_has_no_wrong_key_spellings() {
+        let mut linted = 0;
+        let mut findings = Vec::new();
+        for plugin in BUNDLED_PLUGINS {
+            let mut files = Vec::new();
+            collect_lua_files(&plugin.dir, &mut files);
+            for file in files {
+                let Some(source) = file.contents_utf8() else {
+                    continue;
+                };
+                let name = format!("{}/{}", plugin.name, file.path().display());
+                findings.extend(crate::key_lint::lint(&name, source));
+                linted += 1;
+            }
+        }
+
+        assert!(
+            linted > BUNDLED_PLUGINS.len(),
+            "the walk reached past init.lua"
+        );
+        assert!(findings.is_empty(), "{findings:#?}");
     }
 }

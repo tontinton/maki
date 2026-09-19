@@ -19,10 +19,10 @@ local MODE = {
 }
 
 local NEWLINE_KEYS = {
-  ["alt+enter"] = true,
-  ["shift+enter"] = true,
-  ["ctrl+enter"] = true,
-  ["ctrl+j"] = true,
+  ["<M-CR>"] = true,
+  ["<S-CR>"] = true,
+  ["<C-CR>"] = true,
+  ["<C-j>"] = true,
 }
 
 local function display_width(s)
@@ -243,15 +243,15 @@ local function handle_selecting(state, key)
   local q = state.questions[state.tab]
   local n = #q.options + 1
 
-  if key == "up" then
+  if key == "<Up>" then
     if state.cursor > 1 then
       state.cursor = state.cursor - 1
     end
-  elseif key == "down" then
+  elseif key == "<Down>" then
     if state.cursor < n then
       state.cursor = state.cursor + 1
     end
-  elseif key == "enter" then
+  elseif key == "<CR>" then
     if state.cursor == n then
       state.mode = MODE.EDITING_CUSTOM
       state.custom_input = TextInput.new()
@@ -265,14 +265,14 @@ local function handle_selecting(state, key)
       state.answers[state.tab] = { q.options[state.cursor].label }
       advance(state)
     end
-  elseif (key == "tab" or key == "right") and has_confirm(state) then
+  elseif (key == "<Tab>" or key == "<Right>") and has_confirm(state) then
     goto_next_tab(state)
-  elseif (key == "shift+tab" or key == "left") and has_confirm(state) then
+  elseif (key == "<S-Tab>" or key == "<Left>") and has_confirm(state) then
     if state.tab > 1 then
       state.tab = state.tab - 1
       state.cursor = 1
     end
-  elseif key == "esc" or key == "ctrl+c" then
+  elseif key == "<Esc>" or key == "<C-c>" then
     state.done = { type = "dismiss" }
   end
   return state
@@ -280,11 +280,11 @@ end
 
 local function handle_editing_custom(state, key)
   if NEWLINE_KEYS[key] then
-    state.custom_input:handle_key("newline")
-  elseif key == "enter" then
+    state.custom_input:split_line()
+  elseif key == "<CR>" then
     if state.custom_input:char_before_cursor() == "\\" then
-      state.custom_input:handle_key("backspace")
-      state.custom_input:handle_key("newline")
+      state.custom_input:handle_key("<BS>")
+      state.custom_input:split_line()
     else
       local text = state.custom_input:value()
       text = text:match("^%s*(.-)%s*$")
@@ -315,9 +315,9 @@ local function handle_editing_custom(state, key)
         advance(state)
       end
     end
-  elseif key == "esc" then
+  elseif key == "<Esc>" then
     state.mode = MODE.SELECTING
-  elseif key == "ctrl+c" then
+  elseif key == "<C-c>" then
     state.done = { type = "dismiss" }
   else
     state.custom_input:handle_key(key)
@@ -326,13 +326,13 @@ local function handle_editing_custom(state, key)
 end
 
 local function handle_confirming(state, key)
-  if key == "enter" then
+  if key == "<CR>" then
     state.done = { type = "submit", answers = state.answers }
-  elseif key == "shift+tab" or key == "left" then
+  elseif key == "<S-Tab>" or key == "<Left>" then
     state.tab = #state.questions
     state.cursor = 1
     state.mode = MODE.SELECTING
-  elseif key == "esc" or key == "ctrl+c" then
+  elseif key == "<Esc>" or key == "<C-c>" then
     state.done = { type = "dismiss" }
   end
   return state

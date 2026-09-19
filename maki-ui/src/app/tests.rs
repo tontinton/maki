@@ -4926,17 +4926,25 @@ fn ctrl_t_noop_when_plan_not_ready() {
     assert!(!app.plan_form.is_visible());
 }
 
+/// The plugin-boundary identity of a press a test names by code, which is how
+/// the host sees it once [`maki_lua::Key::from_event`] has normalized it.
+fn plugin_key(code: KeyCode, modifiers: KeyModifiers) -> maki_lua::Key {
+    maki_lua::Key::from_event(KeyEvent::new(code, modifiers)).expect(EXPECT_NAMEABLE)
+}
+
 fn install_override(
     app: &mut App,
     key: KeyCode,
     modifiers: KeyModifiers,
 ) -> maki_lua::test_support::RequestProbe {
-    app.keymap_reader = maki_lua::test_support::keymap_reader_with(vec![(key, modifiers)]);
+    app.keymap_reader =
+        maki_lua::test_support::keymap_reader_with(vec![plugin_key(key, modifiers)]);
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
     probe
 }
 
+const EXPECT_NAMEABLE: &str = "the test named a key no notation spells";
 const OVERRIDE_DISPATCHED: &str = "override callback must be dispatched";
 const OVERRIDE_NOT_DISPATCHED: &str = "override callback must not be dispatched";
 
@@ -5075,6 +5083,41 @@ fn streaming_cancel_wins_over_quit_override() {
     );
 }
 
+const HIDDEN_DRAFT: &str = "half a thought";
+
+/// Focus owns the keyboard whatever the press is. A key no notation names
+/// cannot be told to the float, but letting it by runs the chat behind it:
+/// `Super+Enter` submitted a draft the user could not see, `Super+Tab` flipped
+/// the mode and `Super+Backspace` cut the line.
+#[test_case(KeyCode::Enter ; "enter")]
+#[test_case(KeyCode::Tab ; "tab")]
+#[test_case(KeyCode::Backspace ; "backspace")]
+fn a_key_no_notation_names_never_reaches_the_chat_behind_a_focused_float(code: KeyCode) {
+    let mut app = test_app();
+    app.input_box.set_input(HIDDEN_DRAFT.into());
+    app.input_box.buffer.move_to_end();
+    let mode = app.state.mode;
+    let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    app.float_mgr.open(
+        Arc::new(SharedBuf::new()),
+        FloatConfig::default(),
+        true,
+        event_tx,
+        cmd_rx,
+    );
+
+    let actions = app.update(Msg::Key(KeyEvent::new(code, KeyModifiers::SUPER)));
+
+    assert!(actions.is_empty(), "the float spends the key");
+    assert_eq!(app.input_box.buffer.value(), HIDDEN_DRAFT);
+    assert_eq!(app.state.mode, mode);
+    assert!(
+        !event_rx.drain().any(|e| matches!(e, WinEvent::Key { .. })),
+        "a key no notation names has no event to send"
+    );
+}
+
 const CLAIM_DELIVERED: &str = "the popup that claimed the key must be handed it";
 const CLAIM_NOT_DELIVERED: &str = "the popup must not be handed a key it never claimed";
 
@@ -5091,7 +5134,7 @@ fn open_claiming_popup_keys(
     let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
     let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
     let config = FloatConfig {
-        keys: keys.to_vec(),
+        keys: keys.iter().map(|(c, m)| plugin_key(*c, *m)).collect(),
         ..FloatConfig::default()
     };
     app.float_mgr
@@ -5314,16 +5357,17 @@ fn the_first_esc_arms_the_streaming_cancel_with_no_popup_up() {
 #[test]
 fn the_keys_a_plugin_cannot_bind_are_the_keys_the_host_answers_itself() {
     let app = test_app();
-    let reserved: Vec<(KeyCode, KeyModifiers)> = [kb::QUIT, kb::SUSPEND]
+    let reserved: Vec<maki_lua::Key> = [kb::QUIT, kb::SUSPEND]
         .iter()
-        .map(|b| (b.code, b.modifiers))
+        .map(|b| plugin_key(b.code, b.modifiers))
         .collect();
 
     assert_eq!(reserved, maki_lua::RESERVED_KEYS.to_vec());
-    for (code, modifiers) in maki_lua::RESERVED_KEYS {
+    for reserved in maki_lua::RESERVED_KEYS {
         assert!(
-            app.reserved_by_host(KeyEvent::new(code, modifiers)),
-            "the host has to answer {code:?} itself, whatever a plugin bound"
+            app.reserved_by_host(KeyEvent::new(reserved.code(), reserved.modifiers())),
+            "the host has to answer {} itself, whatever a plugin bound",
+            reserved.notation()
         );
     }
 }
@@ -6247,7 +6291,7 @@ fn split_question_keeps_transcript_selectable_and_keyboard_focus(dir: Split) {
     assert!(
         event_rx
             .try_iter()
-            .any(|event| matches!(event, WinEvent::Key { key } if key == "j"))
+            .any(|event| matches!(event, WinEvent::Key { key } if key == plugin_key(KeyCode::Char('j'), KeyModifiers::NONE)))
     );
     assert!(app.input_box.is_empty());
     assert!(app.awaiting_input());

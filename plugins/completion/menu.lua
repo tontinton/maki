@@ -11,7 +11,7 @@ local opts = maki.api.register_options({
 
 -- The keys the popup takes while it is on screen are declared with the
 -- handlers that answer them, further down: see {M.BINDINGS}.
-local FOOTER = { { "Tab", "next" }, { "Enter", "insert" }, { "Esc", "close" } }
+local FOOTER = { { "Tab/Shift+Tab", "move" }, { "Enter", "insert" }, { "Esc", "close" } }
 local MIN_WIDTH = 24
 -- Above the input box and the transcript, below anything modal.
 local ZINDEX = 120
@@ -161,32 +161,23 @@ local function prev_row()
   move(-1)
 end
 
--- Every key the popup takes while it is on screen, in both spellings: the
--- notation the window claims it in, and the name `win:recv` reports the press
--- under. The popup is unfocused, because the user goes on typing into the chat
--- input beneath it, so the host has to be told which keys are the popup's;
--- everything else reaches the input as it always did. The list belongs to the
--- window and dies with it, so there is nothing to release and nothing that can
--- outlive what the user can see.
+-- Every key the popup takes while it is on screen. The popup is unfocused,
+-- because the user goes on typing into the chat input beneath it, so the host
+-- has to be told which keys are the popup's. Everything else reaches the input
+-- as it always did. The list belongs to the window and dies with it, so there
+-- is nothing to release and nothing that can outlive what the user can see.
 --
--- Two spellings because the host parses keymap notation and answers in its
--- own: `<C-n>` is claimed and arrives as `ctrl+n`. Unifying them would change
--- the `key` event for every float and silently break plugins that compare
--- against `"ctrl+c"`, so the bridge lives here and the notation split is
--- tracked on its own.
+-- One spelling: the notation a key is claimed in is the notation `win:recv`
+-- reports the press under, so `claim` is also the handler's key.
 --
--- `<S-Tab>` cannot join the list: it parses to Tab with Shift while terminals
--- deliver BackTab, so a claim on it would never fire.
---
--- Public because the second spelling is the one thing here nothing can check:
--- an event name the host never sends is claimed, consumed, and does nothing,
--- so the spec presses every one of them.
+-- Public so the spec can press every binding the popup declares.
 M.BINDINGS = {
-  { claim = "<Tab>", event = "tab", run = next_row },
-  { claim = "<C-n>", event = "ctrl+n", run = next_row },
-  { claim = "<C-p>", event = "ctrl+p", run = prev_row },
-  { claim = "<Esc>", event = "esc", run = M.close },
-  { claim = "<CR>", event = "enter", run = M.accept },
+  { claim = "<Tab>", run = next_row },
+  { claim = "<S-Tab>", run = prev_row },
+  { claim = "<C-n>", run = next_row },
+  { claim = "<C-p>", run = prev_row },
+  { claim = "<Esc>", run = M.close },
+  { claim = "<CR>", run = M.accept },
 }
 
 -- Derived, not written out a second time: a key on one list and not the other
@@ -194,7 +185,7 @@ M.BINDINGS = {
 local KEYS, HANDLERS = {}, {}
 for i, binding in ipairs(M.BINDINGS) do
   KEYS[i] = binding.claim
-  HANDLERS[binding.event] = binding.run
+  HANDLERS[binding.claim] = binding.run
 end
 
 function M.handle_key(key)

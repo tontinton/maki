@@ -95,23 +95,23 @@ end
 
 local function editing_custom_single()
   local s = selecting_single()
-  press_many(s, { "down", "down", "enter" })
+  press_many(s, { "<Down>", "<Down>", "<CR>" })
   return s
 end
 
 local function confirming_multi()
   local s = QuestionForm._initial_state(multi_questions())
-  press_many(s, { "enter", "enter" })
+  press_many(s, { "<CR>", "<CR>" })
   return s
 end
 
 case("dismiss_keys_per_mode", function()
   local cases = {
-    { build = selecting_single, key = "esc" },
-    { build = selecting_single, key = "ctrl+c" },
-    { build = editing_custom_single, key = "ctrl+c" },
-    { build = confirming_multi, key = "esc" },
-    { build = confirming_multi, key = "ctrl+c" },
+    { build = selecting_single, key = "<Esc>" },
+    { build = selecting_single, key = "<C-c>" },
+    { build = editing_custom_single, key = "<C-c>" },
+    { build = confirming_multi, key = "<Esc>" },
+    { build = confirming_multi, key = "<C-c>" },
   }
   for i, c in ipairs(cases) do
     local s = c.build()
@@ -122,38 +122,38 @@ end)
 
 case("multiple_choice_toggle_then_tab_to_review_and_submit", function()
   local s = QuestionForm._initial_state(single_question({ multiple = true }))
-  press(s, "enter")
+  press(s, "<CR>")
   eq(s.answers[1][1], "Yes", "first enter toggles on")
   eq(s.mode, MODE.SELECTING, "multi-toggle stays in selecting")
-  press(s, "enter")
+  press(s, "<CR>")
   eq(s.answers[1] == nil or #s.answers[1] == 0, true, "second enter toggles off")
-  press(s, "enter")
-  press(s, "tab")
+  press(s, "<CR>")
+  press(s, "<Tab>")
   eq(s.mode, MODE.CONFIRMING)
-  press(s, "enter")
+  press(s, "<CR>")
   eq(s.done.type, "submit")
   eq(s.done.answers[1][1], "Yes")
 end)
 
 case("arrow_keys_navigate_questions_and_clamp_at_ends", function()
   local s = QuestionForm._initial_state(multi_questions())
-  press(s, "left")
+  press(s, "<Left>")
   eq(s.tab, 1, "shift+tab at first question is a no-op")
-  press(s, "right")
+  press(s, "<Right>")
   eq(s.tab, 2)
-  press(s, "right")
+  press(s, "<Right>")
   eq(s.mode, MODE.CONFIRMING, "past last question goes to review")
-  press(s, "left")
+  press(s, "<Left>")
   eq(s.mode, MODE.SELECTING, "shift+tab from confirming returns to last question")
   eq(s.tab, #s.questions)
 end)
 
 case("enter_advances_through_questions_then_confirming", function()
   local s = QuestionForm._initial_state(multi_questions())
-  press(s, "enter")
+  press(s, "<CR>")
   eq(s.tab, 2, "after selecting q1, auto-advance to q2")
   eq(s.answers[1][1], "a1")
-  press(s, "enter")
+  press(s, "<CR>")
   eq(s.mode, MODE.CONFIRMING, "last question lands on review")
   eq(s.answers[2][1], "b1")
 end)
@@ -161,16 +161,16 @@ end)
 case("editing_custom_esc_returns_to_selecting", function()
   local s = editing_custom_single()
   eq(s.mode, MODE.EDITING_CUSTOM)
-  press(s, "esc")
+  press(s, "<Esc>")
   eq(s.mode, MODE.SELECTING)
   eq(s.done, nil, "esc in editing_custom must NOT dismiss the form")
 end)
 
 case("editing_custom_empty_or_whitespace_submit_returns_to_selecting", function()
-  for _, prefix in ipairs({ {}, { "space", "space" } }) do
+  for _, prefix in ipairs({ {}, { "<Space>", "<Space>" } }) do
     local s = editing_custom_single()
     press_many(s, prefix)
-    press(s, "enter")
+    press(s, "<CR>")
     eq(s.mode, MODE.SELECTING, "empty/whitespace must not advance")
     eq(s.answers[1], nil, "no answer recorded")
   end
@@ -178,20 +178,20 @@ end)
 
 case("editing_custom_submits_trimmed_text_and_finishes_single_question", function()
   local s = selecting_single()
-  press_many(s, { "down", "down", "enter", "space", "h", "i", "space", "enter" })
+  press_many(s, { "<Down>", "<Down>", "<CR>", "<Space>", "h", "i", "<Space>", "<CR>" })
   eq(s.answers[1][1], "hi", "leading/trailing whitespace trimmed")
   eq(s.done.type, "submit")
 end)
 
 case("editing_custom_newline_shortcuts_insert_not_submit", function()
-  for _, key in ipairs({ "alt+enter", "shift+enter", "ctrl+enter", "ctrl+j" }) do
+  for _, key in ipairs({ "<M-CR>", "<S-CR>", "<C-CR>", "<C-j>" }) do
     local s = selecting_single()
-    press_many(s, { "down", "down", "enter", "a", key, "b" })
+    press_many(s, { "<Down>", "<Down>", "<CR>", "a", key, "b" })
     eq(s.mode, MODE.EDITING_CUSTOM, key .. ": stays in editing")
     eq(s.custom_input:value(), "a\nb", key .. ": inserted newline")
   end
   local s = selecting_single()
-  press_many(s, { "down", "down", "enter", "a", "\\", "enter", "b" })
+  press_many(s, { "<Down>", "<Down>", "<CR>", "a", "\\", "<CR>", "b" })
   eq(s.mode, MODE.EDITING_CUSTOM)
   eq(s.custom_input:value(), "a\nb", "backslash+enter inserts newline, consumes backslash")
 end)
@@ -264,13 +264,13 @@ case("render_selecting_uses_radio_for_single_and_check_for_multiple", function()
   end
 
   local single = QuestionForm._initial_state(single_question())
-  press(single, "enter")
+  press(single, "<CR>")
   local single_lines = QuestionForm._render(single, 80).lines
   assert(contains(single_lines, "(single answer)"), "single answer hint missing")
   assert(contains(single_lines, "● Yes"), "single selected must use bullet")
 
   local multi = QuestionForm._initial_state(single_question({ multiple = true }))
-  press(multi, "enter")
+  press(multi, "<CR>")
   local multi_lines = QuestionForm._render(multi, 80).lines
   assert(contains(multi_lines, "(multiple answers)"), "multiple answer hint missing")
   assert(contains(multi_lines, "✓ Yes"), "multiple selected must use check")
@@ -455,12 +455,12 @@ end
 
 case("multi_custom_appends_keeps_predefined_selections", function()
   local s = QuestionForm._initial_state(multi_with_custom())
-  press(s, "enter")
-  press_many(s, { "down", "enter" })
-  press_many(s, { "down", "down", "enter" })
+  press(s, "<CR>")
+  press_many(s, { "<Down>", "<CR>" })
+  press_many(s, { "<Down>", "<Down>", "<CR>" })
   eq(s.mode, MODE.EDITING_CUSTOM)
   type_text(s, "foo")
-  press(s, "enter")
+  press(s, "<CR>")
   eq(s.mode, MODE.SELECTING)
   eq(s.done, nil, "multi custom submit must not finish")
   local ans = s.answers[1]
@@ -472,13 +472,13 @@ end)
 
 case("multi_custom_resubmit_replaces_only_custom", function()
   local s = QuestionForm._initial_state(multi_with_custom())
-  press_many(s, { "enter", "down", "enter", "down", "down", "enter" })
+  press_many(s, { "<CR>", "<Down>", "<CR>", "<Down>", "<Down>", "<CR>" })
   type_text(s, "foo")
-  press(s, "enter")
-  press(s, "enter")
-  press_many(s, { "backspace", "backspace", "backspace" })
+  press(s, "<CR>")
+  press(s, "<CR>")
+  press_many(s, { "<BS>", "<BS>", "<BS>" })
   type_text(s, "bar")
-  press(s, "enter")
+  press(s, "<CR>")
   local ans = s.answers[1]
   eq(#ans, 3)
   eq(ans[1], "a1")
@@ -488,20 +488,20 @@ end)
 
 case("multi_custom_reopen_prefills_editor", function()
   local s = QuestionForm._initial_state(multi_with_custom())
-  press_many(s, { "down", "down", "enter" })
+  press_many(s, { "<Down>", "<Down>", "<CR>" })
   type_text(s, "foo")
-  press_many(s, { "enter", "enter" })
+  press_many(s, { "<CR>", "<CR>" })
   eq(s.mode, MODE.EDITING_CUSTOM)
   eq(s.custom_input:value(), "foo")
 end)
 
 case("multi_custom_clearing_keeps_predefined", function()
   local s = QuestionForm._initial_state(single_question({ multiple = true }))
-  press(s, "enter")
+  press(s, "<CR>")
   eq(s.answers[1][1], "Yes", "predefined selected")
-  press_many(s, { "down", "down", "enter", "h", "i", "enter" })
+  press_many(s, { "<Down>", "<Down>", "<CR>", "h", "i", "<CR>" })
   eq(#s.answers[1], 2, "predefined + custom selected")
-  press_many(s, { "enter", "backspace", "backspace", "enter" })
+  press_many(s, { "<CR>", "<BS>", "<BS>", "<CR>" })
   eq(#s.answers[1], 1, "only predefined remains")
   eq(s.answers[1][1], "Yes")
 end)
@@ -519,7 +519,7 @@ case("review_tab_label_present_and_styled_differently_between_modes", function()
   end
   local review_inactive = find_review_span(QuestionForm._render(s, 80).lines)
   assert(review_inactive, "Review tab must appear in selecting mode")
-  press_many(s, { "enter", "enter" })
+  press_many(s, { "<CR>", "<CR>" })
   eq(s.mode, MODE.CONFIRMING)
   local review_active = find_review_span(QuestionForm._render(s, 80).lines)
   assert(review_active, "Review tab must appear in confirming mode")
@@ -547,7 +547,7 @@ end)
 
 case("answered_non_current_tab_shows_check_glyph", function()
   local s = QuestionForm._initial_state(multi_questions())
-  press(s, "enter")
+  press(s, "<CR>")
   eq(s.tab, 2, "after answering Q1, cursor advances to Q2")
   local tab_bar = QuestionForm._render(s, 80).lines[1]
   local q1_has_check, q2_has_check = false, false
@@ -565,8 +565,8 @@ end)
 
 case("render_confirming_shows_no_answer_placeholder_for_unanswered_question", function()
   local s = QuestionForm._initial_state(multi_questions())
-  press(s, "enter")
-  press(s, "right")
+  press(s, "<CR>")
+  press(s, "<Right>")
   eq(s.mode, MODE.CONFIRMING, "from last question, right goes to confirming")
   local placeholder = find_span_with_text(QuestionForm._render(s, 80).lines, "(no answer)")
   assert(placeholder, "unanswered question row must contain '(no answer)' span")
@@ -577,7 +577,7 @@ case("render_selecting_focus_row_tracks_cursor_down_movement", function()
     options = { { label = "o1" }, { label = "o2" }, { label = "o3" } },
   }))
   local r1 = QuestionForm._render(s, 80)
-  press_many(s, { "down", "down" })
+  press_many(s, { "<Down>", "<Down>" })
   eq(s.cursor, 3, "two downs land on option 3")
   local r3 = QuestionForm._render(s, 80)
   assert(r3.focus_row > r1.focus_row, "focus_row must advance when cursor moves down")

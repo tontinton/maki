@@ -7,10 +7,14 @@
 --   * No line ever contains a literal newline; newlines split into rows.
 --
 -- Parents OWN their keys. `handle_key` returns one of R.IGNORED / R.MOVED /
--- R.CHANGED. Parent dispatchers must filter their own keys (esc, ctrl+c,
+-- R.CHANGED. Parent dispatchers must filter their own keys (`<Esc>`, `<C-c>`,
 -- submit keys, etc.) BEFORE forwarding, because `handle_key` claims any key
--- it can interpret. `ctrl+a` is bound to move-home; if a parent wants it for
--- "select all" it must intercept first.
+-- it can interpret. `<C-a>` is bound to move-home, so a parent that wants it
+-- for "select all" must intercept first.
+--
+-- Keys are in canonical notation, as `win:recv` delivers them. Splitting a
+-- line is the `input:split_line()` method rather than a pseudo-key, so every
+-- key in KEYMAP is one a terminal can send.
 --
 -- IGNORED is returned when the buffer literally cannot act (backspace at
 -- (1, 0), right at end of buffer, etc.). Parents can use that signal to fall
@@ -354,31 +358,30 @@ function TextInput:_check_invariants()
 end
 
 local KEYMAP = {
-  ["left"] = "move_left",
-  ["right"] = "move_right",
-  ["up"] = "move_up",
-  ["down"] = "move_down",
-  ["home"] = "move_home",
-  ["end"] = "move_end",
-  ["ctrl+left"] = "move_word_left",
-  ["ctrl+right"] = "move_word_right",
-  ["alt+left"] = "move_word_left",
-  ["alt+right"] = "move_word_right",
-  ["alt+b"] = "move_word_left",
-  ["alt+f"] = "move_word_right",
-  ["ctrl+a"] = "move_home",
-  ["backspace"] = "remove_char",
-  ["shift+backspace"] = "remove_char",
-  ["delete"] = "delete_char",
-  ["ctrl+w"] = "remove_word_before",
-  ["ctrl+backspace"] = "remove_word_before",
-  ["alt+backspace"] = "remove_word_before",
-  ["ctrl+delete"] = "delete_word_after",
-  ["alt+delete"] = "delete_word_after",
-  ["alt+d"] = "delete_word_after",
-  ["ctrl+k"] = "kill_to_end_of_line",
-  ["newline"] = "split_line",
-  ["space"] = "insert_space",
+  ["<Left>"] = "move_left",
+  ["<Right>"] = "move_right",
+  ["<Up>"] = "move_up",
+  ["<Down>"] = "move_down",
+  ["<Home>"] = "move_home",
+  ["<End>"] = "move_end",
+  ["<C-Left>"] = "move_word_left",
+  ["<C-Right>"] = "move_word_right",
+  ["<M-Left>"] = "move_word_left",
+  ["<M-Right>"] = "move_word_right",
+  ["<M-b>"] = "move_word_left",
+  ["<M-f>"] = "move_word_right",
+  ["<C-a>"] = "move_home",
+  ["<BS>"] = "remove_char",
+  ["<S-BS>"] = "remove_char",
+  ["<Del>"] = "delete_char",
+  ["<C-w>"] = "remove_word_before",
+  ["<C-BS>"] = "remove_word_before",
+  ["<M-BS>"] = "remove_word_before",
+  ["<C-Del>"] = "delete_word_after",
+  ["<M-Del>"] = "delete_word_after",
+  ["<M-d>"] = "delete_word_after",
+  ["<C-k>"] = "kill_to_end_of_line",
+  ["<Space>"] = "insert_space",
 }
 
 function TextInput:handle_key(key)

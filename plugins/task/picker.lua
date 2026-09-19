@@ -208,9 +208,9 @@ local function open_selected()
 end
 
 local function handle_key(key)
-  if key == "ctrl+c" or key == "ctrl+x" then
+  if key == "<C-c>" or key == "<C-x>" then
     finish(false)
-  elseif key == "esc" then
+  elseif key == "<Esc>" then
     if board.input:is_empty() then
       finish(false)
     else
@@ -218,15 +218,15 @@ local function handle_key(key)
       rebuild()
       render()
     end
-  elseif key == "up" then
+  elseif key == "<Up>" then
     move_sel(-1, true)
-  elseif key == "down" then
+  elseif key == "<Down>" then
     move_sel(1, true)
-  elseif key == "pageup" then
+  elseif key == "<PageUp>" then
     move_sel(-page_size())
-  elseif key == "pagedown" then
+  elseif key == "<PageDown>" then
     move_sel(page_size())
-  elseif key == "enter" then
+  elseif key == "<CR>" then
     open_selected()
   elseif board.input:handle_key(key) ~= "ignored" then
     rebuild()

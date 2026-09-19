@@ -94,7 +94,7 @@ local function press(state, keys)
 end
 
 case("the_picker_opens_on_the_row_the_session_runs", function()
-  eq(press(picker_on(MEDIUM), { "enter" }), MEDIUM)
+  eq(press(picker_on(MEDIUM), { "<CR>" }), MEDIUM)
 end)
 
 -- The one fallback: a value no row names is a raw token budget.
@@ -102,24 +102,24 @@ case("a_raw_budget_opens_the_custom_row_pre_filled", function()
   local state = picker_on(RAW_BUDGET)
   eq(state.cursor, state.custom_row)
   th.has(line_text(Picker.render(state, WIDE)[state.custom_row]), RAW_BUDGET .. " tokens")
-  eq(press(state, { "enter" }), RAW_BUDGET)
+  eq(press(state, { "<CR>" }), RAW_BUDGET)
 end)
 
 case("keys_pick_a_value_or_dismiss_the_picker", function()
-  eq(press(picker_on(MEDIUM), { "down", "down", "enter" }), "xhigh")
-  eq(press(picker_on(MEDIUM), { "up", "enter" }), "low")
-  eq(press(picker_on(MEDIUM), { "esc" }), "cancel")
-  eq(press(picker_on(MEDIUM), { "8", "1", "9", "2", "enter" }), "8192")
-  eq(press(picker_on(MEDIUM), { "4", "0", "9", "6", "backspace", "enter" }), "409")
-  eq(press(picker_on(MEDIUM), { "4", "esc", "enter" }), "4", "esc leaves the editor, not the picker")
+  eq(press(picker_on(MEDIUM), { "<Down>", "<Down>", "<CR>" }), "xhigh")
+  eq(press(picker_on(MEDIUM), { "<Up>", "<CR>" }), "low")
+  eq(press(picker_on(MEDIUM), { "<Esc>" }), "cancel")
+  eq(press(picker_on(MEDIUM), { "8", "1", "9", "2", "<CR>" }), "8192")
+  eq(press(picker_on(MEDIUM), { "4", "0", "9", "6", "<BS>", "<CR>" }), "409")
+  eq(press(picker_on(MEDIUM), { "4", "<Esc>", "<CR>" }), "4", "esc leaves the editor, not the picker")
 end)
 
 case("the_cursor_walks_over_blank_rows_and_stops_at_the_ends", function()
   local walked = {}
   local state = picker_on("off")
-  eq(press(state, { "up" }), "off", "nothing above the first row")
+  eq(press(state, { "<Up>" }), "off", "nothing above the first row")
   for _ = 1, #LADDER + 1 do
-    Picker.handle_key(state, "down")
+    Picker.handle_key(state, "<Down>")
     walked[#walked + 1] = Picker.value(state)
   end
   -- The last step falls off the end of the list and stays on the custom row,
@@ -185,7 +185,7 @@ case("an_option_the_plugin_never_heard_of_renders_as_a_normal_row", function()
   extended[#extended + 1] = { name = "ultra", tokens = 65536 }
   local state = picker_on("max", extended)
 
-  eq(press(state, { "down", "enter" }), "ultra")
+  eq(press(state, { "<Down>", "<CR>" }), "ultra")
   local lines = Picker.render(state, WIDE)
   th.has(line_text(lines[state.cursor]), "ultra")
   th.has(line_text(lines[state.cursor]), "65.5k")
@@ -271,7 +271,7 @@ local function run(events, opts)
 end
 
 case("enter_sends_the_picked_value_once_and_says_so", function()
-  local result = run({ key("down"), key("down"), key("enter") })
+  local result = run({ key("<Down>"), key("<Down>"), key("<CR>") })
   eq(result.sets, "xhigh")
   eq(result.flashes, "Thinking: xhigh")
   eq(result.closed, true)
@@ -280,9 +280,9 @@ end)
 -- Nothing reaches the host until Enter, so there is never a value to undo.
 case("a_dismissed_picker_sends_nothing", function()
   for name, events in pairs({
-    esc = { key("down"), key("esc") },
-    ["external close"] = { key("down"), CLOSE },
-    ["dead channel"] = { key("down") },
+    esc = { key("<Down>"), key("<Esc>") },
+    ["external close"] = { key("<Down>"), CLOSE },
+    ["dead channel"] = { key("<Down>") },
   }) do
     local result = run(events)
     eq(result.sets, "", name)
@@ -298,11 +298,11 @@ case("a_crash_closes_the_window_and_is_reported", function()
   eq(result.sets, "")
   eq(result.closed, true)
   th.has(result.err or "", BOOM)
-  eq(run({ key("enter") }).sets, MEDIUM, "the window reopens after a crash")
+  eq(run({ key("<CR>") }).sets, MEDIUM, "the window reopens after a crash")
 end)
 
 case("a_refused_value_flashes_what_the_host_answered", function()
-  eq(run({ key("enter") }, { reject = true }).flashes, REJECTED)
+  eq(run({ key("<CR>") }, { reject = true }).flashes, REJECTED)
   eq(run({}, { direct = "nonsense", reject = true }).flashes, REJECTED)
 end)
 

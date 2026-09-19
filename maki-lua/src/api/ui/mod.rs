@@ -3,14 +3,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyModifiers};
 use humantime::format_duration;
 use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
 use strum::VariantNames;
 
-use crate::api::keymap::{parse_key_notation, reject_reserved};
+use crate::api::keymap::accept_key;
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
     InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_send,
@@ -18,6 +17,7 @@ use crate::api::util::command::{
 use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
+use crate::key::Key;
 pub(crate) mod blit;
 pub(crate) mod buf;
 pub(crate) mod win;
@@ -399,10 +399,8 @@ fn set_window_title(
 /// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
 /// `"prev_chat"`, `"next_chat"`, `"model_picker"`.
 ///
-/// Sending the user's turn is not on the list. A key a popup should hold only
-/// while it is on screen is one to declare in `maki.ui.open_win`'s `keys`: the
-/// host routes it to that window and hands it back the moment the window
-/// closes.
+/// There is no action for sending the user's message. To take keys like
+/// `<CR>` while a popup is open, use the `keys` option of `maki.ui.open_win`.
 ///
 /// For slash commands rather than keybound actions, see
 /// `maki.api.run_command`.
@@ -560,12 +558,12 @@ async fn open_editor(
     Ok(reply_rx.recv_async().await.unwrap_or(-1))
 }
 
-/// The keys an unfocused window takes while it is on screen, parsed with the
-/// notation parser `maki.keymap.set` uses so the two can never drift.
+/// The keys an unfocused window takes while it is on screen, read through the
+/// same gate `maki.keymap.set` reads, so the two can never drift.
 ///
 /// Every key is parsed before the window is opened, so a typo leaves the
 /// plugin with no window rather than a window holding half a list.
-fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<(KeyCode, KeyModifiers)>> {
+fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
     let Some(keys) = opts.get::<Option<Table>>("keys")? else {
         return Ok(Vec::new());
     };
@@ -573,12 +571,7 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<(KeyCode, KeyM
         return Err(mlua::Error::runtime(FOCUSED_CLAIM_ERR));
     }
     keys.sequence_values::<String>()
-        .map(|lhs| {
-            let lhs = lhs?;
-            let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
-            reject_reserved(&lhs, key, modifiers)?;
-            Ok((key, modifiers))
-        })
+        .map(|lhs| accept_key(&lhs?))
         .collect()
 }
 
@@ -604,8 +597,8 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<(KeyCode, KeyM
 ///   - split (string): dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
 ///   - order (integer): paint order among split windows at the same edge. Default 50.
 ///   - focus (boolean): whether the window takes keyboard focus on open. Default true.
-///   - keys (table): key notation this window takes while it is on screen, e.g. `{ "<Tab>", "<CR>" }`. For an unfocused window only, since a focused one is handed every key already, and passing both is an error. A claimed key goes to this window's `recv` and is consumed there, so the chat input under it and any `maki.keymap.set` binding never see it. The claims last exactly as long as the window, so there is nothing to release, and `<C-c>` and `<C-z>` are refused here the way they are in `maki.keymap.set`. The window has to be on screen to take a key: one that is hidden, or sized to nothing, claims nothing. The host's own overlays are answered first, so a picker or the slash command palette opened over the window holds the keys until it closes, and unloading the plugin closes the window and the claims with it. `<S-Tab>` cannot be claimed: it parses as Shift+Tab while terminals deliver BackTab, so the claim would never fire.
-///   - visible (boolean): whether the window is initially visible. Default true.
+///   - keys (table): keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or `maki.keymap.set` bindings. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
+///   - visible (boolean): whether the window is initially visible. Default true. See `win:hide()` for what hiding does.
 ///   - needs_input (boolean): whether the window means the session needs user input. Default false.
 ///   - stack (boolean): offset the window past the other stacked windows sharing its anchor, in open order, with a one row gap. Closing one moves the rest up. Floating windows only. Default false.
 /// @return (Win) Window handle.
@@ -1056,10 +1049,7 @@ mod tests {
 
         assert_eq!(
             parse_claimed_keys(&opts, false).unwrap(),
-            vec![
-                (KeyCode::Tab, KeyModifiers::NONE),
-                (KeyCode::Char('n'), KeyModifiers::CONTROL),
-            ]
+            vec![Key::parse("<Tab>").unwrap(), Key::parse("<C-n>").unwrap()]
         );
     }
 
