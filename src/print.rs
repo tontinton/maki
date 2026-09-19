@@ -17,6 +17,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use maki_agent::headless::{self, HeadlessHandle, HeadlessParams};
 use maki_agent::permissions::PluginRuleStore;
+use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig};
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
@@ -24,6 +25,7 @@ use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::model::Model;
 use maki_providers::{TokenUsage, add_cost};
+use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use serde::Serialize;
 use serde_json::Value;
@@ -149,6 +151,10 @@ pub struct PrintParams {
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub project_config: ProjectConfig,
+    /// Which session this run continues and writes under, and where. Resolved
+    /// by the caller from the same flags every other entry point reads.
+    pub resumed: Resumed,
+    pub storage: StateDir,
 }
 
 pub fn run(params: PrintParams) -> Result<()> {
@@ -166,6 +172,8 @@ pub fn run(params: PrintParams) -> Result<()> {
         model_policy,
         plugin_rules,
         project_config,
+        resumed,
+        storage,
     } = params;
 
     let prompt = match prompt {
@@ -201,6 +209,8 @@ pub fn run(params: PrintParams) -> Result<()> {
         excluded_tools: vec![QUESTION_TOOL_NAME],
         mcp_handle,
         initial_wd: cwd,
+        resumed,
+        storage,
         defaults,
         model_policy,
         plugin_rules,
@@ -213,7 +223,6 @@ pub fn run(params: PrintParams) -> Result<()> {
         cwd,
         task,
     } = handle;
-    crate::setup::report_session_start(maki_otel::emit::START_FRESH, Some(&session_id));
     let start = Instant::now();
 
     let mut verbose_out = match format {

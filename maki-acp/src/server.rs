@@ -20,6 +20,7 @@ use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
+use maki_agent::session::{Resumed, StoredSession};
 use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
 use maki_agent::types::AgentEvent;
 use maki_agent::{
@@ -289,8 +290,7 @@ async fn new_session(
         srv,
         params,
         req.cwd,
-        None,
-        InitialHistory::default(),
+        Resumed::fresh(),
         mcp,
         project_config,
         None,
@@ -313,7 +313,7 @@ async fn load_session(
         .0
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
-    let mut restored = load_history(session_ref.id())?;
+    let mut restored = load_history(&params.storage, session_ref.id())?;
     close_session(srv, SessionEndReason::Replaced).await;
     let project_config = trusted_project_config(
         &req.cwd,
@@ -341,9 +341,9 @@ async fn load_session(
         srv,
         params,
         req.cwd,
-        Some(session_ref),
-        InitialHistory {
-            messages: restored.history,
+        Resumed {
+            id: session_ref,
+            history: restored.history,
             context_size: restored.context_size,
         },
         mcp,
@@ -365,8 +365,7 @@ fn start_session(
     srv: &mut Server,
     params: &AcpParams,
     cwd: PathBuf,
-    session_id: Option<SessionRef>,
-    initial: InitialHistory,
+    resumed: Resumed,
     mcp: Option<McpHandle>,
     project_config: ProjectConfig,
     initial_cost: Option<f64>,
@@ -396,9 +395,8 @@ fn start_session(
         excluded_tools,
         mcp_handle: mcp.clone(),
         initial_wd: cwd.clone(),
-        session_id,
-        initial_history: initial.messages,
-        initial_context_size: initial.context_size,
+        resumed,
+        storage: params.storage.clone(),
         yolo: params.yolo,
         system_prompt_override: None,
         append_system_prompt: None,
@@ -610,15 +608,6 @@ async fn close_session(srv: &mut Server, reason: SessionEndReason) {
     }
 }
 
-/// The transcript a session starts from, with the provider's own count for it.
-/// Paired so a resumed session cannot get its history while its gauge falls
-/// back to estimating that same history.
-#[derive(Default)]
-struct InitialHistory {
-    messages: Vec<Message>,
-    context_size: u32,
-}
-
 #[derive(Debug)]
 struct Restored {
     history: Vec<Message>,
@@ -630,24 +619,14 @@ struct Restored {
     model: String,
 }
 
-fn load_history(session_id: MakiId) -> Result<Restored, AcpError> {
-    let storage = maki_storage::StateDir::resolve()
-        .map_err(|e| AcpError::internal_error().data(json_str(&e)))?;
-    load_history_from(&storage, session_id)
-}
-
 /// History plus the absolute cwd the session recorded in its header. Tool
 /// inputs from a past run resolve against that cwd, not the client's current
 /// one; a non-absolute recording falls back to the caller's cwd.
-fn load_history_from(
-    storage: &maki_storage::StateDir,
-    session_id: MakiId,
-) -> Result<Restored, AcpError> {
-    let session: maki_storage::sessions::Session<
-        Message,
-        maki_providers::TokenUsage,
-        maki_agent::ToolOutput,
-    > = maki_storage::sessions::Session::load(session_id, storage).map_err(|e| {
+///
+/// Reads from the server's state dir, the one the run writes back to, rather
+/// than resolving a second answer to where sessions live.
+fn load_history(storage: &StateDir, session_id: MakiId) -> Result<Restored, AcpError> {
+    let session = StoredSession::load(session_id, storage).map_err(|e| {
         AcpError::resource_not_found(Some(format!("session/{session_id}"))).data(json_str(&e))
     })?;
     let recorded = if Path::new(&session.cwd).is_absolute() {
@@ -1939,7 +1918,7 @@ mod tests {
         session.save(&dir).unwrap();
 
         let id: MakiId = session.id;
-        let restored = load_history_from(&dir, id).unwrap();
+        let restored = load_history(&dir, id).unwrap();
         assert_eq!(restored.model, "anthropic/test-model");
         assert_eq!(
             serde_json::to_value(&restored.history).unwrap(),
@@ -1974,7 +1953,7 @@ mod tests {
         );
         session.save(&dir).unwrap();
 
-        let mut restored = load_history_from(&dir, session.id).unwrap();
+        let mut restored = load_history(&dir, session.id).unwrap();
         assert_eq!(
             restored.by_model[RETIRED_MODEL_ID].cost,
             Some(RECORDED_COST),
@@ -2003,14 +1982,14 @@ mod tests {
         let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
             Session::new("anthropic/test-model", "relative/project");
         session.save(&dir).unwrap();
-        assert_eq!(load_history_from(&dir, session.id).unwrap().cwd, None);
+        assert_eq!(load_history(&dir, session.id).unwrap().cwd, None);
     }
 
     #[test]
     fn load_missing_session_is_resource_not_found() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let err = load_history_from(&dir, MakiId::generate()).unwrap_err();
+        let err = load_history(&dir, MakiId::generate()).unwrap_err();
         assert_eq!(err.code, AcpError::resource_not_found(None).code);
     }
 

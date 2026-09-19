@@ -1,20 +1,17 @@
 use std::env;
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::Arc;
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
-use maki_config::project::{self, ProjectDecision, TrustMode};
+use maki_config::project::{self, TrustMode};
 use maki_config::providers::{
     ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
-use maki_config::{Config, load_env_files, load_permissions};
-use maki_lua::{InitFiles, PluginHost};
 use maki_providers::provider::fetch_all_models;
 use maki_providers::{ProviderData, catalog_providers};
 use maki_providers::{copilot_auth, dynamic, openai_auth, xai_auth};
@@ -539,23 +536,7 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
 }
 
 pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMode) -> Result<()> {
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    // The `trust.paths` policy deliberately stops at the session entry points
-    // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
-    // user never saw, for a session it never runs.
-    let trust = project::resolve_noninteractive(&cwd, trust_mode);
-    load_env_files(&trust.project_config);
-
-    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
-        .context("initialize lua plugin host")?;
-    let (config, warnings) = super::load_plugins(
-        &mut host,
-        no_plugins,
-        super::BuiltinFailure::Fatal,
-        maki_lua::Interaction::None,
-        |host, names, warnings| load_effective_config(host, no_plugins, &trust, names, warnings),
-    )?;
-    super::report_warnings(warnings);
+    let (_host, config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
 
     let mut refresh_failure = None;
     if refresh {
@@ -584,51 +565,10 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
     Ok(())
 }
 
-fn load_effective_config(
-    host: &PluginHost,
-    no_plugins: bool,
-    trust: &ProjectDecision,
-    names: &super::KnownNames<'_>,
-    warnings: &mut Vec<String>,
-) -> Result<Config> {
-    // `notices`, not `warning`: these commands never ask, so the skipped path
-    // and how to undo it are the only sign the project config did nothing.
-    warnings.extend(trust.notices());
-    let raw_config = host
-        .load_init_files(
-            InitFiles::resolve(&trust.project_config, no_plugins),
-            warnings,
-        )
-        .context("load init.lua files")?;
-    raw_config
-        .unwrap_or_default()
-        .into_config(&names(host)?)
-        .context("invalid config")
-}
-
 pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) -> Result<()> {
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    // The `trust.paths` policy deliberately stops at the session entry points
-    // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
-    // user never saw, for a session it never runs.
-    let trust = project::resolve_noninteractive(&cwd, trust_mode);
-    load_env_files(&trust.project_config);
-
-    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
-        .context("initialize lua plugin host")?;
-
-    let (_, warnings) = super::load_plugins(
-        &mut host,
-        no_plugins,
-        super::BuiltinFailure::Fatal,
-        maki_lua::Interaction::None,
-        |host, names, warnings| {
-            let mut config = load_effective_config(host, no_plugins, &trust, names, warnings)?;
-            config.permissions = load_permissions(&trust.project_config);
-            Ok(config)
-        },
-    )?;
-    super::report_warnings(warnings);
+    // Load-bearing binding: `index` is a Lua builtin, and dropping the host
+    // stops the Lua thread the tool runs on.
+    let (_host, _config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
 
     let abs_path = Path::new(path)
         .canonicalize()
@@ -710,24 +650,10 @@ pub fn prompt(
         bail!("--plan can only be used with the 'system' prompt variant");
     }
 
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    // The `trust.paths` policy deliberately stops at the session entry points
-    // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
-    // user never saw, for a session it never runs.
-    let trust = project::resolve_noninteractive(&cwd, trust_mode);
+    let (host, config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
 
     let vars = template::env_vars();
     let reg = ToolRegistry::global_arc();
-    let mut host =
-        PluginHost::with_jit(Arc::clone(reg), !no_jit).context("initialize lua plugin host")?;
-    let (config, warnings) = super::load_plugins(
-        &mut host,
-        no_plugins,
-        super::BuiltinFailure::Fatal,
-        maki_lua::Interaction::None,
-        |host, names, warnings| load_effective_config(host, no_plugins, &trust, names, warnings),
-    )?;
-    super::report_warnings(warnings);
 
     if tools {
         let ctx = DescriptionContext {
@@ -752,8 +678,8 @@ pub fn prompt(
         return Ok(());
     }
 
-    let cwd_str = cwd.to_string_lossy();
-    let instructions = load_instruction_text(&cwd_str);
+    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    let instructions = load_instruction_text(&cwd.to_string_lossy());
     let slots = host.event_handle().collect_prompt_slots();
 
     let output = match variant {

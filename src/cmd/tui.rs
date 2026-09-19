@@ -15,10 +15,10 @@ use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::{InitFiles, Interaction, PackPlan, PackReport, PluginHost};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
-use maki_storage::id::MakiId;
 use maki_ui::{AppSession, RunOutcome};
 
 use crate::cli::{Cli, normalize_tool_name};
+use crate::resume::{self, Resolved};
 use crate::setup;
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
@@ -205,58 +205,16 @@ fn build_stack(
     ))
 }
 
-fn resolve_session(
-    continue_session: bool,
-    session_id: Option<&str>,
-    model: &str,
-    explicit_model: bool,
-    cwd: &str,
-    storage: &StateDir,
-) -> Result<AppSession> {
-    if let Some(mut session) = stored_session(continue_session, session_id, cwd, storage)? {
-        // An explicit `--model` is a choice about the session being opened,
-        // and a session's own spec is what every later switch reads.
-        if explicit_model {
-            session.set_model(model.to_owned());
-        }
-        return Ok(session);
+/// The tab a run opens on. Which session that is lives in [`crate::resume`],
+/// and the only step left here is the TUI-only one: an explicit `--model` is a
+/// choice about the session being opened, and a session's own spec is what
+/// every later switch reads.
+fn open_tab(resolved: Resolved, model: &str, explicit_model: bool, cwd: &str) -> AppSession {
+    let mut session = resolved.into_session(model, cwd);
+    if explicit_model {
+        session.set_model(model.to_owned());
     }
-    let session = AppSession::new(model, cwd);
-    setup::report_session_start(maki_otel::emit::START_FRESH, Some(session.id));
-    Ok(session)
-}
-
-/// The session the flags point at, if there is one. A missing `--continue`
-/// history is not an error, the caller just starts fresh.
-fn stored_session(
-    continue_session: bool,
-    session_id: Option<&str>,
-    cwd: &str,
-    storage: &StateDir,
-) -> Result<Option<AppSession>> {
-    if let Some(raw) = session_id {
-        let id: MakiId = raw
-            .parse()
-            .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
-        let session = AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
-        setup::report_session_start(maki_otel::emit::START_RESUME, Some(session.id));
-        return Ok(Some(session));
-    }
-    if continue_session {
-        match AppSession::latest(cwd, storage) {
-            Ok(Some(session)) => {
-                setup::report_session_start(maki_otel::emit::START_CONTINUE, Some(session.id));
-                return Ok(Some(session));
-            }
-            Ok(None) => {
-                tracing::info!("no previous session found for this directory, starting new");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to load latest session, starting new");
-            }
-        }
-    }
-    Ok(None)
+    session
 }
 
 fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
@@ -417,11 +375,20 @@ pub fn run(mut cli: Cli) -> Result<()> {
         }
     }
 
+    // Resolved before the modes diverge, so `--print`, the SDK and the UI
+    // cannot pick different sessions, different ids or a different cwd to look
+    // in, and all three report the same start to telemetry.
+    let cwd_str = cwd.to_string_lossy().into_owned();
+    let resolved = resume::resolve(&cli, &cwd_str, &storage)?;
+    setup::report_session_start(resolved.start_type, Some(&resolved.id));
+
     if cli.is_sdk_mode() {
         let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
+            resumed: resolved.into_resumed(),
+            storage: storage.clone(),
             model: stack.model,
             config: stack.config.agent,
             permissions_config: stack.config.permissions,
@@ -436,6 +403,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         .context("run sdk mode")?;
         return Ok(());
     }
+
     if cli.print {
         let timeouts = stack.timeouts();
         crate::print::run(crate::print::PrintParams {
@@ -452,20 +420,19 @@ pub fn run(mut cli: Cli) -> Result<()> {
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
             project_config: trust.project_config.clone(),
+            resumed: resolved.into_resumed(),
+            storage: storage.clone(),
         })
         .context("run print mode")?;
         return Ok(());
     }
 
-    let cwd_str = cwd.to_string_lossy().into_owned();
-    let mut tabs = vec![resolve_session(
-        cli.continue_session,
-        cli.session.as_deref(),
+    let mut tabs = vec![open_tab(
+        resolved,
         &stack.model.spec(),
         cli.model.is_some(),
         &cwd_str,
-        &storage,
-    )?];
+    )];
     let mut focused = 0;
     let mut warnings = startup_warnings;
     let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
@@ -564,9 +531,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 )?;
                 tabs = reloaded;
                 if tabs.is_empty() {
-                    let session = AppSession::new(&new_stack.model.spec(), &cwd_str);
-                    setup::report_session_start(maki_otel::emit::START_FRESH, Some(session.id));
-                    tabs.push(session);
+                    let replacement = Resolved::fresh();
+                    setup::report_session_start(replacement.start_type, Some(&replacement.id));
+                    tabs.push(replacement.into_session(&new_stack.model.spec(), &cwd_str));
                 }
                 stack = new_stack;
                 if let Some(report) = pack_report {
@@ -606,23 +573,21 @@ fn warn_stale_config_toml(project_config: &ProjectConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use color_eyre::eyre::eyre;
+    use maki_agent::tools::ToolRegistry;
     use maki_config::RawConfig;
     use maki_providers::Message;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tempfile::{TempDir, tempdir};
+    use tempfile::tempdir;
     use test_case::test_case;
 
     const STARTUP_SPEC: &str = "anthropic/claude-sonnet-4-5";
     const STORED_SPEC: &str = "zai/glm-4.6";
-    const DECOY_SPEC: &str = "openai/gpt-5";
+    const CWD: &str = "/project";
     const STORED_MESSAGE: &str = "the turn the stored session already had";
-    const DECOY_MESSAGE: &str = "an older session in the same directory";
-    const MALFORMED_SESSION_ID: &str = "not-a-session-id";
-    const INVALID_ID_ERROR: &str = "invalid session id";
-    const NOT_FOUND_ERROR: &str = "not found";
 
     fn no_names(_: &PluginHost) -> Result<Vec<String>> {
         Ok(Vec::new())
@@ -712,10 +677,6 @@ mod tests {
     /// `init.lua` must not be executed in that mode.
     #[test]
     fn no_plugins_skips_broken_init_lua_but_keeps_host_alive() {
-        use clap::Parser;
-        use maki_agent::tools::ToolRegistry;
-        use tempfile::tempdir;
-
         let dir = tempdir().expect("tempdir");
         let maki_dir: PathBuf = dir.path().join(".maki");
         fs::create_dir_all(&maki_dir).expect("mkdir .maki");
@@ -757,10 +718,6 @@ mod tests {
     /// cannot silently regress into a tautology.
     #[test]
     fn broken_init_lua_errors_without_no_plugins() {
-        use clap::Parser;
-        use maki_agent::tools::ToolRegistry;
-        use tempfile::tempdir;
-
         let dir = tempdir().expect("tempdir");
         let maki_dir: PathBuf = dir.path().join(".maki");
         fs::create_dir_all(&maki_dir).expect("mkdir .maki");
@@ -791,53 +748,25 @@ mod tests {
         plugin_host.begin_shutdown();
     }
 
-    fn save_session(storage: &StateDir, cwd: &str, spec: &str, text: &str) -> MakiId {
-        let mut session = AppSession::new(spec, cwd);
-        session.push_message(Message::user(text.to_owned()));
-        session.save(storage).expect("write session to disk");
-        session.id
-    }
-
-    /// Two sessions in one cwd, so `--continue` has to actually pick instead of
-    /// taking the only one there is. Saving claims the cwd index `latest` reads
-    /// first, so saving the target last pins the order rather than leaning on a
-    /// one second `updated_at`.
-    fn storage_with_stored_session() -> (TempDir, StateDir, String, MakiId) {
+    /// A session's recorded spec is the single source of truth for the model
+    /// its tab runs on, so both directions matter. An explicit `--model` used
+    /// to be ignored on a resumed session, and without one the startup default
+    /// must not overwrite the recorded spec, or per tab models die on every
+    /// restart.
+    #[test_case(false, STORED_SPEC ; "a resumed tab keeps its own spec")]
+    #[test_case(true, STARTUP_SPEC ; "explicit model wins over a resumed spec")]
+    fn explicit_model_overrides_only_a_resumed_spec(explicit_model: bool, expected_spec: &str) {
         let dir = tempdir().expect("tempdir");
         let storage = StateDir::from_path(dir.path().join("state"));
         let cwd = dir.path().to_string_lossy().into_owned();
-        save_session(&storage, &cwd, DECOY_SPEC, DECOY_MESSAGE);
-        let id = save_session(&storage, &cwd, STORED_SPEC, STORED_MESSAGE);
-        (dir, storage, cwd, id)
-    }
+        let mut stored = AppSession::new(STORED_SPEC, &cwd);
+        stored.push_message(Message::user(STORED_MESSAGE.to_owned()));
+        stored.save(&storage).expect("write session to disk");
+        let stored_id = stored.id;
+        let resolved = resume::resolve(&Cli::parse_from(["maki", "-c"]), &cwd, &storage)
+            .expect("continue resolves");
 
-    /// A session's recorded spec is the single source of truth for the model
-    /// its tab runs on, so both directions matter. An explicit `--model` used
-    /// to be quietly ignored on `--continue` and `--session`, the resumed spec
-    /// won. Without one the startup default must not overwrite that recorded
-    /// spec, or per tab models die on every restart.
-    #[test_case(false, true, false, STORED_SPEC ; "resume keeps its own spec")]
-    #[test_case(false, true, true, STARTUP_SPEC ; "explicit model wins over a resumed spec")]
-    #[test_case(true, false, false, STORED_SPEC ; "continue keeps the latest session's own spec")]
-    #[test_case(true, false, true, STARTUP_SPEC ; "explicit model wins over the latest session's spec")]
-    fn stored_session_opens_on_the_expected_spec(
-        continue_session: bool,
-        by_id: bool,
-        explicit_model: bool,
-        expected_spec: &str,
-    ) {
-        let (_dir, storage, cwd, stored_id) = storage_with_stored_session();
-        let raw_id = stored_id.to_string();
-
-        let session = resolve_session(
-            continue_session,
-            by_id.then_some(raw_id.as_str()),
-            STARTUP_SPEC,
-            explicit_model,
-            &cwd,
-            &storage,
-        )
-        .expect("stored session resolves");
+        let session = open_tab(resolved, STARTUP_SPEC, explicit_model, &cwd);
 
         assert_eq!(session.id, stored_id);
         assert_eq!(
@@ -851,47 +780,17 @@ mod tests {
         assert_eq!(session.model, expected_spec);
     }
 
-    /// Without `--continue` or `--session` the stored history does not matter.
-    /// A new tab starts on the startup spec, which already folded in `--model`,
-    /// so the flag changes nothing here.
-    #[test_case(false ; "no model flag")]
-    #[test_case(true ; "explicit model flag")]
-    fn fresh_session_starts_on_the_startup_spec(explicit_model: bool) {
-        let (_dir, storage, cwd, stored_id) = storage_with_stored_session();
-
-        let session = resolve_session(false, None, STARTUP_SPEC, explicit_model, &cwd, &storage)
-            .expect("fresh session resolves");
-
-        assert_ne!(session.id, stored_id);
-        assert!(session.messages().is_empty());
-        assert_eq!(session.model, STARTUP_SPEC);
-    }
-
-    /// `--continue` in a directory nobody has worked in yet is a fresh start,
-    /// not a reason to refuse to launch.
+    /// A fresh tab opens on the startup spec, which already folded in
+    /// `--model`, and under the id the resolver picked, so what the run
+    /// reports is what it writes.
     #[test]
-    fn continue_without_history_falls_back_to_a_fresh_session() {
-        let dir = tempdir().expect("tempdir");
-        let storage = StateDir::from_path(dir.path().join("state"));
-        let cwd = dir.path().to_string_lossy().into_owned();
+    fn a_fresh_tab_opens_on_the_resolved_id_and_the_startup_spec() {
+        let resolved = Resolved::fresh();
+        let id = resolved.id.id();
+        let session = open_tab(resolved, STARTUP_SPEC, false, CWD);
 
-        let session = resolve_session(true, None, STARTUP_SPEC, false, &cwd, &storage)
-            .expect("missing history must not be an error");
-
+        assert_eq!(session.id, id);
         assert!(session.messages().is_empty());
         assert_eq!(session.model, STARTUP_SPEC);
-    }
-
-    /// A `--session` that cannot be opened has to fail loudly. Starting fresh
-    /// on the same terminal looks exactly like the history was lost.
-    #[test_case(MALFORMED_SESSION_ID.to_owned(), INVALID_ID_ERROR ; "a malformed id")]
-    #[test_case(MakiId::generate().to_string(), NOT_FOUND_ERROR ; "an id nothing was written for")]
-    fn unopenable_session_id_errors(raw_id: String, expected: &str) {
-        let (_dir, storage, cwd, _) = storage_with_stored_session();
-
-        match resolve_session(false, Some(&raw_id), STARTUP_SPEC, false, &cwd, &storage) {
-            Err(e) => assert!(e.to_string().contains(expected), "{e}"),
-            Ok(s) => panic!("expected an error, got session {}", s.id),
-        }
     }
 }

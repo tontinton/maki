@@ -99,7 +99,7 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',', visible_alias = "disallowedTools")]
     pub disallowed_tools: Vec<String>,
 
-    /// Session ID for SDK mode
+    /// Write this run under a chosen session ID, unless one already exists there
     #[arg(long)]
     pub session_id: Option<String>,
 

@@ -5,6 +5,7 @@ use maki_agent::agent;
 use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::mcp::{McpHandle, McpSession};
 use maki_agent::permissions::PermissionManager;
+use maki_agent::session::Resumed;
 use maki_agent::template;
 use maki_agent::template::Vars;
 use maki_agent::tools::{FileAccess, RequestTools, ToolAudience, ToolRegistry};
@@ -42,8 +43,8 @@ pub(super) struct AgentLoop {
     agent_tx: flume::Sender<Envelope>,
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
     queue: Arc<QueueReceiver>,
-    session_id: Option<SessionRef>,
-    mailbox: Option<SessionMailbox>,
+    session_id: SessionRef,
+    mailbox: SessionMailbox,
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
@@ -56,8 +57,7 @@ impl AgentLoop {
         model_slot: Arc<ArcSwap<ModelSlot>>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
-        initial_history: Vec<Message>,
-        initial_context_size: u32,
+        resumed: Resumed,
         shared_history: SharedMessages,
         btw_system: Arc<ArcSwap<String>>,
         mcp_handle: Option<McpHandle>,
@@ -66,15 +66,15 @@ impl AgentLoop {
         answer_rx: flume::Receiver<String>,
         queue: Arc<QueueReceiver>,
         cancels: Arc<RunCancels>,
-        session_id: Option<SessionRef>,
-        mailbox: Option<SessionMailbox>,
+        mailbox: SessionMailbox,
         timeouts: maki_providers::Timeouts,
         lua_handle: EventHandle,
         subagent_cancels: Arc<CancelMap<String>>,
         model_policy: Arc<ModelPolicy>,
     ) -> Self {
-        let mcp = mcp_handle.map(|h| McpSession::new(h, &initial_history));
+        let mcp = mcp_handle.map(|h| McpSession::new(h, &resumed.history));
         Self {
+            session_id: resumed.id,
             model_slot,
             config,
             tool_output_lines,
@@ -82,8 +82,8 @@ impl AgentLoop {
             instructions: Instructions::default(),
             tools: RequestTools::default(),
             mcp,
-            history: History::restored(initial_history).with_mirror(shared_history),
-            gauge: ContextGauge::restored(initial_context_size),
+            history: History::restored(resumed.history).with_mirror(shared_history),
+            gauge: ContextGauge::restored(resumed.context_size),
             btw_system,
             cancels,
             permissions,
@@ -91,7 +91,6 @@ impl AgentLoop {
             agent_tx,
             answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
             queue,
-            session_id,
             mailbox,
             timeouts,
             lua_handle,
@@ -227,7 +226,7 @@ impl AgentLoop {
             cancel,
             &self.config,
             instructions,
-            self.session_id.as_ref(),
+            Some(&self.session_id),
             self.timeouts.retry,
         )
         .await
@@ -295,9 +294,9 @@ impl AgentLoop {
                 config: self.config.clone(),
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),
-                session_id: self.session_id.clone(),
+                session_id: Some(self.session_id.clone()),
                 task_id: None,
-                mailbox: self.mailbox.clone(),
+                mailbox: Some(self.mailbox.clone()),
                 timeouts: self.timeouts,
                 file_access: Arc::clone(&self.file_access),
                 prompt_slots: Arc::new(prompt_slots),

@@ -39,13 +39,12 @@ mod terminal_image;
 use std::time::Instant;
 
 use color_eyre::Result;
-use maki_agent::ToolOutput;
 use maki_lua::PackPlan;
-use maki_providers::Message;
-use maki_providers::TokenUsage;
 use maki_storage::id::MakiId;
 
-pub type AppSession = maki_storage::sessions::Session<Message, TokenUsage, ToolOutput>;
+/// The tabs keep their own name, but the type is the same one the drivers
+/// persist, by construction rather than by coincidence.
+pub use maki_agent::session::StoredSession as AppSession;
 
 /// Width of the controlling terminal, if any. Answers even when stdout is
 /// redirected, so callers that care gate on [`std::io::IsTerminal`].

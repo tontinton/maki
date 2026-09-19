@@ -20,6 +20,7 @@ use crossterm::event::{
 };
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
+use maki_agent::session::Resumed;
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
@@ -407,12 +408,14 @@ impl SpawnCtx {
         let cell = Arc::new(ArcSwap::from(Arc::clone(&slot)));
         let handles = AgentHandles::spawn(
             &cell,
-            session.messages().to_vec(),
-            session.meta.context_size,
+            Resumed {
+                id: SessionRef::from(session.id),
+                history: session.messages().to_vec(),
+                context_size: session.meta.context_size,
+            },
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,
-            Some(SessionRef::from(session.id)),
             self.timeouts,
             self.lua_event_handle.clone(),
             self.mcp_handle.clone(),

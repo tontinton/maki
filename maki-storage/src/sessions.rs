@@ -78,8 +78,20 @@ pub enum SessionError {
         raw_id: String,
         source: MakiIdParseError,
     },
+    #[error("session log {path} has no header record")]
+    MissingHeader { path: String },
     #[error("session log diverged ({reason}); rewrite required")]
     LogDiverged { reason: &'static str },
+}
+
+impl SessionError {
+    /// "Nothing was ever written here", as opposed to "something is there and
+    /// this process could not read it". A caller that creates a session when
+    /// the load fails has to tell the two apart, or it answers an unreadable
+    /// session by overwriting it.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Storage(StorageError::NotFound(_)))
+    }
 }
 
 /// Per-model token breakdown entry. Mirrors the four usage counters tracked by
@@ -1052,7 +1064,12 @@ where
         }
     }
 
-    let id = id.ok_or(StorageError::NotFound(display_path.to_string()))?;
+    // Not `NotFound`: the file is there and this is the user's only copy of
+    // whatever is in it. A caller that creates a session when nothing was ever
+    // written must not take this for an empty slot.
+    let id = id.ok_or_else(|| SessionError::MissingHeader {
+        path: display_path.to_string(),
+    })?;
 
     Ok(Session {
         version: SESSION_VERSION,
@@ -1499,6 +1516,25 @@ where
         self.rewrite();
     }
 
+    /// This transcript as a session of its own, under a new id and in the
+    /// directory the forking run works in, so `--continue` there finds the fork
+    /// and the original keeps its own place in the index.
+    ///
+    /// Everything the transcript needs to render travels along, tool outputs
+    /// and subagent histories included. Spending does not: the fork is billed
+    /// for the turns it runs, and counting the original's again would bill them
+    /// twice. The epoch is minted fresh because no append cursor into the file
+    /// this was read from says anything about the new one.
+    pub fn fork(mut self, id: MakiId, cwd: &str) -> Self {
+        self.id = id;
+        self.cwd = cwd.into();
+        self.token_usage = U::default();
+        self.usage_by_model.clear();
+        self.created_at = now_epoch();
+        self.rewrite_messages();
+        self
+    }
+
     pub fn push_message(&mut self, msg: M) {
         Arc::make_mut(&mut self.messages).push(msg);
         self.touch();
@@ -1683,6 +1719,15 @@ where
     pub fn load(id: MakiId, dir: &StateDir) -> Result<Self, SessionError> {
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
         Self::load_from(id, &sessions_dir)
+    }
+
+    /// Whether the id names a session on disk, without paying to parse it. A
+    /// file that exists but no longer loads still answers `true`, because the
+    /// question callers ask is "would writing here destroy something". Asking
+    /// must not create the directory it looks in, so this is the one entry
+    /// point that joins the path instead of ensuring it.
+    pub fn exists(id: MakiId, dir: &StateDir) -> bool {
+        locate_session_file(&dir.path().join(SESSIONS_DIR), id).is_some()
     }
 
     pub fn load_from(id: MakiId, dir: &Path) -> Result<Self, SessionError> {
@@ -2098,6 +2143,29 @@ mod tests {
         assert_same_session(&reloaded, &loaded);
         assert_eq!(reloaded.subagents(), loaded.subagents());
         assert_eq!(reloaded.usage_by_model(), loaded.usage_by_model());
+    }
+
+    /// A fork opens with the conversation it copied, in the directory that
+    /// asked for it, owing nothing for the turns it did not run.
+    #[test]
+    fn fork_carries_the_transcript_and_none_of_the_spending() {
+        const FORK_CWD: &str = "/project/fork";
+        const TOOL_ID: &str = "tool-1";
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("first"));
+        session.insert_tool_output(TOOL_ID.into(), Arc::new(Value::from("out")));
+        session.token_usage = Value::from(1_000);
+        session.add_model_usage("m", usage(1_000, Some(SONNET_COST)));
+        let id = MakiId::generate();
+
+        let forked = session.fork(id, FORK_CWD);
+
+        assert_eq!(forked.id, id);
+        assert_eq!(forked.cwd, FORK_CWD);
+        assert_eq!(forked.messages().len(), 1);
+        assert!(forked.tool_outputs().contains_key(TOOL_ID));
+        assert_eq!(forked.token_usage, Value::default());
+        assert!(forked.usage_by_model().is_empty());
     }
 
     #[test]
@@ -3252,8 +3320,11 @@ mod tests {
         assert!(loaded.tool_outputs().contains_key("t1"));
     }
 
+    /// A log whose header is unreadable is not an empty slot: the file is
+    /// there, and a caller that creates a session on `NotFound` would write
+    /// over whatever it holds.
     #[test]
-    fn corrupt_header_line_only_returns_not_found() {
+    fn corrupt_header_line_only_is_not_reported_as_missing() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let id: MakiId = "01965087-4c71-7f00-8000-000000000000".parse().unwrap();
@@ -3261,10 +3332,8 @@ mod tests {
         fs::write(&path, "NOT_A_HEADER\n").unwrap();
 
         let err = TestSession::load_from(id, dir).unwrap_err();
-        assert!(matches!(
-            err,
-            SessionError::Storage(StorageError::NotFound(_))
-        ));
+        assert!(matches!(err, SessionError::MissingHeader { .. }), "{err}");
+        assert!(!err.is_not_found());
     }
 
     #[test]

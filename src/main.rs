@@ -2,6 +2,7 @@ mod cli;
 mod cmd;
 mod print;
 mod project_trust;
+mod resume;
 mod sdk_mode;
 mod setup;
 mod update;

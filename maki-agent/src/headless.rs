@@ -5,75 +5,48 @@ use std::time::Duration;
 
 use async_lock::Mutex;
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
-use maki_providers::ContextGauge;
-use maki_providers::Message;
 use maki_providers::Timeouts;
-use maki_providers::TokenUsage;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
 use maki_storage::StateDir;
-use maki_storage::id::{MakiId, SessionRef};
-use maki_storage::sessions::Session;
+use maki_storage::id::SessionRef;
 use serde_json::Value;
-use tracing::{error, warn};
+use tracing::error;
 
-use crate::agent::{self, History};
+use crate::agent;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
+use crate::session::{Resumed, SessionTrack};
 use crate::template;
 use crate::tools::{FileAccess, LocalTools, RequestTools, ToolAudience, ToolRegistry};
+use crate::types::EventSender;
 use crate::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
-    EventStreamGuard, ImageSource, McpHandle, McpSession, PermissionsConfig, RunLedger,
-    SessionEvents, SessionMailbox, ToolOutput, ToolOutputLines, event_stream,
+    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, EventStreamGuard,
+    ImageSource, McpHandle, McpSession, PermissionsConfig, RunLedger, SessionEvents,
+    SessionMailbox, ToolOutputLines, event_stream,
 };
 
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-type StoredSession = Session<Message, TokenUsage, ToolOutput>;
-
-struct SessionStore {
-    dir: StateDir,
-    session: StoredSession,
-}
-
-impl SessionStore {
-    fn open(session_id: MakiId, cwd: &str, model_spec: &str) -> Option<Self> {
-        let dir = StateDir::resolve()
-            .map_err(|e| warn!(error = %e, "state dir unavailable; session will not be persisted"))
-            .ok()?;
-        Some(Self::open_in(dir, session_id, cwd, model_spec))
-    }
-
-    fn open_in(dir: StateDir, session_id: MakiId, cwd: &str, model_spec: &str) -> Self {
-        match StoredSession::load(session_id, &dir) {
-            Ok(session) => Self { dir, session },
-            Err(_) => {
-                let mut session = StoredSession::new(model_spec, cwd);
-                session.id = session_id;
-                let mut store = Self { dir, session };
-                store.save();
-                store
-            }
+/// Resolve a provider, or report the failure on the event stream and let the
+/// caller give up. Every site that reaches a provider comes through here, so a
+/// failed connect cannot be silent on one path and loud on another. What giving
+/// up means is the caller's call: abandon the session, or skip this turn.
+async fn connect(
+    model: &mut Model,
+    timeouts: Timeouts,
+    event_tx: &EventSender,
+) -> Option<Arc<dyn Provider>> {
+    match provider::from_model_async(model, timeouts).await {
+        Ok(p) => Some(Arc::from(p)),
+        Err(e) => {
+            error!(error = %e, "provider error");
+            let _ = event_tx.send(AgentEvent::Error {
+                message: e.user_message(),
+            });
+            None
         }
-    }
-
-    fn save(&mut self) {
-        if let Err(e) = self.session.save(&self.dir) {
-            warn!(error = %e, session_id = %self.session.id, "failed to persist session");
-        }
-    }
-
-    /// `context_size` travels with the messages, since a resumed session seeds
-    /// its gauge from it: stored without one, the next process is back to
-    /// estimating a transcript this one had measured.
-    fn record_turn(&mut self, messages: &[Message], model_spec: String, context_size: u32) {
-        self.session.replace_messages(messages.to_vec());
-        self.session.set_model(model_spec);
-        self.session.meta.context_size = context_size;
-        self.session.update_title_if_default();
-        self.save();
     }
 }
 
@@ -88,6 +61,10 @@ pub struct HeadlessParams {
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
+    pub resumed: Resumed,
+    /// Where the transcript is written. The same dir the caller resolved the
+    /// session from, so a run cannot read one session and write another.
+    pub storage: StateDir,
     /// The `always_*` knobs. A headless run has no toggle UI, so config is the
     /// whole answer. The model gate stays in `RequestOptions::clamped`.
     pub defaults: SessionDefaults,
@@ -170,38 +147,36 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
         &params.model,
     );
 
-    let mcp = params.mcp_handle.clone().map(|h| McpSession::new(h, &[]));
+    let mcp = params
+        .mcp_handle
+        .clone()
+        .map(|h| McpSession::new(h, &params.resumed.history));
     let tool_names = advertised_tool_names(tools.definitions(), mcp.as_ref());
 
     let (guard, events) = event_stream();
     let event_tx = guard.sender(0);
 
-    let session_id = MakiId::generate();
-    let session_ref = SessionRef::from(session_id);
-    let session_ref_clone = session_ref.clone();
-    let mailbox = SessionMailbox::register(session_id);
+    let session_ref = params.resumed.id.clone();
+    let mailbox = SessionMailbox::register(session_ref.id());
+    let run_session_ref = session_ref.clone();
     let defaults = params.defaults;
     let working_dir_path = params.initial_wd.clone();
+    let task_working_dir = working_dir.clone();
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
-        let provider: Arc<dyn Provider> =
-            match provider::from_model_async(&mut model, params.timeouts).await {
-                Ok(p) => Arc::from(p),
-                Err(e) => {
-                    error!(error = %e, "provider error");
-                    let _ = event_tx.send(AgentEvent::Error {
-                        message: e.user_message(),
-                    });
-                    return;
-                }
-            };
+        let Some(provider) = connect(&mut model, params.timeouts, &event_tx).await else {
+            return;
+        };
+        let mut track = SessionTrack::open(params.resumed, params.storage, &task_working_dir);
+
         let error_tx = event_tx.clone();
-        let mut history = History::new(Vec::new());
-        let mut gauge = ContextGauge::default();
+        // Outlives `agent`, so dropping it writes the transcript once the agent
+        // that produced it is gone, without this body saying so.
+        let mut turn = track.turn(model.spec());
         let mut agent = Agent::new(
             AgentParams {
                 provider,
-                model,
+                model: model.clone(),
                 config: params.config,
                 tool_output_lines: ToolOutputLines::default(),
                 permissions: Arc::new(PermissionManager::new(
@@ -210,9 +185,9 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                     params.project_config,
                     params.plugin_rules,
                 )),
-                session_id: Some(session_ref_clone.clone()),
+                session_id: Some(run_session_ref),
                 task_id: None,
-                mailbox: Some(mailbox.clone()),
+                mailbox: Some(mailbox),
                 timeouts: params.timeouts,
                 file_access: FileAccess::fresh(),
                 prompt_slots: Arc::new(params.prompt_slots),
@@ -222,13 +197,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::clone(&params.model_policy),
             },
-            AgentRunParams {
-                gauge: &mut gauge,
-                history: &mut history,
-                system,
-                event_tx,
-                tools,
-            },
+            turn.run_params(system, event_tx, tools),
         )
         .with_loaded_instructions(instructions.loaded)
         .with_mcp(mcp);
@@ -250,7 +219,6 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
             });
         }
     }));
-
     (
         HeadlessHandle {
             tool_names,
@@ -271,12 +239,9 @@ pub struct InteractiveParams {
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
-    pub session_id: Option<SessionRef>,
-    pub initial_history: Vec<Message>,
-    /// What the provider last counted for `initial_history`, zero for a
-    /// transcript nobody has sent yet. Seeds the gauge so a resumed session's
-    /// first request is budgeted against a measurement rather than a floor.
-    pub initial_context_size: u32,
+    pub resumed: Resumed,
+    /// See [`HeadlessParams::storage`].
+    pub storage: StateDir,
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
@@ -318,7 +283,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let mcp = params
         .mcp_handle
         .clone()
-        .map(|h| McpSession::new(h, &params.initial_history));
+        .map(|h| McpSession::new(h, &params.resumed.history));
     let tool_names = advertised_tool_names(tools.definitions(), mcp.as_ref());
 
     let (guard, events) = event_stream();
@@ -328,14 +293,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
 
-    let (session_id, session_ref) = match params.session_id.clone() {
-        Some(w) => (w.id(), w),
-        None => {
-            let id = MakiId::generate();
-            (id, SessionRef::from(id))
-        }
-    };
-    let mailbox = SessionMailbox::register(session_id);
+    let session_ref = params.resumed.id.clone();
+    let mailbox = SessionMailbox::register(session_ref.id());
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mut permissions_config = params.permissions_config;
@@ -354,21 +313,10 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let task_permissions = Arc::clone(&permissions);
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
-        let mut provider: Arc<dyn Provider> =
-            match provider::from_model_async(&mut model, params.timeouts).await {
-                Ok(p) => Arc::from(p),
-                Err(e) => {
-                    error!(error = %e, "provider error");
-                    let _ = base_tx.send(AgentEvent::Error {
-                        message: e.user_message(),
-                    });
-                    return;
-                }
-            };
-
-        let mut store = SessionStore::open(session_id, &working_dir, &model.spec());
-        let mut history = History::restored(params.initial_history);
-        let mut gauge = ContextGauge::restored(params.initial_context_size);
+        let Some(mut provider) = connect(&mut model, params.timeouts, &base_tx).await else {
+            return;
+        };
+        let mut track = SessionTrack::open(params.resumed, params.storage, &working_dir);
         let mut run_id: u64 = 0;
 
         while let Ok(input) = input_rx.recv_async().await {
@@ -398,29 +346,22 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                 .filter(|candidate| params.model_policy.allows(&candidate.spec()))
                 && new_model.spec() != model.spec()
             {
-                match provider::from_model_async(&mut new_model, params.timeouts).await {
-                    Ok(p) => {
-                        provider = Arc::from(p);
-                        tools = RequestTools::build(
-                            ToolRegistry::global(),
-                            &vars,
-                            &new_model,
-                            &params.config,
-                            &params.excluded_tools,
-                            params.defaults.workflow,
-                            mcp.is_some(),
-                        );
-                        model = new_model;
-                    }
-                    Err(e) => {
-                        error!(error = %e, "provider error");
-                        let _ = error_tx.send(AgentEvent::Error {
-                            message: e.user_message(),
-                        });
-                        run_id += 1;
-                        continue;
-                    }
-                }
+                let Some(switched) = connect(&mut new_model, params.timeouts, &error_tx).await
+                else {
+                    run_id += 1;
+                    continue;
+                };
+                provider = switched;
+                tools = RequestTools::build(
+                    ToolRegistry::global(),
+                    &vars,
+                    &new_model,
+                    &params.config,
+                    &params.excluded_tools,
+                    params.defaults.workflow,
+                    mcp.is_some(),
+                );
+                model = new_model;
             }
 
             let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
@@ -439,6 +380,9 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
             while answer_rx.lock().await.try_recv().is_ok() {}
 
+            // Outlives `agent`, so this turn is on disk before the next prompt
+            // is read, without the loop body remembering to write it.
+            let mut turn = track.turn(model.spec());
             let mut agent = Agent::new(
                 AgentParams {
                     provider: Arc::clone(&provider),
@@ -458,13 +402,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     audience: ToolAudience::MAIN,
                     model_policy: Arc::clone(&params.model_policy),
                 },
-                AgentRunParams {
-                    gauge: &mut gauge,
-                    history: &mut history,
-                    system,
-                    event_tx,
-                    tools: tools.clone(),
-                },
+                turn.run_params(system, event_tx, tools.clone()),
             )
             .with_loaded_instructions(instructions.loaded.clone())
             .with_user_response_rx(Arc::clone(&answer_rx))
@@ -483,9 +421,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                 });
             }
 
-            if let Some(store) = &mut store {
-                store.record_turn(history.as_slice(), model.spec(), gauge.size());
-            }
             run_id += 1;
         }
     }));
@@ -547,15 +482,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use futures_lite::future::poll_once;
-    use maki_storage::sessions::generate_title;
-    use tempfile::TempDir;
 
     use super::*;
     use crate::mcp::McpCommand;
 
-    const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
-    const CWD: &str = "/project";
-    const MODEL_SPEC: &str = "anthropic/claude-test";
     const RUN_ID: u64 = 7;
     const STREAM_ENDED: &str = "the stream must end with the run, not with teardown";
     const SHUTDOWN_WEDGED: &str = "the MCP shutdown must still be waiting for its ack";
@@ -563,95 +493,6 @@ mod tests {
     const BODY_EVENT: &str = "the body's event must be delivered before the close";
     const STILL_WORKING: &str = "await_shutdown must not return while the task still works";
     const TASK_DROPPED: &str = "await_shutdown dropped a task that had work left";
-
-    fn session_id() -> MakiId {
-        SESSION_ID.parse().unwrap()
-    }
-
-    fn store_in(tmp: &TempDir) -> SessionStore {
-        SessionStore::open_in(
-            StateDir::from_path(tmp.path().to_path_buf()),
-            session_id(),
-            CWD,
-            MODEL_SPEC,
-        )
-    }
-
-    fn load(tmp: &TempDir) -> StoredSession {
-        StoredSession::load(session_id(), &StateDir::from_path(tmp.path().to_path_buf())).unwrap()
-    }
-
-    #[test]
-    fn new_session_is_loadable_before_first_turn() {
-        let tmp = TempDir::new().unwrap();
-        store_in(&tmp);
-        let loaded = load(&tmp);
-        assert_eq!(loaded.id, session_id());
-        assert_eq!(loaded.cwd, CWD);
-        assert_eq!(loaded.model, MODEL_SPEC);
-        assert!(loaded.messages().is_empty());
-    }
-
-    const CONTEXT_SIZE: u32 = 42_000;
-
-    #[test]
-    fn record_turn_persists_messages_and_title() {
-        let tmp = TempDir::new().unwrap();
-        let mut store = store_in(&tmp);
-        let messages = vec![Message::user("fix the login bug".into())];
-        store.record_turn(&messages, MODEL_SPEC.into(), CONTEXT_SIZE);
-
-        let loaded = load(&tmp);
-        assert_eq!(loaded.messages().len(), 1);
-        assert_eq!(loaded.title, generate_title(&messages));
-        assert_eq!(
-            loaded.meta.context_size, CONTEXT_SIZE,
-            "a resumed session seeds its gauge from this, so it has to be stored"
-        );
-    }
-
-    #[test]
-    fn record_turn_persists_observations() {
-        let tmp = TempDir::new().unwrap();
-        let mut store = store_in(&tmp);
-        store.record_turn(
-            &[
-                Message::user("fix the login bug".into()),
-                Message::observation("build failed".into()),
-            ],
-            MODEL_SPEC.into(),
-            CONTEXT_SIZE,
-        );
-
-        let loaded = load(&tmp);
-        assert_eq!(loaded.messages().len(), 2);
-        assert!(loaded.messages()[1].is_observation());
-    }
-
-    #[test]
-    fn reopening_resumes_existing_session() {
-        let tmp = TempDir::new().unwrap();
-        let mut store = store_in(&tmp);
-        store.record_turn(
-            &[Message::user("first prompt".into())],
-            MODEL_SPEC.into(),
-            CONTEXT_SIZE,
-        );
-        drop(store);
-
-        let mut store = store_in(&tmp);
-        assert_eq!(store.session.messages().len(), 1);
-
-        let messages = vec![
-            Message::user("first prompt".into()),
-            Message::user("second prompt".into()),
-        ];
-        store.record_turn(&messages, "other/model".into(), CONTEXT_SIZE);
-
-        let loaded = load(&tmp);
-        assert_eq!(loaded.messages().len(), 2);
-        assert_eq!(loaded.model, "other/model");
-    }
 
     #[test]
     fn extract_tool_names_filters_valid_entries() {

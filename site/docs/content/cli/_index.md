@@ -24,12 +24,13 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--yolo` | yes | yes | yes (or `--permission-mode bypassPermissions`) |
 | `--no-plugins` / `--no-commands` / `--no-jit` | yes | yes | yes |
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
-| `-c` / `--continue`, `-s` / `--session` | yes | no (always new session) | yes |
+| `-c` / `--continue`, `-s` / `--session` | yes | yes | yes |
 | `--exit-on-done` | yes | n/a (always exits) | n/a |
 | `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | no | no | yes |
-| `--max-turns`, `--session-id`, `--fork-session` | no | no | yes |
+| `--session-id`, `--fork-session` | yes | yes | yes |
+| `--max-turns` | no | no | yes |
 | `--permission-mode` | no | no | yes |
 | `--include-partial-messages` | no | no | yes |
 
@@ -41,8 +42,8 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
 | `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used → `provider.default_model` in config → auto-detect from available providers |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
-| `-c`, `--continue` | Resume the most recent session in this directory (TUI / SDK only) |
-| `-s`, `--session` / `--resume <ID>` | Resume a specific session (TUI / SDK only) |
+| `-c`, `--continue` | Resume the most recent session in this directory |
+| `-s`, `--session` / `--resume <ID>` | Resume a specific session |
 | `--output-format <text\|json\|stream-json>` | Output shape for `--print` (default `text`) |
 | `--input-format <text\|stream-json>` | With `--print`, `stream-json` enters SDK mode |
 | `--no-commands` | Skip custom commands from `.maki/commands`, `.claude/commands`, etc. |
@@ -53,8 +54,8 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers) |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
-| `--session-id <ID>` | Session id for SDK mode |
-| `--fork-session` | Load a session's history under a new id (SDK) |
+| `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-s` / `-c` is continuing that same session |
+| `--fork-session` | Copy the resumed session's history under a new id, leaving the original untouched. See [Sessions](/docs/headless/#sessions) |
 | `--max-turns <N>` | Cap agent turns (SDK) |
 | `--system-prompt <TEXT>` | Replace the system prompt (SDK only) |
 | `--append-system-prompt <TEXT>` | Append to the built-in system prompt (SDK only) |
