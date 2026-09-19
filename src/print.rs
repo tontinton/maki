@@ -27,6 +27,7 @@ use maki_providers::model::Model;
 use maki_providers::{TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
+use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -154,6 +155,9 @@ pub struct PrintParams {
     /// Which session this run continues and writes under, and where. Resolved
     /// by the caller from the same flags every other entry point reads.
     pub resumed: Resumed,
+    /// The right to write [`Self::resumed`]'s session, taken when it was
+    /// resolved and held for the whole run.
+    pub claim: SessionClaim,
     pub storage: StateDir,
 }
 
@@ -173,6 +177,7 @@ pub fn run(params: PrintParams) -> Result<()> {
         plugin_rules,
         project_config,
         resumed,
+        claim,
         storage,
     } = params;
 
@@ -210,6 +215,7 @@ pub fn run(params: PrintParams) -> Result<()> {
         mcp_handle,
         initial_wd: cwd,
         resumed,
+        claim,
         storage,
         defaults,
         model_policy,

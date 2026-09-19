@@ -2,8 +2,8 @@
 
 use maki_providers::{ContextGauge, Message, TokenUsage};
 use maki_storage::StateDir;
-use maki_storage::id::{MakiId, SessionRef};
-use maki_storage::sessions::Session;
+use maki_storage::id::SessionRef;
+use maki_storage::sessions::{Session, SessionClaim};
 use tracing::warn;
 
 use crate::agent::History;
@@ -80,9 +80,12 @@ impl SessionTrack {
     /// Built once the provider resolves, so a run that never started leaves no
     /// file behind. The state dir comes from the caller rather than being
     /// resolved here, so the run writes where its history was read from.
-    pub fn open(resumed: Resumed, storage: StateDir, cwd: &str) -> Self {
+    ///
+    /// Takes the claim by value, so nobody else can write the session for as
+    /// long as this track can.
+    pub fn open(resumed: Resumed, claim: SessionClaim, storage: StateDir, cwd: &str) -> Self {
         Self {
-            store: SessionStore::open(storage, resumed.session, resumed.id.id(), cwd),
+            store: SessionStore::open(storage, claim, resumed.session, cwd),
             history: History::restored(resumed.history),
             gauge: ContextGauge::restored(resumed.context_size),
         }
@@ -135,6 +138,7 @@ impl Drop for SessionTurn<'_> {
 
 struct SessionStore {
     dir: StateDir,
+    claim: SessionClaim,
     session: StoredSession,
 }
 
@@ -144,13 +148,17 @@ impl SessionStore {
     /// yet is held in memory until [`Self::record_turn`] has something to
     /// store, so every file on disk has a transcript in it. The blank model
     /// spec is [`SessionTrack::turn`]'s to fill, and it runs before any write.
-    fn open(dir: StateDir, stored: Option<StoredSession>, id: MakiId, cwd: &str) -> Self {
+    fn open(dir: StateDir, claim: SessionClaim, stored: Option<StoredSession>, cwd: &str) -> Self {
         let session = stored.unwrap_or_else(|| {
             let mut session = StoredSession::new("", cwd);
-            session.id = id;
+            session.id = claim.id();
             session
         });
-        Self { dir, session }
+        Self {
+            dir,
+            claim,
+            session,
+        }
     }
 
     /// `context_size` travels with the messages, since a resumed session seeds
@@ -169,7 +177,7 @@ impl SessionStore {
         self.session.replace_messages(messages.to_vec());
         self.session.meta.context_size = context_size;
         self.session.update_title_if_default();
-        if let Err(e) = self.session.save(&self.dir) {
+        if let Err(e) = self.session.save(&self.claim, &self.dir) {
             warn!(error = %e, session_id = %self.session.id, "failed to persist session");
         }
     }
@@ -177,6 +185,7 @@ impl SessionStore {
 
 #[cfg(test)]
 mod tests {
+    use maki_storage::id::MakiId;
     use maki_storage::sessions::generate_title;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -212,8 +221,12 @@ mod tests {
         Resumed::empty(SessionRef::from(session_id()))
     }
 
+    fn claim(tmp: &TempDir) -> SessionClaim {
+        SessionClaim::acquire(session_id(), &state_dir(tmp)).expect("nothing else holds it")
+    }
+
     fn track_on(tmp: &TempDir) -> SessionTrack {
-        SessionTrack::open(resumed(), state_dir(tmp), CWD)
+        SessionTrack::open(resumed(), claim(tmp), state_dir(tmp), CWD)
     }
 
     fn push_turn(track: &mut SessionTrack, spec: &str, edit: impl FnOnce(AgentRunParams<'_>)) {
@@ -250,7 +263,7 @@ mod tests {
             "{NO_EMPTY_FILE}"
         );
         assert!(
-            StoredSession::latest(CWD, &state_dir(&tmp))
+            StoredSession::claim_latest(CWD, &state_dir(&tmp))
                 .expect("an empty store is readable")
                 .is_none(),
             "{NO_EMPTY_LATEST}"
@@ -321,6 +334,7 @@ mod tests {
 
         let mut track = SessionTrack::open(
             Resumed::stored(SessionRef::from(session_id()), stored),
+            claim(&tmp),
             state_dir(&tmp),
             CWD,
         );

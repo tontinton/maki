@@ -4,6 +4,12 @@
 //! the newest snapshot of every session per wake and performs O(delta)
 //! appends. Deletes travel through the same per-session slot as saves, so
 //! whichever the app asked for last is what reaches disk.
+//!
+//! Every entry carries the claim it is written under, and the writer holds
+//! none of its own. A session stays locked exactly while a tab has it open or
+//! a write for it is still queued, so a tab that lets go frees it the moment
+//! its last snapshot lands. There is no release message that could overtake
+//! that snapshot.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -12,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SESSIONS_DIR, SessionError, SessionLog};
+use maki_storage::sessions::{SessionClaim, SessionError};
 use maki_storage::{StateDir, StorageError};
 use tracing::warn;
 
@@ -30,8 +36,10 @@ type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 /// drain a save enqueued after it, so the delete unlinked a session the app
 /// had just saved.
 enum Entry {
-    Save(Arc<AppSession>),
-    Delete(DeleteCallback),
+    Save(Arc<AppSession>, SessionClaim),
+    /// The claim when the caller holds one. Acquiring it again here would
+    /// conflict with that holder, since a lock is per open file.
+    Delete(Option<SessionClaim>, DeleteCallback),
 }
 
 pub struct StorageWriter {
@@ -53,7 +61,6 @@ impl StorageWriter {
                 let mut writer = Writer {
                     dir,
                     warn_tx,
-                    logs: HashMap::new(),
                     failing: HashSet::new(),
                 };
                 while wake_rx.recv().is_ok() {
@@ -71,21 +78,28 @@ impl StorageWriter {
         }
     }
 
-    pub fn send(&self, session: Arc<AppSession>) {
-        self.enqueue(session.id, Entry::Save(session));
+    pub fn send(&self, session: Arc<AppSession>, claim: SessionClaim) {
+        self.enqueue(session.id, Entry::Save(session, claim));
     }
 
     /// Delete a session's files on the writer thread; `done` fires there, so
     /// callers never block on disk. Deleting a session that was never written
     /// reports success, and a save enqueued afterwards supersedes the delete.
-    pub fn delete(&self, id: MakiId, done: impl FnOnce(Result<(), SessionError>) + Send + 'static) {
-        self.enqueue(id, Entry::Delete(Box::new(done)));
+    /// A caller with the session open passes its claim. Any other session is
+    /// claimed here and refused if another process has it.
+    pub fn delete(
+        &self,
+        id: MakiId,
+        claim: Option<SessionClaim>,
+        done: impl FnOnce(Result<(), SessionError>) + Send + 'static,
+    ) {
+        self.enqueue(id, Entry::Delete(claim, Box::new(done)));
     }
 
     fn enqueue(&self, id: MakiId, entry: Entry) {
         lock(&self.pending).insert(id, entry);
         if self.wake.send(()).is_err()
-            && let Some(Entry::Delete(done)) = lock(&self.pending).remove(&id)
+            && let Some(Entry::Delete(_, done)) = lock(&self.pending).remove(&id)
         {
             done(Err(writer_gone()));
         }
@@ -112,70 +126,52 @@ fn writer_gone() -> SessionError {
 struct Writer {
     dir: StateDir,
     warn_tx: flume::Sender<String>,
-    /// Only cursors that still describe their file.
-    logs: HashMap<MakiId, SessionLog>,
     /// Sessions whose last write failed, so a sick disk warns once instead of
     /// once per frame.
     failing: HashSet<MakiId>,
 }
 
 impl Writer {
-    fn forget(&mut self, id: MakiId) {
-        self.logs.remove(&id);
-        self.failing.remove(&id);
-    }
-
     fn flush(&mut self, pending: &Pending) {
         // Bound first: a `for` head temporary lives for the whole loop, so
         // iterating the guard directly would deadlock the re-insert below.
         let batch = mem::take(&mut *lock(pending));
         for (id, entry) in batch {
             match entry {
-                Entry::Save(session) => {
-                    let result = self.write(&session);
+                Entry::Save(session, claim) => {
+                    let result = claim.persist(&*session);
                     if result.is_err() {
                         // `checkpoint` never resends an unchanged revision, so
                         // a dropped snapshot would miss disk for good.
                         // `or_insert` lets a newer op win; the shutdown flush
-                        // is the last retry.
-                        lock(pending).entry(id).or_insert(Entry::Save(session));
+                        // is the last retry. The claim stays queued with it, so
+                        // the session stays locked while a write is owed.
+                        lock(pending)
+                            .entry(id)
+                            .or_insert(Entry::Save(session, claim));
                     }
                     self.report(id, result);
                 }
-                Entry::Delete(done) => {
-                    self.forget(id);
-                    done(match AppSession::delete(id, &self.dir) {
-                        Err(SessionError::Storage(StorageError::NotFound(_))) => Ok(()),
-                        result => result,
-                    });
+                Entry::Delete(claim, done) => {
+                    self.failing.remove(&id);
+                    done(self.remove(id, claim));
                 }
             }
         }
     }
 
-    fn write(&mut self, session: &AppSession) -> Result<(), SessionError> {
-        let sessions_dir = self.dir.ensure_subdir(SESSIONS_DIR)?;
-        if let Some(mut log) = self.logs.remove(&session.id) {
-            // A failed `append` rolls the file back to the last record boundary,
-            // so the cursor still fits and is worth keeping: rebuilding it costs
-            // a second full write, the last thing a failing disk needs.
-            // Divergence is the one answer a cursor cannot survive.
-            let appended = log.append(session);
-            if !matches!(appended, Err(SessionError::LogDiverged { .. })) {
-                self.logs.insert(session.id, log);
-                return appended;
-            }
+    fn remove(&self, id: MakiId, claim: Option<SessionClaim>) -> Result<(), SessionError> {
+        let claim = match claim {
+            Some(claim) => claim,
+            None => SessionClaim::acquire(id, &self.dir)?,
+        };
+        match AppSession::delete(&claim, &self.dir) {
+            Err(e) if e.is_not_found() => Ok(()),
+            result => result,
         }
-        // No usable cursor, whether because this thread never wrote the file
-        // or because the log diverged, so the file starts over. Reading the
-        // old file back gains nothing: a cursor recovered from disk describes
-        // the session that was stored, never the live one.
-        self.logs
-            .insert(session.id, SessionLog::rewrite(&sessions_dir, session)?);
-        Ok(())
     }
 
-    fn report(&mut self, id: MakiId, result: Result<(), impl std::fmt::Display>) {
+    fn report(&mut self, id: MakiId, result: Result<(), SessionError>) {
         match result {
             Ok(()) => {
                 if self.failing.remove(&id) {
@@ -194,8 +190,13 @@ impl Writer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::PathBuf;
+
+    use maki_storage::sessions::SESSIONS_DIR;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::OpenSession;
 
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
     const MODEL: &str = "test-model";
@@ -205,6 +206,8 @@ mod tests {
     const TOOL_ID: &str = "tool-1";
     const TOOL_TEXT: &str = "tool output";
     const TITLE: &str = "renamed after reload";
+    const OWED_WRITE_HOLDS: &str = "a session with a write still owed must stay claimed";
+    const LANDED_RELEASES: &str = "a session let go is free once its last snapshot landed";
 
     fn state_dir() -> (TempDir, StateDir) {
         let tmp = TempDir::new().unwrap();
@@ -215,6 +218,15 @@ mod tests {
     fn writer(dir: &StateDir) -> (StorageWriter, flume::Receiver<String>) {
         let (warn_tx, warn_rx) = flume::unbounded();
         (StorageWriter::new(dir.clone(), warn_tx), warn_rx)
+    }
+
+    fn fresh(dir: &StateDir) -> (AppSession, SessionClaim) {
+        let OpenSession { session, claim } = OpenSession::fresh(MODEL, CWD, dir);
+        (session, claim)
+    }
+
+    fn sessions_dir(dir: &StateDir) -> PathBuf {
+        dir.path().join(SESSIONS_DIR)
     }
 
     fn message_texts(session: &AppSession) -> Vec<String> {
@@ -236,7 +248,15 @@ mod tests {
     /// A plain file where the sessions dir should be. `create_dir_all` cannot
     /// turn that into a directory, so every flush fails until it is removed.
     fn block_sessions_dir(dir: &StateDir) {
-        std::fs::write(dir.path().join(SESSIONS_DIR), "").unwrap();
+        std::fs::write(sessions_dir(dir), "").unwrap();
+    }
+
+    /// A directory where one session's rewrite puts its temp file, so that
+    /// session fails to write while its lock and every other session work.
+    fn block_log(dir: &StateDir, id: MakiId) -> PathBuf {
+        let blocker = sessions_dir(dir).join(format!("{id}.jsonl.tmp"));
+        std::fs::create_dir_all(&blocker).unwrap();
+        blocker
     }
 
     /// Snapshots must coalesce per session id, not into one `latest` slot:
@@ -245,13 +265,13 @@ mod tests {
     fn shutdown_drains_newest_snapshot_of_every_session() {
         let (_tmp, dir) = state_dir();
         let (writer, _warn_rx) = writer(&dir);
-        let a = AppSession::new("test-model", "/tmp/a");
-        let mut b = AppSession::new("test-model", "/tmp/b");
+        let (a, a_claim) = fresh(&dir);
+        let (mut b, b_claim) = fresh(&dir);
         let (a_id, b_id) = (a.id, b.id);
-        writer.send(Arc::new(a));
-        writer.send(Arc::new(b.clone()));
+        writer.send(Arc::new(a), a_claim);
+        writer.send(Arc::new(b.clone()), b_claim.clone());
         b.set_title("renamed".into());
-        writer.send(Arc::new(b));
+        writer.send(Arc::new(b), b_claim);
         writer.shutdown(DRAIN_TIMEOUT);
 
         assert!(AppSession::load(a_id, &dir).is_ok());
@@ -262,11 +282,11 @@ mod tests {
     fn delete_discards_pending_snapshot() {
         let (_tmp, dir) = state_dir();
         let (writer, _warn_rx) = writer(&dir);
-        let session = AppSession::new("test-model", "/tmp/c");
+        let (session, claim) = fresh(&dir);
         let id = session.id;
-        writer.send(Arc::new(session));
+        writer.send(Arc::new(session), claim.clone());
         let (done_tx, done_rx) = flume::bounded(1);
-        writer.delete(id, move |res| {
+        writer.delete(id, Some(claim), move |res| {
             let _ = done_tx.send(res);
         });
         writer.shutdown(DRAIN_TIMEOUT);
@@ -275,20 +295,19 @@ mod tests {
         assert!(AppSession::load(id, &dir).is_err());
     }
 
-    /// A fresh writer over an existing file has no cursor, so it re-opens the
-    /// log and gets cursors for the loaded session, not the live one. The first
-    /// append must diverge into a full rewrite instead of landing on stale
-    /// offsets.
+    /// A later run over an existing file holds a new claim and so no cursor.
+    /// Its first write must start the file over instead of landing on offsets
+    /// that describe the session as the earlier run left it.
     #[test]
-    fn reopened_log_rewrites_diverged_file_instead_of_appending() {
+    fn a_new_claim_rewrites_the_file_instead_of_appending() {
         let (_tmp, dir) = state_dir();
-        let mut session = AppSession::new(MODEL, CWD);
+        let (mut session, claim) = fresh(&dir);
         let id = session.id;
         for i in 0..5 {
             session.push_message(user_message(i));
         }
         let (first, _first_warn_rx) = writer(&dir);
-        first.send(Arc::new(session.clone()));
+        first.send(Arc::new(session.clone()), claim);
         first.shutdown(DRAIN_TIMEOUT);
 
         session.truncate_messages(2);
@@ -300,7 +319,8 @@ mod tests {
         session.set_title(TITLE.into());
 
         let (second, second_warn_rx) = writer(&dir);
-        second.send(Arc::new(session.clone()));
+        let claim = SessionClaim::acquire(id, &dir).expect("the first run let go");
+        second.send(Arc::new(session.clone()), claim);
         second.shutdown(DRAIN_TIMEOUT);
 
         let loaded = AppSession::load(id, &dir).unwrap();
@@ -323,31 +343,62 @@ mod tests {
         let (_tmp, dir) = state_dir();
         block_sessions_dir(&dir);
         let (writer, warn_rx) = writer(&dir);
-        let session = Arc::new(AppSession::new(MODEL, CWD));
+        let (session, claim) = fresh(&dir);
+        let session = Arc::new(session);
         let id = session.id;
 
-        writer.send(Arc::clone(&session));
+        writer.send(Arc::clone(&session), claim.clone());
         let warning = warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
         assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
 
         // The save is enqueued before the delete, so the flush that runs the
         // delete has already drained it; a repeat failure must stay silent.
-        writer.send(Arc::clone(&session));
+        writer.send(Arc::clone(&session), claim.clone());
         let (done_tx, done_rx) = flume::bounded(1);
-        writer.delete(MakiId::generate(), move |res| {
+        writer.delete(MakiId::generate(), None, move |res| {
             let _ = done_tx.send(res);
         });
         assert!(done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().is_err());
         assert!(warn_rx.is_empty(), "second failure warned again");
 
-        std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
-        writer.send(session);
+        std::fs::remove_file(sessions_dir(&dir)).unwrap();
+        writer.send(session, claim);
         let recovered = warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
         assert_eq!(recovered, SAVE_RECOVERED);
         writer.shutdown(DRAIN_TIMEOUT);
 
         assert!(warn_rx.is_empty());
         assert!(AppSession::load(id, &dir).is_ok());
+    }
+
+    /// A tab that swaps its session out drops its claim right after queueing
+    /// the last snapshot. The session must stay locked until that snapshot is
+    /// on disk and be free right after, without anyone telling the writer.
+    #[test]
+    fn a_session_let_go_stays_claimed_until_its_last_snapshot_lands() {
+        let (_tmp, dir) = state_dir();
+        let (writer, warn_rx) = writer(&dir);
+        let (mut session, claim) = fresh(&dir);
+        session.push_message(user_message(0));
+        let id = session.id;
+        let blocker = block_log(&dir, id);
+
+        writer.send(Arc::new(session), claim);
+        let warning = warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
+        assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
+        assert!(
+            SessionClaim::acquire(id, &dir).is_err(),
+            "{OWED_WRITE_HOLDS}"
+        );
+
+        std::fs::remove_dir(blocker).unwrap();
+        writer.shutdown(DRAIN_TIMEOUT);
+
+        SessionClaim::acquire(id, &dir).expect(LANDED_RELEASES);
+        assert_eq!(
+            message_texts(&AppSession::load(id, &dir).unwrap()),
+            [msg_text(0)]
+        );
     }
 
     /// A save enqueued after a delete must win: clear a draft and retype it
@@ -357,13 +408,13 @@ mod tests {
     fn save_enqueued_after_delete_survives() {
         let (_tmp, dir) = state_dir();
         let (writer, warn_rx) = writer(&dir);
-        let mut session = AppSession::new(MODEL, CWD);
+        let (mut session, claim) = fresh(&dir);
         let id = session.id;
         session.push_message(user_message(0));
-        writer.send(Arc::new(session.clone()));
-        writer.delete(id, |_| {});
+        writer.send(Arc::new(session.clone()), claim.clone());
+        writer.delete(id, Some(claim.clone()), |_| {});
         session.push_message(maki_providers::Message::user(RESUMED_MSG.into()));
-        writer.send(Arc::new(session));
+        writer.send(Arc::new(session), claim);
         writer.shutdown(DRAIN_TIMEOUT);
 
         let loaded = AppSession::load(id, &dir).unwrap();
@@ -382,14 +433,14 @@ mod tests {
         let (_tmp, dir) = state_dir();
         block_sessions_dir(&dir);
         let (writer, warn_rx) = writer(&dir);
-        let session = Arc::new(AppSession::new(MODEL, CWD));
+        let (session, claim) = fresh(&dir);
         let id = session.id;
 
-        writer.send(session);
+        writer.send(Arc::new(session), claim);
         let warning = warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
         assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
 
-        std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
+        std::fs::remove_file(sessions_dir(&dir)).unwrap();
         writer.shutdown(DRAIN_TIMEOUT);
 
         assert!(AppSession::load(id, &dir).is_ok());
@@ -398,26 +449,26 @@ mod tests {
 
     /// After a delete the cursor still holds an open handle to the unlinked
     /// file, which still looks unchanged, so an append would write the session
-    /// into nothing. Forgetting the cursor makes the next snapshot write a
-    /// whole file.
+    /// into nothing. The delete voids the claim's cursor, so the next snapshot
+    /// writes a whole file.
     #[test]
     fn session_recreated_after_delete_is_written_in_full() {
         let (_tmp, dir) = state_dir();
         let (writer, warn_rx) = writer(&dir);
-        let mut session = AppSession::new(MODEL, CWD);
+        let (mut session, claim) = fresh(&dir);
         let id = session.id;
         session.push_message(user_message(0));
-        writer.send(Arc::new(session.clone()));
+        writer.send(Arc::new(session.clone()), claim.clone());
 
         let (done_tx, done_rx) = flume::bounded(1);
-        writer.delete(id, move |res| {
+        writer.delete(id, Some(claim.clone()), move |res| {
             let _ = done_tx.send(res);
         });
         done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
         assert!(AppSession::load(id, &dir).is_err());
 
         session.push_message(maki_providers::Message::user(RESUMED_MSG.into()));
-        writer.send(Arc::new(session));
+        writer.send(Arc::new(session), claim);
         writer.shutdown(DRAIN_TIMEOUT);
 
         let loaded = AppSession::load(id, &dir).unwrap();

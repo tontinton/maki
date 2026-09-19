@@ -9,12 +9,18 @@ use color_eyre::eyre::eyre;
 use maki_agent::session::{Resumed, StoredSession};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
+use maki_storage::sessions::{SessionClaim, SessionError};
+use maki_ui::OpenSession;
 
 use crate::cli::Cli;
 
 const NO_PREVIOUS_SESSION: &str = "no previous session found for this directory, starting new";
 const ID_IN_USE: &str = "--session-id names a session that already exists";
 const ID_IN_USE_HINT: &str = "pass -s/--session to continue it, or --fork-session to copy it";
+/// Both ways out, since neither is obviously right: a copy keeps the history
+/// but splits off from it, and dropping the flag starts over here.
+const BUSY_HINT: &str = "  --fork-session  work on a copy of it
+  or drop -c/-s to start a new session here";
 
 pub struct Resolved {
     /// The id this run writes under: the resumed one, `--session-id`, a fresh
@@ -23,6 +29,10 @@ pub struct Resolved {
     /// spelled it, since every `session_id` the run reports is this reference.
     pub id: SessionRef,
     pub start_type: &'static str,
+    /// The right to write [`Self::id`], taken before anything else is decided.
+    /// A second run on the same session is refused right here, before any
+    /// request goes out.
+    claim: SessionClaim,
     /// The transcript to restore, under [`Self::id`] either way: the stored
     /// session itself when the run continues it in place, or the copy a fork or
     /// a redirecting `--session-id` already wrote under the new id.
@@ -32,39 +42,48 @@ pub struct Resolved {
 impl Resolved {
     /// A session no flag asked for: the replacement tab `/reload` opens when a
     /// reload closed the last one. Minting the id here keeps every session id
-    /// in the process coming from the same place.
-    pub fn fresh() -> Self {
+    /// in the process coming from the same place, claim included.
+    pub fn fresh(storage: &StateDir) -> Self {
+        let claim = SessionClaim::fresh(storage);
         Self {
-            id: SessionRef::generate(),
+            id: SessionRef::from(claim.id()),
             start_type: maki_otel::emit::START_FRESH,
+            claim,
             session: None,
         }
     }
 
     /// What the agent needs: the transcript, what it measured and the session
     /// it came out of, under the id the run writes to.
-    pub fn into_resumed(self) -> Resumed {
-        match self.session {
+    pub fn into_resumed(self) -> (Resumed, SessionClaim) {
+        let resumed = match self.session {
             Some(session) => Resumed::stored(self.id, session),
             None => Resumed::empty(self.id),
-        }
+        };
+        (resumed, self.claim)
     }
 
     /// What the TUI needs: the stored session itself, or a fresh one. Either
     /// way it carries [`Self::id`], so a tab cannot open under one id while the
     /// run writes another.
-    pub fn into_session(self, model_spec: &str, cwd: &str) -> StoredSession {
-        self.session.unwrap_or_else(|| {
+    pub fn into_session(self, model_spec: &str, cwd: &str) -> OpenSession {
+        let session = self.session.unwrap_or_else(|| {
             let mut fresh = StoredSession::new(model_spec, cwd);
             fresh.id = self.id.id();
             fresh
-        })
+        });
+        OpenSession {
+            session,
+            claim: self.claim,
+        }
     }
 }
 
-/// A transcript a flag pointed at, under the reference that named it.
+/// A transcript a flag pointed at, under the reference that named it, and the
+/// claim it was read under.
 struct Loaded {
     session: StoredSession,
+    claim: SessionClaim,
     /// The caller's own spelling of the id. [`MakiId`](maki_storage::id::MakiId)
     /// renders canonical base58, so rebuilding this from `session.id` would
     /// answer a client that resumed by hex uuid with a different string for the
@@ -92,28 +111,36 @@ pub fn resolve(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<Resolved> {
         .map(|loaded| loaded.reference.clone());
 
     let id = match &cli.session_id {
-        // Named from outside, so it may already hold a transcript. The
-        // alternatives cannot: a generated id is unused by construction, and
-        // the resumed reference is this run's own to replace.
-        Some(raw) => claim(parse_id(raw)?, in_place.as_ref(), storage)?,
+        Some(raw) => parse_id(raw)?,
         None => in_place.clone().unwrap_or_else(SessionRef::generate),
     };
-
     let continuing = continues_in_place(in_place.as_ref(), &id);
-    let start_type = loaded
-        .as_ref()
-        .filter(|_| continuing)
-        .map_or(maki_otel::emit::START_FRESH, |loaded| loaded.start_type);
-    let session = loaded
-        .map(|loaded| match continuing {
-            true => Ok(loaded.session),
-            false => copy(loaded.session, &id, cwd, storage),
-        })
-        .transpose()?;
+
+    let (start_type, session, claim) = match loaded {
+        // Keeps the claim the transcript was read under. A second one on the
+        // same id would conflict with it, since the lock belongs to the open
+        // file and not to the process.
+        Some(loaded) if continuing => (loaded.start_type, Some(loaded.session), loaded.claim),
+        // A fork or a redirect writes somewhere else, so it lets go of the
+        // original first. That way `--fork-session` onto its own source id
+        // fails as an id already in use, not as a clash with our own read.
+        Some(Loaded { session, claim, .. }) => {
+            drop(claim);
+            let claim = claim_unused(&id, storage)?;
+            let copy = copy(session, &claim, cwd, storage)?;
+            (maki_otel::emit::START_FRESH, Some(copy), claim)
+        }
+        None => (
+            maki_otel::emit::START_FRESH,
+            None,
+            claim_unused(&id, storage)?,
+        ),
+    };
 
     Ok(Resolved {
         id,
         start_type,
+        claim,
         session,
     })
 }
@@ -125,12 +152,13 @@ pub fn resolve(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<Resolved> {
 /// session under the new id, and a fork whose run dies early is still there.
 fn copy(
     session: StoredSession,
-    id: &SessionRef,
+    claim: &SessionClaim,
     cwd: &str,
     storage: &StateDir,
 ) -> Result<StoredSession> {
-    let mut copy = session.fork(id.id(), cwd);
-    copy.save(storage)
+    let id = claim.id();
+    let mut copy = session.fork(id, cwd);
+    copy.save(claim, storage)
         .map_err(|e| eyre!("failed to write session {id}: {e}"))?;
     Ok(copy)
 }
@@ -142,14 +170,26 @@ fn continues_in_place(in_place: Option<&SessionRef>, id: &SessionRef) -> bool {
     in_place.is_some_and(|original| original.id() == id.id())
 }
 
-/// A run replaces the transcript it writes to, so an id already in use has to
-/// be refused rather than silently emptied. Continuing in place is the one
-/// exemption: that transcript is this run's own to replace.
-fn claim(id: SessionRef, in_place: Option<&SessionRef>, storage: &StateDir) -> Result<SessionRef> {
-    if !continues_in_place(in_place, &id) && StoredSession::exists(id.id(), storage) {
+/// An id this run is about to write from scratch: a generated one, or the
+/// `--session-id` a fork or a redirect lands on. A run replaces the transcript
+/// it writes to, so finding one there is refused rather than silently emptied.
+/// The lock comes before the `exists` check, so two runs naming the same new
+/// `--session-id` cannot both pass it.
+fn claim_unused(id: &SessionRef, storage: &StateDir) -> Result<SessionClaim> {
+    let claim = SessionClaim::acquire(id.id(), storage).map_err(with_busy_hint)?;
+    if StoredSession::exists(id.id(), storage) {
         return Err(eyre!("{ID_IN_USE}: {id}\n{ID_IN_USE_HINT}"));
     }
-    Ok(id)
+    Ok(claim)
+}
+
+/// A busy session is the one failure with more than one sensible way out, so
+/// its message lists them.
+fn with_busy_hint(e: SessionError) -> color_eyre::Report {
+    match e.is_busy() {
+        true => eyre!("{e}\n{BUSY_HINT}"),
+        false => eyre!("{e}"),
+    }
 }
 
 fn parse_id<T: FromStr<Err: Display>>(raw: &str) -> Result<T> {
@@ -157,29 +197,37 @@ fn parse_id<T: FromStr<Err: Display>>(raw: &str) -> Result<T> {
         .map_err(|e| eyre!("invalid session id {raw:?}: {e}"))
 }
 
-/// The session the flags point at, if there is one. A missing `--continue`
-/// history is not an error, the caller just starts fresh.
+/// The session the flags point at, if there is one, claimed before it is read.
+/// A missing `--continue` history is not an error, the caller just starts
+/// fresh.
 fn load(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<Option<Loaded>> {
     if let Some(raw) = &cli.session {
         let reference: SessionRef = parse_id(raw)?;
-        let session = StoredSession::load(reference.id(), storage).map_err(|e| eyre!("{e}"))?;
+        let (session, claim) =
+            StoredSession::claim_and_load(reference.id(), storage).map_err(with_busy_hint)?;
         return Ok(Some(Loaded {
             session,
+            claim,
             reference,
             start_type: maki_otel::emit::START_RESUME,
         }));
     }
     if cli.continue_session {
-        match StoredSession::latest(cwd, storage) {
+        match StoredSession::claim_latest(cwd, storage) {
             // Nobody spelled this id, so canonical is the only spelling of it.
-            Ok(Some(session)) => {
+            Ok(Some((session, claim))) => {
                 return Ok(Some(Loaded {
                     reference: SessionRef::from(session.id),
                     session,
+                    claim,
                     start_type: maki_otel::emit::START_CONTINUE,
                 }));
             }
             Ok(None) => tracing::info!(NO_PREVIOUS_SESSION),
+            // Starting over suits a session that is missing or will not parse.
+            // A busy one is intact and just belongs to someone else, and
+            // quietly opening another session would hide that.
+            Err(e) if e.is_busy() => return Err(with_busy_hint(e)),
             Err(e) => tracing::warn!(error = %e, "failed to load latest session, starting new"),
         }
     }
@@ -215,6 +263,7 @@ mod tests {
     /// sends, rather than the base58 a `MakiId` renders.
     const HEX_SESSION_ID: &str = "01965087-4c71-7f00-8000-0000000000aa";
     const SPELLING: &str = "the reported id must keep the spelling the caller sent";
+    const ORIGINAL_FREE: &str = "a fork holds its copy, not the session it copied";
 
     fn empty_storage() -> (TempDir, StateDir, String) {
         let dir = tempdir().expect("tempdir");
@@ -242,7 +291,10 @@ mod tests {
             input: STORED_INPUT_TOKENS,
             ..Default::default()
         };
-        session.save(storage).expect("write session to disk");
+        let claim = SessionClaim::acquire(id, storage).expect("claim the session");
+        session
+            .save(&claim, storage)
+            .expect("write session to disk");
         session.id
     }
 
@@ -311,6 +363,18 @@ mod tests {
             assert_ne!(resolved.id.id(), stored);
             assert!(resolved.session.is_none());
         }
+    }
+
+    /// Nothing about copying a session is a reason to keep it locked.
+    #[test]
+    fn a_fork_leaves_the_session_it_copied_free() {
+        let (_dir, storage, cwd, stored) = storage_with_stored_session();
+
+        let resolved = resolve(&cli(&["--fork-session", "-c"], stored), &cwd, &storage)
+            .expect("a fork resolves");
+
+        assert_ne!(resolved.id.id(), stored);
+        SessionClaim::acquire(stored, &storage).expect(ORIGINAL_FREE);
     }
 
     /// `--continue` in a directory nobody has worked in yet is a fresh start,
@@ -469,14 +533,33 @@ mod tests {
         assert!(error.contains(expected), "{error}");
     }
 
+    /// Two runs on one session used to both load it and both write it back, and
+    /// whichever finished last wiped the other's turns. The second one is now
+    /// refused before any request goes out. `-c` must refuse too, not quietly
+    /// start a new session and hide the conflict.
+    #[test_case(&["-c"] ; "two continues of the same session")]
+    #[test_case(&["-s", ID_PLACEHOLDER] ; "two resumes of the same session")]
+    #[test_case(&["-c", "--session-id", ID_PLACEHOLDER] ; "a redirect onto a session already running")]
+    #[test_case(&["--session-id", UNUSED_SESSION_ID] ; "two runs naming one new session id")]
+    fn a_session_another_run_holds_is_refused(args: &[&str]) {
+        let (_dir, storage, cwd, stored) = storage_with_stored_session();
+        let _first = resolve(&cli(args, stored), &cwd, &storage).expect("the first run resolves");
+
+        let error = refusal(&cli(args, stored), &cwd, &storage);
+
+        assert!(error.contains(BUSY_HINT), "{error}");
+        assert_eq!(stored_messages(&storage, stored), 1, "{SURVIVED}");
+    }
+
     /// The measured prompt size travels with the messages, or a resumed run
     /// budgets its first request from an estimate.
     #[test]
     fn into_resumed_carries_the_measured_context_size() {
         let (_dir, storage, cwd, stored) = storage_with_stored_session();
-        let resumed = resolve(&cli(&["-c"], stored), &cwd, &storage)
+        let (resumed, claim) = resolve(&cli(&["-c"], stored), &cwd, &storage)
             .expect("continue resolves")
             .into_resumed();
+        assert_eq!(claim.id(), stored, "the run writes what it claimed");
 
         assert_eq!(resumed.context_size, CONTEXT_SIZE);
         assert_eq!(resumed.history.len(), 1);
@@ -496,10 +579,10 @@ mod tests {
 
         let as_tab = resolve(&cli, &cwd, &storage).expect("resolves");
         let reported = as_tab.id.id();
-        assert_eq!(as_tab.into_session(FRESH_MODEL, &cwd).id, reported);
+        assert_eq!(as_tab.into_session(FRESH_MODEL, &cwd).session.id, reported);
 
         let as_run = resolve(&cli, &cwd, &storage).expect("resolves");
         let reported = as_run.id.id();
-        assert_eq!(as_run.into_resumed().id.id(), reported);
+        assert_eq!(as_run.into_resumed().0.id.id(), reported);
     }
 }

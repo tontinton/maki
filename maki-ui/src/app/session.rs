@@ -11,7 +11,7 @@ use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_messag
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionMeta, StoredSubagent};
 
-use crate::AppSession;
+use crate::{AppSession, OpenSession};
 
 use super::session_state::{SessionState, rules_to_stored, stored_to_rules};
 use super::{App, Mode, PendingInput, PlanState, Status};
@@ -79,7 +79,8 @@ impl App {
             let id = self.state.session.id;
             if self.status == Status::Idle && self.last_sent.take_if(|last| last.id == id).is_some()
             {
-                self.storage_writer.delete(id, |_| {});
+                self.storage_writer
+                    .delete(id, Some(self.state.claim.clone()), |_| {});
             }
             return;
         }
@@ -105,7 +106,8 @@ impl App {
             }
         }
 
-        self.storage_writer.send(Arc::clone(&self.state.session));
+        self.storage_writer
+            .send(Arc::clone(&self.state.session), self.state.claim.clone());
         self.last_sent = Some(sent);
     }
 
@@ -306,9 +308,13 @@ impl App {
     /// `SessionMeta` field has to pick a side: settings that say how the user
     /// works ride along, anything a finished turn produced stays behind, or the
     /// new session writes over work it never did.
-    pub(crate) fn blank_session(&self) -> AppSession {
-        let mut session = AppSession::new(&self.state.model.spec(), &self.state.session.cwd);
-        session.meta = SessionMeta {
+    pub(crate) fn blank_session(&self) -> OpenSession {
+        let mut open = OpenSession::fresh(
+            &self.state.model.spec(),
+            &self.state.session.cwd,
+            &self.storage,
+        );
+        open.session.meta = SessionMeta {
             mode: Some(self.state.mode.into()),
             thinking: Some(self.state.thinking.into()),
             fast: self.state.fast_intent(),
@@ -321,7 +327,7 @@ impl App {
             queued_messages: Vec::new(),
             yolo: self.permissions.persisted_yolo(),
         };
-        session
+        open
     }
 
     pub(super) fn reset_session(&mut self) -> Vec<Action> {
@@ -339,9 +345,12 @@ impl App {
         self.fire_session_autocmd("SessionReset", serde_json::json!({}));
         self.lua_event_handle
             .end_session(self.state.session.id, SessionEndReason::Reset);
-        let session = self.blank_session();
+        // Swapping the claim is what gives the old session back: the snapshot
+        // `checkpoint_now` just queued holds its own clone until it lands.
+        let OpenSession { session, claim } = self.blank_session();
         self.apply_stored_permissions(&session.meta);
         self.state.session = Arc::new(session);
+        self.state.claim = claim;
         self.reset_ui_chrome();
         maki_otel::emit::session_started(
             maki_otel::emit::START_FRESH,
@@ -390,13 +399,13 @@ impl App {
     /// model and this only adopts it.
     pub(crate) fn apply_loaded_session(
         &mut self,
-        session: AppSession,
+        open: OpenSession,
         model: &Model,
     ) -> Vec<Message> {
         let previous = self.state.session.id;
         self.checkpoint_now();
-        self.apply_stored_permissions(&session.meta);
-        self.state = SessionState::from_session(session, model, &self.storage);
+        self.apply_stored_permissions(&open.session.meta);
+        self.state = SessionState::from_session(open, model, &self.storage);
         if previous != self.state.session.id {
             self.lua_event_handle
                 .end_session(previous, SessionEndReason::Load);
@@ -439,7 +448,7 @@ mod tests {
         assert!(!app.state.fast);
         assert_eq!(app.state.pending_fast, !cancel);
         assert_eq!(app.build_meta().fast, !cancel);
-        assert_eq!(app.blank_session().meta.fast, !cancel);
+        assert_eq!(app.blank_session().session.meta.fast, !cancel);
 
         let mut model = app.state.model.clone();
         model.supports_fast_override = Some(FastSupport::Supported);

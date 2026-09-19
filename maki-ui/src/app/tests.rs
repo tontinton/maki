@@ -1,4 +1,5 @@
 use super::*;
+use crate::AppSession;
 use crate::agent::shared_queue;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::btw_modal::BtwEvent;
@@ -30,7 +31,7 @@ use maki_providers::{
     ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, TokenUsage,
 };
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionMeta, StoredMode, StoredThinking};
+use maki_storage::sessions::{SessionClaim, SessionMeta, StoredMode, StoredThinking};
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -116,13 +117,8 @@ fn build_app_with_lua(
     writer: Arc<StorageWriter>,
     lua_commands: LuaCommandReader,
 ) -> App {
-    build_app_with_session(
-        dir,
-        writer,
-        lua_commands,
-        AppSession::new(TEST_MODEL_SPEC, TEST_CWD),
-        test_permissions(false),
-    )
+    let tab = OpenSession::fresh(TEST_MODEL_SPEC, TEST_CWD, &dir);
+    build_app_with_session(dir, writer, lua_commands, tab, test_permissions(false))
 }
 
 fn test_permissions(yolo: bool) -> Arc<PermissionManager> {
@@ -141,15 +137,15 @@ fn build_app_with_session(
     dir: StateDir,
     writer: Arc<StorageWriter>,
     lua_commands: LuaCommandReader,
-    session: AppSession,
+    tab: OpenSession,
     permissions: Arc<PermissionManager>,
 ) -> App {
     // Mirrors the event loop, where the session's own spec decides and the
     // startup model catches one that will not resolve.
-    let model = Model::from_spec(&session.model).unwrap_or_else(|_| test_model());
+    let model = Model::from_spec(&tab.session.model).unwrap_or_else(|_| test_model());
     App::new(
         &model,
-        session,
+        tab,
         dir,
         Arc::new(ArcSwapOption::empty()),
         McpSnapshotReader::empty(),
@@ -173,7 +169,7 @@ fn test_writer(dir: StateDir) -> StorageWriter {
 
 pub(crate) fn test_app() -> App {
     spawned_app(
-        AppSession::new(TEST_MODEL_SPEC, TEST_CWD),
+        tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD)),
         test_permissions(false),
     )
 }
@@ -181,14 +177,22 @@ pub(crate) fn test_app() -> App {
 /// A tab the way `Ctrl-N` and a resume build one. `App::new` takes the session
 /// plus a fork of the prototype manager, and everything the permissions do has
 /// to come back out of that meta.
-fn spawned_app(session: AppSession, permissions: Arc<PermissionManager>) -> App {
-    let dir = StateDir::from_path(env::temp_dir());
+fn spawned_app(tab: OpenSession, permissions: Arc<PermissionManager>) -> App {
+    let dir = tmp_state();
     let writer = Arc::new(test_writer(dir.clone()));
-    let mut app =
-        build_app_with_session(dir, writer, LuaCommandReader::empty(), session, permissions);
+    let mut app = build_app_with_session(dir, writer, LuaCommandReader::empty(), tab, permissions);
     let (shared_queue, _rx) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
+}
+
+fn tmp_state() -> StateDir {
+    StateDir::from_path(env::temp_dir())
+}
+
+/// A hand-built session opened the way [`spawned_app`] stores it.
+fn tmp_tab(session: AppSession) -> OpenSession {
+    OpenSession::claimed(session, &tmp_state())
 }
 
 /// A `test_app` past its idle splash, whose drifting starfield would mask
@@ -234,8 +238,8 @@ fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
 /// What the event loop does on a load. It reads the session, resolves its
 /// model and hands both to the app, which adopts them.
 fn load_session(app: &mut App, id: MakiId, model: &Model) {
-    let session = AppSession::load(id, &app.storage).unwrap();
-    app.apply_loaded_session(session, model);
+    let tab = OpenSession::load(id, &app.storage).unwrap();
+    app.apply_loaded_session(tab, model);
 }
 
 fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Msg {
@@ -856,7 +860,7 @@ fn blank_session_carries_the_settings_that_outlive_a_turn() {
     app.permissions.set_session_yolo(Some(true));
     app.checkpoint();
 
-    let session = app.blank_session();
+    let session = app.blank_session().session;
 
     assert_eq!(
         session.meta,
@@ -914,14 +918,14 @@ fn a_spawned_tab_opens_on_the_settings_it_was_started_with() {
 fn a_spawned_tab_honours_the_yolo_turned_off_under_the_flag() {
     let prototype = test_permissions(true);
     let app = spawned_app(
-        AppSession::new(TEST_MODEL_SPEC, TEST_CWD),
+        tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD)),
         Arc::new(prototype.fork()),
     );
     assert!(app.permissions.is_yolo(), "--yolo seeds the first tab");
 
     app.permissions.toggle_yolo();
     let session = app.blank_session();
-    assert_eq!(session.meta.yolo, Some(false));
+    assert_eq!(session.session.meta.yolo, Some(false));
 
     let spawned = spawned_app(session, Arc::new(prototype.fork()));
 
@@ -1356,7 +1360,7 @@ fn a_pick_answered_after_another_session_loaded_submits_nothing() {
     loaded.meta.plan_path = Some(other_draft.display().to_string());
     loaded.meta.plan_written = true;
     let model = app.state.model.clone();
-    app.apply_loaded_session(loaded, &model);
+    app.apply_loaded_session(OpenSession::claimed(loaded, &app.storage), &model);
     assert!(
         app.plan_answers.form.is_none(),
         "the abandoned draft's menu answer does not follow the user"
@@ -1519,11 +1523,12 @@ fn load_session_clears_plan() {
     app.state
         .session_mut()
         .push_message(Message::user("test".into()));
-    app.state.session_mut().save(&app.storage).unwrap();
-    let id = app.state.session.id;
+    let claim = app.state.claim.clone();
+    app.state.session_mut().save(&claim, &app.storage).unwrap();
+    let session = AppSession::load(app.state.session.id, &app.storage).unwrap();
     app.state.mode = Mode::Build;
     app.state.plan = PlanState::Ready(PathBuf::from("old-plan.md"));
-    load_session(&mut app, id, &test_model());
+    app.apply_loaded_session(OpenSession { session, claim }, &test_model());
     assert_eq!(app.state.mode, Mode::Build);
     assert_eq!(app.state.plan.path(), None);
 }
@@ -1783,7 +1788,7 @@ fn resumed_session_keeps_adding_to_the_restored_bill() {
     stored.token_usage = RESTORED_TOKENS;
     stored.add_model_usage(RESTORED_MODEL, RESTORED_TOKENS.billed(Some(RESTORED_COST)));
 
-    app.apply_loaded_session(stored, &test_model());
+    app.apply_loaded_session(OpenSession::claimed(stored, &app.storage), &test_model());
     assert_eq!(app.state.cost, Some(RESTORED_COST));
     assert_eq!(app.chats[0].cost, Some(RESTORED_COST));
 
@@ -3528,11 +3533,8 @@ fn reload_leaves_empty_session_unpersisted_on_disk() {
     app.execute_command(cmd("/reload"), 0);
     drain_writer(app, writer);
 
-    let sessions_dir = tmp.path().join(maki_storage::sessions::SESSIONS_DIR);
-    let entries = std::fs::read_dir(&sessions_dir)
-        .map(|d| d.count())
-        .unwrap_or(0);
-    assert_eq!(entries, 0);
+    let storage = StateDir::from_path(tmp.path().to_path_buf());
+    assert!(AppSession::list_all(&storage).unwrap().is_empty());
 }
 
 #[test]
@@ -3555,7 +3557,7 @@ fn apply_loaded_session_defers_queued_messages_until_respawn() {
     session.push_message(Message::user("hello".into()));
 
     let model = app.state.model.clone();
-    app.apply_loaded_session(session, &model);
+    app.apply_loaded_session(OpenSession::claimed(session, &app.storage), &model);
 
     assert!(app.queue.is_empty());
     assert_eq!(app.state.session.meta.queued_messages, ["deferred"]);
@@ -3609,7 +3611,7 @@ fn session_with_yolo(stored: Option<bool>) -> AppSession {
 #[test_case(true,  Some(true)  => (true,  Some(true))  ; "the_flag_does_not_wipe_stored_on")]
 #[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
 fn resume_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (bool, Option<bool>) {
-    let mut app = spawned_app(session_with_yolo(stored), test_permissions(seed));
+    let mut app = spawned_app(tmp_tab(session_with_yolo(stored)), test_permissions(seed));
 
     app.restore_resumed_session();
     app.checkpoint();
@@ -3626,12 +3628,15 @@ fn resume_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (bool, Option
 #[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
 fn loading_a_session_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (bool, Option<bool>) {
     let mut app = spawned_app(
-        AppSession::new(TEST_MODEL_SPEC, TEST_CWD),
+        tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD)),
         test_permissions(seed),
     );
     let model = app.state.model.clone();
 
-    app.apply_loaded_session(session_with_yolo(stored), &model);
+    app.apply_loaded_session(
+        OpenSession::claimed(session_with_yolo(stored), &app.storage),
+        &model,
+    );
     app.checkpoint();
     (app.permissions.is_yolo(), app.state.session.meta.yolo)
 }
@@ -3643,7 +3648,10 @@ fn loading_a_session_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (b
 #[test_case(false => (true,  Some(true))  ; "a_fresh_session_keeps_the_toggle_on")]
 #[test_case(true  => (false, Some(false)) ; "a_fresh_session_keeps_the_toggle_off")]
 fn resetting_the_session_drops_what_the_last_one_was_granted(seed: bool) -> (bool, Option<bool>) {
-    let mut app = spawned_app(session_with_yolo(Some(!seed)), test_permissions(seed));
+    let mut app = spawned_app(
+        tmp_tab(session_with_yolo(Some(!seed))),
+        test_permissions(seed),
+    );
     app.permissions.load_session_rules(vec![session_rule()]);
     assert_eq!(app.permissions.is_yolo(), !seed);
 
@@ -5506,7 +5514,11 @@ fn thinking_restored_from_session_meta() {
     let mut session = AppSession::new("test-model", "/tmp/test");
     session.meta.thinking = Some(StoredThinking::Budget { tokens: 4096 });
 
-    let state = SessionState::from_session(session, &test_model(), &storage);
+    let state = SessionState::from_session(
+        OpenSession::claimed(session, &storage),
+        &test_model(),
+        &storage,
+    );
     assert_eq!(state.thinking, ThinkingConfig::Budget(4096));
 }
 
@@ -5591,8 +5603,11 @@ fn fast_restored_from_session_meta() {
     let mut session = AppSession::new(OPUS_SPEC, "/tmp/test");
     session.meta.fast = true;
 
-    let state =
-        SessionState::from_session(session, &Model::from_spec(OPUS_SPEC).unwrap(), &storage);
+    let state = SessionState::from_session(
+        OpenSession::claimed(session, &storage),
+        &Model::from_spec(OPUS_SPEC).unwrap(),
+        &storage,
+    );
     assert!(state.fast);
 }
 
@@ -5605,7 +5620,11 @@ fn fast_normalized_off_when_restored_onto_ineligible_model() {
     let mut session = AppSession::new(SONNET_SPEC, "/tmp/test");
     session.meta.fast = true;
 
-    let state = SessionState::from_session(session, &test_model(), &storage);
+    let state = SessionState::from_session(
+        OpenSession::claimed(session, &storage),
+        &test_model(),
+        &storage,
+    );
     assert!(!state.fast);
 }
 
@@ -5729,7 +5748,10 @@ fn loading_a_session_on_another_model_announces_the_swap() {
     app.lua_event_handle = handle;
     let resolved = Model::from_spec(OPUS_SPEC).unwrap();
 
-    app.apply_loaded_session(AppSession::new(OPUS_SPEC, "/tmp/test"), &resolved);
+    app.apply_loaded_session(
+        OpenSession::claimed(AppSession::new(OPUS_SPEC, "/tmp/test"), &app.storage),
+        &resolved,
+    );
     app.emit_model_change();
 
     let (event, data) = probe.try_recv_autocmd().expect(MODEL_CHANGED_EVENT);
@@ -6726,7 +6748,9 @@ fn loading_a_session_stamps_its_restores_as_a_load_of_that_session() {
     let mut stored = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
     stored.push_message(tool_use_msg(SUB_TOOL_ID));
     stored.push_message(tool_result_msg(SUB_TOOL_ID, &tool_text(SUB_TOOL_ID)));
-    stored.save(&dir).unwrap();
+    stored
+        .save(&SessionClaim::acquire(stored.id, &dir).unwrap(), &dir)
+        .unwrap();
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
     app.restore_event_tx = Some(maki_agent::EventSender::new(flume::unbounded().0, 0));
@@ -6857,7 +6881,7 @@ fn rewind_gesture(app: &mut App) -> Vec<Message> {
 fn load_gesture(app: &mut App) -> Vec<Message> {
     let mut stored = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
     stored.push_message(Message::user(STORED_SESSION_TEXT.into()));
-    app.apply_loaded_session(stored, &test_model())
+    app.apply_loaded_session(OpenSession::claimed(stored, &app.storage), &test_model())
 }
 
 /// The three gestures that hand the agent a history it did not produce. Each
@@ -6907,13 +6931,18 @@ fn loading_ends_the_previous_session_only_when_the_id_changes(same: bool) {
     let previous = app.state.session.id;
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
-    let session = if same {
-        (*app.state.session).clone()
+    // Reopening the session a tab holds shares its claim, as every holder in
+    // one process must.
+    let tab = if same {
+        OpenSession {
+            session: (*app.state.session).clone(),
+            claim: app.state.claim.clone(),
+        }
     } else {
-        AppSession::new(TEST_MODEL_SPEC, TEST_CWD)
+        OpenSession::claimed(AppSession::new(TEST_MODEL_SPEC, TEST_CWD), &app.storage)
     };
 
-    app.apply_loaded_session(session, &test_model());
+    app.apply_loaded_session(tab, &test_model());
 
     assert_eq!(
         probe.try_recv_end_session(),
@@ -6935,7 +6964,9 @@ fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
     let mut stored = AppSession::new("test-model", "/tmp/test");
     stored.push_message(Message::user(STORED_SESSION_TEXT.into()));
-    stored.save(&dir).unwrap();
+    stored
+        .save(&SessionClaim::acquire(stored.id, &dir).unwrap(), &dir)
+        .unwrap();
 
     let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
     app.input_box.set_input(UNSENT_DRAFT.into());

@@ -633,7 +633,7 @@ fn git_checkout_boundary(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use maki_storage::sessions::{SESSIONS_DIR, Session, TitleSource};
+    use maki_storage::sessions::{SESSIONS_DIR, Session, SessionClaim, TitleSource};
     use maki_storage::trusted_folders::TrustStatus;
     use serde::{Deserialize, Serialize};
 
@@ -734,7 +734,8 @@ mod tests {
     fn record_session(storage: &StateDir, cwd: &Path) {
         let mut session: Session<StoredMessage, u32, ()> =
             Session::new(MODEL, cwd.to_str().unwrap());
-        session.save(storage).unwrap();
+        let claim = SessionClaim::acquire(session.id, storage).unwrap();
+        session.save(&claim, storage).unwrap();
     }
 
     fn setup() -> (tempfile::TempDir, tempfile::TempDir, StateDir) {

@@ -9,7 +9,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use maki_storage::id::MakiId;
 use maki_storage::paths;
-use maki_storage::sessions::{SessionError, SessionSummary};
+use maki_storage::sessions::{SessionClaim, SessionError, SessionSummary};
 use maki_storage::{StateDir, StorageError, now_epoch};
 use maki_ui::AppSession;
 
@@ -65,7 +65,10 @@ pub fn delete(session_id: &str, force: bool, storage: &StateDir) -> Result<()> {
         println!("{CANCELLED}");
         return Ok(());
     }
-    match AppSession::delete(id, storage) {
+    // Refusing to delete a session another maki is writing beats unlinking the
+    // file it keeps appending to.
+    let claim = SessionClaim::acquire(id, storage).context("claim session")?;
+    match AppSession::delete(&claim, storage) {
         Ok(()) => println!("Deleted session {id}"),
         Err(SessionError::Storage(StorageError::NotFound(_))) => {
             bail!("session {session_id} not found")

@@ -33,6 +33,7 @@ use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::sessions::{SessionClaim, SessionError};
 use serde::Serialize;
 use serde_json::Value;
 use smol::Task;
@@ -51,6 +52,10 @@ const AUTH_FAILED_MSG: &str =
 /// config value, so reading it here would reprice history the user paid for at
 /// standard rates. New turns still honour it.
 const RESTORED_FAST: bool = false;
+/// From JSON-RPC's range for application errors. A session another maki holds
+/// is not an internal error (`-32603`), nothing broke here, and the message
+/// already says which session and why.
+const SESSION_BUSY_CODE: i32 = -32000;
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
@@ -85,6 +90,9 @@ struct SessionState {
     current_mode: AgentMode,
     current_model: String,
     pending: PendingState,
+    /// Shared with the run, so reloading the same session reads under this
+    /// claim instead of clashing with it.
+    claim: SessionClaim,
 }
 
 struct Server {
@@ -285,11 +293,13 @@ async fn new_session(
         &params.trust_policy,
     );
     let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone()).await;
+    let claim = SessionClaim::fresh(&params.storage);
     let session_ref = start_session(
         srv,
         params,
         req.cwd,
-        Resumed::fresh(),
+        Resumed::empty(SessionRef::from(claim.id())),
+        claim,
         mcp,
         project_config,
         None,
@@ -312,8 +322,26 @@ async fn load_session(
         .0
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
-    let restored = load_history(&params.storage, session_ref.id())?;
-    close_session(srv, SessionEndReason::Replaced).await;
+    // Reloading the session we already run keeps its claim, so no other process
+    // slips in, and closes the run first so the read includes its last turn.
+    // Any other session is read first, so a failed load leaves the running one
+    // alone.
+    let held = srv
+        .session
+        .as_ref()
+        .map(|state| state.claim.clone())
+        .filter(|claim| claim.id() == session_ref.id());
+    let (restored, claim) = match held {
+        Some(claim) => {
+            close_session(srv, SessionEndReason::Replaced).await;
+            (reload_history(&params.storage, &claim)?, claim)
+        }
+        None => {
+            let loaded = claim_history(&params.storage, session_ref.id())?;
+            close_session(srv, SessionEndReason::Replaced).await;
+            loaded
+        }
+    };
     let project_config = trusted_project_config(
         &req.cwd,
         &params.storage,
@@ -324,7 +352,8 @@ async fn load_session(
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
     let replay_cwd = restored.cwd.as_deref().unwrap_or(&req.cwd);
-    for update in translate::replay_history(restored.session.messages(), replay_cwd, home.as_deref())
+    for update in
+        translate::replay_history(restored.session.messages(), replay_cwd, home.as_deref())
     {
         session_update(&srv.out_tx, &sid, update);
     }
@@ -347,6 +376,7 @@ async fn load_session(
         params,
         req.cwd,
         Resumed::stored(session_ref, restored.session),
+        claim,
         mcp,
         project_config,
         restored_cost,
@@ -367,6 +397,7 @@ fn start_session(
     params: &AcpParams,
     cwd: PathBuf,
     resumed: Resumed,
+    claim: SessionClaim,
     mcp: Option<McpHandle>,
     project_config: ProjectConfig,
     initial_cost: Option<f64>,
@@ -397,6 +428,7 @@ fn start_session(
         mcp_handle: mcp.clone(),
         initial_wd: cwd.clone(),
         resumed,
+        claim: claim.clone(),
         storage: params.storage.clone(),
         yolo: params.yolo,
         system_prompt_override: None,
@@ -426,6 +458,7 @@ fn start_session(
         current_mode: AgentMode::Build,
         current_model: params.model.spec(),
         pending,
+        claim,
     });
     session_ref
 }
@@ -624,19 +657,42 @@ struct Restored {
 ///
 /// Reads from the server's state dir, the one the run writes back to, rather
 /// than resolving a second answer to where sessions live.
-fn load_history(storage: &StateDir, session_id: MakiId) -> Result<Restored, AcpError> {
-    let session = StoredSession::load(session_id, storage).map_err(|e| {
-        AcpError::resource_not_found(Some(format!("session/{session_id}"))).data(json_str(&e))
-    })?;
-    let recorded = if Path::new(&session.cwd).is_absolute() {
-        Some(PathBuf::from(&session.cwd))
-    } else {
-        None
-    };
-    Ok(Restored {
-        cwd: recorded,
-        session,
-    })
+///
+/// Claims before it reads, since the turns that follow replace this transcript.
+fn claim_history(
+    storage: &StateDir,
+    session_id: MakiId,
+) -> Result<(Restored, SessionClaim), AcpError> {
+    let (session, claim) = StoredSession::claim_and_load(session_id, storage)
+        .map_err(|e| load_error(e, session_id))?;
+    Ok((Restored::from(session), claim))
+}
+
+/// [`claim_history`] for the session this server already holds.
+fn reload_history(storage: &StateDir, claim: &SessionClaim) -> Result<Restored, AcpError> {
+    StoredSession::load_claimed(claim, storage)
+        .map(Restored::from)
+        .map_err(|e| load_error(e, claim.id()))
+}
+
+fn load_error(e: SessionError, session_id: MakiId) -> AcpError {
+    match e.is_busy() {
+        // `not found` would send the client looking for a session it can see
+        // right there in the list.
+        true => AcpError::new(SESSION_BUSY_CODE, e.to_string()),
+        false => {
+            AcpError::resource_not_found(Some(format!("session/{session_id}"))).data(json_str(&e))
+        }
+    }
+}
+
+impl From<StoredSession> for Restored {
+    fn from(session: StoredSession) -> Self {
+        let cwd = Path::new(&session.cwd)
+            .is_absolute()
+            .then(|| PathBuf::from(&session.cwd));
+        Self { cwd, session }
+    }
 }
 
 fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
@@ -1009,14 +1065,16 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
     use maki_agent::tools::PermissionScopes;
     use maki_agent::{
         CancelToken, DoneReason, EventSender, SubagentInfo, ToolStartEvent, TurnCompleteEvent,
     };
     use maki_config::project::TrustQuestion;
-    use maki_config::{Effect, ToolKey, TrustFileConfig};
-    use maki_providers::{ContentBlock as MsgBlock, Message, Role, TokenUsage};
+    use maki_config::{AgentConfig, Effect, ToolKey, TrustFileConfig};
+    use maki_providers::{ContentBlock as MsgBlock, Message, Role, Timeouts, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::sessions::{Session, StoredTokenUsage};
     use maki_storage::trusted_folders::{CanonicalFolder, TrustStatus, TrustedFolders};
@@ -1030,6 +1088,7 @@ mod tests {
     const DISCOVERED_SPEC: &str = "openrouter/discovered-model";
     const OFFLINE_SPEC: &str = "openai/gpt-5";
     const SELECTED_SPEC: &str = "openai/gpt-5.6-sol";
+    const FAILED_LOAD_KEEPS_SESSION: &str = "a load that failed must not close the running session";
     /// Neither resolves in the price tables, so nothing can re-price a restored
     /// session back onto the recorded number by luck.
     const RETIRED_SPEC: &str = "retired-vendor/retired-model-9000";
@@ -1049,6 +1108,10 @@ mod tests {
     const NEXT_TURN_SCOPE: &str = "rm -rf /";
     const NEXT_TURN_TOOL_USE_ID: &str = "toolu_next_turn";
     const STALE_ALLOW: &str = "a stale answer must never allow the next turn's tool";
+
+    /// Where fixture servers claim their placeholder session. One dir is enough,
+    /// since fresh ids never collide and nothing is written under them.
+    static FIXTURE_CLAIMS: LazyLock<TempDir> = LazyLock::new(|| TempDir::new().unwrap());
 
     /// The client picks the session cwd, so that folder's stored trust decides
     /// whether its `.maki` may widen permissions. Its deny rules need no trust:
@@ -1237,13 +1300,14 @@ mod tests {
     fn test_server() -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
         let (answer_tx, answer_rx) = flume::unbounded();
         let (out_tx, out_rx) = flume::unbounded();
+        let claim = SessionClaim::fresh(&StateDir::from_path(FIXTURE_CLAIMS.path().to_path_buf()));
         let handle = InteractiveHandle {
             tool_names: Vec::new(),
             input_tx: flume::unbounded().0,
             answer_tx,
             cancel_tx: flume::unbounded().0,
             model_tx: flume::unbounded().0,
-            session_id: SessionRef::from(MakiId::generate()),
+            session_id: SessionRef::from(claim.id()),
             permissions: Arc::new(PermissionManager::new(
                 maki_config::PermissionsConfig::default(),
                 PathBuf::from("/project"),
@@ -1265,9 +1329,68 @@ mod tests {
                 current_mode: AgentMode::Build,
                 current_model: String::new(),
                 pending: Arc::default(),
+                claim,
             }),
         };
         (server, answer_rx, out_rx)
+    }
+
+    fn acp_params(storage: StateDir) -> AcpParams {
+        AcpParams {
+            model: Model::from_spec(SELECTED_SPEC).expect("a shipped model"),
+            config: AgentConfig::default(),
+            timeouts: Timeouts::default(),
+            initial_wd: PathBuf::from("/project"),
+            prompt_slots: Arc::default(),
+            yolo: false,
+            defaults: SessionDefaults::default(),
+            model_policy: Arc::default(),
+            plugin_rules: Arc::default(),
+            trust_mode: TrustMode::Consult,
+            trust_policy: Arc::default(),
+            on_session_end: None,
+            storage,
+        }
+    }
+
+    fn load_request(id: MakiId) -> Value {
+        serde_json::json!({
+            "params": { "sessionId": id.to_string(), "cwd": "/project", "mcpServers": [] }
+        })
+    }
+
+    /// A load that cannot happen must not take the running session down with
+    /// it: the client still holds that session, and every prompt it sends next
+    /// would otherwise answer "no active session".
+    #[test_case(false ; "a session that does not exist")]
+    #[test_case(true ; "a session another maki holds")]
+    fn a_failed_load_leaves_the_running_session_alone(held_elsewhere: bool) {
+        let tmp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let mut stored: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+            Session::new(SELECTED_SPEC, "/project");
+        let claim = SessionClaim::acquire(stored.id, &storage).unwrap();
+        stored.save(&claim, &storage).unwrap();
+        let _elsewhere = held_elsewhere.then_some(claim);
+        let target = match held_elsewhere {
+            true => stored.id,
+            false => MakiId::generate(),
+        };
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let running = srv.session.as_ref().unwrap().handle.session_id.clone();
+
+        let result = smol::block_on(load_session(
+            &mut srv,
+            &load_request(target),
+            &acp_params(storage),
+        ));
+
+        assert!(result.is_err());
+        assert_eq!(
+            srv.session.as_ref().map(|s| s.handle.session_id.clone()),
+            Some(running),
+            "{FAILED_LOAD_KEEPS_SESSION}"
+        );
     }
 
     fn pending(srv: &Server) -> &PendingState {
@@ -1910,10 +2033,12 @@ mod tests {
             output: 200,
             ..Default::default()
         };
-        session.save(&dir).unwrap();
+        session
+            .save(&SessionClaim::acquire(session.id, &dir).unwrap(), &dir)
+            .unwrap();
 
         let id: MakiId = session.id;
-        let restored = load_history(&dir, id).unwrap();
+        let restored = claim_history(&dir, id).unwrap().0;
         assert_eq!(restored.session.model, "anthropic/test-model");
         assert_eq!(
             serde_json::to_value(restored.session.messages()).unwrap(),
@@ -1946,9 +2071,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        session.save(&dir).unwrap();
+        session
+            .save(&SessionClaim::acquire(session.id, &dir).unwrap(), &dir)
+            .unwrap();
 
-        let restored = load_history(&dir, session.id).unwrap();
+        let restored = claim_history(&dir, session.id).unwrap().0;
         let mut by_model = restored.session.usage_by_model().clone();
         assert_eq!(
             by_model[RETIRED_MODEL_ID].cost,
@@ -1977,15 +2104,17 @@ mod tests {
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
             Session::new("anthropic/test-model", "relative/project");
-        session.save(&dir).unwrap();
-        assert_eq!(load_history(&dir, session.id).unwrap().cwd, None);
+        session
+            .save(&SessionClaim::acquire(session.id, &dir).unwrap(), &dir)
+            .unwrap();
+        assert_eq!(claim_history(&dir, session.id).unwrap().0.cwd, None);
     }
 
     #[test]
     fn load_missing_session_is_resource_not_found() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let err = load_history(&dir, MakiId::generate()).unwrap_err();
+        let err = claim_history(&dir, MakiId::generate()).unwrap_err();
         assert_eq!(err.code, AcpError::resource_not_found(None).code);
     }
 

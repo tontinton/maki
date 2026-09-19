@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::AppSession;
+use crate::OpenSession;
 use crate::app::tasks::TaskOutcome;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
@@ -420,7 +420,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: &Model,
-        session: AppSession,
+        session: OpenSession,
         storage: StateDir,
         available_models: Arc<ArcSwapOption<Vec<String>>>,
         mcp_reader: McpSnapshotReader,

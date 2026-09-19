@@ -654,7 +654,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::sessions::{Session, TitleSource};
+    use crate::sessions::{Session, SessionClaim, TitleSource};
 
     const SESSION_MODEL: &str = "test-model";
     const INIT_LUA: &str = "init.lua";
@@ -702,7 +702,8 @@ mod tests {
         let state = StateDir::from_path(dir.path().to_path_buf());
         let mut session: Session<StoredMessage, u32, ()> =
             Session::new(SESSION_MODEL, cwd.to_str().unwrap());
-        session.save(&state).unwrap();
+        let claim = SessionClaim::acquire(session.id, &state).unwrap();
+        session.save(&claim, &state).unwrap();
     }
 
     #[test]

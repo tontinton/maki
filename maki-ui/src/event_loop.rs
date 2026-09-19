@@ -48,7 +48,6 @@ use ratatui::layout::Rect;
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::AppSession;
 use crate::agent::{
     AgentHandles, ModelSlot, ModelSlots,
     shared_queue::{Compaction, QueueItem, QueuedInput},
@@ -63,6 +62,7 @@ use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 use crate::input::InputReader;
 use crate::repaint::{Dirty, IDLE_POLL};
+use crate::{AppSession, OpenSession};
 
 use crate::storage_writer::StorageWriter;
 use crate::terminal;
@@ -81,7 +81,7 @@ const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
 /// disk round-trip; `session_has_content` tells which ones were saved.
 pub(crate) struct ShutdownReport {
     pub exit: ExitRequest,
-    pub tabs: Vec<AppSession>,
+    pub tabs: Vec<OpenSession>,
     pub focused: usize,
 }
 
@@ -89,7 +89,7 @@ pub struct EventLoopParams {
     pub model: Model,
     pub needs_login: bool,
     pub commands: Vec<CustomCommand>,
-    pub sessions: Vec<AppSession>,
+    pub sessions: Vec<OpenSession>,
     pub focused: usize,
     pub startup_warnings: Vec<String>,
     pub startup_notice: Option<String>,
@@ -402,7 +402,8 @@ struct SpawnCtx {
 }
 
 impl SpawnCtx {
-    fn spawn_runtime(&self, session: AppSession, slot: Arc<ModelSlot>) -> SessionRuntime {
+    fn spawn_runtime(&self, open: OpenSession, slot: Arc<ModelSlot>) -> SessionRuntime {
+        let session = &open.session;
         let resumed = !session.messages().is_empty();
         let permissions = Arc::new(self.permissions.fork());
         let cell = Arc::new(ArcSwap::from(Arc::clone(&slot)));
@@ -427,7 +428,7 @@ impl SpawnCtx {
         );
         let mut app = App::new(
             &slot.model,
-            session,
+            open,
             self.storage.clone(),
             Arc::clone(&self.available_models),
             handles.mcp_reader(),
@@ -667,9 +668,9 @@ impl<'t> EventLoop<'t> {
 
         let mut runtimes: Vec<SessionRuntime> = sessions
             .into_iter()
-            .map(|session| {
-                let (slot, reason) = slots.get_or_fallback(&session.model);
-                let mut rt = ctx.spawn_runtime(session, slot);
+            .map(|open| {
+                let (slot, reason) = slots.get_or_fallback(&open.session.model);
+                let mut rt = ctx.spawn_runtime(open, slot);
                 if let Some(reason) = reason {
                     rt.app.flash(reason);
                 }
@@ -1185,6 +1186,7 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                 };
+                let mut claim = None;
                 if let Some(i) = self.position(id) {
                     if i == self.focused {
                         let _ = reply_tx.send(Err(DELETE_FOCUSED_ERR.into()));
@@ -1195,8 +1197,9 @@ impl<'t> EventLoop<'t> {
                         .lua_event_handle
                         .end_session(rt.id(), SessionEndReason::Delete);
                     rt.handles.cancel_all();
+                    claim = Some(rt.app.state.claim.clone());
                 }
-                self.ctx.storage_writer.delete(id, move |res| {
+                self.ctx.storage_writer.delete(id, claim, move |res| {
                     let reply = match res {
                         Ok(()) | Err(SessionError::Storage(StorageError::NotFound(_))) => {
                             Ok(json!(true))
@@ -1234,11 +1237,11 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(reply);
             }
             SessionRequest::New { prompt, focus } => {
-                let session = self.focused_app().blank_session();
+                let open = self.focused_app().blank_session();
                 // A blank session inherits the focused tab's model, whose slot
                 // is already built and sitting right here.
                 let slot = self.sessions[self.focused].slot.load_full();
-                let idx = self.push_runtime(self.ctx.spawn_runtime(session, slot));
+                let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
                 let id = self.sessions[idx].id();
                 maki_otel::emit::session_started(
                     maki_otel::emit::START_FRESH,
@@ -1286,10 +1289,10 @@ impl<'t> EventLoop<'t> {
                     if let Some(i) = self.position(id) {
                         self.sessions[i].app.state.session_mut().set_title(title);
                     } else {
-                        let mut session =
-                            AppSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
+                        let OpenSession { mut session, claim } =
+                            OpenSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
                         session.set_title(title);
-                        self.ctx.storage_writer.send(Arc::new(session));
+                        self.ctx.storage_writer.send(Arc::new(session), claim);
                     }
                     Ok(json!(true))
                 })();
@@ -1444,19 +1447,21 @@ impl<'t> EventLoop<'t> {
             self.focused = i;
             return Ok(());
         }
-        let session = AppSession::load(id, &self.ctx.storage)
+        // A session another maki owns is refused here, where it costs a flash,
+        // rather than at the first write, after a whole conversation.
+        let open = OpenSession::load(id, &self.ctx.storage)
             .map_err(|e| format!("Failed to load session: {e}"))?;
-        let (slot, reason) = self.slots.get_or_fallback(&session.model);
+        let (slot, reason) = self.slots.get_or_fallback(&open.session.model);
         let focused = &self.sessions[self.focused];
         if SessionStatus::of(&focused.app) == SessionStatus::Idle && !focused.app.has_content() {
             let idx = self.focused;
             let history = self.sessions[idx]
                 .app
-                .apply_loaded_session(session, &slot.model);
+                .apply_loaded_session(open, &slot.model);
             self.apply_model(idx, slot);
             self.respawn_agent(idx, history);
         } else {
-            self.focused = self.push_runtime(self.ctx.spawn_runtime(session, slot));
+            self.focused = self.push_runtime(self.ctx.spawn_runtime(open, slot));
         }
         if let Some(reason) = reason {
             self.focused_app().flash(reason);
@@ -1860,7 +1865,10 @@ impl<'t> EventLoop<'t> {
             app.checkpoint_now();
             // `app` drops at the end of this iteration, closing the
             // channels the agent loop waits on, so `join_all` can finish.
-            tabs.push(Arc::unwrap_or_clone(app.state.session));
+            tabs.push(OpenSession {
+                session: Arc::unwrap_or_clone(app.state.session),
+                claim: app.state.claim,
+            });
             agent_tasks.push(handles.into_task());
         }
         let save_sessions_ms = lap();

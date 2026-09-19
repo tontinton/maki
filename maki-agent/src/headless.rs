@@ -10,6 +10,7 @@ use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
+use maki_storage::sessions::SessionClaim;
 use serde_json::Value;
 use tracing::error;
 
@@ -62,6 +63,9 @@ pub struct HeadlessParams {
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
     pub resumed: Resumed,
+    /// The right to write [`Self::resumed`]'s session, taken before its
+    /// transcript was read.
+    pub claim: SessionClaim,
     /// Where the transcript is written. The same dir the caller resolved the
     /// session from, so a run cannot read one session and write another.
     pub storage: StateDir,
@@ -167,7 +171,12 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
         let Some(provider) = connect(&mut model, params.timeouts, &event_tx).await else {
             return;
         };
-        let mut track = SessionTrack::open(params.resumed, params.storage, &task_working_dir);
+        let mut track = SessionTrack::open(
+            params.resumed,
+            params.claim,
+            params.storage,
+            &task_working_dir,
+        );
 
         let error_tx = event_tx.clone();
         // Outlives `agent`, so dropping it writes the transcript once the agent
@@ -240,6 +249,8 @@ pub struct InteractiveParams {
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
     pub resumed: Resumed,
+    /// See [`HeadlessParams::claim`].
+    pub claim: SessionClaim,
     /// See [`HeadlessParams::storage`].
     pub storage: StateDir,
     pub yolo: bool,
@@ -316,7 +327,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
         let Some(mut provider) = connect(&mut model, params.timeouts, &base_tx).await else {
             return;
         };
-        let mut track = SessionTrack::open(params.resumed, params.storage, &working_dir);
+        let mut track =
+            SessionTrack::open(params.resumed, params.claim, params.storage, &working_dir);
         let mut run_id: u64 = 0;
 
         while let Ok(input) = input_rx.recv_async().await {

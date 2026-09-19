@@ -15,7 +15,7 @@ use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::{InitFiles, Interaction, PackPlan, PackReport, PluginHost};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
-use maki_ui::{AppSession, RunOutcome};
+use maki_ui::{OpenSession, RunOutcome};
 
 use crate::cli::{Cli, normalize_tool_name};
 use crate::resume::{self, Resolved};
@@ -209,12 +209,12 @@ fn build_stack(
 /// and the only step left here is the TUI-only one: an explicit `--model` is a
 /// choice about the session being opened, and a session's own spec is what
 /// every later switch reads.
-fn open_tab(resolved: Resolved, model: &str, explicit_model: bool, cwd: &str) -> AppSession {
-    let mut session = resolved.into_session(model, cwd);
+fn open_tab(resolved: Resolved, model: &str, explicit_model: bool, cwd: &str) -> OpenSession {
+    let mut tab = resolved.into_session(model, cwd);
     if explicit_model {
-        session.set_model(model.to_owned());
+        tab.session.set_model(model.to_owned());
     }
-    session
+    tab
 }
 
 fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
@@ -383,11 +383,13 @@ pub fn run(mut cli: Cli) -> Result<()> {
     setup::report_session_start(resolved.start_type, Some(&resolved.id));
 
     if cli.is_sdk_mode() {
+        let (resumed, claim) = resolved.into_resumed();
         let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
-            resumed: resolved.into_resumed(),
+            resumed,
+            claim,
             storage: storage.clone(),
             model: stack.model,
             config: stack.config.agent,
@@ -405,6 +407,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     }
 
     if cli.print {
+        let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
         crate::print::run(crate::print::PrintParams {
             model: stack.model,
@@ -420,7 +423,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
             project_config: trust.project_config.clone(),
-            resumed: resolved.into_resumed(),
+            resumed,
+            claim,
             storage: storage.clone(),
         })
         .context("run print mode")?;
@@ -444,7 +448,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     };
 
     loop {
-        for session in &mut tabs {
+        for OpenSession { session, .. } in &mut tabs {
             if session.messages().is_empty() {
                 stack.config.session_defaults.seed(&mut session.meta);
             }
@@ -531,7 +535,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 )?;
                 tabs = reloaded;
                 if tabs.is_empty() {
-                    let replacement = Resolved::fresh();
+                    let replacement = Resolved::fresh(&storage);
                     setup::report_session_start(replacement.start_type, Some(&replacement.id));
                     tabs.push(replacement.into_session(&new_stack.model.spec(), &cwd_str));
                 }
@@ -578,6 +582,8 @@ mod tests {
     use maki_agent::tools::ToolRegistry;
     use maki_config::RawConfig;
     use maki_providers::Message;
+    use maki_storage::sessions::SessionClaim;
+    use maki_ui::AppSession;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -761,12 +767,17 @@ mod tests {
         let cwd = dir.path().to_string_lossy().into_owned();
         let mut stored = AppSession::new(STORED_SPEC, &cwd);
         stored.push_message(Message::user(STORED_MESSAGE.to_owned()));
-        stored.save(&storage).expect("write session to disk");
         let stored_id = stored.id;
+        stored
+            .save(
+                &SessionClaim::acquire(stored_id, &storage).expect("claim"),
+                &storage,
+            )
+            .expect("write session to disk");
         let resolved = resume::resolve(&Cli::parse_from(["maki", "-c"]), &cwd, &storage)
             .expect("continue resolves");
 
-        let session = open_tab(resolved, STARTUP_SPEC, explicit_model, &cwd);
+        let session = open_tab(resolved, STARTUP_SPEC, explicit_model, &cwd).session;
 
         assert_eq!(session.id, stored_id);
         assert_eq!(
@@ -785,9 +796,11 @@ mod tests {
     /// reports is what it writes.
     #[test]
     fn a_fresh_tab_opens_on_the_resolved_id_and_the_startup_spec() {
-        let resolved = Resolved::fresh();
+        let dir = tempdir().expect("tempdir");
+        let storage = StateDir::from_path(dir.path().join("state"));
+        let resolved = Resolved::fresh(&storage);
         let id = resolved.id.id();
-        let session = open_tab(resolved, STARTUP_SPEC, false, CWD);
+        let session = open_tab(resolved, STARTUP_SPEC, false, CWD).session;
 
         assert_eq!(session.id, id);
         assert!(session.messages().is_empty());
