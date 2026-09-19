@@ -4186,6 +4186,10 @@ pub fn spawn(
             // no caller blocks on a dead host.
             for _ in rx.drain() {}
             for _ in prio_rx.drain() {}
+            // Each pooled client owns a curl thread and its connection cache.
+            // Nothing else hands them back, so a host that fetched once would
+            // keep its sockets open for the rest of the process.
+            crate::api::net::clear_client_pool();
         })
         .map_err(|e| PluginError::Io {
             path: PathBuf::from("lua-thread"),

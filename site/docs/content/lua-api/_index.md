@@ -3449,6 +3449,9 @@ blocked to prevent SSRF, including after a redirect. Hosts listed in
 the `net.allowed_private_hosts` config option are exempt.
 Failed requests (5xx) are retried automatically.
 
+Requests reuse a pool of clients, so calls to the same host share one
+keep-alive connection rather than pay a fresh handshake each time.
+
 ```lua
 local res, err = maki.net.request("https://example.com")
 if res then print(res.body) end
@@ -3474,6 +3477,9 @@ listed in `net.allowed_private_hosts`.
   `timeout` (integer) Timeout in seconds, max 120 (default 30).
   `max_bytes` (integer) Max response size in bytes (default 5 MB).
   `retry` (integer) Retries on 5xx errors (default 3).
+  `line_prefixes` (table) Array of strings. Keep only the response
+  lines that start with one of them. Filtering happens after the body
+  is read, so `max_bytes` still caps the transfer.
 
 The response table has three fields: `body` (string), `status`
 (integer), and `content_type` (string).
