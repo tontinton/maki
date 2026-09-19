@@ -8,6 +8,7 @@ use crate::selection::{
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
+use crate::image;
 use crate::repaint::Dirty;
 
 use super::App;
@@ -18,6 +19,13 @@ pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) {
         match event.kind {
+            // Mouse capture turns the X11 paste into a plain button event, so
+            // the selection is read back and routed like a bracketed paste.
+            MouseEventKind::Down(MouseButton::Middle) => {
+                if let Some(text) = self.clipboard.primary_selection() {
+                    self.insert_pasted(text);
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(zone) = self.zone_at(event.row, event.column) {
                     if self.has_modal_overlay() && zone.zone != SelectionZone::Overlay {
@@ -54,6 +62,24 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// An image path anywhere in the paste wins and the text is dropped, the
+    /// same rule a bracketed paste follows.
+    pub(super) fn insert_pasted(&mut self, text: String) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut any_image = false;
+        if self.is_main_chat() {
+            for line in text.lines() {
+                if let Some((path, media_type)) = image::try_parse_image_path(line) {
+                    self.start_file_image_paste(path, media_type);
+                    any_image = true;
+                }
+            }
+        }
+        if !any_image {
+            self.route_text_paste(&text);
         }
     }
 

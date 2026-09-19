@@ -570,6 +570,16 @@ fn paste_file_path_triggers_image_load() {
 }
 
 #[test]
+fn paste_loads_every_image_path_in_the_text() {
+    let mut app = test_app();
+    app.update(Msg::Paste(
+        "file:///tmp/one.png\nnot an image\nfile:///tmp/two.jpg".into(),
+    ));
+    assert_eq!(app.image_paste_rx.len(), 2);
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+#[test]
 fn submit_during_streaming_queues_message() {
     let mut app = test_app();
     app.update(Msg::Key(key(KeyCode::Char('a'))));

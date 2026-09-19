@@ -23,6 +23,27 @@ impl ClipboardState {
         Self::copy_text_impl(text, |t| self.copy_native(t), terminal::copy_to_clipboard)
     }
 
+    /// Reads the X11 PRIMARY selection, the one middle-click pastes. Always
+    /// `None` off Linux or over Wayland's data-control protocol, which has no
+    /// primary selection to offer.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn primary_selection(&mut self) -> Option<String> {
+        use arboard::GetExtLinux;
+        let text = self
+            .native
+            .as_mut()?
+            .get()
+            .clipboard(LinuxClipboardKind::Primary)
+            .text()
+            .ok()?;
+        (!text.is_empty()).then_some(text)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn primary_selection(&mut self) -> Option<String> {
+        None
+    }
+
     fn copy_text_impl<F, G>(text: &str, native: F, osc52: G) -> Result<CopyResult, String>
     where
         F: FnOnce(&str) -> Result<(), String>,
