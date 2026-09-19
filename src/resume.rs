@@ -41,20 +41,12 @@ impl Resolved {
         }
     }
 
-    /// What the agent needs: the transcript and what it measured, under the id
-    /// the run writes to.
+    /// What the agent needs: the transcript, what it measured and the session
+    /// it came out of, under the id the run writes to.
     pub fn into_resumed(self) -> Resumed {
-        let (history, context_size) = match self.session {
-            Some(session) => {
-                let measured = session.meta.context_size;
-                (session.take_messages(), measured)
-            }
-            None => (Vec::new(), 0),
-        };
-        Resumed {
-            id: self.id,
-            history,
-            context_size,
+        match self.session {
+            Some(session) => Resumed::stored(self.id, session),
+            None => Resumed::empty(self.id),
         }
     }
 
@@ -489,6 +481,8 @@ mod tests {
         assert_eq!(resumed.context_size, CONTEXT_SIZE);
         assert_eq!(resumed.history.len(), 1);
         assert_eq!(resumed.id.id(), stored);
+        let session = resumed.session.expect("the loaded session travels along");
+        assert_eq!(session.id, stored);
     }
 
     /// The tab the TUI opens and the transcript a headless run writes have to

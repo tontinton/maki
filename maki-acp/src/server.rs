@@ -30,10 +30,9 @@ use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
-use maki_providers::{Message, TokenUsage, add_cost, settle_session};
+use maki_providers::{add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
-use maki_storage::sessions::StoredTokenUsage;
 use serde::Serialize;
 use serde_json::Value;
 use smol::Task;
@@ -313,7 +312,7 @@ async fn load_session(
         .0
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
-    let mut restored = load_history(&params.storage, session_ref.id())?;
+    let restored = load_history(&params.storage, session_ref.id())?;
     close_session(srv, SessionEndReason::Replaced).await;
     let project_config = trusted_project_config(
         &req.cwd,
@@ -325,15 +324,21 @@ async fn load_session(
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
     let replay_cwd = restored.cwd.as_deref().unwrap_or(&req.cwd);
-    for update in translate::replay_history(&restored.history, replay_cwd, home.as_deref()) {
+    for update in translate::replay_history(restored.session.messages(), replay_cwd, home.as_deref())
+    {
         session_update(&srv.out_tx, &sid, update);
     }
     // Priced against the model the session recorded, not the one selected now
     // (which may cost 10x more or less). Later turns add their own exact cost.
-    let recorded_model = Model::from_spec(&restored.model).unwrap_or_else(|_| params.model.clone());
+    let recorded_model =
+        Model::from_spec(&restored.session.model).unwrap_or_else(|_| params.model.clone());
+    // Settling writes today's estimate into entries that never recorded a cost.
+    // The run saves this session back, so we settle a copy and keep that
+    // estimate off disk.
+    let mut by_model = restored.session.usage_by_model().clone();
     let restored_cost = settle_session(
-        &restored.usage,
-        &mut restored.by_model,
+        &restored.session.token_usage,
+        &mut by_model,
         &recorded_model,
         RESTORED_FAST,
     );
@@ -341,11 +346,7 @@ async fn load_session(
         srv,
         params,
         req.cwd,
-        Resumed {
-            id: session_ref,
-            history: restored.history,
-            context_size: restored.context_size,
-        },
+        Resumed::stored(session_ref, restored.session),
         mcp,
         project_config,
         restored_cost,
@@ -610,13 +611,11 @@ async fn close_session(srv: &mut Server, reason: SessionEndReason) {
 
 #[derive(Debug)]
 struct Restored {
-    history: Vec<Message>,
+    /// Handed to the run whole, so the turns that follow write back into the
+    /// session this read rather than into a blank one under the same id.
+    session: StoredSession,
     /// Only set when the session recorded an absolute cwd.
     cwd: Option<PathBuf>,
-    usage: TokenUsage,
-    context_size: u32,
-    by_model: HashMap<String, StoredTokenUsage>,
-    model: String,
 }
 
 /// History plus the absolute cwd the session recorded in its header. Tool
@@ -636,11 +635,7 @@ fn load_history(storage: &StateDir, session_id: MakiId) -> Result<Restored, AcpE
     };
     Ok(Restored {
         cwd: recorded,
-        usage: session.token_usage,
-        context_size: session.meta.context_size,
-        by_model: session.usage_by_model().clone(),
-        model: session.model.clone(),
-        history: session.take_messages(),
+        session,
     })
 }
 
@@ -1021,9 +1016,9 @@ mod tests {
     };
     use maki_config::project::TrustQuestion;
     use maki_config::{Effect, ToolKey, TrustFileConfig};
-    use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
+    use maki_providers::{ContentBlock as MsgBlock, Message, Role, TokenUsage};
     use maki_storage::StateDir;
-    use maki_storage::sessions::Session;
+    use maki_storage::sessions::{Session, StoredTokenUsage};
     use maki_storage::trusted_folders::{CanonicalFolder, TrustStatus, TrustedFolders};
     use tempfile::TempDir;
     use test_case::test_case;
@@ -1919,18 +1914,18 @@ mod tests {
 
         let id: MakiId = session.id;
         let restored = load_history(&dir, id).unwrap();
-        assert_eq!(restored.model, "anthropic/test-model");
+        assert_eq!(restored.session.model, "anthropic/test-model");
         assert_eq!(
-            serde_json::to_value(&restored.history).unwrap(),
+            serde_json::to_value(restored.session.messages()).unwrap(),
             serde_json::to_value(&messages).unwrap()
         );
         assert_eq!(restored.cwd, Some(PathBuf::from("/project")));
-        assert_eq!(restored.usage, session.token_usage);
+        assert_eq!(restored.session.token_usage, session.token_usage);
     }
 
-    /// Resuming must bill what the session actually paid. If `by_model` came
-    /// back empty or lost its recorded costs, ACP would re-price the restored
-    /// total against today's table and disagree with the TUI.
+    /// Resuming must bill what the session actually paid. If the per-model
+    /// breakdown came back empty or lost its recorded costs, ACP would re-price
+    /// the restored total against today's table and disagree with the TUI.
     #[test]
     fn load_history_prices_a_resumed_session_at_what_it_paid() {
         let tmp = TempDir::new().unwrap();
@@ -1953,21 +1948,22 @@ mod tests {
         );
         session.save(&dir).unwrap();
 
-        let mut restored = load_history(&dir, session.id).unwrap();
+        let restored = load_history(&dir, session.id).unwrap();
+        let mut by_model = restored.session.usage_by_model().clone();
         assert_eq!(
-            restored.by_model[RETIRED_MODEL_ID].cost,
+            by_model[RETIRED_MODEL_ID].cost,
             Some(RECORDED_COST),
             "the per-model breakdown survives the file"
         );
 
         // Mirrors `load_session`: the recorded spec no longer parses, so the
         // selected model stands in, and that must not change the bill.
-        let recorded_model = Model::from_spec(&restored.model)
+        let recorded_model = Model::from_spec(&restored.session.model)
             .unwrap_or_else(|_| Model::from_spec(SELECTED_SPEC).expect("a shipped model"));
         assert_eq!(
             settle_session(
-                &restored.usage,
-                &mut restored.by_model,
+                &restored.session.token_usage,
+                &mut by_model,
                 &recorded_model,
                 false
             ),

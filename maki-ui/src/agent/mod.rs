@@ -155,6 +155,7 @@ impl AgentHandles {
                 // A respawn carries the app's last reported count across, so
                 // the next request is not left guessing at its own prompt.
                 context_size: app.state.context_size,
+                session: None,
             },
             config,
             tool_output_lines,

@@ -1470,6 +1470,13 @@ where
         Arc::unwrap_or_clone(self.messages)
     }
 
+    /// Takes the transcript and leaves the session empty. It is for a caller
+    /// that runs on the messages and later writes back into the session, which
+    /// would otherwise have to copy every message to hold both.
+    pub fn drain_messages(&mut self) -> Vec<M> {
+        Arc::unwrap_or_clone(std::mem::take(&mut self.messages))
+    }
+
     pub fn tool_outputs(&self) -> &HashMap<String, Arc<T>> {
         &self.tool_outputs
     }

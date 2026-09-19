@@ -20,10 +20,17 @@ pub type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 /// second answer minted here would not be the one the user was told.
 pub struct Resumed {
     pub id: SessionRef,
+    /// The transcript to run on. It is moved out of [`Self::session`] when
+    /// there is one, so the two never hold two copies of it.
     pub history: Vec<Message>,
     /// The provider's last prompt count for `history`, so a resumed run budgets
     /// from a measurement instead of an estimate.
     pub context_size: u32,
+    /// The stored session `history` came out of, if the driver read one. The
+    /// run writes back into it, so the title, spending and meta survive without
+    /// a second parse of the file. `None` when nothing is stored under the id
+    /// yet, or when the driver owns the session and persists it itself.
+    pub session: Option<StoredSession>,
 }
 
 impl Resumed {
@@ -31,10 +38,26 @@ impl Resumed {
     /// minting an id is a decision, and reaching for it by accident writes a
     /// transcript under an id nobody reported.
     pub fn fresh() -> Self {
+        Self::empty(SessionRef::generate())
+    }
+
+    /// A run under `id` with nothing read from disk for it.
+    pub fn empty(id: SessionRef) -> Self {
         Self {
-            id: SessionRef::generate(),
+            id,
             history: Vec::new(),
             context_size: 0,
+            session: None,
+        }
+    }
+
+    /// A run continuing a session the driver already loaded.
+    pub fn stored(id: SessionRef, mut session: StoredSession) -> Self {
+        Self {
+            id,
+            history: session.drain_messages(),
+            context_size: session.meta.context_size,
+            session: Some(session),
         }
     }
 }
@@ -50,9 +73,7 @@ impl Resumed {
 pub struct SessionTrack {
     history: History,
     gauge: ContextGauge,
-    /// `None` only when the id names a session this process cannot read, see
-    /// [`SessionStore::open`]. There is no "not opened yet" state to forget.
-    store: Option<SessionStore>,
+    store: SessionStore,
 }
 
 impl SessionTrack {
@@ -61,7 +82,7 @@ impl SessionTrack {
     /// resolved here, so the run writes where its history was read from.
     pub fn open(resumed: Resumed, storage: StateDir, cwd: &str) -> Self {
         Self {
-            store: SessionStore::open(storage, resumed.id.id(), cwd),
+            store: SessionStore::open(storage, resumed.session, resumed.id.id(), cwd),
             history: History::restored(resumed.history),
             gauge: ContextGauge::restored(resumed.context_size),
         }
@@ -76,9 +97,7 @@ impl SessionTrack {
     /// model before it builds the agent. Since this is the only path to a
     /// write, no stored session can carry a spec no turn ran on.
     pub fn turn(&mut self, model_spec: String) -> SessionTurn<'_> {
-        if let Some(store) = &mut self.store {
-            store.session.set_model(model_spec);
-        }
+        self.store.session.set_model(model_spec);
         SessionTurn(self)
     }
 }
@@ -110,9 +129,7 @@ impl Drop for SessionTurn<'_> {
             gauge,
             store,
         } = &mut *self.0;
-        if let Some(store) = store {
-            store.record_turn(history.as_slice(), gauge.size());
-        }
+        store.record_turn(history.as_slice(), gauge.size());
     }
 }
 
@@ -122,27 +139,18 @@ struct SessionStore {
 }
 
 impl SessionStore {
-    /// Opening touches no file. A session nothing was written for yet is held
-    /// in memory until [`Self::record_turn`] has something to store, so every
-    /// file on disk has a transcript in it. The blank model spec is
-    /// [`SessionTrack::turn`]'s to fill, and it runs before any write.
-    ///
-    /// `None` when the id names a session this process cannot read. Creating a
-    /// blank one in its place is worse than not persisting at all, because the
-    /// first write would replace a transcript whose only copy is that file.
-    fn open(dir: StateDir, session_id: MakiId, cwd: &str) -> Option<Self> {
-        match StoredSession::load(session_id, &dir) {
-            Ok(session) => Some(Self { dir, session }),
-            Err(e) if e.is_not_found() => {
-                let mut session = StoredSession::new("", cwd);
-                session.id = session_id;
-                Some(Self { dir, session })
-            }
-            Err(e) => {
-                warn!(error = %e, %session_id, "session unreadable; this run will not be persisted");
-                None
-            }
-        }
+    /// Opening touches no file: the driver either read the session already or
+    /// there is nothing under the id to read. A session nothing was written for
+    /// yet is held in memory until [`Self::record_turn`] has something to
+    /// store, so every file on disk has a transcript in it. The blank model
+    /// spec is [`SessionTrack::turn`]'s to fill, and it runs before any write.
+    fn open(dir: StateDir, stored: Option<StoredSession>, id: MakiId, cwd: &str) -> Self {
+        let session = stored.unwrap_or_else(|| {
+            let mut session = StoredSession::new("", cwd);
+            session.id = id;
+            session
+        });
+        Self { dir, session }
     }
 
     /// `context_size` travels with the messages, since a resumed session seeds
@@ -169,7 +177,7 @@ impl SessionStore {
 
 #[cfg(test)]
 mod tests {
-    use maki_storage::sessions::{SESSIONS_DIR, generate_title};
+    use maki_storage::sessions::generate_title;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -182,8 +190,8 @@ mod tests {
     const CONTEXT_SIZE: u32 = 42_000;
     const PROMPT: &str = "fix the login bug";
     const OBSERVATION: &str = "build failed";
-    const CORRUPT_LOG: &str = "{not json\n";
-    const KEPT: &str = "the file the run could not read has to survive it";
+    const TITLE: &str = "a title the user set";
+    const PLAN_PATH: &str = "/plans/plan.md";
     const NO_EMPTY_FILE: &str = "a session with no transcript must not be on disk";
     const NO_EMPTY_LATEST: &str = "an empty session must not be what --continue resolves to";
     const NOT_WIPED: &str = "an empty history must not replace the transcript it came from";
@@ -201,11 +209,7 @@ mod tests {
     }
 
     fn resumed() -> Resumed {
-        Resumed {
-            id: SessionRef::from(session_id()),
-            history: Vec::new(),
-            context_size: 0,
-        }
+        Resumed::empty(SessionRef::from(session_id()))
     }
 
     fn track_on(tmp: &TempDir) -> SessionTrack {
@@ -304,46 +308,28 @@ mod tests {
     }
 
     /// The next process continues the transcript instead of starting one
-    /// beside it, which is the whole point of `-c` and `-s`.
+    /// beside it, which is the whole point of `-c` and `-s`. The title and plan
+    /// are set only in memory, so they reach disk only if the run writes back
+    /// into the session it was handed rather than reading the file again.
     #[test]
-    fn reopening_resumes_the_stored_transcript() {
+    fn reopening_resumes_the_stored_session() {
         let tmp = TempDir::new().unwrap();
         push_prompt(&mut track_on(&tmp), MODEL_SPEC, PROMPT);
+        let mut stored = load(&tmp);
+        stored.set_title(TITLE.to_owned());
+        stored.meta.plan_path = Some(PLAN_PATH.to_owned());
 
         let mut track = SessionTrack::open(
-            Resumed {
-                history: load(&tmp).take_messages(),
-                ..resumed()
-            },
+            Resumed::stored(SessionRef::from(session_id()), stored),
             state_dir(&tmp),
             CWD,
         );
-        push_prompt(&mut track, OTHER_SPEC, "second");
+        push_prompt(&mut track, OTHER_SPEC, PROMPT);
 
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 2);
         assert_eq!(loaded.model, OTHER_SPEC);
-    }
-
-    /// A session file this process cannot parse is still the user's only copy.
-    /// Opening it gives up, and the turn that follows writes nothing, so the
-    /// transcript is there to recover instead of replaced by an empty one.
-    #[test]
-    fn an_unreadable_session_is_never_overwritten() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp
-            .path()
-            .join(SESSIONS_DIR)
-            .join(format!("{}.jsonl", session_id()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, CORRUPT_LOG).unwrap();
-
-        push_prompt(&mut track_on(&tmp), MODEL_SPEC, PROMPT);
-
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            CORRUPT_LOG,
-            "{KEPT}"
-        );
+        assert_eq!(loaded.title, TITLE);
+        assert_eq!(loaded.meta.plan_path.as_deref(), Some(PLAN_PATH));
     }
 }

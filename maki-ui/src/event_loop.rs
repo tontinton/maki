@@ -412,6 +412,9 @@ impl SpawnCtx {
                 id: SessionRef::from(session.id),
                 history: session.messages().to_vec(),
                 context_size: session.meta.context_size,
+                // The tab owns the session and persists it through
+                // `StorageWriter`, so the agent gets the transcript only.
+                session: None,
             },
             self.config.clone(),
             self.ui_config.tool_output_lines,
