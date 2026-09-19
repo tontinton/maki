@@ -23,6 +23,16 @@ pub enum InputFormat {
     StreamJson,
 }
 
+/// What a new `--worktree` branches from.
+#[derive(Clone, Copy, ValueEnum, Default)]
+pub enum WorktreeBase {
+    /// Branch from the current local HEAD, carrying unpushed work (default).
+    #[default]
+    Head,
+    /// Branch from the repository's default branch fetched from the remote.
+    Fresh,
+}
+
 #[derive(Parser)]
 #[command(name = "maki", version, about = "AI coding agent for the terminal")]
 pub struct Cli {
@@ -48,6 +58,27 @@ pub struct Cli {
     /// Resume the most recent session in this directory
     #[arg(short = 'c', long = "continue")]
     pub continue_session: bool,
+
+    /// Create a git worktree and start an interactive maki session inside it,
+    /// isolating this session's files from the current checkout. The worktree
+    /// lands at <git-root>/.maki/worktrees/<NAME> on a new branch worktree-<NAME>.
+    /// Omit --worktree-name to auto-generate one.
+    #[arg(short = 'w', long)]
+    pub worktree: bool,
+
+    /// Name for a new --worktree session; auto-generates when omitted.
+    #[arg(long, value_name = "NAME")]
+    pub worktree_name: Option<String>,
+
+    /// Branch a new --worktree from the remote default branch instead of the
+    /// current local HEAD.
+    #[arg(long, value_enum, default_value_t = WorktreeBase::Head)]
+    pub worktree_base: WorktreeBase,
+
+    /// Place a new --worktree at this path instead of
+    /// <git-root>/.maki/worktrees/<NAME>. Must live outside the current checkout.
+    #[arg(long, value_name = "DIR")]
+    pub worktree_dir: Option<std::path::PathBuf>,
 
     /// Resume a specific session by its ID
     #[arg(short = 's', long, alias = "resume")]

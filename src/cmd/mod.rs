@@ -3,6 +3,7 @@ mod migrate;
 mod session;
 mod subcmd;
 mod tui;
+mod worktree;
 
 use color_eyre::Result;
 use color_eyre::eyre::Context;
@@ -124,6 +125,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     } else {
         TrustMode::Consult
     };
+    if cli.worktree && cli.command.is_some() {
+        color_eyre::eyre::bail!(
+            "--worktree only applies to the interactive session, not subcommands"
+        );
+    }
+    if cli.worktree && (cli.print || cli.is_sdk_mode()) {
+        color_eyre::eyre::bail!(
+            "--worktree only applies to the interactive session, not headless mode"
+        );
+    }
     match cli.command {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
