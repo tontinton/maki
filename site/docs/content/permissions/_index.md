@@ -73,6 +73,10 @@ Tools that never declare permission scopes (for example `read`, `glob`, `grep`, 
 
 Container tools like `batch` and `code_execution` prompt for each inner tool individually.
 
+## Background Sessions
+
+A subagent running in the background has no one to answer a prompt. A tool call that would prompt is denied instead, and the error tells you to add an allow rule for that tool. This applies to every tool the background subagent calls, including `bash` and `webfetch`. Sessions you watch in the foreground keep prompting as usual.
+
 ## TOML Configuration
 
 There are two permission files:
