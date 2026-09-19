@@ -3243,13 +3243,7 @@ end
 
 ## maki.keymap {#maki-keymap}
 
-Key mappings, modeled after `vim.keymap`. If you have written a
-Neovim keymap plugin before, this will feel familiar.
-
-`set` claims a key for the rest of the run. A key a popup should own
-only while it is on screen belongs in the `keys` of
-`maki.ui.open_win`, which routes it to that window and hands it back
-when the window closes.
+Key mappings, modeled after `vim.keymap`.
 
 ```lua
 maki.keymap.set("n", "<C-t>", function()
@@ -3259,13 +3253,16 @@ end, { desc = "Say hello" })
 
 ## Key notation
 
-One notation covers every place maki names a key: the string `set` and
-`del` read, the `keys` a window claims in `maki.ui.open_win`, and the
-`key` field of a `win:recv` keypress event. `normalize` turns any
-accepted spelling into the one maki prints.
+`set`, `del`, the `keys` option of `maki.ui.open_win` and `win:recv`
+key events all use one notation. `normalize` converts any accepted
+spelling to the canonical one.
 
-A single character stands for itself: `a`, `A`, `7`, `?`. Every other
-key goes in angle brackets, behind its modifier prefixes.
+```lua
+if ev.type == "key" and ev.key == "<CR>" then submit() end
+```
+
+A single character stands for itself: `a`, `A`, `7`, `?`. Other keys
+go in angle brackets, after any modifiers.
 
 | Key | Notation | Also accepted |
 | --- | --- | --- |
@@ -3280,35 +3277,26 @@ key goes in angle brackets, behind its modifier prefixes.
 | Navigation | `<Home>`, `<End>`, `<PageUp>`, `<PageDown>`, `<Insert>` | |
 | Function keys | `<F1>` through `<F24>` | |
 
-Modifiers are `C-` for control, `M-` for alt and `S-` for shift,
-written in that order when a key carries more than one: `<C-M-x>`.
-`Ctrl-`, `Alt-`, `A-` and `Shift-` are read on the way in and never
-printed.
+Modifiers are `C-` (control), `M-` (alt) and `S-` (shift), in that
+order: `<C-M-x>`. `Ctrl-`, `Alt-`, `A-` and `Shift-` are accepted as
+input.
 
-Terminals disagree with each other about three keys, so maki settles
-each one way:
+Terminals report some keys differently, so maki picks one form:
 
-- Control plus a letter is lowercase, so `<C-N>` is `<C-n>`, the same
-  rule as Vim.
-- Shift plus a letter is the uppercase letter, so `<S-a>` is `A`. Shift
-  plus a digit or a punctuation mark keeps its prefix: `<S-1>`.
-- Shift+Tab is `<S-Tab>` whether or not the terminal speaks the kitty
-  keyboard protocol.
+- Control plus a letter is lowercase: `<C-N>` is `<C-n>`, as in Vim.
+- Shift plus a letter is the uppercase letter: `<S-a>` is `A`. Shift
+  plus a digit or punctuation keeps the prefix: `<S-1>`.
+- Shift+Tab is always `<S-Tab>`, with or without the kitty keyboard
+  protocol.
 
-Key spellings in a plugin's source, its entrypoints and every module it
-`require`s, are checked as they load. Each wrong one is logged naming the file and
-line, and the status bar sums them up in one line, so a typo is a
-message at startup rather than a binding that quietly never fires.
+Key strings in a plugin and every module it `require`s are checked at
+load. Each invalid one is logged with its file and line, and the status
+bar shows a summary, so a typo shows up at startup.
 
-```lua
-if ev.type == "key" and ev.key == "<CR>" then submit() end
-```
-
-Earlier versions of maki delivered a `win:recv` key event as `"enter"`,
-`"esc"`, `"ctrl+n"` or `"shift+tab"`. The same presses now arrive as
-`<CR>`, `<Esc>`, `<C-n>` and `<S-Tab>`. That check reports the old
-spellings by name, so a plugin written against them says so at startup
-instead of going quiet.
+Upgrading from older versions: `win:recv` used to deliver `"enter"`,
+`"esc"`, `"ctrl+n"` and `"shift+tab"`. These now arrive as `<CR>`,
+`<Esc>`, `<C-n>` and `<S-Tab>`, and the load check flags the old
+spellings.
 
 ---
 
@@ -3318,32 +3306,34 @@ instead of going quiet.
 maki.keymap.set({mode}, {lhs}, {rhs}, {opts?})
 ```
 
-Bind a key to a Lua function, just like `vim.keymap.set`. Only
-normal mode (`"n"`) is supported right now. If {lhs} is already
-mapped, the old binding is replaced and a warning is logged.
+Bind a key to a Lua function, like `vim.keymap.set`. Only normal mode
+(`"n"`) is supported.
 
-The binding is global and lasts until `del` or the plugin unloads. For a
-key a popup should own only while it is on screen, declare it in the
-`keys` of `maki.ui.open_win` instead: the host routes it to that window
-and hands it back when the window closes.
+Bindings are global and belong to the plugin that set them. They stack:
+the last `set` wins, and when that plugin calls `del` or unloads, the
+previous holder gets the key back. Shadowing another plugin's binding logs
+a warning naming both. Setting a key you already hold replaces your
+binding.
 
-A handler that runs owns the key. Its return value is not read, and a
-handler that raises is logged with the key spent all the same: a keystroke
-replayed once the UI has moved on lands somewhere the user never aimed it.
-The key reaches the binding underneath only when the host could not
-dispatch it at all, which it settles before any of your Lua runs.
+For a key a popup should own only while it is on screen, use the `keys`
+option of `maki.ui.open_win` instead.
 
-`<C-c>` and `<C-z>` are the two keys no binding takes: quitting and
-suspending have to work whatever a plugin is doing. Binding one is an
-error rather than a mapping that never fires.
+A handler that runs consumes the key, even if it raises (the error is
+logged). If the plugin has too many callbacks in flight, the key goes to
+maki's built-in binding rather than to the binding underneath.
+
+`<C-c>` and `<C-z>` are reserved so quit and suspend always work. Binding
+either is an error.
 
 **Parameters:**
 
 - `{mode}` (`string`) Mode letter. Currently only `"n"` is accepted.
 - `{lhs}` (`string`) Key in Vim notation, e.g. `"<C-t>"`, `"<Space>"`, `"a"`.
-- `{rhs}` (`function`) Called when the key is pressed. Its return value is not read.
+- `{rhs}` (`function`) Called when the key is pressed. The return value is ignored.
 - `{opts?}` (`table?`) Options:
   - `desc` (`string`) short description shown in the keymap list.
+  - `unique` (`boolean`) fail the call, naming the owner, when anything
+    already maps the key. Default false.
 
 **Example:**
 
@@ -3361,8 +3351,13 @@ end, { desc = "Toggle panel" })
 maki.keymap.del({mode}, {lhs})
 ```
 
-Remove the mapping for {lhs} in {mode}. Does nothing if no mapping
-exists for that key.
+Remove your plugin's mapping for {lhs} in {mode}, like `vim.keymap.del`.
+The key goes back to whoever held it before you, or to maki's default
+binding.
+
+A plugin can only remove its own mappings. If another plugin maps {lhs},
+nothing changes and a warning names that plugin. Does nothing if nothing
+maps {lhs}.
 
 **Parameters:**
 
@@ -3383,9 +3378,8 @@ maki.keymap.del("n", "<C-t>")
 maki.keymap.normalize({lhs})
 ```
 
-Canonical spelling of {lhs}, so no plugin has to know which of
-`<CR>`/`<Enter>`/`<Return>` maki prints. Every spelling `set` accepts is
-accepted here, and the answer is the string a `key` event carries.
+Canonical spelling of {lhs}. Accepts every spelling `set` accepts and
+returns the string a `key` event carries.
 
 **Parameters:**
 

@@ -114,18 +114,18 @@ Plugins and `init.lua` can rebind keys at runtime with `maki.keymap.set` and `ma
 
 Precedence, high to low:
 
-1. **Suspend** (`Ctrl+Z`, Unix). Always wins, non-remappable.
+1. **Suspend** (`Ctrl+Z`, Unix). Always wins.
 2. **Modal and overlay keys.** An open modal or picker consumes its keys first, so they cannot be shadowed while open.
-3. **Lua overrides** from `maki.keymap.set`. Last set wins; binding the same key twice warns.
-4. **Built-in defaults.** An override on the same key shadows them; `maki.keymap.del` lifts the override so the default returns. Suspend is the only binding outside this layer, so every key is remappable except `Ctrl+Z`.
+3. **Lua overrides** from `maki.keymap.set`. The last set wins. Shadowing another plugin's binding logs a warning, and the shadowed binding returns when the plugin on top deletes it or unloads.
+4. **Built-in defaults.** Any override on the same key shadows them, and the default returns once every override on it is gone. A plugin's `maki.keymap.del` only removes its own binding.
 
-Only single-key bindings can be overridden. Multi-key combinations and non-key rows (like `Type` to filter) cannot.
+`Ctrl+C` and `Ctrl+Z` cannot be rebound, so quit and suspend always work. Only single-key bindings can be overridden. Multi-key combinations and non-key rows (like `Type` to filter) cannot.
 
 The `/help` modal and the splash show default labels, not live overrides, but pressing the key still runs the override.
 
 ### Recovering from a bad keymap
 
-If an override leaves Maki stuck (a rebound `Ctrl+C`, a modal that won't close, a plugin that throws on load), boot without user `init.lua`:
+If an override leaves Maki stuck (a modal that does not close, a plugin that throws on load), boot without user `init.lua`:
 
 ```bash
 maki --no-plugins

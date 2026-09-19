@@ -1276,6 +1276,7 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::keymap::TAKEN_ERR;
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
     use crossterm::event::KeyCode;
     use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
@@ -1577,6 +1578,44 @@ mod tests {
             .expect_err("Ctrl+C is the host's");
         assert!(err.to_string().contains("reserved"), "got: {err}");
         assert!(host.keymap_reader().load().entries.is_empty());
+    }
+
+    /// `unique` is a plugin saying the key is no good to it shared, so the
+    /// call has to fail where the author reads it and name who to go look at.
+    #[test]
+    fn a_unique_bind_fails_on_a_key_another_plugin_holds() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("first", r#"maki.keymap.set("n", "<C-g>", function() end)"#)
+            .unwrap();
+
+        let err = host
+            .load_source(
+                "second",
+                r#"maki.keymap.set("n", "<C-g>", function() end, { unique = true })"#,
+            )
+            .expect_err("the key is taken");
+        let err = err.to_string();
+        assert!(
+            err.contains(&format!("{TAKEN_ERR} first")),
+            "the error has to name the owner, got: {err}"
+        );
+        assert_eq!(
+            host.keymap_reader().load().entries.len(),
+            1,
+            "the refused bind stored nothing"
+        );
+    }
+
+    #[test]
+    fn del_from_another_plugin_leaves_the_key_alone() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("first", r#"maki.keymap.set("n", "<C-g>", function() end)"#)
+            .unwrap();
+
+        host.load_source("second", r#"maki.keymap.del("n", "<C-g>")"#)
+            .unwrap();
+
+        assert_eq!(host.keymap_reader().load().entries.len(), 1);
     }
 
     /// A handler that raises is logged and its key is spent: handing the key

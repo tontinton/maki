@@ -179,19 +179,21 @@ fn write_overrides(out: &mut String) {
     );
     out.push_str("Precedence, high to low:\n\n");
     out.push_str(
-        "1. **Suspend** (`Ctrl+Z`, Unix). Always wins, non-remappable.\n\
+        "1. **Suspend** (`Ctrl+Z`, Unix). Always wins.\n\
          2. **Modal and overlay keys.** An open modal or picker consumes \
          its keys first, so they cannot be shadowed while open.\n\
-         3. **Lua overrides** from `maki.keymap.set`. Last set wins; \
-         binding the same key twice warns.\n\
-         4. **Built-in defaults.** An override on the same key shadows \
-         them; `maki.keymap.del` lifts the override so the default returns. \
-         Suspend is the only binding outside this layer, so every key is \
-         remappable except `Ctrl+Z`.\n\n",
+         3. **Lua overrides** from `maki.keymap.set`. The last set wins. \
+         Shadowing another plugin's binding logs a warning, and the \
+         shadowed binding returns when the plugin on top deletes it or \
+         unloads.\n\
+         4. **Built-in defaults.** Any override on the same key shadows \
+         them, and the default returns once every override on it is gone. \
+         A plugin's `maki.keymap.del` only removes its own binding.\n\n",
     );
     out.push_str(
-        "Only single-key bindings can be overridden. Multi-key combinations \
-         and non-key rows (like `Type` to filter) cannot.\n\n",
+        "`Ctrl+C` and `Ctrl+Z` cannot be rebound, so quit and suspend \
+         always work. Only single-key bindings can be overridden. Multi-key \
+         combinations and non-key rows (like `Type` to filter) cannot.\n\n",
     );
     out.push_str(
         "The `/help` modal and the splash show default labels, not live \
@@ -199,9 +201,8 @@ fn write_overrides(out: &mut String) {
     );
     out.push_str("### Recovering from a bad keymap\n\n");
     out.push_str(
-        "If an override leaves Maki stuck (a rebound `Ctrl+C`, a modal \
-         that won't close, a plugin that throws on load), boot without \
-         user `init.lua`:\n\n",
+        "If an override leaves Maki stuck (a modal that does not close, a \
+         plugin that throws on load), boot without user `init.lua`:\n\n",
     );
     out.push_str("```bash\nmaki --no-plugins\n```\n\n");
     out.push_str(

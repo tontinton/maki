@@ -196,7 +196,7 @@ pub mod test_support {
             let callback = lua
                 .create_registry_value(lua.create_function(|_, ()| Ok(())).unwrap())
                 .unwrap();
-            store.set(key, callback, Arc::clone(&plugin), String::new());
+            store.set(key, callback, Arc::clone(&plugin), String::new(), false);
         }
         let (writer, reader) = KeymapWriter::new();
         writer.publish(store.snapshot_entries());
