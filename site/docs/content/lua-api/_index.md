@@ -3199,7 +3199,8 @@ maki.keymap.del({mode}, {lhs})
 ```
 
 Remove the mapping for {lhs} in {mode}. Does nothing if no mapping
-exists for that key.
+exists for that key, or if the mapping on it belongs to another plugin:
+you can only remove what you bound.
 
 **Parameters:**
 
