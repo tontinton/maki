@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
+use serde_json::Value as JsonValue;
 use shell_words::join as shell_join;
 
 use crate::api::fs::expand_tilde;
@@ -33,9 +34,67 @@ const NO_TASK_SCOPE_ERR: &str =
 const TABLE_SCOPE_ERR: &str = "jobstart: table scope must be { session = <id> }";
 const SCOPE_TYPE_ERR: &str = "jobstart: scope must be \"task\", \"plugin\", or { session = <id> }";
 const JOB_NOT_FOUND_ERR: &str = "job: not found";
+/// The wait thread reports unreapable children as -1; a killed job reuses it.
+const JOB_KILLED_EXIT_CODE: i32 = -1;
+pub(crate) const JOB_START_EVENT: &str = "JobStart";
+pub(crate) const JOB_EXIT_EVENT: &str = "JobExit";
 const BLANK_NAME_ERR: &str = "jobstart: name must be non-blank";
 const EMPTY_ARGV_ERR: &str = "jobstart: argv table must not be empty";
 const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv table";
+
+/// Job lifecycle queued for the [`JOB_START_EVENT`] / [`JOB_EXIT_EVENT`]
+/// autocmds. Only [`JobOwner::Session`] jobs produce these; task and plugin
+/// jobs are transient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JobLifecycle {
+    Started {
+        session: MakiId,
+        plugin: Arc<str>,
+        name: Option<String>,
+        command: String,
+    },
+    Exited {
+        session: MakiId,
+        plugin: Arc<str>,
+        code: i32,
+    },
+}
+
+impl JobLifecycle {
+    pub fn event(&self) -> &'static str {
+        match self {
+            Self::Started { .. } => JOB_START_EVENT,
+            Self::Exited { .. } => JOB_EXIT_EVENT,
+        }
+    }
+
+    pub fn to_json(&self, job_id: u32) -> JsonValue {
+        match self {
+            Self::Started {
+                session,
+                plugin,
+                name,
+                command,
+            } => serde_json::json!({
+                "id": job_id,
+                "session": session.to_string(),
+                "plugin": plugin.as_ref(),
+                "name": name,
+                "command": command,
+            }),
+            Self::Exited {
+                session,
+                plugin,
+                code,
+            } => serde_json::json!({
+                "id": job_id,
+                "session": session.to_string(),
+                "plugin": plugin.as_ref(),
+                "exit_code": code,
+            }),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) enum JobEvent {
@@ -193,6 +252,35 @@ impl JobMeta {
         }
     }
 
+    fn lifecycle_started(&self, job_id: u32) -> Option<(u32, JobLifecycle)> {
+        let JobOwner::Session { session, plugin } = &self.owner else {
+            return None;
+        };
+        Some((
+            job_id,
+            JobLifecycle::Started {
+                session: *session,
+                plugin: Arc::clone(plugin),
+                name: self.name.clone(),
+                command: self.command.clone(),
+            },
+        ))
+    }
+
+    fn lifecycle_exit(&self, job_id: u32, code: i32) -> Option<(u32, JobLifecycle)> {
+        let JobOwner::Session { session, plugin } = &self.owner else {
+            return None;
+        };
+        Some((
+            job_id,
+            JobLifecycle::Exited {
+                session: *session,
+                plugin: Arc::clone(plugin),
+                code,
+            },
+        ))
+    }
+
     fn record_line(&mut self, stdout: bool, line: &str) {
         let cap = self.tail_cap;
         if cap == 0 {
@@ -249,6 +337,7 @@ pub(crate) struct JobStore {
     /// Id served by the last [`JobStore::next_matching`], so the next scan
     /// starts past it.
     scan_cursor: u32,
+    lifecycle_tx: Option<flume::Sender<(u32, JobLifecycle)>>,
 }
 
 struct CheckedOutReceiver {
@@ -258,11 +347,18 @@ struct CheckedOutReceiver {
 }
 
 impl JobStore {
-    pub fn new() -> Self {
+    pub fn new(lifecycle_tx: Option<flume::Sender<(u32, JobLifecycle)>>) -> Self {
         Self {
             jobs: HashMap::new(),
             next_id: 1,
             scan_cursor: 0,
+            lifecycle_tx,
+        }
+    }
+
+    fn emit_lifecycle(&self, notice: (u32, JobLifecycle)) {
+        if let Some(tx) = &self.lifecycle_tx {
+            let _ = tx.try_send(notice);
         }
     }
 
@@ -389,6 +485,9 @@ impl JobStore {
                 replay_exit: None,
             },
         );
+        if let Some(notice) = self.jobs.get(&id).and_then(|job| job.lifecycle_started(id)) {
+            self.emit_lifecycle(notice);
+        }
 
         Ok(id)
     }
@@ -499,7 +598,11 @@ impl JobStore {
         job.exit_code = Some(code);
         job.elapsed_secs = Some(job.started.elapsed().as_secs());
         let session_plugin = job.session_plugin().cloned();
+        let lifecycle = job.lifecycle_exit(job_id, code);
         drop_callbacks(lua, job);
+        if let Some(notice) = lifecycle {
+            self.emit_lifecycle(notice);
+        }
         match session_plugin {
             Some(plugin) => self.evict_completed(lua, &plugin),
             None => self.finish(lua, job_id),
@@ -607,6 +710,11 @@ impl JobStore {
     /// List jobs this plugin can see. Task and plugin jobs leave the map on
     /// exit; session-owned jobs stay so exited ids stay findable. Tails live
     /// on `snapshot` / `jobinfo`.
+    ///
+    /// A session filter lists every job owned by that session, whatever
+    /// plugin started it: the session's UI (the /tasks picker) needs to see
+    /// monitor jobs the monitor plugin owns. Without a filter, ownership
+    /// applies as usual.
     pub fn list(
         &self,
         session: Option<MakiId>,
@@ -615,8 +723,10 @@ impl JobStore {
     ) -> Vec<JobSnapshot> {
         self.jobs
             .iter()
-            .filter(|(_, job)| job.can_access(task_id, plugin))
-            .filter(|(_, job)| session.is_none_or(|s| job.session() == Some(s)))
+            .filter(|(_, job)| match session {
+                Some(s) => job.session() == Some(s),
+                None => job.can_access(task_id, plugin),
+            })
             .map(|(&id, job)| JobSnapshot::from_job(id, job, false))
             .collect()
     }
@@ -658,7 +768,17 @@ impl JobStore {
 
     fn remove(&mut self, lua: &Lua, job_id: u32, kill: bool) {
         if let Some(job) = self.jobs.remove(&job_id) {
-            if kill {
+            // A killed or forgotten job never runs [`Self::complete`], so the
+            // autocmd pair would be left without a close; already-booked exits
+            // were reported there.
+            if job.exit_code.is_none() {
+                if kill {
+                    kill_job(&job);
+                }
+                if let Some(notice) = job.lifecycle_exit(job_id, JOB_KILLED_EXIT_CODE) {
+                    self.emit_lifecycle(notice);
+                }
+            } else if kill {
                 kill_job(&job);
             }
             for key in [job.on_stdout, job.on_stderr, job.on_exit]
@@ -848,6 +968,8 @@ fn kill_job(job: &JobMeta) {
 ///     (default 20, 0 disables, max 1024).
 ///   `name` (string?) handle for `jobfind`, unique among the live jobs this
 ///     plugin can see. Starting a second job under a live name is an error.
+///     Session jobs also show it in the /tasks picker and on the `JobStart`
+///     autocmd, so name long-running work even when you never look it up.
 /// @return (integer) Job id.
 /// @example
 /// local id = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
@@ -1448,7 +1570,7 @@ mod tests {
     }
 
     fn make_store() -> JobStore {
-        JobStore::new()
+        JobStore::new(None)
     }
 
     fn task_owner(id: u64) -> JobOwner {
@@ -1802,7 +1924,7 @@ mod tests {
     #[test]
     fn exit_cleanup_runs_before_a_failing_callback() {
         let lua = Lua::new();
-        lua.set_app_data(JobStore::new());
+        lua.set_app_data(JobStore::new(None));
         let callback = lua
             .create_function(|_, ()| Err::<(), _>(mlua::Error::runtime("callback failed")))
             .unwrap();
@@ -2344,5 +2466,126 @@ mod tests {
             "exited session job must stay listed"
         );
         store.kill_session(&lua, session);
+    }
+
+    const TEST_JOB_NAME: &str = "watcher";
+
+    fn make_lifecycle_store() -> (JobStore, flume::Receiver<(u32, JobLifecycle)>) {
+        let (tx, rx) = flume::unbounded();
+        (JobStore::new(Some(tx)), rx)
+    }
+
+    fn lifecycle_started(store: &mut JobStore, session: MakiId) -> u32 {
+        let mut spec = JobSpec::new(session_owner(session), "echo hi");
+        spec.name = Some(TEST_JOB_NAME.into());
+        store.start(spec).unwrap()
+    }
+
+    #[test]
+    fn session_job_reports_started_and_exited_lifecycle() {
+        let lua = Lua::new();
+        let (mut store, lifecycle_rx) = make_lifecycle_store();
+        let session = MakiId::generate();
+
+        let id = lifecycle_started(&mut store, session);
+        let (start_id, start) = lifecycle_rx.try_recv().unwrap();
+        assert_eq!(start_id, id);
+        assert_eq!(start.event(), JOB_START_EVENT);
+        assert_eq!(
+            start.to_json(id),
+            serde_json::json!({
+                "id": id,
+                "session": session.to_string(),
+                "plugin": TEST_PLUGIN,
+                "name": TEST_JOB_NAME,
+                "command": "echo hi",
+            })
+        );
+
+        store.complete(&lua, id, 3);
+        let (exit_id, exit) = lifecycle_rx.try_recv().unwrap();
+        assert_eq!(exit_id, id);
+        assert_eq!(exit.event(), JOB_EXIT_EVENT);
+        assert_eq!(
+            exit.to_json(id),
+            serde_json::json!({
+                "id": id,
+                "session": session.to_string(),
+                "plugin": TEST_PLUGIN,
+                "exit_code": 3,
+            })
+        );
+        assert!(
+            lifecycle_rx.try_recv().is_err(),
+            "exit must be reported once"
+        );
+    }
+
+    #[test]
+    fn transient_jobs_never_report_lifecycle() {
+        let (mut store, lifecycle_rx) = make_lifecycle_store();
+        start_echo(&mut store);
+        assert!(lifecycle_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn killed_session_job_reports_exit_without_complete() {
+        let lua = Lua::new();
+        let (mut store, lifecycle_rx) = make_lifecycle_store();
+        let session = MakiId::generate();
+        let id = lifecycle_started(&mut store, session);
+        let _ = lifecycle_rx.try_recv();
+
+        store.remove(&lua, id, true);
+        let (_, exit) = lifecycle_rx.try_recv().unwrap();
+        assert_eq!(exit.event(), JOB_EXIT_EVENT);
+        assert_eq!(
+            exit.to_json(id)["exit_code"],
+            serde_json::json!(JOB_KILLED_EXIT_CODE)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_filter_lists_session_jobs_across_owning_plugins() {
+        let session = MakiId::generate();
+        let other = MakiId::generate();
+        let mut store = make_store();
+        let monitor = store
+            .start(JobSpec::new(
+                JobOwner::Session {
+                    session,
+                    plugin: Arc::from("monitor"),
+                },
+                "sleep 0",
+            ))
+            .unwrap();
+        let foreign_session = store
+            .start(JobSpec::new(
+                JobOwner::Session {
+                    session: other,
+                    plugin: Arc::from("monitor"),
+                },
+                "sleep 0",
+            ))
+            .unwrap();
+
+        let from_task_plugin: Vec<u32> = store
+            .list(Some(session), None, "task")
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(
+            from_task_plugin,
+            [monitor],
+            "session filter crosses plugins"
+        );
+
+        let from_monitor: Vec<u32> = store
+            .list(Some(other), None, "monitor")
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(from_monitor, [foreign_session]);
     }
 }
