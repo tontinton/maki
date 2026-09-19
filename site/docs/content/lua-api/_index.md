@@ -3449,6 +3449,9 @@ blocked to prevent SSRF, including after a redirect. Hosts listed in
 the `net.allowed_private_hosts` config option are exempt.
 Failed requests (5xx) are retried automatically.
 
+Requests reuse a pool of clients, so calls to the same host share one
+keep-alive connection rather than pay a fresh handshake each time.
+
 ```lua
 local res, err = maki.net.request("https://example.com")
 if res then print(res.body) end
