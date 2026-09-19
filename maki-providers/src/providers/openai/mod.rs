@@ -12,7 +12,7 @@ use crate::AgentError;
 use crate::model::ModelFamily;
 use crate::provider::Provider;
 use crate::providers::{ResolvedAuth, Timeouts};
-use crate::spec::{AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
+use crate::spec::{AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
 
 pub(crate) const SLUG: &str = "openai";
 const DISPLAY_NAME: &str = "OpenAI";
@@ -40,11 +40,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/openai.toml"),
     pricing_schedule: None,
-    native: Some(Native {
+    build: Build::Native(Native {
         new: create,
         with_auth: create_with_auth,
-        aperture: None,
     }),
+    aperture: None,
     login: Some(LoginConfig {
         protocol: Protocol::Openai,
         default_base_url: BASE_URL,

@@ -261,6 +261,8 @@ reaches every host, asks again before it loads.
 
 To reach a service on your own machine or network, list it in [`net.allowed_private_hosts`](/docs/configuration/#net). An allowed host also keeps plain `http://` instead of being upgraded to `https://`, since a service on your LAN rarely has a certificate.
 
+A provider plugin's own calls (model listing, usage) to the origin you pointed it at with `<SLUG>_BASE_URL` or `providers.toml` skip the guard, since chat requests already go there. So do a built-in provider's calls to its default origin. A third-party plugin's declared `base_url` gets no such pass.
+
 ## Session Persistence
 
 When you save a session, its permission rules are saved too. Loading the session restores them.

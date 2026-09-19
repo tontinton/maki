@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -22,12 +23,12 @@ use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::providers::{ResolvedAuth, refreshed_tokens};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: super::SLUG,
-    api_key_env: "OPENAI_API_KEY",
-    base_url: "https://api.openai.com/v1",
-    max_tokens_field: "max_completion_tokens",
+    slug: Cow::Borrowed(super::SLUG),
+    api_key_env: Cow::Borrowed("OPENAI_API_KEY"),
+    base_url: Cow::Borrowed("https://api.openai.com/v1"),
+    max_tokens_field: Cow::Borrowed("max_completion_tokens"),
     include_stream_usage: true,
-    provider_name: "OpenAI",
+    provider_name: Cow::Borrowed("OpenAI"),
 };
 
 // Offline fallback; the Codex backend's `/models` is the source of truth.
@@ -171,6 +172,8 @@ impl PlanModel {
                 .then(|| self.input_modalities.iter().any(|m| m == IMAGE_MODALITY)),
             tier: None,
             provider_info: Some(Arc::new(info)),
+            extra: None,
+            effort: None,
         }
     }
 }
@@ -238,7 +241,7 @@ fn apply_plan_fast(
     auth: &ResolvedAuth,
     info: Option<&PlanModelInfo>,
 ) {
-    let complete = model_registry::discovery_complete(CONFIG.slug);
+    let complete = model_registry::discovery_complete(&CONFIG.slug);
     if fast && supports_plan_fast(Some(auth), info, complete) == FastSupport::Supported {
         body["service_tier"] = FAST_SERVICE_TIER.into();
     }
@@ -383,7 +386,7 @@ impl OpenAi {
             auth.base_url = self
                 .resolved_base_url
                 .clone()
-                .or_else(|| Some(CONFIG.base_url.into()));
+                .or_else(|| Some(CONFIG.base_url.to_string()));
         }
         Ok(auth)
     }
@@ -501,7 +504,8 @@ impl Provider for OpenAi {
             let mut buf = String::new();
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
-            let discovered = model_registry::provider_info::<PlanModelInfo>(CONFIG.slug, &model.id);
+            let discovered =
+                model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
             let plan_dialect = discovered
                 .as_deref()
                 .map(PlanModelInfo::dialect)
@@ -613,11 +617,11 @@ impl Provider for OpenAi {
             return;
         }
         let auth = self.codex_auth().ok();
-        let info = model_registry::provider_info::<PlanModelInfo>(CONFIG.slug, &model.id);
+        let info = model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
         model.supports_fast_override = Some(supports_plan_fast(
             auth.as_ref(),
             info.as_deref(),
-            model_registry::discovery_complete(CONFIG.slug),
+            model_registry::discovery_complete(&CONFIG.slug),
         ));
         if let Some(context_window) = coding_plan_context_window(&model.id) {
             model.context_window = model.context_window.min(context_window);

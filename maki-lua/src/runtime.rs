@@ -33,10 +33,10 @@ use serde_json::Value;
 use strum::{EnumString, IntoStaticStr};
 
 use maki_config::RawConfig;
+use maki_providers::plugin::DeclAuthority;
 use maki_storage::id::{MakiId, SessionRef};
 
 use crate::api::autocmd::AutocmdStore;
-use crate::api::create_maki_global;
 use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::fs::publish_walks;
 use crate::api::keymap::KeymapReader;
@@ -63,6 +63,7 @@ use crate::api::util::command::{
 use crate::api::util::convert::{json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::setup::ConfigStore;
+use crate::api::{Owner, create_maki_global};
 use crate::docs_render;
 use crate::error::PluginError;
 use crate::key_lint::KeyLint;
@@ -231,8 +232,9 @@ fn load_user_source<'a>(lua: &'a Lua, name: &str, source: &'a str) -> Chunk<'a> 
 /// Everything a load needs besides the code itself.
 ///
 /// One value rather than a row of positional arguments: it travels unchanged
-/// from the caller through the request channel into the runtime, and the two
-/// package-only fields would otherwise be `None, false` at every other site.
+/// from the caller through the request channel into the runtime, and the
+/// fields only a package cares about would otherwise be spelled out, at their
+/// boring default, by every other caller.
 pub struct LoadContext {
     pub plugin_dir: Option<PathBuf>,
     pub permissions: PluginPermissions,
@@ -244,6 +246,12 @@ pub struct LoadContext {
     /// Whether this owner is a package, which is what `pack.get` reports as
     /// active.
     pub package: bool,
+    /// Whether the code being loaded ships inside the binary, which is what
+    /// lets it declare a provider under a built-in slug. Everything else is
+    /// third party however the user installed it, so every path but
+    /// [`PluginHost::load_builtins`] leaves this at the answer that grants
+    /// nothing.
+    pub authority: DeclAuthority,
 }
 
 impl LoadContext {
@@ -256,6 +264,7 @@ impl LoadContext {
             opts: PluginOpts::default(),
             revision_guard: None,
             package: false,
+            authority: DeclAuthority::ThirdParty,
         }
     }
 }
@@ -338,11 +347,17 @@ pub enum Request {
     /// cannot swap the code out from under it. Rides the priority lane and is
     /// spawned like a tool call, but takes no [`InflightGate`] slot: a provider
     /// hook is not a tool, and the model is waiting on it.
+    ///
+    /// Ends like a tool call does, though: at `deadline`, or once `cancel`
+    /// fires because the caller stopped waiting. A hook nobody waits for must
+    /// not keep spending a refresh token behind the caller's back.
     CallProviderHook {
         hook: Arc<crate::api::provider::LuaHookKeys>,
         slot: crate::api::provider::HookSlot,
         payload: Value,
-        reply: flume::Sender<Result<Value, String>>,
+        cancel: CancelToken,
+        deadline: Option<Instant>,
+        answer: crate::api::provider::HookAnswer,
     },
     CallTool {
         plugin: Arc<str>,
@@ -1287,13 +1302,24 @@ async fn run_awaited<F: Future>(
     deadline: Instant,
     fut: F,
 ) -> Result<F::Output, &'static str> {
-    let scope = TaskScope::new(lua, TaskCell::new(cancel, Some(deadline), None));
-    let handle = Arc::clone(scope.handle());
     covered(
         Some(GateGuard::new(gate)),
-        until_abandoned(run_scoped(lua, scope, fut), &handle),
+        run_abandonable(lua, cancel, Some(deadline), fut),
     )
     .await
+}
+
+/// [`run_awaited`] without the [`InflightGate`] slot, for code a reload must
+/// not wait on, yet that still ends with its caller's cancel and deadline.
+async fn run_abandonable<F: Future>(
+    lua: &Lua,
+    cancel: CancelToken,
+    deadline: Option<Instant>,
+    fut: F,
+) -> Result<F::Output, &'static str> {
+    let scope = TaskScope::new(lua, TaskCell::new(cancel, deadline, None));
+    let handle = Arc::clone(scope.handle());
+    until_abandoned(run_scoped(lua, scope, fut), &handle).await
 }
 
 /// [`run_detached`] for a slash-command handler, seeding the hop count that
@@ -2561,6 +2587,7 @@ impl LuaRuntime {
             opts,
             revision_guard,
             package,
+            authority,
         } = context;
         let map_err = |e: mlua::Error| PluginError::Lua {
             plugin: name.to_string(),
@@ -2587,7 +2614,10 @@ impl LuaRuntime {
             &self.lua,
             Arc::clone(&self.pending),
             Arc::clone(&pending_rules),
-            Arc::clone(&name),
+            Owner {
+                name: Arc::clone(&name),
+                authority,
+            },
             self.ui_action_tx.clone(),
             &permissions,
             Arc::clone(&opts),
@@ -2743,8 +2773,8 @@ impl LuaRuntime {
     }
 
     /// Undoes a load that failed after its chunks ran: the tools it was about
-    /// to register, the package operations it queued, and the commands,
-    /// keymaps, hints and slots it published on the way.
+    /// to register, the package operations it queued, the providers it staged,
+    /// and the commands, keymaps, hints and slots it published on the way.
     fn rollback_load(&mut self, plugin: &str, pending: Vec<PendingTool>, pack_ops: usize) {
         self.discard_pending(pending);
         with_packs(&self.lua, |packs| packs.pending.truncate(pack_ops));
@@ -2753,6 +2783,7 @@ impl LuaRuntime {
 
     fn clear_plugin(&mut self, plugin: &str) {
         self.registry.clear_plugin(plugin);
+        maki_providers::plugin::discard(plugin);
         self.plugin_rules.remove(plugin);
         if let Some(queue) = self.lua.app_data_ref::<DeferQueue>() {
             queue.cancel_plugin(plugin);
@@ -3959,14 +3990,21 @@ pub fn spawn(
                             hook,
                             slot,
                             payload,
-                            reply,
+                            cancel,
+                            deadline,
+                            answer,
                         } => {
                             let lua = rt.lua.clone();
                             ex.spawn(async move {
-                                let answer =
-                                    crate::api::provider::run_hook(&lua, &hook, slot, payload)
-                                        .await;
-                                let _ = reply.send(answer);
+                                let returned = run_abandonable(
+                                    &lua,
+                                    cancel,
+                                    deadline,
+                                    crate::api::provider::run_hook(&lua, &hook, slot, payload),
+                                )
+                                .await
+                                .unwrap_or_else(|why| Err(why.to_owned()));
+                                answer(&lua, returned);
                             })
                             .detach();
                         }

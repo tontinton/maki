@@ -176,7 +176,7 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
                 .map(move |p| format!("{}/{}", m.slug, p))
         })
         .collect();
-    for slug in plugin::registered_slugs() {
+    for slug in plugin::unclaimed_slugs() {
         specs.extend(plugin::plugin_model_specs_for(&slug));
     }
     for spec in custom::declared_model_specs() {
@@ -264,7 +264,7 @@ pub async fn fetch_all_models(
         .detach();
     }
 
-    for slug in plugin::registered_slugs() {
+    for slug in plugin::unclaimed_slugs() {
         let tx = tx.clone();
         smol::spawn(async move {
             let static_fallback = |reason: String| {

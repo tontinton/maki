@@ -1686,4 +1686,282 @@ case("picker_keys_are_normalized_and_bad_ones_are_dropped", function()
   eq(set["<nope>"], nil, "a key maki cannot name is dropped, not stored to never match")
 end)
 
+local parse = require("maki.provider_parse")
+
+local NUMBERS_JSON = [[{
+  "int": 8192, "whole_float": 8192.0, "exp": 1e3, "frac": 1.5, "neg": -1, "neg_zero": -0,
+  "null": null, "str": "8192", "bool": true,
+  "u32_max": 4294967295, "past_u32": 4294967296,
+  "u64_max": 18446744073709551615, "past_u64": 18446744073709551616,
+  "nested": { "list": [1.0, 2] }
+}]]
+
+local function is_neg_zero(x)
+  return x == 0 and 1 / x < 0
+end
+
+case("provider_parse_as_u64_takes_only_non_negative_integers", function()
+  local doc = assert(parse.decode(NUMBERS_JSON))
+  for key, expected in pairs({
+    int = 8192,
+    whole_float = false,
+    exp = false,
+    frac = false,
+    neg = false,
+    neg_zero = false,
+    null = false,
+    str = false,
+    bool = false,
+    missing = false,
+    past_u32 = 4294967296,
+    u64_max = 2 ^ 64,
+    past_u64 = false,
+  }) do
+    eq(parse.as_u64(doc, key), expected or nil, key)
+  end
+  eq(parse.as_u64(doc.nested.list, 1), nil, "a float array element")
+  eq(parse.as_u64(doc.nested.list, 2), 2, "an integer array element")
+  eq(parse.as_u64(doc.str, "x"), nil, "a non-table container")
+end)
+
+case("provider_parse_as_u32_rejects_past_u32_max", function()
+  local doc = assert(parse.decode(NUMBERS_JSON))
+  eq(parse.as_u32(doc, "u32_max"), 4294967295)
+  eq(parse.as_u32(doc, "past_u32"), nil)
+  eq(parse.as_u32(doc, "whole_float"), nil)
+  eq(parse.as_u32(doc, "neg"), nil)
+end)
+
+case("provider_parse_as_f64_takes_any_number", function()
+  local doc = assert(parse.decode(NUMBERS_JSON))
+  eq(parse.as_f64(doc, "int"), 8192)
+  eq(parse.as_f64(doc, "whole_float"), 8192)
+  eq(parse.as_f64(doc, "exp"), 1000)
+  eq(parse.as_f64(doc, "neg"), -1)
+  assert(is_neg_zero(parse.as_f64(doc, "neg_zero")), "-0 keeps its sign")
+  eq(parse.as_f64(doc, "null"), nil)
+  eq(parse.as_f64(doc, "str"), nil)
+  eq(parse.as_f64(doc, "bool"), nil)
+end)
+
+case("provider_parse_decode_keeps_strings_and_float_values", function()
+  local doc = assert(parse.decode([[{"k\"1.0": "1.0 \\", "p": 2.675, "e": -2.5e-3, "a": [0.1, 7]}]]))
+  eq(doc['k"1.0'], "1.0 \\")
+  eq(doc.p, 2.675)
+  eq(doc.e, -2.5e-3)
+  eq(doc.a[1], 0.1)
+  eq(doc.a[2], 7)
+  eq(parse.decode("2.5"), 2.5, "a top-level float")
+end)
+
+case("provider_parse_decode_reports_bad_json", function()
+  local value, err = parse.decode('{"a": 1.5,')
+  eq(value, nil)
+  assert(err, "an error message")
+  value, err = parse.decode('{"a": "\\u0000f64:1"}')
+  eq(value, nil)
+  assert(err, "the reserved tag is refused")
+end)
+
+local function collect(arr)
+  local seen = {}
+  for i, v in parse.items(arr) do
+    table.insert(seen, string.format("%d=%s", i, tostring(v)))
+  end
+  return table.concat(seen, ",")
+end
+
+case("provider_parse_is_null_tells_null_from_missing", function()
+  local doc = assert(parse.decode('{"a": null, "b": 1, "c": "null", "d": {"e": null}}'))
+  eq(parse.is_null(doc, "a"), true)
+  eq(doc.a, nil)
+  eq(parse.is_null(doc, "b"), false)
+  eq(parse.is_null(doc, "c"), false, "a string spelling null")
+  eq(doc.c, "null")
+  eq(parse.is_null(doc, "missing"), false)
+  eq(parse.is_null(doc.d, "e"), true, "a nested null")
+  eq(parse.is_null(doc, "d"), false)
+  eq(parse.is_null(nil, "a"), false, "a non-table container")
+  eq(parse.is_null({}, "a"), false, "a table not from decode")
+end)
+
+case("provider_parse_items_visits_null_elements", function()
+  local doc = assert(parse.decode('{"mid": [1, null, 3], "tail": [1, 2.5, null, null], "all": [null], "none": []}'))
+  eq(parse.len(doc.mid), 3)
+  eq(collect(doc.mid), "1=1,2=nil,3=3")
+  eq(parse.is_null(doc.mid, 2), true)
+  eq(parse.is_null(doc.mid, 1), false)
+  eq(parse.len(doc.tail), 4, "trailing nulls count")
+  eq(collect(doc.tail), "1=1,2=2.5,3=nil,4=nil")
+  eq(parse.as_u64(doc.tail, 2), nil, "float marks survive alongside nulls")
+  eq(parse.len(doc.all), 1)
+  eq(collect(doc.all), "1=nil")
+  eq(parse.len(doc.none), 0)
+  eq(collect(doc.none), "")
+end)
+
+case("provider_parse_items_walks_nested_arrays", function()
+  local doc = assert(parse.decode('[[null, {"k": null}], null, [2, null]]'))
+  eq(parse.len(doc), 3)
+  eq(parse.len(doc[1]), 2)
+  eq(parse.is_null(doc[1], 1), true)
+  eq(parse.is_null(doc[1][2], "k"), true)
+  eq(parse.is_null(doc, 2), true)
+  eq(collect(doc[3]), "1=2,2=nil")
+  eq(parse.decode("null"), nil, "a top-level null")
+end)
+
+case("provider_parse_items_falls_back_to_length_outside_decode", function()
+  eq(parse.len({ "a", "b" }), 2)
+  eq(collect({ "a", "b" }), "1=a,2=b")
+  eq(parse.len(nil), 0, "a non-table")
+  eq(parse.len("abc"), 0, "a string")
+  eq(collect(nil), "")
+end)
+
+case("provider_parse_decode_refuses_the_null_tag", function()
+  local value, err = parse.decode('["\\u0000null"]')
+  eq(value, nil)
+  assert(err, "the reserved tag is refused")
+  eq(assert(parse.decode('["\\u0000nullx"]'))[1], "\0nullx", "only the exact tag is reserved")
+end)
+
+case("provider_parse_parse_f64_matches_rust", function()
+  for _, c in ipairs({
+    { "1e3", 1000 },
+    { "+1", 1 },
+    { "-1", -1 },
+    { ".5", 0.5 },
+    { "5.", 5 },
+    { "1E+3", 1000 },
+    { "+.5e1", 5 },
+    { "00012", 12 },
+    { "0.000001", 0.000001 },
+    { "1e-400", 0 },
+    { "1e400", math.huge },
+    { "inf", math.huge },
+    { "+Infinity", math.huge },
+    { "-INF", -math.huge },
+  }) do
+    eq(parse.parse_f64(c[1]), c[2], c[1])
+  end
+  for _, s in ipairs({ "nan", "-NaN" }) do
+    local x = parse.parse_f64(s)
+    assert(x ~= x, s .. " is NaN")
+  end
+  for _, s in ipairs({
+    "",
+    " 1",
+    "1 ",
+    "0x10",
+    ".",
+    "e5",
+    "1e",
+    "1e+",
+    "1_000",
+    "--1",
+    "+-1",
+    "- 1",
+    "1.2.3",
+    "infx",
+    "in",
+    "1d",
+    "1f",
+    "$0.50",
+  }) do
+    eq(parse.parse_f64(s), nil, "'" .. s .. "'")
+  end
+  eq(parse.parse_f64(1.5), nil, "a number is not a string")
+  eq(parse.parse_f64(nil), nil)
+end)
+
+case("provider_parse_round_is_half_away_from_zero", function()
+  eq(parse.round(0.5), 1)
+  eq(parse.round(2.5), 3)
+  eq(parse.round(-2.5), -3)
+  eq(parse.round(0.49999999999999994), 0)
+  assert(is_neg_zero(parse.round(-0.4)), "-0.4 rounds to -0")
+  eq(parse.round(math.huge), math.huge)
+  local nan = parse.round(0 / 0)
+  assert(nan ~= nan, "NaN stays NaN")
+end)
+
+case("provider_parse_fixed_matches_rust_format", function()
+  for _, c in ipairs({
+    { 0.125, 2, "0.12" },
+    { 0.375, 2, "0.38" },
+    { 2.675, 2, "2.67" },
+    { 1.005, 2, "1.00" },
+    { 0.045, 2, "0.04" },
+    { -0.005, 2, "-0.01" },
+    { -0.125, 2, "-0.12" },
+    { 123.456, 2, "123.46" },
+    { 0.5, 0, "0" },
+    { 1.5, 0, "2" },
+    { 2.5, 0, "2" },
+    { -0.0, 2, "-0.00" },
+    { -0.001, 2, "-0.00" },
+    { 1e-7, 2, "0.00" },
+    { 1e21, 2, "1000000000000000000000.00" },
+    { 29027, 0, "29027" },
+    { math.huge, 2, "inf" },
+    { -math.huge, 2, "-inf" },
+    { 0 / 0, 2, "NaN" },
+  }) do
+    eq(parse.fixed(c[1], c[2]), c[3], string.format("%.17g", c[1]))
+  end
+end)
+
+case("provider_parse_casts_saturate_like_rust_as", function()
+  for _, c in ipairs({
+    { -1, 0, 0 },
+    { -0.5, 0, 0 },
+    { 0 / 0, 0, 0 },
+    { 2.5, 2, 2 },
+    { 4294967295.9, 4294967295, 4294967295 },
+    { 4294967296, 4294967296, 4294967295 },
+    { 1e300, 2 ^ 64, 4294967295 },
+    { math.huge, 2 ^ 64, 4294967295 },
+  }) do
+    eq(parse.cast_u64(c[1]), c[2], "u64 " .. tostring(c[1]))
+    eq(parse.cast_u32(c[1]), c[3], "u32 " .. tostring(c[1]))
+  end
+end)
+
+case("provider_parse_stable_sort_by_keeps_equal_keys_in_order", function()
+  local rows = {
+    { id = "a", spend = 3 },
+    { id = "b", spend = 1 },
+    { id = "c", spend = 3 },
+    { id = "d", spend = 2 },
+    { id = "e", spend = 1 },
+  }
+  parse.stable_sort_by(rows, function(x, y)
+    return x.spend > y.spend
+  end)
+  local ids = {}
+  for _, row in ipairs(rows) do
+    table.insert(ids, row.id)
+  end
+  eq(table.concat(ids), "acdbe")
+
+  local many, expected = {}, {}
+  for i = 1, 37 do
+    many[i] = { key = (i * 7) % 4, seq = i }
+  end
+  for key = 0, 3 do
+    for _, item in ipairs(many) do
+      if item.key == key then
+        table.insert(expected, item.seq)
+      end
+    end
+  end
+  parse.stable_sort_by(many, function(x, y)
+    return x.key < y.key
+  end)
+  for i, item in ipairs(many) do
+    eq(item.seq, expected[i], "position " .. i)
+  end
+end)
+
 th.report()

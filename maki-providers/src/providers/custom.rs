@@ -10,7 +10,7 @@ use tracing::warn;
 use super::ResolvedAuth;
 use super::anthropic::shared;
 use super::catalog;
-use super::codec::protocol_spec;
+use super::codec::{CodecOptions, protocol_spec};
 use crate::AgentError;
 use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::Provider;
@@ -41,20 +41,22 @@ pub fn base_spec(slug: &str) -> Option<&'static ProviderSpec> {
     protocol_spec(config.get(slug)?.protocol?)
 }
 
-fn resolve_custom_auth(slug: &str) -> Result<ResolvedAuth, AgentError> {
+/// The credentials and the env var they came out of, which the codec carries
+/// as part of this provider's wire config.
+fn resolve_custom_auth(slug: &str) -> Result<(ResolvedAuth, String), AgentError> {
     let config = ProvidersConfig::load();
     let def = config.get(slug).ok_or_else(|| AgentError::Config {
         message: format!("unknown custom provider '{slug}'"),
     })?;
 
-    let resolved_env = resolve_api_key_env(slug, Some(def));
-    let env_var = def.api_key_env.as_deref().unwrap_or(&resolved_env);
-    let pool = super::KeyPool::resolve(slug, env_var)?;
+    let env_var = resolve_api_key_env(slug, Some(def));
+    let pool = super::KeyPool::resolve(slug, &env_var)?;
 
-    Ok(
+    Ok((
         ResolvedAuth::bearer(slug, pool.current())?
             .with_base_url(resolve_base_url(slug, Some(def))),
-    )
+        env_var,
+    ))
 }
 
 pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
@@ -65,10 +67,18 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
         .ok_or_else(|| AgentError::Config {
             message: format!("unknown custom provider '{slug}'"),
         })?;
-    let resolved = resolve_custom_auth(slug)?;
+    let (resolved, api_key_env) = resolve_custom_auth(slug)?;
     let auth = Arc::new(Mutex::new(resolved));
 
-    Ok(super::codec::build(protocol, auth, timeouts, None, None))
+    // No `base_url`: `resolve_custom_auth` already put the configured origin in
+    // `auth.base_url`, which outranks anything the config could carry here, so
+    // restating it would be the same string twice. The slug is what matters,
+    // since that is how the compat layer finds `<SLUG>_BASE_URL` at all.
+    let options = CodecOptions {
+        api_key_env: api_key_env.into(),
+        ..CodecOptions::new(protocol, slug.to_owned())
+    };
+    Ok(super::codec::build(options, auth, timeouts))
 }
 
 pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {

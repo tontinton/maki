@@ -8,6 +8,10 @@ pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
 pub mod spec;
+/// One recorded server for two audiences: other crates get it behind the
+/// feature, this crate's own tests get it without.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod tokens;
 pub(crate) mod types;
 
@@ -18,7 +22,6 @@ pub use model::{
     ThinkingOption, ThinkingSupport, TokenUsage, format_tokens,
 };
 pub use pricing::{model_cost, settle_session};
-pub use providers::Timeouts;
 pub use providers::catalog::ProviderData;
 pub use providers::catalog::{
     catalog_provider, catalog_provider_if_available, catalog_providers,
@@ -29,6 +32,18 @@ pub use providers::openai::auth as openai_auth;
 pub use providers::plugin;
 pub use providers::xai::auth as xai_auth;
 pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
+pub use providers::{Timeouts, user_agent};
+/// The golden replay harness and the recorded cases of every ported provider,
+/// published on the same terms as [`test_support`] and for the same reason:
+/// the authoring that ships is a Lua plugin, which only `maki-lua` can stage,
+/// and it answers to these goldens.
+#[cfg(any(test, feature = "test-support"))]
+pub use providers::{
+    deepseek::fixtures as deepseek_fixtures, mistral::fixtures as mistral_fixtures,
+    openrouter::fixtures as openrouter_fixtures, regolo::fixtures as regolo_fixtures, replay,
+    requesty::fixtures as requesty_fixtures, synthetic::fixtures as synthetic_fixtures,
+    tensorx::fixtures as tensorx_fixtures,
+};
 pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{
     ContentBlock, EMPTY_RESPONSE_MARKER, Effort, EffortDialect, IMAGE_EVICTED_NOTE,

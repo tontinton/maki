@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use maki_lua::{OptionType, PluginHost};
 
+use crate::lua_util::in_registration_window;
+
 const DATE_PLACEHOLDER: &str = "YYYY-MM-DD";
 
 const SECTIONS: &[(&str, &[&str])] = &[
@@ -227,17 +229,19 @@ fn collect_tool_info(
 /// opt-in tools too. "Opt-in" means the plugin declares the tool as a boolean
 /// option defaulting to false, so the badge cannot drift from the defaults.
 fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
-    let registry = Arc::new(ToolRegistry::new());
-    let mut host = PluginHost::new(Arc::clone(&registry)).expect("plugin host");
-
-    let mut plugins = HashMap::new();
     let mut edit = PluginFileConfig::default();
     for &sub in maki_config::EDIT_SUB_TOOLS {
         edit.opts.insert(sub.to_owned(), Value::Bool(true));
     }
-    plugins.insert("edit".to_owned(), edit);
-    host.load_builtins(&PluginsConfig::from_plugins(plugins))
-        .expect("loading builtin plugins");
+    let config = PluginsConfig::from_plugins(HashMap::from([("edit".to_owned(), edit)]));
+
+    let registry = Arc::new(ToolRegistry::new());
+    let host = in_registration_window(|| {
+        let mut host = PluginHost::new(Arc::clone(&registry)).expect("plugin host");
+        host.load_builtins(&config)
+            .expect("loading builtin plugins");
+        host
+    });
 
     let opt_in = host
         .plugin_options()

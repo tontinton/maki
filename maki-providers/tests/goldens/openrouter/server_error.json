@@ -1,0 +1,25 @@
+{
+  "events": [],
+  "outcome": {
+    "error": "Api { status: 500, retry_after: None, overflow: None, quota_exhausted: false, auth_error: false }",
+    "message": "API error (500): {\"error\":{\"message\":\"internal error\"}}"
+  },
+  "requests": [
+    {
+      "body": "{\"cache_control\":{\"type\":\"ephemeral\"},\"max_tokens\":128000,\"messages\":[{\"content\":\"You are a replay fixture.\",\"role\":\"system\"},{\"content\":\"read a.txt\",\"role\":\"user\"}],\"model\":\"meta-llama/llama-5\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "content-length": "425",
+        "content-type": "application/json",
+        "host": "<volatile>",
+        "http-referer": "https://maki.sh",
+        "user-agent": "<volatile>",
+        "x-openrouter-title": "maki"
+      },
+      "method": "POST",
+      "path": "/v1/chat/completions"
+    }
+  ]
+}

@@ -3,19 +3,16 @@
 //! The fixture in `tests/fixtures/provider_plugin` is loaded into a real plugin
 //! host and driven through the [`Provider`] trait against recorded transcripts
 //! served on loopback, so every hook is exercised the way a request exercises
-//! it. Two plugins written inline cover what the fixture cannot: the responses
-//! codec, and a hook still running when its plugin is reloaded.
+//! it. A few plugins written inline cover what the fixture cannot: the
+//! responses codec, a credential write racing another maki process, and a hook
+//! still running when its plugin is reloaded.
 //!
 //! The provider registry and the process environment are both global, which is
 //! why each test here boots its own host and leans on `cargo nextest` giving
 //! every test its own process.
 
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use maki_agent::tools::ToolRegistry;
@@ -23,6 +20,7 @@ use maki_lua::{PluginHost, PluginPermissions};
 use maki_providers::model::{Model, ModelTier};
 use maki_providers::provider::Provider;
 use maki_providers::retry::RetryKind;
+use maki_providers::test_support::{Canned, JSON_HEADERS, Recorded, Requests, serve};
 use maki_providers::{
     AgentError, Effort, Message, ProviderEvent, RequestOptions, StopReason, StreamResponse,
     ThinkingConfig, Timeouts, plugin,
@@ -37,31 +35,41 @@ const SLUG: &str = "acmelua";
 const DISPLAY_NAME: &str = "Acme (Lua)";
 const MODEL: &str = "acme-1";
 const BASE_URL_ENV: &str = "ACME_BASE_URL";
-const LOOPBACK: &str = "127.0.0.1:0";
 const LOOPBACK_HOST: &str = "127.0.0.1";
-const REASON_PHRASE: &str = "Recorded";
 const TOKEN_KEY: &str = "token";
+const ANON_TOKEN: &str = "anonymous";
 const RENEWED_TOKEN: &str = "anonymous-renewed";
-/// A refresh that parked on the credential lock would spend `HOOK_TIMEOUT`,
-/// which is 30 seconds.
-const REFRESH_BUDGET: Duration = Duration::from_secs(5);
-const RETRY_AFTER_SECONDS: u64 = 7;
+/// What the recorded server answers a rate limit with, and the same seconds
+/// the error is expected to carry back out. One literal, so the header and the
+/// expectation cannot drift apart.
+const RETRY_AFTER: &str = "7";
+
+/// Every plugin written inline loads under this one name, so loading a second
+/// source is a reload of the first.
+const INLINE_PLUGIN: &str = "acme_inline";
 
 const RESPONSES_SLUG: &str = "acmeresponses";
 const RESPONSES_MODEL: &str = "acme-r1";
 const RESPONSES_MARKER: &str = "responses";
 
-const PARKING_PLUGIN: &str = "acme_parked";
 const PARKING_SLUG: &str = "acmeparked";
 const PARKING_HOST: &str = "api.acme.example";
 const PARKING_POLL_MS: u64 = 10;
+const LOCKED_TOKEN: &str = "locked";
 const LOCKED_SLUG: &str = "acmelocked";
 const FREE_SLUG: &str = "acmefree";
-/// Comfortably under `LOCK_WAIT`, which is what a host thread parked on the
-/// credential lock would spend.
-const UNBLOCKED_BUDGET: Duration = Duration::from_secs(5);
-const PARKING_TIMEOUT: Duration = Duration::from_secs(20);
+/// Generous on purpose. Nothing waited on here takes a whole second on any
+/// machine, so spending this much means it is stuck for good rather than slow.
+const STUCK_AFTER: Duration = Duration::from_secs(20);
 const RELOADED_SOURCE: &str = "-- the provider plugin, reloaded without its registration\n";
+
+/// A provider maki ships a declaration for, so the slug is both a built-in row
+/// and a decl already standing when the plugin below reaches for it.
+const BUILTIN_SLUG: &str = "deepseek";
+const BUILTIN_HOST: &str = "api.deepseek.com";
+const RESERVED_SLUG_MESSAGE: &str = "belongs to a built-in provider";
+const CLAIM_ALLOWED: &str = "a third-party plugin took a built-in slug";
+const BUILTIN_TAKEN: &str = "a refused declaration must not be serving the slug";
 
 const PROMPT: &str = "read a.txt";
 const SYSTEM: &str = "You are a test.";
@@ -71,19 +79,18 @@ const SYSTEM_PREFIX: &str = "Acme house rules: answer in full sentences.";
 const REMAPPED_MESSAGE: &str = "Acme allowance is spent until the next cycle";
 
 const HOST_FAILED: &str = "the plugin host did not start";
-const NEVER_PARKED: &str = "the login hook never parked";
+const HOOK_NEVER_SIGNALLED: &str = "the login hook never reached the point the test waits on";
+const BAD_RETRY_AFTER: &str = "the recorded retry-after is not a number of seconds";
 const HOOK_THREAD_FAILED: &str = "the thread running the login hook panicked";
 const LOAD_FAILED: &str = "the provider plugin did not load";
 const CREATE_FAILED: &str = "the registered provider could not be built";
 const UNKNOWN_MODEL: &str = "the registered model table has no such model";
-const SERVER_FAILED: &str = "the recorded server panicked";
 const STREAM_FAILED: &str = "the recorded transcript did not stream";
 const HOOK_FAILED: &str = "a provider hook did not answer";
 const NO_USAGE: &str = "fetch_usage answered with nothing";
 const NO_STATE_DIR: &str = "the isolated state directory did not resolve";
 const NO_CREDENTIALS: &str = "the refresh hook stored no credentials";
 const TEMPDIR_FAILED: &str = "no temporary state directory";
-const BIND_FAILED: &str = "cannot bind loopback";
 const IO_FAILED: &str = "the recorded connection broke";
 const NO_TOKEN_LOCK: &str = "the credential lock could not be taken";
 const HOST_THREAD_PARKED: &str =
@@ -121,10 +128,10 @@ const EXPIRED_TOKEN_BODY: &str = r#"{"error":{"message":"token expired"}}"#;
 const ALLOWANCE_BODY: &str = r#"{"error":{"message":"monthly allowance exhausted"}}"#;
 const OVERLOADED_BODY: &str = r#"{"error":{"message":"upstream is busy"}}"#;
 
-const SSE_HEADERS: &[(&str, &str)] = &[("content-type", "text/event-stream")];
-const JSON_HEADERS: &[(&str, &str)] = &[("content-type", "application/json")];
-const SLOW_DOWN_HEADERS: &[(&str, &str)] =
-    &[("content-type", "application/json"), ("retry-after", "7")];
+const SLOW_DOWN_HEADERS: &[(&str, &str)] = &[
+    ("content-type", "application/json"),
+    ("retry-after", RETRY_AFTER),
+];
 
 const CHAT_SCRIPT: &[Canned] = &[Canned::sse(CHAT_TRANSCRIPT)];
 const RESPONSES_SCRIPT: &[Canned] = &[Canned::sse(RESPONSES_TRANSCRIPT)];
@@ -134,6 +141,7 @@ const REFRESH_SCRIPT: &[Canned] = &[
         status: 401,
         headers: JSON_HEADERS,
         body: EXPIRED_TOKEN_BODY,
+        path: None,
     },
     Canned::sse(CHAT_TRANSCRIPT),
     Canned::sse(CHAT_TRANSCRIPT),
@@ -142,105 +150,14 @@ const ALLOWANCE_SCRIPT: &[Canned] = &[Canned {
     status: 429,
     headers: SLOW_DOWN_HEADERS,
     body: ALLOWANCE_BODY,
+    path: None,
 }];
 const OVERLOADED_SCRIPT: &[Canned] = &[Canned {
     status: 503,
     headers: SLOW_DOWN_HEADERS,
     body: OVERLOADED_BODY,
+    path: None,
 }];
-
-/// One recorded response, replayed in script order.
-struct Canned {
-    status: u16,
-    headers: &'static [(&'static str, &'static str)],
-    body: &'static str,
-}
-
-impl Canned {
-    const fn sse(body: &'static str) -> Self {
-        Self {
-            status: 200,
-            headers: SSE_HEADERS,
-            body,
-        }
-    }
-}
-
-/// What the plugin actually put on the wire.
-struct Recorded {
-    headers: HashMap<String, String>,
-    body: Value,
-}
-
-impl Recorded {
-    fn authorization(&self) -> &str {
-        self.headers.get("authorization").map_or("", String::as_str)
-    }
-}
-
-/// Serves `script` in order on loopback, one connection per entry, and hands
-/// back every request it saw. Joining before the script is spent would block,
-/// so the request count is part of what each test asserts.
-fn serve(script: &'static [Canned]) -> (String, JoinHandle<Vec<Recorded>>) {
-    let listener = TcpListener::bind(LOOPBACK).expect(BIND_FAILED);
-    let base_url = format!("http://{}/v1", listener.local_addr().expect(BIND_FAILED));
-    let handle = std::thread::spawn(move || {
-        script
-            .iter()
-            .map(|canned| {
-                let (stream, _) = listener.accept().expect(IO_FAILED);
-                let recorded = read_request(&stream);
-                write_canned(&stream, canned);
-                recorded
-            })
-            .collect()
-    });
-    (base_url, handle)
-}
-
-fn read_request(stream: &TcpStream) -> Recorded {
-    let mut reader = BufReader::new(stream);
-    reader.read_line(&mut String::new()).expect(IO_FAILED);
-
-    let mut headers = HashMap::new();
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).expect(IO_FAILED);
-        let line = line.trim_end();
-        if line.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
-        }
-    }
-
-    let length = headers
-        .get("content-length")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    let mut body = vec![0u8; length];
-    reader.read_exact(&mut body).expect(IO_FAILED);
-    Recorded {
-        headers,
-        body: serde_json::from_slice(&body).unwrap_or(Value::Null),
-    }
-}
-
-fn write_canned(mut stream: &TcpStream, canned: &Canned) {
-    let mut response = format!(
-        "HTTP/1.1 {} {REASON_PHRASE}\r\ncontent-length: {}\r\nconnection: close\r\n",
-        canned.status,
-        canned.body.len()
-    );
-    for (name, value) in canned.headers {
-        response.push_str(&format!("{name}: {value}\r\n"));
-    }
-    response.push_str("\r\n");
-    response.push_str(canned.body);
-    stream.write_all(response.as_bytes()).expect(IO_FAILED);
-    stream.flush().expect(IO_FAILED);
-}
 
 /// Points every base directory at a throwaway tree, so the credentials the
 /// fixture's `login` and `refresh_auth` store never touch the real state dir.
@@ -270,11 +187,24 @@ fn permissions_for(host: &str) -> PluginPermissions {
     permissions
 }
 
+fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+fn plugin_host() -> PluginHost {
+    PluginHost::new(Arc::new(ToolRegistry::new())).expect(HOST_FAILED)
+}
+
+fn load_inline(host: &PluginHost, source: &str, net_host: &str) {
+    host.load_source_with_permissions(INLINE_PLUGIN, source, permissions_for(net_host))
+        .expect(LOAD_FAILED);
+}
+
 /// The fixture plugin, loaded from disk with the grant its `plugin.toml`
 /// declares, talking to a recorded server instead of Acme.
 struct Fixture {
     provider: Box<dyn Provider>,
-    server: JoinHandle<Vec<Recorded>>,
+    server: Requests,
     _state: TempDir,
     _host: PluginHost,
 }
@@ -285,7 +215,7 @@ impl Fixture {
         let (base_url, server) = serve(script);
         unsafe { std::env::set_var(BASE_URL_ENV, &base_url) };
 
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).expect(HOST_FAILED);
+        let host = plugin_host();
         host.load_plugin_file(&fixture_path()).expect(LOAD_FAILED);
         plugin::commit_load();
 
@@ -305,8 +235,22 @@ impl Fixture {
         stream(self.provider.as_ref(), &model, thinking)
     }
 
-    fn requests(self) -> Vec<Recorded> {
-        self.server.join().expect(SERVER_FAILED)
+    fn requests(&self) -> Vec<Value> {
+        self.server
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Recorded::json)
+            .collect()
+    }
+
+    fn tokens(&self) -> Vec<String> {
+        self.server
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|recorded| recorded.authorization().to_owned())
+            .collect()
     }
 }
 
@@ -369,20 +313,20 @@ fn a_recorded_turn_streams_its_events_and_posts_the_body_the_hook_built() {
 
     let sent = fixture.requests();
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].authorization(), "Bearer anonymous");
-    assert_eq!(sent[0].body["model"], json!(MODEL));
+    assert_eq!(fixture.tokens(), [bearer(ANON_TOKEN)]);
+    assert_eq!(sent[0]["model"], json!(MODEL));
     assert_eq!(
-        sent[0].body["messages"][0]["content"],
+        sent[0]["messages"][0]["content"],
         json!(format!("{SYSTEM_PREFIX}\n\n{SYSTEM}"))
     );
     assert_eq!(
-        sent[0].body["acme_reasoning"],
+        sent[0]["acme_reasoning"],
         json!({ "model": MODEL, "effort": SNAPPED_EFFORT, "asked_for": ASKED_EFFORT.as_str() })
     );
     assert!(
-        sent[0].body.get("reasoning_effort").is_none(),
+        sent[0].get("reasoning_effort").is_none(),
         "the hook removed reasoning_effort, so it must not be on the wire: {}",
-        sent[0].body
+        sent[0]
     );
 }
 
@@ -398,33 +342,25 @@ fn the_auth_hooks_drive_the_credential_lifecycle() {
     smol::block_on(fixture.provider.reload_auth()).expect(HOOK_FAILED);
     fixture.stream(ThinkingConfig::Off).1.expect(STREAM_FAILED);
 
-    let sent = fixture.requests();
-    let tokens: Vec<&str> = sent.iter().map(Recorded::authorization).collect();
     assert_eq!(
-        tokens,
+        fixture.tokens(),
         [
-            "Bearer anonymous",
-            "Bearer anonymous-renewed",
-            "Bearer anonymous-renewed",
+            bearer(ANON_TOKEN),
+            bearer(RENEWED_TOKEN),
+            bearer(RENEWED_TOKEN),
         ]
     );
 }
 
 /// The host holds this provider's credential lock while `refresh_auth` runs, so
 /// a hook that stores the token it minted has to be let back in through that
-/// same lock. It would otherwise wait on its own caller until the hook times
-/// out, which is why the budget here is well under `HOOK_TIMEOUT`.
+/// same lock. A hook that waits on its own caller instead never answers, and
+/// the call below comes back as a hook timeout rather than as a token.
 #[test]
 fn a_refresh_hook_persists_the_token_it_minted() {
     let fixture = Fixture::start(NO_REQUESTS);
 
-    let started = Instant::now();
     smol::block_on(fixture.provider.refresh_auth()).expect(HOOK_FAILED);
-    assert!(
-        started.elapsed() < REFRESH_BUDGET,
-        "{:?}",
-        started.elapsed()
-    );
 
     let dir = StateDir::resolve().expect(NO_STATE_DIR);
     let stored = load_plugin_auth(&dir, SLUG).expect(NO_CREDENTIALS);
@@ -476,10 +412,8 @@ fn map_error_restates_the_status_and_keeps_retry_after(
     assert_eq!(*status, expected_status);
     assert_eq!(message, expected_message);
     assert_eq!(error.retry_kind(), expected_kind);
-    assert_eq!(
-        error.retry_after(),
-        Some(Duration::from_secs(RETRY_AFTER_SECONDS))
-    );
+    let asked_for = Duration::from_secs(RETRY_AFTER.parse().expect(BAD_RETRY_AFTER));
+    assert_eq!(error.retry_after(), Some(asked_for));
 }
 
 /// There is no `has_auth` flag: defining `login` is the whole of what makes a
@@ -521,13 +455,8 @@ maki.provider.register({{
 fn the_responses_codec_applies_the_body_hook_too() {
     let _state = isolated_state();
     let (base_url, server) = serve(RESPONSES_SCRIPT);
-    let host = PluginHost::new(Arc::new(ToolRegistry::new())).expect(HOST_FAILED);
-    host.load_source_with_permissions(
-        RESPONSES_SLUG,
-        &responses_plugin(&base_url),
-        permissions_for(LOOPBACK_HOST),
-    )
-    .expect(LOAD_FAILED);
+    let host = plugin_host();
+    load_inline(&host, &responses_plugin(&base_url), LOOPBACK_HOST);
     plugin::commit_load();
 
     let provider = plugin::create(RESPONSES_SLUG, Timeouts::default()).expect(CREATE_FAILED);
@@ -544,71 +473,66 @@ fn the_responses_codec_applies_the_body_hook_too() {
     );
     assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
 
-    let sent = server.join().expect(SERVER_FAILED);
+    let sent = server.lock().unwrap();
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].body["acme_marker"], json!(RESPONSES_MARKER));
+    assert_eq!(sent[0].json()["acme_marker"], json!(RESPONSES_MARKER));
 }
 
-/// A provider whose `login` parks until the test releases it, so a reload can
-/// land while the call is genuinely in flight.
-fn parking_plugin(started: &Path, release: &Path) -> String {
-    let started = started.display();
-    let release = release.display();
+/// One provider whose `login` runs `body`. The registration is the same every
+/// time, since what these tests vary is only what the hook does once it is
+/// called.
+fn login_plugin(slug: &str, body: &str) -> String {
     format!(
         r#"
 maki.provider.register({{
-  slug = "{PARKING_SLUG}",
-  display_name = "Acme Parked",
+  slug = "{slug}",
+  display_name = "{slug}",
   codec = "openai",
   base_url = "https://{PARKING_HOST}/v1",
   models = {{ {{ prefixes = {{ "{MODEL}" }} }} }},
   login = function()
-    maki.fs.write("{started}", "1")
-    while not maki.fs.read("{release}") do
-      maki.async.sleep({PARKING_POLL_MS})
-    end
+{body}
   end,
 }})
 "#
     )
 }
 
-fn wait_for(path: &Path) {
-    let deadline = Instant::now() + PARKING_TIMEOUT;
-    while !path.exists() {
-        assert!(Instant::now() < deadline, "{NEVER_PARKED}");
-        std::thread::sleep(Duration::from_millis(PARKING_POLL_MS));
-    }
+/// Parks until the test drops a file, so a reload can land while the call is
+/// genuinely in flight.
+fn park_until_released(started: &Path, release: &Path) -> String {
+    let started = started.display();
+    let release = release.display();
+    format!(
+        r#"    maki.fs.write("{started}", "1")
+    while not maki.fs.read("{release}") do
+      maki.async.sleep({PARKING_POLL_MS})
+    end"#
+    )
 }
 
-/// Two providers in one plugin: one whose `login` writes the credential store
-/// while another process holds that slug's lock, and one whose `login` does
-/// nothing but answer.
-fn locking_plugin(entered: &Path, done: &Path) -> String {
+/// Writes the credential store from inside a hook, which is the call the test
+/// below wants to catch parking the host.
+fn write_credentials(entered: &Path, done: &Path) -> String {
     let entered = entered.display();
     let done = done.display();
     format!(
-        r#"
-local function provider(slug, login)
-  maki.provider.register({{
-    slug = slug,
-    display_name = slug,
-    codec = "openai",
-    base_url = "https://{PARKING_HOST}/v1",
-    models = {{ {{ prefixes = {{ "{MODEL}" }} }} }},
-    login = login,
-  }})
-end
-
-provider("{LOCKED_SLUG}", function()
-  maki.fs.write("{entered}", "1")
-  maki.provider.auth.set("{LOCKED_SLUG}", {{ token = "locked" }})
-  maki.fs.write("{done}", "1")
-end)
-
-provider("{FREE_SLUG}", function() end)
-"#
+        r#"    maki.fs.write("{entered}", "1")
+    maki.provider.auth.set("{LOCKED_SLUG}", {{ token = "{LOCKED_TOKEN}" }})
+    maki.fs.write("{done}", "1")"#
     )
+}
+
+/// Waits on a file a Lua hook writes, which is the only line a hook running on
+/// the host's own thread can hand back to the test. Polling rather than timing:
+/// nothing here is expected to take a set amount of time, and the deadline only
+/// turns a hang into a failure the runner can report.
+fn wait_for(path: &Path) {
+    let deadline = Instant::now() + STUCK_AFTER;
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "{HOOK_NEVER_SIGNALLED}");
+        std::thread::sleep(Duration::from_millis(PARKING_POLL_MS));
+    }
 }
 
 /// The defect that keeps the credential store off the plugin host's thread:
@@ -619,19 +543,22 @@ provider("{FREE_SLUG}", function() end)
 /// The lock here is held on a second file descriptor, which is what a second
 /// maki process looks like to `flock`, and the in-process re-entrancy that lets
 /// a `refresh_auth` persist its own token deliberately does not cover it.
+///
+/// `login` carries no hook timeout, so the free login gets a thread of its own.
+/// A parked host would otherwise hang the test for good instead of failing it.
 #[test]
 fn a_credential_write_does_not_park_the_plugin_host() {
     let state = isolated_state();
     let entered = state.path().join("entered");
     let done = state.path().join("done");
 
-    let host = PluginHost::new(Arc::new(ToolRegistry::new())).expect(HOST_FAILED);
-    host.load_source_with_permissions(
-        PARKING_PLUGIN,
-        &locking_plugin(&entered, &done),
-        permissions_for(PARKING_HOST),
-    )
-    .expect(LOAD_FAILED);
+    let host = plugin_host();
+    let source = format!(
+        "{}{}",
+        login_plugin(LOCKED_SLUG, &write_credentials(&entered, &done)),
+        login_plugin(FREE_SLUG, "")
+    );
+    load_inline(&host, &source, PARKING_HOST);
     plugin::commit_load();
 
     let dir = StateDir::resolve().expect(NO_STATE_DIR);
@@ -639,10 +566,13 @@ fn a_credential_write_does_not_park_the_plugin_host() {
     let locked = std::thread::spawn(|| plugin::login(LOCKED_SLUG));
     wait_for(&entered);
 
-    let started = Instant::now();
-    plugin::login(FREE_SLUG).expect(HOOK_FAILED);
+    let (served, free_login) = flume::bounded(1);
+    std::thread::spawn(move || served.send(plugin::login(FREE_SLUG)));
+    free_login
+        .recv_timeout(STUCK_AFTER)
+        .expect(HOST_THREAD_PARKED)
+        .expect(HOOK_FAILED);
 
-    assert!(started.elapsed() < UNBLOCKED_BUDGET, "{HOST_THREAD_PARKED}");
     assert!(!done.exists(), "{HOST_THREAD_PARKED}");
     drop(held);
     locked.join().expect(HOOK_THREAD_FAILED).expect(HOOK_FAILED);
@@ -653,22 +583,45 @@ fn a_credential_write_does_not_park_the_plugin_host() {
 /// on belong to the handle and go only once nobody holds it.
 #[test]
 fn an_in_flight_hook_call_survives_a_plugin_reload() {
-    let state = TempDir::new().expect(TEMPDIR_FAILED);
+    let state = isolated_state();
     let started = state.path().join("started");
     let release = state.path().join("release");
 
-    let host = PluginHost::new(Arc::new(ToolRegistry::new())).expect(HOST_FAILED);
-    let load = |source: &str| {
-        host.load_source_with_permissions(PARKING_PLUGIN, source, permissions_for(PARKING_HOST))
-            .expect(LOAD_FAILED);
-    };
-    load(&parking_plugin(&started, &release));
+    let host = plugin_host();
+    let parking = login_plugin(PARKING_SLUG, &park_until_released(&started, &release));
+    load_inline(&host, &parking, PARKING_HOST);
     plugin::commit_load();
 
     let login = std::thread::spawn(|| plugin::login(PARKING_SLUG));
     wait_for(&started);
-    load(RELOADED_SOURCE);
+    load_inline(&host, RELOADED_SOURCE, PARKING_HOST);
     std::fs::write(&release, "1").expect(IO_FAILED);
 
     login.join().expect(HOOK_THREAD_FAILED).expect(HOOK_FAILED);
+}
+
+/// A slug maki ships is maki's to declare, and a plugin from outside the
+/// binary may not take it. A decl that claims one inherits its `api_key_env`,
+/// so the key the user set for the built-in would be resolved into the
+/// claimant's credentials and handed straight to it by
+/// `maki.provider.auth.resolved`, under a name the picker still labels with
+/// the built-in's display name. No `net` grant and no host list ever bought
+/// that reach.
+#[test]
+fn a_third_party_plugin_cannot_take_a_builtin_slug() {
+    let _state = isolated_state();
+    let host = plugin_host();
+    plugin::begin_load();
+
+    let error = host
+        .load_source_with_permissions(
+            INLINE_PLUGIN,
+            &format!(r#"maki.provider.register({{ slug = "{BUILTIN_SLUG}", codec = "openai" }})"#),
+            permissions_for(BUILTIN_HOST),
+        )
+        .expect_err(CLAIM_ALLOWED);
+    plugin::commit_load();
+
+    assert!(error.to_string().contains(RESERVED_SLUG_MESSAGE), "{error}");
+    assert!(!plugin::is_registered(BUILTIN_SLUG), "{BUILTIN_TAKEN}");
 }

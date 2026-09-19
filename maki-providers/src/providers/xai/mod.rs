@@ -12,7 +12,7 @@ use crate::AgentError;
 use crate::model::ModelFamily;
 use crate::provider::Provider;
 use crate::providers::{ResolvedAuth, Timeouts};
-use crate::spec::{AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
+use crate::spec::{AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
 
 const GROK_MAX_OUTPUT_TOKENS: u32 = 131_072;
 
@@ -41,11 +41,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_context_window: 500_000,
     models_toml: include_str!("../../../models/xai.toml"),
     pricing_schedule: None,
-    native: Some(Native {
+    build: Build::Native(Native {
         new: create,
         with_auth: create_with_auth,
-        aperture: None,
     }),
+    aperture: None,
     login: Some(LoginConfig {
         protocol: Protocol::Openai,
         default_base_url: BASE_URL,

@@ -1,10 +1,13 @@
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use maki_config::host_allowed;
+use maki_providers::plugin;
 use mlua::{Error as LuaError, Function, IntoLuaMulti, Lua, Result as LuaResult};
 use semver::Version;
 use tracing::warn;
+use url::Url;
 
 use crate::error::PluginError;
 
@@ -23,6 +26,88 @@ const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// host", while a list present means exactly those hosts. Shared because every
 /// `maki.net` call in one plugin reads the same list.
 pub type NetHosts = Option<Arc<[String]>>;
+
+/// The slugs one plugin registered a provider for, captured when its `maki`
+/// global was built. Nothing on the Lua side names a plugin, so a plugin
+/// reaches its own providers and no one else's by construction rather than by
+/// a check it could be handed the wrong argument for.
+pub type OwnedSlugs = Arc<Mutex<Vec<String>>>;
+
+/// Where a plugin is allowed to send bytes, as one answer rather than two
+/// lists that a call site could consult one of.
+///
+/// A manifest can only name the hosts its author knew about. The origin of a
+/// provider *this plugin registered* is the other half, and only maki knows
+/// it: the user repoints a slug with `<SLUG>_BASE_URL` or `providers.toml`,
+/// and no `plugin.toml` written beforehand can have that host in it. Leaving
+/// it out made a provider's own `fetch_usage` unreachable for exactly the
+/// users who need it, while the codec went to that very origin with the very
+/// same credentials and was never questioned.
+#[derive(Clone, Default)]
+pub struct NetEgress {
+    declared: NetHosts,
+    providers: OwnedSlugs,
+}
+
+impl NetEgress {
+    pub fn new(declared: NetHosts) -> Self {
+        Self {
+            declared,
+            providers: OwnedSlugs::default(),
+        }
+    }
+
+    /// The manifest's list, for the one caller that has to answer "did this
+    /// plugin declare any hosts at all" before it can register a provider.
+    pub(crate) fn declared(&self) -> &NetHosts {
+        &self.declared
+    }
+
+    /// Records a slug [`crate::api::provider`] just registered. Kept here and
+    /// not beside the registration so the network layer cannot be given a
+    /// stale copy: both surfaces read this one cell.
+    pub(crate) fn owns(&self, slug: String) {
+        self.providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(slug);
+    }
+
+    pub(crate) fn owned(&self) -> OwnedSlugs {
+        Arc::clone(&self.providers)
+    }
+
+    /// Whether this plugin may reach `host`: its manifest says so, or `host`
+    /// is where maki itself would send the credentials of a provider it
+    /// registered.
+    pub(crate) fn allows(&self, host: &str) -> bool {
+        let Some(declared) = &self.declared else {
+            return true;
+        };
+        host_allowed(host, declared) || self.serves(host)
+    }
+
+    /// Whether `url` is on the origin of a provider this plugin registered,
+    /// as chosen by the user or by maki. See [`plugin::vouched_origin`].
+    pub(crate) fn vouches(&self, url: &Url) -> bool {
+        let origin = url.origin();
+        self.providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|slug| plugin::vouched_origin(slug))
+            .any(|vouched| vouched.origin() == origin)
+    }
+
+    fn serves(&self, host: &str) -> bool {
+        self.providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|slug| plugin::effective_host(slug))
+            .any(|origin| host_allowed(host, &[origin]))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PluginPermissions {
@@ -365,6 +450,11 @@ mod tests {
     use super::*;
 
     const PLUGIN: &str = "test-plugin";
+    const DECLARED_HOST: &str = "api.example.com";
+    const OTHER_HOST: &str = "elsewhere.example";
+    /// A slug no load ever registered, which is the state every slug is in
+    /// here: these run without a provider registry.
+    const UNREGISTERED_SLUG: &str = "not-a-provider";
 
     fn assert_denied(permissions: &PluginPermissions) {
         for &permission in Permission::ALL {
@@ -373,6 +463,23 @@ mod tests {
                 "{permission} should be denied"
             );
         }
+    }
+
+    /// The grant a registered provider adds is covered end to end by
+    /// `tests/provider_replay.rs`, where a real slug has a real origin.
+    /// What is worth pinning here is the other direction: owning a slug is
+    /// never a grant by itself, so a plugin cannot widen its own reach by
+    /// naming providers that do not resolve.
+    #[test_case(None, &[], OTHER_HOST, true ; "a_plugin_that_declared_nothing_is_unrestricted")]
+    #[test_case(Some(DECLARED_HOST), &[], DECLARED_HOST, true ; "a_declared_host_is_reachable")]
+    #[test_case(Some(DECLARED_HOST), &[], OTHER_HOST, false ; "and_nothing_else_is")]
+    #[test_case(Some(DECLARED_HOST), &[UNREGISTERED_SLUG], OTHER_HOST, false ; "owning_a_slug_that_serves_nothing_grants_nothing")]
+    fn egress_reaches(declared: Option<&str>, owns: &[&str], host: &str, expected: bool) {
+        let egress = NetEgress::new(declared.map(|host| Arc::from(vec![host.to_owned()])));
+        for slug in owns {
+            egress.owns((*slug).to_owned());
+        }
+        assert_eq!(egress.allows(host), expected);
     }
 
     #[test]

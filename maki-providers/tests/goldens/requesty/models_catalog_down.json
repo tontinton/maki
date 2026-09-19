@@ -1,0 +1,86 @@
+{
+  "outcome": {
+    "models": [
+      {
+        "context_window": 200000,
+        "id": "claude-sonnet-4-5",
+        "max_output_tokens": 64000,
+        "pricing": {
+          "cache_read": 0.3,
+          "cache_write": 3.75,
+          "fast": null,
+          "input": 3.0,
+          "output": 15.0
+        },
+        "supports_thinking": true,
+        "supports_vision": true,
+        "tier": null
+      },
+      {
+        "context_window": 1000000,
+        "id": "claude-sonnet-4-5",
+        "max_output_tokens": 64000,
+        "pricing": {
+          "cache_read": 0.0,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": 6.0,
+          "output": 22.5
+        },
+        "supports_thinking": true,
+        "supports_vision": true,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "claude-sonnet-4-5@eu",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": false,
+        "supports_vision": false,
+        "tier": null
+      },
+      {
+        "context_window": 400000,
+        "id": "gpt-5.4-mini",
+        "max_output_tokens": 128000,
+        "pricing": {
+          "cache_read": 0.024999999999999998,
+          "cache_write": 0.0,
+          "fast": null,
+          "input": 0.25,
+          "output": 2.0
+        },
+        "supports_thinking": true,
+        "supports_vision": true,
+        "tier": null
+      }
+    ]
+  },
+  "requests": [
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/v1/models"
+    },
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/v1/models/managed"
+    }
+  ]
+}

@@ -13,13 +13,17 @@ use std::sync::Arc;
 use jiff::Timestamp;
 use maki_config::ModelPolicy;
 use maki_storage::sessions::{Effort, MIN_THINKING_BUDGET, StoredTokenUsage};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
+use tracing::debug;
 
 use crate::model_registry;
 use crate::providers::catalog::{self, CatalogMeta};
 use crate::providers::{anthropic, custom, plugin};
 use crate::spec::{ProviderRegistry, ProviderSpec};
-use crate::types::{FALLBACK_MAX_THINKING_BUDGET, THINKING_ADAPTIVE, THINKING_OFF};
+use crate::types::{
+    EffortDialect, FALLBACK_MAX_THINKING_BUDGET, THINKING_ADAPTIVE, THINKING_OFF, dialect,
+};
 use maki_config::providers::ThinkingFields;
 
 const PER_MILLION: f64 = 1_000_000.0;
@@ -45,7 +49,7 @@ pub enum ModelError {
 /// Also the shape of a rate in `models/<slug>.toml`. None of the four rates may
 /// ever gain a `#[serde(default)]`: a curated row that forgets one has to fail
 /// loudly instead of quietly billing the user zero.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct ModelPricing {
     pub input: f64,
     pub output: f64,
@@ -65,8 +69,9 @@ pub struct ModelPricing {
 /// the shape a plugin may state is this one minus [`Self::provider_info`],
 /// which is a stash only the Rust provider that filled it can read back. Every
 /// optional field defaults, so an omitted one stays distinguishable from a
-/// published negative.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// published negative. `Serialize` is the same shape going the other way, so a
+/// golden records every field there is rather than a hand-picked few.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ModelInfo {
     pub id: String,
     #[serde(default)]
@@ -84,6 +89,76 @@ pub struct ModelInfo {
     /// Store of additional metadata from the provider.
     #[serde(skip)]
     pub provider_info: Option<Arc<dyn Any + Send + Sync>>,
+    /// Opaque JSON a declaration's `list_models` attaches to the row, handed
+    /// back to its `build_body` on every request for the model
+    /// (`opts.model_info` in Lua). Never serialized, like
+    /// [`Self::provider_info`]: the listing goldens predate it, so the request
+    /// bodies of a discovery run are what pin it.
+    #[serde(default, skip_serializing)]
+    pub extra: Option<Value>,
+    /// What the model says about effort, narrowing its declared dialect (see
+    /// [`ModelEffort::refine`]). Never serialized, for the reason
+    /// [`Self::extra`] is not.
+    #[serde(default, skip_serializing)]
+    pub effort: Option<ModelEffort>,
+}
+
+/// A listed model's own effort levels and off switch. The codec folds them
+/// into the declared dialect first, so the effort snaps once, against the
+/// result. Decoding goes through [`Self::known_levels`], the one place a level
+/// maki has no name for is dropped.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelEffort {
+    /// Ascending. Empty inherits the declared levels, since a model that
+    /// named none, or only unknown ones, said nothing usable.
+    #[serde(default, deserialize_with = "known_efforts")]
+    pub supported: Vec<Effort>,
+    /// `true` sends [`dialect::OFF`] for Off, `false` sends nothing, and
+    /// absent keeps what the declared dialect does.
+    #[serde(default)]
+    pub send_off: Option<bool>,
+}
+
+impl ModelEffort {
+    /// The declared dialect as this model speaks it. `adaptive` stays the
+    /// declaration's: a model lists levels, not a default.
+    pub fn refine<'a>(&'a self, declared: &EffortDialect<'a>) -> EffortDialect<'a> {
+        EffortDialect {
+            supported: match self.supported.as_slice() {
+                [] => declared.supported,
+                listed => listed,
+            },
+            adaptive: declared.adaptive,
+            off: match self.send_off {
+                Some(true) => Some(dialect::OFF),
+                Some(false) => None,
+                None => declared.off,
+            },
+        }
+    }
+
+    /// What [`Self::supported`] keeps of the names a provider listed.
+    fn known_levels(listed: &[Value]) -> Vec<Effort> {
+        let mut efforts: Vec<Effort> = listed
+            .iter()
+            .filter_map(|raw| {
+                let known = raw.as_str().and_then(|name| name.parse().ok());
+                if known.is_none() {
+                    debug!(effort = %raw, "dropping an effort level maki has no name for");
+                }
+                known
+            })
+            .collect();
+        efforts.sort_unstable();
+        efforts
+    }
+}
+
+fn known_efforts<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Effort>, D::Error> {
+    Ok(ModelEffort::known_levels(&Vec::<Value>::deserialize(
+        deserializer,
+    )?))
 }
 
 impl ModelInfo {
@@ -98,7 +173,7 @@ impl ModelInfo {
 /// Cache rates are missing on purpose: Anthropic derives them from `input` with
 /// the same multipliers it uses for standard pricing, so storing them would just
 /// invite the two copies to drift apart.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct FastPricing {
     pub input: f64,
     pub output: f64,
@@ -424,7 +499,8 @@ fn local_thinking_overlay(
 
 /// `Required` marks APIs that reject requests with thinking disabled;
 /// [`crate::RequestOptions::clamped`] raises `Off` to minimal effort for them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ThinkingSupport {
     No,
     Yes,
@@ -859,10 +935,12 @@ impl Model {
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
         let (slug, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
 
-        // Order settles nothing between the first three: registration rejects
-        // any slug a builtin or a custom entry already owns, so they cannot
-        // collide. The models.dev catalogue comes last because it is the open
-        // ended one, and anything defined on this machine should win over it.
+        // Order only decides the last step, because the first three cannot
+        // collide: a declaration claiming a built-in slug inherits that row
+        // instead of restating it, and registration refuses a slug
+        // `providers.toml` already defines. models.dev comes last because it
+        // is the open ended one, and anything defined on this machine should
+        // beat it.
         if let Some(spec) = ProviderRegistry::get(slug) {
             return Ok(Self::from_base(spec, slug, model_id));
         }
@@ -1054,6 +1132,8 @@ impl AddAssign for TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ThinkingConfig;
+    use serde_json::json;
     use test_case::test_case;
 
     fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
@@ -1907,5 +1987,60 @@ mod tests {
         assert!(model.billed_cost(&INPUT_ONLY, false).is_some());
         assert_eq!(model.subsidised_list_cost(&INPUT_ONLY, false), None);
         assert_eq!(model.subsidy_source(), None);
+    }
+
+    #[test_case(json!({ "supported": ["high", "bogus", 1, null, "LOW", "low", "none"] }), &[Effort::Low, Effort::High] ; "unknown_names_dropped_and_sorted")]
+    #[test_case(json!({ "supported": ["none", "bogus"] }), &[] ; "only_unknown_names_leave_it_empty")]
+    #[test_case(json!({}), &[] ; "absent_is_empty")]
+    fn model_effort_keeps_the_known_levels_in_order(authored: Value, expected: &[Effort]) {
+        let effort: ModelEffort = serde_json::from_value(authored).unwrap();
+        assert_eq!(effort.supported, expected);
+    }
+
+    #[test]
+    fn model_effort_refuses_an_unknown_key() {
+        assert!(serde_json::from_value::<ModelEffort>(json!({ "sendoff": true })).is_err());
+    }
+
+    /// Snapped once, against the levels the model listed, falling back to
+    /// the declared ones when it listed none.
+    #[test_case(&[Effort::High, Effort::XHigh], ThinkingConfig::Effort(Effort::XHigh), Some("xhigh") ; "listed_xhigh_passes_through")]
+    #[test_case(&[Effort::High, Effort::XHigh], ThinkingConfig::Effort(Effort::Max), Some("xhigh") ; "max_snaps_to_listed_xhigh")]
+    #[test_case(&[Effort::Minimal, Effort::Low], ThinkingConfig::Adaptive, Some("low") ; "declared_adaptive_snaps_into_listed")]
+    #[test_case(&[], ThinkingConfig::Effort(Effort::XHigh), Some("high") ; "nothing_listed_inherits_declared")]
+    fn refined_dialect_snaps_against_the_listed_levels(
+        supported: &[Effort],
+        thinking: ThinkingConfig,
+        expected: Option<&str>,
+    ) {
+        let effort = ModelEffort {
+            supported: supported.to_vec(),
+            send_off: None,
+        };
+        let model = ladder_model(ThinkingSupport::Yes, None);
+        assert_eq!(
+            thinking.effort_str(&effort.refine(&dialect::PREFER_HIGH), &model),
+            expected
+        );
+    }
+
+    #[test_case(&dialect::PREFER_HIGH, Some(true), Some(dialect::OFF) ; "send_off_sends_none")]
+    #[test_case(&dialect::CODING_PLAN, Some(false), None ; "no_send_off_silences_a_declared_opt_out")]
+    #[test_case(&dialect::CODING_PLAN, None, Some(dialect::OFF) ; "absent_inherits_the_declared_opt_out")]
+    #[test_case(&dialect::PREFER_HIGH, None, None ; "absent_inherits_no_opt_out")]
+    fn refined_dialect_maps_send_off(
+        declared: &EffortDialect<'static>,
+        send_off: Option<bool>,
+        expected: Option<&str>,
+    ) {
+        let effort = ModelEffort {
+            supported: Vec::new(),
+            send_off,
+        };
+        let model = ladder_model(ThinkingSupport::Yes, None);
+        assert_eq!(
+            ThinkingConfig::Off.effort_str(&effort.refine(declared), &model),
+            expected
+        );
     }
 }

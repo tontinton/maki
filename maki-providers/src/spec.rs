@@ -13,6 +13,24 @@ use crate::providers::{
     xai, zai,
 };
 
+/// The slugs a plugin may name as its `base`, in documentation order. A `base`
+/// borrows a bespoke `impl Provider` whole, so every entry must be a
+/// [`Build::Native`] row. Written out rather than derived from the rows, so a
+/// provider leaving it is a deliberate, documented break and never the side
+/// effect of a port.
+pub const BASES: &[&str] = &[
+    anthropic::SPEC.slug,
+    openai::SPEC.slug,
+    google::SPEC.slug,
+    copilot::SPEC.slug,
+    ollama::SPEC.slug,
+    llama_cpp::SPEC.slug,
+    zai::SPEC.slug,
+    opencode::ZEN_SPEC.slug,
+    xai::SPEC.slug,
+    aperture::SPEC.slug,
+];
+
 /// Stands in for the model table when a provider curates none.
 pub const GENERIC_DISCOVERY_NOTE: &str =
     "No hardcoded model catalog. Use any model ID supported by this provider.";
@@ -46,9 +64,10 @@ pub struct ProviderSpec {
     /// sit next to the prices they scale. Everyone else bills flat.
     pub pricing_schedule: Option<&'static PricingSchedule>,
 
-    /// `None` for a slug `catalog::try_create` constructs out of models.dev;
-    /// that row carries metadata only.
-    pub native: Option<Native>,
+    pub build: Build,
+    /// `Some` iff Aperture can proxy onto this provider. Lives on the spec, not
+    /// on [`Native`], so the route survives a provider losing its bespoke impl.
+    pub aperture: Option<ApertureRoute>,
     /// `None` for slugs that are never a `maki auth login` target and so have
     /// no `maki-config` row. `Some` is the *only* authoring site for that row;
     /// see [`ProviderSpec::config_row`].
@@ -65,7 +84,18 @@ pub type NewFn = fn(Timeouts) -> Result<Box<dyn Provider>, AgentError>;
 /// room to name.
 pub type WithAuthFn = fn(Arc<Mutex<ResolvedAuth>>, Timeouts, Option<String>) -> Box<dyn Provider>;
 
-/// How maki builds a provider it does not read out of the catalog.
+/// How maki builds the provider this row describes.
+#[derive(Debug, Clone, Copy)]
+pub enum Build {
+    /// A bespoke `impl Provider`.
+    Native(Native),
+    /// A declaration a bundled plugin registers, claiming this row.
+    Declared,
+    /// `catalog::try_create`, out of models.dev. The row carries metadata only.
+    Catalog,
+}
+
+/// How maki builds a provider that has its own `impl Provider`.
 #[derive(Debug, Clone, Copy)]
 pub struct Native {
     /// Built from config and env by maki itself.
@@ -73,10 +103,6 @@ pub struct Native {
     /// Build against auth someone else resolved. Used by plugin providers
     /// that extend a base slug and by Aperture's gateway routing.
     pub with_auth: WithAuthFn,
-    /// `Some` iff Aperture can proxy onto this provider. Lives here on
-    /// purpose: a route is only expressible for a provider that has
-    /// `with_auth`.
-    pub aperture: Option<ApertureRoute>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -137,10 +163,17 @@ impl ProviderSpec {
         manifest::table(self.slug)
     }
 
-    /// Whether maki builds this provider itself, as opposed to reading it out
-    /// of the models.dev catalog.
+    pub const fn native(&self) -> Option<Native> {
+        match self.build {
+            Build::Native(native) => Some(native),
+            Build::Declared | Build::Catalog => None,
+        }
+    }
+
+    /// Whether this provider has a bespoke `impl Provider`, as opposed to a
+    /// declaration or a models.dev catalog entry.
     pub const fn is_native(&self) -> bool {
-        self.native.is_some()
+        self.native().is_some()
     }
 
     /// The `maki-config` view of this provider, derived. Const-panics for a
@@ -214,12 +247,6 @@ impl ProviderRegistry {
         BUILTINS
     }
 
-    /// The slugs a registered plugin or a `providers.toml` entry may not
-    /// claim, and the ones a plugin may name as its `base`.
-    pub fn native_slugs() -> impl Iterator<Item = &'static str> {
-        BUILTINS.iter().filter(|s| s.is_native()).map(|s| s.slug)
-    }
-
     pub fn find_default_for_tier(slug: &str, tier: ModelTier) -> Option<&'static ModelEntry> {
         Self::for_slug(slug)?
             .models()
@@ -235,11 +262,11 @@ impl ProviderRegistry {
 /// knows about a slug: a catalog-backed builtin has a spec row and is still
 /// `Catalog` here.
 pub enum Owner {
+    /// A registered declaration.
+    Plugin,
     /// Carries the constructor rather than the spec, so "builtin" and
     /// "buildable" cannot come apart.
     Builtin(NewFn),
-    /// `maki.provider.register` from a Lua plugin
-    Plugin,
     /// `providers.toml`
     Custom,
     /// models.dev
@@ -249,16 +276,20 @@ pub enum Owner {
 
 impl Owner {
     pub fn of(slug: &str) -> Self {
-        if let Some(native) = ProviderRegistry::get(slug).and_then(|s| s.native) {
-            return Self::Builtin(native.new);
-        }
+        // A declaration answers first, built-in row or not: once a slug has
+        // one, that is what builds it. A provider still on a bespoke `native`
+        // impl keeps its old path, which is how the ports land one at a time.
         if plugin::is_registered(slug) {
             return Self::Plugin;
+        }
+        let builtin = ProviderRegistry::get(slug);
+        if let Some(native) = builtin.and_then(ProviderSpec::native) {
+            return Self::Builtin(native.new);
         }
         if custom::base_spec(slug).is_some() {
             return Self::Custom;
         }
-        if ProviderRegistry::get(slug).is_some() {
+        if builtin.is_some() {
             return Self::Catalog;
         }
         Self::Unknown
@@ -275,14 +306,33 @@ mod tests {
     /// is only the right filter while the registry is exactly what maki builds
     /// plus what it deliberately reads from the catalog. A duplicate slug would
     /// vanish into the set, so count before comparing.
+    ///
+    /// That a [`Build::Declared`] row really has a bundled plugin claiming it
+    /// is `maki-lua`'s to prove, since only it can load one.
     #[test]
-    fn builtins_are_the_native_and_catalog_backed_slugs() {
+    fn builtins_are_the_native_declared_and_catalog_backed_slugs() {
         let registry: HashSet<&str> = BUILTINS.iter().map(|s| s.slug).collect();
         assert_eq!(registry.len(), BUILTINS.len(), "duplicate slug in BUILTINS");
-        let expected: HashSet<&str> = ProviderRegistry::native_slugs()
-            .chain(CATALOG_BACKED_BUILTINS.iter().copied())
-            .collect();
-        assert_eq!(registry, expected);
+        for spec in BUILTINS {
+            let built = match spec.build {
+                Build::Native(_) | Build::Declared => true,
+                Build::Catalog => CATALOG_BACKED_BUILTINS.contains(&spec.slug),
+            };
+            assert!(built, "nothing builds {}", spec.slug);
+        }
+        for slug in CATALOG_BACKED_BUILTINS {
+            assert!(registry.contains(slug), "{slug} has no spec row");
+        }
+    }
+
+    /// A `base` borrows a native constructor, so a slug on the list that lost
+    /// its `impl Provider` would pass registration and fail every `create`.
+    #[test]
+    fn every_base_is_a_native_builtin() {
+        for base in BASES {
+            let spec = ProviderRegistry::get(base);
+            assert!(spec.is_some_and(ProviderSpec::is_native), "{base}");
+        }
     }
 
     /// The picker lists the inventory, so a spec without an entry is a
@@ -339,7 +389,7 @@ mod tests {
     }
 
     /// A spec row alone does not make a provider buildable. Hand `opencode-go`
-    /// a `native` and `provider_for_slug` would quietly stop asking models.dev
+    /// a [`Build::Native`] and `provider_for_slug` would quietly stop asking models.dev
     /// for it.
     #[test]
     fn a_spec_row_without_a_constructor_still_belongs_to_the_catalog() {

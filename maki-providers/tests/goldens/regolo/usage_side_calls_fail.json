@@ -1,0 +1,52 @@
+{
+  "outcome": {
+    "usage": {
+      "limits": [
+        {
+          "detail": "$0.12 spent of $0.38 budget",
+          "label": "Spend",
+          "percentage": 33,
+          "reset_at": 1790812800250
+        }
+      ]
+    }
+  },
+  "requests": [
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/global/activity?start_date=<today>&end_date=<today>"
+    },
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/key/info"
+    },
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/spend/logs/v2?start_date=<today>&end_date=<today>"
+    }
+  ]
+}

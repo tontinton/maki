@@ -26,6 +26,8 @@ const OPENAI_LIMIT: &str = "maximum context length is ";
 const CONNECT_FAILED_MESSAGE: &str =
     "could not connect, check the server is running and the base URL is correct";
 const NETWORK_ERROR_MESSAGE: &str = "connection error, check your network";
+const UNREADABLE_BODY_MESSAGE: &str = "unable to read error body";
+const RETRY_AFTER_HEADER: &str = "retry-after";
 /// The request field a server names when it refuses reasoning summaries. Every
 /// Responses implementation spells the rejection with a different `code`, so
 /// the field is the only stable part of the answer.
@@ -129,7 +131,67 @@ pub enum AgentError {
     EmptySummary,
 }
 
+/// Everything the retry loop and the compaction path can tell about an error,
+/// and nothing else. Two errors that project the same behave the same, which
+/// is the comparison replay goldens need out of a type that cannot be
+/// `PartialEq` itself. The test at the bottom of this file is the proof, and it
+/// is what lets each provider go without its own retry fixtures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorProjection {
+    Api {
+        status: u16,
+        retry_after: Option<Duration>,
+        /// The body is read only through these three answers, so two wordings
+        /// that classify alike are the same error here.
+        overflow: Option<Overflow>,
+        quota_exhausted: bool,
+        auth_error: bool,
+    },
+    Config,
+    Tool,
+    /// The kind is all anyone reads off an io error.
+    Io(io::ErrorKind),
+    /// Transports split on whether a connection was ever made.
+    Http {
+        connect_failure: bool,
+    },
+    HttpRequest,
+    Json,
+    Channel,
+    Cancelled,
+    Timeout,
+    EmptySummary,
+}
+
 impl AgentError {
+    pub fn projection(&self) -> ErrorProjection {
+        match self {
+            Self::Api {
+                status,
+                retry_after,
+                ..
+            } => ErrorProjection::Api {
+                status: *status,
+                retry_after: *retry_after,
+                overflow: self.overflow(),
+                quota_exhausted: self.is_quota_exhausted(),
+                auth_error: self.is_auth_error(),
+            },
+            Self::Config { .. } => ErrorProjection::Config,
+            Self::Tool { .. } => ErrorProjection::Tool,
+            Self::Io(e) => ErrorProjection::Io(e.kind()),
+            Self::Http(e) => ErrorProjection::Http {
+                connect_failure: is_connect_failure(e),
+            },
+            Self::HttpRequest(_) => ErrorProjection::HttpRequest,
+            Self::Json(_) => ErrorProjection::Json,
+            Self::Channel => ErrorProjection::Channel,
+            Self::Cancelled => ErrorProjection::Cancelled,
+            Self::Timeout { .. } => ErrorProjection::Timeout,
+            Self::EmptySummary => ErrorProjection::EmptySummary,
+        }
+    }
+
     /// An API error with no `Retry-After` behind it. Everything that is not a
     /// response we read the headers of lands here, SSE error frames included.
     pub fn api(status: u16, message: impl Into<String>) -> Self {
@@ -311,26 +373,37 @@ impl AgentError {
     }
 
     pub async fn from_response(mut response: isahc::Response<isahc::AsyncBody>) -> Self {
-        let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_retry_after);
-        let message = response
+        let body = response
             .text()
             .await
-            .unwrap_or_else(|_| "unable to read error body".into());
+            .unwrap_or_else(|_| UNREADABLE_BODY_MESSAGE.into());
+        Self::from_parts(
+            response.status().as_u16(),
+            |name| response.headers().get(name).and_then(|v| v.to_str().ok()),
+            body,
+        )
+    }
+
+    /// The one classifier for a failed HTTP exchange, built from what any
+    /// client can hand over: the status, a header lookup by lowercase name,
+    /// and the body text. [`Self::from_response`] is this over isahc, and a
+    /// plugin's `maki.net` response reaches it through the same parts, so a
+    /// failure reads the same whichever side made the request.
+    pub fn from_parts<'a>(
+        status: u16,
+        header: impl Fn(&str) -> Option<&'a str>,
+        body: String,
+    ) -> Self {
         Self::Api {
             status,
-            message,
-            retry_after,
+            message: body,
+            retry_after: header(RETRY_AFTER_HEADER).and_then(parse_retry_after),
         }
     }
 
     /// How long the server asked us to wait, when it bothered to say. Always a
-    /// positive duration: only [`Self::from_response`] ever reads headers, and
-    /// an error built any other way answers `None` and the caller falls back on
+    /// positive duration: only [`Self::from_parts`] ever reads headers, and an
+    /// error built any other way answers `None` and the caller falls back on
     /// its own backoff.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
@@ -403,6 +476,8 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, mem::discriminant};
+
     use maki_config::DEFAULT_MAX_RETRIES;
     use serde_json::{Value, json};
     use test_case::test_case;
@@ -614,6 +689,25 @@ mod tests {
         assert_eq!(parse_retry_after(value), expected);
     }
 
+    #[test_case(Some("7"), Some(Duration::from_secs(7)) ; "retry_after_read")]
+    #[test_case(None, None                              ; "no_retry_after")]
+    fn from_parts_reads_status_retry_after_and_body(
+        retry_after: Option<&str>,
+        expected: Option<Duration>,
+    ) {
+        const BODY: &str = r#"{"error":"slow down"}"#;
+        let error = AgentError::from_parts(
+            429,
+            |name| retry_after.filter(|_| name == RETRY_AFTER_HEADER),
+            BODY.into(),
+        );
+        assert!(matches!(
+            &error,
+            AgentError::Api { status: 429, message, .. } if message == BODY
+        ));
+        assert_eq!(error.retry_after(), expected);
+    }
+
     // llama.cpp: https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-context.cpp
     #[test_case(400, "request (268914 tokens) exceeds the available context size (262144 tokens)", true   ; "llama_cpp_overshoot")]
     // OpenAI: https://platform.openai.com/docs/guides/error-codes
@@ -684,5 +778,152 @@ mod tests {
     #[test_case("prompt is too long: 250000 tokens > 200000 maximum", Overflow::Prompt ; "anthropic_prompt_alone")]
     fn overflow_kind_is_read_off_the_message(message: &str, expected: Overflow) {
         assert_eq!(api_msg(400, message).overflow(), Some(expected));
+    }
+
+    /// One sample per `AgentError` variant. A new variant means a new sample
+    /// in [`corpus`] and a bump here, or the corpus quietly stops covering it.
+    const VARIANT_COUNT: usize = 11;
+    /// One status per branch the answers below split on: refused for size
+    /// (400, 413), stale token (401), dead key but live account (403), rate
+    /// limit (429), server trouble (500). The rest behave like one of these.
+    const CORPUS_STATUSES: [u16; 6] = [400, 401, 403, 413, 429, 500];
+    const CORPUS_RETRY_AFTER: Option<Duration> = Some(Duration::from_secs(30));
+    const PLAIN_MESSAGE: &str = "bad input";
+    const OVERFLOW_MESSAGE: &str = "Input exceeds context limit";
+    /// A second wording of the same refusal: different body, same answers.
+    const OVERFLOW_ALIAS: &str = "context length exceeded";
+    const TOOL_NAME: &str = "bash";
+    const CONFIG_MESSAGE: &str = "no model configured";
+    const TIMEOUT_SECS: u64 = 30;
+    const INVALID_URI: &str = "http://[";
+    const INVALID_JSON: &str = "{";
+
+    /// Every variant, and for `Api` every wording and status the answers are
+    /// known to turn on, crossed with both `Retry-After` shapes.
+    fn corpus() -> Vec<AgentError> {
+        let quota = opencode_body("GoUsageLimitError", QUOTA_MESSAGE);
+        let model = opencode_body("ModelError", MODEL_MESSAGE);
+        let messages = [
+            "",
+            PLAIN_MESSAGE,
+            OVERFLOW_MESSAGE,
+            OVERFLOW_ALIAS,
+            ANTHROPIC_BUDGET,
+            quota.as_str(),
+            model.as_str(),
+        ];
+        let mut corpus = Vec::new();
+        for status in CORPUS_STATUSES {
+            for message in messages {
+                for retry_after in [None, CORPUS_RETRY_AFTER] {
+                    corpus.push(AgentError::Api {
+                        status,
+                        message: message.into(),
+                        retry_after,
+                    });
+                }
+            }
+        }
+        // One kind on each side of the connect/transient split, plus the second
+        // connect failure so the two that share a projection have to agree.
+        corpus.extend(
+            [
+                io::ErrorKind::ConnectionRefused,
+                io::ErrorKind::UnexpectedEof,
+            ]
+            .map(|kind| AgentError::Io(kind.into())),
+        );
+        corpus.extend(
+            [
+                HttpErrorKind::ConnectionFailed,
+                HttpErrorKind::NameResolution,
+                HttpErrorKind::TlsEngine,
+            ]
+            .map(|kind| AgentError::Http(kind.into())),
+        );
+        corpus.extend([
+            AgentError::Config {
+                message: CONFIG_MESSAGE.into(),
+            },
+            AgentError::Tool {
+                tool: TOOL_NAME.into(),
+                message: PLAIN_MESSAGE.into(),
+            },
+            AgentError::HttpRequest(
+                isahc::http::Uri::try_from(INVALID_URI)
+                    .expect_err("a malformed uri")
+                    .into(),
+            ),
+            AgentError::Json(
+                serde_json::from_str::<Value>(INVALID_JSON).expect_err("truncated json"),
+            ),
+            AgentError::Channel,
+            AgentError::Cancelled,
+            AgentError::Timeout { secs: TIMEOUT_SECS },
+            AgentError::EmptySummary,
+        ]);
+        corpus
+    }
+
+    /// Every answer the retry loop and the compaction path ever ask an error
+    /// for. Named fields rather than a tuple so a failure says which one moved.
+    #[derive(Debug, PartialEq)]
+    struct Observables {
+        retry_kind: Option<RetryKind>,
+        retry_after: Option<Duration>,
+        overflow: Option<Overflow>,
+        quota_exhausted: bool,
+        auth_error: bool,
+        rotate_key: bool,
+    }
+
+    impl Observables {
+        fn of(error: &AgentError) -> Self {
+            Self {
+                retry_kind: error.retry_kind(),
+                retry_after: error.retry_after(),
+                overflow: error.overflow(),
+                quota_exhausted: error.is_quota_exhausted(),
+                auth_error: error.is_auth_error(),
+                rotate_key: error.should_rotate_key(),
+            }
+        }
+    }
+
+    /// Why [`AgentError::projection`] earns its keep: the answers above are a
+    /// function of the projection, so a replay golden that pins the projection
+    /// pins the behaviour, and no provider needs retry fixtures of its own.
+    #[test]
+    fn equal_projections_agree_on_every_observable() {
+        let mut seen: Vec<(ErrorProjection, Observables)> = Vec::new();
+        let mut variants = HashSet::new();
+        let mut shared_projections = false;
+
+        for error in corpus() {
+            variants.insert(discriminant(&error));
+            let projection = error.projection();
+            let observed = Observables::of(&error);
+            match seen.iter().position(|(p, _)| *p == projection) {
+                Some(twin) => {
+                    shared_projections = true;
+                    assert_eq!(
+                        seen[twin].1, observed,
+                        "{error:?} projects to {projection:?}"
+                    );
+                }
+                None => seen.push((projection, observed)),
+            }
+        }
+
+        assert_eq!(
+            variants.len(),
+            VARIANT_COUNT,
+            "the corpus skipped a variant"
+        );
+        // All-distinct projections would pass without proving a thing.
+        assert!(
+            shared_projections,
+            "the corpus needs errors that differ below the projection"
+        );
     }
 }

@@ -10,10 +10,11 @@ use std::borrow::Cow;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
+use jiff::Timestamp;
 use maki_storage::intern;
 pub use maki_storage::sessions::Effort;
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, TitleSource};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 use strum::{Display, IntoStaticStr};
 use tracing::warn;
@@ -592,7 +593,7 @@ fn declared_fragment(
         .map(|f| (f, false))
 }
 
-fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
+pub(crate) fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
     for (key, value) in fragment {
         match (body.get_mut(key), value.as_object()) {
             (Some(Value::Object(target)), Some(source)) => merge_body(target, source),
@@ -603,6 +604,55 @@ fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
     }
 }
 
+/// One table, and every view of it is read off that table: the consts, the
+/// wire names, and the lookup in both directions. Kept by hand they drift, and
+/// a dialect missing from `by_name` is a declaration that stops loading.
+macro_rules! dialects {
+    ($(
+        $(#[$attr:meta])+
+        $konst:ident $name:literal {
+            supported: [$($level:ident),+ $(,)?],
+            adaptive: $adaptive:expr,
+            off: $off:expr $(,)?
+        }
+    ),+ $(,)?) => {
+        $(
+            $(#[$attr])+
+            pub const $konst: EffortDialect = EffortDialect {
+                supported: &[$($level),+],
+                adaptive: $adaptive,
+                off: $off,
+            };
+        )+
+
+        /// Every dialect name, in declaration order.
+        pub const NAMES: &[&str] = &[$($name),+];
+
+        /// Resolve a dialect by its wire name, as listed in [`NAMES`].
+        pub fn by_name(name: &str) -> Option<&'static EffortDialect<'static>> {
+            match name {
+                $($name => Some(&$konst),)+
+                _ => None,
+            }
+        }
+
+        /// The name [`by_name`] answers this dialect to, so a declaration can
+        /// serialise the dialect it holds instead of keeping the name twice.
+        /// Written as the inverse of `by_name` so the two cannot drift.
+        ///
+        /// Matched by value, not by address: a `const` is inlined at each use
+        /// site, so two `&STANDARD` need not be the same pointer. `None` for a
+        /// dialect built at runtime out of a model's declared levels (see
+        /// OpenRouter), which no declaration can name.
+        pub fn name_of(dialect: &EffortDialect) -> Option<&'static str> {
+            NAMES
+                .iter()
+                .copied()
+                .find(|name| by_name(name).is_some_and(|known| known == dialect))
+        }
+    };
+}
+
 pub mod dialect {
     use super::EffortDialect;
     use maki_storage::sessions::Effort::{High, Low, Max, Medium, Minimal, XHigh};
@@ -611,102 +661,104 @@ pub mod dialect {
     /// opt-out.
     pub const OFF: &str = "none";
 
-    /// OpenAI platform, synthetic.
-    pub const STANDARD: EffortDialect = EffortDialect {
-        supported: &[Minimal, Low, Medium, High],
-        adaptive: Some(Medium),
-        off: None,
-    };
-    /// OpenAI Responses API models whose highest effort is `xhigh`.
-    pub const CODEX: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High, XHigh],
-        adaptive: Some(Medium),
-        off: None,
-    };
-    /// OpenAI GPT-5.1 Codex Responses API models.
-    pub const CODEX_5_1: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(Medium),
-        off: None,
-    };
-    /// OpenAI Coding Plan models that aren't Codex. They keep `minimal`, and
-    /// the Responses API opts out of reasoning with an explicit "none".
-    pub const CODING_PLAN: EffortDialect = EffortDialect {
-        supported: &[Minimal, Low, Medium, High, XHigh],
-        adaptive: Some(Medium),
-        off: Some(OFF),
-    };
-    /// OpenAI GPT-5.6 Coding Plan models (Luna, Terra, Sol), which also take
-    /// `max`.
-    pub const GPT_5_6: EffortDialect = EffortDialect {
-        supported: &[Minimal, Low, Medium, High, XHigh, Max],
-        adaptive: Some(Medium),
-        off: Some(OFF),
-    };
-    /// OpenAI GPT-6 (Astra): `low` through `max`, no `minimal` and no
-    /// explicit opt-out, so Off omits the reasoning field.
-    pub const GPT_6: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High, XHigh, Max],
-        adaptive: Some(Medium),
-        off: None,
-    };
-    /// opencode chat-completions, openrouter (static fallback).
-    pub const PREFER_HIGH: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(High),
-        off: None,
-    };
-    /// Mistral.
-    pub const HIGH_ONLY: EffortDialect = EffortDialect {
-        supported: &[High],
-        adaptive: Some(High),
-        off: None,
-    };
-    /// Z.AI. GLM reasons by default, so Off sends "none" explicitly.
-    /// Only use behind `Model::supports_thinking`.
-    pub const GLM: EffortDialect = EffortDialect {
-        supported: &[High, XHigh],
-        adaptive: Some(High),
-        off: Some(OFF),
-    };
-    /// DeepSeek accepts only "max"; Adaptive keeps the model's own default
-    /// reasoning depth by sending no effort at all.
-    pub const DEEPSEEK: EffortDialect = EffortDialect {
-        supported: &[Max],
-        adaptive: None,
-        off: None,
-    };
-    /// `output_config.effort` on Anthropic adaptive-thinking models. The API
-    /// has native adaptive mode, so Adaptive sends no effort.
-    pub const ANTHROPIC_ADAPTIVE: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: None,
-        off: None,
-    };
-    /// TensorX routes models that may reason by default, so Off sends "none"
-    /// explicitly and Adaptive asks for full depth.
-    pub const TENSORX: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(High),
-        off: Some(OFF),
-    };
-    /// xAI Grok 4.5/4.6. Adaptive defaults to high; Off sends nothing so the
-    /// model keeps its own default. `xhigh` is advertised on Grok 4.6.
-    pub const GROK: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High, XHigh],
-        adaptive: Some(High),
-        off: None,
-    };
-    /// Ollama's OpenAI-compat endpoint documents low, medium and high, and
-    /// rejects the rest, so anything higher snaps down. A model with its own
-    /// words for it says so through `thinking_fields` instead. Leaving effort
-    /// out lets a capable model start reasoning on its own, so Off has to say
-    /// "none" out loud. Only use behind `Model::supports_thinking`.
-    pub const OLLAMA: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(Medium),
-        off: Some(OFF),
-    };
+    dialects! {
+        /// OpenAI platform, synthetic.
+        STANDARD "standard" {
+            supported: [Minimal, Low, Medium, High],
+            adaptive: Some(Medium),
+            off: None
+        },
+        /// OpenAI Responses API models whose highest effort is `xhigh`.
+        CODEX "codex" {
+            supported: [Low, Medium, High, XHigh],
+            adaptive: Some(Medium),
+            off: None
+        },
+        /// OpenAI GPT-5.1 Codex Responses API models.
+        CODEX_5_1 "codex-5-1" {
+            supported: [Low, Medium, High],
+            adaptive: Some(Medium),
+            off: None
+        },
+        /// OpenAI Coding Plan models that aren't Codex. They keep `minimal`, and
+        /// the Responses API opts out of reasoning with an explicit "none".
+        CODING_PLAN "coding-plan" {
+            supported: [Minimal, Low, Medium, High, XHigh],
+            adaptive: Some(Medium),
+            off: Some(OFF)
+        },
+        /// OpenAI GPT-5.6 Coding Plan models (Luna, Terra, Sol), which also take
+        /// `max`.
+        GPT_5_6 "gpt-5-6" {
+            supported: [Minimal, Low, Medium, High, XHigh, Max],
+            adaptive: Some(Medium),
+            off: Some(OFF)
+        },
+        /// OpenAI GPT-6 (Astra): `low` through `max`, no `minimal` and no
+        /// explicit opt-out, so Off omits the reasoning field.
+        GPT_6 "gpt-6" {
+            supported: [Low, Medium, High, XHigh, Max],
+            adaptive: Some(Medium),
+            off: None
+        },
+        /// opencode chat-completions, openrouter (static fallback).
+        PREFER_HIGH "prefer-high" {
+            supported: [Low, Medium, High],
+            adaptive: Some(High),
+            off: None
+        },
+        /// Mistral.
+        HIGH_ONLY "high-only" {
+            supported: [High],
+            adaptive: Some(High),
+            off: None
+        },
+        /// Z.AI. GLM reasons by default, so Off sends "none" explicitly.
+        /// Only use behind `Model::supports_thinking`.
+        GLM "glm" {
+            supported: [High, XHigh],
+            adaptive: Some(High),
+            off: Some(OFF)
+        },
+        /// DeepSeek accepts only "max"; Adaptive keeps the model's own default
+        /// reasoning depth by sending no effort at all.
+        DEEPSEEK "deepseek" {
+            supported: [Max],
+            adaptive: None,
+            off: None
+        },
+        /// `output_config.effort` on Anthropic adaptive-thinking models. The API
+        /// has native adaptive mode, so Adaptive sends no effort.
+        ANTHROPIC_ADAPTIVE "anthropic-adaptive" {
+            supported: [Low, Medium, High],
+            adaptive: None,
+            off: None
+        },
+        /// TensorX routes models that may reason by default, so Off sends "none"
+        /// explicitly and Adaptive asks for full depth.
+        TENSORX "tensorx" {
+            supported: [Low, Medium, High],
+            adaptive: Some(High),
+            off: Some(OFF)
+        },
+        /// xAI Grok 4.5/4.6. Adaptive defaults to high; Off sends nothing so the
+        /// model keeps its own default. `xhigh` is advertised on Grok 4.6.
+        GROK "grok" {
+            supported: [Low, Medium, High, XHigh],
+            adaptive: Some(High),
+            off: None
+        },
+        /// Ollama's OpenAI-compat endpoint documents low, medium and high, and
+        /// rejects the rest, so anything higher snaps down. A model with its own
+        /// words for it says so through `thinking_fields` instead. Leaving effort
+        /// out lets a capable model start reasoning on its own, so Off has to say
+        /// "none" out loud. Only use behind `Model::supports_thinking`.
+        OLLAMA "ollama" {
+            supported: [Low, Medium, High],
+            adaptive: Some(Medium),
+            off: Some(OFF)
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1084,12 +1136,45 @@ pub struct UsageLimit {
     /// Usage percentage within the window, 0-100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub percentage: Option<u32>,
-    /// When the window resets, as epoch milliseconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// When the window resets, as epoch milliseconds. Also read from an RFC
+    /// 3339 timestamp, see [`deserialize_reset_at`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_reset_at"
+    )]
     pub reset_at: Option<u64>,
     /// Extra provider-supplied context, e.g. "$2.33 spent" for usage credits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+/// Epoch milliseconds of an RFC 3339 timestamp, clamped at the epoch. `None`
+/// for a string that is no timestamp.
+pub(crate) fn rfc3339_millis(at: &str) -> Option<u64> {
+    at.parse::<Timestamp>()
+        .ok()
+        .map(|at| at.as_millisecond().max(0) as u64)
+}
+
+/// A usage hook may hand back the timestamp it read off the wire as is, so a
+/// plugin needs no date parser that could drift from this one. A string that
+/// is no timestamp reads as no reset, the way maki's own providers read one,
+/// rather than failing the whole report over one field.
+fn deserialize_reset_at<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ResetAt {
+        Millis(u64),
+        Timestamp(String),
+    }
+    Ok(match Option::<ResetAt>::deserialize(deserializer)? {
+        Some(ResetAt::Millis(millis)) => Some(millis),
+        Some(ResetAt::Timestamp(at)) => rfc3339_millis(&at),
+        None => None,
+    })
 }
 
 #[cfg(test)]
@@ -1103,6 +1188,8 @@ mod tests {
 
     /// Ollama is the one path that pairs a dialect with per-model fields.
     const DIALECT: ThinkingFallback = ThinkingFallback::Dialect(&dialect::OLLAMA);
+
+    const UNKNOWN_DIALECT: &str = "name in NAMES must resolve";
 
     const INTERNED_DATA: &str = "aW50ZXJuZWQtcGF5bG9hZA==";
     /// Valid ASCII, but no image ever started with these bytes.
@@ -1416,31 +1503,22 @@ mod tests {
         )
     }
 
+    /// `Effort::snap` walks `supported` expecting it sorted, and `name_of`
+    /// matches on field values, so two dialects with identical fields would
+    /// hand a declaration back the wrong name.
     #[test]
-    fn dialects_have_non_empty_ascending_supported() {
-        let all = [
-            &dialect::STANDARD,
-            &dialect::CODEX,
-            &dialect::CODEX_5_1,
-            &dialect::CODING_PLAN,
-            &dialect::GPT_5_6,
-            &dialect::PREFER_HIGH,
-            &dialect::HIGH_ONLY,
-            &dialect::GLM,
-            &dialect::DEEPSEEK,
-            &dialect::ANTHROPIC_ADAPTIVE,
-            &dialect::TENSORX,
-            &dialect::GROK,
-            &dialect::OLLAMA,
-        ];
-        for d in all {
-            assert!(!d.supported.is_empty());
+    fn every_dialect_is_well_formed_and_uniquely_named() {
+        for name in dialect::NAMES {
+            let d = dialect::by_name(name).expect(UNKNOWN_DIALECT);
+            assert!(!d.supported.is_empty(), "{name} supports nothing");
             for pair in d.supported.windows(2) {
-                assert!(pair[0] < pair[1], "supported must be strictly ascending");
+                assert!(pair[0] < pair[1], "{name} is not strictly ascending");
             }
             if let Some(adaptive) = d.adaptive {
-                assert!(d.supported.contains(&adaptive));
+                let supported = d.supported.contains(&adaptive);
+                assert!(supported, "{name} adaptive is not a supported level");
             }
+            assert_eq!(dialect::name_of(d), Some(*name));
         }
     }
 
@@ -1831,5 +1909,25 @@ mod tests {
         };
         let json = serde_json::to_value(&block).unwrap();
         assert!(json.get("signature").is_none());
+    }
+
+    const USAGE_LABEL: &str = "Spend";
+    const RESET_MILLIS: u64 = 1_790_812_800_250;
+
+    #[test_case(json!(RESET_MILLIS), Some(RESET_MILLIS) ; "epoch_millis")]
+    #[test_case(json!("2026-10-01T02:00:00.25+02:00"), Some(RESET_MILLIS) ; "rfc3339_with_offset_and_fraction")]
+    #[test_case(json!("1969-12-31T23:59:59Z"), Some(0) ; "before_the_epoch_clamps")]
+    #[test_case(json!("next month"), None ; "not_a_timestamp")]
+    #[test_case(Value::Null, None ; "null")]
+    fn usage_limit_reset_at_reads_millis_or_rfc3339(reset_at: Value, expected: Option<u64>) {
+        let limit: UsageLimit =
+            serde_json::from_value(json!({ "label": USAGE_LABEL, "reset_at": reset_at })).unwrap();
+        assert_eq!(limit.reset_at, expected);
+    }
+
+    #[test]
+    fn usage_limit_without_reset_at_has_none() {
+        let limit: UsageLimit = serde_json::from_value(json!({ "label": USAGE_LABEL })).unwrap();
+        assert_eq!(limit.reset_at, None);
     }
 }

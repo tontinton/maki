@@ -92,6 +92,7 @@ base64 = { workspace = true }
 criterion = { workspace = true }
 image = { workspace = true }
 maki-agent = { workspace = true }
+maki-providers = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 test-case = { workspace = true }
 

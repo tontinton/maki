@@ -1,0 +1,128 @@
+{
+  "discovery": {
+    "models": [
+      {
+        "context_window": null,
+        "id": "deepseek/deepseek-flash",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": null,
+        "supports_vision": false,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "deepseek/deepseek-reasoner",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": null,
+        "supports_vision": false,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "openai/gpt-oss-120b",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": null,
+        "supports_vision": false,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "qwen/qwen3.5-397b",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": null,
+        "supports_vision": false,
+        "tier": null
+      },
+      {
+        "context_window": null,
+        "id": "z-ai/glm-5.2",
+        "max_output_tokens": null,
+        "pricing": null,
+        "supports_thinking": null,
+        "supports_vision": false,
+        "tier": null
+      }
+    ]
+  },
+  "events": [
+    {
+      "ThinkingDelta": {
+        "text": "weighing the options"
+      }
+    },
+    {
+      "TextDelta": {
+        "text": "Hello"
+      }
+    },
+    {
+      "ToolUseStart": {
+        "id": "call_1",
+        "name": "read"
+      }
+    }
+  ],
+  "outcome": {
+    "context_size": 12,
+    "message": {
+      "content": [
+        {
+          "thinking": "weighing the options",
+          "type": "thinking"
+        },
+        {
+          "text": "Hello",
+          "type": "text"
+        },
+        {
+          "id": "call_1",
+          "input": {
+            "path": "a.txt"
+          },
+          "name": "read",
+          "type": "tool_use"
+        }
+      ],
+      "role": "assistant"
+    },
+    "stop_reason": "tool_use",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 4,
+      "input_tokens": 8,
+      "output_tokens": 5
+    }
+  },
+  "requests": [
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/v1/model/info"
+    },
+    {
+      "body": "{\"messages\":[{\"content\":\"You are a replay fixture.\",\"role\":\"system\"},{\"content\":\"read a.txt\",\"role\":\"user\"}],\"model\":\"moonshotai/kimi-k3\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "content-length": "368",
+        "content-type": "application/json",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "POST",
+      "path": "/v1/chat/completions"
+    }
+  ]
+}

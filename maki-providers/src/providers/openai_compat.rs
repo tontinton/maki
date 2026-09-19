@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -27,6 +28,9 @@ const PROCESS_TAG_LEN: usize = 8;
 /// The listing every OpenAI compatible API serves, relative to the base URL.
 /// Providers with a second catalog pass their own path instead.
 pub(crate) const MODELS_PATH: &str = "/models";
+/// What a plain openai endpoint takes, and what a declaration that says
+/// nothing about it gets.
+pub(crate) const DEFAULT_MAX_TOKENS_FIELD: &str = "max_tokens";
 static NEXT_UNNAMED_TOOL_ID: AtomicU64 = AtomicU64::new(0);
 /// Minted once per process: the counter alone restarts at 0 on every run, so a
 /// session resumed with `--continue` would mint ids that already exist in its
@@ -36,18 +40,33 @@ static PROCESS_TAG: LazyLock<String> = LazyLock::new(|| {
     id[id.len() - PROCESS_TAG_LEN..].to_owned()
 });
 
+#[derive(Clone)]
 pub(crate) struct OpenAiCompatConfig {
-    pub slug: &'static str,
-    pub api_key_env: &'static str,
-    pub base_url: &'static str,
-    pub max_tokens_field: &'static str,
+    pub slug: Cow<'static, str>,
+    pub api_key_env: Cow<'static, str>,
+    pub base_url: Cow<'static, str>,
+    pub max_tokens_field: Cow<'static, str>,
     pub include_stream_usage: bool,
-    pub provider_name: &'static str,
+    pub provider_name: Cow<'static, str>,
+}
+
+impl From<&'static OpenAiCompatConfig> for Cow<'static, OpenAiCompatConfig> {
+    fn from(config: &'static OpenAiCompatConfig) -> Self {
+        Cow::Borrowed(config)
+    }
+}
+
+/// For a config assembled at runtime from a provider declaration, which has no
+/// `static` to borrow. `std` has no blanket `From<T> for Cow<'_, T>`.
+impl From<OpenAiCompatConfig> for Cow<'static, OpenAiCompatConfig> {
+    fn from(config: OpenAiCompatConfig) -> Self {
+        Cow::Owned(config)
+    }
 }
 
 pub(crate) struct OpenAiCompatProvider {
     client: HttpClient,
-    config: &'static OpenAiCompatConfig,
+    config: Cow<'static, OpenAiCompatConfig>,
     stream_timeout: Duration,
     /// Env / `providers.toml` override, resolved once at construction. The
     /// static compat default stays the last resort because it can be more
@@ -58,12 +77,16 @@ pub(crate) struct OpenAiCompatProvider {
 }
 
 impl OpenAiCompatProvider {
-    pub fn new(config: &'static OpenAiCompatConfig, timeouts: super::Timeouts) -> Self {
+    pub fn new(
+        config: impl Into<Cow<'static, OpenAiCompatConfig>>,
+        timeouts: super::Timeouts,
+    ) -> Self {
+        let config = config.into();
         let resolved_base_url = if config.slug.is_empty() {
             None
         } else {
             let providers = maki_config::providers::ProvidersConfig::load();
-            maki_config::providers::configured_base_url(config.slug, providers.get(config.slug))
+            maki_config::providers::configured_base_url(&config.slug, providers.get(&config.slug))
         };
         Self {
             client: super::http_client(timeouts),
@@ -77,8 +100,8 @@ impl OpenAiCompatProvider {
         &self.client
     }
 
-    pub(crate) fn config(&self) -> &'static OpenAiCompatConfig {
-        self.config
+    pub(crate) fn config(&self) -> &OpenAiCompatConfig {
+        &self.config
     }
 
     pub(crate) fn stream_timeout(&self) -> Duration {
@@ -145,7 +168,7 @@ impl OpenAiCompatProvider {
             "stream": true,
         });
         if let Some(max_output) = model.output_tokens() {
-            body[self.config.max_tokens_field] = json!(max_output);
+            body[&*self.config.max_tokens_field] = json!(max_output);
         }
         if self.config.include_stream_usage {
             body["stream_options"] = json!({"include_usage": true});
@@ -183,6 +206,10 @@ impl OpenAiCompatProvider {
         )
     }
 
+    /// Where a provider's own headers meet the credentials. A header already on
+    /// the request wins: no denylist could say which headers carry a
+    /// credential (`x-api-key`, `api-key`, `x-goog-api-key`, ...), so whatever
+    /// the auth layer wrote stays, key rotation included.
     pub async fn do_stream(
         &self,
         model: &crate::model::Model,
@@ -196,6 +223,13 @@ impl OpenAiCompatProvider {
             .build_request("POST", "/chat/completions", auth)
             .header("content-type", "application/json");
         for &(key, value) in extra_headers {
+            if request
+                .headers_ref()
+                .is_some_and(|set| set.contains_key(key))
+            {
+                debug!(header = key, "kept the header already on the request");
+                continue;
+            }
             request = request.header(key, value);
         }
 
@@ -203,7 +237,7 @@ impl OpenAiCompatProvider {
 
         debug!(
             model = %model.id,
-            provider = self.config.provider_name,
+            provider = &*self.config.provider_name,
             "sending API request"
         );
 
@@ -282,6 +316,8 @@ impl OpenAiCompatProvider {
             supports_vision,
             tier: None,
             provider_info: None,
+            extra: None,
+            effort: None,
         })
     }
 

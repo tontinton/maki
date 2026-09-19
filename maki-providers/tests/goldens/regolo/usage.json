@@ -1,0 +1,94 @@
+{
+  "outcome": {
+    "usage": {
+      "by_model_today": [
+        {
+          "input_tokens": 20000,
+          "model": "qwen3-coder-next",
+          "output_tokens": 8000,
+          "spend_microdollars": 14200,
+          "total_tokens": 28000
+        },
+        {
+          "input_tokens": 200,
+          "model": "glm5.2",
+          "output_tokens": 160,
+          "spend_microdollars": 900,
+          "total_tokens": 360
+        },
+        {
+          "input_tokens": 1000,
+          "model": "gpt-oss-120b",
+          "output_tokens": 200,
+          "spend_microdollars": 900,
+          "total_tokens": 1200
+        },
+        {
+          "input_tokens": 4294967296,
+          "model": "qwen3.5-9b",
+          "output_tokens": 1,
+          "spend_microdollars": 13,
+          "total_tokens": 4294967297
+        },
+        {
+          "input_tokens": 0,
+          "model": "llama-refund",
+          "output_tokens": 0,
+          "spend_microdollars": 0,
+          "total_tokens": 0
+        }
+      ],
+      "limits": [
+        {
+          "detail": "$0.12 spent of $0.38 budget",
+          "label": "Spend",
+          "percentage": 33,
+          "reset_at": 1790812800250
+        },
+        {
+          "detail": "14 requests · 5000000000 tokens",
+          "label": "Today",
+          "reset_at": "<next-utc-midnight>"
+        }
+      ]
+    }
+  },
+  "requests": [
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/global/activity?start_date=<today>&end_date=<today>"
+    },
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/key/info"
+    },
+    {
+      "body": "",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "deflate, gzip",
+        "authorization": "Bearer sk-replay",
+        "host": "<volatile>",
+        "user-agent": "<volatile>"
+      },
+      "method": "GET",
+      "path": "/spend/logs/v2?start_date=<today>&end_date=<today>"
+    }
+  ]
+}

@@ -3676,7 +3676,8 @@ if m and m.subsidised_by then print(m.subsidised_by, m.pricing.input) end
 HTTP client for fetching web content. All traffic goes over HTTPS
 (plain HTTP is upgraded). Private and metadata IP addresses are
 blocked to prevent SSRF, including after a redirect. Hosts listed in
-the `net.allowed_private_hosts` config option are exempt.
+the `net.allowed_private_hosts` config option are exempt, and so is a
+provider plugin's own origin (see `maki.net.request`).
 Failed requests (5xx) are retried automatically.
 
 Requests reuse a pool of clients, so calls to the same host share one
@@ -3700,19 +3701,30 @@ URLs are automatically upgraded to `https://`. Requests to private
 or metadata IP addresses are blocked for safety, unless the host is
 listed in `net.allowed_private_hosts`.
 
+A request to the origin of a provider this plugin registered, as the
+user (`<SLUG>_BASE_URL`, `providers.toml`) or maki (a built-in's
+default) chose it, goes out the way the provider's chat requests do:
+no address check or upgrade, maki's user agent, and connect and stall
+timeouts instead of a total one.
+
 {opts} fields:
   `method` (string) HTTP verb (default `"GET"`).
   `headers` (table) Header name/value pairs.
   `body` (string) Request body.
-  `timeout` (integer) Timeout in seconds, max 120 (default 30).
+  `timeout` (integer) Total timeout in seconds, max 120 (default 30,
+    none on a provider's origin).
   `max_bytes` (integer) Max response size in bytes (default 5 MB).
   `retry` (integer) Retries on 5xx errors (default 3).
   `line_match` (string) Regex. Keep only the response lines it
   matches. Filtering happens after the body is read, so `max_bytes`
   still caps the transfer.
 
-The response table has three fields: `body` (string), `status`
-(integer), and `content_type` (string).
+The response table has `body` (string), `status` (integer),
+`content_type` (string) and `headers` (table). `headers` comes from the
+final response after redirects and is keyed by lowercase name, as in
+`res.headers["retry-after"]`. A header sent more than once has its values
+joined with `, `, which mangles `set-cookie`. Bytes that are not UTF-8
+become U+FFFD. The table can go straight to `maki.provider.http_error`.
 
 Requires the `net` [plugin permission](#plugin-permissions).
 
@@ -3775,9 +3787,12 @@ any other provider's: they appear in the model picker, in `/model`, and in
 `providers.toml` overrides, addressed as `<slug>/<model>`.
 
 The plugin must declare the hosts it talks to as `net_hosts` under
-`[permissions]` in its `plugin.toml`. That list is the only set of origins
-maki will send this provider's credentials to, whatever a hook returns
-later. Registering with no declared host fails.
+`[permissions]` in its `plugin.toml`. That list is what maki will send this
+provider's credentials to, whatever a hook returns later. The one origin it
+need not name is the one the user chose: a slug pointed at a gateway with
+`<SLUG>_BASE_URL` or `providers.toml` is reachable from this provider's
+hooks, since its requests already go there. Registering with no declared
+host fails.
 
 Give exactly one of `codec` (speak a wire protocol maki already knows) or
 `base` (borrow a native provider whole, including its quirks and its model
@@ -3787,26 +3802,69 @@ changes whenever that provider does.
 
 Every callback is optional, and a registration with none is a perfectly
 good static provider. Callbacks run on maki's plugin host, so they may use
-`maki.net`, `maki.fs` and the rest of the API.
+`maki.net`, `maki.fs` and the rest of the API. A callback that fails on an
+HTTP response returns `nil, maki.provider.http_error(res)`.
 
 An option the target cannot honour fails at registration rather than being
-ignored at request time: `build_body` needs one of the `openai` codecs, and
-`system_prefix` is refused by the `google` codec, which drops it.
+ignored at request time: `build_body` needs one of the `openai` codecs, the
+`openai` table needs `codec = "openai"`, and `system_prefix` is refused by
+the `google` codec, which drops it. So does a key this list does not name.
 
 {spec} fields:
   `slug` (string) Required. How the provider is addressed: `<slug>/<model>`.
-          Letters, digits, `_` and `-`, starting with a letter or digit, and
-          not a slug a built-in or `providers.toml` already owns.
+          Letters, digits, `_` and `-`, starting with a letter or digit,
+          and neither a slug `providers.toml` already owns nor one of a
+          built-in provider. A built-in slug is reserved: claiming it
+          inherits that provider's `api_key_env`, which would hand a plugin
+          the key the user set for the built-in. Only the plugins maki
+          ships inside the binary may take one, and they inherit
+          `display_name`, `api_key_env`, `base_url`, the curated model
+          table and its pricing, so restating any of those is an error
+          rather than an override.
   `display_name` (string) Required. Shown in the UI.
   `codec` (string) `"openai"`, `"openai-responses"`, `"anthropic"` or
           `"google"`. Mutually exclusive with `base`.
   `base` (string) A native provider slug to build on, e.g. `"anthropic"`.
-  `base_url` (string) Default origin for requests. Its host must be one of
-          the declared `net_hosts`, and it must be `https` unless it points
-          at loopback.
-  `api_key_env` (string) Environment variable holding an API key. Read at
-          registration and sent as a bearer token when set.
+  `base_url` (string) Fallback origin for requests. `<SLUG>_BASE_URL` and
+          `providers.toml` outrank it, and an origin an auth hook returns
+          outranks those. Its host must be one of the declared `net_hosts`,
+          and it must be `https` unless it points at loopback.
+  `api_key_env` (string) Environment variable holding an API key, sent
+          when set in the header the target reads: `x-api-key` for
+          anthropic, `x-goog-api-key` for google, a bearer token otherwise.
+          Needs the `env` permission: resolving it reads the environment,
+          and the key saved for the slug.
+          Re-read every time maki builds the provider, so a key set or
+          replaced since is picked up.
   `system_prefix` (string) Text prepended to the system prompt.
+  `openai` (table) How the `openai` codec speaks to this provider. Every
+          key is optional:
+    `max_tokens_field` (string) Body field carrying the output cap.
+            Defaults to `max_tokens`.
+    `include_stream_usage` (boolean) Whether to ask for usage on the
+            stream. Defaults to `true`.
+    `thinking` (table) How the API spells reasoning effort. Omitting it
+            leaves effort to each model's `thinking_fields`.
+      `dialect` (string) Required. The provider's effort dialect, one of
+              `"standard"`, `"codex"`, `"codex-5-1"`, `"coding-plan"`,
+              `"gpt-5-6"`, `"gpt-6"`, `"prefer-high"`, `"high-only"`,
+              `"glm"`, `"deepseek"`, `"anthropic-adaptive"`, `"tensorx"`,
+              `"grok"` or `"ollama"`.
+      `field` (string) Where the effort goes in the body. A dotted path
+              nests, e.g. `"reasoning.effort"`. Defaults to
+              `reasoning_effort`.
+      `requires_support` (boolean) Send effort only to models that
+              support thinking. Defaults to `false`.
+    `headers` (table) Header name to value, sent with every request. A
+            header the credentials already set keeps its value, and
+            `host`, `content-length`, `transfer-encoding` and `connection`
+            are refused.
+    `extra_body` (table) Merged into every request body.
+    `session_id` (table) Sends the session id, as
+            `{ header = "x-affinity" }` or `{ body_field = "session_id" }`.
+    `thinking_overrides` (table) Model id prefix to `"no"`, `"yes"` or
+            `"required"`, overriding what the model table says about
+            thinking. The longest matching prefix wins.
   `models` (table) List of model rows. Each row has `prefixes` (list): the
            row answers for every model id starting with one of them,
            longest prefix first, and `prefixes[1]` is the canonical id.
@@ -3826,16 +3884,30 @@ ignored at request time: `build_body` needs one of the `openai` codecs, and
            broken is still listed and fails when it is used. `purpose` is
            `"resolve"`. Omitting `base_url` keeps the one in force.
   `refresh_auth` (function) Same shape, called after a 401 with
-           `purpose = "refresh"`. Falls back to `resolve_auth`.
+           `purpose = "refresh"`.
   `reload_auth` (function) Same shape, called with `purpose = "reload"` to
-           re-read what a `login` wrote. Falls back to `resolve_auth`.
+           re-read what a `login` wrote.
+           The three are one hook with three entry points: a purpose runs
+           the entry named for it, and falls back to the first of the three
+           the plugin supplied. Writing only `resolve_auth` therefore
+           serves all three, which is right for a plugin that reads its
+           credentials fresh every time.
   `list_models` (function) `function()` returning a list of model rows,
            for a provider whose catalogue is only known at runtime. Rows
            carry `id`, `context_window`, `max_output_tokens`, `pricing`,
-           `supports_thinking`, `supports_vision` and `tier`.
+           `supports_thinking`, `supports_vision` and `tier`. Two more
+           are optional. `extra` is any JSON value the plugin wants back
+           when the model is used. `effort` narrows the declared
+           `openai.thinking` dialect for this model: `supported` lists
+           its effort names as the provider spells them (names maki has
+           no level for are dropped, an empty list keeps the dialect's
+           levels), and `send_off` is `true` to send `"none"` for off,
+           `false` to send nothing, or omitted to keep the dialect's way.
   `build_body` (function) `function(body, model, opts)` returning the
            request body to send. `opts.thinking` is the effort level as
-           rendered. Only for the `openai` codecs.
+           rendered. `opts.model_info` is the `extra` this provider's
+           `list_models` attached to the model, nil when it attached none
+           or the model was never listed. Only for the `openai` codecs.
   `map_error` (function) `function(status, message)` returning
            `{ status = ..., message = ... }`, or nil to keep the original.
            Those two fields are all it may change: `retry_after` comes from
@@ -3875,6 +3947,45 @@ maki.provider.register({
 })
 ```
 
+---
+
+### `maki.provider.http_error()` {#maki-provider-http_error}
+
+```lua
+maki.provider.http_error({res})
+```
+
+Turn a failed `maki.net.request` response into the error maki's own
+providers raise for it. Any hook can return it second: `return nil, err`.
+
+maki then treats it like a native provider's failure. A 429 or a 5xx is
+retried, `retry-after` sets the wait, and the user sees the same message.
+A hook that raises instead fails as a broken hook.
+
+{res} fields:
+  `status` (integer) Required. The HTTP status.
+  `body` (string) Required. The response body, kept as the error message.
+  `headers` (table) Header name to value, matched case-insensitively. Only
+          `retry-after` is read.
+
+**Parameters:**
+
+- `{res}` (`table`) A response from `maki.net.request`.
+
+**Returns:** (`userdata`) A `ProviderError`. Opaque, but `tostring` renders it.
+
+**Example:**
+
+```lua
+fetch_usage = function()
+  local res = assert(maki.net.request(url, { headers = auth.headers }))
+  if res.status ~= 200 then
+    return nil, maki.provider.http_error(res)
+  end
+  return { limits = {} }
+end
+```
+
 
 ## maki.provider.auth {#maki-provider-auth}
 
@@ -3887,11 +3998,16 @@ while a refresh writes.
 The stored value is a free-form JSON object. maki owns where it lives
 and who may read it, the plugin owns what is in it.
 
+`resolved` is the other direction: not what the plugin wrote, but the
+credentials and origin maki resolved for the slug and sends on every
+request to it.
+
 A plugin can only reach slugs it registered itself.
 
 ```lua
 maki.provider.auth.set("acme", { access_token = tok, expires = when })
 local creds = maki.provider.auth.get("acme")
+local auth = maki.provider.auth.resolved("acme")
 maki.provider.auth.clear("acme")
 ```
 
@@ -3972,6 +4088,48 @@ Forget the credentials stored for one of this plugin's providers.
 
 ```lua
 maki.provider.auth.clear("acme")
+```
+
+---
+
+### `maki.provider.auth.resolved()` {#maki-provider-auth-resolved}
+
+```lua
+maki.provider.auth.resolved({slug})
+```
+
+Read the live credentials and effective origin of one of this plugin's
+providers.
+
+For a hook that has to reach an endpoint the codec knows nothing about, a
+balance or a quota url, and so needs exactly what every request to the slug
+already carries. `headers` holds whatever maki resolved for it: the bearer
+token from the declared `api_key_env`, whatever `resolve_auth` returned, and
+any `[<slug>.headers]` from `providers.toml`. `base_url` is the origin a
+request would reach right now, resolved the way the codec resolves it: an
+auth-supplied origin, then `<SLUG>_BASE_URL` or `providers.toml`, then the
+declared `base_url`. Hard-coding an origin instead would send the call
+somewhere else than the rest of the provider whenever a user points the slug
+at a gateway.
+
+This hands over live credentials, which is why it only answers for the
+providers the calling plugin declared. A snapshot, like the one every
+request takes, so a refresh landing mid-call cannot swap the headers a hook
+is already building a request from.
+
+**Parameters:**
+
+- `{slug}` (`string`) A provider slug this plugin registered.
+
+**Returns:** (`table?`, `string?`) `{ base_url = ..., headers = { ... } }`, or
+  `(nil, err)` on failure.
+
+**Example:**
+
+```lua
+local auth, err = maki.provider.auth.resolved("acme")
+if not auth then return end
+local res = maki.net.request(auth.base_url .. "/usage", { headers = auth.headers })
 ```
 
 
@@ -6904,6 +7062,103 @@ function M.tail(text, n)
 --- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
 --- "timeout").
 function M.cut(view, out, reason, timeout_secs)
+```
+
+### `require("maki.provider_parse")`
+
+```lua
+-- Rust parity for provider plugins that port a bespoke Rust parser. The Rust
+-- side reads JSON with serde_json and prints with `format!`, and these helpers
+-- reproduce its numbers bit for bit. Other plugins are better off with
+-- `maki.json`.
+--
+-- Luau has a single number type, so `maki.json.decode` gives `8192` and
+-- `8192.0` the same value, while serde_json's `as_u64` accepts only the first.
+-- `M.decode` remembers which numbers were floats in the source text, and the
+-- readers take the container and key (`M.as_u32(m, "context_length")` mirrors
+-- `m["context_length"].as_u64().and_then(|v| u32::try_from(v).ok())`). A
+-- missing key, a JSON null, a non-table container or the wrong type reads as
+-- nil. Tables that did not come from `M.decode` carry no float marks, so there
+-- a whole-valued float passes as an integer.
+--
+-- A JSON null decodes to nil, which looks like a missing key and leaves a hole
+-- that stops `#` and `ipairs` early. `M.decode` also remembers where the nulls
+-- were: `M.is_null` tells them from missing keys, and `M.items` walks an array
+-- the way Rust's `as_array().iter()` does, nulls included.
+--
+-- `M.get_json` and `M.models` are the two halves of the Rust side's
+-- `fetch_and_parse_models`, for a hook that fetches off the codec's request
+-- path.
+--
+-- Luau numbers are doubles: a u64 above 2^53 comes back rounded, and
+-- u64::MAX reads as 2^64.
+
+--- `maki.json.decode`, plus a record of which numbers serde_json would read
+--- as floats and where the nulls were. Returns the value, or nil and an error.
+function M.decode(text)
+
+--- serde_json `tbl.get(key).is_some_and(Value::is_null)`: true only where the
+--- decoded JSON held a null, never for a missing key or a table that did not
+--- come from `M.decode`.
+function M.is_null(tbl, key)
+
+--- The JSON array's length, nulls included. `#arr` for a table that did not
+--- come from `M.decode`, 0 for a non-table.
+function M.len(arr)
+
+--- Rust `as_array().iter().enumerate()`, 1-based: `for i, v in M.items(arr)`
+--- visits every index up to `M.len(arr)`, with v nil for a null element.
+function M.items(arr)
+
+--- Rust `get_text` then `serde_json::from_str`: a GET with the provider's
+--- resolved `auth`, never retried. Returns the decoded body, nil for a JSON
+--- null. On failure returns nil and an error for `M.fail`.
+function M.get_json(auth, url)
+
+--- Hands a `M.get_json` error back from a hook. A refused request is returned,
+--- so it fails the way the native provider does. Anything else never got an
+--- HTTP status and is raised.
+function M.fail(err)
+
+--- serde_json `Value::as_u64` on `tbl[key]`: a non-negative integer, never a
+--- float such as `1.0`, `1e3` or `-0`.
+function M.as_u64(tbl, key)
+
+--- `as_u64` then `u32::try_from(v).ok()`.
+function M.as_u32(tbl, key)
+
+--- serde_json `Value::as_f64` on `tbl[key]`: any number, integer or float.
+function M.as_f64(tbl, key)
+
+--- serde_json `Value::as_bool` on `tbl[key]`.
+function M.as_bool(tbl, key)
+
+--- Rust `s.parse::<f64>().ok()`: no whitespace, no hex, an optional sign,
+--- and `inf`, `infinity` or `nan` in any case. nil for a non-string.
+function M.parse_f64(s)
+
+--- Rust `x as u64`: truncates, NaN and negatives give 0, saturates at the top.
+function M.cast_u64(x)
+
+--- Rust `x as u32`: truncates, NaN and negatives give 0, saturates at the top.
+function M.cast_u32(x)
+
+--- Rust `f64::round`: halves round away from zero.
+M.round = math.round
+
+--- Rust `format!("{:.n$}", x)`: the exact binary value rounded, ties to even,
+--- so `0.125` prints `0.12`. A whole number with `n = 0` prints like Rust's
+--- integer `{}`.
+function M.fixed(x, n)
+
+--- Rust `sort_by`, in place: stable, so elements that are not `less` than
+--- each other keep their order. `less(a, b)` is true when `a` sorts first.
+function M.stable_sort_by(list, less)
+
+--- The rest of Rust `fetch_and_parse_models`: each `body.data` element through
+--- `parse_row`, nils dropped, sorted by `id`. A body without a `data` array
+--- lists nothing.
+function M.models(body, parse_row)
 ```
 
 ### `require("maki.scroll")`
