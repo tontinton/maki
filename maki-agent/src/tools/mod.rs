@@ -1050,9 +1050,12 @@ mod tests {
 
         let root_str = root.to_string_lossy();
         let collect = |patterns: &[&str]| -> Vec<String> {
-            walk_builder(&root_str, patterns)
-                .unwrap()
-                .build()
+            // A developer's global gitignore decides for itself whether a
+            // dotfile like `.env` is ignored, and this test is about our
+            // filters, not theirs.
+            let mut wb = walk_builder(&root_str, patterns).unwrap();
+            wb.git_global(false);
+            wb.build()
                 .flatten()
                 .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
                 .map(|e| {
