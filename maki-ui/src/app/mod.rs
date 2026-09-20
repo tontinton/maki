@@ -537,8 +537,12 @@ impl App {
         self.active_chat == 0
     }
 
-    fn plan_form_active(&self) -> bool {
+    fn plan_form_open(&self) -> bool {
         self.state.mode == Mode::Plan && self.plan_form.is_visible()
+    }
+
+    fn plan_form_active(&self) -> bool {
+        self.is_main_chat() && self.plan_form_open()
     }
 
     /// One diff per frame covers every way a model can change (the picker,
@@ -2066,7 +2070,7 @@ impl App {
         if matches!(self.pending_input, PendingInput::AuthRetry { .. }) {
             return Some(Notification::AuthenticationRequired);
         }
-        if self.status != Status::Streaming && self.plan_form_active() {
+        if self.status != Status::Streaming && self.plan_form_open() {
             return Some(Notification::PlanReady);
         }
         self.float_mgr
