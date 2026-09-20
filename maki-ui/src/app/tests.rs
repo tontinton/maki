@@ -6667,6 +6667,29 @@ fn attention_classifies_auth_and_ready_plan() {
     assert_eq!(app.attention(), None);
 }
 
+#[test]
+fn plan_form_on_a_subtask_leaves_keys_alone_but_still_wants_attention() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "sub".into() },
+        TASK_ID,
+        Some("research"),
+    ));
+    app.status = Status::Idle;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
+    app.plan_form.on_plan_ready();
+    app.run_builtin(BuiltinAction::NextChat);
+    assert_eq!(app.active_chat, 1);
+
+    let parallel = app.plan_form.parallel();
+    app.update(Msg::Key(key(KeyCode::Char(' '))));
+    assert_eq!(app.plan_form.parallel(), parallel);
+    assert_eq!(app.attention(), Some(Notification::PlanReady));
+}
+
 fn tool_use_msg(id: &str) -> Message {
     Message {
         role: Role::Assistant,
