@@ -132,6 +132,8 @@ const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
+const PROVIDER_FOLDED_SUFFIX: &str = ": folded away";
+const PROVIDER_UNFOLDED_SUFFIX: &str = ": unfolded";
 const PACK_CHANGES_DECLINED: &str = "Package changes declined";
 const PACK_USER_ONLY_SUFFIX: &str = " can only be run by you";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
@@ -551,6 +553,8 @@ impl App {
                 .filter(|spec| model_policy.allows(spec))
                 .collect(),
         );
+        app.model_picker
+            .set_collapsed(maki_storage::model::read_collapsed_providers(&app.storage));
         // The manager arrives forked from the prototype the process was
         // started with, so a tab that resumes or spawns blank runs on
         // `--yolo` until its own meta is read back here.
@@ -1125,6 +1129,21 @@ impl App {
                 }
                 ModelPickerAction::UnassignTier(spec, tier) => {
                     vec![Action::UnassignTier(spec, tier)]
+                }
+                // Saved right here instead of going through an `Action`. A fold
+                // only changes how the picker looks, and the state dir lives here.
+                ModelPickerAction::Collapse(slug, folded) => {
+                    maki_storage::model::persist_collapsed_providers(
+                        &self.storage,
+                        self.model_picker.collapsed_providers(),
+                    );
+                    let suffix = if folded {
+                        PROVIDER_FOLDED_SUFFIX
+                    } else {
+                        PROVIDER_UNFOLDED_SUFFIX
+                    };
+                    self.flash(format!("{slug}{suffix}"));
+                    vec![]
                 }
                 ModelPickerAction::Close => vec![],
             });

@@ -49,6 +49,11 @@ pub trait PickerItem {
     fn is_highlighted(&self) -> bool {
         false
     }
+    /// Drawn in place of its section header, so the cursor can land on the
+    /// section itself.
+    fn is_section_row(&self) -> bool {
+        false
+    }
 }
 
 impl PickerItem for String {
@@ -618,16 +623,20 @@ fn render_ready<T: PickerItem>(
 }
 
 fn section_gap<T: PickerItem>(filtered: &[usize], items: &[T], idx: usize, start: usize) -> usize {
-    let Some(sec) = items[filtered[idx]].section() else {
+    let item = &items[filtered[idx]];
+    let Some(sec) = item.section() else {
         return 0;
     };
+    // A section row draws itself where the header would have gone, so it costs
+    // the blank spacer above it and nothing more.
+    let header = usize::from(!item.is_section_row());
     if idx == start {
-        return 1;
+        return header;
     }
     let is_break = items[filtered[idx - 1]]
         .section()
         .is_none_or(|prev| prev != sec);
-    if is_break { 2 } else { 0 }
+    if is_break { 1 + header } else { 0 }
 }
 
 fn visual_rows_in_range<T: PickerItem>(
@@ -723,7 +732,7 @@ fn render_list<T: PickerItem>(
             if !lines.is_empty() && lines.len() < viewport_height {
                 lines.push(Line::raw(""));
             }
-            if lines.len() < viewport_height {
+            if !item.is_section_row() && lines.len() < viewport_height {
                 lines.push(Line::from(Span::styled(
                     format!("  {sec}"),
                     theme::current().keybind_section,
@@ -745,6 +754,9 @@ fn render_list<T: PickerItem>(
             }
             (true, false) => (t.item_selected, t.item_selected),
             (false, true) => (t.accent, theme::dim_style(t.accent, 0.4)),
+            (false, false) if item.is_section_row() => {
+                (t.keybind_section, theme::dim_style(t.keybind_section, 0.4))
+            }
             (false, false) => (t.item, t.item_desc),
         };
         let checkbox = enabled.map(|en| {
@@ -1070,6 +1082,7 @@ mod tests {
     struct SectionEntry {
         label: String,
         section: &'static str,
+        is_section_row: bool,
     }
 
     impl PickerItem for SectionEntry {
@@ -1079,22 +1092,41 @@ mod tests {
         fn section(&self) -> Option<&str> {
             Some(self.section)
         }
+        fn is_section_row(&self) -> bool {
+            self.is_section_row
+        }
+    }
+
+    fn in_section(label: &str, section: &'static str) -> SectionEntry {
+        SectionEntry {
+            label: label.into(),
+            section,
+            is_section_row: false,
+        }
+    }
+
+    fn heading(section: &'static str) -> SectionEntry {
+        SectionEntry {
+            label: section.into(),
+            section,
+            is_section_row: true,
+        }
     }
 
     fn section_entries() -> Vec<SectionEntry> {
         vec![
-            SectionEntry {
-                label: "a1".into(),
-                section: "A",
-            },
-            SectionEntry {
-                label: "a2".into(),
-                section: "A",
-            },
-            SectionEntry {
-                label: "b1".into(),
-                section: "B",
-            },
+            in_section("a1", "A"),
+            in_section("a2", "A"),
+            in_section("b1", "B"),
+        ]
+    }
+
+    fn headed_entries() -> Vec<SectionEntry> {
+        vec![
+            heading("Anthropic"),
+            in_section("a1", "Anthropic"),
+            heading("Openrouter"),
+            in_section("b1", "Openrouter"),
         ]
     }
 
@@ -1104,6 +1136,20 @@ mod tests {
         let filtered: Vec<usize> = (0..items.len()).collect();
         let rows = visual_rows_in_range(&filtered, &items, 0, items.len());
         assert_eq!(rows, 6);
+    }
+
+    #[test]
+    fn a_section_row_costs_its_spacer_and_not_a_second_header() {
+        let items = headed_entries();
+        let filtered: Vec<usize> = (0..items.len()).collect();
+
+        let rows = visual_rows_in_range(&filtered, &items, 0, items.len());
+        assert_eq!(rows, 5, "4 items and the one spacer between the sections");
+        assert_eq!(
+            find_scroll_offset_for(&filtered, &items, 3, 3),
+            2,
+            "scrolling has to count the spacer the second heading brings"
+        );
     }
 
     #[test]

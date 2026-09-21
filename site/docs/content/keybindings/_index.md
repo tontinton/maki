@@ -86,6 +86,7 @@ Some pickers add extra bindings on top of the defaults:
 | Queue | `Enter` | Remove item |
 | Commands | `Tab` | Complete command |
 | Model Picker | `!/@/#/$` | Set tier (strong/medium/weak/compaction) |
+| Model Picker | `%` | Fold or unfold provider |
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
