@@ -163,7 +163,7 @@ impl App {
     }
 
     pub(super) fn save_input_history(&self) {
-        if let Err(e) = self.input_box.history().save(&self.storage) {
+        if let Err(e) = self.input_box.history().save() {
             tracing::warn!(error = %e, "input history save failed");
         }
     }

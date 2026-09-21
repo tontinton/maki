@@ -490,6 +490,11 @@ impl InputBox {
         &self.history
     }
 
+    pub fn set_history(&mut self, history: InputHistory) {
+        self.history = history;
+        self.history_index = None;
+    }
+
     pub fn scroll(&mut self, delta: i32) {
         self.scroll_y = apply_scroll_delta(self.scroll_y, delta).min(self.max_scroll());
         self.follow_cursor = false;

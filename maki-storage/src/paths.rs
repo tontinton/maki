@@ -4,8 +4,15 @@ use std::sync::OnceLock;
 
 use etcetera::base_strategy::BaseStrategy;
 
+use crate::StateDir;
+
 const FALLBACK_DIR: &str = ".maki";
 const APP_NAME: &str = "maki";
+const PROJECTS_DIR: &str = "projects";
+pub(crate) const GIT_MARKER: &str = ".git";
+const UNNAMED_PROJECT: &str = "root";
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
 
 static STRATEGY: OnceLock<Option<Paths>> = OnceLock::new();
 
@@ -136,6 +143,32 @@ pub fn canonical_key(path: &Path) -> PathBuf {
     let expanded = expand_tilde(path);
     let abs = std::path::absolute(&expanded).unwrap_or(expanded);
     incremental_canonicalize(&abs).unwrap_or_else(|| normalize_path(&abs))
+}
+
+/// Per-project state, laid out exactly like the memory plugin's
+/// `projects/<id>/` so both land in one folder: the project is the nearest
+/// ancestor of `cwd` holding a `.git`, else `cwd` itself, taken as spelled.
+pub fn project_dir(state: &StateDir, cwd: &Path) -> PathBuf {
+    let root = cwd
+        .ancestors()
+        .find(|dir| dir.join(GIT_MARKER).exists())
+        .unwrap_or(cwd);
+    state.path().join(PROJECTS_DIR).join(project_id(root))
+}
+
+fn project_id(root: &Path) -> String {
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(UNNAMED_PROJECT);
+    let hash = fnv1a_64(root.as_os_str().as_encoded_bytes());
+    format!("{name}-{hash:016x}")
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(FNV_OFFSET_BASIS, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+    })
 }
 
 /// Strip the `\\?\` prefix that Windows `canonicalize` adds, using the
@@ -326,6 +359,32 @@ mod tests {
 
     const KEYED_FILE: &str = "f.rs";
     const SUBDIR: &str = "sub";
+    const STATE_SUBDIR: &str = "state";
+
+    #[test_case(b"", 0xcbf29ce484222325 ; "empty")]
+    #[test_case(b"a", 0xaf63dc4c8601ec8c ; "single_byte")]
+    fn fnv1a_64_matches_reference_vectors(input: &[u8], expected: u64) {
+        assert_eq!(fnv1a_64(input), expected);
+    }
+
+    #[test_case("/home/user/maki", "maki-87a295246017c748" ; "named_dir")]
+    #[test_case("/", "root-af63a24c860189fe" ; "filesystem_root")]
+    fn project_id_matches_memory_plugin(root: &str, expected: &str) {
+        assert_eq!(project_id(Path::new(root)), expected);
+    }
+
+    #[test]
+    fn a_dir_outside_any_repo_is_its_own_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = StateDir::from_path(tmp.path().join(STATE_SUBDIR));
+        let dir = tmp.path().join(SUBDIR);
+        fs::create_dir(&dir).unwrap();
+
+        assert_eq!(
+            project_dir(&state, &dir),
+            state.path().join(PROJECTS_DIR).join(project_id(&dir))
+        );
+    }
 
     #[test_case(|_rel, abs| abs.join(KEYED_FILE); "absolute")]
     #[test_case(|rel, _abs| rel.join(KEYED_FILE); "relative")]

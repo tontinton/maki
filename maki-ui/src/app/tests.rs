@@ -105,6 +105,8 @@ const FIRST_ASK: &str = "ask-a";
 const SECOND_ASK: &str = "ask-b";
 const OTHER_SESSION_ID: &str = "11111111-1111-1111-1111-111111111111";
 const EDIT_PLUGIN: &str = "completion";
+const CD_TARGET_DIR: &str = "other";
+const CD_TARGET_PROMPT: &str = "typed in the other project";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -3740,6 +3742,28 @@ fn cd_command_behavior() {
     );
     let flash = app.status_bar.flash_text().unwrap();
     assert!(flash.starts_with("cd: "), "error flash={flash:?}");
+}
+
+#[test]
+fn cd_swaps_input_history_to_the_new_dir() {
+    let (tmp, dir, _writer, mut app) = tempdir_app();
+    let target = tmp.path().join(CD_TARGET_DIR);
+    fs::create_dir(&target).unwrap();
+    let target = maki_storage::paths::canonicalize_clean(&target);
+    let mut seeded = InputHistory::load(&dir, &target, app.input_box.history().max_entries());
+    seeded.push(CD_TARGET_PROMPT.into());
+    seeded.save().unwrap();
+
+    app.execute_command(
+        ParsedCommand {
+            name: "/cd".into(),
+            args: target.to_string_lossy().into_owned(),
+            bang: false,
+        },
+        0,
+    );
+
+    assert_eq!(app.input_box.history().get(0), Some(CD_TARGET_PROMPT));
 }
 
 #[test]

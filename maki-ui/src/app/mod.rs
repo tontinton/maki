@@ -18,6 +18,7 @@ pub(crate) mod tests;
 pub(crate) mod view;
 
 use std::collections::HashMap;
+use std::env;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -441,7 +442,11 @@ impl App {
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
         let input_box = InputBox::new(
-            InputHistory::load(&storage, input_history_size),
+            InputHistory::load(
+                &storage,
+                &env::current_dir().unwrap_or_else(|_| PathBuf::from(&state.session.cwd)),
+                input_history_size,
+            ),
             ui_config.max_input_lines,
         );
         let mut app = Self {
@@ -1989,9 +1994,16 @@ impl App {
                 None => PathBuf::from(args),
             }
         };
-        match std::env::set_current_dir(&path) {
+        self.save_input_history();
+        match env::set_current_dir(&path) {
             Ok(()) => {
-                if let Ok(canonical) = std::env::current_dir() {
+                if let Ok(canonical) = env::current_dir() {
+                    let max_entries = self.input_box.history().max_entries();
+                    self.input_box.set_history(InputHistory::load(
+                        &self.storage,
+                        &canonical,
+                        max_entries,
+                    ));
                     self.state
                         .session_mut()
                         .set_cwd(canonical.to_string_lossy().into_owned());
