@@ -80,24 +80,22 @@ fn highlights_table(
 }
 
 /// Scores {needle} against {haystack} with the fuzzy matcher the built-in
-/// pickers rank with. {needle} is one fuzzy pattern, spaces included.
+/// pickers use. {needle} is one pattern, spaces included.
 ///
-/// A higher score is a better match. Scores compare only between haystacks
-/// scored against the same needle. An empty needle matches everything with a
-/// score of 0.
+/// Higher is better. Scores are only comparable across haystacks scored
+/// against the same needle. An empty needle matches everything with score 0.
 ///
-/// The second return value is where the match landed, in the shape
-/// `maki.fs.fuzzy_files` reports: 1-based inclusive `{ from, to }` byte
-/// ranges of {haystack}, ascending, with characters that touch coalesced into
-/// one range. `haystack:sub(from, to)` is the matched text, whatever the
-/// characters took to encode.
+/// The second return value lists where the match landed, in the same shape
+/// as `maki.fs.fuzzy_files`: 1-based inclusive `{ from, to }` byte ranges,
+/// ascending, with adjacent characters merged. `haystack:sub(from, to)` is
+/// the matched text.
 ///
-/// Pure computation, so it needs no plugin permission.
+/// Needs no plugin permission.
 ///
 /// @param needle string What the user typed.
 /// @param haystack string The candidate to score it against.
 /// @param opts table? Options:
-///   `paths` (boolean) rank {haystack} as a path, the way the file picker does, favouring the last segment. Off by default, which is how the model, command and list pickers rank.
+///   `paths` (boolean) rank {haystack} as a path, favouring the last segment, like the file picker. Off by default, like the model, command and list pickers.
 /// @return (integer|nil, table|nil) Score and matched byte ranges, or nil when the needle does not match.
 /// @example
 /// local score, at = maki.text.fuzzy("mrs", "maki-ui/src/main.rs", { paths = true })
@@ -122,28 +120,24 @@ fn fuzzy(
     })
 }
 
-/// Scores {needle} against every entry of {haystacks} and returns only the
-/// ones that matched, best first. One call filters a list as the user types.
+/// Scores {needle} against every entry of {haystacks} and returns the
+/// matches, best first.
 ///
-/// Entries that score the same keep the order they were given in, so a caller
-/// that sorted its candidates first (by mtime, say) keeps that order for an
-/// empty needle.
+/// Ties keep their input order, so candidates you pre-sorted (by mtime, say)
+/// stay in that order for an empty needle. `index` is the 1-based position in
+/// {haystacks}, and `highlights` uses the byte ranges of `fuzzy`. Entries
+/// that are not valid UTF-8 are skipped.
 ///
-/// Each result is `{ text, index, score, highlights? }`. `index` is a 1-based
-/// position in {haystacks}, `highlights` holds byte ranges, as in `fuzzy`. A
-/// Lua string is a byte string, so an entry that is not valid UTF-8 is
-/// skipped rather than failing the call over one candidate.
+/// To rank files, use `maki.fs.fuzzy_files` instead. It queries the index
+/// the host already keeps, so no candidate list crosses into Lua.
 ///
-/// To rank files, use `maki.fs.fuzzy_files`. It queries an index the host
-/// already keeps, so no list of candidates has to cross into Lua.
-///
-/// Pure computation, so it needs no plugin permission.
+/// Needs no plugin permission.
 ///
 /// @param needle string What the user typed.
 /// @param haystacks table Array of candidate strings.
 /// @param opts table? Options:
 ///   `limit` (integer) keep at most this many results.
-///   `paths` (boolean) rank candidates as paths, the way the file picker does. Off by default.
+///   `paths` (boolean) rank candidates as paths, like the file picker. Off by default.
 ///   `highlights` (boolean) also return where the query matched, off by default since it costs a second pass.
 /// @return (table) Array of `{ text, index, score, highlights? }`, best first.
 /// @example
@@ -204,10 +198,8 @@ fn fuzzy_list(
 }
 
 lua_table! {
-    /// Text transformation utilities.
-    ///
-    /// Helper functions for converting between text formats, and the fuzzy
-    /// matcher the built-in pickers rank with.
+    /// Text utilities: format conversion and the fuzzy matcher the built-in
+    /// pickers use.
     ///
     /// ```lua
     /// local md = maki.text.html_to_markdown(html)

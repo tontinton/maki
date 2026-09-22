@@ -69,7 +69,7 @@ Rule of thumb: when `AGENTS.md` grows past a screen, the new material probably w
 
 ## Pointing at a file with `@`
 
-Naming the file you mean saves the agent a search, and a search costs a tool call and a few hundred tokens before it has read anything. Typing `@` in the chat input opens a completion popup over your message, ranked with the same matcher as the `Ctrl+S` file picker:
+Naming the file saves the agent a search, which costs a tool call and a few hundred tokens. Type `@` in the chat input to open a completion popup, ranked like the `Ctrl+S` file picker:
 
 ```
 > explain @maki-ui/src/app/mo
@@ -79,32 +79,28 @@ Naming the file you mean saves the agent a search, and a search costs a tool cal
                 ╰─ Tab next · Enter insert · Esc ╯
 ```
 
-| Key | What it does |
-|-----|--------------|
-| `Tab`, `Ctrl+N` | next row |
-| `Ctrl+P` | previous row |
-| `Enter` | insert the highlighted path |
-| `Esc` | close the popup |
+| Key | Action |
+|-----|--------|
+| `Tab`, `Ctrl+N` | Next row |
+| `Ctrl+P` | Previous row |
+| `Enter` | Insert the highlighted path |
+| `Esc` | Close the popup |
 
-The popup owns those keys only while it is on screen, so `Ctrl+P` still opens `/sessions` the rest of the time and every other key still types into your message. Keep typing to narrow the list. A space ends the mention, so `@` in an email address opens nothing. Moving the caret out of the mention with an arrow key closes the popup and gives the keys back, without changing a character of what you typed. With no match to insert, Enter closes the popup and sends nothing, and the next Enter sends your message as usual.
+The popup takes these keys only while it is open. Otherwise `Ctrl+P` still opens `/sessions`. Keep typing to narrow the list. A space ends the mention, so an email address does not open the popup. Moving the caret out of the mention closes it. With no match, `Enter` closes the popup without sending. While the agent is working, the first `Esc` only closes the popup, and after that `Esc` stops the turn as usual.
 
-Esc closes the popup while the agent is working too, and the press after that stops the turn, the way it does with nothing on screen.
+The inserted path is plain text in your message. Nothing is attached or read until the agent calls `read`.
 
-The rows are ranked for the text as it stood when you asked for them. Press Enter on a row faster than the list can catch up with your typing and maki refuses the insert and says so, rather than writing a path over the wrong part of your line.
-
-Inserting a path writes text into your message. The file is not attached and nothing is read yet: the agent reads it when it decides to, with the same `read` tool it would have used anyway.
-
-The plugin ships switched off while its file index proves itself on large repositories. Turn it on in `init.lua`:
+The plugin is off by default while its file index is tested on large repositories. Turn it on in `init.lua`:
 
 ```lua
 maki.setup({
   plugins = {
-    completion = { enabled = true, max_items = 10 },
+    completion = { enabled = true },
   },
 })
 ```
 
-`max_items` is how many rows the popup shows at once. The first walk of a large tree takes a moment. Until it lands the popup says `scanning…`, then fills in on its own when the walk finishes, so you do not have to press a key to wake it. Enter while it is still scanning waits for the rows instead of closing the popup a moment before they arrive. That wait is bounded: when a walk never reports back the popup gives up after a few seconds, the rows read `no matches`, and Enter closes the popup from there.
+On a large repository the first index walk takes a moment. The popup shows `scanning…` and fills in when the walk finishes. If the walk has not reported back after a few seconds, it shows `no matches`. Other options are under `plugins.completion` in [configuration](/docs/configuration/).
 
 ## When the window fills
 
