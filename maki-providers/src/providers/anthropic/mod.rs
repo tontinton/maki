@@ -774,8 +774,8 @@ mod tests {
         assert_eq!(origin(input), expected);
     }
 
-    fn mock_response(data: &'static [u8]) -> isahc::Response<isahc::AsyncBody> {
-        let body = isahc::AsyncBody::from_bytes_static(data);
+    fn mock_response(data: impl Into<Vec<u8>>) -> isahc::Response<isahc::AsyncBody> {
+        let body = isahc::AsyncBody::from(data.into());
         isahc::Response::builder().status(200).body(body).unwrap()
     }
 
@@ -831,6 +831,45 @@ data: {\"type\":\"message_stop\"}\n";
                 }
             }
             assert_eq!(deltas, vec!["Hello", " world"]);
+        })
+    }
+
+    #[test_case(
+        r#"{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}"# ;
+        "zeros_in_message_start"
+    )]
+    #[test_case(
+        r#"{"input_tokens":42,"cache_creation_input_tokens":5,"cache_read_input_tokens":8}"# ;
+        "same_counts_in_message_start"
+    )]
+    fn parse_sse_usage_in_message_delta(start_usage: &str) {
+        smol::block_on(async {
+            let sse_data = format!(
+                "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{start_usage}}}}}\n\
+\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"input_tokens\":42,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":8,\"output_tokens\":10}}}}\n\
+\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n"
+            );
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                resp.usage,
+                TokenUsage {
+                    input: 42,
+                    output: 10,
+                    cache_creation: 5,
+                    cache_read: 8,
+                    cost: None,
+                }
+            );
         })
     }
 

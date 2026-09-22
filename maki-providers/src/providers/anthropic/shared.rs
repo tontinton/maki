@@ -364,6 +364,22 @@ impl EventParser {
                 if let Ok(ev) = serde_json::from_str::<MessageDeltaEvent>(data) {
                     if let Some(u) = ev.usage {
                         self.usage.output = u.output_tokens;
+                        // Gateways like Bifrost send zeros in message_start and the real
+                        // counts here. The first-party API often leaves these fields out, and
+                        // serde turns a missing field into 0, so a zero must not wipe what
+                        // message_start gave us.
+                        for (dst, src) in [
+                            (&mut self.usage.input, u.input_tokens),
+                            (&mut self.usage.cache_read, u.cache_read_input_tokens),
+                            (
+                                &mut self.usage.cache_creation,
+                                u.cache_creation_input_tokens,
+                            ),
+                        ] {
+                            if src > 0 {
+                                *dst = src;
+                            }
+                        }
                     }
                     if let Some(d) = ev.delta {
                         self.stop_reason = d
