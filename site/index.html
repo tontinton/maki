@@ -196,12 +196,12 @@
     }
     :not(html)::-webkit-scrollbar-thumb:hover { background: var(--scroll-thumb-hover); }
     a { color: var(--accent); text-decoration: none; }
-    p a {
+    p a, figcaption a {
       text-decoration: underline;
       text-decoration-color: var(--link-underline);
       text-underline-offset: 2px;
     }
-    p a:hover { color: var(--accent-hover); text-decoration-color: currentColor; }
+    p a:hover, figcaption a:hover { color: var(--accent-hover); text-decoration-color: currentColor; }
     :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
     code {
@@ -829,6 +829,23 @@
     }
     .pane-solo { border: 1px solid var(--pane-line); border-radius: 10px; overflow: hidden; }
 
+    /* ── benchmark ── */
+    .bench { margin: 0; }
+    .bench img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border-radius: 10px;
+      background: #000;
+      box-shadow: var(--demo-shadow);
+    }
+    .bench figcaption {
+      margin-top: 0.85rem;
+      font-size: 0.95rem;
+      color: var(--ink-2);
+      text-align: center;
+    }
+
     /* ── doom ── */
     .doom-demo {
       max-width: 900px;
@@ -1107,7 +1124,14 @@
 
 <main class="content">
 
-  <section class="block" id="tokens" data-section="tokens">
+  <section class="block" id="benchmark" data-section="benchmark">
+    <figure class="bench">
+      <a href="bench.svg" target="_blank" rel="noopener"><img src="bench.svg" width="1344" height="938" alt="Maki 0.5.5 at 80% pass rate and $1.75 per pass, against the FrontierHarness Eval baselines (Codex 66.7% at $3.47, Claude Code 63.3% at $18.34)"></a>
+      <figcaption><a href="https://frontierharness.org/" target="_blank" rel="noopener">FrontierHarness Eval</a> benchmark result, <a href="https://github.com/tontinton/maki/releases/download/v0.5.5/frontierharness-report-2026-09-19.zip">click here to download report.zip</a></figcaption>
+    </figure>
+  </section>
+
+  <section class="block reveal" id="tokens" data-section="tokens">
     <div class="sec-head">
       <h2>Where tokens go</h2>
     </div>

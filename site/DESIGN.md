@@ -58,7 +58,7 @@ Prose runs in groups of one or two sentences with 0.5rem between them, tighter t
 
 ## Order
 
-Claim then proof: the token items run straight into `index` and `code_execution`, the two sections they link to. `What you get` follows, opening on Lua plugins rather than burying the name in the closing list, since the plugin API is the thing worth showcasing; that item links into the Lua section directly below and stops one sentence short of it. The long tail of features is one closing sentence in the body face, never a run of dim mono chips.
+The FrontierHarness chart opens the content, right under the hero's 2x claim, as a figure with its caption (source link plus the report zip, hosted as a v0.5.5 release asset to keep 25MB out of git). Then claim and proof: the token items run straight into `index` and `code_execution`, the two sections they link to. `What you get` follows, opening on Lua plugins rather than burying the name in the closing list, since the plugin API is the thing worth showcasing; that item links into the Lua section directly below and stops one sentence short of it. The long tail of features is one closing sentence in the body face, never a run of dim mono chips.
 
 ## Layout
 
