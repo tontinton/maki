@@ -51,6 +51,7 @@ async def gather(*calls):
 local TOOLS_HEADER = "\n\nAvailable tools (async Python functions, keyword args only):\n"
 local WORKFLOW_TOOLS_NOTE =
   "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `gather(task(...), task(...))` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
+local WORKFLOW_OFF_NOTE = "\nNot callable: %s\n"
 -- MCP names and schemas already sit in the tool array (or the tool_search
 -- catalog), so point at those instead of repeating them here.
 local MCP_NOTE =
@@ -231,15 +232,24 @@ end
 -- to avoid recursion from describe callbacks.
 local function describe(dctx)
   local parts = { description, TOOLS_HEADER }
-  local has_workflow_only = false
-  for _, t in ipairs(interpreter_tools(maki.api.get_tools(), dctx.audience, dctx.workflow)) do
+  local has_workflow_only, gated = false, {}
+  -- Ask as if workflow were on, then hold back what it would unlock: those
+  -- names are listed as not callable, so the model stops trying them.
+  for _, t in ipairs(interpreter_tools(maki.api.get_tools(), dctx.audience, true)) do
     if matches_filter(t.name, dctx) then
-      has_workflow_only = has_workflow_only or t.workflow_only
-      parts[#parts + 1] = signature(t) .. "\n"
+      if t.workflow_only and not dctx.workflow then
+        gated[#gated + 1] = t.name
+      else
+        has_workflow_only = has_workflow_only or t.workflow_only
+        parts[#parts + 1] = signature(t) .. "\n"
+      end
     end
   end
   if has_workflow_only then
     parts[#parts + 1] = WORKFLOW_TOOLS_NOTE
+  end
+  if #gated > 0 then
+    parts[#parts + 1] = WORKFLOW_OFF_NOTE:format(table.concat(gated, ", "))
   end
   if dctx.mcp then
     parts[#parts + 1] = MCP_NOTE

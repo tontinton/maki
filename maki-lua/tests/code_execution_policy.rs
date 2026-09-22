@@ -21,6 +21,7 @@ const ERROR_PREFIX: &str = "[ERROR] ";
 const GATHER_HINT_SUBSTR: &str = "`gather(...)` keeps the other results";
 const TASK_PREFIX: &str = "task:";
 const WORKFLOW_NOTE_SUBSTR: &str = "Workflow mode: orchestrate subagents";
+const WF_TASK_GATED_LINE: &str = "Not callable: wf_task";
 const INTERP_ECHO_SIG: &str = "- interp_echo(msg: str, count: int = None, flag: bool = None, items: list = None, raw: any = None) -> str";
 const WF_TASK_SIG: &str = "- wf_task(prompt: str, model_tier: str = None) -> str";
 const SUB_TOOL_SIG: &str = "- sub_tool() -> str";
@@ -205,7 +206,8 @@ fn describe_main_hides_workflow_and_sub_tools() {
         desc.lines().any(|l| l == INTERP_ECHO_SIG),
         "expected exact line {INTERP_ECHO_SIG:?} in: {desc}"
     );
-    assert!(!desc.contains("wf_task"), "got: {desc}");
+    assert!(!desc.contains(WF_TASK_SIG), "got: {desc}");
+    assert!(desc.lines().any(|l| l == WF_TASK_GATED_LINE), "got: {desc}");
     assert!(!desc.contains("sub_tool"), "got: {desc}");
     assert!(!desc.contains(WORKFLOW_NOTE_SUBSTR), "got: {desc}");
 }
@@ -216,6 +218,7 @@ fn describe_workflow_adds_workflow_tools_and_note() {
     let desc = describe(&reg, &ToolFilter::All, ToolAudience::MAIN, true);
     assert!(desc.contains(WF_TASK_SIG), "got: {desc}");
     assert!(desc.contains(WORKFLOW_NOTE_SUBSTR), "got: {desc}");
+    assert!(!desc.contains(WF_TASK_GATED_LINE), "got: {desc}");
     assert!(!desc.contains("sub_tool"), "got: {desc}");
 }
 
@@ -228,12 +231,13 @@ fn describe_general_sub_scopes_to_sub_audience() {
     assert!(!desc.contains("wf_task"), "got: {desc}");
 }
 
-#[test]
-fn except_filter_removes_tool_from_description() {
+#[test_case::test_case("interp_echo" ; "callable")]
+#[test_case::test_case("wf_task" ; "workflow_gated")]
+fn except_filter_removes_tool_from_description(name: &str) {
     let (reg, _host) = setup();
-    let filter = ToolFilter::AllExcept(vec!["interp_echo".to_owned()]);
+    let filter = ToolFilter::AllExcept(vec![name.to_owned()]);
     let desc = describe(&reg, &filter, ToolAudience::MAIN, false);
-    assert!(!desc.contains("interp_echo"), "got: {desc}");
+    assert!(!desc.contains(name), "got: {desc}");
 }
 
 #[test]
