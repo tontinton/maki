@@ -46,7 +46,7 @@ Add `--verbose` to include full turn-by-turn messages in the output.
 ## Sessions
 
 A `--print` run stores its session, so `maki session list` shows it and the next
-run can resume it with `-c` or `-s <id>`. `text` output prints `session: <id>`
+run can resume it with `-c` or `-r <id>`. `text` output prints `session: <id>`
 on stderr to keep stdout clean for pipes. `json` and `stream-json` return it as
 `session_id`.
 
@@ -60,9 +60,9 @@ under that id. To build on a session that exists:
 
 | Goal | Flags |
 |------|-------|
-| Continue it in place | `-s <id>` |
-| Copy its history under a generated id | `-s <id> --fork-session` |
-| Copy its history under an id you choose | `-s <old> --session-id <new>` |
+| Continue it in place | `-r <id>` |
+| Copy its history under a generated id | `-r <id> --fork-session` |
+| Copy its history under an id you choose | `-r <old> --session-id <new>` |
 
 A copy belongs to the directory you run it in, so `maki -c` there continues the
 copy rather than the session it came from.
@@ -74,12 +74,12 @@ comes back as that hex uuid rather than the base58 form Maki generates.
 
 Only one Maki process can have a session open, so two runs cannot overwrite
 each other's turns. A second process that resumes a busy session with `-c` or
-`-s` exits before it sends any request:
+`-r` exits before it sends any request:
 
 ```
 session <id> is open in another maki process
   --fork-session  work on a copy of it
-  or drop -c/-s to start a new session here
+  or drop -c/-r to start a new session here
 ```
 
 The lock is released when the process exits, even after a crash. On a filesystem

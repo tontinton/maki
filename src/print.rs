@@ -248,7 +248,7 @@ pub fn run(params: PrintParams) -> Result<()> {
             tools: &tool_names,
             model: &model.id,
         })?,
-        // Text mode never says which session it wrote, and a later `-s`
+        // Text mode never says which session it wrote, and a later `-r`
         // needs it. On stderr so a pipe reading the answer is unaffected.
         None => eprintln!("{SESSION_LINE_PREFIX}{session_id}"),
     }

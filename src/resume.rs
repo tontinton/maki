@@ -1,4 +1,4 @@
-//! What `-c`, `-s`, `--fork-session` and `--session-id` mean. One definition,
+//! What `-c`, `-r`, `--fork-session` and `--session-id` mean. One definition,
 //! so the TUI, the SDK and `--print` cannot disagree about a flag again.
 
 use std::fmt::Display;
@@ -17,14 +17,14 @@ use crate::cli::Cli;
 const NO_PREVIOUS_SESSION: &str = "no previous session found for this directory, starting new";
 const LATEST_UNREADABLE: &str = "failed to load latest session, starting new";
 const ID_IN_USE: &str = "--session-id names a session that already exists";
-const ID_IN_USE_HINT: &str = "pass -s/--session to continue it, or --fork-session to copy it";
+const ID_IN_USE_HINT: &str = "pass -r/--resume to continue it, or --fork-session to copy it";
 /// For a run that already passed `--fork-session`. Suggesting the flag they
 /// just used reads like we did not listen.
-const ID_IN_USE_FORK_HINT: &str = "pass -s/--session to continue it, or drop --session-id";
+const ID_IN_USE_FORK_HINT: &str = "pass -r/--resume to continue it, or drop --session-id";
 /// Both ways out, since neither is obviously right: a copy keeps the history
 /// but splits off from it, and dropping the flag starts over here.
 const BUSY_HINT: &str = "  --fork-session  work on a copy of it
-  or drop -c/-s to start a new session here";
+  or drop -c/-r to start a new session here";
 
 pub struct Resolved {
     /// The id this run writes under: the resumed one, `--session-id`, a fresh
@@ -83,7 +83,7 @@ impl Resolved {
     }
 }
 
-/// What `-s` or `-c` points at, settled before anything is claimed or read.
+/// What `-r` or `-c` points at, settled before anything is claimed or read.
 enum Source {
     /// The caller's own spelling of the id. [`MakiId`] renders canonical
     /// base58, so rebuilding this from the id would answer a client that
@@ -96,7 +96,7 @@ enum Source {
 
 impl Source {
     fn from_flags(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<Option<Self>> {
-        if let Some(raw) = &cli.session {
+        if let Some(raw) = &cli.resume {
             return parse_id(raw).map(|reference| Some(Self::Named(reference)));
         }
         if !cli.continue_session {
@@ -386,7 +386,7 @@ mod tests {
     }
 
     #[test_case(&[], maki_otel::emit::START_FRESH, false ; "no flags is a fresh session")]
-    #[test_case(&["-s", ID_PLACEHOLDER], maki_otel::emit::START_RESUME, true ; "an explicit id resumes")]
+    #[test_case(&["-r", ID_PLACEHOLDER], maki_otel::emit::START_RESUME, true ; "an explicit id resumes")]
     #[test_case(&["-c"], maki_otel::emit::START_CONTINUE, true ; "continue takes the latest session")]
     fn flags_pick_a_session_and_a_start_type(
         args: &[&str],
@@ -421,7 +421,7 @@ mod tests {
     /// A copy claims only the id it writes, so a session another run has open
     /// copies like a closed one and comes out of it byte for byte the same.
     #[test_case(&["-c", "--fork-session"] ; "forking the latest session")]
-    #[test_case(&["-s", ID_PLACEHOLDER, "--fork-session"] ; "forking a named session")]
+    #[test_case(&["-r", ID_PLACEHOLDER, "--fork-session"] ; "forking a named session")]
     #[test_case(&["-c", "--session-id", UNUSED_SESSION_ID] ; "redirecting the latest session")]
     fn a_session_another_run_holds_can_still_be_copied(args: &[&str]) {
         let (_dir, storage, cwd, stored) = storage_with_stored_session();
@@ -463,7 +463,7 @@ mod tests {
     fn fork_copies_the_history_under_a_new_id() {
         let (_dir, storage, cwd, stored) = storage_with_stored_session();
         let resolved = resolve(
-            &cli(&["-s", ID_PLACEHOLDER, "--fork-session"], stored),
+            &cli(&["-r", ID_PLACEHOLDER, "--fork-session"], stored),
             &cwd,
             &storage,
         )
@@ -484,8 +484,8 @@ mod tests {
     /// every consumer reads one file: the tab the TUI opens, the transcript a
     /// headless turn writes back to, and the entry `maki session list` shows
     /// even when the run dies in its first turn.
-    #[test_case(&["-s", ID_PLACEHOLDER, "--fork-session"] ; "a fork")]
-    #[test_case(&["-s", ID_PLACEHOLDER, "--session-id", UNUSED_SESSION_ID] ; "a redirected write target")]
+    #[test_case(&["-r", ID_PLACEHOLDER, "--fork-session"] ; "a fork")]
+    #[test_case(&["-r", ID_PLACEHOLDER, "--session-id", UNUSED_SESSION_ID] ; "a redirected write target")]
     fn a_copy_is_a_session_of_its_own(args: &[&str]) {
         let (_dir, storage, cwd, stored) = storage_with_stored_session();
 
@@ -514,7 +514,7 @@ mod tests {
     /// resumed is a no-op rather than a collision, the run was going to write
     /// there anyway.
     #[test_case(&["-c", "--session-id", ID_PLACEHOLDER] ; "an id the run already resolved to")]
-    #[test_case(&["-s", ID_PLACEHOLDER, "--session-id", ID_PLACEHOLDER] ; "the resumed id spelled twice")]
+    #[test_case(&["-r", ID_PLACEHOLDER, "--session-id", ID_PLACEHOLDER] ; "the resumed id spelled twice")]
     fn session_id_names_the_id_the_run_writes_under(args: &[&str]) {
         let (_dir, storage, cwd, stored) = storage_with_stored_session();
 
@@ -534,7 +534,7 @@ mod tests {
 
         let resolved = resolve(
             &cli(
-                &["-s", ID_PLACEHOLDER, "--session-id", UNUSED_SESSION_ID],
+                &["-r", ID_PLACEHOLDER, "--session-id", UNUSED_SESSION_ID],
                 stored,
             ),
             &cwd,
@@ -557,7 +557,7 @@ mod tests {
     /// named the session by hex uuid has to be answered with the string it
     /// sent: an SDK client correlating by that string cannot be handed a second
     /// spelling of the session it just asked for.
-    #[test_case(&["-s", HEX_SESSION_ID], true ; "resuming an id spelled as hex")]
+    #[test_case(&["-r", HEX_SESSION_ID], true ; "resuming an id spelled as hex")]
     #[test_case(&["--session-id", HEX_SESSION_ID], false ; "writing under an id spelled as hex")]
     fn the_reported_id_keeps_the_callers_spelling(args: &[&str], stored: bool) {
         let (_dir, storage, cwd) = empty_storage();
@@ -577,7 +577,7 @@ mod tests {
     /// deleted history. A fork gets no exemption, it continues nothing in
     /// place, and `--fork-session` promises to leave the original alone.
     #[test_case(&["--session-id", ID_PLACEHOLDER], ID_IN_USE_HINT ; "an id already in use")]
-    #[test_case(&["-s", ID_PLACEHOLDER, "--session-id", ID_PLACEHOLDER, "--fork-session"], ID_IN_USE_FORK_HINT ; "a fork claiming the id it forked from")]
+    #[test_case(&["-r", ID_PLACEHOLDER, "--session-id", ID_PLACEHOLDER, "--fork-session"], ID_IN_USE_FORK_HINT ; "a fork claiming the id it forked from")]
     fn a_claimed_session_id_is_refused(args: &[&str], hint: &str) {
         let (_dir, storage, cwd, stored) = storage_with_stored_session();
 
@@ -590,9 +590,9 @@ mod tests {
 
     /// A session flag that cannot be opened has to fail loudly. Starting fresh
     /// on the same terminal looks exactly like the history was lost.
-    #[test_case(&["-s", MALFORMED_SESSION_ID], INVALID_ID_ERROR ; "a malformed id to resume")]
+    #[test_case(&["-r", MALFORMED_SESSION_ID], INVALID_ID_ERROR ; "a malformed id to resume")]
     #[test_case(&["--session-id", MALFORMED_SESSION_ID], INVALID_ID_ERROR ; "a malformed id to write under")]
-    #[test_case(&["-s", UNUSED_SESSION_ID], NOT_FOUND_ERROR ; "an id nothing was written for")]
+    #[test_case(&["-r", UNUSED_SESSION_ID], NOT_FOUND_ERROR ; "an id nothing was written for")]
     fn an_unopenable_session_flag_errors(args: &[&str], expected: &str) {
         let (_dir, storage, cwd, stored) = storage_with_stored_session();
 
@@ -606,7 +606,7 @@ mod tests {
     /// refused before any request goes out. `-c` must refuse too, not quietly
     /// start a new session and hide the conflict.
     #[test_case(&["-c"] ; "two continues of the same session")]
-    #[test_case(&["-s", ID_PLACEHOLDER] ; "two resumes of the same session")]
+    #[test_case(&["-r", ID_PLACEHOLDER] ; "two resumes of the same session")]
     #[test_case(&["-c", "--session-id", ID_PLACEHOLDER] ; "a redirect onto a session already running")]
     #[test_case(&["--session-id", UNUSED_SESSION_ID] ; "two runs naming one new session id")]
     fn a_session_another_run_holds_is_refused(args: &[&str]) {

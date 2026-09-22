@@ -431,7 +431,7 @@ mod tests {
     }
 
     /// The next process continues the transcript instead of starting one
-    /// beside it, which is the whole point of `-c` and `-s`. The title and plan
+    /// beside it, which is the whole point of `-c` and `-r`. The title and plan
     /// are set only in memory, so they reach disk only if the run writes back
     /// into the session it was handed rather than reading the file again.
     #[test]

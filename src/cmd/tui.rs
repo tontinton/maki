@@ -497,7 +497,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         match outcome {
             RunOutcome::Exit { session_id, code } => {
                 if let Some(session_id) = session_id {
-                    eprintln!("Resume session:\n\n  maki -s {session_id}");
+                    eprintln!("Resume session:\n\n  maki -r {session_id}");
                 }
                 let started = Instant::now();
                 drop(stack);

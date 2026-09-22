@@ -28,7 +28,7 @@ pub enum InputFormat {
 // Only one way to name the session to load, or the resolver would quietly pick
 // one. `--fork-session` requires it, since forking nothing used to start a
 // blank session.
-#[command(group = ArgGroup::new("loaded").args(["continue_session", "session"]))]
+#[command(group = ArgGroup::new("loaded").args(["continue_session", "resume"]))]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -54,8 +54,13 @@ pub struct Cli {
     pub continue_session: bool,
 
     /// Resume a specific session by its ID
-    #[arg(short = 's', long, alias = "resume")]
-    pub session: Option<String>,
+    #[arg(
+        short = 'r',
+        long,
+        visible_short_alias = 's',
+        visible_alias = "session"
+    )]
+    pub resume: Option<String>,
 
     /// Output format for --print mode
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -400,10 +405,12 @@ mod tests {
 
     /// `--session-id` with `-c` stays legal: continue the latest, but write
     /// under this id.
-    #[test_case(&["-c", "-s", SESSION_ID], false ; "two sessions to load")]
+    #[test_case(&["-c", "-r", SESSION_ID], false ; "two sessions to load")]
+    #[test_case(&["-c", "-s", SESSION_ID], false ; "two sessions to load through the short alias")]
+    #[test_case(&["-c", "--session", SESSION_ID], false ; "two sessions to load through the long alias")]
     #[test_case(&["--fork-session"], false ; "a fork with nothing to fork")]
     #[test_case(&["--fork-session", "-c"], true ; "a fork of the latest")]
-    #[test_case(&["--fork-session", "-s", SESSION_ID], true ; "a fork of a named session")]
+    #[test_case(&["--fork-session", "-r", SESSION_ID], true ; "a fork of a named session")]
     #[test_case(&["-c", "--session-id", SESSION_ID], true ; "a redirected continue")]
     fn session_flag_combinations(args: &[&str], accepted: bool) {
         let argv = std::iter::once("maki").chain(args.iter().copied());

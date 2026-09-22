@@ -114,7 +114,7 @@ An archive is a complete session file, so `jq` or an editor reads it as it is. T
 cd ~/.local/state/maki/sessions
 mv <session-id>.jsonl <session-id>.jsonl.bak
 cp archive/<session-id>/<n>.jsonl <session-id>.jsonl
-maki -s <session-id>
+maki -r <session-id>
 ```
 
 `MAKI_DISABLE_AUTOCOMPACT=1` turns off the automatic compaction. A manual `/compact` still compacts.

@@ -24,7 +24,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--yolo` | yes | yes | yes (or `--permission-mode bypassPermissions`) |
 | `--no-plugins` / `--no-commands` / `--no-jit` | yes | yes | yes |
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
-| `-c` / `--continue`, `-s` / `--session` | yes | yes | yes |
+| `-c` / `--continue`, `-r` / `--resume` | yes | yes | yes |
 | `--exit-on-done` | yes | n/a (always exits) | n/a |
 | `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
 | `--verbose`, `--output-format` | no | yes | stream only |
@@ -43,7 +43,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used → `provider.default_model` in config → auto-detect from available providers |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
 | `-c`, `--continue` | Resume the most recent session in this directory |
-| `-s`, `--session` / `--resume <ID>` | Resume a specific session |
+| `-r`, `--resume <ID>` | Resume a specific session (aliases: `-s`, `--session`) |
 | `--output-format <text\|json\|stream-json>` | Output shape for `--print` (default `text`) |
 | `--input-format <text\|stream-json>` | With `--print`, `stream-json` enters SDK mode |
 | `--no-commands` | Skip custom commands from `.maki/commands`, `.claude/commands`, etc. |
@@ -54,7 +54,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers) |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
-| `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-s` / `-c` is continuing that same session |
+| `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-r` / `-c` is continuing that same session |
 | `--fork-session` | Copy the resumed session's history under a new id, leaving the original untouched. See [Sessions](/docs/headless/#sessions) |
 | `--max-turns <N>` | Cap agent turns (SDK) |
 | `--system-prompt <TEXT>` | Replace the system prompt (SDK only) |
@@ -110,7 +110,7 @@ maki session list --global   # sessions from all projects
 maki session delete <id>     # asks first, -f skips
 ```
 
-Prints stored sessions as a table (id, title, project directory with `$HOME` collapsed to `~`, last update as a relative age), newest first. A listed id works with `maki --session <id>` to resume it. `delete` removes the session log along with its archives and index entries, and asks for confirmation first unless you pass `-f` / `--force`; without a terminal to ask on it refuses outright. A maki that already has the session open will not notice the delete and will lose the rest of that conversation, so close it first. Inside the TUI the same data lives behind `/sessions` (`Ctrl+P`), where `Ctrl+D` deletes.
+Prints stored sessions as a table (id, title, project directory with `$HOME` collapsed to `~`, last update as a relative age), newest first. A listed id works with `maki --resume <id>` to resume it. `delete` removes the session log along with its archives and index entries, and asks for confirmation first unless you pass `-f` / `--force`; without a terminal to ask on it refuses outright. A maki that already has the session open will not notice the delete and will lose the rest of that conversation, so close it first. Inside the TUI the same data lives behind `/sessions` (`Ctrl+P`), where `Ctrl+D` deletes.
 
 ### `maki mcp`
 
