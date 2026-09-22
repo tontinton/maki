@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use humantime::format_duration;
+use maki_agent::UiWaker;
 use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
@@ -23,7 +24,7 @@ pub(crate) mod buf;
 pub(crate) mod win;
 
 use crate::runtime::with_task_bufs;
-use win::WinHandle;
+use win::{WinHandle, WinSender};
 
 /// `fg`, `bg` and six modifiers.
 const UI_STYLE_FIELDS: usize = 8;
@@ -77,13 +78,13 @@ impl HintStore {
 /// nothing until a collection they cannot ask for.
 #[derive(Default)]
 pub(crate) struct WinStore {
-    open: BTreeMap<Arc<str>, Vec<flume::Sender<WinCommand>>>,
+    open: BTreeMap<Arc<str>, Vec<WinSender>>,
 }
 
 impl WinStore {
     /// Drops the windows that have already gone on the way in, so a plugin
     /// opening and closing one per keystroke does not grow this for the run.
-    fn track(&mut self, plugin: Arc<str>, cmd_tx: flume::Sender<WinCommand>) {
+    fn track(&mut self, plugin: Arc<str>, cmd_tx: WinSender) {
         let windows = self.open.entry(plugin).or_default();
         windows.retain(|tx| !tx.is_disconnected());
         windows.push(cmd_tx);
@@ -94,7 +95,7 @@ impl WinStore {
     /// loop still hears the close it is waiting on.
     pub fn close_plugin(&mut self, plugin: &str) {
         for tx in self.open.remove(plugin).unwrap_or_default() {
-            let _ = tx.try_send(WinCommand::Close);
+            tx.send(WinCommand::Close);
         }
     }
 }
@@ -589,7 +590,7 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
 ///   - border (string): border style. One of "rounded" (default), "single", "double", "none".
 ///   - title (string): text shown in the top border. Default "".
 ///   - title_pos (string): title alignment. One of "left" (default), "center", "right".
-///   - footer (table): key-hint pairs shown in the bottom border. Each entry is {key, label}.
+///   - footer (table): key-hint pairs shown in the bottom border. Each entry is {key, label}. A bordered float is widened to fit its title and footer, up to the screen width.
 ///   - zindex (integer): stacking order. Default 50.
 ///   - cursor_line (boolean): highlight the focused row. Default false.
 ///   - reserved_top (integer): rows reserved at the top of the content area. Default 0.
@@ -685,6 +686,11 @@ fn open_win(
     // in practice.
     let (event_tx, event_rx) = flume::unbounded::<WinEvent>();
     let (cmd_tx, cmd_rx) = flume::unbounded::<WinCommand>();
+    let waker = lua.app_data_ref::<UiWaker>().map(|waker| waker.clone());
+    if let Some(waker) = &waker {
+        buf_handle.buf.wake_on_change(waker);
+    }
+    let cmd_tx = WinSender::new(cmd_tx, waker);
 
     let _ = tx.try_send(UiAction::OpenWin {
         buf: buf_handle.buf.clone(),
@@ -1678,8 +1684,8 @@ mod tests {
         let mut store = WinStore::default();
         let (mine, mine_rx) = flume::unbounded::<WinCommand>();
         let (theirs, theirs_rx) = flume::unbounded::<WinCommand>();
-        store.track(Arc::from(WIN_PLUGIN), mine);
-        store.track(Arc::from(OTHER_WIN_PLUGIN), theirs);
+        store.track(Arc::from(WIN_PLUGIN), WinSender::new(mine, None));
+        store.track(Arc::from(OTHER_WIN_PLUGIN), WinSender::new(theirs, None));
 
         store.close_plugin(WIN_PLUGIN);
 
@@ -1696,11 +1702,11 @@ mod tests {
     fn a_window_already_gone_is_forgotten_on_the_next_open() {
         let mut store = WinStore::default();
         let (gone, gone_rx) = flume::unbounded::<WinCommand>();
-        store.track(Arc::from(WIN_PLUGIN), gone);
+        store.track(Arc::from(WIN_PLUGIN), WinSender::new(gone, None));
         drop(gone_rx);
 
         let (live, _live_rx) = flume::unbounded::<WinCommand>();
-        store.track(Arc::from(WIN_PLUGIN), live);
+        store.track(Arc::from(WIN_PLUGIN), WinSender::new(live, None));
 
         assert_eq!(store.open[WIN_PLUGIN].len(), 1);
     }

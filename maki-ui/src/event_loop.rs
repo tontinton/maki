@@ -107,6 +107,7 @@ pub struct EventLoopParams {
     pub keymap_reader: KeymapReader,
     pub hint_reader: HintReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
+    pub ui_wake_rx: flume::Receiver<()>,
     pub ui_attachment: UiAttachment,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
@@ -482,6 +483,7 @@ pub(crate) struct EventLoop<'t> {
     models_rx: flume::Receiver<()>,
     models_tx: flume::Sender<()>,
     ui_action_rx: flume::Receiver<UiAction>,
+    ui_wake_rx: flume::Receiver<()>,
     ui_attachment: UiAttachment,
     pack_tx: flume::Sender<Box<PackPreparation>>,
     pack_rx: flume::Receiver<Box<PackPreparation>>,
@@ -498,6 +500,9 @@ enum Wake {
     Input(Event),
     InputGone,
     Ui(UiAction),
+    /// Nothing to handle. The tick after every wake is what reads plugin
+    /// windows.
+    PluginWindow,
     Agent(usize, Box<maki_agent::Envelope>),
     Shell(usize, ShellEvent),
     Warn(String),
@@ -601,6 +606,7 @@ impl<'t> EventLoop<'t> {
             keymap_reader,
             hint_reader,
             ui_action_rx,
+            ui_wake_rx,
             ui_attachment,
             lua_event_handle,
             model_policy,
@@ -716,6 +722,7 @@ impl<'t> EventLoop<'t> {
             models_rx: bg.models_rx,
             models_tx: bg.models_tx,
             ui_action_rx,
+            ui_wake_rx,
             ui_attachment,
             pack_tx,
             pack_rx,
@@ -824,6 +831,11 @@ impl<'t> EventLoop<'t> {
         if !self.ui_action_rx.is_disconnected() {
             sel = sel.recv(&self.ui_action_rx, |res| res.ok().map(Wake::Ui));
         }
+        if !self.ui_wake_rx.is_disconnected() {
+            sel = sel.recv(&self.ui_wake_rx, |res| {
+                res.ok().map(|()| Wake::PluginWindow)
+            });
+        }
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
         sel = sel.recv(&self.pack_rx, |res| res.ok().map(Wake::Pack));
         sel = sel.recv(&self.models_rx, |res| {
@@ -847,6 +859,7 @@ impl<'t> EventLoop<'t> {
             Wake::Input(ev) => self.handle_input(ev),
             Wake::InputGone => return Err(eyre!("terminal input reader stopped")),
             Wake::Ui(action) => self.handle_ui_action(action),
+            Wake::PluginWindow => {}
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),

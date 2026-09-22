@@ -81,8 +81,9 @@ local function match_ranges(label, words)
   return merged
 end
 
-local function highlight_spans(label, words, base, match_style)
-  local ranges = match_ranges(label, words)
+-- {ranges} are ascending, disjoint, 1-based inclusive byte ranges of {label},
+-- the shape `maki.text.fuzzy` and the file ranking report matches in.
+local function range_spans(label, ranges, base, match_style)
   if #ranges == 0 then
     return { { label, base } }
   end
@@ -98,6 +99,10 @@ local function highlight_spans(label, words, base, match_style)
     spans[#spans + 1] = { label:sub(pos), base }
   end
   return spans
+end
+
+local function highlight_spans(label, words, base, match_style)
+  return range_spans(label, match_ranges(label, words), base, match_style)
 end
 
 local function item_label(item)
@@ -572,6 +577,7 @@ end
 ListPicker.split_words = split_words
 ListPicker.matches = matches
 ListPicker.highlight_spans = highlight_spans
+ListPicker.range_spans = range_spans
 
 ListPicker._render_lines = render_lines
 ListPicker._filter_items = filter_items

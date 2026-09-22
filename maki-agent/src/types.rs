@@ -2,7 +2,7 @@ use std::any::Any;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use flume::{Receiver, Sender};
 use maki_config::ToolKey;
@@ -695,11 +695,32 @@ pub enum AgentEvent {
     StreamClosed,
 }
 
+/// Wakes the UI loop so a change made on another thread is painted now, not on
+/// the loop's next timed poll. Wakes pile up into one until the loop looks, so
+/// a plugin writing in a tight loop costs one frame, not one per write.
+#[derive(Clone)]
+pub struct UiWaker(Sender<()>);
+
+impl UiWaker {
+    pub fn new() -> (Self, Receiver<()>) {
+        let (tx, rx) = flume::bounded(1);
+        (Self(tx), rx)
+    }
+
+    pub fn wake(&self) {
+        let _ = self.0.try_send(());
+    }
+}
+
 /// Append-only buffer for streaming tool output to the UI. Writers append
 /// under a Mutex, readers get a cheap Arc clone via `read_if_dirty()`.
 pub struct SharedBuf {
     committed: Mutex<Arc<Vec<SnapshotLine>>>,
     dirty: AtomicBool,
+    /// Only a buffer shown in a plugin window gets one, since the UI reads
+    /// those on a tick. A tool body is repainted by the agent events that
+    /// carry it.
+    waker: OnceLock<UiWaker>,
     on_change: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Opaque click handler owned by the Lua layer. It lives on the buffer
     /// itself, not on any one handle, so every handle wrapping this buf,
@@ -713,6 +734,7 @@ impl SharedBuf {
         Self {
             committed: Mutex::new(Arc::new(Vec::new())),
             dirty: AtomicBool::new(false),
+            waker: OnceLock::new(),
             on_change: Mutex::new(None),
             click: Mutex::new(None),
             notifying: AtomicBool::new(false),
@@ -745,7 +767,16 @@ impl SharedBuf {
         *self.on_change.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
+    /// There is one waker per process, so the first window to show the buffer
+    /// sets it for good.
+    pub fn wake_on_change(&self, waker: &UiWaker) {
+        let _ = self.waker.set(waker.clone());
+    }
+
     fn notify_change(&self) {
+        if let Some(waker) = self.waker.get() {
+            waker.wake();
+        }
         if self.notifying.swap(true, Ordering::AcqRel) {
             return;
         }

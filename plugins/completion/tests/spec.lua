@@ -210,9 +210,15 @@ local function harness(body)
   maki.ui.flash = function(msg)
     table.insert(h.flashes, msg)
   end
-  maki.fs.fuzzy_files = function()
+  -- Once asked, the host reports highlights for every item, so a fixture
+  -- without them matched nothing.
+  maki.fs.fuzzy_files = function(rank_opts)
+    h.rank_opts = rank_opts
     if h.before_rank then
       h.before_rank()
+    end
+    for _, item in ipairs(h.found.items) do
+      item.highlights = item.highlights or {}
     end
     return h.found
   end
@@ -267,7 +273,23 @@ end
 
 -- The text of the row the popup painted at {i}, border padding included.
 local function row(h, i)
-  return h.rows[i] and h.rows[i][1][1]
+  if not h.rows[i] then
+    return nil
+  end
+  local text = {}
+  for _, span in ipairs(h.rows[i]) do
+    text[#text + 1] = span[1]
+  end
+  return table.concat(text)
+end
+
+-- Row {i} as `[text:style]` per span, to compare the styling in one string.
+local function styled(h, i)
+  local out = {}
+  for _, span in ipairs(h.rows[i]) do
+    out[#out + 1] = "[" .. span[1] .. ":" .. span[2] .. "]"
+  end
+  return table.concat(out)
 end
 
 -- A walk landing, as the host delivers it: the tree it covered and nothing
@@ -438,7 +460,7 @@ end)
 
 -- Moving the caret out of the mention changes no text at all. Until the host
 -- reported cursor-only moves the popup stayed up over a mention the user had
--- left, holding `<Tab>`, `<C-p>`, `<Esc>` and `<CR>` with it.
+-- left, holding `<Up>`, `<C-p>`, `<Esc>` and `<CR>` with it.
 
 case("the_popup_closes_when_the_caret_leaves_the_mention", function()
   harness(function(h)
@@ -511,19 +533,44 @@ case("every_claimed_key_is_answered", function()
   end
 end)
 
--- Navigation is the other half of what the claimed keys are for.
+-- Navigation is the other half of what the claimed keys are for. Up from the
+-- first row wraps to the last, which is where a list shown above the input
+-- keeps its nearest rows.
 case("the_navigation_keys_move_the_highlight", function()
+  for _, press in ipairs({ { "<Down>" }, { "<C-n>" }, { "<Up>" }, { "<C-p>" }, { "<Down>", "<Down>", "<Up>" } }) do
+    local h = harness(function(hh)
+      hh.found = {
+        complete = true,
+        root = ROOT,
+        items = { { path = MATCH }, { path = OTHER_MATCH } },
+      }
+      Menu.refresh(hh.input)
+      for _, key in ipairs(press) do
+        Menu.handle_key(key)
+      end
+      Menu.handle_key("<CR>")
+    end)
+    eq(h.edits[1].text, OTHER_MATCH .. " ", table.concat(press, " ") .. " landed on the second row")
+  end
+end)
+
+-- Matches are marked the way the `Ctrl+S` picker marks them, on the selected
+-- row and off it.
+case("the_matched_characters_are_highlighted", function()
   local h = harness(function(hh)
     hh.found = {
       complete = true,
       root = ROOT,
-      items = { { path = MATCH }, { path = OTHER_MATCH } },
+      items = {
+        { path = MATCH, highlights = { { 1, 3 }, { 5, 6 } } },
+        { path = OTHER_MATCH, highlights = { { 5, 5 } } },
+      },
     }
     Menu.refresh(hh.input)
-    Menu.handle_key("<Tab>")
-    Menu.handle_key("<CR>")
   end)
-  eq(h.edits[1].text, OTHER_MATCH .. " ", "Tab moved the highlight down a row")
+  eq(h.rank_opts.highlights, true, "the ranking was asked where it matched")
+  eq(styled(h, 1), "[ :selected][src:match_selected][/:selected][ma:match_selected][in.rs:selected]")
+  eq(styled(h, 2), "[ :item][src/:item][m:match][enu.rs:item]")
 end)
 
 -- Esc is the key the popup shares with the host: while the agent streams the
@@ -596,6 +643,55 @@ case("a_walk_of_another_tree_leaves_the_rows_waiting", function()
   eq(h.on_index_ready, nil)
 end)
 
+-- One keystroke past `INPUT`.
+local TYPED = { text = INPUT.text .. "i", cursor = INPUT.cursor + 1, version = INPUT.version + 1, session_id = SESSION }
+local ANSWERS_THE_LAST_KEYSTROKE = "the rows answer the text the user typed last"
+
+-- The two ways a scan asks for another look. Each used to rank the snapshot it
+-- started from, which cancelled the ranking of the newer keystroke and left old
+-- rows up, with a version every accept was then refused for.
+
+case("a_walk_landing_mid_keystroke_ranks_the_newest_input", function()
+  local h = harness(function(hh)
+    hh.found = { complete = false, root = ROOT, items = {} }
+    Menu.refresh(hh.input)
+    hh.found = { complete = true, root = ROOT, items = { { path = MATCH } } }
+    hh.defer = true
+    hh.before_rank = function()
+      hh.before_rank = nil
+      walk_landed(hh)
+    end
+    Menu.refresh(TYPED)
+    hh.flush()
+    Menu.handle_key("<CR>")
+  end)
+  eq(h.edits[1].version, TYPED.version, ANSWERS_THE_LAST_KEYSTROKE)
+end)
+
+case("a_look_queued_behind_a_newer_keystroke_ranks_the_newest_input", function()
+  local h = harness(function(hh)
+    hh.found = { complete = false, root = ROOT, items = {} }
+    hh.defer = true
+    Menu.refresh(hh.input)
+    hh.found = { complete = true, root = ROOT, items = { { path = MATCH } } }
+    Menu.refresh(TYPED)
+    hh.flush()
+    Menu.handle_key("<CR>")
+  end)
+  eq(h.edits[1].version, TYPED.version, ANSWERS_THE_LAST_KEYSTROKE)
+end)
+
+case("esc_during_a_scan_is_not_undone_by_a_queued_look", function()
+  local h = harness(function(hh)
+    hh.found = { complete = false, root = ROOT, items = {} }
+    hh.defer = true
+    Menu.refresh(hh.input)
+    Menu.handle_key("<Esc>")
+    hh.flush()
+  end)
+  eq(h.opens, 1, "the popup stayed closed")
+end)
+
 -- The walk can land between the ranking and the subscription, and that event
 -- has no subscriber. Without one more look the rows then say `scanning…` until
 -- the user presses a key, which is the opposite of what the docs promise.
@@ -608,7 +704,7 @@ case("a_walk_that_landed_before_the_subscription_still_fills_the_rows", function
       if looks == 1 then
         return { complete = false, root = ROOT, items = {} }
       end
-      return { complete = true, root = ROOT, items = { { path = MATCH } } }
+      return { complete = true, root = ROOT, items = { { path = MATCH, highlights = {} } } }
     end
     Menu.refresh(hh.input)
     eq(row(hh, 1), " " .. MATCH, "the look after subscribing found the walk already in")

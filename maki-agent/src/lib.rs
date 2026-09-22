@@ -48,7 +48,7 @@ pub use types::{
     GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, RunLedger, RunTotals,
     SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanColor, SpanStyle,
     SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent, event_stream,
+    TurnCompleteEvent, UiWaker, event_stream,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

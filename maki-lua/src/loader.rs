@@ -975,6 +975,11 @@ impl PluginHost {
         self.inner.ui_action_rx.clone()
     }
 
+    /// Rings when a plugin changes a window or what one shows.
+    pub fn ui_wake_rx(&self) -> flume::Receiver<()> {
+        self.inner.ui_wake_rx.clone()
+    }
+
     /// The bit every `maki.ui` and `maki.fn` roundtrip consults. The event
     /// loop attaches while it drains [`Self::ui_action_rx`] and detaches
     /// before teardown runs `SessionEnd`, since that receiver is a clone and

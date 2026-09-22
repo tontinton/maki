@@ -73,20 +73,20 @@ Naming the file saves the agent a search, which costs a tool call and a few hund
 
 ```
 > explain @maki-ui/src/app/mo
-                ╭────────────────────────────────╮
-                │ maki-ui/src/app/mod.rs         │
-                │ maki-ui/src/app/model.rs       │
-                ╰─ Tab next · Enter insert · Esc ╯
+                ╭─────────────────────────────────╮
+                │ maki-ui/src/app/mod.rs          │
+                │ maki-ui/src/app/model.rs        │
+                ╰ ↑/↓ move Enter insert Esc close ╯
 ```
 
 | Key | Action |
 |-----|--------|
-| `Tab`, `Ctrl+N` | Next row |
-| `Ctrl+P` | Previous row |
+| `↓`, `Ctrl+N` | Next row |
+| `↑`, `Ctrl+P` | Previous row |
 | `Enter` | Insert the highlighted path |
 | `Esc` | Close the popup |
 
-The popup takes these keys only while it is open. Otherwise `Ctrl+P` still opens `/sessions`. Keep typing to narrow the list. A space ends the mention, so an email address does not open the popup. Moving the caret out of the mention closes it. With no match, `Enter` closes the popup without sending. While the agent is working, the first `Esc` only closes the popup, and after that `Esc` stops the turn as usual.
+The popup takes these keys only while it is open. Otherwise `↑` and `↓` still walk the input history and `Ctrl+P` still opens `/sessions`. The characters your query matched are highlighted the way the file picker highlights them. Keep typing to narrow the list. A space ends the mention, so an email address does not open the popup. Moving the caret out of the mention closes it. With no match, `Enter` closes the popup without sending. While the agent is working, the first `Esc` only closes the popup, and after that `Esc` stops the turn as usual.
 
 The inserted path is plain text in your message. Nothing is attached or read until the agent calls `read`.
 

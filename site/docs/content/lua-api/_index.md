@@ -5713,7 +5713,7 @@ and close the window when you are done.
   - `border` (`string`) border style. One of "rounded" (default), "single", "double", "none".
   - `title` (`string`) text shown in the top border. Default "".
   - `title_pos` (`string`) title alignment. One of "left" (default), "center", "right".
-  - `footer` (`table`) key-hint pairs shown in the bottom border. Each entry is {key, label}.
+  - `footer` (`table`) key-hint pairs shown in the bottom border. Each entry is {key, label}. A bordered float is widened to fit its title and footer, up to the screen width.
   - `zindex` (`integer`) stacking order. Default 50.
   - `cursor_line` (`boolean`) highlight the focused row. Default false.
   - `reserved_top` (`integer`) rows reserved at the top of the content area. Default 0.
@@ -6561,6 +6561,7 @@ function ListPicker.open(items, opts)
 ListPicker.split_words = split_words
 ListPicker.matches = matches
 ListPicker.highlight_spans = highlight_spans
+ListPicker.range_spans = range_spans
 ```
 
 ### `require("maki.output_limits")`

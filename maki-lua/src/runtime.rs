@@ -23,7 +23,7 @@ use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
 use maki_agent::{
-    BufferSnapshot, SessionEndReason, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
+    BufferSnapshot, SessionEndReason, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, UiWaker,
 };
 use mlua::{
     Chunk, ChunkMode, Compiler, Function, Lua, MultiValue, RegistryKey, Table, Value as LuaValue,
@@ -3692,6 +3692,7 @@ pub(crate) struct LuaThread {
     pub keymap_reader: KeymapReader,
     pub hint_reader: crate::api::util::command::HintReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
+    pub ui_wake_rx: flume::Receiver<()>,
     pub ui_attachment: UiAttachment,
     /// What [`load_user_source`] found on the Lua thread, for the host to
     /// report.
@@ -3715,6 +3716,7 @@ pub fn spawn(
     let shutdown_thread = Arc::clone(&shutdown);
     let (init_tx, init_rx) = flume::bounded::<Result<(), PluginError>>(1);
     let (ui_action_tx, ui_action_rx) = flume::unbounded::<UiAction>();
+    let (ui_waker, ui_wake_rx) = UiWaker::new();
     let ui_attachment = UiAttachment::default();
     let ui_attachment_thread = ui_attachment.clone();
     let (command_writer, command_reader) = LuaCommandWriter::new();
@@ -3745,6 +3747,7 @@ pub fn spawn(
             ) {
                 Ok(r) => {
                     r.lua.set_app_data(key_lint_thread);
+                    r.lua.set_app_data(ui_waker);
                     let _ = init_tx.send(Ok(()));
                     r
                 }
@@ -4349,6 +4352,7 @@ pub fn spawn(
         keymap_reader,
         hint_reader,
         ui_action_rx,
+        ui_wake_rx,
         ui_attachment,
         key_lint,
     })

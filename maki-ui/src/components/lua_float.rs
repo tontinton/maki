@@ -7,6 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::split_layout::SplitReq;
@@ -20,6 +21,8 @@ use crate::theme;
 
 /// Blank rows kept between two windows of the same stack.
 const STACK_GAP: u16 = 1;
+/// Cells a border takes from a row, one at each end.
+const BORDER_CELLS: u16 = 2;
 
 /// A top band, a bottom band, and the scrollable middle. When the window is too
 /// short for both bands the bottom wins, so footers like keybind hints survive
@@ -738,11 +741,38 @@ fn effective_height(config: &FloatConfig, area: Rect, caret: Option<Position>) -
     let h = config.height.resolve(area.height).min(area.height);
     match caret {
         Some(caret) if config.anchor == Anchor::InputCaret => {
-            let w = config.width.resolve(area.width).min(area.width);
-            caret_rect(caret, w, h, area).0.height
+            caret_rect(caret, float_width(config, area), h, area)
+                .0
+                .height
         }
         _ => h,
     }
+}
+
+/// Widened to fit the title and footer. The footer is often the only place a
+/// popup lists its keys, and a key cut off there is one the user never learns.
+/// Doing it here also spares every plugin from measuring our footer layout.
+fn float_width(config: &FloatConfig, area: Rect) -> u16 {
+    config
+        .width
+        .resolve(area.width)
+        .max(chrome_width(config))
+        .min(area.width)
+}
+
+/// Title and footer are drawn on the border, so a borderless window has none.
+fn chrome_width(config: &FloatConfig) -> u16 {
+    if config.border == Border::None {
+        return 0;
+    }
+    let footer = match config.footer.is_empty() {
+        true => 0,
+        false => hint_footer(&config.footer).width(),
+    };
+    let widest = config.title.as_str().width().max(footer);
+    u16::try_from(widest)
+        .unwrap_or(u16::MAX)
+        .saturating_add(BORDER_CELLS)
 }
 
 /// Widened to `i32` before the shift: a column near `u16::MAX` plus a
@@ -773,7 +803,7 @@ fn resolve_rect(
     stack_offset: u16,
     caret: Option<Position>,
 ) -> Rect {
-    let w = config.width.resolve(area.width).min(area.width);
+    let w = float_width(config, area);
     let h = config.height.resolve(area.height).min(area.height);
     let (left, top) = (area.x, area.y);
     let (right, bottom) = (area.x + area.width, area.y + area.height);
@@ -1013,6 +1043,40 @@ mod tests {
         };
         mgr.open(make_buf(&[]), config, false, event_tx, cmd_rx);
         assert_eq!(mgr.needs_input(), visible);
+    }
+
+    const CHROME_AREA_HEIGHT: u16 = 40;
+    const NARROW_WIDTH: u16 = 10;
+    const LONG_TITLE: &str = "a title wider than the rows under it";
+
+    fn chrome_config(border: Border, title: &str, footer: &[(&str, &str)]) -> FloatConfig {
+        FloatConfig {
+            width: Dimension::Abs(NARROW_WIDTH),
+            height: Dimension::Abs(5),
+            border,
+            title: title.to_owned(),
+            footer: footer
+                .iter()
+                .map(|(key, desc)| ((*key).to_owned(), (*desc).to_owned()))
+                .collect(),
+            ..FloatConfig::default()
+        }
+    }
+
+    #[test_case(Border::Rounded, "", &[("Up/Down", "move"), ("Esc", "close")], 80 => 26 ; "widened_to_its_footer")]
+    #[test_case(Border::Rounded, LONG_TITLE, &[], 80 => 38 ; "widened_to_its_title")]
+    #[test_case(Border::Rounded, "", &[("Up/Down", "move"), ("Esc", "close")], 20 => 20 ; "the_screen_edge_still_cuts_it")]
+    #[test_case(Border::None, LONG_TITLE, &[("Esc", "close")], 80 => NARROW_WIDTH ; "borderless_draws_no_chrome")]
+    #[test_case(Border::Rounded, "", &[], 80 => NARROW_WIDTH ; "no_chrome_keeps_the_width_asked_for")]
+    fn a_float_fits_its_chrome(
+        border: Border,
+        title: &str,
+        footer: &[(&str, &str)],
+        screen_width: u16,
+    ) -> u16 {
+        let area = Rect::new(0, 0, screen_width, CHROME_AREA_HEIGHT);
+        let config = chrome_config(border, title, footer);
+        resolve_rect(&config, area, NO_STACK_OFFSET, NO_CARET).width
     }
 
     #[test]

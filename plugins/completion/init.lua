@@ -29,8 +29,8 @@ maki.api.create_autocmd("SessionReset", {
 
 -- Cycling to a subagent tab stays within the session, so nothing else here
 -- fires. The popup's keys are routed to it before the chat's own, so one left
--- open over a subagent takes `<Tab>` away from the mode toggle and lets `<CR>`
--- write a path into a tab the user is not looking at.
+-- open over a subagent takes `<Up>` away from the input history and lets
+-- `<CR>` write a path into a tab the user is not looking at.
 maki.api.create_autocmd("TaskFocusChanged", {
   callback = Menu.close,
 })

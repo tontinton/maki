@@ -1,6 +1,7 @@
 -- The `@` completion popup: what it shows, the keys it takes while it is up,
 -- and the edit that accepts a row.
 
+local ListPicker = require("maki.list_picker")
 local Trigger = require("trigger")
 
 local M = {}
@@ -11,8 +12,7 @@ local opts = maki.api.register_options({
 
 -- The keys the popup takes while it is on screen are declared with the
 -- handlers that answer them, further down: see {M.BINDINGS}.
-local FOOTER = { { "Tab/Shift+Tab", "move" }, { "Enter", "insert" }, { "Esc", "close" } }
-local MIN_WIDTH = 24
+local FOOTER = { { "↑/↓", "move" }, { "Enter", "insert" }, { "Esc", "close" } }
 -- Above the input box and the transcript, below anything modal.
 local ZINDEX = 120
 -- Cells the border costs, on both sides and on both ends.
@@ -48,6 +48,9 @@ local generation = 0
 -- Numbers the refreshes. Only the newest may paint, or the loser leaves the
 -- previous query's files on screen.
 local latest = 0
+-- The input the newest refresh was for. The rows on screen can be older than
+-- this, because the refresh for the last keystroke may still be ranking.
+local latest_input = nil
 -- The session's working tree, and the session it was read for. One read per
 -- popup rather than one per keystroke: `maki.session.read` is a round trip,
 -- and the tree cannot move under a popup that is up, because a `/cd` starts
@@ -144,7 +147,7 @@ function M.accept()
   local ok, err = maki.ui.input_edit({
     start = at.start,
     stop = at.st.cursor,
-    text = choice .. " ",
+    text = choice.path .. " ",
     version = at.st.version,
     session_id = at.st.session_id,
   })
@@ -171,9 +174,12 @@ end
 -- reports the press under, so `claim` is also the handler's key.
 --
 -- Public so the spec can press every binding the popup declares.
+--
+-- No `<Tab>` here. It toggles the mode, and it should do that whether a popup
+-- is up or not.
 M.BINDINGS = {
-  { claim = "<Tab>", run = next_row },
-  { claim = "<S-Tab>", run = prev_row },
+  { claim = "<Down>", run = next_row },
+  { claim = "<Up>", run = prev_row },
   { claim = "<C-n>", run = next_row },
   { claim = "<C-p>", run = prev_row },
   { claim = "<Esc>", run = M.close },
@@ -218,28 +224,34 @@ end
 -- The ranked paths, or the one placeholder row that stands in for them.
 local function rows()
   if #popup.items == 0 then
-    return { popup.scanning and SCANNING or NO_MATCHES }, true
+    return { { path = popup.scanning and SCANNING or NO_MATCHES, highlights = {} } }, true
   end
   return popup.items, false
 end
 
+-- Matches are drawn the way the `Ctrl+S` file picker draws them, so both
+-- lists read alike.
 function lines()
   local shown, empty = rows()
   local out = {}
   for i, item in ipairs(shown) do
-    local style = empty and "dim" or (i == popup.sel and "selected" or "item")
-    out[i] = { { " " .. item, style } }
+    local selected = not empty and i == popup.sel
+    local base = empty and "dim" or (selected and "selected" or "item")
+    local matched = selected and "match_selected" or "match"
+    out[i] = ListPicker.range_spans(item.path, item.highlights, base, matched)
+    table.insert(out[i], 1, { " ", base })
   end
   return out
 end
 
 -- Only the size. The caret anchor decides where the popup goes and the host
 -- redoes that every frame, so it follows the caret through wraps and resizes.
+-- The host already widens the window to fit its footer, so only rows count.
 local function render(size)
   local shown = rows()
-  local width = MIN_WIDTH
+  local width = 0
   for _, item in ipairs(shown) do
-    width = math.max(width, maki.ui.display_width(item) + PAD + BORDER)
+    width = math.max(width, maki.ui.display_width(item.path) + PAD + BORDER)
   end
   popup.buf:set_lines(lines())
   popup.win:set_config({ width = math.min(width, size.cols), height = #shown + BORDER })
@@ -254,7 +266,7 @@ local function ensure_popup()
   end
   local buf = maki.ui.buf()
   local win = maki.ui.open_win(buf, {
-    width = MIN_WIDTH,
+    width = PAD + BORDER,
     height = BORDER + 1,
     anchor = "input_caret",
     border = "rounded",
@@ -271,6 +283,19 @@ local function ensure_popup()
     items = {},
   }
   read_keys(popup)
+end
+
+-- Ranks again, later, whatever the user typed last by the time it runs.
+-- Keystrokes can queue up behind it, and ranking the snapshot it was asked for
+-- would cancel the ranking of the newest one and leave old rows up for good.
+-- A close in between wins, or an `<Esc>` pressed mid-scan would be undone.
+local function rerank()
+  local token = generation
+  maki.async.run(function()
+    if generation == token then
+      M.refresh(latest_input)
+    end
+  end)
 end
 
 -- Asks the index again once the walk behind a `scanning…` row lands.
@@ -323,10 +348,7 @@ local function watch_the_walk(token)
       if ev.data.root ~= popup.root then
         return
       end
-      -- The walk carries no input of its own, so the rows it fills in are the
-      -- ones the popup is already showing. Typing past them fires an
-      -- `InputChanged` that refreshes against the newer snapshot.
-      M.refresh_later(popup.st)
+      rerank()
     end,
   })
   return true
@@ -367,6 +389,7 @@ function M.refresh(st)
   local token = generation
   latest = latest + 1
   local mine = latest
+  latest_input = st
   -- True once this refresh has been overtaken, either by a newer keystroke or
   -- by a close.
   local function stale()
@@ -393,13 +416,9 @@ function M.refresh(st)
   -- with its own file picker, and only `limit` paths come back. A nil answer
   -- is a newer keystroke cancelling this call, which is how most refreshes
   -- end while the user types.
-  local found = maki.fs.fuzzy_files({ query = query, limit = opts.max_items, path = root })
+  local found = maki.fs.fuzzy_files({ query = query, limit = opts.max_items, path = root, highlights = true })
   if stale() or not found then
     return
-  end
-  local paths = {}
-  for i, item in ipairs(found.items) do
-    paths[i] = item.path
   end
 
   ensure_popup()
@@ -418,9 +437,9 @@ function M.refresh(st)
   -- so a keystroke that only drops candidates does not move the selection out
   -- from under the user.
   local was = popup.items[popup.sel]
-  popup.items, popup.sel = paths, 1
-  for i, path in ipairs(paths) do
-    if path == was then
+  popup.items, popup.sel = found.items, 1
+  for i, item in ipairs(found.items) do
+    if was and item.path == was.path then
       popup.sel = i
     end
   end
@@ -429,7 +448,7 @@ function M.refresh(st)
     return unwatch()
   end
   if watch_the_walk(token) then
-    M.refresh_later(st)
+    rerank()
   end
 end
 

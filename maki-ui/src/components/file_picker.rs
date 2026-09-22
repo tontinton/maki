@@ -10,7 +10,7 @@ use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Matcher, Nucleo};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tracing::warn;
@@ -630,10 +630,10 @@ fn build_highlighted_line<'a>(
     selected: bool,
     t: &'a theme::Theme,
 ) -> Line<'a> {
-    let base = if selected { t.item_selected } else { t.item };
-    let highlight = base
-        .fg(t.accent.fg.unwrap_or_default())
-        .add_modifier(Modifier::BOLD);
+    let (base, highlight) = match selected {
+        true => (t.item_selected, t.item_match_selected),
+        false => (t.item, t.item_match),
+    };
 
     let mut spans = vec![Span::styled(LABEL_INDENT, base)];
     let mut in_match = false;
