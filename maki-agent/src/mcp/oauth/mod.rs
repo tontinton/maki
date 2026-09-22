@@ -18,7 +18,9 @@ use tracing::{info, warn};
 use url::Url;
 
 use self::callback::{CallbackResult, CallbackServer};
-use self::discovery::parse_www_authenticate;
+use self::discovery::{
+    AuthServerMetadata, ResourceMetadata, WwwAuthenticateInfo, parse_www_authenticate,
+};
 use super::config::OauthClientConfig;
 use super::error::McpError;
 
@@ -78,20 +80,10 @@ pub async fn authenticate(
 
     let www_auth = www_authenticate.and_then(parse_www_authenticate);
 
-    let resource_meta =
-        discovery::discover_resource_metadata(&client, server_url, www_auth.as_ref())
+    let (resource_meta, auth_server) =
+        discover_auth_server_for(&client, server_url, www_auth.as_ref())
             .await
             .map_err(&wrap)?;
-
-    let auth_server_url = resource_meta
-        .authorization_servers
-        .first()
-        .cloned()
-        .unwrap_or_else(|| discovery::server_origin(server_url));
-
-    let auth_server = discovery::discover_auth_server(&client, &auth_server_url)
-        .await
-        .map_err(&wrap)?;
 
     if !auth_server.code_challenge_methods_supported.is_empty()
         && !auth_server
@@ -148,10 +140,11 @@ pub async fn authenticate(
         .map_err(|e| wrap(OAuthError::Other(format!("CSPRNG unavailable: {e}"))))?;
     let state = URL_SAFE_NO_PAD.encode(state_buf);
 
-    let scope = www_auth
-        .as_ref()
-        .and_then(|w| w.scope.clone())
-        .or_else(|| resource_meta.scopes_supported.as_ref().map(|s| s.join(" ")));
+    let scope = www_auth.as_ref().and_then(|w| w.scope.clone()).or_else(|| {
+        resource_meta
+            .and_then(|m| m.scopes_supported)
+            .map(|s| s.join(" "))
+    });
 
     let auth_url = build_authorization_url(
         &auth_server.authorization_endpoint,
@@ -262,9 +255,8 @@ pub async fn silent_refresh(
     let token_endpoint = match existing.token_endpoint.clone() {
         Some(pinned) => pinned,
         None => {
-            discover_auth_server_for(&client, server_url, None)
-                .await?
-                .token_endpoint
+            let (_, auth_server) = discover_auth_server_for(&client, server_url, None).await?;
+            auth_server.token_endpoint
         }
     };
 
@@ -292,15 +284,21 @@ pub async fn silent_refresh(
 async fn discover_auth_server_for(
     client: &HttpClient,
     server_url: &str,
-    www_auth: Option<&discovery::WwwAuthenticateInfo>,
-) -> Result<discovery::AuthServerMetadata, OAuthError> {
-    let resource_meta = discovery::discover_resource_metadata(client, server_url, www_auth).await?;
+    www_auth: Option<&WwwAuthenticateInfo>,
+) -> Result<(Option<ResourceMetadata>, AuthServerMetadata), OAuthError> {
+    // Some servers, like Atlassian's, never publish RFC 9728 resource metadata.
+    // Before 9728 the MCP server was its own auth server, so its origin is a
+    // good guess. If that guess is wrong too, the auth server lookup says so.
+    let resource_meta = discovery::discover_resource_metadata(client, server_url, www_auth)
+        .await
+        .inspect_err(|e| warn!(server_url, error = %e, "no resource metadata, trying server origin as auth server"))
+        .ok();
     let auth_server_url = resource_meta
-        .authorization_servers
-        .first()
-        .cloned()
+        .as_ref()
+        .and_then(|m| m.authorization_servers.first().cloned())
         .unwrap_or_else(|| discovery::server_origin(server_url));
-    discovery::discover_auth_server(client, &auth_server_url).await
+    let auth_server = discovery::discover_auth_server(client, &auth_server_url).await?;
+    Ok((resource_meta, auth_server))
 }
 
 async fn auth_timeout() -> Result<CallbackResult, String> {
