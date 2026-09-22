@@ -186,7 +186,7 @@ impl ModelPicker {
     fn preselect_current_model(&mut self) {
         if !self
             .picker
-            .select_item_by(|e| e.spec == self.current_spec && e.suffix().is_none())
+            .select_item_by(|e| e.spec == self.current_spec && e.suffix().is_some())
         {
             self.picker.select_item_by(|e| e.spec == self.current_spec);
         }
@@ -495,34 +495,26 @@ mod tests {
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
             matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
-            "current model should be preselected in its provider section",
+            "current model should be preselected in the Recent section",
         );
     }
 
     #[test]
-    fn reopen_preselects_current_model_in_provider_section() {
+    fn open_preselects_current_model_in_recent_section() {
         let models = test_models();
         let mut p = ModelPicker::new(models);
         p.set_recents(vec![
             "zai/glm-5".into(),
             "anthropic/claude-sonnet-4-20250514".into(),
         ]);
-        p.open("anthropic/claude-sonnet-4-20250514");
-        p.handle_key(key(KeyCode::Down));
-        let action = p.handle_key(key(KeyCode::Enter));
-        assert!(
-            matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
-            "selecting the provider entry should return its spec",
-        );
-
         p.open("zai/glm-5");
 
-        let entry = p.picker.selected_item().expect("selection on reopen");
+        let entry = p.picker.selected_item().expect("selection on open");
         assert_eq!(entry.spec, "zai/glm-5");
         assert_eq!(
             entry.section(),
-            Some("Z.AI"),
-            "selection should land on the provider entry, not the Recent copy",
+            Some("Recent"),
+            "selection should land on the Recent entry, not the provider copy",
         );
     }
 
@@ -535,6 +527,8 @@ mod tests {
             "anthropic/claude-sonnet-4-20250514".into(),
         ]);
         p.open("anthropic/claude-sonnet-4-20250514");
+        p.handle_key(key(KeyCode::Down));
+        p.handle_key(key(KeyCode::Down));
         p.handle_key(key(KeyCode::Down));
         p.handle_key(key(KeyCode::Char('!')));
 
@@ -550,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_after_collapse_anchors_to_provider_entry() {
+    fn refresh_after_collapse_keeps_selection_on_recent_entry() {
         let models = test_models();
         let mut p = ModelPicker::new(models.clone());
         p.set_recents(vec![
@@ -576,8 +570,8 @@ mod tests {
         assert_eq!(entry.spec, "anthropic/claude-sonnet-4-20250514");
         assert_eq!(
             entry.section(),
-            Some("Anthropic"),
-            "cursor should migrate to the provider entry once it arrives",
+            Some("Recent"),
+            "cursor should stay on the Recent entry when the provider list arrives",
         );
     }
 
