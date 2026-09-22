@@ -67,3 +67,18 @@ class Account(val id: Int) {
   local text, meta = idx_with_meta(src, "kotlin")
   helpers.assert_ranged_meta(text, meta, { "deposit", "withdraw" })
 end)
+
+case("kotlin_companion_object_members", function()
+  local src = [==[
+class SessionViewModel : ViewModel() {
+    fun start() {}
+    companion object {
+        private const val TAG = "Session"
+        fun create(): SessionViewModel = SessionViewModel()
+    }
+}
+]==]
+  local text, meta = idx_with_meta(src, "kotlin")
+  has(text, { "SessionViewModel", "start", "companion.private const val TAG", "companion.fun create()" })
+  helpers.assert_ranged_meta(text, meta, { "companion.fun create()" })
+end)

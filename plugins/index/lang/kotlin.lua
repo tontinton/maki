@@ -147,7 +147,11 @@ return function(U)
         if sub_body then
           local sub = class_members(sub_body, source)
           for _, m in ipairs(sub) do
-            members[#members + 1] = "companion." .. m
+            if type(m) == "table" then
+              members[#members + 1] = ranged("companion." .. m.body, m.range)
+            else
+              members[#members + 1] = "companion." .. m
+            end
           end
         end
       elseif ck == "enum_entry" then
