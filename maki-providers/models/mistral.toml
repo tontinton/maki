@@ -11,6 +11,15 @@ context_window = 262144
 pricing = { input = 1.5, output = 7.5, cache_write = 0.0, cache_read = 0.0 }
 
 [[model]]
+prefixes = ["zai-glm-latest", "zai-glm-5-3", "zai-glm-5"]
+tier = "strong"
+family = "glm"
+vision = false
+default = false
+context_window = 1000000
+pricing = { input = 1.4, output = 4.4, cache_write = 0.0, cache_read = 0.14 }
+
+[[model]]
 prefixes = ["glm-5-2", "zai-glm-5-2"]
 tier = "strong"
 family = "glm"
