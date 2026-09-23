@@ -135,6 +135,14 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
+        "The input caret uses `cursor` when the terminal has focus and \
+         `cursor_unfocused` when focus is lost. `cursor_unfocused` defaults \
+         to `cursor`, so themes only need it when the two should differ. \
+         Terminals that do not report focus events keep the focused caret.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
         "Themes use 24-bit colors by default, but not every terminal can show \
          them. Maki checks the environment, terminfo, and the terminal itself, \
          and when truecolor is missing it quietly falls back to the closest of \
