@@ -9,7 +9,7 @@ use crate::components::rewind_picker::RewindEntry;
 use maki_lua::SessionEndReason;
 use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionMeta, StoredSubagent};
+use maki_storage::sessions::{SessionMeta, StoredMode, StoredSubagent};
 
 use crate::{AppSession, OpenSession};
 
@@ -31,19 +31,25 @@ pub(super) struct Sent {
     pub at: Instant,
 }
 
-/// The one content check: `App::checkpoint` saves a session only when this
-/// holds, and the shutdown report reuses it to say which tabs were saved, so
-/// the report and the disk can never disagree.
+/// The one content check. `App::checkpoint` saves a session only when this
+/// holds, and the shutdown report asks the same question, so the report and the
+/// disk never disagree. A draft, a queue or plan mode used to count too, and
+/// every tab that had one showed up in the picker as another empty session.
 pub(crate) fn session_has_content(session: &AppSession) -> bool {
     !session.messages().is_empty()
-        || session.meta.input_draft.is_some()
-        || !session.meta.queued_messages.is_empty()
-        || session.meta.mode != Some(maki_storage::sessions::StoredMode::Build)
 }
 
 impl App {
-    pub(crate) fn has_content(&self) -> bool {
-        session_has_content(&self.state.session)
+    /// Stricter than `session_has_content`. A draft or plan mode is not worth a
+    /// file, but it is still worth keeping when the picker wants this tab for
+    /// another session.
+    pub(crate) fn is_blank(&self) -> bool {
+        let session = &self.state.session;
+        let meta = &session.meta;
+        !session_has_content(session)
+            && meta.input_draft.is_none()
+            && meta.queued_messages.is_empty()
+            && meta.mode == Some(StoredMode::Build)
     }
 
     /// The event loop runs this once per frame per session. It syncs whatever
@@ -71,14 +77,11 @@ impl App {
             self.state.token_usage,
         );
 
-        if !self.has_content() {
-            // A draft typed and then deleted is already on disk, and a file with
-            // nothing in it is a session the picker still offers to resume. Idle
-            // only: submitting empties the draft a frame before the agent mirrors
-            // the prompt back, and that gap is not an abandoned session.
+        if !session_has_content(&self.state.session) {
+            // A rewind to the first prompt empties a session already on disk,
+            // which the picker would otherwise still offer to resume.
             let id = self.state.session.id;
-            if self.status == Status::Idle && self.last_sent.take_if(|last| last.id == id).is_some()
-            {
+            if self.last_sent.take_if(|last| last.id == id).is_some() {
                 self.storage_writer
                     .delete(id, Some(self.state.claim.clone()), |_| {});
             }
@@ -180,7 +183,7 @@ impl App {
         self.chats.push(main);
         self.active_chat = 0;
         self.chat_index.clear();
-        self.status = super::Status::Idle;
+        self.status = Status::Idle;
         self.clear_exit_request();
         self.queue.clear();
         self.recoverable_queue.clear();

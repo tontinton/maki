@@ -1468,7 +1468,7 @@ impl<'t> EventLoop<'t> {
             .map_err(|e| format!("Failed to load session: {e}"))?;
         let (slot, reason) = self.slots.get_or_fallback(&open.session.model);
         let focused = &self.sessions[self.focused];
-        if SessionStatus::of(&focused.app) == SessionStatus::Idle && !focused.app.has_content() {
+        if SessionStatus::of(&focused.app) == SessionStatus::Idle && focused.app.is_blank() {
             let idx = self.focused;
             let history = self.sessions[idx]
                 .app

@@ -3429,45 +3429,24 @@ fn submit_exit_quits() {
 }
 
 #[test]
-fn session_has_content_covers_each_branch() {
-    let mut session = AppSession::new("test-model", "/tmp/test");
-    assert!(!session_has_content(&session));
-
-    session.meta.input_draft = Some("draft".into());
-    assert!(session_has_content(&session));
-    session.meta.input_draft = None;
-
-    session.meta.queued_messages = vec!["queued".into()];
-    assert!(session_has_content(&session));
-    session.meta.queued_messages.clear();
-
-    session.meta.mode = Some(StoredMode::Plan);
-    assert!(session_has_content(&session));
-    session.meta.mode = Some(StoredMode::Build);
-
-    session.push_message(Message::user("hello".into()));
-    assert!(session_has_content(&session));
-}
-
-#[test]
-fn checkpoint_syncs_ephemeral_content_into_meta() {
+fn a_tab_stays_blank_until_the_user_touches_it() {
     let mut app = test_app();
     app.checkpoint();
-    assert!(!session_has_content(&app.state.session));
+    assert!(app.is_blank());
 
     app.update(Msg::Key(key(KeyCode::Char('x'))));
     app.checkpoint();
-    assert!(session_has_content(&app.state.session));
+    assert!(!app.is_blank());
 
     app.update(Msg::Key(key(KeyCode::Backspace)));
     app.checkpoint();
     assert!(app.state.session.meta.input_draft.is_none());
-    assert!(!session_has_content(&app.state.session));
+    assert!(app.is_blank());
 
     app.update(Msg::Key(key(KeyCode::Tab)));
     app.checkpoint();
     assert_eq!(app.state.session.meta.mode, Some(StoredMode::Plan));
-    assert!(session_has_content(&app.state.session));
+    assert!(!app.is_blank());
 
     let mut queued = app_with_queued_message();
     queued.checkpoint();
@@ -3476,7 +3455,14 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
     assert!(session.meta.input_draft.is_none());
     assert_eq!(session.meta.mode, Some(StoredMode::Build));
     assert_eq!(session.meta.queued_messages, vec!["queued".to_string()]);
-    assert!(session_has_content(session));
+    assert!(!queued.is_blank());
+
+    let mut chatted = test_app();
+    chatted
+        .state
+        .session_mut()
+        .push_message(Message::user("hello".into()));
+    assert!(!chatted.is_blank());
 }
 
 #[test]
@@ -6691,23 +6677,21 @@ fn attach_live_history(app: &mut App, messages: Vec<Message>) -> maki_agent::His
     history
 }
 
-/// Types [`TYPED_DRAFT`] one key per frame and hands back the stamp of the
-/// write the first key caused. The soft delay never elapses, so every key after
-/// the first is still waiting when the caller looks.
-fn type_draft_leaving_last_key_waiting(app: &mut App) -> Sent {
-    let mut keys = TYPED_DRAFT.chars();
-    app.update(Msg::Key(key(KeyCode::Char(keys.next().unwrap()))));
+/// Saves a session with one message, then types [`TYPED_DRAFT`] one key per
+/// frame. The soft delay never runs out, so every key is still waiting when
+/// the caller looks. Hands back the stamp of the save.
+fn type_draft_into_saved_session(app: &mut App) -> Sent {
+    app.state
+        .session_mut()
+        .push_message(Message::user(LIVE_AGENT_TEXT.into()));
     app.checkpoint();
-    let first = app
-        .last_sent
-        .clone()
-        .expect("the first keystroke puts the session on disk");
+    let saved = app.last_sent.clone().expect("a message puts it on disk");
 
-    for c in keys {
+    for c in TYPED_DRAFT.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
         app.checkpoint_with(SOFT_DELAY_HELD);
     }
-    first
+    saved
 }
 
 /// Checkpointing mid-batch used to freeze the tools as failed forever. The
@@ -7020,23 +7004,22 @@ fn idle_checkpoint_changes_nothing() {
 }
 
 /// Issue #675: a crash between a keystroke and submit threw the draft away,
-/// because nothing was written until the turn ended. The first key lands within
-/// a frame now, and the keys behind it ride along on a later write rather than
-/// each costing an `fsync`.
+/// because nothing was written until the turn ended. Now the keys land once
+/// the soft delay is up, all in one write rather than one `fsync` each.
 #[test]
-fn first_draft_keystroke_lands_and_the_rest_coalesce() {
+fn draft_keystrokes_wait_and_land_in_one_write() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
-    let first = type_draft_leaving_last_key_waiting(&mut app);
+    let saved_stamp = type_draft_into_saved_session(&mut app);
     assert_eq!(
         app.last_sent.as_ref(),
-        Some(&first),
+        Some(&saved_stamp),
         "a keystroke on its own waits instead of costing a write",
     );
 
     app.checkpoint_with(Duration::ZERO);
     assert_ne!(
         app.last_sent.as_ref(),
-        Some(&first),
+        Some(&saved_stamp),
         "and lands once the delay is up"
     );
 
@@ -7044,13 +7027,12 @@ fn first_draft_keystroke_lands_and_the_rest_coalesce() {
     drain_writer(app, writer);
     let saved = AppSession::load(id, &dir).unwrap();
     assert_eq!(saved.meta.input_draft.as_deref(), Some(TYPED_DRAFT));
-    assert!(saved.messages().is_empty());
 }
 
 #[test]
 fn a_content_change_writes_the_waiting_draft_with_it() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
-    type_draft_leaving_last_key_waiting(&mut app);
+    type_draft_into_saved_session(&mut app);
 
     app.state
         .session_mut()
@@ -7060,14 +7042,14 @@ fn a_content_change_writes_the_waiting_draft_with_it() {
     let id = app.state.session.id;
     drain_writer(app, writer);
     let saved = AppSession::load(id, &dir).unwrap();
-    assert_eq!(saved.messages().len(), 1, "content never waits");
+    assert_eq!(saved.messages().len(), 2, "content never waits");
     assert_eq!(saved.meta.input_draft.as_deref(), Some(TYPED_DRAFT));
 }
 
 #[test]
 fn shutdown_writes_a_draft_that_is_still_waiting() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
-    type_draft_leaving_last_key_waiting(&mut app);
+    type_draft_into_saved_session(&mut app);
 
     app.checkpoint_now();
 
@@ -7077,37 +7059,32 @@ fn shutdown_writes_a_draft_that_is_still_waiting() {
     assert_eq!(saved.meta.input_draft.as_deref(), Some(TYPED_DRAFT));
 }
 
-/// Submitting empties the draft a frame before the agent mirrors the prompt
-/// back. Delete the session in that gap and the user loses the one they were
-/// just starting.
 #[test]
-fn submitting_the_draft_keeps_the_session_on_disk() {
+fn a_draft_in_plan_mode_is_not_saved_without_a_message() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
-    type_draft_leaving_last_key_waiting(&mut app);
-    let id = app.state.session.id;
-
-    app.update(Msg::Key(key(KeyCode::Enter)));
-    app.checkpoint();
-    assert!(!app.has_content(), "the submit window is what this covers");
+    for c in TYPED_DRAFT.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    app.checkpoint_now();
 
     drain_writer(app, writer);
-    assert!(AppSession::load(id, &dir).is_ok());
+    assert!(AppSession::list_all(&dir).unwrap().is_empty());
 }
 
-/// The draft put the session on disk, and deleting it leaves nothing worth
-/// keeping. Without the delete the file survives with the abandoned draft in
-/// it, and the picker offers an empty session to resume.
 #[test]
-fn deleting_the_draft_takes_the_session_off_disk() {
+fn rewinding_to_the_first_prompt_takes_the_session_off_disk() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
-    type_draft_leaving_last_key_waiting(&mut app);
+    let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
+    app.checkpoint();
     let id = app.state.session.id;
 
-    for _ in TYPED_DRAFT.chars() {
-        app.update(Msg::Key(key(KeyCode::Backspace)));
-    }
+    app.rewind_to(RewindEntry {
+        turn_index: 0,
+        prompt_preview: LIVE_AGENT_TEXT.into(),
+        prompt_text: LIVE_AGENT_TEXT.into(),
+    });
     app.checkpoint();
-    assert!(app.last_sent.is_none(), "nothing is on disk to stamp");
 
     drain_writer(app, writer);
     assert!(AppSession::load(id, &dir).is_err());
