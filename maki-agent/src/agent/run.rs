@@ -3,27 +3,30 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
 use maki_providers::provider::Provider;
 use maki_providers::{
-    ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
-    StopReason, StreamResponse,
+    ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, ImageSource, Message, Model, RequestOptions,
+    Role, StopReason, StreamResponse,
 };
 
-use super::compaction;
+use super::compaction::{self, CompactReason, CompactSteer};
 use super::history::{History, sanitize_cancelled_history};
+use super::hook::{AgentHooks, AgentSlot};
 use super::instructions::{CallInstructions, LoadedInstructions};
 use super::streaming::{StreamError, StreamRequest, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
+use crate::tools::hook::Verdict;
 use crate::tools::{Deadline, FileAccess, LocalTools, RequestTools, ToolAudience, ToolContext};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
-    ExtractedCommand, InterruptSource, RunLedger, SessionMailbox, TurnCompleteEvent,
+    ExtractedCommand, InputSource, InterruptSource, RunLedger, SessionMailbox, SteerKind,
+    TurnCompleteEvent,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
@@ -44,6 +47,14 @@ const RECENT_TOOL_WINDOW: usize = 5;
 const CANCELLED_TEXT_NOTE: &str = "[Response cut off by user cancel]";
 const INTERRUPT_NOTE: &str =
     "The user sent a new message while you were working. Address it and continue.";
+/// A layer that always answers "continue" would never let the run end, and
+/// the user would pay for every turn of it. So `agent.stop` gets this many in
+/// a row, and the count starts over whenever the user speaks.
+const MAX_STOP_CONTINUATIONS: u32 = 3;
+const FIELD_TEXT: &str = "text";
+const STOP_FINISHED: &str = "finished";
+const STOP_MAX_TOKENS: &str = "max_tokens";
+const EMPTIED_MESSAGE: &str = "A plugin emptied the message, so there was nothing to send.";
 
 pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
@@ -157,6 +168,7 @@ pub struct Agent<'h> {
     local_tools: LocalTools,
     model_policy: Arc<ModelPolicy>,
     model_sync: Option<(Arc<ArcSwap<ModelSlot>>, RunContextBuilder)>,
+    stop_continuations: u32,
 }
 
 impl<'h> Agent<'h> {
@@ -200,6 +212,7 @@ impl<'h> Agent<'h> {
             local_tools: LocalTools::default(),
             model_policy: params.model_policy,
             model_sync: None,
+            stop_continuations: 0,
         }
     }
 
@@ -256,18 +269,37 @@ impl<'h> Agent<'h> {
             mode,
             images,
             preamble,
+            earlier,
             thinking,
             fast,
             workflow,
             prompt: _,
+            source,
         } = input;
         self.rollback_len = self.history.len();
         self.carry_from = self.history.len();
-        self.push_input_context(preamble);
-        if !message.trim().is_empty() || !images.is_empty() {
-            self.history
-                .push(Message::user_with_images(message.clone(), images));
+        self.stop_continuations = 0;
+        // Each message of a burst is judged on its own, and one kept message is
+        // enough for the run to go on.
+        let burst = earlier
+            .into_iter()
+            .map(|e| (e.message, e.images, e.preamble))
+            .chain([(message, images, preamble)]);
+        let mut prompt = None;
+        for (message, images, preamble) in burst {
+            let kept = self
+                .filter_user_message(message, images.len(), source)
+                .await?
+                .map(|text| {
+                    prompt = Some(text.clone());
+                    Message::user_with_images(text, images)
+                });
+            self.land_input(preamble, kept);
         }
+        let Some(message) = prompt else {
+            self.emit_done(DoneReason::Dropped)?;
+            return Ok(DoneReason::Dropped);
+        };
         self.mode = mode;
         self.workflow = workflow;
         self.opts = RequestOptions { thinking, fast };
@@ -317,15 +349,32 @@ impl<'h> Agent<'h> {
         Ok(reason)
     }
 
-    fn push_input_context(&mut self, preamble: Vec<Message>) {
+    /// The preamble lands even when the message was dropped. It holds what the
+    /// user already ran (a `!cmd` result), and that is not a layer's to judge.
+    /// The mailbox waits for a kept message. Draining it for a dropped one
+    /// would bury its notes in a run that ends right away, and eat the wake
+    /// they would have caused.
+    fn land_input(&mut self, preamble: Vec<Message>, message: Option<Message>) {
         for message in preamble {
             self.history.push(message);
         }
+        let Some(message) = message else {
+            return;
+        };
         if let Some(mailbox) = &self.mailbox {
             for message in mailbox.drain() {
                 self.history.push(message);
             }
         }
+        if !message.content.is_empty() {
+            self.history.push(message);
+        }
+    }
+
+    fn turns_exhausted(&self) -> bool {
+        self.config
+            .max_turns
+            .is_some_and(|max| self.num_turns >= max)
     }
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
@@ -334,9 +383,7 @@ impl<'h> Agent<'h> {
             // would compact against the old window and then overflow the new
             // one.
             self.sync_model();
-            if let Some(max) = self.config.max_turns
-                && self.num_turns >= max
-            {
+            if self.turns_exhausted() {
                 return Ok(DoneReason::MaxTurns);
             }
             self.try_auto_compact().await?;
@@ -479,10 +526,124 @@ impl<'h> Agent<'h> {
         }
 
         if has_tools {
-            Ok(TurnOutcome::Continue)
-        } else {
-            Ok(TurnOutcome::Done(stop_reason.into()))
+            return Ok(TurnOutcome::Continue);
         }
+        let reason = stop_reason.into();
+        if self.keep_going(reason).await? {
+            return Ok(TurnOutcome::Continue);
+        }
+        Ok(TurnOutcome::Done(reason))
+    }
+
+    /// The session's own model and gauge, even when a compaction summarizes
+    /// with another model, because that is the run the layers are steering.
+    fn hooks(&self) -> AgentHooks<'_> {
+        AgentHooks {
+            registry: &self.registry,
+            session_id: self.session_id.as_ref(),
+            task_id: self.task_id.as_deref(),
+            model: &self.model,
+            cancel: &self.cancel,
+            context_size: self.gauge.size(),
+        }
+    }
+
+    /// `None` means a layer dropped the message. A rewrite is what history
+    /// keeps, and the frontend hears about it so the transcript can show the
+    /// two differ. A rewrite down to nothing counts as a drop, or the model
+    /// would be asked to answer a transcript with nothing new in it. Blank
+    /// text comes back empty, since providers refuse a whitespace-only block.
+    async fn filter_user_message(
+        &self,
+        message: String,
+        images: usize,
+        source: InputSource,
+    ) -> Result<Option<String>, AgentError> {
+        let blank = |text: &str| text.trim().is_empty();
+        if blank(&message) && images == 0 {
+            return Ok(Some(String::new()));
+        }
+        let verdict = self
+            .hooks()
+            .fire(
+                AgentSlot::UserMessage,
+                || json!({ FIELD_TEXT: message, "images": images, "source": source.as_str() }),
+            )
+            .await;
+        let dropped = |reason: String| {
+            info!(source = source.as_str(), %reason, "agent.user_message dropped the message");
+            self.steer(SteerKind::MessageDropped, reason).map(|()| None)
+        };
+        let text = match verdict {
+            Verdict::Replaced(value) => match value.get(FIELD_TEXT).and_then(Value::as_str) {
+                Some(text) if blank(text) && images == 0 => {
+                    return dropped(EMPTIED_MESSAGE.into());
+                }
+                Some(text) if text != message => {
+                    info!(
+                        source = source.as_str(),
+                        "agent.user_message rewrote the message"
+                    );
+                    self.steer(SteerKind::MessageRewritten, text.to_owned())?;
+                    text.to_owned()
+                }
+                _ => message,
+            },
+            Verdict::Denied(reason) => return dropped(reason),
+            Verdict::Unchanged | Verdict::Ask { .. } => message,
+        };
+        Ok(Some(if blank(&text) { String::new() } else { text }))
+    }
+
+    fn steer(&self, kind: SteerKind, text: String) -> Result<(), AgentError> {
+        self.event_tx.send(AgentEvent::Steered { kind, text })
+    }
+
+    /// True when a layer kept the run going, with its message now last in
+    /// history. A run out of turns is not asked, because its continuation
+    /// would just sit there unanswered.
+    async fn keep_going(&mut self, reason: DoneReason) -> Result<bool, AgentError> {
+        if self.stop_continuations >= MAX_STOP_CONTINUATIONS || self.turns_exhausted() {
+            return Ok(false);
+        }
+        let reason = match reason {
+            DoneReason::MaxTokens => STOP_MAX_TOKENS,
+            _ => STOP_FINISHED,
+        };
+        let last_message = self
+            .history
+            .as_slice()
+            .last()
+            .filter(|m| matches!(m.role, Role::Assistant))
+            .and_then(Message::first_text_content)
+            .unwrap_or_default();
+        let verdict = self
+            .hooks()
+            .fire(AgentSlot::Stop, || {
+                json!({
+                    "reason": reason,
+                    "last_message": last_message,
+                    "num_turns": self.num_turns,
+                })
+            })
+            .await;
+        if self.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        let Verdict::Replaced(value) = verdict else {
+            return Ok(false);
+        };
+        let Some(message) = compaction::continue_text(&value) else {
+            return Ok(false);
+        };
+        self.stop_continuations += 1;
+        info!(
+            continuations = self.stop_continuations,
+            "agent.stop kept the run going"
+        );
+        self.steer(SteerKind::Continued, message.to_owned())?;
+        self.history.push(Message::synthetic(message.to_owned()));
+        Ok(true)
     }
 
     /// The gauge is a chars/4 floor, so a prompt can overflow with the
@@ -500,7 +661,7 @@ impl<'h> Agent<'h> {
             context_size = self.gauge.size(),
             "prompt overflowed below the compaction threshold"
         );
-        self.compact_now().await?;
+        self.compact_now(CompactReason::Overflow).await?;
         Ok(TurnOutcome::Continue)
     }
 
@@ -648,31 +809,42 @@ impl<'h> Agent<'h> {
             return Ok(());
         }
         info!(context_size, "auto-compacting");
-        self.compact_now().await
+        self.compact_now(CompactReason::Auto).await
     }
 
-    async fn compact_now(&mut self) -> Result<(), AgentError> {
+    /// A layer may skip an automatic compaction to wait for a better moment,
+    /// but only until the provider itself refuses the prompt.
+    async fn compact_now(&mut self, reason: CompactReason) -> Result<(), AgentError> {
+        let Some(steer) =
+            compaction::steer_compaction(&self.hooks(), &self.config, reason, None).await
+        else {
+            return Ok(());
+        };
         self.event_tx.send(AgentEvent::AutoCompacting {
             context_size: self.gauge.size(),
             context_window: self.model.context_window,
         })?;
-        self.do_compact(None).await
+        self.do_compact(steer).await
     }
 
-    async fn do_compact(&mut self, instructions: Option<&str>) -> Result<(), AgentError> {
+    async fn do_compact(&mut self, steer: CompactSteer) -> Result<(), AgentError> {
         // Compaction replaces the whole transcript, so input no turn has
         // answered yet would be summarized away before the model ever saw it,
         // images and all. `carry_from` is where that input starts: the run's
         // own prompt, plus anything queued in since the last turn ended.
         let carry_len = self.history.len().saturating_sub(self.carry_from);
-        self.compact_and_bill(instructions, carry_len).await?;
+        self.compact_and_bill(steer.instructions.as_deref(), carry_len)
+            .await?;
         // An unanswered prompt says what to do next better than the generic
-        // nudge, so it stands in for it.
+        // nudge, so it stands in for it. A layer's own words still go in.
         if carry_len == 0 {
             self.history
                 .push(Message::synthetic(compaction::continue_message(
                     &self.config,
+                    steer.continue_text.as_deref(),
                 )));
+        } else if let Some(text) = steer.continue_text {
+            self.history.push(Message::synthetic(text));
         }
         Ok(())
     }
@@ -689,16 +861,25 @@ impl<'h> Agent<'h> {
             self.timeouts,
             &self.model_policy,
         );
-        let compaction_usage = compaction::compact_history(
+        // Built from the fields, not `self.hooks()`, which would borrow all of
+        // `self` while `history` is lent out mutably.
+        let hooks = AgentHooks {
+            registry: &self.registry,
+            session_id: self.session_id.as_ref(),
+            task_id: self.task_id.as_deref(),
+            model: &self.model,
+            cancel: &self.cancel,
+            context_size: context_size_before,
+        };
+        let (compaction_usage, summary) = compaction::compact_history(
             &*compact_provider,
             &compact_model,
             self.history,
             &self.event_tx,
-            &self.cancel,
+            &hooks,
             &self.config,
             instructions,
             carry_len,
-            self.session_id.as_ref(),
             self.timeouts.retry,
         )
         .await?;
@@ -725,6 +906,7 @@ impl<'h> Agent<'h> {
             context_size_before,
             context_size_after,
             context_window: self.model.context_window,
+            summary,
         })?;
         Ok(())
     }
@@ -736,38 +918,60 @@ impl<'h> Agent<'h> {
         let Some(cmd) = source.poll() else {
             return Ok(false);
         };
+        // True only when something new landed for the model. Going on without
+        // it would send the finished answer back as the last message.
         match cmd {
             // The burst lands as consecutive user messages, so one request
             // carries all of it.
             ExtractedCommand::Interrupt(inputs) => {
+                let mut kept_any = false;
                 for input in inputs {
                     self.event_tx.send(AgentEvent::QueueItemConsumed {
                         text: input.message.clone(),
                         images: input.images.clone(),
                     })?;
-                    self.push_input_context(input.preamble);
-                    self.mode = input.mode;
-                    let wrapped = format!(
-                        "<user-interrupt>\n{INTERRUPT_NOTE}\n\n{}\n</user-interrupt>",
-                        input.message
-                    );
-                    self.history.push(Message {
-                        display_text: Some(
-                            if input.message.is_empty() && !input.images.is_empty() {
-                                IMAGE_PLACEHOLDER.into()
-                            } else {
-                                input.message
-                            },
-                        ),
-                        ..Message::user_with_images(wrapped, input.images)
-                    });
+                    let kept = self
+                        .filter_user_message(input.message, input.images.len(), input.source)
+                        .await?;
+                    let message = kept.map(|text| interrupt_message(text, input.images));
+                    if message.is_some() {
+                        self.mode = input.mode;
+                        // The user spoke, so `agent.stop` gets its full
+                        // allowance back.
+                        self.stop_continuations = 0;
+                        kept_any = true;
+                    }
+                    self.land_input(input.preamble, message);
                 }
+                Ok(kept_any)
             }
             ExtractedCommand::Compact(instructions) => {
-                self.do_compact(instructions.as_deref()).await?;
+                let Some(steer) = compaction::steer_compaction(
+                    &self.hooks(),
+                    &self.config,
+                    CompactReason::Manual,
+                    instructions.as_deref(),
+                )
+                .await
+                else {
+                    return Ok(false);
+                };
+                self.do_compact(steer).await?;
+                Ok(true)
             }
         }
-        Ok(true)
+    }
+}
+
+fn interrupt_message(message: String, images: Vec<ImageSource>) -> Message {
+    let wrapped = format!("<user-interrupt>\n{INTERRUPT_NOTE}\n\n{message}\n</user-interrupt>");
+    Message {
+        display_text: Some(if message.is_empty() && !images.is_empty() {
+            IMAGE_PLACEHOLDER.into()
+        } else {
+            message
+        }),
+        ..Message::user_with_images(wrapped, images)
     }
 }
 
@@ -803,12 +1007,15 @@ mod tests {
     use serde_json::Value;
     use test_case::test_case;
 
+    use super::compaction::FIELD_CONTINUE;
     use super::*;
-    use crate::Envelope;
+    use crate::agent::hook::testing::{Seen, script};
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
+    use crate::{EarlierInput, Envelope};
 
     const QUEUED_MESSAGES: [&str; 3] = ["first", "second", "third"];
+    const RESPONSE_TEXT: &str = "response";
     const ONE_GAUGE_MSG: &str =
         "TurnComplete, Done, and the compaction trigger must read one context gauge";
 
@@ -929,7 +1136,7 @@ mod tests {
             message: Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Text {
-                    text: "response".into(),
+                    text: RESPONSE_TEXT.into(),
                 }],
                 ..Default::default()
             },
@@ -1021,10 +1228,12 @@ mod tests {
             mode: AgentMode::Build,
             images: Vec::new(),
             preamble: Vec::new(),
+            earlier: Vec::new(),
             thinking: Default::default(),
             fast: false,
             workflow: false,
             prompt: None,
+            source: InputSource::Tui,
         }
     }
 
@@ -1744,7 +1953,7 @@ mod tests {
             );
             agent.config.post_compaction_instructions = Some(POST.into());
             agent.carry_from = agent.history.len();
-            agent.do_compact(None).await.unwrap();
+            agent.do_compact(CompactSteer::default()).await.unwrap();
             drop(agent);
 
             let last = history.as_slice().last().unwrap();
@@ -1990,5 +2199,438 @@ mod tests {
             .expect("valid session id");
         agent.session_id = Some(session.clone());
         assert_eq!(agent.tool_context().session_id, Some(session));
+    }
+
+    fn answer_only(
+        slot: AgentSlot,
+        value: Value,
+    ) -> impl Fn(AgentSlot, &Value) -> Verdict + Send + Sync + 'static {
+        move |fired, _| {
+            if fired == slot {
+                Verdict::Replaced(value.clone())
+            } else {
+                Verdict::Unchanged
+            }
+        }
+    }
+
+    fn steers(events: &[Envelope]) -> Vec<(SteerKind, String)> {
+        events
+            .iter()
+            .filter_map(|e| match &e.event {
+                AgentEvent::Steered { kind, text } => Some((*kind, text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const REWRITTEN: &str = "hello, with the CI log attached";
+    const DROP_REASON: &str = "that prompt is on the blocklist";
+    const KEEP_GOING: &str = "The todo list still has open items.";
+    const BLOCKED: &str = "blocked";
+    const SHELL_RESULT: &str = "shell result";
+
+    fn drop_blocked(slot: AgentSlot, value: &Value) -> Verdict {
+        match slot {
+            AgentSlot::UserMessage if value[FIELD_TEXT] == BLOCKED => {
+                Verdict::Denied(DROP_REASON.into())
+            }
+            AgentSlot::CompactBefore => Verdict::Replaced(json!({ compaction::FIELD_SKIP: true })),
+            _ => Verdict::Unchanged,
+        }
+    }
+
+    #[test]
+    fn user_message_rewrite_is_what_the_model_sees() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            let seen = script(
+                &agent.registry,
+                answer_only(AgentSlot::UserMessage, json!({ FIELD_TEXT: REWRITTEN })),
+            );
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert_eq!(history.as_slice()[0].user_text(), Some(REWRITTEN));
+            let (slot, value) = seen.lock().unwrap()[0].clone();
+            assert_eq!(slot, AgentSlot::UserMessage);
+            assert_eq!(value["source"], InputSource::Tui.as_str());
+            assert_eq!(
+                steers(&drain_events(&event_rx)),
+                [(SteerKind::MessageRewritten, REWRITTEN.to_owned())]
+            );
+        });
+    }
+
+    /// The mock has no responses and panics on any request, so passing proves
+    /// the model never heard the message.
+    #[test_case(|_, _| Verdict::Denied(DROP_REASON.into()), DROP_REASON ; "denied")]
+    #[test_case(|_, _| Verdict::Replaced(json!({ FIELD_TEXT: " " })), EMPTIED_MESSAGE ; "rewritten_to_nothing")]
+    fn user_message_drop_ends_the_run_before_any_request(
+        answer: fn(AgentSlot, &Value) -> Verdict,
+        reason: &str,
+    ) {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            script(&agent.registry, answer);
+
+            let done = agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert_eq!(done, DoneReason::Dropped);
+            assert!(history.is_empty());
+            assert_eq!(
+                steers(&drain_events(&event_rx)),
+                [(SteerKind::MessageDropped, reason.to_owned())]
+            );
+        });
+    }
+
+    /// The mock holds one response, so a run that went on anyway would panic
+    /// on its second request.
+    #[test_case(ExtractedCommand::Interrupt(vec![AgentInput { message: BLOCKED.into(), ..default_input() }]) ; "dropped_interrupt")]
+    #[test_case(ExtractedCommand::Compact(None) ; "skipped_compact")]
+    fn queued_command_that_lands_nothing_ends_the_run(cmd: ExtractedCommand) {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            let mut agent = agent.with_interrupt_source(MockInterruptSource::new(vec![cmd]));
+            script(&agent.registry, drop_blocked);
+
+            let reason = agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert_eq!(reason, DoneReason::EndTurn);
+            assert!(matches!(
+                history.as_slice().last().unwrap().role,
+                Role::Assistant
+            ));
+        });
+    }
+
+    /// The shell result lands in every case, even when every message around
+    /// it is dropped. The user already ran that command, so it is not a layer's
+    /// call to make.
+    #[test_case(BLOCKED, "hello", &[SHELL_RESULT, "hello"], DoneReason::EndTurn ; "earlier_dropped")]
+    #[test_case("first", BLOCKED, &[SHELL_RESULT, "first"], DoneReason::EndTurn ; "last_dropped")]
+    #[test_case(BLOCKED, BLOCKED, &[SHELL_RESULT], DoneReason::Dropped ; "all_dropped")]
+    fn burst_filters_every_message(
+        first: &str,
+        last: &str,
+        expected: &[&str],
+        expected_reason: DoneReason,
+    ) {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            script(&agent.registry, drop_blocked);
+            let input = AgentInput {
+                message: last.into(),
+                earlier: vec![EarlierInput {
+                    message: first.into(),
+                    images: Vec::new(),
+                    preamble: vec![Message::observation(SHELL_RESULT.into())],
+                }],
+                ..default_input()
+            };
+
+            let reason = agent.run(input).await.unwrap();
+            drop(agent);
+
+            assert_eq!(reason, expected_reason);
+            let users: Vec<_> = history
+                .as_slice()
+                .iter()
+                .filter(|m| matches!(m.role, Role::User))
+                .filter_map(Message::user_text)
+                .collect();
+            assert_eq!(users, expected);
+        });
+    }
+
+    /// A layer that always says "continue" is exactly what both bounds are
+    /// for. The mock holds one turn past what the bound allows, so a missing
+    /// bound panics instead of looping.
+    #[test_case(None, MAX_STOP_CONTINUATIONS ; "capped_in_a_row")]
+    #[test_case(Some(1), 0 ; "not_asked_on_the_last_turn")]
+    fn stop_continuations_are_bounded(max_turns: Option<u32>, allowed: u32) {
+        smol::block_on(async {
+            let allowed = allowed as usize;
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(
+                    (0..=allowed)
+                        .map(|_| text_response(StopReason::EndTurn))
+                        .collect(),
+                ),
+                &mut history,
+            );
+            agent.config.max_turns = max_turns;
+            script(
+                &agent.registry,
+                answer_only(AgentSlot::Stop, json!({ FIELD_CONTINUE: KEEP_GOING })),
+            );
+
+            let reason = agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert_eq!(reason, DoneReason::EndTurn);
+            assert_continued(&drain_events(&event_rx), &history, allowed);
+        });
+    }
+
+    /// The user is told about every continuation and the model reads each one.
+    fn assert_continued(events: &[Envelope], history: &History, expected: usize) {
+        assert_eq!(steers(events).len(), expected);
+        let continued = history
+            .as_slice()
+            .iter()
+            .filter(|m| m.first_text_content() == Some(KEEP_GOING))
+            .count();
+        assert_eq!(continued, expected);
+    }
+
+    /// A slow stop layer is the widest window a cancel can land in after the
+    /// answer is done, and the frontend must still hear it was cancelled.
+    #[test]
+    fn cancel_during_stop_layer_reports_cancelled() {
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            let trigger = Mutex::new(Some(trigger));
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            let mut agent = agent.with_cancel(cancel);
+            script(&agent.registry, move |slot, _| {
+                if slot == AgentSlot::Stop
+                    && let Some(trigger) = trigger.lock().unwrap().take()
+                {
+                    trigger.cancel();
+                }
+                Verdict::Unchanged
+            });
+
+            let reason = agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert_eq!(reason, DoneReason::Cancelled);
+            assert_ends_with_cancel_marker(&history);
+        });
+    }
+
+    #[test]
+    fn stop_sees_the_last_answer() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            let seen = script(&agent.registry, |_, _| Verdict::Unchanged);
+
+            agent.run(default_input()).await.unwrap();
+
+            let seen = seen.lock().unwrap();
+            let (_, stop) = seen.iter().find(|(s, _)| *s == AgentSlot::Stop).unwrap();
+            assert_eq!(stop["reason"], STOP_FINISHED);
+            assert_eq!(stop["last_message"], RESPONSE_TEXT);
+            assert_eq!(stop["num_turns"], 1);
+        });
+    }
+
+    #[test_case(drop_blocked, CompactReason::Auto, false ; "auto_is_skipped")]
+    #[test_case(drop_blocked, CompactReason::Overflow, true ; "overflow_ignores_the_skip")]
+    #[test_case(|_, _| Verdict::Denied(DROP_REASON.into()), CompactReason::Auto, false ; "denied_auto_is_skipped")]
+    #[test_case(|_, _| Verdict::Denied(DROP_REASON.into()), CompactReason::Overflow, true ; "denied_overflow_still_compacts")]
+    fn compact_before_skip(
+        answer: fn(AgentSlot, &Value) -> Verdict,
+        reason: CompactReason,
+        compacts: bool,
+    ) {
+        smol::block_on(async {
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            script(&agent.registry, answer);
+
+            agent.compact_now(reason).await.unwrap();
+            drop(agent);
+
+            assert_eq!(
+                has_event(&drain_events(&event_rx), |e| matches!(
+                    e,
+                    AgentEvent::CompactionDone { .. }
+                )),
+                compacts
+            );
+        });
+    }
+
+    #[test]
+    fn compact_before_continue_joins_the_configured_one() {
+        smol::block_on(async {
+            const POST: &str = "Re-read plan.md";
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.config.post_compaction_instructions = Some(POST.into());
+            agent.carry_from = agent.history.len();
+            script(
+                &agent.registry,
+                answer_only(
+                    AgentSlot::CompactBefore,
+                    json!({ FIELD_CONTINUE: KEEP_GOING }),
+                ),
+            );
+
+            agent.compact_now(CompactReason::Auto).await.unwrap();
+            drop(agent);
+
+            let last = history
+                .as_slice()
+                .last()
+                .unwrap()
+                .first_text_content()
+                .unwrap();
+            assert!(last.contains(POST) && last.contains(KEEP_GOING), "{last}");
+        });
+    }
+
+    const CARRIED: &str = "answer this next";
+    const SUMMARY: &str = "We fixed the flaky test in run.rs";
+
+    /// The carried prompt already says what to do next, so the layer's words
+    /// follow it and the generic nudge stays out.
+    #[test]
+    fn compact_before_continue_follows_carried_input() {
+        smol::block_on(async {
+            let mut history = History::new(vec![
+                Message::user("go".into()),
+                Message::user(CARRIED.into()),
+            ]);
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.carry_from = 1;
+            script(
+                &agent.registry,
+                answer_only(
+                    AgentSlot::CompactBefore,
+                    json!({ FIELD_CONTINUE: KEEP_GOING }),
+                ),
+            );
+
+            agent.compact_now(CompactReason::Auto).await.unwrap();
+            drop(agent);
+
+            let tail: Vec<_> = history.as_slice()[2..]
+                .iter()
+                .map(Message::first_text_content)
+                .collect();
+            assert_eq!(tail, [Some(CARRIED), Some(KEEP_GOING)]);
+        });
+    }
+
+    #[test]
+    fn compaction_done_carries_the_summary() {
+        smol::block_on(async {
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![assistant_response(vec![ContentBlock::Text {
+                    text: SUMMARY.into(),
+                }])]),
+                &mut history,
+            );
+            agent.carry_from = agent.history.len();
+
+            agent.do_compact(CompactSteer::default()).await.unwrap();
+            drop(agent);
+
+            let summaries: Vec<_> = drain_events(&event_rx)
+                .into_iter()
+                .filter_map(|e| match e.event {
+                    AgentEvent::CompactionDone { summary, .. } => Some(summary),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(summaries, [SUMMARY]);
+        });
+    }
+
+    /// Lands its command once the stop layer has spent the allowance, keyed on
+    /// what the layer was asked rather than on how often the loop polls.
+    struct InterruptWhenSpent {
+        seen: Seen,
+        cmd: Mutex<Option<ExtractedCommand>>,
+    }
+
+    impl InterruptSource for InterruptWhenSpent {
+        fn poll(&self) -> Option<ExtractedCommand> {
+            let stops = self
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(slot, _)| *slot == AgentSlot::Stop)
+                .count();
+            (stops >= MAX_STOP_CONTINUATIONS as usize)
+                .then(|| self.cmd.lock().unwrap().take())
+                .flatten()
+        }
+    }
+
+    /// The mock holds exactly two allowances' worth of turns plus the one the
+    /// interrupt adds, so a missing reset ends the run early and a missing
+    /// bound panics on the request after.
+    #[test]
+    fn interrupt_restores_the_stop_allowance() {
+        smol::block_on(async {
+            let allowed = 2 * MAX_STOP_CONTINUATIONS as usize;
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(
+                MockProvider::new(
+                    (0..allowed + 2)
+                        .map(|_| text_response(StopReason::EndTurn))
+                        .collect(),
+                ),
+                &mut history,
+            );
+            let seen = script(
+                &agent.registry,
+                answer_only(AgentSlot::Stop, json!({ FIELD_CONTINUE: KEEP_GOING })),
+            );
+            let mut agent = agent.with_interrupt_source(Arc::new(InterruptWhenSpent {
+                seen,
+                cmd: Mutex::new(Some(ExtractedCommand::Interrupt(vec![AgentInput {
+                    message: QUEUED_INPUT.into(),
+                    ..default_input()
+                }]))),
+            }));
+
+            let reason = agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert_eq!(reason, DoneReason::EndTurn);
+            assert_continued(&drain_events(&event_rx), &history, allowed);
+        });
     }
 }

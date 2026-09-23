@@ -1,7 +1,9 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
 use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
+use maki_storage::id::MakiId;
 use maki_storage::sessions::next_epoch;
 use tracing::warn;
 
@@ -10,6 +12,28 @@ pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 
 pub type HistorySnapshot = maki_storage::sessions::HistorySnapshot<Message>;
 pub type SharedMessages = Arc<ArcSwap<HistorySnapshot>>;
+
+/// Weak, so a session that ends takes its transcript with it. The dead entries
+/// it leaves behind get swept on the next publish.
+static LIVE_HISTORIES: LazyLock<Mutex<HashMap<MakiId, Weak<ArcSwap<HistorySnapshot>>>>> =
+    LazyLock::new(Mutex::default);
+
+/// A second publish for the same id wins, which is what a reloaded tab wants.
+pub fn publish_live_history(session: MakiId, mirror: &SharedMessages) {
+    let mut live = LIVE_HISTORIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    live.retain(|_, mirror| mirror.strong_count() > 0);
+    live.insert(session, Arc::downgrade(mirror));
+}
+
+pub fn live_history(session: MakiId) -> Option<Arc<Vec<Message>>> {
+    let live = LIVE_HISTORIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mirror = live.get(&session)?.upgrade()?;
+    Some(Arc::clone(&mirror.load().messages))
+}
 
 pub struct History {
     /// The value the mirror publishes, held whole so the two can never

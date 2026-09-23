@@ -10,8 +10,9 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use maki_agent::{AgentInput, AgentMode, ExtractedCommand, ImageSource, InterruptSource};
-use maki_providers::Message;
+use maki_agent::{
+    AgentInput, AgentMode, EarlierInput, ExtractedCommand, ImageSource, InterruptSource,
+};
 
 use crate::components::input::Submission;
 use crate::components::queue_panel::QueueEntry;
@@ -64,8 +65,10 @@ impl QueuedInput {
             message: _,
             images: _,
             preamble: _,
+            earlier: _,
             thinking: _,
             fast: _,
+            source: _,
         } = &self.input;
         prompt.is_none().then(|| (mode.clone(), *workflow))
     }
@@ -276,23 +279,20 @@ impl InterruptSource for QueueReceiver {
 /// Folds a run of queued messages into one agent input. The last message
 /// drives the run and the earlier ones ride in front of it as their own user
 /// messages, so each keeps its images and the model answers the burst in one
-/// request. The run shares one mode and one workflow by construction, so only
-/// the preferences (thinking, fast) come from the last message, the user's
-/// most recent intent.
+/// request. They stay messages rather than preamble, so `agent.user_message`
+/// gets to judge every one. The run shares one mode and one workflow by
+/// construction, so only the preferences (thinking, fast) come from the last
+/// message, the user's most recent intent.
 pub(crate) fn merge_inputs(mut inputs: Vec<AgentInput>) -> Option<AgentInput> {
     let mut last = inputs.pop()?;
-    let mut preamble = Vec::new();
-    for earlier in inputs {
-        preamble.extend(earlier.preamble);
-        let message = Message::user_with_images(earlier.message, earlier.images);
-        // An input with neither text nor images would become a user message
-        // with no content at all, which providers reject.
-        if !message.content.is_empty() {
-            preamble.push(message);
-        }
-    }
-    preamble.append(&mut last.preamble);
-    last.preamble = preamble;
+    last.earlier = inputs
+        .into_iter()
+        .map(|earlier| EarlierInput {
+            message: earlier.message,
+            images: earlier.images,
+            preamble: earlier.preamble,
+        })
+        .collect();
     Some(last)
 }
 
@@ -302,7 +302,7 @@ mod tests {
     use std::sync::Barrier;
     use std::thread;
 
-    use maki_agent::{ImageMediaType, McpPromptRef};
+    use maki_agent::{ImageMediaType, InputSource, McpPromptRef};
 
     use super::*;
     use test_case::test_case;
@@ -314,8 +314,6 @@ mod tests {
     const PLAN_PATH: &str = "plan.md";
     const NOT_AN_INTERRUPT: &str = "expected an interrupt carrying the queued messages";
     const GUIDANCE: &str = "keep the failing test names";
-    /// One image block plus one text block.
-    const BLOCKS_PER_MESSAGE: usize = 2;
 
     fn input(message: &str) -> AgentInput {
         AgentInput {
@@ -323,10 +321,12 @@ mod tests {
             mode: Default::default(),
             images: Vec::new(),
             preamble: Vec::new(),
+            earlier: Vec::new(),
             thinking: Default::default(),
             fast: false,
             workflow: false,
             prompt: None,
+            source: InputSource::Tui,
         }
     }
 
@@ -482,7 +482,7 @@ mod tests {
     }
 
     #[test_case(&[FIRST] ; "single_message_stays_alone")]
-    #[test_case(&[FIRST, SECOND, THIRD] ; "earlier_messages_ride_in_the_preamble")]
+    #[test_case(&[FIRST, SECOND, THIRD] ; "earlier_messages_stay_messages")]
     fn merge_inputs_keeps_every_message_with_its_own_image(texts: &[&str]) {
         let inputs = texts
             .iter()
@@ -497,15 +497,13 @@ mod tests {
         let (last, earlier) = texts.split_last().unwrap();
         assert_eq!(merged.message, *last);
         assert_eq!(merged.images.len(), 1);
-        let preamble: Vec<_> = merged
-            .preamble
+        assert!(merged.preamble.is_empty());
+        let kept: Vec<_> = merged
+            .earlier
             .iter()
-            .map(|m| (m.user_text(), m.content.len()))
+            .map(|e| (e.message.as_str(), e.images.len()))
             .collect();
-        let expected: Vec<_> = earlier
-            .iter()
-            .map(|text| (Some(*text), BLOCKS_PER_MESSAGE))
-            .collect();
-        assert_eq!(preamble, expected);
+        let expected: Vec<_> = earlier.iter().map(|text| (*text, 1)).collect();
+        assert_eq!(kept, expected);
     }
 }

@@ -668,6 +668,29 @@ impl PermissionManager {
         }
     }
 
+    /// For a call a plugin escalated. Allow rules, defaults and yolo all turn
+    /// into a question for the user. Only a deny still answers on its own, so
+    /// escalating can make a call harder to run but never easier.
+    fn check_escalated(
+        &self,
+        tool: &ToolKey,
+        scopes: &[&str],
+        plan_path: Option<&Path>,
+    ) -> PermissionCheck {
+        match self.check_inner(tool, scopes, true, plan_path) {
+            PermissionCheck::Denied => PermissionCheck::Denied,
+            PermissionCheck::Allowed | PermissionCheck::NeedsPrompt { .. } => {
+                PermissionCheck::NeedsPrompt {
+                    tool: tool.clone(),
+                    scopes: scopes.iter().map(|s| s.to_string()).collect(),
+                    force_prompt: true,
+                }
+            }
+        }
+    }
+
+    /// `ask` is a plugin's reason to show this call to the user whatever the
+    /// rules say. See [`Self::check_escalated`].
     #[allow(clippy::too_many_arguments)]
     pub async fn enforce(
         &self,
@@ -678,7 +701,12 @@ impl PermissionManager {
         request_id: &str,
         cancel: &crate::CancelToken,
         plan_path: Option<&Path>,
+        ask: Option<&str>,
     ) -> Result<(), PermissionError> {
+        let check = |tool: &ToolKey, scopes: &[&str], force_prompt: bool| match ask {
+            Some(_) => self.check_escalated(tool, scopes, plan_path),
+            None => self.check_inner(tool, scopes, force_prompt, plan_path),
+        };
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
         let tool_string = tool.to_string();
         let scope_display = || scopes.scopes.join("; ");
@@ -703,16 +731,15 @@ impl PermissionManager {
             }
         };
 
-        let (pt, ps, force_prompt) =
-            match self.check_inner(tool, &scope_refs, scopes.force_prompt, plan_path) {
-                PermissionCheck::Allowed => return allowed(by_rule()),
-                PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
-                PermissionCheck::NeedsPrompt {
-                    tool,
-                    scopes,
-                    force_prompt,
-                } => (tool, scopes, force_prompt),
-            };
+        let (pt, ps, force_prompt) = match check(tool, &scope_refs, scopes.force_prompt) {
+            PermissionCheck::Allowed => return allowed(by_rule()),
+            PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
+            PermissionCheck::NeedsPrompt {
+                tool,
+                scopes,
+                force_prompt,
+            } => (tool, scopes, force_prompt),
+        };
 
         let Some(rx) = user_response_rx else {
             warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
@@ -721,7 +748,7 @@ impl PermissionManager {
 
         let guard = rx.lock().await;
         let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
-        let (t2, s2) = match self.check_inner(&pt, &refs, force_prompt, plan_path) {
+        let (t2, s2) = match check(&pt, &refs, force_prompt) {
             PermissionCheck::Allowed => return allowed(by_rule()),
             PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
             PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
@@ -731,6 +758,7 @@ impl PermissionManager {
             id: request_id.to_owned(),
             tool: t2.clone(),
             scopes: s2.clone(),
+            reason: ask.map(str::to_owned),
         });
         // Only the answer naming this ask may be applied. Anything else is a
         // leftover from a cancelled or reassigned ask, so it is dropped and the

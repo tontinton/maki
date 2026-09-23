@@ -35,6 +35,7 @@ fn tool_images_survive_snapshot_rebuilds(loaded: bool) {
     panel.image_picker = None;
     rebuild(&mut panel);
     panel.tool_done(ToolDoneEvent {
+        call: None,
         output: Arc::new(ToolOutput::Image {
             source: source.clone(),
             text: CAPTION.into(),
@@ -128,6 +129,7 @@ fn panel_with_tools(ids: &[(&str, &'static str)]) -> MessagesPanel {
 
 fn done(id: &str) -> ToolDoneEvent {
     ToolDoneEvent {
+        call: None,
         id: id.into(),
         tool: BASH_TOOL_NAME.into(),
         output: Arc::new(ToolOutput::Plain("output".into())),
@@ -150,6 +152,7 @@ fn finish_with_live_buf(
     ev.raw_input = Some(serde_json::json!({ "command": "true" }));
     panel.tool_start(ev);
     panel.tool_done(ToolDoneEvent {
+        call: None,
         is_error,
         ..done(id)
     });
@@ -162,6 +165,7 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", "bash"));
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "bash".into(),
         output: Arc::new(ToolOutput::Plain("output".into())),
@@ -191,6 +195,7 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", tool));
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: tool.into(),
         output: Arc::new(output),
@@ -209,6 +214,7 @@ fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
     event.annotation = Some("2m timeout".into());
     panel.tool_start(event);
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
         output: Arc::new(ToolOutput::Plain(output.into())),
@@ -235,6 +241,7 @@ fn tool_done_grep_shows_matches() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", GREP_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: GREP_TOOL_NAME.into(),
         output: Arc::new(grep_output(2)),
@@ -337,6 +344,7 @@ fn unknown_tool_id_is_noop() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_output("ghost", "data");
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "orphan".into(),
         tool: "bash".into(),
         output: Arc::new(ToolOutput::Plain("output".into())),
@@ -366,6 +374,7 @@ fn in_progress_tracking() {
     assert_eq!(panel.in_progress_count(), 2);
 
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "bash".into(),
         output: Arc::new(ToolOutput::Plain("ok".into())),
@@ -376,6 +385,7 @@ fn in_progress_tracking() {
     assert_eq!(panel.in_progress_count(), 1);
 
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t2".into(),
         tool: "read".into(),
         output: Arc::new(ToolOutput::Plain("ok".into())),
@@ -443,6 +453,7 @@ fn events_before_cache_built_render_correctly() {
     let mut panel = panel_with_tools(&[("t1", "bash"), ("t2", "bash")]);
     panel.tool_output("t1", "early output");
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t2".into(),
         tool: "bash".into(),
         output: Arc::new(ToolOutput::Plain("result".into())),
@@ -482,6 +493,7 @@ fn bash_live_output_with_code_input() {
     assert!(seg_text(&panel, "t1").contains("streaming"));
 
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
         output: Arc::new(ToolOutput::Plain("done".into())),
@@ -499,6 +511,7 @@ fn bash_live_output_with_code_input() {
 fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
     let mut panel = panel_with_tools(&[("t1", "bash"), ("t2", "read")]);
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "bash".into(),
         output: Arc::new(ToolOutput::Plain("ok".into())),
@@ -589,6 +602,7 @@ fn tick_drains_the_highlight_worker() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", "read"));
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "read".into(),
         output: Arc::new(ToolOutput::ReadCode {
@@ -639,6 +653,7 @@ fn tool_done_after_cancel_in_progress_does_not_underflow() {
     assert_eq!(panel.in_progress_count(), 0);
 
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "bash".into(),
         output: Arc::new(ToolOutput::Plain("late".into())),
@@ -684,6 +699,7 @@ fn search_text_grep_result_includes_structured_output() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", "grep"));
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "grep".into(),
         output: Arc::new(grep_output(2)),
@@ -701,6 +717,7 @@ fn search_text_diff_output_includes_hunks() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", "edit"));
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "edit".into(),
         output: Arc::new(ToolOutput::Diff {
@@ -723,6 +740,7 @@ fn search_text_bash_with_code_input() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     bash_code_start(&mut panel, "t1", "echo hello");
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
         output: Arc::new(ToolOutput::Plain("hello".into())),
@@ -747,6 +765,7 @@ fn search_text_instruction_segment_indexes_its_own_blocks() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", "read"));
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "read".into(),
         output: Arc::new(read_code_with_instructions(vec![InstructionBlock {
@@ -1156,6 +1175,7 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
         render_header: None,
     });
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
         output: Arc::new(ToolOutput::Plain(body.into())),
@@ -1250,6 +1270,7 @@ fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
         render_header: None,
     });
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: GREP_TOOL_NAME.into(),
         output: Arc::new(ToolOutput::GrepResult { entries }),
@@ -1321,6 +1342,7 @@ fn search_text_includes_truncated_bash_output() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     bash_code_start(&mut panel, "t1", "echo lines");
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
         output: Arc::new(ToolOutput::Plain(full_output.clone().into())),
@@ -1356,6 +1378,7 @@ fn prev_segment_is_spacer(panel: &MessagesPanel, tool_id: &str) -> bool {
 
 fn done_with_instructions(id: &str) -> ToolDoneEvent {
     ToolDoneEvent {
+        call: None,
         id: id.into(),
         tool: "read".into(),
         output: Arc::new(read_code_with_instructions(instruction_blocks())),
@@ -1433,6 +1456,7 @@ fn instruction_segment_has_spacer_before_it() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", "read"));
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "read".into(),
         output: Arc::new(read_code_with_instructions(instruction_blocks())),
@@ -1466,6 +1490,7 @@ fn toggle_instruction_segment_expands_and_collapses() {
     }];
     panel.tool_start(start("t1", "read"));
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "read".into(),
         output: Arc::new(read_code_with_instructions(blocks)),
@@ -1498,6 +1523,7 @@ fn handle_click_on_done_tool_records_click_row() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
         output: Arc::new(ToolOutput::Plain("output".into())),
@@ -1559,6 +1585,7 @@ fn tool_done_removes_live_buf_and_snapshots_dirty() {
     panel.register_live_buf("t1".into(), Arc::clone(&buf));
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
         output: Arc::new(ToolOutput::Plain("output".into())),
@@ -1869,6 +1896,7 @@ fn tool_done_without_live_buf_preserves_existing_snapshot() {
         None,
     );
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
         output: Arc::new(ToolOutput::Plain("output".into())),
@@ -1892,6 +1920,7 @@ fn tool_done_clean_live_buf_does_not_snapshot() {
     panel.register_live_buf("t1".into(), Arc::clone(&buf));
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
         output: Arc::new(ToolOutput::Plain("output".into())),
@@ -1918,6 +1947,7 @@ fn bash_tool_with_snapshot(id: &str) -> MessagesPanel {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start(id, BASH_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: id.into(),
         tool: BASH_TOOL_NAME.into(),
         output: Arc::new(ToolOutput::Plain("output".into())),
@@ -2481,6 +2511,7 @@ fn resize_reflows_tool_segment_and_keeps_instruction_segment() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", "read"));
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "read".into(),
         output: Arc::new(read_code_with_instructions(instruction_blocks())),
@@ -2662,6 +2693,7 @@ fn theme_switch_repaints_highlighted_code() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", "read"));
     panel.tool_done(ToolDoneEvent {
+        call: None,
         id: "t1".into(),
         tool: "read".into(),
         output: Arc::new(ToolOutput::ReadCode {

@@ -19,7 +19,9 @@ use maki_agent::headless::{self, HeadlessHandle, HeadlessParams};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
-use maki_agent::{AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig};
+use maki_agent::{
+    AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig, SteerKind,
+};
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_lua::{EventHandle, SessionEndReason};
@@ -316,6 +318,12 @@ pub fn run(params: PrintParams) -> Result<()> {
             | AgentEvent::Nudge
             | AgentEvent::PromptProgress { .. }
             | AgentEvent::StreamClosed => {}
+            AgentEvent::Steered { .. } => {
+                if let Some(reason) = dropped_prompt(event, parent_tool_use_id) {
+                    is_error = true;
+                    result_text = reason.to_owned();
+                }
+            }
             AgentEvent::Retry {
                 attempt,
                 message,
@@ -422,10 +430,41 @@ pub fn run(params: PrintParams) -> Result<()> {
     Ok(())
 }
 
+/// Nothing reached the model, so the reason is the only answer there is. A
+/// script checking the exit status should see that the prompt never ran.
+fn dropped_prompt<'a>(event: &'a AgentEvent, parent_tool_use_id: Option<&str>) -> Option<&'a str> {
+    match event {
+        AgentEvent::Steered {
+            kind: SteerKind::MessageDropped,
+            text,
+        } if parent_tool_use_id.is_none() => Some(text),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use maki_providers::TokenUsage;
+    use test_case::test_case;
+
+    const DROP_REASON: &str = "blocked by a plugin";
+    const PARENT_TOOL_USE_ID: &str = "toolu_parent";
+
+    #[test_case(SteerKind::MessageDropped, None, Some(DROP_REASON) ; "top_level_drop_is_the_result")]
+    #[test_case(SteerKind::MessageDropped, Some(PARENT_TOOL_USE_ID), None ; "subagent_drop_is_ignored")]
+    #[test_case(SteerKind::MessageRewritten, None, None ; "other_steers_are_ignored")]
+    fn dropped_prompt_only_counts_a_top_level_drop(
+        kind: SteerKind,
+        parent: Option<&str>,
+        expected: Option<&str>,
+    ) {
+        let event = AgentEvent::Steered {
+            kind,
+            text: DROP_REASON.into(),
+        };
+        assert_eq!(dropped_prompt(&event, parent), expected);
+    }
 
     const PRINT_RESULT_FIELDS: &[&str] = &[
         "type",

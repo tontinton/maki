@@ -1,12 +1,15 @@
 //! The one vocabulary every driver uses to talk about a persisted session.
 
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use maki_providers::{ContextGauge, Message, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::{SAVE_FAILED, Session, SessionClaim, SessionError};
 use tracing::warn;
 
-use crate::agent::History;
+use crate::agent::{History, HistorySnapshot, SharedMessages, publish_live_history};
 use crate::tools::RequestTools;
 use crate::types::EventSender;
 use crate::{AgentRunParams, ToolOutput};
@@ -83,10 +86,15 @@ impl SessionTrack {
     ///
     /// Takes the claim by value, so nobody else can write the session for as
     /// long as this track can.
+    ///
+    /// Publishes the transcript under the session's id, so
+    /// `maki.session.messages` works under a headless driver too.
     pub fn open(resumed: Resumed, claim: SessionClaim, storage: StateDir, cwd: &str) -> Self {
+        let mirror: SharedMessages = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+        publish_live_history(resumed.id.id(), &mirror);
         Self {
             store: SessionStore::open(storage, claim, resumed.session, cwd),
-            history: History::restored(resumed.history),
+            history: History::restored(resumed.history).with_mirror(mirror),
             gauge: ContextGauge::restored(resumed.context_size),
         }
     }
@@ -207,6 +215,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::agent::live_history;
 
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const CWD: &str = "/project";
@@ -455,5 +464,33 @@ mod tests {
         assert_eq!(loaded.model, OTHER_SPEC);
         assert_eq!(loaded.title, TITLE);
         assert_eq!(loaded.meta.plan_path.as_deref(), Some(PLAN_PATH));
+    }
+
+    /// `maki.session.messages` under a headless driver reads what the track
+    /// publishes, so the restored transcript and every turn after it have to
+    /// be there, and gone once the run ends. The id is minted so no other test
+    /// holding the shared one can publish over it.
+    #[test]
+    fn open_publishes_the_live_transcript_until_dropped() {
+        let tmp = TempDir::new().unwrap();
+        let id = MakiId::generate();
+        let resumed = Resumed {
+            history: vec![Message::user(PROMPT.into())],
+            ..Resumed::empty(SessionRef::from(id))
+        };
+        let claim = SessionClaim::acquire(id, &state_dir(&tmp)).expect("nothing else holds it");
+        let mut track = SessionTrack::open(resumed, claim, state_dir(&tmp), CWD);
+
+        let restored = live_history(id).expect("an open track is live");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].user_text(), Some(PROMPT));
+
+        push_prompt(&mut track, MODEL_SPEC, OBSERVATION);
+        let pushed = live_history(id).expect("an open track is live");
+        assert_eq!(pushed.len(), 2);
+        assert_eq!(pushed[1].user_text(), Some(OBSERVATION));
+
+        drop(track);
+        assert!(live_history(id).is_none());
     }
 }

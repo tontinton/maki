@@ -18,9 +18,13 @@ use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions};
 /// Slot names the host fires itself. A plugin declaring one would shadow a
 /// point whose firing order dispatch guarantees, so the namespace is closed.
 pub(crate) const HOST_PREFIX: &str = "tool.";
-/// The other closed namespace: built-in surfaces a plugin layers to take over.
+/// The other closed namespaces: built-in surfaces a plugin layers to take
+/// over, and the points the agent loop fires itself.
 pub(crate) const UI_PREFIX: &str = "ui.";
-const HOST_PREFIXES: [&str; 2] = [HOST_PREFIX, UI_PREFIX];
+pub(crate) const AGENT_PREFIX: &str = "agent.";
+const HOST_PREFIXES: [&str; 3] = [HOST_PREFIX, UI_PREFIX, AGENT_PREFIX];
+/// `tool.*.input` wraps every call, whichever tool it names.
+pub(crate) const ANY_TOOL: &str = "*";
 
 /// Fired when the agent finishes writing a plan. The default opens the
 /// built-in plan form, so a layer that answers `false` owns the surface for
@@ -106,7 +110,7 @@ impl SlotStore {
             if let Some((tool, stage)) = host_slot_target(name) {
                 stages[stage as usize].insert(Arc::from(tool));
             }
-            if name.starts_with(UI_PREFIX) {
+            if name.starts_with(UI_PREFIX) || name.starts_with(AGENT_PREFIX) {
                 surfaces.insert(Arc::from(name.as_str()));
             }
         }
@@ -127,15 +131,18 @@ type StageSets = [HashSet<Arc<str>>; HookStage::ALL.len()];
 #[derive(Default)]
 pub struct LayeredTools {
     stages: ArcSwap<StageSets>,
-    /// The `ui.` slots with at least one layer. The UI reads this before it
-    /// asks a chain anything, so a stock install draws its built-in surface
-    /// in the same frame instead of waiting on a roundtrip.
+    /// The `ui.` and `agent.` slots with at least one layer. The UI reads this
+    /// before it asks a chain anything, so a stock install draws its built-in
+    /// surface in the same frame instead of waiting on a roundtrip. The agent
+    /// loop reads it too, so it never leaves its thread for a slot nobody
+    /// wrapped.
     surfaces: ArcSwap<HashSet<Arc<str>>>,
 }
 
 impl LayeredTools {
     pub fn wraps(&self, tool: &str, stage: HookStage) -> bool {
-        self.stages.load()[stage as usize].contains(tool)
+        let layered = &self.stages.load()[stage as usize];
+        layered.contains(tool) || layered.contains(ANY_TOOL)
     }
 
     /// Whether any plugin is layering the host surface {slot}.
@@ -403,13 +410,17 @@ pub(crate) fn host_slot_target(slot: &str) -> Option<(&str, HookStage)> {
 /// `None` means nothing ran, which the identity default handing back `args`
 /// would not say: the caller has to leave the value alone rather than report a
 /// rewrite.
+///
+/// Several `names` run as one chain, innermost first. `[tool.bash.input,
+/// tool.*.input]` puts every wildcard layer outside every `bash` one, so an
+/// override written for one tool always has the last word on it.
 pub(crate) async fn run_host_chain(
     lua: &Lua,
-    name: &str,
+    names: &[&str],
     args: MultiValue,
     allow_layer: &dyn Fn(&str) -> bool,
 ) -> LuaResult<Option<MultiValue>> {
-    run_host_chain_with(lua, name, identity_default(lua)?, args, allow_layer, None).await
+    run_host_chain_with(lua, names, identity_default(lua)?, args, allow_layer, None).await
 }
 
 /// [`run_host_chain`] with a default of the host's choosing, for a slot whose
@@ -419,24 +430,25 @@ pub(crate) async fn run_host_chain(
 /// apart from the layer that produced it.
 pub(crate) async fn run_host_chain_with(
     lua: &Lua,
-    name: &str,
+    names: &[&str],
     default: Function,
     args: MultiValue,
     allow_layer: &dyn Fn(&str) -> bool,
     observe: Option<ChainObserver>,
 ) -> LuaResult<Option<MultiValue>> {
-    let Some((_, _, _, layers)) = snapshot(lua, name) else {
+    let [inner, ..] = names else {
         return Ok(None);
     };
-    let layers: Arc<[SlotLayer]> = layers
+    let layers: Arc<[SlotLayer]> = names
         .iter()
+        .filter_map(|name| snapshot(lua, name))
+        .flat_map(|(_, _, _, layers)| layers.to_vec())
         .filter(|layer| allow_layer(&layer.plugin))
-        .cloned()
         .collect();
     if layers.is_empty() {
         return Ok(None);
     }
-    run_chain(lua, Arc::from(name), default, layers, args, observe)
+    run_chain(lua, Arc::from(*inner), default, layers, args, observe)
         .await
         .map(Some)
 }
@@ -485,8 +497,8 @@ fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
 /// own plugin holds.
 ///
 /// Throws if another plugin already owns a slot with the same {name}, or
-/// if {name} starts with `"tool."` or `"ui."`, which the host fires itself.
-/// The name stays yours across an unload: nobody else can take it over, or
+/// if {name} starts with `"tool."`, `"ui."`, or `"agent."`, which the host
+/// fires itself. The name stays yours across an unload: nobody else can take it over, or
 /// re-declare it cheaper, while maki runs.
 ///
 /// The chain is async: the default and every layer may park (`maki.fs.*`,
@@ -613,8 +625,15 @@ fn parse_slot_capability(
 /// permissions look at the call, and `tool.<name>.output` on the text it
 /// produced. Both take `function(prev, value, ctx)` and answer with a
 /// table to replace the value, nothing to leave it alone, or
-/// `nil, reason` to stop the call. Wrapping one costs the capability the
-/// tool declares, and a tool declaring none costs every permission. See
+/// `nil, reason` to stop the call. An input layer can also answer
+/// `value, { ask = reason }` to make the user approve the call. Name the
+/// tool `*` (`tool.*.input`) to wrap every tool. Wrapping one costs the
+/// capability the tool declares, and a tool declaring none costs every
+/// permission.
+///
+/// The agent loop fires `agent.user_message`, `agent.stop`,
+/// `agent.compact.before`, and `agent.compact.prepare`, with the same
+/// contract. Wrapping one costs every permission. See
 /// [Hooks](/docs/hooks/).
 ///
 /// Wrapping a slot another plugin declared steers a chain that plugin's

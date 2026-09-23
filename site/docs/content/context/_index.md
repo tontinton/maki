@@ -102,6 +102,8 @@ maki.setup({
 
 On a large repository the first index walk takes a moment. The popup shows `scanning…` and fills in when the walk finishes. If the walk has not reported back after a few seconds, it shows `no matches`. Other options are under `plugins.completion` in [configuration](/docs/configuration/).
 
+Plugins can add their own entries to the popup, such as issues after `#` or people after `@`. See [completion sources](/docs/hooks/#completion-sources).
+
 ## When the window fills
 
 Long sessions eventually approach the model's context limit. Maki reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/compact keep the repro steps` steers that one summary, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers every summary.

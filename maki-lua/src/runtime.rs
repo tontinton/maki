@@ -125,6 +125,7 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 /// tool's rendered output.
 const RESTORE_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
 const TURN_END_EVENT: &str = "TurnEnd";
+const ASK_FIELD: &str = "ask";
 /// Cap on the last delivery pass a scope makes before it reaps its jobs. A job
 /// printing faster than we deliver always has another event queued, so an
 /// unbounded pass would never reach the reap.
@@ -288,7 +289,8 @@ enum PluginLoad<'a> {
 
 /// One firing of a host-owned slot, as the call being filtered described it.
 pub(crate) struct HookRun {
-    pub slot: String,
+    /// Innermost first, run as one chain. See [`run_host_chain`].
+    pub slots: Vec<String>,
     pub authority: Authority,
     /// The filtered call's own cancellation and window. The chain runs on the
     /// Lua thread, so without them nothing here knows when the caller stopped
@@ -379,9 +381,9 @@ pub enum Request {
         input: Value,
         reply: flume::Sender<Option<PermissionScopes>>,
     },
-    /// A host-owned slot chain (`tool.<name>.input`, `tool.<name>.output`).
-    /// Only sent when the slot has layers, so the idle case never reaches the
-    /// request loop at all.
+    /// A host-owned slot chain (`tool.<name>.input`, `tool.<name>.output`,
+    /// `agent.*`). Only sent when the slot has layers, so the idle case never
+    /// reaches the request loop at all.
     RunHook {
         run: HookRun,
         reply: flume::Sender<Verdict>,
@@ -2188,6 +2190,10 @@ impl LuaRuntime {
         lua.set_app_data(SlotStore::new(Arc::clone(&layered)));
         registry.set_hook(crate::hook::SlotHook {
             tx: tx.clone(),
+            layered: Arc::clone(&layered),
+        });
+        registry.set_agent_hook(crate::hook::SlotHook {
+            tx: tx.clone(),
             layered,
         });
         lua.set_app_data(KeymapStore::new());
@@ -3285,7 +3291,7 @@ async fn plan_form_opens(
     args: MultiValue,
 ) -> bool {
     let allow_layer = layer_delegation(plugins, PLAN_FORM_AUTHORITY, PLAN_FORM_SLOT);
-    let chain = run_host_chain(lua, PLAN_FORM_SLOT, args, &allow_layer);
+    let chain = run_host_chain(lua, &[PLAN_FORM_SLOT], args, &allow_layer);
     match run_awaited(lua, gate, CancelToken::none(), deadline, chain).await {
         // `None` is "nothing layered it", so there is nobody else to draw it.
         Ok(Ok(None)) => true,
@@ -3345,7 +3351,7 @@ async fn plan_form_rows(
             Ok(default) => {
                 let chain = run_host_chain_with(
                     lua,
-                    PLAN_FORM_ACTIONS_SLOT,
+                    &[PLAN_FORM_ACTIONS_SLOT],
                     default,
                     args,
                     &allow_layer,
@@ -3445,7 +3451,9 @@ async fn open_plan_form(
 
 /// Fires a host-owned chain and reads back the one contract every host slot
 /// shares: a table replaces the value, `nil` leaves it alone, and
-/// `nil, reason` stops the call with a reason the model reads.
+/// `nil, reason` stops the call with a reason the model reads. A second value
+/// of `{ ask = reason }` instead escalates the call to the user, with or
+/// without a rewrite in front of it.
 ///
 /// Every failure below is a pass-through, because a layer is an opinion about a
 /// call and never a precondition for making it.
@@ -3460,20 +3468,23 @@ async fn run_hook(
     run: HookRun,
 ) -> Verdict {
     let HookRun {
-        slot,
+        slots,
         authority,
         cancel,
         deadline,
         value,
         call,
     } = run;
-    let slot = slot.as_str();
+    let names: Vec<&str> = slots.iter().map(String::as_str).collect();
+    let Some(&slot) = names.first() else {
+        return Verdict::Unchanged;
+    };
     let args = match (json_to_lua(lua, &value), json_to_lua(lua, &call)) {
         (Ok(value), Ok(call)) => MultiValue::from_vec(vec![value, call]),
         _ => return Verdict::Unchanged,
     };
     let allow_layer = layer_delegation(plugins, authority, slot);
-    let chain = run_host_chain(lua, slot, args, &allow_layer);
+    let chain = run_host_chain(lua, &names, args, &allow_layer);
     let returned = match run_awaited(lua, gate, cancel, deadline, chain).await {
         Ok(Ok(Some(values))) => values,
         Ok(Ok(None)) => return Verdict::Unchanged,
@@ -3488,31 +3499,47 @@ async fn run_hook(
     };
 
     let mut returned = returned.into_iter();
-    match returned.next() {
+    let first = returned.next();
+    let ask = match returned.next() {
+        Some(LuaValue::Table(second)) => match second.get::<Option<String>>(ASK_FIELD) {
+            Ok(reason) => reason,
+            Err(e) => {
+                tracing::warn!(slot, error = %e, "slot answered `ask` with something other than a string");
+                None
+            }
+        },
+        Some(LuaValue::String(reason)) if matches!(first, None | Some(LuaValue::Nil)) => {
+            return Verdict::Denied(reason.to_string_lossy());
+        }
+        _ => None,
+    };
+    let replaced = match first {
         Some(table @ LuaValue::Table(_)) => match lua_to_json_within(lua, &table, &value) {
             // The identity default hands back the value it was given, so a
             // layer that only deferred returns a table too. Comparing is the
             // only way to tell that apart from a rewrite, and it keeps the
             // original `Value` in play instead of a re-encode of it.
-            Ok(replacement) if replacement == value => Verdict::Unchanged,
-            Ok(replacement) => Verdict::Replaced(replacement),
+            Ok(replacement) if replacement == value => None,
+            Ok(replacement) => Some(replacement),
             Err(e) => {
                 tracing::warn!(slot, error = %strip_traceback(&e), "slot returned a table that is not json");
-                Verdict::Unchanged
+                None
             }
         },
-        None | Some(LuaValue::Nil) => match returned.next() {
-            Some(LuaValue::String(reason)) => Verdict::Denied(reason.to_string_lossy()),
-            _ => Verdict::Unchanged,
-        },
+        None | Some(LuaValue::Nil) => None,
         Some(other) => {
             tracing::warn!(
                 slot,
                 returned = other.type_name(),
                 "slot must return a table, nil, or nil plus a reason"
             );
-            Verdict::Unchanged
+            None
         }
+    };
+    match (ask, replaced) {
+        (Some(reason), input) => Verdict::Ask { reason, input },
+        (None, Some(replacement)) => Verdict::Replaced(replacement),
+        (None, None) => Verdict::Unchanged,
     }
 }
 

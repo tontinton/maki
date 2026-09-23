@@ -1,7 +1,8 @@
--- The `@` completion popup: what it shows, the keys it takes while it is up,
+-- The completion popup: what it shows, the keys it takes while it is up,
 -- and the edit that accepts a row.
 
 local ListPicker = require("maki.list_picker")
+local Sources = require("sources")
 local Trigger = require("trigger")
 
 local M = {}
@@ -32,13 +33,30 @@ local TEARDOWN_FAILED = "completion: teardown step failed: "
 -- ceiling of indexed roots. Enter is the key that pays for the wait, so the
 -- bound is one pause the user can sit through rather than a dead key.
 local SCAN_WAIT_MS = 3000
+-- Rows fill in as answers land, so this is not a delay. It only bounds how
+-- long a source that never answers can keep `scanning…` up and hold Enter.
+-- Past it, that source's rows from the keystroke before are dropped, so they
+-- cannot pass for current.
+local SOURCE_WAIT_MS = 1000
 -- The user pressed Enter on a row and got nothing. Saying so beats leaving
 -- them looking at a popup that did not answer the key it advertised.
 local EDIT_REFUSED = "completion: the path was not inserted: "
 
+-- `{ win, buf, sel, view }`. A view is what one refresh drew: the input
+-- snapshot, the mention, the rows, and what is still on its way. Every row
+-- keeps the snapshot it was ranked for, also when a later view carries it
+-- over, so an accept never writes one keystroke's row over another
+-- keystroke's range.
 local popup = nil
 -- Declared up here because the key handlers below redraw with it.
 local lines
+
+-- Rows may still be on their way: the files are ranking, the walk behind
+-- them has not landed, or a source has not answered. An empty list then means
+-- "not looked yet", so it reads `scanning…` and Enter waits.
+local function scanning(view)
+  return view.ranking or view.walking or next(view.waiting) ~= nil
+end
 -- The `FileIndexReady` subscription while a popup waits on a walk, nil the
 -- rest of the time.
 local index_sub = nil
@@ -60,7 +78,7 @@ local cwd = nil
 
 -- The session the popup belongs to, or nil when there is no popup.
 function M.session_id()
-  return popup and popup.st.session_id
+  return popup and popup.view.st.session_id
 end
 
 -- Stops listening for the walk. Safe when nothing is listening.
@@ -104,7 +122,7 @@ local function move(delta)
   if not popup then
     return
   end
-  local n = #popup.items
+  local n = #popup.view.items
   if n > 0 then
     popup.sel = (popup.sel - 1 + delta) % n + 1
     popup.buf:set_lines(lines())
@@ -113,8 +131,8 @@ end
 
 -- Insert the highlighted row over the mention it was ranked for.
 --
--- The range, the version and the session all came with the snapshot the
--- refresh drew from, and writing that range back is the same edit the user
+-- The range, the version and the session all came with the snapshot the row
+-- was ranked for, and writing that range back is the same edit the user
 -- pressed Enter on. Nothing is re-read: `maki.ui.input_edit` weighs that
 -- snapshot itself and refuses an edit the input has moved past, which is where
 -- staleness belongs.
@@ -124,32 +142,32 @@ end
 --
 -- With no row to insert, Enter closes the popup and nothing else. The user's
 -- next Enter sends the message, which is the standard behaviour and needs no
--- agreement with the host about who holds the key. Not while the walk is still
--- running, though: there is no row yet because nothing has looked, and closing
--- on the press the user made to pick one would take the popup down a moment
--- before its rows arrive. That wait is bounded by {SCAN_WAIT_MS}, after which
--- the rows are all there is going to be and Enter closes the popup the way it
--- does on an empty list.
+-- agreement with the host about who holds the key. Not while {scanning},
+-- though: there is no row yet because nothing has looked, and closing on the
+-- press the user made to pick one would take the popup down a moment before
+-- its rows arrive. That wait is bounded by {SCAN_WAIT_MS} and
+-- {SOURCE_WAIT_MS}, after which the rows are all there is going to be and
+-- Enter closes the popup the way it does on an empty list.
 --
 -- A refusal is still the end of the key, but not of the user's question: they
 -- pressed Enter on a row and the path is not there. The host knows why, so
 -- pass its answer on instead of dropping it.
 function M.accept()
-  local at = popup
-  local choice = at and at.items[at.sel]
+  local view = popup and popup.view
+  local choice = view and view.items[popup.sel]
   if not choice then
-    if at and at.scanning then
+    if view and scanning(view) then
       return
     end
     return M.close()
   end
   M.close()
   local ok, err = maki.ui.input_edit({
-    start = at.start,
-    stop = at.st.cursor,
-    text = choice.path .. " ",
-    version = at.st.version,
-    session_id = at.st.session_id,
+    start = view.start,
+    stop = choice.st.cursor,
+    text = choice.insert .. " ",
+    version = choice.st.version,
+    session_id = choice.st.session_id,
   })
   if not ok then
     maki.ui.flash(EDIT_REFUSED .. tostring(err))
@@ -221,12 +239,13 @@ local function read_keys(mine)
   end)
 end
 
--- The ranked paths, or the one placeholder row that stands in for them.
+-- The ranked rows, or the one placeholder row that stands in for them.
 local function rows()
-  if #popup.items == 0 then
-    return { { path = popup.scanning and SCANNING or NO_MATCHES, highlights = {} } }, true
+  local view = popup.view
+  if #view.items == 0 then
+    return { { label = scanning(view) and SCANNING or NO_MATCHES, highlights = {} } }, true
   end
-  return popup.items, false
+  return view.items, false
 end
 
 -- Matches are drawn the way the `Ctrl+S` file picker draws them, so both
@@ -238,7 +257,7 @@ function lines()
     local selected = not empty and i == popup.sel
     local base = empty and "dim" or (selected and "selected" or "item")
     local matched = selected and "match_selected" or "match"
-    out[i] = ListPicker.range_spans(item.path, item.highlights, base, matched)
+    out[i] = ListPicker.range_spans(item.label, item.highlights, base, matched)
     table.insert(out[i], 1, { " ", base })
   end
   return out
@@ -251,7 +270,7 @@ local function render(size)
   local shown = rows()
   local width = 0
   for _, item in ipairs(shown) do
-    width = math.max(width, maki.ui.display_width(item.path) + PAD + BORDER)
+    width = math.max(width, maki.ui.display_width(item.label) + PAD + BORDER)
   end
   popup.buf:set_lines(lines())
   popup.win:set_config({ width = math.min(width, size.cols), height = #shown + BORDER })
@@ -259,7 +278,7 @@ local function render(size)
 end
 
 -- Opened hidden, so the first frame never paints an empty popup before the
--- files it is for have been read.
+-- rows it is for have arrived.
 local function ensure_popup()
   if popup then
     return
@@ -280,7 +299,6 @@ local function ensure_popup()
     win = win,
     buf = buf,
     sel = 1,
-    items = {},
   }
   read_keys(popup)
 end
@@ -324,18 +342,24 @@ local function watch_the_walk(token)
   if index_sub then
     return false
   end
+  local sub
   maki.defer_fn(function()
-    if generation ~= token or not popup or not popup.scanning then
+    -- A newer wait took over, or this one already ended. Either way there is
+    -- nothing left for this deadline to guard.
+    if index_sub ~= sub then
+      return
+    end
+    unwatch()
+    if generation ~= token or not popup or not popup.view.walking then
       return
     end
     -- Nothing is coming. What is on screen is every row there is, so the popup
     -- stops saying otherwise and hands Enter the same answer an empty list
     -- gives it.
-    popup.scanning = false
-    unwatch()
+    popup.view.walking = false
     render(maki.ui.terminal_size())
   end, SCAN_WAIT_MS)
-  index_sub = maki.api.create_autocmd("FileIndexReady", {
+  sub = maki.api.create_autocmd("FileIndexReady", {
     callback = function(ev)
       -- A close, a newer popup or a session switch can land between the walk
       -- ending and this, and each of them owns the popup more than the walk
@@ -345,12 +369,13 @@ local function watch_the_walk(token)
       end
       -- Another tree's walk says nothing about these rows, and the walk this
       -- popup is waiting on has still not landed.
-      if ev.data.root ~= popup.root then
+      if ev.data.root ~= popup.view.root then
         return
       end
       rerank()
     end,
   })
+  index_sub = sub
   return true
 end
 
@@ -377,6 +402,106 @@ function M.refresh_later(st)
   end)
 end
 
+-- The popup opens here and nowhere else, so it never shows up before it has
+-- something to say.
+--
+-- The highlight stays on its row while that row is still listed, so a
+-- keystroke that only drops candidates, or a source answering late, does not
+-- move the selection out from under the user.
+local function paint(view)
+  ensure_popup()
+  local was = popup.view and popup.view.items[popup.sel]
+  view.items = Sources.merge(view.files, view.answers, view.order, opts.max_items)
+  popup.view, popup.sel = view, 1
+  for i, item in ipairs(view.items) do
+    if was and item.insert == was.insert then
+      popup.sel = i
+    end
+  end
+  render(maki.ui.terminal_size())
+end
+
+-- Stamps {rows} with the snapshot they answer. See {popup}.
+local function ranked_for(rows, st)
+  for _, row in ipairs(rows) do
+    row.st = st
+  end
+  return rows
+end
+
+-- Rows drawn for the same mention a keystroke ago stay up until this one's
+-- answers replace them, so the popup narrows instead of blinking empty on
+-- every key. A different mention starts from nothing, because the old rows
+-- would answer a question nobody is asking any more.
+--
+-- `ranking` starts true for `@`, because a source can answer and paint before
+-- the files are ranked. Also returns whether the old rows were carried over.
+local function new_view(st, start, trigger, asked)
+  local prior = popup and popup.view
+  local same = prior and prior.trigger == trigger and prior.start == start
+  local view = {
+    st = st,
+    start = start,
+    trigger = trigger,
+    ranking = trigger == Trigger.FILES,
+    files = same and prior.files or {},
+    walking = same and prior.walking or false,
+    root = same and prior.root or nil,
+    answers = {},
+    order = {},
+    waiting = {},
+    items = {},
+  }
+  for i, source in ipairs(asked) do
+    view.order[i] = source.name
+    view.waiting[source.name] = true
+    view.answers[source.name] = same and prior.answers[source.name] or nil
+  end
+  return view, same
+end
+
+-- Asks every source at once and paints each answer as it lands. A newer
+-- keystroke, a close or the deadline stops the waiting, and from then on a
+-- late answer is ignored. `ctx.cancelled()` lets a source that cares notice
+-- and stop early.
+local function ask_sources(view, asked, query, root, stale)
+  if #asked == 0 then
+    return
+  end
+  for _, source in ipairs(asked) do
+    local name = source.name
+    local function awaited()
+      return not stale() and view.waiting[name] ~= nil
+    end
+    local ctx = {
+      trigger = view.trigger,
+      session_id = view.st.session_id,
+      cwd = root,
+      cancelled = function()
+        return not awaited()
+      end,
+    }
+    Sources.ask(source, query, ctx, function(rows)
+      if not awaited() then
+        return
+      end
+      view.waiting[name] = nil
+      view.answers[name] = ranked_for(rows, view.st)
+      paint(view)
+    end)
+  end
+  maki.defer_fn(function()
+    if stale() or not next(view.waiting) then
+      return
+    end
+    for name in pairs(view.waiting) do
+      view.answers[name] = nil
+    end
+    view.waiting = {}
+    paint(view)
+  end, SOURCE_WAIT_MS)
+end
+
 -- The one place that decides whether there should be a popup at all, and what
 -- is in it.
 --
@@ -396,7 +521,13 @@ function M.refresh(st)
     return generation ~= token or latest ~= mine
   end
 
-  local start, query = Trigger.find(st.text, st.cursor)
+  -- Gathered on every keystroke rather than kept, so a plugin loaded or
+  -- unloaded mid-session counts from the very next key.
+  local sources = Sources.collect()
+  if stale() then
+    return
+  end
+  local start, query, trigger = Trigger.find(st.text, st.cursor, Trigger.FILES .. Sources.triggers(sources))
   -- A slash command owns the input while the command palette is up, so there
   -- is no mention to complete in one. The palette's keys are the host's to
   -- route, above every claim, so this is about the rows and not about them.
@@ -412,39 +543,52 @@ function M.refresh(st)
     return M.close()
   end
 
+  local asked = Sources.for_trigger(sources, trigger)
+  local view, same = new_view(st, start, trigger, asked)
+  -- Asked before the files are ranked, so the two run side by side.
+  ask_sources(view, asked, query, root, stale)
+  -- A popup still showing another mention's rows would let Enter accept one
+  -- of them, so it switches to `scanning…` until this mention's answers land.
+  -- When only the files are coming, the old rows stay up for the one frame
+  -- ranking takes.
+  if popup and not same and next(view.waiting) and not stale() then
+    paint(view)
+  end
+  if trigger ~= Trigger.FILES then
+    -- No walk behind these rows. A wait left over from a file mention would
+    -- only stop the next file mention from starting its own.
+    if not stale() then
+      unwatch()
+    end
+    return
+  end
+
   -- One ranking, not one walk: the host indexed this tree once and shares it
   -- with its own file picker, and only `limit` paths come back. A nil answer
   -- is a newer keystroke cancelling this call, which is how most refreshes
   -- end while the user types.
   local found = maki.fs.fuzzy_files({ query = query, limit = opts.max_items, path = root, highlights = true })
-  if stale() or not found then
+  if stale() then
     return
   end
-
-  ensure_popup()
-  -- The snapshot the rows below answer, and the range an accept writes over.
-  -- `maki.ui.input_edit` weighs it again when the accept comes, so a row drawn
-  -- for text the user has typed past is refused rather than written.
-  popup.st = st
-  popup.start = start
+  view.ranking = false
+  if not found then
+    -- A ranking that failed adds no files, so a view the sources already
+    -- painted stops holding Enter for them.
+    if popup and popup.view == view then
+      paint(view)
+    end
+    return
+  end
+  view.files = ranked_for(Sources.file_rows(found.items), st)
   -- A walk that crashed or hit the host's ceiling has ended, so what is on
   -- screen is all there is going to be and saying `scanning…` would be a lie.
-  popup.scanning = not found.complete
+  view.walking = not found.complete
   -- The tree these rows came from, as the host spells it, which is what tells
   -- the walk this popup waits on from every other one.
-  popup.root = found.root
-  -- The highlight follows the path it was on while that path is still listed,
-  -- so a keystroke that only drops candidates does not move the selection out
-  -- from under the user.
-  local was = popup.items[popup.sel]
-  popup.items, popup.sel = found.items, 1
-  for i, item in ipairs(found.items) do
-    if was and item.path == was.path then
-      popup.sel = i
-    end
-  end
-  render(maki.ui.terminal_size())
-  if not popup.scanning then
+  view.root = found.root
+  paint(view)
+  if not view.walking then
     return unwatch()
   end
   if watch_the_walk(token) then

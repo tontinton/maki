@@ -24,7 +24,8 @@ use maki_agent::session::{Resumed, StoredSession};
 use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
 use maki_agent::types::AgentEvent;
 use maki_agent::{
-    AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, SessionEndReason, SessionEvents,
+    AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, InputSource, SessionEndReason,
+    SessionEvents,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
@@ -700,8 +701,13 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     let session = srv.session.as_ref().ok_or_else(no_session)?;
 
     let (message, images) = extract_prompt_content(&req.prompt);
-    let input =
-        AgentInput::from_defaults(message, session.current_mode.clone(), images, srv.defaults);
+    let input = AgentInput::from_defaults(
+        message,
+        session.current_mode.clone(),
+        images,
+        srv.defaults,
+        InputSource::Acp,
+    );
 
     // One outstanding id per session, checked and set under the same guard:
     // `input_tx` is unbounded, so a second prompt would queue happily and
@@ -909,9 +915,20 @@ fn start_event_pump(
             }
 
             let update = match event {
-                AgentEvent::PermissionRequest { id, tool, scopes } => {
+                AgentEvent::PermissionRequest {
+                    id,
+                    tool,
+                    scopes,
+                    reason,
+                } => {
                     let tool = tool.to_string();
                     let scope = format!("{tool}: {}", scopes.join(", "));
+                    // A plugin escalated this call, and its reason is what the
+                    // user most needs to read.
+                    let scope = match reason {
+                        Some(reason) => format!("{reason} ({scope})"),
+                        None => scope,
+                    };
                     // The cache is keyed by the call that asked for permission,
                     // so look it up before the remap below. A subagent is left
                     // out on purpose: nothing makes a child's ids unique
@@ -1433,6 +1450,8 @@ mod tests {
     const PERMISSION_TOOL: &str = "write";
     const MAIN_PERMISSION_TITLE: &str = "write: /project";
     const CHILD_PERMISSION_TITLE: &str = "task: write: /project";
+    const ESCALATION_REASON: &str = "plugin flagged this write";
+    const ESCALATED_PERMISSION_TITLE: &str = "plugin flagged this write (write: /project)";
     const TURN_ERROR: &str = "provider returned 500";
     /// One tool id arriving from two runs of the same session. `openai_compat`
     /// mints unique ids now, but a provider can still repeat one, and the pump
@@ -1524,6 +1543,7 @@ mod tests {
             id: tool_use_id.to_owned(),
             tool: ToolKey::native(PERMISSION_TOOL),
             scopes: vec![PUMP_CWD.to_owned()],
+            reason: None,
         }
     }
 
@@ -1649,6 +1669,7 @@ mod tests {
             Some(&rx),
             request_id,
             &CancelToken::none(),
+            None,
             None,
         ))
     }
@@ -1826,6 +1847,28 @@ mod tests {
         for field in ["kind", "locations", "rawInput", "content"] {
             assert!(call[field].is_null(), "{field} must stay unset: {request}");
         }
+    }
+
+    #[test_case(Some(ESCALATION_REASON), ESCALATED_PERMISSION_TITLE ; "a_plugin_reason_leads_the_title")]
+    #[test_case(None, MAIN_PERMISSION_TITLE ; "no_reason_keeps_the_plain_title")]
+    fn permission_title_carries_the_escalation_reason(reason: Option<&str>, title: &str) {
+        let (srv, .., out_rx) = test_server();
+        run_pump(&srv, None, |sender| {
+            sender
+                .send(AgentEvent::PermissionRequest {
+                    id: PARENT_TOOL_USE_ID.to_owned(),
+                    tool: ToolKey::native(PERMISSION_TOOL),
+                    scopes: vec![PUMP_CWD.to_owned()],
+                    reason: reason.map(str::to_owned),
+                })
+                .unwrap();
+        });
+
+        let request = out_rx
+            .try_recv()
+            .expect("the permission request reaches the client");
+        assert_eq!(request["method"], "session/request_permission");
+        assert_eq!(request["params"]["toolCall"]["title"], title);
     }
 
     /// A resumed session opens with a bill, and subagent turns spend against it

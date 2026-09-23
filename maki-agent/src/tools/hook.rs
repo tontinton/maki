@@ -62,6 +62,12 @@ pub enum Authority {
 pub struct HookCall<'a> {
     pub tool: &'a str,
     pub tool_id: &'a str,
+    /// The group the tool files itself under (`read`, `edit`, `execute`,
+    /// ...), so a layer wrapping every tool can skip the harmless ones.
+    pub tool_kind: Option<&'a str>,
+    /// Only set for [`HookStage::Output`], so a layer judging a result never
+    /// has to stash the call that produced it.
+    pub input: Option<&'a Value>,
     pub session_id: Option<&'a str>,
     pub origin: CallOrigin,
     pub authority: Authority,
@@ -75,10 +81,20 @@ pub struct HookCall<'a> {
 /// How a hook answered. `Unchanged` also covers every way a hook can fail: a
 /// hook is an opinion about a call, never a precondition for making it, so a
 /// broken one costs exactly what no hook costs.
+#[derive(Debug)]
 pub enum Verdict {
     Unchanged,
     Replaced(Value),
     Denied(String),
+    /// Show the call to the user whatever the rules and yolo say, with
+    /// `reason` on the prompt. It can only make things stricter, so a deny
+    /// rule still wins. `input` is a rewrite that came along, if any. Only
+    /// [`HookStage::Input`] may ask, and everywhere else this reads as
+    /// [`Verdict::Unchanged`].
+    Ask {
+        reason: String,
+        input: Option<Value>,
+    },
 }
 
 pub trait ToolHook: Send + Sync + 'static {

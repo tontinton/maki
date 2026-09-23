@@ -3,13 +3,16 @@
 //! directly to the agent mailbox so synchronous callbacks can use it.
 
 use maki_agent::SessionMailbox;
+use maki_agent::agent::live_history;
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_providers::{ContentBlock, Message, Role};
 use maki_storage::id::MakiId;
 use mlua::{Lua, Result as LuaResult, Table, Value};
+use serde_json::json;
 
-use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip};
+use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip, ui_roundtrip};
 use crate::api::util::convert::json_to_lua;
-use crate::api::util::pair::{Pair, err_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 /// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
 /// optional session id from Lua and returns a serialized
@@ -21,6 +24,8 @@ pub struct SessionSnapshotSlot(pub SessionSnapshotFn);
 
 const BLANK_NOTIFY_ERR: &str = "text must not be blank";
 const SESSION_REQUIRED_ERR: &str = "session is required";
+const NOT_LIVE_ERR: &str = "session not live";
+const NO_FOCUSED_ERR: &str = "no focused session";
 
 async fn roundtrip(
     lua: Lua,
@@ -110,6 +115,136 @@ async fn read(
         reply_tx,
     })
     .await
+}
+
+/// The focused tab, or under a headless driver the one session it runs.
+async fn focused_session(
+    lua: &Lua,
+    tx: Option<&flume::Sender<UiAction>>,
+) -> Result<String, String> {
+    // Asked in its own statement, so the borrow of the app data ends before
+    // the roundtrip below parks the task.
+    let headless = lua
+        .app_data_ref::<SessionSnapshotSlot>()
+        .map(|slot| (slot.0)(None));
+    let snapshot = match headless {
+        Some(snapshot) => snapshot?,
+        None => {
+            ui_roundtrip(tx, |reply_tx| UiAction::Session {
+                req: SessionRequest::Current,
+                reply_tx,
+            })
+            .await??
+        }
+    };
+    // The UI answers with the bare id, a headless driver with its snapshot.
+    snapshot
+        .get("id")
+        .unwrap_or(&snapshot)
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| NO_FOCUSED_ERR.to_owned())
+}
+
+fn block_json(block: &ContentBlock) -> Option<serde_json::Value> {
+    Some(match block {
+        ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
+        ContentBlock::Thinking { thinking, .. } => json!({ "type": "thinking", "text": thinking }),
+        ContentBlock::RedactedThinking { .. } => return None,
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => {
+            json!({ "type": "tool_use", "id": id, "name": name, "input": input })
+        }
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => json!({
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": content,
+            "is_error": is_error,
+        }),
+        ContentBlock::Image { source } => {
+            json!({ "type": "image", "media_type": source.media_type })
+        }
+    })
+}
+
+/// An image keeps only its media type. A plugin reading history wants to know
+/// one was there, and the base64 payload would cost megabytes per call.
+fn message_json(message: &Message) -> serde_json::Value {
+    let content: Vec<_> = message.content.iter().filter_map(block_json).collect();
+    json!({
+        "role": match message.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        },
+        "kind": message.kind,
+        "hidden": message.display_text.as_deref() == Some(""),
+        "content": content,
+    })
+}
+
+/// Reads a live session's transcript, oldest first: everything the model has
+/// been sent so far, tool calls and results included. Read only.
+///
+/// Each message is `{ role, kind, hidden, content }`. `role` is `"user"` or
+/// `"assistant"`. `kind` is `"turn"` for something the user or the model said
+/// and `"observation"` for a report sent to the model as a user message, like
+/// `maki.session.notify`. `hidden` marks a message only the model sees, such
+/// as a nudge or a compaction note. `content` lists blocks:
+///
+/// ```text
+/// { type = "text", text }
+/// { type = "thinking", text }
+/// { type = "tool_use", id, name, input }
+/// { type = "tool_result", tool_use_id, content, is_error }
+/// { type = "image", media_type }
+/// ```
+///
+/// Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no focused
+/// session, so pass `session` there. Hook and event payloads carry the
+/// `session_id` to pass.
+///
+/// @param opts table? Options:
+///   `session` (string?) id of a live session, defaults to the focused one.
+///   `last` (integer?) only the newest `last` messages.
+/// @return (table|nil, string|nil) Array of messages, or nil and an error.
+/// @example
+/// local msgs = maki.session.messages({ last = 1 })
+/// local last = msgs and msgs[1]
+/// if last and last.role == "assistant" then
+///   print(last.content[1].text)
+/// end
+#[lua_fn]
+async fn messages(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Table>> {
+    let (id, last) = match &opts {
+        Some(opts) => (
+            opts.get::<Option<String>>("session")?,
+            opts.get::<Option<usize>>("last")?,
+        ),
+        None => (None, None),
+    };
+    let raw = match id {
+        Some(id) => id,
+        None => try_pair!(focused_session(&lua, tx.as_ref()).await),
+    };
+    let session: MakiId = try_pair!(raw.parse());
+    let Some(history) = live_history(session) else {
+        return Ok(err_pair(format!("{NOT_LIVE_ERR}: {session}")));
+    };
+    let skip = last.map_or(0, |n| history.len().saturating_sub(n));
+    let out = lua.create_table()?;
+    for message in &history[skip..] {
+        out.push(json_to_lua(&lua, &message_json(message))?)?;
+    }
+    Ok((Some(out), None))
 }
 
 /// Returns the id of the currently focused session.
@@ -284,16 +419,32 @@ lua_table! {
     /// attached"` without a UI. `notify` instead targets a live agent mailbox
     /// directly, so it also works under ACP and SDK frontends.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), live(tx), current(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_mode(tx), set_title(tx)]
+    DOCS [list(tx), live(tx), current(tx), read(tx), messages(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_mode(tx), set_title(tx)]
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
+    use maki_agent::agent::{History, HistorySnapshot, SharedMessages, publish_live_history};
+    use maki_providers::{ImageMediaType, ImageSource, MessageKind};
+
     use super::*;
     use crate::api::util::command::NO_UI_ERR;
     use mlua::Value;
     use serde_json::json;
     use test_case::test_case;
+
+    const FOCUSED_TEXT: &str = "focused";
+    const TOOL_ID: &str = "toolu_1";
+    const TOOL_NAME: &str = "read";
+    const TOOL_PATH: &str = "src/main.rs";
+    const TOOL_OUTPUT: &str = "no such file";
+    const SIGNATURE: &str = "sig";
+    const THOUGHT: &str = "let me check";
+    const IMAGE_DATA: &str = "iVBORw0KGgo=";
+    const TEXT: &str = "hello";
 
     fn lua_with_session(tx: Option<flume::Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
@@ -457,6 +608,184 @@ mod tests {
             .eval()
             .unwrap();
         assert!(invalid.is_some_and(|error| error.contains("invalid base58")));
+    }
+
+    /// Keep the returned history alive for as long as the session should be.
+    fn live(id: MakiId, messages: Vec<Message>) -> History {
+        let mirror: SharedMessages = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+        publish_live_history(id, &mirror);
+        History::new(messages).with_mirror(mirror)
+    }
+
+    #[test]
+    fn messages_reads_a_live_transcript() {
+        const FIRST: &str = "first";
+        const ANSWER: &str = "done";
+        let id = MakiId::generate();
+        let _history = live(
+            id,
+            vec![
+                Message::user(FIRST.into()),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: ANSWER.into(),
+                    }],
+                    ..Default::default()
+                },
+            ],
+        );
+        let lua = lua_with_session(None);
+
+        let code = format!("return session.messages({{ session = '{id}', last = 1 }})");
+        let (msgs, err): (Table, Option<String>) =
+            smol::block_on(lua.load(&code).eval_async()).unwrap();
+        assert_eq!(err, None);
+        assert_eq!(msgs.raw_len(), 1);
+        let last: Table = msgs.get(1).unwrap();
+        assert_eq!(last.get::<String>("role").unwrap(), "assistant");
+        let block: Table = last.get::<Table>("content").unwrap().get(1).unwrap();
+        assert_eq!(block.get::<String>("text").unwrap(), ANSWER);
+    }
+
+    #[test]
+    fn messages_of_a_session_that_is_not_live_is_an_error_pair() {
+        let id = MakiId::generate();
+        let lua = lua_with_session(None);
+        let code = format!("return session.messages({{ session = '{id}' }})");
+        let (_, err): (Value, Option<String>) =
+            smol::block_on(lua.load(&code).eval_async()).unwrap();
+        assert_eq!(err, Some(format!("{NOT_LIVE_ERR}: {id}")));
+    }
+
+    fn headless_focused_on(id: MakiId) -> Lua {
+        let lua = lua_with_session(None);
+        let snapshot = json!({ "id": id.to_string(), "title": FOCUSED_TEXT });
+        let provider: SessionSnapshotFn = Box::new(move |requested| {
+            assert_eq!(requested, None);
+            Ok(snapshot.clone())
+        });
+        lua.set_app_data(SessionSnapshotSlot(provider));
+        lua
+    }
+
+    /// The UI answers `Current` with the bare id, not a snapshot.
+    fn ui_focused_on(id: MakiId) -> Lua {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        std::thread::spawn(move || {
+            let Ok(UiAction::Session {
+                req: SessionRequest::Current,
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected current request");
+            };
+            reply_tx.send(Ok(json!(id.to_string()))).unwrap();
+        });
+        lua_with_session(Some(tx))
+    }
+
+    #[test_case(headless_focused_on ; "headless_snapshot_id")]
+    #[test_case(ui_focused_on ; "ui_current_bare_id")]
+    fn messages_defaults_to_the_focused_session(focused_on: fn(MakiId) -> Lua) {
+        let id = MakiId::generate();
+        let _history = live(id, vec![Message::user(FOCUSED_TEXT.into())]);
+        let lua = focused_on(id);
+
+        let (msgs, err): (Table, Option<String>) =
+            smol::block_on(lua.load("return session.messages()").eval_async()).unwrap();
+        assert_eq!(err, None);
+        assert_eq!(msgs.raw_len(), 1);
+        let block: Table = msgs
+            .get::<Table>(1)
+            .unwrap()
+            .get::<Table>("content")
+            .unwrap()
+            .get(1)
+            .unwrap();
+        assert_eq!(block.get::<String>("text").unwrap(), FOCUSED_TEXT);
+    }
+
+    #[test]
+    fn messages_without_a_focused_session_is_an_error_pair() {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        std::thread::spawn(move || {
+            let Ok(UiAction::Session { reply_tx, .. }) = rx.recv() else {
+                panic!("expected session request");
+            };
+            reply_tx.send(Ok(serde_json::Value::Null)).unwrap();
+        });
+        let (_, err): (Value, Option<String>) =
+            smol::block_on(lua.load("return session.messages()").eval_async()).unwrap();
+        assert_eq!(err.as_deref(), Some(NO_FOCUSED_ERR));
+    }
+
+    #[test_case(
+        ContentBlock::ToolUse {
+            id: TOOL_ID.into(),
+            name: TOOL_NAME.into(),
+            input: json!({ "path": TOOL_PATH }),
+            thought_signature: Some(SIGNATURE.into()),
+        },
+        Some(json!({ "type": "tool_use", "id": TOOL_ID, "name": TOOL_NAME, "input": { "path": TOOL_PATH } }))
+        ; "tool_use_keeps_id_name_and_input"
+    )]
+    #[test_case(
+        ContentBlock::ToolResult { tool_use_id: TOOL_ID.into(), content: TOOL_OUTPUT.into(), is_error: true },
+        Some(json!({ "type": "tool_result", "tool_use_id": TOOL_ID, "content": TOOL_OUTPUT, "is_error": true }))
+        ; "tool_result_keeps_id_content_and_error_flag"
+    )]
+    #[test_case(
+        ContentBlock::Image { source: ImageSource::new(ImageMediaType::Png, IMAGE_DATA.into()) },
+        Some(json!({ "type": "image", "media_type": ImageMediaType::Png.mime() }))
+        ; "image_keeps_only_the_media_type"
+    )]
+    #[test_case(
+        ContentBlock::Thinking { thinking: THOUGHT.into(), signature: Some(SIGNATURE.into()) },
+        Some(json!({ "type": "thinking", "text": THOUGHT }))
+        ; "thinking_becomes_text"
+    )]
+    #[test_case(
+        ContentBlock::RedactedThinking { data: SIGNATURE.into() },
+        None
+        ; "redacted_thinking_is_omitted"
+    )]
+    fn block_json_shape(block: ContentBlock, expected: Option<serde_json::Value>) {
+        assert_eq!(block_json(&block), expected);
+    }
+
+    #[test_case(Role::User, MessageKind::Turn, None, "user", "turn", false ; "user_turn_is_visible")]
+    #[test_case(Role::User, MessageKind::Observation, Some(""), "user", "observation", true ; "blank_display_text_is_hidden")]
+    #[test_case(Role::Assistant, MessageKind::Turn, Some(TEXT), "assistant", "turn", false ; "display_text_with_content_is_visible")]
+    fn message_json_reports_role_kind_and_hidden(
+        role: Role,
+        kind: MessageKind,
+        display_text: Option<&str>,
+        expected_role: &str,
+        expected_kind: &str,
+        hidden: bool,
+    ) {
+        let message = Message {
+            role,
+            kind,
+            display_text: display_text.map(str::to_owned),
+            content: vec![
+                ContentBlock::Text { text: TEXT.into() },
+                ContentBlock::RedactedThinking {
+                    data: SIGNATURE.into(),
+                },
+            ],
+        };
+        assert_eq!(
+            message_json(&message),
+            json!({
+                "role": expected_role,
+                "kind": expected_kind,
+                "hidden": hidden,
+                "content": [{ "type": "text", "text": TEXT }],
+            })
+        );
     }
 
     #[test]

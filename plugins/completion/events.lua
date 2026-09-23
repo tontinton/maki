@@ -39,7 +39,10 @@ function Events.input_changed(data)
   if open and open ~= data.session_id then
     Menu.close()
   end
-  if not Menu.session_id() and not Trigger.find(data.text, data.cursor) then
+  -- Which punctuation opens a mention depends on the sources loaded, and
+  -- asking them is too slow for this handler. So any punctuation earns a
+  -- refresh, and the refresh sorts it out.
+  if not Menu.session_id() and not Trigger.may_open(data.text, data.cursor) then
     return
   end
   Menu.refresh_later(data)

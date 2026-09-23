@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::agent::QueuedMessage;
 use crate::components::Status;
 use crate::theme;
-use maki_agent::{AgentInput, AgentMode};
+use maki_agent::{AgentInput, AgentMode, InputSource};
 use maki_storage::StateDir;
 use maki_storage::plans;
 use ratatui::style::{Color, Modifier, Style};
@@ -142,10 +142,12 @@ impl App {
             mode: self.agent_mode(),
             images: msg.images.clone(),
             preamble: Vec::new(),
+            earlier: Vec::new(),
             thinking: self.state.thinking,
             fast: self.state.fast,
             workflow: self.state.workflow,
             prompt: None,
+            source: InputSource::Tui,
         }
     }
 

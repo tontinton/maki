@@ -1,4 +1,6 @@
--- `@` file completion for the chat input, in Lua.
+-- Mention completion for the chat input, in Lua: files after `@`, and
+-- whatever other plugins offer through the `completion.sources` slot (see
+-- `sources.lua`).
 --
 -- Nothing here is special-cased in the host. The popup is an ordinary
 -- unfocused float on the input caret anchor, the navigation keys are the
@@ -14,6 +16,9 @@
 
 local Events = require("events")
 local Menu = require("menu")
+local Sources = require("sources")
+
+Sources.declare()
 
 maki.api.create_autocmd("InputChanged", {
   callback = function(ev)
