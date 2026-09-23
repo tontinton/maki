@@ -161,8 +161,8 @@ fn effort_dialect(info: Option<&OpenRouterModelInfo>) -> EffortDialect<'_> {
 fn parse_model(m: &Value) -> Option<ModelInfo> {
     // Filter: only text input/output models
     let architecture = m["architecture"].as_object()?;
-    let input_modalities = architecture["input_modalities"].as_array()?;
-    let output_modalities = architecture["output_modalities"].as_array()?;
+    let input_modalities = architecture.get("input_modalities")?.as_array()?;
+    let output_modalities = architecture.get("output_modalities")?.as_array()?;
 
     let has_text_input = input_modalities.iter().any(|m| m.as_str() == Some("text"));
     let has_text_output = output_modalities.iter().any(|m| m.as_str() == Some("text"));

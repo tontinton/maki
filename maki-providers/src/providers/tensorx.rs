@@ -183,7 +183,7 @@ impl Provider for TensorX {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
-            let url = format!("{}/model/info", CONFIG.base_url);
+            let url = format!("{}/model/info", self.compat.base_url(&auth));
             let text = self.compat.get_text(&auth, &url).await?;
             let body: Value = serde_json::from_str(&text)?;
 
