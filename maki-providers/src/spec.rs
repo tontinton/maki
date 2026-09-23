@@ -10,7 +10,7 @@ use crate::provider::Provider;
 use crate::providers::{
     ResolvedAuth, Timeouts, anthropic, aperture, copilot, custom, deepseek, dynamic, google,
     llama_cpp, mistral, ollama, openai, opencode, openrouter, regolo, requesty, synthetic, tensorx,
-    xai, zai,
+    xai, yolo_auto, zai,
 };
 
 /// Stands in for the model table when a provider curates none.
@@ -185,6 +185,7 @@ const BUILTINS: &[ProviderSpec] = &[
     synthetic::SPEC,
     regolo::SPEC,
     tensorx::SPEC,
+    yolo_auto::SPEC,
     opencode::ZEN_SPEC,
     xai::SPEC,
     aperture::SPEC,

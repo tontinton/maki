@@ -277,6 +277,16 @@ Defaults: qwen3.5-122b (strong), qwen3-coder-next (medium), qwen3.5-9b (weak)
 
 No hardcoded model catalog. Use any model ID supported by this provider.
 
+### Yolo-Auto
+
+- **Env var**: `YOLO_AUTO_API_KEY`
+- **API**: `https://yolo-auto.com/v1`
+- **Features**: OpenAI-compatible chat completions with tool calling and reasoning effort levels. Flat-rate plans, no per-token billing
+
+No hardcoded model catalog. Use any model ID supported by this provider.
+
+The `yolo` and `yolo-small` aliases are always available, and the rest of the catalogue is served live from `/v1/models`. Plans are flat-rate, so no per-token rate is quoted.
+
 ### Opencode Zen
 
 - **Env var**: `OPENCODE_API_KEY`
@@ -513,7 +523,7 @@ To add a custom provider or proxy, drop an executable script into the config `pr
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `requesty`, `synthetic`, `regolo`, `tensorx`, `opencode`, `xai`, `aperture`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `requesty`, `synthetic`, `regolo`, `tensorx`, `yolo-auto`, `opencode`, `xai`, `aperture`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 
