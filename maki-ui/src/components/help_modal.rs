@@ -4,7 +4,7 @@ use crate::components::keybindings::{
     ALT_SEP, KEYBINDS, KeybindContext, ResolvedLabel, all_contexts, key,
 };
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::render_vertical_scrollbar_in_border;
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -215,7 +215,7 @@ impl HelpModal {
         frame.render_widget(paragraph, inner);
 
         if total > viewport_h {
-            render_vertical_scrollbar(frame, inner, u32::from(total), u32::from(scroll));
+            render_vertical_scrollbar_in_border(frame, inner, u32::from(total), u32::from(scroll));
         }
 
         popup
