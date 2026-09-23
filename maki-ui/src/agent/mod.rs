@@ -285,6 +285,7 @@ fn spawn_agent_internal(
 
 #[cfg(test)]
 mod tests {
+    use maki_providers::ProviderSession;
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
@@ -324,7 +325,7 @@ mod tests {
             _tools: &'a serde_json::Value,
             _event_tx: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
+            _session_id: Option<&'a ProviderSession>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
         }
@@ -419,7 +420,7 @@ mod tests {
             _tools: &'a serde_json::Value,
             _event_tx: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
+            _session_id: Option<&'a ProviderSession>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             let id = model.id.clone();
             Box::pin(async move {
@@ -481,6 +482,7 @@ mod tests {
                 preamble: Vec::new(),
                 thinking: ThinkingConfig::default(),
                 fast: false,
+                prompt_cache_key: None,
                 workflow: false,
                 prompt: None,
             },

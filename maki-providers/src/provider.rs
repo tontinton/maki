@@ -1,3 +1,4 @@
+use crate::ProviderSession;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -7,7 +8,6 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use maki_config::ModelPolicy;
-use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelInfo};
 use crate::model_registry::set_known_models;
@@ -30,7 +30,7 @@ pub trait Provider: Send + Sync {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
@@ -132,7 +132,7 @@ impl Provider for UnconfiguredProvider {
         _tools: &'a Value,
         _event_tx: &'a Sender<ProviderEvent>,
         _opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _session_id: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async {
             Err(AgentError::Config {

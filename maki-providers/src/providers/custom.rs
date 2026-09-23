@@ -1,3 +1,4 @@
+use crate::ProviderSession;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -6,7 +7,6 @@ use serde_json::Value;
 use maki_config::providers::{
     Protocol, ProviderDef, ProvidersConfig, resolve_api_key_env, resolve_base_url, resolve_protocol,
 };
-use maki_storage::id::SessionRef;
 use tracing::warn;
 
 use super::ResolvedAuth;
@@ -346,7 +346,7 @@ impl Provider for CustomOpenAiProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _session_id: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();

@@ -1,3 +1,4 @@
+use crate::ProviderSession;
 use std::env;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -9,7 +10,6 @@ use flume::Sender;
 use hmac::{Hmac, Mac};
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{HttpClient, ReadResponseExt, Request};
-use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
@@ -527,7 +527,7 @@ impl Provider for Bedrock {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _session_id: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             if self.needs_refresh() {

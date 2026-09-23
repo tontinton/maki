@@ -1,3 +1,4 @@
+use maki_providers::ProviderSession;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +57,7 @@ pub struct HeadlessParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt: String,
+    pub prompt_cache_key: Option<String>,
     pub images: Vec<ImageSource>,
     pub prompt_slots: ResolvedSlots,
     pub excluded_tools: Vec<&'static str>,
@@ -159,6 +161,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let session_ref = params.resumed.id.clone();
     let mailbox = SessionMailbox::register(session_ref.id());
     let run_session_ref = session_ref.clone();
+    let provider_session = ProviderSession::new(session_ref.clone());
     let defaults = params.defaults;
     let working_dir_path = params.initial_wd.clone();
     let task_working_dir = working_dir.clone();
@@ -186,6 +189,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                     params.plugin_rules,
                 )),
                 session_id: Some(run_session_ref),
+                provider_session: Some(provider_session.clone()),
                 task_id: None,
                 mailbox: Some(mailbox),
                 timeouts: params.timeouts,
@@ -203,12 +207,10 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
         .with_mcp(mcp);
 
         let result = agent
-            .run(AgentInput::from_defaults(
-                params.prompt,
-                mode,
-                params.images,
-                defaults,
-            ))
+            .run(
+                AgentInput::from_defaults(params.prompt, mode, params.images, defaults)
+                    .with_prompt_cache_key(params.prompt_cache_key),
+            )
             .await;
         drop(agent);
 
@@ -294,6 +296,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let (model_tx, model_rx) = flume::unbounded::<Model>();
 
     let session_ref = params.resumed.id.clone();
+    let provider_session = ProviderSession::new(session_ref.clone());
     let mailbox = SessionMailbox::register(session_ref.id());
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
@@ -391,6 +394,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     tool_output_lines: ToolOutputLines::default(),
                     permissions: Arc::clone(&task_permissions),
                     session_id: Some(session_ref_clone.clone()),
+                    provider_session: Some(provider_session.clone()),
                     task_id: None,
                     mailbox: Some(mailbox.clone()),
                     timeouts: params.timeouts,

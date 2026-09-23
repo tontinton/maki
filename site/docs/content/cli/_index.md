@@ -33,6 +33,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--max-turns` | no | no | yes |
 | `--permission-mode` | no | no | yes |
 | `--include-partial-messages` | no | no | yes |
+| `--prompt-cache-key` | no | yes | yes |
 
 ### Shared flags (detail)
 
@@ -61,6 +62,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--append-system-prompt <TEXT>` | Append to the built-in system prompt (SDK only) |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
 | `--include-partial-messages` | Stream partial deltas in SDK mode |
+| `--prompt-cache-key <KEY>` | Attach a routing and accounting key to OpenAI Responses requests for this run. Parent and subagent requests inherit it |
 
 ### Tool name lists
 

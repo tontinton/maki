@@ -74,6 +74,7 @@ repository = "https://github.com/tontinton/maki"
 rust-version = "1.88"
 
 [workspace.dependencies]
+async-tungstenite = { version = "0.35", features = ["smol-runtime", "smol-native-tls"] }
 maki-agent = { path = "maki-agent" }
 maki-acp = { path = "maki-acp" }
 maki-config = { path = "maki-config" }

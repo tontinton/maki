@@ -1,3 +1,4 @@
+use crate::ProviderSession;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -5,7 +6,6 @@ use std::time::Duration;
 use flume::Sender;
 use futures_lite::io::BufReader;
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -741,7 +741,7 @@ impl Provider for Copilot {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _session_id: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut prefixed_system = String::new();

@@ -1,10 +1,11 @@
+use crate::ProviderSession;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::id::MakiId;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
@@ -252,7 +253,7 @@ impl Provider for Google {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _session_id: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts.thinking))
     }
@@ -351,7 +352,7 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     }
                     parts.push(part);
                 }
-                ContentBlock::RedactedThinking { .. } => {}
+                ContentBlock::RedactedThinking { .. } | ContentBlock::OpenAiReasoning { .. } => {}
                 ContentBlock::ToolUse {
                     id: _,
                     name,
@@ -1247,5 +1248,25 @@ mod tests {
         assert_eq!(result.usage.input, 100);
         assert_eq!(result.usage.output, 10);
         assert_eq!(result.usage.cache_read, 50);
+    }
+    #[test_case(())]
+    fn opaque_reasoning_is_omitted(_: ()) {
+        const CIPHERTEXT: &str = "encrypted-other-provider-fixture";
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::OpenAiReasoning {
+                    item: serde_json::json!({"type":"reasoning", "encrypted_content":CIPHERTEXT}),
+                },
+                ContentBlock::Text {
+                    text: "visible".into(),
+                },
+            ],
+            ..Default::default()
+        }];
+        let wire = serde_json::to_value(convert_messages(&messages)).unwrap();
+        assert!(!wire.to_string().contains(CIPHERTEXT));
+        assert!(!wire.to_string().contains("open_ai_reasoning"));
+        assert!(wire.to_string().contains("visible"));
     }
 }

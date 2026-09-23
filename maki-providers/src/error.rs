@@ -125,6 +125,8 @@ pub enum AgentError {
     Cancelled,
     #[error("stream timed out after {secs}s of inactivity")]
     Timeout { secs: u64 },
+    #[error("Responses request interrupted; automatic replay is unsafe: {message}")]
+    AmbiguousResponse { message: String },
     #[error("compaction returned no summary")]
     EmptySummary,
 }
@@ -160,6 +162,7 @@ impl AgentError {
             | Self::Channel
             | Self::Json(_)
             | Self::Cancelled
+            | Self::AmbiguousResponse { .. }
             | Self::EmptySummary
             | Self::HttpRequest(_) => None,
         }
@@ -268,6 +271,22 @@ impl AgentError {
                 .is_some_and(|message| message.contains(REASONING_SUMMARY_PARAM))
     }
 
+    pub fn is_unsupported_parameter(&self, parameter: &str) -> bool {
+        let Self::Api { message, .. } = self else {
+            return false;
+        };
+        let Ok(body) = serde_json::from_str::<Value>(message) else {
+            return false;
+        };
+        body["error"]["param"].as_str() == Some(parameter)
+            || body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(parameter))
+            || body["detail"]
+                .as_str()
+                .is_some_and(|message| message.contains(parameter))
+    }
+
     /// Whether *this key* is the problem rather than the account, which is a
     /// different question from whether the request is worth retrying: the retry
     /// loop asks it for every error, since a 401 or a 403 is dead for this key
@@ -306,6 +325,7 @@ impl AgentError {
             Self::Json(_) => "received an invalid response from the API".into(),
             Self::Channel => "internal error, try again".into(),
             Self::Cancelled => "cancelled".into(),
+            Self::AmbiguousResponse { .. } => self.to_string(),
             Self::EmptySummary => "compaction returned no summary, history kept as is".into(),
         }
     }
@@ -452,6 +472,17 @@ mod tests {
             expected
         );
         assert!(!api(400).is_unsupported_reasoning_summary());
+    }
+
+    #[test_case(r#"{"detail":"Unsupported parameter: prompt_cache_options"}"#, true ; "detail")]
+    #[test_case(r#"{"error":{"param":"prompt_cache_options"}}"#, true ; "parameter")]
+    #[test_case(r#"{"error":{"message":"Unknown prompt_cache_options field"}}"#, true ; "message")]
+    #[test_case(r#"{"detail":"Unsupported parameter: store"}"#, false ; "other_parameter")]
+    fn unsupported_parameter_matches_body(body: &str, expected: bool) {
+        assert_eq!(
+            api_msg(400, body).is_unsupported_parameter("prompt_cache_options"),
+            expected
+        );
     }
 
     fn opencode_body(error_type: &str, message: &str) -> String {

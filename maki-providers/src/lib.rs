@@ -7,6 +7,8 @@ pub mod pricing;
 pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
+mod session;
+pub use session::ProviderSession;
 pub mod spec;
 pub mod tokens;
 pub(crate) mod types;

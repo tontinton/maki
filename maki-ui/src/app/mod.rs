@@ -1712,7 +1712,7 @@ impl App {
         );
         chat.set_restore_channel(self.restore_event_tx.clone());
         chat.model_id = subagent.model.clone();
-        chat.opts = subagent.opts;
+        chat.opts = subagent.opts.clone();
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
         }

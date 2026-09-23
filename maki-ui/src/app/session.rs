@@ -149,8 +149,8 @@ impl App {
                     tool_use_id: tool_id.clone(),
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
-                    thinking: chat.opts.map(|o| o.thinking.into()),
-                    fast: chat.opts.is_some_and(|o| o.fast),
+                    thinking: chat.opts.as_ref().map(|o| o.thinking.into()),
+                    fast: chat.opts.as_ref().is_some_and(|o| o.fast),
                 }
             })
             .collect();
@@ -248,6 +248,7 @@ impl App {
             chat.opts = sa.thinking.map(|thinking| RequestOptions {
                 thinking: thinking.into(),
                 fast: sa.fast,
+                prompt_cache_key: None,
             });
             chat.load_messages(display);
             // The session file keeps the transcript but never how it ended,

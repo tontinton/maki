@@ -33,7 +33,9 @@ pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
                 ContentBlock::ToolUse { input, .. } => (bytes + json_len(input), images),
                 ContentBlock::Thinking { thinking, .. } => (bytes + thinking.len(), images),
                 ContentBlock::Image { .. } => (bytes, images + 1),
-                ContentBlock::RedactedThinking { .. } => (bytes, images),
+                ContentBlock::RedactedThinking { .. } | ContentBlock::OpenAiReasoning { .. } => {
+                    (bytes, images)
+                }
             });
     (total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN) as u32 + images * TOKENS_PER_IMAGE
 }

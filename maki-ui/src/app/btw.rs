@@ -3,7 +3,7 @@ use std::sync::Arc;
 use flume::Sender;
 use futures_lite::future;
 use maki_providers::provider::Provider;
-use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
+use maki_providers::{Message, Model, ProviderEvent, ProviderSession, RequestOptions};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 
@@ -72,6 +72,7 @@ async fn run_btw(
     btw_tx: Sender<BtwEvent>,
     session_id: Option<SessionRef>,
 ) {
+    let session = session_id.map(|id| ProviderSession::new(id).child(None));
     let (event_tx, event_rx) = flume::unbounded();
     let tools = Value::Array(vec![]);
     let messages = maki_providers::adapt_images_for_model(&model, &messages).await;
@@ -83,7 +84,7 @@ async fn run_btw(
         &tools,
         &event_tx,
         RequestOptions::default(),
-        session_id.as_ref(),
+        session.as_ref(),
     );
 
     let forward_fut = async {

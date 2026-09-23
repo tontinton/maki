@@ -66,6 +66,7 @@ impl QueuedInput {
             preamble: _,
             thinking: _,
             fast: _,
+            prompt_cache_key: _,
         } = &self.input;
         prompt.is_none().then(|| (mode.clone(), *workflow))
     }
@@ -325,6 +326,7 @@ mod tests {
             preamble: Vec::new(),
             thinking: Default::default(),
             fast: false,
+            prompt_cache_key: None,
             workflow: false,
             prompt: None,
         }

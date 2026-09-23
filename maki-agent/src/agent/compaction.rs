@@ -1,3 +1,4 @@
+use maki_providers::ProviderSession;
 use std::env;
 
 use maki_config::AgentConfig;
@@ -6,7 +7,6 @@ use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
     StreamResponse, TokenUsage,
 };
-use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::info;
 
@@ -86,7 +86,8 @@ pub(super) async fn compact_history(
     config: &AgentConfig,
     instructions: Option<&str>,
     carry_len: usize,
-    session_id: Option<&SessionRef>,
+    prompt_cache_key: Option<&str>,
+    session_id: Option<&ProviderSession>,
     retry: RetryPolicy,
 ) -> Result<TokenUsage, AgentError> {
     let compact_start = std::time::Instant::now();
@@ -110,7 +111,10 @@ pub(super) async fn compact_history(
                 messages: &compaction_history,
                 system: crate::prompt::COMPACTION_SYSTEM,
                 tools: &empty_tools,
-                opts: RequestOptions::default(),
+                opts: RequestOptions {
+                    prompt_cache_key: prompt_cache_key.map(str::to_owned),
+                    ..Default::default()
+                },
                 output_budget: SUMMARY_OUTPUT_BUDGET,
                 session_id,
                 retry,
@@ -214,7 +218,7 @@ pub async fn compact(
     cancel: &CancelToken,
     config: &AgentConfig,
     instructions: Option<&str>,
-    session_id: Option<&SessionRef>,
+    session_id: Option<&ProviderSession>,
     retry: RetryPolicy,
 ) -> Result<DoneReason, AgentError> {
     let size_before = gauge.size();
@@ -227,6 +231,7 @@ pub async fn compact(
         config,
         instructions,
         0,
+        None,
         session_id,
         retry,
     )
@@ -440,7 +445,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            session_id: Option<&'a SessionRef>,
+            session_id: Option<&'a ProviderSession>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.requests.lock().unwrap().push(messages.to_vec());
@@ -517,7 +522,7 @@ mod tests {
         provider: &MockProvider,
         history: &mut History,
         carry_len: usize,
-        session_id: Option<&SessionRef>,
+        session_id: Option<&ProviderSession>,
     ) {
         let (raw_tx, _rx) = flume::unbounded();
         compact_history(
@@ -529,6 +534,7 @@ mod tests {
             &AgentConfig::default(),
             None,
             carry_len,
+            None,
             session_id,
             RetryPolicy::default(),
         )
@@ -902,6 +908,9 @@ mod tests {
                 ContentBlock::RedactedThinking {
                     data: "opaque".into(),
                 },
+                ContentBlock::OpenAiReasoning {
+                    item: serde_json::json!({"encrypted_content":"opaque"}),
+                },
             ],
             ..Default::default()
         }];
@@ -1049,7 +1058,7 @@ mod tests {
         smol::block_on(async {
             let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
             let mut history = History::new(vec![Message::user("work".into())]);
-            let session = SessionRef::generate();
+            let session = ProviderSession::new(SessionRef::generate());
             summarize_history(&provider, &mut history, 0, Some(&session)).await;
 
             let sessions = provider.sessions.lock().unwrap();

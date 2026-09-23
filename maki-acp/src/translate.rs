@@ -522,6 +522,9 @@ mod tests {
         let messages = vec![
             Message::user("hello".into()),
             assistant(vec![
+                MsgBlock::OpenAiReasoning {
+                    item: serde_json::json!({"encrypted_content":"opaque"}),
+                },
                 MsgBlock::Thinking {
                     thinking: "hmm".into(),
                     signature: None,

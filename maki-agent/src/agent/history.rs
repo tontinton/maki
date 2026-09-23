@@ -174,9 +174,14 @@ fn is_system_padding(m: &Message) -> bool {
 /// text verbatim writes a real message, and it has to break the nudge streak
 /// like any other.
 fn is_empty_marker(m: &Message) -> bool {
+    let mut content = m
+        .content
+        .iter()
+        .filter(|block| !matches!(block, ContentBlock::OpenAiReasoning { .. }));
     matches!(m.role, Role::Assistant)
         && m.display_text.is_none()
-        && matches!(&m.content[..], [ContentBlock::Text { text }] if text == EMPTY_RESPONSE_MARKER)
+        && matches!(content.next(), Some(ContentBlock::Text { text }) if text == EMPTY_RESPONSE_MARKER)
+        && content.next().is_none()
 }
 
 /// Restored sessions can have orphaned tool_results or unclosed tool_uses

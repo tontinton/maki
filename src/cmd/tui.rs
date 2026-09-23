@@ -409,6 +409,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         crate::print::run(crate::print::PrintParams {
             model: stack.model,
             prompt: cli.initial_prompt,
+            prompt_cache_key: cli.prompt_cache_key,
             image_paths: cli.images,
             format: cli.output_format,
             verbose: cli.verbose,

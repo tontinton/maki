@@ -1232,6 +1232,9 @@ mod tests {
                     text: "answer".into(),
                 },
                 ContentBlock::RedactedThinking { data: "x".into() },
+                ContentBlock::OpenAiReasoning {
+                    item: serde_json::json!({"encrypted_content":"opaque"}),
+                },
             ],
             ..Default::default()
         }];

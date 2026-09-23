@@ -1,3 +1,4 @@
+use maki_providers::ProviderSession;
 use std::time::{Duration, Instant};
 
 use maki_providers::provider::Provider;
@@ -6,7 +7,6 @@ use maki_providers::{
     ContentBlock, ContextGauge, Message, Model, Overflow, ProviderEvent, RequestOptions,
     StreamResponse, estimate_prompt_tokens,
 };
-use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::warn;
 
@@ -123,7 +123,7 @@ impl From<StreamError> for AgentError {
 /// cannot climb down from.
 ///
 /// [`compaction::reserved`]: super::compaction::reserved
-fn planned_output(model: &Model, opts: RequestOptions, budget: u32, prompt: u32) -> u32 {
+fn planned_output(model: &Model, opts: &RequestOptions, budget: u32, prompt: u32) -> u32 {
     let thinking_room = opts
         .thinking
         .reserved_thinking(model)
@@ -176,7 +176,7 @@ pub(crate) struct StreamRequest<'a> {
     /// Output tokens this kind of turn may generate. A summary needs far less
     /// than a coding turn, so the caller decides.
     pub output_budget: u32,
-    pub session_id: Option<&'a SessionRef>,
+    pub session_id: Option<&'a ProviderSession>,
     pub retry: RetryPolicy,
 }
 
@@ -206,7 +206,7 @@ pub(crate) async fn stream_with_retry(
     let measured = gauge.as_deref().map_or(0, ContextGauge::size);
     let prompt = estimate_prompt_tokens(messages, system, tools).max(measured);
     let floor = min_output(model);
-    let mut budget = planned_output(model, opts, output_budget, prompt);
+    let mut budget = planned_output(model, &opts, output_budget, prompt);
     let mut budget_retries = 0;
     // Counted here rather than off `retry`, which neither a budget retry nor a
     // rotation spends, so the number otel and the status bar show never repeats
@@ -240,7 +240,15 @@ pub(crate) async fn stream_with_retry(
         // retry slept on a server `Retry-After` never pays for the attempt it
         // woke up to make.
         let result = cancel
-            .race(provider.stream_message(model, messages, system, tools, &ptx, opts, session_id))
+            .race(provider.stream_message(
+                model,
+                messages,
+                system,
+                tools,
+                &ptx,
+                opts.clone(),
+                session_id,
+            ))
             .await
             .unwrap_or(Err(AgentError::Cancelled));
         drop(ptx);
@@ -248,7 +256,7 @@ pub(crate) async fn stream_with_retry(
         match result {
             Ok(mut r) => {
                 canonicalize_tool_names(&mut r.message);
-                emit_api_request(model, &r, opts, started.elapsed());
+                emit_api_request(model, &r, &opts, started.elapsed());
                 if let Some(gauge) = gauge.as_deref_mut() {
                     gauge.record(r.usage.total_input());
                 }
@@ -331,7 +339,7 @@ pub(crate) async fn stream_with_retry(
     }
 }
 
-fn emit_api_request(model: &Model, r: &StreamResponse, opts: RequestOptions, took: Duration) {
+fn emit_api_request(model: &Model, r: &StreamResponse, opts: &RequestOptions, took: Duration) {
     if !maki_otel::enabled() {
         return;
     }
@@ -416,6 +424,7 @@ mod tests {
         RequestOptions {
             thinking,
             fast: false,
+            prompt_cache_key: None,
         }
     }
 
@@ -438,7 +447,7 @@ mod tests {
         assert_eq!(
             planned_output(
                 &model_with(max_output_tokens),
-                opts_with(ThinkingConfig::Off),
+                &opts_with(ThinkingConfig::Off),
                 TURN_BUDGET,
                 prompt_tokens
             ),
@@ -453,7 +462,7 @@ mod tests {
     /// no dialect is handed a budget its own `max_tokens` refuses.
     fn fitted_with(thinking: ThinkingConfig, prompt: u32) -> (Model, Model) {
         let declared = model_with(Some(DECLARED_MAX_OUTPUT));
-        let budget = planned_output(&declared, opts_with(thinking), TURN_BUDGET, prompt);
+        let budget = planned_output(&declared, &opts_with(thinking), TURN_BUDGET, prompt);
         let fitted = declared.with_turn_output(budget);
 
         let asked = fitted.output_tokens().expect("a budget is always set");
@@ -594,7 +603,7 @@ mod tests {
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a ProviderSession>,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let prompt = (estimate_prompt_tokens(messages, system, tools) as f32
@@ -865,7 +874,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a ProviderSession>,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let key = self.pool.current().to_owned();

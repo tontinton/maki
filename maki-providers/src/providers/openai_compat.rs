@@ -326,7 +326,8 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                         }
                         ContentBlock::ToolUse { .. }
                         | ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. } => {}
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::OpenAiReasoning { .. } => {}
                     }
                 }
 
@@ -368,7 +369,8 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                         }
                         ContentBlock::ToolResult { .. }
                         | ContentBlock::Image { .. }
-                        | ContentBlock::RedactedThinking { .. } => {}
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::OpenAiReasoning { .. } => {}
                     }
                 }
 
@@ -1398,5 +1400,25 @@ data: [DONE]\n";
             assert_eq!(text_deltas, vec!["Hello"]);
             assert_eq!(thinking_deltas, vec!["Let me think", "..."]);
         })
+    }
+    #[test_case(())]
+    fn opaque_reasoning_is_omitted(_: ()) {
+        const CIPHERTEXT: &str = "encrypted-other-provider-fixture";
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::OpenAiReasoning {
+                    item: serde_json::json!({"type":"reasoning", "encrypted_content":CIPHERTEXT}),
+                },
+                ContentBlock::Text {
+                    text: "visible".into(),
+                },
+            ],
+            ..Default::default()
+        }];
+        let wire = serde_json::to_value(convert_messages(&messages, "")).unwrap();
+        assert!(!wire.to_string().contains(CIPHERTEXT));
+        assert!(!wire.to_string().contains("open_ai_reasoning"));
+        assert!(wire.to_string().contains("visible"));
     }
 }

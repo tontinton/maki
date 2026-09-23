@@ -44,7 +44,12 @@ const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started 
 /// comes back split into "on now" and "still waiting", which is the only place
 /// those two bits are derived.
 fn clamp(thinking: ThinkingConfig, fast: bool, model: &Model) -> (ThinkingConfig, bool, bool) {
-    let opts = RequestOptions { thinking, fast }.clamped(model);
+    let opts = RequestOptions {
+        thinking,
+        fast,
+        prompt_cache_key: None,
+    }
+    .clamped(model);
     (opts.thinking, opts.fast, fast && model.fast_pending())
 }
 

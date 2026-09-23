@@ -1,7 +1,7 @@
+use crate::ProviderSession;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
-use maki_storage::id::SessionRef;
 use serde_json::Value;
 
 use maki_config::providers::Protocol;
@@ -129,7 +129,7 @@ impl Provider for Synthetic {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _session_id: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();

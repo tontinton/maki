@@ -1,3 +1,4 @@
+use crate::ProviderSession;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,7 +9,6 @@ use flume::Sender;
 use maki_config::providers::ProvidersConfig;
 use maki_storage::StateDir;
 use maki_storage::auth::lock_exclusive;
-use maki_storage::id::SessionRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -702,7 +702,7 @@ impl Provider for DynamicProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             // First attempt streams through a counting relay: a 401 is only
@@ -713,7 +713,15 @@ impl Provider for DynamicProvider {
             let attempt = async {
                 let result = self
                     .inner
-                    .stream_message(model, messages, system, tools, &tx, opts, session_id)
+                    .stream_message(
+                        model,
+                        messages,
+                        system,
+                        tools,
+                        &tx,
+                        opts.clone(),
+                        session_id,
+                    )
                     .await;
                 drop(tx);
                 result

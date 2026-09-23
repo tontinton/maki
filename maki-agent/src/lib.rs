@@ -95,6 +95,7 @@ pub struct AgentInput {
     pub preamble: Vec<Message>,
     pub thinking: ThinkingConfig,
     pub fast: bool,
+    pub prompt_cache_key: Option<String>,
     /// No `Default` on this struct so adding a field forces every call site to update.
     pub workflow: bool,
     pub prompt: Option<Box<McpPromptRef>>,
@@ -117,8 +118,14 @@ impl AgentInput {
             preamble: Vec::new(),
             thinking: defaults.thinking.into(),
             fast: defaults.fast,
+            prompt_cache_key: None,
             workflow: defaults.workflow,
             prompt: None,
         }
+    }
+
+    pub fn with_prompt_cache_key(mut self, prompt_cache_key: Option<String>) -> Self {
+        self.prompt_cache_key = prompt_cache_key;
+        self
     }
 }

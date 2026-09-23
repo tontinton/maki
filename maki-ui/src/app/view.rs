@@ -339,9 +339,10 @@ impl App {
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {
         let chat = &self.chats[render_chat];
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
-        let opts = chat.opts.unwrap_or(RequestOptions {
+        let opts = chat.opts.clone().unwrap_or(RequestOptions {
             thinking: self.state.thinking,
             fast: self.state.fast,
+            prompt_cache_key: None,
         });
         let (mode_label, mode_style) = self.mode_label();
         let ctx = StatusBarContext {

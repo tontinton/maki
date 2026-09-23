@@ -8,6 +8,7 @@
 //! their own [`CatalogProvider`] instance, created from the same
 //! [`ProviderData`].
 
+use crate::ProviderSession;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -848,9 +849,10 @@ impl Provider for CatalogProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
+            let session_id = session_id.map(ProviderSession::session_ref);
             let auth = self.auth.unlocked(&self.data.slug)?.clone();
             let auth = self.data.request_auth(auth, session_id);
             let meta = self
@@ -950,7 +952,7 @@ impl Provider for LazyCatalogProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.resolve()

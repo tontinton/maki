@@ -258,6 +258,9 @@ pub enum ContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
+    OpenAiReasoning {
+        item: Value,
+    },
     RedactedThinking {
         data: String,
     },
@@ -281,7 +284,10 @@ pub enum ContentBlock {
 
 impl ContentBlock {
     pub fn is_thinking(&self) -> bool {
-        matches!(self, Self::Thinking { .. } | Self::RedactedThinking { .. })
+        matches!(
+            self,
+            Self::Thinking { .. } | Self::RedactedThinking { .. } | Self::OpenAiReasoning { .. }
+        )
     }
 }
 
@@ -1003,11 +1009,12 @@ impl From<ThinkingConfig> for StoredThinking {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RequestOptions {
     pub thinking: ThinkingConfig,
     /// Raw user preference, reconciled by [`RequestOptions::clamped`] before use.
     pub fast: bool,
+    pub prompt_cache_key: Option<String>,
 }
 
 impl RequestOptions {
@@ -1018,6 +1025,7 @@ impl RequestOptions {
         Self {
             thinking: self.thinking.clamped(model),
             fast: self.fast && model.supports_fast(),
+            prompt_cache_key: self.prompt_cache_key,
         }
     }
 }
@@ -1659,6 +1667,7 @@ mod tests {
         let thinking = RequestOptions {
             thinking: ThinkingConfig::Off,
             fast: false,
+            prompt_cache_key: None,
         }
         .clamped(&model)
         .thinking;
@@ -1759,8 +1768,11 @@ mod tests {
         let opts = RequestOptions {
             thinking,
             fast: false,
+            prompt_cache_key: Some("cache-probe".into()),
         };
-        assert_eq!(opts.clamped(&model).thinking, expected);
+        let clamped = opts.clamped(&model);
+        assert_eq!(clamped.thinking, expected);
+        assert_eq!(clamped.prompt_cache_key.as_deref(), Some("cache-probe"));
     }
 
     #[test_case(None,                           ThinkingConfig::Off      ; "absent_means_off")]
@@ -1778,6 +1790,7 @@ mod tests {
         let opts = RequestOptions {
             thinking: ThinkingConfig::Off,
             fast: true,
+            prompt_cache_key: None,
         };
         assert!(!opts.clamped(&model).fast);
     }

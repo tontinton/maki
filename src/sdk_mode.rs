@@ -686,7 +686,8 @@ pub fn run(params: SdkParams) -> Result<()> {
                     shared.permission_mode
                 };
                 let input =
-                    AgentInput::from_defaults(prompt, mode.agent_mode(&cwd), images, defaults);
+                    AgentInput::from_defaults(prompt, mode.agent_mode(&cwd), images, defaults)
+                        .with_prompt_cache_key(cli.prompt_cache_key.clone());
                 if handle.input_tx.send(input).is_err() {
                     break;
                 }

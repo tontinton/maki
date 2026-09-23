@@ -140,6 +140,7 @@ impl VerboseOutput {
 pub struct PrintParams {
     pub model: Model,
     pub prompt: Option<String>,
+    pub prompt_cache_key: Option<String>,
     pub image_paths: Vec<PathBuf>,
     pub format: OutputFormat,
     pub verbose: bool,
@@ -161,6 +162,7 @@ pub fn run(params: PrintParams) -> Result<()> {
     let PrintParams {
         model,
         prompt,
+        prompt_cache_key,
         image_paths,
         format,
         verbose,
@@ -204,6 +206,7 @@ pub fn run(params: PrintParams) -> Result<()> {
         permissions_config,
         timeouts,
         prompt,
+        prompt_cache_key,
         images,
         prompt_slots,
         excluded_tools: vec![QUESTION_TOOL_NAME],

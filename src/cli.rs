@@ -8,6 +8,13 @@ use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
 
 use crate::print::OutputFormat;
 
+fn non_empty(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        return Err("value must not be empty".into());
+    }
+    Ok(value.to_owned())
+}
+
 #[derive(Clone, ValueEnum, Default)]
 pub enum PromptVariant {
     #[default]
@@ -126,6 +133,10 @@ pub struct Cli {
     /// Include partial streaming messages in SDK output
     #[arg(long)]
     pub include_partial_messages: bool,
+
+    /// Attach a cache-routing key to OpenAI Responses requests in --print mode
+    #[arg(long, requires = "print", value_parser = non_empty)]
+    pub prompt_cache_key: Option<String>,
 
     /// Permission prompt tool (accepted for compat, used in SDK mode)
     #[arg(long, hide = true)]
@@ -370,6 +381,7 @@ pub fn normalize_tool_name(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use test_case::test_case;
 
     #[test_case("Read", "read")]
@@ -390,5 +402,18 @@ mod tests {
     #[test]
     fn normalize_tool_name_multi_edit_rejects_snake_variant() {
         assert!(normalize_tool_name("MultiEdit").is_err());
+    }
+
+    #[test]
+    fn prompt_cache_key_requires_print_mode() {
+        assert!(Cli::try_parse_from(["maki", "--prompt-cache-key", "probe"]).is_err());
+        let cli = Cli::try_parse_from(["maki", "--print", "--prompt-cache-key", "probe", "hello"])
+            .unwrap();
+        assert_eq!(cli.prompt_cache_key.as_deref(), Some("probe"));
+    }
+
+    #[test]
+    fn prompt_cache_key_rejects_empty_values() {
+        assert!(Cli::try_parse_from(["maki", "--print", "--prompt-cache-key", "  "]).is_err());
     }
 }

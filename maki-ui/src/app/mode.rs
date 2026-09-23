@@ -144,6 +144,7 @@ impl App {
             preamble: Vec::new(),
             thinking: self.state.thinking,
             fast: self.state.fast,
+            prompt_cache_key: None,
             workflow: self.state.workflow,
             prompt: None,
         }

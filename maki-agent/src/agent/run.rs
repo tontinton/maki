@@ -1,3 +1,4 @@
+use maki_providers::ProviderSession;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Instant;
@@ -74,6 +75,7 @@ pub struct AgentParams {
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<SessionRef>,
+    pub provider_session: Option<ProviderSession>,
     pub task_id: Option<Arc<str>>,
     pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
@@ -125,6 +127,7 @@ pub struct Agent<'h> {
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
+    provider_session: Option<ProviderSession>,
     task_id: Option<Arc<str>>,
     mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
@@ -168,6 +171,7 @@ impl<'h> Agent<'h> {
             overflow_recoveries: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
+            provider_session: params.provider_session,
             task_id: params.task_id,
             mailbox: params.mailbox,
             file_access: params.file_access,
@@ -224,6 +228,7 @@ impl<'h> Agent<'h> {
             preamble,
             thinking,
             fast,
+            prompt_cache_key,
             workflow,
             prompt: _,
         } = input;
@@ -236,7 +241,14 @@ impl<'h> Agent<'h> {
         }
         self.mode = mode;
         self.workflow = workflow;
-        self.opts = RequestOptions { thinking, fast };
+        if let Some(session) = &self.provider_session {
+            session.begin_turn().await;
+        }
+        self.opts = RequestOptions {
+            thinking,
+            fast,
+            prompt_cache_key,
+        };
 
         info!(
             model = %self.model.id,
@@ -321,9 +333,9 @@ impl<'h> Agent<'h> {
                 messages: self.history.as_slice(),
                 system: &self.system,
                 tools: tools.as_ref(),
-                opts: self.opts,
+                opts: self.opts.clone(),
                 output_budget: self.config.max_turn_output,
-                session_id: self.session_id.as_ref(),
+                session_id: self.provider_session.as_ref(),
                 retry: self.timeouts.retry,
             },
             Some(self.gauge),
@@ -388,7 +400,7 @@ impl<'h> Agent<'h> {
         } else {
             if response.message.first_text_content().is_some() {
                 self.history.push(response.message);
-            } else if self.recover_stalled_turn()? {
+            } else if self.recover_stalled_turn(response.message)? {
                 return Ok(TurnOutcome::Continue);
             }
 
@@ -512,10 +524,18 @@ impl<'h> Agent<'h> {
 
     /// The turn came back without text, so [`Message::empty_marker`] takes its
     /// place in history. Returns true when the model was nudged to try again.
-    fn recover_stalled_turn(&mut self) -> Result<bool, AgentError> {
+    fn recover_stalled_turn(&mut self, response: Message) -> Result<bool, AgentError> {
         let nudges = self.history.recent_nudges();
         let nudge = nudges < MAX_NUDGES && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
-        self.history.push(Message::empty_marker());
+        let mut marker = Message::empty_marker();
+        let mut content: Vec<_> = response
+            .content
+            .into_iter()
+            .filter(|block| matches!(block, ContentBlock::OpenAiReasoning { .. }))
+            .collect();
+        content.append(&mut marker.content);
+        marker.content = content;
+        self.history.push(marker);
         if !nudge {
             return Ok(false);
         }
@@ -548,6 +568,7 @@ impl<'h> Agent<'h> {
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
             session_id: self.session_id.clone(),
+            provider_session: self.provider_session.clone(),
             task_id: self.task_id.clone(),
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
@@ -563,7 +584,7 @@ impl<'h> Agent<'h> {
             timeouts: self.timeouts,
             file_access: Arc::clone(&self.file_access),
             prompt_slots: Arc::clone(&self.prompt_slots),
-            opts: self.opts,
+            opts: self.opts.clone(),
             subagent_cancels: Arc::clone(&self.subagent_cancels),
             ledger: Arc::clone(&self.ledger),
             registry: Arc::clone(&self.registry),
@@ -631,7 +652,8 @@ impl<'h> Agent<'h> {
             &self.config,
             instructions,
             carry_len,
-            self.session_id.as_ref(),
+            self.opts.prompt_cache_key.as_deref(),
+            self.provider_session.as_ref(),
             self.timeouts.retry,
         )
         .await?;
@@ -786,7 +808,7 @@ mod tests {
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a ProviderSession>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 self.captured_tools.lock().unwrap().push(tools.clone());
@@ -819,7 +841,7 @@ mod tests {
             _: &'a Value,
             ptx: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a ProviderSession>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 if let Some(text) = self.delta {
@@ -906,6 +928,7 @@ mod tests {
                     Arc::default(),
                 )),
                 session_id: None,
+                provider_session: None,
                 task_id: None,
                 mailbox: None,
                 timeouts: maki_providers::Timeouts::default(),
@@ -936,6 +959,7 @@ mod tests {
             preamble: Vec::new(),
             thinking: Default::default(),
             fast: false,
+            prompt_cache_key: None,
             workflow: false,
             prompt: None,
         }
@@ -1440,7 +1464,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a ProviderSession>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 let mut remaining = self.0.lock().unwrap();
@@ -1716,6 +1740,11 @@ mod tests {
         ; "no_nudge_when_text_after_tools"
     )]
     #[test_case(
+        [tool_call_response("glob", "t1")].into_iter().chain((0..=MAX_NUDGES).map(|_| assistant_response(vec![ContentBlock::OpenAiReasoning { item: serde_json::json!({"type":"reasoning","encrypted_content":"opaque"}) }]))).collect(),
+        MAX_NUDGES + 2, MAX_NUDGES as usize
+        ; "opaque_reasoning_keeps_recovery_limit"
+    )]
+    #[test_case(
         vec![
             empty_response(),
             text_response(StopReason::EndTurn),
@@ -1796,5 +1825,50 @@ mod tests {
             .expect("valid session id");
         agent.session_id = Some(session.clone());
         assert_eq!(agent.tool_context().session_id, Some(session));
+    }
+    #[test_case(false ; "without_tools")]
+    #[test_case(true ; "after_tools")]
+    fn opaque_reasoning_survives_stalled_recovery(after_tools: bool) {
+        const CIPHERTEXT: &str = "encrypted-stalled-response";
+        smol::block_on(async {
+            let item = serde_json::json!({"type":"reasoning","id":"rs_stalled","summary":[],"encrypted_content":CIPHERTEXT});
+            let opaque =
+                assistant_response(vec![ContentBlock::OpenAiReasoning { item: item.clone() }]);
+            let responses = if after_tools {
+                vec![
+                    tool_call_response("glob", "t1"),
+                    opaque,
+                    text_response(StopReason::EndTurn),
+                ]
+            } else {
+                vec![opaque]
+            };
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+            let retained: Vec<_> = history
+                .as_slice()
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|block| match block {
+                    ContentBlock::OpenAiReasoning { item } => Some(item),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(retained, vec![&item]);
+            assert_eq!(
+                drain_events(&event_rx)
+                    .iter()
+                    .filter(|event| matches!(event.event, AgentEvent::Nudge))
+                    .count(),
+                usize::from(after_tools)
+            );
+            assert!(history.as_slice().iter().all(|message| {
+                message
+                    .first_text_content()
+                    .is_none_or(|text| !text.contains(CIPHERTEXT))
+            }));
+        });
     }
 }

@@ -4,13 +4,13 @@
 pub(crate) mod bedrock;
 pub(crate) mod shared;
 
+use crate::ProviderSession;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::debug;
@@ -461,7 +461,7 @@ impl Provider for Anthropic {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _session_id: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let system_blocks = if let Some(prefix) = &self.system_prefix {
@@ -494,7 +494,7 @@ impl Provider for Anthropic {
             );
             body["model"] = json!(shared::strip_long_context(&model.id));
             body["stream"] = json!(true);
-            let fast = apply_fast_mode(&mut body, model, opts);
+            let fast = apply_fast_mode(&mut body, model, opts.clone());
             let long_context = model.id.ends_with(shared::LONG_CONTEXT_SUFFIX);
 
             debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, fast, long_context, "sending API request");

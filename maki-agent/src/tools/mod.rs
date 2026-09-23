@@ -20,6 +20,7 @@ pub use registry::{
     ToolRegistry, ToolSource,
 };
 
+use maki_providers::ProviderSession;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -337,6 +338,7 @@ pub struct ToolContext {
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `maki index` one-shot.
     pub session_id: Option<SessionRef>,
+    pub provider_session: Option<ProviderSession>,
     /// `None` in the agent that owns the session ([`MAIN_TASK_ID`]), the
     /// spawning call's `tool_use_id` in a subagent. A subagent shares
     /// `session_id` with its parent on purpose (provider affinity, hooks,
@@ -542,7 +544,7 @@ impl Provider for NullProvider {
         _: &'a Value,
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
-        _: Option<&'a SessionRef>,
+        _: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }
@@ -572,6 +574,7 @@ pub fn interpreter_ctx(
         event_tx: event_tx.clone(),
         mode: mode.clone(),
         session_id: None,
+        provider_session: None,
         task_id: None,
         tool_use_id: None,
         user_response_rx,

@@ -1,3 +1,4 @@
+use crate::ProviderSession;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -162,9 +163,10 @@ impl Provider for Xai {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
+            let session_id = session_id.map(ProviderSession::session_ref);
             let mut buf = String::new();
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 

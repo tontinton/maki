@@ -3300,9 +3300,10 @@ fn resolve_or_create_chat_sets_subagent_opts() {
     let opts = RequestOptions {
         thinking: ThinkingConfig::Effort(Effort::High),
         fast: true,
+        prompt_cache_key: None,
     };
     let mut info = subagent_info(TASK_ID, "research");
-    info.opts = Some(opts);
+    info.opts = Some(opts.clone());
 
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta { text: "hi".into() },

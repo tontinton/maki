@@ -1,8 +1,8 @@
+use crate::ProviderSession;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_storage::StateDir;
-use maki_storage::id::SessionRef;
 use maki_storage::sessions::Effort;
 use serde::Deserialize;
 use serde_json::Value;
@@ -209,7 +209,11 @@ fn supports_plan_fast(
     discovery_complete: bool,
 ) -> FastSupport {
     let account_id = auth
-        .filter(|auth| auth.base_url.as_deref() == Some(auth::CODING_PLAN_BASE_URL))
+        .filter(|auth| {
+            auth.base_url
+                .as_deref()
+                .is_some_and(super::routing::is_coding_plan)
+        })
         .and_then(plan_account_id);
     let Some(account_id) = account_id else {
         return FastSupport::Unsupported;
@@ -275,6 +279,7 @@ struct CodexUsageWindow {
 
 pub struct OpenAi {
     compat: OpenAiCompatProvider,
+    timeouts: crate::providers::Timeouts,
     auth: Arc<Mutex<ResolvedAuth>>,
     storage: Option<StateDir>,
     system_prefix: Option<String>,
@@ -290,6 +295,7 @@ impl OpenAi {
         let resolved = auth::resolve(&storage)?;
         let compat = OpenAiCompatProvider::new(&CONFIG, timeouts);
         Ok(Self {
+            timeouts,
             resolved_base_url: resolve_openai_base_url(),
             compat,
             auth: Arc::new(Mutex::new(resolved)),
@@ -303,6 +309,7 @@ impl OpenAi {
         timeouts: crate::providers::Timeouts,
     ) -> Self {
         Self {
+            timeouts,
             resolved_base_url: resolve_openai_base_url(),
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth,
@@ -483,6 +490,53 @@ fn plan_dialect(model_id: &str) -> &'static EffortDialect<'static> {
     }
 }
 
+fn apply_session_identity(
+    auth: &mut ResolvedAuth,
+    body: &mut Value,
+    session: Option<&ProviderSession>,
+    cache_key: Option<&str>,
+) {
+    if !auth
+        .base_url
+        .as_deref()
+        .is_some_and(super::routing::is_coding_plan)
+    {
+        super::responses::apply_prompt_cache_key(body, cache_key);
+        return;
+    }
+    let cache_key = cache_key.or_else(|| session.map(ProviderSession::cache_key));
+    super::responses::apply_prompt_cache_key(body, cache_key);
+    if let Some(key) = cache_key {
+        auth.set_header("session-id", key.to_owned());
+    }
+    if let Some(session) = session {
+        for header in ["thread-id", "x-client-request-id"] {
+            auth.set_header(header, session.thread_id().to_owned());
+        }
+    }
+}
+
+fn apply_coding_plan_request(
+    auth: &mut ResolvedAuth,
+    body: &mut Value,
+    messages: &[Message],
+) -> bool {
+    if !auth
+        .base_url
+        .as_deref()
+        .is_some_and(super::routing::is_coding_plan)
+    {
+        return false;
+    }
+    body["input"] = super::responses::coding_plan_input(messages);
+    body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+    auth.set_header(
+        super::routing::ROUTING_HINT_HEADER,
+        super::routing::routing_hint(body),
+    );
+    true
+}
+
 impl Provider for OpenAi {
     fn stream_message<'a>(
         &'a self,
@@ -492,7 +546,7 @@ impl Provider for OpenAi {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut buf = String::new();
@@ -507,7 +561,7 @@ impl Provider for OpenAi {
                 let stream_timeout = self.compat.stream_timeout();
                 return self
                     .with_oauth_retry(|| async {
-                        let codex_auth = self.codex_auth()?;
+                        let mut codex_auth = self.codex_auth()?;
                         let mut body = super::responses::build_body(model, messages, system, tools);
                         super::responses::apply_responses_reasoning(
                             &mut body,
@@ -515,14 +569,43 @@ impl Provider for OpenAi {
                             model,
                             &dialect,
                         );
+                        apply_session_identity(
+                            &mut codex_auth,
+                            &mut body,
+                            session_id,
+                            opts.prompt_cache_key.as_deref(),
+                        );
                         apply_plan_fast(&mut body, opts.fast, &codex_auth, discovered.as_deref());
-                        super::responses::do_stream(
+                        let coding_plan =
+                            apply_coding_plan_request(&mut codex_auth, &mut body, messages);
+                        let routing = session_id
+                            .filter(|_| coding_plan)
+                            .map(ProviderSession::routing);
+                        if let Some(session) = session_id {
+                            session.routing().prepare(&codex_auth)?;
+                        }
+                        if coding_plan
+                            && let Some(session) = session_id
+                            && let Some(response) = super::websocket::stream(
+                                session,
+                                model,
+                                &body,
+                                event_tx,
+                                &codex_auth,
+                                self.timeouts,
+                            )
+                            .await?
+                        {
+                            return Ok(response);
+                        }
+                        super::responses::do_stream_with_routing(
                             self.compat.client(),
                             model,
                             &body,
                             event_tx,
                             &codex_auth,
                             stream_timeout,
+                            routing,
                         )
                         .await
                     })
@@ -624,12 +707,71 @@ impl Provider for OpenAi {
 
 #[cfg(test)]
 mod tests {
+    use isahc::Request;
+    use maki_storage::id::SessionRef;
     use serde_json::json;
     use test_case::test_case;
 
     use super::super::responses;
     use super::*;
-    use crate::ThinkingConfig;
+    use crate::{ContentBlock, Role, ThinkingConfig};
+
+    const SESSION_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const CACHE_KEY: &str = "explicit-cache-key";
+
+    #[test_case(Some(SESSION_ID), None ; "session_default")]
+    #[test_case(Some(SESSION_ID), Some(CACHE_KEY) ; "explicit_override")]
+    #[test_case(None, Some(CACHE_KEY) ; "key_only")]
+    #[test_case(None, None ; "no_identity")]
+    fn session_identity_headers(session: Option<&str>, key: Option<&str>) {
+        let session_ref = session.map(|id| ProviderSession::new(id.parse::<SessionRef>().unwrap()));
+        let expected_key = key.or(session);
+        let mut auth = ResolvedAuth::new("openai", vec![])
+            .unwrap()
+            .with_base_url(Some(auth::CODING_PLAN_BASE_URL.into()));
+        for _ in 0..2 {
+            let mut body = json!({});
+            apply_session_identity(&mut auth, &mut body, session_ref.as_ref(), key);
+            let request = auth.configure_request(Request::builder()).body(()).unwrap();
+            assert_eq!(
+                body.get("prompt_cache_key").and_then(Value::as_str),
+                expected_key
+            );
+            for (header, expected) in [
+                ("session-id", expected_key),
+                ("thread-id", session),
+                ("x-client-request-id", session),
+            ] {
+                assert_eq!(
+                    request
+                        .headers()
+                        .get(header)
+                        .map(|value| value.to_str().unwrap()),
+                    expected
+                );
+                assert_eq!(
+                    request.headers().get_all(header).iter().count(),
+                    usize::from(expected.is_some())
+                );
+            }
+        }
+    }
+
+    #[test_case(None ; "without_explicit_key")]
+    #[test_case(Some(CACHE_KEY) ; "with_explicit_key")]
+    fn api_key_responses_preserve_explicit_cache_key_only(key: Option<&str>) {
+        let mut auth = ResolvedAuth::new("openai", vec![])
+            .unwrap()
+            .with_base_url(Some(CONFIG.base_url.into()));
+        let session = ProviderSession::new(SESSION_ID.parse::<SessionRef>().unwrap());
+        let mut body = json!({});
+        apply_session_identity(&mut auth, &mut body, Some(&session), key);
+        assert_eq!(body.get("prompt_cache_key").and_then(Value::as_str), key);
+        let request = auth.configure_request(Request::builder()).body(()).unwrap();
+        for header in ["session-id", "thread-id", "x-client-request-id"] {
+            assert!(!request.headers().contains_key(header));
+        }
+    }
 
     #[test_case("gpt-5.6-luna")]
     #[test_case("gpt-5.6-terra")]
@@ -925,8 +1067,9 @@ mod tests {
         let opts = RequestOptions {
             thinking: ThinkingConfig::Adaptive,
             fast,
+            prompt_cache_key: None,
         };
-        assert_eq!(opts.clamped(&model).fast, expected);
+        assert_eq!(opts.clone().clamped(&model).fast, expected);
         let mut body = responses::build_body(&model, &[], "", &json!([]));
         responses::apply_responses_reasoning(
             &mut body,
@@ -1037,5 +1180,41 @@ mod tests {
             parse_usage(response).unwrap_err().to_string(),
             EMPTY_USAGE_ERROR
         );
+    }
+    #[test_case(auth::CODING_PLAN_BASE_URL, true ; "coding_plan")]
+    #[test_case("https://chatgpt.com/backend-api/codex/", true ; "trailing_slash")]
+    #[test_case("https://api.openai.com/v1", false ; "public_api")]
+    #[test_case("https://other.example/v1", false ; "other_responses")]
+    fn encrypted_replay_and_routing_are_coding_plan_only(base: &str, coding_plan: bool) {
+        const CIPHERTEXT: &str = "opaque-provider-gate";
+        let mut auth = ResolvedAuth::for_test(Some(base.into()), vec![]);
+        let model = Model::from_spec("openai/gpt-5.6-luna").unwrap();
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::OpenAiReasoning {
+                item: json!({"type":"reasoning","encrypted_content":CIPHERTEXT}),
+            }],
+            ..Default::default()
+        }];
+        let mut body = responses::build_body(&model, &messages, "", &json!([]));
+        assert_eq!(
+            apply_coding_plan_request(&mut auth, &mut body, &messages),
+            coding_plan
+        );
+        assert_eq!(body.get("include").is_some(), coding_plan);
+        assert_eq!(
+            body["input"].as_array().unwrap().len(),
+            usize::from(coding_plan)
+        );
+        assert_eq!(
+            auth.configure_request(Request::builder())
+                .body(())
+                .unwrap()
+                .headers()
+                .contains_key(super::super::routing::ROUTING_HINT_HEADER),
+            coding_plan
+        );
+        assert_eq!(body["store"], false);
+        assert!(body.get("prompt_cache_options").is_none());
     }
 }

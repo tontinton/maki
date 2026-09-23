@@ -1,3 +1,4 @@
+use crate::ProviderSession;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -13,7 +14,6 @@ use crate::spec::{
     ProviderRegistry, ProviderSpec,
 };
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
-use maki_storage::id::SessionRef;
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{ResolvedAuth, Timeouts, google};
@@ -357,7 +357,7 @@ impl Provider for Aperture {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", &model.id));

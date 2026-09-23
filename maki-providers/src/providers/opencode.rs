@@ -1,3 +1,4 @@
+use crate::ProviderSession;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -219,9 +220,10 @@ impl Provider for Opencode {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
+            let session_id = session_id.map(ProviderSession::session_ref);
             let (sub_provider, actual_id) =
                 model.id.split_once('/').unwrap_or((ZEN_SLUG, &model.id));
 

@@ -561,7 +561,12 @@ async fn session(
     let thinking = requested_thinking.map_or(agent_ctx.opts.thinking, |t| {
         t.clamp_to(agent_ctx.opts.thinking)
     });
-    let opts = RequestOptions { thinking, fast }.clamped(&model);
+    let opts = RequestOptions {
+        thinking,
+        fast,
+        prompt_cache_key: agent_ctx.opts.prompt_cache_key.clone(),
+    }
+    .clamped(&model);
 
     let (stream_guard, sub_events) = event_stream();
     let sub_event_tx = stream_guard.sender(agent_ctx.event_tx.run_id());
@@ -612,6 +617,10 @@ async fn session(
             tool_output_lines: maki_config::ToolOutputLines::default(),
             permissions: Arc::clone(&agent_ctx.permissions),
             session_id: agent_ctx.session_id.clone(),
+            provider_session: agent_ctx
+                .provider_session
+                .as_ref()
+                .map(|session| session.child(opts.prompt_cache_key.as_deref())),
             task_id: Some(Arc::from(ui_id.as_str())),
             mailbox: None,
             timeouts: agent_ctx.timeouts,
@@ -866,7 +875,7 @@ async fn prompt(
             name: s.name.clone(),
             prompt: Some(message.clone()),
             model: Some(s.params.model.spec()),
-            opts: Some(s.opts),
+            opts: Some(s.opts.clone()),
             answer_tx: s.answer_tx.take(),
         });
     }
@@ -895,6 +904,7 @@ async fn prompt(
         preamble: Vec::new(),
         thinking: s.opts.thinking,
         fast: s.opts.fast,
+        prompt_cache_key: s.opts.prompt_cache_key.clone(),
         workflow: false,
         prompt: None,
     };
