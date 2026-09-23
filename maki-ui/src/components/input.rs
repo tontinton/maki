@@ -761,7 +761,7 @@ fn overlay_cursor(
         if !reversed {
             return style;
         }
-        let theme_cursor = theme::current().cursor;
+        let theme_cursor = theme::cursor_style();
         if theme_cursor == Style::default() {
             style.reversed()
         } else {
