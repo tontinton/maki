@@ -12,6 +12,7 @@ use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
+use crate::theme;
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
@@ -85,8 +86,8 @@ const WAIT_AHEAD: Duration = Duration::from_secs(60);
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
 const CURSOR_ON_SCREEN: &str = "the reported cursor must be on screen";
-const CURSOR_ON_REVERSED_CELL: &str = "the focused input box owns a reversed cursor cell";
-const OVERLAY_TAKES_THE_CURSOR: &str = "an overlay unfocuses the input box, so no cell is reversed";
+const CURSOR_ON_STYLED_CELL: &str = "the focused input box owns a cell painted as the cursor";
+const OVERLAY_TAKES_THE_CURSOR: &str = "an overlay unfocuses the input box, so no cell is a cursor";
 /// Stands in for a size the provider measured, baseline included.
 const MEASURED_CONTEXT: u32 = 100_000;
 const TEST_MODEL_SPEC: &str = "test-model";
@@ -2512,7 +2513,7 @@ fn rendered(app: &mut App) -> String {
 
 /// The event loop parks the terminal cursor on whatever `view` reports, so an
 /// IME anchors its preedit text there. The report has to be the very cell the
-/// input box reversed for its software cursor, and the hardware cursor has to
+/// input box painted for its software cursor, and the hardware cursor has to
 /// stay hidden: shown, it would invert that cell back to plain text.
 #[test]
 fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
@@ -2532,13 +2533,15 @@ fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
                 .buffer()
                 .cell(pos)
                 .expect(CURSOR_ON_SCREEN);
-            (pos, cell.modifier.contains(Modifier::REVERSED))
+            let theme = theme::current();
+            let styled = cell.fg == theme.background && cell.bg == theme.foreground;
+            (pos, styled || cell.modifier.contains(Modifier::REVERSED))
         })
     };
 
     assert!(
         matches!(draw(&mut app), Some((_, true))),
-        "{CURSOR_ON_REVERSED_CELL}"
+        "{CURSOR_ON_STYLED_CELL}"
     );
 
     app.update(Msg::Key(kb::HELP.to_key_event()));
