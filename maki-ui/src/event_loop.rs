@@ -1534,7 +1534,12 @@ impl<'t> EventLoop<'t> {
                 (Some(Msg::Paste(text)), None)
             }
             Event::Mouse(mouse) => {
-                self.focus.note_input();
+                // Hover motion proves nothing: tmux forwards moves from a
+                // pane the user is merely passing over, and treating them as
+                // attention would recolor the caret of an unfocused pane.
+                if mouse.kind != MouseEventKind::Moved {
+                    self.focus.note_input();
+                }
                 self.translate_mouse(mouse)
             }
             _ => (None, None),
