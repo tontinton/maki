@@ -19,8 +19,8 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
-    EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, McpSession, RunLedger,
-    SessionEvents, SubagentInfo, ToolDoneEvent, event_stream,
+    EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, InputSource, McpSession,
+    RunLedger, SessionEvents, SubagentInfo, ToolDoneEvent, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -893,10 +893,12 @@ async fn prompt(
         mode: AgentMode::Build,
         images: Vec::new(),
         preamble: Vec::new(),
+        earlier: Vec::new(),
         thinking: s.opts.thinking,
         fast: s.opts.fast,
         workflow: false,
         prompt: None,
+        source: InputSource::Plugin,
     };
     let result = agent.run(input).await;
     drop(agent);

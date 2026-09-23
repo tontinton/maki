@@ -19,6 +19,7 @@ use crate::{BufferSnapshot, ToolOutput};
 use super::hook::ToolHook;
 use super::schema::sanitize_tool_input_schema;
 use super::{DescriptionContext, ToolContext};
+use crate::agent::AgentHook;
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,11 +267,15 @@ pub struct ToolRegistry {
     /// registry rather than one per tool, so a tool arriving from a new place
     /// is hookable the day it lands.
     hook: ArcSwapOption<Box<dyn ToolHook>>,
+    /// The agent loop's own slots. They live here because the registry is the
+    /// one handle every run already carries.
+    agent_hook: ArcSwapOption<Box<dyn AgentHook>>,
 }
 
 /// `ArcSwapOption` needs a sized payload, hence the `Box`. Auto-deref hides
 /// it at every call site.
 pub type InstalledHook = Arc<Box<dyn ToolHook>>;
+pub type InstalledAgentHook = Arc<Box<dyn AgentHook>>;
 
 impl Default for ToolRegistry {
     fn default() -> Self {
@@ -289,6 +294,7 @@ impl ToolRegistry {
         Self {
             tools: ArcSwap::from_pointee(Vec::new()),
             hook: ArcSwapOption::empty(),
+            agent_hook: ArcSwapOption::empty(),
         }
     }
 
@@ -302,6 +308,16 @@ impl ToolRegistry {
 
     pub fn hook(&self) -> Option<InstalledHook> {
         self.hook.load_full()
+    }
+
+    /// Same lifetime rule as [`Self::set_hook`].
+    pub fn set_agent_hook(&self, hook: impl AgentHook) {
+        let boxed: Box<dyn AgentHook> = Box::new(hook);
+        self.agent_hook.store(Some(Arc::new(boxed)));
+    }
+
+    pub fn agent_hook(&self) -> Option<InstalledAgentHook> {
+        self.agent_hook.load_full()
     }
 
     /// The process-wide registry. Every tool in it comes from a Lua plugin

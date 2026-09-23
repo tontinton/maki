@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 
 use maki_config::AgentConfig;
@@ -6,14 +7,15 @@ use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
     StreamResponse, TokenUsage,
 };
-use maki_storage::id::SessionRef;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::info;
 
 use super::history::{History, remove_orphaned_tool_results};
+use super::hook::{AgentHooks, AgentSlot};
 use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry};
-use crate::cancel::CancelToken;
 use crate::prompt::COMPACTION_USER;
+use crate::tools::hook::Verdict;
+use crate::tools::truncate_bytes;
 use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
@@ -36,6 +38,104 @@ const SUMMARY_OUTPUT_BUDGET: u32 = 16_384;
 /// llama.cpp server started with `n_ctx 4096` summarized itself before every
 /// single turn.
 const MAX_RESERVED_PERCENT: u32 = 50;
+/// A layer only needs a taste of each result to judge it. Shipping a 40 KB
+/// build log to Lua for every result of a long session would cost more than
+/// the layer saves. `bytes` still tells the full size.
+const PREPARE_TEXT_MAX: usize = 4 * 1024;
+
+pub(super) const FIELD_SKIP: &str = "skip";
+const FIELD_INSTRUCTIONS: &str = "instructions";
+pub(super) const FIELD_CONTINUE: &str = "continue";
+const FIELD_COLLAPSE: &str = "collapse";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum CompactReason {
+    Auto,
+    /// The provider already refused the prompt as too long. Compaction is the
+    /// only way out, so a layer cannot skip this one.
+    Overflow,
+    Manual,
+}
+
+impl CompactReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Overflow => "overflow",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+/// Both strings go on top of the configured ones and never replace them, so a
+/// plugin cannot quietly drop what the user put in config.
+#[derive(Default)]
+pub(super) struct CompactSteer {
+    /// Already holds the `/compact` request's own words, with the layer's
+    /// after them.
+    pub instructions: Option<String>,
+    pub continue_text: Option<String>,
+}
+
+fn join_lines<'a>(parts: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    let joined = parts
+        .into_iter()
+        .filter_map(normalize)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!joined.is_empty()).then_some(joined)
+}
+
+/// `agent.stop` and `agent.compact.before` both resume the run with it.
+pub(super) fn continue_text(value: &Value) -> Option<&str> {
+    normalize(value.get(FIELD_CONTINUE).and_then(Value::as_str))
+}
+
+/// `None` when a layer skipped it. The gauge stays where it was, so an
+/// automatic compaction simply asks again before the next turn.
+pub(super) async fn steer_compaction(
+    hooks: &AgentHooks<'_>,
+    config: &AgentConfig,
+    reason: CompactReason,
+    request: Option<&str>,
+) -> Option<CompactSteer> {
+    let verdict = hooks
+        .fire(AgentSlot::CompactBefore, || {
+            json!({
+                "reason": reason.as_str(),
+                "context_size": hooks.context_size,
+                "usable": usable(hooks.model, config),
+                "request_instructions": request,
+            })
+        })
+        .await;
+    let (skip, added, continue_with) = match &verdict {
+        Verdict::Replaced(value) => (
+            value
+                .get(FIELD_SKIP)
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            value.get(FIELD_INSTRUCTIONS).and_then(Value::as_str),
+            continue_text(value),
+        ),
+        Verdict::Denied(why) => {
+            info!(reason = %why, "agent.compact.before asked to skip");
+            (true, None, None)
+        }
+        Verdict::Unchanged | Verdict::Ask { .. } => (false, None, None),
+    };
+    if skip && reason != CompactReason::Overflow {
+        info!(
+            reason = reason.as_str(),
+            "agent.compact.before skipped the compaction"
+        );
+        return None;
+    }
+    Some(CompactSteer {
+        instructions: join_lines([request, added]),
+        continue_text: continue_with.map(str::to_owned),
+    })
+}
 
 fn percent_of(tokens: u32, percent: u32) -> u32 {
     (u64::from(tokens) * u64::from(percent) / 100) as u32
@@ -62,8 +162,8 @@ fn summary_prompt(config: &AgentConfig, request: Option<&str>) -> String {
     format!("{COMPACTION_USER}\n\nAdditional instructions:\n{extras}")
 }
 
-pub(super) fn continue_message(config: &AgentConfig) -> String {
-    match normalize(config.post_compaction_instructions.as_deref()) {
+pub(super) fn continue_message(config: &AgentConfig, added: Option<&str>) -> String {
+    match join_lines([config.post_compaction_instructions.as_deref(), added]) {
         Some(extra) => format!("{CONTINUE_AFTER_COMPACT}\n\n{extra}"),
         None => CONTINUE_AFTER_COMPACT.to_string(),
     }
@@ -82,20 +182,19 @@ pub(super) async fn compact_history(
     model: &Model,
     history: &mut History,
     event_tx: &EventSender,
-    cancel: &CancelToken,
+    hooks: &AgentHooks<'_>,
     config: &AgentConfig,
     instructions: Option<&str>,
     carry_len: usize,
-    session_id: Option<&SessionRef>,
     retry: RetryPolicy,
-) -> Result<TokenUsage, AgentError> {
+) -> Result<(TokenUsage, String), AgentError> {
     let compact_start = std::time::Instant::now();
     let summarized = history.len().saturating_sub(carry_len);
     let mut compaction_history: Vec<Message> = history.as_slice()[..summarized].to_vec();
     remove_orphaned_tool_results(&mut compaction_history);
     strip_images(&mut compaction_history);
     strip_thinking(&mut compaction_history);
-    collapse_tool_results(&mut compaction_history, RECENT_TOOL_RESULT_BUDGET);
+    prepare_collapse(hooks, &mut compaction_history, RECENT_TOOL_RESULT_BUDGET).await;
     compaction_history.push(Message::user(summary_prompt(config, instructions)));
 
     let empty_tools = serde_json::json!([]);
@@ -112,7 +211,7 @@ pub(super) async fn compact_history(
                 tools: &empty_tools,
                 opts: RequestOptions::default(),
                 output_budget: SUMMARY_OUTPUT_BUDGET,
-                session_id,
+                session_id: hooks.session_id,
                 retry,
             },
             // A stripped, collapsed rewrite of the transcript, far smaller than
@@ -121,7 +220,7 @@ pub(super) async fn compact_history(
             // and its measurement describes a prompt the session never had.
             None,
             event_tx,
-            cancel,
+            hooks.cancel,
         )
         .await
         {
@@ -162,7 +261,7 @@ fn finish_compact(
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
-) -> Result<TokenUsage, AgentError> {
+) -> Result<(TokenUsage, String), AgentError> {
     let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
         message: response.message.clone(),
         usage: response.usage,
@@ -175,9 +274,9 @@ fn finish_compact(
 
     // Swapping the history for a summary the model never wrote would throw the
     // session away for nothing.
-    if response.message.first_text_content().is_none() {
+    let Some(summary) = response.message.first_text_content().map(str::to_owned) else {
         return Err(AgentError::EmptySummary);
-    }
+    };
 
     let mut new_history = vec![
         Message::user("What did we do so far?".into()),
@@ -191,12 +290,13 @@ fn finish_compact(
         "compaction completed"
     );
 
-    Ok(response.usage)
+    Ok((response.usage, summary))
 }
 
 /// `system` and `tools` are the ones the next request will carry: compaction
 /// replaces the transcript and leaves that baseline untouched, so the gauge
-/// cannot be resized without them.
+/// cannot be resized without them. `model` is the one writing the summary,
+/// while `hooks` holds the session's own model, the one layers care about.
 ///
 /// A retry in here can honour a server `Retry-After` that parks the request for
 /// an hour, so esc has to reach it. The cancel comes back as
@@ -211,35 +311,52 @@ pub async fn compact(
     system: &str,
     tools: &Value,
     event_tx: &EventSender,
-    cancel: &CancelToken,
+    hooks: &AgentHooks<'_>,
     config: &AgentConfig,
     instructions: Option<&str>,
-    session_id: Option<&SessionRef>,
     retry: RetryPolicy,
 ) -> Result<DoneReason, AgentError> {
     let size_before = gauge.size();
-    let usage = match compact_history(
+    let finished = |usage: TokenUsage, context_size| AgentEvent::Done {
+        usage,
+        cost: model.billed_cost(&usage, false),
+        list_cost: model.list_cost(&usage, false),
+        context_size,
+        context_window: model.context_window,
+        num_turns: 1,
+        // `Compact` and not `EndTurn`, so a goal loop reading this sees
+        // housekeeping and does not treat it as a turn boundary.
+        reason: DoneReason::Compact,
+    };
+    let Some(steer) = steer_compaction(hooks, config, CompactReason::Manual, instructions).await
+    else {
+        event_tx.send(finished(TokenUsage::default(), size_before))?;
+        return Ok(DoneReason::Compact);
+    };
+    let (usage, summary) = match compact_history(
         provider,
         model,
         history,
         event_tx,
-        cancel,
+        hooks,
         config,
-        instructions,
+        steer.instructions.as_deref(),
         0,
-        session_id,
         retry,
     )
     .await
     {
-        Ok(usage) => usage,
+        Ok(done) => done,
         // `finish_compact` is the only writer in here, so a cancel leaves the
         // transcript and the gauge untouched and the session carries on.
         Err(AgentError::Cancelled) => return Ok(DoneReason::Cancelled),
         Err(e) => return Err(e),
     };
-    if let Some(post) = normalize(config.post_compaction_instructions.as_deref()) {
-        history.push(Message::synthetic(post.to_string()));
+    if let Some(post) = join_lines([
+        config.post_compaction_instructions.as_deref(),
+        steer.continue_text.as_deref(),
+    ]) {
+        history.push(Message::synthetic(post));
     }
     gauge.reset(history.as_slice(), system, tools);
 
@@ -252,19 +369,9 @@ pub async fn compact(
         context_size_before,
         context_size_after,
         context_window: model.context_window,
+        summary,
     })?;
-
-    // `Compact` and not `EndTurn`, so a goal loop reading this sees
-    // housekeeping and does not treat it as a turn boundary.
-    event_tx.send(AgentEvent::Done {
-        usage,
-        cost: model.billed_cost(&usage, false),
-        list_cost: model.list_cost(&usage, false),
-        context_size: context_size_after,
-        context_window: model.context_window,
-        num_turns: 1,
-        reason: DoneReason::Compact,
-    })?;
+    event_tx.send(finished(usage, context_size_after))?;
 
     Ok(DoneReason::Compact)
 }
@@ -320,30 +427,139 @@ fn strip_thinking(messages: &mut [Message]) {
     }
 }
 
-/// Walks newest first and collapses every tool result that does not fit in
-/// what is left of `budget`. One oversized result is collapsed on its own and
-/// leaves the budget to the older ones, which is the whole point: charging it
-/// would spend the tail on a block that is no longer there. Returns whether
-/// anything actually shrank, so a caller retrying on overflow can tell
-/// progress from a no-op.
-fn collapse_tool_results(messages: &mut [Message], mut budget: usize) -> bool {
+/// Where every tool result sits, oldest first, as `(message, block)`.
+fn tool_result_positions(messages: &[Message]) -> Vec<(usize, usize)> {
+    messages
+        .iter()
+        .enumerate()
+        .flat_map(|(m, msg)| {
+            msg.content
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| matches!(block, ContentBlock::ToolResult { .. }))
+                .map(move |(b, _)| (m, b))
+        })
+        .collect()
+}
+
+fn tool_result(messages: &[Message], (m, b): (usize, usize)) -> (&str, &str) {
+    match &messages[m].content[b] {
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } => (tool_use_id, content),
+        _ => ("", ""),
+    }
+}
+
+/// Walks newest first and marks every result that does not fit in what is left
+/// of `budget`. One oversized result gets marked on its own and leaves the
+/// budget to the older ones. That is the whole point: charging it would spend
+/// the tail on a block that is no longer there.
+fn default_collapse(
+    messages: &[Message],
+    positions: &[(usize, usize)],
+    mut budget: usize,
+) -> Vec<bool> {
+    let mut collapse = vec![false; positions.len()];
+    for (i, &pos) in positions.iter().enumerate().rev() {
+        match budget.checked_sub(tool_result(messages, pos).1.len()) {
+            Some(rest) => budget = rest,
+            None => collapse[i] = true,
+        }
+    }
+    collapse
+}
+
+/// Returns whether anything actually shrank, so a caller retrying on overflow
+/// can tell progress from a no-op.
+fn apply_collapse(
+    messages: &mut [Message],
+    positions: &[(usize, usize)],
+    collapse: &[bool],
+) -> bool {
     let mut collapsed = false;
-    for block in messages
-        .iter_mut()
-        .rev()
-        .flat_map(|m| m.content.iter_mut().rev())
-    {
-        if let ContentBlock::ToolResult { content, .. } = block {
-            match budget.checked_sub(content.len()) {
-                Some(rest) => budget = rest,
-                None => {
-                    collapsed |= content != TOOL_RESULT_PLACEHOLDER;
-                    *content = TOOL_RESULT_PLACEHOLDER.into();
-                }
-            }
+    for (&(m, b), _) in positions.iter().zip(collapse).filter(|(_, c)| **c) {
+        if let ContentBlock::ToolResult { content, .. } = &mut messages[m].content[b] {
+            collapsed |= content != TOOL_RESULT_PLACEHOLDER;
+            *content = TOOL_RESULT_PLACEHOLDER.into();
         }
     }
     collapsed
+}
+
+fn collapse_tool_results(messages: &mut [Message], budget: usize) -> bool {
+    let positions = tool_result_positions(messages);
+    let collapse = default_collapse(messages, &positions, budget);
+    apply_collapse(messages, &positions, &collapse)
+}
+
+/// The host's own pick rides along in `collapse`, so a layer that only wants
+/// to spare one result edits that list and hands it back, instead of redoing
+/// the budget math. Indices start at 1 because a Lua list does.
+fn prepare_value(
+    messages: &[Message],
+    positions: &[(usize, usize)],
+    collapse: &[bool],
+    budget: usize,
+) -> Value {
+    let calls: HashMap<&str, (&str, &Value)> = messages
+        .iter()
+        .flat_map(Message::tool_uses)
+        .map(|(id, name, input)| (id, (name, input)))
+        .collect();
+    let results: Vec<Value> = positions
+        .iter()
+        .enumerate()
+        .map(|(i, &pos)| {
+            let (tool_use_id, text) = tool_result(messages, pos);
+            let (tool, input) = calls
+                .get(tool_use_id)
+                .map_or((None, None), |(name, input)| (Some(*name), Some(*input)));
+            json!({
+                "index": i + 1,
+                "tool": tool,
+                "input": input,
+                "bytes": text.len(),
+                "text": truncate_bytes(text, PREPARE_TEXT_MAX),
+            })
+        })
+        .collect();
+    let picked: Vec<usize> = collapse
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c)
+        .map(|(i, _)| i + 1)
+        .collect();
+    json!({ "results": results, "budget": budget, FIELD_COLLAPSE: picked })
+}
+
+/// The layer only picks. The host still makes the edit, so no layer can
+/// orphan a tool call or lose the user's message along the way.
+async fn prepare_collapse(hooks: &AgentHooks<'_>, messages: &mut [Message], budget: usize) {
+    let positions = tool_result_positions(messages);
+    if positions.is_empty() {
+        return;
+    }
+    let mut collapse = default_collapse(messages, &positions, budget);
+    let verdict = hooks
+        .fire(AgentSlot::CompactPrepare, || {
+            prepare_value(messages, &positions, &collapse, budget)
+        })
+        .await;
+    if let Verdict::Replaced(value) = verdict
+        && let Some(picked) = value.get(FIELD_COLLAPSE).and_then(Value::as_array)
+    {
+        collapse.fill(false);
+        let indices = picked.iter().filter_map(Value::as_u64);
+        for i in indices.filter_map(|index| (index as usize).checked_sub(1)) {
+            if let Some(slot) = collapse.get_mut(i) {
+                *slot = true;
+            }
+        }
+    }
+    apply_collapse(messages, &positions, &collapse);
 }
 
 fn truncate_oldest_round(messages: &mut Vec<Message>) {
@@ -395,6 +611,9 @@ mod tests {
 
     use super::*;
     use crate::AgentConfig;
+    use crate::agent::hook::testing::script;
+    use crate::cancel::CancelToken;
+    use crate::tools::ToolRegistry;
     use maki_config::CompactionBuffer;
 
     const CONFIG_EXTRA: &str = "Record anything that belongs in plan.md";
@@ -487,6 +706,22 @@ mod tests {
         }
     }
 
+    fn test_hooks<'a>(
+        registry: &'a ToolRegistry,
+        session_id: Option<&'a SessionRef>,
+        model: &'a Model,
+        cancel: &'a CancelToken,
+    ) -> AgentHooks<'a> {
+        AgentHooks {
+            registry,
+            session_id,
+            task_id: None,
+            model,
+            cancel,
+            context_size: 0,
+        }
+    }
+
     async fn summarize(
         provider: &MockProvider,
         history: &mut History,
@@ -496,18 +731,19 @@ mod tests {
         cancel: &CancelToken,
     ) -> Result<DoneReason, AgentError> {
         let (raw_tx, _rx) = flume::unbounded();
+        let registry = ToolRegistry::new();
+        let model = default_model();
         compact(
             provider,
-            &default_model(),
+            &model,
             history,
             gauge,
             NO_SYSTEM,
             &no_tools(),
             &EventSender::new(raw_tx, 0),
-            cancel,
+            &test_hooks(&registry, None, &model, cancel),
             config,
             instructions,
-            None,
             RetryPolicy::default(),
         )
         .await
@@ -520,16 +756,18 @@ mod tests {
         session_id: Option<&SessionRef>,
     ) {
         let (raw_tx, _rx) = flume::unbounded();
+        let registry = ToolRegistry::new();
+        let model = default_model();
+        let cancel = CancelToken::none();
         compact_history(
             provider,
-            &default_model(),
+            &model,
             history,
             &EventSender::new(raw_tx, 0),
-            &CancelToken::none(),
+            &test_hooks(&registry, session_id, &model, &cancel),
             &AgentConfig::default(),
             None,
             carry_len,
-            session_id,
             RetryPolicy::default(),
         )
         .await
@@ -748,6 +986,145 @@ mod tests {
         });
     }
 
+    const LAYER_EXTRA: &str = "Name every file you touched";
+    const SUMMARY: &str = "We fixed the flaky test in run.rs";
+
+    fn before_answers(value: Value) -> impl Fn(AgentSlot, &Value) -> Verdict + Send + Sync {
+        move |slot, _| match slot {
+            AgentSlot::CompactBefore => Verdict::Replaced(value.clone()),
+            _ => Verdict::Unchanged,
+        }
+    }
+
+    /// Runs the `/compact` path with a gauge at [`SUMMARISED_PROMPT`] and
+    /// hands back every event it sent.
+    async fn summarize_steered(
+        provider: &MockProvider,
+        history: &mut History,
+        instructions: Option<&str>,
+        answer: impl Fn(AgentSlot, &Value) -> Verdict + Send + Sync + 'static,
+    ) -> (Result<DoneReason, AgentError>, Vec<AgentEvent>) {
+        let (raw_tx, rx) = flume::unbounded();
+        let registry = ToolRegistry::new();
+        script(&registry, answer);
+        let model = default_model();
+        let cancel = CancelToken::none();
+        let result = compact(
+            provider,
+            &model,
+            history,
+            &mut ContextGauge::restored(SUMMARISED_PROMPT),
+            NO_SYSTEM,
+            &no_tools(),
+            &EventSender::new(raw_tx, 0),
+            &test_hooks(&registry, None, &model, &cancel),
+            &AgentConfig::default(),
+            instructions,
+            RetryPolicy::default(),
+        )
+        .await;
+        (result, rx.try_iter().map(|e| e.event).collect())
+    }
+
+    /// The mock holds no responses, so any request would panic.
+    #[test]
+    fn manual_compact_skipped_by_layer_ends_without_a_request() {
+        smol::block_on(async {
+            let provider = MockProvider::new(Vec::new());
+            let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
+
+            let (result, events) = summarize_steered(
+                &provider,
+                &mut history,
+                None,
+                before_answers(json!({ FIELD_SKIP: true })),
+            )
+            .await;
+
+            assert_eq!(result.unwrap(), DoneReason::Compact);
+            assert_eq!(history.len(), 1);
+            assert_eq!(history.as_slice()[0].user_text(), Some(KEPT_TEXT));
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::CompactionDone { .. }))
+            );
+            let done: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Done {
+                        usage,
+                        context_size,
+                        reason,
+                        ..
+                    } => Some((*usage, *context_size, *reason)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                done,
+                [(
+                    TokenUsage::default(),
+                    SUMMARISED_PROMPT,
+                    DoneReason::Compact
+                )]
+            );
+        });
+    }
+
+    #[test]
+    fn layer_instructions_follow_the_requests_own() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![Message::user("work".into())]);
+
+            let (result, _) = summarize_steered(
+                &provider,
+                &mut history,
+                Some(REQUEST_EXTRA),
+                before_answers(json!({ FIELD_INSTRUCTIONS: LAYER_EXTRA })),
+            )
+            .await;
+            result.unwrap();
+
+            let requests = provider.requests.lock().unwrap();
+            let prompt = requests[0].last().unwrap().first_text_content().unwrap();
+            let request_at = prompt.find(REQUEST_EXTRA).expect(prompt);
+            let layer_at = prompt.find(LAYER_EXTRA).expect(prompt);
+            assert!(request_at < layer_at, "{prompt}");
+        });
+    }
+
+    #[test]
+    fn manual_compact_reports_the_summary() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: SUMMARY.into(),
+                    }],
+                    ..Default::default()
+                },
+                ..text_response(StopReason::EndTurn)
+            })]);
+            let mut history = History::new(vec![Message::user("work".into())]);
+
+            let (result, events) =
+                summarize_steered(&provider, &mut history, None, |_, _| Verdict::Unchanged).await;
+            result.unwrap();
+
+            let summaries: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::CompactionDone { summary, .. } => Some(summary.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(summaries, [SUMMARY]);
+        });
+    }
+
     #[test_case(None, None, false, false ; "no_instructions")]
     #[test_case(Some(CONFIG_EXTRA), None, true, false ; "config_only")]
     #[test_case(None, Some(REQUEST_EXTRA), false, true ; "request_only")]
@@ -943,6 +1320,69 @@ mod tests {
         assert!(
             matches!(&messages[0].content[2], ContentBlock::Text { text } if text == KEPT_TEXT)
         );
+    }
+
+    /// The layer flips the host's pick, and its index past the end is dropped
+    /// rather than trusted.
+    #[test]
+    fn prepare_layer_picks_what_collapses() {
+        smol::block_on(async {
+            const TOOL: &str = "read";
+            const OUT_OF_RANGE: usize = 99;
+            let mut messages = vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::tool_use("t1", TOOL, json!({})),
+                        ContentBlock::tool_use("t2", TOOL, json!({})),
+                    ],
+                    ..Default::default()
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![
+                        ContentBlock::ToolResult {
+                            tool_use_id: "t1".into(),
+                            content: OLD_RESULT.into(),
+                            is_error: false,
+                        },
+                        ContentBlock::ToolResult {
+                            tool_use_id: "t2".into(),
+                            content: NEW_RESULT.into(),
+                            is_error: false,
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ];
+            let registry = ToolRegistry::new();
+            let seen = script(&registry, |_, _| {
+                Verdict::Replaced(json!({ FIELD_COLLAPSE: [2, OUT_OF_RANGE] }))
+            });
+            let model = default_model();
+            let cancel = CancelToken::none();
+
+            prepare_collapse(
+                &test_hooks(&registry, None, &model, &cancel),
+                &mut messages,
+                NEW_RESULT.len(),
+            )
+            .await;
+
+            let (slot, value) = seen.lock().unwrap()[0].clone();
+            assert_eq!(slot, AgentSlot::CompactPrepare);
+            assert_eq!(value[FIELD_COLLAPSE], json!([1]));
+            assert_eq!(value["results"][0]["tool"], TOOL);
+            let contents: Vec<&str> = messages[1]
+                .content
+                .iter()
+                .map(|b| match b {
+                    ContentBlock::ToolResult { content, .. } => content.as_str(),
+                    _ => "",
+                })
+                .collect();
+            assert_eq!(contents, [OLD_RESULT, TOOL_RESULT_PLACEHOLDER]);
+        });
     }
 
     fn tool_use(id: &str) -> Message {

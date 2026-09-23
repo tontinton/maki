@@ -234,6 +234,7 @@ fn spawn_agent_internal(
     // synchronously, before any handle escapes.
     let shared_history: SharedMessages =
         Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+    maki_agent::agent::publish_live_history(resumed.id.id(), &shared_history);
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let cancels = RunCancels::new();
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
@@ -284,7 +285,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
-    use maki_agent::{AgentEvent, AgentInput, AgentMode};
+    use maki_agent::{AgentEvent, AgentInput, AgentMode, InputSource};
     use maki_config::{PermissionsConfig, ProjectConfig};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -475,10 +476,12 @@ mod tests {
                 mode: AgentMode::default(),
                 images: Vec::new(),
                 preamble: Vec::new(),
+                earlier: Vec::new(),
                 thinking: ThinkingConfig::default(),
                 fast: false,
                 workflow: false,
                 prompt: None,
+                source: InputSource::Tui,
             },
             run_id,
             displayed: true,

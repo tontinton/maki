@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use maki_agent::agent;
+use maki_agent::agent::{self, AgentHooks};
 use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::mcp::{McpHandle, McpSession};
 use maki_agent::permissions::PermissionManager;
@@ -230,6 +230,14 @@ impl AgentLoop {
         let system = self.system_prompt(&self.lua_handle.collect_prompt_slots_async().await);
         let base = base_tools(&self.vars, &model, &self.config, self.mcp.is_some(), false);
         let tools = agent::request_tools(&base, self.mcp.as_ref());
+        let hooks = AgentHooks {
+            registry: ToolRegistry::global(),
+            session_id: Some(&self.session_id),
+            task_id: None,
+            model: &slot.model,
+            cancel,
+            context_size: self.gauge.size(),
+        };
         agent::compact(
             &*provider,
             &model,
@@ -238,10 +246,9 @@ impl AgentLoop {
             &system,
             &tools,
             event_tx,
-            cancel,
+            &hooks,
             &self.config,
             instructions,
-            Some(&self.session_id),
             self.timeouts.retry,
         )
         .await

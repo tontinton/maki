@@ -127,6 +127,9 @@ struct Request {
     subagent_id: Option<String>,
     allow_scopes: Vec<String>,
     project_trusted: bool,
+    /// Set when a plugin escalated the call, so the user sees why they are
+    /// asked about a call their rules might have let through.
+    reason: Option<String>,
 }
 
 /// An answer carries the ask it settles: the agent only accepts one naming the
@@ -181,6 +184,7 @@ impl PermissionPrompt {
         scopes: Vec<String>,
         subagent_id: Option<String>,
         project_trusted: bool,
+        reason: Option<String>,
     ) {
         let allow_scopes = generalized_scopes(&tool, &scopes);
         let allow_scopes = if allow_scopes == scopes {
@@ -195,6 +199,7 @@ impl PermissionPrompt {
             subagent_id,
             allow_scopes,
             project_trusted,
+            reason,
         });
     }
 
@@ -325,6 +330,7 @@ impl PermissionPrompt {
             subagent_id,
             allow_scopes,
             project_trusted,
+            reason,
             ..
         }) = self.queue.front()
         else {
@@ -342,6 +348,13 @@ impl PermissionPrompt {
         tool_spans.push(Span::styled(tool.to_string(), value_style));
 
         let mut lines = vec![Line::raw(""), Line::from(tool_spans)];
+        if let Some(reason) = reason {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("why   ", label_style),
+                Span::styled(reason.clone(), value_style),
+            ]));
+        }
         let waiting = self.queue.len() - 1;
         if waiting > 0 {
             lines.push(Line::from(vec![
@@ -487,6 +500,7 @@ mod tests {
             vec!["execute".into()],
             None,
             project_trusted,
+            None,
         );
     }
 
@@ -497,6 +511,7 @@ mod tests {
             vec!["/tmp/x".into()],
             Some(SUB_AGENT.into()),
             true,
+            None,
         );
     }
 
@@ -589,7 +604,7 @@ mod tests {
     #[test]
     fn wildcard_tool_key_opens() {
         let mut prompt = PermissionPrompt::new();
-        prompt.push(MAIN_ID.into(), ToolKey::Wildcard, vec![], None, true);
+        prompt.push(MAIN_ID.into(), ToolKey::Wildcard, vec![], None, true, None);
         assert!(prompt.is_open());
     }
 
@@ -687,5 +702,34 @@ mod tests {
             None,
             "the project answer stays available either way"
         );
+    }
+
+    const ASK_REASON: &str = "plugin wants a human to look";
+    const WHY_LABEL: &str = "why";
+
+    #[test_case(Some(ASK_REASON) ; "with_reason")]
+    #[test_case(None ; "without_reason")]
+    fn why_row_follows_reason(reason: Option<&str>) {
+        let mut prompt = PermissionPrompt::new();
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec!["execute".into()],
+            None,
+            true,
+            reason.map(str::to_owned),
+        );
+
+        let why_row = prompt.build_lines().iter().find_map(|line| {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            text.trim_start()
+                .starts_with(WHY_LABEL)
+                .then(|| text.trim_start()[WHY_LABEL.len()..].trim().to_owned())
+        });
+        assert_eq!(why_row.as_deref(), reason);
     }
 }

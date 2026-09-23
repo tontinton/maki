@@ -345,6 +345,9 @@ pub fn map_done_reason(reason: DoneReason) -> StopReason {
         // Manual `/compact` isn't a turn boundary; ACP has no dedicated
         // stop reason for housekeeping, so surface it as EndTurn.
         DoneReason::Compact => StopReason::EndTurn,
+        // The prompt never reached the model and stays out of the next one,
+        // which is what ACP means by a refusal.
+        DoneReason::Dropped => StopReason::Refusal,
     }
 }
 
@@ -491,14 +494,13 @@ mod tests {
         assert_eq!(fenced(input), expected);
     }
 
-    /// The only pair whose names disagree, and the one ACP clients read to tell
-    /// "the model stopped" from "the agent ran out of turns".
-    #[test]
-    fn max_turns_maps_to_max_turn_requests() {
-        assert_eq!(
-            map_done_reason(DoneReason::MaxTurns),
-            StopReason::MaxTurnRequests
-        );
+    /// The pairs whose names disagree. ACP clients read these to tell "the
+    /// model stopped" from "the agent ran out of turns" or "the prompt never
+    /// ran".
+    #[test_case(DoneReason::MaxTurns, StopReason::MaxTurnRequests ; "max_turns_maps_to_max_turn_requests")]
+    #[test_case(DoneReason::Dropped, StopReason::Refusal ; "dropped_maps_to_refusal")]
+    fn map_done_reason_renames(reason: DoneReason, expected: StopReason) {
+        assert_eq!(map_done_reason(reason), expected);
     }
 
     fn assistant(content: Vec<MsgBlock>) -> Message {
@@ -721,6 +723,7 @@ mod tests {
         written: Option<&str>,
     ) -> ToolDoneEvent {
         ToolDoneEvent {
+            call: None,
             id: "t-1".into(),
             tool: Arc::from(tool),
             output: Arc::new(output),

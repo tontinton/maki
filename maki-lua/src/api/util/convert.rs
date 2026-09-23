@@ -113,7 +113,9 @@ fn within_template(lua: &Lua, val: &Value, template: Option<&JsonValue>) -> LuaR
             // on every JSON array and a null element leaves an absent key:
             // density cannot be re-derived, and the gaps are holes to fill with
             // null. Keys an array cannot express still fall back to the object
-            // encoding, which keeps all of them.
+            // encoding, which keeps all of them. A fresh `{}` cannot say which
+            // it is, so the template decides: a layer emptying a list with
+            // `value.paths = {}` must not hand back an object.
             let mut has_non_int = false;
             let mut int_count = 0;
             let mut max_int = 0;
@@ -140,7 +142,7 @@ fn within_template(lua: &Lua, val: &Value, template: Option<&JsonValue>) -> LuaR
                 && if tagged {
                     holes <= MAX_ARRAY_HOLES
                 } else {
-                    int_count > 0 && holes == 0
+                    holes == 0 && (int_count > 0 || template.is_some_and(JsonValue::is_array))
                 };
             if is_array {
                 let template = template.and_then(JsonValue::as_array);
@@ -445,12 +447,16 @@ mod tests {
             r#"{"a":1,"c":2}"#,
         ),
         (r#"{"a":null,"b":1}"#, "value.b = nil", r#"{"a":null}"#),
+        (r#"{"a":[1,2]}"#, "value.a = {}", r#"{"a":[]}"#),
+        (r#"{"a":{"b":1}}"#, "value.a = {}", r#"{"a":{}}"#),
     ];
 
     #[test_case(0 ; "truncating_a_real_value_shortens_the_array")]
     #[test_case(1 ; "a_null_replaced_by_a_value_keeps_the_value")]
     #[test_case(2 ; "an_object_replaced_by_a_scalar_ends_the_template")]
     #[test_case(3 ; "deleting_a_non_null_key_still_deletes_it")]
+    #[test_case(4 ; "a_fresh_empty_table_in_place_of_an_array_stays_an_array")]
+    #[test_case(5 ; "a_fresh_empty_table_in_place_of_an_object_stays_an_object")]
     fn lua_to_json_within_template_lets_the_layer_win(idx: usize) {
         let (template, edit, expected) = LAYER_CASES[idx];
         let template: JsonValue = serde_json::from_str(template).unwrap();

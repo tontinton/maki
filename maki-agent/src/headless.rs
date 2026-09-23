@@ -24,7 +24,7 @@ use crate::tools::{FileAccess, LocalTools, RequestTools, ToolAudience, ToolRegis
 use crate::types::EventSender;
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, EventStreamGuard,
-    ImageSource, McpHandle, McpSession, PermissionsConfig, RunLedger, SessionEvents,
+    ImageSource, InputSource, McpHandle, McpSession, PermissionsConfig, RunLedger, SessionEvents,
     SessionMailbox, ToolOutputLines, event_stream,
 };
 
@@ -217,6 +217,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                 mode,
                 params.images,
                 defaults,
+                InputSource::Headless,
             ))
             .await;
         drop(agent);

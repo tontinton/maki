@@ -1,13 +1,25 @@
 local Events = require("events")
 local Menu = require("menu")
+local Sources = require("sources")
 local Trigger = require("trigger")
 local th = require("maki.test_helpers")
 
 local case = th.case
 local eq = th.eq
 
+-- Layered once, the way another plugin would, so every case goes through the
+-- real chain. The harness empties `offered` after each case.
+local offered = {}
+Sources.declare()
+maki.api.set_slot(Sources.SLOT, function(prev, list)
+  for _, source in ipairs(offered) do
+    table.insert(list, source)
+  end
+  return prev(list)
+end)
+
 local function find(text, cursor)
-  local start, query = Trigger.find(text, cursor or #text)
+  local start, query = Trigger.find(text, cursor or #text, Trigger.FILES)
   return start, query
 end
 
@@ -265,6 +277,9 @@ local function harness(body)
   maki.api.create_autocmd, maki.api.del_autocmd = saved.create_autocmd, saved.del_autocmd
   maki.defer_fn = saved.defer_fn
   maki.log.warn = saved.warn
+  for i = #offered, 1, -1 do
+    offered[i] = nil
+  end
   if not ok then
     error(err)
   end
@@ -841,6 +856,203 @@ case("events_close_a_popup_when_the_input_goes_off_screen", function()
 
     Events.session_status_changed({ focused = true, status = "needs_input" })
     eq(Menu.session_id(), nil)
+  end)
+end)
+
+-- ------------------------------------------------------------ sources
+
+local ISSUE_TRIGGER = "#"
+local ISSUE_INPUT = { text = "fix #cr", cursor = 7, version = 5, session_id = SESSION }
+local ISSUE = "#12"
+local ISSUE_LABEL = "#12 crash on start"
+
+-- A source that answers {items} and records every call it got.
+local function source(name, trigger, items)
+  local s = { name = name, trigger = trigger, calls = {} }
+  s.complete = function(query, ctx)
+    table.insert(s.calls, { query = query, ctx = ctx })
+    return items
+  end
+  table.insert(offered, s)
+  return s
+end
+
+case("trigger_opens_on_any_listed_character", function()
+  local start, query, trigger = Trigger.find("see #12", 7, "@#")
+  eq(start, 4)
+  eq(query, "12")
+  eq(trigger, "#")
+  eq(Trigger.find("see #12", 7, "@"), nil, "a character no source listens for opens nothing")
+  eq(Trigger.may_open("see (x", 6), true)
+  eq(Trigger.may_open("see x", 5), false)
+end)
+
+case("a_source_answers_the_trigger_it_listens_on", function()
+  local issues
+  local h = harness(function(hh)
+    issues = source("issues", ISSUE_TRIGGER, { { text = ISSUE, label = ISSUE_LABEL } })
+    Menu.refresh(ISSUE_INPUT)
+    eq(row(hh, 1), " " .. ISSUE_LABEL, "the label is what the row shows")
+    Menu.accept()
+  end)
+  eq(issues.calls[1].query, "cr")
+  eq(issues.calls[1].ctx.trigger, ISSUE_TRIGGER)
+  eq(issues.calls[1].ctx.session_id, SESSION)
+  eq(h.rank_opts, nil, "files are the `@` trigger's, not every trigger's")
+  eq(h.edits[1].text, ISSUE .. " ", "the text is what the accept inserts")
+  eq(h.edits[1].start, 4, "over the mention, trigger included")
+end)
+
+case("source_rows_merge_with_the_files_by_score", function()
+  harness(function(hh)
+    source("people", Trigger.FILES, {
+      { text = "@low", score = -1 },
+      { text = "@tie" },
+      { text = "@high", score = 2 },
+    })
+    Menu.refresh(hh.input)
+    eq(row(hh, 1), " @high")
+    eq(row(hh, 2), " " .. MATCH)
+    eq(row(hh, 3), " @tie")
+    eq(row(hh, 4), " @low")
+  end)
+end)
+
+case("a_broken_source_costs_only_its_own_rows", function()
+  local h = harness(function(hh)
+    local raising = source("raising", ISSUE_TRIGGER, nil)
+    raising.complete = function()
+      error("boom")
+    end
+    source("textless", ISSUE_TRIGGER, { { label = "no text" } })
+    source("fine", ISSUE_TRIGGER, { { text = ISSUE } })
+    Menu.refresh(ISSUE_INPUT)
+    eq(row(hh, 1), " " .. ISSUE)
+    eq(row(hh, 2), nil, "an item with nothing to insert is not a row")
+  end)
+  th.has(table.concat(h.warnings, "\n"), "raising", "the failure is logged under the source's name")
+end)
+
+case("a_malformed_source_is_skipped_and_logged_once", function()
+  local h = harness(function(hh)
+    source("two_chars", "##", { { text = ISSUE } })
+    source("dup", ISSUE_TRIGGER, { { text = "first" } })
+    source("dup", ISSUE_TRIGGER, { { text = "second" } })
+    Menu.refresh(ISSUE_INPUT)
+    Menu.refresh(ISSUE_INPUT)
+    eq(row(hh, 1), " first", "the first source under a name keeps it")
+    eq(row(hh, 2), nil)
+  end)
+  eq(#h.warnings, 2, "one line per problem, not one per keystroke")
+end)
+
+case("a_silent_source_is_given_up_on_at_the_deadline", function()
+  harness(function(hh)
+    local silent = source("silent", ISSUE_TRIGGER, { { text = ISSUE } })
+    hh.defer = true
+    Menu.refresh(ISSUE_INPUT)
+    eq(Menu.session_id(), nil, "nothing to show yet, so nothing is shown")
+
+    hh.fire_timers()
+    eq(row(hh, 1), " " .. NO_MATCHES, "past the deadline the answer is that nothing matched")
+
+    hh.flush()
+    eq(silent.calls[1].ctx.cancelled(), true, "the source can tell it is no longer awaited")
+    eq(row(hh, 1), " " .. NO_MATCHES, "and its late answer paints nothing")
+  end)
+end)
+
+case("a_newer_keystroke_supersedes_the_answer_in_flight", function()
+  local NEWER = { text = "fix #cra", cursor = 8, version = 6, session_id = SESSION }
+  harness(function(hh)
+    local issues = source("issues", ISSUE_TRIGGER, { { text = ISSUE } })
+    hh.defer = true
+    Menu.refresh(ISSUE_INPUT)
+    Menu.refresh(NEWER)
+    hh.flush()
+    eq(issues.calls[1].ctx.cancelled(), true, "the first ask answers a keystroke nobody is on")
+    eq(issues.calls[2].query, "cra")
+    Menu.accept()
+    eq(hh.edits[1].version, NEWER.version, "the rows on screen are the newest keystroke's")
+  end)
+end)
+
+case("rows_carry_over_within_a_mention_and_not_across_one", function()
+  local SAME = { text = "fix #cra", cursor = 8, version = 6, session_id = SESSION }
+  local OTHER = { text = "fix #cra and #b", cursor = 15, version = 7, session_id = SESSION }
+  harness(function(hh)
+    source("issues", ISSUE_TRIGGER, { { text = ISSUE } })
+    Menu.refresh(ISSUE_INPUT)
+    hh.defer = true
+
+    Menu.refresh(SAME)
+    eq(row(hh, 1), " " .. ISSUE, "the popup narrows instead of blinking empty")
+
+    Menu.refresh(OTHER)
+    eq(row(hh, 1), " " .. SCANNING)
+    Menu.handle_key("<CR>")
+    eq(#hh.edits, 0, "Enter waits for this mention's rows")
+    eq(Menu.session_id(), SESSION, "and holds the popup open meanwhile")
+  end)
+end)
+
+-- A source answering before the files are ranked paints the files carried
+-- from the keystroke before, and those still answer that keystroke's text.
+case("a_carried_file_row_is_weighed_against_the_snapshot_it_was_ranked_for", function()
+  local h = harness(function(hh)
+    source("people", Trigger.FILES, { { text = "@ann" } })
+    Menu.refresh(hh.input)
+    -- The source answered first, so the highlight followed its row down.
+    Menu.handle_key("<Up>")
+    hh.defer = true
+    hh.before_rank = function()
+      hh.before_rank = nil
+      hh.flush()
+      eq(row(hh, 1), " " .. MATCH)
+      Menu.accept()
+    end
+    Menu.refresh(TYPED)
+  end)
+  eq(h.edits[1].version, INPUT.version, "the version the row was ranked against")
+  eq(h.edits[1].stop, INPUT.cursor, "and the range it was ranked for")
+end)
+
+case("an_empty_list_while_the_files_rank_is_not_no_matches", function()
+  harness(function(hh)
+    source("people", Trigger.FILES, { { text = "@ann" } })
+    hh.defer = true
+    hh.before_rank = function()
+      hh.before_rank = nil
+      hh.fire_timers()
+      eq(row(hh, 1), " " .. SCANNING, "past the source deadline, the files are still coming")
+      Menu.handle_key("<CR>")
+      eq(Menu.session_id(), SESSION, "so Enter waits for them")
+    end
+    Menu.refresh(hh.input)
+    eq(row(hh, 1), " " .. MATCH)
+  end)
+end)
+
+-- This one bit once. An issue mention left the file mention's wait
+-- subscribed, so the next file mention found it there and armed no deadline.
+-- A walk that never landed then held `scanning…` and Enter until Esc.
+case("leaving_a_file_mention_ends_its_wait_on_the_walk", function()
+  local ISSUE_AFTER = { text = INPUT.text .. " #cr", cursor = #INPUT.text + 4, version = 4, session_id = SESSION }
+  local BACK = { text = ISSUE_AFTER.text .. " @x", cursor = #ISSUE_AFTER.text + 3, version = 5, session_id = SESSION }
+  harness(function(hh)
+    source("issues", ISSUE_TRIGGER, { { text = ISSUE } })
+    hh.found = { complete = false, root = ROOT, items = {} }
+    Menu.refresh(hh.input)
+    eq(type(hh.on_index_ready), "function")
+
+    Menu.refresh(ISSUE_AFTER)
+    eq(hh.on_index_ready, nil, "an issue mention waits on no walk")
+
+    hh.fire_timers()
+    Menu.refresh(BACK)
+    eq(hh.subscriptions, 2, "the next file mention starts its own wait")
+    hh.fire_timers()
+    eq(row(hh, 1), " " .. NO_MATCHES, "and gives up on a walk that never lands")
   end)
 end)
 

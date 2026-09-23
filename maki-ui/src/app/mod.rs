@@ -1628,10 +1628,22 @@ impl App {
             return vec![];
         }
 
-        if let ChatEventResult::PermissionRequest { id, tool, scopes } = result {
+        if let ChatEventResult::PermissionRequest {
+            id,
+            tool,
+            scopes,
+            reason,
+        } = result
+        {
             let project_trusted = self.permissions.project_is_trusted();
-            self.permission_prompt
-                .push(id, tool, scopes, subagent_id.clone(), project_trusted);
+            self.permission_prompt.push(
+                id,
+                tool,
+                scopes,
+                subagent_id.clone(),
+                project_trusted,
+                reason,
+            );
             return vec![];
         }
 

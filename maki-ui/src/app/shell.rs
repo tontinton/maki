@@ -149,6 +149,7 @@ impl App {
                     None
                 };
                 self.main_chat().shell_tool_done(ToolDoneEvent {
+                    call: None,
                     id: id.clone(),
                     tool: "bash".into(),
                     output: Arc::new(ToolOutput::Plain(output.into())),

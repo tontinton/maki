@@ -782,9 +782,15 @@ which is about a directory rather than a session. For `"SessionReset"` and
 name the session now running or focused. What each event adds:
 
 - `"ToolStart"`, `"ToolDone"`: `data.tool_id` and `data.tool`.
+- `"ToolDone"` adds `data.is_error` and `data.bytes`, the size of the
+  text the model reads. A call that ran also carries `data.duration_ms`
+  and `data.input`, the input after every `tool.*.input` layer. A call
+  that never ran, like a cancelled one, has neither.
+- `"TurnStart"`: `data.text`, the message that started the turn.
 - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
-  `"max_turns"`, or `"cancelled"`), `data.usage` (four token fields,
-  cache included), `data.cost`, `data.list_cost`, `data.context_size`,
+  `"max_turns"`, `"cancelled"`, or `"dropped"` when an
+  `agent.user_message` layer refused the message), `data.usage` (four
+  token fields, cache included), `data.cost`, `data.list_cost`, `data.context_size`,
   `data.context_window`, and `data.num_turns` (model round-trips the
   turn took). `list_cost` is the un-subsidised list price and `cost` is
   the real bill, so a budget plugin charges against whichever one it
@@ -792,7 +798,8 @@ name the session now running or focused. What each event adds:
 - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
   trigger time.
 - `"CompactionDone"`: `data.context_size_before`,
-  `data.context_size_after`, and `data.context_window`.
+  `data.context_size_after`, `data.context_window`, and `data.summary`,
+  the text that replaced the history.
 - `"PlanReady"`: `data.path`, the absolute path of the plan file the
   agent just wrote. Fires once per draft. Plan state is per session, so
   pass `data.session_id` to `maki.plan.read`.
@@ -955,8 +962,8 @@ tool declaring no capability charges. You can only name permissions your
 own plugin holds.
 
 Throws if another plugin already owns a slot with the same {name}, or
-if {name} starts with `"tool."` or `"ui."`, which the host fires itself.
-The name stays yours across an unload: nobody else can take it over, or
+if {name} starts with `"tool."`, `"ui."`, or `"agent."`, which the host
+fires itself. The name stays yours across an unload: nobody else can take it over, or
 re-declare it cheaper, while maki runs.
 
 The chain is async: the default and every layer may park (`maki.fs.*`,
@@ -1016,8 +1023,15 @@ Maki fires two slots per tool itself: `tool.<name>.input` before
 permissions look at the call, and `tool.<name>.output` on the text it
 produced. Both take `function(prev, value, ctx)` and answer with a
 table to replace the value, nothing to leave it alone, or
-`nil, reason` to stop the call. Wrapping one costs the capability the
-tool declares, and a tool declaring none costs every permission. See
+`nil, reason` to stop the call. An input layer can also answer
+`value, { ask = reason }` to make the user approve the call. Name the
+tool `*` (`tool.*.input`) to wrap every tool. Wrapping one costs the
+capability the tool declares, and a tool declaring none costs every
+permission.
+
+The agent loop fires `agent.user_message`, `agent.stop`,
+`agent.compact.before`, and `agent.compact.prepare`, with the same
+contract. Wrapping one costs every permission. See
 [Hooks](/docs/hooks/).
 
 Wrapping a slot another plugin declared steers a chain that plugin's
@@ -3819,6 +3833,53 @@ session's own, since a subagent runs its own window. There is no
 local s = maki.session.read()
 if s.context_size > s.context_window * 0.8 then
   maki.ui.notify("context is nearly full")
+end
+```
+
+---
+
+### `maki.session.messages()` {#maki-session-messages}
+
+```lua
+maki.session.messages({opts?})
+```
+
+Reads a live session's transcript, oldest first: everything the model has
+been sent so far, tool calls and results included. Read only.
+
+Each message is `{ role, kind, hidden, content }`. `role` is `"user"` or
+`"assistant"`. `kind` is `"turn"` for something the user or the model said
+and `"observation"` for a report sent to the model as a user message, like
+`maki.session.notify`. `hidden` marks a message only the model sees, such
+as a nudge or a compaction note. `content` lists blocks:
+
+```text
+{ type = "text", text }
+{ type = "thinking", text }
+{ type = "tool_use", id, name, input }
+{ type = "tool_result", tool_use_id, content, is_error }
+{ type = "image", media_type }
+```
+
+Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no focused
+session, so pass `session` there. Hook and event payloads carry the
+`session_id` to pass.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Options:
+  - `session` (`string?`) id of a live session, defaults to the focused one.
+  - `last` (`integer?`) only the newest `last` messages.
+
+**Returns:** (`table|nil`, `string|nil`) Array of messages, or nil and an error.
+
+**Example:**
+
+```lua
+local msgs = maki.session.messages({ last = 1 })
+local last = msgs and msgs[1]
+if last and last.role == "assistant" then
+  print(last.content[1].text)
 end
 ```
 

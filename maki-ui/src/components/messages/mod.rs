@@ -463,6 +463,7 @@ impl MessagesPanel {
             .collect();
         for (id, tool) in ids {
             self.tool_done(ToolDoneEvent {
+                call: None,
                 id,
                 tool,
                 output: Arc::new(ToolOutput::Plain(message.clone().into())),

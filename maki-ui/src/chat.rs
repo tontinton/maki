@@ -13,7 +13,9 @@ use crate::markdown::truncate_output;
 
 use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
-use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use maki_agent::{
+    AgentEvent, BufferSnapshot, SteerKind, ToolDoneEvent, ToolOutput, ToolStartEvent,
+};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::WinView;
 use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
@@ -30,6 +32,9 @@ pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
 /// One notice per streak: a wedged model can spend twenty nudges, and twenty
 /// identical bubbles bury the conversation they are about.
 const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
+const REWRITTEN_PREFIX: &str = "A plugin rewrote this message. The model got:";
+const DROPPED_PREFIX: &str = "A plugin kept this message from the model:";
+const CONTINUED_PREFIX: &str = "A plugin kept the agent going:";
 
 pub enum ChatEventResult {
     Continue,
@@ -43,6 +48,7 @@ pub enum ChatEventResult {
         id: String,
         tool: ToolKey,
         scopes: Vec<String>,
+        reason: Option<String>,
     },
     AuthRequired,
 }
@@ -186,8 +192,30 @@ impl Chat {
                 self.messages_panel.flush();
                 return ChatEventResult::Error(message);
             }
-            AgentEvent::PermissionRequest { id, tool, scopes } => {
-                return ChatEventResult::PermissionRequest { id, tool, scopes };
+            AgentEvent::PermissionRequest {
+                id,
+                tool,
+                scopes,
+                reason,
+            } => {
+                return ChatEventResult::PermissionRequest {
+                    id,
+                    tool,
+                    scopes,
+                    reason,
+                };
+            }
+            AgentEvent::Steered { kind, text } => {
+                let prefix = match kind {
+                    SteerKind::MessageRewritten => REWRITTEN_PREFIX,
+                    SteerKind::MessageDropped => DROPPED_PREFIX,
+                    SteerKind::Continued => CONTINUED_PREFIX,
+                };
+                self.messages_panel.flush();
+                self.messages_panel.push(DisplayMessage::new(
+                    DisplayRole::Assistant,
+                    format!("{prefix}\n\n{text}"),
+                ));
             }
             AgentEvent::AuthRequired => {
                 return ChatEventResult::AuthRequired;
@@ -879,6 +907,7 @@ mod tests {
         written_path: Option<String>,
     ) -> AgentEvent {
         AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            call: None,
             id: id.into(),
             tool: tool.into(),
             output: Arc::new(output),
@@ -1343,6 +1372,7 @@ mod tests {
                 context_size_before: 0,
                 context_size_after: 0,
                 context_window: 0,
+                summary: String::new(),
             },
             None,
         );
@@ -1471,5 +1501,49 @@ mod tests {
         assert!(sub.is_finished());
         assert_eq!(sub.task_status(), TaskStatus::Error);
         assert_eq!(sub.task_id().map(|id| &**id), Some(TASK_ID));
+    }
+
+    const STEER_TEXT: &str = "keep going";
+    const ASK_REASON: &str = "plugin wants a human to look";
+    const EXPECTED_PERMISSION_REQUEST: &str = "a permission request must reach the caller";
+
+    #[test_case(SteerKind::MessageRewritten, REWRITTEN_PREFIX ; "message_rewritten")]
+    #[test_case(SteerKind::MessageDropped, DROPPED_PREFIX ; "message_dropped")]
+    #[test_case(SteerKind::Continued, CONTINUED_PREFIX ; "continued")]
+    fn steered_shows_one_prefixed_assistant_message(kind: SteerKind, prefix: &str) {
+        let mut chat = chat();
+        chat.handle_event(
+            AgentEvent::Steered {
+                kind,
+                text: STEER_TEXT.into(),
+            },
+            None,
+        );
+        assert_eq!(chat.message_count(), 1);
+        let text = chat.last_message_text();
+        assert!(
+            text.starts_with(prefix) && text.ends_with(STEER_TEXT),
+            "{text}"
+        );
+        assert_eq!(chat.last_message_role(), Some(&DisplayRole::Assistant));
+    }
+
+    #[test]
+    fn permission_request_carries_reason() {
+        let mut chat = chat();
+        let result = chat.handle_event(
+            AgentEvent::PermissionRequest {
+                id: TASK_ID.into(),
+                tool: ToolKey::native("bash"),
+                scopes: Vec::new(),
+                reason: Some(ASK_REASON.into()),
+            },
+            None,
+        );
+        let ChatEventResult::PermissionRequest { id, reason, .. } = result else {
+            panic!("{EXPECTED_PERMISSION_REQUEST}");
+        };
+        assert_eq!(id, TASK_ID);
+        assert_eq!(reason.as_deref(), Some(ASK_REASON));
     }
 }

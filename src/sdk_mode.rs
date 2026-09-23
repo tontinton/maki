@@ -24,8 +24,8 @@ use maki_agent::prompt::ResolvedSlots;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, PermissionsConfig,
-    SessionEndReason, SessionEvents,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, InputSource,
+    PermissionsConfig, SessionEndReason, SessionEvents,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
@@ -691,8 +691,13 @@ pub fn run(params: SdkParams) -> Result<()> {
                     shared.turn_start = Instant::now();
                     shared.permission_mode
                 };
-                let input =
-                    AgentInput::from_defaults(prompt, mode.agent_mode(&cwd), images, defaults);
+                let input = AgentInput::from_defaults(
+                    prompt,
+                    mode.agent_mode(&cwd),
+                    images,
+                    defaults,
+                    InputSource::Headless,
+                );
                 if handle.input_tx.send(input).is_err() {
                     break;
                 }
@@ -1058,6 +1063,7 @@ impl EventPump {
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
             | AgentEvent::PromptProgress { .. }
+            | AgentEvent::Steered { .. }
             | AgentEvent::StreamClosed => {}
             AgentEvent::Retry {
                 attempt,
@@ -1630,6 +1636,7 @@ mod tests {
                 id: TEST_TOOL_USE_ID.to_owned(),
                 tool: ToolKey::parse(TEST_TOOL).unwrap(),
                 scopes: Vec::new(),
+                reason: None,
             },
             subagent: None,
             run_id: 0,

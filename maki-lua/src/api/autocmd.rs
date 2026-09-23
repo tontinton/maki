@@ -160,9 +160,15 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// name the session now running or focused. What each event adds:
 ///
 /// - `"ToolStart"`, `"ToolDone"`: `data.tool_id` and `data.tool`.
+/// - `"ToolDone"` adds `data.is_error` and `data.bytes`, the size of the
+///   text the model reads. A call that ran also carries `data.duration_ms`
+///   and `data.input`, the input after every `tool.*.input` layer. A call
+///   that never ran, like a cancelled one, has neither.
+/// - `"TurnStart"`: `data.text`, the message that started the turn.
 /// - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
-///   `"max_turns"`, or `"cancelled"`), `data.usage` (four token fields,
-///   cache included), `data.cost`, `data.list_cost`, `data.context_size`,
+///   `"max_turns"`, `"cancelled"`, or `"dropped"` when an
+///   `agent.user_message` layer refused the message), `data.usage` (four
+///   token fields, cache included), `data.cost`, `data.list_cost`, `data.context_size`,
 ///   `data.context_window`, and `data.num_turns` (model round-trips the
 ///   turn took). `list_cost` is the un-subsidised list price and `cost` is
 ///   the real bill, so a budget plugin charges against whichever one it
@@ -170,7 +176,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
 ///   trigger time.
 /// - `"CompactionDone"`: `data.context_size_before`,
-///   `data.context_size_after`, and `data.context_window`.
+///   `data.context_size_after`, `data.context_window`, and `data.summary`,
+///   the text that replaced the history.
 /// - `"PlanReady"`: `data.path`, the absolute path of the plan file the
 ///   agent just wrote. Fires once per draft. Plan state is per session, so
 ///   pass `data.session_id` to `maki.plan.read`.

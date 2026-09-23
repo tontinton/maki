@@ -2,6 +2,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use maki_agent::agent::{AgentCall, AgentSlot};
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
 use maki_agent::tools::{CallOrigin, ToolRegistry};
@@ -379,6 +380,8 @@ fn call_of<'a>(
     HookCall {
         tool,
         tool_id: TOOL_ID,
+        tool_kind: None,
+        input: None,
         session_id: None,
         origin,
         authority,
@@ -457,6 +460,7 @@ fn input_from(
         Verdict::Unchanged => (None, None),
         Verdict::Replaced(v) => (Some(v[COMMAND_FIELD].as_str().unwrap().to_owned()), None),
         Verdict::Denied(reason) => (None, Some(reason)),
+        Verdict::Ask { reason, .. } => unreachable!("no layer here escalates, got {reason}"),
     }
 }
 
@@ -469,6 +473,9 @@ fn output(reg: &ToolRegistry, tool: &str, text: &str, is_error: bool) -> Option<
             v[hook::OUTPUT_TEXT].as_str().unwrap().to_owned(),
             v[hook::OUTPUT_IS_ERROR].as_bool().unwrap_or(is_error),
         )),
+        Verdict::Ask { reason, .. } => {
+            unreachable!("an output layer cannot escalate, got {reason}")
+        }
     }
 }
 
@@ -819,6 +826,7 @@ fn a_parked_layer_ends_at_the_window_it_was_given() {
 #[test_case("tool.bash.input" ; "tool_stage")]
 #[test_case("ui.plan_form" ; "ui_surface")]
 #[test_case("ui.plan_form.actions" ; "ui_menu")]
+#[test_case("agent.stop" ; "agent_slot")]
 fn host_slot_names_are_reserved(name: &str) {
     let (_reg, host) = host();
     let err = host
@@ -1404,6 +1412,145 @@ fn layers_compose_with_the_last_registered_outermost() {
     assert_eq!(
         input(&reg, SLOT_TOOL, COMMAND),
         (Some(format!("{COMMAND}{OUTER_MARK}{INNER_MARK}")), None)
+    );
+}
+
+const ANY_TOOL: &str = "*";
+
+/// The wildcard is loaded first, so load order alone would put it inside.
+#[test]
+fn wildcard_layers_wrap_every_tool_outside_the_specific_ones() {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    guarded_tool(&host);
+    load(&host, OUTER_LAYER, &marking_layer(ANY_TOOL, OUTER_MARK));
+    load(&host, INNER_LAYER, &marking_layer(SLOT_TOOL, INNER_MARK));
+
+    assert_eq!(
+        input(&reg, SLOT_TOOL, COMMAND),
+        (Some(format!("{COMMAND}{OUTER_MARK}{INNER_MARK}")), None)
+    );
+    assert_eq!(
+        input(&reg, GUARDED_TOOL, COMMAND),
+        (Some(format!("{COMMAND}{OUTER_MARK}")), None)
+    );
+}
+
+#[test]
+fn output_ctx_carries_the_input_and_kind() {
+    const KIND: &str = "execute";
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        LAYER_PLUGIN,
+        &layer(
+            ANY_TOOL,
+            HookStage::Output,
+            &format!(
+                r#"value.{text} = ctx.tool_kind .. ":" .. ctx.input.{COMMAND_FIELD}; return prev(value, ctx)"#,
+                text = hook::OUTPUT_TEXT
+            ),
+        ),
+    );
+    let cancel = CancelToken::none();
+    let tool_input = serde_json::json!({ COMMAND_FIELD: COMMAND });
+    let call = HookCall {
+        tool_kind: Some(KIND),
+        input: Some(&tool_input),
+        ..call_of(SLOT_TOOL, Authority::Unbounded, CallOrigin::Model, &cancel)
+    };
+
+    let verdict = fire_call(
+        &reg,
+        &call,
+        HookStage::Output,
+        serde_json::json!({ hook::OUTPUT_TEXT: "out", hook::OUTPUT_IS_ERROR: false }),
+    );
+    let Verdict::Replaced(value) = verdict else {
+        panic!("the layer rewrote the output, got {verdict:?}");
+    };
+    assert_eq!(value[hook::OUTPUT_TEXT], format!("{KIND}:{COMMAND}"));
+}
+
+/// Handing the value back untouched is a pass through and not a rewrite, so
+/// the prompt shows the call as the model made it.
+#[test_case("nil",                               None                  ; "ask_alone")]
+#[test_case("value",                             None                  ; "ask_after_a_pass_through_is_no_rewrite")]
+#[test_case(r#"{ command = "rm -rf /tmp/x" }"#, Some("rm -rf /tmp/x") ; "ask_with_a_rewrite")]
+fn input_layer_may_ask_the_user(answer: &str, rewritten: Option<&str>) {
+    const WHY: &str = "touches files outside the project";
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        LAYER_PLUGIN,
+        &layer(
+            SLOT_TOOL,
+            HookStage::Input,
+            &format!(r#"return {answer}, {{ ask = "{WHY}" }}"#),
+        ),
+    );
+
+    let verdict = fire(
+        &reg,
+        SLOT_TOOL,
+        CallOrigin::Model,
+        HookStage::Input,
+        serde_json::json!({ COMMAND_FIELD: COMMAND }),
+    );
+    let Verdict::Ask { reason, input } = verdict else {
+        panic!("the layer asked, got {verdict:?}");
+    };
+    assert_eq!(reason, WHY);
+    assert_eq!(
+        input,
+        rewritten.map(|r| serde_json::json!({ COMMAND_FIELD: r }))
+    );
+}
+
+const AGENT_MODEL: &str = "anthropic/claude-sonnet-4";
+const KEEP_GOING: &str = "keep going";
+const CONTINUE_FIELD: &str = "continue";
+
+fn stop_layer() -> String {
+    format!(
+        r#"maki.api.set_slot("agent.stop", function(prev, value, ctx)
+    assert(ctx.model == "{AGENT_MODEL}", ctx.model)
+    return {{ {CONTINUE_FIELD} = "{KEEP_GOING}" }}
+end)"#
+    )
+}
+
+/// Steering the agent is priced like a tool with no declared reach, so only a
+/// fully trusted plugin's layer runs.
+#[test_case(PluginPermissions::trusted, true  ; "trusted_layer_runs")]
+#[test_case(all_but_run,                false ; "almost_trusted_is_skipped")]
+fn agent_slot_layers_need_full_trust(granted: fn() -> PluginPermissions, runs: bool) {
+    let (reg, host) = host();
+    let hook = reg
+        .agent_hook()
+        .expect("the plugin host installs one at boot");
+    assert!(!hook.wraps(AgentSlot::Stop));
+    load_granted(&host, LAYER_PLUGIN, &stop_layer(), granted());
+    assert!(hook.wraps(AgentSlot::Stop));
+    assert!(!hook.wraps(AgentSlot::UserMessage));
+
+    let cancel = CancelToken::none();
+    let call = AgentCall {
+        session_id: None,
+        task_id: None,
+        model: AGENT_MODEL,
+        context_size: 0,
+        context_window: 0,
+        cancel: &cancel,
+        deadline: Instant::now() + DISPATCH_TIMEOUT,
+    };
+    let verdict = within(hook.run(AgentSlot::Stop, serde_json::json!({}), &call));
+    let kept_going = serde_json::json!({ CONTINUE_FIELD: KEEP_GOING });
+    assert_eq!(
+        matches!(verdict, Verdict::Replaced(value) if value == kept_going),
+        runs
     );
 }
 

@@ -42,10 +42,20 @@ pub fn autocmd_for(
             "ToolStart",
             json!({ "session_id": sid(), "tool_id": e.id, "tool": e.tool }),
         )),
-        AgentEvent::ToolDone(e) => Some((
-            "ToolDone",
-            json!({ "session_id": sid(), "tool_id": e.id, "tool": e.tool }),
-        )),
+        AgentEvent::ToolDone(e) => {
+            let mut data = json!({
+                "session_id": sid(),
+                "tool_id": e.id,
+                "tool": e.tool,
+                "is_error": e.is_error,
+                "bytes": e.output.as_text().len(),
+            });
+            if let Some(call) = &e.call {
+                data["input"] = call.input.clone();
+                data["duration_ms"] = json!(call.duration.as_millis() as u64);
+            }
+            Some(("ToolDone", data))
+        }
         AgentEvent::AutoCompacting {
             context_size,
             context_window,
@@ -61,6 +71,7 @@ pub fn autocmd_for(
             context_size_before,
             context_size_after,
             context_window,
+            summary,
         } => Some((
             "CompactionDone",
             json!({
@@ -68,6 +79,7 @@ pub fn autocmd_for(
                 "context_size_before": context_size_before,
                 "context_size_after": context_size_after,
                 "context_window": context_window,
+                "summary": summary,
             }),
         )),
         AgentEvent::Done {
@@ -107,6 +119,7 @@ fn turn_end_reason(reason: DoneReason) -> Option<&'static str> {
         DoneReason::MaxTokens => Some("max_tokens"),
         DoneReason::MaxTurns => Some("max_turns"),
         DoneReason::Cancelled => Some("cancelled"),
+        DoneReason::Dropped => Some("dropped"),
         DoneReason::Compact => None,
     }
 }
@@ -115,13 +128,18 @@ fn turn_end_reason(reason: DoneReason) -> Option<&'static str> {
 mod tests {
     use std::sync::Arc;
 
-    use maki_agent::{ToolDoneEvent, ToolOutput, ToolStartEvent};
+    use std::time::Duration;
+
+    use maki_agent::{CallRecord, ToolDoneEvent, ToolOutput, ToolStartEvent};
     use maki_providers::TokenUsage;
     use test_case::test_case;
 
     use super::*;
 
     const SESSION: &str = "session-x";
+    const TOOL_TEXT: &str = "ok";
+    const TOOL_COMMAND: &str = "cargo test";
+    const TOOL_MILLIS: u64 = 42;
 
     fn done(reason: DoneReason) -> AgentEvent {
         AgentEvent::Done {
@@ -139,6 +157,30 @@ mod tests {
         }
     }
 
+    fn tool_done() -> AgentEvent {
+        AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            id: "t1".into(),
+            tool: "bash".into(),
+            output: Arc::new(ToolOutput::Plain(TOOL_TEXT.into())),
+            is_error: false,
+            annotation: None,
+            written_path: None,
+            call: Some(Box::new(CallRecord {
+                input: json!({ "command": TOOL_COMMAND }),
+                duration: Duration::from_millis(TOOL_MILLIS),
+            })),
+        }))
+    }
+
+    #[test]
+    fn tool_done_carries_the_call() {
+        let (_, data) = autocmd_for(&tool_done(), &SESSION, false).unwrap();
+        assert_eq!(data["input"]["command"], TOOL_COMMAND);
+        assert_eq!(data["duration_ms"], TOOL_MILLIS);
+        assert_eq!(data["bytes"], TOOL_TEXT.len());
+        assert_eq!(data["is_error"], false);
+    }
+
     fn every_event() -> Vec<AgentEvent> {
         vec![
             AgentEvent::ToolStart(Box::new(ToolStartEvent {
@@ -151,14 +193,7 @@ mod tests {
                 raw_input: None,
                 output: None,
             })),
-            AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-                id: "t1".into(),
-                tool: "bash".into(),
-                output: Arc::new(ToolOutput::Plain("ok".into())),
-                is_error: false,
-                annotation: None,
-                written_path: None,
-            })),
+            tool_done(),
             AgentEvent::AutoCompacting {
                 context_size: 1,
                 context_window: 2,
@@ -167,6 +202,7 @@ mod tests {
                 context_size_before: 100_000,
                 context_size_after: 30_000,
                 context_window: 200_000,
+                summary: String::new(),
             },
             done(DoneReason::EndTurn),
             AgentEvent::Error {
@@ -179,6 +215,7 @@ mod tests {
     #[test_case(DoneReason::MaxTokens, Some("max_tokens") ; "max_tokens")]
     #[test_case(DoneReason::MaxTurns, Some("max_turns") ; "max_turns")]
     #[test_case(DoneReason::Cancelled, Some("cancelled") ; "cancelled")]
+    #[test_case(DoneReason::Dropped, Some("dropped") ; "dropped")]
     #[test_case(DoneReason::Compact, None ; "manual_compact_is_not_a_turn")]
     fn done_maps_to_a_turn_end_reason(reason: DoneReason, expected: Option<&str>) {
         let fired = autocmd_for(&done(reason), &SESSION, false);

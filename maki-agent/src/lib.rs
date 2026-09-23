@@ -44,11 +44,11 @@ pub use maki_providers::AgentError;
 use maki_providers::Message;
 pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
-    AgentEvent, BufferSnapshot, DoneReason, Envelope, EventSender, EventStreamGuard, GrepFileEntry,
-    GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, RunLedger, RunTotals,
-    SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanColor, SpanStyle,
-    SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent, UiWaker, event_stream,
+    AgentEvent, BufferSnapshot, CallRecord, DoneReason, Envelope, EventSender, EventStreamGuard,
+    GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, RunLedger,
+    RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanColor,
+    SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput,
+    ToolStartEvent, TurnCompleteEvent, UiWaker, event_stream,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -88,16 +88,48 @@ pub struct McpPromptRef {
     pub arguments: HashMap<String, String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InputSource {
+    Tui,
+    Acp,
+    /// `maki -p` and sdk mode.
+    Headless,
+    /// A plugin prompting a session of its own, `task` subagents included.
+    Plugin,
+}
+
+impl InputSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tui => "tui",
+            Self::Acp => "acp",
+            Self::Headless => "headless",
+            Self::Plugin => "plugin",
+        }
+    }
+}
+
+/// A message queued ahead of the one that drives a run. It stays apart from
+/// the preamble so `agent.user_message` gets to judge it like any other.
+pub struct EarlierInput {
+    pub message: String,
+    pub images: Vec<ImageSource>,
+    pub preamble: Vec<Message>,
+}
+
 pub struct AgentInput {
     pub message: String,
     pub mode: AgentMode,
     pub images: Vec<ImageSource>,
     pub preamble: Vec<Message>,
+    /// The rest of a burst of queued messages, oldest first.
+    pub earlier: Vec<EarlierInput>,
     pub thinking: ThinkingConfig,
     pub fast: bool,
     /// No `Default` on this struct so adding a field forces every call site to update.
     pub workflow: bool,
     pub prompt: Option<Box<McpPromptRef>>,
+    pub source: InputSource,
 }
 
 impl AgentInput {
@@ -109,16 +141,19 @@ impl AgentInput {
         mode: AgentMode,
         images: Vec<ImageSource>,
         defaults: SessionDefaults,
+        source: InputSource,
     ) -> Self {
         Self {
             message,
             mode,
             images,
             preamble: Vec::new(),
+            earlier: Vec::new(),
             thinking: defaults.thinking.into(),
             fast: defaults.fast,
             workflow: defaults.workflow,
             prompt: None,
+            source,
         }
     }
 }
