@@ -387,6 +387,15 @@ fn find_git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
         if git.is_dir() {
             return Some(git);
         }
+        if let Ok(contents) = std::fs::read_to_string(&git) {
+            let path = contents.trim().strip_prefix("gitdir: ")?.trim_start();
+            let path = Path::new(path);
+            return Some(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                dir.join(path)
+            });
+        }
         dir = dir.parent()?;
     }
 }
@@ -577,6 +586,22 @@ mod tests {
         }
         let path = dir.path().to_string_lossy().into_owned();
         (dir, path)
+    }
+
+    #[test]
+    fn detect_branch_from_worktree() {
+        let dir = TempDir::new().unwrap();
+        let wt_head = dir.path().join("main/.git/worktrees/wt");
+        fs::create_dir_all(&wt_head).unwrap();
+        fs::write(dir.path().join("main/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(wt_head.join("HEAD"), "ref: refs/heads/db/worktree-branch\n").unwrap();
+        let wt = dir.path().join("wt");
+        fs::create_dir(&wt).unwrap();
+        fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_head.display())).unwrap();
+        assert_eq!(
+            detect_branch(&wt.to_string_lossy()),
+            Some("db/worktree-branch".to_string())
+        );
     }
 
     #[test_case(Some("ref: refs/heads/feature/foo\n"), Some("feature/foo") ; "regular_ref")]
