@@ -40,6 +40,9 @@ pub enum HostEvent<'a> {
         input: Option<&'a Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
+        context_size: u32,
+        context_window: u32,
+        subagent: bool,
     },
     AutoCompacting {
         context_size: u32,
@@ -169,7 +172,16 @@ impl HostEventKind {
             Self::ToolStart => (&[], &["tool_id", "tool"]),
             Self::ToolDone => (
                 &["input"],
-                &["tool_id", "tool", "is_error", "bytes", "duration_ms"],
+                &[
+                    "tool_id",
+                    "tool",
+                    "is_error",
+                    "bytes",
+                    "duration_ms",
+                    "context_size",
+                    "context_window",
+                    "subagent",
+                ],
             ),
             Self::AutoCompacting => (&[], &["context_size", "context_window"]),
             Self::CompactionDone => (
@@ -234,13 +246,16 @@ pub fn dispatch(
 
 /// Subagent envelopes carry the parent's `session_id`, so firing on them too
 /// would double count every budget and every tool the parent already reported,
-/// and a subagent compacting would look like the main context shrank.
+/// and a subagent compacting would look like the main context shrank. The one
+/// exception is `ToolDone`: it carries the subagent's own gauge, and
+/// `data.subagent` says which run it is, so a listener watching the parent's
+/// context can skip the subagent's calls.
 ///
 /// This runs on every envelope, streaming deltas included, and almost all of
 /// them map to nothing, so the event borrows and only a mapped one pays for
 /// a payload.
 pub fn host_event_for(event: &AgentEvent, subagent_bounded: bool) -> Option<HostEvent<'_>> {
-    if subagent_bounded {
+    if subagent_bounded && !matches!(event, AgentEvent::ToolDone(_)) {
         return None;
     }
     match event {
@@ -255,6 +270,9 @@ pub fn host_event_for(event: &AgentEvent, subagent_bounded: bool) -> Option<Host
             bytes: e.output.as_text().len(),
             input: e.call.as_ref().map(|call| &call.input),
             duration_ms: e.call.as_ref().map(|call| call.duration.as_millis() as u64),
+            context_size: e.context_size,
+            context_window: e.context_window,
+            subagent: subagent_bounded,
         }),
         AgentEvent::AutoCompacting {
             context_size,
@@ -354,6 +372,8 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path: None,
+            context_size: 0,
+            context_window: 0,
             call: Some(Box::new(CallRecord {
                 input: json!({ "command": TOOL_COMMAND }),
                 duration: Duration::from_millis(TOOL_MILLIS),
@@ -458,6 +478,9 @@ mod tests {
                 bytes: 0,
                 input: Some(&INPUT),
                 duration_ms: Some(0),
+                context_size: 0,
+                context_window: 0,
+                subagent: false,
             },
             HostEventKind::AutoCompacting => HostEvent::AutoCompacting {
                 context_size: 0,
@@ -559,12 +582,32 @@ mod tests {
     }
 
     #[test]
-    fn subagent_envelopes_fire_nothing() {
+    fn tool_done_carries_the_run_context() {
+        let AgentEvent::ToolDone(mut done) = tool_done() else {
+            unreachable!("tool_done() is a ToolDone")
+        };
+        done.context_size = 150_000;
+        done.context_window = 200_000;
+        let data = host_event_for(&AgentEvent::ToolDone(done), false)
+            .expect("ToolDone fires")
+            .payload(Some(&SESSION));
+        assert_eq!(data["context_size"], 150_000);
+        assert_eq!(data["context_window"], 200_000);
+        assert_eq!(data["subagent"], false);
+    }
+
+    #[test]
+    fn subagent_envelopes_fire_only_tool_done() {
         for event in every_event() {
-            assert!(
-                host_event_for(&event, true).is_none(),
+            let fired = host_event_for(&event, true);
+            assert_eq!(
+                fired.is_some(),
+                matches!(event, AgentEvent::ToolDone(_)),
                 "{event:?} leaked from a subagent"
             );
+            if let Some(HostEvent::ToolDone { subagent, .. }) = &fired {
+                assert!(*subagent, "{event:?} is not a subagent event");
+            }
         }
     }
 }

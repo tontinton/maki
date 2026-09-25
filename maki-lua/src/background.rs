@@ -819,6 +819,8 @@ pub(crate) mod tests {
             annotation: None,
             written_path: None,
             call: None,
+            context_size: 0,
+            context_window: 0,
             backgrounded: false,
         }
     }
