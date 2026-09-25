@@ -211,7 +211,11 @@ impl AgentLoop {
         if *self.vars.apply("{cwd}") != old_cwd {
             self.reload_instructions().await;
         }
-        let prompt_slots = Arc::new(self.lua_handle.collect_prompt_slots_async().await);
+        let prompt_slots = Arc::new(
+            self.lua_handle
+                .collect_prompt_slots_async(Some(self.seed.session_id.as_str()))
+                .await,
+        );
         let vars = self.vars.clone();
         let instructions = self.instructions.text.clone();
         let slots = Arc::clone(&prompt_slots);

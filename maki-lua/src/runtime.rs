@@ -558,7 +558,9 @@ pub enum Request {
         /// handler's [`Lineage::command_depth`], so an alias cycle runs out.
         depth: u8,
     },
+    /// Session whose prompt is being built, if any; see `run_hint_callback`.
     CollectPromptSlots {
+        session: Option<String>,
         reply: flume::Sender<ResolvedPrompts>,
     },
     CollectPluginOptions {
@@ -3769,9 +3771,26 @@ impl LuaRuntime {
         revision_guard
     }
 
-    async fn run_hint_callback(&self, plugin: &str, func: Function) -> Option<String> {
+    /// Calls a hint's content function with `{ session_id = ... }` naming the
+    /// session whose prompt is being built, or nil when there is none:
+    /// `maki.session.current()` names the focused tab, and background
+    /// sessions build prompts too.
+    async fn run_hint_callback(
+        &self,
+        plugin: &str,
+        func: Function,
+        session: Option<&str>,
+    ) -> Option<String> {
+        let ctx = match session {
+            Some(id) => {
+                let table = self.lua.create_table().ok()?;
+                table.set("session_id", id).ok()?;
+                LuaValue::Table(table)
+            }
+            None => LuaValue::Nil,
+        };
         let result: mlua::Result<LuaValue> =
-            run_detached(&self.lua, func.call_async::<LuaValue>(())).await;
+            run_detached(&self.lua, func.call_async::<LuaValue>(ctx)).await;
         match result {
             Ok(LuaValue::String(s)) => Some(s.to_string_lossy()),
             Ok(LuaValue::Nil) => None,
@@ -3786,7 +3805,7 @@ impl LuaRuntime {
         }
     }
 
-    async fn collect_prompt_slots(&self) -> ResolvedPrompts {
+    async fn collect_prompt_slots(&self, session: Option<&str>) -> ResolvedPrompts {
         struct Pending {
             plugin: Arc<str>,
             prompts: Vec<PromptId>,
@@ -3845,7 +3864,9 @@ impl LuaRuntime {
             };
             let content = match item.content {
                 PendingContent::Static(s) => Some(s),
-                PendingContent::Callback(func) => self.run_hint_callback(&item.plugin, func).await,
+                PendingContent::Callback(func) => {
+                    self.run_hint_callback(&item.plugin, func, session).await
+                }
             };
             let Some(content) = content else { continue };
             for pid in item.prompts {
@@ -5969,8 +5990,8 @@ pub fn spawn(
                             let res = rt.run_init_lua(&source, scope, plugin_dir).await;
                             let _ = reply.send(res);
                         }
-                        Request::CollectPromptSlots { reply } => {
-                            let slots = rt.collect_prompt_slots().await;
+                        Request::CollectPromptSlots { session, reply } => {
+                            let slots = rt.collect_prompt_slots(session.as_deref()).await;
                             let _ = reply.send(slots);
                         }
                         Request::CollectPluginOptions { reply } => {
