@@ -1491,6 +1491,7 @@ mod tests {
             model: None,
             opts: None,
             answer_tx,
+            detached: false,
         }
     }
 
@@ -1650,6 +1651,7 @@ mod tests {
             request_id,
             &CancelToken::none(),
             None,
+            false,
         ))
     }
 
