@@ -77,6 +77,7 @@ struct State<T> {
     inner_area: Rect,
     enabled: Option<Vec<bool>>,
     matcher: Matcher,
+    notice: Option<&'static str>,
 }
 
 impl<T: PickerItem> State<T> {
@@ -92,6 +93,7 @@ impl<T: PickerItem> State<T> {
             inner_area: Rect::default(),
             enabled: None,
             matcher: Matcher::new(Config::DEFAULT),
+            notice: None,
         }
     }
 
@@ -288,6 +290,13 @@ impl<T: PickerItem> ListPicker<T> {
 
     pub fn set_error_text(&mut self, text: Option<String>) {
         self.error_text = text;
+    }
+
+    /// A dim line under the list, for state that is not an item.
+    pub fn set_notice(&mut self, notice: Option<&'static str>) {
+        if let Some(s) = self.state.as_mut() {
+            s.notice = notice;
+        }
     }
 
     pub fn replace_items(&mut self, items: Vec<T>) {
@@ -506,6 +515,7 @@ fn render_ready<T: PickerItem>(
     footer: Option<fn() -> Line<'static>>,
     error_text: Option<&str>,
 ) -> Rect {
+    let notice = s.notice;
     let footer_rows = if footer.is_some() { 1u16 } else { 0 };
     let content_rows = if s.filtered.is_empty() {
         1
@@ -517,6 +527,7 @@ fn render_ready<T: PickerItem>(
         }
     };
     let error_rows = error_text.is_some() as u16;
+    let notice_rows = notice.is_some() as u16;
     let modal = Modal {
         title,
         width_percent: MIN_WIDTH_PERCENT,
@@ -525,20 +536,24 @@ fn render_ready<T: PickerItem>(
     let (popup, inner) = modal.render(
         frame,
         area,
-        content_rows + SEARCH_ROW + footer_rows + error_rows,
+        content_rows + SEARCH_ROW + footer_rows + error_rows + notice_rows,
     );
     let viewport_h = inner
         .height
-        .saturating_sub(error_rows + SEARCH_ROW + footer_rows);
+        .saturating_sub(error_rows + notice_rows + SEARCH_ROW + footer_rows);
     s.viewport_height = viewport_h as usize;
     s.ensure_visible();
 
-    let mut constraints: Vec<Constraint> =
-        Vec::with_capacity(3 + footer.is_some() as usize + error_text.is_some() as usize);
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(
+        3 + footer.is_some() as usize + error_text.is_some() as usize + notice.is_some() as usize,
+    );
     if error_text.is_some() {
         constraints.push(Constraint::Length(1)); // error line
     }
     constraints.push(Constraint::Min(1)); // list
+    if notice.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
     constraints.push(Constraint::Length(1)); // search
     if footer.is_some() {
         constraints.push(Constraint::Length(1));
@@ -558,6 +573,15 @@ fn render_ready<T: PickerItem>(
 
     let list_area = areas[area_idx];
     area_idx += 1;
+
+    if let Some(notice) = notice {
+        let line = Line::from(Span::styled(
+            format!("  {notice}"),
+            theme::current().tool_dim,
+        ));
+        frame.render_widget(Paragraph::new(vec![line]), areas[area_idx]);
+        area_idx += 1;
+    }
 
     let search_area = areas[area_idx];
     area_idx += 1;

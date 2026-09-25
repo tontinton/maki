@@ -36,7 +36,8 @@ use maki_lua::{
     UiAction, UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
-use maki_providers::provider::{Provider, fetch_all_models, from_model};
+use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
+use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
@@ -399,7 +400,7 @@ struct SpawnCtx {
     lua_event_handle: EventHandle,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
-    available_models: Arc<ArcSwapOption<Vec<String>>>,
+    available_models: Arc<ArcSwapOption<ModelList>>,
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
     trust_question: Option<TrustQuestion>,
@@ -511,32 +512,12 @@ enum Wake {
 }
 
 struct BackgroundModels {
-    available: Arc<ArcSwapOption<Vec<String>>>,
+    available: Arc<ArcSwapOption<ModelList>>,
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     models_rx: flume::Receiver<()>,
     models_tx: flume::Sender<()>,
     task: smol::Task<()>,
-}
-
-fn merge_batch(
-    available: &Arc<ArcSwapOption<Vec<String>>>,
-    batch: maki_providers::provider::ModelBatch,
-    warn_tx: &flume::Sender<String>,
-) {
-    for w in batch.warnings {
-        let _ = warn_tx.try_send(w);
-    }
-    if batch.models.is_empty() {
-        return;
-    }
-    let mut merged = available.load().as_deref().cloned().unwrap_or_default();
-    for spec in &batch.models {
-        if !merged.contains(spec) {
-            merged.push(spec.clone());
-        }
-    }
-    available.store(Some(Arc::new(merged)));
 }
 
 /// The one way discovery starts, so startup and `/models refresh` cannot drift
@@ -545,25 +526,25 @@ fn merge_batch(
 /// next tick. The channel holds one slot, which collapses overlapping fetches
 /// into a single rebuild.
 fn fetch_models(
-    available: Arc<ArcSwapOption<Vec<String>>>,
+    available: Arc<ArcSwapOption<ModelList>>,
     policy: Arc<ModelPolicy>,
     warn_tx: flume::Sender<String>,
     models_tx: flume::Sender<()>,
 ) -> smol::Task<()> {
     smol::spawn(async move {
-        fetch_all_models(
-            &policy,
-            |batch| merge_batch(&available, batch, &warn_tx),
-            Some(Box::new(move || {
-                let _ = models_tx.try_send(());
-            })),
-        )
+        fetch_all_models_cached(&policy, |list, warnings| {
+            for w in warnings {
+                let _ = warn_tx.try_send(w);
+            }
+            available.store(Some(Arc::new(list)));
+        })
         .await;
+        let _ = models_tx.try_send(());
     })
 }
 
 fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
-    let available: Arc<ArcSwapOption<Vec<String>>> = Arc::new(ArcSwapOption::empty());
+    let available: Arc<ArcSwapOption<ModelList>> = Arc::new(ArcSwapOption::empty());
     let (warn_tx, warn_rx) = flume::unbounded::<String>();
     let (models_tx, models_rx) = flume::bounded::<()>(1);
     let task = fetch_models(
@@ -1339,7 +1320,10 @@ impl<'t> EventLoop<'t> {
             ModelRequest::Available => {
                 let available = self.ctx.available_models.load();
                 Ok(json!(
-                    available.as_deref().map(Vec::as_slice).unwrap_or(&[])
+                    available
+                        .as_deref()
+                        .map(|list| list.specs.as_slice())
+                        .unwrap_or(&[])
                 ))
             }
             ModelRequest::Set {
@@ -1796,7 +1780,6 @@ impl<'t> EventLoop<'t> {
     }
 
     fn refresh_models(&self) {
-        self.ctx.available_models.store(None);
         fetch_models(
             Arc::clone(&self.ctx.available_models),
             Arc::clone(&self.ctx.model_policy),

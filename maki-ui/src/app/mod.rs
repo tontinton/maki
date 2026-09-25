@@ -69,6 +69,7 @@ use maki_lua::{
     LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
     PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, WinView, is_reserved,
 };
+use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
@@ -422,7 +423,7 @@ impl App {
         model: &Model,
         session: OpenSession,
         storage: StateDir,
-        available_models: Arc<ArcSwapOption<Vec<String>>>,
+        available_models: Arc<ArcSwapOption<ModelList>>,
         mcp_reader: McpSnapshotReader,
         mcp_config_errors: McpConfigErrors,
         lua_command_reader: LuaCommandReader,

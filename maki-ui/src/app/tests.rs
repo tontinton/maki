@@ -209,7 +209,7 @@ fn app_without_splash() -> App {
 
 /// Hands back the slot providers publish their model lists into, since the app
 /// keeps no handle to it once the picker owns it.
-fn app_with_model_slot() -> (App, Arc<ArcSwapOption<Vec<String>>>) {
+fn app_with_model_slot() -> (App, Arc<ArcSwapOption<ModelList>>) {
     let models = Arc::new(ArcSwapOption::empty());
     let mut app = test_app();
     app.model_picker = ModelPicker::new(Arc::clone(&models));
@@ -2446,7 +2446,10 @@ fn model_list_arriving_in_the_background_owes_a_frame() {
     assert!(app.model_picker.is_open());
 
     assert_owes_one_frame(&mut app, || {
-        models.store(Some(Arc::new(vec![LATE_MODEL_SPEC.into()])));
+        models.store(Some(Arc::new(ModelList {
+            specs: vec![LATE_MODEL_SPEC.into()],
+            loading: false,
+        })));
     });
 }
 
