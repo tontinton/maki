@@ -10,6 +10,7 @@ use maki_config::{
 use thiserror::Error;
 use tracing::{info, warn};
 
+use crate::tools::registry::BoxFuture;
 use crate::{AgentEvent, EventSender};
 
 pub const DEFAULT_DENY_GUIDANCE: &str =
@@ -25,6 +26,7 @@ pub const DECISION_SOURCE_USER_ONCE: &str = "user_once";
 pub const DECISION_SOURCE_USER_SESSION: &str = "user_session";
 pub const DECISION_SOURCE_USER_ALWAYS: &str = "user_always";
 pub const DECISION_SOURCE_USER_ABORT: &str = "user_abort";
+pub const DECISION_SOURCE_PLUGIN: &str = "plugin";
 
 const TASK_TOOL: &str = "task";
 const BASH_TOOL: &str = "bash";
@@ -87,6 +89,9 @@ pub struct PermissionError {
     tool: String,
     scope: String,
     guidance: Option<String>,
+    /// Set when a plugin answered instead of the user. Its guidance is still
+    /// text the agent reads, so it must not arrive dressed as the user's.
+    plugin: Option<Arc<str>>,
 }
 
 impl std::fmt::Display for PermissionError {
@@ -96,28 +101,11 @@ impl std::fmt::Display for PermissionError {
             "{} `{}` ({}).",
             PERMISSION_DENIED_PREFIX, self.tool, self.scope
         )?;
-        if let Some(g) = &self.guidance {
-            write!(f, " User guidance: {}", g)
-        } else {
-            write!(f, " {}", DEFAULT_DENY_GUIDANCE)
-        }
-    }
-}
-
-impl PermissionError {
-    fn new(tool: &str, scope: &str) -> Self {
-        Self {
-            tool: tool.to_string(),
-            scope: scope.to_string(),
-            guidance: None,
-        }
-    }
-
-    fn with_guidance(tool: &str, scope: &str, guidance: String) -> Self {
-        Self {
-            tool: tool.to_string(),
-            scope: scope.to_string(),
-            guidance: Some(guidance),
+        match (&self.plugin, &self.guidance) {
+            (Some(p), Some(g)) => write!(f, " Plugin `{p}` denied it: {g}"),
+            (Some(p), None) => write!(f, " Plugin `{p}` denied it. {DEFAULT_DENY_GUIDANCE}"),
+            (None, Some(g)) => write!(f, " User guidance: {g}"),
+            (None, None) => write!(f, " {DEFAULT_DENY_GUIDANCE}"),
         }
     }
 }
@@ -265,6 +253,20 @@ impl TaggedAnswer {
         let (request_id, answer) = raw.split_once(ANSWER_ID_SEPARATOR)?;
         Some(Self::new(request_id, PermissionAnswer::decode(answer)?))
     }
+}
+
+/// A plugin's answer to a call that would have prompted, given with the
+/// options the prompt offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerAnswer {
+    pub plugin: Arc<str>,
+    pub answer: PermissionAnswer,
+}
+
+/// Whatever sits in front of the permission prompt. `None` leaves the call to
+/// the prompt, exactly as if nothing were there.
+pub trait PromptLayers: Sync {
+    fn answer<'a>(&'a self, scopes: &'a [String]) -> BoxFuture<'a, Option<LayerAnswer>>;
 }
 
 /// Permission rules declared by Lua plugins via
@@ -678,17 +680,20 @@ impl PermissionManager {
         request_id: &str,
         cancel: &crate::CancelToken,
         plan_path: Option<&Path>,
+        layers: Option<&dyn PromptLayers>,
     ) -> Result<(), PermissionError> {
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
         let tool_string = tool.to_string();
         let scope_display = || scopes.scopes.join("; ");
         // Every deny is built here and every approval passes through
         // `allowed`, so reporting cannot drift from what the caller gets.
-        let deny = |source: &'static str, guidance: Option<String>| {
+        let deny = |source: &'static str, guidance: Option<String>, plugin: Option<Arc<str>>| {
             maki_otel::emit::tool_decision(&tool_string, maki_otel::emit::DECISION_REJECT, source);
-            match guidance {
-                Some(g) => PermissionError::with_guidance(&tool_string, &scope_display(), g),
-                None => PermissionError::new(&tool_string, &scope_display()),
+            PermissionError {
+                tool: tool_string.clone(),
+                scope: scope_display(),
+                guidance,
+                plugin,
             }
         };
         let allowed = |source: &'static str| {
@@ -706,7 +711,7 @@ impl PermissionManager {
         let (pt, ps, force_prompt) =
             match self.check_inner(tool, &scope_refs, scopes.force_prompt, plan_path) {
                 PermissionCheck::Allowed => return allowed(by_rule()),
-                PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
+                PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None, None)),
                 PermissionCheck::NeedsPrompt {
                     tool,
                     scopes,
@@ -714,16 +719,38 @@ impl PermissionManager {
                 } => (tool, scopes, force_prompt),
             };
 
+        // Runs before the prompt's lock, so a slow layer never holds up a
+        // prompt the user could already be answering, and before the missing
+        // channel check, since a run nobody watches is where a layer earns
+        // its keep.
+        if let Some(layers) = layers
+            && let Ok(Some(LayerAnswer { plugin, answer })) = cancel.race(layers.answer(&ps)).await
+        {
+            self.apply_decision(&pt, &ps, &answer);
+            if !answer.is_allow() {
+                return Err(deny(
+                    DECISION_SOURCE_PLUGIN,
+                    answer.guidance().map(String::from),
+                    Some(plugin),
+                ));
+            }
+            let _ = event_tx.send(AgentEvent::AllowedByPlugin {
+                id: request_id.to_owned(),
+                plugin: plugin.to_string(),
+            });
+            return allowed(DECISION_SOURCE_PLUGIN);
+        }
+
         let Some(rx) = user_response_rx else {
             warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
-            return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+            return Err(deny(DECISION_SOURCE_USER_ABORT, None, None));
         };
 
         let guard = rx.lock().await;
         let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
         let (t2, s2) = match self.check_inner(&pt, &refs, force_prompt, plan_path) {
             PermissionCheck::Allowed => return allowed(by_rule()),
-            PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
+            PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None, None)),
             PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
         };
 
@@ -752,11 +779,11 @@ impl PermissionManager {
                 Ok(Err(_)) => {
                     drop(guard);
                     warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
-                    return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+                    return Err(deny(DECISION_SOURCE_USER_ABORT, None, None));
                 }
                 Err(_) => {
                     drop(guard);
-                    return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+                    return Err(deny(DECISION_SOURCE_USER_ABORT, None, None));
                 }
             }
         };
@@ -767,7 +794,7 @@ impl PermissionManager {
         if answer.is_allow() {
             allowed(source)
         } else {
-            Err(deny(source, answer.guidance().map(String::from)))
+            Err(deny(source, answer.guidance().map(String::from), None))
         }
     }
 }
@@ -2228,5 +2255,83 @@ mod tests {
                 "{scope}"
             );
         }
+    }
+
+    const LAYER_PLUGIN: &str = "guard";
+    const LAYER_SCOPE: &str = "rm -rf build";
+    const LAYER_GUIDANCE: &str = "use trash instead";
+
+    struct Layer(Option<PermissionAnswer>);
+
+    impl PromptLayers for Layer {
+        fn answer<'a>(&'a self, _scopes: &'a [String]) -> BoxFuture<'a, Option<LayerAnswer>> {
+            let answer = self.0.clone().map(|answer| LayerAnswer {
+                plugin: Arc::from(LAYER_PLUGIN),
+                answer,
+            });
+            Box::pin(std::future::ready(answer))
+        }
+    }
+
+    /// Runs one call that would prompt, with no answer channel behind the
+    /// layer, the way `maki -p` does. Returns what the call got and whether a
+    /// frontend was told a plugin allowed it.
+    fn enforce_behind(
+        mgr: &PermissionManager,
+        layer: Layer,
+    ) -> (Result<(), PermissionError>, bool) {
+        let (guard, mut events) = crate::event_stream();
+        let result = smol::block_on(mgr.enforce(
+            &ToolKey::native(BASH_TOOL),
+            &crate::tools::PermissionScopes::single(LAYER_SCOPE.to_owned()),
+            &guard.sender(0),
+            None,
+            TAGGED_REQUEST_ID,
+            &crate::CancelToken::none(),
+            None,
+            Some(&layer),
+        ));
+        drop(guard);
+        let mut marked = false;
+        while let Some(envelope) = smol::block_on(events.next()) {
+            marked |= matches!(envelope.event, AgentEvent::AllowedByPlugin { .. });
+        }
+        (result, marked)
+    }
+
+    #[test_case(Some(PermissionAnswer::AllowOnce), true, PROMPTS ; "allow_once_leaves_no_rule")]
+    #[test_case(Some(PermissionAnswer::AllowSession), true, ALLOWED ; "allow_session_sticks")]
+    #[test_case(Some(PermissionAnswer::Deny), false, PROMPTS ; "deny")]
+    #[test_case(None, false, PROMPTS ; "no_answer_falls_to_the_prompt")]
+    fn a_layer_answers_in_place_of_the_prompt(
+        answer: Option<PermissionAnswer>,
+        allowed: bool,
+        next_call: &str,
+    ) {
+        let mgr = default_mgr();
+        let (result, marked) = enforce_behind(&mgr, Layer(answer));
+        assert_eq!(result.is_ok(), allowed, "{result:?}");
+        assert_eq!(
+            marked, allowed,
+            "only an allow skips a prompt the user would have seen"
+        );
+        assert_eq!(
+            outcome(mgr.check(&ToolKey::native(BASH_TOOL), LAYER_SCOPE, None)),
+            next_call
+        );
+    }
+
+    /// A plugin's reason is shaped by the very call it judged, so the agent
+    /// has to be told whose voice it is reading.
+    #[test_case(PermissionAnswer::Deny, DEFAULT_DENY_GUIDANCE ; "bare")]
+    #[test_case(PermissionAnswer::DenyWithGuidance(LAYER_GUIDANCE.into()), LAYER_GUIDANCE ; "with_guidance")]
+    fn a_layer_deny_is_labelled_by_plugin(answer: PermissionAnswer, guidance: &str) {
+        let (result, _) = enforce_behind(&default_mgr(), Layer(Some(answer)));
+        let err = result.expect_err("a deny").to_string();
+        assert!(
+            err.contains(&format!("Plugin `{LAYER_PLUGIN}` denied it")),
+            "{err}"
+        );
+        assert!(err.contains(guidance), "{err}");
     }
 }

@@ -29,6 +29,9 @@ pub(crate) const ERROR_TEXT: &str = "Error";
 pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
 /// One notice per streak: a wedged model can spend twenty nudges, and twenty
 /// identical bubbles bury the conversation they are about.
+/// Marks a call a `permission.prompt` layer allowed, since the user never saw
+/// a prompt for it.
+const ALLOWED_BY: &str = "allowed by";
 const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
 
 pub enum ChatEventResult {
@@ -189,6 +192,9 @@ impl Chat {
             AgentEvent::PermissionRequest { id, tool, scopes } => {
                 return ChatEventResult::PermissionRequest { id, tool, scopes };
             }
+            AgentEvent::AllowedByPlugin { id, plugin } => self
+                .messages_panel
+                .annotate_tool(&id, &format!("{ALLOWED_BY} {plugin}")),
             AgentEvent::AuthRequired => {
                 return ChatEventResult::AuthRequired;
             }
@@ -400,7 +406,7 @@ impl Chat {
     }
 
     pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
-        self.messages_panel.update_tool_model(tool_id, model);
+        self.messages_panel.annotate_tool(tool_id, model);
     }
 
     pub fn set_tool_turn_usage(&mut self, tool_id: &str, usage: String) {
@@ -957,6 +963,27 @@ mod tests {
             None,
         );
         assert_eq!(chat.in_progress_count(), 0);
+    }
+
+    /// The call never opened a prompt, so the row is the only place the user
+    /// learns something let it through.
+    #[test]
+    fn a_call_a_plugin_allowed_is_marked_on_its_row() {
+        const PLUGIN: &str = "automode";
+        let mut chat = chat();
+        chat.handle_event(tool_start("t1", "bash"), None);
+        chat.handle_event(
+            AgentEvent::AllowedByPlugin {
+                id: "t1".into(),
+                plugin: PLUGIN.into(),
+            },
+            None,
+        );
+        let row = chat.message_at(0).expect("the tool row");
+        assert_eq!(
+            row.annotation.as_deref(),
+            Some(format!("{ALLOWED_BY} {PLUGIN}").as_str())
+        );
     }
 
     #[test]

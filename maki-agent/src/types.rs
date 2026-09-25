@@ -661,6 +661,13 @@ pub enum AgentEvent {
         tool: ToolKey,
         scopes: Vec<String>,
     },
+    /// A `permission.prompt` layer allowed a call that would have prompted.
+    /// The prompt is where the user learns what the agent is about to do, so
+    /// a frontend marks the call instead.
+    AllowedByPlugin {
+        id: String,
+        plugin: String,
+    },
     AuthRequired,
     Nudge,
     SubagentHistory {

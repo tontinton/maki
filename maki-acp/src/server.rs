@@ -1650,6 +1650,7 @@ mod tests {
             request_id,
             &CancelToken::none(),
             None,
+            None,
         ))
     }
 

@@ -11,9 +11,10 @@ use tracing::{debug, error, warn};
 
 use crate::agent::CallInstructions;
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
+use crate::permissions::{LayerAnswer, PromptLayers};
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
-use crate::tools::registry::{InstalledHook, RegisteredTool, ToolInvocation};
+use crate::tools::registry::{BoxFuture, InstalledHook, RegisteredTool, ToolInvocation};
 use crate::tools::{
     CallOrigin, Deadline, FileKey, LocalTool, LocalToolFn, ToolAudience, ToolContext,
     truncate_bytes,
@@ -126,7 +127,7 @@ pub async fn run(
     };
 
     let telemetry = maki_otel::enabled().then(|| (resolved.route.source(), Instant::now()));
-    let mut done = run_inner(resolved, id, &input, ctx, origin).await;
+    let mut done = run_inner(resolved, id, &input, ctx, origin, hook.as_ref()).await;
     if let Some(hook) = &hook {
         hook.filter_output(&mut done).await;
     }
@@ -262,7 +263,24 @@ impl<'a> Hook<'a> {
         value: Value,
         on_cancel: Verdict,
     ) -> Verdict {
-        let call = HookCall {
+        let call = self.call(tool_id);
+        self.ctx
+            .cancel
+            .race(self.installed.run(stage, value, &call))
+            .await
+            .unwrap_or(on_cancel)
+    }
+
+    fn prompt_layers<'b>(&'b self, tool_id: &'b str, input: &'b Value) -> PromptAsk<'b> {
+        PromptAsk {
+            hook: self,
+            tool_id,
+            input,
+        }
+    }
+
+    fn call<'b>(&'b self, tool_id: &'b str) -> HookCall<'b> {
+        HookCall {
             tool: self.tool,
             tool_id,
             session_id: self.ctx.session_id.as_ref().map(SessionRef::as_str),
@@ -270,12 +288,7 @@ impl<'a> Hook<'a> {
             authority: self.authority,
             cancel: &self.ctx.cancel,
             deadline: self.window(),
-        };
-        self.ctx
-            .cancel
-            .race(self.installed.run(stage, value, &call))
-            .await
-            .unwrap_or(on_cancel)
+        }
     }
 
     /// Read when a stage fires, not once per call: the input chain and the tool
@@ -287,6 +300,25 @@ impl<'a> Hook<'a> {
             Deadline::At(at) => at.min(cap),
             Deadline::None => cap,
         }
+    }
+}
+
+/// The hook, bound to the call whose permission prompt it may answer.
+struct PromptAsk<'a> {
+    hook: &'a Hook<'a>,
+    tool_id: &'a str,
+    input: &'a Value,
+}
+
+impl PromptLayers for PromptAsk<'_> {
+    fn answer<'a>(&'a self, scopes: &'a [String]) -> BoxFuture<'a, Option<LayerAnswer>> {
+        Box::pin(async move {
+            let call = self.hook.call(self.tool_id);
+            self.hook
+                .installed
+                .prompt(self.input, scopes, &call, self.hook.ctx)
+                .await
+        })
     }
 }
 
@@ -491,14 +523,15 @@ async fn run_inner(
     input: &Value,
     ctx: &ToolContext,
     origin: CallOrigin,
+    hook: Option<&Hook<'_>>,
 ) -> ToolDoneEvent {
     let name = resolved.name;
     match resolved.route {
         Route::Local(local) => run_local_tool(&local.handler, id, name, input, ctx, origin).await,
-        Route::Native(entry) => run_native_tool(entry, id, name, input, ctx, origin).await,
+        Route::Native(entry) => run_native_tool(entry, id, name, input, ctx, origin, hook).await,
         Route::ToolSearch(mcp) => run_tool_search(mcp, id, input, ctx, origin),
         Route::Mcp(mcp, qualified) => {
-            execute_mcp_tool(ctx, mcp, &id, qualified, input, origin).await
+            execute_mcp_tool(ctx, mcp, &id, qualified, input, origin, hook).await
         }
         Route::Unknown => {
             warn!(tool = %name, "unknown tool");
@@ -524,6 +557,7 @@ async fn run_native_tool(
     input: &Value,
     ctx: &ToolContext,
     origin: CallOrigin,
+    hook: Option<&Hook<'_>>,
 ) -> ToolDoneEvent {
     let tool_id: Arc<str> = Arc::from(entry.tool.name());
     let started = Instant::now();
@@ -594,7 +628,8 @@ async fn run_native_tool(
 
     invocation.start(ctx).await;
 
-    if let Err(e) = enforce_permission(invocation.as_ref(), name, ctx, &id).await {
+    let layers = hook.map(|hook| hook.prompt_layers(&id, input));
+    if let Err(e) = enforce_permission(invocation.as_ref(), name, ctx, &id, layers.as_ref()).await {
         return done_error(e);
     }
 
@@ -753,6 +788,7 @@ async fn enforce_permission(
     name: &str,
     ctx: &ToolContext,
     id: &str,
+    layers: Option<&PromptAsk<'_>>,
 ) -> Result<(), String> {
     if name.contains('.') {
         return Err(format!(
@@ -770,6 +806,7 @@ async fn enforce_permission(
                 id,
                 &ctx.cancel,
                 ctx.mode.plan_path(),
+                layers.map(|l| l as &dyn PromptLayers),
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -784,6 +821,7 @@ async fn execute_mcp_tool(
     tool: Arc<str>,
     input: &Value,
     origin: CallOrigin,
+    hook: Option<&Hook<'_>>,
 ) -> ToolDoneEvent {
     emit_raw_start(ctx, origin, id, &tool, format!("mcp: {tool}"), input);
     let done = |output: String, is_error: bool| ToolDoneEvent {
@@ -803,6 +841,7 @@ async fn execute_mcp_tool(
     };
     let perm_scope = truncate_bytes(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
     let perm_scopes = crate::tools::PermissionScopes::single(perm_scope);
+    let layers = hook.map(|hook| hook.prompt_layers(id, input));
 
     if let Err(e) = ctx
         .permissions
@@ -814,6 +853,7 @@ async fn execute_mcp_tool(
             id,
             &ctx.cancel,
             ctx.mode.plan_path(),
+            layers.as_ref().map(|l| l as &dyn PromptLayers),
         )
         .await
     {
@@ -1353,6 +1393,16 @@ mod tests {
                 Reply::Answers(answer) => Box::pin(std::future::ready(answer(stage, &value))),
                 Reply::Pending => Box::pin(std::future::pending()),
             }
+        }
+
+        fn prompt<'a>(
+            &'a self,
+            _input: &'a Value,
+            _scopes: &'a [String],
+            _call: &'a HookCall<'a>,
+            _ctx: &'a ToolContext,
+        ) -> BoxFuture<'a, Option<LayerAnswer>> {
+            Box::pin(std::future::ready(None))
         }
     }
 

@@ -2,8 +2,11 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use maki_agent::AgentMode;
 use maki_agent::cancel::CancelToken;
+use maki_agent::permissions::{LayerAnswer, PermissionAnswer};
 use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
+use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{CallOrigin, ToolRegistry};
 use maki_lua::{
     Permission, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRowAction, PluginHost,
@@ -819,6 +822,7 @@ fn a_parked_layer_ends_at_the_window_it_was_given() {
 #[test_case("tool.bash.input" ; "tool_stage")]
 #[test_case("ui.plan_form" ; "ui_surface")]
 #[test_case("ui.plan_form.actions" ; "ui_menu")]
+#[test_case("permission.prompt" ; "permission_prompt")]
 fn host_slot_names_are_reserved(name: &str) {
     let (_reg, host) = host();
     let err = host
@@ -833,6 +837,101 @@ fn host_slot_names_are_reserved(name: &str) {
     for expected in ["host owned", "reserved", "set_slot"] {
         assert!(err.contains(expected), "{err}");
     }
+}
+
+// -------------------------------------------------- permission.prompt slot
+
+const PROMPT_ALLOW: &str = r#"return { decision = "allow" }"#;
+const PROMPT_PASS: &str = "return prev(req, ctx)";
+const PROMPT_GUIDANCE: &str = "use trash instead";
+
+fn prompt_layer(body: &str) -> String {
+    format!(r#"maki.api.set_slot("permission.prompt", function(prev, req, ctx) {body} end)"#)
+}
+
+/// Asks the chain what `enforce` asks it about a call to {SLOT_TOOL} that
+/// would otherwise prompt.
+fn ask_prompt(reg: &ToolRegistry, authority: Authority) -> Option<LayerAnswer> {
+    let hook = reg.hook().expect("the plugin host installs one at boot");
+    let cancel = CancelToken::none();
+    let call = call_of(SLOT_TOOL, authority, CallOrigin::Model, &cancel);
+    let input = serde_json::json!({ COMMAND_FIELD: COMMAND });
+    let scopes = [COMMAND.to_owned()];
+    let ctx = stub_ctx(&AgentMode::Build);
+    within(hook.prompt(&input, &scopes, &call, &ctx))
+}
+
+#[test_case(r#"return { decision = "allow_session" }"#, Some(PermissionAnswer::AllowSession) ; "answers_for_the_user")]
+#[test_case(PROMPT_PASS, None ; "passing_it_on_leaves_it_to_the_prompt")]
+#[test_case(r#"return { decision = "maybe" }"#, None ; "an_answer_the_prompt_does_not_offer_prompts")]
+#[test_case(r#"error("boom")"#, None ; "a_throwing_layer_prompts")]
+#[test_case(
+    r#"if req.tool == "slotted" and req.tool_id == "t1" and req.input.command == "ls"
+        and req.scopes[1] == "ls" and ctx:task_id() == "main" then
+        return { decision = "allow" }
+    end
+    return prev(req, ctx)"#,
+    Some(PermissionAnswer::AllowOnce) ;
+    "req_and_ctx_describe_the_call"
+)]
+#[test_case(
+    r#"local judge = maki.agent.session(ctx, { name = "judge" })
+    if not judge then return prev(req, ctx) end
+    judge:close()
+    return { decision = "allow" }"#,
+    Some(PermissionAnswer::AllowOnce) ;
+    "ctx_can_open_a_session_to_ask_a_model"
+)]
+fn a_prompt_layer_answers_with_the_prompts_options(body: &str, expected: Option<PermissionAnswer>) {
+    let (reg, host) = host();
+    load(&host, LAYER_PLUGIN, &prompt_layer(body));
+
+    let answered = ask_prompt(&reg, Authority::Unbounded);
+
+    assert_eq!(
+        answered,
+        expected.map(|answer| LayerAnswer {
+            plugin: Arc::from(LAYER_PLUGIN),
+            answer,
+        })
+    );
+}
+
+/// The tool row names the plugin that allowed a call and a deny speaks in
+/// its voice, so the answer has to be pinned on the layer that built it, not
+/// on whichever one handed it up last.
+#[test_case(PROMPT_PASS, INNER_LAYER, PermissionAnswer::AllowOnce ; "passed_up")]
+#[test_case(
+    &format!(r#"prev(req, ctx); return {{ decision = "deny", guidance = "{PROMPT_GUIDANCE}" }}"#),
+    OUTER_LAYER,
+    PermissionAnswer::DenyWithGuidance(PROMPT_GUIDANCE.into()) ;
+    "overruled"
+)]
+fn the_layer_that_built_the_answer_is_named(outer: &str, decider: &str, answer: PermissionAnswer) {
+    let (reg, host) = host();
+    load(&host, INNER_LAYER, &prompt_layer(PROMPT_ALLOW));
+    load(&host, OUTER_LAYER, &prompt_layer(outer));
+
+    let answered = ask_prompt(&reg, Authority::Unbounded);
+
+    assert_eq!(
+        answered,
+        Some(LayerAnswer {
+            plugin: Arc::from(decider),
+            answer,
+        })
+    );
+}
+
+/// Allowing a call lends the call's reach, so a layer pays for it the way a
+/// `tool.<name>.input` layer does.
+#[test_case(Authority::Capability(Permission::Run), true ; "the_calls_capability_is_enough")]
+#[test_case(Authority::Unbounded, false ; "an_undeclared_reach_takes_every_one")]
+fn a_prompt_layer_pays_the_authority_of_the_call(authority: Authority, answers: bool) {
+    let (reg, host) = host();
+    load_granted(&host, LAYER_PLUGIN, &prompt_layer(PROMPT_ALLOW), only_run());
+
+    assert_eq!(ask_prompt(&reg, authority).is_some(), answers);
 }
 
 // ------------------------------------------------------ ui.plan_form slots

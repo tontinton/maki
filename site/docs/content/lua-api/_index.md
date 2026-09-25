@@ -955,7 +955,8 @@ tool declaring no capability charges. You can only name permissions your
 own plugin holds.
 
 Throws if another plugin already owns a slot with the same {name}, or
-if {name} starts with `"tool."` or `"ui."`, which the host fires itself.
+if {name} starts with `"tool."`, `"ui."` or `"permission."`, which the host
+fires itself.
 The name stays yours across an unload: nobody else can take it over, or
 re-declare it cheaper, while maki runs.
 
@@ -1019,6 +1020,12 @@ table to replace the value, nothing to leave it alone, or
 `nil, reason` to stop the call. Wrapping one costs the capability the
 tool declares, and a tool declaring none costs every permission. See
 [Hooks](/docs/hooks/).
+
+`permission.prompt` fires where the permission prompt would show, with
+the prompt as its default. A layer takes `function(prev, req, ctx)` and
+answers with one of the prompt's options, like
+`{ decision = "allow_session" }`, or passes the call on with
+`prev(req, ctx)`. See [Hooks](/docs/hooks/#permission-prompt).
 
 Wrapping a slot another plugin declared steers a chain that plugin's
 callers trust, so it costs whatever the owner priced it at in

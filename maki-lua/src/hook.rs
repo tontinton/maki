@@ -5,12 +5,15 @@
 use std::sync::Arc;
 
 use flume::Sender;
+use maki_agent::permissions::LayerAnswer;
+use maki_agent::tools::ToolContext;
 use maki_agent::tools::hook::{HookCall, HookStage, ToolHook, Verdict};
 use maki_agent::tools::registry::BoxFuture;
 use serde_json::{Value, json};
 
-use crate::api::slot::{LayeredTools, host_slot_name};
-use crate::runtime::{HookRun, Request};
+use crate::api::slot::{LayeredTools, PERMISSION_PROMPT_SLOT, host_slot_name};
+use crate::api::util::ctx::LuaCtx;
+use crate::runtime::{HookRun, PromptRun, Request};
 
 pub(crate) struct SlotHook {
     pub(crate) tx: Sender<Request>,
@@ -54,6 +57,38 @@ impl ToolHook for SlotHook {
                 return Verdict::Unchanged;
             }
             answer.recv_async().await.unwrap_or(Verdict::Unchanged)
+        })
+    }
+
+    fn prompt<'a>(
+        &'a self,
+        input: &'a Value,
+        scopes: &'a [String],
+        call: &'a HookCall<'a>,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Option<LayerAnswer>> {
+        Box::pin(async move {
+            if !self.layered.layers_surface(PERMISSION_PROMPT_SLOT) {
+                return None;
+            }
+            let (reply, answer) = flume::bounded(1);
+            let run = PromptRun {
+                authority: call.authority,
+                cancel: call.cancel.clone(),
+                deadline: call.deadline,
+                req: json!({
+                    "tool": call.tool,
+                    "tool_id": call.tool_id,
+                    "input": input,
+                    "scopes": scopes,
+                }),
+                ctx: Box::new(LuaCtx::handler(ctx)),
+            };
+            self.tx
+                .send_async(Request::RunPrompt { run, reply })
+                .await
+                .ok()?;
+            answer.recv_async().await.ok().flatten()
         })
     }
 }

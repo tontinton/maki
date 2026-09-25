@@ -308,6 +308,7 @@ pub fn run(params: PrintParams) -> Result<()> {
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
+            | AgentEvent::AllowedByPlugin { .. }
             | AgentEvent::PermissionRequest { .. }
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }

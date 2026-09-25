@@ -361,8 +361,8 @@ impl MessagesPanel {
         self.update_tool(tool_id, |msg| msg.text = summary.to_owned());
     }
 
-    pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
-        self.update_tool(tool_id, |msg| append_annotation(&mut msg.annotation, model));
+    pub fn annotate_tool(&mut self, tool_id: &str, note: &str) {
+        self.update_tool(tool_id, |msg| append_annotation(&mut msg.annotation, note));
     }
 
     pub fn tool_snapshot(

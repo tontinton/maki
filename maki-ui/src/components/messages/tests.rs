@@ -786,11 +786,11 @@ fn search_text_includes_role_prefix() {
 }
 
 #[test]
-fn update_tool_model_sets_annotation() {
+fn annotate_tool_sets_annotation() {
     let mut panel = panel_with_tools(&[("t1", "task"), ("t2", "bash")]);
     rebuild(&mut panel);
 
-    panel.update_tool_model("t1", "anthropic/claude-sonnet-4-20250514");
+    panel.annotate_tool("t1", "anthropic/claude-sonnet-4-20250514");
 
     let msg = &panel.messages[0];
     assert_eq!(
@@ -805,7 +805,7 @@ fn set_tool_turn_usage_updates_exact_tool_and_keeps_annotation() {
     const USAGE: &str = "1.2k↑ 345↓ $0.010";
 
     let mut panel = panel_with_tools(&[("t1", "task"), ("t2", "task")]);
-    panel.update_tool_model("t1", MODEL);
+    panel.annotate_tool("t1", MODEL);
 
     panel.set_tool_turn_usage("t1", USAGE.into());
 

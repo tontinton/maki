@@ -201,6 +201,39 @@ server connects. Naming one slot directly has no such ordering rule: `set_slot`
 accepts a name before anything registers it, and what a layer is entitled to is
 weighed when the chain fires rather than when you register it.
 
+## Permission prompt
+
+`permission.prompt` fires where the permission prompt would show, once the
+rules and YOLO have had their say. The prompt is its default, so a layer either
+answers for the user or passes the call on:
+
+```lua
+maki.api.set_slot("permission.prompt", function(prev, req, ctx)
+  if req.tool == "bash" and req.input.command:match("^git status") then
+    return { decision = "allow_session" }
+  end
+  return prev(req, ctx)
+end)
+```
+
+`req` carries `tool`, `tool_id`, `input` and the `scopes` the prompt would ask
+about. A layer answers with what the prompt offers: `"allow"`,
+`"allow_session"`, `"allow_always_project"`, `"allow_always_global"`, `"deny"`,
+`"deny_always_project"` or `"deny_always_global"`, as `decision`. A `"deny"` may
+carry `guidance`, which the model reads under the plugin's name rather than as
+the user's words.
+
+`ctx` is the agent ctx of the call. `ctx:session_id()` and `ctx:task_id()` say
+whose call it is, a subagent included, and `maki.agent.session(ctx, ...)` with
+no tools can ask a model, billed to that session.
+
+When a layer allows a call, its tool row shows which plugin allowed it, since
+the user never saw a prompt. A layer that throws, answers something the prompt
+does not offer, or is still running after the same 60 second window, leaves the
+call to the prompt. Where nobody can answer a prompt, as with `maki -p`, the
+default denies, the same as without a layer. Wrapping costs the capability the
+tool declares, the same price a `tool.<name>.input` layer pays.
+
 ## Plugin slots
 
 A plugin can define an extension point of its own with
@@ -240,13 +273,13 @@ Unloading the owner stops the chain firing, but does not free the name: nobody
 else can take it over, or re-declare it at a cheaper price and inherit the
 layers that trusted the old one.
 
-Names starting with `tool.` are reserved for maki, which fires them at points
-whose ordering it guarantees.
+Names starting with `tool.`, `ui.` or `permission.` are reserved for maki,
+which fires them at points whose ordering it guarantees.
 
 Use `maki.api.get_slots()` to see who owns and who wraps each slot.
 
 ## Limits
 
-A layer has no agent context, so `maki.agent.call_tool` and
+A `tool.*` layer has no agent context, so `maki.agent.call_tool` and
 `maki.agent.session` are out of reach inside one. Read files, run jobs, and
-decide from those.
+decide from those. A `permission.prompt` layer gets the agent ctx.
