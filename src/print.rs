@@ -273,7 +273,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
     // After the prompt is read, so a signal still ends a stdin read at once.
     let interrupt = Interrupt::install();
 
-    let prompt_slots = lua_handle.collect_prompt_slots();
+    let prompt_slots = lua_handle.collect_prompt_slots(Some(resumed.id.as_str()));
 
     let initial_wd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let cwd = initial_wd.to_string_lossy().into_owned();

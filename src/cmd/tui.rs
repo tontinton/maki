@@ -387,8 +387,11 @@ pub async fn run(mut cli: Cli, mut legacy_notice: Option<String>) -> Result<()> 
     setup::report_session_start(resolved.start_type, Some(&resolved.id));
 
     if cli.is_sdk_mode() {
+        let prompt_slots = stack
+            .plugin_host
+            .event_handle()
+            .collect_prompt_slots(Some(resolved.id.as_str()));
         let (resumed, claim) = resolved.into_resumed();
-        let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
         let interrupt = crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,

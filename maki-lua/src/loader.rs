@@ -1187,9 +1187,14 @@ impl EventHandle {
         });
     }
 
-    pub fn collect_prompt_slots(&self) -> ResolvedPrompts {
+    /// Prompt builds that name no session (startup, ACP clients) hand content
+    /// callbacks nil as their context.
+    pub fn collect_prompt_slots(&self, session: Option<&str>) -> ResolvedPrompts {
         let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
+        let _ = self.tx.send(Request::CollectPromptSlots {
+            session: session.map(str::to_owned),
+            reply: tx,
+        });
         rx.recv().unwrap_or_default()
     }
 
@@ -1207,9 +1212,14 @@ impl EventHandle {
         Ok(crate::pack::PackContext::new(declared, installed, active))
     }
 
-    pub async fn collect_prompt_slots_async(&self) -> ResolvedPrompts {
+    /// `session` names the session whose prompt is being built, so content
+    /// callbacks can tell it apart from the focused tab.
+    pub async fn collect_prompt_slots_async(&self, session: Option<&str>) -> ResolvedPrompts {
         let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
+        let _ = self.tx.send(Request::CollectPromptSlots {
+            session: session.map(str::to_owned),
+            reply: tx,
+        });
         rx.recv_async().await.unwrap_or_default()
     }
 
@@ -1442,14 +1452,14 @@ mod tests {
         let handle = host.event_handle();
         host.begin_shutdown();
 
-        let slots = handle.collect_prompt_slots();
+        let slots = handle.collect_prompt_slots(None);
         assert!(
             contents(&slots, PromptId::System, Slot::ToolUsage).is_empty(),
             "dead host must yield defaults, not real slots"
         );
 
         drop(host);
-        let slots = handle.collect_prompt_slots();
+        let slots = handle.collect_prompt_slots(None);
         assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
     }
 
@@ -1458,7 +1468,7 @@ mod tests {
     fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedPrompts) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(plugin, src).unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots(None);
         (host, slots)
     }
 
@@ -2403,6 +2413,38 @@ mod tests {
         assert!(!assemble(PromptId::Research, &slots, "").contains("never lands"));
     }
 
+    /// Content callbacks receive the session whose prompt is built, not the
+    /// focused tab.
+    #[tokio::test]
+    async fn hint_callback_names_the_prompt_session() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "sid",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "tool_usage",
+                content = function(ctx)
+                    return ctx and ctx.session_id or "no session"
+                end,
+            })
+            "#,
+        )
+        .unwrap();
+        let named = host
+            .event_handle()
+            .collect_prompt_slots_async(Some("session-x"))
+            .await;
+        assert_eq!(
+            contents(&named, PromptId::System, Slot::ToolUsage),
+            ["session-x"]
+        );
+        let unnamed = host.event_handle().collect_prompt_slots(None);
+        assert_eq!(
+            contents(&unnamed, PromptId::System, Slot::ToolUsage),
+            ["no session"]
+        );
+    }
+
     #[test]
     fn prompt_list_targets_each_listed_prompt() {
         const CONTENT: &str = "shared";
@@ -2441,7 +2483,7 @@ mod tests {
             )
             .unwrap();
         }
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots(None);
         assert_eq!(
             contents(&slots, PromptId::System, Slot::ToolUsage),
             ["from_aaa", "from_zzz"],
@@ -2463,7 +2505,7 @@ mod tests {
         .unwrap();
         let handle = host.event_handle();
 
-        let slots = handle.collect_prompt_slots();
+        let slots = handle.collect_prompt_slots(None);
         assert_eq!(
             contents(&slots, PromptId::System, Slot::ToolUsage),
             ["usage"]
@@ -2474,7 +2516,7 @@ mod tests {
         );
 
         host.unload("multi").unwrap();
-        let slots = handle.collect_prompt_slots();
+        let slots = handle.collect_prompt_slots(None);
         assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
         assert!(contents(&slots, PromptId::System, Slot::Conventions).is_empty());
     }
@@ -2523,7 +2565,7 @@ mod tests {
             r#"maki.api.set_prompt({ slot = "identity", content = "ZZZ" })"#,
         )
         .unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots(None);
         let entries = slots.get(PromptId::System, Slot::Identity);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries.last().unwrap().content, "ZZZ");
@@ -2616,7 +2658,7 @@ mod tests {
             r#"maki.api.set_prompt({ slot = "identity", content = "SET" })"#,
         )
         .unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots(None);
         assert_eq!(
             contents(&slots, PromptId::System, Slot::ToolUsage),
             ["HINT"]
@@ -2703,7 +2745,7 @@ mod tests {
             end })
             "#,
         );
-        let second = host.event_handle().collect_prompt_slots();
+        let second = host.event_handle().collect_prompt_slots(None);
         for &pid in PromptId::ALL {
             assert_eq!(contents(&first, pid, Slot::Identity), ["1"]);
             assert_eq!(contents(&second, pid, Slot::Identity), ["2"]);
@@ -2730,7 +2772,7 @@ mod tests {
         assert_eq!(
             assemble(
                 PromptId::System,
-                &host.event_handle().collect_prompt_slots(),
+                &host.event_handle().collect_prompt_slots(None),
                 INSTRUCTIONS,
             ),
             format!("Analysis policy.\n{SECTION}\n{INSTRUCTIONS}")
@@ -2786,7 +2828,7 @@ mod tests {
             r#"maki.api.set_prompt({ prompt = "plan", content = "{{conventions}}" })"#,
         )
         .unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots(None);
         assert_eq!(assemble(PromptId::Plan, &slots, ""), CONTENT);
     }
 
@@ -2810,13 +2852,13 @@ mod tests {
             maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "first section" })
             "#,
         ).unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots(None);
         assert_eq!(assemble(PromptId::System, &slots, ""), CONTENT);
         host.unload("zzz").unwrap();
         assert_eq!(
             assemble(
                 PromptId::System,
-                &host.event_handle().collect_prompt_slots(),
+                &host.event_handle().collect_prompt_slots(None),
                 ""
             ),
             "first template: first section"
@@ -2864,25 +2906,25 @@ mod tests {
         host.load_source("owned", source).unwrap();
         let handle = host.event_handle();
         assert_eq!(
-            assemble(PromptId::System, &handle.collect_prompt_slots(), ""),
+            assemble(PromptId::System, &handle.collect_prompt_slots(None), ""),
             TEMPLATE
         );
         host.unload("owned").unwrap();
-        assert!(!handle.collect_prompt_slots().has_replacements());
+        assert!(!handle.collect_prompt_slots(None).has_replacements());
         host.load_source("owned", source).unwrap();
         host.load_source(
             "owned",
             r#"maki.api.set_prompt({ prompt = "system", content = "new" })"#,
         )
         .unwrap();
-        let reloaded = handle.collect_prompt_slots();
+        let reloaded = handle.collect_prompt_slots(None);
         assert_eq!(assemble(PromptId::System, &reloaded, ""), "new");
         assert!(contents(&reloaded, PromptId::System, Slot::Identity).is_empty());
         assert!(
             host.load_source("owned", &format!("{source}\nerror('failed load')"))
                 .is_err()
         );
-        let failed = handle.collect_prompt_slots();
+        let failed = handle.collect_prompt_slots(None);
         assert!(!failed.has_replacements());
         assert!(contents(&failed, PromptId::System, Slot::Identity).is_empty());
         assert_eq!(
@@ -2916,7 +2958,7 @@ mod tests {
         assert!(
             !host
                 .event_handle()
-                .collect_prompt_slots()
+                .collect_prompt_slots(None)
                 .has_replacements()
         );
     }

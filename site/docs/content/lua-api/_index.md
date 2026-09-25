@@ -654,8 +654,16 @@ until the next compaction.
 
 - `{spec}` (`table`) Hint specification:
   - `slot` (`string`) Required. Aggregate slot name (e.g. "tool_usage", "conventions").
-  - `content` (`string|function`) Required. Static text, or a `function()` that returns a string. Max 1 MiB.
-  - `prompt` (`string|string[]`) Optional. Restrict to specific prompt ids (e.g. "system").
+  - `content` (`string|function`) Required. Static text, or a `function(ctx)` that
+    returns a string. Max 1 MiB. `ctx` is
+    `{ session_id = "..." }` naming the session whose
+    prompt is being built, or nil when there really
+    is no session (startup, ACP clients).
+  - `prompt` (`string|string[]`) Optional. Restrict to specific prompt ids
+    (e.g. "system"). Entries resolve with the run's
+    other prompt slots, so nothing caches them
+    across turns. One-shot clients (`maki -p`, the
+    SDK, ACP) resolve all hints once at startup.
 
 **Example:**
 
@@ -724,8 +732,9 @@ Sections: `identity`, `tone`, `tool_usage`, `efficient_tools`, `conventions`,
 
 Identity and tone are available in system, research, and general prompts.
 Sections target the main agent when `prompt` is omitted. Only identity and
-tone accept a function called before every run. Its first value goes in the
-system prompt. Later changes reach the main agent as a context update.
+tone accept a function called before every run; it receives `ctx` as in
+`register_prompt_hint`. Its first value goes in the system prompt. Later
+changes reach the main agent as a context update.
 Other replacements require static strings.
 A known section missing from the resolved template is ignored, with a warning
 for explicit prompt targets.
