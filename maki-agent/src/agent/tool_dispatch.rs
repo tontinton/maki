@@ -770,6 +770,7 @@ async fn enforce_permission(
                 id,
                 &ctx.cancel,
                 ctx.mode.plan_path(),
+                ctx.unattended,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -814,6 +815,7 @@ async fn execute_mcp_tool(
             id,
             &ctx.cancel,
             ctx.mode.plan_path(),
+            ctx.unattended,
         )
         .await
     {

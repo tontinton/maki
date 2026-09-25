@@ -1020,6 +1020,15 @@ impl<'t> EventLoop<'t> {
                 let actions = self.focused_app().run_builtin(action);
                 self.dispatch(self.focused, actions);
             }
+            UiAction::ChatItem(item) => {
+                self.focused_app().handle_chat_item(&item);
+            }
+            UiAction::StatusSegment(segment) => {
+                self.focused_app().set_status_segment(segment);
+            }
+            UiAction::ClearStatusSegments { plugin } => {
+                self.focused_app().clear_status_segments(&plugin);
+            }
             UiAction::RunCommand {
                 cmdline,
                 depth,
