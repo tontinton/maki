@@ -16,6 +16,7 @@ local SIZE_STYLE = "dim"
 local WRITE_REJECT_PREFIX = "invalid tag(s) rejected: "
 local READ_REJECT_PREFIX = "warning: ignored invalid tag(s): "
 local UNREADABLE_PREFIX = "warning: unreadable memory files: "
+local EDIT_REDIRECT = "memory has no edit command, use `edit` on "
 local NO_MATCH_MSG = "no memory files matched any of the given tags; use `list` to see available tags"
 local PRUNE_ADVISORY = "Consider removing or consolidating stale memories to stay under " .. M.MAX_TAGS .. " tags."
 
@@ -133,6 +134,18 @@ function M.format_rejected(rejected)
     out[i] = #v > MAX_REJECT_DISPLAY and v:sub(1, MAX_REJECT_DISPLAY) .. "..." or v
   end
   return table.concat(out, ", ")
+end
+
+-- The reply to a model that reaches for an in-tool edit. Notes are plain
+-- files on purpose, so the fix is the `edit` tool pointed at the real path.
+function M.edit_redirect_msg(dir, path)
+  if not dir then
+    return EDIT_REDIRECT .. "the memory files"
+  end
+  if path and path ~= "" then
+    return EDIT_REDIRECT .. maki.fs.joinpath(dir, path)
+  end
+  return EDIT_REDIRECT .. dir .. "/<name>"
 end
 
 function M.validate_input(input)

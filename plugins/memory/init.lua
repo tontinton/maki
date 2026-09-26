@@ -231,6 +231,12 @@ maki.api.register_tool({
   end,
 
   handler = function(input, ctx)
+    if input.command == "edit" or input.old_string ~= nil or input.new_string ~= nil then
+      return {
+        llm_output = "error: " .. helpers.edit_redirect_msg(resolve_dir(true), input.path),
+        is_error = true,
+      }
+    end
     if type(input.tags) == "string" then
       input.tags = { input.tags }
     end
