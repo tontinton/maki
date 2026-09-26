@@ -43,6 +43,7 @@ use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
+const PROMPT_DROPPED_ERR: &str = "an `agent.user_message` layer dropped the prompt";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
@@ -910,11 +911,18 @@ async fn prompt(
     let turn = &s.history.as_slice()[history_len.min(s.history.len())..];
     // A subagent can be cancelled on its own, and its caller should hear about
     // that instead of taking a half-finished answer for a real one, so cancel
-    // reads like an error here even though the run ended normally.
+    // reads like an error here even though the run ended normally. A dropped
+    // prompt never reached the model, so an empty answer would be a lie.
     let cut_short = match &result {
         Err(e) => Some(e.to_string()),
         Ok(DoneReason::Cancelled) => Some(CANCELLED_MSG.to_owned()),
-        Ok(_) => None,
+        Ok(DoneReason::Dropped) => Some(PROMPT_DROPPED_ERR.to_owned()),
+        Ok(
+            DoneReason::EndTurn
+            | DoneReason::MaxTokens
+            | DoneReason::MaxTurns
+            | DoneReason::Compact,
+        ) => None,
     };
     if let Some(err) = cut_short {
         let partial = turn
