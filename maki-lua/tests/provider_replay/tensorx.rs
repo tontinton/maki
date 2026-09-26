@@ -23,8 +23,7 @@ fn the_bundled_tensorx_plugin_replays_the_recorded_exchange(fixture: &Fixture) {
     );
 }
 
-/// Every numeric edge in `/model/info` goes through `maki.provider_parse`, so
-/// the rows come out as serde_json reads them.
+/// Every numeric edge in `/model/info` goes through `maki.provider_parse`.
 #[test_case(&tensorx::MODELS ; "models")]
 #[test_case(&tensorx::MODELS_WITHOUT_DATA ; "models_without_data")]
 #[test_case(&tensorx::MODELS_UNAUTHORIZED ; "models_unauthorized")]

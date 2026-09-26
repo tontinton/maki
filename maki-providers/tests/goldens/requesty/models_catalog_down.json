@@ -17,21 +17,6 @@
         "tier": null
       },
       {
-        "context_window": 1000000,
-        "id": "claude-sonnet-4-5",
-        "max_output_tokens": 64000,
-        "pricing": {
-          "cache_read": 0.0,
-          "cache_write": 0.0,
-          "fast": null,
-          "input": 6.0,
-          "output": 22.5
-        },
-        "supports_thinking": true,
-        "supports_vision": true,
-        "tier": null
-      },
-      {
         "context_window": null,
         "id": "claude-sonnet-4-5@eu",
         "max_output_tokens": null,

@@ -2,7 +2,7 @@
   "outcome": {
     "models": [
       {
-        "context_window": null,
+        "context_window": 256000,
         "id": "codestral-latest",
         "max_output_tokens": null,
         "pricing": null,
@@ -44,15 +44,6 @@
         "pricing": null,
         "supports_thinking": null,
         "supports_vision": true,
-        "tier": null
-      },
-      {
-        "context_window": 128000,
-        "id": "mistral-large-latest",
-        "max_output_tokens": null,
-        "pricing": null,
-        "supports_thinking": true,
-        "supports_vision": false,
         "tier": null
       },
       {

@@ -23,7 +23,7 @@ local function read(m, name, reader)
   if m[name] == nil then
     return nil
   end
-  local parsed = reader(m, name)
+  local parsed = reader(m[name])
   if parsed == nil then
     maki.log.warn(
       string.format(

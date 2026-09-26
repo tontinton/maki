@@ -30,15 +30,6 @@
       },
       {
         "context_window": null,
-        "id": "glm5.2",
-        "max_output_tokens": null,
-        "pricing": null,
-        "supports_thinking": null,
-        "supports_vision": null,
-        "tier": null
-      },
-      {
-        "context_window": null,
         "id": "gpt-oss-120b",
         "max_output_tokens": null,
         "pricing": null,

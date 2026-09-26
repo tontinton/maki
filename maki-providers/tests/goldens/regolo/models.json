@@ -17,21 +17,6 @@
         "tier": null
       },
       {
-        "context_window": 64000,
-        "id": "glm5.2",
-        "max_output_tokens": 32000,
-        "pricing": {
-          "cache_read": 0.0,
-          "cache_write": 0.0,
-          "fast": null,
-          "input": 2.0,
-          "output": 5.2
-        },
-        "supports_thinking": true,
-        "supports_vision": true,
-        "tier": null
-      },
-      {
         "context_window": 131072,
         "id": "gpt-oss-120b",
         "max_output_tokens": null,

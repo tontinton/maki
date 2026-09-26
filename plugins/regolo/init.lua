@@ -69,7 +69,7 @@ local function valid_group(group)
     return false
   end
   for _, key in ipairs(GROUP_NUMBERS) do
-    if group[key] ~= nil and parse.as_f64(group, key) == nil then
+    if group[key] ~= nil and type(group[key]) ~= "number" then
       return false
     end
   end
@@ -80,7 +80,7 @@ local function parse_groups(body)
   if type(body.data) ~= "table" then
     return nil
   end
-  for _, group in parse.items(body.data) do
+  for _, group in ipairs(body.data) do
     if not valid_group(group) then
       return nil
     end
@@ -88,13 +88,13 @@ local function parse_groups(body)
   return body.data
 end
 
--- Rust `u32::try_from(tokens as u64).ok()`: an out-of-range window is no
--- window, not a clamped one.
+-- A fraction is truncated and a negative reads as 0, while an out-of-range
+-- window is no window, not a clamped one.
 local function window(tokens)
   if tokens == nil then
     return nil
   end
-  local whole = parse.cast_u64(tokens)
+  local whole = math.max(0, math.floor(tokens))
   if whole > U32_MAX then
     return nil
   end
@@ -153,18 +153,18 @@ local function spend_limit(info)
   if type(info) ~= "table" then
     return nil
   end
-  local spend = parse.as_f64(info, "spend")
-  local budget = parse.as_f64(info, "max_budget")
+  local spend = parse.as_f64(info.spend)
+  local budget = parse.as_f64(info.max_budget)
   local reset = info.budget_reset_at
   if spend == nil or (info.max_budget ~= nil and budget == nil) or (reset ~= nil and type(reset) ~= "string") then
     return nil
   end
-  local detail = "$" .. parse.fixed(spend, 2) .. " spent"
+  local detail = string.format("$%.2f spent", spend)
   local percentage
   if budget ~= nil then
-    detail = detail .. " of $" .. parse.fixed(budget, 2) .. " budget"
+    detail = detail .. string.format(" of $%.2f budget", budget)
     if budget > 0 then
-      percentage = math.min(parse.cast_u32(spend / budget * 100), 100)
+      percentage = math.clamp(math.floor(spend / budget * 100), 0, 100)
     end
   end
   -- Handed back as the timestamp it arrived as: maki reads RFC 3339 itself, and
@@ -179,33 +179,33 @@ end
 -- Regolo tracks a per-account daily token cap but no endpoint reports it, so
 -- there is no honest percentage to show.
 local function activity_limit(body)
-  local requests = parse.as_u64(body, "sum_api_requests")
-  local tokens = parse.as_u64(body, "sum_total_tokens")
+  local requests = parse.as_u64(body.sum_api_requests)
+  local tokens = parse.as_u64(body.sum_total_tokens)
   if requests == nil or tokens == nil then
     return nil
   end
   return {
     label = "Today",
     reset_at = next_utc_midnight(),
-    detail = string.format("%s requests · %s tokens", parse.fixed(requests, 0), parse.fixed(tokens, 0)),
+    detail = string.format("%.0f requests · %.0f tokens", requests, tokens),
   }
 end
 
--- Hourly rows summed per model in name order, then ranked by spend, which
--- keeps the name order between equal spends.
+-- Hourly rows summed per model, ranked by spend, then by name between equal
+-- spends.
 local function spend_rows(body)
   if type(body.data) ~= "table" then
     return nil
   end
-  local by_model, names = {}, {}
-  for _, entry in parse.items(body.data) do
+  local by_model = {}
+  for _, entry in ipairs(body.data) do
     if type(entry) ~= "table" or type(entry.model_group) ~= "string" then
       return nil
     end
-    local input = parse.as_u64(entry, "prompt_tokens")
-    local output = parse.as_u64(entry, "completion_tokens")
-    local total = parse.as_u64(entry, "total_tokens")
-    local spend = parse.as_f64(entry, "spend")
+    local input = parse.as_u64(entry.prompt_tokens)
+    local output = parse.as_u64(entry.completion_tokens)
+    local total = parse.as_u64(entry.total_tokens)
+    local spend = parse.as_f64(entry.spend)
     if input == nil or output == nil or total == nil or spend == nil then
       return nil
     end
@@ -217,24 +217,24 @@ local function spend_rows(body)
       acc.spend = acc.spend + spend
     else
       by_model[entry.model_group] = { input = input, output = output, total = total, spend = spend }
-      table.insert(names, entry.model_group)
     end
   end
-  table.sort(names)
 
   local rows = {}
-  for _, name in ipairs(names) do
-    local acc = by_model[name]
+  for name, acc in pairs(by_model) do
     table.insert(rows, {
       model = name,
       input_tokens = acc.input,
       output_tokens = acc.output,
       total_tokens = acc.total,
-      spend_microdollars = parse.cast_u64(parse.round(acc.spend * PER_MILLION)),
+      spend_microdollars = math.max(0, math.round(acc.spend * PER_MILLION)),
     })
   end
-  parse.stable_sort_by(rows, function(a, b)
-    return a.spend_microdollars > b.spend_microdollars
+  table.sort(rows, function(a, b)
+    if a.spend_microdollars ~= b.spend_microdollars then
+      return a.spend_microdollars > b.spend_microdollars
+    end
+    return a.model < b.model
   end)
   return rows
 end
