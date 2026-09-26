@@ -1,4 +1,6 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
@@ -30,12 +32,17 @@ type FileStamp = (PathBuf, Option<SystemTime>, u64);
 /// those costs a read plus a full TOML parse.
 static PARSED: Mutex<Option<(FileStamp, ProvidersConfig)>> = Mutex::new(None);
 
-/// Coarse capability classification used by maki-providers to dispatch tiered
-/// requests. Mirrors `maki_providers::ModelTier` shape but lives here so the
-/// config layer can validate inputs without depending on maki-providers.
+/// The role a model plays, which is what tiered requests dispatch on. Lives
+/// here rather than in maki-providers so `providers.toml` can name it.
+///
+/// Ordering is a cost guarantee (a subagent may never run on a pricier tier
+/// than its parent), so the strength is written down in [`ModelTier::strength`]
+/// instead of being inherited from declaration order, where inserting or moving
+/// a variant would silently redefine "stronger". `Ord` stays because the tier is
+/// also a `BTreeMap` key in `model_registry`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Tier {
+pub enum ModelTier {
     Weak,
     #[default]
     Medium,
@@ -43,11 +50,78 @@ pub enum Tier {
     Compaction,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("invalid model tier '{0}' (expected: strong, medium, weak)")]
+pub struct InvalidTier(String);
+
+impl ModelTier {
+    /// `Compaction` is not a capability tier: it is a user-assigned slot for the
+    /// cheap model that rewrites history. It therefore ranks below every agent
+    /// tier, which makes it the tightest ceiling a parent can impose - a session
+    /// on a compaction model hands its children that same model rather than
+    /// letting them escalate to a capability tier.
+    const fn strength(self) -> u8 {
+        match self {
+            Self::Compaction => 0,
+            Self::Weak => 1,
+            Self::Medium => 2,
+            Self::Strong => 3,
+        }
+    }
+
+    /// The single named way to cap a requested tier, so no call site re-derives
+    /// the cost rule with an ad-hoc comparison.
+    pub fn capped_at(self, ceiling: Self) -> Self {
+        if self.strength() <= ceiling.strength() {
+            self
+        } else {
+            ceiling
+        }
+    }
+}
+
+impl Ord for ModelTier {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.strength().cmp(&other.strength())
+    }
+}
+
+impl PartialOrd for ModelTier {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Display for ModelTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Weak => "weak",
+            Self::Medium => "medium",
+            Self::Strong => "strong",
+            Self::Compaction => "compaction",
+        })
+    }
+}
+
+impl FromStr for ModelTier {
+    type Err = InvalidTier;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "weak" => Ok(Self::Weak),
+            "medium" => Ok(Self::Medium),
+            "strong" => Ok(Self::Strong),
+            "compaction" => Ok(Self::Compaction),
+            other => Err(InvalidTier(other.to_string())),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDef {
     pub id: String,
     #[serde(default)]
-    pub tier: Tier,
+    pub tier: ModelTier,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -428,7 +502,7 @@ pub fn overlays_local_thinking(slug: &str) -> bool {
 fn ignored_local_model_fields(models: &[ModelDef]) -> Vec<&'static str> {
     let any = |is_set: fn(&ModelDef) -> bool| models.iter().any(is_set);
     let mut ignored = Vec::new();
-    if any(|m| m.tier != Tier::default()) {
+    if any(|m| m.tier != ModelTier::default()) {
         ignored.push("models.tier");
     }
     if any(|m| m.context_window.is_some()) {
@@ -610,14 +684,14 @@ tier = "mediums"
     #[test]
     fn model_def_tier_defaults_to_medium() {
         let m: ModelDef = toml::from_str(r#"id = "x""#).unwrap();
-        assert_eq!(m.tier, Tier::Medium);
+        assert_eq!(m.tier, ModelTier::Medium);
     }
 
-    #[test_case("weak", Tier::Weak ; "weak")]
-    #[test_case("medium", Tier::Medium ; "medium")]
-    #[test_case("strong", Tier::Strong ; "strong")]
-    #[test_case("compaction", Tier::Compaction ; "compaction")]
-    fn model_def_tier_roundtrip(input: &str, expected: Tier) {
+    #[test_case("weak", ModelTier::Weak ; "weak")]
+    #[test_case("medium", ModelTier::Medium ; "medium")]
+    #[test_case("strong", ModelTier::Strong ; "strong")]
+    #[test_case("compaction", ModelTier::Compaction ; "compaction")]
+    fn model_def_tier_roundtrip(input: &str, expected: ModelTier) {
         let toml = format!(
             r#"id = "x"
 tier = "{input}"
@@ -625,6 +699,69 @@ tier = "{input}"
         );
         let m: ModelDef = toml::from_str(&toml).unwrap();
         assert_eq!(m.tier, expected);
+    }
+
+    const TIERS: [ModelTier; 4] = [
+        ModelTier::Weak,
+        ModelTier::Medium,
+        ModelTier::Strong,
+        ModelTier::Compaction,
+    ];
+
+    /// Declaration index of `Compaction`, which a derived `Ord` would read as
+    /// the strongest tier.
+    const COMPACTION_DECLARED_LAST: u8 = 3;
+
+    #[test_case(ModelTier::Strong, ModelTier::Weak, ModelTier::Weak ; "strong_child_capped_to_weak_parent")]
+    #[test_case(ModelTier::Weak, ModelTier::Strong, ModelTier::Weak ; "weak_child_stays_weak_under_strong_parent")]
+    #[test_case(ModelTier::Medium, ModelTier::Medium, ModelTier::Medium ; "equal_tiers_pass_through")]
+    #[test_case(ModelTier::Strong, ModelTier::Compaction, ModelTier::Compaction ; "strong_child_capped_to_compaction_parent")]
+    #[test_case(ModelTier::Medium, ModelTier::Compaction, ModelTier::Compaction ; "medium_child_capped_to_compaction_parent")]
+    #[test_case(ModelTier::Compaction, ModelTier::Strong, ModelTier::Compaction ; "compaction_child_is_not_escalated")]
+    fn capped_at_never_exceeds_ceiling(
+        requested: ModelTier,
+        ceiling: ModelTier,
+        expected: ModelTier,
+    ) {
+        assert_eq!(requested.capped_at(ceiling), expected);
+        assert!(requested.capped_at(ceiling) <= ceiling);
+    }
+
+    #[test]
+    fn every_tier_under_a_compaction_ceiling_stays_at_compaction() {
+        for tier in TIERS {
+            assert_eq!(tier.capped_at(ModelTier::Compaction), ModelTier::Compaction);
+        }
+    }
+
+    /// Fails if the variants get reordered (the hand-written strength table
+    /// would no longer be the thing that disagrees with declaration order) or if
+    /// the explicit `Ord` is ever replaced by a derive, which would rank
+    /// `Compaction` above `Strong` and turn the subagent cap into a no-op.
+    #[test]
+    fn tier_order_is_explicit_not_declaration_order() {
+        assert_eq!(ModelTier::Compaction as u8, COMPACTION_DECLARED_LAST);
+        assert!(ModelTier::Compaction < ModelTier::Weak);
+
+        let mut tiers = TIERS;
+        tiers.sort();
+        assert_eq!(
+            tiers,
+            [
+                ModelTier::Compaction,
+                ModelTier::Weak,
+                ModelTier::Medium,
+                ModelTier::Strong
+            ]
+        );
+    }
+
+    #[test]
+    fn tier_display_roundtrip() {
+        for tier in TIERS {
+            assert_eq!(tier.to_string().parse::<ModelTier>().unwrap(), tier);
+        }
+        assert!("turbo".parse::<ModelTier>().is_err());
     }
 
     #[test_case("anthropic", None => "ANTHROPIC_API_KEY".to_string(); "builtin_default")]
@@ -747,7 +884,7 @@ tier = "{input}"
     fn every_model_def_field_is_read_or_reported() {
         let every_field_set = ModelDef {
             id: "qwen".to_string(),
-            tier: Tier::Strong,
+            tier: ModelTier::Strong,
             context_window: Some(131_072),
             max_output_tokens: Some(8192),
             supports_tool_examples: Some(true),

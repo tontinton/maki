@@ -231,7 +231,7 @@ pub async fn fetch_all_models(
                         models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
                     set_known_models(slug, models);
                     for entry in spec.models() {
-                        for prefix in entry.prefixes {
+                        for prefix in &entry.prefixes {
                             let spec = format!("{slug}/{prefix}");
                             if !specs.contains(&spec) {
                                 specs.push(spec);

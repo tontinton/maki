@@ -1,0 +1,106 @@
+{
+  "call": {
+    "endpoint": "models"
+  },
+  "script": [
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"object\":\"list\",\"data\":[\n{\"id\":\"mistral-medium-latest\",\"object\":\"model\",\"capabilities\":{\"completion_chat\":true,\"function_calling\":true,\"reasoning\":true,\"vision\":true},\"max_context_length\":262144},\n{\"id\":\"mistral-large-latest\",\"object\":\"model\",\"capabilities\":{\"completion_chat\":true,\"vision\":true},\"max_context_length\":131072},\n{\"id\":\"codestral-latest\",\"object\":\"model\",\"capabilities\":{\"completion_chat\":true,\"reasoning\":false,\"vision\":false},\"max_context_length\":256000.0},\n{\"id\":\"mistral-embed\",\"object\":\"model\",\"capabilities\":{\"completion_chat\":false},\"max_context_length\":8192},\n{\"id\":\"ministral-14b-latest\",\"object\":\"model\",\"capabilities\":{\"completion_chat\":true},\"max_context_length\":-1},\n{\"id\":\"mistral-ocr-latest\",\"object\":\"model\",\"capabilities\":{},\"max_context_length\":32768},\n{\"id\":\"magistral-medium-latest\",\"object\":\"model\",\"capabilities\":{\"completion_chat\":true,\"reasoning\":true,\"vision\":\"yes\"},\"max_context_length\":4294967296},\n{\"id\":\"pixtral-large-latest\",\"object\":\"model\",\"capabilities\":{\"completion_chat\":\"true\",\"vision\":true},\"max_context_length\":131072},\n{\"id\":\"mistral-small-latest\",\"object\":\"model\",\"capabilities\":{\"completion_chat\":true,\"reasoning\":null,\"vision\":null},\"max_context_length\":null},\n{\"id\":\"devstral-medium-latest\",\"object\":\"model\",\"capabilities\":{\"completion_chat\":true,\"vision\":false},\"max_context_length\":4294967295},\n{\"id\":\"open-mistral-nemo\",\"object\":\"model\",\"capabilities\":{\"completion_chat\":true,\"reasoning\":\"false\"},\"max_context_length\":\"131072\"},\n{\"id\":\"mistral-moderation-latest\",\"object\":\"model\",\"max_context_length\":8192},\n{\"object\":\"model\",\"capabilities\":{\"completion_chat\":true},\"max_context_length\":32768},\n{\"id\":42,\"object\":\"model\",\"capabilities\":{\"completion_chat\":true},\"max_context_length\":32768},\n{\"id\":\"mistral-large-latest\",\"object\":\"model\",\"capabilities\":{\"completion_chat\":true,\"reasoning\":true},\"max_context_length\":128000}\n]}"
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "models": [
+        {
+          "context_window": 256000,
+          "id": "codestral-latest",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": false,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": 4294967295,
+          "id": "devstral-medium-latest",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "magistral-medium-latest",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": true,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "ministral-14b-latest",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": 131072,
+          "id": "mistral-large-latest",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": true,
+          "tier": null
+        },
+        {
+          "context_window": 262144,
+          "id": "mistral-medium-latest",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": true,
+          "supports_vision": true,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "mistral-small-latest",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "open-mistral-nemo",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": false,
+          "tier": null
+        }
+      ]
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/v1/models"
+      }
+    ]
+  }
+}

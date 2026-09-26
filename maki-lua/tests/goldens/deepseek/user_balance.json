@@ -1,0 +1,44 @@
+{
+  "call": {
+    "endpoint": "usage"
+  },
+  "script": [
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"is_available\":true,\"balance_infos\":[{\"currency\":\"USD\",\"total_balance\":\"12.34\",\"granted_balance\":\"2.00\",\"topped_up_balance\":\"10.34\"},{\"currency\":\"CNY\",\"total_balance\":\"88.00\",\"granted_balance\":\"0.00\",\"topped_up_balance\":\"88.00\"}]}"
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "usage": {
+        "limits": [
+          {
+            "detail": "total: $12.34, topped-up: $10.34, granted: $2.00",
+            "label": "Balance"
+          },
+          {
+            "detail": "total: ¥88.00, topped-up: ¥88.00, granted: ¥0.00",
+            "label": "Balance"
+          }
+        ]
+      }
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/v1/user/balance"
+      }
+    ]
+  }
+}

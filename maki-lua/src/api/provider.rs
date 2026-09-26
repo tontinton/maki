@@ -25,8 +25,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::api::net::{self, NetError, ResponseData};
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_to_json_within};
-use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::{NetEgress, OwnedSlugs, Permission, PluginPermissions};
 use crate::runtime::{DeferredCallback, Request, host_senders};
 
@@ -44,9 +45,7 @@ const REQUEST_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 /// fallback after a stalled call, must get to finish.
 const SIDE_CALL_HOOK_TIMEOUT: Duration = Duration::from_secs(300);
 
-const RESOLVE_AUTH: &str = "resolve_auth";
-const REFRESH_AUTH: &str = "refresh_auth";
-const RELOAD_AUTH: &str = "reload_auth";
+const AUTH: &str = "auth";
 const LIST_MODELS: &str = "list_models";
 const BUILD_BODY: &str = "build_body";
 const MAP_ERROR: &str = "map_error";
@@ -54,8 +53,15 @@ const FETCH_USAGE: &str = "fetch_usage";
 const LOGIN: &str = "login";
 const LOGOUT: &str = "logout";
 
+const SLUG: &str = "slug";
 const BASE_URL: &str = "base_url";
 const HEADERS: &str = "headers";
+const GET_JSON: &str = "get_json";
+const HTTP_OK: u16 = 200;
+const HTTP_SCHEME: &str = "http://";
+const HTTPS_SCHEME: &str = "https://";
+const PATH_PREFIX: char = '/';
+const NO_ORIGIN: &str = "the provider has no origin to resolve a path against";
 
 const BODY_FIELD: &str = "body";
 const MODEL_FIELD: &str = "model";
@@ -71,10 +77,7 @@ const API_KEY_ENV_NEEDS_ENV: &str = "`api_key_env` reads the environment, which 
 const SECRET_MASK: char = '*';
 
 /// One plugin-supplied provider callback, named the way the registry names it.
-///
-/// A slot is not the same thing as a Lua entry: `Auth` is one hook the registry
-/// calls with a purpose, and three entries a plugin may write.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum HookSlot {
     Auth,
     ListModels,
@@ -88,16 +91,15 @@ pub enum HookSlot {
 /// Everything that differs between hooks, one row each, so adding a hook is a
 /// row and a call site rather than a branch anywhere in the bridge.
 struct SlotSpec {
-    /// Lua entries that can serve the slot, each with the serialized payload
-    /// that selects it. Only auth has more than one, and `""` marks the entry
-    /// every payload falls back to.
-    entries: &'static [(&'static str, &'static str)],
-    /// Payload fields handed over as positional arguments, in order. Whatever
-    /// the payload holds beyond them arrives as a trailing table, so the Lua
-    /// signature an author writes does not have to track the wire shape.
+    /// The key the plugin writes the function under.
+    name: &'static str,
+    /// Payload fields handed over as positional arguments after `ctx`, in
+    /// order. Whatever the payload holds beyond them arrives as a trailing
+    /// table, so the Lua signature an author writes does not have to track the
+    /// wire shape.
     positional: &'static [&'static str],
-    /// Whether the call is handed a `ctx` that can talk to the terminal.
-    ctx: bool,
+    /// Whether `ctx` can also talk to the terminal.
+    terminal: bool,
     /// The payload field the answer is a *refinement* of, when the hook edits
     /// something maki handed it rather than producing something new.
     ///
@@ -125,49 +127,45 @@ impl HookSlot {
     const fn spec(self) -> SlotSpec {
         match self {
             Self::Auth => SlotSpec {
-                entries: &[
-                    ("resolve", RESOLVE_AUTH),
-                    ("refresh", REFRESH_AUTH),
-                    ("reload", RELOAD_AUTH),
-                ],
+                name: AUTH,
                 positional: &[],
-                ctx: false,
+                terminal: false,
                 refines: None,
             },
             Self::ListModels => SlotSpec {
-                entries: &[("", LIST_MODELS)],
+                name: LIST_MODELS,
                 positional: &[],
-                ctx: false,
+                terminal: false,
                 refines: None,
             },
             Self::BuildBody => SlotSpec {
-                entries: &[("", BUILD_BODY)],
+                name: BUILD_BODY,
                 positional: &[BODY_FIELD, MODEL_FIELD],
-                ctx: false,
+                terminal: false,
                 refines: Some(BODY_FIELD),
             },
             Self::MapError => SlotSpec {
-                entries: &[("", MAP_ERROR)],
+                name: MAP_ERROR,
                 positional: &[STATUS_FIELD, MESSAGE_FIELD],
-                ctx: false,
+                terminal: false,
                 refines: None,
             },
             Self::FetchUsage => SlotSpec {
-                entries: &[("", FETCH_USAGE)],
+                name: FETCH_USAGE,
                 positional: &[],
-                ctx: false,
+                terminal: false,
                 refines: None,
             },
             Self::Login => SlotSpec {
-                entries: &[("", LOGIN)],
+                name: LOGIN,
                 positional: &[],
-                ctx: true,
+                terminal: true,
                 refines: None,
             },
             Self::Logout => SlotSpec {
-                entries: &[("", LOGOUT)],
+                name: LOGOUT,
                 positional: &[],
-                ctx: true,
+                terminal: true,
                 refines: None,
             },
         }
@@ -183,34 +181,11 @@ impl HookSlot {
 pub struct LuaHookKeys {
     plugin: Arc<str>,
     slug: String,
-    keys: HashMap<&'static str, RegistryKey>,
+    keys: HashMap<HookSlot, RegistryKey>,
+    /// The registering plugin's reach, which `ctx.get_json` goes out under.
+    egress: NetEgress,
     requests: flume::Sender<Request>,
     release: flume::Sender<DeferredCallback>,
-}
-
-impl LuaHookKeys {
-    /// The entry that serves this call: the one the payload names, else the
-    /// first the plugin supplied, in the order [`HookSlot::spec`] lists them.
-    /// A plugin that writes only `resolve_auth` gets it for refreshes and
-    /// reloads too, which is right for one that reads its credentials fresh
-    /// every time, and one that writes only `refresh_auth` gets that for the
-    /// initial resolve rather than no way to mint credentials at all.
-    fn entry(&self, slot: HookSlot, payload: &Value) -> Option<&RegistryKey> {
-        let entries = slot.spec().entries;
-        let selector = payload.as_str().unwrap_or_default();
-        entries
-            .iter()
-            .find(|(select, _)| *select == selector)
-            .and_then(|(_, entry)| self.keys.get(entry))
-            .or_else(|| entries.iter().find_map(|(_, entry)| self.keys.get(entry)))
-    }
-
-    fn serves(&self, slot: HookSlot) -> bool {
-        slot.spec()
-            .entries
-            .iter()
-            .any(|(_, entry)| self.keys.contains_key(entry))
-    }
 }
 
 impl Drop for LuaHookKeys {
@@ -375,7 +350,7 @@ where
     In: Serialize + Send + 'static,
     Out: DeserializeOwned + Send + 'static,
 {
-    keys.serves(slot).then(|| {
+    keys.keys.contains_key(&slot).then(|| {
         Arc::new(LuaHook {
             keys: Arc::clone(keys),
             slot,
@@ -397,13 +372,13 @@ pub(crate) async fn run_hook(
     slot: HookSlot,
     payload: Value,
 ) -> Result<HookReturn, String> {
-    let Some(key) = keys.entry(slot, &payload) else {
+    let Some(key) = keys.keys.get(&slot) else {
         return Err(format!("no lua function is registered for {slot:?}"));
     };
     let func: Function = lua.registry_value(key).map_err(|e| e.to_string())?;
     let spec = slot.spec();
     let template = spec.refines.and_then(|field| payload.get(field).cloned());
-    let args = call_args(lua, spec, payload).map_err(|e| e.to_string())?;
+    let args = call_args(lua, keys, spec, payload).map_err(|e| e.to_string())?;
     let call = async {
         lua.create_thread(func)?
             .into_async::<(LuaValue, LuaValue)>(args)?
@@ -418,11 +393,13 @@ pub(crate) async fn run_hook(
     Ok(HookReturn::Value { value, template })
 }
 
-fn call_args(lua: &Lua, spec: SlotSpec, payload: Value) -> LuaResult<MultiValue> {
-    let mut args = Vec::new();
-    if spec.ctx {
-        args.push(LuaValue::Table(stdio_ctx(lua)?));
-    }
+fn call_args(
+    lua: &Lua,
+    keys: &LuaHookKeys,
+    spec: SlotSpec,
+    payload: Value,
+) -> LuaResult<MultiValue> {
+    let mut args = vec![LuaValue::Table(hook_ctx(lua, keys, spec.terminal)?)];
     match payload {
         Value::Null => {}
         Value::Object(mut fields) if !spec.positional.is_empty() => {
@@ -437,10 +414,107 @@ fn call_args(lua: &Lua, spec: SlotSpec, payload: Value) -> LuaResult<MultiValue>
     Ok(MultiValue::from_vec(args))
 }
 
-/// The `ctx` a login or logout gets. Stdio, because the one caller is the cli,
-/// which is exactly what the retired subprocess providers got by inheriting it.
-fn stdio_ctx(lua: &Lua) -> LuaResult<Table> {
+/// The `ctx` every hook is handed first, read when the call starts: the origin
+/// and headers a request to the slug would carry right now, and a GET that
+/// sends exactly those.
+fn hook_ctx(lua: &Lua, keys: &LuaHookKeys, terminal: bool) -> LuaResult<Table> {
     let ctx = lua.create_table()?;
+    if terminal {
+        add_stdio(lua, &ctx)?;
+    }
+    let base_url = plugin::effective_base_url(&keys.slug);
+    let headers = plugin::resolved_auth(&keys.slug)
+        .map(|auth| auth.headers)
+        .unwrap_or_default();
+    ctx.set(SLUG, keys.slug.as_str())?;
+    ctx.set(BASE_URL, base_url.as_deref())?;
+    ctx.set(HEADERS, lua.create_table_from(headers.clone())?)?;
+    ctx.set(
+        GET_JSON,
+        get_json(lua, base_url, headers, keys.egress.clone())?,
+    )?;
+    Ok(ctx)
+}
+
+/// `ctx.get_json(target)`. Either way `target` resolves, it goes out under the
+/// plugin's own reach, so an absolute url is no wider a door than
+/// `maki.net.request`.
+fn get_json(
+    lua: &Lua,
+    base_url: Option<String>,
+    headers: Vec<(String, String)>,
+    egress: NetEgress,
+) -> LuaResult<Function> {
+    lua.create_async_function(move |lua, target: String| {
+        let url = target_url(base_url.as_deref(), &target);
+        let (headers, egress) = (headers.clone(), egress.clone());
+        async move {
+            let fetched = match url? {
+                Some(url) => fetch_json(&url, headers, egress).await,
+                None => Err(AgentError::Config {
+                    message: format!("{GET_JSON} {target}: {NO_ORIGIN}"),
+                }),
+            };
+            match fetched {
+                Ok(value) => Ok((json_to_lua(&lua, &value)?, None)),
+                Err(error) => Ok((LuaValue::Nil, Some(ProviderError(error)))),
+            }
+        }
+    })
+}
+
+/// An absolute http(s) url as is, a path appended to the origin, which is
+/// `None` when there is none. Anything else would glue a bare name onto the
+/// origin's last segment, so it is refused as the programmer error it is.
+fn target_url(base_url: Option<&str>, target: &str) -> LuaResult<Option<String>> {
+    if target.starts_with(HTTP_SCHEME) || target.starts_with(HTTPS_SCHEME) {
+        return Ok(Some(target.to_owned()));
+    }
+    if target.starts_with(PATH_PREFIX) {
+        return Ok(base_url.map(|base_url| format!("{base_url}{target}")));
+    }
+    Err(mlua::Error::runtime(format!(
+        "{GET_JSON}: '{target}' is neither a path starting with `/` nor an http(s) url"
+    )))
+}
+
+/// A 200 decoded, and every failure classified the way the codec's own
+/// requests classify theirs, so a hook can hand it straight back.
+async fn fetch_json(
+    url: &str,
+    headers: Vec<(String, String)>,
+    egress: NetEgress,
+) -> Result<Value, AgentError> {
+    let ResponseData {
+        body,
+        status,
+        headers,
+        ..
+    } = net::provider_get(url, headers, egress)
+        .await
+        .map_err(|error| match error {
+            NetError::Transport(error) => AgentError::Http(error),
+            NetError::Read(error) => AgentError::Io(error),
+            NetError::Refused(message) => AgentError::Config {
+                message: format!("{GET_JSON} {url}: {message}"),
+            },
+        })?;
+    if status != HTTP_OK {
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        return Err(AgentError::from_parts(status, header, body));
+    }
+    Ok(serde_json::from_str(&body)?)
+}
+
+/// What a login or logout adds to `ctx`. Stdio, because the one caller is the
+/// cli, which is exactly what the retired subprocess providers got by
+/// inheriting it.
+fn add_stdio(lua: &Lua, ctx: &Table) -> LuaResult<()> {
     ctx.set(
         "print",
         lua.create_function(|_, text: String| {
@@ -462,8 +536,7 @@ fn stdio_ctx(lua: &Lua) -> LuaResult<Table> {
             try_pair!(open::that(&url));
             Ok((Some(true), None))
         })?,
-    )?;
-    Ok(ctx)
+    )
 }
 
 /// Reads one line of an answer from the terminal.
@@ -556,6 +629,20 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 /// `maki.net`, `maki.fs` and the rest of the API. A callback that fails on an
 /// HTTP response returns `nil, maki.provider.http_error(res)`.
 ///
+/// Every callback is handed a `ctx` table first, read as the call starts.
+/// `ctx.slug` is the slug it serves. `ctx.base_url` is the origin a request
+/// to the slug would reach right now: an origin the auth hook returned, then
+/// `<SLUG>_BASE_URL` or `providers.toml`, then the declared `base_url`.
+/// `ctx.headers` holds the headers every request to it carries.
+/// `ctx.get_json(target)` is a GET with `ctx.headers` to
+/// `ctx.base_url .. target` when `target` starts with `/`, or to `target` when
+/// it is an absolute url, under the same host rules as `maki.net.request` and
+/// never retried. It returns the decoded body, or nil and an error the
+/// callback can return as its own, whether the server refused or the
+/// connection failed. Reading `ctx.base_url` rather than hard-coding an origin
+/// keeps a side call going where the rest of the provider goes when a user
+/// points the slug at a gateway.
+///
 /// An option the target cannot honour fails at registration rather than being
 /// ignored at request time: `build_body` needs one of the `openai` codecs, the
 /// `openai` table needs `codec = "openai"`, and `system_prefix` is refused by
@@ -629,21 +716,14 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 ///            provider, `false` turns the feature off for that model. Read
 ///            once, here, so this table must not depend on anything asked at
 ///            runtime.
-///   `resolve_auth` (function) `function(purpose)` returning
-///            `{ base_url = ..., headers = { ... } }`. Called once, lazily,
-///            before the first request, so a provider whose credentials are
-///            broken is still listed and fails when it is used. `purpose` is
-///            `"resolve"`. Omitting `base_url` keeps the one in force.
-///   `refresh_auth` (function) Same shape, called after a 401 with
-///            `purpose = "refresh"`.
-///   `reload_auth` (function) Same shape, called with `purpose = "reload"` to
-///            re-read what a `login` wrote.
-///            The three are one hook with three entry points: a purpose runs
-///            the entry named for it, and falls back to the first of the three
-///            the plugin supplied. Writing only `resolve_auth` therefore
-///            serves all three, which is right for a plugin that reads its
-///            credentials fresh every time.
-///   `list_models` (function) `function()` returning a list of model rows,
+///   `auth` (function) `function(ctx, purpose)` returning
+///            `{ base_url = ..., headers = { ... } }`. `purpose` is
+///            `"resolve"` for the first call, made lazily before the first
+///            request, so a provider whose credentials are broken is still
+///            listed and fails when it is used. It is `"refresh"` after a 401
+///            and `"reload"` to re-read what a `login` wrote. Omitting
+///            `base_url` keeps the one in force.
+///   `list_models` (function) `function(ctx)` returning a list of model rows,
 ///            for a provider whose catalogue is only known at runtime. Rows
 ///            carry `id`, `context_window`, `max_output_tokens`, `pricing`,
 ///            `supports_thinking`, `supports_vision` and `tier`. Two more
@@ -654,23 +734,24 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 ///            no level for are dropped, an empty list keeps the dialect's
 ///            levels), and `send_off` is `true` to send `"none"` for off,
 ///            `false` to send nothing, or omitted to keep the dialect's way.
-///   `build_body` (function) `function(body, model, opts)` returning the
-///            request body to send. `opts.thinking` is the effort level as
-///            rendered. `opts.model_info` is the `extra` this provider's
-///            `list_models` attached to the model, nil when it attached none
-///            or the model was never listed. Only for the `openai` codecs.
-///   `map_error` (function) `function(status, message)` returning
+///   `build_body` (function) `function(ctx, body, model, opts)` returning
+///            the request body to send. `opts.thinking` is the effort level
+///            as rendered, nil when thinking is off. `opts.model_info` is the
+///            `extra` this provider's `list_models` attached to the model,
+///            nil when it attached none or the model was never listed. Only
+///            for the `openai` codecs.
+///   `map_error` (function) `function(ctx, status, message)` returning
 ///            `{ status = ..., message = ... }`, or nil to keep the original.
 ///            Those two fields are all it may change: `retry_after` comes from
 ///            the response header, and whether an error is retryable is
 ///            derived from the status.
-///   `fetch_usage` (function) `function()` returning a usage summary.
+///   `fetch_usage` (function) `function(ctx)` returning a usage summary.
 ///   `login` (function) `function(ctx)`. Having one is what makes the provider
 ///            an auth target: it then shows up in `maki auth login`. There is
-///            no separate flag for it. `ctx` is a table of functions, called
-///            with a dot: `ctx.print(text)`,
-///            `ctx.prompt({ label = ..., secret = ... })` and
-///            `ctx.open_url(url)`.
+///            no separate flag for it. Its `ctx` can also talk to the
+///            terminal, through functions called with a dot:
+///            `ctx.print(text)`, `ctx.prompt({ label = ..., secret = ... })`
+///            and `ctx.open_url(url)`.
 ///   `logout` (function) `function(ctx)`, the `maki auth logout` side.
 ///
 /// @param spec table Provider specification (see above).
@@ -685,8 +766,8 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 ///   models = {
 ///     { prefixes = { "acme-large" }, tier = "strong", context_window = 200000 },
 ///   },
-///   resolve_auth = function()
-///     local token = maki.provider.auth.get("acme")
+///   auth = function(ctx, purpose)
+///     local token = maki.provider.auth.get(ctx.slug)
 ///     return { headers = { Authorization = "Bearer " .. token.access } }
 ///   end,
 /// })
@@ -715,6 +796,7 @@ fn register(
         plugin: Arc::clone(&plugin),
         slug: slug.clone(),
         keys: hook_keys,
+        egress: egress.clone(),
         requests,
         release,
     });
@@ -748,7 +830,7 @@ fn must_be(key: &str, kind: &str) -> mlua::Error {
     register_error(format!("'{key}' must be a {kind}"))
 }
 
-/// Splits the spec in two: the hook functions, by the entry names
+/// Splits the spec in two: the hook functions, by the names
 /// [`HookSlot::spec`] lists, and the rest, which serde decodes as the
 /// declaration. So an unknown key, a codec or dialect nobody implements, or a
 /// malformed option fails here, while we can still name the plugin that wrote
@@ -756,22 +838,22 @@ fn must_be(key: &str, kind: &str) -> mlua::Error {
 fn declaration(
     lua: &Lua,
     spec: &Table,
-) -> LuaResult<(HashMap<&'static str, RegistryKey>, ProviderDecl)> {
+) -> LuaResult<(HashMap<HookSlot, RegistryKey>, ProviderDecl)> {
     let mut keys = HashMap::new();
     let data = lua.create_table()?;
     for pair in spec.pairs::<LuaValue, LuaValue>() {
         let (key, value) = pair?;
-        let Some(entry) = key
+        let Some(slot) = key
             .as_string()
-            .and_then(|name| hook_entry(&name.to_str().ok()?))
+            .and_then(|name| hook_slot(&name.to_str().ok()?))
         else {
             data.raw_set(key, value)?;
             continue;
         };
         let LuaValue::Function(func) = value else {
-            return Err(must_be(entry, "function"));
+            return Err(must_be(slot.spec().name, "function"));
         };
-        keys.insert(entry, lua.create_registry_value(func)?);
+        keys.insert(slot, lua.create_registry_value(func)?);
     }
     let decl = lua.from_value(LuaValue::Table(data)).map_err(|e| match e {
         mlua::Error::DeserializeError(message) => register_error(message),
@@ -780,12 +862,10 @@ fn declaration(
     Ok((keys, decl))
 }
 
-fn hook_entry(name: &str) -> Option<&'static str> {
+fn hook_slot(name: &str) -> Option<HookSlot> {
     HookSlot::ALL
         .into_iter()
-        .flat_map(|slot| slot.spec().entries)
-        .map(|(_, entry)| *entry)
-        .find(|entry| *entry == name)
+        .find(|slot| slot.spec().name == name)
 }
 
 /// Turn a failed `maki.net.request` response into the error maki's own
@@ -804,8 +884,8 @@ fn hook_entry(name: &str) -> Option<&'static str> {
 /// @param res table A response from `maki.net.request`.
 /// @return (userdata) A `ProviderError`. Opaque, but `tostring` renders it.
 /// @example
-/// fetch_usage = function()
-///   local res = assert(maki.net.request(url, { headers = auth.headers }))
+/// fetch_usage = function(ctx)
+///   local res = assert(maki.net.request(ctx.base_url .. "/usage", { headers = ctx.headers }))
 ///   if res.status ~= 200 then
 ///     return nil, maki.provider.http_error(res)
 ///   end
@@ -834,7 +914,7 @@ fn http_error(_lua: &Lua, res: Table) -> LuaResult<ProviderError> {
 ///
 /// The value is whatever the plugin wrote. maki keeps the file, the plugin
 /// keeps its shape. Nothing is returned when the provider has never stored
-/// any, which is how a first `resolve_auth` tells a fresh install from a
+/// any, which is how a first `auth` call tells a fresh install from a
 /// logged-in one.
 ///
 /// @param slug string A provider slug this plugin registered.
@@ -853,50 +933,6 @@ fn get(lua: &Lua, #[ctx] slugs: OwnedSlugs, slug: String) -> LuaResult<Pair<Tabl
         LuaValue::Table(table) => Ok((Some(table), None)),
         _ => Ok((None, None)),
     }
-}
-
-/// Read the live credentials and effective origin of one of this plugin's
-/// providers.
-///
-/// For a hook that has to reach an endpoint the codec knows nothing about, a
-/// balance or a quota url, and so needs exactly what every request to the slug
-/// already carries. `headers` holds whatever maki resolved for it: the bearer
-/// token from the declared `api_key_env`, whatever `resolve_auth` returned, and
-/// any `[<slug>.headers]` from `providers.toml`. `base_url` is the origin a
-/// request would reach right now, resolved the way the codec resolves it: an
-/// auth-supplied origin, then `<SLUG>_BASE_URL` or `providers.toml`, then the
-/// declared `base_url`. Hard-coding an origin instead would send the call
-/// somewhere else than the rest of the provider whenever a user points the slug
-/// at a gateway.
-///
-/// This hands over live credentials, which is why it only answers for the
-/// providers the calling plugin declared. A snapshot, like the one every
-/// request takes, so a refresh landing mid-call cannot swap the headers a hook
-/// is already building a request from.
-///
-/// @param slug string A provider slug this plugin registered.
-/// @return (table?, string?) `{ base_url = ..., headers = { ... } }`, or
-///   `(nil, err)` on failure.
-/// @example
-/// local auth, err = maki.provider.auth.resolved("acme")
-/// if not auth then return end
-/// local res = maki.net.request(auth.base_url .. "/usage", { headers = auth.headers })
-#[lua_fn]
-fn resolved(lua: &Lua, #[ctx] slugs: OwnedSlugs, slug: String) -> LuaResult<Pair<Table>> {
-    owned(&slugs, &slug)?;
-    let Some(auth) = plugin::resolved_auth(&slug) else {
-        return Ok(err_pair(format!(
-            "maki.provider.auth.resolved: no provider serves '{slug}'"
-        )));
-    };
-    let headers = lua.create_table()?;
-    for (name, value) in auth.headers {
-        headers.set(name, value)?;
-    }
-    let resolved = lua.create_table()?;
-    resolved.set(BASE_URL, plugin::effective_base_url(&slug))?;
-    resolved.set(HEADERS, headers)?;
-    Ok((Some(resolved), None))
 }
 
 /// Every change to the credential store, off the plugin host's thread.
@@ -984,23 +1020,17 @@ lua_table! {
     /// The stored value is a free-form JSON object. maki owns where it lives
     /// and who may read it, the plugin owns what is in it.
     ///
-    /// `resolved` is the other direction: not what the plugin wrote, but the
-    /// credentials and origin maki resolved for the slug and sends on every
-    /// request to it.
-    ///
     /// A plugin can only reach slugs it registered itself.
     ///
     /// ```lua
     /// maki.provider.auth.set("acme", { access_token = tok, expires = when })
     /// local creds = maki.provider.auth.get("acme")
-    /// local auth = maki.provider.auth.resolved("acme")
     /// maki.provider.auth.clear("acme")
     /// ```
     "maki.provider.auth" => pub(crate) fn create_auth_table(slugs: OwnedSlugs), AUTH_DOCS [
         get(slugs),
         set(slugs),
         clear(slugs),
-        resolved(slugs),
     ]
 }
 
@@ -1056,9 +1086,10 @@ pub(crate) fn create_provider_namespace(
 #[cfg(test)]
 mod tests {
     use maki_providers::ProviderUsage;
-    use maki_providers::plugin::AuthPurpose;
     use serde_json::json;
     use test_case::test_case;
+
+    use mlua::AnyUserData;
 
     use super::*;
     use crate::plugin_permissions::NET_HOSTS_KEY;
@@ -1071,6 +1102,9 @@ mod tests {
     const UNKNOWN_CODEC: &str = "grpc";
     const UNKNOWN_DIALECT: &str = "esperanto";
     const STRAY_KEY: &str = "thinking_dialect";
+    const RETIRED_AUTH_ENTRY: &str = "resolve_auth";
+    const RELATIVE_TARGET: &str = "models";
+    const PATH_TARGET: &str = "/models";
     const TRANSPORT_HEADER: &str = "Host";
     const BAD_HEADER: &str = "bad header";
     const FAILED_BODY: &str = r#"{"error":{"message":"slow down"}}"#;
@@ -1083,108 +1117,114 @@ mod tests {
 
     fn keys_from(
         lua: &Lua,
-        entries: impl IntoIterator<Item = (&'static str, Function)>,
+        entries: impl IntoIterator<Item = (HookSlot, Function)>,
     ) -> LuaHookKeys {
         LuaHookKeys {
             plugin: Arc::from(PLUGIN),
             slug: SLUG_NAME.to_owned(),
             keys: entries
                 .into_iter()
-                .map(|(name, func)| (name, lua.create_registry_value(func).unwrap()))
+                .map(|(slot, func)| (slot, lua.create_registry_value(func).unwrap()))
                 .collect(),
+            egress: NetEgress::default(),
             requests: flume::unbounded().0,
             release: flume::unbounded().0,
         }
     }
 
-    fn keys_with(entries: &[&'static str]) -> LuaHookKeys {
-        let lua = Lua::new();
-        let noop = lua.create_function(|_, ()| Ok(())).unwrap();
-        keys_from(&lua, entries.iter().map(|name| (*name, noop.clone())))
+    fn args_for(lua: &Lua, slot: HookSlot, payload: Value) -> Vec<LuaValue> {
+        call_args(lua, &keys_from(lua, []), slot.spec(), payload)
+            .unwrap()
+            .into_iter()
+            .collect()
     }
 
-    /// The selector on the wire is whatever serde renders [`AuthPurpose`] as,
-    /// and the entry table here spells those three names again. A rename on
-    /// either side would fall back to the first entry the plugin wrote, which
-    /// is the wrong hook rather than an error, so the two tables are pinned to
-    /// each other.
-    #[test_case(AuthPurpose::Resolve, RESOLVE_AUTH ; "resolve")]
-    #[test_case(AuthPurpose::Refresh, REFRESH_AUTH ; "refresh")]
-    #[test_case(AuthPurpose::Reload, RELOAD_AUTH ; "reload")]
-    fn a_purpose_picks_the_entry_named_after_it(purpose: AuthPurpose, expected: &'static str) {
-        let keys = keys_with(&[RESOLVE_AUTH, REFRESH_AUTH, RELOAD_AUTH]);
-        let payload = serde_json::to_value(purpose).unwrap();
-
-        let chosen = keys.entry(HookSlot::Auth, &payload).unwrap();
-
-        assert!(std::ptr::eq(chosen, keys.keys.get(expected).unwrap()));
-    }
-
-    /// One host-side hook, three Lua entries, and a plugin that reads its
-    /// credentials fresh every time writes only `resolve_auth`.
-    #[test_case(&[RESOLVE_AUTH], "refresh", Some(RESOLVE_AUTH) ; "refresh_falls_back_to_resolve")]
-    #[test_case(&[RESOLVE_AUTH], "reload", Some(RESOLVE_AUTH) ; "reload_falls_back_to_resolve")]
-    #[test_case(&[], "resolve", None ; "no_auth_entry_serves_nothing")]
-    fn auth_purpose_selects_an_entry(
-        entries: &[&'static str],
-        purpose: &str,
-        expected: Option<&'static str>,
-    ) {
-        let keys = keys_with(entries);
-        let payload = json!(purpose);
-        let chosen = keys.entry(HookSlot::Auth, &payload);
-        assert_eq!(
-            chosen.is_some(),
-            expected.is_some(),
-            "{entries:?} for {purpose}"
-        );
-        if let Some(expected) = expected {
-            assert!(std::ptr::eq(
-                chosen.unwrap(),
-                keys.keys.get(expected).unwrap()
-            ));
+    /// Every spec key names one slot and every slot is reachable by its key,
+    /// so no hook can be written under a name nothing calls.
+    #[test]
+    fn every_slot_is_found_by_its_own_name() {
+        for slot in HookSlot::ALL {
+            assert_eq!(hook_slot(slot.spec().name), Some(slot));
         }
     }
 
-    #[test_case(HookSlot::Login, &[LOGIN], true ; "a_login_entry_serves_the_login_slot")]
-    #[test_case(HookSlot::Login, &[LOGOUT], false ; "a_logout_entry_does_not")]
-    #[test_case(HookSlot::Auth, &[RELOAD_AUTH], true ; "any_auth_entry_serves_the_auth_slot")]
-    fn slots_are_served_by_their_own_entries(
-        slot: HookSlot,
-        entries: &[&'static str],
-        expected: bool,
-    ) {
-        assert_eq!(keys_with(entries).serves(slot), expected);
-    }
-
-    /// `build_body(body, model, opts)`: the fields the signature names arrive
-    /// positionally, the rest ride along in the trailing table.
+    /// `build_body(ctx, body, model, opts)`: the fields the signature names
+    /// arrive positionally after `ctx`, the rest ride along in the trailing
+    /// table.
     #[test]
     fn body_input_is_split_into_the_documented_arguments() {
         let lua = Lua::new();
         let payload = json!({ "body": { "stream": true }, "model": "m-1", "thinking": "high" });
-        let args = call_args(&lua, HookSlot::BuildBody.spec(), payload).unwrap();
-        let args: Vec<LuaValue> = args.into_iter().collect();
+        let args = args_for(&lua, HookSlot::BuildBody, payload);
 
-        assert_eq!(args.len(), 3);
-        let body = args[0].as_table().unwrap();
+        assert_eq!(args.len(), 4);
+        assert!(args[0].as_table().is_some());
+        let body = args[1].as_table().unwrap();
         assert!(body.get::<bool>("stream").unwrap());
-        assert_eq!(args[1].as_string().unwrap().to_string_lossy(), "m-1");
-        let opts = args[2].as_table().unwrap();
+        assert_eq!(args[2].as_string().unwrap().to_string_lossy(), "m-1");
+        let opts = args[3].as_table().unwrap();
         assert_eq!(opts.get::<String>("thinking").unwrap(), "high");
     }
 
-    #[test]
-    fn a_login_call_is_handed_a_terminal_ctx() {
+    /// Every hook gets the same `ctx`, and only the two the cli runs can talk
+    /// to the terminal: anywhere else stdout belongs to the ui.
+    #[test_case(HookSlot::Login, true ; "login")]
+    #[test_case(HookSlot::Logout, true ; "logout")]
+    #[test_case(HookSlot::ListModels, false ; "list_models")]
+    #[test_case(HookSlot::FetchUsage, false ; "fetch_usage")]
+    fn every_hook_is_handed_a_ctx_first(slot: HookSlot, terminal: bool) {
         let lua = Lua::new();
-        let args = call_args(&lua, HookSlot::Login.spec(), Value::Null).unwrap();
-        let args: Vec<LuaValue> = args.into_iter().collect();
+        let args = args_for(&lua, slot, Value::Null);
 
         assert_eq!(args.len(), 1);
         let ctx = args[0].as_table().unwrap();
+        assert_eq!(ctx.get::<String>(SLUG).unwrap(), SLUG_NAME);
+        assert!(ctx.get::<Table>(HEADERS).is_ok());
+        assert!(ctx.get::<Function>(GET_JSON).is_ok());
         for name in ["print", "prompt", "open_url"] {
-            assert!(ctx.get::<Function>(name).is_ok(), "ctx.{name} is missing");
+            assert_eq!(ctx.get::<Function>(name).is_ok(), terminal, "ctx.{name}");
         }
+    }
+
+    #[test]
+    fn the_auth_hook_gets_its_purpose_after_ctx() {
+        let lua = Lua::new();
+        let args = args_for(&lua, HookSlot::Auth, json!("refresh"));
+
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[1].as_string().unwrap().to_string_lossy(), "refresh");
+    }
+
+    /// A bare name would silently glue onto the origin's last segment, so it
+    /// is refused as the programmer error it is.
+    #[test]
+    fn get_json_refuses_a_target_that_is_neither_a_path_nor_a_url() {
+        let lua = Lua::new();
+        let ctx = hook_ctx(&lua, &keys_from(&lua, []), false).unwrap();
+        let get_json: Function = ctx.get(GET_JSON).unwrap();
+
+        let error = smol::block_on(get_json.call_async::<LuaValue>(RELATIVE_TARGET)).unwrap_err();
+
+        assert!(error.to_string().contains(RELATIVE_TARGET), "{error}");
+    }
+
+    /// A slug with no origin is a state the plugin can report, so it comes
+    /// back as an error to return rather than raised.
+    #[test]
+    fn get_json_without_an_origin_answers_with_an_error() {
+        let lua = Lua::new();
+        let ctx = hook_ctx(&lua, &keys_from(&lua, []), false).unwrap();
+        let get_json: Function = ctx.get(GET_JSON).unwrap();
+
+        let (value, error): (LuaValue, AnyUserData) =
+            smol::block_on(get_json.call_async(PATH_TARGET)).unwrap();
+
+        assert!(value.is_nil());
+        let ProviderError(error) = error.take().unwrap();
+        assert!(
+            matches!(&error, AgentError::Config { message } if message.contains(NO_ORIGIN)),
+            "{error:?}"
+        );
     }
 
     /// The hook every plugin writes without knowing it: `build_body` edits one
@@ -1199,12 +1239,14 @@ mod tests {
 
         let lua = Lua::new();
         let func = lua
-            .create_function(|_, (body, _model, _opts): (Table, LuaValue, LuaValue)| {
-                body.set(EDITED_FIELD, true)?;
-                Ok(body)
-            })
+            .create_function(
+                |_, (_ctx, body, _model, _opts): (Table, Table, LuaValue, LuaValue)| {
+                    body.set(EDITED_FIELD, true)?;
+                    Ok(body)
+                },
+            )
             .unwrap();
-        let hooks = keys_from(&lua, [(BUILD_BODY, func)]);
+        let hooks = keys_from(&lua, [(HookSlot::BuildBody, func)]);
         let payload = json!({
             BODY_FIELD: { KEPT_NULL_FIELD: Value::Null, "stream": true },
             MODEL_FIELD: "m-1",
@@ -1266,7 +1308,7 @@ mod tests {
         let lua = provider_lua(true);
         let func: Function = lua.load(source).eval().unwrap();
         let (requests, served) = flume::unbounded();
-        let mut keys = keys_from(&lua, [(FETCH_USAGE, func)]);
+        let mut keys = keys_from(&lua, [(HookSlot::FetchUsage, func)]);
         keys.requests = requests;
         let bridge: LuaHook<(), Option<ProviderUsage>> = LuaHook {
             keys: Arc::new(keys),
@@ -1362,7 +1404,7 @@ mod tests {
 
     /// Decodes `{ slug = ..., <fields> }` the way `register` does, before any
     /// permission or registry check gets a say.
-    fn decode_spec(fields: &str) -> LuaResult<(HashMap<&'static str, RegistryKey>, ProviderDecl)> {
+    fn decode_spec(fields: &str) -> LuaResult<(HashMap<HookSlot, RegistryKey>, ProviderDecl)> {
         let lua = Lua::new();
         let spec: Table = lua
             .load(format!(r#"return {{ slug = "{SLUG_NAME}", {fields} }}"#))
@@ -1409,7 +1451,7 @@ mod tests {
     fn hooks_are_taken_out_of_the_declaration() {
         let (keys, decl) =
             decode_spec(&format!("{BUILD_BODY} = function(body) return body end")).unwrap();
-        assert!(keys.contains_key(BUILD_BODY));
+        assert!(keys.contains_key(&HookSlot::BuildBody));
         assert_eq!(decl.slug, SLUG_NAME);
     }
 
@@ -1425,6 +1467,7 @@ mod tests {
     #[test_case(r#"codec = "openai", openai = { headers = { Host = "evil.example" } }"#, TRANSPORT_HEADER ; "transport_header")]
     #[test_case(r#"codec = "openai", openai = { headers = { ["bad header"] = "x" } }"#, BAD_HEADER ; "bad_header_name")]
     #[test_case(r#"build_body = "not a function""#, BUILD_BODY ; "hook_that_is_not_a_function")]
+    #[test_case("resolve_auth = function() end", RETIRED_AUTH_ENTRY ; "an_auth_entry_under_its_retired_name")]
     fn an_invalid_declaration_is_refused_where_the_plugin_can_be_named(
         fields: &str,
         culprit: &str,
@@ -1478,7 +1521,7 @@ mod tests {
 
     /// `api_key_env` names a variable for maki to read, so a plugin without
     /// `env` could otherwise read any secret in the environment by naming it
-    /// and asking `maki.provider.auth.resolved` for the bearer it became.
+    /// and reading the bearer it became off any hook's `ctx.headers`.
     #[test]
     fn an_api_key_env_needs_the_env_permission() {
         let error = register_refusal(false, r#", api_key_env = "AWS_SECRET_ACCESS_KEY""#);

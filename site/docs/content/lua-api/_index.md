@@ -3805,6 +3805,20 @@ good static provider. Callbacks run on maki's plugin host, so they may use
 `maki.net`, `maki.fs` and the rest of the API. A callback that fails on an
 HTTP response returns `nil, maki.provider.http_error(res)`.
 
+Every callback is handed a `ctx` table first, read as the call starts.
+`ctx.slug` is the slug it serves. `ctx.base_url` is the origin a request
+to the slug would reach right now: an origin the auth hook returned, then
+`<SLUG>_BASE_URL` or `providers.toml`, then the declared `base_url`.
+`ctx.headers` holds the headers every request to it carries.
+`ctx.get_json(target)` is a GET with `ctx.headers` to
+`ctx.base_url .. target` when `target` starts with `/`, or to `target` when
+it is an absolute url, under the same host rules as `maki.net.request` and
+never retried. It returns the decoded body, or nil and an error the
+callback can return as its own, whether the server refused or the
+connection failed. Reading `ctx.base_url` rather than hard-coding an origin
+keeps a side call going where the rest of the provider goes when a user
+points the slug at a gateway.
+
 An option the target cannot honour fails at registration rather than being
 ignored at request time: `build_body` needs one of the `openai` codecs, the
 `openai` table needs `codec = "openai"`, and `system_prefix` is refused by
@@ -3878,21 +3892,14 @@ the `google` codec, which drops it. So does a key this list does not name.
            provider, `false` turns the feature off for that model. Read
            once, here, so this table must not depend on anything asked at
            runtime.
-  `resolve_auth` (function) `function(purpose)` returning
-           `{ base_url = ..., headers = { ... } }`. Called once, lazily,
-           before the first request, so a provider whose credentials are
-           broken is still listed and fails when it is used. `purpose` is
-           `"resolve"`. Omitting `base_url` keeps the one in force.
-  `refresh_auth` (function) Same shape, called after a 401 with
-           `purpose = "refresh"`.
-  `reload_auth` (function) Same shape, called with `purpose = "reload"` to
-           re-read what a `login` wrote.
-           The three are one hook with three entry points: a purpose runs
-           the entry named for it, and falls back to the first of the three
-           the plugin supplied. Writing only `resolve_auth` therefore
-           serves all three, which is right for a plugin that reads its
-           credentials fresh every time.
-  `list_models` (function) `function()` returning a list of model rows,
+  `auth` (function) `function(ctx, purpose)` returning
+           `{ base_url = ..., headers = { ... } }`. `purpose` is
+           `"resolve"` for the first call, made lazily before the first
+           request, so a provider whose credentials are broken is still
+           listed and fails when it is used. It is `"refresh"` after a 401
+           and `"reload"` to re-read what a `login` wrote. Omitting
+           `base_url` keeps the one in force.
+  `list_models` (function) `function(ctx)` returning a list of model rows,
            for a provider whose catalogue is only known at runtime. Rows
            carry `id`, `context_window`, `max_output_tokens`, `pricing`,
            `supports_thinking`, `supports_vision` and `tier`. Two more
@@ -3903,23 +3910,24 @@ the `google` codec, which drops it. So does a key this list does not name.
            no level for are dropped, an empty list keeps the dialect's
            levels), and `send_off` is `true` to send `"none"` for off,
            `false` to send nothing, or omitted to keep the dialect's way.
-  `build_body` (function) `function(body, model, opts)` returning the
-           request body to send. `opts.thinking` is the effort level as
-           rendered. `opts.model_info` is the `extra` this provider's
-           `list_models` attached to the model, nil when it attached none
-           or the model was never listed. Only for the `openai` codecs.
-  `map_error` (function) `function(status, message)` returning
+  `build_body` (function) `function(ctx, body, model, opts)` returning
+           the request body to send. `opts.thinking` is the effort level
+           as rendered, nil when thinking is off. `opts.model_info` is the
+           `extra` this provider's `list_models` attached to the model,
+           nil when it attached none or the model was never listed. Only
+           for the `openai` codecs.
+  `map_error` (function) `function(ctx, status, message)` returning
            `{ status = ..., message = ... }`, or nil to keep the original.
            Those two fields are all it may change: `retry_after` comes from
            the response header, and whether an error is retryable is
            derived from the status.
-  `fetch_usage` (function) `function()` returning a usage summary.
+  `fetch_usage` (function) `function(ctx)` returning a usage summary.
   `login` (function) `function(ctx)`. Having one is what makes the provider
            an auth target: it then shows up in `maki auth login`. There is
-           no separate flag for it. `ctx` is a table of functions, called
-           with a dot: `ctx.print(text)`,
-           `ctx.prompt({ label = ..., secret = ... })` and
-           `ctx.open_url(url)`.
+           no separate flag for it. Its `ctx` can also talk to the
+           terminal, through functions called with a dot:
+           `ctx.print(text)`, `ctx.prompt({ label = ..., secret = ... })`
+           and `ctx.open_url(url)`.
   `logout` (function) `function(ctx)`, the `maki auth logout` side.
 
 Requires the `net` [plugin permission](#plugin-permissions).
@@ -3940,8 +3948,8 @@ maki.provider.register({
   models = {
     { prefixes = { "acme-large" }, tier = "strong", context_window = 200000 },
   },
-  resolve_auth = function()
-    local token = maki.provider.auth.get("acme")
+  auth = function(ctx, purpose)
+    local token = maki.provider.auth.get(ctx.slug)
     return { headers = { Authorization = "Bearer " .. token.access } }
   end,
 })
@@ -3977,8 +3985,8 @@ A hook that raises instead fails as a broken hook.
 **Example:**
 
 ```lua
-fetch_usage = function()
-  local res = assert(maki.net.request(url, { headers = auth.headers }))
+fetch_usage = function(ctx)
+  local res = assert(maki.net.request(ctx.base_url .. "/usage", { headers = ctx.headers }))
   if res.status ~= 200 then
     return nil, maki.provider.http_error(res)
   end
@@ -3998,16 +4006,11 @@ while a refresh writes.
 The stored value is a free-form JSON object. maki owns where it lives
 and who may read it, the plugin owns what is in it.
 
-`resolved` is the other direction: not what the plugin wrote, but the
-credentials and origin maki resolved for the slug and sends on every
-request to it.
-
 A plugin can only reach slugs it registered itself.
 
 ```lua
 maki.provider.auth.set("acme", { access_token = tok, expires = when })
 local creds = maki.provider.auth.get("acme")
-local auth = maki.provider.auth.resolved("acme")
 maki.provider.auth.clear("acme")
 ```
 
@@ -4023,7 +4026,7 @@ Read the credentials this plugin stored for one of its providers.
 
 The value is whatever the plugin wrote. maki keeps the file, the plugin
 keeps its shape. Nothing is returned when the provider has never stored
-any, which is how a first `resolve_auth` tells a fresh install from a
+any, which is how a first `auth` call tells a fresh install from a
 logged-in one.
 
 **Parameters:**
@@ -4088,48 +4091,6 @@ Forget the credentials stored for one of this plugin's providers.
 
 ```lua
 maki.provider.auth.clear("acme")
-```
-
----
-
-### `maki.provider.auth.resolved()` {#maki-provider-auth-resolved}
-
-```lua
-maki.provider.auth.resolved({slug})
-```
-
-Read the live credentials and effective origin of one of this plugin's
-providers.
-
-For a hook that has to reach an endpoint the codec knows nothing about, a
-balance or a quota url, and so needs exactly what every request to the slug
-already carries. `headers` holds whatever maki resolved for it: the bearer
-token from the declared `api_key_env`, whatever `resolve_auth` returned, and
-any `[<slug>.headers]` from `providers.toml`. `base_url` is the origin a
-request would reach right now, resolved the way the codec resolves it: an
-auth-supplied origin, then `<SLUG>_BASE_URL` or `providers.toml`, then the
-declared `base_url`. Hard-coding an origin instead would send the call
-somewhere else than the rest of the provider whenever a user points the slug
-at a gateway.
-
-This hands over live credentials, which is why it only answers for the
-providers the calling plugin declared. A snapshot, like the one every
-request takes, so a refresh landing mid-call cannot swap the headers a hook
-is already building a request from.
-
-**Parameters:**
-
-- `{slug}` (`string`) A provider slug this plugin registered.
-
-**Returns:** (`table?`, `string?`) `{ base_url = ..., headers = { ... } }`, or
-  `(nil, err)` on failure.
-
-**Example:**
-
-```lua
-local auth, err = maki.provider.auth.resolved("acme")
-if not auth then return end
-local res = maki.net.request(auth.base_url .. "/usage", { headers = auth.headers })
 ```
 
 
@@ -7075,15 +7036,6 @@ function M.cut(view, out, reason, timeout_secs)
 -- missing key, and in an array it leaves a hole that stops `ipairs`. Numbers
 -- above 2^53 come back rounded.
 
---- A GET with the provider's resolved `auth`, never retried. Returns the
---- decoded body. On failure returns nil and an error for `M.fail`.
-function M.get_json(auth, url)
-
---- Hands a `M.get_json` error back from a hook. A refused request is returned,
---- so it fails the way the native provider does. Anything else never got an
---- HTTP status and is raised.
-function M.fail(err)
-
 --- A whole, non-negative number up to 2^64, or nil.
 function M.as_u64(value)
 
@@ -7095,6 +7047,11 @@ function M.as_f64(value)
 
 --- A boolean, or nil.
 function M.as_bool(value)
+
+--- A model row's `pricing` from per-token prices, in dollars per million
+--- tokens. Half a price is no price: without both `input` and `output` it
+--- would read as free, so the answer is nil. A missing cache price is 0.
+function M.pricing(input, output, cache_write, cache_read)
 
 --- Each `body.data` element through `parse_row`, nils dropped, the first row
 --- per id kept, sorted by id. A body without a `data` array lists nothing.

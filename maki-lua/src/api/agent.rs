@@ -26,8 +26,7 @@ use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{
-    ContentBlock, ContextGauge, Model, ModelError, RequestOptions, Role, ThinkingConfig,
-    TokenUsage, add_cost,
+    ContentBlock, ContextGauge, Model, RequestOptions, Role, ThinkingConfig, TokenUsage, add_cost,
 };
 use maki_storage::id::MakiId;
 use maki_storage::sessions::StoredThinking;
@@ -49,7 +48,7 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
     let Some(tier_str) = tier else {
         return Ok(Model::clone(&ctx.model));
     };
-    let requested: ModelTier = tier_str.parse().map_err(|e: ModelError| e.to_string())?;
+    let requested = tier_str.parse::<ModelTier>().map_err(|e| e.to_string())?;
     let effective = requested.capped_at(ctx.model.tier);
     if effective == ctx.model.tier {
         return Ok(Model::clone(&ctx.model));

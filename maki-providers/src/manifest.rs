@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 
-use crate::model::{ModelEntry, ModelTier};
+use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::spec::{NO_CURATED_MODELS, ProviderRegistry};
 
 const SLUG_MISMATCH: &str = "slug header";
@@ -19,22 +19,42 @@ const OUTPUT_EXCEEDS_WINDOW: &str = "exceeds context_window";
 #[serde(deny_unknown_fields)]
 struct ModelTable {
     slug: String,
-    model: Vec<ModelEntry>,
+    model: Vec<CuratedRow>,
 }
 
-/// Curated prefixes outlive every caller anyway, so they are leaked instead of
-/// dragging a lifetime through the crate. Bounded: a few hundred short strings,
-/// parsed once per process.
-pub(crate) fn leak_prefixes<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<&'static [&'static str], D::Error> {
-    let prefixes = Vec::<String>::deserialize(deserializer)?;
-    Ok(Box::leak(
-        prefixes
-            .into_iter()
-            .map(|prefix| &*String::leak(prefix))
-            .collect::<Box<[&'static str]>>(),
-    ))
+/// One curated row as the file spells it. Stricter than the plugin surface
+/// [`ModelEntry`] decodes: `max_output_tokens` is the only field allowed a
+/// serde default, because TOML has no null and an absent limit really does
+/// mean "the provider never published one". Everything else missing, or
+/// spelled wrong, is a mistake worth hearing about.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CuratedRow {
+    prefixes: Vec<String>,
+    tier: ModelTier,
+    family: ModelFamily,
+    vision: bool,
+    default: bool,
+    pricing: ModelPricing,
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
+    context_window: u32,
+}
+
+impl From<CuratedRow> for ModelEntry {
+    fn from(row: CuratedRow) -> Self {
+        Self {
+            prefixes: row.prefixes,
+            tier: row.tier,
+            family: Some(row.family),
+            supports_vision: Some(row.vision),
+            default: row.default,
+            pricing: Some(row.pricing),
+            max_output_tokens: row.max_output_tokens,
+            context_window: Some(row.context_window),
+            ..Self::default()
+        }
+    }
 }
 
 /// Every curated table, parsed once and keyed by the slug that owns it. Keyed
@@ -77,34 +97,34 @@ fn parse(slug: &str, src: &str) -> Result<Box<[ModelEntry]>, String> {
     let mut prefixes_seen: HashSet<&str> = HashSet::new();
     let mut defaults_seen: Vec<ModelTier> = Vec::new();
 
-    for (index, entry) in table.model.iter().enumerate() {
-        let Some(name) = entry.prefixes.first() else {
+    for (index, row) in table.model.iter().enumerate() {
+        let Some(name) = row.prefixes.first() else {
             return Err(format!("{file}: row {}: {NO_PREFIXES}", index + 1));
         };
         let at = format!("{file} {name:?}");
 
-        for prefix in entry.prefixes {
+        for prefix in &row.prefixes {
             if !prefixes_seen.insert(prefix) {
                 return Err(format!("{at}: {DUPLICATE_PREFIX} {prefix:?}"));
             }
         }
-        if let Some(max_output) = entry.max_output_tokens
-            && max_output > entry.context_window
+        if let Some(max_output) = row.max_output_tokens
+            && max_output > row.context_window
         {
             return Err(format!(
                 "{at}: max_output_tokens {max_output} {OUTPUT_EXCEEDS_WINDOW} {}",
-                entry.context_window
+                row.context_window
             ));
         }
-        if entry.default {
-            if defaults_seen.contains(&entry.tier) {
-                return Err(format!("{at}: {DUPLICATE_DEFAULT} {:?}", entry.tier));
+        if row.default {
+            if defaults_seen.contains(&row.tier) {
+                return Err(format!("{at}: {DUPLICATE_DEFAULT} {:?}", row.tier));
             }
-            defaults_seen.push(entry.tier);
+            defaults_seen.push(row.tier);
         }
     }
 
-    Ok(table.model.into())
+    Ok(table.model.into_iter().map(ModelEntry::from).collect())
 }
 
 #[cfg(test)]
@@ -159,7 +179,7 @@ mod tests {
 
         let bare = parse(SLUG, &table(SLUG, ROW)).expect(PARSED);
         assert_eq!(bare[0].max_output_tokens, None);
-        assert!(bare[0].pricing.fast.is_none());
+        assert!(bare[0].pricing.as_ref().expect(PARSED).fast.is_none());
 
         let declared = table(SLUG, ROW).replace(
             "cache_read = 0.0 }",
@@ -168,7 +188,11 @@ mod tests {
             ),
         );
         let entries = parse(SLUG, &declared).expect(PARSED);
-        let fast = entries[0].pricing.fast.as_ref().expect(PARSED);
+        let fast = entries[0]
+            .pricing
+            .as_ref()
+            .and_then(|pricing| pricing.fast.as_ref())
+            .expect(PARSED);
 
         assert_eq!(entries[0].max_output_tokens, Some(MAX_OUTPUT));
         assert_eq!(fast.input, FAST_INPUT);

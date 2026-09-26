@@ -345,23 +345,32 @@ Every callback is optional. A registration with none is a static provider that r
 
 | Field | Signature | When it runs |
 |-------|-----------|--------------|
-| `resolve_auth` | `function(purpose)` | Once, lazily, before the first request |
-| `refresh_auth` | `function(purpose)` | After a 401, before one silent retry |
-| `reload_auth` | `function(purpose)` | When Maki re-reads what a login wrote |
-| `list_models` | `function()` | Model listing: the picker, `maki models` |
-| `build_body` | `function(body, model, opts)` | Every request, on the final body |
-| `map_error` | `function(status, message)` | On an API error, before it reaches the UI |
-| `fetch_usage` | `function()` | Quota and usage display |
+| `auth` | `function(ctx, purpose)` | `"resolve"` once, lazily, before the first request. `"refresh"` after a 401, before one silent retry. `"reload"` when Maki re-reads what a login wrote |
+| `list_models` | `function(ctx)` | Model listing: the picker, `maki models` |
+| `build_body` | `function(ctx, body, model, opts)` | Every request, on the final body |
+| `map_error` | `function(ctx, status, message)` | On an API error, before it reaches the UI |
+| `fetch_usage` | `function(ctx)` | Quota and usage display |
 | `login` | `function(ctx)` | `maki auth login <slug>` |
 | `logout` | `function(ctx)` | `maki auth logout <slug>` |
 
-The three auth entries are one hook with three purposes. Whichever entries you write serve the rest, so a plugin that reads its credentials fresh every time can write `resolve_auth` alone and get refresh and reload for free. They return `{{ base_url = ..., headers = {{ ... }} }}`, and omitting `base_url` keeps the one already in force.
+Every callback gets a `ctx` table first, read when the call starts:
 
-An auth hook may write the store as well as read it. Maki holds the cross-process lock on that provider's credentials while `resolve` and `refresh` run, and a `maki.provider.auth.set` inside one re-enters that lock instead of waiting on it, so a `refresh_auth` that rotates a token can persist what it minted.
+| Field | What it holds |
+|-------|---------------|
+| `ctx.slug` | The slug the callback serves |
+| `ctx.base_url` | The origin a request would reach right now: an origin `auth` returned, then `<SLUG>_BASE_URL` or `providers.toml`, then the declared `base_url` |
+| `ctx.headers` | The headers every request to the slug carries, as a snapshot |
+| `ctx.get_json(target)` | A GET with `ctx.headers`. A `target` starting with `/` is appended to `ctx.base_url`, an absolute url is sent as is. Returns the decoded body, or nil and an error the callback can return as its own |
+
+`ctx.get_json` goes out under the same host rules as `maki.net.request` and never retries. An error status and a connection that failed both come back as the error a built-in provider raises for them, so `return nil, err` keeps retries and `Retry-After` working. Reading `ctx.base_url` rather than writing an origin into the plugin keeps a side call on the same gateway as the chat requests when a user points the slug somewhere else.
+
+`auth` returns `{{ base_url = ..., headers = {{ ... }} }}`, and omitting `base_url` keeps the one already in force. A plugin that reads its credentials fresh every time can ignore `purpose`.
+
+An auth hook may write the store as well as read it. Maki holds the cross-process lock on that provider's credentials during `resolve` and `refresh`, and a `maki.provider.auth.set` inside the hook re-enters that lock instead of waiting on it, so a refresh that rotates a token can persist what it minted.
 
 Credentials resolve lazily, on the first request that needs them. A plugin provider whose credentials are missing or expired stays in the picker and fails when you send a message, the same as a built-in provider with an unset API key. Provider scripts behaved the other way round: a `resolve` that failed took the provider out of the list, so a stale token looked like a missing provider.
 
-Writing a `login` function is what makes the slug an auth target. There is no `has_auth` flag: a provider with `login` appears in `maki auth login`, one without it is an API-key provider and says so when asked to log in. The `ctx` handed to `login` and `logout` speaks to the terminal with `ctx.print(text)`, `ctx.prompt({{ label = ..., secret = true }})` and `ctx.open_url(url)`. Call them with a dot, since `ctx` is a plain table of functions.
+Writing a `login` function is what makes the slug an auth target. There is no `has_auth` flag: a provider with `login` appears in `maki auth login`, one without it is an API-key provider and says so when asked to log in. The `ctx` handed to `login` and `logout` also speaks to the terminal with `ctx.print(text)`, `ctx.prompt({{ label = ..., secret = true }})` and `ctx.open_url(url)`. Call them with a dot, since `ctx` is a plain table of functions.
 
 `map_error` returns `{{ status = ..., message = ... }}`, or nil to keep the error as it was. Those two fields are all it can change. It cannot set `retry_after`, which is what the server asked for in the response header, and it cannot decide whether an error is retryable, which Maki derives from the status. Use it to turn an opaque vendor body into a message a person can act on.
 
@@ -396,14 +405,12 @@ Earlier versions loaded executable scripts from the config `providers/` director
 |-------------------|-----|
 | `info` returning `display_name`, `base`, `system_prefix`, `has_auth` | The same fields on the registration table. `has_auth` is gone, because a `login` function is what makes the provider an auth target |
 | `models` returning model rows | The static `models` table. `id` becomes `prefixes`, a list, which is what the field always was: `id = "acme"` becomes `prefixes = {{ "acme" }}` and matches the same ids |
-| `resolve` | `resolve_auth` |
-| `refresh` | `refresh_auth` |
-| `reload` | `reload_auth` |
+| `resolve`, `refresh`, `reload` | `auth = function(ctx, purpose)`, with `purpose` naming the subcommand |
 | `login` over inherited stdio | `login = function(ctx)`, using `ctx.print`, `ctx.prompt` and `ctx.open_url` |
 | `logout` over inherited stdio | `logout = function(ctx)` |
 | No equivalent | `build_body`, `map_error`, `fetch_usage`, `list_models` |
 
-A script that stored its credentials in its own file can keep them. Import that file the first time `resolve_auth` runs and hand it to Maki:
+A script that stored its credentials in its own file can keep them. Import that file the first time `auth` runs and hand it to Maki:
 
 ```lua
 local function credentials()
@@ -454,11 +461,16 @@ fn tier_label(tier: ModelTier) -> &'static str {
 }
 
 fn format_pricing(entry: &ModelEntry) -> String {
-    format!("${:.2} / ${:.2}", entry.pricing.input, entry.pricing.output)
+    entry.pricing.as_ref().map_or_else(String::new, |pricing| {
+        format!("${:.2} / ${:.2}", pricing.input, pricing.output)
+    })
 }
 
 fn format_context(entry: &ModelEntry) -> String {
-    let ctx_k = entry.context_window / 1_000;
+    let Some(context_window) = entry.context_window else {
+        return String::new();
+    };
+    let ctx_k = context_window / 1_000;
     match entry.max_output_tokens {
         Some(out) => format!("{ctx_k}K ctx / {}K out", out / 1_000),
         None => format!("{ctx_k}K ctx"),
@@ -501,7 +513,7 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
         .map(|e| {
             format!(
                 "{} ({})",
-                e.prefixes.first().unwrap_or(&"?"),
+                e.prefixes.first().map_or("?", String::as_str),
                 tier_label(e.tier).to_lowercase(),
             )
         })

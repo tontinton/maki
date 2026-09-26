@@ -10,11 +10,7 @@
 
 local parse = require("maki.provider_parse")
 
-local SLUG = "tensorx"
 local MODEL_INFO_PATH = "/model/info"
--- `opts.thinking` arrives rendered, and this is the one rendering that means
--- disabled.
-local THINKING_OFF = "off"
 -- The name of the knob both in `supported_openai_params` and on the wire.
 local THINKING = "thinking"
 local REASONING_EFFORT = "reasoning_effort"
@@ -95,24 +91,23 @@ local function model_row(entry)
 end
 
 maki.provider.register({
-  slug = SLUG,
+  slug = "tensorx",
   codec = "openai",
   openai = { thinking = { dialect = "tensorx" } },
 
-  list_models = function()
-    local auth = assert(maki.provider.auth.resolved(SLUG))
-    local body, err = parse.get_json(auth, auth.base_url .. MODEL_INFO_PATH)
+  list_models = function(ctx)
+    local body, err = ctx.get_json(MODEL_INFO_PATH)
     if err then
-      return parse.fail(err)
+      return nil, err
     end
     return parse.models(body, model_row)
   end,
 
   -- Each knob goes on the wire only for a model that advertised it. A DeepSeek
   -- model that advertises neither takes the toggle through its chat template.
-  build_body = function(body, model, opts)
+  build_body = function(_, body, model, opts)
     local advertised = opts.model_info or {}
-    local enabled = opts.thinking ~= THINKING_OFF
+    local enabled = opts.thinking ~= nil
 
     if advertised.has_thinking then
       body.thinking = enabled

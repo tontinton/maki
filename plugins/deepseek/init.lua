@@ -4,14 +4,7 @@
 -- those here, or the codec's own max tokens field and stream usage, is a
 -- registration error rather than an override.
 
-local parse = require("maki.provider_parse")
-
-local SLUG = "deepseek"
 local BALANCE_PATH = "/user/balance"
--- `opts.thinking` arrives rendered, and this is the one rendering that means
--- disabled: every effort level spells itself, `adaptive` spells itself, and a
--- budget arrives as its bare token count.
-local THINKING_OFF = "off"
 -- The API only checks that the field exists.
 local PAD = ""
 -- R1 is the one model outside the thinking protocol DeepSeek introduced with
@@ -57,12 +50,12 @@ local function balance_limit(info)
 end
 
 maki.provider.register({
-  slug = SLUG,
+  slug = "deepseek",
   codec = "openai",
   openai = { thinking = { dialect = "deepseek" } },
 
-  build_body = function(body, model, opts)
-    local enabled = opts.thinking ~= THINKING_OFF
+  build_body = function(_, body, model, opts)
+    local enabled = opts.thinking ~= nil
     body.thinking = { type = enabled and "enabled" or "disabled" }
     if enabled then
       pad_reasoning_content(body, model)
@@ -70,16 +63,13 @@ maki.provider.register({
     return body
   end,
 
-  -- Not on the codec's request path, so this hook resolves the credentials and
-  -- the origin itself. Reading the origin rather than hard-coding one keeps a
-  -- user who points the slug at a gateway from having their balance read
-  -- straight from DeepSeek with the gateway's key. A refused request is
-  -- returned rather than raised, so it fails the way the native provider does.
-  fetch_usage = function()
-    local auth = assert(maki.provider.auth.resolved(SLUG))
-    local parsed, err = parse.get_json(auth, auth.base_url .. BALANCE_PATH)
+  -- Asked of the configured origin, so a user who points the slug at a
+  -- gateway does not have their balance read straight from DeepSeek with the
+  -- gateway's key.
+  fetch_usage = function(ctx)
+    local parsed, err = ctx.get_json(BALANCE_PATH)
     if err then
-      return parse.fail(err)
+      return nil, err
     end
 
     local limits = {}

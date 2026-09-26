@@ -1,8 +1,8 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
 use maki_config::providers::{
-    Protocol, ProviderDef, ProvidersConfig, ThinkingFields, resolve_api_key_env, resolve_base_url,
-    resolve_protocol,
+    ModelDef, Protocol, ProviderDef, ProvidersConfig, ThinkingFields, resolve_api_key_env,
+    resolve_base_url, resolve_protocol,
 };
 use serde_json::json;
 use tracing::warn;
@@ -12,7 +12,7 @@ use super::anthropic::shared;
 use super::catalog;
 use super::codec::{CodecOptions, protocol_spec};
 use crate::AgentError;
-use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
+use crate::model::{FastPricing, Model, ModelEntry, ModelInfo, ModelPricing, ModelTier};
 use crate::provider::Provider;
 use crate::providers::Timeouts;
 use crate::spec::{ProviderRegistry, ProviderSpec};
@@ -106,8 +106,39 @@ fn catalog_fallback_id<'a>(
         .then(|| shared::strip_long_context(model_id))
 }
 
+/// A `providers.toml` model as the row every declaration becomes. An unset
+/// pricing key reads as zero once any of them is set.
+impl From<&ModelDef> for ModelEntry {
+    fn from(def: &ModelDef) -> Self {
+        Self {
+            prefixes: vec![def.id.clone()],
+            tier: def.tier,
+            supports_tool_examples: def.supports_tool_examples,
+            supports_thinking: def.supports_thinking,
+            requires_thinking: def.requires_thinking.unwrap_or(false),
+            supports_vision: def.supports_vision,
+            max_output_tokens: def.max_output_tokens,
+            context_window: def.context_window,
+            pricing: def.has_pricing().then(|| ModelPricing {
+                input: def.pricing_input.unwrap_or(0.0),
+                output: def.pricing_output.unwrap_or(0.0),
+                cache_write: def.pricing_cache_write.unwrap_or(0.0),
+                cache_read: def.pricing_cache_read.unwrap_or(0.0),
+                fast: def.has_fast_pricing().then(|| FastPricing {
+                    input: def.pricing_fast_input.unwrap_or(0.0),
+                    output: def.pricing_fast_output.unwrap_or(0.0),
+                }),
+            }),
+            thinking_fields: def.thinking_fields.clone(),
+            family: None,
+            default: false,
+        }
+    }
+}
+
 /// Build a model from an already-loaded provider definition so tier resolution
 /// and id lookup can share one `providers.toml` read instead of loading twice.
+/// What the entry leaves out, discovery answers before the base spec does.
 fn model_from_def(
     def: &ProviderDef,
     base: &'static ProviderSpec,
@@ -115,45 +146,40 @@ fn model_from_def(
     model_id: &str,
 ) -> Model {
     let subsidy_source = def.subsidised_by.as_deref();
-    let declared = def.models.iter().find(|m| m.id == model_id);
-    let tier = declared
-        .map(|m| ModelTier::from(m.tier))
-        .unwrap_or(ModelTier::Medium);
+    let mut row = def
+        .models
+        .iter()
+        .find(|m| m.id == model_id)
+        .map(ModelEntry::from)
+        .unwrap_or_default();
     let discovered = crate::model_registry::discovered(slug, model_id);
     let discovered = discovered.as_ref();
-    let max_output_tokens = declared
-        .and_then(|m| m.max_output_tokens)
-        .or_else(|| discovered.and_then(|d| d.max_output_tokens))
-        .or(base.fallback_max_output);
+    row.max_output_tokens = row
+        .max_output_tokens
+        .or_else(|| discovered.and_then(|d| d.max_output_tokens));
     // Same precedence as the builtin path ([`Model::from_base`]): the `-1m`
     // suffix only stands in for a window nothing more specific reported, so a
     // proxy that answers /v1/models with its real cap still wins. Without this
     // arm a -1m variant on a custom Anthropic slug (cliproxy on Claude Max)
     // would read back as the 200K protocol default.
-    let context_window = declared
-        .and_then(|m| m.context_window)
+    row.context_window = row
+        .context_window
         .or_else(|| discovered.and_then(|d| d.context_window))
-        .or_else(|| shared::long_context_window(model_id))
-        .unwrap_or(base.fallback_context_window);
-    let supports_tool_examples_override = declared.and_then(|m| m.supports_tool_examples);
-    let declared_fields = declared.and_then(|m| m.thinking_fields.as_ref());
+        .or_else(|| shared::long_context_window(model_id));
     // Resolved here rather than left to `Model::supports_thinking`, which would
     // reach the same spec through `custom::base_spec` and so re-read
     // providers.toml on every call, and would answer from whatever the builtin
     // slug discovered for a colliding model id.
-    let thinking_override = ThinkingSupport::from_flags(
-        declared
-            .and_then(|m| m.supports_thinking)
-            // Spelling out how a model thinks is as good as saying that it does.
-            .or_else(|| declared_fields.map(|_| true))
-            .or(Some(base.supports_thinking)),
-        declared.and_then(|m| m.requires_thinking).unwrap_or(false),
-    );
+    row.supports_thinking = row
+        .supports_thinking
+        // Spelling out how a model thinks is as good as saying that it does.
+        .or_else(|| row.thinking_fields.as_ref().map(|_| true))
+        .or(Some(base.supports_thinking));
     // Only the openai chat path merges the fragments into the body: the
     // responses path has no thinking wiring yet, and anthropic and google spell
     // thinking their own way. Anywhere else they would vanish without a trace.
-    let thinking_fields = match declared_fields {
-        Some(fields) if def.protocol == Some(Protocol::Openai) => Some(Box::new(fields.clone())),
+    row.thinking_fields = match row.thinking_fields.take() {
+        Some(fields) if def.protocol == Some(Protocol::Openai) => Some(fields),
         Some(_) => {
             warn!(
                 slug,
@@ -163,54 +189,21 @@ fn model_from_def(
             );
             None
         }
-        None if def.protocol == Some(Protocol::Openai) => {
-            Some(Box::new(UNDECLARED_THINKING_FIELDS.clone()))
-        }
+        None if def.protocol == Some(Protocol::Openai) => Some(UNDECLARED_THINKING_FIELDS.clone()),
         None => None,
     };
-    let supports_vision_override = declared.and_then(|m| m.supports_vision);
-    let pricing = declared
-        .filter(|m| m.has_pricing())
-        .map(|m| ModelPricing {
-            input: m.pricing_input.unwrap_or(0.0),
-            output: m.pricing_output.unwrap_or(0.0),
-            cache_write: m.pricing_cache_write.unwrap_or(0.0),
-            cache_read: m.pricing_cache_read.unwrap_or(0.0),
-            fast: declared
-                .filter(|d| d.has_fast_pricing())
-                .map(|d| FastPricing {
-                    input: d.pricing_fast_input.unwrap_or(0.0),
-                    output: d.pricing_fast_output.unwrap_or(0.0),
-                }),
-        })
-        .unwrap_or_default();
     // A subsidised provider (Claude Max via cliproxy) rarely quotes its own
     // rates -- it is free at the point of use -- so fall back to the
     // published list price purely as the reference shown alongside the $0
     // bill.
-    let mut pricing = pricing;
-    if let Some(base_id) = catalog_fallback_id(base, &pricing, subsidy_source.is_some(), model_id)
-        && let Some(meta) = catalog::model_meta_if_available(super::anthropic::SLUG, base_id)
-        && let Some(list) = meta.pricing
-    {
-        pricing = list;
-    }
+    let pricing = row.pricing.take().unwrap_or_default();
+    row.pricing = catalog_fallback_id(base, &pricing, subsidy_source.is_some(), model_id)
+        .and_then(|base_id| catalog::model_meta_if_available(super::anthropic::SLUG, base_id))
+        .and_then(|meta| meta.pricing)
+        .or(Some(pricing));
     Model {
-        id: model_id.to_string(),
-        provider: Arc::from(slug),
-        tier,
-        family: base.family,
-        supports_tool_examples_override,
-        thinking_override,
-        supports_vision_override,
-        supports_fast_override: None,
-        pricing,
         subsidised_by: subsidy_source.map(Arc::from),
-        discovered_free: false,
-        max_output_tokens,
-        turn_output_tokens: None,
-        context_window,
-        thinking_fields,
+        ..row.to_model(slug, base, model_id.to_string())
     }
 }
 
@@ -260,7 +253,7 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
     let Some(base) = protocol_spec(protocol) else {
         return TierLookup::Unknown;
     };
-    match def.models.iter().find(|m| ModelTier::from(m.tier) == tier) {
+    match def.models.iter().find(|m| m.tier == tier) {
         Some(declared) => TierLookup::Model(model_from_def(def, base, slug, &declared.id)),
         None => TierLookup::NoModelForTier(base),
     }
@@ -315,7 +308,7 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
 fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
     for model in models {
         if let Some(declared) = def.models.iter().find(|m| m.id == model.id) {
-            model.tier = Some(ModelTier::from(declared.tier));
+            model.tier = Some(declared.tier);
         }
     }
 }

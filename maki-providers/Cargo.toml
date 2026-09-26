@@ -4,11 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-# The recorded loopback server in `test_support` and the golden replay harness
-# in `providers::replay`, for suites in other crates. The harness points the
-# base directories at a throwaway tree, which is what pulls in `tempfile`
-# outside `dev-dependencies`.
-test-support = ["dep:tempfile"]
+# The recorded loopback server in `test_support`, for suites in other crates.
+test-support = []
 
 [dependencies]
 serde = { workspace = true }
@@ -36,7 +33,6 @@ open = { workspace = true }
 keyring = { workspace = true }
 url = { workspace = true }
 toml = { workspace = true }
-tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

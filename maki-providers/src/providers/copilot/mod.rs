@@ -474,8 +474,9 @@ impl CopilotModel {
             return None;
         }
         let usd_per_million = AIC_TO_USD_PER_MILLION / batch_size;
-        let manifest_cache_write =
-            lookup_entry(SPEC.models(), &self.id).map_or(0.0, |entry| entry.pricing.cache_write);
+        let manifest_cache_write = lookup_entry(SPEC.models(), &self.id)
+            .and_then(|entry| entry.pricing.as_ref())
+            .map_or(0.0, |pricing| pricing.cache_write);
         Some(ModelPricing::per_million(
             default.input_price * usd_per_million,
             default.output_price * usd_per_million,

@@ -1,0 +1,83 @@
+{
+  "call": {
+    "endpoint": "usage"
+  },
+  "script": [
+    {
+      "path": "/key/info",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"key\":\"88dc28d0f030c55ed4ab77ed8faf0981\",\"info\":{\"key_name\":\"sk-...abcd\",\"key_alias\":\"me@example.com\",\"spend\":0.125,\"max_budget\":0.375,\"budget_duration\":\"30d\",\"budget_reset_at\":\"2026-10-01T02:00:00.25+02:00\",\"models\":[],\"metadata\":{}}}"
+    },
+    {
+      "path": "/global/activity",
+      "status": 500,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":{\"message\":\"internal server error\"}}"
+    },
+    {
+      "path": "/spend/logs/v2",
+      "status": 500,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":{\"message\":\"internal server error\"}}"
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "usage": {
+        "limits": [
+          {
+            "detail": "$0.12 spent of $0.38 budget",
+            "label": "Spend",
+            "percentage": 33,
+            "reset_at": 1790812800250
+          }
+        ]
+      }
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/global/activity?start_date=<today>&end_date=<today>"
+      },
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/key/info"
+      },
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/spend/logs/v2?start_date=<today>&end_date=<today>"
+      }
+    ]
+  }
+}

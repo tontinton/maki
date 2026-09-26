@@ -5,12 +5,11 @@
 
 local parse = require("maki.provider_parse")
 
-local SLUG = "regolo"
 local MODELS_PATH = "/models"
 -- The management endpoints live at the host root, outside the versioned API.
 -- They are reached through the configured origin with the version stripped,
--- never through an absolute url, so a gateway in front of Regolo keeps serving
--- them instead of being bypassed with the key meant for it.
+-- never through a hard-coded one, so a gateway in front of Regolo keeps
+-- serving them instead of being bypassed with the key meant for it.
 local VERSION_SEGMENT = "/v1"
 local MODEL_GROUP_INFO_PATH = "/model_group/info"
 local KEY_INFO_PATH = "/key/info"
@@ -19,8 +18,8 @@ local ACTIVITY_PATH = "/global/activity"
 -- One row per model per hour, so rows are summed per model.
 local SPEND_LOGS_PATH = "/spend/logs/v2"
 local CHAT_MODE = "chat"
--- Prices and spend arrive in dollars per token, rows want them per million.
-local PER_MILLION = 1000000
+-- Spend arrives in dollars, rows want it in microdollars.
+local MICRODOLLARS_PER_DOLLAR = 1000000
 local U32_MAX = 4294967295
 local SECONDS_PER_DAY = 86400
 local MILLIS_PER_SECOND = 1000
@@ -44,8 +43,8 @@ end
 
 -- A side answer the caller can do without: a failed request, a status other
 -- than 200 or a shape `read` refuses all read as no answer.
-local function fetch_optional(auth, url, read)
-  local body = parse.get_json(auth, url)
+local function fetch_optional(ctx, url, read)
+  local body = ctx.get_json(url)
   if type(body) ~= "table" then
     return nil
   end
@@ -122,16 +121,6 @@ local function join(listed, groups)
   for _, row in ipairs(listed) do
     local group = by_group[row.id]
     if group then
-      -- Half a price is no price: without both sides it would read as free.
-      local pricing
-      if group.input_cost_per_token ~= nil and group.output_cost_per_token ~= nil then
-        pricing = {
-          input = group.input_cost_per_token * PER_MILLION,
-          output = group.output_cost_per_token * PER_MILLION,
-          cache_write = 0,
-          cache_read = 0,
-        }
-      end
       local context = group.max_input_tokens
       if context == nil then
         context = group.max_tokens
@@ -140,7 +129,7 @@ local function join(listed, groups)
         id = row.id,
         context_window = window(context),
         max_output_tokens = window(group.max_output_tokens),
-        pricing = pricing,
+        pricing = parse.pricing(group.input_cost_per_token, group.output_cost_per_token),
         supports_thinking = group.supports_reasoning,
         supports_vision = group.supports_vision,
       })
@@ -227,7 +216,7 @@ local function spend_rows(body)
       input_tokens = acc.input,
       output_tokens = acc.output,
       total_tokens = acc.total,
-      spend_microdollars = math.max(0, math.round(acc.spend * PER_MILLION)),
+      spend_microdollars = math.max(0, math.round(acc.spend * MICRODOLLARS_PER_DOLLAR)),
     })
   end
   table.sort(rows, function(a, b)
@@ -247,7 +236,7 @@ local function settled(result)
 end
 
 maki.provider.register({
-  slug = SLUG,
+  slug = "regolo",
   codec = "openai",
   openai = {
     max_tokens_field = "max_completion_tokens",
@@ -256,15 +245,14 @@ maki.provider.register({
 
   -- The group metadata is optional: the endpoint has 500ed in the wild, and
   -- the live ids beat the static few.
-  list_models = function()
-    local auth = assert(maki.provider.auth.resolved(SLUG))
-    local body, err = parse.get_json(auth, auth.base_url .. MODELS_PATH)
+  list_models = function(ctx)
+    local body, err = ctx.get_json(MODELS_PATH)
     if err then
-      return parse.fail(err)
+      return nil, err
     end
     local listed = parse.models(body, listed_id)
 
-    local groups = fetch_optional(auth, root_url(auth.base_url) .. MODEL_GROUP_INFO_PATH, parse_groups)
+    local groups = fetch_optional(ctx, root_url(ctx.base_url) .. MODEL_GROUP_INFO_PATH, parse_groups)
     if groups then
       return join(listed, groups)
     end
@@ -274,22 +262,21 @@ maki.provider.register({
   -- The key's spend is the report and its failure is the hook's. Today's
   -- activity and per-model spend go out together once the key answered, and
   -- each is dropped on its own when it fails.
-  fetch_usage = function()
-    local auth = assert(maki.provider.auth.resolved(SLUG))
-    local root = root_url(auth.base_url)
-    local body, err = parse.get_json(auth, root .. KEY_INFO_PATH)
+  fetch_usage = function(ctx)
+    local root = root_url(ctx.base_url)
+    local body, err = ctx.get_json(root .. KEY_INFO_PATH)
     if err then
-      return parse.fail(err)
+      return nil, err
     end
     local spend = assert(spend_limit(type(body) == "table" and body.info), MALFORMED_KEY_INFO)
 
     local today = os.date(UTC_DAY_FORMAT)
     local side = maki.async.gather({
       function()
-        return fetch_optional(auth, day_url(root, ACTIVITY_PATH, today), activity_limit)
+        return fetch_optional(ctx, day_url(root, ACTIVITY_PATH, today), activity_limit)
       end,
       function()
-        return fetch_optional(auth, day_url(root, SPEND_LOGS_PATH, today), spend_rows)
+        return fetch_optional(ctx, day_url(root, SPEND_LOGS_PATH, today), spend_rows)
       end,
     })
     local limits = { spend }

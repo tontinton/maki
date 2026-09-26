@@ -9,33 +9,7 @@ local M = {}
 
 local U32_MAX = 4294967295
 local U64_MAX = 2 ^ 64
-local HTTP_OK = 200
--- A side call that failed is reported, not replayed: a retried 5xx would be
--- extra requests nobody asked for.
-local NO_RETRY = 0
-
---- A GET with the provider's resolved `auth`, never retried. Returns the
---- decoded body. On failure returns nil and an error for `M.fail`.
-function M.get_json(auth, url)
-  local res, err = maki.net.request(url, { headers = auth.headers, retry = NO_RETRY })
-  if not res then
-    return nil, err
-  end
-  if res.status ~= HTTP_OK then
-    return nil, maki.provider.http_error(res)
-  end
-  return maki.json.decode(res.body)
-end
-
---- Hands a `M.get_json` error back from a hook. A refused request is returned,
---- so it fails the way the native provider does. Anything else never got an
---- HTTP status and is raised.
-function M.fail(err)
-  if type(err) == "string" then
-    error(err, 0)
-  end
-  return nil, err
-end
+local PER_MILLION = 1000000
 
 local function whole(value, max)
   if type(value) ~= "number" or value ~= math.floor(value) or value < 0 or value > max then
@@ -68,6 +42,21 @@ function M.as_bool(value)
     return nil
   end
   return value
+end
+
+--- A model row's `pricing` from per-token prices, in dollars per million
+--- tokens. Half a price is no price: without both `input` and `output` it
+--- would read as free, so the answer is nil. A missing cache price is 0.
+function M.pricing(input, output, cache_write, cache_read)
+  if input == nil or output == nil then
+    return nil
+  end
+  return {
+    input = input * PER_MILLION,
+    output = output * PER_MILLION,
+    cache_write = (cache_write or 0) * PER_MILLION,
+    cache_read = (cache_read or 0) * PER_MILLION,
+  }
 end
 
 --- Each `body.data` element through `parse_row`, nils dropped, the first row

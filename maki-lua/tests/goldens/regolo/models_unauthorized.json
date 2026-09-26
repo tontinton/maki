@@ -1,0 +1,43 @@
+{
+  "call": {
+    "endpoint": "models"
+  },
+  "script": [
+    {
+      "path": "/v1/models",
+      "status": 401,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":{\"message\":\"Authentication Error, Invalid proxy server token passed.\"}}"
+    },
+    {
+      "path": "/model_group/info",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"data\":[\n        {\"model_group\":\"glm5.2\",\"mode\":\"chat\",\"input_cost_per_token\":2e-06,\"output_cost_per_token\":5.2e-06,\"max_input_tokens\":96000.0,\"max_output_tokens\":96000.0,\"max_tokens\":null,\"supports_reasoning\":true,\"supports_vision\":false},\n        {\"model_group\":\"qwen3-coder-next\",\"mode\":\"chat\",\"input_cost_per_token\":5e-07,\"output_cost_per_token\":2e-06,\"max_input_tokens\":null,\"max_output_tokens\":120000,\"max_tokens\":240000.0,\"supports_reasoning\":false,\"supports_vision\":true,\"supports_function_calling\":true},\n        {\"model_group\":\"qwen3.5-9b\",\"mode\":\"chat\",\"input_cost_per_token\":7e-08,\"output_cost_per_token\":3.5e-07,\"max_input_tokens\":80000.7,\"max_output_tokens\":120000.0,\"max_tokens\":200000.0,\"supports_reasoning\":true,\"supports_vision\":false},\n        {\"model_group\":\"gpt-oss-120b\",\"mode\":\"chat\",\"input_cost_per_token\":1.25e-07,\"output_cost_per_token\":6.25e-07,\"max_input_tokens\":131072,\"max_output_tokens\":null,\"max_tokens\":null,\"supports_reasoning\":true,\"supports_vision\":false},\n        {\"model_group\":\"llama-huge\",\"mode\":\"chat\",\"input_cost_per_token\":1e-06,\"output_cost_per_token\":1e-06,\"max_input_tokens\":5000000000.0,\"max_output_tokens\":4294967296,\"max_tokens\":131072.0,\"supports_reasoning\":false,\"supports_vision\":false},\n        {\"model_group\":\"legacy-negative\",\"mode\":\"chat\",\"input_cost_per_token\":-1e-06,\"output_cost_per_token\":0.0,\"max_input_tokens\":-1.0,\"max_output_tokens\":-512,\"max_tokens\":null,\"supports_reasoning\":false,\"supports_vision\":false},\n        {\"model_group\":\"half-priced\",\"mode\":\"chat\",\"input_cost_per_token\":1e-06,\"output_cost_per_token\":null,\"max_input_tokens\":null,\"max_output_tokens\":null,\"max_tokens\":null,\"supports_reasoning\":false,\"supports_vision\":false},\n        {\"model_group\":\"Qwen3-Embedding-8B\",\"mode\":\"embedding\",\"input_cost_per_token\":0.0,\"output_cost_per_token\":0.0,\"max_input_tokens\":32000.0,\"max_output_tokens\":null,\"max_tokens\":null,\"supports_reasoning\":false,\"supports_vision\":false},\n        {\"model_group\":\"orphan-chat\",\"mode\":\"chat\",\"input_cost_per_token\":1e-06,\"output_cost_per_token\":1e-06,\"max_input_tokens\":8192.0,\"max_output_tokens\":8192.0,\"max_tokens\":null,\"supports_reasoning\":false,\"supports_vision\":false},\n        {\"model_group\":\"glm5.2\",\"mode\":\"chat\",\"input_cost_per_token\":2e-06,\"output_cost_per_token\":5.2e-06,\"max_input_tokens\":64000.0,\"max_output_tokens\":32000.0,\"max_tokens\":null,\"supports_reasoning\":true,\"supports_vision\":true},\n        {\"model_group\":\"glm5.2\",\"mode\":\"rerank\",\"input_cost_per_token\":null,\"output_cost_per_token\":null,\"max_input_tokens\":null,\"max_output_tokens\":null,\"max_tokens\":null,\"supports_reasoning\":false,\"supports_vision\":false}\n    ]}"
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "error": "Api { status: 401, retry_after: None, overflow: None, quota_exhausted: false, auth_error: true }",
+      "message": "API error (401): {\"error\":{\"message\":\"Authentication Error, Invalid proxy server token passed.\"}}"
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/v1/models"
+      }
+    ]
+  }
+}

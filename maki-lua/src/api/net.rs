@@ -14,6 +14,7 @@ use maki_providers::Timeouts;
 use mlua::{Lua, Result as LuaResult, Table};
 use regex::bytes::Regex;
 use smol::{Timer, unblock};
+use thiserror::Error;
 use url::Url;
 
 use crate::api::util::pair::{Pair, try_pair};
@@ -24,6 +25,10 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_MAX_BYTES: usize = 5 * 1024 * 1024;
 const MAX_RETRIES: u32 = 3;
+/// What a provider hook's GET retries: the codec's own side requests never do.
+const PROVIDER_GET_RETRIES: u32 = 0;
+const GET: &str = "GET";
+const NO_ATTEMPT: &str = "no request was attempted";
 const MAX_REDIRECTS: u32 = 10;
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const CF_MITIGATED: &str = "cf-mitigated";
@@ -246,11 +251,30 @@ impl Route {
     }
 }
 
-struct ResponseData {
-    body: String,
-    status: u16,
+pub(crate) struct ResponseData {
+    pub(crate) body: String,
+    pub(crate) status: u16,
     content_type: String,
-    headers: Vec<(String, String)>,
+    pub(crate) headers: Vec<(String, String)>,
+}
+
+/// Why a request came back without a response, split the way a provider
+/// classifies it: a transport failure reads as the codec's own would.
+#[derive(Debug, Error)]
+pub(crate) enum NetError {
+    /// Refused by maki before or between hops, or a response it will not read.
+    #[error("{0}")]
+    Refused(String),
+    #[error("request failed: {0}")]
+    Transport(isahc::Error),
+    #[error("read error: {0}")]
+    Read(io::Error),
+}
+
+impl From<String> for NetError {
+    fn from(message: String) -> Self {
+        Self::Refused(message)
+    }
 }
 
 impl ResponseData {
@@ -401,7 +425,7 @@ async fn extract_request_params(
 
     let method = opts
         .and_then(|o| o.get::<String>("method").ok())
-        .unwrap_or_else(|| "GET".to_string());
+        .unwrap_or_else(|| GET.to_owned());
 
     let headers = if let Some(tbl) = opts.and_then(|o| o.get::<Table>("headers").ok()) {
         let mut h = Vec::new();
@@ -487,10 +511,10 @@ fn build_request(
 async fn send_with_retries(
     client: &HttpClient,
     params: &RequestParams,
-) -> Result<Response<AsyncBody>, String> {
-    let is_get = params.method.eq_ignore_ascii_case("GET");
+) -> Result<Response<AsyncBody>, NetError> {
+    let is_get = params.method.eq_ignore_ascii_case(GET);
     let (user_agent, fallback_user_agent) = params.route.user_agents();
-    let mut last_err = String::new();
+    let mut last_err = None;
 
     'retry: {
         for attempt in 0..=params.retries {
@@ -524,19 +548,18 @@ async fn send_with_retries(
                         )?;
                         match client.send_async(req).await {
                             Ok(resp) => break 'retry Ok(resp),
-                            Err(e) => last_err = format!("request failed: {e}"),
+                            Err(e) => last_err = Some(e),
                         }
                     } else if status >= 500 && attempt < params.retries {
-                        last_err = format!("HTTP {status}");
                         continue;
                     } else {
                         break 'retry Ok(resp);
                     }
                 }
-                Err(e) => last_err = format!("request failed: {e}"),
+                Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err)
+        Err(last_err.map_or_else(|| NO_ATTEMPT.to_owned().into(), NetError::Transport))
     }
 }
 
@@ -693,7 +716,31 @@ fn keep_lines_matching(body: &[u8], pattern: &Regex) -> Vec<u8> {
     kept
 }
 
-async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
+/// The GET behind a provider hook's `ctx.get_json`: vetted, pooled and routed
+/// exactly as `maki.net.request` would send it.
+pub(crate) async fn provider_get(
+    url: &str,
+    headers: Vec<(String, String)>,
+    egress: NetEgress,
+) -> Result<ResponseData, NetError> {
+    let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
+    let (url, route) = vet(url, &allowed, &egress).await?;
+    do_request(RequestParams {
+        url,
+        method: GET.to_owned(),
+        headers,
+        body: Vec::new(),
+        timeout: None,
+        max_bytes: DEFAULT_MAX_BYTES,
+        retries: PROVIDER_GET_RETRIES,
+        line_match: None,
+        route,
+        egress,
+    })
+    .await
+}
+
+async fn do_request(mut params: RequestParams) -> Result<ResponseData, NetError> {
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
     let client = pooled_client(&params)?;
     let mut response = send_with_retries(&client, &params).await?;
@@ -709,7 +756,7 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
         response = send_with_retries(&client, &params).await?;
     }
     if redirect_location(&response).is_some() {
-        return Err(format!("gave up after {MAX_REDIRECTS} redirects"));
+        return Err(format!("gave up after {MAX_REDIRECTS} redirects").into());
     }
 
     let status = response.status().as_u16();
@@ -728,7 +775,7 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
         .and_then(|v| v.parse::<usize>().ok())
         && len > params.max_bytes
     {
-        return Err(format!("response too large: {len} bytes"));
+        return Err(format!("response too large: {len} bytes").into());
     }
 
     let mut bytes = Vec::new();
@@ -737,10 +784,10 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
         .take((params.max_bytes + 1) as u64)
         .read_to_end(&mut bytes)
         .await
-        .map_err(|e| format!("read error: {e}"))?;
+        .map_err(NetError::Read)?;
 
     if bytes.len() > params.max_bytes {
-        return Err(format!("response too large: {} bytes", bytes.len()));
+        return Err(format!("response too large: {} bytes", bytes.len()).into());
     }
 
     let bytes = match &params.line_match {

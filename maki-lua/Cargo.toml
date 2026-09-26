@@ -91,6 +91,7 @@ rustix = { workspace = true }
 base64 = { workspace = true }
 criterion = { workspace = true }
 image = { workspace = true }
+jiff = { workspace = true }
 maki-agent = { workspace = true }
 maki-providers = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }

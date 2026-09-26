@@ -1,0 +1,51 @@
+{
+  "call": {
+    "endpoint": "usage"
+  },
+  "script": [
+    {
+      "path": "/key/info",
+      "status": 401,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":{\"message\":\"Authentication Error, Invalid proxy server token passed.\"}}"
+    },
+    {
+      "path": "/global/activity",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"daily_data\":[{\"date\":\"2026-09-23\",\"metrics\":{\"api_requests\":14,\"total_tokens\":5000000000}}],\"sum_api_requests\":14,\"sum_total_tokens\":5000000000}"
+    },
+    {
+      "path": "/spend/logs/v2",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"data\":[\n        {\"request_id\":\"h1\",\"api_key\":\"k\",\"model_group\":\"gpt-oss-120b\",\"key_alias\":\"a\",\"startTime\":\"2026-09-23T09:00:00+00:00\",\"endTime\":\"2026-09-23T10:00:00+00:00\",\"completionStartTime\":null,\"api_requests\":1,\"prompt_tokens\":1000,\"completion_tokens\":200,\"total_tokens\":1200,\"spend\":0.0009,\"request_duration_ms\":3600000},\n        {\"request_id\":\"h2\",\"api_key\":\"k\",\"model_group\":\"qwen3-coder-next\",\"key_alias\":\"a\",\"startTime\":\"2026-09-23T09:00:00+00:00\",\"endTime\":\"2026-09-23T10:00:00+00:00\",\"completionStartTime\":null,\"api_requests\":4,\"prompt_tokens\":15000,\"completion_tokens\":5000,\"total_tokens\":20000,\"spend\":0.01,\"request_duration_ms\":3600000},\n        {\"request_id\":\"h3\",\"api_key\":\"k\",\"model_group\":\"glm5.2\",\"key_alias\":\"a\",\"startTime\":\"2026-09-23T09:00:00+00:00\",\"endTime\":\"2026-09-23T10:00:00+00:00\",\"completionStartTime\":null,\"api_requests\":1,\"prompt_tokens\":120,\"completion_tokens\":80,\"total_tokens\":200,\"spend\":0.0004,\"request_duration_ms\":3600000},\n        {\"request_id\":\"h4\",\"api_key\":\"k\",\"model_group\":\"qwen3-coder-next\",\"key_alias\":\"a\",\"startTime\":\"2026-09-23T10:00:00+00:00\",\"endTime\":\"2026-09-23T11:00:00+00:00\",\"completionStartTime\":null,\"api_requests\":3,\"prompt_tokens\":5000,\"completion_tokens\":3000,\"total_tokens\":8000,\"spend\":0.0042,\"request_duration_ms\":3600000},\n        {\"request_id\":\"h5\",\"api_key\":\"k\",\"model_group\":\"glm5.2\",\"key_alias\":\"a\",\"startTime\":\"2026-09-23T10:00:00+00:00\",\"endTime\":\"2026-09-23T11:00:00+00:00\",\"completionStartTime\":null,\"api_requests\":1,\"prompt_tokens\":80,\"completion_tokens\":80,\"total_tokens\":160,\"spend\":0.0005,\"request_duration_ms\":3600000},\n        {\"request_id\":\"h6\",\"api_key\":\"k\",\"model_group\":\"qwen3.5-9b\",\"key_alias\":\"a\",\"startTime\":\"2026-09-23T11:00:00+00:00\",\"endTime\":\"2026-09-23T12:00:00+00:00\",\"completionStartTime\":null,\"api_requests\":1,\"prompt_tokens\":4294967296,\"completion_tokens\":1,\"total_tokens\":4294967297,\"spend\":0.0000125,\"request_duration_ms\":3600000},\n        {\"request_id\":\"h7\",\"api_key\":\"k\",\"model_group\":\"llama-refund\",\"key_alias\":\"a\",\"startTime\":\"2026-09-23T11:00:00+00:00\",\"endTime\":\"2026-09-23T12:00:00+00:00\",\"completionStartTime\":null,\"api_requests\":0,\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0,\"spend\":-0.0005,\"request_duration_ms\":3600000}\n    ]}"
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "error": "Api { status: 401, retry_after: None, overflow: None, quota_exhausted: false, auth_error: true }",
+      "message": "API error (401): {\"error\":{\"message\":\"Authentication Error, Invalid proxy server token passed.\"}}"
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/key/info"
+      }
+    ]
+  }
+}

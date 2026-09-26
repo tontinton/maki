@@ -1,0 +1,136 @@
+{
+  "call": {
+    "endpoint": "models"
+  },
+  "script": [
+    {
+      "path": "/v1/models",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"object\":\"list\",\"data\":[\n        {\"id\":\"qwen3.5-9b\",\"object\":\"model\",\"owned_by\":\"regolo\",\"context_length\":4096},\n        {\"id\":\"glm5.2\",\"object\":\"model\"},\n        {\"id\":\"Qwen3-Embedding-8B\",\"object\":\"model\"},\n        {\"id\":\"qwen3-coder-next\",\"object\":\"model\"},\n        {\"id\":\"gpt-oss-120b\",\"object\":\"model\"},\n        {\"id\":\"glm5.2\",\"object\":\"model\"},\n        {\"id\":\"llama-huge\",\"object\":\"model\"},\n        {\"id\":\"brand-new-model\",\"object\":\"model\"},\n        {\"id\":\"legacy-negative\",\"object\":\"model\"},\n        {\"id\":\"half-priced\",\"object\":\"model\"},\n        {\"id\":null,\"object\":\"model\"},\n        {\"object\":\"model\"},\n        {\"id\":42,\"object\":\"model\"}\n    ]}"
+    },
+    {
+      "path": "/model_group/info",
+      "status": 500,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":{\"message\":\"internal server error\"}}"
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "models": [
+        {
+          "context_window": null,
+          "id": "Qwen3-Embedding-8B",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "brand-new-model",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "glm5.2",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "gpt-oss-120b",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "half-priced",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "legacy-negative",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "llama-huge",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "qwen3-coder-next",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "qwen3.5-9b",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        }
+      ]
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/model_group/info"
+      },
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/v1/models"
+      }
+    ]
+  }
+}

@@ -8,10 +8,7 @@
 
 local parse = require("maki.provider_parse")
 
-local SLUG = "openrouter"
 local MODELS_PATH = "/models"
--- Prices arrive per token, a row wants dollars per million.
-local PER_MILLION = 1000000
 local TEXT_MODALITY = "text"
 local IMAGE_MODALITY = "image"
 local REASONING_PARAMETER = "reasoning"
@@ -27,30 +24,25 @@ local function lists(modalities, wanted)
   return false
 end
 
-local function per_million(prices, key)
+-- Prices arrive per token as decimal strings.
+local function per_token(prices, key)
   local value = prices[key]
   if type(value) ~= "string" then
     return nil
   end
-  local parsed = tonumber(value)
-  return parsed and parsed * PER_MILLION
+  return tonumber(value)
 end
 
--- A price we cannot read leaves the pricing unknown rather than free.
 local function pricing_of(prices)
   if type(prices) ~= "table" then
     return nil
   end
-  local input, output = per_million(prices, "prompt"), per_million(prices, "completion")
-  if not (input and output) then
-    return nil
-  end
-  return {
-    input = input,
-    output = output,
-    cache_write = per_million(prices, "input_cache_write") or 0,
-    cache_read = per_million(prices, "input_cache_read") or 0,
-  }
+  return parse.pricing(
+    per_token(prices, "prompt"),
+    per_token(prices, "completion"),
+    per_token(prices, "input_cache_write"),
+    per_token(prices, "input_cache_read")
+  )
 end
 
 -- The `reasoning` block in its three states: mandatory (always on, Off sends
@@ -102,7 +94,7 @@ local function parse_model(m)
 end
 
 maki.provider.register({
-  slug = SLUG,
+  slug = "openrouter",
   codec = "openai",
   openai = {
     thinking = { dialect = "prefer-high", field = "reasoning.effort", requires_support = true },
@@ -113,11 +105,10 @@ maki.provider.register({
     session_id = { body_field = "session_id" },
   },
 
-  list_models = function()
-    local auth = assert(maki.provider.auth.resolved(SLUG))
-    local body, err = parse.get_json(auth, auth.base_url .. MODELS_PATH)
+  list_models = function(ctx)
+    local body, err = ctx.get_json(MODELS_PATH)
     if err then
-      return parse.fail(err)
+      return nil, err
     end
     return parse.models(body, parse_model)
   end,

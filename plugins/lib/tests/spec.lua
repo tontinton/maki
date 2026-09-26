@@ -1731,6 +1731,16 @@ case("provider_parse_as_f64_and_as_bool_take_only_their_type", function()
   eq(parse.as_bool(doc.str), nil)
 end)
 
+case("provider_parse_pricing_needs_both_sides", function()
+  eq(parse.pricing(1e-6, nil), nil, "no output price")
+  eq(parse.pricing(nil, 2e-6), nil, "no input price")
+  local pricing = assert(parse.pricing(1e-6, 2e-6, nil, 5e-7))
+  eq(pricing.input, 1)
+  eq(pricing.output, 2)
+  eq(pricing.cache_write, 0, "a missing cache price")
+  eq(pricing.cache_read, 0.5)
+end)
+
 case("provider_parse_models_keeps_the_first_row_per_id_sorted", function()
   local body = assert(maki.json.decode([[{"data": [
     {"id": "b", "n": 1}, {"id": "a"}, {"id": "b", "n": 2}, {"n": 3}, "stray"

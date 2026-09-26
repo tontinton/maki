@@ -588,23 +588,32 @@ Every callback is optional. A registration with none is a static provider that r
 
 | Field | Signature | When it runs |
 |-------|-----------|--------------|
-| `resolve_auth` | `function(purpose)` | Once, lazily, before the first request |
-| `refresh_auth` | `function(purpose)` | After a 401, before one silent retry |
-| `reload_auth` | `function(purpose)` | When Maki re-reads what a login wrote |
-| `list_models` | `function()` | Model listing: the picker, `maki models` |
-| `build_body` | `function(body, model, opts)` | Every request, on the final body |
-| `map_error` | `function(status, message)` | On an API error, before it reaches the UI |
-| `fetch_usage` | `function()` | Quota and usage display |
+| `auth` | `function(ctx, purpose)` | `"resolve"` once, lazily, before the first request. `"refresh"` after a 401, before one silent retry. `"reload"` when Maki re-reads what a login wrote |
+| `list_models` | `function(ctx)` | Model listing: the picker, `maki models` |
+| `build_body` | `function(ctx, body, model, opts)` | Every request, on the final body |
+| `map_error` | `function(ctx, status, message)` | On an API error, before it reaches the UI |
+| `fetch_usage` | `function(ctx)` | Quota and usage display |
 | `login` | `function(ctx)` | `maki auth login <slug>` |
 | `logout` | `function(ctx)` | `maki auth logout <slug>` |
 
-The three auth entries are one hook with three purposes. Whichever entries you write serve the rest, so a plugin that reads its credentials fresh every time can write `resolve_auth` alone and get refresh and reload for free. They return `{ base_url = ..., headers = { ... } }`, and omitting `base_url` keeps the one already in force.
+Every callback gets a `ctx` table first, read when the call starts:
 
-An auth hook may write the store as well as read it. Maki holds the cross-process lock on that provider's credentials while `resolve` and `refresh` run, and a `maki.provider.auth.set` inside one re-enters that lock instead of waiting on it, so a `refresh_auth` that rotates a token can persist what it minted.
+| Field | What it holds |
+|-------|---------------|
+| `ctx.slug` | The slug the callback serves |
+| `ctx.base_url` | The origin a request would reach right now: an origin `auth` returned, then `<SLUG>_BASE_URL` or `providers.toml`, then the declared `base_url` |
+| `ctx.headers` | The headers every request to the slug carries, as a snapshot |
+| `ctx.get_json(target)` | A GET with `ctx.headers`. A `target` starting with `/` is appended to `ctx.base_url`, an absolute url is sent as is. Returns the decoded body, or nil and an error the callback can return as its own |
+
+`ctx.get_json` goes out under the same host rules as `maki.net.request` and never retries. An error status and a connection that failed both come back as the error a built-in provider raises for them, so `return nil, err` keeps retries and `Retry-After` working. Reading `ctx.base_url` rather than writing an origin into the plugin keeps a side call on the same gateway as the chat requests when a user points the slug somewhere else.
+
+`auth` returns `{ base_url = ..., headers = { ... } }`, and omitting `base_url` keeps the one already in force. A plugin that reads its credentials fresh every time can ignore `purpose`.
+
+An auth hook may write the store as well as read it. Maki holds the cross-process lock on that provider's credentials during `resolve` and `refresh`, and a `maki.provider.auth.set` inside the hook re-enters that lock instead of waiting on it, so a refresh that rotates a token can persist what it minted.
 
 Credentials resolve lazily, on the first request that needs them. A plugin provider whose credentials are missing or expired stays in the picker and fails when you send a message, the same as a built-in provider with an unset API key. Provider scripts behaved the other way round: a `resolve` that failed took the provider out of the list, so a stale token looked like a missing provider.
 
-Writing a `login` function is what makes the slug an auth target. There is no `has_auth` flag: a provider with `login` appears in `maki auth login`, one without it is an API-key provider and says so when asked to log in. The `ctx` handed to `login` and `logout` speaks to the terminal with `ctx.print(text)`, `ctx.prompt({ label = ..., secret = true })` and `ctx.open_url(url)`. Call them with a dot, since `ctx` is a plain table of functions.
+Writing a `login` function is what makes the slug an auth target. There is no `has_auth` flag: a provider with `login` appears in `maki auth login`, one without it is an API-key provider and says so when asked to log in. The `ctx` handed to `login` and `logout` also speaks to the terminal with `ctx.print(text)`, `ctx.prompt({ label = ..., secret = true })` and `ctx.open_url(url)`. Call them with a dot, since `ctx` is a plain table of functions.
 
 `map_error` returns `{ status = ..., message = ... }`, or nil to keep the error as it was. Those two fields are all it can change. It cannot set `retry_after`, which is what the server asked for in the response header, and it cannot decide whether an error is retryable, which Maki derives from the status. Use it to turn an opaque vendor body into a message a person can act on.
 
@@ -639,14 +648,12 @@ Earlier versions loaded executable scripts from the config `providers/` director
 |-------------------|-----|
 | `info` returning `display_name`, `base`, `system_prefix`, `has_auth` | The same fields on the registration table. `has_auth` is gone, because a `login` function is what makes the provider an auth target |
 | `models` returning model rows | The static `models` table. `id` becomes `prefixes`, a list, which is what the field always was: `id = "acme"` becomes `prefixes = { "acme" }` and matches the same ids |
-| `resolve` | `resolve_auth` |
-| `refresh` | `refresh_auth` |
-| `reload` | `reload_auth` |
+| `resolve`, `refresh`, `reload` | `auth = function(ctx, purpose)`, with `purpose` naming the subcommand |
 | `login` over inherited stdio | `login = function(ctx)`, using `ctx.print`, `ctx.prompt` and `ctx.open_url` |
 | `logout` over inherited stdio | `logout = function(ctx)` |
 | No equivalent | `build_body`, `map_error`, `fetch_usage`, `list_models` |
 
-A script that stored its credentials in its own file can keep them. Import that file the first time `resolve_auth` runs and hand it to Maki:
+A script that stored its credentials in its own file can keep them. Import that file the first time `auth` runs and hand it to Maki:
 
 ```lua
 local function credentials()
@@ -675,8 +682,7 @@ Its manifest:
 ```toml
 [permissions]
 net = true
-env = true
-net_hosts = ["api.acme.example", "127.0.0.1"]
+net_hosts = ["api.acme.example"]
 ```
 
 The plugin itself:
@@ -685,27 +691,29 @@ The plugin itself:
 -- An OpenAI-compatible provider written entirely in Lua.
 --
 -- Every hook `maki.provider.register` accepts appears once, with the reason it
--- exists, so this file doubles as the worked example in the plugin docs.
+-- exists, so this file doubles as the worked example in the plugin docs. Each
+-- one is handed a `ctx` first, which knows the slug, the origin in force and
+-- the headers every request carries.
 
-local SLUG = "acmelua"
 local ANONYMOUS = "anonymous"
-local BASE_URL = maki.uv.os_getenv("ACME_BASE_URL") or "https://api.acme.example/v1"
+local REFRESH = "refresh"
+local MODELS_PATH = "/models"
 
 -- The token `login` stored, or none at all.
-local function stored_token()
-  local stored = maki.provider.auth.get(SLUG)
+local function stored_token(slug)
+  local stored = maki.provider.auth.get(slug)
   return (stored and stored.token) or ANONYMOUS
 end
 
-local function lease(token)
-  return { base_url = BASE_URL, headers = { authorization = "Bearer " .. token } }
+local function bearer(token)
+  return { headers = { authorization = "Bearer " .. token } }
 end
 
 maki.provider.register({
-  slug = SLUG,
+  slug = "acmelua",
   display_name = "Acme (Lua)",
   codec = "openai",
-  base_url = BASE_URL,
+  base_url = "https://api.acme.example/v1",
   -- Prepended to whatever system prompt maki assembled, so house rules the
   -- provider needs ride along without the agent having to know about them.
   system_prefix = "Acme house rules: answer in full sentences.",
@@ -724,43 +732,49 @@ maki.provider.register({
     },
   },
 
-  -- Called once, lazily, before the first request of the session.
-  resolve_auth = function()
-    return lease(stored_token())
-  end,
-
-  -- Called after a 401 that arrived before any output. An Acme lease is single
-  -- use, so the stored credential buys the next one instead of being resent,
-  -- and the new one is stored right here: maki holds this provider's credential
-  -- lock while the hook runs and lets the hook itself back in through it.
-  refresh_auth = function()
-    local renewed = stored_token() .. "-renewed"
-    maki.provider.auth.set(SLUG, { token = renewed })
-    return lease(renewed)
-  end,
-
-  -- Called when the store changed underneath us, e.g. after `maki auth login`
-  -- ran in another process.
-  reload_auth = function()
-    return lease(stored_token())
+  -- `purpose` says why maki asks: "resolve" once, lazily, before the first
+  -- request of the session, "reload" when the store changed underneath us
+  -- (after `maki auth login` ran in another process), and "refresh" after a
+  -- 401 that arrived before any output. An Acme lease is single use, so a
+  -- refresh buys the next one with the stored credential instead of resending
+  -- it, and stores it right here: maki holds this provider's credential lock
+  -- while the hook runs and lets the hook itself back in through it.
+  auth = function(ctx, purpose)
+    if purpose ~= REFRESH then
+      return bearer(stored_token(ctx.slug))
+    end
+    local renewed = stored_token(ctx.slug) .. "-renewed"
+    maki.provider.auth.set(ctx.slug, { token = renewed })
+    return bearer(renewed)
   end,
 
   -- Acme's catalogue moves faster than this file, so the picker asks the API.
-  list_models = function()
-    return { { id = "acme-1", context_window = 200000, tier = "strong" } }
+  -- `ctx.get_json` goes where the chat requests go, with their headers, and a
+  -- failure it hands back is returned as the hook's own.
+  list_models = function(ctx)
+    local body, err = ctx.get_json(MODELS_PATH)
+    if err then
+      return nil, err
+    end
+    local models = {}
+    for _, m in ipairs(body.data or {}) do
+      table.insert(models, { id = m.id, context_window = m.context_length, tier = "strong" })
+    end
+    return models
   end,
 
   -- Runs on the final body, after maki rendered the thinking level into it, so
   -- what arrives here is exactly what goes on the wire. Acme wants the effort
-  -- under its own key and rejects OpenAI's.
-  build_body = function(body, model, opts)
+  -- under its own key and rejects OpenAI's. `opts.thinking` is nil when
+  -- thinking is off.
+  build_body = function(_, body, model, opts)
     body.acme_reasoning = { model = model, effort = body.reasoning_effort, asked_for = opts.thinking }
     body.reasoning_effort = nil
     return body
   end,
 
   -- Acme answers 429 for a spent monthly allowance, which no retry can fix.
-  map_error = function(status, message)
+  map_error = function(_, status, message)
     if status == 429 and message:find("allowance") then
       return { status = 400, message = "Acme allowance is spent until the next cycle" }
     end
@@ -771,19 +785,20 @@ maki.provider.register({
   end,
 
   -- Having a `login` is what makes this provider an auth target: it shows up in
-  -- `maki auth login` because this function exists.
+  -- `maki auth login` because this function exists. Its `ctx` can also talk to
+  -- the terminal.
   login = function(ctx)
     local key = ctx.prompt({ label = "Acme API key: ", secret = true })
     if not key or key == "" then
       ctx.print("No key entered, nothing was stored.")
       return
     end
-    maki.provider.auth.set(SLUG, { token = key })
+    maki.provider.auth.set(ctx.slug, { token = key })
     ctx.print("Stored your Acme key.")
   end,
 
   logout = function(ctx)
-    maki.provider.auth.clear(SLUG)
+    maki.provider.auth.clear(ctx.slug)
     ctx.print("Forgot your Acme key.")
   end,
 })
