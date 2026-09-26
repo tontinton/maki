@@ -1707,8 +1707,11 @@ mod tests {
 
         let curated = &deepseek::SPEC.models()[0];
         let listed = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", curated_flash())).unwrap();
-        assert_eq!(listed.pricing.input, curated.pricing.input);
-        assert_eq!(listed.context_window, curated.context_window);
+        assert_eq!(
+            Some(listed.pricing.input),
+            curated.pricing.as_ref().map(|pricing| pricing.input)
+        );
+        assert_eq!(Some(listed.context_window), curated.context_window);
     }
 
     /// Curated rows match by prefix, so `deepseek-flash` answers for every id
@@ -1731,7 +1734,8 @@ mod tests {
             "the curated relative has vision"
         );
         assert_eq!(
-            sibling.family, curated.family,
+            Some(sibling.family),
+            curated.family,
             "which dialect a model speaks is still the relative's answer to give"
         );
 
@@ -1740,7 +1744,10 @@ mod tests {
             curated_flash()
         ))
         .unwrap();
-        assert_eq!(snapshot.pricing.input, curated.pricing.input);
+        assert_eq!(
+            Some(snapshot.pricing.input),
+            curated.pricing.as_ref().map(|pricing| pricing.input)
+        );
     }
 
     /// The catalog only outranks a relative where it has something to say.
@@ -1759,9 +1766,9 @@ mod tests {
             quiet.pricing.input, UNLISTED_INPUT_PRICE,
             "the catalog priced it, so it has to be the one answering below"
         );
-        assert_eq!(quiet.context_window, curated.context_window);
+        assert_eq!(Some(quiet.context_window), curated.context_window);
         assert_eq!(quiet.max_output_tokens, curated.max_output_tokens);
-        assert_eq!(quiet.supports_vision(), curated.vision);
+        assert_eq!(Some(quiet.supports_vision()), curated.supports_vision);
         assert_eq!(quiet.supports_thinking(), spec.supports_thinking);
     }
 
@@ -1937,7 +1944,7 @@ mod tests {
     }
 
     fn curated_flash() -> &'static str {
-        deepseek::SPEC.models()[0].prefixes[0]
+        &deepseek::SPEC.models()[0].prefixes[0]
     }
 
     fn sibling_model() -> String {

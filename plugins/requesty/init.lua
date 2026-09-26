@@ -7,14 +7,11 @@
 
 local parse = require("maki.provider_parse")
 
-local SLUG = "requesty"
 -- Requesty's own curated routing policies, with short stable ids like
 -- `claude-sonnet-4-5`, listed before the raw `<vendor>/<model>` catalog.
 local MANAGED_PATH = "/models/managed"
 local CATALOG_PATH = "/models"
 local CHAT_API = "chat"
--- Prices arrive per token, a row wants dollars per million.
-local PER_MILLION = 1000000
 
 -- A missing or null field is the normal "Requesty does not say" and stays
 -- quiet, while a field in a shape we cannot read is upstream drift: it gets a
@@ -48,8 +45,7 @@ local function limit(m, name)
 end
 
 local function price(m, name)
-  local value = read(m, name, parse.as_f64)
-  return value and value * PER_MILLION
+  return read(m, name, parse.as_f64)
 end
 
 -- Managed policies and the full catalog share this shape, so one parser reads
@@ -63,23 +59,16 @@ local function parse_model(m)
     return nil
   end
 
-  -- Half a price is no price: without both sides it would read as free.
-  local pricing
-  local input, output = price(m, "input_price"), price(m, "output_price")
-  if input and output then
-    pricing = {
-      input = input,
-      output = output,
-      cache_write = price(m, "caching_price") or 0,
-      cache_read = price(m, "cached_price") or 0,
-    }
-  end
-
   return {
     id = m.id,
     context_window = limit(m, "context_window"),
     max_output_tokens = limit(m, "max_output_tokens"),
-    pricing = pricing,
+    pricing = parse.pricing(
+      price(m, "input_price"),
+      price(m, "output_price"),
+      price(m, "caching_price"),
+      price(m, "cached_price")
+    ),
     supports_thinking = read(m, "supports_reasoning", parse.as_bool) == true,
     supports_vision = read(m, "supports_vision", parse.as_bool) == true,
   }
@@ -87,8 +76,8 @@ end
 
 -- A failure is handed back rather than raised, so the other listing can still
 -- stand in for it.
-local function fetch_listing(auth, path)
-  local body, err = parse.get_json(auth, auth.base_url .. path)
+local function fetch_listing(ctx, path)
+  local body, err = ctx.get_json(path)
   if err then
     return { err = err }
   end
@@ -119,7 +108,7 @@ local function settled(result)
 end
 
 maki.provider.register({
-  slug = SLUG,
+  slug = "requesty",
   codec = "openai",
   openai = {
     thinking = { dialect = "prefer-high", requires_support = true },
@@ -132,14 +121,13 @@ maki.provider.register({
   -- Both listings go out at once: the picker only shows up once the slowest
   -- provider answers. Either stands in for the other when it fails, and with
   -- both down the managed failure is the one that surfaces.
-  list_models = function()
-    local auth = assert(maki.provider.auth.resolved(SLUG))
+  list_models = function(ctx)
     local results = maki.async.gather({
       function()
-        return fetch_listing(auth, MANAGED_PATH)
+        return fetch_listing(ctx, MANAGED_PATH)
       end,
       function()
-        return fetch_listing(auth, CATALOG_PATH)
+        return fetch_listing(ctx, CATALOG_PATH)
       end,
     })
     local managed, catalog = settled(results[1]), settled(results[2])
@@ -154,6 +142,6 @@ maki.provider.register({
       maki.log.warn("requesty: managed models unavailable, listing full catalog only: " .. tostring(managed.err))
       return catalog.models
     end
-    return parse.fail(managed.err)
+    return nil, managed.err
   end,
 })

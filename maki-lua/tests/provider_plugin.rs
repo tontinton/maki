@@ -11,6 +11,7 @@
 //! why each test here boots its own host and leans on `cargo nextest` giving
 //! every test its own process.
 
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,7 +35,11 @@ use test_case::test_case;
 const SLUG: &str = "acmelua";
 const DISPLAY_NAME: &str = "Acme (Lua)";
 const MODEL: &str = "acme-1";
-const BASE_URL_ENV: &str = "ACME_BASE_URL";
+/// The origin a user points the slug at, which is the one a hook's side
+/// requests reach unguarded, loopback included.
+const BASE_URL_ENV: &str = "ACMELUA_BASE_URL";
+const MODELS_PATH: &str = "/models";
+const LISTED_WINDOW: u32 = 128000;
 const LOOPBACK_HOST: &str = "127.0.0.1";
 const TOKEN_KEY: &str = "token";
 const ANON_TOKEN: &str = "anonymous";
@@ -136,6 +141,8 @@ const SLOW_DOWN_HEADERS: &[(&str, &str)] = &[
 const CHAT_SCRIPT: &[Canned] = &[Canned::sse(CHAT_TRANSCRIPT)];
 const RESPONSES_SCRIPT: &[Canned] = &[Canned::sse(RESPONSES_TRANSCRIPT)];
 const NO_REQUESTS: &[Canned] = &[];
+const MODELS_BODY: &str = r#"{"data":[{"id":"acme-1","context_length":128000}]}"#;
+const MODELS_SCRIPT: &[Canned] = &[Canned::json(200, MODELS_BODY)];
 const REFRESH_SCRIPT: &[Canned] = &[
     Canned {
         status: 401,
@@ -160,7 +167,7 @@ const OVERLOADED_SCRIPT: &[Canned] = &[Canned {
 }];
 
 /// Points every base directory at a throwaway tree, so the credentials the
-/// fixture's `login` and `refresh_auth` store never touch the real state dir.
+/// fixture's `login` and `auth` store never touch the real state dir.
 fn isolated_state() -> TempDir {
     let dir = TempDir::new().expect(TEMPDIR_FAILED);
     for var in [
@@ -211,9 +218,13 @@ struct Fixture {
 
 impl Fixture {
     fn start(script: &'static [Canned]) -> Self {
-        let state = isolated_state();
         let (base_url, server) = serve(script);
-        unsafe { std::env::set_var(BASE_URL_ENV, &base_url) };
+        Self::at(&base_url, server)
+    }
+
+    fn at(base_url: &str, server: Requests) -> Self {
+        let state = isolated_state();
+        unsafe { std::env::set_var(BASE_URL_ENV, base_url) };
 
         let host = plugin_host();
         host.load_plugin_file(&fixture_path()).expect(LOAD_FAILED);
@@ -330,10 +341,10 @@ fn a_recorded_turn_streams_its_events_and_posts_the_body_the_hook_built() {
     );
 }
 
-/// All three auth entries, each observed through the token that reached the
-/// server: `resolve_auth` before the first request, `refresh_auth` after a 401
-/// that preceded every event, and `reload_auth` re-reading the store, which by
-/// then holds the token the refresh minted and wrote.
+/// All three auth purposes, each observed through the token that reached the
+/// server: `resolve` before the first request, `refresh` after a 401 that
+/// preceded every event, and `reload` re-reading the store, which by then
+/// holds the token the refresh minted and wrote.
 #[test]
 fn the_auth_hooks_drive_the_credential_lifecycle() {
     let fixture = Fixture::start(REFRESH_SCRIPT);
@@ -352,7 +363,7 @@ fn the_auth_hooks_drive_the_credential_lifecycle() {
     );
 }
 
-/// The host holds this provider's credential lock while `refresh_auth` runs, so
+/// The host holds this provider's credential lock while a refresh runs, so
 /// a hook that stores the token it minted has to be let back in through that
 /// same lock. A hook that waits on its own caller instead never answers, and
 /// the call below comes back as a hook timeout rather than as a token.
@@ -368,17 +379,24 @@ fn a_refresh_hook_persists_the_token_it_minted() {
 }
 
 /// Both answers come from hooks rather than from the static registration: the
-/// tier is one the `models` table never states, and the output window it does
-/// state is absent.
+/// listing is what the server answered `ctx.get_json`, asked with the token
+/// every request carries, and the output window the `models` table states is
+/// absent from it.
 #[test]
 fn list_models_and_fetch_usage_answer_from_their_hooks() {
-    let fixture = Fixture::start(NO_REQUESTS);
+    let fixture = Fixture::start(MODELS_SCRIPT);
 
     let models = smol::block_on(fixture.provider.list_models()).expect(HOOK_FAILED);
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, MODEL);
+    assert_eq!(models[0].context_window, Some(LISTED_WINDOW));
     assert_eq!(models[0].tier, Some(ModelTier::Strong));
     assert_eq!(models[0].max_output_tokens, None);
+    let asked = fixture.server.lock().unwrap();
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].path.ends_with(MODELS_PATH), "{}", asked[0].path);
+    assert_eq!(asked[0].authorization(), bearer(ANON_TOKEN));
+    drop(asked);
 
     let usage = smol::block_on(fixture.provider.fetch_usage())
         .expect(HOOK_FAILED)
@@ -416,6 +434,36 @@ fn map_error_restates_the_status_and_keeps_retry_after(
     assert_eq!(error.retry_after(), Some(asked_for));
 }
 
+/// `ctx.get_json` hands back a refused request as the error the codec would
+/// raise for it, `Retry-After` included.
+#[test]
+fn a_refused_side_request_is_the_native_error() {
+    let fixture = Fixture::start(OVERLOADED_SCRIPT);
+
+    let error = smol::block_on(fixture.provider.list_models()).unwrap_err();
+
+    assert!(
+        matches!(error, AgentError::Api { status: 503, .. }),
+        "{error:?}"
+    );
+    let asked_for = Duration::from_secs(RETRY_AFTER.parse().expect(BAD_RETRY_AFTER));
+    assert_eq!(error.retry_after(), Some(asked_for));
+}
+
+/// A side request that never reached a server reads as the transport failure
+/// it is, not as a broken hook.
+#[test]
+fn a_side_request_that_cannot_connect_is_a_transport_error() {
+    let closed = TcpListener::bind((LOOPBACK_HOST, 0)).expect(IO_FAILED);
+    let base_url = format!("http://{}", closed.local_addr().expect(IO_FAILED));
+    drop(closed);
+    let fixture = Fixture::at(&base_url, Requests::default());
+
+    let error = smol::block_on(fixture.provider.list_models()).unwrap_err();
+
+    assert!(matches!(error, AgentError::Http(_)), "{error:?}");
+}
+
 /// There is no `has_auth` flag: defining `login` is the whole of what makes a
 /// plugin provider an auth target, and both halves run against a real host.
 #[test]
@@ -440,7 +488,7 @@ maki.provider.register({{
   codec = "openai-responses",
   base_url = "{base_url}",
   models = {{ {{ prefixes = {{ "{RESPONSES_MODEL}" }} }} }},
-  build_body = function(body)
+  build_body = function(_, body)
     body.acme_marker = "{RESPONSES_MARKER}"
     return body
   end,
@@ -542,7 +590,8 @@ fn wait_for(path: &Path) {
 ///
 /// The lock here is held on a second file descriptor, which is what a second
 /// maki process looks like to `flock`, and the in-process re-entrancy that lets
-/// a `refresh_auth` persist its own token deliberately does not cover it.
+/// a refreshing `auth` hook persist its own token deliberately does not cover
+/// it.
 ///
 /// `login` carries no hook timeout, so the free login gets a thread of its own.
 /// A parked host would otherwise hang the test for good instead of failing it.
@@ -603,9 +652,9 @@ fn an_in_flight_hook_call_survives_a_plugin_reload() {
 /// A slug maki ships is maki's to declare, and a plugin from outside the
 /// binary may not take it. A decl that claims one inherits its `api_key_env`,
 /// so the key the user set for the built-in would be resolved into the
-/// claimant's credentials and handed straight to it by
-/// `maki.provider.auth.resolved`, under a name the picker still labels with
-/// the built-in's display name. No `net` grant and no host list ever bought
+/// claimant's credentials and handed straight to it as every hook's
+/// `ctx.headers`, under a name the picker still labels with the built-in's
+/// display name. No `net` grant and no host list ever bought
 /// that reach.
 #[test]
 fn a_third_party_plugin_cannot_take_a_builtin_slug() {

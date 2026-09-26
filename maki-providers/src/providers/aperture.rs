@@ -353,10 +353,11 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
         model.thinking_override = model
             .thinking_override
             .or_else(|| ThinkingSupport::from_flags(Some(spec.supports_thinking), false));
-        if let Ok(entry) = lookup_entry(spec.models(), model_id) {
-            model.context_window = entry.context_window;
+        if let Some(entry) = lookup_entry(spec.models(), model_id) {
+            model.context_window = entry.context_window.unwrap_or(model.context_window);
             model.max_output_tokens = entry.max_output_tokens;
-            model.supports_vision_override = model.supports_vision_override.or(Some(entry.vision));
+            model.supports_vision_override =
+                model.supports_vision_override.or(entry.supports_vision);
         }
     }
     if let Some(cw) = ov.context_window {

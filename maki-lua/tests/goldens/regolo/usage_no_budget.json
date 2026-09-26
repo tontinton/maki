@@ -1,0 +1,86 @@
+{
+  "call": {
+    "endpoint": "usage"
+  },
+  "script": [
+    {
+      "path": "/key/info",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"key\":\"k\",\"info\":{\"key_alias\":null,\"spend\":-0.5,\"max_budget\":null}}"
+    },
+    {
+      "path": "/global/activity",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"daily_data\":[],\"sum_api_requests\":0,\"sum_total_tokens\":0}"
+    },
+    {
+      "path": "/spend/logs/v2",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"data\":[]}"
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "usage": {
+        "limits": [
+          {
+            "detail": "$-0.50 spent",
+            "label": "Spend"
+          },
+          {
+            "detail": "0 requests · 0 tokens",
+            "label": "Today",
+            "reset_at": "<next-utc-midnight>"
+          }
+        ]
+      }
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/global/activity?start_date=<today>&end_date=<today>"
+      },
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/key/info"
+      },
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/spend/logs/v2?start_date=<today>&end_date=<today>"
+      }
+    ]
+  }
+}

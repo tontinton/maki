@@ -228,8 +228,8 @@ limits which APIs the file reaches rather than sandboxing the file.
 
 ### Plugin egress: net_hosts
 
-`net = true` lets a plugin reach any public host. A plugin can narrow that to an
-allowlist in the same `[permissions]` table:
+`net = true` lets a plugin reach any public host. `net_hosts` in the same
+table narrows that to an allowlist:
 
 ```toml
 [permissions]
@@ -237,23 +237,18 @@ net = true
 net_hosts = ["api.acme.com", "*.acme.dev"]
 ```
 
-An absent `net_hosts` and an empty one are different answers. Absent keeps the
-old meaning of `net = true`, any public host. Present means exactly the hosts
-listed, and an empty list reaches nothing.
+A pattern is an exact host or a single leading `*.` label. `*.acme.dev` matches
+`api.acme.dev`, and it does not match `acme.dev` or `evilacme.dev`. An empty
+list reaches no host at all, which differs from leaving the key out.
 
-A pattern is either an exact host or one leading `*.` label. `*.acme.dev`
-matches `api.acme.dev` and leaves both `acme.dev` and `evilacme.dev` out. No
-other wildcard form is understood.
+The list covers the plugin's `maki.net` calls and the `base_url` of any
+[provider it registers](/docs/providers/#plugin-providers), so an auth hook
+cannot send credentials to a host the manifest does not name. A plugin that
+calls `maki.provider.register` must declare a non-empty list.
 
-The list is enforced in two places: the plugin's own `maki.net` calls, and the
-`base_url` a [plugin provider](/docs/providers/#plugin-providers) ends up using,
-so an auth hook cannot repoint credentials at a host the manifest never named. A
-plugin that calls `maki.provider.register` must declare a non-empty list, and
-registration fails without one.
-
-For an installed [package](/docs/packages/), the approved hosts are recorded
-with the approval. A package that later widens its list, or drops it and so
-reaches every host, asks again before it loads.
+For an installed [package](/docs/packages/#package-permissions), Maki stores
+the hosts with the approval and asks again when an update widens or drops the
+list.
 
 ## Network Addresses
 
@@ -261,7 +256,7 @@ reaches every host, asks again before it loads.
 
 To reach a service on your own machine or network, list it in [`net.allowed_private_hosts`](/docs/configuration/#net). An allowed host also keeps plain `http://` instead of being upgraded to `https://`, since a service on your LAN rarely has a certificate.
 
-A provider plugin's own calls (model listing, usage) to the origin you pointed it at with `<SLUG>_BASE_URL` or `providers.toml` skip the guard, since chat requests already go there. So do a built-in provider's calls to its default origin. A third-party plugin's declared `base_url` gets no such pass.
+A provider plugin calling its own origin also skips the guard, since chat requests already go there. This covers an origin you set with `<SLUG>_BASE_URL` or `providers.toml`, and a built-in provider's default. It does not cover a `base_url` that a third-party plugin declares.
 
 ## Session Persistence
 

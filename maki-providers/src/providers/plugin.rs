@@ -15,20 +15,15 @@ use serde_json::Value;
 use tracing::{debug, warn};
 use url::{Host, Url};
 
-use crate::model::{
-    Model, ModelInfo, ModelPricing, ModelTier, Prefixed, ThinkingSupport, longest_prefix_match,
-};
+use crate::model::{Model, ModelEntry, ModelInfo, ModelTier, lookup_entry};
 use crate::provider::{BoxFuture, Provider};
 use crate::spec::{BASES, ProviderRegistry, ProviderSpec};
-use crate::types::ThinkingFields;
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
 use super::codec::{self, BodyHook, CodecOptions, RequestCtx};
 pub use super::codec::{EffortField, OpenAiWire, SessionCarrier, ThinkingWire};
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 
-const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16384;
-const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
 const BUILD_BODY_OPTION: &str = "build_body hook";
 const SYSTEM_PREFIX_OPTION: &str = "system_prefix";
 const OPENAI_OPTION: &str = "openai";
@@ -69,12 +64,14 @@ pub enum AuthPurpose {
 
 /// The request as it goes on the wire, plus the things a plugin branches on.
 /// `thinking` is rendered text and not structure, because the hook is a
-/// wire-level escape hatch and not a second place to model effort.
+/// wire-level escape hatch and not a second place to model effort. `None`
+/// when thinking is off.
 #[derive(Serialize)]
 pub struct BodyInput {
     pub body: Value,
     pub model: String,
-    pub thinking: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     /// The [`ModelInfo::extra`] this slug's `list_models` attached to the
     /// model, absent when discovery said nothing about it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,100 +144,6 @@ fn is_loopback(url: &Url) -> bool {
     }
 }
 
-/// One declared model row. `Serialize` mirrors `Deserialize` field for field,
-/// defaults included, so a row survives a round trip.
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PluginModel {
-    /// Every id this row answers for. `prefixes[0]` is the canonical id,
-    /// used wherever a concrete model has to be named.
-    pub prefixes: Vec<String>,
-    #[serde(default = "default_tier")]
-    pub tier: ModelTier,
-    #[serde(default)]
-    pub supports_tool_examples: Option<bool>,
-    #[serde(default)]
-    pub supports_thinking: Option<bool>,
-    #[serde(default)]
-    pub requires_thinking: bool,
-    #[serde(default)]
-    pub supports_vision: Option<bool>,
-    #[serde(default = "default_max_output_tokens")]
-    pub max_output_tokens: u32,
-    #[serde(default = "default_context_window")]
-    pub context_window: u32,
-    #[serde(default)]
-    pub pricing: Option<ModelPricing>,
-    #[serde(default)]
-    pub thinking_fields: Option<ThinkingFields>,
-}
-
-impl Prefixed for PluginModel {
-    fn prefixes(&self) -> impl Iterator<Item = &str> {
-        self.prefixes.iter().map(String::as_str)
-    }
-}
-
-impl PluginModel {
-    fn canonical_id(&self) -> Option<&str> {
-        self.prefixes.first().map(String::as_str)
-    }
-
-    fn to_model(&self, slug: &str, base: &'static ProviderSpec, id: String) -> Model {
-        Model {
-            id,
-            provider: Arc::from(slug),
-            tier: self.tier,
-            family: base.family,
-            supports_tool_examples_override: self.supports_tool_examples,
-            thinking_override: ThinkingSupport::from_flags(
-                self.supports_thinking,
-                self.requires_thinking,
-            ),
-            supports_vision_override: self.supports_vision,
-            supports_fast_override: None,
-            pricing: self.pricing.clone().unwrap_or_default(),
-            subsidised_by: None,
-            discovered_free: false,
-            max_output_tokens: Some(self.max_output_tokens),
-            turn_output_tokens: None,
-            context_window: self.context_window,
-            thinking_fields: self.thinking_fields.clone().map(Box::new),
-        }
-    }
-
-    /// This row as the catalogue reports it. The `supports_*` flags are
-    /// `Option` on both sides, so an unstated one stays unstated rather than
-    /// becoming a published negative. `provider_info` is a stash only the Rust
-    /// provider that filled it reads back, so a declared row never has one.
-    fn to_info(&self) -> ModelInfo {
-        ModelInfo {
-            id: self.canonical_id().unwrap_or_default().to_string(),
-            context_window: Some(self.context_window),
-            max_output_tokens: Some(self.max_output_tokens),
-            pricing: self.pricing.clone(),
-            supports_thinking: self.supports_thinking,
-            supports_vision: self.supports_vision,
-            tier: Some(self.tier),
-            provider_info: None,
-            extra: None,
-            effort: None,
-        }
-    }
-}
-
-fn default_tier() -> ModelTier {
-    ModelTier::Medium
-}
-
-fn default_max_output_tokens() -> u32 {
-    DEFAULT_MAX_OUTPUT_TOKENS
-}
-
-fn default_context_window() -> u32 {
-    DEFAULT_CONTEXT_WINDOW
-}
-
 /// One provider, as data: everything maki needs to build it except the
 /// callbacks.
 ///
@@ -264,7 +167,7 @@ pub struct ProviderDecl {
     pub api_key_env: Option<String>,
     pub system_prefix: Option<String>,
     #[serde(default)]
-    pub models: Vec<PluginModel>,
+    pub models: Vec<ModelEntry>,
     /// Only for `codec = "openai"`: grouped under the codec that honours them,
     /// so one rule refuses every option a different target would ignore.
     pub openai: Option<OpenAiWire>,
@@ -1078,7 +981,11 @@ impl BodyHook for BodyAdapter {
         self.0.call(BodyInput {
             body,
             model: ctx.model.id.clone(),
-            thinking: ctx.opts.thinking.to_string(),
+            thinking: ctx
+                .opts
+                .thinking
+                .is_enabled()
+                .then(|| ctx.opts.thinking.to_string()),
             model_info: ctx.discovered.as_ref().and_then(|info| info.extra.clone()),
         })
     }
@@ -1147,7 +1054,7 @@ impl PluginProvider {
             .decl
             .models
             .iter()
-            .map(PluginModel::to_info)
+            .map(ModelEntry::to_info)
             .collect())
     }
 
@@ -1439,7 +1346,7 @@ pub fn build_with_auth(
 
 pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
     let entry = entry(slug)?;
-    let model = longest_prefix_match(&entry.decl.models, model_id)?;
+    let model = lookup_entry(&entry.decl.models, model_id)?;
     Some(model.to_model(slug, entry.spec()?, model_id.to_string()))
 }
 
@@ -1461,7 +1368,7 @@ pub fn plugin_model_specs_for(slug: &str) -> Vec<String> {
             .map(|spec| {
                 spec.models()
                     .iter()
-                    .flat_map(|row| row.prefixes.iter().copied())
+                    .flat_map(|row| row.prefixes.iter().map(String::as_str))
                     .collect()
             })
             .unwrap_or_default()
@@ -1470,7 +1377,7 @@ pub fn plugin_model_specs_for(slug: &str) -> Vec<String> {
             .decl
             .models
             .iter()
-            .filter_map(PluginModel::canonical_id)
+            .filter_map(ModelEntry::canonical_id)
             .collect()
     };
     ids.into_iter().map(|id| format!("{slug}/{id}")).collect()

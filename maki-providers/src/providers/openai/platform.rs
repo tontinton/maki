@@ -251,9 +251,9 @@ fn static_plan_models() -> Vec<ModelInfo> {
     super::SPEC
         .models()
         .iter()
-        .flat_map(|e| e.prefixes.iter())
+        .flat_map(|e| &e.prefixes)
         .filter(|id| is_codex_model(id))
-        .map(|&s| ModelInfo::id_only(s.to_string()))
+        .map(|id| ModelInfo::id_only(id.clone()))
         .collect()
 }
 

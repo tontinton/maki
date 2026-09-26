@@ -33,12 +33,12 @@ Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BAS
 ANTHROPIC_BASE_URL=https://my-proxy.internal maki
 ```
 
-Built-in, plugin and `providers.toml` providers all read it. When more than one origin is available, the first of these that is set wins:
+Built-in, plugin and `providers.toml` providers all read it. When several origins are set, the first one wins:
 
-1. An origin returned by the provider's auth hook, which is how a login flow points the provider at the endpoint it was given.
+1. An origin the provider's auth hook returns, such as the endpoint a login flow was given.
 2. `<SLUG>_BASE_URL`.
 3. `base_url` in `providers.toml`.
-4. The `base_url` the provider's own declaration carries.
+4. The provider's own default `base_url`.
 
 `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. Two exceptions: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend; `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy.
 
@@ -267,7 +267,7 @@ fn plugin_providers_section() -> String {
     format!(
         r#"## Plugin Providers
 
-A Lua plugin can add a provider without any change to Maki. Call `maki.provider.register` while the plugin loads, and the models it declares become addressable as `{{slug}}/{{model_id}}` (e.g. `acme/acme-large`). They show up in `/model` and in the picker, and their requests go through the same retry, pricing and usage accounting as a built-in provider.
+A [Lua plugin](/docs/plugins/) can add a provider. Call `maki.provider.register` at the top level of the plugin file, and its models become `{{slug}}/{{model_id}}` (e.g. `acme/acme-large`) in `/model` and the picker. They get the same retries, pricing and usage accounting as a built-in provider.
 
 ```lua
 maki.provider.register({{
@@ -282,7 +282,7 @@ maki.provider.register({{
 }})
 ```
 
-The plugin needs the `net` permission and must name the hosts it talks to in its `plugin.toml`. Declaring `api_key_env` also needs `env`, since resolving it reads your environment and the key saved for the slug:
+The plugin's `plugin.toml` must grant `net` and list the provider's hosts in `net_hosts`. `api_key_env` also needs `env`:
 
 ```toml
 [permissions]
@@ -291,19 +291,13 @@ env = true
 net_hosts = ["api.acme.com"]
 ```
 
-That list is what Maki sends this provider's credentials to. Maki checks it against both the plugin's own `maki.net` calls and the `base_url` the provider ends up using, so a hook cannot repoint a token at a host the manifest never declared. A `base_url` must also be `https`, or `http` pointing at loopback: a declared host reached in cleartext still puts the token on the wire. Registering with an empty or absent list fails at load.
+Maki sends the provider's credentials only to those hosts, plus any origin you set yourself with `<SLUG>_BASE_URL` or `providers.toml`. The `base_url` must be `https`, or `http` on loopback. See [plugin egress](/docs/permissions/#plugin-egress-net-hosts) for the pattern syntax.
 
-The origin you chose yourself is the exception. If `<SLUG>_BASE_URL` or `providers.toml` points the slug at a gateway, the provider's hooks reach that gateway too, since its requests already go there.
-
-See [plugin permissions](/docs/lua-api/#plugin-permissions) for the pattern language and how approval works.
-
-The full field reference lives in the [Lua API](/docs/lua-api/#maki-provider). This page covers what the choices mean for the provider you are building.
+The [Lua API](/docs/lua-api/#maki-provider-register) lists every field. This section explains the choices.
 
 ### codec or base
 
-A registration sets exactly one of `codec` and `base`. Setting both, or neither, fails at load with the plugin named.
-
-`codec` is the supported surface for a third-party provider. Pick the wire format the API speaks:
+Set exactly one of the two. `codec` picks the wire format the API speaks:
 
 | `codec` | Wire format |
 |---------|-------------|
@@ -312,19 +306,19 @@ A registration sets exactly one of `codec` and `base`. Setting both, or neither,
 | `anthropic` | Anthropic messages |
 | `google` | Gemini `generateContent` |
 
-`base` names a native provider and borrows that provider's whole adapter, quirks included: Ollama's handling of the thinking field, Copilot's endpoint routing. It exists for people moving an old provider script over, where `base` was the only way to describe a provider. A new provider is better off with a codec, because a base can change behaviour whenever the provider it names does. The list of bases is fixed, and removing one is a deliberate breaking change. Valid values: {}.
+`base` borrows a built-in provider's whole adapter, quirks included, such as Ollama's thinking field or Copilot's endpoint routing. Use it when porting a provider script that set `base`, or when no codec fits. A base changes whenever that provider does, so prefer a codec. Valid values: {}.
 
-Either choice also supplies defaults. A registration with no `models` table borrows the catalog of its codec or base.
+Without a `models` table, the provider uses the catalog of its codec or base.
 
-### The models table
+### Model rows
 
-`models` is static data, read once at registration, so it must not depend on anything the plugin asks at runtime. For a catalog that is only known at runtime, use `list_models` instead.
+`models` is read once at registration. For a catalog known only at runtime, use the `list_models` hook.
 
-Each row carries `prefixes`, a list. The row answers for every model id that starts with one of its prefixes, and the longest matching prefix wins, so `acme-large-2504` reads an `acme-large` row rather than an `acme` one. `prefixes[1]` is the canonical id, used wherever Maki has to name one concrete model: the picker, tier defaults, and `{{slug}}/{{model_id}}` specs.
+A row matches every model id that starts with one of its `prefixes`, and the longest match wins: `acme-large-2504` uses an `acme-large` row over an `acme` row. `prefixes[1]` is the canonical id, shown in the picker and used in `{{slug}}/{{model_id}}`.
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
-| `prefixes` | list of strings | required | Every id this row answers for. The first is the canonical id |
+| `prefixes` | list of strings | required | The first is the canonical id |
 | `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction` |
 | `context_window` | number | 128000 | Tokens of context |
 | `max_output_tokens` | number | 16384 | Max completion tokens |
@@ -335,41 +329,37 @@ Each row carries `prefixes`, a list. The row answers for every model id that sta
 | `pricing` | table | unset | `input`, `output`, `cache_write`, `cache_read`, in dollars per 1M tokens |
 | `thinking_fields` | table | unset | How this model spells each thinking mode on the wire |
 
-`supports_thinking`, `supports_vision` and `supports_tool_examples` have three states. Leaving one out is different from setting it to `false`: omitted asks the codec or base provider, `false` turns the feature off for that model. Declare them only for ids where you know the answer.
+An unset `supports_*` flag uses the codec or base provider's answer, and `false` turns the feature off for that model.
 
-`thinking_fields` works as in [providers.toml](#providers-toml). Keys are `off`, `adaptive`, and the effort levels {}. Each value is a JSON fragment merged into the request body, nesting included. A mode you leave out sends nothing on a codec, and falls back to the base provider's own mapping with `base = "llama-cpp"` or `base = "ollama"`.
+`thinking_fields` works as in [providers.toml](#providers-toml). Keys are `off`, `adaptive` and the effort levels {}, each mapped to a JSON fragment merged into the request body. A mode you leave out sends nothing with a codec, and falls back to the built-in mapping with `base = "llama-cpp"` or `base = "ollama"`.
 
-### Callbacks
+### Hooks
 
-Every callback is optional. A registration with none is a static provider that reads its key from `api_key_env`.
+Every hook is optional. Without any, the provider reads its key from `api_key_env`.
 
-| Field | Signature | When it runs |
-|-------|-----------|--------------|
-| `resolve_auth` | `function(purpose)` | Once, lazily, before the first request |
-| `refresh_auth` | `function(purpose)` | After a 401, before one silent retry |
-| `reload_auth` | `function(purpose)` | When Maki re-reads what a login wrote |
-| `list_models` | `function()` | Model listing: the picker, `maki models` |
-| `build_body` | `function(body, model, opts)` | Every request, on the final body |
-| `map_error` | `function(status, message)` | On an API error, before it reaches the UI |
-| `fetch_usage` | `function()` | Quota and usage display |
-| `login` | `function(ctx)` | `maki auth login <slug>` |
-| `logout` | `function(ctx)` | `maki auth logout <slug>` |
+| Hook | Runs |
+|------|------|
+| `auth(ctx, purpose)` | `"resolve"` before the first request, `"refresh"` after a 401 (then retries once), `"reload"` after a login changed the stored credentials |
+| `list_models(ctx)` | When the picker or `maki models` lists models |
+| `build_body(ctx, body, model, opts)` | On every request, with the final body |
+| `map_error(ctx, status, message)` | On an API error, before it reaches the UI |
+| `fetch_usage(ctx)` | When the usage display asks for quota |
+| `login(ctx)` | `maki auth login <slug>` |
+| `logout(ctx)` | `maki auth logout <slug>` |
 
-The three auth entries are one hook with three purposes. Whichever entries you write serve the rest, so a plugin that reads its credentials fresh every time can write `resolve_auth` alone and get refresh and reload for free. They return `{{ base_url = ..., headers = {{ ... }} }}`, and omitting `base_url` keeps the one already in force.
+Each hook gets a [`ctx`](/docs/lua-api/#maki-provider-register) table first, with the slug, the current origin and headers, and a `ctx.get_json` helper. Build URLs from `ctx.base_url` so side calls follow a user who points the slug at a gateway. To fail, return `nil, err` with an error from `ctx.get_json` or `maki.provider.http_error`, and Maki retries as it would for a built-in provider.
 
-An auth hook may write the store as well as read it. Maki holds the cross-process lock on that provider's credentials while `resolve` and `refresh` run, and a `maki.provider.auth.set` inside one re-enters that lock instead of waiting on it, so a `refresh_auth` that rotates a token can persist what it minted.
+Credentials resolve on the first request. A provider with missing or expired credentials stays in the picker and fails when you send a message, like a built-in provider with no API key.
 
-Credentials resolve lazily, on the first request that needs them. A plugin provider whose credentials are missing or expired stays in the picker and fails when you send a message, the same as a built-in provider with an unset API key. Provider scripts behaved the other way round: a `resolve` that failed took the provider out of the list, so a stale token looked like a missing provider.
+Defining `login` lists the provider in `maki auth login`. Without it, the slug is an API-key provider.
 
-Writing a `login` function is what makes the slug an auth target. There is no `has_auth` flag: a provider with `login` appears in `maki auth login`, one without it is an API-key provider and says so when asked to log in. The `ctx` handed to `login` and `logout` speaks to the terminal with `ctx.print(text)`, `ctx.prompt({{ label = ..., secret = true }})` and `ctx.open_url(url)`. Call them with a dot, since `ctx` is a plain table of functions.
+`map_error` can change the status and message of an API error, for example to turn an opaque vendor error into advice. Retries follow the new status, and `retry-after` still comes from the server.
 
-`map_error` returns `{{ status = ..., message = ... }}`, or nil to keep the error as it was. Those two fields are all it can change. It cannot set `retry_after`, which is what the server asked for in the response header, and it cannot decide whether an error is retryable, which Maki derives from the status. Use it to turn an opaque vendor body into a message a person can act on.
-
-An option the target cannot honour fails at registration rather than turning into a no-op at request time. `build_body` is accepted only with `codec = "openai"` or `codec = "openai-responses"`, and `system_prefix` is rejected with `codec = "google"`, because the Gemini path drops it. Either one fails naming the slug, the option and the target.
+`build_body` needs the `openai` or `openai-responses` codec, and the `google` codec refuses `system_prefix`. Both mistakes fail at registration.
 
 ### Credentials
 
-`maki.provider.auth` is a credential store Maki owns and the plugin fills:
+`maki.provider.auth` stores credentials for the plugin's own slugs:
 
 ```lua
 maki.provider.auth.set("acme", {{ access_token = token, expires_at = when }})
@@ -377,33 +367,27 @@ local creds = maki.provider.auth.get("acme")
 maki.provider.auth.clear("acme")
 ```
 
-The value is a free-form JSON object. Maki decides where it lives and who can read it, the plugin decides what is in it. Each slug is one file at `~/.local/state/maki/auth/plugins/<slug>.json`, apart from every credential Maki keeps for anything else, created with mode 0600, replaced in a single atomic step, and locked against other Maki processes touching the same provider. A plugin can only reach slugs it registered itself.
+The value is any JSON object. Each slug gets its own file at `~/.local/state/maki/auth/plugins/<slug>.json`, with mode 0600, atomic writes and a lock against other Maki processes. An `auth` hook can call `set` to save a refreshed token.
 
 ### Slug rules
 
-- Must start with a letter or digit
-- Only letters, digits, underscores, and hyphens after that
-- Cannot reuse a slug defined in `providers.toml`
-- Cannot be a built-in provider's slug. A declaration inherits that provider's `api_key_env`, so the key you set for the built-in would be handed to the plugin and sent to whatever hosts its `net` permission names. Only the provider plugins Maki ships inside the binary may claim a built-in slug, and they inherit the built-in's display name, `api_key_env`, curated model table and pricing. Restating any of those is a registration error, because the built-in's row stays the one source for them
-- Two plugins cannot declare the same slug
-- Registration only works while plugins load, so it belongs at the top level of the plugin file
+- Starts with a letter or digit, then only letters, digits, `_` and `-`
+- Not a built-in slug, because the plugin would inherit the API key you set for the built-in. Plugins bundled with Maki are the exception
+- Not a slug from `providers.toml` or another plugin
 
 ### Migrating from provider scripts
 
-Earlier versions loaded executable scripts from the config `providers/` directory and talked to them over stdout JSON. That mechanism is gone. Every part of it has a Lua equivalent, and the port is mechanical:
+Maki no longer runs executable scripts from the config `providers/` directory. Each script subcommand maps to part of the registration:
 
 | Script subcommand | Lua |
 |-------------------|-----|
-| `info` returning `display_name`, `base`, `system_prefix`, `has_auth` | The same fields on the registration table. `has_auth` is gone, because a `login` function is what makes the provider an auth target |
-| `models` returning model rows | The static `models` table. `id` becomes `prefixes`, a list, which is what the field always was: `id = "acme"` becomes `prefixes = {{ "acme" }}` and matches the same ids |
-| `resolve` | `resolve_auth` |
-| `refresh` | `refresh_auth` |
-| `reload` | `reload_auth` |
-| `login` over inherited stdio | `login = function(ctx)`, using `ctx.print`, `ctx.prompt` and `ctx.open_url` |
-| `logout` over inherited stdio | `logout = function(ctx)` |
-| No equivalent | `build_body`, `map_error`, `fetch_usage`, `list_models` |
+| `info` | The same fields on the registration table, minus `has_auth`. Defining `login` replaces it |
+| `models` | The `models` table. `id = "acme"` becomes `prefixes = {{ "acme" }}` and matches the same ids |
+| `resolve`, `refresh`, `reload` | `auth = function(ctx, purpose)`, with `purpose` naming the subcommand |
+| `login` | `login = function(ctx)`, using `ctx.print`, `ctx.prompt` and `ctx.open_url` |
+| `logout` | `logout = function(ctx)` |
 
-A script that stored its credentials in its own file can keep them. Import that file the first time `resolve_auth` runs and hand it to Maki:
+A script that kept credentials in its own file can import them on first use, so nobody has to log in again:
 
 ```lua
 local function credentials()
@@ -421,18 +405,16 @@ local function credentials()
 end
 ```
 
-Nobody has to log in again. The first request after the upgrade reads the old file once and writes it into Maki's store, and every later run reads it from there.
-
 ### Worked example
 
-The plugin below is Maki's test fixture for the provider API, quoted from the file the test suite runs, so it cannot drift from the API it documents. It speaks `codec = "openai"` and uses every hook once.
+Maki's tests load this plugin, so it matches the current API. It uses `codec = "openai"` and every hook.
 
-Its manifest:
+`plugin.toml`:
 
 ```toml
 {}```
 
-The plugin itself:
+`init.lua`:
 
 ```lua
 {}```
@@ -454,11 +436,16 @@ fn tier_label(tier: ModelTier) -> &'static str {
 }
 
 fn format_pricing(entry: &ModelEntry) -> String {
-    format!("${:.2} / ${:.2}", entry.pricing.input, entry.pricing.output)
+    entry.pricing.as_ref().map_or_else(String::new, |pricing| {
+        format!("${:.2} / ${:.2}", pricing.input, pricing.output)
+    })
 }
 
 fn format_context(entry: &ModelEntry) -> String {
-    let ctx_k = entry.context_window / 1_000;
+    let Some(context_window) = entry.context_window else {
+        return String::new();
+    };
+    let ctx_k = context_window / 1_000;
     match entry.max_output_tokens {
         Some(out) => format!("{ctx_k}K ctx / {}K out", out / 1_000),
         None => format!("{ctx_k}K ctx"),
@@ -501,7 +488,7 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
         .map(|e| {
             format!(
                 "{} ({})",
-                e.prefixes.first().unwrap_or(&"?"),
+                e.prefixes.first().map_or("?", String::as_str),
                 tier_label(e.tier).to_lowercase(),
             )
         })

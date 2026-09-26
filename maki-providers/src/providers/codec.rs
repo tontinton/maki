@@ -563,7 +563,6 @@ mod tests {
     use test_case::test_case;
 
     use super::super::plugin::PluginAuth;
-    use super::super::synthetic;
     use super::*;
     use crate::model::ModelEffort;
     use crate::{Effort, ThinkingConfig};
@@ -572,6 +571,7 @@ mod tests {
     const AFFINITY_HEADER: &str = "x-affinity";
     const SAFE_VALUE: &str = "maki";
     const SESSION_FIELD: &str = "session_id";
+    const MODEL_SPEC: &str = "synthetic/hf:moonshotai/Kimi-K2.5";
 
     /// One slug per case: `<SLUG>_BASE_URL` is process-wide, and these run in
     /// one process under `cargo test`.
@@ -639,6 +639,10 @@ mod tests {
 
     fn wire(authored: Value) -> Result<OpenAiWire, String> {
         serde_json::from_value(authored).map_err(|e| e.to_string())
+    }
+
+    fn synthetic_model() -> Model {
+        Model::from_spec(MODEL_SPEC).unwrap()
     }
 
     fn ctx(model: &Model, thinking: ThinkingConfig) -> RequestCtx<'_> {
@@ -715,7 +719,7 @@ mod tests {
             "session_id": { "body_field": SESSION_FIELD },
         }))
         .unwrap();
-        let model = synthetic::fixtures::model();
+        let model = synthetic_model();
         let session = SessionRef::generate();
         let ctx = RequestCtx {
             session: Some(&session),
@@ -743,7 +747,7 @@ mod tests {
             "thinking": { "dialect": "standard", "requires_support": requires_support },
         }))
         .unwrap();
-        let mut model = synthetic::fixtures::model();
+        let mut model = synthetic_model();
         model.thinking_override = Some(ThinkingSupport::No);
         let mut body = json!({});
 
@@ -764,7 +768,7 @@ mod tests {
         expected: &str,
     ) {
         let wire = wire(json!({ "thinking": { "dialect": "prefer-high" } })).unwrap();
-        let model = synthetic::fixtures::model();
+        let model = synthetic_model();
         let ctx = RequestCtx {
             discovered: Some(ModelInfo {
                 effort: listed.map(|supported| ModelEffort {

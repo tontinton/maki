@@ -1,0 +1,94 @@
+{
+  "call": {
+    "endpoint": "models"
+  },
+  "script": [
+    {
+      "path": "/v1/models/managed",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"data\":[\n{\"id\":\"gpt-5.4-mini\",\"api\":\"chat\",\"context_window\":400000,\"max_output_tokens\":128000,\"input_price\":0.00000025,\"output_price\":0.000002,\"cached_price\":0.000000025,\"supports_reasoning\":true,\"supports_vision\":true},\n{\"id\":\"claude-sonnet-4-5\",\"api\":\"chat\",\"context_window\":200000,\"max_output_tokens\":64000,\"input_price\":0.000003,\"output_price\":0.000015,\"caching_price\":0.00000375,\"cached_price\":0.0000003,\"supports_reasoning\":true,\"supports_vision\":true},\n{\"id\":\"claude-sonnet-4-5\",\"api\":\"chat\",\"context_window\":1000000,\"max_output_tokens\":64000,\"input_price\":0.000006,\"output_price\":0.0000225,\"supports_reasoning\":true,\"supports_vision\":true},\n{\"id\":\"claude-sonnet-4-5@eu\",\"api\":\"chat\",\"context_window\":0,\"max_output_tokens\":0,\"input_price\":\"0.000003\",\"output_price\":0.000015,\"supports_reasoning\":null,\"supports_vision\":\"yes\"},\n{\"api\":\"chat\",\"context_window\":128000},\n{\"id\":42,\"api\":\"chat\"}\n]}"
+    },
+    {
+      "path": "/v1/models",
+      "status": 500,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":{\"message\":\"internal error\"}}"
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "models": [
+        {
+          "context_window": 200000,
+          "id": "claude-sonnet-4-5",
+          "max_output_tokens": 64000,
+          "pricing": {
+            "cache_read": 0.3,
+            "cache_write": 3.75,
+            "fast": null,
+            "input": 3.0,
+            "output": 15.0
+          },
+          "supports_thinking": true,
+          "supports_vision": true,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "claude-sonnet-4-5@eu",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": false,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": 400000,
+          "id": "gpt-5.4-mini",
+          "max_output_tokens": 128000,
+          "pricing": {
+            "cache_read": 0.024999999999999998,
+            "cache_write": 0.0,
+            "fast": null,
+            "input": 0.25,
+            "output": 2.0
+          },
+          "supports_thinking": true,
+          "supports_vision": true,
+          "tier": null
+        }
+      ]
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/v1/models"
+      },
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/v1/models/managed"
+      }
+    ]
+  }
+}

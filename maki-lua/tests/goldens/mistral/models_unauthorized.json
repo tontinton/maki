@@ -1,0 +1,41 @@
+{
+  "call": {
+    "endpoint": "models"
+  },
+  "script": [
+    {
+      "status": 401,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"message\":\"Unauthorized\",\"request_id\":\"req_replay\"}"
+    },
+    {
+      "status": 401,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"message\":\"Unauthorized\",\"request_id\":\"req_replay\"}"
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "error": "Api { status: 401, retry_after: None, overflow: None, quota_exhausted: false, auth_error: true }",
+      "message": "API error (401): {\"message\":\"Unauthorized\",\"request_id\":\"req_replay\"}"
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/v1/models"
+      }
+    ]
+  }
+}

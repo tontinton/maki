@@ -1,0 +1,86 @@
+{
+  "call": {
+    "endpoint": "stream",
+    "model": "synthetic/hf:moonshotai/Kimi-K2.5",
+    "thinking": {
+      "kind": "effort",
+      "level": "high"
+    }
+  },
+  "script": [
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "text/event-stream"
+      },
+      "body": "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"weighing the options\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a.txt\\\"}\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\ndata: [DONE]\n\n"
+    }
+  ],
+  "expected": {
+    "events": [
+      {
+        "ThinkingDelta": {
+          "text": "weighing the options"
+        }
+      },
+      {
+        "TextDelta": {
+          "text": "Hello"
+        }
+      },
+      {
+        "ToolUseStart": {
+          "id": "call_1",
+          "name": "read"
+        }
+      }
+    ],
+    "outcome": {
+      "context_size": 12,
+      "message": {
+        "content": [
+          {
+            "thinking": "weighing the options",
+            "type": "thinking"
+          },
+          {
+            "text": "Hello",
+            "type": "text"
+          },
+          {
+            "id": "call_1",
+            "input": {
+              "path": "a.txt"
+            },
+            "name": "read",
+            "type": "tool_use"
+          }
+        ],
+        "role": "assistant"
+      },
+      "stop_reason": "tool_use",
+      "usage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 4,
+        "input_tokens": 8,
+        "output_tokens": 5
+      }
+    },
+    "requests": [
+      {
+        "body": "{\"max_completion_tokens\":131072,\"messages\":[{\"content\":\"You are a replay fixture.\",\"role\":\"system\"},{\"content\":\"read a.txt\",\"role\":\"user\"}],\"model\":\"hf:moonshotai/Kimi-K2.5\",\"reasoning_effort\":\"high\",\"stream\":true,\"tools\":[{\"function\":{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "content-length": "390",
+          "content-type": "application/json",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "POST",
+        "path": "/v1/chat/completions"
+      }
+    ]
+  }
+}

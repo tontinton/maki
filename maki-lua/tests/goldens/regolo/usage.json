@@ -1,0 +1,125 @@
+{
+  "call": {
+    "endpoint": "usage"
+  },
+  "script": [
+    {
+      "path": "/key/info",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"key\":\"88dc28d0f030c55ed4ab77ed8faf0981\",\"info\":{\"key_name\":\"sk-...abcd\",\"key_alias\":\"me@example.com\",\"spend\":0.125,\"max_budget\":0.375,\"budget_duration\":\"30d\",\"budget_reset_at\":\"2026-10-01T02:00:00.25+02:00\",\"models\":[],\"metadata\":{}}}"
+    },
+    {
+      "path": "/global/activity",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"daily_data\":[{\"date\":\"2026-09-23\",\"metrics\":{\"api_requests\":14,\"total_tokens\":5000000000}}],\"sum_api_requests\":14,\"sum_total_tokens\":5000000000}"
+    },
+    {
+      "path": "/spend/logs/v2",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"data\":[\n        {\"request_id\":\"h1\",\"api_key\":\"k\",\"model_group\":\"gpt-oss-120b\",\"key_alias\":\"a\",\"startTime\":\"2026-09-23T09:00:00+00:00\",\"endTime\":\"2026-09-23T10:00:00+00:00\",\"completionStartTime\":null,\"api_requests\":1,\"prompt_tokens\":1000,\"completion_tokens\":200,\"total_tokens\":1200,\"spend\":0.0009,\"request_duration_ms\":3600000},\n        {\"request_id\":\"h2\",\"api_key\":\"k\",\"model_group\":\"qwen3-coder-next\",\"key_alias\":\"a\",\"startTime\":\"2026-09-23T09:00:00+00:00\",\"endTime\":\"2026-09-23T10:00:00+00:00\",\"completionStartTime\":null,\"api_requests\":4,\"prompt_tokens\":15000,\"completion_tokens\":5000,\"total_tokens\":20000,\"spend\":0.01,\"request_duration_ms\":3600000},\n        {\"request_id\":\"h3\",\"api_key\":\"k\",\"model_group\":\"glm5.2\",\"key_alias\":\"a\",\"startTime\":\"2026-09-23T09:00:00+00:00\",\"endTime\":\"2026-09-23T10:00:00+00:00\",\"completionStartTime\":null,\"api_requests\":1,\"prompt_tokens\":120,\"completion_tokens\":80,\"total_tokens\":200,\"spend\":0.0004,\"request_duration_ms\":3600000},\n        {\"request_id\":\"h4\",\"api_key\":\"k\",\"model_group\":\"qwen3-coder-next\",\"key_alias\":\"a\",\"startTime\":\"2026-09-23T10:00:00+00:00\",\"endTime\":\"2026-09-23T11:00:00+00:00\",\"completionStartTime\":null,\"api_requests\":3,\"prompt_tokens\":5000,\"completion_tokens\":3000,\"total_tokens\":8000,\"spend\":0.0042,\"request_duration_ms\":3600000},\n        {\"request_id\":\"h5\",\"api_key\":\"k\",\"model_group\":\"glm5.2\",\"key_alias\":\"a\",\"startTime\":\"2026-09-23T10:00:00+00:00\",\"endTime\":\"2026-09-23T11:00:00+00:00\",\"completionStartTime\":null,\"api_requests\":1,\"prompt_tokens\":80,\"completion_tokens\":80,\"total_tokens\":160,\"spend\":0.0005,\"request_duration_ms\":3600000},\n        {\"request_id\":\"h6\",\"api_key\":\"k\",\"model_group\":\"qwen3.5-9b\",\"key_alias\":\"a\",\"startTime\":\"2026-09-23T11:00:00+00:00\",\"endTime\":\"2026-09-23T12:00:00+00:00\",\"completionStartTime\":null,\"api_requests\":1,\"prompt_tokens\":4294967296,\"completion_tokens\":1,\"total_tokens\":4294967297,\"spend\":0.0000125,\"request_duration_ms\":3600000},\n        {\"request_id\":\"h7\",\"api_key\":\"k\",\"model_group\":\"llama-refund\",\"key_alias\":\"a\",\"startTime\":\"2026-09-23T11:00:00+00:00\",\"endTime\":\"2026-09-23T12:00:00+00:00\",\"completionStartTime\":null,\"api_requests\":0,\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0,\"spend\":-0.0005,\"request_duration_ms\":3600000}\n    ]}"
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "usage": {
+        "by_model_today": [
+          {
+            "input_tokens": 20000,
+            "model": "qwen3-coder-next",
+            "output_tokens": 8000,
+            "spend_microdollars": 14200,
+            "total_tokens": 28000
+          },
+          {
+            "input_tokens": 200,
+            "model": "glm5.2",
+            "output_tokens": 160,
+            "spend_microdollars": 900,
+            "total_tokens": 360
+          },
+          {
+            "input_tokens": 1000,
+            "model": "gpt-oss-120b",
+            "output_tokens": 200,
+            "spend_microdollars": 900,
+            "total_tokens": 1200
+          },
+          {
+            "input_tokens": 4294967296,
+            "model": "qwen3.5-9b",
+            "output_tokens": 1,
+            "spend_microdollars": 13,
+            "total_tokens": 4294967297
+          },
+          {
+            "input_tokens": 0,
+            "model": "llama-refund",
+            "output_tokens": 0,
+            "spend_microdollars": 0,
+            "total_tokens": 0
+          }
+        ],
+        "limits": [
+          {
+            "detail": "$0.12 spent of $0.38 budget",
+            "label": "Spend",
+            "percentage": 33,
+            "reset_at": 1790812800250
+          },
+          {
+            "detail": "14 requests · 5000000000 tokens",
+            "label": "Today",
+            "reset_at": "<next-utc-midnight>"
+          }
+        ]
+      }
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/global/activity?start_date=<today>&end_date=<today>"
+      },
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/key/info"
+      },
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/spend/logs/v2?start_date=<today>&end_date=<today>"
+      }
+    ]
+  }
+}

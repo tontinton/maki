@@ -1,0 +1,95 @@
+{
+  "call": {
+    "endpoint": "stream",
+    "model": "mistral/mistral-medium-latest",
+    "thinking": {
+      "kind": "off"
+    }
+  },
+  "script": [
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "text/event-stream"
+      },
+      "body": "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"weighing the options\"}]}]}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[\" and a plan\"]},{\"type\":\"text\",\"text\":\"Hello\"}]}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"c.txt\\\"}\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\ndata: [DONE]\n\n"
+    }
+  ],
+  "expected": {
+    "events": [
+      {
+        "ThinkingDelta": {
+          "text": "weighing the options"
+        }
+      },
+      {
+        "ThinkingDelta": {
+          "text": " and a plan"
+        }
+      },
+      {
+        "TextDelta": {
+          "text": "Hello"
+        }
+      },
+      {
+        "TextDelta": {
+          "text": " there"
+        }
+      },
+      {
+        "ToolUseStart": {
+          "id": "call_9",
+          "name": "read"
+        }
+      }
+    ],
+    "outcome": {
+      "context_size": 12,
+      "message": {
+        "content": [
+          {
+            "thinking": "weighing the options and a plan",
+            "type": "thinking"
+          },
+          {
+            "text": "Hello there",
+            "type": "text"
+          },
+          {
+            "id": "call_9",
+            "input": {
+              "path": "c.txt"
+            },
+            "name": "read",
+            "type": "tool_use"
+          }
+        ],
+        "role": "assistant"
+      },
+      "stop_reason": "tool_use",
+      "usage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 4,
+        "input_tokens": 8,
+        "output_tokens": 5
+      }
+    },
+    "requests": [
+      {
+        "body": "{\"messages\":[{\"content\":\"You are a replay fixture.\",\"role\":\"system\"},{\"content\":\"read a.txt\",\"role\":\"user\"}],\"model\":\"mistral-medium-latest\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "content-length": "371",
+          "content-type": "application/json",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "POST",
+        "path": "/v1/chat/completions"
+      }
+    ]
+  }
+}

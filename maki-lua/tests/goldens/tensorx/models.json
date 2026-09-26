@@ -1,0 +1,196 @@
+{
+  "call": {
+    "endpoint": "models"
+  },
+  "script": [
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"data\":[\n{\"model_name\":\"openai/gpt-oss-120b\",\"model_info\":{\"mode\":\"chat\",\"max_input_tokens\":131072,\"max_output_tokens\":32768,\"input_cost_per_token\":1.5e-7,\"output_cost_per_token\":6e-7,\"supports_reasoning\":true,\"supported_openai_params\":[\"max_tokens\",\"tools\",\"reasoning_effort\"]}},\n{\"model_name\":\"z-ai/glm-5.2\",\"model_info\":{\"mode\":\"chat\",\"max_tokens\":202752,\"max_input_tokens\":200000,\"max_output_tokens\":131072,\"input_cost_per_token\":6e-7,\"output_cost_per_token\":2.2e-6,\"cache_read_input_token_cost\":1.1e-7,\"supports_vision\":false,\"supports_reasoning\":true,\"supported_openai_params\":[\"max_tokens\",\"tools\",\"thinking\"]}},\n{\"model_name\":\"edge/duplicate\",\"model_info\":{\"mode\":\"chat\",\"max_tokens\":1000}},\n{\"model_name\":\"qwen/qwen3.5-397b\",\"model_info\":{\"mode\":\"chat\",\"max_tokens\":262144,\"supports_vision\":true,\"supports_reasoning\":true,\"supported_openai_params\":[\"thinking\",\"reasoning_effort\"]}},\n{\"model_name\":\"deepseek/deepseek-flash\",\"model_info\":{\"mode\":\"chat\",\"max_tokens\":1000000,\"max_output_tokens\":384000,\"input_cost_per_token\":2.8e-7,\"output_cost_per_token\":4.2e-7,\"cache_creation_input_token_cost\":0,\"cache_read_input_token_cost\":2.8e-8,\"supports_reasoning\":true,\"supported_openai_params\":[\"max_tokens\",\"tools\"]}},\n{\"model_name\":\"deepseek/deepseek-reasoner\",\"model_info\":{\"mode\":\"chat\",\"max_tokens\":131072,\"supports_reasoning\":true,\"supported_openai_params\":[\"tools\"]}},\n{\"model_name\":\"moonshotai/kimi-k3\",\"model_info\":{\"max_tokens\":262144,\"supports_vision\":true}},\n{\"model_name\":\"qwen/qwen3-embedding\",\"model_info\":{\"mode\":\"embedding\",\"max_tokens\":8192}},\n{\"model_name\":\"black-forest-labs/flux\",\"model_info\":{\"mode\":\"image_generation\"}},\n{\"model_name\":\"edge/float-counts\",\"model_info\":{\"mode\":\"chat\",\"max_tokens\":131072.0,\"max_input_tokens\":65536,\"max_output_tokens\":8192.5}},\n{\"model_name\":\"edge/negative\",\"model_info\":{\"mode\":\"chat\",\"max_tokens\":-1,\"max_input_tokens\":-1,\"max_output_tokens\":-5,\"input_cost_per_token\":-1e-6}},\n{\"model_name\":\"edge/null\",\"model_info\":{\"mode\":null,\"max_tokens\":null,\"max_input_tokens\":32768,\"max_output_tokens\":null,\"input_cost_per_token\":null,\"output_cost_per_token\":1e-6,\"supports_vision\":null,\"supports_reasoning\":null,\"supported_openai_params\":null}},\n{\"model_name\":\"edge/beyond-u32\",\"model_info\":{\"mode\":\"chat\",\"max_tokens\":5000000000,\"max_input_tokens\":131072,\"max_output_tokens\":4294967296}},\n{\"model_name\":\"edge/wrong-types\",\"model_info\":{\"mode\":1,\"input_cost_per_token\":\"0.000001\",\"output_cost_per_token\":\"abc\",\"supports_vision\":\"true\",\"supports_reasoning\":\"yes\",\"supported_openai_params\":\"thinking\"}},\n{\"model_name\":\"edge/mixed-params\",\"model_info\":{\"mode\":\"chat\",\"supported_openai_params\":[\"thinking\",1,null,{\"name\":\"reasoning_effort\"}]}},\n{\"model_name\":\"edge/rounding-tie\",\"model_info\":{\"mode\":\"chat\",\"input_cost_per_token\":1.25e-7,\"output_cost_per_token\":3.75e-7,\"cache_read_input_token_cost\":1.5e-8}},\n{\"model_name\":\"edge/null-info\",\"model_info\":null},\n{\"model_name\":\"edge/duplicate\",\"model_info\":{\"mode\":\"chat\",\"max_tokens\":2000}},\n{\"model_name\":42,\"model_info\":{\"mode\":\"chat\"}},\n{\"model_info\":{\"mode\":\"chat\"}},\n{\"model_name\":\"edge/no-info\"},\nnull,\n\"stray\"\n]}"
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "models": [
+        {
+          "context_window": 1000000,
+          "id": "deepseek/deepseek-flash",
+          "max_output_tokens": 384000,
+          "pricing": {
+            "cache_read": 0.028,
+            "cache_write": 0.0,
+            "fast": null,
+            "input": 0.28,
+            "output": 0.42
+          },
+          "supports_thinking": true,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": 131072,
+          "id": "deepseek/deepseek-reasoner",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": true,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "edge/beyond-u32",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": 1000,
+          "id": "edge/duplicate",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": 131072,
+          "id": "edge/float-counts",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "edge/mixed-params",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "edge/negative",
+          "max_output_tokens": null,
+          "pricing": {
+            "cache_read": 0.0,
+            "cache_write": 0.0,
+            "fast": null,
+            "input": -1.0,
+            "output": 0.0
+          },
+          "supports_thinking": null,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": 32768,
+          "id": "edge/null",
+          "max_output_tokens": null,
+          "pricing": {
+            "cache_read": 0.0,
+            "cache_write": 0.0,
+            "fast": null,
+            "input": 0.0,
+            "output": 1.0
+          },
+          "supports_thinking": null,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "edge/rounding-tie",
+          "max_output_tokens": null,
+          "pricing": {
+            "cache_read": 0.015,
+            "cache_write": 0.0,
+            "fast": null,
+            "input": 0.125,
+            "output": 0.375
+          },
+          "supports_thinking": null,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "edge/wrong-types",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": 262144,
+          "id": "moonshotai/kimi-k3",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": true,
+          "tier": null
+        },
+        {
+          "context_window": 131072,
+          "id": "openai/gpt-oss-120b",
+          "max_output_tokens": 32768,
+          "pricing": {
+            "cache_read": 0.0,
+            "cache_write": 0.0,
+            "fast": null,
+            "input": 0.15,
+            "output": 0.6
+          },
+          "supports_thinking": true,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "context_window": 262144,
+          "id": "qwen/qwen3.5-397b",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": true,
+          "supports_vision": true,
+          "tier": null
+        },
+        {
+          "context_window": 202752,
+          "id": "z-ai/glm-5.2",
+          "max_output_tokens": 131072,
+          "pricing": {
+            "cache_read": 0.11,
+            "cache_write": 0.0,
+            "fast": null,
+            "input": 0.6,
+            "output": 2.2
+          },
+          "supports_thinking": true,
+          "supports_vision": false,
+          "tier": null
+        }
+      ]
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/v1/model/info"
+      }
+    ]
+  }
+}

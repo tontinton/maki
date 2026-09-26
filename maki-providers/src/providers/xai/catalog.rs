@@ -43,12 +43,23 @@ pub(crate) struct CachedModel {
     pub max_tokens: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ModelPricingDto {
     pub input: f64,
     pub output: f64,
     pub cache_write: f64,
     pub cache_read: f64,
+}
+
+impl From<&ModelPricing> for ModelPricingDto {
+    fn from(pricing: &ModelPricing) -> Self {
+        Self {
+            input: pricing.input,
+            output: pricing.output,
+            cache_write: pricing.cache_write,
+            cache_read: pricing.cache_read,
+        }
+    }
 }
 
 impl From<CachedModel> for ModelInfo {
@@ -165,18 +176,16 @@ fn curated_fallback() -> Vec<CachedModel> {
         .models()
         .iter()
         .filter_map(|entry| {
-            let id = *entry.prefixes.first()?;
             Some(CachedModel {
-                id: id.to_string(),
+                id: entry.canonical_id()?.to_string(),
                 reasoning: true,
-                vision: entry.vision,
-                pricing: ModelPricingDto {
-                    input: entry.pricing.input,
-                    output: entry.pricing.output,
-                    cache_write: entry.pricing.cache_write,
-                    cache_read: entry.pricing.cache_read,
-                },
-                context_window: entry.context_window,
+                vision: entry.supports_vision.unwrap_or_default(),
+                pricing: entry
+                    .pricing
+                    .as_ref()
+                    .map(ModelPricingDto::from)
+                    .unwrap_or_default(),
+                context_window: entry.context_window?,
                 max_tokens: entry
                     .max_output_tokens
                     .unwrap_or(DEFAULT_UNKNOWN_MAX_TOKENS),
@@ -345,7 +354,8 @@ fn normalize_entry(value: &serde_json::Value) -> EntryResult {
         .find(|entry| entry.prefixes.iter().any(|p| normalized.starts_with(p)));
     let vision = first_bool(obj, meta, &["acceptsImages"])
         .or_else(|| parse_accepts_images(first_value(obj, meta, &["inputModalities"])))
-        .unwrap_or(known.is_some_and(|entry| entry.vision));
+        .or_else(|| known.and_then(|entry| entry.supports_vision))
+        .unwrap_or(false);
 
     let supports_effort = first_bool(
         obj,
@@ -364,18 +374,9 @@ fn normalize_entry(value: &serde_json::Value) -> EntryResult {
     });
 
     let pricing = known
-        .map(|entry| ModelPricingDto {
-            input: entry.pricing.input,
-            output: entry.pricing.output,
-            cache_write: entry.pricing.cache_write,
-            cache_read: entry.pricing.cache_read,
-        })
-        .unwrap_or(ModelPricingDto {
-            input: 0.0,
-            output: 0.0,
-            cache_write: 0.0,
-            cache_read: 0.0,
-        });
+        .and_then(|entry| entry.pricing.as_ref())
+        .map(ModelPricingDto::from)
+        .unwrap_or_default();
 
     EntryResult::Model(CachedModel {
         id,

@@ -6,7 +6,6 @@
 
 local parse = require("maki.provider_parse")
 
-local SLUG = "mistral"
 local MODELS_PATH = "/models"
 
 -- Mistral takes reasoning back as a `thinking` part at the front of the
@@ -48,7 +47,7 @@ local function parse_model(m)
 end
 
 maki.provider.register({
-  slug = SLUG,
+  slug = "mistral",
   codec = "openai",
   openai = {
     thinking = { dialect = "high-only" },
@@ -57,7 +56,7 @@ maki.provider.register({
     thinking_overrides = { ["ministral-"] = "no" },
   },
 
-  build_body = function(body)
+  build_body = function(_, body)
     if type(body.messages) == "table" then
       convert_assistant_messages(body.messages)
     end
@@ -66,11 +65,10 @@ maki.provider.register({
 
   -- Mistral's `/models` lists embedding, OCR and moderation models too, and
   -- names its fields its own way.
-  list_models = function()
-    local auth = assert(maki.provider.auth.resolved(SLUG))
-    local body, err = parse.get_json(auth, auth.base_url .. MODELS_PATH)
+  list_models = function(ctx)
+    local body, err = ctx.get_json(MODELS_PATH)
     if err then
-      return parse.fail(err)
+      return nil, err
     end
     return parse.models(body, parse_model)
   end,

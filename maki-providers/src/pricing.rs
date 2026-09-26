@@ -404,7 +404,10 @@ mod tests {
             .expect("a builtin provider")
             .models()
             .iter()
-            .find_map(|e| (e.pricing.input != current.pricing.input).then_some(e.prefixes[0]))
+            .find_map(|e| {
+                (e.pricing.as_ref()?.input != current.pricing.input)
+                    .then_some(e.prefixes[0].as_str())
+            })
             .expect("a sibling model the table prices differently");
         let sibling = Model::from_spec(&format!("{}/{sibling_id}", current.provider)).unwrap();
         let usage = stored(None);

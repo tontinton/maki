@@ -270,7 +270,7 @@ fn static_prefixes(provider: &str, tier: ModelTier) -> impl Iterator<Item = &'st
         .into_iter()
         .flat_map(|spec| spec.models())
         .filter(move |entry| entry.default && entry.tier == tier)
-        .flat_map(|entry| entry.prefixes.iter().copied())
+        .flat_map(|entry| entry.prefixes.iter().map(String::as_str))
 }
 
 fn tier_for_position(pos: usize) -> ModelTier {
