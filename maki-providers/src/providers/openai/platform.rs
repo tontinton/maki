@@ -34,6 +34,8 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 // Codex models match by their `-codex` substring in
 // `coding_plan_context_window`, so they are not listed here.
 pub(crate) const PLAN_MODELS: &[&str] = &[
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-6-astra",
     "gpt-5.6-luna",
     "gpt-5.6-terra",
@@ -48,8 +50,9 @@ const CODEX_PLAN_CONTEXT_WINDOW: u32 = 272_000;
 const GPT_5_6_PLAN_CONTEXT_WINDOW: u32 = 372_000;
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 // The backend hides models newer than this Codex CLI version, so bump it when
-// a fresh model is missing from the list.
-const CODEX_CLIENT_VERSION: &str = "0.153.4";
+// a fresh model is missing from the list. 0.156.1 is the first line that
+// surfaces GPT-6 Sol / Luna in the picker; 0.157.1 is latest as of 2026-09-26.
+const CODEX_CLIENT_VERSION: &str = "0.157.1";
 const PLAN_MODELS_PATH: &str = "/models?client_version=";
 const LISTED_VISIBILITY: &str = "list";
 const ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
@@ -638,6 +641,8 @@ mod tests {
         assert!(is_codex_model(model_id));
     }
 
+    #[test_case("gpt-6-sol", Some(272_000))]
+    #[test_case("gpt-6-luna", Some(272_000))]
     #[test_case("gpt-6-astra", Some(272_000))]
     #[test_case("gpt-5.6-luna", Some(372_000))]
     #[test_case("gpt-5.6-terra", Some(372_000))]
@@ -668,6 +673,10 @@ mod tests {
     #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-5.6-sol", "max" ; "max_passes_through_on_5_6_sol")]
     #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-5.6-terra", "max" ; "max_passes_through_on_5_6_terra")]
     #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-5.6-luna", "max" ; "max_passes_through_on_5_6_luna")]
+    #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-6-sol", "max" ; "max_passes_through_on_6_sol")]
+    #[test_case(ThinkingConfig::Effort(Effort::Minimal), "gpt-6-sol", "low" ; "minimal_snaps_to_low_on_6_sol")]
+    #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-6-luna", "max" ; "max_passes_through_on_6_luna")]
+    #[test_case(ThinkingConfig::Effort(Effort::Minimal), "gpt-6-luna", "low" ; "minimal_snaps_to_low_on_6_luna")]
     #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-6-astra", "max" ; "max_passes_through_on_6_astra")]
     #[test_case(ThinkingConfig::Effort(Effort::Minimal), "gpt-6-astra", "low" ; "minimal_snaps_to_low_on_6_astra")]
     #[test_case(ThinkingConfig::Adaptive, "gpt-6-astra", "medium" ; "adaptive_on_6_astra")]
@@ -686,6 +695,8 @@ mod tests {
     #[test]
     fn plan_models_have_a_reviewed_dialect() {
         const EXPECTED: &[(&str, &EffortDialect)] = &[
+            ("gpt-6-sol", &dialect::GPT_6),
+            ("gpt-6-luna", &dialect::GPT_6),
             ("gpt-6-astra", &dialect::GPT_6),
             ("gpt-5.6-luna", &dialect::GPT_5_6),
             ("gpt-5.6-terra", &dialect::GPT_5_6),
@@ -707,6 +718,8 @@ mod tests {
     }
 
     #[test_case("gpt-5.3-codex")]
+    #[test_case("gpt-6-sol")]
+    #[test_case("gpt-6-luna")]
     #[test_case("gpt-6-astra")]
     fn responses_reasoning_omits_effort_when_disabled(model_id: &str) {
         let model = Model::from_spec(&format!("openai/{model_id}")).unwrap();

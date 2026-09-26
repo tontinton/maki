@@ -32,6 +32,26 @@ context_window = 372000
 pricing = { input = 5.0, output = 30.0, cache_write = 6.25, cache_read = 0.5 }
 
 [[model]]
+prefixes = ["gpt-6-luna"]
+tier = "weak"
+family = "gpt"
+vision = true
+default = false
+max_output_tokens = 128000
+context_window = 1050000
+pricing = { input = 0.1, output = 0.5, cache_write = 0.125, cache_read = 0.01 }
+
+[[model]]
+prefixes = ["gpt-6-sol"]
+tier = "medium"
+family = "gpt"
+vision = true
+default = false
+max_output_tokens = 128000
+context_window = 1050000
+pricing = { input = 2.0, output = 10.0, cache_write = 2.5, cache_read = 0.2 }
+
+[[model]]
 prefixes = ["gpt-6-astra"]
 tier = "strong"
 family = "gpt"
