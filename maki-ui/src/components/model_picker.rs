@@ -107,7 +107,9 @@ pub struct ModelPicker {
     recents: Vec<String>,
     current_spec: String,
     needs_rebuild: bool,
-    /// User-moved entry to restore on refresh: `(was_recent, spec)`.
+    /// Entry to restore on refresh: `(was_recent, spec)`. Seeded from the
+    /// preselection at open so it survives the background list arriving, and
+    /// moved by user navigation.
     anchor: Option<(bool, String)>,
 }
 
@@ -137,7 +139,9 @@ impl ModelPicker {
         let entries = self.load_entries();
         self.picker.open(entries, TITLE);
         self.show_loading();
-        self.preselect_current_model();
+        if self.preselect_current_model() {
+            self.anchor = self.selected_anchor();
+        }
     }
 
     /// Providers fetch their model lists in the background and drop them into
@@ -194,13 +198,10 @@ impl ModelPicker {
         entries
     }
 
-    fn preselect_current_model(&mut self) {
-        if !self
-            .picker
+    fn preselect_current_model(&mut self) -> bool {
+        self.picker
             .select_item_by(|e| e.spec == self.current_spec && e.suffix().is_none())
-        {
-            self.picker.select_item_by(|e| e.spec == self.current_spec);
-        }
+            || self.picker.select_item_by(|e| e.spec == self.current_spec)
     }
 
     pub fn is_open(&self) -> bool {
@@ -219,16 +220,19 @@ impl ModelPicker {
         self.picker.scroll(delta);
     }
 
+    fn selected_anchor(&self) -> Option<(bool, String)> {
+        self.picker
+            .selected_item()
+            .map(|e| (e.suffix().is_some(), e.spec.clone()))
+    }
+
     fn track_anchor<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
         let before = self.picker.selected_index();
         let result = f(self);
         if let (Some(before), Some(after)) = (before, self.picker.selected_index())
             && before != after
         {
-            self.anchor = self
-                .picker
-                .selected_item()
-                .map(|e| (e.suffix().is_some(), e.spec.clone()));
+            self.anchor = self.selected_anchor();
         }
         result
     }
@@ -634,6 +638,86 @@ mod tests {
             Some("Anthropic"),
             "cursor should migrate to the provider entry once it arrives",
         );
+    }
+
+    #[test]
+    fn arrival_keeps_the_entry_preselected_at_open() {
+        let models = Arc::new(ArcSwapOption::empty());
+        let mut p = ModelPicker::new(models.clone());
+        p.set_recents(vec![
+            "zai/glm-5".into(),
+            "anthropic/claude-sonnet-4-20250514".into(),
+        ]);
+        p.open("anthropic/claude-sonnet-4-20250514");
+
+        let entry = p.picker.selected_item().expect("selection on open");
+        assert_eq!(
+            entry.section(),
+            Some("Recent"),
+            "only recents are listed before the background fetch finishes",
+        );
+
+        models.store(Some(loaded(vec![
+            "anthropic/claude-sonnet-4-20250514".into(),
+            "anthropic/claude-opus-4-6-20260101".into(),
+            "zai/glm-5".into(),
+        ])));
+        let _ = p.refresh();
+
+        let entry = p.picker.selected_item().expect("selection after arrival");
+        assert_eq!(entry.spec, "anthropic/claude-sonnet-4-20250514");
+        assert_eq!(
+            entry.section(),
+            Some("Recent"),
+            "the entry preselected at open should stay selected when the provider list arrives",
+        );
+    }
+
+    #[test]
+    fn arrival_selects_current_model_missing_from_recents() {
+        let models = Arc::new(ArcSwapOption::empty());
+        let mut p = ModelPicker::new(models.clone());
+        p.set_recents(vec!["zai/glm-5".into()]);
+        p.open("anthropic/claude-opus-4-6-20260101");
+
+        models.store(Some(loaded(vec![
+            "anthropic/claude-opus-4-6-20260101".into(),
+            "zai/glm-5".into(),
+        ])));
+        let _ = p.refresh();
+
+        let entry = p.picker.selected_item().expect("selection after arrival");
+        assert_eq!(entry.spec, "anthropic/claude-opus-4-6-20260101");
+    }
+
+    /// Discovery publishes a snapshot per batch, so the preselected entry
+    /// has to survive every intermediate list, not just the finished one.
+    #[test]
+    fn progressive_arrival_keeps_the_entry_preselected_at_open() {
+        let models = Arc::new(ArcSwapOption::empty());
+        let mut p = ModelPicker::new(models.clone());
+        p.set_recents(vec!["anthropic/claude-sonnet-4-20250514".into()]);
+        p.open("anthropic/claude-sonnet-4-20250514");
+
+        for specs in [
+            vec!["anthropic/claude-sonnet-4-20250514".to_string()],
+            vec![
+                "anthropic/claude-sonnet-4-20250514".to_string(),
+                "zai/glm-5".to_string(),
+            ],
+        ] {
+            models.store(Some(Arc::new(ModelList {
+                specs,
+                loading: true,
+            })));
+            let _ = p.refresh();
+            let entry = p.picker.selected_item().expect("selection after a batch");
+            assert_eq!(
+                entry.section(),
+                Some("Recent"),
+                "an intermediate snapshot must not move the cursor to the provider entry",
+            );
+        }
     }
 
     #[test]
