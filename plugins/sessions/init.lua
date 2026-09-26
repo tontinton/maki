@@ -9,7 +9,6 @@ local ListPicker = require("maki.list_picker")
 local FILTER_PREFIX = "❯ "
 local RENAME_PREFIX = "Rename: "
 local CONFIRM_HINT = "  Ctrl+D again to delete"
-local DELETE_FOCUSED_HINT = "Cannot delete the current session"
 local RENAME_USAGE = "Usage: /rename <title>"
 local EMPTY_HINT = "  No sessions yet. Press Ctrl+N to start one."
 local NO_MATCHES_HINT = "  No matches"
@@ -320,13 +319,26 @@ local function open_blank()
   close()
 end
 
+-- The host refuses to delete the focused session, so drop into a fresh one
+-- first: focus moves, the row becomes an ordinary background session, and
+-- the delete goes through. Close the picker so the user lands in the new
+-- session right away.
+local function delete_current(s)
+  local _, err = maki.session.new({ focus = true })
+  if err then
+    maki.ui.flash(err)
+    return
+  end
+  local _, del_err = maki.session.delete(s.id)
+  if del_err then
+    maki.ui.flash(del_err)
+  end
+  close()
+end
+
 local function delete_selected()
   local s = selected()
   if not s then
-    return
-  end
-  if s.focused then
-    maki.ui.flash(DELETE_FOCUSED_HINT)
     return
   end
   if board.confirm ~= s.id then
@@ -335,6 +347,10 @@ local function delete_selected()
     return
   end
   board.confirm = nil
+  if s.focused then
+    delete_current(s)
+    return
+  end
   local _, err = maki.session.delete(s.id)
   if err then
     maki.ui.flash(err)
