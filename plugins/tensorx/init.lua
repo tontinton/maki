@@ -38,7 +38,7 @@ local function uses_v4_thinking_protocol(model_id)
 end
 
 local function price(info, key)
-  return (parse.as_f64(info, key) or 0) * PER_MILLION
+  return (parse.as_f64(info[key]) or 0) * PER_MILLION
 end
 
 -- Which of the two thinking knobs a model advertises, handed back to
@@ -49,7 +49,7 @@ local function knobs(info)
     return nil
   end
   local found = { has_thinking = false, has_reasoning_effort = false }
-  for _, param in parse.items(params) do
+  for _, param in pairs(params) do
     if param == THINKING then
       found.has_thinking = true
     elseif param == REASONING_EFFORT then
@@ -59,14 +59,11 @@ local function knobs(info)
   return found
 end
 
--- One entry of `/model/info`. nil for anything that is not a chat model. A null
--- `model_info` lists like an empty one, where a missing one skips the entry.
+-- One entry of `/model/info`. nil for anything that is not a chat model, and
+-- for an entry without `model_info`. A `model_info` that is not a table lists
+-- like an empty one.
 local function model_row(entry)
-  if
-    type(entry) ~= "table"
-    or type(entry.model_name) ~= "string"
-    or (entry.model_info == nil and not parse.is_null(entry, "model_info"))
-  then
+  if type(entry) ~= "table" or type(entry.model_name) ~= "string" or entry.model_info == nil then
     return nil
   end
   local info = type(entry.model_info) == "table" and entry.model_info or {}
@@ -74,10 +71,10 @@ local function model_row(entry)
     return nil
   end
 
-  local window_key = parse.as_u64(info, "max_tokens") and "max_tokens" or "max_input_tokens"
+  local window = parse.as_u64(info.max_tokens) and info.max_tokens or info.max_input_tokens
 
   local pricing
-  if parse.as_f64(info, "input_cost_per_token") or parse.as_f64(info, "output_cost_per_token") then
+  if parse.as_f64(info.input_cost_per_token) or parse.as_f64(info.output_cost_per_token) then
     pricing = {
       input = price(info, "input_cost_per_token"),
       output = price(info, "output_cost_per_token"),
@@ -88,10 +85,10 @@ local function model_row(entry)
 
   return {
     id = entry.model_name,
-    context_window = parse.as_u32(info, window_key),
-    max_output_tokens = parse.as_u32(info, "max_output_tokens"),
+    context_window = parse.as_u32(window),
+    max_output_tokens = parse.as_u32(info.max_output_tokens),
     pricing = pricing,
-    supports_thinking = parse.as_bool(info, "supports_reasoning"),
+    supports_thinking = parse.as_bool(info.supports_reasoning),
     supports_vision = info.supports_vision == true,
     extra = knobs(info),
   }

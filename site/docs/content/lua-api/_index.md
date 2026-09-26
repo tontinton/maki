@@ -7067,52 +7067,16 @@ function M.cut(view, out, reason, timeout_secs)
 ### `require("maki.provider_parse")`
 
 ```lua
--- Rust parity for provider plugins that port a bespoke Rust parser. The Rust
--- side reads JSON with serde_json and prints with `format!`, and these helpers
--- reproduce its numbers bit for bit. Other plugins are better off with
--- `maki.json`.
+-- Readers for the JSON a provider's side endpoints answer with, shared by the
+-- bundled provider plugins.
 --
--- Luau has a single number type, so `maki.json.decode` gives `8192` and
--- `8192.0` the same value, while serde_json's `as_u64` accepts only the first.
--- `M.decode` remembers which numbers were floats in the source text, and the
--- readers take the container and key (`M.as_u32(m, "context_length")` mirrors
--- `m["context_length"].as_u64().and_then(|v| u32::try_from(v).ok())`). A
--- missing key, a JSON null, a non-table container or the wrong type reads as
--- nil. Tables that did not come from `M.decode` carry no float marks, so there
--- a whole-valued float passes as an integer.
---
--- A JSON null decodes to nil, which looks like a missing key and leaves a hole
--- that stops `#` and `ipairs` early. `M.decode` also remembers where the nulls
--- were: `M.is_null` tells them from missing keys, and `M.items` walks an array
--- the way Rust's `as_array().iter()` does, nulls included.
---
--- `M.get_json` and `M.models` are the two halves of the Rust side's
--- `fetch_and_parse_models`, for a hook that fetches off the codec's request
--- path.
---
--- Luau numbers are doubles: a u64 above 2^53 comes back rounded, and
--- u64::MAX reads as 2^64.
+-- Luau has one number type, so `8192` and `8192.0` decode to the same value
+-- and both read as a whole number. A JSON null decodes to nil: it reads like a
+-- missing key, and in an array it leaves a hole that stops `ipairs`. Numbers
+-- above 2^53 come back rounded.
 
---- `maki.json.decode`, plus a record of which numbers serde_json would read
---- as floats and where the nulls were. Returns the value, or nil and an error.
-function M.decode(text)
-
---- serde_json `tbl.get(key).is_some_and(Value::is_null)`: true only where the
---- decoded JSON held a null, never for a missing key or a table that did not
---- come from `M.decode`.
-function M.is_null(tbl, key)
-
---- The JSON array's length, nulls included. `#arr` for a table that did not
---- come from `M.decode`, 0 for a non-table.
-function M.len(arr)
-
---- Rust `as_array().iter().enumerate()`, 1-based: `for i, v in M.items(arr)`
---- visits every index up to `M.len(arr)`, with v nil for a null element.
-function M.items(arr)
-
---- Rust `get_text` then `serde_json::from_str`: a GET with the provider's
---- resolved `auth`, never retried. Returns the decoded body, nil for a JSON
---- null. On failure returns nil and an error for `M.fail`.
+--- A GET with the provider's resolved `auth`, never retried. Returns the
+--- decoded body. On failure returns nil and an error for `M.fail`.
 function M.get_json(auth, url)
 
 --- Hands a `M.get_json` error back from a hook. A refused request is returned,
@@ -7120,44 +7084,20 @@ function M.get_json(auth, url)
 --- HTTP status and is raised.
 function M.fail(err)
 
---- serde_json `Value::as_u64` on `tbl[key]`: a non-negative integer, never a
---- float such as `1.0`, `1e3` or `-0`.
-function M.as_u64(tbl, key)
+--- A whole, non-negative number up to 2^64, or nil.
+function M.as_u64(value)
 
---- `as_u64` then `u32::try_from(v).ok()`.
-function M.as_u32(tbl, key)
+--- A whole, non-negative number that fits a u32, or nil.
+function M.as_u32(value)
 
---- serde_json `Value::as_f64` on `tbl[key]`: any number, integer or float.
-function M.as_f64(tbl, key)
+--- A number, or nil.
+function M.as_f64(value)
 
---- serde_json `Value::as_bool` on `tbl[key]`.
-function M.as_bool(tbl, key)
+--- A boolean, or nil.
+function M.as_bool(value)
 
---- Rust `s.parse::<f64>().ok()`: no whitespace, no hex, an optional sign,
---- and `inf`, `infinity` or `nan` in any case. nil for a non-string.
-function M.parse_f64(s)
-
---- Rust `x as u64`: truncates, NaN and negatives give 0, saturates at the top.
-function M.cast_u64(x)
-
---- Rust `x as u32`: truncates, NaN and negatives give 0, saturates at the top.
-function M.cast_u32(x)
-
---- Rust `f64::round`: halves round away from zero.
-M.round = math.round
-
---- Rust `format!("{:.n$}", x)`: the exact binary value rounded, ties to even,
---- so `0.125` prints `0.12`. A whole number with `n = 0` prints like Rust's
---- integer `{}`.
-function M.fixed(x, n)
-
---- Rust `sort_by`, in place: stable, so elements that are not `less` than
---- each other keep their order. `less(a, b)` is true when `a` sorts first.
-function M.stable_sort_by(list, less)
-
---- The rest of Rust `fetch_and_parse_models`: each `body.data` element through
---- `parse_row`, nils dropped, sorted by `id`. A body without a `data` array
---- lists nothing.
+--- Each `body.data` element through `parse_row`, nils dropped, the first row
+--- per id kept, sorted by id. A body without a `data` array lists nothing.
 function M.models(body, parse_row)
 ```
 

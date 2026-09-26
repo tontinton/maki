@@ -41,7 +41,7 @@
         "tier": null
       },
       {
-        "context_window": null,
+        "context_window": 131072,
         "id": "vendor/floats",
         "max_output_tokens": null,
         "pricing": {
@@ -104,21 +104,6 @@
           "fast": null,
           "input": 0.0,
           "output": 0.0
-        },
-        "supports_thinking": false,
-        "supports_vision": false,
-        "tier": null
-      },
-      {
-        "context_window": 64000,
-        "id": "vendor/twin",
-        "max_output_tokens": null,
-        "pricing": {
-          "cache_read": 0.0,
-          "cache_write": 0.0,
-          "fast": null,
-          "input": 1.0,
-          "output": 2.0
         },
         "supports_thinking": false,
         "supports_vision": false,

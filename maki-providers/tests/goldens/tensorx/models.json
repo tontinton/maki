@@ -44,16 +44,7 @@
         "tier": null
       },
       {
-        "context_window": 2000,
-        "id": "edge/duplicate",
-        "max_output_tokens": null,
-        "pricing": null,
-        "supports_thinking": null,
-        "supports_vision": false,
-        "tier": null
-      },
-      {
-        "context_window": 65536,
+        "context_window": 131072,
         "id": "edge/float-counts",
         "max_output_tokens": null,
         "pricing": null,
@@ -96,15 +87,6 @@
           "input": 0.0,
           "output": 1.0
         },
-        "supports_thinking": null,
-        "supports_vision": false,
-        "tier": null
-      },
-      {
-        "context_window": null,
-        "id": "edge/null-info",
-        "max_output_tokens": null,
-        "pricing": null,
         "supports_thinking": null,
         "supports_vision": false,
         "tier": null

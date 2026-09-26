@@ -2,7 +2,7 @@
   "discovery": {
     "models": [
       {
-        "context_window": null,
+        "context_window": 1000000,
         "id": "anthropic/claude-opus-5",
         "max_output_tokens": null,
         "pricing": {
@@ -115,21 +115,6 @@
           "output": 2.2
         },
         "supports_thinking": true,
-        "supports_vision": false,
-        "tier": null
-      },
-      {
-        "context_window": 200000,
-        "id": "z-ai/glm-5",
-        "max_output_tokens": null,
-        "pricing": {
-          "cache_read": 0.0,
-          "cache_write": 0.0,
-          "fast": null,
-          "input": 0.6,
-          "output": 2.2
-        },
-        "supports_thinking": false,
         "supports_vision": false,
         "tier": null
       }

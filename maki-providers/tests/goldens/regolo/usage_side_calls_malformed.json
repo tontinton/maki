@@ -7,6 +7,11 @@
           "label": "Spend",
           "percentage": 33,
           "reset_at": 1790812800250
+        },
+        {
+          "detail": "14 requests · 29027 tokens",
+          "label": "Today",
+          "reset_at": "<next-utc-midnight>"
         }
       ]
     }

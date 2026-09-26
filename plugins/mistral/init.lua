@@ -41,8 +41,8 @@ local function parse_model(m)
   end
   return {
     id = m.id,
-    context_window = parse.as_u32(m, "max_context_length"),
-    supports_thinking = parse.as_bool(capabilities, "reasoning"),
+    context_window = parse.as_u32(m.max_context_length),
+    supports_thinking = parse.as_bool(capabilities.reasoning),
     supports_vision = capabilities.vision == true,
   }
 end

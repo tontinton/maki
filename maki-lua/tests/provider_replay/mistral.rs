@@ -45,9 +45,8 @@ fn the_bundled_mistral_plugin_rewrites_the_same_turns() {
     );
 }
 
-/// The catalogue goes through `maki.provider_parse`, so every number shape the
-/// fixture feeds it has to be rejected the way serde_json rejects it, and a
-/// refused listing fails with the bespoke impl's error.
+/// The catalogue goes through `maki.provider_parse`, and a refused listing
+/// fails with the bespoke impl's error.
 #[test_case(&mistral::MODELS ; "models")]
 #[test_case(&mistral::MODELS_UNAUTHORIZED ; "models_unauthorized")]
 fn the_bundled_mistral_plugin_lists_the_recorded_models(fixture: &Fixture) {

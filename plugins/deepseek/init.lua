@@ -83,7 +83,7 @@ maki.provider.register({
     end
 
     local limits = {}
-    for _, info in parse.items(parsed.balance_infos) do
+    for _, info in ipairs(parsed.balance_infos or {}) do
       table.insert(limits, balance_limit(info))
     end
     return { limits = limits }

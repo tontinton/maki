@@ -16,8 +16,10 @@ local TEXT_MODALITY = "text"
 local IMAGE_MODALITY = "image"
 local REASONING_PARAMETER = "reasoning"
 
+-- Lists are read as sets, with `pairs`: a null leaves a hole that would stop
+-- `ipairs` early.
 local function lists(modalities, wanted)
-  for _, value in parse.items(modalities) do
+  for _, value in pairs(type(modalities) == "table" and modalities or {}) do
     if value == wanted then
       return true
     end
@@ -26,8 +28,12 @@ local function lists(modalities, wanted)
 end
 
 local function per_million(prices, key)
-  local value = parse.parse_f64(prices[key])
-  return value and value * PER_MILLION
+  local value = prices[key]
+  if type(value) ~= "string" then
+    return nil
+  end
+  local parsed = tonumber(value)
+  return parsed and parsed * PER_MILLION
 end
 
 -- A price we cannot read leaves the pricing unknown rather than free.
@@ -56,7 +62,8 @@ local function effort_of(reasoning)
     return nil
   end
   local supported = {}
-  for _, name in parse.items(reasoning.supported_efforts) do
+  local listed = reasoning.supported_efforts
+  for _, name in pairs(type(listed) == "table" and listed or {}) do
     if type(name) == "string" then
       table.insert(supported, name)
     end
@@ -86,7 +93,7 @@ local function parse_model(m)
   local effort = effort_of(m.reasoning)
   return {
     id = m.id,
-    context_window = parse.as_u32(m, "context_length"),
+    context_window = parse.as_u32(m.context_length),
     pricing = pricing_of(m.pricing),
     supports_thinking = effort ~= nil or lists(m.supported_parameters, REASONING_PARAMETER),
     supports_vision = lists(input, IMAGE_MODALITY),
