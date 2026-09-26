@@ -757,7 +757,17 @@ fn overlay_cursor(
     cursor_char_pos: usize,
     reversed: bool,
 ) -> (Vec<Span<'static>>, u16) {
-    let cursor_style = |style: Style| if reversed { style.reversed() } else { style };
+    let cursor_style = |style: Style| {
+        if !reversed {
+            return style;
+        }
+        let theme_cursor = theme::cursor_style();
+        if theme_cursor == Style::default() {
+            style.reversed()
+        } else {
+            style.patch(theme_cursor)
+        }
+    };
     let mut result = Vec::new();
     let mut pos = 0;
     let mut cursor_col = None;
@@ -812,6 +822,7 @@ mod tests {
     use crate::components::scrollbar::SCROLLBAR_THUMB;
     use crate::selection::{ContentRegion, ScreenSelection, extract_selected_text};
     use ratatui::layout::{Position, Rect};
+    use ratatui::style::Color;
     use test_case::test_case;
 
     fn type_text(input: &mut InputBox, text: &str) {
@@ -1376,15 +1387,19 @@ mod tests {
     const NO_BLOCK_CURSOR_UNFOCUSED: &str =
         "an overlay owns the keyboard, so nothing may be reversed";
 
-    fn reversed_cells(
-        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
-    ) -> Vec<Position> {
+    /// Finds the caret cell, whether painted with the theme's `[ui] cursor`
+    /// style (fg = background, bg = foreground) or the reversed fallback
+    /// used by themes that leave the style unset.
+    fn caret_cells(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<Position> {
+        let theme = theme::current();
         let buf = terminal.backend().buffer();
         buf.area
             .positions()
             .filter(|&p| {
-                buf.cell(p)
-                    .is_some_and(|c| c.modifier.contains(Modifier::REVERSED))
+                buf.cell(p).is_some_and(|c| {
+                    c.modifier.contains(Modifier::REVERSED)
+                        || (c.fg == theme.background && c.bg == theme.foreground)
+                })
             })
             .collect()
     }
@@ -1400,7 +1415,7 @@ mod tests {
     fn assert_cursor_at(rendered: &Rendered, expected: Option<Position>) {
         assert!(!rendered.terminal.backend().cursor_visible());
         assert_eq!(rendered.cursor, expected);
-        assert_eq!(reversed_cells(&rendered.terminal), Vec::from_iter(expected));
+        assert_eq!(caret_cells(&rendered.terminal), Vec::from_iter(expected));
     }
 
     fn render_cursor(input: &mut InputBox, width: u16, height: u16) -> Rendered {
@@ -1413,6 +1428,29 @@ mod tests {
             input.buffer.move_left();
         }
         render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT)
+    }
+
+    /// The caret cell follows the loaded theme: `[ui] cursor` paints it when
+    /// the theme sets one, otherwise the reversed fallback applies.
+    #[test]
+    fn caret_honors_the_theme_cursor_style() {
+        let theme = theme::current();
+        let styled = theme.cursor != Style::default();
+
+        let rendered = render_with_cursor_left("abc", 1);
+        let cell = rendered
+            .terminal
+            .backend()
+            .buffer()
+            .cell(Position::new(4, 1))
+            .expect("caret cell must be on screen");
+        if styled {
+            assert_eq!(cell.fg, theme.cursor.fg.unwrap_or(theme.foreground));
+            assert_eq!(cell.bg, theme.cursor.bg.unwrap_or(Color::Reset));
+            assert!(!cell.modifier.contains(Modifier::REVERSED));
+        } else {
+            assert!(cell.modifier.contains(Modifier::REVERSED));
+        }
     }
 
     #[test_case("hello", 0, Position::new(7, 1) ; "ascii_at_end_of_line")]
@@ -1521,7 +1559,7 @@ mod tests {
             "{CURSOR_STAYS_HIDDEN}"
         );
         assert_eq!(
-            reversed_cells(&unfocused.terminal),
+            caret_cells(&unfocused.terminal),
             Vec::new(),
             "{NO_BLOCK_CURSOR_UNFOCUSED}"
         );

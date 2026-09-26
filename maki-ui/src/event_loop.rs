@@ -61,6 +61,7 @@ use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 use crate::input::InputReader;
 use crate::repaint::{Dirty, IDLE_POLL};
+use crate::theme;
 use crate::{AppSession, OpenSession};
 
 use crate::storage_writer::StorageWriter;
@@ -1048,6 +1049,7 @@ impl<'t> EventLoop<'t> {
             terminal::open_in_editor(path, self.terminal)
         };
         self.focus.on_resume();
+        self.sync_cursor();
         match result {
             Ok(code) => code,
             Err(e) => {
@@ -1496,6 +1498,13 @@ impl<'t> EventLoop<'t> {
             }
             pending = leftover;
         }
+        self.sync_cursor();
+    }
+
+    /// Reports focus only as far as it was proven; an unproven terminal keeps
+    /// the focused caret so terminals without focus events stay untouched.
+    fn sync_cursor(&self) {
+        theme::set_cursor_focused(self.focus != Focus::Unfocused);
     }
 
     fn translate(&mut self, raw: Event) -> (Option<Msg>, Option<Event>) {
@@ -1525,7 +1534,12 @@ impl<'t> EventLoop<'t> {
                 (Some(Msg::Paste(text)), None)
             }
             Event::Mouse(mouse) => {
-                self.focus.note_input();
+                // Hover motion proves nothing: tmux forwards moves from a
+                // pane the user is merely passing over, and treating them as
+                // attention would recolor the caret of an unfocused pane.
+                if mouse.kind != MouseEventKind::Moved {
+                    self.focus.note_input();
+                }
                 self.translate_mouse(mouse)
             }
             _ => (None, None),
@@ -1722,6 +1736,7 @@ impl<'t> EventLoop<'t> {
                     terminal::edit_temp_content(&current_text, self.terminal)
                 };
                 self.focus.on_resume();
+                self.sync_cursor();
                 match result {
                     Ok(edited) => self.sessions[idx].app.input_box.set_input(edited),
                     Err(e) => self.sessions[idx].app.flash(e),
@@ -1740,6 +1755,7 @@ impl<'t> EventLoop<'t> {
                 let _pause = self.input.pause();
                 terminal::suspend(self.terminal);
                 self.focus.on_resume();
+                self.sync_cursor();
             }
             Action::RefreshModels => self.refresh_models(),
             Action::RefreshUsage => self.refresh_usage(),
