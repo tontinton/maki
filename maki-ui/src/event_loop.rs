@@ -36,7 +36,7 @@ use maki_lua::{
     UiAction, UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
-use maki_providers::provider::{Provider, fetch_all_models, from_model};
+use maki_providers::provider::{ModelBatch, Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
@@ -519,31 +519,29 @@ struct BackgroundModels {
     task: smol::Task<()>,
 }
 
-fn merge_batch(
-    available: &Arc<ArcSwapOption<Vec<String>>>,
-    batch: maki_providers::provider::ModelBatch,
-    warn_tx: &flume::Sender<String>,
-) {
+/// Accumulates one batch into the fresh snapshot the fetch swaps in, so
+/// models that disappeared server-side are not carried over.
+fn merge_batch(discovered: &mut Vec<String>, batch: ModelBatch, warn_tx: &flume::Sender<String>) {
     for w in batch.warnings {
         let _ = warn_tx.try_send(w);
     }
-    if batch.models.is_empty() {
-        return;
-    }
-    let mut merged = available.load().as_deref().cloned().unwrap_or_default();
-    for spec in &batch.models {
-        if !merged.contains(spec) {
-            merged.push(spec.clone());
+    for spec in batch.models {
+        if !discovered.contains(&spec) {
+            discovered.push(spec);
         }
     }
-    available.store(Some(Arc::new(merged)));
 }
 
 /// The one way discovery starts, so startup and `/models refresh` cannot drift
-/// apart. It only reports that it finished and leaves rebuilding to the UI
-/// thread, over a channel so the loop wakes on it instead of noticing at the
-/// next tick. The channel holds one slot, which collapses overlapping fetches
-/// into a single rebuild.
+/// apart. The fetch accumulates its batches locally and swaps the finished
+/// snapshot in exactly once, at the end. Clearing the slot up front would
+/// collapse an open model picker to its recents for the whole fetch, and
+/// republishing partial lists mid-fetch would make providers flicker out and
+/// back while their batch is still pending; a single swap has neither glitch,
+/// and still drops models that disappeared. It only reports that it finished
+/// and leaves rebuilding to the UI thread, over a channel so the loop wakes on
+/// it instead of noticing at the next tick. The channel holds one slot, which
+/// collapses overlapping fetches into a single rebuild.
 fn fetch_models(
     available: Arc<ArcSwapOption<Vec<String>>>,
     policy: Arc<ModelPolicy>,
@@ -551,14 +549,16 @@ fn fetch_models(
     models_tx: flume::Sender<()>,
 ) -> smol::Task<()> {
     smol::spawn(async move {
+        let mut discovered: Vec<String> = Vec::new();
         fetch_all_models(
             &policy,
-            |batch| merge_batch(&available, batch, &warn_tx),
+            |batch| merge_batch(&mut discovered, batch, &warn_tx),
             Some(Box::new(move || {
                 let _ = models_tx.try_send(());
             })),
         )
         .await;
+        available.store(Some(Arc::new(discovered)));
     })
 }
 
@@ -1796,7 +1796,6 @@ impl<'t> EventLoop<'t> {
     }
 
     fn refresh_models(&self) {
-        self.ctx.available_models.store(None);
         fetch_models(
             Arc::clone(&self.ctx.available_models),
             Arc::clone(&self.ctx.model_policy),
