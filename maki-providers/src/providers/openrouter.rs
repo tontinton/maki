@@ -174,13 +174,16 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
 
     // Parse with OpenRouter-specific pricing field names. OpenRouter reports
     // per-token prices; scale to $/M as `ModelPricing` expects. A missing or
-    // unparsable price stays `None` so it never reads as free.
+    // unparsable price stays `None` so it never reads as free. Routers like
+    // `openrouter/auto` report `-1` because the price depends on the pick.
     let id = m["id"].as_str()?;
     let context_window = m["context_length"]
         .as_u64()
         .and_then(|v| u32::try_from(v).ok());
-    let per_token =
-        |p: &Value| -> Option<f64> { Some(p.as_str()?.parse::<f64>().ok()? * PER_MILLION) };
+    let per_token = |p: &Value| -> Option<f64> {
+        let price = p.as_str()?.parse::<f64>().ok()?;
+        (price >= 0.0).then_some(price * PER_MILLION)
+    };
     let pricing = m["pricing"].as_object().and_then(|p| {
         Some(ModelPricing::per_million(
             per_token(p.get("prompt")?)?,
@@ -346,6 +349,7 @@ mod tests {
     #[test_case(json!(null)                                       ; "no_pricing_object")]
     #[test_case(json!({"prompt": "0.000003"})                     ; "no_completion")]
     #[test_case(json!({"prompt": "n/a", "completion": "0.000015"}) ; "unparsable_prompt")]
+    #[test_case(json!({"prompt": "-1", "completion": "-1"})         ; "variable_price_router")]
     fn parse_model_keeps_unusable_pricing_unknown(pricing: Value) {
         let mut m = kimi_k3_json();
         m["pricing"] = pricing;
