@@ -603,6 +603,18 @@ case("validate_input", function()
   end
 end)
 
+case("edit_redirect_msg_names_the_edit_target", function()
+  local msg = h.edit_redirect_msg("/home/u/mem", "notes.md")
+  assert(msg:find("memory has no edit command", 1, true), msg)
+  assert(msg:find("/home/u/mem" .. "[/\\\\]" .. "notes%.md$"), "full target path expected, got: " .. msg)
+
+  msg = h.edit_redirect_msg("/home/u/mem")
+  assert(msg:find("<name>"), "a missing path still shows the target shape: " .. msg)
+
+  msg = h.edit_redirect_msg(nil, "notes.md")
+  eq(msg, "memory has no edit command, use `edit` on the memory files")
+end)
+
 case_tmp("files_with_tags_lists_every_file_once", function(dir)
   eq(#h.files_with_tags(dir), 0, "empty dir lists nothing")
 
