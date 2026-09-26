@@ -835,6 +835,17 @@ impl Theme {
             Modifier::BOLD,
         );
 
+        // Themes that leave `cursor` unset get a visible caret everywhere,
+        // including pickers that paint `t.cursor` directly.
+        let cursor = match style("cursor") {
+            s if s == Style::default() => Style::new().reversed(),
+            s => s,
+        };
+        let cursor_unfocused = match style("cursor_unfocused") {
+            s if s == Style::default() => cursor,
+            s => s,
+        };
+
         Ok(Self {
             background: color("background"),
             foreground: color("foreground"),
@@ -930,15 +941,8 @@ impl Theme {
             },
             panel_border: style("panel_border"),
             panel_title: style("panel_title"),
-            cursor: style("cursor"),
-            cursor_unfocused: {
-                let s = style("cursor_unfocused");
-                if s == Style::default() {
-                    style("cursor")
-                } else {
-                    s
-                }
-            },
+            cursor,
+            cursor_unfocused,
             input_border: style("input_border"),
             accent: style("accent"),
             active: {

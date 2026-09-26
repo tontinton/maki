@@ -763,14 +763,10 @@ fn overlay_cursor(
     reversed: bool,
 ) -> (Vec<Span<'static>>, u16) {
     let cursor_style = |style: Style| {
-        if !reversed {
-            return style;
-        }
-        let theme_cursor = theme::cursor_style();
-        if theme_cursor == Style::default() {
-            style.reversed()
+        if reversed {
+            style.patch(theme::cursor_style())
         } else {
-            style.patch(theme_cursor)
+            style
         }
     };
     let mut result = Vec::new();
@@ -1440,7 +1436,7 @@ mod tests {
     #[test]
     fn caret_honors_the_theme_cursor_style() {
         let theme = theme::current();
-        let styled = theme.cursor != Style::default();
+        let styled = theme.cursor != Style::new().reversed();
 
         let rendered = render_with_cursor_left("abc", 1);
         let cell = rendered
