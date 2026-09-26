@@ -29,16 +29,19 @@ At session start Maki walks from the project git root down to the working direct
 
 | Order | File |
 |------|------|
-| 1 | `AGENTS.md` |
-| 2 | `CLAUDE.md` |
-| 3 | `.github/copilot-instructions.md` |
-| 4 | `COPILOT.md` |
-| 5 | `.cursorrules` |
-| 6 | `.windsurfrules` |
-| 7 | `.clinerules` |
-| 8 | `CONVENTIONS.md` |
-| 9 | `GEMINI.md` |
-| 10 | `CODING_AGENT.md` |
+| 1 | `.maki/AGENTS.md` |
+| 2 | `AGENTS.md` |
+| 3 | `CLAUDE.md` |
+| 4 | `.github/copilot-instructions.md` |
+| 5 | `COPILOT.md` |
+| 6 | `.cursorrules` |
+| 7 | `.windsurfrules` |
+| 8 | `.clinerules` |
+| 9 | `CONVENTIONS.md` |
+| 10 | `GEMINI.md` |
+| 11 | `CODING_AGENT.md` |
+
+When both `.maki/AGENTS.md` and `AGENTS.md` exist in the same directory, only the `.maki` one loads. Use it for rules that apply to maki only, so they override the shared file without doubling context.
 
 After the match it always loads `AGENTS.local.md` from the same directory if present: that one is yours, keep it gitignored. Closer directories win on conflicts. Finally one global `~/.config/maki/AGENTS.md` for preferences that follow you across projects.
 
