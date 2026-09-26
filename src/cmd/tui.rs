@@ -280,6 +280,29 @@ fn rebuild(
 }
 
 pub fn run(mut cli: Cli) -> Result<()> {
+    let mut worktree: Option<super::worktree::EnteredWorktree> = None;
+    let mut worktree_named = false;
+    if cli.worktree {
+        worktree_named = cli.worktree_name.is_some();
+        let base_ref = match cli.worktree_base {
+            crate::cli::WorktreeBase::Head => super::worktree::BaseRef::Head,
+            crate::cli::WorktreeBase::Fresh => super::worktree::BaseRef::Fresh,
+        };
+        let entered = super::worktree::enter(
+            cli.worktree_name.clone().as_deref(),
+            &super::worktree::WorktreeOptions {
+                base_ref,
+                dir_override: cli.worktree_dir.clone(),
+            },
+        )?;
+        eprintln!(
+            "Entered worktree {} (worktree-{})",
+            entered.dir.display(),
+            entered.name
+        );
+        worktree = Some(entered);
+    }
+
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
@@ -508,6 +531,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     teardown_ms = started.elapsed().as_millis() as u64 - stack_ms,
                     "plugin host and teardown joined"
                 );
+                if let Some(worktree) = &worktree {
+                    clean_up_worktree(worktree, worktree_named);
+                }
                 if code != 0 {
                     maki_otel::shutdown(crate::TELEMETRY_SHUTDOWN_TIMEOUT);
                     std::process::exit(code);
@@ -553,6 +579,40 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     "reload: rebuilt plugins and config"
                 );
             }
+        }
+    }
+}
+
+/// Clean up a worktree session at exit: auto-remove a clean, unnamed worktree;
+/// otherwise prompt to keep or remove it. Only used for interactive sessions.
+fn clean_up_worktree(worktree: &super::worktree::EnteredWorktree, named: bool) {
+    let dirty = super::worktree::has_leftover_work(&worktree.dir, worktree.base.as_deref());
+    if !dirty && !named {
+        match super::worktree::remove(&worktree.root, &worktree.dir, &worktree.name) {
+            Ok(()) => eprintln!(
+                "Removed clean worktree {} (worktree-{})",
+                worktree.dir.display(),
+                worktree.name
+            ),
+            Err(e) => eprintln!("could not remove worktree {}: {e}", worktree.dir.display()),
+        }
+        return;
+    }
+    let state = if dirty {
+        "has changes or commits"
+    } else {
+        "is clean"
+    };
+    eprintln!(
+        "Worktree {} {state} (worktree-{}). Remove it? [y/N] ",
+        worktree.dir.display(),
+        worktree.name
+    );
+    let mut reply = String::new();
+    if io::stdin().read_line(&mut reply).is_ok() && reply.trim().eq_ignore_ascii_case("y") {
+        match super::worktree::remove(&worktree.root, &worktree.dir, &worktree.name) {
+            Ok(()) => eprintln!("Removed worktree {}", worktree.dir.display()),
+            Err(e) => eprintln!("could not remove worktree {}: {e}", worktree.dir.display()),
         }
     }
 }
