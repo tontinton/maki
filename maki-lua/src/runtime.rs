@@ -299,6 +299,9 @@ pub(crate) struct HookRun {
     pub deadline: Instant,
     pub value: Value,
     pub call: Value,
+    /// Only a tool input can be put in front of the user, so anywhere else an
+    /// `ask` is dropped and a rewrite next to it still lands.
+    pub may_ask: bool,
 }
 
 /// Load/clear drain in-flight tools first so we never mutate a
@@ -3453,7 +3456,7 @@ async fn open_plan_form(
 /// shares: a table replaces the value, `nil` leaves it alone, and
 /// `nil, reason` stops the call with a reason the model reads. A second value
 /// of `{ ask = reason }` instead escalates the call to the user, with or
-/// without a rewrite in front of it.
+/// without a rewrite in front of it, where [`HookRun::may_ask`] allows it.
 ///
 /// Every failure below is a pass-through, because a layer is an opinion about a
 /// call and never a precondition for making it.
@@ -3474,6 +3477,7 @@ async fn run_hook(
         deadline,
         value,
         call,
+        may_ask,
     } = run;
     let names: Vec<&str> = slots.iter().map(String::as_str).collect();
     let Some(&slot) = names.first() else {
@@ -3512,6 +3516,17 @@ async fn run_hook(
             return Verdict::Denied(reason.to_string_lossy());
         }
         _ => None,
+    };
+    let ask = match ask {
+        Some(reason) if !may_ask => {
+            tracing::warn!(
+                slot,
+                reason,
+                "only a tool input layer can ask, so the ask was dropped"
+            );
+            None
+        }
+        ask => ask,
     };
     let replaced = match first {
         Some(table @ LuaValue::Table(_)) => match lua_to_json_within(lua, &table, &value) {

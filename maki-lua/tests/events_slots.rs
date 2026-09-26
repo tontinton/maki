@@ -1380,6 +1380,41 @@ fn an_output_layer_stops_the_call_with_its_reason() {
     );
 }
 
+/// Nothing can ask the user about an output, so an outer layer asking anyway
+/// must not throw away the redaction an inner plugin made.
+#[test]
+fn an_output_ask_keeps_the_rewrite_under_it() {
+    const REDACTED: &str = "[redacted]";
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        INNER_LAYER,
+        &layer(
+            SLOT_TOOL,
+            HookStage::Output,
+            &format!(
+                r#"value.{text} = "{REDACTED}"; return value"#,
+                text = hook::OUTPUT_TEXT
+            ),
+        ),
+    );
+    load(
+        &host,
+        OUTER_LAYER,
+        &layer(
+            SLOT_TOOL,
+            HookStage::Output,
+            r#"return prev(value, ctx), { ask = "why not" }"#,
+        ),
+    );
+
+    assert_eq!(
+        output(&reg, SLOT_TOOL, "secret", false),
+        Some((REDACTED.to_owned(), false))
+    );
+}
+
 /// One plugin's broken layer must not take the seam down or swallow the layers
 /// another plugin registered underneath it.
 #[test]

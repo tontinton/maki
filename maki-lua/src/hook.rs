@@ -77,6 +77,7 @@ impl ToolHook for SlotHook {
                 "origin": call.origin.as_str(),
                 "deadline_ms": deadline_ms(call.deadline),
             }),
+            may_ask: stage == HookStage::Input,
         })
     }
 }
@@ -106,6 +107,7 @@ impl AgentHook for SlotHook {
                 "context_window": call.context_window,
                 "deadline_ms": deadline_ms(call.deadline),
             }),
+            may_ask: false,
         })
     }
 }

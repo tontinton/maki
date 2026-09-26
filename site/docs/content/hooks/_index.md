@@ -143,7 +143,8 @@ end)
 
 The prompt appears even when an allow rule or yolo mode would let the call
 through. A deny rule still wins. To ask about a rewritten call, return it
-first: `return input, { ask = reason }`.
+first: `return input, { ask = reason }`. Other slots ignore `ask` with a warning
+and keep the rewrite.
 
 Each driver answers this prompt like any other. `maki -p` denies it, and an SDK
 client in `bypassPermissions` mode allows it without showing it.
