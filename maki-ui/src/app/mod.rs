@@ -126,6 +126,8 @@ const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
+const MODEL_ON_SUFFIX: &str = ": on";
+const MODEL_OFF_SUFFIX: &str = ": off for this session";
 const PACK_CHANGES_DECLINED: &str = "Package changes declined";
 const PACK_USER_ONLY_SUFFIX: &str = " can only be run by you";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
@@ -461,7 +463,7 @@ impl App {
                 lua_command_reader,
             ),
             theme_picker: ThemePicker::new(),
-            model_picker: ModelPicker::new(available_models),
+            model_picker: ModelPicker::new(available_models, Arc::clone(&model_policy)),
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
@@ -516,12 +518,11 @@ impl App {
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
         };
-        app.model_picker.set_recents(
-            maki_storage::model::read_recents(&app.storage)
-                .into_iter()
-                .filter(|spec| model_policy.allows(spec))
-                .collect(),
-        );
+        let recents = maki_storage::model::read_recents(&app.storage)
+            .into_iter()
+            .filter(|spec| app.model_offered(spec))
+            .collect();
+        app.model_picker.set_recents(recents);
         // The manager arrives forked from the prototype the process was
         // started with, so a tab that resumes or spawns blank runs on
         // `--yolo` until its own meta is read back here.
@@ -737,7 +738,42 @@ impl App {
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
         let recents = maki_storage::model::push_recent(&self.storage, spec)
             .into_iter()
-            .filter(|spec| self.model_policy.allows(spec))
+            .filter(|spec| self.model_offered(spec))
+            .collect();
+        self.model_picker.set_recents(recents);
+    }
+
+    /// Whether this session puts the spec in front of the user on its own.
+    /// Naming one outright still works: switching a model off says stop
+    /// suggesting it, not refuse it.
+    pub(crate) fn model_offered(&self, spec: &str) -> bool {
+        self.model_policy.allows(spec) && self.model_picker.is_enabled(spec)
+    }
+
+    pub(crate) fn set_model_enabled(&mut self, spec: &str, enabled: bool) {
+        self.model_picker.set_enabled(spec, enabled);
+        self.resettle_recents();
+    }
+
+    pub(crate) fn disabled_models(&self) -> Vec<String> {
+        self.model_picker.disabled_specs()
+    }
+
+    pub(crate) fn set_provider_enabled(&mut self, slug: &str, enabled: bool) {
+        self.model_picker.set_provider_enabled(slug, enabled);
+        self.resettle_recents();
+    }
+
+    pub(crate) fn disabled_providers(&self) -> Vec<String> {
+        self.model_picker.disabled_provider_slugs()
+    }
+
+    /// Re-read rather than filtered in place, so that a model switched back on
+    /// rejoins the shortlist it was dropped from.
+    pub(crate) fn resettle_recents(&mut self) {
+        let recents = maki_storage::model::read_recents(&self.storage)
+            .into_iter()
+            .filter(|spec| self.model_offered(spec))
             .collect();
         self.model_picker.set_recents(recents);
     }
@@ -1061,6 +1097,17 @@ impl App {
                 }
                 ModelPickerAction::UnassignTier(spec, tier) => {
                     vec![Action::UnassignTier(spec, tier)]
+                }
+                ModelPickerAction::Toggle(name, enabled)
+                | ModelPickerAction::ToggleProvider(name, enabled) => {
+                    self.resettle_recents();
+                    let suffix = if enabled {
+                        MODEL_ON_SUFFIX
+                    } else {
+                        MODEL_OFF_SUFFIX
+                    };
+                    self.flash(format!("{name}{suffix}"));
+                    vec![]
                 }
                 ModelPickerAction::Close => vec![],
             });

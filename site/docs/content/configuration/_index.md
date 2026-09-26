@@ -39,6 +39,8 @@ maki.setup({
         default_model = "anthropic/claude-sonnet-4-6",
         allowed_models = { "anthropic/*", "openai/gpt-5" },
         excluded_models = { "*/*-preview" },
+        disabled_models = { "*/*-thinking" },
+        disabled_providers = { "openrouter" },
     },
 
     storage = {
@@ -55,7 +57,9 @@ All fields are optional. Typos in field names cause an error right away.
 
 `provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `maki models`.
 
-`maki.setup()` can only be called once per init.lua.
+`provider.disabled_models` is softer. A model it matches is still allowed and still listed, it just starts every session switched off: it drops out of the recent-models shortlist and out of what an ACP client is offered. Press `%` on a row in the model picker to switch one on or off for the running session, or call `maki.model.enable(spec, on)`. Session switches are never written back, so the config file stays the durable answer. Use it to keep a set of models one keypress away rather than gone.
+
+`provider.disabled_providers` is the same switch, thrown one provider at a time, and matches the bare slug rather than a qualified spec. A provider it names keeps its row in the model picker and collapses its models away, with a count of what is behind it; `%` or `Enter` on that row expands it again, as does `maki.model.enable_provider(slug, on)`. The per-model switches underneath are left alone, so a provider coming back brings each of its models back to whatever it was. Reach for it over `disabled_models = { "anthropic/*" }` when you want the list shorter rather than longer. A pattern with a `/` in it is a config error here, since it could only ever match a spec and never a slug.
 
 ## Full Reference
 
@@ -136,6 +140,8 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `default_model` | String | `none` | - | Default model identifier (e.g. `anthropic/claude-sonnet-4-6`) |
 | `allowed_models` | string[] | `[]` | - | Glob patterns for permitted qualified model specs; empty permits all models |
 | `excluded_models` | string[] | `[]` | - | Glob patterns for excluded qualified model specs; exclusions take precedence |
+| `disabled_models` | string[] | `[]` | - | Glob patterns for models a session starts with switched off; unlike `excluded_models` they stay listed and can be switched back on for the session |
+| `disabled_providers` | string[] | `[]` | - | Glob patterns for providers a session starts with switched off; they stay listed in the model picker with their models collapsed away |
 | `connect_timeout_secs` | u64 | `10` | 1 | HTTP connect timeout (seconds) |
 | `low_speed_timeout_secs` | u64 | `120` | 1 | Low speed timeout (seconds with less than 1 byte received) |
 | `stream_timeout_secs` | u64 | `300` | 10 | Streaming response timeout (seconds) |

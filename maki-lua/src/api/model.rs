@@ -128,6 +128,92 @@ async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaR
     roundtrip(lua, tx, ModelRequest::Available).await
 }
 
+/// Switches a model off for this session, or back on. A model switched off
+/// drops out of the shortlist the picker opens on and stops being suggested;
+/// `set` still takes it by name, because naming one is you asking for it.
+/// Nothing here is written to disk: `provider.disabled_models` in the config
+/// is what survives a restart, and this moves a session away from it.
+///
+/// @param spec string `"provider/id"`, as listed by `available()`. A bare
+///   slug is an error; `enable_provider` is the one that takes those.
+/// @param on boolean|nil `false` to switch it off; omit or pass `true` for on.
+/// @return (boolean|nil, string|nil) Whether the model is now on, which is
+///   `false` whatever you asked for while its provider is switched off, or nil
+///   and an error.
+/// @example
+/// -- an all-local afternoon, without touching the config file
+/// for _, spec in ipairs(maki.model.available()) do
+///   if not spec:match("^lmstudio/") then maki.model.enable(spec, false) end
+/// end
+#[lua_fn]
+async fn enable(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    spec: String,
+    on: Option<bool>,
+) -> LuaResult<Pair<Value>> {
+    let req = ModelRequest::Enable {
+        spec,
+        on: on.unwrap_or(true),
+    };
+    roundtrip(lua, tx, req).await
+}
+
+/// Lists the specs this session is not suggesting: what
+/// `provider.disabled_models` switched off, plus whatever `enable` moved
+/// since. Always a subset of `available()`.
+///
+/// @return (table|nil, string|nil) Array of `"provider/id"` specs, or nil and an error.
+/// @example
+/// local off = maki.model.disabled()
+#[lua_fn]
+async fn disabled(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
+    roundtrip(lua, tx, ModelRequest::Disabled).await
+}
+
+/// Switches a whole provider off for this session, or back on. The picker
+/// keeps the provider listed and collapses its models away. The per-model
+/// switches underneath are left where they were, so a provider coming back
+/// brings each model back to what it was. As with `enable`, nothing is written
+/// to disk: `provider.disabled_providers` in the config is what survives a
+/// restart.
+///
+/// @param slug string Provider slug, the part of a spec before the `/`. A
+///   qualified spec is an error; `enable` is the one that takes those.
+/// @param on boolean|nil `false` to switch it off; omit or pass `true` for on.
+/// @return (boolean|nil, string|nil) Whether the provider is now on, or nil and an error.
+/// @example
+/// -- an all-local afternoon, one call per provider instead of per model
+/// maki.model.enable_provider("anthropic", false)
+#[lua_fn]
+async fn enable_provider(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    slug: String,
+    on: Option<bool>,
+) -> LuaResult<Pair<Value>> {
+    let req = ModelRequest::EnableProvider {
+        slug,
+        on: on.unwrap_or(true),
+    };
+    roundtrip(lua, tx, req).await
+}
+
+/// Lists the provider slugs this session is not suggesting: what
+/// `provider.disabled_providers` switched off, plus whatever
+/// `enable_provider` moved since.
+///
+/// @return (table|nil, string|nil) Array of provider slugs, or nil and an error.
+/// @example
+/// local off = maki.model.disabled_providers()
+#[lua_fn]
+async fn disabled_providers(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+) -> LuaResult<Pair<Value>> {
+    roundtrip(lua, tx, ModelRequest::DisabledProviders).await
+}
+
 /// Switches the focused session's model, thinking level, or fast mode. Fields
 /// you leave out stay as they are, so this doubles as a thinking-only switch.
 /// Answers with the new state, in the same shape `get` returns.
@@ -175,7 +261,7 @@ lua_table! {
     /// Without an interactive UI every function returns
     /// `nil, "no interactive UI attached"`.
     "maki.model" => pub(crate) fn create_model_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [get(tx), available(tx), set(tx), info()]
+    DOCS [get(tx), available(tx), disabled(tx), disabled_providers(tx), set(tx), enable(tx), enable_provider(tx), info()]
 }
 
 #[cfg(test)]
@@ -187,6 +273,7 @@ mod tests {
     use test_case::test_case;
 
     const SPEC: &str = "anthropic/claude-opus-4-6";
+    const PROVIDER: &str = "anthropic";
     const THINKING: &str = "high";
     const UI_FAILURE: &str = "Model is not allowed by policy: anthropic/claude-opus-4-6";
 
@@ -224,6 +311,10 @@ mod tests {
         Some(Ok(match req {
             ModelRequest::Get => json!({ "spec": SPEC, "thinking": THINKING, "fast": true }),
             ModelRequest::Available => json!([SPEC]),
+            ModelRequest::Disabled => json!([SPEC]),
+            ModelRequest::Enable { spec, on } => json!({ "spec": spec, "on": on }),
+            ModelRequest::DisabledProviders => json!([PROVIDER]),
+            ModelRequest::EnableProvider { slug, on } => json!({ "slug": slug, "on": on }),
             ModelRequest::Set {
                 spec,
                 thinking,
@@ -327,6 +418,45 @@ mod tests {
         let json = lua_to_json(&lua, &Value::Table(tbl)).unwrap();
         assert_eq!(json["pricing"], Json::Null);
         assert_eq!(json["subsidised_by"], json!("Max"));
+    }
+
+    /// An omitted `on` must not read as `false`.
+    #[test_case("return model.enable(SPEC)",        json!(true)  ; "omitted_on_means_on")]
+    #[test_case("return model.enable(SPEC, true)",  json!(true)  ; "explicit_on")]
+    #[test_case("return model.enable(SPEC, false)", json!(false) ; "explicit_off")]
+    fn enable_carries_the_spec_and_defaults_to_on(script: &str, want: Json) {
+        let lua = stub_ui(echo);
+        let (val, err) = eval(&lua, &script.replace("SPEC", &format!("'{SPEC}'")));
+        assert_eq!(err, None);
+        assert_eq!(val["spec"], json!(SPEC));
+        assert_eq!(val["on"], want);
+    }
+
+    #[test]
+    fn disabled_answers_with_specs() {
+        let lua = stub_ui(echo);
+        let (val, err) = eval(&lua, "return model.disabled()");
+        assert_eq!(err, None);
+        assert_eq!(val, json!([SPEC]));
+    }
+
+    #[test_case("return model.enable_provider(SLUG)",        json!(true)  ; "omitted_on_means_on")]
+    #[test_case("return model.enable_provider(SLUG, true)",  json!(true)  ; "explicit_on")]
+    #[test_case("return model.enable_provider(SLUG, false)", json!(false) ; "explicit_off")]
+    fn enable_provider_carries_the_slug_and_defaults_to_on(script: &str, want: Json) {
+        let lua = stub_ui(echo);
+        let (val, err) = eval(&lua, &script.replace("SLUG", &format!("'{PROVIDER}'")));
+        assert_eq!(err, None);
+        assert_eq!(val["slug"], json!(PROVIDER));
+        assert_eq!(val["on"], want);
+    }
+
+    #[test]
+    fn disabled_providers_answers_with_slugs() {
+        let lua = stub_ui(echo);
+        let (val, err) = eval(&lua, "return model.disabled_providers()");
+        assert_eq!(err, None);
+        assert_eq!(val, json!([PROVIDER]));
     }
 
     /// A non-spec argument is a programmer error, so it throws instead of

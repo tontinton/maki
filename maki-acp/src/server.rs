@@ -132,7 +132,10 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
 
     let mut server = Server {
         out_tx,
-        model_specs: available_model_specs(&params.model_policy),
+        model_specs: offered_specs(
+            &params.model_policy,
+            available_model_specs(&params.model_policy),
+        ),
         model_policy: Arc::clone(&params.model_policy),
         client_elicits_form: false,
         defaults: params.defaults,
@@ -196,11 +199,18 @@ fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
     .detach();
 }
 
+/// An ACP client has no keypress for handing a switched-off model back the way
+/// the TUI does, so it is never offered one.
+fn offered_specs(policy: &ModelPolicy, mut specs: Vec<String>) -> Vec<String> {
+    specs.retain(|spec| !policy.spec_disabled_by_default(spec));
+    specs
+}
+
 /// Discovery lands in batches after the client built its selector from the
 /// offline list, so every batch that adds something announces the fuller list.
 fn refresh_models(srv: &mut Server, batch: Vec<String>) {
     let known = srv.model_specs.len();
-    for spec in batch {
+    for spec in offered_specs(&srv.model_policy, batch) {
         if !srv.model_specs.contains(&spec) {
             srv.model_specs.push(spec);
         }
@@ -2008,6 +2018,40 @@ mod tests {
 
         refresh_models(&mut srv, batch);
         assert!(out_rx.is_empty(), "a batch adding nothing is not announced");
+    }
+
+    #[test]
+    fn a_disabled_model_is_never_offered_to_the_client() {
+        let (mut srv, .., out_rx) = test_server();
+        srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
+        srv.model_policy = Arc::new(
+            ModelPolicy::new(&[], &[], &["openrouter/*".to_owned()], &[]).expect("a valid glob"),
+        );
+
+        refresh_models(&mut srv, vec![DISCOVERED_SPEC.to_owned()]);
+
+        assert_eq!(srv.model_specs, [OFFLINE_SPEC]);
+        assert!(
+            out_rx.is_empty(),
+            "nothing was added, so nothing is announced"
+        );
+    }
+
+    #[test]
+    fn a_disabled_provider_is_never_offered_to_the_client() {
+        let (mut srv, .., out_rx) = test_server();
+        srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
+        srv.model_policy = Arc::new(
+            ModelPolicy::new(&[], &[], &[], &["openrouter".to_owned()]).expect("a valid glob"),
+        );
+
+        refresh_models(&mut srv, vec![DISCOVERED_SPEC.to_owned()]);
+
+        assert_eq!(srv.model_specs, [OFFLINE_SPEC]);
+        assert!(
+            out_rx.is_empty(),
+            "nothing was added, so nothing is announced"
+        );
     }
 
     #[test]

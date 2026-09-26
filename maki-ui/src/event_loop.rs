@@ -75,6 +75,10 @@ const PACK_PREPARING: &str = "Checking packages...";
 const PACK_BUSY_ERR: &str = "a package command is already running";
 const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
+const ENABLE_WANTS_SPEC: &str =
+    "model.enable expects a \"provider/id\" spec; model.enable_provider is the one taking a slug";
+const ENABLE_PROVIDER_WANTS_SLUG: &str =
+    "model.enable_provider expects a bare provider slug; model.enable is the one taking a spec";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -1358,6 +1362,25 @@ impl<'t> EventLoop<'t> {
                     app.set_fast(fast)?;
                 }
                 Ok(app.model_state())
+            }
+            ModelRequest::Disabled => Ok(json!(self.focused_app().disabled_models())),
+            ModelRequest::Enable { spec, on } => {
+                if !spec.contains('/') {
+                    return Err(format!("{ENABLE_WANTS_SPEC}, got `{spec}`"));
+                }
+                let app = self.focused_app();
+                app.set_model_enabled(&spec, on);
+                // The provider switch outranks the model one, so switching a
+                // model on does not always leave it on offer.
+                Ok(json!(app.model_offered(&spec)))
+            }
+            ModelRequest::DisabledProviders => Ok(json!(self.focused_app().disabled_providers())),
+            ModelRequest::EnableProvider { slug, on } => {
+                if slug.contains('/') {
+                    return Err(format!("{ENABLE_PROVIDER_WANTS_SLUG}, got `{slug}`"));
+                }
+                self.focused_app().set_provider_enabled(&slug, on);
+                Ok(json!(on))
             }
         }
     }

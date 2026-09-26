@@ -374,6 +374,8 @@ mod tests {
                 .iter()
                 .map(|pattern| (*pattern).into())
                 .collect::<Vec<_>>(),
+            &[],
+            &[],
         )
         .unwrap()
     }

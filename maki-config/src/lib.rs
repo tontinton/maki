@@ -319,6 +319,12 @@ pub enum ConfigError {
         #[source]
         source: globset::Error,
     },
+    #[error(
+        "invalid config: provider.disabled_providers takes a bare provider slug, but \
+         `{pattern}` contains a `/`; provider.disabled_models is the one that takes a \
+         model glob"
+    )]
+    QualifiedProviderPattern { pattern: String },
     #[error("invalid config: trust.paths contains invalid glob pattern `{pattern}`: {source}")]
     InvalidTrustPattern {
         pattern: String,
@@ -710,6 +716,8 @@ pub struct ProviderFileConfig {
     pub default_model: Option<String>,
     pub allowed_models: Option<Vec<String>>,
     pub excluded_models: Option<Vec<String>>,
+    pub disabled_models: Option<Vec<String>>,
+    pub disabled_providers: Option<Vec<String>>,
     pub connect_timeout_secs: Option<u64>,
     pub low_speed_timeout_secs: Option<u64>,
     pub stream_timeout_secs: Option<u64>,
@@ -727,6 +735,8 @@ impl ProviderFileConfig {
             default_model,
             allowed_models,
             excluded_models,
+            disabled_models,
+            disabled_providers,
             connect_timeout_secs,
             low_speed_timeout_secs,
             stream_timeout_secs,
@@ -1389,6 +1399,20 @@ pub struct ProviderConfig {
     )]
     pub excluded_models: Vec<String>,
 
+    #[config(
+        ty = "string[]",
+        default_doc = "[]",
+        desc = "Glob patterns for models a session starts with switched off; unlike `excluded_models` they stay listed and can be switched back on for the session"
+    )]
+    pub disabled_models: Vec<String>,
+
+    #[config(
+        ty = "string[]",
+        default_doc = "[]",
+        desc = "Glob patterns for providers a session starts with switched off; they stay listed in the model picker with their models collapsed away"
+    )]
+    pub disabled_providers: Vec<String>,
+
     #[config(skip)]
     pub model_policy: ModelPolicy,
 
@@ -1432,6 +1456,8 @@ impl Default for ProviderConfig {
             default_model: None,
             allowed_models: Vec::new(),
             excluded_models: Vec::new(),
+            disabled_models: Vec::new(),
+            disabled_providers: Vec::new(),
             model_policy: ModelPolicy::allow_all(),
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
             low_speed_timeout: Duration::from_secs(DEFAULT_LOW_SPEED_TIMEOUT_SECS),
@@ -1448,11 +1474,20 @@ impl ProviderConfig {
     fn from_file(f: ProviderFileConfig) -> Result<Self, ConfigError> {
         let allowed_models = f.allowed_models.unwrap_or_default();
         let excluded_models = f.excluded_models.unwrap_or_default();
-        let model_policy = ModelPolicy::new(&allowed_models, &excluded_models)?;
+        let disabled_models = f.disabled_models.unwrap_or_default();
+        let disabled_providers = f.disabled_providers.unwrap_or_default();
+        let model_policy = ModelPolicy::new(
+            &allowed_models,
+            &excluded_models,
+            &disabled_models,
+            &disabled_providers,
+        )?;
         Ok(Self {
             default_model: f.default_model,
             allowed_models,
             excluded_models,
+            disabled_models,
+            disabled_providers,
             model_policy,
             connect_timeout: Duration::from_secs(
                 f.connect_timeout_secs
@@ -1477,6 +1512,8 @@ impl ProviderConfig {
 pub struct ModelPolicy {
     allowed: GlobSet,
     excluded: GlobSet,
+    disabled: GlobSet,
+    disabled_providers: GlobSet,
     has_allowed_models: bool,
 }
 
@@ -1488,13 +1525,28 @@ impl Default for ModelPolicy {
 
 impl ModelPolicy {
     fn allow_all() -> Self {
-        Self::new(&[], &[]).expect("empty model policy is valid")
+        Self::new(&[], &[], &[], &[]).expect("empty model policy is valid")
     }
 
-    pub fn new(allowed_models: &[String], excluded_models: &[String]) -> Result<Self, ConfigError> {
+    pub fn new(
+        allowed_models: &[String],
+        excluded_models: &[String],
+        disabled_models: &[String],
+        disabled_providers: &[String],
+    ) -> Result<Self, ConfigError> {
+        // The two lists sit next to each other in the config and only differ in
+        // shape, so a model glob landing here would otherwise match nothing and
+        // say nothing.
+        if let Some(pattern) = disabled_providers.iter().find(|p| p.contains('/')) {
+            return Err(ConfigError::QualifiedProviderPattern {
+                pattern: pattern.clone(),
+            });
+        }
         Ok(Self {
             allowed: Self::compile("allowed_models", allowed_models)?,
             excluded: Self::compile("excluded_models", excluded_models)?,
+            disabled: Self::compile("disabled_models", disabled_models)?,
+            disabled_providers: Self::compile("disabled_providers", disabled_providers)?,
             has_allowed_models: !allowed_models.is_empty(),
         })
     }
@@ -1527,6 +1579,32 @@ impl ModelPolicy {
 
     pub fn allows(&self, spec: &str) -> bool {
         (!self.has_allowed_models || self.allowed.is_match(spec)) && !self.excluded.is_match(spec)
+    }
+
+    /// Unlike [`Self::allows`], a disabled model is still listed and still
+    /// nameable, so nothing that decides whether a spec exists may consult
+    /// this.
+    pub fn disabled_by_default(&self, spec: &str) -> bool {
+        self.disabled.is_match(spec)
+    }
+
+    /// Matched on the bare slug, so `anthropic` here and `anthropic/*` in
+    /// `disabled_models` are different switches rather than two spellings of
+    /// one.
+    pub fn provider_disabled_by_default(&self, provider: &str) -> bool {
+        self.disabled_providers.is_match(provider)
+    }
+
+    pub fn spec_provider_disabled(&self, spec: &str) -> bool {
+        match spec.split_once('/') {
+            Some((provider, _)) => self.provider_disabled_by_default(provider),
+            None => false,
+        }
+    }
+
+    /// Either switch, for callers that only care whether to offer the spec.
+    pub fn spec_disabled_by_default(&self, spec: &str) -> bool {
+        self.disabled_by_default(spec) || self.spec_provider_disabled(spec)
     }
 }
 
@@ -2885,6 +2963,97 @@ mod tests {
                 .provider
                 .model_policy
                 .allows("anthropic/claude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn a_disabled_model_is_still_an_allowed_one() {
+        let config = RawConfig {
+            provider: ProviderFileConfig {
+                excluded_models: Some(vec!["*/*-preview".into()]),
+                disabled_models: Some(vec!["anthropic/*".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .into_config(&[])
+        .unwrap();
+        let policy = &config.provider.model_policy;
+
+        assert!(policy.allows("anthropic/claude-sonnet-4-6"));
+        assert!(policy.disabled_by_default("anthropic/claude-sonnet-4-6"));
+        assert!(!policy.disabled_by_default("openai/gpt-5"));
+        assert!(
+            !policy.allows("anthropic/claude-preview"),
+            "an exclusion still wins over being merely switched off"
+        );
+    }
+
+    #[test]
+    fn project_disabled_models_replace_the_global_list() {
+        let mut global = RawConfig {
+            provider: ProviderFileConfig {
+                disabled_models: Some(vec!["anthropic/*".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        global.merge(RawConfig {
+            provider: ProviderFileConfig {
+                disabled_models: Some(vec!["openai/*".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let provider = global.into_config(&[]).unwrap().provider;
+        assert_eq!(provider.disabled_models, ["openai/*"]);
+        assert!(!provider.model_policy.disabled_by_default("anthropic/opus"));
+        assert!(provider.model_policy.disabled_by_default("openai/gpt-5"));
+    }
+
+    #[test]
+    fn a_disabled_provider_is_still_an_allowed_one() {
+        let config = RawConfig {
+            provider: ProviderFileConfig {
+                disabled_providers: Some(vec!["anthropic".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .into_config(&[])
+        .unwrap();
+        let policy = &config.provider.model_policy;
+
+        assert!(policy.allows("anthropic/claude-sonnet-4-6"));
+        assert!(policy.provider_disabled_by_default("anthropic"));
+        assert!(policy.spec_provider_disabled("anthropic/claude-sonnet-4-6"));
+        assert!(!policy.spec_provider_disabled("openai/gpt-5"));
+        assert!(
+            !policy.disabled_by_default("anthropic/claude-sonnet-4-6"),
+            "switching the provider off is not the same switch as the model one"
+        );
+        assert!(policy.spec_disabled_by_default("anthropic/claude-sonnet-4-6"));
+        assert!(!policy.spec_disabled_by_default("openai/gpt-5"));
+    }
+
+    #[test]
+    fn a_model_glob_in_disabled_providers_is_a_config_error() {
+        let result = RawConfig {
+            provider: ProviderFileConfig {
+                disabled_providers: Some(vec!["anthropic/*".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .into_config(&[]);
+
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::QualifiedProviderPattern { ref pattern }) if pattern == "anthropic/*"
+            ),
+            "a model glob matches no bare slug, so taking it quietly would switch nothing off"
         );
     }
 
