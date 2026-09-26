@@ -118,7 +118,10 @@ fn create_with_auth(
     timeouts: Timeouts,
     system_prefix: Option<String>,
 ) -> Box<dyn Provider> {
-    Box::new(Anthropic::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+    Box::new(
+        Anthropic::with_auth(auth, timeouts, maki_config::providers::top_p_for(SLUG))
+            .with_system_prefix(system_prefix),
+    )
 }
 
 /// Returns whether the fast-mode beta header must be attached. We re-check
@@ -334,6 +337,7 @@ pub struct Anthropic {
     /// Env / `providers.toml` / inventory default, resolved once at construction.
     /// Reused by key rotation / reload so they do not re-parse providers.toml.
     resolved_base_url: Option<String>,
+    top_p: Option<f64>,
 }
 
 impl Anthropic {
@@ -349,12 +353,14 @@ impl Anthropic {
             system_prefix: None,
             stream_timeout: timeouts.stream,
             resolved_base_url,
+            top_p: maki_config::providers::top_p_for(SLUG),
         })
     }
 
     pub(crate) fn with_auth(
         auth: Arc<Mutex<super::ResolvedAuth>>,
         timeouts: super::Timeouts,
+        top_p: Option<f64>,
     ) -> Self {
         Self {
             client: super::http_client(timeouts),
@@ -366,6 +372,7 @@ impl Anthropic {
             // anthropic override would make every third-party endpoint look
             // first party and poll `/api/oauth/usage` against it.
             resolved_base_url: None,
+            top_p,
         }
     }
 
@@ -491,6 +498,7 @@ impl Provider for Anthropic {
                 &system_blocks,
                 tools,
                 opts.thinking,
+                self.top_p,
             );
             body["model"] = json!(shared::strip_long_context(&model.id));
             body["stream"] = json!(true);
@@ -745,6 +753,7 @@ mod tests {
         let provider = Anthropic::with_auth(
             Arc::new(Mutex::new(auth)),
             crate::providers::Timeouts::default(),
+            None,
         );
         assert!(provider.resolved_base_url.is_none());
         assert!(!usage_eligible(

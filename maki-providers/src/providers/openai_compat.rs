@@ -12,7 +12,8 @@ use tracing::{debug, warn};
 
 use super::ResolvedAuth;
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
+    ThinkingConfig, TokenUsage,
 };
 
 const STREAM_DONE: &str = "[DONE]";
@@ -55,21 +56,24 @@ pub(crate) struct OpenAiCompatProvider {
     /// bare ollama host). Request-time `auth.base_url` still wins (custom,
     /// local, dynamic).
     resolved_base_url: Option<String>,
+    top_p: Option<f64>,
 }
 
 impl OpenAiCompatProvider {
     pub fn new(config: &'static OpenAiCompatConfig, timeouts: super::Timeouts) -> Self {
+        let providers = maki_config::providers::ProvidersConfig::load();
         let resolved_base_url = if config.slug.is_empty() {
             None
         } else {
-            let providers = maki_config::providers::ProvidersConfig::load();
             maki_config::providers::configured_base_url(config.slug, providers.get(config.slug))
         };
+        let top_p = maki_config::providers::resolve_top_p(providers.get(config.slug));
         Self {
             client: super::http_client(timeouts),
             config,
             stream_timeout: timeouts.stream,
             resolved_base_url,
+            top_p,
         }
     }
 
@@ -135,6 +139,7 @@ impl OpenAiCompatProvider {
         messages: &[Message],
         system: &str,
         tools: &Value,
+        thinking: ThinkingConfig,
     ) -> Value {
         let wire_messages = convert_messages(messages, system);
         let wire_tools = convert_tools(tools);
@@ -144,6 +149,13 @@ impl OpenAiCompatProvider {
             "messages": wire_messages,
             "stream": true,
         });
+        // o-series and gpt-5 reject `top_p` whenever reasoning effort is set,
+        // so only send it for non-thinking requests.
+        if let Some(top_p) = self.top_p
+            && !thinking.is_enabled()
+        {
+            body["top_p"] = json!(top_p);
+        }
         if let Some(max_output) = model.output_tokens() {
             body[self.config.max_tokens_field] = json!(max_output);
         }

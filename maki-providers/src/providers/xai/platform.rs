@@ -193,7 +193,9 @@ impl Provider for Xai {
                     .await;
             }
 
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let mut body = self
+                .compat
+                .build_body(model, messages, system, tools, opts.thinking);
             opts.thinking
                 .apply_reasoning_effort(&mut body, &dialect::GROK, model);
             self.with_oauth_retry(|| async {

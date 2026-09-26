@@ -57,6 +57,12 @@ pub(crate) fn is_enabled() -> bool {
     env::var("CLAUDE_CODE_USE_BEDROCK").is_ok_and(|v| v == "1")
 }
 
+fn resolve_bedrock_top_p() -> Option<f64> {
+    // Bedrock is built from the anthropic branch, so it honours the anthropic
+    // slug's `top_p`; there is no `bedrock` section to read.
+    maki_config::providers::top_p_for(super::SLUG)
+}
+
 fn resolve_bedrock_auth() -> Result<BedrockAuth, AgentError> {
     let region = env::var("AWS_REGION").map_err(|_| AgentError::Config {
         message: "AWS_REGION must be set when using Bedrock".into(),
@@ -482,6 +488,7 @@ pub(crate) struct Bedrock {
     client: HttpClient,
     auth: Arc<Mutex<BedrockAuth>>,
     base_url: Option<String>,
+    top_p: Option<f64>,
 }
 
 impl Bedrock {
@@ -497,6 +504,7 @@ impl Bedrock {
             client: super::super::http_client(timeouts),
             auth: Arc::new(Mutex::new(auth)),
             base_url,
+            top_p: resolve_bedrock_top_p(),
         })
     }
 
@@ -549,6 +557,7 @@ impl Provider for Bedrock {
                 }],
                 tools,
                 opts.thinking,
+                self.top_p,
             );
             // Fast mode lives only on the direct API, so Bedrock skips `opts.fast`
             // and never sends the `speed` param.

@@ -92,17 +92,21 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
         })?;
     let resolved = resolve_custom_auth(slug)?;
     let auth = Arc::new(Mutex::new(resolved));
+    let top_p = maki_config::providers::resolve_top_p(config.get(slug));
 
     match protocol {
         Protocol::Anthropic => Ok(Box::new(super::anthropic::Anthropic::with_auth(
-            auth, timeouts,
+            auth, timeouts, top_p,
         ))),
         Protocol::Openai | Protocol::OpenaiResponses => Ok(Box::new(CustomOpenAiProvider {
             compat: OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, timeouts),
             auth,
             protocol,
+            top_p,
         })),
-        Protocol::Google => Ok(Box::new(super::google::Google::with_auth(auth, timeouts))),
+        Protocol::Google => Ok(Box::new(super::google::Google::with_auth(
+            auth, timeouts, top_p,
+        ))),
     }
 }
 
@@ -356,6 +360,7 @@ struct CustomOpenAiProvider {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
     protocol: Protocol,
+    top_p: Option<f64>,
 }
 
 impl Provider for CustomOpenAiProvider {
@@ -386,7 +391,15 @@ impl Provider for CustomOpenAiProvider {
                 .await;
             }
 
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let mut body = self
+                .compat
+                .build_body(model, messages, system, tools, opts.thinking);
+            // o-series and gpt-5 reject top_p when reasoning is on.
+            if let Some(top_p) = self.top_p
+                && !opts.thinking.is_enabled()
+            {
+                body["top_p"] = serde_json::json!(top_p);
+            }
             apply_chat_thinking(opts.thinking, &mut body, model);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)

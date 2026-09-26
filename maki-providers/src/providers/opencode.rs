@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
+use maki_config::providers::{ProvidersConfig, resolve_top_p};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 
@@ -141,6 +142,10 @@ pub struct Opencode {
     transport: CatalogTransport,
     auth: Option<Arc<Mutex<ResolvedAuth>>>,
     system_prefix: Option<String>,
+    /// Loaded once when the provider is built. The routed sub-provider is only
+    /// known per request, so look `top_p` up here rather than re-reading
+    /// `providers.toml` off disk in the async executor on every stream.
+    providers: ProvidersConfig,
 }
 
 impl Opencode {
@@ -149,6 +154,7 @@ impl Opencode {
             transport: CatalogTransport::new(timeouts),
             auth: None,
             system_prefix: None,
+            providers: ProvidersConfig::load_or_default(),
         }
     }
 
@@ -249,6 +255,7 @@ impl Provider for Opencode {
                     event_tx,
                     &auth,
                     &opts,
+                    resolve_top_p(self.providers.get(sub_provider)),
                 )
                 .await
         })

@@ -740,10 +740,19 @@ impl CatalogTransport {
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
         opts: &RequestOptions,
+        top_p: Option<f64>,
     ) -> Result<StreamResponse, AgentError> {
         match api_format {
             EndpointType::ChatCompletions => {
-                let mut body = self.chat_compat.build_body(model, messages, system, tools);
+                let mut body =
+                    self.chat_compat
+                        .build_body(model, messages, system, tools, opts.thinking);
+                // o-series and gpt-5 reject top_p when reasoning is on.
+                if let Some(top_p) = top_p
+                    && !opts.thinking.is_enabled()
+                {
+                    body["top_p"] = serde_json::json!(top_p);
+                }
                 opts.thinking
                     .apply_reasoning_effort(&mut body, &dialect::PREFER_HIGH, model);
                 self.chat_compat
@@ -762,6 +771,7 @@ impl CatalogTransport {
                     &system_blocks,
                     tools,
                     opts.thinking,
+                    top_p,
                 );
                 body["model"] = serde_json::json!(model.id);
                 body["stream"] = serde_json::json!(true);
@@ -799,6 +809,7 @@ pub struct CatalogProvider {
     data: ProviderData,
     auth: CatalogAuth,
     transport: CatalogTransport,
+    top_p: Option<f64>,
 }
 
 /// Which models the resolved auth unlocks: a real key unlocks all, the
@@ -833,6 +844,7 @@ impl CatalogProvider {
     ) -> Result<Self, AgentError> {
         Ok(Self {
             auth: data.catalog_auth(state_dir, allow_free_fallback)?,
+            top_p: maki_config::providers::top_p_for(&data.slug),
             data,
             transport: CatalogTransport::new(timeouts),
         })
@@ -882,6 +894,7 @@ impl Provider for CatalogProvider {
                     event_tx,
                     &auth,
                     &opts,
+                    self.top_p,
                 )
                 .await
         })

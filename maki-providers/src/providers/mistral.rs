@@ -195,7 +195,9 @@ impl Provider for Mistral {
             let auth = self.auth.lock().unwrap().clone();
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let mut body = self
+                .compat
+                .build_body(model, messages, system, tools, opts.thinking);
             opts.thinking
                 .apply_reasoning_effort(&mut body, &dialect::HIGH_ONLY, model);
             // Convert assistant messages to Mistral's expected format with thinking content
