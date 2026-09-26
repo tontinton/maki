@@ -1049,7 +1049,6 @@ impl<'t> EventLoop<'t> {
             terminal::open_in_editor(path, self.terminal)
         };
         self.focus.on_resume();
-        self.sync_cursor();
         match result {
             Ok(code) => code,
             Err(e) => {
@@ -1498,11 +1497,10 @@ impl<'t> EventLoop<'t> {
             }
             pending = leftover;
         }
-        self.sync_cursor();
     }
 
-    /// Reports focus only as far as it was proven; an unproven terminal keeps
-    /// the focused caret so terminals without focus events stay untouched.
+    /// Only a real focus report may recolor the caret: resume heuristics and
+    /// stray input prove nothing, and no FocusGained follows $EDITOR or fg.
     fn sync_cursor(&self) {
         theme::set_cursor_focused(self.focus != Focus::Unfocused);
     }
@@ -1511,10 +1509,12 @@ impl<'t> EventLoop<'t> {
         match raw {
             Event::FocusGained => {
                 self.focus.report(Focus::Focused);
+                self.sync_cursor();
                 (None, None)
             }
             Event::FocusLost => {
                 self.focus.report(Focus::Unfocused);
+                self.sync_cursor();
                 (None, None)
             }
             // The one place the host's view of a keypress is normalized, so
@@ -1736,7 +1736,6 @@ impl<'t> EventLoop<'t> {
                     terminal::edit_temp_content(&current_text, self.terminal)
                 };
                 self.focus.on_resume();
-                self.sync_cursor();
                 match result {
                     Ok(edited) => self.sessions[idx].app.input_box.set_input(edited),
                     Err(e) => self.sessions[idx].app.flash(e),
@@ -1755,7 +1754,6 @@ impl<'t> EventLoop<'t> {
                 let _pause = self.input.pause();
                 terminal::suspend(self.terminal);
                 self.focus.on_resume();
-                self.sync_cursor();
             }
             Action::RefreshModels => self.refresh_models(),
             Action::RefreshUsage => self.refresh_usage(),
