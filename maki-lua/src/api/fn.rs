@@ -36,6 +36,8 @@ const JOB_NOT_FOUND_ERR: &str = "job: not found";
 const BLANK_NAME_ERR: &str = "jobstart: name must be non-blank";
 const EMPTY_ARGV_ERR: &str = "jobstart: argv table must not be empty";
 const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv table";
+#[cfg(windows)]
+const GIT_BASH_PATH: &str = r"C:\Program Files\Git\bin\bash.exe";
 
 #[derive(Clone)]
 pub(crate) enum JobEvent {
@@ -780,6 +782,17 @@ fn shell_command(cmd: &str) -> Command {
     }
     #[cfg(windows)]
     {
+        windows_shell_command(cmd, Path::new(GIT_BASH_PATH))
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_shell_command(cmd: &str, git_bash: &Path) -> Command {
+    if git_bash.is_file() {
+        let mut c = Command::new(git_bash);
+        c.arg("-c").arg(cmd);
+        c
+    } else {
         let mut c = Command::new("cmd.exe");
         c.arg("/C").arg(cmd);
         c
@@ -2034,6 +2047,29 @@ mod tests {
             ARGV,
             "the row a user reads must quote what the shell would have eaten"
         );
+    }
+
+    #[test]
+    fn windows_shell_command_prefers_git_bash_when_present() {
+        const CMD: &str = "echo hello";
+        let dir = tempfile::tempdir().unwrap();
+        let bash_path = dir.path().join("bash.exe");
+        std::fs::write(&bash_path, []).unwrap();
+
+        let cmd = windows_shell_command(CMD, &bash_path);
+        assert_eq!(cmd.get_program(), bash_path.as_os_str());
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["-c", CMD]);
+    }
+
+    #[test]
+    fn windows_shell_command_falls_back_to_cmd_exe_when_git_bash_missing() {
+        const CMD: &str = "echo hello";
+        let missing = Path::new("nonexistent_bash.exe");
+        let cmd = windows_shell_command(CMD, missing);
+        assert_eq!(cmd.get_program(), "cmd.exe");
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["/C", CMD]);
     }
 
     #[cfg(unix)]
