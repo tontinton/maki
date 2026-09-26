@@ -303,6 +303,16 @@ pub fn cursor_style() -> Style {
     }
 }
 
+/// True for a buffer cell that carries the `cursor_style()` paint, so tests
+/// assert against the theme instead of one theme's hardcoded colors.
+#[cfg(test)]
+pub(crate) fn is_caret_cell(cell: &ratatui::buffer::Cell) -> bool {
+    let cursor = cursor_style();
+    cursor.fg.is_none_or(|fg| cell.fg == fg)
+        && cursor.bg.is_none_or(|bg| cell.bg == bg)
+        && cell.modifier.contains(cursor.add_modifier)
+}
+
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::Acquire)
 }

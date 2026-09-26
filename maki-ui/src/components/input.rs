@@ -1387,21 +1387,22 @@ mod tests {
     const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
     const NO_BLOCK_CURSOR_UNFOCUSED: &str =
         "an overlay owns the keyboard, so nothing may be reversed";
+    const CARET_FG: Color = Color::Rgb(0x12, 0x34, 0x56);
+    const CARET_BG: Color = Color::Rgb(0x65, 0x43, 0x21);
+    const CARET_UNFOCUSED_FG: Color = Color::Rgb(0x0f, 0x0f, 0x0f);
+    const CARET_THEME_WITH_CURSOR: &str = r##"
+[ui]
+"cursor" = { fg = "#123456", bg = "#654321" }
+"cursor_unfocused" = { fg = "#0f0f0f" }
+"##;
+    const CARET_THEME_WITHOUT_CURSOR: &str = "";
 
-    /// Finds the caret cell, whether painted with the theme's `[ui] cursor`
-    /// style (fg = background, bg = foreground) or the reversed fallback
-    /// used by themes that leave the style unset.
+    /// Finds the cells painted as the caret, whatever the loaded theme is.
     fn caret_cells(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<Position> {
-        let theme = theme::current();
         let buf = terminal.backend().buffer();
         buf.area
             .positions()
-            .filter(|&p| {
-                buf.cell(p).is_some_and(|c| {
-                    c.modifier.contains(Modifier::REVERSED)
-                        || (c.fg == theme.background && c.bg == theme.foreground)
-                })
-            })
+            .filter(|&p| buf.cell(p).is_some_and(theme::is_caret_cell))
             .collect()
     }
 
@@ -1431,27 +1432,35 @@ mod tests {
         render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT)
     }
 
-    /// The caret cell follows the loaded theme: `[ui] cursor` paints it when
-    /// the theme sets one, otherwise the reversed fallback applies.
-    #[test]
-    fn caret_honors_the_theme_cursor_style() {
-        let theme = theme::current();
-        let styled = theme.cursor != Style::new().reversed();
-
-        let rendered = render_with_cursor_left("abc", 1);
-        let cell = rendered
+    /// The caret carries whatever paint the theme gives it: the explicit
+    /// `[ui] cursor` colors when set, the reversed fallback when not.
+    fn painted_caret() -> ratatui::buffer::Cell {
+        render_with_cursor_left("abc", 1)
             .terminal
             .backend()
             .buffer()
             .cell(Position::new(4, 1))
-            .expect("caret cell must be on screen");
-        if styled {
-            assert_eq!(cell.fg, theme.cursor.fg.unwrap_or(theme.foreground));
-            assert_eq!(cell.bg, theme.cursor.bg.unwrap_or(Color::Reset));
-            assert!(!cell.modifier.contains(Modifier::REVERSED));
-        } else {
-            assert!(cell.modifier.contains(Modifier::REVERSED));
-        }
+            .expect("caret cell must be on screen")
+            .clone()
+    }
+
+    /// The caret carries whatever paint the theme gives it: the explicit
+    /// `[ui] cursor` colors when set, the reversed fallback when not, and
+    /// `[ui] cursor_unfocused` once the terminal reports lost focus.
+    #[test]
+    fn caret_honors_the_theme_cursor_styles() {
+        theme::set(theme::Theme::from_toml(CARET_THEME_WITHOUT_CURSOR).unwrap());
+        assert!(painted_caret().modifier.contains(Modifier::REVERSED));
+
+        theme::set(theme::Theme::from_toml(CARET_THEME_WITH_CURSOR).unwrap());
+        let cell = painted_caret();
+        assert_eq!(cell.fg, CARET_FG);
+        assert_eq!(cell.bg, CARET_BG);
+
+        theme::set_cursor_focused(false);
+        assert_eq!(painted_caret().fg, CARET_UNFOCUSED_FG);
+        theme::set_cursor_focused(true);
+        theme::set(theme::load_by_name("dracula").unwrap());
     }
 
     #[test_case("hello", 0, Position::new(7, 1) ; "ascii_at_end_of_line")]

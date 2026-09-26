@@ -37,7 +37,6 @@ use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Modifier;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -2577,9 +2576,7 @@ fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
                 .buffer()
                 .cell(pos)
                 .expect(CURSOR_ON_SCREEN);
-            let theme = theme::current();
-            let styled = cell.fg == theme.background && cell.bg == theme.foreground;
-            (pos, styled || cell.modifier.contains(Modifier::REVERSED))
+            (pos, theme::is_caret_cell(cell))
         })
     };
 
