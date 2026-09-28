@@ -322,6 +322,8 @@ pub enum SessionAction {
 pub enum MigrateAction {
     /// Migrate files from ~/.maki/ to XDG directories
     Xdg,
+    /// Print a prompt that ports your old provider scripts to Lua plugins
+    Providers,
 }
 
 #[derive(Subcommand)]

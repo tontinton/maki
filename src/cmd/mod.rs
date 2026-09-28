@@ -249,6 +249,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,
+            MigrateAction::Providers => {
+                // A script counts as ported once a plugin registers its slug.
+                let _host = cli_stack(cli.no_plugins, cli.no_jit, trust_mode)?;
+                migrate::providers()?
+            }
         },
         Some(Command::Trust { action }) => {
             let storage = StateDir::resolve().context("resolve state directory")?;

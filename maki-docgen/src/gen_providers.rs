@@ -377,7 +377,22 @@ The value is any JSON object. Each slug gets its own file at `~/.local/state/mak
 
 ### Migrating from provider scripts
 
-Maki no longer runs executable scripts from the config `providers/` directory. Each script subcommand maps to part of the registration:
+Maki no longer runs executable scripts from the config `providers/` directory. At startup it names every script that no plugin has replaced yet. To port them, run:
+
+```bash
+maki migrate providers
+```
+
+It lists those scripts and prints a prompt that asks a coding agent to port them to Lua plugins. The prompt names your files and directories, maps each part of the script protocol to the Lua API, and ends with checks the agent runs before it reports back. It goes to stdout, so you can start maki with it or copy it into another agent:
+
+```bash
+maki "$(maki migrate providers)"
+maki migrate providers | pbcopy
+```
+
+Each plugin keeps its script's file name as the slug, so saved models and `maki auth login <slug>` keep working. The warning for a script stops once a plugin registers its slug. The prompt tells the agent to leave the scripts and their credential files in place, and to tell you which ones you can delete once every check passes.
+
+To port a script by hand, map each subcommand to part of the registration:
 
 | Script subcommand | Lua |
 |-------------------|-----|
@@ -387,7 +402,9 @@ Maki no longer runs executable scripts from the config `providers/` directory. E
 | `login` | `login = function(ctx)`, using `ctx.print`, `ctx.prompt` and `ctx.open_url` |
 | `logout` | `logout = function(ctx)` |
 
-A script that kept credentials in its own file can import them on first use, so nobody has to log in again:
+A script whose `base` was `mistral`, `deepseek`, `openrouter`, `requesty`, `synthetic`, `regolo` or `tensorx` uses `codec = "openai"` now, with that provider's origin as `base_url`. Those providers are Lua plugins themselves, so they cannot be a `base`.
+
+A script that kept credentials in its own file can import them on first use, so nobody has to log in again. Call this from a hook, since `maki.provider.auth.set` only works inside one:
 
 ```lua
 local function credentials()

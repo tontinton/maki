@@ -315,7 +315,7 @@ fn honours_system_prefix(target: Target) -> bool {
         .is_some_and(|spec| spec.slug == super::google::SLUG)
 }
 
-fn is_valid_slug(s: &str) -> bool {
+pub fn is_valid_slug(s: &str) -> bool {
     !s.is_empty()
         && s.as_bytes()[0].is_ascii_alphanumeric()
         && s.bytes()

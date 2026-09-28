@@ -1,4 +1,7 @@
+use std::env;
+use std::fmt::Write;
 use std::fs;
+use std::io::{self, IsTerminal};
 use std::path::Path;
 
 #[cfg(unix)]
@@ -7,19 +10,13 @@ use std::os::unix::fs::PermissionsExt;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 use maki_storage::input_history::MAX_ENTRIES;
-use maki_storage::paths;
+use maki_storage::paths::{self, tilde};
+
+use crate::provider_scripts::{self, MIGRATE_COMMAND, Script};
 
 #[cfg(unix)]
 const AUTH_FILE_MODE: u32 = 0o600;
-
-fn tilde(path: &Path) -> String {
-    match paths::home() {
-        Some(home) if path.starts_with(&home) => {
-            format!("~/{}", path.strip_prefix(&home).unwrap().display())
-        }
-        _ => path.display().to_string(),
-    }
-}
+const WAYLAND_DISPLAY_ENV: &str = "WAYLAND_DISPLAY";
 
 fn log_move(name: &str, dst: &Path, note: Option<&str>) {
     match note {
@@ -244,6 +241,74 @@ fn list_remaining(dir: &Path) -> Vec<String> {
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect()
+}
+
+/// The prompt goes to stdout and everything addressed to the user to stderr,
+/// so `maki "$(maki migrate providers)"` and a pipe into a clipboard tool
+/// carry the prompt and nothing else.
+pub fn providers() -> Result<()> {
+    let Some(dir) = provider_scripts::providers_dir() else {
+        eprintln!("No provider scripts found, so there is nothing to migrate.");
+        return Ok(());
+    };
+    let unported = provider_scripts::unported(&dir);
+    if unported.is_empty() {
+        eprintln!("{}", nothing_to_port(&dir));
+        return Ok(());
+    }
+    if io::stdout().is_terminal() {
+        eprint!("{}", providers_banner(&unported));
+    }
+    print!("{}", provider_scripts::prompt(&dir, &unported));
+    Ok(())
+}
+
+fn nothing_to_port(dir: &Path) -> String {
+    if provider_scripts::scripts_in(dir).is_empty() {
+        return format!(
+            "No provider scripts in {}, so there is nothing to migrate.",
+            tilde(dir)
+        );
+    }
+    format!(
+        "Every provider script in {0} has a Lua plugin now. Maki ignores the scripts, so you can delete {0} once your plugins no longer read credentials from there.",
+        tilde(dir)
+    )
+}
+
+fn providers_banner(scripts: &[Script]) -> String {
+    let width = scripts.iter().map(|s| s.slug.len()).max().unwrap_or(0);
+    let mut out =
+        String::from("Maki no longer runs provider scripts. These need a Lua plugin:\n\n");
+    for script in scripts {
+        let _ = writeln!(out, "  {:<width$}  {}", script.slug, tilde(&script.path));
+    }
+    out.push_str("\nThe prompt below asks a coding agent to port them for you.\n");
+    if !cfg!(windows) {
+        let _ = write!(
+            out,
+            "\nRun it in maki, with any model you have set up:\n\n  maki \"$({MIGRATE_COMMAND})\"\n"
+        );
+    }
+    let copy = if cfg!(windows) { "Copy" } else { "Or copy" };
+    let _ = write!(
+        out,
+        "\n{copy} it into another agent:\n\n  {MIGRATE_COMMAND} | {}\n\n",
+        clipboard_command()
+    );
+    out
+}
+
+fn clipboard_command() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "pbcopy"
+    } else if cfg!(windows) {
+        "clip"
+    } else if env::var_os(WAYLAND_DISPLAY_ENV).is_some() {
+        "wl-copy"
+    } else {
+        "xclip -selection clipboard"
+    }
 }
 
 pub fn xdg() -> Result<()> {

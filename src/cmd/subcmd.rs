@@ -23,6 +23,8 @@ use maki_storage::auth::{
 };
 use maki_storage::model::persist_model;
 
+use crate::provider_scripts;
+
 const PROTOCOL_CHOICES: &str = "openai, openai-responses, anthropic or google";
 const PROVIDERS_TOML_DOCS: &str = "https://maki.sh/docs/providers/";
 
@@ -52,7 +54,10 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     let builtin = builtin_provider(slug);
     let is_custom = ProvidersConfig::load().get(slug).is_some();
     if builtin.is_none() && !plugin::is_registered(slug) && !is_custom {
-        bail!("unknown provider '{slug}'");
+        match provider_scripts::unknown_provider_hint(slug) {
+            Some(hint) => bail!(hint),
+            None => bail!("unknown provider '{slug}'"),
+        }
     }
 
     if builtin.is_none() && plugin::auth_providers().iter().any(|(s, _)| s == slug) {

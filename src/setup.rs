@@ -18,6 +18,8 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
 
+use crate::provider_scripts;
+
 const LOG_ENV: &str = "MAKI_LOG";
 const LOG_ENV_SHARED: &str = "RUST_LOG";
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::INFO;
@@ -108,14 +110,20 @@ fn provider_ready(slug: &str) -> Result<(), AgentError> {
 /// An unknown slug may just mean the models.dev catalog has not been loaded
 /// yet, so retry once with a warm catalog. `Model::from_spec` itself must stay
 /// non-blocking: the UI draws with it.
-fn from_spec_or_warm_catalog(spec: &str) -> Result<Model, ModelError> {
-    match Model::from_spec(spec) {
+fn from_spec_or_warm_catalog(spec: &str) -> Result<Model> {
+    let result = match Model::from_spec(spec) {
         Err(ModelError::UnsupportedProvider(_)) => {
             maki_providers::warm_catalog();
             Model::from_spec(spec)
         }
         result => result,
+    };
+    if let Err(ModelError::UnsupportedProvider(slug)) = &result
+        && let Some(hint) = provider_scripts::unknown_provider_hint(slug)
+    {
+        bail!(hint);
     }
+    Ok(result?)
 }
 
 fn auto_detect_model(policy: &ModelPolicy) -> Option<Model> {

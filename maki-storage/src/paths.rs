@@ -317,6 +317,14 @@ pub fn home() -> Option<PathBuf> {
     etcetera::home_dir().ok()
 }
 
+/// `path` as a user would type it, with the home directory as `~`.
+pub fn tilde(path: &Path) -> String {
+    match home().and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf)) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 pub fn legacy_home_dir() -> Option<PathBuf> {
     etcetera::home_dir()
         .ok()
