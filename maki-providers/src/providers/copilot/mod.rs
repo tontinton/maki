@@ -88,6 +88,9 @@ inventory::submit!(SPEC.config_row());
 const GRAPHQL_QUERY: &str = "query { viewer { copilotEndpoints { api } } }";
 const API_VERSION_HEADER: &str = "2025-10-01";
 const EDITOR_VERSION_HEADER: &str = concat!("Maki/", env!("CARGO_PKG_VERSION"));
+/// Without it the gateway falls back to the `copilot-language-server`
+/// integrator, which intermittently rejects newer models such as gpt-6-luna.
+const INTEGRATION_ID_HEADER: &str = "vscode-chat";
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const RESPONSES_PATH: &str = "/responses";
 const MESSAGES_PATH: &str = "/v1/messages";
@@ -164,13 +167,24 @@ impl Copilot {
         }
 
         let models = self.fetch_models().await?;
-        let mut guard = self.models.lock().unwrap();
-        guard.clear();
-        guard.extend(models.into_iter().map(|model| (model.id.clone(), model)));
-        Ok(guard
+        self.remember(models);
+        Ok(self
+            .models
+            .lock()
+            .unwrap()
             .get(model_id)
             .map(CopilotModel::endpoint)
             .unwrap_or_else(|| guess_endpoint(model_id)))
+    }
+
+    /// Merges rather than replaces: `/models` sometimes omits a model it
+    /// served a moment ago, and forgetting it would reroute that model to
+    /// a guessed endpoint mid-session.
+    fn remember(&self, models: Vec<CopilotModel>) {
+        self.models
+            .lock()
+            .unwrap()
+            .extend(models.into_iter().map(|model| (model.id.clone(), model)));
     }
 
     async fn fetch_models(&self) -> Result<Vec<CopilotModel>, AgentError> {
@@ -637,6 +651,7 @@ fn copilot_request(
         .header("authorization", format!("Bearer {}", auth.token))
         .header("content-type", "application/json")
         .header("editor-version", EDITOR_VERSION_HEADER)
+        .header("copilot-integration-id", INTEGRATION_ID_HEADER)
         .header("x-github-api-version", API_VERSION_HEADER)
         .header("user-agent", super::user_agent());
 
@@ -655,6 +670,10 @@ fn copilot_headers(auth: &CopilotAuth, interaction_type: Option<&str>) -> Vec<(S
         ("authorization".into(), format!("Bearer {}", auth.token)),
         ("content-type".into(), "application/json".into()),
         ("editor-version".into(), EDITOR_VERSION_HEADER.into()),
+        (
+            "copilot-integration-id".into(),
+            INTEGRATION_ID_HEADER.into(),
+        ),
         ("x-github-api-version".into(), API_VERSION_HEADER.into()),
     ];
     if let Some(interaction_type) = interaction_type {
@@ -721,11 +740,20 @@ fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
 fn guess_endpoint(model_id: &str) -> Endpoint {
     if model_id.starts_with("claude-") {
         Endpoint::Messages
-    } else if model_id.contains("gpt-5") || model_id.contains("codex") {
+    } else if model_id.contains("codex") || gpt_major(model_id).is_some_and(|major| major >= 5) {
         Endpoint::Responses
     } else {
         Endpoint::ChatCompletions
     }
+}
+
+fn gpt_major(model_id: &str) -> Option<u32> {
+    model_id
+        .strip_prefix("gpt-")?
+        .split(['.', '-'])
+        .next()?
+        .parse()
+        .ok()
 }
 
 impl Provider for Copilot {
@@ -768,9 +796,7 @@ impl Provider for Copilot {
                 .iter()
                 .map(CopilotModel::model_info)
                 .collect::<Vec<_>>();
-            let mut guard = self.models.lock().unwrap();
-            guard.clear();
-            guard.extend(models.into_iter().map(|model| (model.id.clone(), model)));
+            self.remember(models);
             Ok(infos)
         })
     }
@@ -778,7 +804,6 @@ impl Provider for Copilot {
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
             *self.auth.lock().unwrap() = None;
-            self.models.lock().unwrap().clear();
             Ok(())
         })
     }
@@ -817,6 +842,35 @@ mod tests {
 
         model.supported_endpoints.clear();
         assert_eq!(model.endpoint(), Endpoint::ChatCompletions);
+    }
+
+    #[test_case("gpt-6-luna", Endpoint::Responses ; "gpt_6")]
+    #[test_case("gpt-5.6-terra", Endpoint::Responses ; "gpt_5")]
+    #[test_case("gpt-10-mini", Endpoint::Responses ; "two_digit_major")]
+    #[test_case("gpt-5.3-codex", Endpoint::Responses ; "codex")]
+    #[test_case("gpt-4.1", Endpoint::ChatCompletions ; "gpt_4")]
+    #[test_case("gpt-4o", Endpoint::ChatCompletions ; "gpt_4o")]
+    #[test_case("claude-opus-5", Endpoint::Messages ; "claude")]
+    #[test_case("gemini-3.7-flash", Endpoint::ChatCompletions ; "other")]
+    fn guess_endpoint_for_unlisted_model(model_id: &str, expected: Endpoint) {
+        assert_eq!(guess_endpoint(model_id), expected);
+    }
+
+    #[test]
+    fn requests_identify_integrator() {
+        let auth = CopilotAuth {
+            token: "token".into(),
+            endpoint: DEFAULT_API_ENDPOINT.into(),
+        };
+        let request = copilot_request(Request::builder(), &auth, None);
+        assert_eq!(
+            request.headers_ref().unwrap()["copilot-integration-id"],
+            INTEGRATION_ID_HEADER
+        );
+        assert!(copilot_headers(&auth, None).contains(&(
+            "copilot-integration-id".into(),
+            INTEGRATION_ID_HEADER.into()
+        )));
     }
 
     #[test]
