@@ -15,7 +15,7 @@ use maki_storage::paths::{self, tilde};
 const PROVIDERS_DIR: &str = "providers";
 const INIT_FILE: &str = "init.lua";
 pub const MIGRATE_COMMAND: &str = "maki migrate providers";
-const PROMPT_TEMPLATE: &str = include_str!("provider_scripts_prompt.md");
+const PROMPT_TEMPLATE: &str = include_str!("prompts/provider_scripts.md");
 const SCRIPTS_SLOT: &str = "{scripts}";
 const PROVIDERS_DIR_SLOT: &str = "{providers_dir}";
 const CONFIG_DIR_SLOT: &str = "{config_dir}";
@@ -148,6 +148,7 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    #[cfg(unix)]
     const SCRIPT_BODY: &str = "#!/bin/sh\n";
     const PORTABLE: &str = "acme";
     const SECOND: &str = "zeta-proxy";
