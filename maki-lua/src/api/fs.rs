@@ -1,19 +1,18 @@
 use std::cell::RefCell;
-use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
-use std::fs::{File, FileType};
-use std::io::{Error as IoError, ErrorKind, Read, Result as IoResult};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::UNIX_EPOCH;
 
 use maki_agent::{FileQuery, FileReader, Ranked};
+
+use maki_fs::FsBackend;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 
-use crate::api::util::convert::opt_bool;
+use crate::api::util::convert::{json_to_lua, opt_bool};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
+use crate::backend::resolve_backend;
 use crate::loader::EventHandle;
 use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::LUA_MEMORY_LIMIT;
@@ -43,80 +42,10 @@ fn path_to_string(p: &Path) -> LuaResult<String> {
         .ok_or_else(|| mlua::Error::runtime("non-utf8 path"))
 }
 
-fn filetype_str(ft: &FileType) -> &'static str {
-    if ft.is_file() {
-        "file"
-    } else if ft.is_dir() {
-        "directory"
-    } else if ft.is_symlink() {
-        "link"
-    } else {
-        "unknown"
-    }
-}
-
-fn collect_dir_entries(
-    base: &Path,
-    dir: &Path,
-    depth: u32,
-    max_depth: u32,
-    visited: &mut HashSet<PathBuf>,
-    out: &mut Vec<(String, &'static str)>,
-) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = match path.strip_prefix(base).ok().and_then(|p| p.to_str()) {
-            Some(s) => s.to_owned(),
-            None => continue,
-        };
-        let (type_str, is_dir) = match entry.file_type() {
-            Ok(ft) if ft.is_symlink() => match std::fs::metadata(&path) {
-                Ok(meta) => (filetype_str(&meta.file_type()), meta.is_dir()),
-                Err(_) => ("link", false),
-            },
-            Ok(ft) => (filetype_str(&ft), ft.is_dir()),
-            Err(_) => ("unknown", false),
-        };
-        out.push((name, type_str));
-        if is_dir && depth < max_depth {
-            let canonical = match path.canonicalize() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            if visited.insert(canonical) {
-                collect_dir_entries(base, &path, depth + 1, max_depth, visited, out);
-            }
-        }
-    }
-}
-
-async fn read_file(path: PathBuf, max_bytes: u64) -> IoResult<Vec<u8>> {
-    smol::unblock(move || {
-        let too_large = || {
-            IoError::new(
-                ErrorKind::FileTooLarge,
-                format!("file exceeds the {max_bytes}-byte read limit"),
-            )
-        };
-        let file = File::open(path)?;
-        let size = file.metadata()?.len();
-        if size > max_bytes {
-            return Err(too_large());
-        }
-
-        // Files can grow, and some streams report a size of zero.
-        let mut bytes = Vec::with_capacity(size as usize);
-        file.take(max_bytes + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > max_bytes {
-            return Err(too_large());
-        }
-        Ok(bytes)
-    })
-    .await
+async fn read_backend(backend: Arc<dyn FsBackend>, path: PathBuf) -> Result<Vec<u8>, String> {
+    smol::unblock(move || backend.read(&path, MAX_READ_BYTES))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Read the entire file at {path} as a UTF-8 string.
@@ -133,9 +62,9 @@ async fn read_file(path: PathBuf, max_bytes: u64) -> IoResult<Vec<u8>> {
 ///   return
 /// end
 #[lua_fn(guard = FsRead)]
-async fn read(_lua: Lua, path: String) -> LuaResult<Pair<String>> {
+async fn read(lua: Lua, path: String) -> LuaResult<Pair<String>> {
     let abs = make_absolute(&path)?;
-    let bytes = try_pair!(read_file(abs, MAX_READ_BYTES).await);
+    let bytes = try_pair!(read_backend(resolve_backend(&lua), abs).await);
     match String::from_utf8(bytes) {
         Ok(s) => Ok((Some(s), None)),
         Err(_) => Err(mlua::Error::runtime("non-utf8 content; use read_bytes")),
@@ -155,7 +84,7 @@ async fn read(_lua: Lua, path: String) -> LuaResult<Pair<String>> {
 #[lua_fn(guard = FsRead)]
 async fn read_bytes(lua: Lua, path: String) -> LuaResult<Pair<Buffer>> {
     let abs = make_absolute(&path)?;
-    let bytes = try_pair!(read_file(abs, MAX_READ_BYTES).await);
+    let bytes = try_pair!(read_backend(resolve_backend(&lua), abs).await);
     Ok((Some(lua.create_buffer(bytes)?), None))
 }
 
@@ -175,20 +104,14 @@ async fn read_bytes(lua: Lua, path: String) -> LuaResult<Pair<Buffer>> {
 #[lua_fn(guard = FsRead)]
 async fn metadata(lua: Lua, path: String) -> LuaResult<Pair<Table>> {
     let abs = make_absolute(&path)?;
-    match smol::fs::metadata(&abs).await {
-        Ok(meta) => {
-            let tbl = lua.create_table()?;
-            tbl.set("size", meta.len())?;
-            tbl.set("is_file", meta.is_file())?;
-            tbl.set("is_dir", meta.is_dir())?;
-            if let Ok(modified) = meta.modified()
-                && let Ok(dur) = modified.duration_since(UNIX_EPOCH)
-            {
-                tbl.set("mtime", dur.as_secs_f64())?;
-            }
-            Ok((Some(tbl), None))
-        }
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok((None, None)),
+    let backend = resolve_backend(&lua);
+    let payload = smol::unblock(move || backend.metadata(&abs)).await;
+    match payload {
+        Ok(v) if v.is_null() => Ok((None, None)),
+        Ok(v) => match json_to_lua(&lua, &v)? {
+            Value::Table(tbl) => Ok((Some(tbl), None)),
+            _ => Ok((Some(lua.create_table()?), None)),
+        },
         Err(e) => Ok(err_pair(e)),
     }
 }
@@ -412,29 +335,15 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
         None => 1,
     };
 
-    let result = smol::unblock(move || -> Result<Vec<(String, &'static str)>, String> {
-        if !abs.exists() {
-            return Err(format!("dir: path does not exist: {}", abs.display()));
-        }
-        if !abs.is_dir() {
-            return Err(format!("dir: not a directory: {}", abs.display()));
-        }
-        let mut out = Vec::new();
-        let mut visited = HashSet::new();
-        collect_dir_entries(&abs, &abs, 1, max_depth, &mut visited, &mut out);
-        Ok(out)
-    })
-    .await;
-
-    let entries = try_pair!(result);
-    let tbl = lua.create_table()?;
-    for (i, (name, typ)) in entries.iter().enumerate() {
-        let entry = lua.create_table()?;
-        entry.set(1, name.as_str())?;
-        entry.set(2, *typ)?;
-        tbl.set(i + 1, entry)?;
+    let backend = resolve_backend(&lua);
+    let payload = smol::unblock(move || backend.dir(&abs, max_depth)).await;
+    match payload {
+        Ok(payload) => match json_to_lua(&lua, &payload)? {
+            Value::Table(tbl) => Ok((Some(tbl), None)),
+            _ => Ok((Some(lua.create_table()?), None)),
+        },
+        Err(e) => Ok(err_pair(e)),
     }
-    Ok((Some(tbl), None))
 }
 
 /// Write {content} to the file at {path}, creating it if it does not exist
@@ -447,10 +356,12 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 /// local ok, err = maki.fs.write("out.txt", "hello world")
 /// if err then print("write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+async fn write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
     let abs = make_absolute(&path)?;
-    let result = smol::fs::write(&abs, content).await;
-    Ok(pair(touched(abs, result).await.map(|()| true)))
+    let written = abs.clone();
+    let backend = resolve_backend(&lua);
+    let result = smol::unblock(move || backend.write(&abs, content.as_bytes())).await;
+    Ok(pair(touched(written, result).await.map(|()| true)))
 }
 
 /// Append {content} to the file at {path}, creating it (but not its parent
@@ -463,20 +374,11 @@ async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>
 /// local ok, err = maki.fs.append("out.log", "line\n")
 /// if err then print("append failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+async fn append(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
     let abs = make_absolute(&path)?;
     let appended = abs.clone();
-    // `smol::fs::File` writes through a background task and answers before
-    // the bytes reach the file, so a plain `unblock` keeps append ordered.
-    let result = smol::unblock(move || {
-        use std::io::Write;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&abs)
-            .and_then(|mut f| f.write_all(content.as_bytes()))
-    })
-    .await;
+    let result =
+        smol::unblock(move || resolve_backend(&lua).append(&abs, content.as_bytes())).await;
     Ok(pair(touched(appended, result).await.map(|()| true)))
 }
 
@@ -491,10 +393,11 @@ async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool
 /// local ok, err = maki.fs.atomic_write("state.json", encoded)
 /// if err then print("atomic write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn atomic_write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+async fn atomic_write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
     let abs = make_absolute(&path)?;
     let written = abs.clone();
-    let result = smol::unblock(move || maki_storage::atomic_write(&abs, content.as_bytes())).await;
+    let result =
+        smol::unblock(move || resolve_backend(&lua).atomic_write(&abs, content.as_bytes())).await;
     Ok(pair(touched(written, result).await.map(|()| true)))
 }
 
@@ -511,7 +414,7 @@ async fn atomic_write(_lua: Lua, path: String, content: String) -> LuaResult<Pai
 /// if err then print("rm failed: " .. err) end
 /// maki.fs.rm("stale_dir", { recursive = true, force = true })
 #[lua_fn(guard = FsWrite)]
-async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+async fn rm(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
     let abs = make_absolute(&path)?;
     let recursive = opts
         .as_ref()
@@ -522,25 +425,12 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
         .and_then(|t| opt_bool(t, "force"))
         .unwrap_or(false);
     let removed = abs.clone();
-    let result = smol::unblock(move || -> std::io::Result<()> {
-        let meta = match std::fs::symlink_metadata(&abs) {
-            Ok(m) => m,
-            Err(e) if force && e.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        if meta.is_dir() {
-            if recursive {
-                std::fs::remove_dir_all(&abs)
-            } else {
-                std::fs::remove_dir(&abs)
-            }
-        } else {
-            match std::fs::remove_file(&abs) {
-                Ok(()) => Ok(()),
-                Err(e) if meta.file_type().is_symlink() => std::fs::remove_dir(&abs).map_err(|_| e),
-                Err(e) => Err(e),
-            }
+    let result = smol::unblock(move || {
+        let backend = resolve_backend(&lua);
+        if force && !backend.exists(&abs)? {
+            return Ok(());
         }
+        backend.remove(&abs, recursive)
     })
     .await;
     Ok(pair(touched(removed, result).await.map(|()| true)))
@@ -555,18 +445,16 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
 /// @example
 /// maki.fs.mkdir("a/b/c", { parents = true })
 #[lua_fn(guard = FsWrite)]
-async fn mkdir(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+async fn mkdir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
     let abs = make_absolute(&path)?;
     let parents = opts
         .as_ref()
         .and_then(|t| opt_bool(t, "parents"))
         .unwrap_or(false);
-    let result = if parents {
-        smol::fs::create_dir_all(&abs).await
-    } else {
-        smol::fs::create_dir(&abs).await
-    };
-    Ok(pair(touched(abs, result).await.map(|()| true)))
+    let created = abs.clone();
+    let backend = resolve_backend(&lua);
+    let result = smol::unblock(move || backend.mkdir(&abs, parents)).await;
+    Ok(pair(touched(created, result).await.map(|()| true)))
 }
 
 /// The path {path} really names, for the prefix match the file index picks
@@ -687,40 +575,16 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
     let sort = opts.as_ref().and_then(|t| t.get::<String>("sort").ok());
     let sort_mtime = sort.as_deref() == Some("mtime");
 
+    let backend = resolve_backend(&lua);
     let result: Result<Vec<String>, String> = smol::unblock(move || {
-        let root = maki_agent::tools::resolve_search_path(path.as_deref())?;
-        let pattern_refs: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
-
-        let walker = maki_agent::tools::walk_builder_opts(&root, &pattern_refs, gitignore)?.build();
-
-        let iter = walker
-            .flatten()
-            .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()));
-
-        let paths: Vec<String> = if sort_mtime {
-            let mut entries: Vec<_> = iter
-                .filter_map(|e| {
-                    let p = e.into_path();
-                    let mt = maki_agent::tools::mtime(&p);
-                    p.to_str().map(|s| (mt, s.to_owned()))
-                })
-                .collect();
-            entries.sort_unstable_by_key(|e| Reverse(e.0));
-            if let Some(lim) = limit {
-                entries.truncate(lim);
-            }
-            entries.into_iter().map(|(_, s)| s).collect()
-        } else {
-            let bounded: Box<dyn Iterator<Item = _>> = match limit {
-                Some(lim) => Box::new(iter.take(lim)),
-                None => Box::new(iter),
-            };
-            bounded
-                .filter_map(|e| e.into_path().to_str().map(|s| s.to_owned()))
-                .collect()
-        };
-
-        Ok(paths)
+        let root = maki_fs::search::resolve_search_path(path.as_deref())?;
+        let paths = backend
+            .glob(Path::new(&root), &patterns, gitignore, sort_mtime, limit)
+            .map_err(|e| e.to_string())?;
+        Ok(paths
+            .into_iter()
+            .filter_map(|p| p.to_str().map(|s| s.to_owned()))
+            .collect())
     })
     .await;
 
@@ -753,7 +617,7 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
 /// end
 #[lua_fn(guard = FsRead)]
 async fn grep(lua: Lua, pattern: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
-    let mut params = maki_agent::tools::grep::GrepParams::new(pattern);
+    let mut params = maki_fs::GrepParams::new(pattern);
     if let Some(ref opts) = opts {
         if let Ok(v) = opts.get::<String>("path") {
             params.path = Some(v);
@@ -775,13 +639,13 @@ async fn grep(lua: Lua, pattern: String, opts: Option<Table>) -> LuaResult<Pair<
         }
     }
 
-    let result = smol::unblock(move || maki_agent::tools::grep::grep_search(params)).await;
-
-    let (base, entries) = try_pair!(result);
+    let backend = resolve_backend(&lua);
+    let entries =
+        try_pair!(smol::unblock(move || backend.grep(params).map_err(|e| e.to_string())).await);
     let arr = lua.create_table()?;
     for (i, entry) in entries.iter().enumerate() {
         let etbl = lua.create_table()?;
-        etbl.set("path", base.join(&entry.path).to_string_lossy().as_ref())?;
+        etbl.set("path", entry.path.as_str())?;
         let groups_tbl = lua.create_table()?;
         for (gi, group) in entry.groups.iter().enumerate() {
             let gtbl = lua.create_table()?;
@@ -875,7 +739,7 @@ fn search_root(path: Option<&str>, base: &Path) -> Result<PathBuf, String> {
     let Some(path) = path else {
         return Ok(base.to_path_buf());
     };
-    let resolved = maki_agent::tools::resolve_search_path(Some(path))?;
+    let resolved = maki_fs::search::resolve_search_path(Some(path))?;
     let root = Path::new(&resolved)
         .canonicalize()
         .map_err(|e| format!("{path}: {e}"))?;
@@ -1108,7 +972,7 @@ lua_table! {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::OpenOptions;
+    use std::fs::{self, OpenOptions};
     use std::time::{Duration, Instant, SystemTime};
 
     use super::*;
@@ -1117,20 +981,23 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    use std::thread::yield_now;
+
     const FIRST_CONTENT: &str = "first";
     const REPLACEMENT_CONTENT: &str = "replacement";
     const FS_WRITE_PERMISSION: &str = "fs_write";
     #[cfg(unix)]
     const READ_LIMIT_ERROR: &str = "file exceeds the 536870912-byte read limit";
     const NON_UTF8_ERROR: &str = "non-utf8 content; use read_bytes";
-    const TEST_READ_LIMIT: u64 = 4;
     const TEST_PLUGIN: &str = "test";
 
     #[test]
     fn read_file_ok() {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("hello.txt");
-        std::fs::write(&file, "world").unwrap();
+        fs::write(&file, "world").unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1165,7 +1032,7 @@ mod tests {
     fn oversized_read_returns_nil_err(func_name: &str) {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("oversized");
-        let file = File::create(&path).unwrap();
+        let file = std::fs::File::create(&path).unwrap();
         file.set_len(MAX_READ_BYTES + 1).unwrap();
 
         let lua = Lua::new();
@@ -1179,33 +1046,11 @@ mod tests {
     }
 
     #[test_case(b""; "empty")]
-    #[test_case(b"abc"; "below_limit")]
-    #[test_case(b"abcd"; "at_limit")]
-    fn bounded_read_accepts_contents_within_limit(contents: &[u8]) {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("bounded");
-        std::fs::write(&path, contents).unwrap();
-
-        let bytes = smol::block_on(read_file(path, TEST_READ_LIMIT)).unwrap();
-        assert_eq!(bytes, contents);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bounded_read_limits_stream_with_zero_reported_size() {
-        let path = PathBuf::from("/dev/zero");
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
-
-        let err = smol::block_on(read_file(path, TEST_READ_LIMIT)).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::FileTooLarge);
-    }
-
-    #[test_case(b""; "empty")]
     #[test_case(b"\x00\xff\x80"; "non_utf8")]
     fn read_bytes_preserves_binary_contents(contents: &[u8]) {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("binary");
-        std::fs::write(&path, contents).unwrap();
+        fs::write(&path, contents).unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1221,7 +1066,7 @@ mod tests {
     fn read_non_utf8_still_throws() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("binary");
-        std::fs::write(&path, b"\xff").unwrap();
+        fs::write(&path, b"\xff").unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1234,8 +1079,8 @@ mod tests {
     #[test]
     fn dir_lists_entries() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), "").unwrap();
-        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("a.txt"), "").unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1262,8 +1107,8 @@ mod tests {
     #[test]
     fn dir_recursive() {
         let tmp = TempDir::new().unwrap();
-        std::fs::create_dir(tmp.path().join("d")).unwrap();
-        std::fs::write(tmp.path().join("d/nested.txt"), "").unwrap();
+        fs::create_dir(tmp.path().join("d")).unwrap();
+        fs::write(tmp.path().join("d/nested.txt"), "").unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1315,7 +1160,7 @@ mod tests {
     fn metadata_file_dir_and_missing() {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("probe.txt");
-        std::fs::write(&file, "hello").unwrap();
+        fs::write(&file, "hello").unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1345,9 +1190,9 @@ mod tests {
     fn dir_follows_symlinks() {
         let tmp = TempDir::new().unwrap();
         let real_dir = tmp.path().join("real");
-        std::fs::create_dir(&real_dir).unwrap();
-        std::fs::write(real_dir.join("inner.txt"), "").unwrap();
-        std::os::unix::fs::symlink(&real_dir, tmp.path().join("link")).unwrap();
+        fs::create_dir(&real_dir).unwrap();
+        fs::write(real_dir.join("inner.txt"), "").unwrap();
+        symlink(&real_dir, tmp.path().join("link")).unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1380,7 +1225,7 @@ mod tests {
     #[test]
     fn dir_dangling_symlink() {
         let tmp = TempDir::new().unwrap();
-        std::os::unix::fs::symlink("/nonexistent_target_xyz", tmp.path().join("broken")).unwrap();
+        symlink("/nonexistent_target_xyz", tmp.path().join("broken")).unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1410,8 +1255,8 @@ mod tests {
     fn dir_symlink_cycle_does_not_loop() {
         let tmp = TempDir::new().unwrap();
         let child = tmp.path().join("child");
-        std::fs::create_dir(&child).unwrap();
-        std::os::unix::fs::symlink(tmp.path(), child.join("loop")).unwrap();
+        fs::create_dir(&child).unwrap();
+        symlink(tmp.path(), child.join("loop")).unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1448,13 +1293,13 @@ mod tests {
             smol::block_on(write.call_async((file.to_str().unwrap(), "first"))).unwrap();
         assert!(matches!(ok, mlua::Value::Boolean(true)));
         assert!(matches!(err, mlua::Value::Nil));
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "first");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "first");
 
         smol::block_on(
             write.call_async::<(mlua::Value, mlua::Value)>((file.to_str().unwrap(), "second")),
         )
         .unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "second");
     }
 
     #[test]
@@ -1471,7 +1316,7 @@ mod tests {
                 smol::block_on(atomic_write.call_async((file.to_str().unwrap(), content))).unwrap();
             assert_eq!(ok, Value::Boolean(true));
             assert_eq!(err, Value::Nil);
-            assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+            assert_eq!(fs::read_to_string(&file).unwrap(), content);
         }
     }
 
@@ -1524,7 +1369,7 @@ mod tests {
             smol::block_on(append.call_async((file.to_str().unwrap(), FIRST_CONTENT))).unwrap();
         assert_eq!(ok, Value::Boolean(true));
         assert_eq!(err, Value::Nil);
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), FIRST_CONTENT);
+        assert_eq!(fs::read_to_string(&file).unwrap(), FIRST_CONTENT);
 
         let (ok, err): (Value, Value) =
             smol::block_on(append.call_async((file.to_str().unwrap(), REPLACEMENT_CONTENT)))
@@ -1532,7 +1377,7 @@ mod tests {
         assert_eq!(ok, Value::Boolean(true));
         assert_eq!(err, Value::Nil);
         assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
+            fs::read_to_string(&file).unwrap(),
             format!("{FIRST_CONTENT}{REPLACEMENT_CONTENT}")
         );
     }
@@ -1576,7 +1421,7 @@ mod tests {
     fn rm_deletes_file() {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("doomed.txt");
-        std::fs::write(&file, "bye").unwrap();
+        fs::write(&file, "bye").unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1648,7 +1493,7 @@ mod tests {
     fn rm_empty_dir_without_recursive() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("emptydir");
-        std::fs::create_dir(&dir).unwrap();
+        fs::create_dir(&dir).unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1664,8 +1509,8 @@ mod tests {
     fn rm_nonempty_dir_without_recursive_fails() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("nonempty");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::write(dir.join("child.txt"), "x").unwrap();
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("child.txt"), "x").unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1685,10 +1530,10 @@ mod tests {
     fn rm_recursive_removes_tree() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("tree");
-        std::fs::create_dir_all(dir.join("sub/deeper")).unwrap();
-        std::fs::write(dir.join("a.txt"), "a").unwrap();
-        std::fs::write(dir.join("sub/b.txt"), "b").unwrap();
-        std::fs::write(dir.join("sub/deeper/c.txt"), "c").unwrap();
+        fs::create_dir_all(dir.join("sub/deeper")).unwrap();
+        fs::write(dir.join("a.txt"), "a").unwrap();
+        fs::write(dir.join("sub/b.txt"), "b").unwrap();
+        fs::write(dir.join("sub/deeper/c.txt"), "c").unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1707,9 +1552,9 @@ mod tests {
     fn rm_symlink_removes_link_not_target() {
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("target.txt");
-        std::fs::write(&target, "data").unwrap();
+        fs::write(&target, "data").unwrap();
         let link = tmp.path().join("link.txt");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        symlink(&target, &link).unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1727,10 +1572,10 @@ mod tests {
     fn rm_recursive_symlink_to_dir_does_not_follow() {
         let tmp = TempDir::new().unwrap();
         let real_dir = tmp.path().join("real");
-        std::fs::create_dir_all(real_dir.join("sub")).unwrap();
-        std::fs::write(real_dir.join("sub/keep.txt"), "data").unwrap();
+        fs::create_dir_all(real_dir.join("sub")).unwrap();
+        fs::write(real_dir.join("sub/keep.txt"), "data").unwrap();
         let link = tmp.path().join("link");
-        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+        symlink(&real_dir, &link).unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1746,6 +1591,28 @@ mod tests {
         assert!(
             real_dir.join("sub/keep.txt").exists(),
             "target dir contents should remain"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rm_force_removes_dangling_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let dangling = tmp.path().join("dangling");
+        symlink(tmp.path().join("missing-target"), &dangling).unwrap();
+
+        let lua = Lua::new();
+        let tbl =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let rm: mlua::Function = tbl.get("rm").unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("force", true).unwrap();
+        let (ok, _): (mlua::Value, mlua::Value) =
+            smol::block_on(rm.call_async((dangling.to_str().unwrap(), opts))).unwrap();
+        assert!(matches!(ok, mlua::Value::Boolean(true)));
+        assert!(
+            fs::symlink_metadata(&dangling).is_err(),
+            "dangling symlink should be removed"
         );
     }
 
@@ -1802,8 +1669,8 @@ mod tests {
     #[test]
     fn glob_finds_matching_files() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.rs"), "fn main(){}").unwrap();
-        std::fs::write(tmp.path().join("b.txt"), "hello").unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn main(){}").unwrap();
+        fs::write(tmp.path().join("b.txt"), "hello").unwrap();
         let dir_str = tmp.path().to_string_lossy().to_string();
 
         let lua = Lua::new();
@@ -1836,9 +1703,9 @@ mod tests {
     #[test]
     fn glob_multiple_patterns_union() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("a.rs"), "").unwrap();
-        std::fs::write(tmp.path().join("b.txt"), "").unwrap();
-        std::fs::write(tmp.path().join("c.py"), "").unwrap();
+        fs::write(tmp.path().join("a.rs"), "").unwrap();
+        fs::write(tmp.path().join("b.txt"), "").unwrap();
+        fs::write(tmp.path().join("c.py"), "").unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1870,7 +1737,7 @@ mod tests {
     fn glob_limit_caps_results() {
         let tmp = TempDir::new().unwrap();
         for i in 0..5 {
-            std::fs::write(tmp.path().join(format!("f{i}.rs")), "").unwrap();
+            fs::write(tmp.path().join(format!("f{i}.rs")), "").unwrap();
         }
 
         let lua = Lua::new();
@@ -1895,9 +1762,9 @@ mod tests {
     #[test_case(Some(false), 1 ; "false_includes_ignored_files")]
     fn glob_gitignore_option(gitignore: Option<bool>, expected_hits: i64) {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join(".ignore"), "sub/\n").unwrap();
-        std::fs::create_dir(tmp.path().join("sub")).unwrap();
-        std::fs::write(tmp.path().join("sub/ignored.log"), "").unwrap();
+        fs::write(tmp.path().join(".ignore"), "sub/\n").unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/ignored.log"), "").unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1952,7 +1819,7 @@ mod tests {
     fn dir_path_is_file_returns_nil_err() {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("not_a_dir.txt");
-        std::fs::write(&file, "i am a file").unwrap();
+        fs::write(&file, "i am a file").unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -1974,8 +1841,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let old_path = tmp.path().join("old.rs");
         let new_path = tmp.path().join("new.rs");
-        std::fs::write(&old_path, "").unwrap();
-        std::fs::write(&new_path, "").unwrap();
+        fs::write(&old_path, "").unwrap();
+        fs::write(&new_path, "").unwrap();
 
         let old_time = SystemTime::now() - Duration::from_secs(60);
         let new_time = SystemTime::now();
@@ -2015,9 +1882,9 @@ mod tests {
     fn glob_path_option_scopes_to_directory() {
         let tmp = TempDir::new().unwrap();
         let sub = tmp.path().join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        std::fs::write(sub.join("inner.rs"), "").unwrap();
-        std::fs::write(tmp.path().join("outer.rs"), "").unwrap();
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("inner.rs"), "").unwrap();
+        fs::write(tmp.path().join("outer.rs"), "").unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -2051,8 +1918,8 @@ mod tests {
         for i in 1..=20 {
             content.push_str(&format!("line_{i}\n"));
         }
-        std::fs::write(tmp.path().join("data.txt"), &content).unwrap();
-        std::fs::write(tmp.path().join("other.txt"), "no hits here\n").unwrap();
+        fs::write(tmp.path().join("data.txt"), &content).unwrap();
+        fs::write(tmp.path().join("other.txt"), "no hits here\n").unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -2068,7 +1935,7 @@ mod tests {
         let entry: Table = result.get(1).unwrap();
         let path = entry.get::<String>("path").unwrap();
         assert!(path.ends_with("data.txt"));
-        assert!(std::path::Path::new(&path).is_absolute());
+        assert!(Path::new(&path).is_absolute());
         let groups: Table = entry.get("groups").unwrap();
         assert!(groups.len().unwrap() > 0);
         let line: Table = groups
@@ -2141,7 +2008,7 @@ mod tests {
     #[test]
     fn grep_invalid_regex_returns_nil_err() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("x.txt"), "hello\n").unwrap();
+        fs::write(tmp.path().join("x.txt"), "hello\n").unwrap();
 
         let lua = Lua::new();
         let tbl =
@@ -2217,11 +2084,11 @@ mod tests {
     /// cwd because `maki.fs.fuzzy_files` refuses anything else.
     fn file_tree(base: &Path) -> TempDir {
         let tmp = TempDir::new_in(base).unwrap();
-        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
         for i in 0..FILE_COUNT {
-            std::fs::write(tmp.path().join("src").join(format!("f{i}.rs")), "").unwrap();
+            fs::write(tmp.path().join("src").join(format!("f{i}.rs")), "").unwrap();
         }
-        std::fs::write(tmp.path().join(MAIN_FILE), "").unwrap();
+        fs::write(tmp.path().join(MAIN_FILE), "").unwrap();
         tmp
     }
 
@@ -2235,7 +2102,7 @@ mod tests {
         while !index.corpus().complete {
             assert!(Instant::now() < deadline, "{NEVER_WALKED}");
             index.refresh();
-            std::thread::yield_now();
+            yield_now();
         }
     }
 
@@ -2287,8 +2154,8 @@ mod tests {
         let tmp = TempDir::new_in(base).unwrap();
         for path in [PICKER_MAIN, PICKER_README] {
             let file = tmp.path().join(path);
-            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            std::fs::write(file, "").unwrap();
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, "").unwrap();
         }
         tmp
     }
@@ -2688,9 +2555,9 @@ mod tests {
     fn a_touched_path_names_the_tree_it_really_lies_in() {
         let tmp = TempDir::new().unwrap();
         let real = tmp.path().join(REAL_DIR);
-        std::fs::create_dir_all(real.join(NESTED_DIR)).unwrap();
+        fs::create_dir_all(real.join(NESTED_DIR)).unwrap();
         let link = tmp.path().join(LINK_DIR);
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        symlink(&real, &link).unwrap();
         let want = real.canonicalize().unwrap().join(TOUCHED_FILE);
 
         assert_eq!(
@@ -2721,9 +2588,9 @@ mod tests {
     fn a_tail_that_climbs_out_of_a_symlink_names_the_tree_it_points_into() {
         let tmp = TempDir::new().unwrap();
         let real = tmp.path().join(REAL_DIR);
-        std::fs::create_dir_all(real.join(NESTED_DIR)).unwrap();
+        fs::create_dir_all(real.join(NESTED_DIR)).unwrap();
         let link = tmp.path().join(LINK_DIR);
-        std::os::unix::fs::symlink(real.join(NESTED_DIR), &link).unwrap();
+        symlink(real.join(NESTED_DIR), &link).unwrap();
 
         assert_eq!(
             resolved(
@@ -2747,9 +2614,9 @@ mod tests {
     fn a_touched_path_below_a_directory_that_is_gone_still_names_its_tree() {
         let tmp = TempDir::new().unwrap();
         let real = tmp.path().join(REAL_DIR);
-        std::fs::create_dir(&real).unwrap();
+        fs::create_dir(&real).unwrap();
         let link = tmp.path().join(LINK_DIR);
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        symlink(&real, &link).unwrap();
 
         assert_eq!(
             resolved(&link.join(NESTED_DIR).join(TOUCHED_FILE)),
@@ -2790,7 +2657,7 @@ mod tests {
         while !index.corpus().iter().any(|p| p == NEW_FILE) {
             assert!(Instant::now() < deadline, "{NEVER_WALKED}");
             index.refresh();
-            std::thread::yield_now();
+            yield_now();
         }
 
         assert!(

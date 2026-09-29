@@ -19,9 +19,14 @@ const TELEMETRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() {
     color_eyre::install().ok();
-    let result = cmd::dispatch(Cli::parse());
+    let cli = Cli::parse();
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    if cli.sandbox_inner {
+        maki_sandbox::child::child_inner_main();
+    }
     // Detached export tasks die with the process; drain them here, before
     // the `exit` below skips every destructor.
+    let result = cmd::dispatch(cli);
     maki_otel::shutdown(TELEMETRY_SHUTDOWN_TIMEOUT);
     if let Err(e) = result {
         print_error(&e);

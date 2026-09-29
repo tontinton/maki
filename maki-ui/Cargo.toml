@@ -12,6 +12,7 @@ maki-markdown = { workspace = true }
 maki-providers = { workspace = true }
 maki-lua = { workspace = true }
 maki-storage = { workspace = true }
+maki-sandbox = { workspace = true, optional = true }
 ratatui = { workspace = true }
 ratatui-image = { workspace = true }
 crossterm = { workspace = true }
@@ -45,6 +46,8 @@ tempfile = { workspace = true }
 shell-words = { workspace = true }
 open = { workspace = true }
 
+[features]
+sandbox = ["dep:maki-sandbox", "maki-sandbox/sandbox"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

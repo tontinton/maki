@@ -37,6 +37,8 @@ struct Stack {
     commands: Vec<CustomCommand>,
     model: Model,
     needs_login: bool,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    sandbox: Option<Arc<maki_sandbox::Sandbox>>,
 }
 
 impl Stack {
@@ -101,6 +103,19 @@ fn load_config(
 
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
+    }
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    if cli.sandbox {
+        maki_sandbox::namespace::probe()
+            .map_err(|e| color_eyre::eyre::eyre!("{e}"))
+            .context("sandbox preflight check failed -- cannot start with --sandbox")?;
+        config.agent.sandbox_enabled = true;
+    }
+    #[cfg(not(all(feature = "sandbox", target_os = "linux")))]
+    if cli.sandbox {
+        return Err(color_eyre::eyre::eyre!(
+            "--sandbox is only supported on Linux"
+        ));
     }
     if !cli.allowed_tools.is_empty() {
         config.agent.allowed_tools = cli
@@ -179,6 +194,36 @@ fn build_stack(
     )?;
 
     warnings.extend(provider_scripts::startup_warning());
+
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    let sandbox = if config.agent.sandbox_enabled {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let workspace_name = cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ns_config = {
+            let mut cfg = maki_sandbox::namespace::NamespaceConfig::from_agent_config(
+                config.agent.sandbox_allowed_env.clone(),
+                &config.agent.sandbox_allowed_paths,
+                &config.agent.sandbox_extra_dirs,
+                &maki_sandbox::profiles::select_profiles(&config.agent.sandbox_profiles),
+                cwd,
+                workspace_name,
+            );
+            cfg.prune_missing_mounts();
+            cfg
+        };
+        let sandbox = maki_sandbox::Sandbox::new(ns_config).context("initialize sandbox")?;
+        let fs: Arc<maki_sandbox::fs_backend::SandboxFs> = Arc::new(
+            maki_sandbox::fs_backend::SandboxFs::new(Arc::clone(&sandbox)),
+        );
+        plugin_host.set_sandbox_backend(fs)?;
+        Some(sandbox)
+    } else {
+        None
+    };
+
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage);
@@ -205,6 +250,8 @@ fn build_stack(
             commands,
             model,
             needs_login,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            sandbox,
         },
         super::sanitize_warnings(&warnings),
     ))
@@ -494,6 +541,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
                 project_config: trust.project_config.clone(),
                 trust_question: trust.state.question().cloned(),
+                #[cfg(all(feature = "sandbox", target_os = "linux"))]
+                sandbox: stack.sandbox.as_ref().map(Arc::clone),
             },
             initial_prompt.take(),
         )

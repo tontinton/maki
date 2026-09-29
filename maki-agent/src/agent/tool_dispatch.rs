@@ -16,10 +16,11 @@ use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT
 use crate::tools::registry::{InstalledHook, RegisteredTool, Tool, ToolInvocation};
 use crate::tools::{
     CallOrigin, Deadline, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience,
-    ToolContext, truncate_bytes,
+    ToolContext,
 };
 use crate::{AgentError, AgentEvent, CallRecord, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::ToolKey;
+use maki_fs::search::truncate_bytes;
 use maki_storage::id::SessionRef;
 
 const DOOM_LOOP_THRESHOLD: usize = 3;

@@ -33,6 +33,7 @@ use serde_json::Value;
 use strum::{EnumString, IntoStaticStr};
 
 use maki_config::RawConfig;
+use maki_fs::FsBackend;
 use maki_providers::plugin::DeclAuthority;
 use maki_storage::id::{MakiId, SessionRef};
 
@@ -113,6 +114,14 @@ const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
 /// parked ones do not take the plugin's keys away for the rest of the run, nor
 /// a picker left open hold up a `/reload`.
 const KEYBIND_TICKET_HOLD: Duration = Duration::from_secs(10);
+
+/// Routing policy for a tool call: only a tool that declared
+/// `host_access = true` stays on the host. Everything else, including tools a
+/// later load adds, runs inside the sandbox while it is enabled.
+fn routes_into_sandbox(host_access: bool, sandbox_enabled: bool) -> bool {
+    sandbox_enabled && !host_access
+}
+
 /// Async tasks spawned during restore may spawn further tasks; cap the rounds.
 const RESTORE_SPAWN_ROUNDS: usize = 8;
 /// Keeps a buggy plugin's restore task from freezing the lua loop.
@@ -480,6 +489,8 @@ pub enum Request {
         /// `row`) instead of dropping the click.
         fallback: Option<Box<ClickFallback>>,
     },
+    /// Replaces the backend that routed tool calls run against.
+    SetSandboxBackend(Arc<dyn FsBackend>),
     RunKeybindCallback {
         ticket: KeybindTicket,
     },
@@ -2168,6 +2179,9 @@ struct ToolKeys {
     start: Option<RegistryKey>,
     permission_scopes: Option<RegistryKey>,
     describe: Option<RegistryKey>,
+    /// Declared at registration. True keeps the handler on the host even when
+    /// the sandbox is on; false (the default) routes the call into the sandbox.
+    host_access: bool,
 }
 
 struct PluginOwner {
@@ -2241,6 +2255,7 @@ impl LuaRuntime {
 
         lua.set_app_data(CommandHandlerMap::new());
         lua.set_app_data(JobStore::new());
+        lua.set_app_data(Arc::new(crate::backend::BackendRegistry::new()));
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
         lua.set_app_data(crate::api::top::NotifyHandler::default());
@@ -2755,6 +2770,7 @@ impl LuaRuntime {
                         start: t.start_key,
                         permission_scopes: t.permission.and_then(|p| p.scopes.callback_key()),
                         describe: t.describe_key,
+                        host_access: t.host_access,
                     },
                 )
             })
@@ -3660,6 +3676,17 @@ async fn run_tool_call(
     plugins: PluginMap,
     shutdown: Arc<AtomicBool>,
 ) -> ToolCallReply {
+    if shutdown.load(Ordering::Acquire) {
+        return ToolCallReply::err("plugin host shutting down");
+    }
+    let host_access = {
+        let plugins_ref = plugins.borrow();
+        plugins_ref
+            .get(&*plugin)
+            .and_then(|owner| owner.tools.get(&*tool))
+            .is_some_and(|keys| keys.host_access)
+    };
+    let routed = routes_into_sandbox(host_access, ctx.sandbox_enabled());
     let handler: Function = {
         let plugins_ref = plugins.borrow();
         let Some(owner) = plugins_ref.get(&*plugin) else {
@@ -3673,9 +3700,6 @@ async fn run_tool_call(
             Err(e) => return ToolCallReply::err(strip_traceback(&e)),
         }
     };
-    if shutdown.load(Ordering::Acquire) {
-        return ToolCallReply::err("plugin host shutting down");
-    }
 
     let (finish_tx, finish_rx) = flume::bounded::<ToolCallReply>(1);
     ctx.finish_tx = Some(finish_tx);
@@ -3695,6 +3719,7 @@ async fn run_tool_call(
         Ok(t) => t,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
+    let thread_ptr = thread.to_pointer() as usize;
     let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
     cell.live_sink = live_sink;
@@ -3705,6 +3730,10 @@ async fn run_tool_call(
         Ok(at) => at,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
+    let routed_binding = routed
+        && lua
+            .app_data_ref::<Arc<crate::backend::BackendRegistry>>()
+            .is_some_and(|registry| registry.bind(thread_ptr));
     if let Some(id) = &live_id {
         live_tasks
             .borrow_mut()
@@ -3781,6 +3810,11 @@ async fn run_tool_call(
                 warm.pop_front();
             }
         }
+    }
+    if routed_binding
+        && let Some(registry) = lua.app_data_ref::<Arc<crate::backend::BackendRegistry>>()
+    {
+        registry.unbind(thread_ptr);
     }
     drop(scope);
     reply
@@ -4449,6 +4483,13 @@ pub fn spawn(
                         Request::RunKeybindCallback { ticket } => {
                             spawn_keybind_callback(&rt.lua, &ex, &gate, ticket);
                         }
+                        Request::SetSandboxBackend(backend) => {
+                            if let Some(registry) =
+                                rt.lua.app_data_ref::<Arc<crate::backend::BackendRegistry>>()
+                            {
+                                registry.set_default(backend);
+                            }
+                        }
                     }
                 }
             }));
@@ -4499,6 +4540,16 @@ mod tests {
     use std::future::poll_fn;
     use std::task::Poll;
     use test_case::test_case;
+
+    /// Tools route into the sandbox unless they opted out with `host_access`;
+    /// with the sandbox off nothing is routed, whatever the declaration.
+    #[test_case(false, true, true ; "default_routes_into_sandbox")]
+    #[test_case(true, true, false ; "host_access_stays_on_host")]
+    #[test_case(false, false, false ; "sandbox_off_stays_on_host")]
+    #[test_case(true, false, false ; "host_access_with_sandbox_off_stays_on_host")]
+    fn routing_policy(host_access: bool, sandbox_enabled: bool, routed: bool) {
+        assert_eq!(routes_into_sandbox(host_access, sandbox_enabled), routed);
+    }
 
     fn make_buf_handle(text: &str) -> BufHandle {
         let buf = Arc::new(maki_agent::SharedBuf::new());

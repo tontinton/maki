@@ -184,7 +184,7 @@ fn config_value_expr(ty_name: &str, default: &Option<Expr>) -> TokenStream2 {
             let val = default.as_ref().expect("numeric field requires default");
             quote! { ConfigValue::U64(#val as u64) }
         }
-        "String" => quote! { ConfigValue::Str("none") },
+        "String" | "string[]" => quote! { ConfigValue::Str("none") },
         other => panic!("unsupported config type: {other}"),
     }
 }

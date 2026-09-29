@@ -10,6 +10,7 @@ use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
+use maki_fs::FsBackend;
 use maki_providers::plugin::DeclAuthority;
 
 use crate::api::keymap::{KeybindTicket, KeymapReader};
@@ -1023,6 +1024,16 @@ impl PluginHost {
     /// dropping it would leave a handler parked on a reply that never comes.
     pub fn ui_attachment(&self) -> UiAttachment {
         self.inner.ui_attachment.clone()
+    }
+
+    /// Install the fs backend that routed tool calls run against.
+    pub fn set_sandbox_backend(&self, backend: Arc<dyn FsBackend>) -> Result<(), PluginError> {
+        if let Err(e) = self.inner.tx.try_send(Request::SetSandboxBackend(backend)) {
+            tracing::warn!("failed to send sandbox backend to lua runtime: {e}");
+            Err(PluginError::HostDead)
+        } else {
+            Ok(())
+        }
     }
 }
 

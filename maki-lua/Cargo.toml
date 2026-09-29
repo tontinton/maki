@@ -14,6 +14,7 @@ base64 = { workspace = true }
 image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 crossterm = { workspace = true }
 maki-agent = { workspace = true }
+maki-fs = { workspace = true }
 maki-config = { workspace = true }
 maki-highlight = { workspace = true }
 maki-interpreter = { workspace = true }
@@ -25,7 +26,6 @@ mlua = { workspace = true }
 nucleo-matcher = { workspace = true }
 open = { workspace = true }
 serde = { workspace = true }
-shell-words = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 semver = { workspace = true }
@@ -84,9 +84,6 @@ tree-sitter-hcl = { workspace = true }
 tree-sitter-json = { workspace = true }
 tree-sitter-make = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-rustix = { workspace = true }
-
 [dev-dependencies]
 base64 = { workspace = true }
 criterion = { workspace = true }
@@ -94,6 +91,7 @@ image = { workspace = true }
 jiff = { workspace = true }
 maki-agent = { workspace = true }
 maki-providers = { workspace = true, features = ["test-support"] }
+rustix = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
 

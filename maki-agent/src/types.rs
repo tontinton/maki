@@ -17,59 +17,7 @@ use strum::Display;
 
 pub const NO_FILES_FOUND: &str = "No files found";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GrepFileEntry {
-    pub path: String,
-    pub groups: Vec<GrepMatchGroup>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GrepMatchGroup {
-    pub lines: Vec<GrepLine>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GrepLine {
-    pub line_nr: usize,
-    pub text: String,
-    pub is_match: bool,
-}
-
-impl GrepLine {
-    pub fn matched(line_nr: usize, text: impl Into<String>) -> Self {
-        Self {
-            line_nr,
-            text: text.into(),
-            is_match: true,
-        }
-    }
-
-    pub fn context(line_nr: usize, text: impl Into<String>) -> Self {
-        Self {
-            line_nr,
-            text: text.into(),
-            is_match: false,
-        }
-    }
-}
-
-impl GrepMatchGroup {
-    pub fn single(line_nr: usize, text: impl Into<String>) -> Self {
-        Self {
-            lines: vec![GrepLine::matched(line_nr, text)],
-        }
-    }
-
-    pub fn match_count(&self) -> usize {
-        self.lines.iter().filter(|l| l.is_match).count()
-    }
-}
-
-impl GrepFileEntry {
-    pub fn match_count(&self) -> usize {
-        self.groups.iter().map(|g| g.match_count()).sum()
-    }
-}
+pub use maki_fs::grep::{GrepFileEntry, GrepLine, GrepMatchGroup};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TodoItem {

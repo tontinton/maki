@@ -333,6 +333,13 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        {
+            let r = self.sandbox_modal.view(frame, full);
+            if r.width > 0 {
+                overlay_rect = r;
+            }
+        }
         overlay_rect
     }
 

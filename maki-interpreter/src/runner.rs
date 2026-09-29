@@ -27,7 +27,8 @@ const SCRIPT_NAME: &str = "agent.py";
 const OS_CALLS_DENIED: &str = "OS calls are not permitted";
 const BINARY_FILES_UNSUPPORTED: &str = "binary files are not supported, open in text mode";
 
-pub type ToolFn = Box<dyn Fn(&str, Vec<Value>, Vec<(String, Value)>) -> Result<Value, String>>;
+pub type ToolFn =
+    Box<dyn Fn(&str, Vec<Value>, Vec<(String, Value)>) -> Result<Value, String> + Send + Sync>;
 
 pub struct FileWrite {
     pub path: String,
@@ -441,9 +442,8 @@ pub fn limits(timeout: Duration, max_memory: usize) -> ResourceLimits {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::cell::RefCell;
-    use std::rc::Rc;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use test_case::test_case;
 
@@ -469,7 +469,8 @@ mod tests {
         writes: usize,
     }
 
-    type SharedFs = Rc<RefCell<MemoryFs>>;
+    // `ToolFn` is `Send + Sync`, so the shared fs has to be too.
+    type SharedFs = Arc<Mutex<MemoryFs>>;
 
     fn run_code(
         code: &str,
@@ -489,14 +490,18 @@ mod tests {
     }
 
     fn memory_fs() -> SharedFs {
-        Rc::new(RefCell::new(MemoryFs {
+        Arc::new(Mutex::new(MemoryFs {
             files: HashMap::from([(FILE_PATH.to_owned(), FILE_CONTENT.to_owned())]),
             writes: 0,
         }))
     }
 
     fn content(fs: &SharedFs) -> Value {
-        json!(fs.borrow().files.get(FILE_PATH))
+        json!(lock(fs).files.get(FILE_PATH))
+    }
+
+    fn lock(fs: &SharedFs) -> std::sync::MutexGuard<'_, MemoryFs> {
+        fs.lock().expect("memory fs poisoned")
     }
 
     /// Binds `path`, and `locked` where every write fails. The `peek` tool
@@ -506,9 +511,9 @@ mod tests {
         fs: &SharedFs,
         async_tools: bool,
     ) -> Result<InterpreterResult, InterpreterError> {
-        let host_fs = Rc::clone(fs);
+        let host_fs = Arc::clone(fs);
         let files: FileFn = Box::new(move |op| {
-            let mut fs = host_fs.borrow_mut();
+            let mut fs = lock(&host_fs);
             match op {
                 FileOp::Read(path) => fs
                     .files
@@ -529,9 +534,9 @@ mod tests {
                 }
             }
         });
-        let peek_fs = Rc::clone(fs);
+        let peek_fs = Arc::clone(fs);
         let peek: ToolFn = Box::new(move |_, _, _| Ok(content(&peek_fs)));
-        let resolver_fs = Rc::clone(fs);
+        let resolver_fs = Arc::clone(fs);
         let resolver: AsyncResolver = Box::new(move |calls| {
             Ok(calls
                 .into_iter()
@@ -754,7 +759,7 @@ mod tests {
         let fs = memory_fs();
         run_with_files(code, &fs, false).unwrap();
         assert_eq!(content(&fs), json!(expected));
-        assert_eq!(fs.borrow().writes, 1);
+        assert_eq!(lock(&fs).writes, 1);
     }
 
     #[test]
