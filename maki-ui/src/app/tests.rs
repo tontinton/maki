@@ -7093,6 +7093,67 @@ fn reset_session_never_writes_the_old_conversation_under_the_new_id() {
     );
 }
 
+#[test]
+fn fork_session_saves_a_copy_and_keeps_the_tab_on_the_original() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let _live = attach_live_history(&mut app, vec![Message::user("shared progress".into())]);
+    app.checkpoint();
+    let original = app.state.session.id;
+
+    let actions = app.run_cmdline("/fork", 0).unwrap();
+    assert!(actions.is_empty(), "the live session is not disturbed");
+    assert_eq!(
+        app.state.session.id, original,
+        "the tab stays on the session it forked",
+    );
+
+    drain_writer(app, writer);
+    let stored = AppSession::list_all(&dir).unwrap();
+    let fork = stored
+        .iter()
+        .find(|s| s.id != original)
+        .expect("a fork on disk");
+    assert!(
+        fork.title.starts_with("fork of ") && fork.title != "fork of New session",
+        "the copy is named after what it copied, not the default title: {}",
+        fork.title,
+    );
+    assert_eq!(
+        AppSession::load(fork.id, &dir).unwrap().messages().len(),
+        1,
+        "the copy carries the transcript",
+    );
+    assert_eq!(
+        AppSession::load(original, &dir).unwrap().messages().len(),
+        1,
+        "the original keeps its transcript",
+    );
+}
+
+#[test]
+fn fork_refuses_while_a_run_streams() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let _live = attach_live_history(&mut app, vec![Message::user("mid turn".into())]);
+    app.checkpoint();
+    app.status = Status::Streaming;
+
+    let actions = app.run_cmdline("/fork", 0).unwrap();
+    assert!(actions.is_empty());
+
+    let original = app.state.session.id;
+    drain_writer(app, writer);
+    let ids: Vec<_> = AppSession::list_all(&dir)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![original],
+        "the original is on disk, but no copy was queued",
+    );
+}
+
 const ONE_RESTART: &str = "the gesture must hand the loop exactly one restart";
 const RESTART_MATCHES_SESSION: &str =
     "the respawned agent must run on the history the session now holds";
