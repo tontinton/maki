@@ -1,3 +1,4 @@
+use super::session::{FORK_EMPTY_MSG, FORK_TITLE_PREFIX};
 use super::*;
 use crate::AppSession;
 use crate::agent::shared_queue;
@@ -7466,6 +7467,54 @@ fn reset_session_never_writes_the_old_conversation_under_the_new_id() {
         AppSession::load(new_id, &dir).is_err(),
         "an empty session has no content to persist",
     );
+}
+
+const ONE_FORK: &str = "a fork must hand the loop exactly one copy to open";
+const RECOVERED_PROMPT: &str = "prompt queued before the agent failed";
+
+fn opened_fork(actions: Vec<Action>) -> AppSession {
+    let Ok([Action::OpenFork(open)]) = <[Action; 1]>::try_from(actions) else {
+        panic!("{ONE_FORK}");
+    };
+    open.session
+}
+
+#[test]
+fn fork_opens_a_copy_and_leaves_the_original_alone() {
+    let mut app = test_app();
+    let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
+    app.recoverable_queue = vec![RECOVERED_PROMPT.into()];
+    let original = app.state.session.id;
+
+    let fork = opened_fork(type_and_submit(&mut app, "/fork"));
+    assert_ne!(fork.id, original);
+    assert_eq!(fork.title, format!("{FORK_TITLE_PREFIX}{LIVE_AGENT_TEXT}"));
+    assert_eq!(
+        fork.messages().len(),
+        1,
+        "the copy carries what the agent wrote since the last frame",
+    );
+    assert_eq!(
+        fork.meta.input_draft, None,
+        "the submitted `/fork` must not linger as the copy's draft",
+    );
+    assert!(
+        fork.meta.queued_messages.is_empty(),
+        "the original runs its own queue, the copy must not run it again",
+    );
+    assert_eq!(app.state.session.id, original);
+    assert_eq!(
+        app.state.session.messages().len(),
+        1,
+        "the original keeps its transcript",
+    );
+}
+
+#[test]
+fn fork_refuses_an_empty_copy() {
+    let mut app = test_app();
+    assert!(app.fork_session().is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(FORK_EMPTY_MSG));
 }
 
 const ONE_RESTART: &str = "the gesture must hand the loop exactly one restart";

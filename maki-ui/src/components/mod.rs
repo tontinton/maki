@@ -40,6 +40,8 @@ use maki_lua::{PackCommand, PackPlan};
 use maki_providers::{ImageSource, Message, ModelTier};
 use ratatui::text::{Line, Span};
 
+use crate::OpenSession;
+
 pub(crate) use maki_providers::IMAGE_PLACEHOLDER;
 
 pub(crate) const CHEVRON: &str = "❯ ";
@@ -204,6 +206,8 @@ pub enum Action {
     /// The history under this runtime changed (reset, load, rewind), so the
     /// agent has to be respawned on it.
     RestartAgent(Vec<Message>),
+    /// A copy of this session, to run beside it and take the focus.
+    OpenFork(Box<OpenSession>),
     ChangeModel(String),
     RefreshProvider {
         slug: String,

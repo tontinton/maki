@@ -58,6 +58,7 @@ use crate::app::tasks::{TaskStatus, diff_task_states};
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
 use crate::color_compat;
 use crate::components::input::Submission;
+use crate::components::keybindings::key;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 use crate::input::InputReader;
@@ -77,6 +78,7 @@ const PACK_PREPARING: &str = "Checking packages...";
 const PACK_BUSY_ERR: &str = "a package command is already running";
 const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
+const FORKED_MSG: &str = "Forked, {key} to switch back";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -1685,6 +1687,17 @@ impl<'t> EventLoop<'t> {
         );
     }
 
+    /// The fork runs on the model of the session it came from, whose slot is
+    /// already built.
+    fn open_fork(&mut self, idx: usize, open: OpenSession) {
+        let slot = self.sessions[idx].slot.load_full();
+        self.focused = self.push_runtime(self.ctx.spawn_runtime(open, slot));
+        let id = self.sessions[self.focused].id();
+        maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(&id.to_string()));
+        self.focused_app()
+            .flash(FORKED_MSG.replace("{key}", key::SESSIONS.label));
+    }
+
     fn handle_action(&mut self, idx: usize, action: Action) {
         match action {
             Action::SendMessage(input) => {
@@ -1712,6 +1725,7 @@ impl<'t> EventLoop<'t> {
                 self.ctx.lua_event_handle.cancel_plugin_session(&id);
             }
             Action::RestartAgent(history) => self.respawn_agent(idx, history),
+            Action::OpenFork(open) => self.open_fork(idx, *open),
             Action::ChangeModel(spec) => {
                 if let Err(e) = self.change_model(&spec) {
                     self.focused_app().flash(e);

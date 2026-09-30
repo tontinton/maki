@@ -9,7 +9,7 @@ use crate::components::rewind_picker::RewindEntry;
 use maki_lua::SessionEndReason;
 use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionMeta, StoredMode, StoredSubagent};
+use maki_storage::sessions::{SessionClaim, SessionMeta, StoredMode, StoredSubagent};
 
 use crate::{AppSession, OpenSession};
 
@@ -18,6 +18,10 @@ use super::{App, MAIN_CHAT, Mode, PendingInput, PlanState, Status};
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
+
+pub(super) const FORK_TITLE_PREFIX: &str = "fork of ";
+pub(super) const FORK_EMPTY_MSG: &str = "Nothing to fork, the copy would be empty";
+const FORK_FAILED_MSG: &str = "Fork failed";
 
 /// What `App::checkpoint` last handed to the writer: which session, how far
 /// along it was, and when. The id is part of it because a session swapped into
@@ -376,6 +380,36 @@ impl App {
             Some(&self.state.session.id.to_string()),
         );
         vec![Action::RestartAgent(self.install_local_history())]
+    }
+
+    /// `/fork` copies the session under a fresh id. The event loop opens the
+    /// copy as a session of its own and focuses it, so this one keeps running
+    /// in the background, untouched.
+    pub(super) fn fork_session(&mut self) -> Vec<Action> {
+        // The last frame's snapshot still has `/fork` in the input box, and it
+        // can miss what the agent wrote since, so take a fresh one.
+        self.checkpoint_now();
+        if !session_has_content(&self.state.session) {
+            self.status_bar.flash(FORK_EMPTY_MSG.into());
+            return vec![];
+        }
+        let claim = SessionClaim::fresh(&self.storage);
+        let forked = AppSession::clone(&self.state.session).fork(
+            claim.id(),
+            &self.state.session.cwd,
+            &self.storage,
+        );
+        let mut session = match forked {
+            Ok(session) => session,
+            Err(e) => {
+                self.status_bar.flash(format!("{FORK_FAILED_MSG}: {e}"));
+                return vec![];
+            }
+        };
+        // Without this a young session forks into "fork of New session".
+        session.update_title_if_default();
+        session.set_title(format!("{FORK_TITLE_PREFIX}{}", session.title));
+        vec![Action::OpenFork(Box::new(OpenSession { session, claim }))]
     }
 
     pub(super) fn open_rewind_picker(&mut self) -> Vec<Action> {
