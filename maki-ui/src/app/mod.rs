@@ -1823,6 +1823,7 @@ impl App {
                 }
             }
             "/new" => self.reset_session(),
+            "/fork" => self.fork_session(),
             "/queue" => {
                 self.queue.set_focus();
                 vec![]
