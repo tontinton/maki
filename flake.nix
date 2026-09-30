@@ -89,8 +89,8 @@
       gitDepHashes = {
         "git+https://github.com/pydantic/monty.git?tag=v0.0.23#302e0f27ec8516689ba90793cd0381149e5f4076" =
           "sha256-NUhHd3x0hA+qpQ7wQ30kiynn4M+5XWQrX/fG2zgnlwg=";
-        "git+https://github.com/crossterm-rs/crossterm?rev=3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77#3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77" =
-          "sha256-A5lgiEEi7mktf7m2GljdAxst7Fdl7Uqko29Xq6o90Ow=";
+        "git+https://github.com/crossterm-rs/crossterm?rev=94ed7154e35d24a2f643c61760e1eb05b8ca9e63#94ed7154e35d24a2f643c61760e1eb05b8ca9e63" =
+          "sha256-r2Xsxw8+eqESsJKaax5pb/rIWshkoqi5E81Dkh8snZ8=";
         "git+https://github.com/tontinton/syntect?rev=01df275f6f25da670e5ba5b7128cb89d03795119#01df275f6f25da670e5ba5b7128cb89d03795119" =
           "sha256-ZszhXL+Bd0zZGOfOodvP4z6dLD3jJr3pO07riwFUC70=";
       };
