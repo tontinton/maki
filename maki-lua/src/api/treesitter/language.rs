@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Table, Value as LuaValue};
 
+use crate::api::util::pair::{Pair, err_pair};
 use crate::language::Language;
 
 struct LangRegistry {
@@ -12,15 +13,16 @@ struct LangRegistry {
 }
 
 /// Registers {lang} for use with tree-sitter.
-/// Call this to confirm a language grammar is available. Throws if {lang} is unknown.
-/// Custom grammar paths are not yet supported.
+/// Call this to confirm a language grammar is available. Like
+/// `vim.treesitter.language.add`. Custom grammar paths are not yet supported.
 ///
 /// @param lang string Language name, e.g. `"rust"`.
 /// @param opts table? Options table (the `path` key is not yet supported).
+/// @return (boolean?, string?) `true`, or nil plus an error if {lang} is unknown.
 /// @example
-/// maki.treesitter.language.add("lua")
+/// if not maki.treesitter.language.add("lua") then return end
 #[lua_fn]
-fn add(_lua: &Lua, lang: String, opts: Option<Table>) -> mlua::Result<()> {
+fn add(_lua: &Lua, lang: String, opts: Option<Table>) -> mlua::Result<Pair<bool>> {
     if let Some(ref opts) = opts
         && opts.contains_key("path")?
     {
@@ -29,9 +31,9 @@ fn add(_lua: &Lua, lang: String, opts: Option<Table>) -> mlua::Result<()> {
         ));
     }
     if Language::from_name(&lang).is_none() {
-        return Err(mlua::Error::runtime(format!("language not found: {lang}")));
+        return Ok(err_pair(format!("language not found: {lang}")));
     }
-    Ok(())
+    Ok((Some(true), None))
 }
 
 /// Associates {lang} with one or more filetypes, so you can look up the right

@@ -280,7 +280,9 @@ fn language_module() {
         &host,
         "language_mod",
         r#"
-maki.treesitter.language.add("rust")
+assert(maki.treesitter.language.add("rust") == true)
+local ok, err = maki.treesitter.language.add("unknown_lang_xyz")
+assert(ok == nil and err ~= nil)
 
 maki.treesitter.language.register("rust", "rs")
 assert(maki.treesitter.language.get_lang("rs") == "rust")

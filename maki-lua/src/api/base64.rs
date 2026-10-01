@@ -7,6 +7,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Value as LuaValue};
 
+use crate::api::util::pair::{Pair, try_pair};
+
 pub(crate) fn bytes_arg(val: &LuaValue, what: &str) -> LuaResult<Vec<u8>> {
     match val {
         LuaValue::String(s) => Ok(s.as_bytes().to_vec()),
@@ -32,19 +34,21 @@ fn encode(_lua: &Lua, data: LuaValue) -> LuaResult<String> {
 }
 
 /// Decode a Base64-encoded {str} back to its original bytes. Like `vim.base64.decode`.
-/// Throws if {str} is not valid Base64.
 ///
 /// @param str string|buffer Base64-encoded text.
-/// @return (string) Decoded bytes as a string.
+/// @return (string?, string?) Decoded bytes as a string, or nil plus an error
+///   message if {str} is not valid Base64.
 /// @example
 /// maki.base64.decode("aGVsbG8=") -- "hello"
 #[lua_fn]
-fn decode(lua: &Lua, str: LuaValue) -> LuaResult<mlua::String> {
+fn decode(lua: &Lua, str: LuaValue) -> LuaResult<Pair<mlua::String>> {
     let encoded = bytes_arg(&str, "base64.decode")?;
-    let decoded = BASE64
-        .decode(encoded)
-        .map_err(|e| mlua::Error::runtime(format!("base64.decode: {e}")))?;
-    lua.create_string(decoded)
+    let decoded = try_pair!(
+        BASE64
+            .decode(encoded)
+            .map_err(|e| format!("base64.decode: {e}"))
+    );
+    Ok((Some(lua.create_string(decoded)?), None))
 }
 
 lua_table! {
@@ -82,10 +86,13 @@ mod tests {
     }
 
     #[test]
-    fn decode_invalid_errors() {
+    fn decode_invalid_returns_err() {
         let lua = Lua::new();
         let t = create_base64_table(&lua).unwrap();
         let decode: mlua::Function = t.get("decode").unwrap();
-        assert!(decode.call::<mlua::String>("!!!not base64!!!").is_err());
+        let (decoded, err): (Option<mlua::String>, Option<String>) =
+            decode.call("!!!not base64!!!").unwrap();
+        assert!(decoded.is_none());
+        assert!(err.is_some());
     }
 }

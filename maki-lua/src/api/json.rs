@@ -87,8 +87,8 @@ fn encode(lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
 /// local t, err = maki.json.decode('{"x": 42}')
 /// print(t.x) -- 42
 #[lua_fn]
-fn decode(lua: &Lua, str: String) -> LuaResult<Pair<Value>> {
-    let value = try_pair!(serde_json::from_str::<serde_json::Value>(&str));
+fn decode(lua: &Lua, str: mlua::String) -> LuaResult<Pair<Value>> {
+    let value = try_pair!(serde_json::from_slice::<serde_json::Value>(&str.as_bytes()));
     Ok((Some(json_to_lua(lua, &value)?), None))
 }
 
@@ -133,6 +133,7 @@ lua_table! {
 #[cfg(test)]
 mod tests {
     use mlua::Lua;
+    use test_case::test_case;
 
     fn lua_with_json() -> Lua {
         let lua = Lua::new();
@@ -173,11 +174,14 @@ mod tests {
         assert!(has_err);
     }
 
-    #[test]
-    fn decode_error_returns_nil_and_message() {
+    #[test_case(r#""{invalid}""# ; "invalid_json")]
+    #[test_case(r#""\xff""# ; "non_utf8")]
+    fn decode_error_returns_nil_and_message(input: &str) {
         let lua = lua_with_json();
         let (is_nil, has_err): (bool, bool) = lua
-            .load(r#"local t, err = json.decode("{invalid}"); return t == nil, err ~= nil"#)
+            .load(format!(
+                "local t, err = json.decode({input}); return t == nil, err ~= nil"
+            ))
             .eval()
             .unwrap();
         assert!(is_nil);

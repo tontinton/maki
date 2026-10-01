@@ -21,19 +21,20 @@ use crate::runtime::LUA_MEMORY_LIMIT;
 // Luau allows strings and buffers up to 1 GiB, but the VM budget is the binding
 // limit: a read the VM cannot hold dies with a Lua memory error instead.
 const MAX_READ_BYTES: u64 = LUA_MEMORY_LIMIT as u64;
+const NON_UTF8_CONTENT_ERR: &str = "non-utf8 content; use read_bytes";
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     maki_storage::paths::expand_tilde(Path::new(path))
 }
 
-fn make_absolute(path: &str) -> LuaResult<PathBuf> {
+fn make_absolute(path: &str) -> Result<PathBuf, String> {
     let p = expand_tilde(path);
     if p.is_absolute() {
         Ok(p)
     } else {
         std::env::current_dir()
             .map(|cwd| cwd.join(&p))
-            .map_err(|e| mlua::Error::runtime(format!("cannot resolve cwd: {e}")))
+            .map_err(|e| format!("cannot resolve cwd: {e}"))
     }
 }
 
@@ -120,8 +121,7 @@ async fn read_file(path: PathBuf, max_bytes: u64) -> IoResult<Vec<u8>> {
 }
 
 /// Read the entire file at {path} as a UTF-8 string.
-/// Files larger than 512 MiB return nil plus an error message.
-/// If the file contains bytes that are not valid UTF-8, this function throws.
+/// Files over 512 MiB or not valid UTF-8 return nil plus an error message.
 /// Use `read_bytes` for binary files.
 ///
 /// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
@@ -134,12 +134,11 @@ async fn read_file(path: PathBuf, max_bytes: u64) -> IoResult<Vec<u8>> {
 /// end
 #[lua_fn(guard = FsRead)]
 async fn read(_lua: Lua, path: String) -> LuaResult<Pair<String>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(make_absolute(&path));
     let bytes = try_pair!(read_file(abs, MAX_READ_BYTES).await);
-    match String::from_utf8(bytes) {
-        Ok(s) => Ok((Some(s), None)),
-        Err(_) => Err(mlua::Error::runtime("non-utf8 content; use read_bytes")),
-    }
+    Ok(pair(
+        String::from_utf8(bytes).map_err(|_| NON_UTF8_CONTENT_ERR),
+    ))
 }
 
 /// Read the entire file at {path} as raw bytes, returned as a Luau buffer.
@@ -154,7 +153,7 @@ async fn read(_lua: Lua, path: String) -> LuaResult<Pair<String>> {
 /// local encoded = maki.base64.encode(buf)
 #[lua_fn(guard = FsRead)]
 async fn read_bytes(lua: Lua, path: String) -> LuaResult<Pair<Buffer>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(make_absolute(&path));
     let bytes = try_pair!(read_file(abs, MAX_READ_BYTES).await);
     Ok((Some(lua.create_buffer(bytes)?), None))
 }
@@ -174,7 +173,7 @@ async fn read_bytes(lua: Lua, path: String) -> LuaResult<Pair<Buffer>> {
 /// end
 #[lua_fn(guard = FsRead)]
 async fn metadata(lua: Lua, path: String) -> LuaResult<Pair<Table>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(make_absolute(&path));
     match smol::fs::metadata(&abs).await {
         Ok(meta) => {
             let tbl = lua.create_table()?;
@@ -245,7 +244,7 @@ fn joinpath(_lua: &Lua, parts: mlua::Variadic<String>) -> LuaResult<String> {
 /// maki.fs.normalize("src/../src/api") -- "/home/user/project/src/api"
 #[lua_fn]
 fn normalize(_lua: &Lua, path: String) -> LuaResult<String> {
-    let abs = make_absolute(&path)?;
+    let abs = make_absolute(&path).map_err(mlua::Error::runtime)?;
     let mut components = Vec::new();
     for comp in abs.components() {
         match comp {
@@ -269,7 +268,7 @@ fn normalize(_lua: &Lua, path: String) -> LuaResult<String> {
 /// maki.fs.abspath("src/main.rs") -- "/home/user/project/src/main.rs"
 #[lua_fn]
 fn abspath(_lua: &Lua, path: String) -> LuaResult<String> {
-    path_to_string(&make_absolute(&path)?)
+    path_to_string(&make_absolute(&path).map_err(mlua::Error::runtime)?)
 }
 
 /// Return all ancestor directories of {path}, from the immediate parent up to the root.
@@ -332,7 +331,8 @@ async fn root(_lua: Lua, source: String, marker: Value) -> LuaResult<Option<Stri
             start
         };
 
-        let mut dir = make_absolute(start.to_str().unwrap_or_default())?;
+        let mut dir =
+            make_absolute(start.to_str().unwrap_or_default()).map_err(mlua::Error::runtime)?;
 
         loop {
             for m in &markers {
@@ -406,7 +406,7 @@ fn ext(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
 /// end
 #[lua_fn(guard = FsRead)]
 async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(make_absolute(&path));
     let max_depth: u32 = match &opts {
         Some(t) => t.get::<u32>("depth").unwrap_or(1),
         None => 1,
@@ -448,7 +448,7 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 /// if err then print("write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
 async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(make_absolute(&path));
     let result = smol::fs::write(&abs, content).await;
     Ok(pair(touched(abs, result).await.map(|()| true)))
 }
@@ -464,7 +464,7 @@ async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>
 /// if err then print("append failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
 async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(make_absolute(&path));
     let appended = abs.clone();
     // `smol::fs::File` writes through a background task and answers before
     // the bytes reach the file, so a plain `unblock` keeps append ordered.
@@ -492,7 +492,7 @@ async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool
 /// if err then print("atomic write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
 async fn atomic_write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(make_absolute(&path));
     let written = abs.clone();
     let result = smol::unblock(move || maki_storage::atomic_write(&abs, content.as_bytes())).await;
     Ok(pair(touched(written, result).await.map(|()| true)))
@@ -512,7 +512,7 @@ async fn atomic_write(_lua: Lua, path: String, content: String) -> LuaResult<Pai
 /// maki.fs.rm("stale_dir", { recursive = true, force = true })
 #[lua_fn(guard = FsWrite)]
 async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(make_absolute(&path));
     let recursive = opts
         .as_ref()
         .and_then(|t| opt_bool(t, "recursive"))
@@ -556,7 +556,7 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
 /// maki.fs.mkdir("a/b/c", { parents = true })
 #[lua_fn(guard = FsWrite)]
 async fn mkdir(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
-    let abs = make_absolute(&path)?;
+    let abs = try_pair!(make_absolute(&path));
     let parents = opts
         .as_ref()
         .and_then(|t| opt_bool(t, "parents"))
@@ -1122,7 +1122,6 @@ mod tests {
     const FS_WRITE_PERMISSION: &str = "fs_write";
     #[cfg(unix)]
     const READ_LIMIT_ERROR: &str = "file exceeds the 536870912-byte read limit";
-    const NON_UTF8_ERROR: &str = "non-utf8 content; use read_bytes";
     const TEST_READ_LIMIT: u64 = 4;
     const TEST_PLUGIN: &str = "test";
 
@@ -1218,7 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn read_non_utf8_still_throws() {
+    fn read_non_utf8_returns_err() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("binary");
         std::fs::write(&path, b"\xff").unwrap();
@@ -1227,8 +1226,10 @@ mod tests {
         let tbl =
             create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
         let f: mlua::Function = tbl.get("read").unwrap();
-        let err = smol::block_on(f.call_async::<Value>(path.to_str().unwrap())).unwrap_err();
-        assert!(err.to_string().contains(NON_UTF8_ERROR));
+        let (text, err): (Option<String>, Option<String>) =
+            smol::block_on(f.call_async(path.to_str().unwrap())).unwrap();
+        assert_eq!(text, None);
+        assert_eq!(err.as_deref(), Some(NON_UTF8_CONTENT_ERR));
     }
 
     #[test]

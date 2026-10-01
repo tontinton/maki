@@ -341,8 +341,12 @@ maki.api.set_slot("completion.sources", function(prev, sources)
     trigger = "#",
     name = "issues",
     complete = function(query, ctx)
-      local out = maki.fn.jobwait(maki.fn.jobstart({ "gh", "issue", "list", "--search", query }))
+      local id = maki.fn.jobstart({ "gh", "issue", "list", "--search", query })
+      local out = id and maki.fn.jobwait(id)
       local items = {}
+      if not out then
+        return items
+      end
       for num, title in out.stdout:gmatch("(%d+)%s+%S+%s+([^\t]+)") do
         table.insert(items, { text = "#" .. num, label = "#" .. num .. " " .. title })
       end

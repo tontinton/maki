@@ -240,6 +240,8 @@ const STRING_NAME_SCHEMA: &str = r#"{
 }"#;
 const JOB_BAD_CWD: &str = "~/definitely/not/a/dir";
 const JOB_BAD_CWD_ERR_PREFIX: &str = "cwd is not a directory: ";
+const JOB_UNKNOWN_ID: u32 = 999_999;
+const JOBWAIT_UNKNOWN_ERR: &str = "jobwait: unknown job id or already waited";
 const NIL_WITHOUT_JOBS_ERR: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
 const FINISH_CALLED_TWICE_ERR: &str = "ctx:finish() already called";
@@ -1729,6 +1731,27 @@ fn jobwait_fires_callbacks_while_waiting() {
 }
 
 #[test]
+fn jobwait_unknown_id_returns_err() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "wait_unknown",
+            description = "waits on a job id that never existed",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function()
+                local res, err = maki.fn.jobwait({JOB_UNKNOWN_ID})
+                return tostring(res) .. "|" .. tostring(err)
+            end
+        }})"#,
+    );
+    host.load_source("wait_unknown", &src).unwrap();
+    let out = exec_tool(&reg, "wait_unknown", serde_json::json!({})).unwrap();
+    assert_eq!(out, format!("nil|{JOBWAIT_UNKNOWN_ERR}"));
+}
+
+#[test]
 fn jobstart_invalid_cwd_errors_with_expanded_path() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -1739,7 +1762,7 @@ fn jobstart_invalid_cwd_errors_with_expanded_path() {
             schema = {MINIMAL_SCHEMA},
             audiences = {{ "main" }},
             handler = function(input, ctx)
-                local _, err = pcall(maki.fn.jobstart, "pwd", {{ cwd = "{JOB_BAD_CWD}" }})
+                local _, err = maki.fn.jobstart("pwd", {{ cwd = "{JOB_BAD_CWD}" }})
                 return tostring(err)
             end
         }})"#,
@@ -3244,11 +3267,11 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        local ok, res = pcall(maki.fn.jobwait, job_id, 10000)
-        if not ok then
-            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
+        local res, err = maki.fn.jobwait(job_id, 10000)
+        if not res then
+            return {{ llm_output = "error: " .. err, is_error = true }}
         end
-        return "exit:" .. tostring(res and res.exit_code) .. "|exit_cb:" .. tostring(exit_cb_result)
+        return "exit:" .. tostring(res.exit_code) .. "|exit_cb:" .. tostring(exit_cb_result)
     end,
 }})
 "#,
@@ -6553,12 +6576,9 @@ maki.api.register_tool({{
         job_id = maki.fn.jobstart("sleep 1", {{
             scope = {{ session = "{session}" }},
             on_exit = function(id, code)
-                local ok, res = pcall(maki.fn.jobwait, id, 2000)
-                if not ok then
-                    error("self-wait errored: " .. tostring(res))
-                end
-                if res == nil then
-                    error("self-wait timed out")
+                local res, err = maki.fn.jobwait(id, 2000)
+                if not res then
+                    error("self-wait failed: " .. err)
                 end
                 if res.exit_code ~= code then
                     error("self-wait code mismatch")
@@ -6574,12 +6594,9 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        local ok, res = pcall(maki.fn.jobwait, job_id, 10000)
-        if not ok then
-            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
-        end
-        if res == nil then
-            return {{ llm_output = "error: outer wait timed out", is_error = true }}
+        local res, err = maki.fn.jobwait(job_id, 10000)
+        if not res then
+            return {{ llm_output = "error: " .. err, is_error = true }}
         end
         return "exit:" .. tostring(res.exit_code)
     end,
@@ -6622,12 +6639,9 @@ maki.api.register_tool({{
             scope = {{ session = "{session}" }},
             on_stdout = function() maki.fs.write("{parked}", "parked") end,
         }})
-        local ok, res = pcall(maki.fn.jobwait, id, 25000)
-        if not ok then
-            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
-        end
-        if res == nil then
-            return {{ llm_output = "error: jobwait timed out", is_error = true }}
+        local res, err = maki.fn.jobwait(id, 25000)
+        if not res then
+            return {{ llm_output = "error: " .. err, is_error = true }}
         end
         return "exit:" .. tostring(res.exit_code)
     end,
@@ -6682,14 +6696,11 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        local ok, res = pcall(maki.fn.jobwait, job_id, 10000)
-        if not ok then
-            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
+        local res, err = maki.fn.jobwait(job_id, 10000)
+        if not res then
+            return {{ llm_output = "error: " .. err, is_error = true }}
         end
-        if res == nil then
-            return {{ llm_output = "error: timed out", is_error = true }}
-        end
-                return "exit:" .. tostring(res.exit_code) .. "|stdout:" .. tostring(res.stdout)
+        return "exit:" .. tostring(res.exit_code) .. "|stdout:" .. tostring(res.stdout)
     end,
 }})
 "#

@@ -98,6 +98,18 @@ local function rtk_find_unsupported(cmd)
   return false
 end
 
+local function run_rtk(cmd)
+  local id = maki.fn.jobstart(cmd)
+  if not id then
+    return nil
+  end
+  local result = maki.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
+  if not result then
+    maki.fn.jobstop(id)
+  end
+  return result
+end
+
 local function rtk_rewrite(command, ctx)
   local config = ctx:config()
   if config and not config.rtk then
@@ -105,18 +117,8 @@ local function rtk_rewrite(command, ctx)
   end
 
   if rtk_available == nil then
-    local ok, id = pcall(maki.fn.jobstart, { "rtk", "--version" })
-    if not ok then
-      rtk_available = false
-      return nil
-    end
-    local result = maki.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
-    if result then
-      rtk_available = (result.exit_code == 0)
-    else
-      maki.fn.jobstop(id)
-      rtk_available = false
-    end
+    local result = run_rtk({ "rtk", "--version" })
+    rtk_available = result ~= nil and result.exit_code == 0
   end
 
   if not rtk_available then
@@ -128,10 +130,8 @@ local function rtk_rewrite(command, ctx)
     return nil
   end
 
-  local id = maki.fn.jobstart({ "rtk", "rewrite", command })
-  local result = maki.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
+  local result = run_rtk({ "rtk", "rewrite", command })
   if not result then
-    maki.fn.jobstop(id)
     return nil
   end
 
@@ -431,7 +431,7 @@ maki.api.register_tool({
 
     view:append({ { "Waiting for output...", "dim" } })
 
-    maki.fn.jobstart(command, {
+    local job, err = maki.fn.jobstart(command, {
       cwd = workdir,
       env = { GIT_TERMINAL_PROMPT = "0" },
       on_stdout = function(_, line)
@@ -454,6 +454,9 @@ maki.api.register_tool({
         finish(code)
       end,
     })
+    if not job then
+      return { llm_output = "error: " .. err, is_error = true }
+    end
 
     -- Esc or deadline: hand back the lines streamed so far, so the model
     -- keeps what the user just watched instead of a bare error.

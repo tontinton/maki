@@ -41,6 +41,7 @@ Scripts to port:
   Then I do not have to log in again.
 - A key read from an environment variable becomes `api_key_env = "VAR"`, with no `auth` hook.
 - A secret from another program (`op`, `pass`, `gcloud`, `security`, `gh`, ...): run that same command from the hook with `maki.fn.jobstart({ ... })` and `maki.fn.jobwait(id, timeout_ms)`.
+  Both return nil and an error message on failure (missing binary, timeout), so raise it: `local id, err = maki.fn.jobstart({ ... }); if not id then error(err) end`, and the same for `jobwait`.
   Do not call the old script. An `auth` hook has 30 seconds, and `login` has no time limit.
 
 ## Details that are easy to get wrong

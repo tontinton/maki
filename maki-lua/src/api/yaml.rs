@@ -26,8 +26,8 @@ fn encode(lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
 /// local t, err = maki.yaml.decode("name: maki\nversion: 1")
 /// print(t.name) -- maki
 #[lua_fn]
-fn decode(lua: &Lua, str: String) -> LuaResult<Pair<Value>> {
-    let value = try_pair!(serde_yaml::from_str::<serde_yaml::Value>(&str));
+fn decode(lua: &Lua, str: mlua::String) -> LuaResult<Pair<Value>> {
+    let value = try_pair!(serde_yaml::from_slice::<serde_yaml::Value>(&str.as_bytes()));
     Ok((Some(lua.to_value(&value)?), None))
 }
 
@@ -47,6 +47,7 @@ lua_table! {
 #[cfg(test)]
 mod tests {
     use mlua::Lua;
+    use test_case::test_case;
 
     fn lua_with_yaml() -> Lua {
         let lua = Lua::new();
@@ -65,11 +66,14 @@ mod tests {
         assert_eq!(result, 42);
     }
 
-    #[test]
-    fn decode_error_returns_nil_and_message() {
+    #[test_case(r#"":\n  - :\n  bad""# ; "invalid_yaml")]
+    #[test_case(r#""\xff""# ; "non_utf8")]
+    fn decode_error_returns_nil_and_message(input: &str) {
         let lua = lua_with_yaml();
         let (is_nil, has_err): (bool, bool) = lua
-            .load(r#"local t, err = yaml.decode(":\n  - :\n  bad"); return t == nil, err ~= nil"#)
+            .load(format!(
+                "local t, err = yaml.decode({input}); return t == nil, err ~= nil"
+            ))
             .eval()
             .unwrap();
         assert!(is_nil);

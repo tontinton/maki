@@ -34,6 +34,8 @@ const NO_TASK_SCOPE_ERR: &str =
 const TABLE_SCOPE_ERR: &str = "jobstart: table scope must be { session = <id> }";
 const SCOPE_TYPE_ERR: &str = "jobstart: scope must be \"task\", \"plugin\", or { session = <id> }";
 const JOB_NOT_FOUND_ERR: &str = "job: not found";
+const JOB_UNWAITABLE_ERR: &str = "jobwait: unknown job id or already waited";
+const JOB_WAIT_TIMEOUT_ERR: &str = "jobwait: timed out";
 const BLANK_NAME_ERR: &str = "jobstart: name must be non-blank";
 const EMPTY_ARGV_ERR: &str = "jobstart: argv table must not be empty";
 const CMD_TYPE_ERR: &str = "jobstart: cmd must be a shell string or an argv table";
@@ -849,12 +851,17 @@ fn kill_job(job: &JobMeta) {
 ///     (default 20, 0 disables, max 1024).
 ///   `name` (string?) handle for `jobfind`, unique among the live jobs this
 ///     plugin can see. Starting a second job under a live name is an error.
-/// @return (integer) Job id.
+/// @return (integer?, string?) Job id, or nil plus an error message when the
+///   process could not start (binary not found, bad `cwd`, redirect file not
+///   writable).
 /// @example
-/// local id = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
+/// local id, err = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
 ///   on_stdout = function(_, line) print(line) end,
 ///   on_exit = function(_, code) print("exit: " .. code) end,
 /// })
+/// if not id then
+///   maki.log.warn("rg failed to start: " .. err)
+/// end
 #[lua_fn(guard = Run)]
 fn jobstart(
     lua: &Lua,
@@ -862,7 +869,7 @@ fn jobstart(
     #[ctx] fs_write: bool,
     cmd: Value,
     opts: Option<Table>,
-) -> LuaResult<u32> {
+) -> LuaResult<Pair<u32>> {
     let scope = opts
         .as_ref()
         .map(|opts| opts.get::<Value>("scope"))
@@ -898,15 +905,14 @@ fn jobstart(
         if let Some(ref name) = spec.name
             && let Some(held) = store.find_named(name, task_id, &plugin)
         {
-            return Err(format!(
+            return Err(mlua::Error::runtime(format!(
                 "jobstart: name {name:?} is already held by live job {held}"
-            ));
+            )));
         }
-        let id = store.start(spec)?;
+        let id = try_pair!(store.start(spec));
         store.set_tail(id, tail);
-        Ok::<u32, String>(id)
+        Ok((Some(id), None))
     })
-    .map_err(mlua::Error::runtime)
 }
 
 fn parse_command(cmd: Value) -> LuaResult<JobCommand> {
@@ -1191,21 +1197,22 @@ fn jobforget(lua: &Lua, #[ctx] plugin: Arc<str>, job_id: u32) -> LuaResult<()> {
 /// already exited answers from its captured tail, so `truncated` says
 /// whether that tail ever lost a line (`tail` too small or 0, or the stream
 /// redirected away). Waiting on a live job collects every line and is never
-/// truncated. Returns `nil` if the job does not finish before the timeout.
+/// truncated.
 ///
 /// While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 /// callbacks fire as events arrive (like Neovim), so you can stream
 /// output into a buffer while parked here. An already-exited
 /// session-owned job answers from its snapshot and fires no callbacks.
 /// Task and plugin jobs leave the store on exit, so waiting after that
-/// is an error.
+/// answers nil plus an error.
 ///
 /// @param job_id integer Job id returned by `jobstart`.
 /// @param timeout_ms integer? Maximum wait in milliseconds (default 30000).
-/// @return (table?) `{ stdout, stderr, exit_code, truncated }`, or nil on timeout.
+/// @return (table?, string?) `{ stdout, stderr, exit_code, truncated }`, or
+///   nil plus an error on timeout or an unknown job.
 /// @example
 /// local id = maki.fn.jobstart("echo hello")
-/// local result = maki.fn.jobwait(id, 5000)
+/// local result, err = maki.fn.jobwait(id, 5000)
 /// if result then
 ///   print(result.stdout)
 /// end
@@ -1215,7 +1222,7 @@ async fn jobwait(
     #[ctx] plugin: Arc<str>,
     job_id: u32,
     timeout_ms: Option<u64>,
-) -> LuaResult<Value> {
+) -> LuaResult<Pair<Table>> {
     let task_id = active_task_id(&lua);
     if let Some(snap) = with_jobs(&lua, |store| store.snapshot(job_id, task_id, &plugin))
         && let Some(code) = snap.exit_code
@@ -1228,8 +1235,10 @@ async fn jobwait(
             snap.dropped_output,
         );
     }
-    let receiver = with_jobs(&lua, |store| store.take_receiver(job_id, task_id, &plugin))
-        .ok_or_else(|| mlua::Error::runtime("unknown job id or already waited"))?;
+    let Some(receiver) = with_jobs(&lua, |store| store.take_receiver(job_id, task_id, &plugin))
+    else {
+        return Ok(err_pair(JOB_UNWAITABLE_ERR));
+    };
     let receiver = CheckedOutReceiver::new(&lua, job_id, receiver);
 
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_WAIT_MS));
@@ -1248,7 +1257,7 @@ async fn jobwait(
             .await;
 
         let Some(event) = event else {
-            return Ok(mlua::Value::Nil);
+            return Ok(err_pair(JOB_WAIT_TIMEOUT_ERR));
         };
         // A failing callback must not abort the wait: the event is already
         // recorded and the exit still needs collecting. Same policy as the
@@ -1274,13 +1283,13 @@ fn wait_result(
     stderr: &[String],
     exit_code: i32,
     truncated: bool,
-) -> LuaResult<Value> {
+) -> LuaResult<Pair<Table>> {
     let result = lua.create_table()?;
     result.set("stdout", stdout.join("\n"))?;
     result.set("stderr", stderr.join("\n"))?;
     result.set("exit_code", exit_code)?;
     result.set("truncated", truncated)?;
-    Ok(Value::Table(result))
+    Ok((Some(result), None))
 }
 
 /// Fire the job's Lua callback for {event} (if any) and mark the job

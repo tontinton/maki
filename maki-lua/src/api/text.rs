@@ -6,7 +6,7 @@ use mlua::{Lua, Result as LuaResult, Table};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
-use super::util::pair::{Pair, pair};
+use super::util::pair::{Pair, pair, try_pair};
 
 thread_local! {
     /// `Matcher::new` allocates a score matrix of about 135KB, so building one
@@ -26,7 +26,8 @@ thread_local! {
 /// if err then return end
 /// print(md) -- "# Hello\n\nworld"
 #[lua_fn]
-fn html_to_markdown(_lua: &Lua, html: String) -> LuaResult<Pair<String>> {
+fn html_to_markdown(_lua: &Lua, html: mlua::String) -> LuaResult<Pair<String>> {
+    let html = try_pair!(html.to_str());
     Ok(pair(
         htmd::convert(&html).map_err(|e| format!("html_to_markdown: {e}")),
     ))

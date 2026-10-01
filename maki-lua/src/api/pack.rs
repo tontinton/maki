@@ -7,6 +7,8 @@ use maki_lua_macro::{lua_fn, lua_table};
 use maki_pack::Spec;
 use mlua::{Lua, MultiValue, RegistryKey, Result as LuaResult, Table, Value as LuaValue};
 
+use crate::api::util::pair::{Pair, err_pair};
+
 /// What `pack.add` and `packadd` refuse once startup has loaded the declared
 /// set: nothing reads either list again, so a late call has to say so rather
 /// than record something that will never happen.
@@ -14,6 +16,7 @@ const AFTER_LOAD: &str = "packages have already been loaded";
 /// A name is one package. Two sources under it are a mistake in `init.lua`,
 /// not a preference to resolve silently.
 const ALREADY_DECLARED: &str = "is already declared";
+const LOCKFILE_UNREADABLE_ERR: &str = "pack.get: pack lockfile is unreadable";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadMode {
@@ -291,9 +294,10 @@ pub(crate) fn add_packadd(lua: &Lua, maki: &Table) -> LuaResult<()> {
 ///
 /// @param names table? Package names. Omit for all managed packages.
 /// @param opts table? Reserved. Omit it.
-/// @return (table) Package records with `spec`, `path`, `rev`, and `active`.
+/// @return (table?, string?) Package records with `spec`, `path`, `rev`, and
+///   `active`, or nil plus an error when the pack lockfile cannot be read.
 #[lua_fn]
-fn get(lua: &Lua, names: Option<Table>, opts: Option<Table>) -> LuaResult<Table> {
+fn get(lua: &Lua, names: Option<Table>, opts: Option<Table>) -> LuaResult<Pair<Table>> {
     if let Some(opts) = opts {
         reject_unknown_fields(&opts, &[], "pack.get")?;
     }
@@ -305,10 +309,12 @@ fn get(lua: &Lua, names: Option<Table>, opts: Option<Table>) -> LuaResult<Table>
         .ok_or_else(|| mlua::Error::runtime("pack.get: not available here"))?
         .clone();
     let declarations = store.lock().expect("pack declarations").clone();
-    let lock = crate::pack::read_lockfile(crate::pack::lockfile_path().as_deref())
-        .ok_or_else(|| mlua::Error::runtime("pack.get: pack lockfile is unreadable"))?;
+    let Some(lock) = crate::pack::read_lockfile(crate::pack::lockfile_path().as_deref()) else {
+        return Ok(err_pair(LOCKFILE_UNREADABLE_ERR));
+    };
     let site = crate::pack::site_dir().ok();
-    package_state_table(lua, requested, &declarations, &lock, site.as_deref())
+    let packages = package_state_table(lua, requested, &declarations, &lock, site.as_deref())?;
+    Ok((Some(packages), None))
 }
 
 fn package_state_table(
