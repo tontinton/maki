@@ -306,6 +306,9 @@ pub enum SessionAction {
         /// Show sessions from all projects
         #[arg(short, long)]
         global: bool,
+        /// Print machine-readable session summaries, one JSON array
+        #[arg(long)]
+        json: bool,
     },
     /// Delete a session
     Delete {

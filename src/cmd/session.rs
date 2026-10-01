@@ -35,7 +35,7 @@ const NO_SESSIONS_HERE: &str = "No sessions found in this directory (try --globa
 const NEEDS_TTY: &str = "refusing to delete without a terminal to confirm on, pass --force";
 const CANCELLED: &str = "Cancelled";
 
-pub fn list(global: bool, storage: &StateDir) -> Result<()> {
+pub fn list(global: bool, json: bool, storage: &StateDir) -> Result<()> {
     let summaries = if global {
         AppSession::list_all(storage)
     } else {
@@ -43,6 +43,14 @@ pub fn list(global: bool, storage: &StateDir) -> Result<()> {
         AppSession::list(&cwd.to_string_lossy(), storage)
     }
     .context("list sessions")?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&summaries).context("serialize session summaries")?
+        );
+        return Ok(());
+    }
 
     if summaries.is_empty() {
         if global {
