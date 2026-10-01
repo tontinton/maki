@@ -68,8 +68,7 @@ const FREE_SLUG: &str = "acmefree";
 const STUCK_AFTER: Duration = Duration::from_secs(20);
 const RELOADED_SOURCE: &str = "-- the provider plugin, reloaded without its registration\n";
 
-/// A provider maki ships a declaration for, so the slug is both a built-in row
-/// and a decl already standing when the plugin below reaches for it.
+/// Shipped as a bundled plugin, which this file never loads.
 const BUILTIN_SLUG: &str = "deepseek";
 const BUILTIN_HOST: &str = "api.deepseek.com";
 const RESERVED_SLUG_MESSAGE: &str = "belongs to a built-in provider";
@@ -242,7 +241,7 @@ impl Fixture {
         &self,
         thinking: ThinkingConfig,
     ) -> (Vec<ProviderEvent>, Result<StreamResponse, AgentError>) {
-        let model = plugin::lookup_model(SLUG, MODEL).expect(UNKNOWN_MODEL);
+        let model = Model::from_spec(&format!("{SLUG}/{MODEL}")).expect(UNKNOWN_MODEL);
         stream(self.provider.as_ref(), &model, thinking)
     }
 
@@ -476,7 +475,7 @@ fn a_login_hook_is_what_makes_the_slug_an_auth_target() {
         plugin::auth_providers()
     );
     plugin::login(SLUG).expect(HOOK_FAILED);
-    plugin::logout(SLUG).expect(HOOK_FAILED);
+    assert!(plugin::logout(SLUG).expect(HOOK_FAILED), "{HOOK_FAILED}");
 }
 
 fn responses_plugin(base_url: &str) -> String {
@@ -508,7 +507,8 @@ fn the_responses_codec_applies_the_body_hook_too() {
     plugin::commit_load();
 
     let provider = plugin::create(RESPONSES_SLUG, Timeouts::default()).expect(CREATE_FAILED);
-    let model = plugin::lookup_model(RESPONSES_SLUG, RESPONSES_MODEL).expect(UNKNOWN_MODEL);
+    let model =
+        Model::from_spec(&format!("{RESPONSES_SLUG}/{RESPONSES_MODEL}")).expect(UNKNOWN_MODEL);
 
     let (events, result) = stream(provider.as_ref(), &model, ThinkingConfig::Off);
     let response = result.expect(STREAM_FAILED);
@@ -649,13 +649,10 @@ fn an_in_flight_hook_call_survives_a_plugin_reload() {
     login.join().expect(HOOK_THREAD_FAILED).expect(HOOK_FAILED);
 }
 
-/// A slug maki ships is maki's to declare, and a plugin from outside the
-/// binary may not take it. A decl that claims one inherits its `api_key_env`,
-/// so the key the user set for the built-in would be resolved into the
-/// claimant's credentials and handed straight to it as every hook's
-/// `ctx.headers`, under a name the picker still labels with the built-in's
-/// display name. No `net` grant and no host list ever bought
-/// that reach.
+/// Picture a package that registers `deepseek`. It would get the DeepSeek key
+/// the user saved, in every hook's `ctx.headers`, while the picker still says
+/// "DeepSeek". Asking for `net` and a host list never granted that. So a slug
+/// maki ships stays reserved, even when its bundled plugin is turned off.
 #[test]
 fn a_third_party_plugin_cannot_take_a_builtin_slug() {
     let _state = isolated_state();
@@ -665,7 +662,9 @@ fn a_third_party_plugin_cannot_take_a_builtin_slug() {
     let error = host
         .load_source_with_permissions(
             INLINE_PLUGIN,
-            &format!(r#"maki.provider.register({{ slug = "{BUILTIN_SLUG}", codec = "openai" }})"#),
+            &format!(
+                r#"maki.provider.register({{ slug = "{BUILTIN_SLUG}", display_name = "Taken", codec = "openai" }})"#
+            ),
             permissions_for(BUILTIN_HOST),
         )
         .expect_err(CLAIM_ALLOWED);

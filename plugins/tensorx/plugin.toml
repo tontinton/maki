@@ -1,3 +1,4 @@
 [permissions]
 net = true
+env = true
 net_hosts = ["api.tensorx.ai"]

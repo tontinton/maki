@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 use flume::Sender;
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use maki_config::providers::{ProvidersConfig, builtin_provider};
+use maki_config::providers::ProvidersConfig;
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -32,7 +32,8 @@ use crate::providers::anthropic::shared;
 use crate::providers::openai_compat::{
     DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider,
 };
-use crate::providers::{ResolvedAuth, Timeouts, http_client, opencode, user_agent};
+use crate::providers::{ResolvedAuth, Timeouts, http_client, opencode, plugin, user_agent};
+use crate::spec::ProviderRegistry;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 const MESSAGES_PATH: &str = "/messages";
@@ -47,8 +48,8 @@ const BLOCKED_PROVIDER_IN_CATALOG: &[&str] = &["zai-coding-plan"];
 const BUILTIN_CATALOG_IDS: &[(&str, &str)] =
     &[("github-copilot", "copilot"), ("regolo-ai", "regolo")];
 
-/// Builtins with no native client of their own, so [`builtin_provider`]
-/// knowing them must not drop them from the catalog.
+/// Builtins with no native client of their own, so a spec row knowing them
+/// must not drop them from the catalog.
 pub(crate) const CATALOG_BACKED_BUILTINS: &[&str] = opencode::SLUGS;
 
 /// Provider modules own their entry here; the catalog only reads it.
@@ -354,9 +355,11 @@ impl CatalogData {
 
         for (provider_id, provider) in index {
             let slug = builtin_slug(&provider_id);
-            // The second clause is dead while no Opencode slug has a login
-            // row. It says what to do if one ever gains it: keep the entry.
-            if builtin_provider(slug).is_some() && !CATALOG_BACKED_BUILTINS.contains(&slug) {
+            // maki brings its own client for these, so the catalog only lends
+            // metadata, like the limits that keep requests inside the context.
+            // A bundled plugin counts even while turned off, so the catalog
+            // never serves it in its place.
+            if ProviderRegistry::is_shipped(slug) && !CATALOG_BACKED_BUILTINS.contains(&slug) {
                 let models = parse_models(&provider.models);
                 debug!(
                     provider = %provider_id,
@@ -422,8 +425,15 @@ impl CatalogData {
         Ok((meta, provider_data))
     }
 
+    /// A plugin owns its slug, so a catalog entry of the same name would be a
+    /// second provider under it.
     fn all_providers(&self) -> Vec<ProviderData> {
-        let mut providers: Vec<ProviderData> = self.providers.values().cloned().collect();
+        let mut providers: Vec<ProviderData> = self
+            .providers
+            .values()
+            .filter(|p| !plugin::is_registered(&p.slug))
+            .cloned()
+            .collect();
         providers.sort_by_key(|p| p.display_name.to_lowercase());
         providers
     }
@@ -632,9 +642,8 @@ fn builtin_slug(catalog_id: &str) -> &str {
 }
 
 /// Whether we could stream from this provider ourselves: one of the two
-/// protocols we speak, at a base URL the catalog publishes. Built-ins are
-/// checked first and never come through here, since they bring their own
-/// client and only need the metadata.
+/// protocols we speak, at a base URL the catalog publishes. Shipped providers
+/// never get here, they bring their own client and only need the metadata.
 fn is_servable(provider_id: &str, provider: &schema::CatalogProvider) -> bool {
     if !ALLOWED_NPM.contains(&provider.npm.as_str()) {
         debug!(provider = %provider_id, npm = %provider.npm, "skipping provider: unsupported npm package");
@@ -1054,9 +1063,9 @@ mod tests {
         Authentication, CatalogData, CatalogMeta, EndpointType, ProviderData, ProviderQuirks,
         SessionRef, StateDir, available_if_warm, determine_catalog_format, parse_model, quirks_for,
     };
-    use crate::model::{Model, ModelInfo, ModelPricing};
+    use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
     use crate::provider::Provider;
-    use crate::providers::{ResolvedAuth, Timeouts, deepseek, opencode};
+    use crate::providers::{ResolvedAuth, Timeouts, opencode};
     use crate::spec::ProviderRegistry;
     use crate::{AgentError, ModelFamily, ModelTier, RequestOptions};
     use test_case::test_case;
@@ -1064,7 +1073,8 @@ mod tests {
     const SESSION_HEADER: &str = "x-opencode-session";
     const OPT_IN_HINT: &str = "providers.opencode.enable_free_models = true";
     /// A builtin with a static model table, so it is never a catalog provider.
-    const BUILTIN_SLUG: &str = "deepseek";
+    const BUILTIN_SLUG: &str = "xai";
+    const BUILTIN_BASE_URL: &str = "https://api.x.ai/v1";
     /// Stands in for a model released after our tables were written, so no
     /// curated row of any provider starts with it.
     const UNLISTED_MODEL: &str = "v9-turbo";
@@ -1713,7 +1723,7 @@ mod tests {
             "the spec default is true, so only the catalog can say no"
         );
 
-        let curated = &deepseek::SPEC.models()[0];
+        let curated = curated_row();
         let listed = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", curated_flash())).unwrap();
         assert_eq!(
             Some(listed.pricing.input),
@@ -1722,7 +1732,7 @@ mod tests {
         assert_eq!(Some(listed.context_window), curated.context_window);
     }
 
-    /// Curated rows match by prefix, so `deepseek-flash` answers for every id
+    /// Curated rows match by prefix, so `grok-4.6` answers for every id
     /// starting with it. That guess loses to models.dev naming the exact model,
     /// or the next release in an existing family bills at its predecessor's
     /// rates forever without ever looking stale. A date stamp is the exception:
@@ -1731,7 +1741,7 @@ mod tests {
     fn a_relative_matched_by_prefix_loses_to_the_catalog_naming_the_model() {
         let (_tmp, state_dir) = temp_state_dir();
         super::seed_catalog_for_tests(builtin_catalog(), state_dir);
-        let curated = &deepseek::SPEC.models()[0];
+        let curated = curated_row();
 
         let sibling = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", sibling_model())).unwrap();
         assert_eq!(sibling.pricing.input, UNLISTED_INPUT_PRICE);
@@ -1766,7 +1776,7 @@ mod tests {
     fn fields_the_catalog_omits_fall_through() {
         let (_tmp, state_dir) = temp_state_dir();
         super::seed_catalog_for_tests(builtin_catalog(), state_dir);
-        let curated = &deepseek::SPEC.models()[0];
+        let curated = curated_row();
         let spec = ProviderRegistry::for_slug(BUILTIN_SLUG).unwrap();
 
         let quiet = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", quiet_sibling_model())).unwrap();
@@ -1781,7 +1791,7 @@ mod tests {
     }
 
     /// models.dev leaves `limit` off plenty of entries, and a builtin spec
-    /// carries a real number for its provider (DeepSeek serves 1M context)
+    /// carries a real number for its provider (xAI serves 500k context)
     /// against the 128k/64k the catalog guesses for everyone else. An
     /// unpublished limit must not read as a published one, or every gap in the
     /// catalog silently shrinks the window we paid for.
@@ -1791,7 +1801,7 @@ mod tests {
         let index = single_provider_catalog(
             BUILTIN_SLUG,
             "@ai-sdk/openai-compatible",
-            Some("https://api.deepseek.com"),
+            Some(BUILTIN_BASE_URL),
         );
         super::seed_catalog_for_tests(index, state_dir);
 
@@ -1811,13 +1821,15 @@ mod tests {
     /// there. None of them may reach the provider map: they have a client of
     /// their own, so a second entry would show up twice in the login pickers.
     #[test_case("anthropic", "anthropic", "@ai-sdk/anthropic", None; "sdk we speak but no base url")]
-    #[test_case("deepseek", "deepseek", "@ai-sdk/openai-compatible", Some("https://api.deepseek.com"); "everything it takes to be servable")]
+    #[test_case("xai", "xai", "@ai-sdk/openai-compatible", Some("https://api.x.ai/v1"); "everything it takes to be servable")]
     #[test_case("openai", "openai", "@ai-sdk/openai", Some("https://api.openai.com/v1"); "sdk we do not speak")]
     #[test_case("google", "google", "@ai-sdk/google", None; "sdk we do not speak and no base url")]
-    #[test_case("openrouter", "openrouter", "@openrouter/ai-sdk-provider", Some("https://openrouter.ai/api/v1"); "vendor sdk")]
     #[test_case("zai", "zai", "@ai-sdk/openai-compatible", Some("https://api.z.ai/api/paas/v4"); "pay as you go rates")]
     #[test_case("github-copilot", "copilot", "@ai-sdk/openai-compatible", Some("https://api.githubcopilot.com"); "renamed")]
     #[test_case("regolo-ai", "regolo", "@ai-sdk/openai-compatible", Some("https://api.regolo.ai/v1"); "renamed too")]
+    #[test_case("openrouter", "openrouter", "@openrouter/ai-sdk-provider", Some("https://openrouter.ai/api/v1"); "bundled plugin with a vendor sdk")]
+    #[test_case("mistral", "mistral", "@ai-sdk/mistral", None; "bundled plugin with no base url")]
+    #[test_case("deepseek", "deepseek", "@ai-sdk/openai-compatible", Some("https://api.deepseek.com"); "bundled plugin the catalog could serve")]
     fn builtins_keep_their_catalog_metadata(
         catalog_id: &str,
         slug: &str,
@@ -1850,17 +1862,13 @@ mod tests {
         assert!(data.model_meta("zai", UNLISTED_MODEL).is_none());
     }
 
-    /// A renamed builtin only reaches its metadata while both halves hold: the
-    /// slug is one we ship, and the catalog id is not (or the alias is dead
-    /// weight, since the plain path would already have matched).
+    /// A rename only helps when the catalog id is not a slug we ship.
+    /// Otherwise the plain lookup already finds it.
     #[test]
     fn renamed_builtins_map_a_foreign_id_onto_a_slug_we_ship() {
         for (catalog_id, slug) in super::BUILTIN_CATALOG_IDS {
-            assert!(super::builtin_provider(slug).is_some(), "{slug}");
-            assert!(
-                super::builtin_provider(catalog_id).is_none(),
-                "{catalog_id}"
-            );
+            assert!(!ProviderRegistry::is_shipped(catalog_id), "{catalog_id}");
+            assert!(ProviderRegistry::is_shipped(slug), "{slug}");
         }
     }
 
@@ -1951,8 +1959,12 @@ mod tests {
         catalog_index(catalog_id, npm, api, models)
     }
 
+    fn curated_row() -> &'static ModelEntry {
+        &ProviderRegistry::get(BUILTIN_SLUG).unwrap().models()[0]
+    }
+
     fn curated_flash() -> &'static str {
-        &deepseek::SPEC.models()[0].prefixes[0]
+        &curated_row().prefixes[0]
     }
 
     fn sibling_model() -> String {
@@ -1980,7 +1992,7 @@ mod tests {
         catalog_index(
             BUILTIN_SLUG,
             "@ai-sdk/openai-compatible",
-            Some("https://api.deepseek.com"),
+            Some(BUILTIN_BASE_URL),
             models,
         )
     }

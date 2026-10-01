@@ -1,10 +1,4 @@
 -- OpenRouter, as a declaration plus the one hook the openai codec cannot spell.
--- The slug is one maki ships, so claiming it inherits the display name, the key
--- env var and the fallback limits. Everything static about the wire is data:
--- the attribution headers, the cache marker in every body, the session id in
--- the body, and effort under `reasoning.effort`, sent only to a model that
--- reasons. `prefer-high` is only the fallback for a model the listing never
--- described: each listed one narrows it through the `effort` on its row.
 
 local parse = require("maki.provider_parse")
 
@@ -98,8 +92,25 @@ end
 
 maki.provider.register({
   slug = "openrouter",
+  display_name = "OpenRouter",
   codec = "openai",
+  base_url = "https://openrouter.ai/api/v1",
+  api_key_env = "OPENROUTER_API_KEY",
+  login_url = "https://openrouter.ai/keys",
+  default_model = "openai/gpt-5.5",
+  family = "generic",
+  accepts_arbitrary_models = true,
+  max_output_tokens = 128000,
+  context_window = 200000,
+  aperture = { path_prefix = "/v1" },
+  docs = {
+    features = "300+ models behind one key, prompt caching, provider routing",
+    discovery_note = "Use any model id from [openrouter.ai/models](https://openrouter.ai/models), "
+      .. "e.g. `openrouter/anthropic/claude-sonnet-4`.",
+  },
   openai = {
+    -- `prefer-high` is only for models the listing never described. Each listed
+    -- model narrows it with the `effort` on its row.
     thinking = { dialect = "prefer-high", field = "reasoning.effort", requires_support = true },
     headers = { ["HTTP-Referer"] = "https://maki.sh", ["X-OpenRouter-Title"] = "maki" },
     -- Marks the whole prompt as cacheable, for the upstreams that only cache

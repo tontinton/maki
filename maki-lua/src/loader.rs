@@ -2238,6 +2238,8 @@ mod bundled_manifests {
     const TEST_DIR: &str = "tests";
     const LUA_EXT: &str = "lua";
     const REQUIRE_CALL: &str = "require(";
+    const PROVIDER_REGISTER: &str = "maki.provider.register";
+    const API_KEY_ENV_FIELD: &str = "api_key_env";
 
     /// Every guarded `maki.*` function under the dotted name lua calls it by.
     fn guarded_calls() -> Vec<(String, Permission)> {
@@ -2345,10 +2347,13 @@ mod bundled_manifests {
     /// as a tool, so a bundled plugin that starts registering one must join it.
     #[test]
     fn provider_builtins_are_the_bundled_plugins_that_register_a_provider() {
-        const REGISTER: &str = "maki.provider.register";
         let mut registering: Vec<&str> = BUNDLED_PLUGINS
             .iter()
-            .filter(|p| runtime_sources(&p.dir).iter().any(|s| calls(s, REGISTER)))
+            .filter(|p| {
+                runtime_sources(&p.dir)
+                    .iter()
+                    .any(|s| calls(s, PROVIDER_REGISTER))
+            })
             .map(|p| p.name)
             .collect();
         let mut expected = maki_config::PROVIDER_BUILTINS.to_vec();
@@ -2381,6 +2386,13 @@ mod bundled_manifests {
                     if calls(source, name) {
                         needed.entry(*permission).or_insert_with(|| name.clone());
                     }
+                }
+                // `api_key_env` is a field, not a call, so the scan above
+                // misses it. Registration still refuses it without `env`.
+                if calls(source, PROVIDER_REGISTER) && calls(source, API_KEY_ENV_FIELD) {
+                    needed
+                        .entry(Permission::Env)
+                        .or_insert_with(|| format!("{PROVIDER_REGISTER} with {API_KEY_ENV_FIELD}"));
                 }
             }
 

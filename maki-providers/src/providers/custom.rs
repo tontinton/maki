@@ -29,16 +29,16 @@ static UNDECLARED_THINKING_FIELDS: LazyLock<ThinkingFields> = LazyLock::new(|| T
     ..ThinkingFields::default()
 });
 
-/// Builtins win their slug in `from_spec`/`create`, so every custom path skips
-/// them. Key off the spec (every builtin), not `builtin_provider`, which
-/// omits the `opencode` slugs and would let them shadow the builtin.
+/// Built-in and plugin slugs win in `from_spec` and `create`, so every custom
+/// path skips them. Ask the spec registry, not `builtin_provider`, which
+/// leaves out the `opencode` slugs and would let an entry shadow them.
 fn is_builtin_slug(slug: &str) -> bool {
     ProviderRegistry::get(slug).is_some()
 }
 
 pub fn base_spec(slug: &str) -> Option<&'static ProviderSpec> {
     let config = ProvidersConfig::load();
-    protocol_spec(config.get(slug)?.protocol?)
+    Some(protocol_spec(config.get(slug)?.protocol?))
 }
 
 /// The credentials and the env var they came out of, which the codec carries
@@ -87,7 +87,7 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
     }
     let config = ProvidersConfig::load();
     let def = config.get(slug)?;
-    let base = protocol_spec(def.protocol?)?;
+    let base = protocol_spec(def.protocol?);
     Some(model_from_def(def, base, slug, model_id))
 }
 
@@ -279,9 +279,7 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
     let Some(protocol) = def.protocol else {
         return TierLookup::Unknown;
     };
-    let Some(base) = protocol_spec(protocol) else {
-        return TierLookup::Unknown;
-    };
+    let base = protocol_spec(protocol);
     match def.models.iter().find(|m| m.tier == tier) {
         Some(declared) => TierLookup::Model(model_from_def(def, base, slug, &declared.id)),
         None => TierLookup::NoModelForTier(base),
@@ -491,7 +489,7 @@ mod tests {
             r#"{{"protocol":"{protocol}","models":[{FIELDS_MODEL}]}}"#
         ))
         .unwrap();
-        let base = protocol_spec(def.protocol.unwrap()).unwrap();
+        let base = protocol_spec(def.protocol.unwrap());
         let model = model_from_def(&def, base, "custom-gw", "m");
         assert_eq!(model.thinking_fields.is_some(), kept);
     }

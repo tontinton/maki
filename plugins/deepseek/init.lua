@@ -1,8 +1,4 @@
 -- DeepSeek, as a declaration plus the two hooks the openai codec cannot spell.
--- The slug is one maki ships, so claiming it inherits the display name, the key
--- env var, the curated model table and the peak-hour pricing. Restating any of
--- those here, or the codec's own max tokens field and stream usage, is a
--- registration error rather than an override.
 
 local BALANCE_PATH = "/user/balance"
 -- The API only checks that the field exists.
@@ -51,7 +47,39 @@ end
 
 maki.provider.register({
   slug = "deepseek",
+  display_name = "DeepSeek",
   codec = "openai",
+  base_url = "https://api.deepseek.com",
+  api_key_env = "DEEPSEEK_API_KEY",
+  login_url = "https://platform.deepseek.com/api_keys",
+  default_model = "deepseek-flash",
+  family = "generic",
+  accepts_arbitrary_models = false,
+  max_output_tokens = 384000,
+  context_window = 1000000,
+  aperture = { path_prefix = "/v1" },
+  -- Peak hours double every rate, and the rows below quote the off-peak ones.
+  -- https://api-docs.deepseek.com/quick_start/pricing/
+  pricing_schedule = { windows = { { 1, 4 }, { 6, 10 } }, multiplier = 2, weekdays_only = true },
+  docs = { features = "Thinking on or off, open-weight models" },
+  models = {
+    -- `deepseek-flash` is V4.1 Flash. `deepseek-v4-flash` is the retired name
+    -- the API still accepts, served by V4.1 Flash at its rates.
+    {
+      prefixes = { "deepseek-flash", "deepseek-v4-flash" },
+      tier = "medium",
+      default = true,
+      supports_vision = true,
+      pricing = { input = 0.15, output = 0.6, cache_write = 0.0, cache_read = 0.003 },
+    },
+    {
+      prefixes = { "deepseek-v4-pro" },
+      tier = "strong",
+      default = true,
+      supports_vision = false,
+      pricing = { input = 0.66, output = 1.98, cache_write = 0.0, cache_read = 0.022 },
+    },
+  },
   openai = { thinking = { dialect = "deepseek" } },
 
   build_body = function(_, body, model, opts)

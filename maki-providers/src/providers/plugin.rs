@@ -1,12 +1,13 @@
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::iter;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use flume::Sender;
 use maki_config::host_allowed;
-use maki_config::providers::{Protocol, ProvidersConfig, configured_base_url};
+use maki_config::providers::{Protocol, ProvidersConfig, base_url_override, plan_base_url};
 use maki_storage::StateDir;
 use maki_storage::auth::lock_credentials;
 use maki_storage::id::SessionRef;
@@ -15,7 +16,8 @@ use serde_json::Value;
 use tracing::{debug, warn};
 use url::{Host, Url};
 
-use crate::model::{Model, ModelEntry, ModelInfo, ModelTier, lookup_entry};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelInfo};
+use crate::pricing::PricingSchedule;
 use crate::provider::{BoxFuture, Provider};
 use crate::spec::{BASES, ProviderRegistry, ProviderSpec};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
@@ -24,13 +26,11 @@ use super::codec::{self, BodyHook, CodecOptions, RequestCtx};
 pub use super::codec::{EffortField, OpenAiWire, SessionCarrier, ThinkingWire};
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 
+mod spec;
+
 const BUILD_BODY_OPTION: &str = "build_body hook";
 const SYSTEM_PREFIX_OPTION: &str = "system_prefix";
 const OPENAI_OPTION: &str = "openai";
-const DISPLAY_NAME_FIELD: &str = "display_name";
-const API_KEY_ENV_FIELD: &str = "api_key_env";
-const MODELS_FIELD: &str = "models";
-const BASE_URL_FIELD: &str = "base_url";
 const HTTPS_SCHEME: &str = "https";
 const HTTP_SCHEME: &str = "http";
 const LOCALHOST: &str = "localhost";
@@ -145,25 +145,25 @@ fn is_loopback(url: &Url) -> bool {
 }
 
 /// One provider, as data: everything maki needs to build it except the
-/// callbacks.
+/// callbacks. Bundled and third-party plugins fill in the same fields, and
+/// [`spec`] turns them into the row the rest of maki reads.
 ///
 /// Decoded by serde straight off the authoring surface, and a key it does not
 /// know is an error: a typo'd option would otherwise be an option silently
 /// left out.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderDecl {
     pub slug: String,
-    /// `None` only for a decl that claims a built-in slug, which inherits the
-    /// name off the spec row rather than restating it.
-    pub display_name: Option<String>,
+    pub display_name: String,
     pub codec: Option<Protocol>,
     pub base: Option<String>,
     /// The declaration's static origin, below the user's `<SLUG>_BASE_URL` and
     /// `providers.toml`. An origin a hook returns is a different thing and
-    /// outranks both, see [`CodecOptions::base_url`]. A claim inherits it,
-    /// see [`static_base_url`].
+    /// outranks both, see [`CodecOptions::base_url`].
     pub base_url: Option<String>,
+    /// Setting it also lists the provider in `maki auth login`, which then
+    /// asks for the key.
     pub api_key_env: Option<String>,
     pub system_prefix: Option<String>,
     #[serde(default)]
@@ -171,10 +171,100 @@ pub struct ProviderDecl {
     /// Only for `codec = "openai"`: grouped under the codec that honours them,
     /// so one rule refuses every option a different target would ignore.
     pub openai: Option<OpenAiWire>,
+    /// This and the next three describe a model no row or listing covers.
+    /// Each falls back to the native provider behind the codec or base. The
+    /// two limits also fill in any row that leaves its own out.
+    pub family: Option<ModelFamily>,
+    pub accepts_arbitrary_models: Option<bool>,
+    /// `Some(None)` is a provider that publishes no output cap, stated as
+    /// `false`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "stated_limit"
+    )]
+    pub max_output_tokens: Option<Option<u32>>,
+    pub context_window: Option<u32>,
+    /// For a provider whose rates move with the clock. The model rows quote
+    /// the rates outside its windows.
+    pub pricing_schedule: Option<PricingSchedule>,
+    pub aperture: Option<ApertureDecl>,
+    pub default_model: Option<String>,
+    pub login_url: Option<String>,
+    /// Offered by `maki auth login`, and the pick is saved as `plan` in
+    /// `providers.toml`.
+    #[serde(default)]
+    pub plans: Vec<PlanDecl>,
+    #[serde(default)]
+    pub docs: DocsDecl,
     /// Never written by the author: a Lua plugin's come from its
     /// `plugin.toml`, where the permission to reach them is granted.
     #[serde(skip_deserializing)]
     pub net_hosts: Vec<String>,
+}
+
+/// A limit is a number, or `false` when the provider never published one.
+/// Leaving the key out already means "borrow the native provider's", so
+/// `false` is the only way left to say "there is none".
+mod stated_limit {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    const NOT_A_LIMIT: &str = "a limit is a number, or false when none is published";
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Limit {
+        Tokens(u32),
+        Published(bool),
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        limit: &Option<Option<u32>>,
+        out: S,
+    ) -> Result<S::Ok, S::Error> {
+        match limit.flatten() {
+            Some(tokens) => out.serialize_u32(tokens),
+            None => out.serialize_bool(false),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        input: D,
+    ) -> Result<Option<Option<u32>>, D::Error> {
+        match Limit::deserialize(input).map_err(|_| D::Error::custom(NOT_A_LIMIT))? {
+            Limit::Tokens(tokens) => Ok(Some(Some(tokens))),
+            Limit::Published(false) => Ok(Some(None)),
+            Limit::Published(true) => Err(D::Error::custom(NOT_A_LIMIT)),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApertureDecl {
+    /// See [`crate::spec::ApertureRoute::path_prefix`].
+    pub path_prefix: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanDecl {
+    pub key: String,
+    pub display_name: String,
+    /// Defaults to the declaration's own `base_url`.
+    pub base_url: Option<String>,
+    pub default_model: Option<String>,
+    pub login_url: Option<String>,
+}
+
+/// Read by the docs generator only.
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocsDecl {
+    pub features: Option<String>,
+    /// Stands in for the model table of a provider that declares no rows.
+    pub discovery_note: Option<String>,
 }
 
 /// A declaration plus the callbacks that go with it. The split is the point:
@@ -186,15 +276,9 @@ pub struct Registration {
     pub hooks: ProviderHooks,
 }
 
-/// Who stands behind a declaration, the only thing that decides whether a
-/// slug maki already ships may be taken over.
-///
-/// Claiming a built-in slug inherits that row's `api_key_env`, so the key the
-/// user set for the built-in is resolved into the claimant's credentials and
-/// sent to the origin the claimant declared. Exactly right for the bundled
-/// plugin that *is* the provider, credential theft from anything else. A
-/// package asks for `net` and a list of hosts, and nothing in that grant says
-/// "and the built-in providers' keys".
+/// Who wrote a declaration. Neither may take a slug maki compiles in. Only a
+/// bundled plugin may take its own slug, and only its origins are trusted,
+/// see [`vouched_origin`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeclAuthority {
@@ -213,20 +297,14 @@ pub enum RegisterError {
     InvalidSlug(String),
     #[error("provider slug '{0}' is already defined in providers.toml")]
     ConfiguredSlug(String),
-    #[error(
-        "provider slug '{0}' belongs to a built-in provider and cannot be declared by a plugin maki does not ship"
-    )]
+    #[error("provider slug '{0}' belongs to a built-in provider")]
     ReservedSlug(String),
     #[error("provider '{slug}': {message}")]
     Credentials { slug: String, message: String },
     #[error("provider '{0}' is already registered")]
     DuplicateSlug(String),
-    #[error("provider '{0}' must set a display_name")]
-    NoDisplayName(String),
-    #[error(
-        "provider '{slug}': {field} is inherited from the built-in provider of the same name and must not be restated"
-    )]
-    Restated { slug: String, field: &'static str },
+    #[error("provider '{slug}': models: {message}")]
+    InvalidModels { slug: String, message: String },
     #[error("provider '{0}' must set exactly one of `codec` or `base`")]
     CodecOrBase(String),
     #[error("provider '{slug}': base '{base}' is not a native provider")]
@@ -254,11 +332,12 @@ enum Target {
 }
 
 impl Target {
-    /// The native spec behind this target: model family, fallbacks and the
-    /// model table a plugin that curates none borrows.
-    fn spec(self) -> Option<&'static ProviderSpec> {
+    /// The native spec behind this target: model family, thinking support,
+    /// and for a base also its fallbacks and the model table a plugin that
+    /// curates none borrows.
+    fn spec(self) -> &'static ProviderSpec {
         match self {
-            Self::Base(spec) => Some(spec),
+            Self::Base(spec) => spec,
             Self::Codec(protocol) => codec::protocol_spec(protocol),
         }
     }
@@ -274,9 +353,9 @@ impl Target {
     /// behind this target reads it from, so `codec = "google"` and
     /// `base = "google"` answer alike.
     fn key_header(self) -> KeyHeader {
-        match self.spec().map(|spec| spec.slug) {
-            Some(super::anthropic::SLUG) => KeyHeader::Raw(super::anthropic::API_KEY_HEADER),
-            Some(super::google::SLUG) => KeyHeader::Raw(super::google::API_KEY_HEADER),
+        match self.spec().slug {
+            super::anthropic::SLUG => KeyHeader::Raw(super::anthropic::API_KEY_HEADER),
+            super::google::SLUG => KeyHeader::Raw(super::google::API_KEY_HEADER),
             _ => KeyHeader::Bearer,
         }
     }
@@ -310,9 +389,7 @@ fn honours_openai_wire(target: Target) -> bool {
 /// spec behind the target, because `codec = "google"` and `base = "google"`
 /// reach the same constructor and must answer alike.
 fn honours_system_prefix(target: Target) -> bool {
-    target
-        .spec()
-        .is_none_or(|spec| spec.slug != super::google::SLUG)
+    target.spec().slug != super::google::SLUG
 }
 
 pub fn is_valid_slug(s: &str) -> bool {
@@ -324,11 +401,10 @@ pub fn is_valid_slug(s: &str) -> bool {
 
 struct PluginEntry {
     decl: ProviderDecl,
-    /// The built-in spec row this decl claimed, `None` for a slug maki did not
-    /// already know. What a claim leaves out is read back off the row by
-    /// [`PluginEntry::spec`] and [`PluginEntry::display_name`], so nobody else
-    /// has to ask whether an entry is a claim.
-    claimed: Option<&'static ProviderSpec>,
+    /// `decl` as spec rows, so model lookup, pricing and login read a plugin
+    /// provider the way they read a compiled-in one.
+    built: spec::Built,
+    authority: DeclAuthority,
     /// The plugin that registered this, `None` for a caller outside any
     /// plugin.
     owner: Option<Arc<str>>,
@@ -341,7 +417,8 @@ struct PluginEntry {
     auth: Arc<AuthState>,
 }
 
-type Registry = HashMap<Box<str>, Arc<PluginEntry>>;
+/// Ordered by slug, so every listing comes out the same each run.
+type Registry = BTreeMap<Box<str>, Arc<PluginEntry>>;
 
 /// What every read answers. Only ever replaced whole, by [`commit_load`], so
 /// there is no moment at which a reader can see a half-built registry: during
@@ -377,7 +454,7 @@ pub fn commit_load() {
     };
     for entry in staged.values() {
         let slug = &entry.decl.slug;
-        let api_key_env = api_key_env(&entry.decl, entry.claimed);
+        let api_key_env = entry.decl.api_key_env.clone().filter(|var| !var.is_empty());
         if let Err(error) = entry.auth.redeclare(
             slug,
             api_key_env,
@@ -387,6 +464,8 @@ pub fn commit_load() {
             warn!(slug, %error, "provider credentials were not re-declared");
         }
     }
+    let logins = staged.values().filter_map(|e| e.built.login).collect();
+    maki_config::providers::set_registered_providers(logins);
     *PROVIDERS.write().unwrap() = Arc::new(staged);
 }
 
@@ -437,49 +516,51 @@ fn register_owned(
     if !is_valid_slug(&slug) {
         return Err(RegisterError::InvalidSlug(slug));
     }
-    // maki's own plugins may claim a built-in slug, because a declaration is
-    // how a built-in provider is written now and the spec row it claims stays
-    // the single source of truth for everything [`inherited`] lists.
-    //
-    // For anyone else the slug stays reserved, and the rejection is here
-    // rather than a silent demotion to a non-claim: a third party that took
-    // `anthropic` without inheriting the row would still have taken
-    // `anthropic`, which is the part that matters. See [`DeclAuthority`]. A
-    // slug maki has no row for is nobody's to claim either, there would be
-    // nothing to inherit and the name would collide with a future built-in.
-    let claimed = match (ProviderRegistry::get(&slug), authority) {
-        (Some(spec), DeclAuthority::Bundled) => Some(spec),
-        (Some(_), DeclAuthority::ThirdParty) => return Err(RegisterError::ReservedSlug(slug)),
-        (None, _) => None,
+    // A third party on a slug maki ships would be handed the key the user
+    // saved for that provider. A bundled slug stays reserved even while its
+    // plugin is off, so turning a plugin off never frees the name.
+    let reserved = match authority {
+        DeclAuthority::Bundled => ProviderRegistry::compiled(&slug).is_some(),
+        DeclAuthority::ThirdParty => ProviderRegistry::is_shipped(&slug),
     };
-    // Only a slug maki does not already own can be lost to `providers.toml`.
-    // An entry under a built-in slug has never defined a provider: the built-in
-    // keeps the slug and the entry overlays what
-    // [`maki_config::providers::ignored_builtin_fields`] does not name, which
-    // is how `[deepseek] base_url` points the shipped provider at a gateway.
-    // Rejecting the claim over one would delete the provider the overlay was
-    // written for.
-    if claimed.is_none() && ProvidersConfig::load_or_default().get(&slug).is_some() {
+    if reserved {
+        return Err(RegisterError::ReservedSlug(slug));
+    }
+    // A `providers.toml` entry only defines a provider when it sets a
+    // `protocol`, and only a third party loses the slug to it. Without one the
+    // entry just tweaks the declaration, like `[deepseek] base_url` pointing at
+    // a gateway. A bundled plugin keeps its slug either way and only gets a
+    // warning, because failing here would abort the whole bundled load and
+    // maki would not start.
+    if authority == DeclAuthority::ThirdParty
+        && ProvidersConfig::load_or_default()
+            .get(&slug)
+            .is_some_and(|def| def.protocol.is_some())
+    {
         return Err(RegisterError::ConfiguredSlug(slug));
     }
     if decl.net_hosts.is_empty() {
         return Err(RegisterError::NoNetHosts(slug));
     }
-    inherited(&decl, claimed)?;
-    // Vetted here and then dropped: a declared origin is the codec's last
-    // resort (see [`CodecOptions::base_url`]), not a credential, so it is the
-    // one thing checked at registration and read back at `create`. An
-    // inherited one answers to the same host list, so a bundled plugin that
-    // forgot its row's host fails here rather than at the first request.
-    let base_url = static_base_url(&decl, claimed).map(str::to_owned);
-    declared_base_url(&slug, base_url, &decl.net_hosts)
-        .map_err(RegisterError::UndeclaredBaseUrl)?;
+    // Checked here and then thrown away. A declared origin is only the codec's
+    // last resort (see [`CodecOptions::base_url`]), not a credential, so
+    // `create` can simply read it again. A plan's origin is where
+    // `maki auth login` sends the key, so it has to stay on the same hosts.
+    let origins = iter::once(&decl.base_url).chain(decl.plans.iter().map(|p| &p.base_url));
+    for origin in origins {
+        declared_base_url(&slug, origin.clone(), &decl.net_hosts)
+            .map_err(RegisterError::UndeclaredBaseUrl)?;
+    }
     let target = target_of(&decl, &hooks)?;
+    let built = spec::build(&decl, target).map_err(|message| RegisterError::InvalidModels {
+        slug: slug.clone(),
+        message,
+    })?;
     // Checked now and applied at [`commit_load`], so a bad `[<slug>.headers]`
-    // still fails the plugin that registered the slug. A built-in's fails only
-    // its own [`create`], as it did natively: failing the bundled load would
-    // keep maki from starting over a provider the user may never pick.
-    if claimed.is_none() {
+    // fails the plugin that registered the slug. A bundled provider only
+    // fails later, in its own [`create`], since failing the bundled load would
+    // stop maki from starting over a provider the user may never pick.
+    if authority == DeclAuthority::ThirdParty {
         ResolvedAuth::new(&slug, Vec::new()).map_err(|e| RegisterError::Credentials {
             slug: slug.clone(),
             message: e.to_string(),
@@ -496,7 +577,6 @@ fn register_owned(
     debug!(
         slug,
         ?authority,
-        claims_builtin = claimed.is_some(),
         codec = ?decl.codec,
         base = decl.base.as_deref(),
         models = decl.models.len(),
@@ -505,8 +585,9 @@ fn register_owned(
     );
     vacant.insert(Arc::new(PluginEntry {
         auth: shared_auth(&slug),
+        built,
         decl,
-        claimed,
+        authority,
         owner,
         target,
         hooks,
@@ -522,7 +603,7 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     let target = match (decl.codec, &decl.base) {
         (Some(protocol), None) => Target::Codec(protocol),
         (None, Some(base)) => Target::Base(
-            ProviderRegistry::get(base)
+            ProviderRegistry::compiled(base)
                 .filter(|spec| BASES.contains(&spec.slug))
                 .ok_or_else(|| RegisterError::UnknownBase {
                     slug: decl.slug.clone(),
@@ -559,60 +640,6 @@ fn shared_auth(slug: &str) -> Arc<AuthState> {
     let state = Arc::new(AuthState::new());
     states.insert(slug.into(), Arc::clone(&state));
     state
-}
-
-/// The env var this declaration's key comes out of: its own, or the claimed
-/// row's. Empty means the provider has no key env at all (Ollama's host,
-/// Aperture's gateway), which is the same as declaring none.
-fn api_key_env(decl: &ProviderDecl, claimed: Option<&'static ProviderSpec>) -> Option<String> {
-    decl.api_key_env
-        .as_deref()
-        .or(claimed.map(|spec| spec.api_key_env))
-        .filter(|env_var| !env_var.is_empty())
-        .map(str::to_owned)
-}
-
-/// The declaration's static origin: its own, or the claimed row's login
-/// default. The one definition of it, read at registration, where no entry
-/// exists yet, and through [`PluginEntry::base_url`] everywhere after.
-fn static_base_url<'a>(
-    decl: &'a ProviderDecl,
-    claimed: Option<&'static ProviderSpec>,
-) -> Option<&'a str> {
-    decl.base_url.as_deref().or(claimed
-        .and_then(|spec| spec.login.as_ref())
-        .map(|login| login.default_base_url))
-}
-
-/// What a claim may not restate, and what a non-claim may not leave out.
-///
-/// Restating an inherited field is refused rather than ignored, for the reason
-/// [`honours_build_body`] gives: an option that cannot be honoured is a
-/// registration error, never a no-op. Two homes for `display_name` is exactly
-/// what a silent override would bring back.
-fn inherited(
-    decl: &ProviderDecl,
-    claimed: Option<&'static ProviderSpec>,
-) -> Result<(), RegisterError> {
-    if claimed.is_none() {
-        return match decl.display_name {
-            Some(_) => Ok(()),
-            None => Err(RegisterError::NoDisplayName(decl.slug.clone())),
-        };
-    }
-    let restated = [
-        (DISPLAY_NAME_FIELD, decl.display_name.is_some()),
-        (API_KEY_ENV_FIELD, decl.api_key_env.is_some()),
-        (MODELS_FIELD, !decl.models.is_empty()),
-        (BASE_URL_FIELD, decl.base_url.is_some()),
-    ];
-    match restated.into_iter().find(|(_, stated)| *stated) {
-        Some((field, _)) => Err(RegisterError::Restated {
-            slug: decl.slug.clone(),
-            field,
-        }),
-        None => Ok(()),
-    }
 }
 
 fn entries() -> Arc<Registry> {
@@ -851,30 +878,6 @@ impl AuthState {
 }
 
 impl PluginEntry {
-    /// The spec row this entry answers inherited questions from: the built-in
-    /// it claimed, else the native spec behind its target. Model family,
-    /// fallbacks and the curated table a declaration with none of its own
-    /// borrows all come from here, so no caller has to ask what kind of entry
-    /// it is holding.
-    fn spec(&self) -> Option<&'static ProviderSpec> {
-        self.claimed.or_else(|| self.target.spec())
-    }
-
-    /// The declaration's static origin, see [`static_base_url`].
-    fn base_url(&self) -> Option<&str> {
-        static_base_url(&self.decl, self.claimed)
-    }
-
-    fn display_name(&self) -> &str {
-        self.decl
-            .display_name
-            .as_deref()
-            .or(self.claimed.map(|spec| spec.display_name))
-            // Registration refuses a declaration with neither, so a real entry
-            // never reaches this arm.
-            .unwrap_or(&self.decl.slug)
-    }
-
     /// Resolve once, lazily, from async code. Every fallible provider method
     /// starts here, so no synchronous path ever has to reach a hook.
     async fn ensure_auth(&self) -> Result<(), AgentError> {
@@ -1040,22 +1043,13 @@ impl PluginProvider {
 
     async fn models(&self) -> Result<Vec<ModelInfo>, AgentError> {
         self.entry.ensure_auth().await?;
-        if let Some(hook) = &self.entry.hooks.list_models {
-            return hook.call(()).await;
+        // Rows describe models, they do not bound the catalogue, so without a
+        // hook the listing is whatever the codec or base serves. Listing the
+        // rows too, and falling back to them alone, is `fetch_all_models`'s job.
+        match &self.entry.hooks.list_models {
+            Some(hook) => hook.call(()).await,
+            None => self.inner.list_models().await,
         }
-        // A declaration with no table of its own, a claim included, falls
-        // through to the inner provider, which is built from the very codec
-        // the built-in uses. So asking it is asking the built-in.
-        if self.entry.decl.models.is_empty() {
-            return self.inner.list_models().await;
-        }
-        Ok(self
-            .entry
-            .decl
-            .models
-            .iter()
-            .map(ModelEntry::to_info)
-            .collect())
     }
 
     async fn usage(&self) -> Result<Option<ProviderUsage>, AgentError> {
@@ -1235,8 +1229,8 @@ fn codec_options(entry: &PluginEntry, protocol: Protocol) -> CodecOptions {
     let decl = &entry.decl;
     CodecOptions {
         api_key_env: decl.api_key_env.clone().unwrap_or_default().into(),
-        base_url: entry.base_url().unwrap_or_default().to_owned().into(),
-        provider_name: entry.display_name().to_owned().into(),
+        base_url: decl.base_url.clone().unwrap_or_default().into(),
+        provider_name: decl.display_name.clone().into(),
         system_prefix: decl.system_prefix.clone(),
         openai: decl.openai.clone().unwrap_or_default(),
         build_body: entry
@@ -1246,12 +1240,6 @@ fn codec_options(entry: &PluginEntry, protocol: Protocol) -> CodecOptions {
             .map(|hook| Arc::new(BodyAdapter(hook)) as Arc<dyn BodyHook>),
         ..CodecOptions::new(protocol, decl.slug.clone())
     }
-}
-
-/// Owned, not `&'static`: unlike a script's metadata, a plugin entry can be
-/// replaced by a reload while a caller holds the name.
-pub fn display_name(slug: &str) -> Option<String> {
-    entry(slug).map(|entry| entry.display_name().to_owned())
 }
 
 /// The credentials a registered slug currently holds, for a hook that has to
@@ -1274,7 +1262,7 @@ pub fn effective_base_url(slug: &str) -> Option<String> {
 }
 
 /// The origin of [`effective_base_url`] when the user or maki picked it, never
-/// one a third-party plugin authored.
+/// one a third-party plugin authored. A bundled plugin's origin is maki's.
 ///
 /// The codec reaches this origin over the Rust client, which knows no
 /// private-address guard, so a provider's own side calls have to reach it on
@@ -1283,7 +1271,7 @@ pub fn effective_base_url(slug: &str) -> Option<String> {
 pub fn vouched_origin(slug: &str) -> Option<Url> {
     let entry = entry(slug)?;
     let (base_url, chosen_by) = resolve_base_url(&entry)?;
-    if chosen_by == OriginChooser::Plugin && entry.claimed.is_none() {
+    if chosen_by == OriginChooser::Plugin && entry.authority == DeclAuthority::ThirdParty {
         return None;
     }
     Url::parse(&base_url).ok()
@@ -1300,12 +1288,14 @@ fn resolve_base_url(entry: &PluginEntry) -> Option<(String, OriginChooser)> {
         return Some((explicit, OriginChooser::Plugin));
     }
     let slug = entry.decl.slug.as_str();
-    if let Some(configured) =
-        configured_base_url(slug, ProvidersConfig::load_or_default().get(slug))
-    {
-        return Some((configured, OriginChooser::User));
+    let config = ProvidersConfig::load_or_default();
+    let def = config.get(slug);
+    if let Some(stated) = base_url_override(slug).or_else(|| def?.base_url.clone()) {
+        return Some((stated, OriginChooser::User));
     }
-    Some((entry.base_url()?.to_owned(), OriginChooser::Plugin))
+    // The user picked the plan, but the plugin wrote the URL behind it.
+    let planned = plan_base_url(slug, def).or_else(|| entry.decl.base_url.clone())?;
+    Some((planned, OriginChooser::Plugin))
 }
 
 /// The host of [`effective_base_url`], for a caller deciding whether an
@@ -1317,8 +1307,22 @@ pub fn effective_host(slug: &str) -> Option<String> {
     Some(Url::parse(&base_url).ok()?.host_str()?.to_owned())
 }
 
-pub fn base_for_slug(slug: &str) -> Option<&'static ProviderSpec> {
-    entry(slug)?.spec()
+pub fn spec(slug: &str) -> Option<&'static ProviderSpec> {
+    Some(entry(slug)?.built.spec)
+}
+
+/// The native provider whose wire `slug` speaks, through its codec or base.
+pub fn native_spec(slug: &str) -> Option<&'static ProviderSpec> {
+    Some(entry(slug)?.target.spec())
+}
+
+/// The provider a `base` lends whole, models.dev entries included. A codec
+/// lends only its wire, so it has none.
+pub fn base_spec(slug: &str) -> Option<&'static ProviderSpec> {
+    match entry(slug)?.target {
+        Target::Base(spec) => Some(spec),
+        Target::Codec(_) => None,
+    }
 }
 
 /// A provider for `slug` built against auth the caller resolved, for a caller
@@ -1344,61 +1348,16 @@ pub fn build_with_auth(
     Some(codec::build(options, auth, timeouts))
 }
 
-pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
-    let entry = entry(slug)?;
-    let model = lookup_entry(&entry.decl.models, model_id)?;
-    Some(model.to_model(slug, entry.spec()?, model_id.to_string()))
+pub fn specs() -> Vec<&'static ProviderSpec> {
+    entries().values().map(|entry| entry.built.spec).collect()
 }
 
-pub fn find_model_for_tier(slug: &str, tier: ModelTier) -> Option<Model> {
-    let entry = entry(slug)?;
-    let model = entry.decl.models.iter().find(|model| model.tier == tier)?;
-    Some(model.to_model(slug, entry.spec()?, model.canonical_id()?.to_string()))
-}
-
-/// A declaration that curates no table of its own borrows the one behind its
-/// spec row, the same table the built-in serves.
-pub fn plugin_model_specs_for(slug: &str) -> Vec<String> {
-    let Some(entry) = entry(slug) else {
-        return Vec::new();
-    };
-    let ids: Vec<&str> = if entry.decl.models.is_empty() {
-        entry
-            .spec()
-            .map(|spec| {
-                spec.models()
-                    .iter()
-                    .flat_map(|row| row.prefixes.iter().map(String::as_str))
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        entry
-            .decl
-            .models
-            .iter()
-            .filter_map(ModelEntry::canonical_id)
-            .collect()
-    };
-    ids.into_iter().map(|id| format!("{slug}/{id}")).collect()
-}
-
-/// The slugs only a declaration knows about. A claim is left out: it answers
-/// for a built-in row, and whatever lists the built-ins already lists it, with
-/// the built-in's rule for a provider that has no key.
-pub fn unclaimed_slugs() -> Vec<String> {
-    entries()
-        .values()
-        .filter(|entry| entry.claimed.is_none())
-        .map(|entry| entry.decl.slug.clone())
-        .collect()
-}
-
+/// The providers whose `maki auth login` runs a `login` hook.
 pub fn auth_providers() -> Vec<(String, String)> {
     entries()
         .values()
         .filter(|entry| entry.hooks.login.is_some())
-        .map(|entry| (entry.decl.slug.clone(), entry.display_name().to_owned()))
+        .map(|entry| (entry.decl.slug.clone(), entry.decl.display_name.clone()))
         .collect()
 }
 
@@ -1409,26 +1368,26 @@ pub fn is_registered(slug: &str) -> bool {
 /// Blocks, so it belongs to the cli thread and never to the plugin host's: the
 /// hook it drives runs on the host, and waiting for it from there deadlocks.
 pub fn login(slug: &str) -> Result<(), AgentError> {
-    interactive(slug, |hooks| hooks.login.clone(), "login")
-}
-
-pub fn logout(slug: &str) -> Result<(), AgentError> {
-    interactive(slug, |hooks| hooks.logout.clone(), "logout")
-}
-
-/// The two hooks a person triggers rather than the model.
-type InteractiveHook = Option<Arc<dyn Hook<(), ()>>>;
-
-fn interactive(
-    slug: &str,
-    pick: fn(&ProviderHooks) -> InteractiveHook,
-    what: &str,
-) -> Result<(), AgentError> {
     let entry = entry(slug).ok_or_else(|| unknown(slug))?;
-    let hook = pick(&entry.hooks).ok_or_else(|| AgentError::Config {
-        message: format!("provider '{slug}' does not support {what} (uses API key)"),
-    })?;
+    let hook = entry
+        .hooks
+        .login
+        .clone()
+        .ok_or_else(|| AgentError::Config {
+            message: format!("provider '{slug}' does not support login (uses API key)"),
+        })?;
     smol::block_on(hook.call(()))
+}
+
+/// Runs the `logout` hook, `false` when no registered provider defines one.
+/// Forgetting what maki stored never needs one, so the hook is only for what
+/// maki cannot do itself, like revoking a token upstream.
+pub fn logout(slug: &str) -> Result<bool, AgentError> {
+    let Some(hook) = entry(slug).and_then(|entry| entry.hooks.logout.clone()) else {
+        return Ok(false);
+    };
+    smol::block_on(hook.call(()))?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1437,10 +1396,14 @@ mod tests {
     use std::time::Duration;
 
     use futures_lite::future::zip;
+    use maki_config::PROVIDER_BUILTINS;
     use maki_config::providers::base_url_env_var;
     use test_case::test_case;
 
+    use super::spec::{UNKNOWN_MODEL_CONTEXT_WINDOW, UNKNOWN_MODEL_MAX_OUTPUT};
     use super::*;
+    use crate::model::ModelTier;
+    use crate::model_registry;
     use crate::retry::RetryKind;
     use crate::test_support::{Canned, serve};
     use crate::types::dialect;
@@ -1466,15 +1429,16 @@ mod tests {
     /// is what makes a lookup prove it took the longest match.
     const MODEL_VARIANT: &str = "plug-1-mini";
     const MODEL_TIER: ModelTier = ModelTier::Strong;
+    const PROVIDER_MAX_OUTPUT: u32 = 32_000;
+    const PROVIDER_CONTEXT: u32 = 96_000;
+    const ROW_MAX_OUTPUT: u32 = 8_000;
+    const ROW_CONTEXT: u32 = 48_000;
+    const CAP_SLUG: &str = "cap-plugin";
     const UNDECLARED_BASE_URL: &str = "https://evil.test/v1";
-    /// A native built-in with a curated table, claimed with a codec that is
-    /// deliberately not its own so inheritance cannot be mistaken for the
-    /// target's fallback.
-    const CLAIMED_SLUG: &str = super::super::anthropic::SLUG;
-    const NO_CLAIMED_SPEC: &str = "the claimed slug must have a spec row";
-    const CLAIM_READS_THE_CODEC_SPEC: &str =
-        "a claim resolves through the row it claimed, not through its codec's";
-    const CLAIM_LOST_THE_TABLE: &str = "a claim serves the curated table it inherited";
+    /// A native built-in, which no declaration may take.
+    const BUILTIN_SLUG: &str = super::super::anthropic::SLUG;
+    /// A slug a bundled plugin ships, which only that plugin may declare.
+    const BUNDLED_SLUG: &str = PROVIDER_BUILTINS[0];
     const RELOAD_DROPS_STALE: &str = "a new load must not inherit the last load's entries";
     const RELOAD_KEEPS_SERVING: &str = "a load in progress must not unpublish what is serving";
     const LEASE_LOST: &str = "the origin the auth hook leased must reach the auth cell";
@@ -1483,13 +1447,9 @@ mod tests {
     fn decl(slug: &str) -> ProviderDecl {
         ProviderDecl {
             slug: slug.to_string(),
-            display_name: Some(DISPLAY_NAME.to_string()),
+            display_name: DISPLAY_NAME.to_string(),
             codec: Some(Protocol::Openai),
-            base: None,
             base_url: Some(EXAMPLE_BASE_URL.to_string()),
-            api_key_env: None,
-            system_prefix: None,
-            openai: None,
             models: vec![
                 serde_json::from_value(serde_json::json!({
                     "prefixes": [MODEL_ID, MODEL_ALIAS],
@@ -1498,6 +1458,7 @@ mod tests {
                 .unwrap(),
             ],
             net_hosts: vec![EXAMPLE_HOST.to_string()],
+            ..ProviderDecl::default()
         }
     }
 
@@ -1514,8 +1475,6 @@ mod tests {
         register_loaded_as(reg, DeclAuthority::ThirdParty)
     }
 
-    /// [`register_loaded`] for the declarations maki itself ships, which are
-    /// the only ones that may take a built-in slug.
     fn register_loaded_as(
         reg: Registration,
         authority: DeclAuthority,
@@ -1653,11 +1612,13 @@ mod tests {
         let auth = AuthState::new();
         auth.redeclare(SLUG, None, &decl.net_hosts, KeyHeader::Bearer)
             .unwrap();
+        let target = Target::Codec(Protocol::Openai);
         Arc::new(PluginEntry {
+            built: spec::build(&decl, target).unwrap(),
             decl,
-            claimed: None,
+            authority: DeclAuthority::ThirdParty,
             owner: None,
-            target: Target::Codec(Protocol::Openai),
+            target,
             hooks,
             auth: Arc::new(auth),
         })
@@ -1808,11 +1769,13 @@ mod tests {
         register_loaded(reg).unwrap();
 
         create(SLUG, Timeouts::default()).unwrap();
-        assert_eq!(display_name(SLUG).as_deref(), Some(DISPLAY_NAME));
-        assert!(base_for_slug(SLUG).is_some());
-        assert_eq!(lookup_model(SLUG, MODEL_VARIANT).unwrap().id, MODEL_VARIANT);
-        assert_eq!(find_model_for_tier(SLUG, MODEL_TIER).unwrap().id, MODEL_ID);
-        assert_eq!(plugin_model_specs_for(SLUG), [format!("{SLUG}/{MODEL_ID}")]);
+        assert_eq!(spec(SLUG).map(|s| s.display_name), Some(DISPLAY_NAME));
+        let variant = Model::from_spec(&format!("{SLUG}/{MODEL_VARIANT}")).unwrap();
+        assert_eq!(variant.id, MODEL_VARIANT);
+        assert_eq!(
+            Model::from_tier_dynamic(SLUG, MODEL_TIER).unwrap().id,
+            MODEL_ID
+        );
         assert_eq!(
             auth_providers(),
             [(SLUG.to_string(), DISPLAY_NAME.to_string())]
@@ -1889,23 +1852,85 @@ mod tests {
         assert_eq!(auth.headers, [(header.to_string(), value)]);
     }
 
-    /// A claim answers for a built-in row, so the built-ins' listing already
-    /// covers it; listing it again as a plugin doubled every model it has and,
-    /// with no key, offered the models anyway under a warning.
-    #[test]
-    fn only_a_slug_no_builtin_owns_is_listed_as_a_plugin() {
-        const SLUG: &str = "unclaimed-plugin";
-        begin_load();
-        register(registration(SLUG), DeclAuthority::ThirdParty).unwrap();
-        register(claim(CLAIMED_SLUG), DeclAuthority::Bundled).unwrap();
-        commit_load();
+    /// Tier defaults are looked up through `default`, like in a curated table.
+    /// So a declaration that marks no row still needs one picked per tier, and
+    /// a row the author did mark has to keep it.
+    #[test_case(None, 0 ; "unmarked_tier_defaults_to_its_first_row")]
+    #[test_case(Some(1), 1 ; "a_marked_row_stays_the_default")]
+    fn every_declared_tier_has_one_default(marked: Option<usize>, expected: usize) {
+        const SLUG: &str = "tiered-plugin";
+        const SECOND_MODEL: &str = "plug-2";
+        let mut reg = registration(SLUG);
+        let mut second = reg.decl.models[0].clone();
+        second.prefixes = vec![SECOND_MODEL.to_string()];
+        reg.decl.models.push(second);
+        if let Some(index) = marked {
+            reg.decl.models[index].default = true;
+        }
+        register_loaded(reg).unwrap();
 
-        assert_eq!(unclaimed_slugs(), [SLUG]);
+        let defaults: Vec<usize> = spec(SLUG)
+            .unwrap()
+            .models()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| row.default.then_some(index))
+            .collect();
+        assert_eq!(defaults, [expected]);
+    }
+
+    /// Fast mode is part of the Anthropic wire, so a plugin speaking it
+    /// through a `base` keeps it for the fast-priced rows it borrows.
+    #[test]
+    fn the_anthropic_base_lends_fast_mode() {
+        const SLUG: &str = "fast-plugin";
+        let mut reg = registration(SLUG);
+        reg.decl.codec = None;
+        reg.decl.base = Some(super::super::anthropic::SLUG.to_string());
+        register_loaded(reg).unwrap();
+
+        let fast_id = ProviderRegistry::compiled(super::super::anthropic::SLUG)
+            .unwrap()
+            .models()
+            .iter()
+            .find(|row| row.pricing.as_ref().is_some_and(|p| p.fast.is_some()))
+            .and_then(ModelEntry::canonical_id)
+            .unwrap();
+        let model = Model::from_spec(&format!("{SLUG}/{fast_id}")).unwrap();
+        assert!(model.supports_fast());
+    }
+
+    /// Listing one model under a `base` overrides that model alone. Every
+    /// other model keeps the base's row, and so does every tier the
+    /// declaration leaves uncovered.
+    #[test]
+    fn a_base_lends_the_rows_a_declaration_leaves_out() {
+        const SLUG: &str = "lending-plugin";
+        let mut reg = registration(SLUG);
+        reg.decl.codec = None;
+        reg.decl.base = Some(super::super::anthropic::SLUG.to_string());
+        register_loaded(reg).unwrap();
+
+        let base = ProviderRegistry::compiled(super::super::anthropic::SLUG).unwrap();
+        let lent = base
+            .models()
+            .iter()
+            .find(|row| row.default && row.tier != MODEL_TIER && row.pricing.is_some())
+            .unwrap();
+        let lent_id = lent.canonical_id().unwrap();
+        let model = Model::from_spec(&format!("{SLUG}/{lent_id}")).unwrap();
+        let tier_default = |tier| {
+            ProviderRegistry::find_default_for_tier(SLUG, tier).and_then(ModelEntry::canonical_id)
+        };
+
+        assert_eq!(Some(model.pricing), lent.pricing);
+        assert_eq!(tier_default(lent.tier), Some(lent_id));
+        assert_eq!(tier_default(MODEL_TIER), Some(MODEL_ID));
     }
 
     /// A plugin whose load fails after registering must leave no provider
-    /// behind, claims included, exactly as if it had never loaded. Another
-    /// plugin's declarations in the same load are none of its business.
+    /// behind, exactly as if it had never loaded. Another plugin's
+    /// declarations in the same load are none of its business.
     #[test]
     fn a_discarded_plugin_leaves_nothing_staged() {
         const PLUGIN: &str = "failed-plugin";
@@ -1921,12 +1946,6 @@ mod tests {
         )
         .unwrap();
         register_plugin(
-            Arc::from(PLUGIN),
-            claim(CLAIMED_SLUG),
-            DeclAuthority::Bundled,
-        )
-        .unwrap();
-        register_plugin(
             Arc::from(BYSTANDER),
             registration(BYSTANDER),
             DeclAuthority::ThirdParty,
@@ -1936,7 +1955,6 @@ mod tests {
         commit_load();
 
         assert!(!is_registered(SLUG), "{DISCARDED_SERVES}");
-        assert!(!is_registered(CLAIMED_SLUG), "{DISCARDED_SERVES}");
         assert!(is_registered(BYSTANDER), "{BYSTANDER_LOST}");
     }
 
@@ -2003,7 +2021,7 @@ mod tests {
         register_loaded(reg).unwrap();
 
         let provider = create(SLUG, Timeouts::default()).unwrap();
-        let model = lookup_model(SLUG, MODEL_ID).unwrap();
+        let model = Model::from_spec(&format!("{SLUG}/{MODEL_ID}")).unwrap();
         let messages = [Message::user(PROMPT.to_owned())];
         let (tx, _rx) = flume::unbounded();
         let result = smol::block_on(provider.stream_message(
@@ -2027,56 +2045,172 @@ mod tests {
     /// the one a third-party decl wrote.
     #[test_case(DeclAuthority::ThirdParty, None, None ; "third_party_declared_origin")]
     #[test_case(DeclAuthority::ThirdParty, Some(OTHER_BASE_URL), Some(OTHER_BASE_URL) ; "third_party_user_origin")]
-    #[test_case(DeclAuthority::Bundled, None, Some(claimed_base_url(CLAIMED_SLUG)) ; "bundled_inherited_origin")]
+    #[test_case(DeclAuthority::Bundled, None, Some(EXAMPLE_BASE_URL) ; "bundled_declared_origin")]
     fn vouched_origin_is_the_users_or_makis(
         authority: DeclAuthority,
         configured: Option<&str>,
         expected: Option<&str>,
     ) {
-        const THIRD_PARTY_SLUG: &str = "vouch-plugin";
-        let (slug, reg) = match authority {
-            DeclAuthority::Bundled => (CLAIMED_SLUG, claim(CLAIMED_SLUG)),
-            DeclAuthority::ThirdParty => (THIRD_PARTY_SLUG, registration(THIRD_PARTY_SLUG)),
-        };
+        const SLUG: &str = "vouch-plugin";
         if let Some(configured) = configured {
-            unsafe { std::env::set_var(base_url_env_var(slug), configured) };
+            unsafe { std::env::set_var(base_url_env_var(SLUG), configured) };
         }
-        register_loaded_as(reg, authority).unwrap();
+        register_loaded_as(registration(SLUG), authority).unwrap();
 
         let expected = expected.map(|url| Url::parse(url).unwrap());
-        assert_eq!(vouched_origin(slug), expected);
+        assert_eq!(vouched_origin(SLUG), expected);
     }
 
-    /// A decl that claims a built-in slug states only what the row does not
-    /// already answer, and every inherited answer comes off the row: the name,
-    /// the origin, the curated table, and the spec behind it, which here is
-    /// *not* the one the declared codec would have resolved to.
     #[test]
-    fn a_claim_inherits_the_spec_row() {
-        let spec = ProviderRegistry::get(CLAIMED_SLUG).expect(NO_CLAIMED_SPEC);
-        register_loaded_as(claim(CLAIMED_SLUG), DeclAuthority::Bundled).unwrap();
+    fn a_declaration_builds_its_own_spec_row() {
+        const SLUG: &str = "row-plugin";
+        const ENV_VAR: &str = "MAKI_TEST_ROW_PLUGIN_KEY";
+        const CONTEXT_WINDOW: u32 = 64_000;
+        let mut reg = registration(SLUG);
+        reg.decl.api_key_env = Some(ENV_VAR.to_string());
+        reg.decl.family = Some(ModelFamily::Synthetic);
+        reg.decl.context_window = Some(CONTEXT_WINDOW);
+        reg.decl.default_model = Some(MODEL_ID.to_string());
+        register_loaded(reg).unwrap();
 
+        let row = spec(SLUG).unwrap();
+        assert_eq!(row.api_key_env, ENV_VAR);
+        assert_eq!(row.family, ModelFamily::Synthetic);
+        assert_eq!(row.fallback_context_window, CONTEXT_WINDOW);
+        assert_eq!(ProviderRegistry::get(SLUG).map(|s| s.slug), Some(SLUG));
+
+        let login = maki_config::providers::builtin_provider(SLUG).unwrap();
+        assert_eq!(login.default_api_key_env, ENV_VAR);
         assert_eq!(
-            display_name(CLAIMED_SLUG).as_deref(),
-            Some(spec.display_name)
+            login.default_model,
+            Some(format!("{SLUG}/{MODEL_ID}").as_str())
         );
+    }
+
+    #[test_case(None ; "codec_lends_only_its_wire")]
+    #[test_case(Some(BUILTIN_SLUG) ; "base_lends_its_provider")]
+    fn undeclared_curation_and_limits(base: Option<&str>) {
+        const SLUG: &str = "defaults-plugin";
+        let mut reg = registration(SLUG);
+        if let Some(base) = base {
+            reg.decl.codec = None;
+            reg.decl.base = Some(base.to_string());
+        }
+        register_loaded(reg).unwrap();
+
+        let row = spec(SLUG).unwrap();
+        let expected = match base.and_then(ProviderRegistry::compiled) {
+            Some(base) => (
+                base.accepts_arbitrary_models,
+                base.fallback_max_output,
+                base.fallback_context_window,
+            ),
+            None => (
+                true,
+                Some(UNKNOWN_MODEL_MAX_OUTPUT),
+                UNKNOWN_MODEL_CONTEXT_WINDOW,
+            ),
+        };
         assert_eq!(
-            effective_base_url(CLAIMED_SLUG).as_deref(),
-            Some(claimed_base_url(CLAIMED_SLUG))
+            (
+                row.accepts_arbitrary_models,
+                row.fallback_max_output,
+                row.fallback_context_window,
+            ),
+            expected
         );
+    }
+
+    /// A plugin's `list_models` knows its own catalogue, so the tier it
+    /// reports for a model it alone serves is the one startup and the picker
+    /// use.
+    #[test]
+    fn a_codec_provider_takes_its_discovered_tiers() {
+        const SLUG: &str = "discovered-tiers-plugin";
+        const DISCOVERED_TIER: ModelTier = ModelTier::Weak;
+        let mut reg = registration(SLUG);
+        reg.decl.models.clear();
+        register_loaded(reg).unwrap();
+        model_registry::set_known_models(
+            SLUG,
+            vec![ModelInfo {
+                tier: Some(DISCOVERED_TIER),
+                ..ModelInfo::id_only(MODEL_VARIANT.to_string())
+            }],
+        );
+
+        let model = Model::from_tier_dynamic(SLUG, DISCOVERED_TIER).unwrap();
+        assert_eq!(model.spec(), format!("{SLUG}/{MODEL_VARIANT}"));
+    }
+
+    #[test_case(None, None, Some(None), None ; "unpublished_provider_cap_reaches_the_row")]
+    #[test_case(None, None, Some(Some(PROVIDER_MAX_OUTPUT)), Some(PROVIDER_MAX_OUTPUT) ; "provider_cap_fills_the_row")]
+    #[test_case(Some(ROW_MAX_OUTPUT), Some(ROW_CONTEXT), Some(Some(PROVIDER_MAX_OUTPUT)), Some(ROW_MAX_OUTPUT) ; "row_states_its_own")]
+    fn rows_inherit_the_provider_limits(
+        row_max_output: Option<u32>,
+        row_context: Option<u32>,
+        provider_max_output: Option<Option<u32>>,
+        expected_max_output: Option<u32>,
+    ) {
+        const SLUG: &str = "limits-plugin";
+        let mut reg = registration(SLUG);
+        reg.decl.max_output_tokens = provider_max_output;
+        reg.decl.context_window = Some(PROVIDER_CONTEXT);
+        reg.decl.models[0].max_output_tokens = row_max_output;
+        reg.decl.models[0].context_window = row_context;
+        register_loaded(reg).unwrap();
+
+        let row = &spec(SLUG).unwrap().models()[0];
+        assert_eq!(row.max_output_tokens, expected_max_output);
         assert_eq!(
-            base_for_slug(CLAIMED_SLUG).map(|spec| spec.slug),
-            Some(CLAIMED_SLUG),
-            "{CLAIM_READS_THE_CODEC_SPEC}"
+            row.context_window,
+            Some(row_context.unwrap_or(PROVIDER_CONTEXT))
         );
-        assert_eq!(
-            plugin_model_specs_for(CLAIMED_SLUG).len(),
-            spec.models()
-                .iter()
-                .map(|entry| entry.prefixes.len())
-                .sum::<usize>(),
-            "{CLAIM_LOST_THE_TABLE}"
-        );
+    }
+
+    #[test]
+    fn listing_a_model_does_not_move_its_limits() {
+        const SLUG: &str = "unstated-limits-plugin";
+        const UNLISTED_MODEL: &str = "other-model";
+        register_loaded(registration(SLUG)).unwrap();
+
+        let listed = Model::from_spec(&format!("{SLUG}/{MODEL_ID}")).unwrap();
+        let unlisted = Model::from_spec(&format!("{SLUG}/{UNLISTED_MODEL}")).unwrap();
+        assert!(spec(SLUG).unwrap().models()[0].context_window.is_none());
+        assert_eq!(listed.max_output_tokens, unlisted.max_output_tokens);
+        assert_eq!(listed.context_window, unlisted.context_window);
+    }
+
+    fn authored_cap(stated: Option<Value>) -> Value {
+        let mut authored = serde_json::json!({
+            "slug": CAP_SLUG,
+            "display_name": DISPLAY_NAME,
+            "codec": "openai",
+        });
+        if let Some(stated) = stated {
+            authored["max_output_tokens"] = stated;
+        }
+        authored
+    }
+
+    /// Built rows are cached by the dumped JSON. If `false` came back as a
+    /// missing key, which means "take the default", a provider with no cap
+    /// would share a cached row with one that has a default.
+    #[test_case(Some(serde_json::json!(false)), Some(None) ; "unpublished")]
+    #[test_case(Some(serde_json::json!(4096)), Some(Some(4096)) ; "published")]
+    #[test_case(None, None ; "left_out")]
+    fn a_declared_output_cap_round_trips(stated: Option<Value>, expected: Option<Option<u32>>) {
+        let decl: ProviderDecl = serde_json::from_value(authored_cap(stated.clone())).unwrap();
+        assert_eq!(decl.max_output_tokens, expected);
+
+        let dumped = serde_json::to_value(&decl).unwrap();
+        assert_eq!(dumped.get("max_output_tokens"), stated.as_ref());
+    }
+
+    #[test]
+    fn a_true_output_cap_is_refused() {
+        let authored = authored_cap(Some(serde_json::json!(true)));
+        assert!(serde_json::from_value::<ProviderDecl>(authored).is_err());
     }
 
     /// A dialect is named, not spelled out: it resolves by name, an unknown
@@ -2089,6 +2223,7 @@ mod tests {
         let authored = |name: &str| {
             serde_json::json!({
                 "slug": "dialect-plugin",
+                "display_name": DISPLAY_NAME,
                 "codec": "openai",
                 "openai": { "thinking": { "dialect": name } },
             })
@@ -2114,56 +2249,26 @@ mod tests {
         );
     }
 
-    /// A decl that claims a built-in slug: it states only what the spec row
-    /// does not already answer, and grants the host of the origin it inherits.
-    fn claim(slug: &str) -> Registration {
-        let mut reg = registration(slug);
-        reg.decl.display_name = None;
-        reg.decl.models.clear();
-        reg.decl.base_url = None;
-        reg.decl.net_hosts = vec![claimed_host(slug)];
-        reg
-    }
-
-    fn claimed_base_url(slug: &str) -> &'static str {
-        let spec = ProviderRegistry::get(slug).expect(NO_CLAIMED_SPEC);
-        spec.login.as_ref().expect(NO_CLAIMED_SPEC).default_base_url
-    }
-
-    fn claimed_host(slug: &str) -> String {
-        let url = Url::parse(claimed_base_url(slug)).expect(NO_CLAIMED_SPEC);
-        url.host_str().expect(NO_CLAIMED_SPEC).to_owned()
-    }
-
     fn bad_slug(reg: &mut Registration) {
         reg.decl.slug = "has.dot".to_string();
     }
 
-    fn no_display_name(reg: &mut Registration) {
-        reg.decl.display_name = None;
+    fn two_defaults_for_a_tier(reg: &mut Registration) {
+        let mut twin = reg.decl.models[0].clone();
+        twin.prefixes = vec![MODEL_VARIANT.to_string()];
+        twin.default = true;
+        reg.decl.models[0].default = true;
+        reg.decl.models.push(twin);
     }
 
-    fn claim_restating_the_display_name(reg: &mut Registration) {
-        *reg = claim(CLAIMED_SLUG);
-        reg.decl.display_name = Some(DISPLAY_NAME.to_string());
-    }
-
-    fn claim_restating_the_api_key_env(reg: &mut Registration) {
-        *reg = claim(CLAIMED_SLUG);
-        reg.decl.api_key_env = Some("PLUGIN_API_KEY".to_string());
-    }
-
-    /// A claim keeping the table [`claim`] drops.
-    fn claim_restating_the_model_table(reg: &mut Registration) {
-        *reg = claim(CLAIMED_SLUG);
-        reg.decl.models = registration(CLAIMED_SLUG).decl.models;
-    }
-
-    /// Even the row's own origin: the claim inherits it, so a copy could only
-    /// ever drift from it.
-    fn claim_restating_the_base_url(reg: &mut Registration) {
-        *reg = claim(CLAIMED_SLUG);
-        reg.decl.base_url = Some(claimed_base_url(CLAIMED_SLUG).to_owned());
+    fn plan_off_the_declared_hosts(reg: &mut Registration) {
+        reg.decl.plans = vec![PlanDecl {
+            key: MODEL_ID.to_string(),
+            display_name: DISPLAY_NAME.to_string(),
+            base_url: Some(UNDECLARED_BASE_URL.to_string()),
+            default_model: None,
+            login_url: None,
+        }];
     }
 
     fn already_registered(reg: &mut Registration) {
@@ -2226,11 +2331,6 @@ mod tests {
     /// a test fixture. They are covered out of line, in
     /// `tests/configured_overlay.rs`.
     #[test_case(bad_slug, |e| matches!(e, RegisterError::InvalidSlug(_)) ; "invalid_slug")]
-    #[test_case(no_display_name, |e| matches!(e, RegisterError::NoDisplayName(_)) ; "display_name_is_mandatory_without_a_row_to_inherit_it_from")]
-    #[test_case(claim_restating_the_display_name, |e| matches!(e, RegisterError::Restated { field, .. } if *field == DISPLAY_NAME_FIELD) ; "claim_restates_display_name")]
-    #[test_case(claim_restating_the_api_key_env, |e| matches!(e, RegisterError::Restated { field, .. } if *field == API_KEY_ENV_FIELD) ; "claim_restates_api_key_env")]
-    #[test_case(claim_restating_the_model_table, |e| matches!(e, RegisterError::Restated { field, .. } if *field == MODELS_FIELD) ; "claim_restates_models")]
-    #[test_case(claim_restating_the_base_url, |e| matches!(e, RegisterError::Restated { field, .. } if *field == BASE_URL_FIELD) ; "claim_restates_base_url")]
     #[test_case(already_registered, |e| matches!(e, RegisterError::DuplicateSlug(_)) ; "duplicate")]
     #[test_case(codec_and_base, |e| matches!(e, RegisterError::CodecOrBase(_)) ; "codec_and_base_together")]
     #[test_case(missing_base, |e| matches!(e, RegisterError::UnknownBase { .. }) ; "unknown_base")]
@@ -2242,6 +2342,8 @@ mod tests {
     #[test_case(system_prefix_on_the_google_base, |e| matches!(e, RegisterError::Unsupported { .. }) ; "so_does_the_google_base")]
     #[test_case(base_url_off_the_declared_hosts, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "base_url_must_be_declared")]
     #[test_case(base_url_over_plain_http, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "base_url_must_be_https")]
+    #[test_case(plan_off_the_declared_hosts, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "plan_base_url_must_be_declared")]
+    #[test_case(two_defaults_for_a_tier, |e| matches!(e, RegisterError::InvalidModels { .. }) ; "one_default_per_tier")]
     fn registration_rejects(mutate: fn(&mut Registration), expected: fn(&RegisterError) -> bool) {
         const SLUG: &str = "rejected-plugin";
         begin_load();
@@ -2252,22 +2354,18 @@ mod tests {
         commit_load();
     }
 
-    /// A built-in slug is maki's to declare and nobody else's. Claiming one
-    /// inherits its `api_key_env`, so a package that took `anthropic` would
-    /// have the user's Anthropic key resolved into its own credentials and
-    /// sent to the origin it declared. That is reach a grant of `net` plus a
-    /// host list never bought, under a name the picker still labels
-    /// "Anthropic".
-    ///
-    /// Refused outright rather than demoted to a non-claim, because a third
-    /// party serving `anthropic` on its own terms is the same theft without
-    /// the inheritance.
-    #[test]
-    fn a_third_party_cannot_declare_a_builtin_slug() {
-        let error = register_loaded(registration(CLAIMED_SLUG)).unwrap_err();
+    /// A compiled-in slug is nobody's to declare, maki's own plugins
+    /// included: a package that took `anthropic` would have the user's
+    /// Anthropic key resolved into its own credentials and sent to the origin
+    /// it declared, under a name the picker still labels "Anthropic".
+    #[test_case(BUILTIN_SLUG, DeclAuthority::ThirdParty ; "third_party")]
+    #[test_case(BUILTIN_SLUG, DeclAuthority::Bundled ; "bundled")]
+    #[test_case(BUNDLED_SLUG, DeclAuthority::ThirdParty ; "third_party_on_a_bundled_slug")]
+    fn a_shipped_slug_is_reserved(slug: &str, authority: DeclAuthority) {
+        let error = register_loaded_as(registration(slug), authority).unwrap_err();
 
         assert!(matches!(error, RegisterError::ReservedSlug(_)), "{error}");
-        assert!(!is_registered(CLAIMED_SLUG), "{RESERVED_SLUG_TAKEN}");
+        assert!(!is_registered(slug), "{RESERVED_SLUG_TAKEN}");
     }
 
     const UPSTREAM_SAID_NO: &str = "upstream said no";

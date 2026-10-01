@@ -1,5 +1,6 @@
 //! A recorded loopback server: the one copy every replay suite in the
-//! workspace serves its transcripts from.
+//! workspace serves its transcripts from. Also the one way a test registers a
+//! declared provider, see [`register_bundled`].
 //!
 //! Synchronous and dependency-light on purpose. It is the thing a provider is
 //! compared *against*, so it shares nothing with the async stack under test:
@@ -15,6 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
+use crate::providers::plugin::{self, DeclAuthority, ProviderDecl, ProviderHooks, Registration};
+
 const LOOPBACK: &str = "127.0.0.1:0";
 const REASON_PHRASE: &str = "Recorded";
 const CONTENT_LENGTH: &str = "content-length";
@@ -22,6 +25,7 @@ const AUTHORIZATION: &str = "authorization";
 const BIND_FAILED: &str = "cannot bind loopback";
 const IO_FAILED: &str = "the recorded connection broke";
 const QUERY_START: char = '?';
+const BAD_DECLARATION: &str = "the test declaration must register";
 const MIXED_SCRIPT: &str =
     "a script is either all routed with `Canned::at` or all sequential, never a mix";
 
@@ -210,6 +214,21 @@ fn write_canned(mut stream: &TcpStream, canned: &Canned) {
     response.push_str(canned.body);
     stream.write_all(response.as_bytes()).expect(IO_FAILED);
     stream.flush().expect(IO_FAILED);
+}
+
+/// Registers `authored` like a bundled plugin load would, with `host` as its
+/// only net host. Each call is a whole load, so it replaces whatever the last
+/// call registered.
+pub fn register_bundled(authored: Value, host: &str) {
+    let mut decl: ProviderDecl = serde_json::from_value(authored).expect(BAD_DECLARATION);
+    decl.net_hosts = vec![host.to_owned()];
+    plugin::begin_load();
+    let registration = Registration {
+        decl,
+        hooks: ProviderHooks::default(),
+    };
+    plugin::register(registration, DeclAuthority::Bundled).expect(BAD_DECLARATION);
+    plugin::commit_load();
 }
 
 #[cfg(test)]

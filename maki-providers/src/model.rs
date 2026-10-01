@@ -25,9 +25,6 @@ pub use maki_config::providers::ModelTier;
 use maki_config::providers::{ProviderDef, ProvidersConfig, ThinkingFields};
 
 const PER_MILLION: f64 = 1_000_000.0;
-/// What a plugin's model row falls back to for a limit it leaves out.
-const DECLARED_MAX_OUTPUT_TOKENS: u32 = 16384;
-const DECLARED_CONTEXT_WINDOW: u32 = 128_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
@@ -221,7 +218,7 @@ impl ModelPricing {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelFamily {
     Claude,
@@ -239,9 +236,8 @@ pub enum ModelFamily {
 ///
 /// `Deserialize` is the plugin surface, decoded straight off the Lua table, so
 /// its defaults are the ones a plugin author is promised. A curated file
-/// states every field it has instead, and `family` and `default` are keys
-/// only that file knows. `Serialize` mirrors `Deserialize` field for field,
-/// defaults included, so a declared row survives a round trip.
+/// states every field it has instead. `Serialize` mirrors `Deserialize` field
+/// for field, defaults included, so a declared row survives a round trip.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelEntry {
@@ -259,30 +255,24 @@ pub struct ModelEntry {
     /// Gates vision-only tools (`view_image`) and image blocks at request time.
     #[serde(default)]
     pub supports_vision: Option<bool>,
-    /// `None` when the provider never published one.
-    #[serde(default = "declared_max_output_tokens")]
+    /// `None` when the provider never published one. A plugin row that leaves
+    /// it out takes its provider's, see [`crate::plugin::ProviderDecl`].
+    #[serde(default)]
     pub max_output_tokens: Option<u32>,
-    /// `None` only for a `providers.toml` model that leaves it to discovery.
-    #[serde(default = "declared_context_window")]
+    /// `None` for a `providers.toml` model that leaves it to discovery. A
+    /// plugin row that leaves it out takes its provider's.
+    #[serde(default)]
     pub context_window: Option<u32>,
     #[serde(default)]
     pub pricing: Option<ModelPricing>,
     #[serde(default)]
     pub thinking_fields: Option<ThinkingFields>,
     /// `None` speaks the family of the spec the row is served through.
-    #[serde(skip)]
+    #[serde(default)]
     pub family: Option<ModelFamily>,
     /// The model its tier resolves to when nothing else picked one.
-    #[serde(skip)]
+    #[serde(default)]
     pub default: bool,
-}
-
-fn declared_max_output_tokens() -> Option<u32> {
-    Some(DECLARED_MAX_OUTPUT_TOKENS)
-}
-
-fn declared_context_window() -> Option<u32> {
-    Some(DECLARED_CONTEXT_WINDOW)
 }
 
 impl ModelEntry {
@@ -313,25 +303,6 @@ impl ModelEntry {
             turn_output_tokens: None,
             context_window: self.context_window.unwrap_or(base.fallback_context_window),
             thinking_fields: self.thinking_fields.clone().map(Box::new),
-        }
-    }
-
-    /// This row as the catalogue reports it. The `supports_*` flags are
-    /// `Option` on both sides, so an unstated one stays unstated rather than
-    /// becoming a published negative. `provider_info` is a stash only the Rust
-    /// provider that filled it reads back, so a declared row never has one.
-    pub(crate) fn to_info(&self) -> ModelInfo {
-        ModelInfo {
-            id: self.canonical_id().unwrap_or_default().to_string(),
-            context_window: self.context_window,
-            max_output_tokens: self.max_output_tokens,
-            pricing: self.pricing.clone(),
-            supports_thinking: self.supports_thinking,
-            supports_vision: self.supports_vision,
-            tier: Some(self.tier),
-            provider_info: None,
-            extra: None,
-            effort: None,
         }
     }
 }
@@ -395,11 +366,12 @@ impl<'a> ModelSources<'a> {
     fn resolve(spec: &'a ProviderSpec, model_id: &str) -> Self {
         let entry = lookup_entry(spec.models(), model_id);
         let exact = entry.is_some_and(|entry| names_exactly(entry, model_id));
+        let catalog_slug = plugin::base_spec(spec.slug).map_or(spec.slug, |base| base.slug);
         Self {
             entry,
             exact,
             catalog: (!exact)
-                .then(|| catalog::model_meta_if_available(spec.slug, model_id))
+                .then(|| catalog::model_meta_if_available(catalog_slug, model_id))
                 .flatten(),
         }
     }
@@ -581,13 +553,20 @@ impl Model {
             .or_else(|| anthropic::shared::long_context_window(model_id))
             .or_else(|| sources.pick(|entry| entry.context_window, |meta| meta.context))
             .unwrap_or(base.fallback_context_window);
-        let (thinking_override, thinking_fields) = local_thinking_overlay(slug, model_id);
+        let (overlay_thinking, overlay_fields) = local_thinking_overlay(slug, model_id);
+        // Curated files never set these, only a plugin's rows do.
+        let thinking_override = overlay_thinking.or_else(|| {
+            entry
+                .and_then(|e| ThinkingSupport::from_flags(e.supports_thinking, e.requires_thinking))
+        });
+        let thinking_fields =
+            overlay_fields.or_else(|| entry.and_then(|e| e.thinking_fields.clone().map(Box::new)));
         Self {
             id: model_id.to_string(),
             provider: Arc::from(slug),
             tier,
             family,
-            supports_tool_examples_override: None,
+            supports_tool_examples_override: entry.and_then(|e| e.supports_tool_examples),
             thinking_override,
             supports_vision_override: None,
             supports_fast_override: None,
@@ -753,7 +732,8 @@ impl Model {
             Some(support) => support == FastSupport::Supported,
             None => {
                 self.pricing.fast.is_some()
-                    && ProviderRegistry::for_slug(&self.provider)
+                    && plugin::native_spec(&self.provider)
+                        .or_else(|| ProviderRegistry::for_slug(&self.provider))
                         .is_some_and(|m| m.slug == FAST_PROVIDER)
             }
         }
@@ -880,8 +860,8 @@ impl Model {
     }
 
     pub fn from_tier_dynamic(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
-        if let Some(model) = plugin::find_model_for_tier(slug, tier) {
-            return Ok(model);
+        if ProviderRegistry::get(slug).is_some() {
+            return Self::from_tier(slug, tier);
         }
         // One providers.toml read, three answers: a model declared at this tier,
         // the provider exists but declares nothing here (inherit the base
@@ -899,11 +879,6 @@ impl Model {
             }
             custom::TierLookup::Unknown => {}
         }
-        // A plugin slug has no models table of its own to default from, so it
-        // resolves through the base it borrowed.
-        if ProviderRegistry::get(slug).is_some() || plugin::base_for_slug(slug).is_some() {
-            return Self::from_tier(slug, tier);
-        }
         Err(ModelError::UnsupportedProvider(slug.to_string()))
     }
 
@@ -917,22 +892,12 @@ impl Model {
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
         let (slug, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
 
-        // Order only decides the last step, because the first three cannot
-        // collide: a declaration claiming a built-in slug inherits that row
-        // instead of restating it, and registration refuses a slug
-        // `providers.toml` already defines. models.dev comes last because it
-        // is the open ended one, and anything defined on this machine should
-        // beat it.
+        // The first two never fight over a slug. A plugin can't register a
+        // built-in one, and `custom` steps aside for any slug a plugin
+        // registered. models.dev goes last because it knows about everything,
+        // and whatever this machine defines should win over it.
         if let Some(spec) = ProviderRegistry::get(slug) {
             return Ok(Self::from_base(spec, slug, model_id));
-        }
-
-        if let Some(model) = plugin::lookup_model(slug, model_id) {
-            return Ok(model);
-        }
-
-        if let Some(base) = plugin::base_for_slug(slug) {
-            return Ok(Self::from_base(base, slug, model_id));
         }
 
         if let Some(model) = custom::lookup_model(slug, model_id) {
@@ -1119,6 +1084,7 @@ impl AddAssign for TokenUsage {
 mod tests {
     use super::*;
     use crate::ThinkingConfig;
+    use crate::test_support::register_bundled;
     use serde_json::json;
     use test_case::test_case;
 
@@ -1145,10 +1111,15 @@ mod tests {
 
     const EPSILON: f64 = 1e-10;
 
-    /// The only builtin whose rates move with the wall clock.
-    const SCHEDULED_PROVIDERS: [&str; 1] = ["deepseek"];
-    const DEEPSEEK_SPEC: &str = "deepseek/deepseek-v4-pro";
-    const UNPRICED_DEEPSEEK_SPEC: &str = "deepseek/my-custom-model";
+    /// A declared provider with a surcharge like DeepSeek's peak hours, and one
+    /// priced text-only model. The window covers the whole day, so the bill
+    /// does not depend on when the test runs.
+    const SCHEDULED_SLUG: &str = "scheduled-plugin";
+    const SCHEDULED_MODEL: &str = "priced-model";
+    const SCHEDULED_SPEC: &str = "scheduled-plugin/priced-model";
+    const UNPRICED_SCHEDULED_SPEC: &str = "scheduled-plugin/my-custom-model";
+    const SCHEDULED_HOST: &str = "scheduled.example";
+    const SURCHARGE: f64 = 2.0;
     const MILLION: u32 = 1_000_000;
     const INPUT_ONLY: TokenUsage = TokenUsage {
         input: MILLION,
@@ -1232,25 +1203,25 @@ mod tests {
     }
 
     /// The plugin surface keeps the defaults it documents, which the curated
-    /// file sharing the row must not tighten.
+    /// file sharing the row must not tighten. Limits stay unset here, for the
+    /// provider to fill in.
     #[test]
     fn a_declared_row_defaults_what_it_leaves_out() {
         let row = declared(json!({ "prefixes": [DECLARED_ID] })).unwrap();
 
         assert_eq!(row.tier, ModelTier::Medium);
-        assert_eq!(row.max_output_tokens, Some(DECLARED_MAX_OUTPUT_TOKENS));
-        assert_eq!(row.context_window, Some(DECLARED_CONTEXT_WINDOW));
+        assert!(row.max_output_tokens.is_none());
+        assert!(row.context_window.is_none());
         assert!(row.pricing.is_none());
         assert!(row.supports_vision.is_none());
         assert!(!row.requires_thinking);
     }
 
-    /// Keys only the curated file knows stay out of the plugin surface.
-    #[test_case("family", json!("generic") ; "family")]
-    #[test_case("default", json!(true) ; "default")]
-    #[test_case("vision", json!(true) ; "vision")]
-    fn a_declared_row_refuses_curated_keys(key: &str, value: Value) {
-        let error = declared(json!({ "prefixes": [DECLARED_ID], (key): value })).unwrap_err();
+    /// Plugins spell it `supports_vision`. The curated file's `vision` would be
+    /// silently ignored if it slipped through.
+    #[test]
+    fn a_declared_row_refuses_the_curated_vision_key() {
+        let error = declared(json!({ "prefixes": [DECLARED_ID], "vision": true })).unwrap_err();
 
         assert!(error.to_string().contains(UNKNOWN_FIELD), "{error}");
     }
@@ -1399,9 +1370,10 @@ mod tests {
     /// A bill wins outright, and the two ways it used to get lost are the two
     /// cases here: DeepSeek would have scaled it by the hour on top, and an
     /// unpriced model would have thrown it away for having no rate to quote.
-    #[test_case(DEEPSEEK_SPEC ; "priced_and_scheduled")]
-    #[test_case(UNPRICED_DEEPSEEK_SPEC ; "unpriced")]
+    #[test_case(SCHEDULED_SPEC ; "priced_and_scheduled")]
+    #[test_case(UNPRICED_SCHEDULED_SPEC ; "unpriced")]
     fn a_reported_cost_is_the_whole_answer(spec: &str) {
+        register_scheduled();
         let model = Model::from_spec(spec).unwrap();
         let billed = TokenUsage {
             cost: Some(RECORDED_COST),
@@ -1471,7 +1443,7 @@ mod tests {
 
     #[test]
     fn fast_pricing_is_always_a_premium() {
-        for spec in ProviderRegistry::builtins() {
+        for spec in ProviderRegistry::all_compiled() {
             for entry in spec.models() {
                 let Some(pricing) = &entry.pricing else {
                     continue;
@@ -1491,7 +1463,7 @@ mod tests {
 
     #[test]
     fn spec_roundtrip() {
-        for spec in ProviderRegistry::builtins() {
+        for spec in ProviderRegistry::all_compiled() {
             if spec.accepts_arbitrary_models {
                 continue;
             }
@@ -1522,16 +1494,12 @@ mod tests {
 
     #[test]
     fn from_tier_covers_all_providers() {
-        for spec in ProviderRegistry::builtins() {
+        for spec in ProviderRegistry::all_compiled() {
             if spec.accepts_arbitrary_models {
                 continue;
             }
             let slug: Arc<str> = Arc::from(spec.slug);
             for &tier in &TIERS {
-                // DeepSeek has no Weak tier model
-                if spec.slug == "deepseek" && tier == ModelTier::Weak {
-                    continue;
-                }
                 // Compaction is user-assigned only, not in static registry
                 if tier == ModelTier::Compaction {
                     continue;
@@ -1548,15 +1516,12 @@ mod tests {
 
     #[test]
     fn exactly_one_default_per_provider_tier() {
-        for spec in ProviderRegistry::builtins() {
+        for spec in ProviderRegistry::all_compiled() {
             if spec.accepts_arbitrary_models {
                 continue;
             }
             let entries = spec.models();
             for &tier in &TIERS {
-                if spec.slug == "deepseek" && tier == ModelTier::Weak {
-                    continue;
-                }
                 // Compaction is user-assigned only, not in static registry
                 if tier == ModelTier::Compaction {
                     continue;
@@ -1578,10 +1543,10 @@ mod tests {
     #[test_case("zai/glm-99", "zai", "glm-99" ; "unknown_zai_model_accepted")]
     #[test_case("openai/gpt-99", "openai", "gpt-99" ; "unknown_openai_model_accepted")]
     #[test_case("xai/grok-99", "xai", "grok-99" ; "unknown_xai_model_accepted")]
-    #[test_case("synthetic/hf:nonexistent", "synthetic", "hf:nonexistent" ; "unknown_synthetic_model_accepted")]
     #[test_case("ollama/my-custom-model", "ollama", "my-custom-model" ; "unknown_ollama_model_accepted")]
-    #[test_case("deepseek/my-custom-model", "deepseek", "my-custom-model" ; "unknown_deepseek_model_accepted")]
+    #[test_case(UNPRICED_SCHEDULED_SPEC, SCHEDULED_SLUG, "my-custom-model" ; "unknown_declared_model_accepted")]
     fn unknown_model_accepted(spec: &str, expected_slug: &str, expected_id: &str) {
+        register_scheduled();
         let model = Model::from_spec(spec).unwrap();
         assert_eq!(model.provider, Arc::<str>::from(expected_slug));
         assert_eq!(model.id, expected_id);
@@ -1616,12 +1581,11 @@ mod tests {
     #[test_case("google/gemini-2.5-pro",            true  ; "gemini")]
     #[test_case("copilot/claude-opus-4.7",          true  ; "copilot_entry_beats_generic_family")]
     #[test_case("zai/glm-5-code",                   false ; "glm_code_text_only")]
-    #[test_case("deepseek/deepseek-v4-pro",         false ; "deepseek_text_only")]
-    #[test_case("mistral/mistral-medium-latest",    true  ; "mistral_medium")]
-    #[test_case("mistral/ministral-14b-latest",     false ; "ministral_text_only")]
+    #[test_case(SCHEDULED_SPEC,                     false ; "declared_text_only")]
     #[test_case("anthropic/claude-nonexistent-99",  true  ; "unknown_model_uses_family_fallback")]
-    #[test_case("deepseek/my-custom-model",         false ; "unknown_generic_defaults_off")]
+    #[test_case(UNPRICED_SCHEDULED_SPEC,            false ; "unknown_generic_defaults_off")]
     fn vision_resolved_from_entry_or_family(spec: &str, expected: bool) {
+        register_scheduled();
         assert_eq!(Model::from_spec(spec).unwrap().supports_vision(), expected);
     }
 
@@ -1713,19 +1677,19 @@ mod tests {
         use crate::model::ModelInfo;
 
         model_registry::set_known_models(
-            "synthetic",
+            "xai",
             vec![
                 ModelInfo {
                     supports_vision: Some(true),
-                    ..ModelInfo::id_only("syn:test-vision".into())
+                    ..ModelInfo::id_only("test-vision".into())
                 },
-                ModelInfo::id_only("syn:test-blind".into()),
+                ModelInfo::id_only("test-blind".into()),
             ],
         );
 
         let vision = |id| Model::from_spec(id).unwrap().supports_vision();
-        assert!(vision("synthetic/syn:test-vision"));
-        assert!(!vision("synthetic/syn:test-blind"));
+        assert!(vision("xai/test-vision"));
+        assert!(!vision("xai/test-blind"));
     }
 
     #[test]
@@ -1778,34 +1742,40 @@ mod tests {
     /// The tri-state is the public one: a plugin has to be able to tell a `$0`
     /// model from one nothing ever priced, which the boolean collapses.
     #[test_case("zai/glm-4.7-flash",                   Some(true)  ; "curated_zero_is_free")]
-    #[test_case(DEEPSEEK_SPEC,                         Some(false) ; "priced_is_not_free")]
-    #[test_case(UNPRICED_DEEPSEEK_SPEC,                None        ; "no_price_table_is_unknown")]
+    #[test_case(SCHEDULED_SPEC,                        Some(false) ; "priced_is_not_free")]
+    #[test_case(UNPRICED_SCHEDULED_SPEC,               None        ; "no_price_table_is_unknown")]
     fn free_separates_zero_from_unknown(spec: &str, expected: Option<bool>) {
+        register_scheduled();
         assert_eq!(Model::from_spec(spec).unwrap().free(), expected);
     }
 
-    /// A schedule hung on the wrong spec silently doubles every turn of a
-    /// provider that bills flat.
-    #[test]
-    fn only_deepseek_bills_by_the_clock() {
-        let scheduled: Vec<&str> = ProviderRegistry::builtins()
-            .iter()
-            .filter(|m| m.pricing_schedule.is_some())
-            .map(|m| m.slug)
-            .collect();
-        assert_eq!(scheduled, SCHEDULED_PROVIDERS);
+    fn register_scheduled() {
+        register_bundled(
+            json!({
+                "slug": SCHEDULED_SLUG,
+                "display_name": "Scheduled",
+                "codec": "openai",
+                "family": "generic",
+                "accepts_arbitrary_models": false,
+                "pricing_schedule": { "windows": [[0, 24]], "multiplier": SURCHARGE },
+                "models": [{
+                    "prefixes": [SCHEDULED_MODEL],
+                    "tier": "strong",
+                    "supports_vision": false,
+                    "pricing": { "input": 0.5, "output": 2.0, "cache_write": 0.0, "cache_read": 0.0 },
+                }],
+            }),
+            SCHEDULED_HOST,
+        );
     }
 
-    /// Nothing else pins the wiring: a real DeepSeek model has to pick the
-    /// schedule up out of its spec, and `list_cost` has to stay out of it.
-    /// `billed_cost` reads the real clock, so the expectation is sampled either
-    /// side of the call in case the hour ticks over mid-test.
+    /// The only test that sees the schedule travel from a declaration into a
+    /// real bill. `list_cost` must stay at the table price, because it
+    /// re-prices old turns and nobody knows what hour those ran at.
     #[test]
-    fn deepseek_bills_its_peak_surcharge_on_top_of_the_table() {
-        let model = Model::from_spec(DEEPSEEK_SPEC).unwrap();
-        let schedule = ProviderRegistry::for_slug(&model.provider)
-            .and_then(|m| m.pricing_schedule)
-            .expect("deepseek bills by the clock");
+    fn a_declared_schedule_bills_its_surcharge_on_top_of_the_table() {
+        register_scheduled();
+        let model = Model::from_spec(SCHEDULED_SPEC).unwrap();
 
         let list = model.list_cost(&INPUT_ONLY, false).unwrap();
         let table_price = f64::from(INPUT_ONLY.input) * model.pricing.input / PER_MILLION;
@@ -1814,14 +1784,10 @@ mod tests {
             "list_cost {list} must be the table price {table_price}, surcharge free"
         );
 
-        let before = schedule.multiplier_at(Timestamp::now());
         let billed = model.billed_cost(&INPUT_ONLY, false).unwrap();
-        let after = schedule.multiplier_at(Timestamp::now());
         assert!(
-            [before, after]
-                .iter()
-                .any(|multiplier| (billed - list * multiplier).abs() < EPSILON),
-            "billed {billed} is not {list} scaled by the schedule ({before} or {after})"
+            (billed - list * SURCHARGE).abs() < EPSILON,
+            "billed {billed} is not {list} with the {SURCHARGE}x surcharge"
         );
     }
 
@@ -1830,7 +1796,8 @@ mod tests {
     /// zero lands in the same place, which is where it has always been.
     #[test]
     fn unpriced_models_stay_unpriced_under_a_schedule() {
-        let model = Model::from_spec(UNPRICED_DEEPSEEK_SPEC).unwrap();
+        register_scheduled();
+        let model = Model::from_spec(UNPRICED_SCHEDULED_SPEC).unwrap();
         let free = TokenUsage {
             cost: Some(0.0),
             ..INPUT_ONLY
@@ -1925,7 +1892,8 @@ mod tests {
     /// reference, so "covered by the subscription" and "free" read apart.
     #[test]
     fn subsidised_pricing_bills_zero_and_keeps_the_list_price() {
-        let mut model = Model::from_spec(UNPRICED_DEEPSEEK_SPEC).unwrap();
+        register_scheduled();
+        let mut model = Model::from_spec(UNPRICED_SCHEDULED_SPEC).unwrap();
         model.pricing = PAID_PRICING;
         model.subsidised_by = Some(Arc::from("Max"));
         let list = model.list_cost(&INPUT_ONLY, false).unwrap();
@@ -1939,7 +1907,8 @@ mod tests {
     /// zero rates there is nothing to reference, so both costs stay `None`.
     #[test]
     fn subsidised_but_unpriced_model_stays_unpriced() {
-        let mut model = Model::from_spec(UNPRICED_DEEPSEEK_SPEC).unwrap();
+        register_scheduled();
+        let mut model = Model::from_spec(UNPRICED_SCHEDULED_SPEC).unwrap();
         assert!(model.pricing.is_zero());
         model.subsidised_by = Some(Arc::from("Max"));
         assert_eq!(model.billed_cost(&INPUT_ONLY, false), None);
@@ -1950,7 +1919,8 @@ mod tests {
     /// figure only appears next to a subsidised `$0` bill.
     #[test]
     fn metered_model_has_no_subsidised_list_cost() {
-        let model = Model::from_spec(DEEPSEEK_SPEC).unwrap();
+        register_scheduled();
+        let model = Model::from_spec(SCHEDULED_SPEC).unwrap();
         assert!(model.billed_cost(&INPUT_ONLY, false).is_some());
         assert_eq!(model.subsidised_list_cost(&INPUT_ONLY, false), None);
         assert_eq!(model.subsidy_source(), None);

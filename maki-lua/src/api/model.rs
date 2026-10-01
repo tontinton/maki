@@ -328,10 +328,10 @@ mod tests {
     #[test]
     fn info_resolves_a_builtin_model_without_a_ui() {
         let lua = lua_with_model(None);
-        let (val, err) = eval(&lua, "return model.info('deepseek/deepseek-v4-pro')");
+        let (val, err) = eval(&lua, "return model.info('anthropic/claude-sonnet-4-5')");
         assert_eq!(err, None);
-        assert_eq!(val["spec"], json!("deepseek/deepseek-v4-pro"));
-        assert_eq!(val["provider"], json!("deepseek"));
+        assert_eq!(val["spec"], json!("anthropic/claude-sonnet-4-5"));
+        assert_eq!(val["provider"], json!("anthropic"));
         assert!(val["context_window"].as_u64().unwrap() > 0);
         assert!(val["pricing"]["input"].as_f64().unwrap() > 0.0);
         assert!(val["pricing"]["output"].as_f64().unwrap() > 0.0);
@@ -342,8 +342,8 @@ mod tests {
     /// The three states have to read apart: a known `$0`, a metered model, and
     /// one nothing ever quoted a price for.
     #[test_case("zai/glm-4.7-flash",       json!(true)  ; "builtin_zero_priced_is_free")]
-    #[test_case("deepseek/deepseek-v4-pro", json!(false) ; "metered_is_not_free")]
-    #[test_case("deepseek/my-custom-model", Json::Null   ; "no_price_table_is_unknown")]
+    #[test_case("anthropic/claude-sonnet-4-5", json!(false) ; "metered_is_not_free")]
+    #[test_case("ollama/my-custom-model", Json::Null   ; "no_price_table_is_unknown")]
     fn info_free_separates_zero_from_unknown(spec: &str, expected: Json) {
         let lua = lua_with_model(None);
         let (val, err) = eval(&lua, &format!("return model.info('{spec}')"));
@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn info_table_carries_the_subsidy_source() {
         let lua = Lua::new();
-        let mut model = Model::from_spec("deepseek/deepseek-v4-pro").unwrap();
+        let mut model = Model::from_spec("anthropic/claude-sonnet-4-5").unwrap();
         model.subsidised_by = Some(std::sync::Arc::from("Max"));
         let tbl = model_info_table(&lua, &model).unwrap();
         let json = lua_to_json(&lua, &Value::Table(tbl)).unwrap();
@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn info_table_reports_a_subsidy_with_no_price_table() {
         let lua = Lua::new();
-        let mut model = Model::from_spec("deepseek/my-custom-model").unwrap();
+        let mut model = Model::from_spec("ollama/my-custom-model").unwrap();
         model.subsidised_by = Some(std::sync::Arc::from("Max"));
         let tbl = model_info_table(&lua, &model).unwrap();
         let json = lua_to_json(&lua, &Value::Table(tbl)).unwrap();

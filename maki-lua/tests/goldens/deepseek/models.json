@@ -1,0 +1,61 @@
+{
+  "call": {
+    "endpoint": "models"
+  },
+  "script": [
+    {
+      "body": "{\"object\":\"list\",\"data\":[{\"id\":\"deepseek-v4-flash\",\"object\":\"model\",\"owned_by\":\"deepseek\"},{\"id\":\"deepseek-v4-pro\",\"object\":\"model\",\"owned_by\":\"deepseek\"},{\"id\":\"deepseek-reasoner\",\"object\":\"model\",\"owned_by\":\"deepseek\"}]}",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "status": 200
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "models": [
+        {
+          "context_window": null,
+          "id": "deepseek-reasoner",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "deepseek-v4-flash",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "context_window": null,
+          "id": "deepseek-v4-pro",
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        }
+      ]
+    },
+    "requests": [
+      {
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        },
+        "method": "GET",
+        "path": "/v1/models"
+      }
+    ]
+  }
+}

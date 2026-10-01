@@ -1,8 +1,4 @@
 -- TensorX, as a declaration plus the two hooks the openai codec cannot spell.
--- The slug is one maki ships, so claiming it inherits the display name, the key
--- env var and the fallback limits. Restating any of those here, or the codec's
--- own max tokens field and stream usage, is a registration error rather than
--- an override.
 --
 -- The declared dialect writes `reasoning_effort` on every request, which is
 -- right for a model that advertises the knob and wrong for every other one, so
@@ -92,7 +88,18 @@ end
 
 maki.provider.register({
   slug = "tensorx",
+  display_name = "TensorX",
   codec = "openai",
+  base_url = "https://api.tensorx.ai/v1",
+  api_key_env = "TENSORX_API_KEY",
+  login_url = "https://tensorx.ai",
+  default_model = "z-ai/glm-5.2",
+  family = "generic",
+  accepts_arbitrary_models = true,
+  max_output_tokens = false,
+  context_window = 200000,
+  aperture = { path_prefix = "/v1" },
+  docs = { features = "Open-weight models, zero data retention, prompt caching" },
   openai = { thinking = { dialect = "tensorx" } },
 
   list_models = function(ctx)

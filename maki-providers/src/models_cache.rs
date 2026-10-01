@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::provider::{ModelBatch, fetch_all_models, provider_available};
-use crate::providers::{custom, plugin};
+use crate::providers::custom;
 use crate::spec::ProviderRegistry;
 
 const CACHE_FILE: &str = "discovered-models.json";
@@ -118,13 +118,12 @@ fn cache_path() -> Option<PathBuf> {
 /// fingerprint between a cold start and the write at the end of discovery, and
 /// the cache would miss every time.
 fn resolved_providers() -> Vec<String> {
-    let mut slugs: Vec<String> = ProviderRegistry::builtins()
-        .iter()
+    let mut slugs: Vec<String> = ProviderRegistry::all()
+        .into_iter()
         .map(|m| m.slug)
         .filter(|slug| provider_available(slug))
         .map(str::to_string)
         .collect();
-    slugs.extend(plugin::unclaimed_slugs());
     slugs.extend(
         custom::declared_model_specs()
             .iter()

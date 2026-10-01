@@ -27,6 +27,8 @@ Scripts to port:
   Use `codec = "openai"` instead, with that provider's API origin as `base_url` when `resolve` did not return one.
 - `models`: becomes the `models` table.
   Each `"id": "x"` becomes `prefixes = { "x" }`, and every other field keeps its name and default.
+  Rows describe models but do not limit the list: without a `list_models` hook, maki also lists what the API's model endpoint serves.
+  If the API has no model list, add `list_models = function() return {} end` so only the rows are listed.
   A script without `models` used its base's catalog.
   With a kept `base`, leave `models` out.
   With `codec = "openai"`, add a `list_models` hook that reads the API's model list with `ctx.get_json`, or ask me which models I use.

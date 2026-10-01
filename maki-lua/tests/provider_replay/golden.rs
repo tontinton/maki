@@ -1,5 +1,5 @@
 //! Golden replay: one recorded exchange per file, replayed through the bundled
-//! plugin that claims the slug its directory is named after.
+//! plugin that declares the slug its directory is named after.
 //!
 //! A file under `tests/goldens/<slug>/` carries the whole case: the `call`
 //! (which endpoint, and for a turn the model, thinking mode, session, history
@@ -37,7 +37,6 @@ use maki_providers::model::ModelInfo;
 use maki_providers::model_registry;
 use maki_providers::plugin;
 use maki_providers::provider::Provider;
-use maki_providers::spec::ProviderRegistry;
 use maki_providers::test_support::{Canned, Recorded, Requests, is_routed, serve};
 use maki_providers::{
     AgentError, Message, Model, ProviderEvent, RequestOptions, StreamResponse, ThinkingSupport,
@@ -92,7 +91,7 @@ const WRITE_FAILED: &str = "the golden could not be recorded";
 const BAD_GOLDEN: &str = "the golden is not a well-formed case";
 const NOT_AN_OBJECT: &str = "an observation is always a json object";
 const NO_REQUESTS: &str = "every observation records the requests it sent";
-const NOT_A_BUILTIN: &str = "a replayed slug is a builtin";
+const NOT_DECLARED: &str = "the bundled plugin did not declare its slug";
 const CREATE_FAILED: &str = "the provider could not be built";
 const UNKNOWN_MODEL: &str = "the model spec did not resolve";
 const NO_MIDNIGHT: &str = "the day after a sampled one is representable";
@@ -316,28 +315,20 @@ struct Replay {
 }
 
 impl Replay {
-    /// Stands up the whole world one exchange needs: a throwaway home with
-    /// the key the slug reads and the recorded server, then the bundled plugin
-    /// registered inside the load window the way a plugin load does. `create`
-    /// resolves the inherited `api_key_env` into a key pool right away, so the
-    /// claim on the built-in slug is exercised instead of assumed.
+    /// The key goes under the env var the plugin itself declared, and `create`
+    /// reads it right away. So a broken `api_key_env` fails here instead of
+    /// hiding behind a name the test hard-coded.
     ///
-    /// Loopback is published through `<SLUG>_BASE_URL` because that is the
-    /// only rung of the precedence a test can reach. The declaration's own
-    /// `base_url` is inherited from the row, and `auth.base_url` is only ever
-    /// written by an auth hook.
+    /// The recorded server goes in `<SLUG>_BASE_URL` because it is the only
+    /// origin a test can set. The declared `base_url` is the real provider, and
+    /// `auth.base_url` only comes from an auth hook.
     fn open(slug: &str, script: &'static [Canned]) -> Self {
         let home = isolated_state();
-        let key_env = ProviderRegistry::get(slug)
-            .expect(NOT_A_BUILTIN)
-            .api_key_env;
-        unsafe { env::set_var(key_env, API_KEY) };
-
         let (base_url, requests) = serve(script);
         unsafe { env::set_var(base_url_env_var(slug), base_url) };
-        plugin::begin_load();
         let host = load_bundled(slug);
-        plugin::commit_load();
+        let key_env = plugin::spec(slug).expect(NOT_DECLARED).api_key_env;
+        unsafe { env::set_var(key_env, API_KEY) };
         let provider = plugin::create(slug, Timeouts::default()).expect(CREATE_FAILED);
         Self {
             provider,

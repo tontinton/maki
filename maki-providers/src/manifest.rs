@@ -61,7 +61,7 @@ impl From<CuratedRow> for ModelEntry {
 /// by slug rather than by spec identity because a `ProviderSpec` is a `const`
 /// that call sites copy, so there is no single address to key on.
 static TABLES: LazyLock<HashMap<&'static str, Box<[ModelEntry]>>> = LazyLock::new(|| {
-    ProviderRegistry::builtins()
+    ProviderRegistry::all_compiled()
         .iter()
         .map(|spec| {
             // Const fields only. Calling `ProviderSpec::models()` here would
@@ -93,27 +93,32 @@ fn parse(slug: &str, src: &str) -> Result<Box<[ModelEntry]>, String> {
             table.slug
         ));
     }
+    let rows: Box<[ModelEntry]> = table.model.into_iter().map(ModelEntry::from).collect();
+    check_rows(&rows).map_err(|e| format!("{file}: {e}"))?;
+    Ok(rows)
+}
 
+pub(crate) fn check_rows(rows: &[ModelEntry]) -> Result<(), String> {
     let mut prefixes_seen: HashSet<&str> = HashSet::new();
     let mut defaults_seen: Vec<ModelTier> = Vec::new();
 
-    for (index, row) in table.model.iter().enumerate() {
+    for (index, row) in rows.iter().enumerate() {
         let Some(name) = row.prefixes.first() else {
-            return Err(format!("{file}: row {}: {NO_PREFIXES}", index + 1));
+            return Err(format!("row {}: {NO_PREFIXES}", index + 1));
         };
-        let at = format!("{file} {name:?}");
+        let at = format!("{name:?}");
 
         for prefix in &row.prefixes {
             if !prefixes_seen.insert(prefix) {
                 return Err(format!("{at}: {DUPLICATE_PREFIX} {prefix:?}"));
             }
         }
-        if let Some(max_output) = row.max_output_tokens
-            && max_output > row.context_window
+        if let (Some(max_output), Some(context_window)) =
+            (row.max_output_tokens, row.context_window)
+            && max_output > context_window
         {
             return Err(format!(
-                "{at}: max_output_tokens {max_output} {OUTPUT_EXCEEDS_WINDOW} {}",
-                row.context_window
+                "{at}: max_output_tokens {max_output} {OUTPUT_EXCEEDS_WINDOW} {context_window}"
             ));
         }
         if row.default {
@@ -123,8 +128,7 @@ fn parse(slug: &str, src: &str) -> Result<Box<[ModelEntry]>, String> {
             defaults_seen.push(row.tier);
         }
     }
-
-    Ok(table.model.into_iter().map(ModelEntry::from).collect())
+    Ok(())
 }
 
 #[cfg(test)]

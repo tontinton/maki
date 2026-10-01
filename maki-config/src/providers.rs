@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -236,7 +236,7 @@ pub struct BuiltInProvider {
     pub protocol: Protocol,
     pub default_base_url: &'static str,
     pub default_api_key_env: &'static str,
-    pub default_model: &'static str,
+    pub default_model: Option<&'static str>,
     pub plans: Option<&'static [(&'static str, ProviderPlan)]>,
     pub login_url: Option<&'static str>,
     /// Whether the login flow should prompt for a base URL (e.g. local inference servers).
@@ -244,6 +244,10 @@ pub struct BuiltInProvider {
 }
 
 inventory::collect!(BuiltInProvider);
+
+/// Login rows of Lua plugin providers. They show up at runtime, too late for
+/// `inventory`, so they live here and every lookup checks both.
+static REGISTERED: RwLock<Vec<&'static BuiltInProvider>> = RwLock::new(Vec::new());
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OverrideFields {
@@ -440,14 +444,25 @@ fn providers_file_path() -> PathBuf {
     })
 }
 
+pub fn set_registered_providers(rows: Vec<&'static BuiltInProvider>) {
+    *REGISTERED.write().unwrap_or_else(|e| e.into_inner()) = rows;
+}
+
 pub fn builtin_provider(slug: &str) -> Option<&'static BuiltInProvider> {
     inventory::iter::<BuiltInProvider>()
         .into_iter()
         .find(|p| p.slug == slug)
+        .or_else(|| {
+            let registered = REGISTERED.read().unwrap_or_else(|e| e.into_inner());
+            registered.iter().copied().find(|p| p.slug == slug)
+        })
 }
 
 pub fn all_builtins() -> Vec<&'static BuiltInProvider> {
-    inventory::iter::<BuiltInProvider>().collect()
+    let registered = REGISTERED.read().unwrap_or_else(|e| e.into_inner());
+    inventory::iter::<BuiltInProvider>()
+        .chain(registered.iter().copied())
+        .collect()
 }
 
 pub fn resolve_api_key_env(slug: &str, def: Option<&ProviderDef>) -> String {
@@ -479,14 +494,13 @@ pub fn base_url_override(slug: &str) -> Option<String> {
 /// that already carry a default (the openai-compat layer, whose static default
 /// can be more specific than the inventory one) use this.
 pub fn configured_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String> {
-    if let Some(url) = base_url_override(slug) {
-        return Some(url);
-    }
-    let def = def?;
-    if let Some(url) = &def.base_url {
-        return Some(url.clone());
-    }
-    let plan_name = def.plan.as_ref()?;
+    base_url_override(slug)
+        .or_else(|| def?.base_url.clone())
+        .or_else(|| plan_base_url(slug, def))
+}
+
+pub fn plan_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String> {
+    let plan_name = def?.plan.as_ref()?;
     builtin_provider(slug)?
         .plans?
         .iter()
@@ -611,7 +625,7 @@ pub fn resolve_default_model(slug: &str, def: Option<&ProviderDef>) -> Option<St
             }
         }
     }
-    builtin_provider(slug).map(|b| b.default_model.to_string())
+    builtin_provider(slug)?.default_model.map(str::to_owned)
 }
 
 pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {

@@ -18,7 +18,7 @@ use super::{KeyRotation, ResolvedAuth, Timeouts};
 use crate::model::{Model, ModelInfo, ThinkingSupport};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
-use crate::spec::{ProviderRegistry, ProviderSpec};
+use crate::spec::ProviderSpec;
 use crate::types::{EffortDialect, ThinkingFallback, dialect, merge_body};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
@@ -392,14 +392,13 @@ impl CodecOptions {
 }
 
 /// The native provider a custom or plugin slug borrows its codec and fallbacks
-/// from. Resolved through [`ProviderRegistry::get`], never `for_slug`, so the
-/// lookup cannot recurse back into here.
-pub(crate) fn protocol_spec(protocol: Protocol) -> Option<&'static ProviderSpec> {
-    ProviderRegistry::get(match protocol {
-        Protocol::Openai | Protocol::OpenaiResponses => super::openai::SLUG,
-        Protocol::Anthropic => super::anthropic::SLUG,
-        Protocol::Google => super::google::SLUG,
-    })
+/// from. It points straight at the row, so it can never come back empty.
+pub(crate) fn protocol_spec(protocol: Protocol) -> &'static ProviderSpec {
+    match protocol {
+        Protocol::Openai | Protocol::OpenaiResponses => &super::openai::SPEC,
+        Protocol::Anthropic => &super::anthropic::SPEC,
+        Protocol::Google => &super::google::SPEC,
+    }
 }
 
 /// Applied to the final request body, after the codec built it and after the
@@ -573,7 +572,7 @@ mod tests {
     const AFFINITY_HEADER: &str = "x-affinity";
     const SAFE_VALUE: &str = "maki";
     const SESSION_FIELD: &str = "session_id";
-    const MODEL_SPEC: &str = "synthetic/hf:moonshotai/Kimi-K2.5";
+    const MODEL_SPEC: &str = "xai/grok-4.6";
 
     /// One slug per case: `<SLUG>_BASE_URL` is process-wide, and these run in
     /// one process under `cargo test`.
@@ -643,7 +642,7 @@ mod tests {
         serde_json::from_value(authored).map_err(|e| e.to_string())
     }
 
-    fn synthetic_model() -> Model {
+    fn curated_model() -> Model {
         Model::from_spec(MODEL_SPEC).unwrap()
     }
 
@@ -721,7 +720,7 @@ mod tests {
             "session_id": { "body_field": SESSION_FIELD },
         }))
         .unwrap();
-        let model = synthetic_model();
+        let model = curated_model();
         let session = SessionRef::generate();
         let ctx = RequestCtx {
             session: Some(&session),
@@ -749,7 +748,7 @@ mod tests {
             "thinking": { "dialect": "standard", "requires_support": requires_support },
         }))
         .unwrap();
-        let mut model = synthetic_model();
+        let mut model = curated_model();
         model.thinking_override = Some(ThinkingSupport::No);
         let mut body = json!({});
 
@@ -770,7 +769,7 @@ mod tests {
         expected: &str,
     ) {
         let wire = wire(json!({ "thinking": { "dialect": "prefer-high" } })).unwrap();
-        let model = synthetic_model();
+        let model = curated_model();
         let ctx = RequestCtx {
             discovered: Some(ModelInfo {
                 effort: listed.map(|supported| ModelEffort {

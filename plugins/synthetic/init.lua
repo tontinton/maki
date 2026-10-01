@@ -1,10 +1,46 @@
--- Synthetic, as a declaration. The slug is one maki ships, so claiming it
--- inherits the display name, the key env var and the curated model table, and
--- restating any of them here would be a registration error, not an override.
-
 maki.provider.register({
   slug = "synthetic",
+  display_name = "Synthetic",
   codec = "openai",
+  base_url = "https://api.synthetic.new/openai/v1",
+  api_key_env = "SYNTHETIC_API_KEY",
+  login_url = "https://synthetic.new",
+  default_model = "hf:moonshotai/Kimi-K2.5",
+  family = "synthetic",
+  accepts_arbitrary_models = false,
+  max_output_tokens = 32000,
+  context_window = 128000,
+  aperture = { path_prefix = "/v1" },
+  docs = { features = "Reasoning effort (low, medium, high), open-weight models" },
+  models = {
+    {
+      prefixes = { "hf:moonshotai/Kimi-K2.5" },
+      tier = "strong",
+      default = true,
+      supports_vision = false,
+      max_output_tokens = 131072,
+      context_window = 200000,
+      pricing = { input = 0.45, output = 3.4, cache_write = 0.0, cache_read = 0.0 },
+    },
+    {
+      prefixes = { "hf:deepseek-ai/DeepSeek-V3.2" },
+      tier = "medium",
+      default = true,
+      supports_vision = false,
+      max_output_tokens = 131072,
+      context_window = 200000,
+      pricing = { input = 0.56, output = 1.68, cache_write = 0.0, cache_read = 0.0 },
+    },
+    {
+      prefixes = { "hf:zai-org/GLM-4.7-Flash" },
+      tier = "weak",
+      default = true,
+      supports_vision = false,
+      max_output_tokens = 131072,
+      context_window = 200000,
+      pricing = { input = 0.1, output = 0.5, cache_write = 0.0, cache_read = 0.0 },
+    },
+  },
   openai = {
     max_tokens_field = "max_completion_tokens",
     include_stream_usage = false,

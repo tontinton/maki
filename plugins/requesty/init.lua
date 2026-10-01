@@ -1,9 +1,4 @@
 -- Requesty, as a declaration plus the one hook the openai codec cannot spell.
--- The slug is one maki ships, so claiming it inherits the display name, the key
--- env var and the fallback limits. Everything static about the wire is data:
--- the attribution headers, the cache flag in every body, and effort sent only to
--- a model that reasons, since Requesty hands the field on to upstreams that
--- reject it.
 
 local parse = require("maki.provider_parse")
 
@@ -109,8 +104,30 @@ end
 
 maki.provider.register({
   slug = "requesty",
+  display_name = "Requesty",
   codec = "openai",
+  base_url = "https://router.requesty.ai/v1",
+  api_key_env = "REQUESTY_API_KEY",
+  login_url = "https://app.requesty.ai/api-keys",
+  default_model = "openai/gpt-5.5",
+  family = "generic",
+  accepts_arbitrary_models = true,
+  max_output_tokens = 128000,
+  context_window = 200000,
+  aperture = { path_prefix = "/v1" },
+  docs = {
+    features = "700+ models behind one key, managed routing policies, EU region",
+    discovery_note = "Models are listed live from the API. Managed policies come first, "
+      .. "with short ids such as `requesty/claude-sonnet-4-5`, and their `@eu` variants "
+      .. "use only EU providers. The full `<vendor>/<model>` catalog follows, "
+      .. "e.g. `requesty/openai/gpt-4o-mini`. "
+      .. "Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). "
+      .. "Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all "
+      .. "traffic in the EU.",
+  },
   openai = {
+    -- Requesty passes the effort field on to every upstream, and the ones
+    -- without reasoning reject it.
     thinking = { dialect = "prefer-high", requires_support = true },
     headers = { ["HTTP-Referer"] = "https://maki.sh", ["X-Title"] = "maki" },
     -- Requesty only inserts Anthropic cache breakpoints when asked to. Without

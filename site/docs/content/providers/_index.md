@@ -45,6 +45,8 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 
 ## Built-in Providers
 
+`deepseek`, `mistral`, `openrouter`, `regolo`, `requesty`, `synthetic` and `tensorx` ship as bundled [plugins](/docs/plugins/) and are listed last. Turn one off with `plugins = { tensorx = { enabled = false } }` in [`maki.setup`](/docs/configuration/#plugins).
+
 ### Anthropic
 
 - **Env var**: `ANTHROPIC_API_KEY`
@@ -184,21 +186,6 @@ This provider talks the OpenAI-compatible `/v1` API, so it also works with llama
 
 Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` to your server address (defaults to `http://localhost:8080`).
 
-### Mistral
-
-- **Env var**: `MISTRAL_API_KEY`
-- **API**: `https://api.mistral.ai/v1`
-
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **ministral-14b-latest, ministral-14b-2512** (default) | $0.20 / $0.20 | 262K ctx |
-| Medium | **mistral-small-latest, mistral-small-2603** (default) | $0.15 / $0.60 | 262K ctx |
-| Strong | **mistral-medium-latest, mistral-medium-3.5, mistral-medium-3-5, mistral-medium-2604** (default) | $1.50 / $7.50 | 262K ctx |
-| Strong | zai-glm-latest, zai-glm-5-3, zai-glm-5 | $1.40 / $4.40 | 1000K ctx |
-| Strong | glm-5-2, zai-glm-5-2 | $1.40 / $4.40 | 1000K ctx |
-
-Defaults: mistral-medium-latest (strong), mistral-small-latest (medium), ministral-14b-latest (weak)
-
 ### Z.AI
 
 - **Env var**: `ZHIPU_API_KEY` (shared across both endpoints)
@@ -221,72 +208,6 @@ Defaults: mistral-medium-latest (strong), mistral-small-latest (medium), ministr
 | Strong | glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
 
 Defaults: glm-5-code (strong), glm-4.7-flash (weak), glm-4.7 (medium)
-
-### DeepSeek
-
-- **Env var**: `DEEPSEEK_API_KEY`
-- **API**: `https://api.deepseek.com`
-- **Features**: Thinking mode toggle (on/off), open-weight models
-- **Peak pricing**: the prices below are off-peak; each turn is billed as it happens, at 2x during 01:00-04:00, 06:00-10:00 UTC, Mon-Fri
-
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Medium | **deepseek-flash, deepseek-v4-flash** (default) | $0.15 / $0.60 | 1000K ctx / 384K out |
-| Strong | **deepseek-v4-pro** (default) | $0.66 / $1.98 | 1000K ctx / 384K out |
-
-Defaults: deepseek-flash (medium), deepseek-v4-pro (strong)
-
-### OpenRouter
-
-- **Env var**: `OPENROUTER_API_KEY`
-- **API**: `https://openrouter.ai/api/v1`
-- **Features**: 300+ models from all providers, prompt caching, provider routing
-
-OpenRouter aggregates models from many providers behind a single API key. Browse available models at [openrouter.ai/models](https://openrouter.ai/models). Use any model ID directly (e.g. `openrouter/anthropic/claude-sonnet-4`).
-
-### Requesty
-
-- **Env var**: `REQUESTY_API_KEY`
-- **API**: `https://router.requesty.ai/v1`
-- **Features**: 700+ models behind one key, curated managed routing policies, EU region via `REQUESTY_BASE_URL`
-
-Requesty routes 700+ models from many providers behind a single API key. Models are listed live from the API: curated managed policies first (short ids such as `requesty/claude-sonnet-4-5` or `requesty/gpt-5.4-mini`, `@eu` variants route only through EU providers), then the full `<vendor>/<model>` catalog (e.g. `requesty/openai/gpt-4o-mini`). Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all traffic in the EU.
-
-### Synthetic
-
-- **Env var**: `SYNTHETIC_API_KEY`
-- **API**: `https://api.synthetic.new/openai/v1`
-- **Features**: Reasoning effort support (low/medium/high), open-weight models
-
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **hf:zai-org/GLM-4.7-Flash** (default) | $0.10 / $0.50 | 200K ctx / 131K out |
-| Medium | **hf:deepseek-ai/DeepSeek-V3.2** (default) | $0.56 / $1.68 | 200K ctx / 131K out |
-| Strong | **hf:moonshotai/Kimi-K2.5** (default) | $0.45 / $3.40 | 200K ctx / 131K out |
-
-Defaults: hf:moonshotai/Kimi-K2.5 (strong), hf:deepseek-ai/DeepSeek-V3.2 (medium), hf:zai-org/GLM-4.7-Flash (weak)
-
-### Regolo
-
-- **Env var**: `REGOLO_API_KEY`
-- **API**: `https://api.regolo.ai/v1`
-- **Features**: EU-hosted open-weight models with tool calling. The catalogue and prices are listed live from the API
-
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **qwen3.5-9b** (default) | $0.07 / $0.35 | 80K ctx / 80K out |
-| Medium | **qwen3-coder-next** (default) | $0.50 / $2.00 | 120K ctx / 120K out |
-| Strong | **qwen3.5-122b** (default) | $1.00 / $4.20 | 120K ctx / 120K out |
-
-Defaults: qwen3.5-122b (strong), qwen3-coder-next (medium), qwen3.5-9b (weak)
-
-### TensorX
-
-- **Env var**: `TENSORX_API_KEY`
-- **API**: `https://api.tensorx.ai/v1`
-- **Features**: Open-weight models, zero data retention, prompt caching
-
-No hardcoded model catalog. Use any model ID supported by this provider.
 
 ### Opencode Zen
 
@@ -340,6 +261,87 @@ Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailsca
 - **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API
 
 No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
+
+### DeepSeek
+
+- **Env var**: `DEEPSEEK_API_KEY`
+- **API**: `https://api.deepseek.com`
+- **Features**: Thinking on or off, open-weight models
+- **Peak pricing**: 2x during 01:00-04:00, 06:00-10:00 UTC, Mon-Fri. The prices below are off-peak, and each turn pays the rate in effect when it runs
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Medium | **deepseek-flash, deepseek-v4-flash** (default) | $0.15 / $0.60 | 1000K ctx / 384K out |
+| Strong | **deepseek-v4-pro** (default) | $0.66 / $1.98 | 1000K ctx / 384K out |
+
+Defaults: deepseek-flash (medium), deepseek-v4-pro (strong)
+
+### Mistral
+
+- **Env var**: `MISTRAL_API_KEY`
+- **API**: `https://api.mistral.ai/v1`
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Weak | **ministral-14b-latest, ministral-14b-2512** (default) | $0.20 / $0.20 | 262K ctx |
+| Medium | **mistral-small-latest, mistral-small-2603** (default) | $0.15 / $0.60 | 262K ctx |
+| Strong | **mistral-medium-latest, mistral-medium-3.5, mistral-medium-3-5, mistral-medium-2604** (default) | $1.50 / $7.50 | 262K ctx |
+| Strong | zai-glm-latest, zai-glm-5-3, zai-glm-5 | $1.40 / $4.40 | 1000K ctx |
+| Strong | glm-5-2, zai-glm-5-2 | $1.40 / $4.40 | 1000K ctx |
+
+Defaults: mistral-medium-latest (strong), mistral-small-latest (medium), ministral-14b-latest (weak)
+
+### OpenRouter
+
+- **Env var**: `OPENROUTER_API_KEY`
+- **API**: `https://openrouter.ai/api/v1`
+- **Features**: 300+ models behind one key, prompt caching, provider routing
+
+Use any model id from [openrouter.ai/models](https://openrouter.ai/models), e.g. `openrouter/anthropic/claude-sonnet-4`.
+
+### Regolo
+
+- **Env var**: `REGOLO_API_KEY`
+- **API**: `https://api.regolo.ai/v1`
+- **Features**: EU-hosted open-weight models, live catalog and prices
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Weak | **qwen3.5-9b** (default) | $0.07 / $0.35 | 80K ctx / 80K out |
+| Medium | **qwen3-coder-next** (default) | $0.50 / $2.00 | 120K ctx / 120K out |
+| Strong | **qwen3.5-122b** (default) | $1.00 / $4.20 | 120K ctx / 120K out |
+
+Defaults: qwen3.5-122b (strong), qwen3-coder-next (medium), qwen3.5-9b (weak)
+
+### Requesty
+
+- **Env var**: `REQUESTY_API_KEY`
+- **API**: `https://router.requesty.ai/v1`
+- **Features**: 700+ models behind one key, managed routing policies, EU region
+
+Models are listed live from the API. Managed policies come first, with short ids such as `requesty/claude-sonnet-4-5`, and their `@eu` variants use only EU providers. The full `<vendor>/<model>` catalog follows, e.g. `requesty/openai/gpt-4o-mini`. Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all traffic in the EU.
+
+### Synthetic
+
+- **Env var**: `SYNTHETIC_API_KEY`
+- **API**: `https://api.synthetic.new/openai/v1`
+- **Features**: Reasoning effort (low, medium, high), open-weight models
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Weak | **hf:zai-org/GLM-4.7-Flash** (default) | $0.10 / $0.50 | 200K ctx / 131K out |
+| Medium | **hf:deepseek-ai/DeepSeek-V3.2** (default) | $0.56 / $1.68 | 200K ctx / 131K out |
+| Strong | **hf:moonshotai/Kimi-K2.5** (default) | $0.45 / $3.40 | 200K ctx / 131K out |
+
+Defaults: hf:moonshotai/Kimi-K2.5 (strong), hf:deepseek-ai/DeepSeek-V3.2 (medium), hf:zai-org/GLM-4.7-Flash (weak)
+
+### TensorX
+
+- **Env var**: `TENSORX_API_KEY`
+- **API**: `https://api.tensorx.ai/v1`
+- **Features**: Open-weight models, zero data retention, prompt caching
+
+No hardcoded model catalog. Use any model ID supported by this provider.
 
 ## Model Identifiers
 
@@ -554,11 +556,13 @@ Set exactly one of the two. `codec` picks the wire format the API speaks:
 
 `base` borrows a built-in provider's whole adapter, quirks included, such as Ollama's thinking field or Copilot's endpoint routing. Use it when porting a provider script that set `base`, or when no codec fits. A base changes whenever that provider does, so prefer a codec. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `zai`, `opencode`, `xai`, `aperture`.
 
-Without a `models` table, the provider uses the catalog of its codec or base.
+Without a `list_models` hook, the provider lists what its codec or base lists, such as `GET /models` for `codec = "openai"`. A `base` also lends its model rows, so a model your `models` table leaves out keeps the base's price, limits and tier.
+
+`family`, `accepts_arbitrary_models`, `max_output_tokens` and `context_window` apply to models without a row, and default to the provider behind the codec or base. `codec = "openai"` defaults to the `gpt` family, so set `family = "generic"` unless the API serves GPT models. Rows that leave out a limit take the provider's.
 
 ### Model rows
 
-`models` is read once at registration. For a catalog known only at runtime, use the `list_models` hook.
+`models` is read once at registration. Rows describe models, and the picker lists them next to the runtime list. To change how the runtime list is fetched, use the `list_models` hook.
 
 A row matches every model id that starts with one of its `prefixes`, and the longest match wins: `acme-large-2504` uses an `acme-large` row over an `acme` row. `prefixes[1]` is the canonical id, shown in the picker and used in `{slug}/{model_id}`.
 
@@ -566,14 +570,16 @@ A row matches every model id that starts with one of its `prefixes`, and the lon
 |-------|------|---------|-------|
 | `prefixes` | list of strings | required | The first is the canonical id |
 | `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction` |
-| `context_window` | number | 128000 | Tokens of context |
-| `max_output_tokens` | number | 16384 | Max completion tokens |
+| `context_window` | number | provider's | Tokens of context |
+| `max_output_tokens` | number | provider's | Max completion tokens |
 | `supports_thinking` | bool | unset | |
 | `requires_thinking` | bool | `false` | For APIs that reject a request with thinking off. Implies `supports_thinking` and raises thinking to minimal effort when off |
 | `supports_vision` | bool | unset | When false, image input and `view_image` are off for this model |
 | `supports_tool_examples` | bool | unset | |
 | `pricing` | table | unset | `input`, `output`, `cache_write`, `cache_read`, in dollars per 1M tokens |
 | `thinking_fields` | table | unset | How this model spells each thinking mode on the wire |
+| `family` | string | provider's | `generic`, `claude`, `gpt`, `gemini`, `glm` or `synthetic` |
+| `default` | bool | first row of its tier | The tier's default model. At most one per tier |
 
 An unset `supports_*` flag uses the codec or base provider's answer, and `false` turns the feature off for that model.
 
@@ -597,7 +603,7 @@ Each hook gets a [`ctx`](/docs/lua-api/#maki-provider-register) table first, wit
 
 Credentials resolve on the first request. A provider with missing or expired credentials stays in the picker and fails when you send a message, like a built-in provider with no API key.
 
-Defining `login` lists the provider in `maki auth login`. Without it, the slug is an API-key provider.
+`maki auth login` lists a provider that defines `login` or `api_key_env`. With `login`, it runs the hook. Otherwise it asks for one of the `plans` if there are any, opens `login_url`, and saves the key you paste.
 
 `map_error` can change the status and message of an API error, for example to turn an opaque vendor error into advice. Retries follow the new status, and `retry-after` still comes from the server.
 
@@ -618,7 +624,7 @@ The value is any JSON object. Each slug gets its own file at `~/.local/state/mak
 ### Slug rules
 
 - Starts with a letter or digit, then only letters, digits, `_` and `-`
-- Not a built-in slug, because the plugin would inherit the API key you set for the built-in. Plugins bundled with Maki are the exception
+- Not a slug Maki ships, built in or as a bundled plugin, even one you turned off. Your plugin would otherwise get the API key saved for that provider
 - Not a slug from `providers.toml` or another plugin
 
 ### Migrating from provider scripts
@@ -643,7 +649,7 @@ To port a script by hand, map each subcommand to part of the registration:
 | Script subcommand | Lua |
 |-------------------|-----|
 | `info` | The same fields on the registration table, minus `has_auth`. Defining `login` replaces it |
-| `models` | The `models` table. `id = "acme"` becomes `prefixes = { "acme" }` and matches the same ids |
+| `models` | The `models` table. `id = "acme"` becomes `prefixes = { "acme" }` and matches the same ids. Rows no longer bound the list, so if the API has no model list, add `list_models = function() return {} end` to list only the rows |
 | `resolve`, `refresh`, `reload` | `auth = function(ctx, purpose)`, with `purpose` naming the subcommand |
 | `login` | `login = function(ctx)`, using `ctx.print`, `ctx.prompt` and `ctx.open_url` |
 | `logout` | `logout = function(ctx)` |

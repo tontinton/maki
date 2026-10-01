@@ -1848,8 +1848,9 @@ impl<'t> EventLoop<'t> {
             .any(|rt| *rt.app.state.model.provider == *slug)
         {
             self.rebuild_models();
-        } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug)
-            && let Err(e) = self.change_model(builtin.default_model)
+        } else if let Some(default_model) =
+            maki_config::providers::builtin_provider(&slug).and_then(|b| b.default_model)
+            && let Err(e) = self.change_model(default_model)
         {
             self.focused_app().flash(e);
         }

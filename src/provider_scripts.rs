@@ -33,8 +33,8 @@ pub fn providers_dir() -> Option<PathBuf> {
     paths::find_config_path(PROVIDERS_DIR)
 }
 
-/// Every file the script loader would have run, sorted by slug. A built-in
-/// slug or a non-executable file never loaded, so neither is listed.
+/// Every file the script loader would have run, sorted by slug. A slug maki
+/// ships or a non-executable file never loaded, so neither is listed.
 pub fn scripts_in(dir: &Path) -> Vec<Script> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -45,7 +45,7 @@ pub fn scripts_in(dir: &Path) -> Vec<Script> {
         .filter(|path| is_executable_file(path))
         .filter_map(|path| {
             let slug = path.file_name()?.to_str()?.to_owned();
-            (plugin::is_valid_slug(&slug) && ProviderRegistry::get(&slug).is_none())
+            (plugin::is_valid_slug(&slug) && !ProviderRegistry::is_shipped(&slug))
                 .then_some(Script { slug, path })
         })
         .collect();
@@ -176,6 +176,7 @@ mod tests {
         write(dir.path(), "not-executable", 0o644);
         write(dir.path(), ".hidden", 0o755);
         write(dir.path(), "anthropic", 0o755);
+        write(dir.path(), "deepseek", 0o755);
         fs::create_dir(dir.path().join("subdir")).unwrap();
 
         let slugs: Vec<String> = scripts_in(dir.path())

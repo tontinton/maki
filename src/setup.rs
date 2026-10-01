@@ -154,16 +154,13 @@ fn auto_detect_model(policy: &ModelPolicy) -> Option<Model> {
         })
 }
 
-/// Lua plugin providers that claim no built-in slug, then `providers.toml`
-/// entries. They come after the built-ins so a key in the environment still
-/// wins, as it always did. Sorted by slug, since the registry is a map and
-/// startup should pick the same provider every run.
+/// Lua plugin providers, then `providers.toml` entries. They come after the
+/// prioritised slugs so a key in the environment still wins. Plugins come
+/// sorted by slug, so startup picks the same provider every run.
 fn user_provider_models() -> impl Iterator<Item = Model> {
-    let mut plugin_slugs = plugin::unclaimed_slugs();
-    plugin_slugs.sort_unstable();
-    let plugins = plugin_slugs
+    let plugins = plugin::specs()
         .into_iter()
-        .flat_map(|slug| STARTUP_TIERS.map(|tier| Model::from_tier_dynamic(&slug, tier)));
+        .flat_map(|spec| STARTUP_TIERS.map(|tier| Model::from_tier_dynamic(spec.slug, tier)));
     let custom = custom::startup_specs(&STARTUP_TIERS)
         .into_iter()
         .map(|spec| Model::from_spec(&spec));
@@ -172,11 +169,13 @@ fn user_provider_models() -> impl Iterator<Item = Model> {
 
 /// Built-in slugs keep their compiled protocol, model catalog and auth wiring,
 /// so a `providers.toml` entry setting those fields is only partly honored
-/// (#597). Call this after `init_logging`, otherwise the warning has no
-/// subscriber to reach.
+/// (#597). A bundled plugin's slug counts once its declaration registered,
+/// since it keeps the slug over a `protocol` the same way. Call this after
+/// `init_logging` and the bundled load, or the warning has nowhere to go and
+/// no declaration to check.
 pub fn warn_ignored_provider_fields() {
     for (slug, def) in &maki_config::providers::ProvidersConfig::load().providers {
-        if ProviderRegistry::get(slug).is_none() {
+        if !ProviderRegistry::is_shipped(slug) || ProviderRegistry::get(slug).is_none() {
             continue;
         }
         let ignored = maki_config::providers::ignored_builtin_fields(slug, def);

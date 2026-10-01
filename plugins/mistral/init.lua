@@ -1,8 +1,4 @@
 -- Mistral, as a declaration plus the two hooks the openai codec cannot spell.
--- The slug is one maki ships, so claiming it inherits the display name, the key
--- env var, the curated model table and the login plans. Restating any of those
--- here, or the codec's own max tokens field and stream usage, is a
--- registration error rather than an override.
 
 local parse = require("maki.provider_parse")
 
@@ -48,7 +44,69 @@ end
 
 maki.provider.register({
   slug = "mistral",
+  display_name = "Mistral",
   codec = "openai",
+  base_url = "https://api.mistral.ai/v1",
+  api_key_env = "MISTRAL_API_KEY",
+  login_url = "https://admin.mistral.ai/organization/api-keys",
+  default_model = "mistral-medium-latest",
+  plans = {
+    { key = "standard", display_name = "Standard", default_model = "mistral-medium-latest" },
+    {
+      key = "coding",
+      display_name = "Vibe / Coding",
+      default_model = "mistral-vibe-cli-latest",
+      login_url = "https://console.mistral.ai/codestral/cli",
+    },
+  },
+  family = "generic",
+  accepts_arbitrary_models = true,
+  -- Mistral publishes no output caps.
+  max_output_tokens = false,
+  context_window = 128000,
+  aperture = { path_prefix = "/v1" },
+  models = {
+    {
+      prefixes = { "mistral-medium-latest", "mistral-medium-3.5", "mistral-medium-3-5", "mistral-medium-2604" },
+      tier = "strong",
+      default = true,
+      supports_vision = true,
+      context_window = 262144,
+      pricing = { input = 1.5, output = 7.5, cache_write = 0.0, cache_read = 0.0 },
+    },
+    {
+      prefixes = { "zai-glm-latest", "zai-glm-5-3", "zai-glm-5" },
+      tier = "strong",
+      family = "glm",
+      supports_vision = false,
+      context_window = 1000000,
+      pricing = { input = 1.4, output = 4.4, cache_write = 0.0, cache_read = 0.14 },
+    },
+    {
+      prefixes = { "glm-5-2", "zai-glm-5-2" },
+      tier = "strong",
+      family = "glm",
+      supports_vision = false,
+      context_window = 1000000,
+      pricing = { input = 1.4, output = 4.4, cache_write = 0.0, cache_read = 0.14 },
+    },
+    {
+      prefixes = { "mistral-small-latest", "mistral-small-2603" },
+      tier = "medium",
+      default = true,
+      supports_vision = true,
+      context_window = 262144,
+      pricing = { input = 0.15, output = 0.6, cache_write = 0.0, cache_read = 0.0 },
+    },
+    {
+      prefixes = { "ministral-14b-latest", "ministral-14b-2512" },
+      tier = "weak",
+      default = true,
+      supports_vision = false,
+      context_window = 262144,
+      pricing = { input = 0.2, output = 0.2, cache_write = 0.0, cache_read = 0.0 },
+    },
+  },
   openai = {
     thinking = { dialect = "high-only" },
     session_id = { header = "x-affinity" },

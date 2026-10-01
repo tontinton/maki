@@ -161,13 +161,12 @@ pub struct ModelBatch {
     pub warnings: Vec<String>,
 }
 
-/// Offline version of model discovery: returns specs from static tables
-/// and registered plugin providers. See [`fetch_all_models`] for live lookups.
-/// Never blocks on catalog download; catalog-backed providers appear only once
-/// the catalog has warmed in the background.
+/// The offline twin of [`fetch_all_models`]. It never waits for the catalog
+/// download, so catalog-backed providers only show up once the catalog has
+/// warmed in the background.
 pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
-    let mut specs: Vec<String> = ProviderRegistry::builtins()
-        .iter()
+    let mut specs: Vec<String> = ProviderRegistry::all()
+        .into_iter()
         .filter(|m| provider_available_offline(m.slug))
         .flat_map(|m| {
             m.models()
@@ -176,9 +175,6 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
                 .map(move |p| format!("{}/{}", m.slug, p))
         })
         .collect();
-    for slug in plugin::unclaimed_slugs() {
-        specs.extend(plugin::plugin_model_specs_for(&slug));
-    }
     for spec in custom::declared_model_specs() {
         if !specs.contains(&spec) {
             specs.push(spec);
@@ -216,7 +212,7 @@ pub async fn fetch_all_models(
     let (tx, rx) = flume::unbounded();
     let timeouts = Timeouts::default();
 
-    for spec in ProviderRegistry::builtins() {
+    for spec in ProviderRegistry::all() {
         let slug = spec.slug;
         let Ok(provider) = smol::unblock(move || provider_for_slug(slug, timeouts)).await else {
             warn!(provider = slug, "failed to create provider, skipping");
@@ -258,35 +254,6 @@ pub async fn fetch_all_models(
                         )],
                     }
                 }
-            };
-            let _ = tx.send_async(batch).await;
-        })
-        .detach();
-    }
-
-    for slug in plugin::unclaimed_slugs() {
-        let tx = tx.clone();
-        smol::spawn(async move {
-            let static_fallback = |reason: String| {
-                warn!(
-                    slug,
-                    error = reason,
-                    "plugin model listing failed, using static fallback"
-                );
-                ModelBatch {
-                    models: plugin::plugin_model_specs_for(&slug),
-                    warnings: vec![format!("{slug}: {reason} (using static fallback)")],
-                }
-            };
-            let batch = match plugin::create(&slug, timeouts) {
-                Ok(provider) => match provider.list_models().await {
-                    Ok(models) => ModelBatch {
-                        models: models.iter().map(|m| format!("{slug}/{}", m.id)).collect(),
-                        warnings: Vec::new(),
-                    },
-                    Err(e) => static_fallback(e.to_string()),
-                },
-                Err(e) => static_fallback(e.to_string()),
             };
             let _ = tx.send_async(batch).await;
         })

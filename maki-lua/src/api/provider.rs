@@ -636,7 +636,7 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 ///
 /// {spec} fields:
 ///   `slug` (string) Required. Letters, digits, `_` and `-`, starting with a
-///           letter or digit. Must not be a built-in slug or one defined in
+///           letter or digit. Must not be a slug Maki ships or one defined in
 ///           `providers.toml`.
 ///   `display_name` (string) Required. Shown in the UI.
 ///   `codec` (string) Wire format: `"openai"`, `"openai-responses"`,
@@ -648,7 +648,36 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 ///   `api_key_env` (string) Env var holding the API key, re-read each time
 ///           the provider is built. Sent as `x-api-key` for anthropic,
 ///           `x-goog-api-key` for google, and a bearer token otherwise.
-///           Needs the `env` permission.
+///           Also lists the provider in `maki auth login`, which saves the
+///           key. Needs the `env` permission.
+///   `default_model` (string) Model id without the slug, selected after
+///           `maki auth login`.
+///   `login_url` (string) Page `maki auth login` opens to get a key.
+///   `plans` (table) List of `{ key, display_name, base_url, default_model,
+///           login_url }` for `maki auth login` to offer. `key` and
+///           `display_name` are required. A plan's `base_url` defaults to
+///           the provider's and must match `net_hosts`. The choice is saved
+///           as `plan` in `providers.toml`.
+///   `family` (string) `"generic"`, `"claude"`, `"gpt"`, `"gemini"`,
+///           `"glm"` or `"synthetic"`. Applies to models without a row.
+///           Defaults to the provider behind `codec` or `base`.
+///   `accepts_arbitrary_models` (boolean) Assign tiers to `list_models`
+///           results. When false, tiers come only from `models`. This and
+///           the next two default to the `base` provider's, or with a
+///           `codec` to `true`, `16384` and `128000`.
+///   `max_output_tokens` (integer|false) Output cap for rows that leave it
+///           out and models without a row. `false` sends no cap.
+///   `context_window` (integer) Context window for rows that leave it out
+///           and models without a row.
+///   `pricing_schedule` (table) Peak-hour pricing, as
+///           `{ windows = { { 1, 4 }, ... }, multiplier = 2,
+///           weekdays_only = true }`. Windows are `{ start, end }` UTC
+///           hours with `end` exclusive. Row `pricing` is the off-peak rate.
+///   `aperture` (table) `{ path_prefix = "/v1" }` routes Aperture models
+///           of this slug through this provider.
+///   `docs` (table) `{ features, discovery_note }` for the generated
+///           [Providers](/docs/providers/) page. `discovery_note` replaces
+///           the model table when `models` is empty.
 ///   `system_prefix` (string) Text prepended to the system prompt. The
 ///           `google` codec refuses it.
 ///   `openai` (table) Options for `codec = "openai"`, all optional:
@@ -675,7 +704,8 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 ///             `{ header = "x-affinity" }` or `{ body_field = "session_id" }`.
 ///     `thinking_overrides` (table) Model id prefix to `"no"`, `"yes"` or
 ///             `"required"`, overriding the model table. Longest prefix wins.
-///   `models` (table) Static model rows, read once at registration. See
+///   `models` (table) Static model rows, read once at registration. They
+///            describe models and add to the runtime list. See
 ///            [model rows](/docs/providers/#model-rows).
 ///   `auth` (function) `function(ctx, purpose)` returning
 ///            `{ base_url = ..., headers = { ... } }`. `purpose` is
@@ -683,7 +713,8 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 ///            or `"reload"` after a login changed the stored credentials.
 ///            Omitting `base_url` keeps the current one.
 ///   `list_models` (function) `function(ctx)` returning model rows for a
-///            catalogue only known at runtime. Rows carry `id`,
+///            catalogue only known at runtime. Without it, the provider
+///            lists what its codec or base lists. Rows carry `id`,
 ///            `context_window`, `max_output_tokens`, `pricing`,
 ///            `supports_thinking`, `supports_vision` and `tier`, plus two
 ///            optional fields. `extra` is any JSON value, handed back to
@@ -707,7 +738,9 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 ///            `maki auth login`. This `ctx` also has `ctx.print(text)`,
 ///            `ctx.prompt({ label = ..., secret = ... })` and
 ///            `ctx.open_url(url)`.
-///   `logout` (function) `function(ctx)`, run by `maki auth logout`.
+///   `logout` (function) `function(ctx)`, run by `maki auth logout` before
+///            Maki deletes the stored credentials itself. Only needed for
+///            work Maki cannot do, such as revoking a token upstream.
 ///
 /// @param spec table Provider specification (see above).
 /// @return
@@ -1340,7 +1373,9 @@ mod tests {
     fn decode_spec(fields: &str) -> LuaResult<(HashMap<HookSlot, RegistryKey>, ProviderDecl)> {
         let lua = Lua::new();
         let spec: Table = lua
-            .load(format!(r#"return {{ slug = "{SLUG_NAME}", {fields} }}"#))
+            .load(format!(
+                r#"return {{ slug = "{SLUG_NAME}", display_name = "{SLUG_NAME}", {fields} }}"#
+            ))
             .eval()?;
         declaration(&lua, &spec)
     }

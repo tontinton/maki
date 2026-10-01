@@ -1,7 +1,7 @@
 use std::process::Command;
 
-use maki_config::env_var_refs;
 use maki_config::providers::{ProvidersConfig, resolve_api_key_env};
+use maki_config::{PROVIDER_BUILTINS, env_var_refs};
 
 use crate::providers::anthropic::bedrock;
 use crate::providers::catalog;
@@ -41,16 +41,22 @@ pub fn strip_provider_keys(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
-/// A builtin slug ignores `api_key_env` in `providers.toml`, so that var is
-/// not a key maki reads. Its `headers` are still sent, so their `${VAR}`s count.
+/// `providers.toml` cannot change the `api_key_env` of a known slug, so that
+/// var is never a key maki reads. Its `headers` are still sent though, so
+/// their `${VAR}`s count.
 fn provider_key_vars(config: &ProvidersConfig, catalog_vars: Vec<String>) -> Vec<String> {
-    let builtin = ProviderRegistry::builtins()
-        .iter()
+    let known = ProviderRegistry::all()
+        .into_iter()
         .map(|spec| spec.api_key_env)
         .chain(copilot_auth::TOKEN_ENV_VARS.iter().copied())
         .chain([bedrock::BEARER_TOKEN_ENV])
         .filter(|var| !var.is_empty())
         .map(str::to_owned);
+    // The key stays the user's secret even while its plugin is off or still
+    // loading.
+    let bundled = PROVIDER_BUILTINS
+        .iter()
+        .map(|slug| resolve_api_key_env(slug, None));
     let custom = config
         .providers
         .iter()
@@ -62,7 +68,8 @@ fn provider_key_vars(config: &ProvidersConfig, catalog_vars: Vec<String>) -> Vec
         .flat_map(|def| def.headers.values())
         .flat_map(|value| env_var_refs(value))
         .map(str::to_owned);
-    builtin
+    known
+        .chain(bundled)
         .chain(custom)
         .chain(header_refs)
         .chain(catalog_vars)
@@ -92,6 +99,8 @@ mod tests {
     const CATALOG_KEY_ENV: &str = "FIREWORKS_API_KEY";
     const SHARED_CATALOG_KEY_ENV: &str = "HF_TOKEN";
     const UNRELATED_VAR: &str = "MAKI_TEST_UNRELATED";
+    /// Its plugin never loads in this crate's tests.
+    const BUNDLED_KEY_ENV: &str = "MISTRAL_API_KEY";
     #[cfg(unix)]
     const SECRET: &str = "sk-secret";
 
@@ -127,6 +136,7 @@ mod tests {
     #[test_case(CATALOG_KEY_ENV, true ; "catalog_key")]
     #[test_case(SHARED_CATALOG_KEY_ENV, false ; "shared_credential_in_catalog_kept")]
     #[test_case(UNRELATED_VAR, false ; "unrelated_var_kept")]
+    #[test_case(BUNDLED_KEY_ENV, true ; "unloaded_bundled_plugin_key")]
     fn provider_key_vars_membership(var: &str, stripped: bool) {
         let catalog_vars = vec![CATALOG_KEY_ENV.into(), SHARED_CATALOG_KEY_ENV.into()];
         assert_eq!(
