@@ -149,9 +149,9 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 /// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 /// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
-/// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-/// `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`, and
-/// `"FileIndexReady"`. Plugins can also fire their own events with
+/// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
+/// `"TaskStatusChanged"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
+/// and `"FileIndexReady"`. Plugins can also fire their own events with
 /// `exec_autocmds`.
 ///
 /// Every host event carries `data.session_id` except `"FileIndexReady"`,
@@ -185,6 +185,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   first focus at startup.
 /// - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
 ///   or `"idle"`), `data.title`, and `data.focused` (boolean).
+/// - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
+///   when the title changes (rename or auto-generation).
 /// - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
 ///   (`"working"`, `"done"`, or `"error"`), when a subagent starts or
 ///   changes status. A task that comes back from disk already finished

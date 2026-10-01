@@ -345,6 +345,7 @@ struct SessionRuntime {
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     last_status: SessionStatus,
+    last_title: String,
     /// Keyed by task id, never by position: a session reset reuses positions,
     /// so a new task would inherit the old one's status.
     last_tasks: Vec<(Arc<str>, TaskStatus)>,
@@ -454,12 +455,14 @@ impl SpawnCtx {
             app.restore_resumed_session();
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
+        let last_title = app.state.session.title.clone();
         SessionRuntime {
             app,
             handles,
             shell_tx,
             shell_rx,
             last_status: SessionStatus::Idle,
+            last_title,
             last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
             slot: cell,
@@ -950,6 +953,7 @@ impl<'t> EventLoop<'t> {
         self.emit_focus_changes();
         dirty |= self.start_mailbox_runs();
         self.emit_status_changes();
+        self.emit_title_changes();
         self.emit_task_changes();
         self.emit_notifications();
         // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
@@ -1071,6 +1075,26 @@ impl<'t> EventLoop<'t> {
                     "session_id": rt.id(),
                     "title": rt.app.state.session.title,
                     "status": status.as_str(),
+                    "focused": i == self.focused,
+                }),
+            );
+        }
+    }
+
+    /// `/rename` and title auto-generation change the title without touching
+    /// the status diff above, so the title gets its own diff per frame.
+    fn emit_title_changes(&mut self) {
+        let handle = &self.ctx.lua_event_handle;
+        for (i, rt) in self.sessions.iter_mut().enumerate() {
+            if rt.app.state.session.title == rt.last_title {
+                continue;
+            }
+            rt.last_title = rt.app.state.session.title.clone();
+            handle.fire_autocmd(
+                "SessionTitleChanged",
+                json!({
+                    "session_id": rt.id(),
+                    "title": rt.last_title,
                     "focused": i == self.focused,
                 }),
             );
