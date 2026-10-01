@@ -434,13 +434,16 @@ impl Anthropic {
                 models.extend(discovered_model_infos(m));
             }
 
-            if !page.has_more {
-                break;
+            match page.last_id {
+                Some(cursor) if page.has_more && after_id.as_ref() != Some(&cursor) => {
+                    after_id = Some(cursor)
+                }
+                _ => break,
             }
-            after_id = page.last_id;
         }
 
         models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.dedup_by(|a, b| a.id == b.id);
         Ok(models)
     }
 }
@@ -638,6 +641,7 @@ pub(crate) async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Canned, serve};
     use crate::{ContentBlock, EMPTY_RESPONSE_MARKER, ProviderEvent, Role, StopReason, TokenUsage};
     use serde_json::{Value, json};
     use shared::build_wire_messages;
@@ -1342,6 +1346,38 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
                 "claude-opus-4-8-1m".to_string(),
             ]
         );
+    }
+
+    const PAGE_WITHOUT_CURSOR: &[Canned] = &[Canned::json(
+        200,
+        r#"{"data": [{"id": "a"}], "has_more": true, "last_id": null}"#,
+    )];
+    const PAGE_A_WITH_MORE: Canned = Canned::json(
+        200,
+        r#"{"data": [{"id": "a"}], "has_more": true, "last_id": "a"}"#,
+    );
+    const TWO_PAGES: &[Canned] = &[
+        PAGE_A_WITH_MORE,
+        Canned::json(200, r#"{"data": [{"id": "b"}], "has_more": false}"#),
+    ];
+    const IGNORED_CURSOR: &[Canned] = &[PAGE_A_WITH_MORE, PAGE_A_WITH_MORE];
+
+    #[test_case(PAGE_WITHOUT_CURSOR, &["a"] ; "stops_when_has_more_without_last_id")]
+    #[test_case(IGNORED_CURSOR, &["a"] ; "stops_when_server_ignores_after_id")]
+    #[test_case(TWO_PAGES, &["a", "b"] ; "follows_last_id_cursor")]
+    fn list_models_pagination(script: &'static [Canned], expected: &[&str]) {
+        let (base_url, requests) = serve(script);
+        let auth = crate::providers::ResolvedAuth::for_test(Some(base_url), Vec::new());
+        let provider = Anthropic::with_auth(
+            Arc::new(Mutex::new(auth)),
+            crate::providers::Timeouts::default(),
+        );
+
+        let models = smol::block_on(provider.list_models()).unwrap();
+
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, expected);
+        assert_eq!(requests.lock().unwrap().len(), script.len());
     }
 
     #[test]
