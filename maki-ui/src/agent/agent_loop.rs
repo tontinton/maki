@@ -142,8 +142,9 @@ impl AgentLoop {
         let result = self.dispatch_run(run, run_id, live.token()).await;
         // A `tool_use_id` only names work inside the run that issued the call,
         // so the run ending is what stops whatever still hangs off one, rather
-        // than a group emptying out.
-        self.subagent_cancels.cancel_all();
+        // than a group emptying out. Detached sessions stay: a background
+        // subagent must outlive the turn that spawned it.
+        self.subagent_cancels.end_run();
 
         // A cancel arrives here as `Ok`, since esc is what the user asked for.
         // As an error it would draw a second "Cancelled." bubble under the one
@@ -330,6 +331,7 @@ impl AgentLoop {
                 ledger: Arc::new(RunLedger::default()),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
+                unattended: false,
                 model_policy: Arc::clone(&self.model_policy),
             },
             AgentRunParams {
