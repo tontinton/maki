@@ -47,10 +47,11 @@ pub use maki_providers::AgentError;
 use maki_providers::Message;
 pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
-    AgentEvent, BufferSnapshot, CallRecord, DoneReason, Envelope, EventSender, EventStreamGuard,
-    GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, RunLedger,
-    RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanColor,
-    SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput,
+    AgentEvent, BufferSnapshot, CallRecord, DETACHED_RUN_ID, DoneReason, Envelope, EventSender,
+    EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND,
+    RunLedger, RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan,
+    SpanColor, SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput,
+    ToolOutput,
     ToolStartEvent, TurnCompleteEvent, UiWaker, event_stream,
 };
 
