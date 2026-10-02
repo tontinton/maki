@@ -704,6 +704,13 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// A `permission.prompt` layer allowed a call that would have prompted.
+    /// The prompt is where the user learns what the agent is about to do, so
+    /// a frontend marks the call instead.
+    AllowedByPlugin {
+        id: String,
+        plugin: String,
+    },
     AuthRequired,
     Nudge,
     /// A plugin changed the run in a way the transcript alone would not show.

@@ -8,12 +8,15 @@ use std::time::Instant;
 
 use flume::Sender;
 use maki_agent::agent::{AgentCall, AgentHook, AgentSlot};
+use maki_agent::permissions::LayerAnswer;
+use maki_agent::tools::ToolContext;
 use maki_agent::tools::hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 use maki_agent::tools::registry::BoxFuture;
 use serde_json::{Value, json};
 
-use crate::api::slot::{ANY_TOOL, LayeredTools, host_slot_name};
-use crate::runtime::{HookRun, Request};
+use crate::api::slot::{ANY_TOOL, LayeredTools, PERMISSION_PROMPT_SLOT, host_slot_name};
+use crate::api::util::ctx::LuaCtx;
+use crate::runtime::{HookRun, PromptRun, Request};
 
 /// Every `agent.*` slot steers what the agent does next: the prompt it
 /// answers, whether it stops, what it remembers after a compaction. No
@@ -78,6 +81,38 @@ impl ToolHook for SlotHook {
                 "deadline_ms": deadline_ms(call.deadline),
             }),
             may_ask: stage == HookStage::Input,
+        })
+    }
+
+    fn prompt<'a>(
+        &'a self,
+        input: &'a Value,
+        scopes: &'a [String],
+        call: &'a HookCall<'a>,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Option<LayerAnswer>> {
+        Box::pin(async move {
+            if !self.layered.layers_surface(PERMISSION_PROMPT_SLOT) {
+                return None;
+            }
+            let (reply, answer) = flume::bounded(1);
+            let run = PromptRun {
+                authority: call.authority,
+                cancel: call.cancel.clone(),
+                deadline: call.deadline,
+                req: json!({
+                    "tool": call.tool,
+                    "tool_id": call.tool_id,
+                    "input": input,
+                    "scopes": scopes,
+                }),
+                ctx: Box::new(LuaCtx::handler(ctx)),
+            };
+            self.tx
+                .send_async(Request::RunPrompt { run, reply })
+                .await
+                .ok()?;
+            answer.recv_async().await.ok().flatten()
         })
     }
 }
