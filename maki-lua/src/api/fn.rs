@@ -4,6 +4,7 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use maki_fs::JobOut;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
@@ -14,9 +15,10 @@ use crate::api::keymap::{InputMode, KeymapWriter};
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::backend::bound_backend;
 use crate::jobs::{
     CallbackUpdate, CallbackUpdates, JobCommand, JobEvent, JobOwner, JobSnapshot, JobSpec,
-    MAX_TAIL_LINES, Redirect, deliver_job_event,
+    MAX_TAIL_LINES, deliver_job_event,
 };
 use crate::plugin_permissions::{Ceiling, Permission, PluginPermissions, require};
 use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
@@ -107,6 +109,7 @@ fn jobstart(
         .transpose()?
         .unwrap_or(Value::Nil);
     let mut spec = JobSpec::new(parse_scope(lua, &plugin, scope)?, parse_command(cmd)?);
+    spec.backend = bound_backend(lua);
     let mut tail = None;
 
     if let Some(ref opts) = opts {
@@ -170,10 +173,10 @@ fn parse_redirect(
     key: &str,
     has_callback: bool,
     grants: &PluginPermissions,
-) -> LuaResult<Redirect> {
+) -> LuaResult<JobOut> {
     let value = opts.get::<Value>(key)?;
     if value.is_nil() {
-        return Ok(Redirect::Capture);
+        return Ok(JobOut::Capture);
     }
     if has_callback {
         return Err(mlua::Error::runtime(format!(
@@ -181,10 +184,10 @@ fn parse_redirect(
         )));
     }
     match value {
-        Value::Boolean(false) => Ok(Redirect::Discard),
+        Value::Boolean(false) => Ok(JobOut::Discard),
         Value::String(path) => {
             require(lua, grants, Permission::FsWrite)?;
-            Ok(Redirect::File(expand_tilde(&path.to_str()?)))
+            Ok(JobOut::File(expand_tilde(&path.to_str()?)))
         }
         _ => Err(mlua::Error::runtime(format!(
             "jobstart: {key} must be a path string or false"

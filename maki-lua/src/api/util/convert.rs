@@ -127,7 +127,7 @@ pub(crate) fn reject_unknown_fields(
     Ok(())
 }
 
-pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String> {
+pub fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String> {
     let mut iter = values.into_iter();
     match iter.next() {
         Some(Value::String(s)) => Ok(s.to_string_lossy()),
@@ -229,7 +229,7 @@ fn element(lua: &Lua, value: &JsonValue, null_is_nil: bool, luanil: &Luanil) -> 
 /// the only Lua → JSON conversion, so `maki.json.encode` and every host reader
 /// agree. Anything else JSON cannot hold (functions, threads, other userdata,
 /// buffers, tables that contain themselves) is an error, never a silent null.
-pub(crate) fn lua_to_json(lua: &Lua, val: &Value) -> LuaResult<JsonValue> {
+pub fn lua_to_json(lua: &Lua, val: &Value) -> LuaResult<JsonValue> {
     within_template(lua, val, None, &mut Vec::new()).map_err(ConvertError::into_lua)
 }
 

@@ -218,6 +218,7 @@ const STRING_FIELD_SCHEMA: &str = r#"{
 }"#;
 
 const INVALID_PERMISSION_SCOPE_ERR: &str = "not in schema properties or not type 'string'";
+const HOST_ACCESS_TYPE_ERR: &str = "register_tool: 'host_access' must be a boolean";
 const BAD_NAME_SRC: &str = r#"name = "bad name!", description = "test""#;
 const EMPTY_DESC_SRC: &str = r#"name = "valid_name", description = """#;
 const EMPTY_AUD_SRC: &str = r#"name = "no_aud", description = "test", audiences = {}"#;
@@ -258,6 +259,8 @@ const SECOND_UNDECLARED_SRC: &str = r#"maki.api.register_tool({
     schema = { type = "object", properties = {} },
     handler = function() return "" end,
 })"#;
+const HOST_ACCESS_NON_BOOL_SRC: &str =
+    r#"name = "host_bad", description = "test", host_access = "yes""#;
 const NON_STRING_FIELD_SCHEMA: &str = r#"{
     type = "object",
     properties = { count = { type = "integer" } },
@@ -708,6 +711,7 @@ fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
 #[test_case::test_case(INERT_WITH_MUTABLE_PATH_SRC, STRING_FIELD_SCHEMA, INERT_WITH_MUTABLE_PATH_ERR ; "inert_with_mutable_path")]
 #[test_case::test_case(PERMISSION_LIST_SRC, MINIMAL_SCHEMA, PERMISSION_SHAPE_ERR ; "permission_list")]
 #[test_case::test_case(PERMISSION_MAP_SRC, MINIMAL_SCHEMA, PERMISSION_SHAPE_ERR ; "permission_map")]
+#[test_case::test_case(HOST_ACCESS_NON_BOOL_SRC, MINIMAL_SCHEMA, HOST_ACCESS_TYPE_ERR ; "host_access_non_bool")]
 fn registration_validation_rejects(fields: &str, schema: &str, expected_err: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -790,6 +794,24 @@ fn permission_scopes_valid_string_field_accepted() {
     );
     host.load_source("ok_scope_plugin", &src).unwrap();
     assert!(reg.has("ok_scope"));
+}
+
+#[test]
+fn host_access_true_is_accepted() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "host_opt_in",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            host_access = true,
+            handler = function() return "" end
+        }})"#,
+    );
+    host.load_source("host_access_plugin", &src).unwrap();
+    assert!(reg.has("host_opt_in"));
 }
 
 #[test]

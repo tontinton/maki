@@ -37,9 +37,14 @@ impl Drop for ExitOnPanic {
 async fn main() {
     color_eyre::install().ok();
     let _exit = ExitOnPanic;
-    let result = cmd::dispatch(Cli::parse()).await;
+    let cli = Cli::parse();
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    if cli.sandbox_inner {
+        maki_sandbox::child::child_inner_main();
+    }
     // Detached export tasks die with the process; drain them here, before
     // the `exit` below skips every destructor.
+    let result = cmd::dispatch(cli).await;
     maki_otel::shutdown(TELEMETRY_SHUTDOWN_TIMEOUT);
     let code = match result {
         Ok(()) => 0,

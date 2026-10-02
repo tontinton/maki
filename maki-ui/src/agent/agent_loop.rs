@@ -1,3 +1,5 @@
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+use std::path::Path;
 use std::sync::Arc;
 
 use maki_agent::agent::{self, AgentHooks};
@@ -212,7 +214,7 @@ impl AgentLoop {
             self.reload_instructions().await;
         }
         let prompt_slots = Arc::new(self.lua_handle.collect_prompt_slots_async().await);
-        let vars = self.vars.clone();
+        let vars = self.prompt_vars();
         let instructions = self.instructions.text.clone();
         let slots = Arc::clone(&prompt_slots);
         let config = self.seed.config.clone();
@@ -364,6 +366,33 @@ impl AgentLoop {
         self.seed
             .instruction_files
             .store(Arc::clone(&self.instructions.files));
+    }
+
+    /// Vars for prompt assembly: when the sandbox is active, `{cwd}` points at
+    /// the workspace path the filesystem tools actually operate on.
+    fn prompt_vars(&self) -> template::Vars {
+        match self.sandbox_cwd() {
+            Some(cwd) => self.vars.clone().set("{cwd}", cwd),
+            None => self.vars.clone(),
+        }
+    }
+
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    fn sandbox_cwd(&self) -> Option<String> {
+        if !self.seed.config.sandbox_enabled {
+            return None;
+        }
+        let host_cwd = self.vars.apply("{cwd}").into_owned();
+        let workspace_name = Path::new(&host_cwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Some(format!("/home/maki/workspace/{workspace_name}"))
+    }
+
+    #[cfg(not(all(feature = "sandbox", target_os = "linux")))]
+    fn sandbox_cwd(&self) -> Option<String> {
+        None
     }
 
     fn emit_error(&self, run_id: u64, error: AgentError, totals: RunTotals) {

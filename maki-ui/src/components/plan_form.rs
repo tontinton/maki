@@ -87,7 +87,7 @@ pub fn builtin_menu() -> PlanMenu {
 }
 
 // 2 borders + 1 empty line + 1 hint bar
-const CHROME_LINES: u16 = 4;
+pub(crate) const CHROME_LINES: u16 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanFormAction {

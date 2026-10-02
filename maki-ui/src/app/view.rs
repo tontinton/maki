@@ -68,6 +68,8 @@ impl App {
             | KeyboardOwner::Usage
             | KeyboardOwner::Btw
             | KeyboardOwner::Queue => None,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            KeyboardOwner::Sandbox => None,
         }
     }
 
@@ -398,6 +400,13 @@ impl App {
         let r = self.alert_modal.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
+        }
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        {
+            let r = self.sandbox_modal.view(frame, full);
+            if r.width > 0 {
+                overlay_rect = r;
+            }
         }
         overlay_rect
     }

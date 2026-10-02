@@ -2506,7 +2506,7 @@ fn plugin_event_without_a_task_shows_nowhere() {
 /// `Done` and `Error` end the prompt, not the session: the task goes idle
 /// with nothing said in the main chat, and the next prompt shows as a user
 /// bubble and brings the spinner back.
-#[test_case(done(),        DisplayRole::Assistant ; "done")]
+#[test_case(done(),        DisplayRole::Assistant ; "task_done")]
 #[test_case(agent_error(), DisplayRole::Error     ; "error")]
 fn plugin_task_idles_between_prompts(ending: AgentEvent, shown_as: DisplayRole) {
     let mut app = app_with_plugin_task();
@@ -13343,6 +13343,8 @@ fn open_owner(app: &mut App, owner: KeyboardOwner) {
         KeyboardOwner::LoginPicker => open_login_provider_list(app),
         KeyboardOwner::McpPicker => open_mcp(app),
         KeyboardOwner::Chat => {}
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        KeyboardOwner::Sandbox => app.sandbox_modal.toggle(),
     }
 }
 
@@ -13478,4 +13480,14 @@ fn the_escape_that_closes_the_palette_stays_out_of_the_chat() {
 
     assert!(!palette_open(&mut app));
     assert_eq!(app.status_bar.flash_text(), None, "{PALETTE_ESC_LEAKED}");
+}
+
+/// The sandbox dialog is bound to a letter crossterm can actually report,
+/// not to Tab, which terminals alias to Ctrl+I.
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+#[test]
+fn sandbox_key_opens_dialog() {
+    let mut app = test_app();
+    app.update(Msg::Key(kb::SANDBOX.to_key_event()));
+    assert!(app.sandbox_modal.is_open());
 }

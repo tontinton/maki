@@ -1,23 +1,22 @@
 use std::cell::RefCell;
-use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
-use std::fs::{File, FileType};
-use std::io::{
-    BufRead, BufReader, Error as IoError, ErrorKind, Read, Result as IoResult, Seek, SeekFrom,
-};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::UNIX_EPOCH;
 
 use maki_agent::{FileQuery, FileReader, Ranked};
+use maki_fs::{
+    FsBackend, GrepParams, PageQuery,
+    window::NON_UTF8_CONTENT_ERR,
+};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 use tokio::task::spawn_blocking;
 
 use crate::agent_autocmd::HostEvent;
-use crate::api::util::convert::{TableExt, bytes_arg};
+use crate::api::util::convert::{TableExt, bytes_arg, json_to_lua};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
+use crate::backend::resolve_backend;
 use crate::loader::EventHandle;
 use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::LUA_MEMORY_LIMIT;
@@ -30,9 +29,6 @@ const _: () = assert!(
     MAX_READ_BYTES == 64 * 1024 * 1024,
     "the Lua API docs and plugin option descs say 64 MiB, change them too"
 );
-const NON_UTF8_CONTENT_ERR: &str = "non-utf8 content; use read_bytes";
-const SCAN_CHUNK: usize = 64 * 1024;
-pub(crate) const LINE_CUT_MARKER: &str = "...";
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     maki_storage::paths::expand_tilde(Path::new(path))
@@ -55,363 +51,10 @@ fn path_to_string(p: &Path) -> LuaResult<String> {
         .ok_or_else(|| mlua::Error::runtime("non-utf8 path"))
 }
 
-fn filetype_str(ft: &FileType) -> &'static str {
-    if ft.is_file() {
-        "file"
-    } else if ft.is_dir() {
-        "directory"
-    } else if ft.is_symlink() {
-        "link"
-    } else {
-        "unknown"
-    }
-}
-
-fn collect_dir_entries(
-    base: &Path,
-    dir: &Path,
-    depth: u32,
-    max_depth: u32,
-    visited: &mut HashSet<PathBuf>,
-    out: &mut Vec<(String, &'static str)>,
-) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = match path.strip_prefix(base).ok().and_then(|p| p.to_str()) {
-            Some(s) => s.to_owned(),
-            None => continue,
-        };
-        let (type_str, is_dir) = match entry.file_type() {
-            Ok(ft) if ft.is_symlink() => match std::fs::metadata(&path) {
-                Ok(meta) => (filetype_str(&meta.file_type()), meta.is_dir()),
-                Err(_) => ("link", false),
-            },
-            Ok(ft) => (filetype_str(&ft), ft.is_dir()),
-            Err(_) => ("unknown", false),
-        };
-        out.push((name, type_str));
-        if is_dir && depth < max_depth {
-            let canonical = match path.canonicalize() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            if visited.insert(canonical) {
-                collect_dir_entries(base, &path, depth + 1, max_depth, visited, out);
-            }
-        }
-    }
-}
-
-async fn read_file(path: PathBuf, max_bytes: u64) -> IoResult<Vec<u8>> {
-    spawn_blocking(move || {
-        let too_large = || {
-            IoError::new(
-                ErrorKind::FileTooLarge,
-                format!("file exceeds the {max_bytes}-byte read limit"),
-            )
-        };
-        let file = File::open(path)?;
-        let size = file.metadata()?.len();
-        if size > max_bytes {
-            return Err(too_large());
-        }
-
-        // Files can grow, and some streams report a size of zero.
-        let mut bytes = Vec::with_capacity(size as usize);
-        file.take(max_bytes + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > max_bytes {
-            return Err(too_large());
-        }
-        Ok(bytes)
-    })
-    .await
-    .map_err(IoError::other)?
-}
-
-fn too_large() -> IoError {
-    IoError::new(
-        ErrorKind::FileTooLarge,
-        format!("file exceeds the {MAX_READ_BYTES}-byte read limit"),
-    )
-}
-
-fn non_utf8() -> IoError {
-    IoError::new(ErrorKind::InvalidData, NON_UTF8_CONTENT_ERR)
-}
-
-/// Read a window of bytes from the file at `path`.
-///
-/// A negative `offset` counts back from the end of the file. `len` caps how many
-/// bytes are read; omit it to read to the end of the file.
-fn read_byte_window(path: &Path, offset: i64, len: Option<u64>) -> IoResult<Vec<u8>> {
-    let mut file = File::open(path)?;
-    let start = if offset < 0 {
-        file.metadata()?.len().saturating_sub(offset.unsigned_abs())
-    } else {
-        offset as u64
-    };
-    file.seek(SeekFrom::Start(start))?;
-
-    let mut buf = Vec::new();
-    file.take(len.unwrap_or(u64::MAX).min(MAX_READ_BYTES + 1))
-        .read_to_end(&mut buf)?;
-    if buf.len() as u64 > MAX_READ_BYTES {
-        return Err(too_large());
-    }
-    Ok(buf)
-}
-
-/// Byte offset where the last `lines` lines of `file` start, found by scanning
-/// back from the end in `chunk_size` reads. A trailing newline does not open a
-/// new line, so the last line of `a\nb\n` is `b\n`.
-fn tail_start(file: &mut File, size: u64, lines: u64, chunk_size: usize) -> IoResult<u64> {
-    let mut buf = vec![0; chunk_size];
-    let mut remaining = lines;
-    let mut end = size;
-    while end > 0 {
-        let len = end.min(chunk_size as u64) as usize;
-        let pos = end - len as u64;
-        file.seek(SeekFrom::Start(pos))?;
-        file.read_exact(&mut buf[..len])?;
-        let mut chunk = &buf[..len];
-        if end == size {
-            chunk = chunk.strip_suffix(b"\n").unwrap_or(chunk);
-        }
-        while let Some(newline) = chunk.iter().rposition(|&b| b == b'\n') {
-            remaining -= 1;
-            if remaining == 0 {
-                return Ok(pos + newline as u64 + 1);
-            }
-            chunk = &chunk[..newline];
-        }
-        end = pos;
-    }
-    Ok(0)
-}
-
-/// Read up to `limit` lines, failing once the returned text passes `MAX_READ_BYTES`.
-fn take_lines(mut reader: impl BufRead, limit: Option<u64>) -> IoResult<String> {
-    let mut out = Vec::new();
-    let mut taken = 0u64;
-    while limit.is_none_or(|l| taken < l) {
-        let budget = MAX_READ_BYTES + 1 - out.len() as u64;
-        if reader.by_ref().take(budget).read_until(b'\n', &mut out)? == 0 {
-            break;
-        }
-        if out.len() as u64 > MAX_READ_BYTES {
-            return Err(too_large());
-        }
-        taken += 1;
-    }
-    String::from_utf8(out).map_err(|_| non_utf8())
-}
-
-/// Skips up to `n` lines and returns how many it skipped. A trailing newline
-/// ends the last line instead of starting a new one, so `a\nb\n` has 2 lines.
-fn skip_lines(reader: &mut impl BufRead, n: u64) -> IoResult<u64> {
-    let mut skipped = 0;
-    while skipped < n && reader.skip_until(b'\n')? > 0 {
-        skipped += 1;
-    }
-    Ok(skipped)
-}
-
-#[derive(Clone)]
-pub(crate) struct Line {
-    pub text: String,
-    /// Its length before any cut, so a caller can say how much was dropped.
-    pub bytes: u64,
-}
-
-impl From<String> for Line {
-    fn from(text: String) -> Self {
-        let bytes = text.len() as u64;
-        Self { text, bytes }
-    }
-}
-
-#[cfg(test)]
-impl From<&str> for Line {
-    fn from(text: &str) -> Self {
-        text.to_owned().into()
-    }
-}
-
-/// The next line without its `\n` or `\r\n`, or `None` at the end of the file.
-/// A line over `max_bytes` is cut and gets [`LINE_CUT_MARKER`]. This is where
-/// the line is buffered, so `max_bytes` is capped at [`MAX_READ_BYTES`] here
-/// and no caller can ask for more. The rest of it
-/// is skipped without ever landing in memory, which is how a file that is one
-/// 300 MB line still pages fine. Without `max_bytes`, a line over
-/// [`MAX_READ_BYTES`] fails the read. Bytes that are not UTF-8 fail the read,
-/// or become U+FFFD when `lossy`.
-pub(crate) fn next_line(
-    reader: &mut impl BufRead,
-    max_bytes: Option<u64>,
-    lossy: bool,
-) -> IoResult<Option<Line>> {
-    let keep = max_bytes.map_or(MAX_READ_BYTES, |max| max.min(MAX_READ_BYTES));
-    // The extra 2 bytes let a line of exactly `keep` bytes see its `\r\n`, so it is not cut.
-    let window = keep + 2;
-    let mut line = Vec::new();
-    let read = reader.by_ref().take(window).read_until(b'\n', &mut line)? as u64;
-    if read == 0 {
-        return Ok(None);
-    }
-    let bytes = if line.ends_with(b"\n") || read < window {
-        line.pop_if(|b| *b == b'\n');
-        line.pop_if(|b| *b == b'\r');
-        line.len() as u64
-    } else {
-        let (rest, last) = skip_rest_of_line(reader)?;
-        // Stripped like the `\r` of a line that fits: by the last byte before the newline.
-        let ends_in_cr = if rest == 0 {
-            line.last().copied()
-        } else {
-            last
-        } == Some(b'\r');
-        read + rest - u64::from(ends_in_cr)
-    };
-    if line.len() as u64 > keep {
-        if max_bytes.is_none() {
-            return Err(too_large());
-        }
-        line.truncate(keep as usize);
-        // An error with no length is a char the cut split in half, so drop what is left of it.
-        let split_char = line
-            .utf8_chunks()
-            .last()
-            .map(|chunk| chunk.invalid())
-            .filter(|tail| std::str::from_utf8(tail).is_err_and(|e| e.error_len().is_none()))
-            .map_or(0, <[u8]>::len);
-        line.truncate(line.len() - split_char);
-        line.extend_from_slice(LINE_CUT_MARKER.as_bytes());
-    }
-    let text = match String::from_utf8(line) {
-        Ok(text) => text,
-        Err(e) if lossy => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-        Err(_) => return Err(non_utf8()),
-    };
-    Ok(Some(Line { text, bytes }))
-}
-
-/// Skips to the next `\n` and returns how many bytes came before it, and the
-/// last of them.
-fn skip_rest_of_line(reader: &mut impl BufRead) -> IoResult<(u64, Option<u8>)> {
-    let (mut skipped, mut last) = (0, None);
-    loop {
-        let buf = match reader.fill_buf() {
-            Ok(buf) => buf,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        if buf.is_empty() {
-            return Ok((skipped, last));
-        }
-        let (rest, found) = match buf.iter().position(|b| *b == b'\n') {
-            Some(newline) => (&buf[..newline], true),
-            None => (buf, false),
-        };
-        skipped += rest.len() as u64;
-        last = rest.last().copied().or(last);
-        let consumed = rest.len() + usize::from(found);
-        reader.consume(consumed);
-        if found {
-            return Ok((skipped, last));
-        }
-    }
-}
-
-struct PageQuery {
-    /// 1-based, so `0` also starts at the first line.
-    offset: u64,
-    limit: Option<u64>,
-    max_line_bytes: Option<u64>,
-    /// Reads on past the page to count every line in the file.
-    count: bool,
-}
-
-impl Default for PageQuery {
-    fn default() -> Self {
-        Self {
-            offset: 1,
-            limit: None,
-            max_line_bytes: None,
-            count: true,
-        }
-    }
-}
-
-impl PageQuery {
-    fn from_opts(opts: Option<&Table>) -> LuaResult<Self> {
-        let Some(opts) = opts else {
-            return Ok(Self::default());
-        };
-        Ok(Self {
-            offset: opts.opt("offset")?.unwrap_or(1),
-            limit: opts.opt::<u64>("limit")?.filter(|l| *l > 0),
-            max_line_bytes: opts.opt_nonzero("max_line_bytes")?,
-            count: opts.opt_bool("count").unwrap_or(true),
-        })
-    }
-}
-
-/// Returns the page and, when the query counts, the total lines in the file.
-/// Both come from one pass, so they always agree even on a log that grows
-/// while we read it. Only the page itself is ever held in memory.
-fn read_line_page(
-    mut reader: impl BufRead,
-    query: &PageQuery,
-) -> IoResult<(Vec<String>, Option<u64>)> {
-    let skipped = skip_lines(&mut reader, query.offset.saturating_sub(1))?;
-    let mut lines = Vec::new();
-    let mut bytes = 0;
-    while query.limit.is_none_or(|l| (lines.len() as u64) < l)
-        && let Some(Line { text: line, .. }) = next_line(&mut reader, query.max_line_bytes, false)?
-    {
-        // A line costs its `String` here and a string and a table slot in Lua,
-        // so even a file of empty lines has to run into the limit.
-        bytes += (line.len() + size_of::<String>()) as u64;
-        if bytes > MAX_READ_BYTES {
-            return Err(too_large());
-        }
-        lines.push(line);
-    }
-    let total = if query.count {
-        Some(skipped + lines.len() as u64 + skip_lines(&mut reader, u64::MAX)?)
-    } else {
-        None
-    };
-    Ok((lines, total))
-}
-
-/// Read a window of lines from the file at `path`.
-///
-/// `offset` is a 1-based line number; a negative `offset` counts back from the last
-/// line, so `-1` starts at the last line. `limit` caps how many lines are read;
-/// omit it to read every line from `offset`. The result holds the file's own text
-/// for those lines, so a window over the whole file equals a plain read. Skipped
-/// lines never count toward the read limit.
-fn read_line_window(
-    path: &Path,
-    offset: i64,
-    limit: Option<u64>,
-    tail_chunk_size: usize,
-) -> IoResult<String> {
-    let mut file = File::open(path)?;
-    if offset < 0 {
-        let size = file.metadata()?.len();
-        let start = tail_start(&mut file, size, offset.unsigned_abs(), tail_chunk_size)?;
-        file.seek(SeekFrom::Start(start))?;
-        return take_lines(BufReader::new(file.take(size - start)), limit);
-    }
-    let mut reader = BufReader::new(file);
-    skip_lines(&mut reader, (offset as u64).saturating_sub(1))?;
-    take_lines(reader, limit)
+async fn read_backend(backend: Arc<dyn FsBackend>, path: PathBuf) -> Result<Vec<u8>, String> {
+    spawn_blocking(move || backend.read(&path, MAX_READ_BYTES).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Read the file at {path} as a UTF-8 string. Pass {opts} to read only some
@@ -431,20 +74,27 @@ fn read_line_window(
 /// end
 /// local tail = maki.fs.read("server.log", { offset = -50 })
 #[lua_fn(guard = FsRead)]
-async fn read(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<String>> {
+async fn read(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<String>> {
     let abs = try_pair!(make_absolute(&path));
-    let Some(opts) = opts.as_ref() else {
-        let bytes = try_pair!(read_file(abs, MAX_READ_BYTES).await);
-        return Ok(pair(
-            String::from_utf8(bytes).map_err(|_| NON_UTF8_CONTENT_ERR),
-        ));
+    let backend = resolve_backend(&lua);
+    let bytes = match opts.as_ref() {
+        None => try_pair!(read_backend(backend, abs).await),
+        Some(opts) => {
+            let offset: i64 = opts.opt::<i64>("offset")?.unwrap_or(1);
+            let limit: Option<u64> = opts.opt::<u64>("limit")?.filter(|l| *l > 0);
+            try_pair!(
+                spawn_blocking(
+                    move || backend.read_line_window(&abs, offset, limit, MAX_READ_BYTES)
+                        .map_err(|e| e.to_string()),
+                )
+                .await
+                .map_err(mlua::Error::external)?
+            )
+        }
     };
-    let offset: i64 = opts.opt::<i64>("offset")?.unwrap_or(1);
-    let limit: Option<u64> = opts.opt::<u64>("limit")?.filter(|l| *l > 0);
-    let text = spawn_blocking(move || read_line_window(&abs, offset, limit, SCAN_CHUNK))
-        .await
-        .map_err(mlua::Error::external)?;
-    Ok(pair(text))
+    Ok(pair(
+        String::from_utf8(bytes).map_err(|_| NON_UTF8_CONTENT_ERR),
+    ))
 }
 
 /// Read the file at {path} as raw bytes in a Luau buffer. Pass {opts} to read
@@ -463,19 +113,35 @@ async fn read(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<St
 #[lua_fn(guard = FsRead)]
 async fn read_bytes(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Buffer>> {
     let abs = try_pair!(make_absolute(&path));
+    let backend = resolve_backend(&lua);
     let bytes = match opts.as_ref() {
+        None => try_pair!(read_backend(backend, abs).await),
         Some(opts) => {
             let offset: i64 = opts.opt::<i64>("offset")?.unwrap_or(0);
             let len: Option<u64> = opts.opt("len")?;
             try_pair!(
-                spawn_blocking(move || read_byte_window(&abs, offset, len))
-                    .await
-                    .map_err(mlua::Error::external)?
+                spawn_blocking(
+                    move || backend.read_byte_window(&abs, offset, len, MAX_READ_BYTES)
+                        .map_err(|e| e.to_string()),
+                )
+                .await
+                .map_err(mlua::Error::external)?
             )
         }
-        None => try_pair!(read_file(abs, MAX_READ_BYTES).await),
     };
     Ok((Some(lua.create_buffer(bytes)?), None))
+}
+
+fn page_query(opts: Option<&Table>) -> LuaResult<PageQuery> {
+    let Some(opts) = opts else {
+        return Ok(PageQuery::default());
+    };
+    Ok(PageQuery {
+        offset: opts.opt("offset")?.unwrap_or(1),
+        limit: opts.opt::<u64>("limit")?.filter(|l| *l > 0),
+        max_line_bytes: opts.opt_nonzero("max_line_bytes")?,
+        count: opts.opt_bool("count").unwrap_or(true),
+    })
 }
 
 /// Read a page of lines from the file at {path}, holding only that page, and
@@ -496,12 +162,13 @@ async fn read_bytes(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
 #[lua_fn(guard = FsRead)]
 async fn read_lines(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
     let abs = try_pair!(make_absolute(&path));
-    let query = PageQuery::from_opts(opts.as_ref())?;
+    let query = page_query(opts.as_ref())?;
+    let backend = resolve_backend(&lua);
     let (lines, total) = try_pair!(
-        spawn_blocking(move || {
-            let reader = BufReader::with_capacity(SCAN_CHUNK, File::open(abs)?);
-            read_line_page(reader, &query)
-        })
+        spawn_blocking(
+            move || backend.read_line_page(&abs, &query, MAX_READ_BYTES)
+                .map_err(|e| e.to_string()),
+        )
         .await
         .map_err(mlua::Error::external)?
     );
@@ -527,20 +194,16 @@ async fn read_lines(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
 #[lua_fn(guard = FsRead)]
 async fn metadata(lua: Lua, path: String) -> LuaResult<Pair<Table>> {
     let abs = try_pair!(make_absolute(&path));
-    match tokio::fs::metadata(&abs).await {
-        Ok(meta) => {
-            let tbl = lua.create_table()?;
-            tbl.set("size", meta.len())?;
-            tbl.set("is_file", meta.is_file())?;
-            tbl.set("is_dir", meta.is_dir())?;
-            if let Ok(modified) = meta.modified()
-                && let Ok(dur) = modified.duration_since(UNIX_EPOCH)
-            {
-                tbl.set("mtime", dur.as_secs_f64())?;
-            }
-            Ok((Some(tbl), None))
-        }
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok((None, None)),
+    let backend = resolve_backend(&lua);
+    let payload = spawn_blocking(move || backend.metadata(&abs))
+        .await
+        .map_err(mlua::Error::external)?;
+    match payload {
+        Ok(v) if v.is_null() => Ok((None, None)),
+        Ok(v) => match json_to_lua(&lua, &v)? {
+            Value::Table(tbl) => Ok((Some(tbl), None)),
+            _ => Ok((Some(lua.create_table()?), None)),
+        },
         Err(e) => Ok(err_pair(e)),
     }
 }
@@ -768,30 +431,17 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
         None => 1,
     };
 
-    let result = spawn_blocking(move || -> Result<Vec<(String, &'static str)>, String> {
-        if !abs.exists() {
-            return Err(format!("dir: path does not exist: {}", abs.display()));
-        }
-        if !abs.is_dir() {
-            return Err(format!("dir: not a directory: {}", abs.display()));
-        }
-        let mut out = Vec::new();
-        let mut visited = HashSet::new();
-        collect_dir_entries(&abs, &abs, 1, max_depth, &mut visited, &mut out);
-        Ok(out)
-    })
-    .await
-    .map_err(mlua::Error::external)?;
-
-    let entries = try_pair!(result);
-    let tbl = lua.create_table()?;
-    for (i, (name, typ)) in entries.iter().enumerate() {
-        let entry = lua.create_table()?;
-        entry.set(1, name.as_str())?;
-        entry.set(2, *typ)?;
-        tbl.set(i + 1, entry)?;
+    let backend = resolve_backend(&lua);
+    let payload = spawn_blocking(move || backend.dir(&abs, max_depth))
+        .await
+        .map_err(mlua::Error::external)?;
+    match payload {
+        Ok(payload) => match json_to_lua(&lua, &payload)? {
+            Value::Table(tbl) => Ok((Some(tbl), None)),
+            _ => Ok((Some(lua.create_table()?), None)),
+        },
+        Err(e) => Ok(err_pair(e)),
     }
-    Ok((Some(tbl), None))
 }
 
 /// Write {content} to the file at {path}, creating it if it does not exist
@@ -804,11 +454,15 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 /// local ok, err = maki.fs.write("out.txt", "hello world")
 /// if err then print("write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn write(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
+async fn write(lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
     let content = bytes_arg(&content, "fs.write")?;
     let abs = try_pair!(make_absolute(&path));
-    let result = tokio::fs::write(&abs, content).await;
-    Ok(pair(touched(abs, result).await.map(|()| true)))
+    let written = abs.clone();
+    let backend = resolve_backend(&lua);
+    let result = spawn_blocking(move || backend.write(&abs, &content))
+        .await
+        .map_err(mlua::Error::external)?;
+    Ok(pair(touched(written, result).await.map(|()| true)))
 }
 
 /// Append {content} to the file at {path}, creating it (but not its parent
@@ -821,20 +475,14 @@ async fn write(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>>
 /// local ok, err = maki.fs.append("out.log", "line\n")
 /// if err then print("append failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn append(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
+async fn append(lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
     let content = bytes_arg(&content, "fs.append")?;
     let abs = try_pair!(make_absolute(&path));
     let appended = abs.clone();
-    let result = spawn_blocking(move || {
-        use std::io::Write;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&abs)
-            .and_then(|mut f| f.write_all(&content))
-    })
-    .await
-    .map_err(mlua::Error::external)?;
+    let backend = resolve_backend(&lua);
+    let result = spawn_blocking(move || backend.append(&abs, &content))
+        .await
+        .map_err(mlua::Error::external)?;
     Ok(pair(touched(appended, result).await.map(|()| true)))
 }
 
@@ -849,11 +497,12 @@ async fn append(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>
 /// local ok, err = maki.fs.atomic_write("state.json", encoded)
 /// if err then print("atomic write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn atomic_write(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
+async fn atomic_write(lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
     let content = bytes_arg(&content, "fs.atomic_write")?;
     let abs = try_pair!(make_absolute(&path));
     let written = abs.clone();
-    let result = spawn_blocking(move || maki_storage::atomic_write(&abs, &content))
+    let backend = resolve_backend(&lua);
+    let result = spawn_blocking(move || backend.atomic_write(&abs, &content))
         .await
         .map_err(mlua::Error::external)?;
     Ok(pair(touched(written, result).await.map(|()| true)))
@@ -872,7 +521,7 @@ async fn atomic_write(_lua: Lua, path: String, content: Value) -> LuaResult<Pair
 /// if err then print("rm failed: " .. err) end
 /// maki.fs.rm("stale_dir", { recursive = true, force = true })
 #[lua_fn(guard = FsWrite)]
-async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+async fn rm(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
     let abs = try_pair!(make_absolute(&path));
     let recursive = opts
         .as_ref()
@@ -883,25 +532,12 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
         .and_then(|t| t.opt_bool("force"))
         .unwrap_or(false);
     let removed = abs.clone();
-    let result = spawn_blocking(move || -> IoResult<()> {
-        let meta = match std::fs::symlink_metadata(&abs) {
-            Ok(m) => m,
-            Err(e) if force && e.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        if meta.is_dir() {
-            if recursive {
-                std::fs::remove_dir_all(&abs)
-            } else {
-                std::fs::remove_dir(&abs)
-            }
-        } else {
-            match std::fs::remove_file(&abs) {
-                Ok(()) => Ok(()),
-                Err(e) if meta.file_type().is_symlink() => std::fs::remove_dir(&abs).map_err(|_| e),
-                Err(e) => Err(e),
-            }
+    let backend = resolve_backend(&lua);
+    let result = spawn_blocking(move || {
+        if force && !backend.exists(&abs)? {
+            return Ok(());
         }
+        backend.remove(&abs, recursive)
     })
     .await
     .map_err(mlua::Error::external)?;
@@ -919,12 +555,17 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
 /// local ok, err = maki.fs.rename("out.log", "out.log.1")
 /// if err then print("rename failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn rename(_lua: Lua, from: String, to: String) -> LuaResult<Pair<bool>> {
+async fn rename(lua: Lua, from: String, to: String) -> LuaResult<Pair<bool>> {
     let from = try_pair!(make_absolute(&from));
     let to = try_pair!(make_absolute(&to));
-    let result = tokio::fs::rename(&from, &to).await;
-    let result = touched(from, result).await;
-    Ok(pair(touched(to, result).await.map(|()| true)))
+    let from_t = from.clone();
+    let to_t = to.clone();
+    let backend = resolve_backend(&lua);
+    let result = spawn_blocking(move || backend.rename(&from, &to))
+        .await
+        .map_err(mlua::Error::external)?;
+    let result = touched(from_t, result).await;
+    Ok(pair(touched(to_t, result).await.map(|()| true)))
 }
 
 /// Create the directory at {path}. Set `parents = true` to create
@@ -936,18 +577,18 @@ async fn rename(_lua: Lua, from: String, to: String) -> LuaResult<Pair<bool>> {
 /// @example
 /// maki.fs.mkdir("a/b/c", { parents = true })
 #[lua_fn(guard = FsWrite)]
-async fn mkdir(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+async fn mkdir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
     let abs = try_pair!(make_absolute(&path));
     let parents = opts
         .as_ref()
         .and_then(|t| t.opt_bool("parents"))
         .unwrap_or(false);
-    let result = if parents {
-        tokio::fs::create_dir_all(&abs).await
-    } else {
-        tokio::fs::create_dir(&abs).await
-    };
-    Ok(pair(touched(abs, result).await.map(|()| true)))
+    let created = abs.clone();
+    let backend = resolve_backend(&lua);
+    let result = spawn_blocking(move || backend.mkdir(&abs, parents))
+        .await
+        .map_err(mlua::Error::external)?;
+    Ok(pair(touched(created, result).await.map(|()| true)))
 }
 
 /// The path {path} really names, for the prefix match the file index picks
@@ -1070,40 +711,16 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
     let sort = opts.as_ref().and_then(|t| t.get::<String>("sort").ok());
     let sort_mtime = sort.as_deref() == Some("mtime");
 
+    let backend = resolve_backend(&lua);
     let result: Result<Vec<String>, String> = spawn_blocking(move || {
-        let root = maki_agent::tools::resolve_search_path(path.as_deref())?;
-        let pattern_refs: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
-
-        let walker = maki_agent::tools::walk_builder_opts(&root, &pattern_refs, gitignore)?.build();
-
-        let iter = walker
-            .flatten()
-            .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()));
-
-        let paths: Vec<String> = if sort_mtime {
-            let mut entries: Vec<_> = iter
-                .filter_map(|e| {
-                    let p = e.into_path();
-                    let mt = maki_agent::tools::mtime(&p);
-                    p.to_str().map(|s| (mt, s.to_owned()))
-                })
-                .collect();
-            entries.sort_unstable_by_key(|e| Reverse(e.0));
-            if let Some(lim) = limit {
-                entries.truncate(lim);
-            }
-            entries.into_iter().map(|(_, s)| s).collect()
-        } else {
-            let bounded: Box<dyn Iterator<Item = _>> = match limit {
-                Some(lim) => Box::new(iter.take(lim)),
-                None => Box::new(iter),
-            };
-            bounded
-                .filter_map(|e| e.into_path().to_str().map(|s| s.to_owned()))
-                .collect()
-        };
-
-        Ok(paths)
+        let root = maki_fs::search::resolve_search_path(path.as_deref())?;
+        let paths = backend
+            .glob(Path::new(&root), &patterns, gitignore, sort_mtime, limit)
+            .map_err(|e| e.to_string())?;
+        Ok(paths
+            .into_iter()
+            .filter_map(|p| p.to_str().map(|s| s.to_owned()))
+            .collect())
     })
     .await
     .map_err(mlua::Error::external)?;
@@ -1137,7 +754,7 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
 /// end
 #[lua_fn(guard = FsRead)]
 async fn grep(lua: Lua, pattern: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
-    let mut params = maki_agent::tools::grep::GrepParams::new(pattern);
+    let mut params = GrepParams::new(pattern);
     if let Some(ref opts) = opts {
         if let Ok(v) = opts.get::<String>("path") {
             params.path = Some(v);
@@ -1159,15 +776,16 @@ async fn grep(lua: Lua, pattern: String, opts: Option<Table>) -> LuaResult<Pair<
         }
     }
 
-    let result = spawn_blocking(move || maki_agent::tools::grep::grep_search(params))
-        .await
-        .map_err(mlua::Error::external)?;
-
-    let (base, entries) = try_pair!(result);
+    let backend = resolve_backend(&lua);
+    let entries = try_pair!(
+        spawn_blocking(move || backend.grep(params).map_err(|e| e.to_string()))
+            .await
+            .map_err(mlua::Error::external)?
+    );
     let arr = lua.create_table()?;
     for (i, entry) in entries.iter().enumerate() {
         let etbl = lua.create_table()?;
-        etbl.set("path", base.join(&entry.path).to_string_lossy().as_ref())?;
+        etbl.set("path", entry.path.as_str())?;
         let groups_tbl = lua.create_table()?;
         for (gi, group) in entry.groups.iter().enumerate() {
             let gtbl = lua.create_table()?;
@@ -1257,7 +875,7 @@ fn search_root(path: Option<&str>, base: &Path) -> Result<PathBuf, String> {
     let Some(path) = path else {
         return Ok(base.to_path_buf());
     };
-    let resolved = maki_agent::tools::resolve_search_path(Some(path))?;
+    let resolved = maki_fs::search::resolve_search_path(Some(path))?;
     let root = Path::new(&resolved)
         .canonicalize()
         .map_err(|e| format!("{path}: {e}"))?;
@@ -1491,10 +1109,10 @@ lua_table! {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::OpenOptions;
+    use std::fs::{File, OpenOptions};
     #[cfg(unix)]
     use std::io::Write;
-    use std::io::repeat;
+    use std::io::{Seek, SeekFrom};
     use std::sync::mpsc;
     use std::time::{Duration, Instant, SystemTime};
 
@@ -1511,7 +1129,6 @@ mod tests {
     const REPLACEMENT_CONTENT: &str = "replacement";
     const FS_WRITE_PERMISSION: &str = "fs_write";
     const READ_LIMIT_ERROR: &str = "file exceeds the 67108864-byte read limit";
-    const TEST_READ_LIMIT: u64 = 4;
     const TEST_PLUGIN: &str = "test";
 
     const OUTPUT_LIMITS_SRC: &str = include_str!("../../../plugins/lib/maki/output_limits.lua");
@@ -1558,162 +1175,6 @@ mod tests {
         }
     }
 
-    const CUT: u64 = 5;
-    const PAGE_LOG: &str = "l1\nl2\nl3\nl4\nl5\n";
-    const PAGE_LOG_LINES: u64 = 5;
-
-    fn small_reader(content: &[u8]) -> BufReader<&[u8]> {
-        BufReader::with_capacity(SMALL_TAIL_CHUNK, content)
-    }
-
-    fn cut_query() -> PageQuery {
-        PageQuery {
-            max_line_bytes: Some(CUT),
-            ..PageQuery::default()
-        }
-    }
-
-    #[test]
-    fn next_line_caps_max_bytes_at_the_read_limit() {
-        let mut huge_line = BufReader::new(repeat(b'x').take(MAX_READ_BYTES + 1));
-        let line = next_line(&mut huge_line, Some(u64::MAX), false)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            line.text.len() as u64,
-            MAX_READ_BYTES + LINE_CUT_MARKER.len() as u64
-        );
-    }
-
-    #[test_case("", &[]; "empty")]
-    #[test_case("a\nb", &["a", "b"]; "unterminated_last_line")]
-    #[test_case("a\nb\n", &["a", "b"]; "trailing_newline")]
-    #[test_case("\n\n\n", &["", "", ""]; "blank_lines")]
-    #[test_case("a\r\nb\r\n", &["a", "b"]; "crlf")]
-    #[test_case("a\r", &["a"]; "unterminated_cr")]
-    #[test_case("hello\r\n", &["hello"]; "exact_fit_before_crlf")]
-    #[test_case("hello world\nnext", &["hello...", "next"]; "cut_skips_the_rest_of_the_line")]
-    #[test_case("caf\u{e9}!", &["caf\u{e9}..."]; "cut_after_a_multibyte_char")]
-    #[test_case("ab\u{1f389}", &["ab..."]; "cut_inside_a_multibyte_char")]
-    fn read_line_page_splits_and_cuts_lines(content: &str, expected: &[&str]) {
-        let (lines, total) =
-            read_line_page(small_reader(content.as_bytes()), &cut_query()).unwrap();
-        assert_eq!(lines, expected);
-        assert_eq!(total, Some(expected.len() as u64));
-    }
-
-    #[test_case(1, None, &["l1", "l2", "l3", "l4", "l5"]; "whole_file")]
-    #[test_case(2, Some(2), &["l2", "l3"]; "window")]
-    #[test_case(0, Some(1), &["l1"]; "offset_zero_starts_at_the_first_line")]
-    #[test_case(4, Some(10), &["l4", "l5"]; "limit_past_the_end")]
-    #[test_case(9, Some(1), &[]; "offset_past_the_end")]
-    fn read_line_page_counts_every_line(offset: u64, limit: Option<u64>, expected: &[&str]) {
-        let query = PageQuery {
-            offset,
-            limit,
-            ..PageQuery::default()
-        };
-        let (lines, total) = read_line_page(small_reader(PAGE_LOG.as_bytes()), &query).unwrap();
-        assert_eq!(lines, expected);
-        assert_eq!(total, Some(PAGE_LOG_LINES));
-    }
-
-    #[test]
-    fn read_line_page_without_count_stops_after_the_page() {
-        let mut reader = small_reader(PAGE_LOG.as_bytes());
-        let query = PageQuery {
-            offset: 2,
-            limit: Some(1),
-            count: false,
-            ..PageQuery::default()
-        };
-        let (lines, total) = read_line_page(&mut reader, &query).unwrap();
-        assert_eq!(lines, ["l2"]);
-        assert_eq!(total, None);
-        let next = next_line(&mut reader, None, false)
-            .unwrap()
-            .map(|line| line.text);
-        assert_eq!(next.as_deref(), Some("l3"));
-    }
-
-    /// The length a cut line had leaves out its line ending, the same way
-    /// the text of a whole line does.
-    #[test_case("abcdefgh\n", 8; "cut_line")]
-    #[test_case("abcdefgh\r\n", 8; "cut_crlf_line")]
-    #[test_case("abcdefgh", 8; "cut_line_at_eof")]
-    #[test_case("abc\r\n", 3; "whole_crlf_line")]
-    fn next_line_reports_the_uncut_length(content: &str, expected: u64) {
-        let line = next_line(&mut small_reader(content.as_bytes()), Some(4), false)
-            .unwrap()
-            .unwrap();
-        assert_eq!(line.bytes, expected);
-    }
-
-    /// Fails its second read with `Interrupted`, which a reader must retry.
-    struct InterruptedOnce<R> {
-        inner: R,
-        reads: usize,
-    }
-
-    impl<R: Read> Read for InterruptedOnce<R> {
-        fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-            self.reads += 1;
-            if self.reads == 2 {
-                return Err(IoError::from(ErrorKind::Interrupted));
-            }
-            self.inner.read(buf)
-        }
-    }
-
-    #[test]
-    fn next_line_retries_an_interrupted_skip() {
-        const CHUNK: usize = 4;
-        let inner = InterruptedOnce {
-            inner: &b"abcdefgh\nnext\n"[..],
-            reads: 0,
-        };
-        let mut reader = BufReader::with_capacity(CHUNK, inner);
-        let cut = next_line(&mut reader, Some(2), false).unwrap().unwrap();
-        assert_eq!((cut.text.as_str(), cut.bytes), ("ab...", 8));
-        let next = next_line(&mut reader, Some(2), false).unwrap().unwrap();
-        assert_eq!(next.bytes, 4);
-    }
-
-    #[test_case(b"a\xffb\n", "a\u{FFFD}b"; "whole_line")]
-    #[test_case(b"\xffa\xc3\xa9b\n", "\u{FFFD}a..."; "cut_through_a_char")]
-    fn next_line_lossy_replaces_non_utf8(content: &[u8], expected: &str) {
-        let line = next_line(&mut small_reader(content), Some(3), true)
-            .unwrap()
-            .unwrap();
-        assert_eq!(line.text, expected);
-    }
-
-    #[test_case(b"ok\xff\n"; "inside_the_kept_bytes")]
-    #[test_case(b"ab\xffcdefgh\n"; "inside_a_cut_line")]
-    fn read_line_page_rejects_non_utf8(content: &[u8]) {
-        let err = read_line_page(small_reader(content), &cut_query()).unwrap_err();
-        assert_eq!(err.to_string(), NON_UTF8_CONTENT_ERR);
-    }
-
-    #[test]
-    fn read_line_page_charges_empty_lines_against_the_read_limit() {
-        let over_the_limit = MAX_READ_BYTES / size_of::<String>() as u64 + 1;
-        let empty_lines = BufReader::new(repeat(b'\n').take(over_the_limit));
-        let err = read_line_page(empty_lines, &PageQuery::default()).unwrap_err();
-        assert_eq!(err.to_string(), READ_LIMIT_ERROR);
-    }
-
-    #[test]
-    fn read_line_page_cuts_a_line_bigger_than_the_read_limit() {
-        let huge_line = || BufReader::new(repeat(b'x').take(MAX_READ_BYTES * 2));
-
-        let (lines, total) = read_line_page(huge_line(), &cut_query()).unwrap();
-        assert_eq!(lines, ["x".repeat(CUT as usize) + LINE_CUT_MARKER]);
-        assert_eq!(total, Some(1));
-
-        let err = read_line_page(huge_line(), &PageQuery::default()).unwrap_err();
-        assert_eq!(err.to_string(), READ_LIMIT_ERROR);
-    }
     // Sparse files keep these oversized-file tests cheap on Unix filesystems.
     #[cfg(unix)]
     #[test_case("read"; "text")]
@@ -1733,29 +1194,6 @@ mod tests {
             f.call_async(path.to_str().unwrap()).await.unwrap();
         assert_eq!(value, Value::Nil);
         assert_eq!(err.as_deref(), Some(READ_LIMIT_ERROR));
-    }
-
-    #[test_case(b""; "empty")]
-    #[test_case(b"abc"; "below_limit")]
-    #[test_case(b"abcd"; "at_limit")]
-    #[tokio::test]
-    async fn bounded_read_accepts_contents_within_limit(contents: &[u8]) {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("bounded");
-        std::fs::write(&path, contents).unwrap();
-
-        let bytes = read_file(path, TEST_READ_LIMIT).await.unwrap();
-        assert_eq!(bytes, contents);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bounded_read_limits_stream_with_zero_reported_size() {
-        let path = PathBuf::from("/dev/zero");
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
-
-        let err = read_file(path, TEST_READ_LIMIT).await.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::FileTooLarge);
     }
 
     #[test_case(b""; "empty")]
@@ -1894,8 +1332,9 @@ mod tests {
         let file = tmp.path().join("log.txt");
         std::fs::write(&file, content).unwrap();
 
-        let text = super::read_line_window(&file, offset, limit, chunk_size).unwrap();
-        assert_eq!(text, expected);
+        let bytes = maki_fs::window::read_line_window(&file, offset, limit, MAX_READ_BYTES, chunk_size)
+            .unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), expected);
     }
 
     #[cfg(unix)]

@@ -1,5 +1,6 @@
 pub mod agent_autocmd;
 mod api;
+mod backend;
 mod background;
 pub mod chunks;
 pub mod docs;
@@ -39,13 +40,13 @@ pub use api::util::command::{
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
-pub use jobs::set_shell_preference;
 pub use key::{Key, PASTE, RESERVED_KEYS, is_reserved};
 pub use key_lint::KEY_WARNING;
 pub use loader::{
     EventHandle, InitFiles, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING,
 };
 pub use maki_agent::SessionEndReason;
+pub use maki_agent::fs_backend::set_shell_preference;
 pub use pack::{
     DeleteTarget, DiscoveredPackage, Discovery, InstallReport, Interaction, MANAGED_GROUP, Origin,
     PackCommand, PackContext, PackPlan, PackPreparation, PackReport, PlannedOp, UpdateOptions,
