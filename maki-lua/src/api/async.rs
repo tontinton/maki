@@ -12,6 +12,7 @@ use crate::runtime::{TaskHandle, enqueue_async_task, lock_cell, register_cancel_
 
 const AWAIT_MIN_ARGS: usize = 2;
 const PERMIT_RELEASED_ERR: &str = "permit already released";
+const SLEEP_NEGATIVE_ERR: &str = "maki.async.sleep: ms must be >= 0";
 
 /// Cancel-aware counting semaphore. Permits release on `:release()` or gc.
 struct LuaSemaphore {
@@ -128,7 +129,8 @@ fn run(lua: &Lua, r#fn: Function, on_finish: Option<Function>) -> LuaResult<()> 
 /// cancelled/timeout error. Mark it `is_error = true` and end it with a
 /// marker, so the model knows the output it gets is cut short.
 ///
-/// The callback runs outside your coroutine, so it must not yield. It
+/// The callback runs on its own coroutine on the runtime executor, outside
+/// your handler's stack, so it may await host calls (`ctx:finish`). It
 /// fires at most once, immediately if the task is already cancelled. An
 /// error inside it is logged and never reaches your handler, and the
 /// other hooks still run.
@@ -196,23 +198,32 @@ async fn gather(lua: Lua, fns: Table) -> LuaResult<Table> {
     Ok(out)
 }
 
-/// Suspend the calling task for {ms} milliseconds. The plugin thread is
-/// never blocked, so other tasks and the UI keep running, and a cancel
-/// still lands while you sleep.
+/// Suspend the current coroutine for {ms} milliseconds. The timer runs on
+/// the async executor, so nothing spins and other tasks keep running.
+/// Cancelling the owning task interrupts the sleep with the cancel error.
 ///
 /// For a timer that has to outlive the tool call that started it, such
 /// as a toast dismissing itself, use `maki.defer_fn`.
 ///
-/// @param ms integer Milliseconds to sleep.
-/// @return
+/// @param ms integer Milliseconds to wait. Must be >= 0.
 /// @example
 /// maki.async.run(function()
-///   maki.async.sleep(4000)
-///   win:close()
+///   maki.async.sleep(250)
+///   retry()
 /// end)
 #[lua_fn]
-async fn sleep(_lua: Lua, ms: u64) -> LuaResult<()> {
-    smol::Timer::after(Duration::from_millis(ms)).await;
+async fn sleep(lua: Lua, ms: i64) -> LuaResult<()> {
+    if ms < 0 {
+        return Err(mlua::Error::runtime(SLEEP_NEGATIVE_ERR));
+    }
+    let cancel = lua
+        .app_data_ref::<TaskHandle>()
+        .map(|h| lock_cell(&h).cancel.clone())
+        .unwrap_or_else(CancelToken::none);
+    cancel
+        .race(smol::Timer::after(Duration::from_millis(ms as u64)))
+        .await
+        .map_err(mlua::Error::runtime)?;
     Ok(())
 }
 
@@ -434,7 +445,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::runtime::{CANCELLED_MSG, TaskCell, TaskScope, block_on_or_fail};
+    use crate::runtime::{CANCELLED_MSG, DispatchExGuard, TaskCell, TaskScope, block_on_or_fail};
 
     const ERR_TOO_FEW_ARGS: &str = "maki.async.await requires at least 2 arguments: argc, fun, ...";
     const ERR_ARGC_GE_1: &str = "argc must be >= 1";
@@ -747,8 +758,17 @@ mod tests {
     const HOOK_RAW_YIELD: &str = "coroutine.yield()";
     const HOOK_AWAIT: &str = "async_tbl.await(1, function() end)";
     const HOOK_LATE_MSG: &str = "the hook must fire while the wait is still parked, not after it";
-    const HOOK_SURVIVED_MSG: &str = "a hook that waits from outside its coroutine must fail there";
+    const HOOK_SETTLE_MSG: &str = "the waiting hook must settle exactly as far as its body allows";
     const TASK_SURVIVED_MSG: &str = "the task must keep working after a hook blew up";
+    /// Cheap polling of a flag another executor task sets; bounded by the
+    /// wake timeout, never by a sleep assumption.
+    const FLAG_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+    async fn wait_for_flag(lua: &Lua, name: &str) {
+        while !lua.globals().get::<bool>(name).unwrap() {
+            smol::Timer::after(FLAG_POLL_INTERVAL).await;
+        }
+    }
 
     fn install_notify(lua: &Lua) -> flume::Receiver<()> {
         let (fired_tx, fired_rx) = flume::bounded(1);
@@ -771,14 +791,17 @@ mod tests {
     }
 
     /// The composition `plugins/batch` leans on, and the one thing the
-    /// runtime's own hook tests cannot show: the handler is parked deep inside
-    /// a real `gather` whose child never finishes, so the hook runs on a VM
-    /// whose coroutine is suspended. Waiting from there is a plugin bug, raw
-    /// or through `maki.async`, and neither may cost the hooks behind it nor
-    /// the task's own result.
-    #[test_case(HOOK_RAW_YIELD ; "raw_yield")]
-    #[test_case(HOOK_AWAIT ; "awaiting")]
-    fn on_cancel_hook_fires_while_gather_is_still_parked(bad_hook_body: &str) {
+    /// runtime's own hook tests cannot show: the handler is parked deep
+    /// inside a real `gather` whose child never finishes, so the hook fires
+    /// while the task's coroutine is suspended. Deliveries race on the
+    /// runtime executor, so a hook that waits — raw yield or `maki.async`
+    /// await, even one parked forever — must not cost the hooks behind it
+    /// nor the task's own result.
+    #[test_case(HOOK_RAW_YIELD, true ; "raw_yield")]
+    #[test_case(HOOK_AWAIT, false ; "awaiting")]
+    fn on_cancel_hook_fires_while_gather_is_still_parked(bad_hook_body: &str, settles: bool) {
+        let guard = DispatchExGuard::install();
+        let ex = guard.ex();
         let (lua, _tbl) = setup();
         let (trigger, scope) = live_scope(&lua);
         let fired_rx = install_notify(&lua);
@@ -798,7 +821,7 @@ mod tests {
             "#
         );
 
-        let vals: Vec<Value> = block_on_or_fail(or(
+        let vals: Vec<Value> = block_on_or_fail(ex.run(or(
             scope.scope_future(lua.load(&code).eval_async::<MultiValue>()),
             async {
                 trigger.cancel();
@@ -807,14 +830,13 @@ mod tests {
                     !lua.globals().get::<bool>("gather_returned").unwrap(),
                     "{HOOK_LATE_MSG}"
                 );
-                assert!(
-                    !lua.globals().get::<bool>("bad_hook_finished").unwrap(),
-                    "{HOOK_SURVIVED_MSG}"
-                );
+                if settles {
+                    wait_for_flag(&lua, "bad_hook_finished").await;
+                }
                 lua.load(RELEASE_PARKED_CHILD).exec().unwrap();
                 std::future::pending().await
             },
-        ))
+        )))
         .unwrap()
         .into_vec();
 
@@ -823,6 +845,11 @@ mod tests {
             vals[1].as_string().unwrap().to_string_lossy(),
             CHILD_VALUE,
             "{TASK_SURVIVED_MSG}"
+        );
+        assert_eq!(
+            lua.globals().get::<bool>("bad_hook_finished").unwrap(),
+            settles,
+            "{HOOK_SETTLE_MSG}"
         );
     }
 
@@ -864,5 +891,67 @@ mod tests {
             err.contains(CANCELLED_MSG),
             "expected error containing {CANCELLED_MSG:?}, got: {err}"
         );
+    }
+
+    #[test_case(-1; "negative_ms")]
+    fn sleep_validation(ms: i64) {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            let err = lua
+                .load(format!("return async_tbl.sleep({ms})"))
+                .eval_async::<Value>()
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(SLEEP_NEGATIVE_ERR),
+                "expected error containing {SLEEP_NEGATIVE_ERR:?}, got: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn sleep_suspends_for_the_requested_duration() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            let began = std::time::Instant::now();
+            lua.load("async_tbl.sleep(30)").exec_async().await.unwrap();
+            assert!(
+                began.elapsed() >= Duration::from_millis(30),
+                "sleep(30) returned early after {:?}",
+                began.elapsed()
+            );
+        });
+    }
+
+    #[test]
+    fn sleep_observes_caller_cancel() {
+        smol::block_on(async {
+            let (lua, _tbl) = setup();
+            let (trigger, token) = CancelToken::new();
+            trigger.cancel();
+            lua.set_app_data::<TaskHandle>(Arc::new(Mutex::new(TaskCell::new(token, None, None))));
+
+            let code = r#"
+                local ok, err = pcall(async_tbl.sleep, 60_000)
+                return ok, tostring(err)
+            "#;
+            let vals: Vec<Value> = lua
+                .load(code)
+                .eval_async::<MultiValue>()
+                .await
+                .unwrap()
+                .into_vec();
+
+            assert!(
+                !vals[0].as_boolean().unwrap(),
+                "a cancelled sleep must not complete"
+            );
+            let err = vals[1].as_string().unwrap().to_string_lossy();
+            assert!(
+                err.contains(CANCELLED_MSG),
+                "expected error containing {CANCELLED_MSG:?}, got: {err}"
+            );
+        });
     }
 }
