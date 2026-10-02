@@ -1345,6 +1345,20 @@ fn executable(_lua: &Lua, name: String) -> LuaResult<i32> {
     Ok(if found { 1 } else { 0 })
 }
 
+/// Whether maki runs on Windows. The compile-time OS the host was built
+/// for, which is also what decides the shell `jobstart` string commands
+/// run through (`bash -c` vs `cmd /C`).
+///
+/// @return (boolean) True on Windows.
+/// @example
+/// if maki.fn.os_is_windows() then
+///   maki.log.info("windows-specific path")
+/// end
+#[lua_fn]
+fn os_is_windows(_lua: &Lua) -> LuaResult<bool> {
+    Ok(cfg!(windows))
+}
+
 /// Read the viewport of the focused chat transcript, like Neovim's
 /// `vim.fn.winsaveview()`. The transcript is the only scrollable window
 /// maki has, so there is no window argument.
@@ -1416,7 +1430,7 @@ lua_table! {
         jobstart(perms, plugin, fs_write), jobstop(perms, plugin), jobforget(perms, plugin),
         jobwait(perms, plugin), jobinfo(perms, plugin), joblist(perms, plugin),
         jobattach(perms, plugin), jobfind(perms, plugin),
-        executable(perms),
+        executable(perms), os_is_windows(),
         winsaveview(tx), winrestview(tx),
     ]
 }

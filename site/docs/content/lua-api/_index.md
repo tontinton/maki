@@ -2282,6 +2282,28 @@ end
 
 ---
 
+### `maki.fn.os_is_windows()` {#maki-fn-os_is_windows}
+
+```lua
+maki.fn.os_is_windows()
+```
+
+Whether maki runs on Windows. The compile-time OS the host was built
+for, which is also what decides the shell `jobstart` string commands
+run through (`bash -c` vs `cmd /C`).
+
+**Returns:** (`boolean`) True on Windows.
+
+**Example:**
+
+```lua
+if maki.fn.os_is_windows() then
+  maki.log.info("windows-specific path")
+end
+```
+
+---
+
 ### `maki.fn.winsaveview()` {#maki-fn-winsaveview}
 
 ```lua

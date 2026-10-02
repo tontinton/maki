@@ -30,20 +30,6 @@ local function unquote(s)
   return s
 end
 
-local function parse_cd_hint(input)
-  if input.workdir then
-    return input.command, input.workdir
-  end
-  local rest = input.command:match("^cd%s+(.+)$")
-  if rest then
-    local dir, tail = rest:match("^(.-)%s+&&%s+(.+)$")
-    if dir and dir ~= "" then
-      return tail, unquote(dir)
-    end
-  end
-  return input.command, nil
-end
-
 local function normalize_sep(s)
   return s:gsub("\\", "/")
 end
@@ -273,7 +259,90 @@ local opts = maki.api.register_options(output_limits.extend({
     min = 5,
     desc = "Kill the command after this many seconds. A call's `timeout` param overrides it.",
   },
+  git_bash_path = {
+    default = "",
+    type = "string",
+    desc = "Windows only. Git Bash install to run string commands through. Empty probes the standard install locations, and cmd.exe is the fallback when none exists.",
+  },
 }))
+
+-- PATH's bash.exe is often the WSL stub, so probe the standard Git for
+-- Windows install locations; nonstandard installs set `git_bash_path`.
+-- When none is found, commands fall back to cmd.exe.
+local IS_WINDOWS = maki.fn.os_is_windows()
+local resolve_git_bash
+
+if IS_WINDOWS then
+  local probed = false
+  local git_bash
+  local BASH_CANDIDATES = {
+    "C:/Program Files/Git/bin/bash.exe",
+    "C:/Program Files (x86)/Git/bin/bash.exe",
+  }
+
+  local function find_git_bash()
+    local configured = opts.git_bash_path
+    if configured ~= "" and maki.fn.executable(configured) == 1 then
+      return configured
+    end
+    for _, candidate in ipairs(BASH_CANDIDATES) do
+      if maki.fn.executable(candidate) == 1 then
+        if configured ~= "" then
+          maki.log.warn(("git_bash_path %q is not executable, using %s instead"):format(configured, candidate))
+        end
+        return candidate
+      end
+    end
+    if configured ~= "" then
+      local msg = "git_bash_path %q is not executable and no standard Git Bash found, falling back to cmd.exe"
+      maki.log.warn(msg:format(configured))
+    else
+      maki.log.warn("no Git Bash found, falling back to cmd.exe")
+    end
+    return nil
+  end
+
+  resolve_git_bash = function()
+    if not probed then
+      probed = true
+      git_bash = find_git_bash()
+    end
+    return git_bash
+  end
+else
+  resolve_git_bash = function()
+    return nil
+  end
+end
+
+local function shell_argv(command)
+  local bash_exe = resolve_git_bash()
+  if bash_exe then
+    return { bash_exe, "-c", command }
+  end
+  return command
+end
+
+-- With Git Bash the `cd` stays in the command and bash resolves the path
+-- itself; extracting the hint would push a possibly-POSIX dir through the
+-- native cwd option. Everywhere else the leading `cd dir &&` is lifted out
+-- into the cwd option.
+local function parse_cd_hint(input)
+  if input.workdir then
+    return input.command, input.workdir
+  end
+  if resolve_git_bash() then
+    return input.command, nil
+  end
+  local rest = input.command:match("^cd%s+(.+)$")
+  if rest then
+    local dir, tail = rest:match("^(.-)%s+&&%s+(.+)$")
+    if dir and dir ~= "" then
+      return tail, unquote(dir)
+    end
+  end
+  return input.command, nil
+end
 
 maki.api.register_tool({
   name = "bash",
@@ -431,7 +500,7 @@ maki.api.register_tool({
 
     view:append({ { "Waiting for output...", "dim" } })
 
-    local job, err = maki.fn.jobstart(command, {
+    local job, err = maki.fn.jobstart(shell_argv(command), {
       cwd = workdir,
       env = { GIT_TERMINAL_PROMPT = "0" },
       on_stdout = function(_, line)
