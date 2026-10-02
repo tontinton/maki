@@ -23,6 +23,9 @@ use crate::runtime::{TaskHandle, lock_cell};
 
 const BRIDGE_CLOSED: &str = "tool bridge closed (cancelled)";
 const FILE_OP_DENIED: &str = "not permitted in this sandbox";
+/// A backlog of lines is ready on every recv, so the loop must yield on its
+/// own or a chatty script holds the Lua thread until the watchdog kills it.
+const LINES_PER_YIELD: usize = 256;
 
 type CallResults = Vec<(u32, Result<Value, String>)>;
 type FileResult = Result<String, String>;
@@ -204,9 +207,16 @@ async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<
     });
 
     let recv_loop = async {
+        let mut lines = 0usize;
         while let Ok(msg) = rx.recv_async().await {
             match msg {
-                BridgeMsg::Line(line) => on_output.call::<()>(line)?,
+                BridgeMsg::Line(line) => {
+                    on_output.call::<()>(line)?;
+                    lines += 1;
+                    if lines.is_multiple_of(LINES_PER_YIELD) {
+                        smol::future::yield_now().await;
+                    }
+                }
                 BridgeMsg::Calls(batch, reply) => {
                     let futs = batch.into_iter().map(|pc| {
                         let f = fns.get(&pc.name).cloned();

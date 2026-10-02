@@ -55,15 +55,16 @@ fn get_string_parser(lua: &Lua, source: String, lang: String) -> LuaResult<Pair<
 /// local text = maki.treesitter.get_node_text(node, source)
 /// print(text)
 #[lua_fn]
-fn get_node_text(_lua: &Lua, node: AnyUserData, source: String) -> LuaResult<String> {
+fn get_node_text(lua: &Lua, node: AnyUserData, source: mlua::String) -> LuaResult<mlua::String> {
     let lua_node = node.borrow::<LuaNode>()?;
     let ts = lua_node.ts_node()?;
-    let start = ts.start_byte();
-    let end = ts.end_byte();
-    if end > source.len() {
-        return Err(mlua::Error::runtime("node range exceeds source length"));
-    }
-    Ok(source[start..end].to_owned())
+    // Borrowed, not copied: indexers call this once per node with the whole
+    // file, and a copy per call made big files quadratic.
+    let source = source.as_bytes();
+    let text = source
+        .get(ts.start_byte()..ts.end_byte())
+        .ok_or_else(|| mlua::Error::runtime("node range exceeds source length"))?;
+    lua.create_string(text)
 }
 
 /// Returns the range of {node} as four 0-based integers: start_row, start_col, end_row, end_col.

@@ -1570,12 +1570,17 @@ Suspend the calling task for {ms} milliseconds. The plugin thread is
 never blocked, so other tasks and the UI keep running, and a cancel
 still lands while you sleep.
 
+All plugins share one Lua thread, and code that runs for 5 seconds
+without yielding is stopped with an error. `sleep(0)` yields without
+waiting: it lets every other ready task run once, then carries on. Call
+it every so often in a long loop.
+
 For a timer that has to outlive the tool call that started it, such
 as a toast dismissing itself, use `maki.defer_fn`.
 
 **Parameters:**
 
-- `{ms}` (`integer`) Milliseconds to sleep.
+- `{ms}` (`integer`) Milliseconds to sleep. Zero only yields.
 
 **Example:**
 
@@ -1584,6 +1589,14 @@ maki.async.run(function()
   maki.async.sleep(4000)
   win:close()
 end)
+
+-- A long loop that keeps the rest of maki responsive:
+for i, line in ipairs(lines) do
+  if i % 1000 == 0 then
+    maki.async.sleep(0)
+  end
+  process(line)
+end
 ```
 
 ---

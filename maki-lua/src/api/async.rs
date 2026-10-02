@@ -200,19 +200,37 @@ async fn gather(lua: Lua, fns: Table) -> LuaResult<Table> {
 /// never blocked, so other tasks and the UI keep running, and a cancel
 /// still lands while you sleep.
 ///
+/// All plugins share one Lua thread, and code that runs for 5 seconds
+/// without yielding is stopped with an error. `sleep(0)` yields without
+/// waiting: it lets every other ready task run once, then carries on. Call
+/// it every so often in a long loop.
+///
 /// For a timer that has to outlive the tool call that started it, such
 /// as a toast dismissing itself, use `maki.defer_fn`.
 ///
-/// @param ms integer Milliseconds to sleep.
+/// @param ms integer Milliseconds to sleep. Zero only yields.
 /// @return
 /// @example
 /// maki.async.run(function()
 ///   maki.async.sleep(4000)
 ///   win:close()
 /// end)
+///
+/// -- A long loop that keeps the rest of maki responsive:
+/// for i, line in ipairs(lines) do
+///   if i % 1000 == 0 then
+///     maki.async.sleep(0)
+///   end
+///   process(line)
+/// end
 #[lua_fn]
 async fn sleep(_lua: Lua, ms: u64) -> LuaResult<()> {
-    smol::Timer::after(Duration::from_millis(ms)).await;
+    // A zero timer is ready on its first poll and never hands the thread back.
+    if ms == 0 {
+        smol::future::yield_now().await;
+    } else {
+        smol::Timer::after(Duration::from_millis(ms)).await;
+    }
     Ok(())
 }
 
@@ -864,5 +882,24 @@ mod tests {
             err.contains(CANCELLED_MSG),
             "expected error containing {CANCELLED_MSG:?}, got: {err}"
         );
+    }
+
+    #[test]
+    fn sleep_zero_lets_a_ready_task_run_first() {
+        let (lua, _tbl) = setup();
+        lua.load("order = {}").exec().unwrap();
+        let sleeper = lua
+            .load("table.insert(order, 'before'); async_tbl.sleep(0); table.insert(order, 'after')")
+            .exec_async();
+        let other = lua.load("table.insert(order, 'other')").exec_async();
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(async {
+            let sleeper = ex.spawn(sleeper);
+            let other = ex.spawn(other);
+            sleeper.await.unwrap();
+            other.await.unwrap();
+        }));
+        let order: Vec<String> = lua.load("return order").eval().unwrap();
+        assert_eq!(order, ["before", "other", "after"]);
     }
 }

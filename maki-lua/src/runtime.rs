@@ -1,6 +1,7 @@
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::ffi::c_int;
+use std::ffi::{CStr, c_int};
 use std::future::Future;
 use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
@@ -58,7 +59,7 @@ use crate::api::ui::{HintStore, WinStore};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::util::command::{
     LuaCommandReader, LuaCommandWriter, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
-    UiAttachment, install_ui_attachment,
+    UiAttachment, install_ui_attachment, ui_send,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
@@ -97,6 +98,15 @@ const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// take as long as it needs, while a loop that never yields dies within
 /// one grace.
 pub const KILL_GRACE: Duration = Duration::from_millis(500);
+/// A slice is one poll of a task, the stretch where it holds the one Lua
+/// thread and every plugin, keymap and the UI wait behind it. A slice this
+/// long gets a log line naming the plugin, so its author knows to yield.
+const SLICE_WARN: Duration = Duration::from_secs(1);
+/// A slice this long is raised even with no deadline in sight. A deadline
+/// caps how long a task runs in total, this caps how long it starves the rest.
+const SLICE_KILL: Duration = Duration::from_secs(5);
+const UNKNOWN_PLUGIN: &str = "<unknown>";
+const UNKNOWN_LOCATION: &str = "?";
 /// Wall clock a cancelled handler gets before the host stops waiting for
 /// it. The watchdog alone never ends a task that parks in an await: it
 /// runs no Lua to interrupt and renews its grace at every yield. Long
@@ -630,14 +640,34 @@ enum KillReason {
     Deadline,
 }
 
+/// Why the watchdog raises. Kept apart from [`KillReason`] because a stuck
+/// task is not doomed: once the raise unwinds, nobody has stopped waiting
+/// for its reply, so it gets no cancel hooks and its error is the reply.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kill {
+    Doomed(KillReason),
+    Stuck,
+}
+
+fn stuck_message(plugin: &str) -> String {
+    format!(
+        "plugin {plugin} blocked the Lua thread for {}s without yielding",
+        SLICE_KILL.as_secs()
+    )
+}
+
 /// Lua is single-threaded so this Mutex never contends, but
 /// `Lua::app_data` requires `Send + Sync` with the `send` feature.
 pub(crate) struct TaskCell {
     pub(crate) id: u64,
     pub(crate) cancel: CancelToken,
     /// End of the current [`KILL_GRACE`], armed by the first watchdog poke
-    /// that sees a doomed task and cleared at every yield.
+    /// that sees a doomed or stuck task and cleared at every yield.
     kill_at: Cell<Option<Instant>>,
+    /// `None` while the task is parked in an await.
+    slice_started: Cell<Option<Instant>>,
+    /// The watchdog pokes every 50ms, and a slow slice should log once.
+    slice_warned: Cell<bool>,
     pub(crate) deadline: Cell<Option<Instant>>,
     pub(crate) deadline_secs: Cell<Option<u64>>,
     /// Notified by `ctx:set_deadline`, so [`until_abandoned`] re-arms on the
@@ -681,6 +711,8 @@ impl TaskCell {
             id: NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed),
             cancel,
             kill_at: Cell::new(None),
+            slice_started: Cell::new(None),
+            slice_warned: Cell::new(false),
             deadline: Cell::new(deadline),
             deadline_secs: Cell::new(None),
             deadline_changed: Event::new(),
@@ -713,23 +745,60 @@ impl TaskCell {
     }
 
     /// [`Self::doomed`] gated by [`KILL_GRACE`]: the task is only shot
-    /// once it has burned a whole grace inside one execution slice.
-    fn kill_due(&self, now: Instant) -> Option<KillReason> {
-        let Some(reason) = self.doomed(now) else {
-            self.renew_kill_grace();
-            return None;
+    /// once it has burned a whole grace inside one execution slice. A slice
+    /// past [`SLICE_KILL`] is shot too, doomed or not.
+    fn kill_due(&self, now: Instant) -> Option<Kill> {
+        let kill = match self.doomed(now) {
+            Some(reason) => Kill::Doomed(reason),
+            None if self.held_for(now).is_some_and(|held| held > SLICE_KILL) => Kill::Stuck,
+            None => {
+                self.renew_kill_grace();
+                return None;
+            }
         };
         match self.kill_at.get() {
             Some(kill_at) if now <= kill_at => None,
             // No stamp yet, or the grace just ran out. Either way a slice
             // starts now: a raise is usually caught (a `pcall`, or a
             // `gather` child dying inside its parent's slice) and what
-            // runs next is the cleanup the grace exists for.
+            // runs next is the cleanup the grace exists for. A stuck slice
+            // already had its seconds, so only its catcher gets a grace.
             stamp => {
                 self.kill_at.set(Some(now + KILL_GRACE));
-                stamp.is_some().then_some(reason)
+                (stamp.is_some() || kill == Kill::Stuck).then_some(kill)
             }
         }
+    }
+
+    /// A poll is starting, so the task yielded and earns a fresh grace. A
+    /// poll nested in another poll of this cell keeps the outer start, or
+    /// nesting would hand the task a new budget. Pass the result to
+    /// [`Self::end_slice`].
+    fn begin_slice(&self, now: Instant) -> Option<Instant> {
+        self.renew_kill_grace();
+        let outer = self.slice_started.get();
+        if outer.is_none() {
+            self.slice_started.set(Some(now));
+            self.slice_warned.set(false);
+        }
+        outer
+    }
+
+    fn end_slice(&self, outer: Option<Instant>) {
+        self.slice_started.set(outer);
+    }
+
+    fn held_for(&self, now: Instant) -> Option<Duration> {
+        self.slice_started
+            .get()
+            .map(|started| now.saturating_duration_since(started))
+    }
+
+    /// How long the slice has held the thread, only the first time it is
+    /// past [`SLICE_WARN`].
+    fn slice_warning(&self, now: Instant) -> Option<Duration> {
+        let held = self.held_for(now)?;
+        (held > SLICE_WARN && !self.slice_warned.replace(true)).then_some(held)
     }
 
     /// The task yielded, so its grace starts over: a task parked in an await
@@ -1175,24 +1244,110 @@ unsafe extern "C-unwind" fn watchdog_interrupt(state: *mut ffi::lua_State, gc: c
                 return;
             }
             ffi::lua_pushlstring(state, msg.as_ptr().cast(), msg.len());
-            ffi::lua_error(state);
         }
+        // `lua_error` can jump straight over Rust destructors, and the VM
+        // has its own copy of the message by now.
+        drop(msg);
+        unsafe { ffi::lua_error(state) };
     }
 }
 
-fn interrupt_reason(state: *mut ffi::lua_State) -> Option<&'static str> {
+fn interrupt_reason(state: *mut ffi::lua_State) -> Option<Cow<'static, str>> {
     let lua = unsafe { Lua::get_or_init_from_ptr(state) };
     if lua
         .app_data_ref::<ShutdownFlag>()
         .is_some_and(|f| f.0.load(Ordering::Relaxed))
     {
-        return Some(INTERRUPT_SHUTDOWN_MSG);
+        return Some(INTERRUPT_SHUTDOWN_MSG.into());
     }
-    let handle = lua.app_data_ref::<TaskHandle>()?;
-    Some(match lock_cell(&handle).kill_due(Instant::now())? {
-        KillReason::Cancelled => INTERRUPT_CANCELLED_MSG,
-        KillReason::Deadline => INTERRUPT_DEADLINE_MSG,
+    let now = Instant::now();
+    let (task, warning, kill) = {
+        let handle = lua.app_data_ref::<TaskHandle>()?;
+        let cell = lock_cell(&handle);
+        (cell.id, cell.slice_warning(now), cell.kill_due(now))
+    };
+    if let Some(held) = warning {
+        let blame = Blame::of(lua, state);
+        tracing::warn!(
+            plugin = %blame.plugin,
+            at = %blame.location,
+            task,
+            held_ms = held.as_millis() as u64,
+            kill_after_ms = SLICE_KILL.as_millis() as u64,
+            "plugin is holding the Lua thread, long loops should call maki.async.sleep(0)"
+        );
+    }
+    Some(match kill? {
+        Kill::Doomed(KillReason::Cancelled) => INTERRUPT_CANCELLED_MSG.into(),
+        Kill::Doomed(KillReason::Deadline) => INTERRUPT_DEADLINE_MSG.into(),
+        Kill::Stuck => {
+            let blame = Blame::of(lua, state);
+            let msg = stuck_message(&blame.plugin);
+            tracing::warn!(plugin = %blame.plugin, at = %blame.location, task, "{msg}");
+            if let Some(ui) = lua.app_data_ref::<HostUi>() {
+                let _ = ui_send(ui.0.as_ref(), UiAction::Flash(msg.clone()));
+            }
+            msg.into()
+        }
     })
+}
+
+/// Each plugin's env table by address. Every function a plugin defines shares
+/// that env, so the watchdog can tell whose code is running from the raw
+/// stack alone.
+#[derive(Default)]
+pub(crate) struct PluginEnvs(HashMap<Arc<str>, usize>);
+
+/// Lets the watchdog tell the user which plugin it stopped. It flashes
+/// instead of going through `maki.notify`, because a notify handler is
+/// plugin code too. If that handler were the one stuck, every kill would
+/// call it again and freeze maki for another few seconds, forever.
+struct HostUi(Option<flume::Sender<UiAction>>);
+
+/// Who to name for the code a watchdog interrupt caught running.
+struct Blame {
+    plugin: Arc<str>,
+    location: String,
+}
+
+impl Blame {
+    /// Walks the stack from the innermost frame out. The location is the
+    /// first Lua frame, the plugin the first frame whose env belongs to one.
+    /// Innermost wins, so when plugin A calls a helper from plugin B and the
+    /// helper spins, B gets the blame.
+    fn of(lua: &Lua, state: *mut ffi::lua_State) -> Self {
+        let mut plugin = None;
+        let mut location = None;
+        let envs = lua.app_data_ref::<PluginEnvs>();
+        // Room for the frame's function and its env.
+        if unsafe { ffi::lua_checkstack(state, 2) } != 0 {
+            let mut ar: ffi::lua_Debug = unsafe { std::mem::zeroed() };
+            let mut level = 0;
+            while plugin.is_none()
+                && unsafe { ffi::lua_getinfo(state, level, c"fsl".as_ptr(), &mut ar) } != 0
+            {
+                if location.is_none() && ar.currentline >= 0 {
+                    let src = unsafe { CStr::from_ptr(ar.short_src) }.to_string_lossy();
+                    location = Some(format!("{src}:{}", ar.currentline));
+                }
+                let env = unsafe {
+                    ffi::lua_getfenv(state, -1);
+                    let env = ffi::lua_topointer(state, -1) as usize;
+                    ffi::lua_pop(state, 2);
+                    env
+                };
+                plugin = envs
+                    .as_ref()
+                    .and_then(|envs| envs.0.iter().find(|(_, ptr)| **ptr == env))
+                    .map(|(name, _)| Arc::clone(name));
+                level += 1;
+            }
+        }
+        Self {
+            plugin: plugin.unwrap_or_else(|| Arc::from(UNKNOWN_PLUGIN)),
+            location: location.unwrap_or_else(|| UNKNOWN_LOCATION.to_owned()),
+        }
+    }
 }
 
 /// Scopes a `TaskCell` into `Lua::app_data` for one task, restoring
@@ -1488,7 +1643,7 @@ impl<F: Future> Future for ScopedFuture<F> {
     ) -> std::task::Poll<Self::Output> {
         let this = self.project();
         // A poll means the task yielded, the cooperation the grace rewards.
-        lock_cell(this.handle).renew_kill_grace();
+        let outer_slice = lock_cell(this.handle).begin_slice(Instant::now());
         let prev = this.lua.set_app_data::<TaskHandle>(Arc::clone(this.handle));
         if let Some(wait) = this.cancel_wait.as_mut()
             && wait.as_mut().poll(cx).is_ready()
@@ -1497,6 +1652,7 @@ impl<F: Future> Future for ScopedFuture<F> {
             fire_cancel_hooks(this.lua, this.handle, KillReason::Cancelled);
         }
         let result = this.inner.poll(cx);
+        lock_cell(this.handle).end_slice(outer_slice);
         match prev {
             Some(p) => {
                 this.lua.set_app_data(p);
@@ -2244,6 +2400,8 @@ impl LuaRuntime {
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
         lua.set_app_data(crate::api::top::NotifyHandler::default());
+        lua.set_app_data(PluginEnvs::default());
+        lua.set_app_data(HostUi(ui_action_tx.clone()));
         lua.set_app_data(command_writer);
         lua.set_app_data(PromptHintCallbacks::default());
         lua.set_app_data(PluginOptionSpecs::default());
@@ -2641,6 +2799,9 @@ impl LuaRuntime {
             maki.set("pack", pack).map_err(&map_err)?;
         }
         let env = self.build_env(maki, require_root).map_err(&map_err)?;
+        if let Some(mut envs) = self.lua.app_data_mut::<PluginEnvs>() {
+            envs.0.insert(Arc::clone(&name), env.to_pointer() as usize);
+        }
 
         drop(self.drop_plugin_keys(&name));
         // The one place a name `clear_plugin` tombstoned comes back live, so
@@ -2792,6 +2953,9 @@ impl LuaRuntime {
             queue.cancel_plugin(plugin);
         }
         crate::api::top::clear_notify_handler(&self.lua, plugin);
+        if let Some(mut envs) = self.lua.app_data_mut::<PluginEnvs>() {
+            envs.0.remove(plugin);
+        }
         crate::api::fs::clear_plugin_files(plugin);
         let revision_guard = self.drop_plugin_keys(plugin);
         with_packs(&self.lua, |packs| packs.active.remove(plugin));
@@ -3277,7 +3441,10 @@ fn run_describe(
     // Runs inline on the dispatcher: without its own scope it executes under
     // whatever handle a parked coroutine left installed, and that task's
     // cancel/deadline would kill the callback (see TaskScope::detached).
-    let _scope = TaskScope::detached(lua);
+    let scope = TaskScope::detached(lua);
+    // No ScopedFuture polls this one, so its slice has to start by hand or a
+    // spinning callback would never be stopped.
+    lock_cell(scope.handle()).begin_slice(Instant::now());
     match func.call::<String>(arg) {
         Ok(s) => Some(s),
         Err(e) => {
@@ -5078,7 +5245,7 @@ mod tests {
         );
         assert_eq!(
             cell.kill_due(start + KILL_GRACE * 2),
-            Some(KillReason::Cancelled)
+            Some(Kill::Doomed(KillReason::Cancelled))
         );
         assert_eq!(
             cell.kill_due(start + KILL_GRACE * 2),
@@ -5110,6 +5277,94 @@ mod tests {
 
         assert_eq!(cell.kill_due(start + KILL_GRACE * 2), None);
         assert!(cell.kill_at.get().is_none(), "healthy poke must disarm");
+    }
+
+    /// A stuck slice has had its seconds already, so the first raise lands at
+    /// once. Only code that catches it gets a grace before the next one.
+    #[test]
+    fn stuck_slice_is_raised_at_once_then_again_a_grace_later() {
+        let cell = TaskCell::new(CancelToken::none(), None, None);
+        let start = Instant::now();
+        cell.begin_slice(start);
+        assert_eq!(cell.kill_due(start + SLICE_WARN), None);
+
+        let stuck = start + SLICE_KILL + WATCHDOG_POLL_INTERVAL;
+        assert_eq!(cell.kill_due(stuck), Some(Kill::Stuck));
+        assert_eq!(cell.kill_due(stuck), None, "a caught raise gets a grace");
+        assert_eq!(cell.kill_due(stuck + KILL_GRACE * 2), Some(Kill::Stuck));
+    }
+
+    #[test]
+    fn yielding_task_outlives_the_slice_budget() {
+        let cell = TaskCell::new(CancelToken::none(), None, None);
+        let start = Instant::now();
+        cell.end_slice(cell.begin_slice(start));
+        let resumed = start + SLICE_KILL;
+        cell.begin_slice(resumed);
+        assert_eq!(cell.kill_due(resumed + SLICE_WARN), None);
+    }
+
+    #[test]
+    fn nested_poll_of_the_same_cell_keeps_the_outer_slice() {
+        let cell = TaskCell::new(CancelToken::none(), None, None);
+        let start = Instant::now();
+        let stuck = start + SLICE_KILL + WATCHDOG_POLL_INTERVAL;
+        let outermost = cell.begin_slice(start);
+        cell.end_slice(cell.begin_slice(start + SLICE_WARN));
+        assert_eq!(cell.kill_due(stuck), Some(Kill::Stuck));
+        cell.end_slice(outermost);
+        assert_eq!(cell.kill_due(stuck), None);
+    }
+
+    #[test]
+    fn slow_slice_warns_once_per_slice() {
+        let cell = TaskCell::new(CancelToken::none(), None, None);
+        let start = Instant::now();
+        let late = start + SLICE_WARN * 2;
+        let outer = cell.begin_slice(start);
+        assert_eq!(cell.slice_warning(start + SLICE_WARN / 2), None);
+        assert_eq!(cell.slice_warning(late), Some(SLICE_WARN * 2));
+        assert_eq!(cell.slice_warning(late), None);
+        cell.end_slice(outer);
+
+        cell.begin_slice(late);
+        assert_eq!(
+            cell.slice_warning(late + SLICE_WARN * 2),
+            Some(SLICE_WARN * 2)
+        );
+    }
+
+    const STUCK_PLUGIN: &str = "spinner";
+
+    /// An autocmd or keymap has no deadline, and a tool handler's is far off.
+    /// Neither may save a slice that holds the thread.
+    #[test_case(None ; "detached")]
+    #[test_case(Some(Duration::from_secs(3600)) ; "before_deadline")]
+    fn stuck_slice_is_killed_naming_the_plugin(deadline: Option<Duration>) {
+        let (lua, _watchdog) = watchdog_lua(false);
+        // The hot loop runs in globals, so globals stand in for a plugin env.
+        let mut envs = PluginEnvs::default();
+        envs.0
+            .insert(Arc::from(STUCK_PLUGIN), lua.globals().to_pointer() as usize);
+        lua.set_app_data(envs);
+        let (ui_tx, ui_rx) = flume::unbounded();
+        lua.set_app_data(HostUi(Some(ui_tx)));
+        let cell = TaskCell::new(
+            CancelToken::none(),
+            deadline.map(|d| Instant::now() + d),
+            None,
+        );
+        cell.begin_slice(Instant::now() - SLICE_KILL);
+        lua.set_app_data::<TaskHandle>(cell.into_handle());
+
+        let (err, _) = hot_loop_expecting_kill(&lua);
+
+        let expected = stuck_message(STUCK_PLUGIN);
+        assert!(err.to_string().contains(&expected), "got: {err}");
+        assert!(
+            matches!(ui_rx.try_recv(), Ok(UiAction::Flash(msg)) if msg == expected),
+            "the user must be told"
+        );
     }
 
     fn task_handle(cancel: CancelToken, deadline: Option<Instant>) -> TaskHandle {
