@@ -28,6 +28,7 @@ The docs are sorted by what you came here to do:
   <div class="card-grid">
     <a class="card" href="/docs/skills/"><span class="card-title">Skills</span><span class="card-desc">Write Markdown playbooks the agent loads on demand.</span></a>
     <a class="card" href="/docs/plugins/"><span class="card-title">Plugins</span><span class="card-desc">Add your own tools and commands in Lua, or let the agent write them.</span></a>
+    <a class="card" href="/docs/long-running-tools/"><span class="card-title">Long-Running Tools</span><span class="card-desc">Write tools that supervise builds, servers, and subagents without parking the session.</span></a>
     <a class="card" href="/docs/headless/"><span class="card-title">Headless Mode</span><span class="card-desc">--print for scripts and CI. Drop-in Claude Code compatible.</span></a>
     <a class="card" href="/docs/acp/"><span class="card-title">ACP</span><span class="card-desc">Drive Maki from your editor, like Zed, over the Agent Client Protocol.</span></a>
   </div>

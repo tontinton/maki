@@ -668,6 +668,37 @@ pub enum UiAction {
         depth: u8,
         reply_tx: flume::Sender<Result<(), String>>,
     },
+    /// A plugin-owned transcript item: `running` creates or re-titles it,
+    /// `done` / `failed` closes it. The `id` is already plugin-scoped.
+    ChatItem(ChatItem),
+    StatusSegment(StatusSegment),
+    ClearStatusSegments {
+        plugin: Arc<str>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatItemStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatItem {
+    pub id: Arc<str>,
+    pub label: Arc<str>,
+    pub title: String,
+    pub status: ChatItemStatus,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StatusSegment {
+    /// Already plugin-scoped.
+    pub id: Arc<str>,
+    pub text: String,
+    pub style: String,
 }
 
 /// Whether an event loop is draining `UiAction`. The channel cannot answer
@@ -680,6 +711,10 @@ pub struct UiAttachment(Arc<AtomicBool>);
 impl Default for UiAttachment {
     /// Attached until a loop says otherwise. Headless runs and ACP hand Lua no
     /// sender at all, so the bit only ever describes a loop that went away.
+    /// A test harness (or other embedder) that drains `ui_action_rx` itself
+    /// without ever building an `EventLoop` relies on this default too, so it
+    /// stays `true`; real cold-start plugin load closes its own gap instead
+    /// by detaching explicitly before `EventLoop::new` reattaches.
     fn default() -> Self {
         Self(Arc::new(AtomicBool::new(true)))
     }
