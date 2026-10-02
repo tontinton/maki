@@ -172,12 +172,16 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
     }
 
     /// Cancels every registration under {id} and marks the id, so a session
-    /// registering under it later is born cancelled too.
-    pub fn cancel(&self, id: K) {
+    /// registering under it later is born cancelled too. Returns whether any
+    /// live registration was cancelled; `false` is a pure precancel, i.e. the
+    /// caller addressed a session that does not exist.
+    pub fn cancel(&self, id: K) -> bool {
         let mut map = self.lock();
         let entry = map.entry(id).or_default();
         entry.cancelled = true;
+        let hit = !entry.registrations.is_empty();
         entry.registrations.clear();
+        hit
     }
 
     /// The run that owned these is over: stop what is still registered and drop
