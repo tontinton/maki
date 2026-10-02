@@ -1760,4 +1760,110 @@ case("provider_parse_models_keeps_the_first_row_per_id_sorted", function()
   eq(#parse.models({}, function() end), 0, "a body without data")
 end)
 
+-- JobPane tests: the pure line/format helpers only; the open() loop needs a
+-- live window and is not spec-testable.
+
+local JobPane = require("maki.job_pane")
+
+case("job_pane_stream_lines_are_tagged_by_stream", function()
+  local out = JobPane.stream_line("stdout", "hello")
+  eq(out[1][1], "out ")
+  eq(out[1][2], "dim")
+  eq(out[2][1], "hello")
+
+  local err_line = JobPane.stream_line("stderr", "boom")
+  eq(err_line[1][1], "err ")
+  eq(err_line[1][2], "error")
+  eq(err_line[2][1], "boom")
+end)
+
+case("job_pane_exit_line_is_success_only_at_zero", function()
+  eq(JobPane.exit_line(0)[1][2], "success")
+  eq(JobPane.exit_line(0)[1][1], "exited (code 0)")
+  eq(JobPane.exit_line(3)[1][2], "error")
+  eq(JobPane.exit_line(3)[1][1], "exited (code 3)")
+end)
+
+case("job_pane_initial_lines_order_tails_and_exit", function()
+  local lines = JobPane.initial_lines({
+    dropped_output = true,
+    stdout_lines = { "a", "b" },
+    stderr_lines = { "warn" },
+    exit_code = 2,
+  })
+  eq(#lines, 5)
+  eq(lines[1][1][1], "… older output not shown")
+  eq(lines[2][2][1], "a")
+  eq(lines[3][2][1], "b")
+  eq(lines[4][1][2], "error")
+  eq(lines[5][1][1], "exited (code 2)")
+end)
+
+case("job_pane_initial_lines_tolerate_missing_tails", function()
+  eq(#JobPane.initial_lines({}), 0)
+  eq(#JobPane.initial_lines({ exit_code = 0 }), 1)
+end)
+
+case("job_pane_cap_trims_from_the_top_only_over_the_limit", function()
+  local lines = {}
+  for i = 1, JobPane.MAX_LINES do
+    lines[i] = i
+  end
+  eq(JobPane.capped(lines), nil, "at the cap there is nothing to trim")
+
+  lines[#lines + 1] = "new"
+  local kept = JobPane.capped(lines)
+  assert(kept ~= nil, "over the cap must trim")
+  eq(#kept, JobPane.KEEP_LINES)
+  eq(kept[#kept], "new")
+  eq(kept[1], lines[#lines - JobPane.KEEP_LINES + 1], "trimming keeps the tail in order")
+end)
+
+case("job_pane_file_lines_keeps_the_last_window", function()
+  eq(#JobPane.file_lines(nil, 3), 0, "unreadable file seeds empty")
+  eq(#JobPane.file_lines("", 3), 0)
+  eq(#JobPane.file_lines("a\nb\nc", 3), 3, "content without a trailing newline keeps its last line")
+
+  local max = JobPane.FILE_MAX_LINES
+  local many = {}
+  for i = 1, max + 10 do
+    many[i] = "line" .. i
+  end
+  local kept = JobPane.file_lines(table.concat(many, "\n") .. "\n", max)
+  eq(#kept, max)
+  eq(kept[1], "line11", "keeps the tail of the file")
+  eq(kept[max], "line" .. (max + 10))
+end)
+
+case("job_pane_initial_lines_seeds_redirected_streams_from_file_content", function()
+  local lines = JobPane.initial_lines({
+    dropped_output = true,
+    stdout_path = "/tmp/out.log",
+    stdout_file = "a\nb\nc\n",
+    stderr_lines = { "warn" },
+    exit_code = 0,
+  })
+  eq(#lines, 6)
+  eq(lines[1][1][1], "… older output not shown")
+  eq(lines[2][1][1], "out ")
+  eq(lines[2][2][1], "a")
+  eq(lines[4][2][1], "c")
+  eq(lines[5][2][1], "warn", "piped stream still uses its tail")
+  eq(lines[6][1][2], "success")
+end)
+
+case("job_pane_stream_texts_reports_source_per_stream", function()
+  local texts = JobPane.stream_texts({
+    stdout_lines = { "t" },
+    stderr_path = "/tmp/err.log",
+    stderr_file = "e1\ne2\n",
+  })
+  eq(texts[1].path, nil)
+  eq(#texts[1].texts, 1)
+  eq(texts[1].texts[1], "t")
+  eq(texts[2].path, "/tmp/err.log")
+  eq(#texts[2].texts, 2)
+  eq(texts[2].texts[1], "e1")
+end)
+
 th.report()
