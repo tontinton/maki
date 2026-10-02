@@ -14,6 +14,7 @@ use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{Cutter, SessionEndReason};
 use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
+use maki_fs::FsBackend;
 use maki_providers::plugin::{DeclAuthority, keep_granted};
 use tokio::runtime::{Builder, EnterGuard, Handle, Runtime, RuntimeFlavor};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -1053,6 +1054,16 @@ impl PluginHost {
     /// Rings when a plugin changes a window or what one shows.
     pub fn ui_waker(&self) -> UiWaker {
         self.inner.ui_waker.clone()
+    }
+
+    /// Install the fs backend that routed tool calls run against.
+    pub fn set_sandbox_backend(&self, backend: Arc<dyn FsBackend>) -> Result<(), PluginError> {
+        if let Err(e) = self.inner.tx.try_send(Request::SetSandboxBackend(backend)) {
+            tracing::warn!("failed to send sandbox backend to lua runtime: {e}");
+            Err(PluginError::HostDead)
+        } else {
+            Ok(())
+        }
     }
 }
 

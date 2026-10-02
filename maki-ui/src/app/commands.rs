@@ -104,6 +104,13 @@ impl App {
                 self.flash(msg.into());
                 vec![]
             }
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            "/sandbox" => {
+                self.sandbox_modal.toggle();
+                vec![]
+            }
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            "/add-dir" => self.cmd_add_dir(&cmd.args),
             "/fast" => {
                 match self.set_fast(!self.state.fast_intent()) {
                     Ok(()) => self.flash(

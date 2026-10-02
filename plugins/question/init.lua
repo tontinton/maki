@@ -73,6 +73,7 @@ maki.api.register_tool({
   },
   audiences = { "main" },
   permission = {},
+  host_access = true,
   timeout = false,
   header = function(input)
     local n = #input.questions

@@ -14,6 +14,7 @@ image = { workspace = true, features = ["jpeg", "gif", "webp", "bmp"] }
 crossterm = { workspace = true }
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
+maki-fs = { workspace = true }
 maki-highlight = { workspace = true }
 maki-interpreter = { workspace = true }
 maki-lua-macro = { workspace = true }

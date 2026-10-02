@@ -154,6 +154,14 @@ pub struct Cli {
     #[arg(long)]
     pub exit_on_done: bool,
 
+    /// Enable sandbox mode for code execution (isolated child process)
+    #[arg(long)]
+    pub sandbox: bool,
+
+    /// Internal: sandbox child inner instance after pivot_root+exec
+    #[arg(long, hide = true)]
+    pub sandbox_inner: bool,
+
     /// Pre-approve tools (comma-separated). Accepts PascalCase (Claude Code) or snake_case.
     #[arg(long, value_delimiter = ',', visible_alias = "allowedTools")]
     pub allowed_tools: Vec<String>,
@@ -320,7 +328,7 @@ impl Cli {
     /// `--verbose` stay out, because Claude Code wrappers pass them on every
     /// path. `every_visible_flag_is_placed` makes each new flag pick a side,
     /// and the matrix in `site/docs/content/cli/_index.md` is a copy by hand.
-    fn scoped_flags(&self) -> [ScopedFlag; 5] {
+    fn scoped_flags(&self) -> [ScopedFlag; 6] {
         let host_prompt = self.host_prompt();
         [
             ScopedFlag {
@@ -347,6 +355,11 @@ impl Cli {
                 name: "image",
                 set: !self.images.is_empty(),
                 paths: &[RunPath::Print],
+            },
+            ScopedFlag {
+                name: "sandbox",
+                set: self.sandbox,
+                paths: &[RunPath::Tui],
             },
         ]
     }

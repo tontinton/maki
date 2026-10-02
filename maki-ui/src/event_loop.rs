@@ -72,6 +72,8 @@ use crate::appearance::{self, Background};
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::keybindings::key;
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+use crate::components::sandbox_modal::SandboxModalEvent;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest};
 use crate::decor_worker;
@@ -149,6 +151,8 @@ pub struct EventLoopParams {
     /// registered its own.
     pub handed_over: Vec<SessionMailbox>,
     pub host_prompt: HostPrompt,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    pub sandbox: Option<Arc<maki_sandbox::Sandbox>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -413,6 +417,10 @@ struct SessionRuntime {
     handles: AgentHandles,
     shell_tx: UnboundedSender<ShellEvent>,
     shell_rx: UnboundedReceiver<ShellEvent>,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    sandbox_tx: UnboundedSender<SandboxModalEvent>,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    sandbox_rx: UnboundedReceiver<SandboxModalEvent>,
     last_status: SessionStatus,
     last_title: String,
     last_tasks: TaskWatch,
@@ -533,11 +541,17 @@ impl SpawnCtx {
         }
         let (shell_tx, shell_rx) = unbounded_channel::<ShellEvent>();
         let last_title = app.state.session.title.clone();
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        let (sandbox_tx, sandbox_rx) = unbounded_channel::<SandboxModalEvent>();
         SessionRuntime {
             app,
             handles,
             shell_tx,
             shell_rx,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            sandbox_tx,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            sandbox_rx,
             last_status: SessionStatus::Idle,
             last_title,
             last_tasks: TaskWatch::default(),
@@ -608,6 +622,8 @@ enum Wake {
     Decor,
     Agent(usize, Box<maki_agent::Envelope>),
     Shell(usize, ShellEvent),
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    Sandbox(usize, SandboxModalEvent),
     Warn(String),
     Pack(Box<PackPreparation>),
     /// `None` when the read panicked, which dropped its reply.
@@ -663,7 +679,9 @@ async fn session_wake(sessions: &mut [SessionRuntime]) -> Wake {
         .enumerate()
         .flat_map(|(i, rt)| {
             let (agent_rx, shell_rx) = (&mut rt.handles.agent_rx, &mut rt.shell_rx);
-            [
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            let sandbox_rx = &mut rt.sandbox_rx;
+            let mut waits = vec![
                 Box::pin(async move { Wake::Agent(i, Box::new(next_or_pending(agent_rx).await)) })
                     as LocalBoxFuture<'_, Wake>,
                 Box::pin(async move {
@@ -672,7 +690,12 @@ async fn session_wake(sessions: &mut [SessionRuntime]) -> Wake {
                         None => pending().await,
                     }
                 }),
-            ]
+            ];
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            waits.push(Box::pin(async move {
+                Wake::Sandbox(i, next_or_pending(sandbox_rx).await)
+            }));
+            waits
         })
         .collect();
     if waits.is_empty() {
@@ -766,6 +789,8 @@ impl<'t> EventLoop<'t> {
             trust,
             handed_over,
             host_prompt,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            sandbox,
         } = params;
         // Apply the config theme before the warmup thread spawns, or warmup
         // could bake the syntax palette from the old theme. Only the
@@ -849,6 +874,8 @@ impl<'t> EventLoop<'t> {
             return Err(eyre!("event loop needs at least one session"));
         }
         let focused = focused.min(runtimes.len() - 1);
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        let sandbox_tx = runtimes[focused].sandbox_tx.clone();
         let app = &mut runtimes[focused].app;
         if exit_on_done {
             app.exit_when_done(background_wait);
@@ -863,6 +890,16 @@ impl<'t> EventLoop<'t> {
         if let Some(notice) = startup_notice {
             app.queue_flash(notice);
         }
+
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        {
+            app.sandbox_modal = crate::components::sandbox_modal::SandboxModal::from_config(
+                &ctx.config,
+                sandbox,
+                sandbox_tx,
+            );
+        }
+
         for warning in startup_warnings {
             app.queue_flash(warning);
         }
@@ -1029,6 +1066,12 @@ impl<'t> EventLoop<'t> {
             Wake::PluginWindow | Wake::Decor => {}
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            Wake::Sandbox(i, event) => {
+                let app = &mut self.sessions[i].app;
+                app.sandbox_modal.apply(event);
+                app.apply_sandbox_changes();
+            }
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Pack(preparation) => self.finish_pack(*preparation),
             Wake::SessionOpened(answer) => self.finish_open(answer),

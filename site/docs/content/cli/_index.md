@@ -32,6 +32,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--system-prompt`, `--append-system-prompt` | yes | yes | yes |
 | `--session-id`, `--fork-session` | yes | yes | yes |
 | `--max-turns` | error | yes | yes |
+| `--sandbox` | yes | error | error |
 | `--permission-mode` | error | error | yes |
 | `--include-partial-messages` | no | no | yes |
 
@@ -61,6 +62,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-r` / `-c` is continuing that same session |
 | `--fork-session` | Copy the resumed session's history under a new id, leaving the original untouched. See [Sessions](/docs/headless/#sessions) |
 | `--max-turns <N>` | Cap agent turns (`--print` and SDK) |
+| `--sandbox` | Run tool handlers and code execution in a namespace-isolated sandbox (TUI only) |
 | `--system-prompt <TEXT>` | Replace the main agent's whole system prompt, so project instructions are dropped too. Subagents keep their own |
 | `--append-system-prompt <TEXT>` | Add text to the end of the main agent's system prompt. Subagents do not get it, so put text they need in `AGENTS.local.md` |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
