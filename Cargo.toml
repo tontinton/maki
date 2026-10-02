@@ -10,7 +10,7 @@ homepage = "https://maki.sh"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "tui", "coding"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.95"
+rust-version = "1.99"
 
 [[bin]]
 name = "maki"
@@ -71,7 +71,7 @@ edition = "2024"
 authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/tontinton/maki"
-rust-version = "1.95"
+rust-version = "1.99"
 
 [workspace.dependencies]
 maki-agent = { path = "maki-agent" }
@@ -93,7 +93,7 @@ serde_json = "1"
 bs58 = "0.5"
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
-ratatui-image = { version = "11.0.8", default-features = false, features = ["crossterm"] }
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.29", features = ["osc52"] }
 color-eyre = { version = "0.6", default-features = false, features = ["track-caller"] }
 termini = "1"
@@ -101,16 +101,16 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "json"] }
 clap = { version = "4", features = ["derive"] }
-sha2 = { version = "0.10", default-features = false }
-hmac = { version = "0.12", default-features = false }
-base64 = "0.22"
+sha2 = { version = "0.11", default-features = false }
+hmac = { version = "0.13", default-features = false }
+base64 = "0.23"
 url = "2"
-getrandom = "0.3"
+getrandom = "0.4"
 fastrand = "2"
 test-case = "3"
 ignore = "0.4"
 memchr = "2"
-strum = { version = "0.27", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 htmd = "0.5"
 tempfile = "3"
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
@@ -121,20 +121,20 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 two-face = { version = "0.5", default-features = false, features = ["syntect-default-fancy"] }
 unicode-width = "0.2"
 unicode-segmentation = "1"
-similar = { version = "2", features = ["inline", "unicode"] }
+similar = { version = "3", features = ["inline", "unicode"] }
 jsonrepair = { version = "0.1", default-features = false, features = ["serde"] }
-jsonschema = { version = "0.33", default-features = false }
+jsonschema = { version = "0.58", default-features = false }
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
 keyring = "4"
 arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
-flume = { version = "0.11", default-features = false, features = ["async", "select"] }
+flume = { version = "0.12", default-features = false, features = ["async", "select"] }
 pin-project-lite = "0.2"
 rustix = { version = "1", default-features = false, features = ["process"] }
 humantime = "2"
 semver = "1"
-toml = "0.8"
-toml_edit = "0.22"
+toml = "1.1"
+toml_edit = "0.25"
 smol = "2"
 async-process = "2"
 async-lock = "3"
@@ -144,19 +144,19 @@ async-io = "2"
 event-listener = "5"
 futures-lite = "2"
 futures = "0.3"
-isahc = { version = "1.7", default-features = false, features = ["text-decoding", "static-curl", "static-ssl", "http2"] }
+isahc = { version = "2.0", default-features = false, features = ["text-decoding", "static-curl", "native-tls-static", "http2"] }
 flate2 = "1"
 libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
 nucleo = "0.5"
 nucleo-matcher = "0.3"
 open = "5"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 etcetera = "0.11"
 dotenvy = "0.15"
-tree-sitter = "0.26"
+tree-sitter = "0.27"
 include_dir = "0.7"
-mlua = { version = "0.11", features = ["luau", "luau-jit", "async", "send", "serde", "macros"] }
+mlua = { version = "0.12", features = ["luau", "luau-jit", "async", "send", "serde", "macros"] }
 tree-sitter-bash = "0.25"
 tree-sitter-c = "0.24"
 tree-sitter-c-sharp = "0.23"
@@ -164,19 +164,19 @@ tree-sitter-clojure-orchard = "0.2.8"
 tree-sitter-cpp = "0.23"
 tree-sitter-elixir = "0.3"
 tree-sitter-gleam = "1.0"
-tree-sitter-go = "0.23"
+tree-sitter-go = "0.25"
 tree-sitter-html = "0.23"
 tree-sitter-java = "0.23"
-tree-sitter-javascript = "0.23"
+tree-sitter-javascript = "0.25"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-lua = "0.5"
 tree-sitter-md = "0.5"
 tree-sitter-nix = "0.3.0"
 tree-sitter-php = "0.24"
-tree-sitter-python = "0.23"
+tree-sitter-python = "0.25"
 tree-sitter-ruby = "0.23"
 tree-sitter-rust = "0.24"
-tree-sitter-scala = "0.25"
+tree-sitter-scala = "0.26"
 tree-sitter-sequel = "0.3"
 tree-sitter-starlark = "1.3"
 tree-sitter-swift = "0.7"
@@ -191,13 +191,12 @@ tree-sitter-css = "0.25"
 tree-sitter-hcl = "1.1"
 tree-sitter-json = "0.24"
 tree-sitter-make = "1.1"
-monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.21", package = "monty" }
-monty-types = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.21", package = "monty-types" }
-get-size2 = "=0.10.1"
-notify = { version = "9.0.0-rc.2", default-features = false, features = ["flume", "macos_fsevent"] }
+monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.23", package = "monty" }
+monty-types = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.23", package = "monty-types" }
+notify = { version = "9.0.0-rc.5", default-features = false, features = ["flume", "macos_fsevent"] }
 serde_yaml = "0.9"
 shell-words = "1"
-agent-client-protocol-schema = { version = "0.13", features = ["unstable_elicitation"] }
+agent-client-protocol-schema = "1.10"
 
 wait-timeout = "0.2"
 inventory = "0.3"

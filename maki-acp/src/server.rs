@@ -5,14 +5,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol_schema::{
+use agent_client_protocol_schema::v1::{
     AgentNotification, AgentRequest, AgentResponse, ConfigOptionUpdate, ContentBlock,
     CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
     InitializeRequest, JsonRpcMessage, LoadSessionRequest, McpServer, NewSessionRequest,
     Notification, PromptRequest, PromptResponse, Request, RequestId, RequestPermissionRequest,
-    RequestPermissionResponse, Response, SessionId, SessionModeId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
+    RequestPermissionResponse, Response, SessionConfigOptionValue, SessionId, SessionModeId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent,
 };
 use color_eyre::eyre::Context;
 use flume::{Sender, WeakSender};
@@ -753,7 +754,10 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
         return Err(AcpError::invalid_params().data(json_str(&detail)));
     }
 
-    let spec = req.value.0.to_string();
+    let SessionConfigOptionValue::ValueId { value } = req.value else {
+        return Err(AcpError::invalid_params().data(json_str(&"model must be a value id")));
+    };
+    let spec = value.0.to_string();
     if !srv.model_policy.allows(&spec) {
         return Err(AcpError::invalid_params().data(json_str(&"model is not allowed by policy")));
     }

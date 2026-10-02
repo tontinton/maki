@@ -1,4 +1,4 @@
-use agent_client_protocol_schema::{
+use agent_client_protocol_schema::v1::{
     PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
 };
 use maki_agent::permissions::PermissionAnswer;
@@ -68,7 +68,7 @@ pub fn outcome_to_answer(outcome: &RequestPermissionOutcome) -> PermissionAnswer
 
 #[cfg(test)]
 mod tests {
-    use agent_client_protocol_schema::SelectedPermissionOutcome;
+    use agent_client_protocol_schema::v1::SelectedPermissionOutcome;
     use test_case::test_case;
 
     use super::{

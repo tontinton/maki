@@ -290,14 +290,14 @@ fn collect_captures(query: &Query, args: &IterArgs) -> mlua::Result<Vec<CaptureE
         if !evaluate_predicates(
             query,
             m.pattern_index,
-            m.captures,
+            m.captures(),
             source_bytes,
             &mut metadata,
             &mut regex_cache,
         ) {
             continue;
         }
-        let capture = &m.captures[*capture_idx];
+        let capture = &m.captures()[*capture_idx];
         results.push(CaptureEntry {
             capture_index: capture.index,
             node: LuaNode::new(capture.node, Arc::clone(&args.lua_node.tree)),
@@ -320,7 +320,7 @@ fn collect_matches(query: &Query, args: &IterArgs) -> mlua::Result<Vec<MatchEntr
         if !evaluate_predicates(
             query,
             m.pattern_index,
-            m.captures,
+            m.captures(),
             source_bytes,
             &mut metadata,
             &mut regex_cache,
@@ -328,7 +328,7 @@ fn collect_matches(query: &Query, args: &IterArgs) -> mlua::Result<Vec<MatchEntr
             continue;
         }
         let mut captures_map: HashMap<u32, Vec<LuaNode>> = HashMap::new();
-        for capture in m.captures {
+        for capture in m.captures() {
             captures_map
                 .entry(capture.index)
                 .or_default()

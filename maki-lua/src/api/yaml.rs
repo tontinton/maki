@@ -1,5 +1,5 @@
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Value};
+use mlua::{Lua, LuaSerdeExt, LuaString, Result as LuaResult, Value};
 
 use super::util::pair::{Pair, pair, try_pair};
 
@@ -26,7 +26,7 @@ fn encode(lua: &Lua, value: Value) -> LuaResult<Pair<String>> {
 /// local t, err = maki.yaml.decode("name: maki\nversion: 1")
 /// print(t.name) -- maki
 #[lua_fn]
-fn decode(lua: &Lua, str: mlua::String) -> LuaResult<Pair<Value>> {
+fn decode(lua: &Lua, str: LuaString) -> LuaResult<Pair<Value>> {
     let value = try_pair!(serde_yaml::from_slice::<serde_yaml::Value>(&str.as_bytes()));
     Ok((Some(lua.to_value(&value)?), None))
 }

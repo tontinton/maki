@@ -240,7 +240,7 @@ fn named_children(lua: &Lua, this: &LuaNode) -> LuaResult<mlua::Table> {
 #[lua_fn]
 fn iter_children(lua: &Lua, this: &LuaNode) -> LuaResult<Function> {
     let node = this.ts_node()?;
-    let count = node.child_count() as u32;
+    let count = node.child_count();
     let mut entries: Vec<(LuaNode, Option<String>)> = Vec::with_capacity(count as usize);
     for i in 0..count {
         if let Some(child) = node.child(i) {

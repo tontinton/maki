@@ -26,10 +26,8 @@ use maki_agent::tools::{
 use maki_agent::{
     BufferSnapshot, SessionEndReason, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, UiWaker,
 };
-use mlua::{
-    Chunk, ChunkMode, Compiler, Function, Lua, MultiValue, RegistryKey, Table, Value as LuaValue,
-    ffi,
-};
+use mlua::chunk::{Chunk, ChunkMode, Compiler};
+use mlua::{Function, Lua, MultiValue, RegistryKey, Table, Value as LuaValue, ffi};
 use serde_json::Value;
 use strum::{EnumString, IntoStaticStr};
 
@@ -2783,22 +2781,22 @@ impl LuaRuntime {
             &permissions,
             Arc::clone(&opts),
         )
-        .map_err(&map_err)?;
+        .map_err(map_err)?;
 
         if let Some(config) = config {
             let setup_fn =
                 crate::api::util::setup::create_setup_fn(&self.lua, Arc::clone(config.store))
-                    .map_err(&map_err)?;
-            maki.set("setup", setup_fn).map_err(&map_err)?;
+                    .map_err(map_err)?;
+            maki.set("setup", setup_fn).map_err(map_err)?;
 
             let pack = match config.scope {
                 ConfigScope::Global => crate::api::pack::create_pack_table(&self.lua),
                 _ => crate::api::pack::create_pack_read_table(&self.lua),
             }
-            .map_err(&map_err)?;
-            maki.set("pack", pack).map_err(&map_err)?;
+            .map_err(map_err)?;
+            maki.set("pack", pack).map_err(map_err)?;
         }
-        let env = self.build_env(maki, require_root).map_err(&map_err)?;
+        let env = self.build_env(maki, require_root).map_err(map_err)?;
         if let Some(mut envs) = self.lua.app_data_mut::<PluginEnvs>() {
             envs.0.insert(Arc::clone(&name), env.to_pointer() as usize);
         }
@@ -2842,7 +2840,7 @@ impl LuaRuntime {
                 result
             }
             PluginLoad::Function { function, argument } => {
-                function.set_environment(env).map_err(&map_err)?;
+                function.set_environment(env).map_err(map_err)?;
                 queue_codegen(&self.codegen_queue, &function);
                 function.call_async::<()>(argument).await
             }

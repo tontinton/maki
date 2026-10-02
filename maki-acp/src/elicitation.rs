@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use agent_client_protocol_schema::{
+use agent_client_protocol_schema::v1::{
     ClientCapabilities, CreateElicitationRequest, ElicitationContentValue, ElicitationFormMode,
     ElicitationPropertySchema, ElicitationSchema, ElicitationSessionScope, EnumOption,
     MultiSelectPropertySchema, SessionId, StringPropertySchema, ToolCallId,
@@ -161,7 +161,7 @@ pub fn format_response(input: &Value, raw_result: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use agent_client_protocol_schema::ElicitationScope;
+    use agent_client_protocol_schema::v1::ElicitationScope;
     use test_case::test_case;
 
     use super::*;

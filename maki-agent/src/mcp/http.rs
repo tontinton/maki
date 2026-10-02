@@ -7,9 +7,10 @@ use std::time::{Duration, Instant};
 use async_lock::Mutex;
 use futures_lite::AsyncReadExt;
 use isahc::HttpClient;
-use isahc::config::{CaCertificate, Configurable, RedirectPolicy, VersionNegotiation};
+use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use isahc::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use isahc::http::{Method, Request, StatusCode, header::HeaderMap};
+use isahc::tls::{TlsConfig, TrustStore};
 use maki_storage::StateDir;
 use maki_storage::auth::load_mcp_auth;
 use serde_json::Value;
@@ -69,7 +70,11 @@ pub(super) fn build_client(
         Some(path) if !path.is_file() => {
             return Err(format!("ca_file '{}' is not a file", path.display()));
         }
-        Some(path) => builder.ssl_ca_certificate(CaCertificate::file(path)),
+        Some(path) => builder.tls_config(
+            TlsConfig::builder()
+                .trust_store(TrustStore::from_file(path))
+                .build(),
+        ),
         None => builder,
     };
     builder.build().map_err(|e| e.to_string())

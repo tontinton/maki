@@ -5,7 +5,7 @@ pub(crate) mod query;
 pub(crate) mod tree;
 
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{AnyUserData, Lua, Result as LuaResult, Table};
+use mlua::{AnyUserData, Lua, LuaString, Result as LuaResult, Table};
 
 use crate::api::util::pair::{Pair, err_pair};
 use crate::language::Language;
@@ -55,7 +55,7 @@ fn get_string_parser(lua: &Lua, source: String, lang: String) -> LuaResult<Pair<
 /// local text = maki.treesitter.get_node_text(node, source)
 /// print(text)
 #[lua_fn]
-fn get_node_text(lua: &Lua, node: AnyUserData, source: mlua::String) -> LuaResult<mlua::String> {
+fn get_node_text(lua: &Lua, node: AnyUserData, source: LuaString) -> LuaResult<LuaString> {
     let lua_node = node.borrow::<LuaNode>()?;
     let ts = lua_node.ts_node()?;
     // Borrowed, not copied: indexers call this once per node with the whole

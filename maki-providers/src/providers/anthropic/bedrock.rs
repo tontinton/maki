@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use flume::Sender;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{HttpClient, ReadResponseExt, Request};
 use maki_storage::id::SessionRef;

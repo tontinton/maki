@@ -57,7 +57,7 @@ fn charge(size: usize) {
 /// huge live count and trip the limit instantly.
 fn refund(size: usize) {
     if in_sandbox() {
-        let _ = LIVE_MEMORY.fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_sub(size)));
+        let _ = LIVE_MEMORY.try_update(Relaxed, Relaxed, |v| Some(v.saturating_sub(size)));
     }
 }
 

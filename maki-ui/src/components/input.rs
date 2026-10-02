@@ -146,8 +146,8 @@ impl InputBox {
         let is_word_boundary =
             |c: char| -> bool { c.is_alphanumeric() || c == '_' || ")]}>".contains(c) };
 
-        let needs_leading = char_before.is_some_and(&is_word_boundary) && !text.starts_with(' ');
-        let needs_trailing = char_after.is_some_and(&is_word_boundary) && !text.ends_with(' ');
+        let needs_leading = char_before.is_some_and(is_word_boundary) && !text.starts_with(' ');
+        let needs_trailing = char_after.is_some_and(is_word_boundary) && !text.ends_with(' ');
 
         if !needs_leading && !needs_trailing {
             return self.handle_paste(text);

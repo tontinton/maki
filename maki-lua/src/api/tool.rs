@@ -23,7 +23,7 @@ use maki_agent::{
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{
-    Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table,
+    Function, Lua, LuaSerdeExt, LuaString, MultiValue, RegistryKey, Result as LuaResult, Table,
     Value as LuaValue,
 };
 use serde_json::{Value, json};
@@ -587,7 +587,7 @@ fn parse_prompt_field(spec: &Table) -> LuaResult<Option<Vec<PromptId>>> {
         Ok(LuaValue::String(s)) => Ok(Some(vec![parse_one(&s.to_str()?)?])),
         Ok(LuaValue::Table(t)) => {
             let mut ids = Vec::new();
-            for pair in t.sequence_values::<mlua::String>() {
+            for pair in t.sequence_values::<LuaString>() {
                 ids.push(parse_one(&pair?.to_str()?)?);
             }
             if ids.is_empty() {

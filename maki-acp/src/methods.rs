@@ -1,8 +1,8 @@
-use agent_client_protocol_schema::{
+use agent_client_protocol_schema::ProtocolVersion;
+use agent_client_protocol_schema::v1::{
     AgentCapabilities, Implementation, InitializeResponse, LoadSessionResponse, McpCapabilities,
-    NewSessionResponse, PromptCapabilities, ProtocolVersion, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode, SessionModeId,
-    SessionModeState,
+    NewSessionResponse, PromptCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionMode, SessionModeId, SessionModeState,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");

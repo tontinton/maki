@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use futures_lite::io::AsyncReadExt;
-use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation};
+use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use isahc::http::HeaderMap;
+use isahc::net::dns::ResolveMap;
 use isahc::{AsyncBody, HttpClient, Request, Response};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::Timeouts;

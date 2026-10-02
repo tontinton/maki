@@ -400,7 +400,7 @@ struct WalkPermit;
 impl WalkPermit {
     fn take() -> Option<Self> {
         WALKS
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |walking| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |walking| {
                 (walking < MAX_WALKS).then_some(walking + 1)
             })
             .ok()

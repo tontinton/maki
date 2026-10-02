@@ -5,7 +5,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, Result as LuaResult, Value as LuaValue};
+use mlua::{Lua, LuaString, Result as LuaResult, Value as LuaValue};
 
 use crate::api::util::pair::{Pair, try_pair};
 
@@ -41,7 +41,7 @@ fn encode(_lua: &Lua, data: LuaValue) -> LuaResult<String> {
 /// @example
 /// maki.base64.decode("aGVsbG8=") -- "hello"
 #[lua_fn]
-fn decode(lua: &Lua, str: LuaValue) -> LuaResult<Pair<mlua::String>> {
+fn decode(lua: &Lua, str: LuaValue) -> LuaResult<Pair<LuaString>> {
     let encoded = bytes_arg(&str, "base64.decode")?;
     let decoded = try_pair!(
         BASE64
@@ -81,7 +81,7 @@ mod tests {
         let bytes = [0u8, 159, 146, 150];
         let encoded: String = encode.call(lua.create_string(bytes).unwrap()).unwrap();
         assert_eq!(encoded, "AJ+Slg==");
-        let decoded: mlua::String = decode.call(encoded).unwrap();
+        let decoded: LuaString = decode.call(encoded).unwrap();
         assert_eq!(&*decoded.as_bytes(), &bytes);
     }
 
@@ -90,7 +90,7 @@ mod tests {
         let lua = Lua::new();
         let t = create_base64_table(&lua).unwrap();
         let decode: mlua::Function = t.get("decode").unwrap();
-        let (decoded, err): (Option<mlua::String>, Option<String>) =
+        let (decoded, err): (Option<LuaString>, Option<String>) =
             decode.call("!!!not base64!!!").unwrap();
         assert!(decoded.is_none());
         assert!(err.is_some());

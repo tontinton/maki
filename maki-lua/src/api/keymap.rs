@@ -55,7 +55,7 @@ impl KeybindTicket {
             return None;
         }
         bind.in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_IN_FLIGHT).then_some(n + 1)
             })
             .ok()?;

@@ -41,7 +41,7 @@
       mkCraneLib =
         pkgs:
         let
-          rustToolchain = pkgs.rust-bin.stable."1.95.0".default.override {
+          rustToolchain = pkgs.rust-bin.stable."1.99.0".default.override {
             extensions = [
               "rust-src"
               "rust-analyzer"
@@ -87,8 +87,8 @@
       #   mismatch that prints the real hash. This is both the recovery
       #   path for updates and a hard stop if pinned content ever changes.
       gitDepHashes = {
-        "git+https://github.com/pydantic/monty.git?tag=v0.0.21#70fe3f5781381eb33579e45046f8cb3845953373" =
-          "sha256-P4PgqfYykkZrWGg5G3WQo070lORLEhmXQUQPx3+Yslo=";
+        "git+https://github.com/pydantic/monty.git?tag=v0.0.23#302e0f27ec8516689ba90793cd0381149e5f4076" =
+          "sha256-NUhHd3x0hA+qpQ7wQ30kiynn4M+5XWQrX/fG2zgnlwg=";
         "git+https://github.com/crossterm-rs/crossterm?rev=3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77#3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77" =
           "sha256-A5lgiEEi7mktf7m2GljdAxst7Fdl7Uqko29Xq6o90Ow=";
         "git+https://github.com/tontinton/syntect?rev=01df275f6f25da670e5ba5b7128cb89d03795119#01df275f6f25da670e5ba5b7128cb89d03795119" =

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use image::{DynamicImage, ImageFormat, ImageReader};
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
-use mlua::{AnyUserData, Lua, Result as LuaResult, Table, Value as LuaValue};
+use mlua::{AnyUserData, Lua, LuaString, Result as LuaResult, Table, Value as LuaValue};
 
 use super::base64::bytes_arg;
 use super::util::pair::{Pair, try_pair};
@@ -109,7 +109,7 @@ async fn encode(
     lua: Lua,
     this: mlua::UserDataRef<LuaImage>,
     format: String,
-) -> LuaResult<mlua::String> {
+) -> LuaResult<LuaString> {
     let img = Arc::clone(&this.0);
     drop(this);
     let out_format = match format.as_str() {
