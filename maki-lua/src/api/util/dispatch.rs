@@ -146,18 +146,22 @@ mod tests {
         let concurrent: Vec<_> = (0..=MAX_HOOK_DEPTH)
             .map(|_| {
                 let scope = TaskScope::detached(&lua);
-                let guard = DepthGuard::enter(&lua, "test", SEAM, Reentry::Task)
-                    .expect("a fresh task starts at zero");
+                let guard = {
+                    let _active = scope.enter();
+                    DepthGuard::enter(&lua, "test", SEAM, Reentry::Task)
+                        .expect("a fresh task starts at zero")
+                };
                 (scope, guard)
             })
             .collect();
-        let nested: Vec<_> = (1..MAX_HOOK_DEPTH)
+        let (last, _) = concurrent.last().expect("at least one task");
+        let _active = last.enter();
+        let _nested: Vec<_> = (1..MAX_HOOK_DEPTH)
             .map(|_| {
                 DepthGuard::enter(&lua, "test", SEAM, Reentry::Task).expect("within the bound")
             })
             .collect();
         assert!(DepthGuard::enter(&lua, "test", SEAM, Reentry::Task).is_err());
-        drop((concurrent, nested));
     }
 
     #[test]

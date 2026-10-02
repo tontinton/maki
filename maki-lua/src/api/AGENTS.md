@@ -1,10 +1,19 @@
 Mirror Neovim's Lua API namespaces (maki.uv = vim.uv, maki.fs = vim.fs, maki.treesitter = vim.treesitter).
 Keep function signatures identical so plugins can be copy-pasted between Neovim and maki.
-Only exception is the UI API, neovim's has baggage.
+`maki.uv` mirrors `vim.uv` for sync utilities only: no libuv handles (tcp, timers) and no callbacks.
+Async io goes in `maki.net` / `maki.async`, coroutine style: the call yields and answers a `(value, err)` pair.
+Other exception is the UI API, neovim's has baggage.
 
 ## Design
 
 Our goal is to let plugin authors have as much freedom as possible, that's why desiging the APIs should be looked at as simple primitives you combine together.
+
+Long-lived work is a `maki.async.spawn` task, and a repeating timer is a `maki.async.sleep` loop inside one.
+
+## Lua thread
+
+All plugins share one Lua thread. Code that holds it for 5s without yielding is killed, warned at 1s.
+Long loops must yield with `maki.async.sleep(0)`. Heavy work belongs in a `maki.*` Rust API that runs off-thread or yields.
 
 ## Error convention
 

@@ -132,7 +132,10 @@ pub(crate) fn create_maki_global(
     )?;
     split::split__register(&maki, lua)?;
     top::add_top_methods(&maki, lua, Arc::clone(&plugin))?;
-    maki.set("async", r#async::create_async_table(lua)?)?;
+    maki.set(
+        "async",
+        r#async::create_async_table(lua, Arc::clone(&plugin))?,
+    )?;
     maki.set(
         "interpreter",
         interpreter::create_interpreter_table(lua, permissions)?,

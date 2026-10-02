@@ -112,6 +112,7 @@ The rules:
 | [`maki.async`](#maki-async) | Tools for running things concurrently in Lua plugins. |
 | [`maki.async.Semaphore`](#maki-async-Semaphore) | A counting semaphore for limiting how many tasks run at once. |
 | [`maki.async.Permit`](#maki-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
+| [`maki.async.Task`](#maki-async-Task) | Handle returned by `maki.async.spawn`. |
 | [`maki.base64`](#maki-base64) | Base64 encoding and decoding, modelled after `vim.base64`. |
 | [`maki.env`](#maki-env) | Paths to maki's own directories (config, state, logs, legacy). |
 | [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
@@ -224,11 +225,10 @@ Load an installed package that is not active.
 maki.defer_fn({callback}, {ms})
 ```
 
-Run {callback} after {ms} milliseconds, on the Lua thread and outside
-any task scope. The timer does not hang off the caller's cancel token
-or the 60 second `async.run` deadline, so the callback still fires
-once the tool call that scheduled it is over. That is what a toast
-needs to dismiss itself, and the difference from `maki.async.sleep`.
+Run {callback} once after {ms} milliseconds. It fires even if the tool
+call that scheduled it has ended or was cancelled, which is what a
+self-dismissing toast needs. For repeating work, use a
+`maki.async.sleep` loop inside `maki.async.spawn`.
 
 You get back a handle. Its `:stop()` cancels a callback that has not
 fired yet, which is how you debounce: schedule, then stop and
@@ -1520,10 +1520,10 @@ the VM sits idle, and the subagent's event relay stays alive until it does.
 
 Tools for running things concurrently in Lua plugins.
 
-Use `run` to fire off background tasks, `gather` or `join` to run
-several functions at once, and `semaphore` to limit concurrency.
-The `await` and `wrap` helpers bridge callback-based APIs into
-coroutine-friendly calls.
+`run` starts a background task that ends with its caller, and `spawn`
+one that lives as long as the plugin. `gather` and `join` run several
+functions at once, and `semaphore` limits how many. `await` and `wrap`
+turn callback APIs into coroutine calls.
 
 ```lua
 local results = maki.async.gather({
@@ -1540,9 +1540,10 @@ local results = maki.async.gather({
 maki.async.run({fn}, {on_finish?})
 ```
 
-Fire off a function as a new async task. It runs in the background and
-you do not wait for it. If you need the result, pass an {on_finish}
-callback.
+Start {fn} as a background task without waiting for it. Pass
+{on_finish} to get the result. The task is cancelled with its caller
+and stopped after 60 seconds. For work that outlives the caller, use
+`maki.async.spawn`.
 
 **Parameters:**
 
@@ -1560,23 +1561,63 @@ end)
 
 ---
 
+### `maki.async.spawn()` {#maki-async-spawn}
+
+```lua
+maki.async.spawn({fn})
+```
+
+Run {fn} in a task that lives as long as your plugin, such as a
+repeating timer or a connection opened at load.
+
+The task has no deadline and outlives the call that started it, so a
+tool handler can spawn it and return. It ends when {fn} returns or
+raises, when you call `task:cancel()`, or when the plugin unloads.
+Errors are logged and flashed with the plugin name.
+
+Spawned at the top level of a plugin file, it starts after the plugin
+loads. It does not keep maki alive: `maki -p` drops it on exit.
+
+Code that runs 5 seconds without yielding is still stopped. See
+`maki.async.sleep`.
+
+**Parameters:**
+
+- `{fn}` (`function`) Zero-argument function to run.
+
+**Returns:** ([`maki.async.Task`](#maki-async-Task)) Handle with `:cancel()`.
+
+**Example:**
+
+```lua
+local task = maki.async.spawn(function()
+  while true do
+    maki.async.sleep(2000)
+    report()
+  end
+end)
+
+task:cancel()
+```
+
+---
+
 ### `maki.async.sleep()` {#maki-async-sleep}
 
 ```lua
 maki.async.sleep({ms})
 ```
 
-Suspend the calling task for {ms} milliseconds. The plugin thread is
-never blocked, so other tasks and the UI keep running, and a cancel
-still lands while you sleep.
+Suspend the calling task for {ms} milliseconds. Other tasks and the UI
+keep running, and a cancel still lands while you sleep.
 
-All plugins share one Lua thread, and code that runs for 5 seconds
-without yielding is stopped with an error. `sleep(0)` yields without
-waiting: it lets every other ready task run once, then carries on. Call
-it every so often in a long loop.
+All plugins share one Lua thread. Code that runs for 5 seconds without
+yielding is stopped with an error. `sleep(0)` lets every other ready
+task run once, then returns. Call it now and then in long loops.
 
-For a timer that has to outlive the tool call that started it, such
-as a toast dismissing itself, use `maki.defer_fn`.
+A repeating timer is a sleep loop inside `maki.async.spawn`. For a
+one-shot timer that outlives the tool call, such as a toast that
+dismisses itself, use `maki.defer_fn`.
 
 **Parameters:**
 
@@ -1819,6 +1860,23 @@ Permit:release()
 
 Give the permit back to the semaphore so another task can acquire it.
 Throws if you already released this permit.
+
+
+## maki.async.Task {#maki-async-Task}
+
+Handle returned by `maki.async.spawn`.
+
+---
+
+### `Task:cancel()` {#Task-cancel}
+
+```lua
+Task:cancel()
+```
+
+Stop the task. A task that is waiting ends right away and runs its
+`maki.async.on_cancel` hooks. A task that cancels itself stops at its
+next yield. Extra calls do nothing.
 
 
 ## maki.base64 {#maki-base64}

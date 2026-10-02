@@ -8,7 +8,10 @@ use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 
 use crate::docs::{FnDoc, ParamDoc};
-use crate::runtime::{TaskHandle, enqueue_async_task, lock_cell, register_cancel_hook};
+use crate::runtime::{
+    SpawnedTask, TaskHandle, enqueue_async_task, enqueue_spawned_task, lock_cell,
+    register_cancel_hook,
+};
 
 const AWAIT_MIN_ARGS: usize = 2;
 const PERMIT_RELEASED_ERR: &str = "permit already released";
@@ -81,9 +84,10 @@ lua_class! {
     "maki.async.Permit" => LuaPermit, PERMIT_DOCS [release]
 }
 
-/// Fire off a function as a new async task. It runs in the background and
-/// you do not wait for it. If you need the result, pass an {on_finish}
-/// callback.
+/// Start {fn} as a background task without waiting for it. Pass
+/// {on_finish} to get the result. The task is cancelled with its caller
+/// and stopped after 60 seconds. For work that outlives the caller, use
+/// `maki.async.spawn`.
 ///
 /// @param fn function Zero-argument function to execute.
 /// @param on_finish function? Optional callback `function(err, result)`. Called once {fn} completes.
@@ -115,6 +119,53 @@ fn run(lua: &Lua, r#fn: Function, on_finish: Option<Function>) -> LuaResult<()> 
     let work_key = lua.create_registry_value(actual_work)?;
     enqueue_async_task(lua, work_key)?;
     Ok(())
+}
+
+/// Run {fn} in a task that lives as long as your plugin, such as a
+/// repeating timer or a connection opened at load.
+///
+/// The task has no deadline and outlives the call that started it, so a
+/// tool handler can spawn it and return. It ends when {fn} returns or
+/// raises, when you call `task:cancel()`, or when the plugin unloads.
+/// Errors are logged and flashed with the plugin name.
+///
+/// Spawned at the top level of a plugin file, it starts after the plugin
+/// loads. It does not keep maki alive: `maki -p` drops it on exit.
+///
+/// Code that runs 5 seconds without yielding is still stopped. See
+/// `maki.async.sleep`.
+///
+/// @param fn function Zero-argument function to run.
+/// @return (maki.async.Task) Handle with `:cancel()`.
+/// @example
+/// local task = maki.async.spawn(function()
+///   while true do
+///     maki.async.sleep(2000)
+///     report()
+///   end
+/// end)
+///
+/// task:cancel()
+#[lua_fn]
+fn spawn(lua: &Lua, #[ctx] plugin: Arc<str>, r#fn: Function) -> LuaResult<SpawnedTask> {
+    let work_key = lua.create_registry_value(r#fn)?;
+    enqueue_spawned_task(lua, plugin, work_key)
+}
+
+/// Stop the task. A task that is waiting ends right away and runs its
+/// `maki.async.on_cancel` hooks. A task that cancels itself stops at its
+/// next yield. Extra calls do nothing.
+///
+/// @return
+#[lua_fn]
+fn cancel(lua: &Lua, this: &SpawnedTask) -> LuaResult<()> {
+    this.cancel(lua);
+    Ok(())
+}
+
+lua_class! {
+    /// Handle returned by `maki.async.spawn`.
+    "maki.async.Task" => SpawnedTask, TASK_DOCS [cancel]
 }
 
 /// Register {fn} to run as soon as the current task is cancelled or hits
@@ -196,17 +247,16 @@ async fn gather(lua: Lua, fns: Table) -> LuaResult<Table> {
     Ok(out)
 }
 
-/// Suspend the calling task for {ms} milliseconds. The plugin thread is
-/// never blocked, so other tasks and the UI keep running, and a cancel
-/// still lands while you sleep.
+/// Suspend the calling task for {ms} milliseconds. Other tasks and the UI
+/// keep running, and a cancel still lands while you sleep.
 ///
-/// All plugins share one Lua thread, and code that runs for 5 seconds
-/// without yielding is stopped with an error. `sleep(0)` yields without
-/// waiting: it lets every other ready task run once, then carries on. Call
-/// it every so often in a long loop.
+/// All plugins share one Lua thread. Code that runs for 5 seconds without
+/// yielding is stopped with an error. `sleep(0)` lets every other ready
+/// task run once, then returns. Call it now and then in long loops.
 ///
-/// For a timer that has to outlive the tool call that started it, such
-/// as a toast dismissing itself, use `maki.defer_fn`.
+/// A repeating timer is a sleep loop inside `maki.async.spawn`. For a
+/// one-shot timer that outlives the tool call, such as a toast that
+/// dismisses itself, use `maki.defer_fn`.
 ///
 /// @param ms integer Milliseconds to sleep. Zero only yields.
 /// @return
@@ -329,10 +379,10 @@ const join__doc: FnDoc = FnDoc {
 lua_table! {
     /// Tools for running things concurrently in Lua plugins.
     ///
-    /// Use `run` to fire off background tasks, `gather` or `join` to run
-    /// several functions at once, and `semaphore` to limit concurrency.
-    /// The `await` and `wrap` helpers bridge callback-based APIs into
-    /// coroutine-friendly calls.
+    /// `run` starts a background task that ends with its caller, and `spawn`
+    /// one that lives as long as the plugin. `gather` and `join` run several
+    /// functions at once, and `semaphore` limits how many. `await` and `wrap`
+    /// turn callback APIs into coroutine calls.
     ///
     /// ```lua
     /// local results = maki.async.gather({
@@ -340,14 +390,14 @@ lua_table! {
     ///   function() return fetch("b.txt") end,
     /// })
     /// ```
-    extend "maki.async" => pub(crate) fn add_async_fns(), DOCS [
-        run, sleep, manual r#await, manual wrap, manual join, gather, semaphore, on_cancel,
+    extend "maki.async" => pub(crate) fn add_async_fns(plugin: Arc<str>), DOCS [
+        run, spawn(plugin), sleep, manual r#await, manual wrap, manual join, gather, semaphore, on_cancel,
     ]
 }
 
-pub(crate) fn create_async_table(lua: &Lua) -> LuaResult<Table> {
+pub(crate) fn create_async_table(lua: &Lua, plugin: Arc<str>) -> LuaResult<Table> {
     let tbl = lua.create_table()?;
-    add_async_fns(&tbl, lua)?;
+    add_async_fns(&tbl, lua, plugin)?;
 
     tbl.set(
         "await",
@@ -458,10 +508,11 @@ mod tests {
     const ERR_ARGC_GE_1: &str = "argc must be >= 1";
     const ERR_ARGC_INTEGER: &str = "argc must be an integer";
     const ERR_SECOND_ARG_FN: &str = "second argument must be a function";
+    const TEST_PLUGIN: &str = "async_test";
 
     fn setup() -> (Lua, Table) {
         let lua = Lua::new();
-        let tbl = create_async_table(&lua).unwrap();
+        let tbl = create_async_table(&lua, Arc::from(TEST_PLUGIN)).unwrap();
         lua.globals().set("async_tbl", tbl.clone()).unwrap();
         (lua, tbl)
     }

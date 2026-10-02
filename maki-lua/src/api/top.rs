@@ -22,11 +22,10 @@ use crate::runtime::{DeferQueue, DeferredCallback};
 #[derive(Default)]
 pub(crate) struct NotifyHandler(pub(crate) Mutex<Option<(Arc<str>, RegistryKey)>>);
 
-/// Run {callback} after {ms} milliseconds, on the Lua thread and outside
-/// any task scope. The timer does not hang off the caller's cancel token
-/// or the 60 second `async.run` deadline, so the callback still fires
-/// once the tool call that scheduled it is over. That is what a toast
-/// needs to dismiss itself, and the difference from `maki.async.sleep`.
+/// Run {callback} once after {ms} milliseconds. It fires even if the tool
+/// call that scheduled it has ended or was cancelled, which is what a
+/// self-dismissing toast needs. For repeating work, use a
+/// `maki.async.sleep` loop inside `maki.async.spawn`.
 ///
 /// You get back a handle. Its `:stop()` cancels a callback that has not
 /// fired yet, which is how you debounce: schedule, then stop and

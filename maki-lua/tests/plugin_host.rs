@@ -6779,3 +6779,202 @@ fn a_config_init_lua_and_the_modules_it_requires_are_linted() {
     let warning = host.take_key_warning().expect("a key warning");
     assert!(warning.contains("more in the log"), "both files: {warning}");
 }
+
+const SPAWN_TICKER_PLUGIN: &str = "spawn_ticker";
+const SPAWN_OBSERVER_PLUGIN: &str = "spawn_observer";
+const SPAWN_SETTLE_TICKS: u64 = 20;
+
+/// Fires `SpawnTick` from a spawned loop, so the observer plugin can tell
+/// whether the loop is still alive.
+const SPAWN_TICKER: &str = r#"
+maki.async.spawn(function()
+    while true do
+        maki.api.exec_autocmds("SpawnTick")
+        maki.async.sleep(1)
+    end
+end)
+"#;
+
+const SPAWN_OBSERVER: &str = r#"
+local state = { own = 0, ticks = 0, armed = 0, hooks = 0 }
+maki.api.create_autocmd("SpawnTick", { callback = function() state.ticks = state.ticks + 1 end })
+maki.api.create_autocmd("SpawnArmed", { callback = function() state.armed = state.armed + 1 end })
+maki.api.create_autocmd("SpawnCancelHook", { callback = function() state.hooks = state.hooks + 1 end })
+maki.async.spawn(function()
+    while true do
+        state.own = state.own + 1
+        maki.async.sleep(1)
+    end
+end)
+local own_during_load = state.own
+maki.api.register_tool({
+    name = "spawn_probe",
+    description = "reports the spawned counters",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    audiences = { "main" },
+    handler = function()
+        return string.format("%d %d %d %d %d", own_during_load, state.own, state.ticks, state.armed, state.hooks)
+    end,
+})
+"#;
+
+struct SpawnProbe {
+    own_during_load: u64,
+    own: u64,
+    ticks: u64,
+    armed: u64,
+    cancel_hooks: u64,
+}
+
+fn spawn_probe(reg: &ToolRegistry) -> SpawnProbe {
+    let out = exec_tool(reg, "spawn_probe", json!({})).unwrap();
+    let mut counts = out.split_whitespace().map(|n| n.parse().unwrap());
+    let mut next = || counts.next().unwrap();
+    SpawnProbe {
+        own_during_load: next(),
+        own: next(),
+        ticks: next(),
+        armed: next(),
+        cancel_hooks: next(),
+    }
+}
+
+fn spawn_host() -> (Arc<ToolRegistry>, PluginHost) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(SPAWN_OBSERVER_PLUGIN, SPAWN_OBSERVER)
+        .unwrap();
+    (reg, host)
+}
+
+/// You can't wait for "never", so the observer's own loop is the clock. It
+/// sleeps as long as the ticker's, so after {SPAWN_SETTLE_TICKS} more rounds
+/// a live ticker would surely have fired.
+fn assert_no_ticks_after(reg: &ToolRegistry, from: &SpawnProbe) {
+    let later = poll_until("the observer's loop keeps going", || {
+        let probe = spawn_probe(reg);
+        (probe.own > from.own + SPAWN_SETTLE_TICKS).then_some(probe)
+    });
+    assert_eq!(later.ticks, from.ticks);
+}
+
+fn poll_ticking(reg: &ToolRegistry, what: &str) -> SpawnProbe {
+    poll_until(what, || {
+        let probe = spawn_probe(reg);
+        (probe.ticks > 0).then_some(probe)
+    })
+}
+
+const SPAWN_LOAD_ERROR: &str = "spawn load boom";
+
+/// The top level registers its spawns before a load raises, so the rollback
+/// has to stop them, and the cancel mark it leaves must not stop the next
+/// clean load from spawning.
+#[test]
+fn a_spawned_task_lives_from_a_clean_load_to_its_unload() {
+    let (reg, host) = spawn_host();
+    let failing = format!("{SPAWN_TICKER}\nerror({SPAWN_LOAD_ERROR:?})");
+    let err = host
+        .load_source(SPAWN_TICKER_PLUGIN, &failing)
+        .expect_err("the load raises")
+        .to_string();
+    assert!(err.contains(SPAWN_LOAD_ERROR), "got: {err}");
+    let failed = spawn_probe(&reg);
+    assert_eq!(failed.ticks, 0);
+    assert_no_ticks_after(&reg, &failed);
+
+    host.load_source(SPAWN_TICKER_PLUGIN, SPAWN_TICKER).unwrap();
+    let running = poll_ticking(&reg, "a clean load spawns");
+    assert_eq!(running.own_during_load, 0, "a spawn waits for its load");
+
+    host.unload(SPAWN_TICKER_PLUGIN).unwrap();
+    assert_no_ticks_after(&reg, &spawn_probe(&reg));
+}
+
+const SPAWN_SUBJECT_PLUGIN: &str = "spawn_subject";
+
+/// The parked runs outlive [`CANCEL_TEST_TIMEOUT`] but not their 60s
+/// deadline, so a drain that waited for them would fail the test.
+const SPAWN_QUEUER: &str = r#"
+maki.async.spawn(function()
+    for _ = 1, 4 do
+        maki.async.run(function() maki.async.sleep(50000) end)
+    end
+    while true do
+        maki.async.run(function() maki.api.exec_autocmds("SpawnTick") end)
+        maki.async.sleep(1)
+    end
+end)
+"#;
+
+const SPAWN_SPINNER: &str = r#"
+maki.async.spawn(function()
+    while true do
+        maki.api.exec_autocmds("SpawnTick")
+        maki.async.sleep(0)
+    end
+end)
+"#;
+
+const SPAWN_HOOK_RESPAWNER: &str = r#"
+maki.async.spawn(function()
+    maki.async.on_cancel(function()
+        maki.async.spawn(function()
+            while true do
+                maki.api.exec_autocmds("SpawnTick")
+                maki.async.sleep(1)
+            end
+        end)
+        maki.api.exec_autocmds("SpawnCancelHook")
+    end)
+    maki.api.exec_autocmds("SpawnArmed")
+    maki.async.sleep(3600000)
+end)
+"#;
+
+/// A spawn holds no drain slot and has no deadline. Next to an endless loop,
+/// maki stays responsive only because the runs it queues are detached and
+/// the loop yields. The work runs off the test thread, so a host that stops
+/// answering fails the test instead of hanging it.
+#[test_case::test_case(SPAWN_QUEUER ; "queueing_parked_runs")]
+#[test_case::test_case(SPAWN_SPINNER ; "spinning_on_sleep_zero")]
+fn a_spawned_loop_never_blocks_calls_loads_or_unloads(subject: &'static str) {
+    let (reg, host) = spawn_host();
+    host.load_source(SPAWN_SUBJECT_PLUGIN, subject).unwrap();
+
+    let (tx, rx) = flume::bounded(1);
+    std::thread::spawn(move || {
+        poll_ticking(&reg, "the loop ticks");
+        host.load_source(SPAWN_TICKER_PLUGIN, SPAWN_TICKER).unwrap();
+        host.unload(SPAWN_SUBJECT_PLUGIN).unwrap();
+        tx.send(()).ok();
+    });
+    rx.recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("the host must keep answering beside the loop");
+}
+
+/// An unloaded plugin's `on_cancel` hook still runs, and a task it spawned
+/// would never end. A reload right after the unload lifts the cancel mark,
+/// so it must not beat the old instance's hook.
+#[test_case::test_case(false ; "unload")]
+#[test_case::test_case(true ; "unload_then_reload")]
+fn an_on_cancel_hook_of_an_unloaded_spawn_cannot_spawn_again(reload: bool) {
+    let (reg, host) = spawn_host();
+    host.load_source(SPAWN_SUBJECT_PLUGIN, SPAWN_HOOK_RESPAWNER)
+        .unwrap();
+    poll_until("the spawn arms its hook", || {
+        (spawn_probe(&reg).armed > 0).then_some(())
+    });
+
+    host.unload(SPAWN_SUBJECT_PLUGIN).unwrap();
+    if reload {
+        host.load_source(SPAWN_SUBJECT_PLUGIN, SPAWN_HOOK_RESPAWNER)
+            .unwrap();
+    }
+    let hooked = poll_until("the unloaded spawn's hook runs", || {
+        let probe = spawn_probe(&reg);
+        (probe.cancel_hooks > 0).then_some(probe)
+    });
+    assert_eq!(hooked.ticks, 0);
+    assert_no_ticks_after(&reg, &hooked);
+}

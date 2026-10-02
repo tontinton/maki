@@ -121,11 +121,11 @@ struct Entry {
 /// and cancelling that id has to reach all of them, even the ones opened after
 /// the cancel.
 ///
-/// So the mark lives on the id until the whole map is drained by
-/// [`cancel_all`](Self::cancel_all). Clearing it when the last sibling retires
-/// would lose the cancels that land while the id sits empty, which it does
-/// before the first session registers and again between two sessions one tool
-/// call opens back to back.
+/// So the mark lives on the id until [`cancel_all`](Self::cancel_all) drains
+/// the whole map or [`revive`](Self::revive) lifts it. Clearing it when the
+/// last sibling retires would lose the cancels that land while the id sits
+/// empty, which it does before the first session registers and again between
+/// two sessions one tool call opens back to back.
 pub struct CancelMap<K> {
     entries: Mutex<HashMap<K, Entry>>,
     next_slot: AtomicU64,
@@ -178,6 +178,14 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
         let entry = map.entry(id).or_default();
         entry.cancelled = true;
         entry.registrations.clear();
+    }
+
+    /// A plugin that loads again needs this, or every task it starts would be
+    /// born cancelled.
+    pub fn revive(&self, id: &K) {
+        if let Some(entry) = self.lock().get_mut(id) {
+            entry.cancelled = false;
+        }
     }
 
     /// The run that owned these is over: stop what is still registered and drop
@@ -378,5 +386,30 @@ mod tests {
 
         map.cancel(key());
         assert!(tok2.is_cancelled());
+    }
+
+    /// After a reload, handles from the old instance can still retire their
+    /// slots, and they must not touch the new ones.
+    #[test]
+    fn cancel_map_revive_survives_stale_retires_and_cancels_again() {
+        let map = CancelMap::new();
+        map.revive(&key());
+        assert!(!map.has_key(&key()), "reviving an unknown id must not leak");
+
+        let (stale_trigger, _stale) = CancelToken::new();
+        let stale_slot = map.insert(key(), stale_trigger);
+        map.cancel(key());
+        map.revive(&key());
+        let (trigger, token) = CancelToken::new();
+        map.insert(key(), trigger);
+
+        map.retire(&key(), stale_slot);
+        assert!(
+            !token.is_cancelled(),
+            "a stale slot must not retire a new one"
+        );
+
+        map.cancel(key());
+        assert!(token.is_cancelled(), "a revived id can be cancelled again");
     }
 }
