@@ -115,6 +115,9 @@ pub struct AgentParams {
     pub ledger: Arc<RunLedger>,
     pub registry: Arc<crate::tools::ToolRegistry>,
     pub audience: ToolAudience,
+    /// Inherited by subagents: an unattended run can never be answered, so
+    /// nested ones must not prompt either.
+    pub unattended: bool,
     pub model_policy: Arc<ModelPolicy>,
 }
 
@@ -164,6 +167,7 @@ pub struct Agent<'h> {
     subagent_cancels: Arc<crate::cancel::CancelMap<String>>,
     registry: Arc<crate::tools::ToolRegistry>,
     audience: ToolAudience,
+    unattended: bool,
     workflow: bool,
     local_tools: LocalTools,
     model_policy: Arc<ModelPolicy>,
@@ -208,6 +212,7 @@ impl<'h> Agent<'h> {
             subagent_cancels: params.subagent_cancels,
             registry: params.registry,
             audience: params.audience,
+            unattended: params.unattended,
             workflow: false,
             local_tools: LocalTools::default(),
             model_policy: params.model_policy,
@@ -808,6 +813,7 @@ impl<'h> Agent<'h> {
             registry: Arc::clone(&self.registry),
             workflow: self.workflow,
             audience: self.audience,
+            unattended: self.unattended,
             local_tools: Arc::clone(&self.local_tools),
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
@@ -1224,6 +1230,7 @@ mod tests {
                 ledger: Arc::new(RunLedger::default()),
                 registry: Arc::new(crate::tools::ToolRegistry::new()),
                 audience: ToolAudience::MAIN,
+                unattended: false,
                 model_policy: Arc::new(ModelPolicy::default()),
             },
             AgentRunParams {
