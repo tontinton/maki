@@ -319,6 +319,12 @@ maki.setup({
 | `allow_model` | boolean | `false` | - | Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves. |
 | `max_concurrent` | integer | `8` | 1 | Max concurrently running subagents. |
 
+### `plugins.todo_write`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `show_on_resume_or_reload` | boolean | `true` | - | Show the todo panel when a session with todos is resumed or reloaded. |
+
 ### `plugins.webfetch`
 
 | Field | Type | Default | Min | Description |
