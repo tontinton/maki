@@ -192,6 +192,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/requesty"),
     },
     BundledPlugin {
+        name: "runinfra",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/runinfra"),
+    },
+    BundledPlugin {
         name: "openrouter",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/openrouter"),
     },
