@@ -6,3 +6,4 @@ runs.csv
 /site/.bin/
 /.playwright-mcp/
 /result
+AGENTS.local.md
