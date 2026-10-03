@@ -38,8 +38,7 @@ impl AlertModal {
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) {
-        if matches!(key_event.code, KeyCode::Esc | KeyCode::Enter) || key::QUIT.matches(key_event)
-        {
+        if matches!(key_event.code, KeyCode::Esc | KeyCode::Enter) || key::QUIT.matches(key_event) {
             self.close();
         }
     }
