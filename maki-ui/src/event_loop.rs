@@ -1125,7 +1125,7 @@ impl<'t> EventLoop<'t> {
             selected = select_notification(selected, candidate);
         }
         if let Some(notification) = selected.filter(|n| self.focus.allows(n))
-            && let Err(error) = notifier.notify(&notification.message())
+            && let Err(error) = notifier.notify(&notification.message(), notification.reason())
         {
             warn!(notifier = ?notifier.notifier(), %error, "terminal notifications disabled after write failure");
             self.notifier = None;

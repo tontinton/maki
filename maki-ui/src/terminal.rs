@@ -18,6 +18,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use maki_config::NotificationMethod;
 
 const FALLBACK_NOTIFICATION_MESSAGE: &str = "Maki needs attention";
+const NOTIFICATION_TITLE: &str = "Maki";
 const BELL_SEQUENCE: &str = "\u{7}";
 /// XTPUSHTITLE saves whatever title the shell left on the window, so the
 /// matching XTPOPTITLE on exit or suspend hands it back and no plugin
@@ -56,6 +57,7 @@ struct TmuxClient {
 pub(crate) enum ResolvedNotifier {
     Osc9,
     Bell,
+    Notify,
 }
 
 pub(crate) struct TerminalNotifier {
@@ -76,7 +78,11 @@ impl TerminalNotifier {
         self.notifier
     }
 
-    pub(crate) fn notify(&self, message: &str) -> std::io::Result<()> {
+    pub(crate) fn notify(&self, message: &str, reason: &str) -> std::io::Result<()> {
+        if matches!(self.notifier, ResolvedNotifier::Notify) {
+            desktop_notification(message, reason);
+            return Ok(());
+        }
         write_sequence(&notification_sequence(self.notifier, self.mux, message))
     }
 }
@@ -138,6 +144,7 @@ fn resolve_notifier(
         } else {
             ResolvedNotifier::Bell
         }),
+        NotificationMethod::Notify => Some(ResolvedNotifier::Notify),
     }
 }
 
@@ -232,7 +239,26 @@ fn notification_sequence(notifier: ResolvedNotifier, mux: TerminalMux, message: 
             mux.wrap_for_mux(format!("\u{1b}]9;{message}\u{7}"))
         }
         ResolvedNotifier::Bell => BELL_SEQUENCE.to_string(),
+        ResolvedNotifier::Notify => {
+            unreachable!("desktop notifications are sent in TerminalNotifier::notify")
+        }
     }
+}
+
+fn desktop_notification(message: &str, reason: &str) {
+    let message = sanitize_notification_message(message);
+    let reason = reason.to_string();
+
+    std::thread::spawn(move || {
+        if let Err(error) = notify_rust::Notification::new()
+            .appname(NOTIFICATION_TITLE)
+            .summary(&reason)
+            .body(&message)
+            .show()
+        {
+            tracing::warn!(%error, "desktop notification failed");
+        }
+    });
 }
 
 impl TerminalMux {
@@ -478,6 +504,10 @@ mod tests {
         assert_eq!(
             resolve_notifier(NotificationMethod::Bell, || panic!("auto detection ran")),
             Some(ResolvedNotifier::Bell)
+        );
+        assert_eq!(
+            resolve_notifier(NotificationMethod::Notify, || panic!("auto detection ran")),
+            Some(ResolvedNotifier::Notify),
         );
         assert_eq!(
             resolve_notifier(NotificationMethod::Off, || panic!("auto detection ran")),
