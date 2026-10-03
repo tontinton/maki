@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +19,8 @@ use maki_config::{
 };
 use maki_lua::{
     InitFiles, KEY_WARNING, MAX_INFLIGHT_TOOLS, PERMISSION_NAME_WARNING, PluginError, PluginHost,
-    SKIPPED_PLUGIN_WARNING, SessionEndReason, WARM_TOOL_CAP,
+    PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason, WARM_TOOL_CAP,
+    set_allowed_private_hosts,
 };
 use maki_providers::Model;
 use maki_storage::id::SessionRef;
@@ -6977,4 +6980,182 @@ fn an_on_cancel_hook_of_an_unloaded_spawn_cannot_spawn_again(reload: bool) {
     });
     assert_eq!(hooked.ticks, 0);
     assert_no_ticks_after(&reg, &hooked);
+}
+
+const NET_PLUGIN: &str = "net_conn";
+const NET_LOOPBACK: &str = "127.0.0.1";
+const NET_PING: &str = "ping";
+/// Big enough to fill the send and receive buffers on loopback, so the
+/// write has to park until the peer reads.
+const NET_PARKING_WRITE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The private host allowlist is global to the process. Every test sets the
+/// same entry, so tests running side by side never undo each other.
+fn net_listener() -> (TcpListener, u16, PluginPermissions) {
+    set_allowed_private_hosts(&[NET_LOOPBACK.to_owned()]);
+    let listener = TcpListener::bind((NET_LOOPBACK, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut perms = PluginPermissions::trusted();
+    perms.set_net_hosts(Some(Arc::from(vec![format!("{NET_LOOPBACK}:{port}")])));
+    (listener, port, perms)
+}
+
+/// The peer waits for `go` before it reads, so a big write from the plugin
+/// stays stuck until the test says so. Sends back how many bytes arrived.
+fn bytes_until_eof(listener: TcpListener, go: flume::Receiver<()>) -> flume::Receiver<usize> {
+    let (tx, rx) = flume::bounded(1);
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        go.recv().ok();
+        let mut got = Vec::new();
+        stream.read_to_end(&mut got).unwrap();
+        tx.send(got.len()).ok();
+    });
+    rx
+}
+
+fn net_plugin_src(port: u16, body: &str) -> String {
+    format!(
+        r#"
+local state = {{ reply = "" }}
+local function tool(name, handler)
+    maki.api.register_tool({{
+        name = name,
+        description = name,
+        schema = {{ type = "object", properties = {{}}, additionalProperties = false }},
+        audiences = {{ "main" }},
+        handler = handler,
+    }})
+end
+tool("net_reply", function() return state.reply end)
+local PORT = {port}
+{body}
+"#
+    )
+}
+
+fn net_host(perms: PluginPermissions, src: &str) -> (Arc<ToolRegistry>, PluginHost) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source_with_permissions(NET_PLUGIN, src, perms)
+        .unwrap();
+    (reg, host)
+}
+
+fn poll_reply(reg: &ToolRegistry, what: &str) -> String {
+    poll_until(what, || {
+        let reply = exec_tool(reg, "net_reply", json!({})).unwrap();
+        (!reply.is_empty()).then_some(reply)
+    })
+}
+
+#[test]
+fn a_spawned_task_echoes_over_maki_net_connect() {
+    let (listener, port, perms) = net_listener();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0; NET_PING.len()];
+        stream.read_exact(&mut buf).unwrap();
+        stream.write_all(&buf).unwrap();
+    });
+    let body = format!(
+        r#"
+maki.async.spawn(function()
+    local conn, err = maki.net.connect("{NET_LOOPBACK}", PORT)
+    if not conn then state.reply = err return end
+    conn:write("{NET_PING}")
+    local chunk, read_err = conn:read()
+    state.reply = chunk or read_err
+    conn:close()
+end)
+"#
+    );
+    let (reg, _host) = net_host(perms, &net_plugin_src(port, &body));
+    assert_eq!(poll_reply(&reg, "the echo comes back"), NET_PING);
+}
+
+#[test]
+fn cancelling_a_task_mid_write_closes_the_conn() {
+    let (listener, port, perms) = net_listener();
+    let (go, wait) = flume::bounded(1);
+    let received = bytes_until_eof(listener, wait);
+    let body = format!(
+        r#"
+local task = maki.async.spawn(function()
+    local conn = assert(maki.net.connect("{NET_LOOPBACK}", PORT))
+    state.reply = "writing"
+    conn:write(string.rep("a", {NET_PARKING_WRITE_BYTES}))
+end)
+tool("net_cancel", function()
+    task:cancel()
+    return "cancelled"
+end)
+"#
+    );
+    let (reg, _host) = net_host(perms, &net_plugin_src(port, &body));
+    poll_reply(&reg, "the write starts");
+    exec_tool(&reg, "net_cancel", json!({})).unwrap();
+    go.send(()).unwrap();
+
+    let got = received
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("the cut write must close the conn");
+    assert!(
+        got < NET_PARKING_WRITE_BYTES,
+        "the write was not cut: {got}"
+    );
+}
+
+#[test]
+fn a_handler_abandoned_mid_write_closes_the_conn() {
+    let (listener, port, perms) = net_listener();
+    let (go, wait) = flume::bounded(1);
+    let received = bytes_until_eof(listener, wait);
+    let body = format!(
+        r#"
+tool("net_parked_write", function(_, ctx)
+    ctx:set_deadline(1)
+    local conn = assert(maki.net.connect("{NET_LOOPBACK}", PORT))
+    conn:write(string.rep("a", {NET_PARKING_WRITE_BYTES}))
+end)
+"#
+    );
+    let (reg, _host) = net_host(perms, &net_plugin_src(port, &body));
+    exec_tool(&reg, "net_parked_write", json!({})).unwrap_err();
+    go.send(()).unwrap();
+
+    let got = received
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("the abandoned write must close the conn");
+    assert!(
+        got < NET_PARKING_WRITE_BYTES,
+        "the write was not cut: {got}"
+    );
+}
+
+#[test]
+fn unloading_a_plugin_closes_the_conns_it_holds() {
+    let (listener, port, perms) = net_listener();
+    let (go, wait) = flume::bounded(1);
+    go.send(()).unwrap();
+    let received = bytes_until_eof(listener, wait);
+    let body = format!(
+        r#"
+local conn
+tool("net_hold", function()
+    conn = assert(maki.net.connect("{NET_LOOPBACK}", PORT))
+    return "held"
+end)
+"#
+    );
+    let (reg, host) = net_host(perms, &net_plugin_src(port, &body));
+    exec_tool(&reg, "net_hold", json!({})).unwrap();
+    host.unload(NET_PLUGIN).unwrap();
+
+    assert_eq!(
+        received
+            .recv_timeout(CANCEL_TEST_TIMEOUT)
+            .expect("the unload must close the conn"),
+        0
+    );
 }

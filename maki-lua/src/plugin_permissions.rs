@@ -57,8 +57,8 @@ impl NetEgress {
         }
     }
 
-    /// The manifest's list, for the one caller that has to answer "did this
-    /// plugin declare any hosts at all" before it can register a provider.
+    /// The raw manifest list. `allows` reads a missing list as "any host",
+    /// and some callers need to treat it as "no host" instead.
     pub(crate) fn declared(&self) -> &NetHosts {
         &self.declared
     }

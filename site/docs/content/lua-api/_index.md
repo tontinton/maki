@@ -125,7 +125,8 @@ The rules:
 | [`maki.keymap`](#maki-keymap) | Key mappings, modeled after `vim.keymap`. |
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
 | [`maki.model`](#maki-model) | The model behind the focused session. |
-| [`maki.net`](#maki-net) | HTTP client for fetching web content. |
+| [`maki.net`](#maki-net) | HTTP and plain TCP for plugins. |
+| [`maki.net.Conn`](#maki-net-Conn) | A TCP connection opened by `maki.net.connect`. |
 | [`maki.provider`](#maki-provider) | Providers implemented in Lua. |
 | [`maki.provider.auth`](#maki-provider-auth) | Credential storage for the providers this plugin registered. |
 | [`maki.session`](#maki-session) | Host session primitives. |
@@ -3785,15 +3786,19 @@ if m and m.subsidised_by then print(m.subsidised_by, m.pricing.input) end
 
 ## maki.net {#maki-net}
 
-HTTP client for fetching web content. All traffic goes over HTTPS
-(plain HTTP is upgraded). Private and metadata IP addresses are
-blocked to prevent SSRF, including after a redirect. Hosts listed in
-the `net.allowed_private_hosts` config option are exempt, and so is a
-provider plugin's own origin (see `maki.net.request`).
-Failed requests (5xx) are retried automatically.
+HTTP and plain TCP for plugins.
+
+`request` traffic goes over HTTPS (plain HTTP is upgraded). Private
+and metadata IP addresses are blocked to prevent SSRF, including
+after a redirect. Hosts listed in the `net.allowed_private_hosts` config
+option are exempt, and so is a provider plugin's own origin (see
+`maki.net.request`). Failed requests (5xx) are retried automatically.
 
 Requests reuse a pool of clients, so calls to the same host share one
 keep-alive connection rather than pay a fresh handshake each time.
+
+`connect` follows the same rules, but only reaches hosts the plugin
+lists in `net_hosts`.
 
 ```lua
 local res, err = maki.net.request("https://example.com")
@@ -3857,6 +3862,125 @@ else
   print(res.status, res.body)
 end
 ```
+
+---
+
+### `maki.net.connect()` {#maki-net-connect}
+
+```lua
+maki.net.connect({host}, {port}, {opts?})
+```
+
+Open a plain TCP connection to {host}:{port}, such as a dashboard or a
+language server running on your machine. There is no TLS.
+
+The plugin must list the host in `net_hosts`, best with its port
+(`"127.0.0.1:7777"`): unlike `request`, `net = true` alone reaches
+nothing. Private and loopback addresses are blocked like in `request`,
+unless `net.allowed_private_hosts` allows them.
+
+`read` and `write` yield, so a connection that stays open belongs in a
+`maki.async.spawn` task. It closes on `conn:close()`, when the handle is
+garbage collected, and when the plugin unloads.
+
+{opts} fields:
+  `timeout` (integer) Connect timeout in seconds, max 60 (default 10).
+
+Requires the `net` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{host}` (`string`) Host name or IP address.
+- `{port}` (`integer`) Port to connect to.
+- `{opts?}` (`table?`) Options (see above).
+
+**Returns:** ([`maki.net.Conn?`](#maki-net-Conn), `string?`) The connection, or nil plus an error string.
+
+**Example:**
+
+```lua
+maki.async.spawn(function()
+  local conn, err = maki.net.connect("127.0.0.1", 7777)
+  if not conn then return maki.log.error(err) end
+  conn:write("hello\n")
+  while true do
+    local chunk = conn:read()
+    if not chunk then break end
+    handle(chunk)
+  end
+  conn:close()
+end)
+```
+
+
+## maki.net.Conn {#maki-net-Conn}
+
+A TCP connection opened by `maki.net.connect`.
+
+`read` and `write` yield until done and can run at the same time.
+The connection closes on `:close()`, when the handle is garbage
+collected, and when the plugin unloads.
+
+---
+
+### `Conn:read()` {#Conn-read}
+
+```lua
+Conn:read()
+```
+
+Wait for data and return what arrived, at most 64 KiB. Returns
+`nil, nil` once the peer has closed its side.
+
+Only one read at a time: a second `read()` while one is waiting returns
+an error. A read and a write can run at the same time.
+
+**Returns:** (`string?`, `string?`) Bytes read, or nil plus an error string, or nil, nil at end of stream.
+
+**Example:**
+
+```lua
+local chunk, err = conn:read()
+if err then return maki.log.error(err) end
+if not chunk then print("peer closed") end
+```
+
+---
+
+### `Conn:write()` {#Conn-write}
+
+```lua
+Conn:write({data})
+```
+
+Send {data} and wait until all of it is written. Writes made while one
+is in flight wait their turn, so each goes out whole and in call order.
+A write that is cancelled or fails partway closes the connection,
+because the peer would read the next write as the rest of the cut one.
+
+**Parameters:**
+
+- `{data}` (`string`) Bytes to send.
+
+**Returns:** (`boolean?`, `string?`) `true`, or nil plus an error string.
+
+**Example:**
+
+```lua
+local ok, err = conn:write(maki.json.encode(msg) .. "\n")
+if not ok then return maki.log.error(err) end
+```
+
+---
+
+### `Conn:close()` {#Conn-close}
+
+```lua
+Conn:close()
+```
+
+Close the connection. A read or write in flight ends with an error.
+Extra calls do nothing.
 
 
 ## maki.provider {#maki-provider}

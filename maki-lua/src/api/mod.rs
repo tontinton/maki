@@ -95,7 +95,7 @@ pub(crate) fn create_maki_global(
     let egress = NetEgress::new(net_hosts);
     maki.set(
         "net",
-        net::create_net_table(lua, permissions, egress.clone())?,
+        net::create_net_table(lua, permissions, egress.clone(), Arc::clone(&plugin))?,
     )?;
     maki.set("plan", plan::create_plan_table(lua, ui_action_tx.clone())?)?;
     maki.set(

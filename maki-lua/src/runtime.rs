@@ -2264,8 +2264,7 @@ async fn run_work_fn(
     handle: &TaskHandle,
 ) -> Result<LuaValue, mlua::Error> {
     let func: Function = lua.registry_value(work_fn)?;
-    let fut = lua.create_thread(func)?.into_async::<LuaValue>(())?;
-    until_abandoned(fut, handle)
+    until_abandoned(func.call_async::<LuaValue>(()), handle)
         .await
         .unwrap_or_else(|msg| Err(mlua::Error::runtime(msg)))
 }
@@ -2475,9 +2474,12 @@ fn spawn_plugin_task(
         cell.command_depth = task.command_depth;
         cell.detached = true;
         let scope = TaskScope::new(&lua, cell);
+        // On cancel, `call_async` drops the Rust future the task is parked in
+        // right away. An `into_async` thread would keep it alive until the next
+        // GC, and a cut `conn:write` must close its conn now, not then.
         let run = async {
             let func: Function = lua.registry_value(&task.work_fn)?;
-            lua.create_thread(func)?.into_async::<()>(())?.await
+            func.call_async::<()>(()).await
         };
         let cancelled = async {
             task.cancel.cancelled().await;
@@ -3175,6 +3177,7 @@ impl LuaRuntime {
             envs.0.remove(plugin);
         }
         crate::api::fs::clear_plugin_files(plugin);
+        crate::api::net::close_plugin_conns(plugin);
         let revision_guard = self.drop_plugin_keys(plugin);
         with_packs(&self.lua, |packs| packs.active.remove(plugin));
         if let Some(mut store) = self.lua.app_data_mut::<KeymapStore>() {
@@ -4075,20 +4078,13 @@ async fn run_tool_call(
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
 
-    let thread = match lua.create_thread(handler) {
-        Ok(t) => t,
-        Err(e) => return ToolCallReply::err(strip_traceback(&e)),
-    };
     let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
     cell.live_sink = live_sink;
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
 
-    let async_thread = match thread.into_async::<LuaValue>((input_lua, ctx_ud)) {
-        Ok(at) => at,
-        Err(e) => return ToolCallReply::err(strip_traceback(&e)),
-    };
+    let async_thread = handler.call_async::<LuaValue>((input_lua, ctx_ud));
     if let Some(id) = &live_id {
         live_tasks
             .borrow_mut()

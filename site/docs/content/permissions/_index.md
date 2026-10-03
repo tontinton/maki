@@ -252,6 +252,11 @@ The list covers the plugin's `maki.net` calls and the `base_url` of any
 cannot send credentials to a host the manifest does not name. A plugin that
 calls `maki.provider.register` must declare a non-empty list.
 
+`maki.net.connect` opens raw TCP and only reaches hosts in `net_hosts`, so
+`net = true` alone is not enough for it. Give these entries a port, as in
+`127.0.0.1:7777`. A loopback or LAN address also needs
+`net.allowed_private_hosts`, as described below.
+
 For an installed [package](/docs/packages/#package-permissions), Maki stores
 the hosts with the approval and asks again when an update widens or drops the
 list.

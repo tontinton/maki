@@ -1,25 +1,29 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use futures_lite::io::AsyncReadExt;
+use async_lock::Mutex as AsyncMutex;
+use futures_lite::FutureExt;
+use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use isahc::http::HeaderMap;
 use isahc::net::dns::ResolveMap;
 use isahc::{AsyncBody, HttpClient, Request, Response};
 use maki_config::split_host_port;
-use maki_lua_macro::{lua_fn, lua_table};
+use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::Timeouts;
-use mlua::{Lua, Result as LuaResult, Table};
+use mlua::{Lua, LuaString, Result as LuaResult, Table, UserDataRef};
 use regex::bytes::Regex;
-use smol::{Timer, unblock};
+use smol::{Async, Timer, unblock};
 use thiserror::Error;
 use url::Url;
 
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 use crate::plugin_permissions::{NetEgress, PluginPermissions};
 
@@ -52,6 +56,14 @@ const BODYLESS_METHODS: &[&str] = &["GET", "HEAD"];
 const HEADER_VALUE_SEPARATOR: &str = ", ";
 const ALLOWLIST_HINT: &str = "add it to `net.allowed_private_hosts` in your init.lua to allow it";
 const UNDECLARED_HOST_HINT: &str = "add it to `net_hosts` under `[permissions]` in plugin.toml";
+const CONNECT_NEEDS_NET_HOSTS: &str = "blocked: maki.net.connect only reaches hosts listed in `net_hosts`, and this plugin lists none";
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+const MAX_CONNECT_TIMEOUT_SECS: u64 = 60;
+/// Anything past this waits in the kernel, not in our memory. So a plugin
+/// that stops reading slows the peer down instead of growing a buffer.
+const READ_CHUNK: usize = 64 * 1024;
+const READ_IN_PROGRESS: &str = "read already in progress";
+const CONN_CLOSED: &str = "connection closed";
 /// Reserved IPv4 ranges the standard library has no predicate for. Carrier
 /// grade NAT is the one that bites: Alibaba Cloud parks its instance metadata
 /// service on it at 100.100.100.200. Then protocol assignments, benchmarking,
@@ -77,6 +89,13 @@ const CROSS_AUTHORITY_HEADERS: [&str; 5] = [
 /// the config: every `maki.net` call, in any plugin, on any Lua thread, reads
 /// the same list, and `/reload` swaps it.
 static ALLOWED_PRIVATE_HOSTS: LazyLock<ArcSwap<HostAllowlist>> = LazyLock::new(ArcSwap::default);
+
+thread_local! {
+    /// Cancelling a plugin's tasks on unload misses a conn it keeps in a plain
+    /// variable, so we remember every conn here. The refs are weak, so the GC
+    /// can still close a dropped conn before that.
+    static PLUGIN_CONNS: RefCell<HashMap<Arc<str>, Vec<Weak<ConnState>>>> = RefCell::default();
+}
 
 /// Applies `net.allowed_private_hosts`. Entries that parse as neither a host,
 /// a `host:port`, nor a CIDR range are dropped with a warning.
@@ -342,24 +361,276 @@ async fn request(
     let resp = try_pair!(do_request(params).await);
     Ok((Some(resp.into_table(&lua)?), None))
 }
+/// Open a plain TCP connection to {host}:{port}, such as a dashboard or a
+/// language server running on your machine. There is no TLS.
+///
+/// The plugin must list the host in `net_hosts`, best with its port
+/// (`"127.0.0.1:7777"`): unlike `request`, `net = true` alone reaches
+/// nothing. Private and loopback addresses are blocked like in `request`,
+/// unless `net.allowed_private_hosts` allows them.
+///
+/// `read` and `write` yield, so a connection that stays open belongs in a
+/// `maki.async.spawn` task. It closes on `conn:close()`, when the handle is
+/// garbage collected, and when the plugin unloads.
+///
+/// {opts} fields:
+///   `timeout` (integer) Connect timeout in seconds, max 60 (default 10).
+///
+/// @param host string Host name or IP address.
+/// @param port integer Port to connect to.
+/// @param opts table? Options (see above).
+/// @return (maki.net.Conn?, string?) The connection, or nil plus an error string.
+/// @example
+/// maki.async.spawn(function()
+///   local conn, err = maki.net.connect("127.0.0.1", 7777)
+///   if not conn then return maki.log.error(err) end
+///   conn:write("hello\n")
+///   while true do
+///     local chunk = conn:read()
+///     if not chunk then break end
+///     handle(chunk)
+///   end
+///   conn:close()
+/// end)
+#[lua_fn(guard = Net)]
+async fn connect(
+    _lua: Lua,
+    #[ctx] egress: NetEgress,
+    #[ctx] plugin: Arc<str>,
+    host: String,
+    port: u16,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Conn>> {
+    let timeout = opts
+        .and_then(|o| o.get::<u64>("timeout").ok())
+        .map_or(DEFAULT_CONNECT_TIMEOUT_SECS, |secs| {
+            secs.min(MAX_CONNECT_TIMEOUT_SECS)
+        });
+    let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
+    let stream = try_pair!(
+        open_stream(&host, port, &egress, &allowed)
+            .or(async {
+                Timer::after(Duration::from_secs(timeout)).await;
+                Err(format!(
+                    "connect to {host}:{port} timed out after {timeout}s"
+                ))
+            })
+            .await
+    );
+    Ok((Some(Conn::track(plugin, stream)), None))
+}
+
+async fn open_stream(
+    host: &str,
+    port: u16,
+    egress: &NetEgress,
+    allowed: &HostAllowlist,
+) -> Result<Async<TcpStream>, String> {
+    if egress.declared().is_none() {
+        return Err(format!(
+            "{CONNECT_NEEDS_NET_HOSTS} ({UNDECLARED_HOST_HINT})"
+        ));
+    }
+    check_declared(host, port, egress)?;
+    // No vetted addresses means a literal, which needs no real lookup, or an
+    // allowlisted name, which the user trusts wherever it points.
+    let addrs = match guard(host, port, allowed).await? {
+        Some(vetted) => vetted,
+        None => lookup(host, port).await?,
+    };
+    let stream = dial(&addrs)
+        .await
+        .map_err(|e| format!("cannot connect to {host}:{port}: {e}"))?;
+    stream
+        .get_ref()
+        .set_nodelay(true)
+        .map_err(|e| format!("cannot set TCP_NODELAY: {e}"))?;
+    Ok(stream)
+}
+
+async fn dial(addrs: &[SocketAddr]) -> io::Result<Async<TcpStream>> {
+    let mut last_err = io::Error::from(io::ErrorKind::AddrNotAvailable);
+    for addr in addrs {
+        match Async::<TcpStream>::connect(*addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+/// A read or write in flight holds its own `Arc`, so the Lua handle can be
+/// collected under it without closing the socket mid-call.
+struct ConnState {
+    stream: Async<TcpStream>,
+    closed: AtomicBool,
+    /// Reads don't wait in line like writes do. Two readers of one stream
+    /// would each get a random slice of it, so a second read is refused.
+    read_buf: AsyncMutex<Vec<u8>>,
+    /// A tool handler and a spawned task may share the conn. Writes wait
+    /// their turn here, so each one goes out whole and in call order.
+    write_turn: AsyncMutex<()>,
+}
+
+impl ConnState {
+    /// Another call may still hold the fd, so we only shut it down. That
+    /// wakes any read or write parked on it, and the fd closes with the last
+    /// `Arc`.
+    fn close(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel)
+            && let Err(e) = self.stream.get_ref().shutdown(Shutdown::Both)
+        {
+            tracing::debug!(error = %e, "tcp shutdown failed");
+        }
+    }
+
+    fn ensure_open(&self) -> Result<(), &'static str> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(CONN_CLOSED);
+        }
+        Ok(())
+    }
+}
+
+/// A write that stops partway, cancelled or failed, leaves half a frame on
+/// the wire. The next write would then look like the rest of it to the peer,
+/// so we close the conn unless the write finished.
+struct TornWrite<'a>(Option<&'a ConnState>);
+
+impl Drop for TornWrite<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0 {
+            conn.close();
+        }
+    }
+}
+
+pub(crate) struct Conn(Arc<ConnState>);
+
+impl Conn {
+    fn track(plugin: Arc<str>, stream: Async<TcpStream>) -> Self {
+        let state = Arc::new(ConnState {
+            stream,
+            closed: AtomicBool::new(false),
+            read_buf: AsyncMutex::new(Vec::new()),
+            write_turn: AsyncMutex::new(()),
+        });
+        PLUGIN_CONNS.with_borrow_mut(|conns| {
+            let open = conns.entry(plugin).or_default();
+            open.retain(|conn| conn.strong_count() > 0);
+            open.push(Arc::downgrade(&state));
+        });
+        Self(state)
+    }
+}
+
+pub(crate) fn close_plugin_conns(plugin: &str) {
+    let conns = PLUGIN_CONNS.with_borrow_mut(|conns| conns.remove(plugin));
+    for conn in conns.iter().flatten().filter_map(Weak::upgrade) {
+        conn.close();
+    }
+}
+
+/// Wait for data and return what arrived, at most 64 KiB. Returns
+/// `nil, nil` once the peer has closed its side.
+///
+/// Only one read at a time: a second `read()` while one is waiting returns
+/// an error. A read and a write can run at the same time.
+///
+/// @return (string?, string?) Bytes read, or nil plus an error string, or nil, nil at end of stream.
+/// @example
+/// local chunk, err = conn:read()
+/// if err then return maki.log.error(err) end
+/// if not chunk then print("peer closed") end
+#[lua_fn]
+async fn read(lua: Lua, this: UserDataRef<Conn>) -> LuaResult<Pair<LuaString>> {
+    let conn = Arc::clone(&this.0);
+    drop(this);
+    let Some(mut buf) = conn.read_buf.try_lock() else {
+        return Ok(err_pair(READ_IN_PROGRESS));
+    };
+    try_pair!(conn.ensure_open());
+    buf.resize(READ_CHUNK, 0);
+    let mut stream = &conn.stream;
+    let read = stream.read(&mut buf[..]).await;
+    try_pair!(conn.ensure_open());
+    match read {
+        Ok(0) => Ok((None, None)),
+        Ok(n) => Ok((Some(lua.create_string(&buf[..n])?), None)),
+        Err(e) => Ok(err_pair(format!("read failed: {e}"))),
+    }
+}
+
+/// Send {data} and wait until all of it is written. Writes made while one
+/// is in flight wait their turn, so each goes out whole and in call order.
+/// A write that is cancelled or fails partway closes the connection,
+/// because the peer would read the next write as the rest of the cut one.
+///
+/// @param data string Bytes to send.
+/// @return (boolean?, string?) `true`, or nil plus an error string.
+/// @example
+/// local ok, err = conn:write(maki.json.encode(msg) .. "\n")
+/// if not ok then return maki.log.error(err) end
+#[lua_fn]
+async fn write(_lua: Lua, this: UserDataRef<Conn>, data: LuaString) -> LuaResult<Pair<bool>> {
+    let conn = Arc::clone(&this.0);
+    drop(this);
+    let data = data.as_bytes().to_vec();
+    let _turn = conn.write_turn.lock().await;
+    try_pair!(conn.ensure_open());
+    let mut torn = TornWrite(Some(&conn));
+    let mut stream = &conn.stream;
+    match stream.write_all(&data).await {
+        Ok(()) => {
+            torn.0 = None;
+            Ok((Some(true), None))
+        }
+        Err(_) if conn.ensure_open().is_err() => Ok(err_pair(CONN_CLOSED)),
+        Err(e) => Ok(err_pair(format!("write failed: {e}"))),
+    }
+}
+
+/// Close the connection. A read or write in flight ends with an error.
+/// Extra calls do nothing.
+///
+/// @return
+#[lua_fn]
+fn close(_lua: &Lua, this: &Conn) -> LuaResult<()> {
+    this.0.close();
+    Ok(())
+}
+
+lua_class! {
+    /// A TCP connection opened by `maki.net.connect`.
+    ///
+    /// `read` and `write` yield until done and can run at the same time.
+    /// The connection closes on `:close()`, when the handle is garbage
+    /// collected, and when the plugin unloads.
+    "maki.net.Conn" => Conn, CONN_DOCS [read, write, close]
+}
 
 lua_table! {
-    /// HTTP client for fetching web content. All traffic goes over HTTPS
-    /// (plain HTTP is upgraded). Private and metadata IP addresses are
-    /// blocked to prevent SSRF, including after a redirect. Hosts listed in
-    /// the `net.allowed_private_hosts` config option are exempt, and so is a
-    /// provider plugin's own origin (see `maki.net.request`).
-    /// Failed requests (5xx) are retried automatically.
+    /// HTTP and plain TCP for plugins.
+    ///
+    /// `request` traffic goes over HTTPS (plain HTTP is upgraded). Private
+    /// and metadata IP addresses are blocked to prevent SSRF, including
+    /// after a redirect. Hosts listed in the `net.allowed_private_hosts` config
+    /// option are exempt, and so is a provider plugin's own origin (see
+    /// `maki.net.request`). Failed requests (5xx) are retried automatically.
     ///
     /// Requests reuse a pool of clients, so calls to the same host share one
     /// keep-alive connection rather than pay a fresh handshake each time.
+    ///
+    /// `connect` follows the same rules, but only reaches hosts the plugin
+    /// lists in `net_hosts`.
     ///
     /// ```lua
     /// local res, err = maki.net.request("https://example.com")
     /// if res then print(res.body) end
     /// ```
-    "maki.net" => pub(crate) fn create_net_table(perms: &PluginPermissions, egress: NetEgress), DOCS [
+    "maki.net" => pub(crate) fn create_net_table(perms: &PluginPermissions, egress: NetEgress, plugin: Arc<str>), DOCS [
         request(perms, egress),
+        connect(perms, egress, plugin),
     ]
 }
 
@@ -368,6 +639,10 @@ lua_table! {
 /// why the manifest is not the whole of it.
 fn check_declared_host(url: &str, egress: &NetEgress) -> Result<(), String> {
     let (host, port) = extract_host_port(url).ok_or("cannot extract host from URL")?;
+    check_declared(host, port, egress)
+}
+
+fn check_declared(host: &str, port: u16, egress: &NetEgress) -> Result<(), String> {
     if egress.allows(host, port) {
         return Ok(());
     }
@@ -866,13 +1141,22 @@ async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     }
 }
 
-/// Runs the guard and, when it had to resolve a name to reach its verdict,
-/// hands back the address the request must then be pinned to.
-async fn check_ssrf(url: &str, allowed: &HostAllowlist) -> Result<Option<DnsPin>, String> {
-    let (host, port) = extract_host_port(url).ok_or("cannot extract host from URL")?;
-    // A name on the allowlist is trusted whatever it resolves to, and a URL
-    // carrying a literal address leaves curl nothing to resolve. Neither
-    // reached a verdict through DNS, so neither has anything to pin.
+async fn lookup(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    resolve(host, port)
+        .await
+        .map_err(|e| format!("cannot resolve {host}: {e}"))
+}
+
+/// The address check for everything in `maki.net` that opens a socket.
+/// It answers `Some` when it had to ask DNS, with every address the name
+/// resolved to (all passed, never empty, resolver order). The caller must use
+/// those and not look the name up again. It answers `None` for a literal
+/// address or an allowlisted name, where DNS had no say.
+async fn guard(
+    host: &str,
+    port: u16,
+    allowed: &HostAllowlist,
+) -> Result<Option<Vec<SocketAddr>>, String> {
     if allowed.allows_host(host, port) {
         return Ok(None);
     }
@@ -889,29 +1173,34 @@ async fn check_ssrf(url: &str, allowed: &HostAllowlist) -> Result<Option<DnsPin>
     // A host we cannot resolve is a host we cannot vouch for, and that covers
     // being offline: the answer the guard would have judged never arrives. The
     // failure is the network's and not a verdict, so it is not worded as one.
-    let addrs = resolve(host, port)
-        .await
-        .map_err(|e| format!("cannot resolve {host}: {e}"))?;
-    let mut vetted = None;
-    for sa in addrs {
-        if is_private_ip(&sa.ip()) && !allowed.allows_ip(sa.ip(), port) {
-            return Err(format!(
-                "blocked: {host} resolves to private address {} ({ALLOWLIST_HINT})",
-                sa.ip()
-            ));
-        }
-        // curl's resolve list holds one address per host and port, so the first
-        // the resolver offered wins. That is the one curl would have tried
-        // first anyway, the order arriving already sorted.
-        vetted.get_or_insert(sa.ip());
+    let addrs = lookup(host, port).await?;
+    if let Some(sa) = addrs
+        .iter()
+        .find(|sa| is_private_ip(&sa.ip()) && !allowed.allows_ip(sa.ip(), port))
+    {
+        return Err(format!(
+            "blocked: {host} resolves to private address {} ({ALLOWLIST_HINT})",
+            sa.ip()
+        ));
     }
+    if addrs.is_empty() {
+        return Err(format!(
+            "blocked: {host} resolves to no addresses ({ALLOWLIST_HINT})"
+        ));
+    }
+    Ok(Some(addrs))
+}
 
-    let addr = vetted
-        .ok_or_else(|| format!("blocked: {host} resolves to no addresses ({ALLOWLIST_HINT})"))?;
-    Ok(Some(DnsPin {
+/// Runs the guard and, when it had to resolve a name to reach its verdict,
+/// hands back the address the request must then be pinned to.
+async fn check_ssrf(url: &str, allowed: &HostAllowlist) -> Result<Option<DnsPin>, String> {
+    let (host, port) = extract_host_port(url).ok_or("cannot extract host from URL")?;
+    // curl takes one pinned address per host and port. We give it the first,
+    // which is the one curl would have tried first anyway.
+    Ok(guard(host, port, allowed).await?.map(|addrs| DnsPin {
         host: host.to_string(),
         port,
-        addr,
+        addr: addrs[0].ip(),
     }))
 }
 
@@ -981,9 +1270,11 @@ fn validate_and_upgrade_url(url: &str, allowed: &HostAllowlist) -> Result<String
 mod tests {
     use super::*;
     use crate::plugin_permissions::PluginPermissions;
+    use futures_lite::future::zip;
     use isahc::http::{HeaderName, HeaderValue};
     use std::collections::HashMap;
-    use std::net::Ipv6Addr;
+    use std::io::{Read, Write};
+    use std::net::{Ipv6Addr, TcpListener};
     use test_case::test_case;
 
     const SEARX_HOST: &str = "searx.lan";
@@ -1031,6 +1322,17 @@ mod tests {
     const LATIN1_LOSSY: &str = "caf\u{FFFD}";
     const JSON_CONTENT_TYPE: &str = "application/json";
     const TOO_MANY_REQUESTS: u16 = 429;
+    const TEST_PLUGIN: &str = "net_test";
+    const LOOPBACK_HOST: &str = "127.0.0.1";
+    const LOOPBACK_ON_ANOTHER_PORT: &str = "127.0.0.1:1";
+    const CANNOT_CONNECT: &str = "cannot connect";
+    /// Big enough to fill the send and receive buffers on loopback, so the
+    /// write really has to wait for the reader.
+    const PARKING_WRITE_BYTES: usize = 16 * 1024 * 1024;
+    const SECOND_WRITE: &str = "second";
+    const PING: &str = "ping";
+
+    type LuaPair = (Option<String>, Option<String>);
 
     fn allowlist(entries: &[&str]) -> HostAllowlist {
         HostAllowlist::parse(&entries.iter().map(|e| (*e).to_string()).collect::<Vec<_>>())
@@ -1373,8 +1675,13 @@ mod tests {
     #[test_case(r#"net.request("ftp://x")"# ; "invalid_url")]
     fn lua_request_error_returns_nil_and_message(expr: &str) {
         let lua = Lua::new();
-        let net =
-            create_net_table(&lua, &PluginPermissions::trusted(), NetEgress::default()).unwrap();
+        let net = create_net_table(
+            &lua,
+            &PluginPermissions::trusted(),
+            NetEgress::default(),
+            Arc::from(TEST_PLUGIN),
+        )
+        .unwrap();
         lua.globals().set("net", net).unwrap();
         let (is_nil, has_err): (bool, bool) = lua
             .load(format!(
@@ -1760,5 +2067,136 @@ mod tests {
             &pooled_client(&plain).unwrap(),
             &pooled_client(&other).unwrap()
         ));
+    }
+
+    fn loopback_listener() -> (TcpListener, u16) {
+        let listener = TcpListener::bind((LOOPBACK_HOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    #[test_case(LOOPBACK_HOST, None, &[LOOPBACK_HOST], Err(CONNECT_NEEDS_NET_HOSTS) ; "net_alone_reaches_nothing")]
+    #[test_case(LOOPBACK_HOST, Some(&[LOOPBACK_HOST]), &[LOOPBACK_HOST], Ok(()) ; "declared_and_allowlisted_connects")]
+    #[test_case(LOOPBACK_HOST, Some(&[LOOPBACK_ON_ANOTHER_PORT]), &[LOOPBACK_HOST], Err(UNDECLARED_HOST_HINT) ; "another_declared_port_is_refused")]
+    #[test_case(LOOPBACK_HOST, Some(&[PUBLIC_HOST]), &[LOOPBACK_HOST], Err(UNDECLARED_HOST_HINT) ; "an_undeclared_host_is_refused")]
+    #[test_case(LOOPBACK_HOST, Some(&[LOOPBACK_HOST]), &[], Err(ALLOWLIST_HINT) ; "a_private_literal_needs_the_allowlist")]
+    #[test_case(LOCALHOST_ENTRY, Some(&[LOCALHOST_ENTRY]), &[LOCALHOST_ENTRY], Ok(()) ; "an_allowlisted_name_connects")]
+    fn connect_host_policy(
+        host: &str,
+        net_hosts: Option<&[&str]>,
+        private: &[&str],
+        expected: Result<(), &str>,
+    ) {
+        let (_listener, port) = loopback_listener();
+        let result = smol::block_on(open_stream(
+            host,
+            port,
+            &declared(net_hosts),
+            &allowlist(private),
+        ));
+        match (result, expected) {
+            (Ok(_), Ok(())) => {}
+            (Err(err), Err(hint)) => assert!(err.contains(hint), "got: {err}"),
+            (result, _) => panic!("expected {expected:?}, got {:?}", result.err()),
+        }
+    }
+
+    #[test]
+    fn a_refused_connection_is_an_error() {
+        let port = loopback_listener().1;
+        let err = smol::block_on(open_stream(
+            LOOPBACK_HOST,
+            port,
+            &declared(Some(&[LOOPBACK_HOST])),
+            &allowlist(&[LOOPBACK_HOST]),
+        ))
+        .unwrap_err();
+        assert!(err.contains(CANNOT_CONNECT), "got: {err}");
+    }
+
+    fn conn_in_lua() -> (Lua, TcpStream) {
+        let listener = loopback_listener().0;
+        let addr = listener.local_addr().unwrap();
+        let stream = smol::block_on(Async::<TcpStream>::connect(addr)).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let lua = Lua::new();
+        let conn = Conn::track(Arc::from(TEST_PLUGIN), stream);
+        lua.globals().set("conn", conn).unwrap();
+        (lua, server)
+    }
+
+    fn eval_pair(lua: &Lua, code: &str) -> LuaPair {
+        smol::block_on(lua.load(code).call_async(())).unwrap()
+    }
+
+    #[test]
+    fn read_returns_nil_nil_once_the_peer_closes() {
+        let (lua, mut server) = conn_in_lua();
+        server.write_all(PING.as_bytes()).unwrap();
+        drop(server);
+        assert_eq!(
+            eval_pair(&lua, "return conn:read()"),
+            (Some(PING.into()), None)
+        );
+        assert_eq!(eval_pair(&lua, "return conn:read()"), (None, None));
+    }
+
+    #[test]
+    fn concurrent_writes_arrive_whole_and_in_call_order() {
+        let (lua, mut server) = conn_in_lua();
+        let reader = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            server.read_to_end(&mut got).unwrap();
+            got
+        });
+        let first = lua
+            .load(format!(
+                "assert(conn:write(string.rep('a', {PARKING_WRITE_BYTES})))"
+            ))
+            .exec_async();
+        let second = lua
+            .load(format!("assert(conn:write('{SECOND_WRITE}'))"))
+            .exec_async();
+        let (first, second) = smol::block_on(zip(first, second));
+        first.unwrap();
+        second.unwrap();
+        lua.load("conn:close()").exec().unwrap();
+
+        let got = reader.join().unwrap();
+        assert_eq!(got.len(), PARKING_WRITE_BYTES + SECOND_WRITE.len());
+        assert!(
+            got.ends_with(SECOND_WRITE.as_bytes()),
+            "the second write cut into the first"
+        );
+    }
+
+    #[test]
+    fn a_parked_read_refuses_a_second_and_ends_on_unload() {
+        let (lua, _server) = conn_in_lua();
+        let parked = lua.load("return conn:read()").call_async::<LuaPair>(());
+        let second_then_unload = async {
+            let second = lua
+                .load("return conn:read()")
+                .call_async::<LuaPair>(())
+                .await;
+            close_plugin_conns(TEST_PLUGIN);
+            second
+        };
+        let (parked, second) = smol::block_on(zip(parked, second_then_unload));
+        assert_eq!(second.unwrap(), (None, Some(READ_IN_PROGRESS.into())));
+        assert_eq!(parked.unwrap(), (None, Some(CONN_CLOSED.into())));
+    }
+
+    #[test]
+    fn a_closed_conn_refuses_reads_and_writes() {
+        let (lua, _server) = conn_in_lua();
+        let errs = eval_pair(
+            &lua,
+            "conn:close(); conn:close()
+             local _, read_err = conn:read()
+             local _, write_err = conn:write('x')
+             return read_err, write_err",
+        );
+        assert_eq!(errs, (Some(CONN_CLOSED.into()), Some(CONN_CLOSED.into())));
     }
 }

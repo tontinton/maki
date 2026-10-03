@@ -221,14 +221,9 @@ async fn gather(lua: Lua, fns: Table) -> LuaResult<Table> {
         let f: Function = fns
             .raw_get(i)
             .map_err(|_| mlua::Error::runtime(format!("gather: funs[{i}] must be a function")))?;
-        children.push(lua.create_thread(f)?);
+        children.push(f.call_async::<Value>(()));
     }
-    let results = join_all(
-        children
-            .into_iter()
-            .map(|thread| async move { thread.into_async::<Value>(())?.await }),
-    )
-    .await;
+    let results = join_all(children).await;
     let out = lua.create_table_with_capacity(count, 0)?;
     for (i, res) in results.into_iter().enumerate() {
         let entry = lua.create_table()?;
