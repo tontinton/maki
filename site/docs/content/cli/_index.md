@@ -33,6 +33,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--max-turns` | no | no | yes |
 | `--permission-mode` | no | no | yes |
 | `--include-partial-messages` | no | no | yes |
+| `-w` / `--worktree` | yes | no | no |
 
 ### Shared flags (detail)
 
@@ -61,6 +62,18 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--append-system-prompt <TEXT>` | Append to the built-in system prompt (SDK only) |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
 | `--include-partial-messages` | Stream partial deltas in SDK mode |
+
+### Worktree flags (TUI only)
+
+`-w` starts the session in a fresh git worktree, so parallel sessions edit isolated file trees. The checkout lands in maki's state directory on a new branch `worktree-<NAME>`, and maki changes into it before the session starts. Rejected with a subcommand or in `--print` / SDK mode, where no cleanup path exists.
+
+| Flag | Description |
+|------|-------------|
+| `-w`, `--worktree` | Create a worktree and run the TUI inside it |
+| `--worktree-name <NAME>` | Name the worktree and branch. Auto-generates an adjective-noun name when omitted |
+| `--worktree-base <head\|fresh>` | Branch from local `HEAD` (default) or the remote default branch |
+
+On exit, an unnamed worktree with no changes is removed. Anything else is kept and its path printed with the commands to remove it.
 
 ### Tool name lists
 

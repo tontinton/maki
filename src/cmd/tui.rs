@@ -288,6 +288,25 @@ pub fn run(mut cli: Cli) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
+    let mut worktree: Option<super::worktree::EnteredWorktree> = None;
+    if cli.worktree {
+        let base_ref = match cli.worktree_base {
+            crate::cli::WorktreeBase::Head => super::worktree::BaseRef::Head,
+            crate::cli::WorktreeBase::Fresh => super::worktree::BaseRef::Fresh,
+        };
+        let entered = super::worktree::enter(
+            cli.worktree_name.clone().as_deref(),
+            &super::worktree::WorktreeOptions { base_ref },
+            &storage,
+        )?;
+        eprintln!(
+            "Entered worktree {} (worktree-{})",
+            entered.dir.display(),
+            entered.name
+        );
+        worktree = Some(entered);
+    }
+
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
     // Only the interactive UI can answer an install confirmation or a trust
@@ -519,6 +538,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     teardown_ms = started.elapsed().as_millis() as u64 - stack_ms,
                     "plugin host and teardown joined"
                 );
+                if let Some(worktree) = &worktree {
+                    clean_up_worktree(worktree);
+                }
                 if code != 0 {
                     maki_otel::shutdown(crate::TELEMETRY_SHUTDOWN_TIMEOUT);
                     std::process::exit(code);
@@ -566,6 +588,29 @@ pub fn run(mut cli: Cli) -> Result<()> {
             }
         }
     }
+}
+
+/// Clean up a worktree session at exit: an unnamed, provably-empty worktree is
+/// removed; anything else is kept, with its path and removal command printed.
+/// Only used for interactive sessions.
+fn clean_up_worktree(worktree: &super::worktree::EnteredWorktree) {
+    let dirty = super::worktree::has_leftover_work(&worktree.dir, worktree.base.as_deref());
+    if !worktree.named && !dirty {
+        match super::worktree::remove(&worktree.root, &worktree.dir, &worktree.name) {
+            Ok(()) => eprintln!("Removed clean worktree {}", worktree.dir.display()),
+            Err(e) => eprintln!("could not remove worktree {}: {e}", worktree.dir.display()),
+        }
+        return;
+    }
+    eprintln!(
+        "Kept worktree {} (branch worktree-{}). Remove it with:\n  git -C {} worktree remove {}\n  git -C {} branch -d worktree-{}",
+        worktree.dir.display(),
+        worktree.name,
+        worktree.root.display(),
+        worktree.dir.display(),
+        worktree.root.display(),
+        worktree.name,
+    );
 }
 
 /// Trust has nothing to say about this file, because Maki no longer reads it.
