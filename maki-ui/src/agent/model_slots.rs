@@ -120,7 +120,7 @@ mod tests {
     }
 
     fn strict_policy() -> ModelPolicy {
-        ModelPolicy::new(&[STARTUP_SPEC.to_owned()], &[]).unwrap()
+        ModelPolicy::new(&[STARTUP_SPEC.to_owned()], &[], &[], &[]).unwrap()
     }
 
     /// Opening ten stored sessions on one model should build one provider, so

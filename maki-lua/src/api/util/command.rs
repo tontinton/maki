@@ -471,10 +471,20 @@ pub enum TaskRequest {
 pub enum ModelRequest {
     Get,
     Available,
+    Disabled,
     Set {
         spec: Option<String>,
         thinking: Option<String>,
         fast: Option<bool>,
+    },
+    Enable {
+        spec: String,
+        on: bool,
+    },
+    DisabledProviders,
+    EnableProvider {
+        slug: String,
+        on: bool,
     },
 }
 

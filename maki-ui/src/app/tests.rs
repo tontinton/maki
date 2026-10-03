@@ -215,7 +215,7 @@ fn app_without_splash() -> App {
 fn app_with_model_slot() -> (App, Arc<ArcSwapOption<ModelList>>) {
     let models = Arc::new(ArcSwapOption::empty());
     let mut app = test_app();
-    app.model_picker = ModelPicker::new(Arc::clone(&models));
+    app.model_picker = ModelPicker::new(Arc::clone(&models), Arc::default());
     (app, models)
 }
 

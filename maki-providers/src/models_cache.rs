@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn replay_applies_current_policy() {
         let (_dir, path) = cache_file(&["kept/model-a", "banned/model-b", "kept/model-c"]);
-        let policy = ModelPolicy::new(&[], &["banned/*".to_string()]).unwrap();
+        let policy = ModelPolicy::new(&[], &["banned/*".to_string()], &[], &[]).unwrap();
         assert_eq!(
             replay(&path, &policy, FINGERPRINT, NOW),
             ["kept/model-a", "kept/model-c"]
