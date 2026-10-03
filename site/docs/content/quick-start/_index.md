@@ -111,10 +111,11 @@ Without it, Maki remembers the last model you used.
 
 ## Teach it your project
 
-Maki loads `AGENTS.md` (or `CLAUDE.md`, `.cursorrules`, and friends) from your repo automatically. Per-project settings live under `.maki/`:
+Maki loads `.maki/AGENTS.md` or `AGENTS.md` (or `CLAUDE.md`, `.cursorrules`, and friends) from your repo automatically. Per-project settings live under `.maki/`:
 
 ```
 .maki/
+├── AGENTS.md          # maki-only instructions, wins over AGENTS.md
 ├── init.lua           # overrides global config
 ├── permissions.toml   # permission rules
 ├── mcp.toml           # MCP server config
