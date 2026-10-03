@@ -9,7 +9,7 @@ use crate::components::rewind_picker::RewindEntry;
 use maki_lua::SessionEndReason;
 use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionMeta, StoredMode, StoredSubagent};
+use maki_storage::sessions::{SessionClaim, SessionMeta, StoredMode, StoredSubagent};
 
 use crate::{AppSession, OpenSession};
 
@@ -18,6 +18,9 @@ use super::{App, Mode, PendingInput, PlanState, Status};
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
+
+const FORK_TITLE_PREFIX: &str = "fork of ";
+const FORK_BUSY_MSG: &str = "Fork is not allowed when a turn is still running.";
 
 /// What `App::checkpoint` last handed to the writer: which session, how far
 /// along it was, and when. The id is part of it because a session swapped into
@@ -362,6 +365,27 @@ impl App {
             Some(&self.state.session.id.to_string()),
         );
         vec![Action::RestartAgent(self.install_local_history())]
+    }
+
+    /// `/fork` queues a copy of the live session under a fresh id, titled
+    /// after the session it copied, and leaves this tab on the original. 
+    /// Refused while a turn runs.
+    pub(super) fn fork_session(&mut self) -> Vec<Action> {
+        if self.status == Status::Streaming {
+            self.status_bar.flash(FORK_BUSY_MSG.into());
+            return vec![];
+        }
+        let claim = SessionClaim::fresh(&self.storage);
+        let cwd = self.state.session.cwd.clone();
+        let mut forked = AppSession::clone(&self.state.session).fork(claim.id(), &cwd);
+        // Add a "fork of" prefix for the copy.
+        forked.update_title_if_default();
+        let title = format!("{FORK_TITLE_PREFIX}{}", forked.title);
+        forked.set_title(title);
+        let id = forked.id;
+        self.storage_writer.send(Arc::new(forked), claim);
+        self.status_bar.flash(format!("Forked; copy {id} queued"));
+        vec![]
     }
 
     pub(super) fn open_rewind_picker(&mut self) -> Vec<Action> {

@@ -40,6 +40,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         bang: false,
     },
     BuiltinCommand {
+        name: "/fork",
+        description: "Fork this session",
+        max_args: 0,
+        bang: false,
+    },
+    BuiltinCommand {
         name: "/help",
         description: "Show keybindings",
         max_args: 0,
