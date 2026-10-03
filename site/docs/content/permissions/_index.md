@@ -234,12 +234,18 @@ table narrows that to an allowlist:
 ```toml
 [permissions]
 net = true
-net_hosts = ["api.acme.com", "*.acme.dev"]
+net_hosts = ["api.acme.com", "*.acme.dev", "127.0.0.1:7777"]
 ```
 
 A pattern is an exact host or a single leading `*.` label. `*.acme.dev` matches
 `api.acme.dev`, and it does not match `acme.dev` or `evilacme.dev`. An empty
 list reaches no host at all, which differs from leaving the key out.
+
+Add `:port` to allow one port only, as in `api.acme.com:443` or
+`*.acme.dev:8443`. Write an IPv6 address in brackets when it has a port, as in
+`[::1]:7777`. A pattern without a port allows every port on that host. Maki
+ignores a pattern it cannot read, such as `acme.com:x` or a bare `*`, and logs a
+warning naming the plugin.
 
 The list covers the plugin's `maki.net` calls and the `base_url` of any
 [provider it registers](/docs/providers/#plugin-providers), so an auth hook

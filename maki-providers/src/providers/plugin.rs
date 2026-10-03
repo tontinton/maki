@@ -128,9 +128,12 @@ fn declared_base_url(
              https, or http only for loopback"
         ));
     }
-    if !host_allowed(host, hosts) {
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| format!("provider '{slug}': base_url '{url}' has no port"))?;
+    if !host_allowed(host, port, hosts) {
         return Err(format!(
-            "provider '{slug}': base_url host '{host}' is not in the declared net hosts"
+            "provider '{slug}': base_url '{host}:{port}' is not in the declared net hosts"
         ));
     }
     Ok(base_url)
@@ -1314,13 +1317,20 @@ fn resolve_base_url(entry: &PluginEntry) -> Option<(String, OriginChooser)> {
     Some((planned, OriginChooser::Plugin))
 }
 
-/// The host of [`effective_base_url`], for a caller deciding whether an
+/// The `host:port` of [`effective_base_url`], for a caller deciding whether an
 /// outbound request is one this provider is already making. Every origin that
 /// can win there was either vetted at registration (the declaration's own, a
 /// hook's) or stated by the user (`<SLUG>_BASE_URL`, `providers.toml`).
-pub fn effective_host(slug: &str) -> Option<String> {
-    let base_url = effective_base_url(slug)?;
-    Some(Url::parse(&base_url).ok()?.host_str()?.to_owned())
+///
+/// The port is always written out, even the default one. This string is
+/// matched as a `net_hosts` pattern, and a bare host there means every port.
+pub fn effective_authority(slug: &str) -> Option<String> {
+    let base_url = Url::parse(&effective_base_url(slug)?).ok()?;
+    Some(format!(
+        "{}:{}",
+        base_url.host_str()?,
+        base_url.port_or_known_default()?
+    ))
 }
 
 pub fn spec(slug: &str) -> Option<&'static ProviderSpec> {
@@ -2123,6 +2133,18 @@ mod tests {
         assert_eq!(vouched_origin(SLUG), expected);
     }
 
+    #[test_case(None, "example.com:443" ; "the_default_port_spelled_out")]
+    #[test_case(Some("http://[::1]:8080/v1"), "[::1]:8080" ; "an_ipv6_origin")]
+    fn effective_authority_names_the_port(configured: Option<&str>, expected: &str) {
+        const SLUG: &str = "authority-plugin";
+        if let Some(configured) = configured {
+            unsafe { std::env::set_var(base_url_env_var(SLUG), configured) };
+        }
+        register_loaded_as(registration(SLUG), DeclAuthority::ThirdParty).unwrap();
+
+        assert_eq!(effective_authority(SLUG).as_deref(), Some(expected));
+    }
+
     #[test]
     fn a_declaration_builds_its_own_spec_row() {
         const SLUG: &str = "row-plugin";
@@ -2524,6 +2546,19 @@ mod tests {
     #[test_case("ftp://example.com/v1", EXAMPLE_HOST, false ; "a_scheme_that_is_neither")]
     fn base_url_scheme(url: &str, host: &str, accepted: bool) {
         const SLUG: &str = "scheme-plugin";
+        let hosts = vec![host.to_string()];
+        assert_eq!(
+            declared_base_url(SLUG, Some(url.to_string()), &hosts).is_ok(),
+            accepted,
+            "{url}"
+        );
+    }
+
+    #[test_case("https://example.com/v1", "example.com:443", true ; "the_default_port_is_the_declared_one")]
+    #[test_case("https://example.com:9443/v1", "example.com:443", false ; "another_port")]
+    #[test_case("http://[::1]:8080/v1", "[::1]:8080", true ; "a_loopback_ipv6_on_its_port")]
+    fn base_url_port(url: &str, host: &str, accepted: bool) {
+        const SLUG: &str = "port-plugin";
         let hosts = vec![host.to_string()];
         assert_eq!(
             declared_base_url(SLUG, Some(url.to_string()), &hosts).is_ok(),

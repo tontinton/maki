@@ -10,6 +10,7 @@ use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use isahc::http::HeaderMap;
 use isahc::net::dns::ResolveMap;
 use isahc::{AsyncBody, HttpClient, Request, Response};
+use maki_config::split_host_port;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::Timeouts;
 use mlua::{Lua, Result as LuaResult, Table};
@@ -114,10 +115,7 @@ impl HostAllowlist {
             self.nets.push((addr, prefix, None));
             return Some(());
         }
-        let (host, port) = split_host_port(entry);
-        if host.is_empty() {
-            return None;
-        }
+        let (host, port) = split_host_port(entry)?;
         match host.parse::<IpAddr>() {
             Ok(addr) => self.nets.push((addr, address_bits(addr), port)),
             Err(_) => self.names.push((host.to_string(), port)),
@@ -175,21 +173,6 @@ fn ip_in_net(ip: IpAddr, net: IpAddr, prefix: u8) -> bool {
 /// would panic.
 fn leading_bits_match(ip: u128, net: u128, prefix: u8, width: u32) -> bool {
     prefix == 0 || (ip ^ net) >> (width - u32::from(prefix)) == 0
-}
-
-/// Splits an authority into host and port, leaving a bare IPv6 literal like
-/// `::1` (more than one colon, no brackets) whole.
-fn split_host_port(authority: &str) -> (&str, Option<u16>) {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let (host, tail) = rest.split_once(']').unwrap_or((rest, ""));
-        return (host, tail.strip_prefix(':').and_then(|p| p.parse().ok()));
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') => {
-            port.parse().map_or((authority, None), |p| (host, Some(p)))
-        }
-        _ => (authority, None),
-    }
 }
 
 /// The address the SSRF guard actually vetted for the host in the URL.
@@ -384,8 +367,8 @@ lua_table! {
 /// URL really points at. See [`NetEgress`] for what a plugin may reach and
 /// why the manifest is not the whole of it.
 fn check_declared_host(url: &str, egress: &NetEgress) -> Result<(), String> {
-    let (host, _) = extract_host_port(url).ok_or("cannot extract host from URL")?;
-    if egress.allows(host) {
+    let (host, port) = extract_host_port(url).ok_or("cannot extract host from URL")?;
+    if egress.allows(host, port) {
         return Ok(());
     }
     Err(format!(
@@ -859,10 +842,7 @@ fn extract_host_port(url: &str) -> Option<(&str, u16)> {
         .or_else(|| url.strip_prefix(HTTP_SCHEME).map(|rest| (rest, HTTP_PORT)))?;
     let authority = rest.split(['/', '?', '#']).next()?;
     let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    if authority.is_empty() {
-        return None;
-    }
-    let (host, port) = split_host_port(authority);
+    let (host, port) = split_host_port(authority)?;
     Some((host, port.unwrap_or(default_port)))
 }
 
@@ -1024,6 +1004,8 @@ mod tests {
     /// An address rather than a name, so no test needs a DNS answer.
     const PUBLIC_URL: &str = "https://8.8.8.8/";
     const PUBLIC_HOST: &str = "8.8.8.8";
+    const PUBLIC_HOST_ON_HTTPS: &str = "8.8.8.8:443";
+    const PUBLIC_HOST_ON_OTHER_PORT: &str = "8.8.8.8:8443";
     const OTHER_PUBLIC_HOST: &str = "1.1.1.1";
     const PUBLIC_HTTP_URL: &str = "http://8.8.8.8/";
     const OTHER_PUBLIC_URL: &str = "https://1.1.1.1/";
@@ -1328,6 +1310,7 @@ mod tests {
     #[test_case("10.0.0.0/33" ; "prefix_too_long")]
     #[test_case("10.0.0.0/x" ; "prefix_not_a_number")]
     #[test_case("" ; "empty_entry")]
+    #[test_case("[::1]:x" ; "bracketed_ipv6_with_a_bad_port")]
     fn unparseable_allowlist_entries_are_dropped(entry: &str) {
         let list = allowlist(&[entry]);
         assert!(list.names.is_empty() && list.nets.is_empty(), "{list:?}");
@@ -1412,9 +1395,17 @@ mod tests {
     #[test_case(None, true ; "no_declared_list_reaches_any_host")]
     #[test_case(Some(&[PUBLIC_HOST]), true ; "declared_host_is_reachable")]
     #[test_case(Some(&[OTHER_PUBLIC_HOST]), false ; "undeclared_host_is_denied")]
+    #[test_case(Some(&[PUBLIC_HOST_ON_HTTPS]), true ; "the_default_port_is_the_declared_one")]
+    #[test_case(Some(&[PUBLIC_HOST_ON_OTHER_PORT]), false ; "another_declared_port_is_denied")]
     fn declared_net_hosts_gate_requests(hosts: Option<&[&str]>, allowed: bool) {
         let result = smol::block_on(extract_request_params(PUBLIC_URL, declared(hosts), None));
-        assert_eq!(result.is_ok(), allowed, "{hosts:?}");
+        match result {
+            Ok(_) => assert!(allowed, "{hosts:?} should be blocked"),
+            Err(e) => assert!(
+                !allowed && e.contains(UNDECLARED_HOST_HINT),
+                "{hosts:?}: {e}"
+            ),
+        }
     }
 
     /// The defect the shared `vet` exists to prevent: a declared host that

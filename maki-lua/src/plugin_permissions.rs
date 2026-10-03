@@ -2,7 +2,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use maki_config::host_allowed;
+use maki_config::{host_allowed, is_valid_host_pattern};
 use maki_providers::plugin;
 use mlua::{Error as LuaError, Function, IntoLuaMulti, Lua, Result as LuaResult};
 use semver::Version;
@@ -77,14 +77,14 @@ impl NetEgress {
         Arc::clone(&self.providers)
     }
 
-    /// Whether this plugin may reach `host`: its manifest says so, or `host`
-    /// is where maki itself would send the credentials of a provider it
-    /// registered.
-    pub(crate) fn allows(&self, host: &str) -> bool {
+    /// Whether this plugin may reach `host:port`: its manifest says so, or it
+    /// is where maki itself would send the credentials of a provider the
+    /// plugin registered.
+    pub(crate) fn allows(&self, host: &str, port: u16) -> bool {
         let Some(declared) = &self.declared else {
             return true;
         };
-        host_allowed(host, declared) || self.serves(host)
+        host_allowed(host, port, declared) || self.serves(host, port)
     }
 
     /// Whether `url` is on the origin of a provider this plugin registered,
@@ -99,13 +99,13 @@ impl NetEgress {
             .any(|vouched| vouched.origin() == origin)
     }
 
-    fn serves(&self, host: &str) -> bool {
+    fn serves(&self, host: &str, port: u16) -> bool {
         self.providers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter_map(|slug| plugin::effective_host(slug))
-            .any(|origin| host_allowed(host, &[origin]))
+            .filter_map(|slug| plugin::effective_authority(slug))
+            .any(|origin| host_allowed(host, port, &[origin]))
     }
 }
 
@@ -311,6 +311,15 @@ fn net_hosts_from_manifest(manifest: &toml::Value) -> NetHosts {
     Some(hosts.into())
 }
 
+/// A typo in `net_hosts` grants nothing. Without this warning the author only
+/// sees a blocked request later, with no hint that the list itself was wrong.
+pub(crate) fn warn_invalid_net_hosts(plugin: &str, hosts: &NetHosts) {
+    let entries = hosts.as_deref().unwrap_or_default();
+    for entry in entries.iter().filter(|entry| !is_valid_host_pattern(entry)) {
+        warn!(plugin, entry, "ignoring unparseable net_hosts entry");
+    }
+}
+
 /// Reads a package's requested permissions.
 ///
 /// Only an absent manifest means "requests nothing". A manifest that exists but
@@ -452,6 +461,7 @@ mod tests {
     const PLUGIN: &str = "test-plugin";
     const DECLARED_HOST: &str = "api.example.com";
     const OTHER_HOST: &str = "elsewhere.example";
+    const HTTPS_PORT: u16 = 443;
     /// A slug no load ever registered, which is the state every slug is in
     /// here: these run without a provider registry.
     const UNREGISTERED_SLUG: &str = "not-a-provider";
@@ -479,7 +489,7 @@ mod tests {
         for slug in owns {
             egress.owns((*slug).to_owned());
         }
-        assert_eq!(egress.allows(host), expected);
+        assert_eq!(egress.allows(host, HTTPS_PORT), expected);
     }
 
     #[test]

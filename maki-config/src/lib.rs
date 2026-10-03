@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -144,6 +145,8 @@ pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_line
 
 const WILDCARD_LABEL: &str = "*.";
 const LABEL_SEPARATOR: char = '.';
+const WILDCARD: char = '*';
+const PORT_SEPARATOR: char = ':';
 
 /// A capability a lua plugin can hold. Declared in `plugin.toml`, recorded in
 /// the package approval store, and named on every guarded `maki.*` function.
@@ -212,39 +215,82 @@ impl std::fmt::Display for Permission {
     }
 }
 
-/// Matches a host against a plugin manifest's `net_hosts`. Lives beside
-/// [`Permission`] because the two answer the same question from the same table,
-/// and both the network sandbox and the provider registry have to give the same
-/// answer for one list.
+/// Matches a host and port against a plugin manifest's `net_hosts`. It lives
+/// next to [`Permission`] because the network sandbox and the provider
+/// registry both read the same list, and they must never disagree about it.
 ///
-/// A pattern is an exact host, or a single leading `*.` standing for "some
-/// subdomain of". The wildcard never covers the bare domain, and never matches
-/// across a partial label, so `*.example.com` takes `api.example.com` and leaves
-/// both `example.com` and `evilexample.com`.
+/// A pattern is an exact host, or a leading `*.` meaning "any subdomain of".
+/// The wildcard never covers the bare domain or half a label, so
+/// `*.example.com` takes `api.example.com` but not `example.com` or
+/// `evilexample.com`. A pattern may end in `:port` to allow only that port.
+/// Without one it allows every port, which is what lists written before ports
+/// existed meant.
 ///
-/// Both sides are canonicalised first, so the two spellings of one DNS name
-/// cannot disagree: `evil.test.` and `evil.test` are the same host, and a
-/// pattern is compared as the name it resolves to rather than as the string it
-/// was typed as.
-pub fn host_allowed(host: &str, patterns: &[String]) -> bool {
+/// Both sides are canonicalised first, so `evil.test.` and `evil.test` are
+/// the same host no matter which side spells it with the trailing dot.
+pub fn host_allowed(host: &str, port: u16, patterns: &[String]) -> bool {
     let host = canonical_host(host);
-    patterns.iter().any(|pattern| {
-        match canonical_host(pattern).strip_prefix(WILDCARD_LABEL) {
-            // An empty domain would leave `strip_suffix` matching every host,
-            // which is a pattern that says "anywhere" while reading as a typo.
-            // Nothing is the safe answer: a list is a grant, so a rule nobody
-            // can state on purpose must grant nothing.
-            Some(domain) => !domain.is_empty() && is_subdomain_of(host, domain),
-            None => host == canonical_host(pattern),
-        }
-    })
+    patterns
+        .iter()
+        .filter_map(|pattern| host_pattern(pattern))
+        .any(|(pattern, allowed_port)| {
+            allowed_port.is_none_or(|allowed| allowed == port)
+                && match pattern.strip_prefix(WILDCARD_LABEL) {
+                    Some(domain) => is_subdomain_of(host, domain),
+                    None => host == pattern,
+                }
+        })
 }
 
-/// One DNS name, one string: the root label is implied, so the trailing dot
-/// that spells it goes. Everything else about a host is already settled by the
-/// time it gets here, since both callers match against a host `url::Url`
-/// parsed, which is lowercased and punycoded.
+pub fn is_valid_host_pattern(pattern: &str) -> bool {
+    host_pattern(pattern).is_some()
+}
+
+/// `None` means the pattern grants nothing. A bare `*.` would read as
+/// "anywhere" and a `*` inside a name can never match a real host. Both look
+/// like typos, and a list is a grant, so a typo must not open anything.
+fn host_pattern(pattern: &str) -> Option<(&str, Option<u16>)> {
+    let (host, port) = split_host_port(pattern)?;
+    let host = canonical_host(host);
+    let domain = host.strip_prefix(WILDCARD_LABEL).unwrap_or(host);
+    (!domain.is_empty() && !domain.contains(WILDCARD)).then_some((host, port))
+}
+
+/// Reads `host`, `host:port` or `[v6]:port`, the one grammar both `net_hosts`
+/// and `net.allowed_private_hosts` use. A bare `::1` has too many colons to
+/// carry a port, so it is all host.
+///
+/// A broken port (`x`, `0`, empty) fails the whole entry. Dropping just the
+/// port would quietly turn a typo into "every port".
+pub fn split_host_port(entry: &str) -> Option<(&str, Option<u16>)> {
+    let (host, port) = match entry.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']')? {
+            (host, "") => (host, None),
+            (host, tail) => (host, Some(tail.strip_prefix(PORT_SEPARATOR)?)),
+        },
+        None => match entry.rsplit_once(PORT_SEPARATOR) {
+            Some((host, port)) if !host.contains(PORT_SEPARATOR) => (host, Some(port)),
+            _ => (entry, None),
+        },
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = match port {
+        Some(port) => Some(port.parse::<NonZeroU16>().ok()?.get()),
+        None => None,
+    };
+    Some((host, port))
+}
+
+/// `url::Url` already lowercases and punycodes hosts, so only two spellings
+/// are left to fold: the trailing root dot, and the brackets a URL puts
+/// around an IPv6 address.
 fn canonical_host(host: &str) -> &str {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
     host.strip_suffix(LABEL_SEPARATOR).unwrap_or(host)
 }
 
@@ -2697,6 +2743,8 @@ mod tests {
     const ABSOLUTE_PATH: &str = "/workspace";
     const BROKEN_GLOB: &str = "[";
     const EXAMPLE_HOST: &str = "example.com";
+    const PINNED_PORT: u16 = 7777;
+    const OTHER_PORT: u16 = 8443;
 
     #[test_case(EXAMPLE_HOST, EXAMPLE_HOST, true ; "exact")]
     #[test_case("api.example.com", EXAMPLE_HOST, false ; "exact_rejects_subdomain")]
@@ -2714,7 +2762,36 @@ mod tests {
     #[test_case("api.example.com.", "*.example.com", true ; "including_under_a_wildcard")]
     #[test_case(EXAMPLE_HOST, "example.com.", true ; "however_the_pattern_spells_it")]
     fn host_allowed_patterns(host: &str, pattern: &str, expected: bool) {
-        assert_eq!(host_allowed(host, &[pattern.to_string()]), expected);
+        assert_eq!(
+            host_allowed(host, PINNED_PORT, &[pattern.to_string()]),
+            expected
+        );
+    }
+
+    #[test_case(EXAMPLE_HOST, OTHER_PORT, EXAMPLE_HOST, true ; "no_port_takes_any_port")]
+    #[test_case(EXAMPLE_HOST, PINNED_PORT, "example.com:7777", true ; "a_port_takes_that_port")]
+    #[test_case(EXAMPLE_HOST, OTHER_PORT, "example.com:7777", false ; "and_no_other")]
+    #[test_case("api.example.com", PINNED_PORT, "*.example.com:7777", true ; "wildcard_with_a_port")]
+    #[test_case("::1", PINNED_PORT, "[::1]:7777", true ; "bracketed_ipv6_with_a_port")]
+    #[test_case("[::1]", PINNED_PORT, "[::1]:7777", true ; "a_url_spelled_ipv6_host")]
+    #[test_case("::1", OTHER_PORT, "::1", true ; "bare_ipv6_takes_any_port")]
+    #[test_case("::1", OTHER_PORT, "[::1]", true ; "bracketed_ipv6_without_a_port_takes_any_port")]
+    #[test_case(EXAMPLE_HOST, PINNED_PORT, "example.com:", false ; "an_empty_port_grants_nothing")]
+    fn host_allowed_ports(host: &str, port: u16, pattern: &str, expected: bool) {
+        assert_eq!(host_allowed(host, port, &[pattern.to_string()]), expected);
+    }
+
+    #[test_case(EXAMPLE_HOST, true ; "a_host")]
+    #[test_case("*.example.com:7777", true ; "a_wildcard_with_a_port")]
+    #[test_case("example.com:x", false ; "a_port_that_is_not_a_number")]
+    #[test_case("example.com:0", false ; "port_zero")]
+    #[test_case(":7777", false ; "a_port_without_a_host")]
+    #[test_case("[::1]7777", false ; "junk_after_brackets")]
+    #[test_case("*", false ; "a_bare_star")]
+    #[test_case("*.", false ; "an_empty_wildcard")]
+    #[test_case("api.*.com", false ; "a_star_inside_the_name")]
+    fn host_pattern_validity(pattern: &str, expected: bool) {
+        assert_eq!(is_valid_host_pattern(pattern), expected);
     }
 
     /// The temp directory a test builds its project in, with its parent

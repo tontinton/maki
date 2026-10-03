@@ -1617,6 +1617,9 @@ mod tests {
     const MISSING_WIDER_HOST: &str = "net host api.other.example";
     /// What the approval prompt lists for a manifest that drops its hosts.
     const MISSING_ANY_HOST: &str = "net host *";
+    const APPROVED_PINNED_HOST: &str = "api.example.com:7777";
+    /// [`NARROW_HOSTS_MANIFEST`]'s host with no port, which reaches every port.
+    const MISSING_UNPINNED_HOST: &str = "net host api.example.com";
     const TEST_REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OTHER_REV: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -1811,6 +1814,7 @@ mod tests {
     #[test_case(WIDENED_HOSTS_MANIFEST, Some(&[APPROVED_HOST]), &[MISSING_WIDER_HOST] ; "a_widened_host_list_asks_again")]
     #[test_case(NET_MANIFEST, Some(&[APPROVED_HOST]), &[MISSING_ANY_HOST] ; "a_dropped_host_list_asks_again")]
     #[test_case(NARROW_HOSTS_MANIFEST, None, &[] ; "a_list_narrows_an_approval_for_every_host")]
+    #[test_case(NARROW_HOSTS_MANIFEST, Some(&[APPROVED_PINNED_HOST]), &[MISSING_UNPINNED_HOST] ; "unpinning_a_port_asks_again")]
     fn net_hosts_are_approved_like_permissions(
         manifest: &str,
         approved: Option<&[&str]>,
