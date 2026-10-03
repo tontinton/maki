@@ -18,9 +18,9 @@ use maki_config::{
     ToolOutputLines,
 };
 use maki_lua::{
-    InitFiles, KEY_WARNING, MAX_INFLIGHT_TOOLS, PERMISSION_NAME_WARNING, PluginError, PluginHost,
-    PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason, WARM_TOOL_CAP,
-    set_allowed_private_hosts,
+    InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, NO_UI_ERR, PERMISSION_NAME_WARNING,
+    PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason,
+    WARM_TOOL_CAP, set_allowed_private_hosts,
 };
 use maki_providers::Model;
 use maki_storage::id::SessionRef;
@@ -7158,4 +7158,30 @@ end)
             .expect("the unload must close the conn"),
         0
     );
+}
+
+const HEADLESS_UI_SRC: &str = r#"
+maki.ui.flash("maki.ui is here headless too")
+maki.api.register_tool({
+    name = "ask_ui",
+    description = "asks the UI something",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    audiences = { "main" },
+    handler = function()
+        local live, err = maki.session.live()
+        return tostring(live) .. " " .. tostring(err)
+    end,
+})
+"#;
+
+/// `maki -p` and ACP run no UI loop. Before, a UI call there waited forever
+/// for a reply nobody would send, so a regression hangs this test.
+#[test]
+fn a_ui_roundtrip_on_a_headless_host_fails_fast() {
+    let reg = fresh_registry();
+    let host = PluginHost::start(Arc::clone(&reg), Interaction::None, true).unwrap();
+    host.load_source("headless_ui", HEADLESS_UI_SRC).unwrap();
+
+    let reply = exec_tool(&reg, "ask_ui", json!({})).unwrap();
+    assert_eq!(reply, format!("nil {NO_UI_ERR}"));
 }

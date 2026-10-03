@@ -19,7 +19,7 @@ use crate::api::util::command::{
     HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
 };
 use crate::error::PluginError;
-use crate::pack::DiscoveredPackage;
+use crate::pack::{DiscoveredPackage, Interaction};
 use crate::plugin_permissions::{
     MANIFEST_FILE, PluginPermissions, Requested, check_plugin_compatibility,
     load_plugin_permissions,
@@ -311,18 +311,24 @@ impl Drop for PluginHost {
 }
 
 impl PluginHost {
+    /// A TUI host with JIT on, so tests get the whole `maki.ui` surface.
     pub fn new(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
-        Self::with_jit(registry, true)
+        Self::start(registry, Interaction::Tty, true)
     }
 
     /// `jit: false` (the `--no-jit` flag) runs plugin Lua on the O1
     /// interpreter with full debug info. Applied at VM creation, so
     /// every chunk gets it, init.lua files included.
-    pub fn with_jit(registry: Arc<ToolRegistry>, jit: bool) -> Result<Self, PluginError> {
+    pub fn start(
+        registry: Arc<ToolRegistry>,
+        interaction: Interaction,
+        jit: bool,
+    ) -> Result<Self, PluginError> {
         let plugin_rules = Arc::new(PluginRuleStore::default());
         let lua = runtime::spawn(
             Arc::clone(&registry),
             *BUNDLED_DIRS,
+            interaction,
             jit,
             Arc::clone(&plugin_rules),
         )?;
@@ -1354,9 +1360,9 @@ mod tests {
     /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
     /// interpreter path needs its own coverage.
     #[test]
-    fn with_jit_off_loads_builtins_and_registers_tools() {
+    fn jit_off_loads_builtins_and_registers_tools() {
         let reg = Arc::new(ToolRegistry::new());
-        let mut host = PluginHost::with_jit(Arc::clone(&reg), false).unwrap();
+        let mut host = PluginHost::start(Arc::clone(&reg), Interaction::Tty, false).unwrap();
         host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .unwrap();
         assert!(reg.has("glob"));

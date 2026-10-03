@@ -96,9 +96,8 @@ lua_class! {
 }
 
 /// Show a one line notice. By default it goes to `maki.ui.flash`, with
-/// `{opts.title}` in front of the message when you pass one. A run with
-/// no UI, such as `maki -p` or the sdk, logs the notice instead of
-/// dropping it.
+/// `{opts.title}` in front of the message when you pass one. Without a UI
+/// (`maki -p`, the sdk, ACP), the notice goes to the log.
 ///
 /// There is one handler for the whole process. Once a plugin calls
 /// `maki.set_notify_handler`, notices from every plugin go through it.

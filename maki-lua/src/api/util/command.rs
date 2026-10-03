@@ -13,7 +13,7 @@ use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::key::Key;
 
-pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
+pub const NO_UI_ERR: &str = "no interactive UI attached";
 pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
 
 const ROW_REFINE: &str = "refine";
@@ -678,8 +678,9 @@ pub enum UiAction {
 pub struct UiAttachment(Arc<AtomicBool>);
 
 impl Default for UiAttachment {
-    /// Attached until a loop says otherwise. Headless runs and ACP hand Lua no
-    /// sender at all, so the bit only ever describes a loop that went away.
+    /// Starts attached, so what a TUI host sends before its loop is up gets
+    /// answered once it is. A headless host has no sender at all, so this bit
+    /// only ever tells of a loop that went away.
     fn default() -> Self {
         Self(Arc::new(AtomicBool::new(true)))
     }

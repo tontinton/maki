@@ -67,6 +67,7 @@ use crate::docs_render;
 use crate::error::PluginError;
 use crate::key_lint::KeyLint;
 use crate::loader::EventHandle;
+use crate::pack::Interaction;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
@@ -4190,6 +4191,7 @@ pub(crate) struct LuaThread {
 pub fn spawn(
     registry: Arc<ToolRegistry>,
     bundled_dirs: &'static [&'static Dir<'static>],
+    interaction: Interaction,
     jit: bool,
     plugin_rules: Arc<PluginRuleStore>,
 ) -> Result<LuaThread, PluginError> {
@@ -4224,7 +4226,7 @@ pub fn spawn(
                 tx_clone,
                 shutdown_thread,
                 bundled_dirs,
-                Some(ui_action_tx),
+                (interaction == Interaction::Tty).then_some(ui_action_tx),
                 command_writer,
                 keymap_writer,
                 hint_writer,

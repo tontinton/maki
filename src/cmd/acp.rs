@@ -7,7 +7,7 @@ use color_eyre::eyre::Context;
 use maki_agent::tools::ToolRegistry;
 use maki_config::load_env_files;
 use maki_config::project::{self, TrustMode};
-use maki_lua::{InitFiles, PluginHost};
+use maki_lua::{InitFiles, Interaction, PluginHost};
 use maki_storage::StateDir;
 
 use crate::provider_scripts;
@@ -27,14 +27,18 @@ pub fn run(
     let trust = project::resolve(&storage, &cwd, trust_mode);
     load_env_files(&trust.project_config);
 
-    let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
-        .context("initialize lua plugin host")?;
+    let mut plugin_host = PluginHost::start(
+        Arc::clone(ToolRegistry::global_arc()),
+        Interaction::None,
+        !no_jit,
+    )
+    .context("initialize lua plugin host")?;
 
     let (mut config, mut warnings) = super::load_plugins(
         &mut plugin_host,
         no_plugins,
         super::BuiltinFailure::Fatal,
-        maki_lua::Interaction::None,
+        Interaction::None,
         |host, names, warnings| {
             warnings.extend(trust.warning.clone());
             let config = host

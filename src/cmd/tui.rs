@@ -151,8 +151,12 @@ fn build_stack(
     fallback: Option<(Config, Model)>,
 ) -> Result<(Stack, Vec<String>)> {
     let cli = launch.cli;
-    let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
-        .context("initialize lua plugin host")?;
+    let mut plugin_host = PluginHost::start(
+        Arc::clone(ToolRegistry::global_arc()),
+        launch.interaction,
+        !cli.no_jit,
+    )
+    .context("initialize lua plugin host")?;
 
     let (fallback_config, fallback_model) = fallback.unzip();
     let (mut config, mut warnings) = super::load_plugins(
@@ -707,7 +711,7 @@ mod tests {
         let cli = Cli::parse_from(["maki", "--no-plugins"]);
         assert!(cli.no_plugins);
 
-        let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
+        let mut plugin_host = PluginHost::new(Arc::new(ToolRegistry::new()))
             .expect("live host boots under --no-plugins");
 
         let config = load_config(
@@ -749,7 +753,7 @@ mod tests {
         assert!(!cli.no_plugins);
 
         let mut plugin_host =
-            PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
+            PluginHost::new(Arc::new(ToolRegistry::new())).expect("live host boots");
 
         match load_config(
             &plugin_host,

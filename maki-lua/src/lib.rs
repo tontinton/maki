@@ -21,7 +21,7 @@ pub use api::session::SessionSnapshotFn;
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
     HintReader, HintSnapshot, InputEdit, InputRequest, LuaCommandInfo, LuaCommandReader,
-    ModelRequest, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRequest, PlanRowAction,
+    ModelRequest, NO_UI_ERR, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRequest, PlanRowAction,
     SessionRequest, Split, TaskRequest, TitlePos, UiAction, UiAttachment, UiReply, WinCommand,
     WinEvent, WinView,
 };

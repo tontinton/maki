@@ -208,10 +208,13 @@ pub fn granted(
     }
 }
 
-/// Whether this entry point can ask the user a question.
+/// Whether someone is there to answer. `Tty` is the TUI: it can confirm an
+/// install on the terminal before it starts, and its loop answers `maki.ui`
+/// calls once it runs. `None` is `maki -p`, the sdk and ACP.
 ///
-/// An install runs downloaded code, so it is a trust decision. A run with no
-/// terminal cannot take one, and must refuse rather than assume consent.
+/// An install runs downloaded code, so it is a trust decision. With nobody to
+/// ask we refuse it rather than assume consent. Lua also gets no UI sender
+/// then, so a UI call fails right away instead of waiting forever for a reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Interaction {
     Tty,

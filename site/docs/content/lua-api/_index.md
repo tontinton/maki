@@ -271,9 +271,8 @@ maki.notify({msg}, {level?}, {opts?})
 ```
 
 Show a one line notice. By default it goes to `maki.ui.flash`, with
-`{opts.title}` in front of the message when you pass one. A run with
-no UI, such as `maki -p` or the sdk, logs the notice instead of
-dropping it.
+`{opts.title}` in front of the message when you pass one. Without a UI
+(`maki -p`, the sdk, ACP), the notice goes to the log.
 
 There is one handler for the whole process. Once a plugin calls
 `maki.set_notify_handler`, notices from every plugin go through it.
@@ -4301,10 +4300,11 @@ maki.provider.auth.clear("acme")
 ## maki.session {#maki-session}
 
 Host session primitives. The interactive UI can run several sessions
-at once; these functions let plugins list, create, focus, rename, and
-delete them. Session management returns `nil, "no interactive UI
-attached"` without a UI. `notify` instead targets a live agent mailbox
-directly, so it also works under ACP and SDK frontends.
+at once. These functions list, create, focus, rename, and delete them.
+
+Without a UI, most functions return `nil, "no interactive UI attached"`.
+`current` and `read` still work under `maki -p` and the sdk.
+`messages` and `notify` work everywhere, ACP included.
 
 ---
 
@@ -4353,7 +4353,8 @@ local live, err = maki.session.live()
 maki.session.current()
 ```
 
-Returns the id of the currently focused session.
+Returns the id of the focused session. Under `maki -p` and the sdk,
+that is the one session they run.
 
 **Returns:** (`string|nil`, `string|nil`) Session id, or nil and an error.
 
@@ -5987,6 +5988,14 @@ buf:line("hello from my plugin!")
 local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
 ```
 
+Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
+still work. The calls that need a screen behave like this:
+
+- `action`, `input`, and `input_edit` return `nil, "no interactive UI attached"`.
+- `open_editor` returns -1.
+- `flash` writes to the log.
+- `open_win`, `set_status_hint`, and `set_window_title` have no effect.
+
 ---
 
 ### `maki.ui.buf()` {#maki-ui-buf}
@@ -6246,9 +6255,8 @@ local t = maki.ui.truncate_text("hello world", 5)
 maki.ui.flash({msg})
 ```
 
-Shows a brief message in the status bar. The message disappears
-after a short time. Good for confirming an action like "copied!"
-or showing a transient warning.
+Shows a short-lived message in the status bar, such as "copied!" or a
+transient warning. Without a UI, the message goes to the log.
 
 **Parameters:**
 
@@ -6287,7 +6295,7 @@ For slash commands rather than keybound actions, see
 
 - `{name}` (`string`) Action name, e.g. `"file_picker"`.
 
-**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error message for an unknown name.
+**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error for an unknown name or a missing UI.
 
 **Example:**
 
@@ -6306,22 +6314,22 @@ end)
 maki.ui.open_editor({path})
 ```
 
-Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and waits for
-it to close. This suspends the TUI while the editor is running.
-Returns the editor's exit code so you can check if the user saved.
+Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and suspends the
+TUI until the editor exits. An exit code of 0 does not mean the user
+saved: read the file back to see what changed.
 
 **Parameters:**
 
 - `{path}` (`string`) File to open.
 
-**Returns:** (`integer`) Editor exit code, or -1 if the action could not be dispatched.
+**Returns:** (`integer`) Editor exit code, or -1 if the editor failed to start or there is no UI.
 
 **Example:**
 
 ```lua
 local code = maki.ui.open_editor("/tmp/scratch.lua")
-if code == 0 then
-  maki.ui.flash("File saved")
+if code ~= 0 then
+  maki.ui.flash("editor exited with " .. code)
 end
 ```
 

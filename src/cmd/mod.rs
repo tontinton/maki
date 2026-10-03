@@ -159,8 +159,12 @@ fn cli_stack(
     let trust = project::resolve_noninteractive(&cwd, trust_mode);
     load_env_files(&trust.project_config);
 
-    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
-        .context("initialize lua plugin host")?;
+    let mut host = PluginHost::start(
+        Arc::clone(ToolRegistry::global_arc()),
+        Interaction::None,
+        !no_jit,
+    )
+    .context("initialize lua plugin host")?;
     let (config, warnings) = load_plugins(
         &mut host,
         no_plugins,

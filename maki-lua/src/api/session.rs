@@ -12,7 +12,7 @@ use serde_json::json;
 
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip, ui_roundtrip};
 use crate::api::util::convert::json_to_lua;
-use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 
 /// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
 /// optional session id from Lua and returns a serialized
@@ -248,14 +248,15 @@ async fn messages(
     Ok((Some(out), None))
 }
 
-/// Returns the id of the currently focused session.
+/// Returns the id of the focused session. Under `maki -p` and the sdk,
+/// that is the one session they run.
 ///
 /// @return (string|nil, string|nil) Session id, or nil and an error.
 /// @example
 /// local id = maki.session.current()
 #[lua_fn]
-async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
-    roundtrip(lua, tx, SessionRequest::Current).await
+async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<String>> {
+    Ok(pair(focused_session(&lua, tx.as_ref()).await))
 }
 
 /// Switches the UI to the session with {id}.
@@ -415,10 +416,11 @@ async fn set_title(
 
 lua_table! {
     /// Host session primitives. The interactive UI can run several sessions
-    /// at once; these functions let plugins list, create, focus, rename, and
-    /// delete them. Session management returns `nil, "no interactive UI
-    /// attached"` without a UI. `notify` instead targets a live agent mailbox
-    /// directly, so it also works under ACP and SDK frontends.
+    /// at once. These functions list, create, focus, rename, and delete them.
+    ///
+    /// Without a UI, most functions return `nil, "no interactive UI attached"`.
+    /// `current` and `read` still work under `maki -p` and the sdk.
+    /// `messages` and `notify` work everywhere, ACP included.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
     DOCS [list(tx), live(tx), current(tx), read(tx), messages(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_mode(tx), set_title(tx)]
 }
@@ -684,6 +686,17 @@ mod tests {
             reply_tx.send(Ok(json!(id.to_string()))).unwrap();
         });
         lua_with_session(Some(tx))
+    }
+
+    #[test_case(headless_focused_on ; "headless_snapshot_id")]
+    #[test_case(ui_focused_on ; "ui_current_bare_id")]
+    fn current_names_the_focused_session(focused_on: fn(MakiId) -> Lua) {
+        let id = MakiId::generate();
+        let lua = focused_on(id);
+        let (got, err): (Option<String>, Option<String>) =
+            smol::block_on(lua.load("return session.current()").eval_async()).unwrap();
+        assert_eq!(err, None);
+        assert_eq!(got, Some(id.to_string()));
     }
 
     #[test_case(headless_focused_on ; "headless_snapshot_id")]

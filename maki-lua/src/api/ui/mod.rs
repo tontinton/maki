@@ -13,7 +13,8 @@ use strum::VariantNames;
 use crate::api::keymap::accept_key;
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
-    InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_send,
+    InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_roundtrip,
+    ui_send,
 };
 use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, try_pair};
@@ -353,17 +354,23 @@ fn truncate_text(lua: &Lua, text: String, max_width: usize) -> LuaResult<Table> 
     Ok(tbl)
 }
 
-/// Shows a brief message in the status bar. The message disappears
-/// after a short time. Good for confirming an action like "copied!"
-/// or showing a transient warning.
+/// Shows a short-lived message in the status bar, such as "copied!" or a
+/// transient warning. Without a UI, the message goes to the log.
 ///
 /// @param msg string Message text.
 /// @return
 /// @example
 /// maki.ui.flash("Copied to clipboard!")
 #[lua_fn]
-fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResult<()> {
-    let _ = tx.try_send(UiAction::Flash(msg));
+fn flash(
+    _lua: &Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] plugin: Arc<str>,
+    msg: String,
+) -> LuaResult<()> {
+    if ui_send(tx.as_ref(), UiAction::Flash(msg.clone())).is_err() {
+        tracing::info!(plugin = %plugin, "{msg}");
+    }
     Ok(())
 }
 
@@ -384,10 +391,10 @@ fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResu
 #[lua_fn]
 fn set_window_title(
     _lua: &Lua,
-    #[ctx] tx: flume::Sender<UiAction>,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
     title: String,
 ) -> LuaResult<()> {
-    let _ = tx.try_send(UiAction::SetWindowTitle(title));
+    let _ = ui_send(tx.as_ref(), UiAction::SetWindowTitle(title));
     Ok(())
 }
 
@@ -407,28 +414,32 @@ fn set_window_title(
 /// `maki.api.run_command`.
 ///
 /// @param name string Action name, e.g. `"file_picker"`.
-/// @return (boolean|nil, string|nil) `true` on success, or nil and an error message for an unknown name.
+/// @return (boolean|nil, string|nil) `true` on success, or nil and an error for an unknown name or a missing UI.
 /// @example
 /// -- Open the built-in file picker with Ctrl+Q instead of Ctrl+S:
 /// maki.keymap.set("n", "<C-q>", function()
 ///   maki.ui.action("file_picker")
 /// end)
 #[lua_fn]
-fn action(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, name: String) -> LuaResult<Pair<bool>> {
+fn action(
+    _lua: &Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    name: String,
+) -> LuaResult<Pair<bool>> {
     let builtin = try_pair!(name.parse::<BuiltinAction>().map_err(|_| format!(
         "unknown action '{name}' (valid: {})",
         BuiltinAction::VARIANTS.join(", ")
     )));
-    try_pair!(ui_send(Some(&tx), UiAction::Builtin(builtin)));
+    try_pair!(ui_send(tx.as_ref(), UiAction::Builtin(builtin)));
     Ok((Some(true), None))
 }
 
 async fn input_roundtrip(
     lua: Lua,
-    tx: &flume::Sender<UiAction>,
+    tx: Option<&flume::Sender<UiAction>>,
     req: InputRequest,
 ) -> LuaResult<Pair<mlua::Value>> {
-    ui_json_roundtrip(&lua, Some(tx), |reply_tx| UiAction::Input { req, reply_tx }).await
+    ui_json_roundtrip(&lua, tx, |reply_tx| UiAction::Input { req, reply_tx }).await
 }
 
 fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
@@ -464,8 +475,11 @@ fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
 /// local st = maki.ui.input()
 /// local before = st.text:sub(1, st.cursor)
 #[lua_fn]
-async fn input(lua: Lua, #[ctx] tx: flume::Sender<UiAction>) -> LuaResult<Pair<mlua::Value>> {
-    input_roundtrip(lua, &tx, InputRequest::Read).await
+async fn input(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+) -> LuaResult<Pair<mlua::Value>> {
+    input_roundtrip(lua, tx.as_ref(), InputRequest::Read).await
 }
 
 /// Replaces a byte range of the chat input, as if the user had selected it
@@ -513,7 +527,7 @@ async fn input(lua: Lua, #[ctx] tx: flume::Sender<UiAction>) -> LuaResult<Pair<m
 #[lua_fn]
 async fn input_edit(
     lua: Lua,
-    #[ctx] tx: flume::Sender<UiAction>,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     opts: Table,
 ) -> LuaResult<Pair<mlua::Value>> {
@@ -526,37 +540,33 @@ async fn input_edit(
         session_id: required(&opts, "session_id")?,
         plugin,
     });
-    input_roundtrip(lua, &tx, req).await
+    input_roundtrip(lua, tx.as_ref(), req).await
 }
 
-/// Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and waits for
-/// it to close. This suspends the TUI while the editor is running.
-/// Returns the editor's exit code so you can check if the user saved.
+/// Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and suspends the
+/// TUI until the editor exits. An exit code of 0 does not mean the user
+/// saved: read the file back to see what changed.
 ///
 /// @param path string File to open.
-/// @return (integer) Editor exit code, or -1 if the action could not be dispatched.
+/// @return (integer) Editor exit code, or -1 if the editor failed to start or there is no UI.
 /// @example
 /// local code = maki.ui.open_editor("/tmp/scratch.lua")
-/// if code == 0 then
-///   maki.ui.flash("File saved")
+/// if code ~= 0 then
+///   maki.ui.flash("editor exited with " .. code)
 /// end
 #[lua_fn]
 async fn open_editor(
     _lua: Lua,
-    #[ctx] tx: flume::Sender<UiAction>,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
     path: String,
 ) -> LuaResult<i32> {
-    let (reply_tx, reply_rx) = flume::bounded::<i32>(1);
-    if tx
-        .try_send(UiAction::OpenEditor {
-            path: PathBuf::from(path),
-            reply_tx,
-        })
-        .is_err()
-    {
-        return Ok(-1);
-    }
-    Ok(reply_rx.recv_async().await.unwrap_or(-1))
+    let path = PathBuf::from(path);
+    Ok(ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::OpenEditor {
+        path,
+        reply_tx,
+    })
+    .await
+    .unwrap_or(-1))
 }
 
 /// The keys an unfocused window takes while it is on screen, read through the
@@ -616,7 +626,7 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
 #[lua_fn]
 fn open_win(
     lua: &Lua,
-    #[ctx] tx: flume::Sender<UiAction>,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     buf: mlua::AnyUserData,
     opts: Table,
@@ -692,13 +702,16 @@ fn open_win(
     }
     let cmd_tx = WinSender::new(cmd_tx, waker);
 
-    let _ = tx.try_send(UiAction::OpenWin {
-        buf: buf_handle.buf.clone(),
-        config,
-        focus,
-        event_tx,
-        cmd_rx,
-    });
+    let _ = ui_send(
+        tx.as_ref(),
+        UiAction::OpenWin {
+            buf: buf_handle.buf.clone(),
+            config,
+            focus,
+            event_tx,
+            cmd_rx,
+        },
+    );
 
     // Stamped with the plugin that opened it so unloading that plugin closes
     // it, the way its keymaps and hints are cleared. Without the stamp the
@@ -735,6 +748,14 @@ lua_table! {
     /// buf:line("hello from my plugin!")
     /// local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
     /// ```
+    ///
+    /// Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
+    /// still work. The calls that need a screen behave like this:
+    ///
+    /// - `action`, `input`, and `input_edit` return `nil, "no interactive UI attached"`.
+    /// - `open_editor` returns -1.
+    /// - `flash` writes to the log.
+    /// - `open_win`, `set_status_hint`, and `set_window_title` have no effect.
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
@@ -751,15 +772,13 @@ pub(crate) fn create_ui_table(
     let t = lua.create_table()?;
     add_ui_fns(&t, lua)?;
 
-    if let Some(tx) = ui_action_tx {
-        flash__register(&t, lua, tx.clone())?;
-        set_window_title__register(&t, lua, tx.clone())?;
-        action__register(&t, lua, tx.clone())?;
-        open_editor__register(&t, lua, tx.clone())?;
-        input__register(&t, lua, tx.clone())?;
-        input_edit__register(&t, lua, tx.clone(), Arc::clone(&plugin))?;
-        open_win__register(&t, lua, tx, Arc::clone(&plugin))?;
-    }
+    flash__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
+    set_window_title__register(&t, lua, ui_action_tx.clone())?;
+    action__register(&t, lua, ui_action_tx.clone())?;
+    open_editor__register(&t, lua, ui_action_tx.clone())?;
+    input__register(&t, lua, ui_action_tx.clone())?;
+    input_edit__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
+    open_win__register(&t, lua, ui_action_tx, Arc::clone(&plugin))?;
 
     let p = Arc::clone(&plugin);
     t.set(
