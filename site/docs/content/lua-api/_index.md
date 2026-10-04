@@ -6320,7 +6320,7 @@ local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 
 Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
 still work. The calls that need a screen behave like this:
 
-- `action`, `input`, and `input_edit` return `nil, "no interactive UI attached"`.
+- `action`, `scroll_to_block`, `transcript_outline`, `input`, and `input_edit` return `nil, "no interactive UI attached"`.
 - `open_editor` returns -1.
 - `flash` writes to the log.
 - `open_win`, `set_status_hint`, and `set_window_title` have no effect.
@@ -6637,6 +6637,77 @@ end)
 
 ---
 
+### `maki.ui.scroll_to_block()` {#maki-ui-scroll_to_block}
+
+```lua
+maki.ui.scroll_to_block({position})
+```
+
+Scrolls the focused chat to the entry at {position} of
+`maki.ui.transcript_outline()`, counting from 1. The outline is the list
+of what can be jumped to, and this call takes a position in it: a pane
+jumps straight to the entry it showed, with no counting of its own.
+
+The entry kinds the outline lists are the items a contents pane shows:
+
+- `"turn"`: a visible user message. A turn starts where the user spoke;
+  everything the model answered with sits under it. Nudges, observations
+  and other entries the transcript never shows are not listed.
+- `"thinking"`: a non-empty thinking block, in order.
+- `"reply"`: a non-empty assistant text block, in order.
+
+Tool calls and results show in the transcript but are not jumpable
+entries. A collapsed thinking block jumps to its indicator line;
+expanding it is a click in the chat, not this call.
+
+The scroll releases the bottom pin, so streaming output stops dragging
+the view away from the block you jumped to.
+
+**Parameters:**
+
+- `{position}` (`integer`) 1-based position in `maki.ui.transcript_outline()`.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error when the position is past the outline or there is no UI.
+
+**Example:**
+
+```lua
+-- A pane that lists the outline, one entry per line, jumps on click:
+win:recv() -- {type = "click", row} for a painted line
+local ok, err = maki.ui.scroll_to_block(row)
+```
+
+---
+
+### `maki.ui.transcript_outline()` {#maki-ui-transcript_outline}
+
+```lua
+maki.ui.transcript_outline()
+```
+
+Reads the transcript as the chat itself lists it: one entry per jumpable
+block, in display order. Each entry is `{ kind, text }` where `kind` is
+`"turn"`, `"thinking"` or `"reply"` and `text` is a first-line preview
+meant for a contents pane to clip to its own width.
+
+This is the list `maki.ui.scroll_to_block` indexes: entry `n` here is
+what `scroll_to_block(n)` jumps to. Which messages show at all is the
+chat's decision alone, so a pane can never disagree with it about what a
+position means.
+
+**Returns:** (`table|nil`, `string|nil`) Array of outline entries, or nil and an error when there is no UI.
+
+**Example:**
+
+```lua
+-- Print each entry with the position a jump answers to:
+for n, b in ipairs(maki.ui.transcript_outline() or {}) do
+  print(n, b.kind, b.text)
+end
+```
+
+---
+
 ### `maki.ui.open_editor()` {#maki-ui-open_editor}
 
 ```lua
@@ -6896,6 +6967,7 @@ Event tables by type:
 - `{type="key", key}` -- keypress. {key} is in canonical `maki.keymap` notation: `"q"`, `"<CR>"`, `"<Esc>"`, `"<C-n>"`, `"<S-Tab>"`.
 - `{type="resize", width, height}` -- terminal was resized.
 - `{type="paste", text}` -- bracketed paste.
+- `{type="click", row, col}` -- left click landed on this window. {row} is the 1-based buffer line under the cursor, accounting for the window's own scroll, and {col} the 1-based column in the content area.
 - `{type="close"}` -- window was closed externally.
 - `{type="timeout"}` -- no event arrived within {timeout_ms}.
 

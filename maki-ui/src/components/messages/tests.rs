@@ -341,6 +341,130 @@ fn rebuild(panel: &mut MessagesPanel) {
 }
 
 #[test]
+fn scroll_to_block_jumps_by_outline_position() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "first question".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Thinking,
+        "pondering".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "an answer".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "second question".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "another answer".into(),
+    ));
+    panel.push(DisplayMessage::plan(
+        "the plan text".into(),
+        "plans/x.md".into(),
+    ));
+    rebuild(&mut panel);
+
+    let seg_of = |panel: &MessagesPanel, msg_idx: usize| {
+        panel
+            .cache
+            .segments()
+            .iter()
+            .position(|s| s.msg_index == Some(msg_idx) && s.tool_id.is_none())
+    };
+
+    assert!(panel.scroll_to_block(4), "the second turn is entry 4");
+    assert_eq!(panel.scroll.seg, seg_of(&panel, 3).unwrap());
+    assert!(!panel.auto_scroll, "jumping releases the bottom pin");
+
+    assert!(panel.scroll_to_block(1));
+    assert_eq!(panel.scroll.seg, seg_of(&panel, 0).unwrap());
+
+    assert!(panel.scroll_to_block(2), "the thinking block");
+    assert_eq!(panel.scroll.seg, seg_of(&panel, 1).unwrap());
+
+    assert!(panel.scroll_to_block(3), "the first reply");
+    assert_eq!(panel.scroll.seg, seg_of(&panel, 2).unwrap());
+
+    assert!(panel.scroll_to_block(5), "the second reply");
+    assert_eq!(panel.scroll.seg, seg_of(&panel, 4).unwrap());
+
+    assert!(
+        !panel.scroll_to_block(6),
+        "the plan bubble is Assistant but never listed, so nothing sits at 6"
+    );
+    assert!(!panel.scroll_to_block(0), "positions are 1-based");
+}
+
+#[test]
+fn outline_lists_jumpable_blocks_with_first_line_previews() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "first line\nignored".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Tool(Box::new(ToolRole {
+            id: "t1".into(),
+            status: ToolStatus::Success,
+            name: "bash".into(),
+        })),
+        "tool noise".into(),
+    ));
+    panel.push(DisplayMessage::new(DisplayRole::Thinking, "hmm".into()));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "an answer\nignored".into(),
+    ));
+    panel.push(DisplayMessage::new(DisplayRole::Error, "boom".into()));
+    panel.push(DisplayMessage::plan(
+        "the plan text".into(),
+        "plans/x.md".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "x".repeat(OUTLINE_PREVIEW_BYTES + 60),
+    ));
+    rebuild(&mut panel);
+
+    let outline = panel.outline();
+    let kinds: Vec<&str> = outline
+        .iter()
+        .map(|(kind, _)| <&'static str>::from(*kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        ["turn", "thinking", "reply", "turn"],
+        "tools, errors and plan announcements are not jumpable blocks"
+    );
+    assert_eq!(
+        outline[0].1, "first line",
+        "preview stops at the first line"
+    );
+    assert_eq!(outline[2].1, "an answer");
+    assert_eq!(
+        outline[3].1.len(),
+        OUTLINE_PREVIEW_BYTES,
+        "a long first line is cut at the cap"
+    );
+
+    for position in 1..=outline.len() {
+        assert!(
+            panel.scroll_to_block(position),
+            "entry {position} of the outline is what the jump answers to"
+        );
+    }
+    assert!(
+        !panel.scroll_to_block(outline.len() + 1),
+        "past the list there is nothing to jump to"
+    );
+}
+
+#[test]
 fn ctrl_d_to_bottom_re_enables_auto_scroll() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.streaming_text.set_buffer(&"a\n".repeat(30));

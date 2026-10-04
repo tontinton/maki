@@ -55,6 +55,9 @@ impl App {
                     } else {
                         let zone = sel.zone;
                         self.selection_state = None;
+                        if self.float_mgr.click_at(event.row, event.column) {
+                            return;
+                        }
                         if zone == SelectionZone::Messages {
                             let area = self.msg_area();
                             self.chats[self.active_chat].handle_click(event.row, area);
