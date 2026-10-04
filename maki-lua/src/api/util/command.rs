@@ -457,9 +457,23 @@ pub struct FloatConfigPatch {
 }
 
 pub enum WinEvent {
-    Key { key: Key },
-    Resize { width: u16, height: u16 },
-    Paste { text: String },
+    Key {
+        key: Key,
+    },
+    Resize {
+        width: u16,
+        height: u16,
+    },
+    Paste {
+        text: String,
+    },
+    /// Left click inside the window's painted content. `row` is the 1-based
+    /// line of the buffer shown under the cursor, `col` the 1-based column
+    /// inside the window's content area.
+    Click {
+        row: u16,
+        col: u16,
+    },
     Close,
 }
 
@@ -772,6 +786,18 @@ impl BuiltinAction {
     }
 }
 
+/// What kind of transcript entry `maki.ui.transcript_outline` lists.
+/// The names are the ones a ToC plugin shows: `turn` is a user prompt, the
+/// others are the sub-items a turn owns. Tool calls and their results are
+/// shown in the transcript but are not entries of these kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum BlockKind {
+    Turn,
+    Thinking,
+    Reply,
+}
+
 pub enum UiAction {
     OpenWin {
         /// `None` opens it in the focused tab.
@@ -821,6 +847,13 @@ pub enum UiAction {
     },
     WinRestView {
         scroll_top: u32,
+    },
+    ScrollToBlock {
+        position: usize,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    TranscriptOutline {
+        reply_tx: flume::Sender<UiReply>,
     },
     /// `reply_tx` answers whether the action did anything, which is what lets
     /// a key handler try one action and fall back to another.
