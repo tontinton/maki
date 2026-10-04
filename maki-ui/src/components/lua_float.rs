@@ -86,6 +86,10 @@ struct FloatWindow {
     /// a window nobody can see is a key taken from the user with no footer to
     /// tell them where it went.
     on_screen: bool,
+    /// Visible content rects paired with the 1-based buffer line each starts
+    /// on, rebuilt whenever the window paints. This is what turns a click's
+    /// screen row into the buffer row the plugin cares about.
+    click_map: Vec<(Rect, usize)>,
     event_tx: flume::Sender<WinEvent>,
     cmd_rx: flume::Receiver<WinCommand>,
 }
@@ -265,6 +269,7 @@ impl FloatManager {
             cached_lines,
             viewport_h: 1,
             last_content: Rect::default(),
+            click_map: Vec::new(),
             cursor: 0,
             visible,
             opened_focused: focus,
@@ -637,9 +642,29 @@ impl FloatManager {
         let top = layout.reserved_top;
         let scrollable = layout.scrollable;
 
+        win.click_map.clear();
+        if let Some(pa) = pinned_top_area {
+            win.click_map.push((pa, 1));
+        }
+
         let vh = win.viewport_h as usize;
         let end = (top + win.scroll_offset + vh).min(top + scrollable);
         let visible = &win.cached_lines[top + win.scroll_offset..end];
+
+        // The scroll area's blank rows below a short list carry no line. A
+        // click there must map to nothing rather than run on into the pinned
+        // footer or past the buffer end, so the rect stops where `visible`
+        // does.
+        win.click_map.push((
+            Rect {
+                height: visible.len() as u16,
+                ..scroll_area
+            },
+            top + win.scroll_offset + 1,
+        ));
+        if let Some(ba) = pinned_bot_area {
+            win.click_map.push((ba, top + scrollable + 1));
+        }
 
         let lines: Vec<Line<'_>> = visible
             .iter()
@@ -687,6 +712,32 @@ impl FloatManager {
 
     pub fn contains(&self, pos: ratatui::layout::Position) -> bool {
         self.focused_rect.is_some_and(|r| r.contains(pos))
+    }
+
+    /// Hands a left click to the frontmost painted window under `(row, col)`.
+    /// The window receives `WinEvent::Click` whose `row` is the 1-based buffer
+    /// line under the cursor, resolved through the window's own scroll and
+    /// pinned areas, so a plugin maps a click to a line without tracking the
+    /// viewport. Answers false when no window is there.
+    pub fn click_at(&mut self, row: u16, col: u16) -> bool {
+        let pos = ratatui::layout::Position::new(col, row);
+        // `windows` is sorted by zindex, so walking it backwards is the order
+        // the user sees, front first, and a click hits the topmost window.
+        for win in self.windows.iter_mut().rev() {
+            if !win.on_screen {
+                continue;
+            }
+            let Some((area, first)) = win.click_map.iter().find(|(a, _)| a.contains(pos)) else {
+                continue;
+            };
+            let line = (*first + (row - area.y) as usize).min(u16::MAX as usize) as u16;
+            let _ = win.event_tx.try_send(WinEvent::Click {
+                row: line,
+                col: col - area.x + 1,
+            });
+            return true;
+        }
+        false
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -2600,6 +2651,7 @@ mod tests {
             cached_lines,
             viewport_h: 1,
             last_content: Rect::default(),
+            click_map: Vec::new(),
             cursor: 0,
             visible: true,
             opened_focused: true,
@@ -2861,6 +2913,182 @@ mod tests {
         "an unfocused split must not claim focused_rect (mouse hit-testing target)";
     const EXPECT_FOCUS_RECOVERS: &str =
         "removing the focused window must hand focus to a surviving window";
+    const EXPECT_CLICK_ROW: &str =
+        "a click must report the buffer line under the cursor, not the screen row";
+
+    fn open_split_with_lines(
+        mgr: &mut FloatManager,
+        dir: Split,
+        extent: u16,
+        lines: &[&str],
+    ) -> flume::Receiver<WinEvent> {
+        let (event_tx, cmd_rx, event_rx, _cmd_tx) = make_channels();
+        mgr.open(
+            make_buf(lines),
+            split_config(dir, Dimension::Abs(extent)),
+            false,
+            event_tx,
+            cmd_rx,
+        );
+        event_rx
+    }
+
+    #[test]
+    fn click_on_painted_split_reports_buffer_line_and_column() {
+        let mut mgr = FloatManager::new();
+        let event_rx = open_split_with_lines(&mut mgr, Split::Left, 20, &["one", "two", "three"]);
+        let area = Rect::new(0, 0, 80, 40);
+        let rect = Rect::new(0, 0, 20, 40);
+        render_into(&mut mgr, area, |m, f| {
+            m.view_split(f, Split::Left, rect);
+            let _ = m.view(f, area, NO_CARET);
+        });
+        event_rx.drain();
+
+        assert!(mgr.click_at(rect.y + 1, rect.x + 3), "{EXPECT_CLICK_ROW}");
+        let click = event_rx.drain().find_map(|e| match e {
+            WinEvent::Click { row, col } => Some((row, col)),
+            _ => None,
+        });
+        assert_eq!(click, Some((2, 4)), "{EXPECT_CLICK_ROW}");
+    }
+
+    #[test]
+    fn click_row_accounts_for_window_scroll() {
+        const AREA: Rect = Rect::new(0, 0, 80, 10);
+        const RECT: Rect = Rect::new(0, 0, 20, 4);
+        fn paint(m: &mut FloatManager, f: &mut Frame) {
+            m.view_split(f, Split::Left, RECT);
+            let _ = m.view(f, AREA, NO_CARET);
+        }
+
+        let mut mgr = FloatManager::new();
+        let lines = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        let event_rx = open_split_with_lines(&mut mgr, Split::Left, 20, &lines);
+        render_into(&mut mgr, AREA, paint);
+        mgr.windows[0].scroll_by(-2);
+        render_into(&mut mgr, AREA, paint);
+        event_rx.drain();
+
+        assert!(mgr.click_at(RECT.y, RECT.x));
+        let click = event_rx.drain().find_map(|e| match e {
+            WinEvent::Click { row, col } => Some((row, col)),
+            _ => None,
+        });
+        assert_eq!(
+            click,
+            Some((3, 1)),
+            "the top row shows buffer line 3 after scrolling two down"
+        );
+    }
+
+    #[test]
+    fn click_below_a_short_list_maps_to_no_line() {
+        const AREA: Rect = Rect::new(0, 0, 80, 10);
+        const RECT: Rect = Rect::new(0, 0, 20, 10);
+
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, event_rx, _cmd_tx) = make_channels();
+        let mut cfg = split_config(Split::Left, Dimension::Abs(20));
+        cfg.reserved_bottom = 1;
+        mgr.open(
+            make_buf(&["only body", "footer"]),
+            cfg,
+            false,
+            event_tx,
+            cmd_rx,
+        );
+        render_into(&mut mgr, AREA, |m, f| {
+            m.view_split(f, Split::Left, RECT);
+            let _ = m.view(f, AREA, NO_CARET);
+        });
+        event_rx.drain();
+
+        assert!(
+            !mgr.click_at(RECT.y + 5, RECT.x),
+            "blank rows under the last body line belong to no line"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a blank click must not fire, the pinned footer included"
+        );
+
+        assert!(mgr.click_at(RECT.y, RECT.x));
+        assert!(
+            matches!(event_rx.try_recv(), Ok(WinEvent::Click { row: 1, .. })),
+            "{EXPECT_CLICK_ROW}"
+        );
+        assert!(mgr.click_at(RECT.y + 9, RECT.x));
+        assert!(
+            matches!(event_rx.try_recv(), Ok(WinEvent::Click { row: 2, .. })),
+            "the pinned footer row still maps to its buffer line"
+        );
+    }
+
+    #[test]
+    fn click_misses_unpainted_and_outside_windows() {
+        let mut mgr = FloatManager::new();
+        assert!(!mgr.click_at(1, 1), "no window, no click");
+        let event_rx = open_split_with_lines(&mut mgr, Split::Left, 20, &["one"]);
+        assert!(
+            !mgr.click_at(1, 1),
+            "a window that has never painted answers no click"
+        );
+        let area = Rect::new(0, 0, 80, 40);
+        let rect = Rect::new(0, 0, 20, 40);
+        render_into(&mut mgr, area, |m, f| {
+            m.view_split(f, Split::Left, rect);
+            let _ = m.view(f, area, NO_CARET);
+        });
+        event_rx.drain();
+
+        assert!(
+            !mgr.click_at(rect.y, rect.x + 25),
+            "outside the carved band"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a miss must not leave an event behind"
+        );
+        assert!(mgr.click_at(rect.y, rect.x + 1), "on the painted row");
+        assert!(matches!(event_rx.try_recv(), Ok(WinEvent::Click { .. })));
+        assert!(
+            !mgr.click_at(rect.y + 1, rect.x + 1),
+            "below the only line there is nothing to click"
+        );
+    }
+
+    #[test]
+    fn click_lands_on_the_frontmost_of_two_overlapping_floats() {
+        let mut mgr = FloatManager::new();
+        let back = open_with_lines(&mut mgr, &["back"]);
+        let (event_tx, cmd_rx, front, _cmd_tx) = make_channels();
+        mgr.open(make_buf(&["front"]), make_config(), false, event_tx, cmd_rx);
+        let area = Rect::new(0, 0, 80, 40);
+        render_into(&mut mgr, area, |m, f| {
+            let _ = m.view(f, area, NO_CARET);
+        });
+        back.0.drain();
+        front.drain();
+
+        // Both floats share a geometry, so any painted cell is covered by
+        // both and only z-order decides who hears the click.
+        let (painted, _) = mgr.windows.last().unwrap().click_map[0];
+        assert!(
+            mgr.click_at(painted.y, painted.x),
+            "the shared painted row is covered"
+        );
+        assert!(
+            front
+                .try_iter()
+                .any(|e| matches!(e, WinEvent::Click { .. })),
+            "the window opened last paints over the first, so it owns the click"
+        );
+        assert!(
+            back.0.try_recv().is_err(),
+            "the covered window must not hear the click"
+        );
+    }
 
     #[test]
     fn unfocused_split_does_not_claim_focused_rect() {
