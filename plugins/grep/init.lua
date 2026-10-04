@@ -64,7 +64,7 @@ end
 
 local function grep_view_opts(ctx)
   local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.other) or 10, keep = "head" }
+  return { max_lines = (tol and tol.grep) or 10, keep = "head" }
 end
 
 local function dim_spans(spans)
