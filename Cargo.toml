@@ -88,7 +88,7 @@ maki-highlight = { path = "maki-highlight" }
 maki-markdown = { path = "maki-markdown" }
 maki-otel = { path = "maki-otel" }
 maki-pack = { path = "maki-pack" }
-serde = { version = "1", features = ["derive", "rc"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bs58 = "0.5"
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }
@@ -109,7 +109,6 @@ getrandom = "0.4"
 fastrand = "2"
 test-case = "3"
 ignore = "0.4"
-memchr = "2"
 strum = { version = "0.28", features = ["derive"] }
 htmd = "0.5"
 tempfile = "3"
@@ -156,7 +155,7 @@ etcetera = "0.11"
 dotenvy = "0.15"
 tree-sitter = "0.27"
 include_dir = "0.7"
-mlua = { version = "0.12", features = ["luau", "luau-jit", "async", "send", "serde", "macros"] }
+mlua = { version = "0.12", features = ["luau", "luau-jit", "async", "send", "serde"] }
 tree-sitter-bash = "0.25"
 tree-sitter-c = "0.24"
 tree-sitter-c-sharp = "0.23"
