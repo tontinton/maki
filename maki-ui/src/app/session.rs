@@ -371,6 +371,23 @@ impl App {
     /// after the session it copied, and leaves this tab on the original.
     /// Refused while a run streams.
     pub(super) fn fork_session(&mut self) -> Vec<Action> {
+        self.fork_session_with(|_| {})
+    }
+
+    /// The rewind picker's fork: same copy, but truncated right before the
+    /// chosen prompt, so the fork continues from there while this tab keeps
+    /// the full transcript. The dropped prompt rides along as the copy's
+    /// draft, so opening the fork puts it back in the input box, exactly
+    /// where an in-place rewind leaves it.
+    pub(super) fn fork_to(&mut self, entry: RewindEntry) -> Vec<Action> {
+        self.fork_session_with(|forked| {
+            forked.truncate_messages(entry.turn_index);
+            forked.prune_orphans(|m| m.tool_uses().map(|(id, _, _)| id.to_owned()).collect());
+            forked.meta.input_draft = Some(entry.prompt_text.clone());
+        })
+    }
+
+    fn fork_session_with(&mut self, adjust: impl FnOnce(&mut AppSession)) -> Vec<Action> {
         if self.status == Status::Streaming {
             self.status_bar.flash(FORK_BUSY_MSG.into());
             return vec![];
@@ -378,6 +395,7 @@ impl App {
         let claim = SessionClaim::fresh(&self.storage);
         let cwd = self.state.session.cwd.clone();
         let mut forked = AppSession::clone(&self.state.session).fork(claim.id(), &cwd);
+        adjust(&mut forked);
         // Add a "fork of" prefix for the copy.
         forked.update_title_if_default();
         let title = format!("{FORK_TITLE_PREFIX}{}", forked.title);

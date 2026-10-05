@@ -534,6 +534,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single("Ctrl+F"),
+        description: "Fork up to the selected prompt",
+        context: KeybindContext::RewindPicker,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Remove item",
         context: KeybindContext::QueueFocus,

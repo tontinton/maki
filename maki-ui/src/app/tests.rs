@@ -7154,6 +7154,79 @@ fn fork_refuses_while_a_run_streams() {
     );
 }
 
+#[test]
+fn fork_to_prompt_saves_a_truncated_copy_and_keeps_the_original() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.state.session_mut().replace_messages(vec![
+        Message::user("first prompt".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "response 1".into(),
+                },
+                ContentBlock::tool_use("tool-1", "bash", serde_json::json!({})),
+            ],
+            ..Default::default()
+        },
+        Message::user("second prompt".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "response 2".into(),
+            }],
+            ..Default::default()
+        },
+        Message::user("third prompt".into()),
+    ]);
+    app.state.session_mut().insert_tool_output(
+        "tool-1".into(),
+        Arc::new(ToolOutput::Plain("output".into())),
+    );
+    app.checkpoint();
+    let original = app.state.session.id;
+
+    let actions = app.fork_to(rewind_to_second_turn());
+    assert!(actions.is_empty(), "forking disturbs neither tab nor agent");
+    assert_eq!(
+        app.state.session.messages().len(),
+        5,
+        "the tab keeps the full transcript",
+    );
+
+    drain_writer(app, writer);
+    let fork = AppSession::list_all(&dir)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id != original)
+        .expect("a fork on disk");
+    let loaded = AppSession::load(fork.id, &dir).unwrap();
+    assert_eq!(
+        loaded.messages().len(),
+        2,
+        "the copy ends right before the selected prompt",
+    );
+    assert!(
+        loaded.tool_outputs().contains_key("tool-1"),
+        "the orphan sweep keeps the pair the truncation leaves intact",
+    );
+    assert_eq!(
+        loaded.meta.input_draft.as_deref(),
+        Some("second prompt"),
+        "the dropped prompt rides along as the copy's draft",
+    );
+    assert!(
+        fork.title.starts_with("fork of "),
+        "the copy is named after what it copied: {}",
+        fork.title,
+    );
+    assert_eq!(
+        AppSession::load(original, &dir).unwrap().messages().len(),
+        5,
+        "the original keeps its transcript",
+    );
+}
+
 const ONE_RESTART: &str = "the gesture must hand the loop exactly one restart";
 const RESTART_MATCHES_SESSION: &str =
     "the respawned agent must run on the history the session now holds";
