@@ -3,6 +3,7 @@ use crate::theme;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::Style;
+use ratatui::text::Line;
 use ratatui::widgets::{Block, BorderType, Clear};
 
 /// The border, in cells, on each axis.
@@ -38,6 +39,18 @@ impl Modal<'_> {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, content_height: u16) -> (Rect, Rect) {
+        self.render_with_footer(frame, area, content_height, None)
+    }
+
+    /// Keybind hints go on the bottom border, like the Lua floats draw them,
+    /// so they cost no content row.
+    pub fn render_with_footer(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        content_height: u16,
+        footer: Option<Line<'_>>,
+    ) -> (Rect, Rect) {
         let total_h = (content_height + BORDER)
             .min(percent_of(area.height, self.max_height_percent))
             .max(BORDER + 1);
@@ -51,12 +64,15 @@ impl Modal<'_> {
 
         frame.render_widget(Clear, popup);
 
-        let block = Block::bordered()
+        let mut block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(theme::current().panel_border)
             .title(self.title)
             .title_style(theme::current().panel_title)
             .style(Style::new().bg(theme::current().background));
+        if let Some(footer) = footer {
+            block = block.title_bottom(footer);
+        }
 
         let inner = block.inner(popup);
         frame.render_widget(block, popup);

@@ -43,6 +43,22 @@ pub(crate) fn session_has_content(session: &AppSession) -> bool {
     !session.messages().is_empty()
 }
 
+/// Cuts the transcript right before `turn_index` and returns what is left of
+/// `context_size`. Rewind and fork both go through here so they never disagree
+/// about what a cut leaves behind.
+fn truncate_to_turn(session: &mut AppSession, turn_index: usize, context_size: u32) -> u32 {
+    // The live size came from the provider, so it also counts the system
+    // prompt and the tool schemas, a baseline the estimator cannot see.
+    // Subtract only what we drop, or the gauge collapses until the next
+    // turn measures it again. An emptied history is a fresh session though,
+    // baseline included.
+    let baseline = context_size.saturating_sub(estimate_message_tokens(session.messages()));
+    session.truncate_messages(turn_index);
+    session.prune_orphans(|m| m.tool_uses().map(|(id, _, _)| id.to_owned()).collect());
+    let kept = estimate_message_tokens(session.messages());
+    if kept == 0 { 0 } else { baseline + kept }
+}
+
 impl App {
     /// Stricter than `session_has_content`. A draft or plan mode is not worth a
     /// file, but it is still worth keeping when the picker wants this tab for
@@ -386,20 +402,34 @@ impl App {
     /// copy as a session of its own and focuses it, so this one keeps running
     /// in the background, untouched.
     pub(super) fn fork_session(&mut self) -> Vec<Action> {
+        self.fork_session_with(|_| {})
+    }
+
+    /// The rewind picker's fork. The copy stops right before the chosen prompt
+    /// and keeps that prompt as its draft, so it feels like a rewind that left
+    /// the original alone.
+    pub(super) fn fork_to(&mut self, entry: RewindEntry) -> Vec<Action> {
+        self.fork_session_with(|forked| {
+            // The agent restores its gauge from this, and the full size on a
+            // short copy would auto compact it on its first prompt.
+            let context_size = forked.meta.context_size;
+            forked.meta.context_size = truncate_to_turn(forked, entry.turn_index, context_size);
+            forked.meta.input_draft = Some(entry.prompt_text);
+        })
+    }
+
+    fn fork_session_with(&mut self, adjust: impl FnOnce(&mut AppSession)) -> Vec<Action> {
         // The last frame's snapshot still has `/fork` in the input box, and it
         // can miss what the agent wrote since, so take a fresh one.
         self.checkpoint_now();
-        if !session_has_content(&self.state.session) {
+        let mut copy = AppSession::clone(&self.state.session);
+        adjust(&mut copy);
+        if !session_has_content(&copy) {
             self.status_bar.flash(FORK_EMPTY_MSG.into());
             return vec![];
         }
         let claim = SessionClaim::fresh(&self.storage);
-        let forked = AppSession::clone(&self.state.session).fork(
-            claim.id(),
-            &self.state.session.cwd,
-            &self.storage,
-        );
-        let mut session = match forked {
+        let mut session = match copy.fork(claim.id(), &self.state.session.cwd, &self.storage) {
             Ok(session) => session,
             Err(e) => {
                 self.status_bar.flash(format!("{FORK_FAILED_MSG}: {e}"));
@@ -423,21 +453,11 @@ impl App {
     }
 
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
-        // The live size came from the provider, so it also counts the system
-        // prompt and the tool schemas, a baseline the estimator cannot see.
-        // Subtract only what we drop, or the gauge collapses until the next
-        // turn measures it again. An emptied history is a fresh session though,
-        // baseline included.
-        let baseline = self
-            .state
-            .context_size
-            .saturating_sub(estimate_message_tokens(self.state.session.messages()));
+        let measured = self.state.context_size;
         let session = self.state.session_mut();
-        session.truncate_messages(entry.turn_index);
-        session.prune_orphans(|m| m.tool_uses().map(|(id, _, _)| id.to_owned()).collect());
+        let context_size = truncate_to_turn(session, entry.turn_index, measured);
         session.update_title_if_default();
-        let kept = estimate_message_tokens(self.state.session.messages());
-        self.state.context_size = if kept == 0 { 0 } else { baseline + kept };
+        self.state.context_size = context_size;
 
         self.reset_ui_chrome();
         self.restore_display();

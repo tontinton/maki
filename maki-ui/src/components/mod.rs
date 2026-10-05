@@ -66,10 +66,25 @@ pub(crate) trait Overlay {
 }
 
 pub(crate) fn hint_line<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> {
+    Line::from(hint_spans(pairs, "  "))
+}
+
+/// The same hints, sized for a bottom border: tighter gaps, and a space at
+/// each end so they never touch a corner.
+pub(crate) fn hint_footer<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> {
+    let mut spans = hint_spans(pairs, " ");
+    spans.push(Span::raw(" "));
+    Line::from(spans).right_aligned()
+}
+
+fn hint_spans<K: AsRef<str>, V: AsRef<str>>(
+    pairs: &[(K, V)],
+    gap: &'static str,
+) -> Vec<Span<'static>> {
     let t = crate::theme::current();
-    let mut spans = Vec::with_capacity(pairs.len() * 3);
+    let mut spans = Vec::with_capacity(pairs.len() * 3 + 1);
     for (key, desc) in pairs {
-        spans.push(Span::raw("  "));
+        spans.push(Span::raw(gap));
         for (i, part) in key.as_ref().split('/').enumerate() {
             if i > 0 {
                 spans.push(Span::styled("/", t.tool_dim));
@@ -78,7 +93,7 @@ pub(crate) fn hint_line<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<
         }
         spans.push(Span::styled(format!(" {}", desc.as_ref()), t.tool_dim));
     }
-    Line::from(spans)
+    spans
 }
 
 pub(crate) fn apply_scroll_delta(offset: u16, delta: i32) -> u16 {

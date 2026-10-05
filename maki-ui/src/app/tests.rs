@@ -4211,8 +4211,12 @@ fn slash_noncommand_sends_as_prompt() {
 
 fn build_rewind_app() -> App {
     let mut app = test_app();
+    seed_rewind_session(app.state.session_mut());
+    app
+}
 
-    app.state.session_mut().replace_messages(vec![
+fn seed_rewind_session(session: &mut AppSession) {
+    session.replace_messages(vec![
         Message::user("first prompt".into()),
         Message {
             role: Role::Assistant,
@@ -4234,11 +4238,10 @@ fn build_rewind_app() -> App {
         },
         Message::user("third prompt".into()),
     ]);
-    app.state.session_mut().insert_tool_output(
+    session.insert_tool_output(
         "tool-1".into(),
         Arc::new(ToolOutput::Plain("output".into())),
     );
-    app
 }
 
 const RESTART_EXPECTED: &str = "a rewind must respawn the agent on the truncated history";
@@ -7510,11 +7513,52 @@ fn fork_opens_a_copy_and_leaves_the_original_alone() {
     );
 }
 
-#[test]
-fn fork_refuses_an_empty_copy() {
+fn fork_to_first_prompt(app: &mut App) -> Vec<Action> {
+    seed_rewind_session(app.state.session_mut());
+    app.fork_to(RewindEntry {
+        turn_index: 0,
+        prompt_preview: "1: first".into(),
+        prompt_text: "first prompt".into(),
+    })
+}
+
+#[test_case(App::fork_session ; "blank_session")]
+#[test_case(fork_to_first_prompt ; "to_the_first_prompt")]
+fn fork_refuses_an_empty_copy(fork: fn(&mut App) -> Vec<Action>) {
     let mut app = test_app();
-    assert!(app.fork_session().is_empty());
+    assert!(fork(&mut app).is_empty());
     assert_eq!(app.status_bar.flash_text(), Some(FORK_EMPTY_MSG));
+}
+
+#[test]
+fn fork_to_prompt_opens_a_truncated_copy_and_leaves_the_original_alone() {
+    let mut app = test_app();
+    seed_rewind_session(app.state.session_mut());
+    app.state.context_size = MEASURED_CONTEXT;
+    let original = app.state.session.id;
+
+    let fork = opened_fork(app.fork_to(rewind_to_second_turn()));
+    assert_eq!(
+        fork.messages().len(),
+        2,
+        "the copy ends right before the selected prompt",
+    );
+    assert_eq!(
+        fork.meta.input_draft.as_deref(),
+        Some("second prompt"),
+        "the dropped prompt rides along as the copy's draft",
+    );
+    assert!(
+        fork.meta.context_size < MEASURED_CONTEXT,
+        "the copy's gauge must drop the turns it left behind",
+    );
+    assert_eq!(app.state.session.id, original);
+    assert_eq!(
+        app.state.session.messages().len(),
+        5,
+        "the original keeps its transcript",
+    );
+    assert_eq!(app.state.context_size, MEASURED_CONTEXT);
 }
 
 const ONE_RESTART: &str = "the gesture must hand the loop exactly one restart";

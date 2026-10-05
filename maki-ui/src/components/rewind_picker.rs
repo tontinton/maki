@@ -1,4 +1,5 @@
 use crate::components::Overlay;
+use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
 
@@ -10,10 +11,12 @@ use ratatui::layout::{Position, Rect};
 const TITLE: &str = " Rewind ";
 const PREVIEW_MAX_LEN: usize = 80;
 pub(crate) const NO_TURNS_MSG: &str = "No user turns to rewind to";
+const FOOTER: &[(&str, &str)] = &[("Enter", "rewind"), (key::FORK.label, "fork")];
 
 pub enum RewindPickerAction {
     Consumed,
     Select(RewindEntry),
+    Fork(RewindEntry),
     Close,
 }
 
@@ -36,7 +39,7 @@ pub struct RewindPicker {
 impl RewindPicker {
     pub fn new() -> Self {
         Self {
-            picker: ListPicker::new(),
+            picker: ListPicker::new().with_footer(FOOTER),
         }
     }
 
@@ -104,6 +107,12 @@ impl RewindPicker {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> RewindPickerAction {
+        if key::FORK.matches(key) {
+            return self
+                .picker
+                .take_selected()
+                .map_or(RewindPickerAction::Consumed, RewindPickerAction::Fork);
+        }
         match self.picker.handle_key(key) {
             PickerAction::Consumed => RewindPickerAction::Consumed,
             PickerAction::Select(entry) => RewindPickerAction::Select(entry),
@@ -249,5 +258,18 @@ mod tests {
         picker.open(&msgs).unwrap();
         let top = picker.picker.selected_item().unwrap();
         assert!(top.label().starts_with("2: second"));
+    }
+
+    #[test]
+    fn fork_key_takes_the_selected_entry_and_closes() {
+        let mut picker = RewindPicker::new();
+        picker
+            .open(&[user_msg("first"), assistant_msg(), user_msg("second")])
+            .unwrap();
+        let RewindPickerAction::Fork(entry) = picker.handle_key(key::FORK.to_key_event()) else {
+            panic!("the fork key commits the selection as a fork");
+        };
+        assert_eq!(entry.turn_index, 2);
+        assert!(!picker.is_open());
     }
 }

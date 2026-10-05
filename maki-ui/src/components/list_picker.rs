@@ -5,10 +5,10 @@ use nucleo_matcher::{Config, Matcher};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::Overlay;
-use crate::components::is_ctrl;
 use crate::components::keybindings::key;
 use crate::components::modal::{BORDER, Modal};
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::{hint_footer, is_ctrl};
 use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -28,6 +28,9 @@ const MIN_WIDTH_COLS: u16 = 72;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
 const DETAIL_RIGHT_PAD: u16 = 1;
+
+/// Key and action pairs for the bottom border, empty for none.
+type Hints = &'static [(&'static str, &'static str)];
 
 pub trait PickerItem {
     fn label(&self) -> &str;
@@ -65,7 +68,7 @@ pub struct ListPicker<T> {
     state: Option<State<T>>,
     title: String,
     max_visible: Option<u16>,
-    footer: Option<fn() -> Line<'static>>,
+    footer: Hints,
     error_text: Option<String>,
 }
 
@@ -235,7 +238,7 @@ impl<T: PickerItem> ListPicker<T> {
             state: None,
             title: String::new(),
             max_visible: None,
-            footer: None,
+            footer: &[],
             error_text: None,
         }
     }
@@ -245,8 +248,8 @@ impl<T: PickerItem> ListPicker<T> {
         self
     }
 
-    pub fn with_footer_builder(mut self, builder: fn() -> Line<'static>) -> Self {
-        self.footer = Some(builder);
+    pub fn with_footer(mut self, hints: Hints) -> Self {
+        self.footer = hints;
         self
     }
 
@@ -447,6 +450,14 @@ impl<T: PickerItem> ListPicker<T> {
         self.state.as_ref().and_then(|s| s.selected_item_index())
     }
 
+    /// Closes with the selected item, for pickers that commit on more than
+    /// Enter. Stays open when nothing is selected.
+    pub fn take_selected(&mut self) -> Option<T> {
+        let idx = self.selected_index()?;
+        let mut state = self.state.take()?;
+        Some(state.items.swap_remove(idx))
+    }
+
     pub fn item(&self, idx: usize) -> Option<&T> {
         self.state.as_ref().and_then(|s| s.items.get(idx))
     }
@@ -514,11 +525,10 @@ fn render_ready<T: PickerItem>(
     s: &mut State<T>,
     title: &str,
     max_visible: Option<u16>,
-    footer: Option<fn() -> Line<'static>>,
+    footer: Hints,
     error_text: Option<&str>,
 ) -> Rect {
     let notice = s.notice;
-    let footer_rows = if footer.is_some() { 1u16 } else { 0 };
     let content_rows = if s.filtered.is_empty() {
         1
     } else {
@@ -536,20 +546,20 @@ fn render_ready<T: PickerItem>(
         min_width: MIN_WIDTH_COLS + BORDER,
         max_height_percent: MAX_HEIGHT_PERCENT,
     };
-    let (popup, inner) = modal.render(
+    let (popup, inner) = modal.render_with_footer(
         frame,
         area,
-        content_rows + SEARCH_ROW + footer_rows + error_rows + notice_rows,
+        content_rows + SEARCH_ROW + error_rows + notice_rows,
+        (!footer.is_empty()).then(|| hint_footer(footer)),
     );
     let viewport_h = inner
         .height
-        .saturating_sub(error_rows + notice_rows + SEARCH_ROW + footer_rows);
+        .saturating_sub(error_rows + notice_rows + SEARCH_ROW);
     s.viewport_height = viewport_h as usize;
     s.ensure_visible();
 
-    let mut constraints: Vec<Constraint> = Vec::with_capacity(
-        3 + footer.is_some() as usize + error_text.is_some() as usize + notice.is_some() as usize,
-    );
+    let mut constraints: Vec<Constraint> =
+        Vec::with_capacity(3 + error_text.is_some() as usize + notice.is_some() as usize);
     if error_text.is_some() {
         constraints.push(Constraint::Length(1)); // error line
     }
@@ -558,9 +568,6 @@ fn render_ready<T: PickerItem>(
         constraints.push(Constraint::Length(1));
     }
     constraints.push(Constraint::Length(1)); // search
-    if footer.is_some() {
-        constraints.push(Constraint::Length(1));
-    }
 
     let areas = Layout::vertical(constraints).split(inner);
     let mut area_idx = 0;
@@ -587,7 +594,6 @@ fn render_ready<T: PickerItem>(
     }
 
     let search_area = areas[area_idx];
-    area_idx += 1;
 
     render_list(
         frame,
@@ -600,10 +606,6 @@ fn render_ready<T: PickerItem>(
         s.enabled.as_deref(),
     );
     render_search(frame, search_area, &s.search);
-
-    if let Some(build) = footer {
-        frame.render_widget(Paragraph::new(build()), areas[area_idx]);
-    }
 
     let total_visual = visual_rows_in_range(&s.filtered, &s.items, 0, s.filtered.len());
     if total_visual as u16 > viewport_h {

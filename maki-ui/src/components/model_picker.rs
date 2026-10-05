@@ -4,7 +4,6 @@ use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::text::{Line, Span};
 
 use maki_providers::Model;
 use maki_providers::ModelTier;
@@ -15,7 +14,6 @@ use maki_providers::spec::{Build, ProviderRegistry};
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::{Cadence, Dirty, Watch};
-use crate::theme;
 
 const TITLE: &str = " Models ";
 const RECENT_SECTION: &str = "Recent";
@@ -24,22 +22,13 @@ const FREE_PREFIX: &str = "Free · ";
 const PRICE_SEPARATOR: &str = " · ";
 const PRICE_WIDTH: usize = 7;
 const LOADING_NOTICE: &str = "loading models...";
-
-fn footer_line() -> Line<'static> {
-    let t = theme::current();
-    Line::from(vec![
-        Span::styled("  Enter", t.keybind_key),
-        Span::styled(" select", t.tool_dim),
-        Span::styled("  !", t.keybind_key),
-        Span::styled(" strong", t.tool_dim),
-        Span::styled("  @", t.keybind_key),
-        Span::styled(" medium", t.tool_dim),
-        Span::styled("  #", t.keybind_key),
-        Span::styled(" weak", t.tool_dim),
-        Span::styled("  $", t.keybind_key),
-        Span::styled(" compaction", t.tool_dim),
-    ])
-}
+const FOOTER: &[(&str, &str)] = &[
+    ("Enter", "select"),
+    ("!", "strong"),
+    ("@", "medium"),
+    ("#", "weak"),
+    ("$", "compaction"),
+];
 
 fn tier_for_shortcut(key: KeyEvent) -> Option<ModelTier> {
     // Shift+digit arrives as the character it types, with the SHIFT bit
@@ -116,7 +105,7 @@ pub struct ModelPicker {
 impl ModelPicker {
     pub fn new(models: Arc<ArcSwapOption<ModelList>>) -> Self {
         Self {
-            picker: ListPicker::new().with_footer_builder(footer_line),
+            picker: ListPicker::new().with_footer(FOOTER),
             models,
             available: Watch::default(),
             recents: Vec::new(),

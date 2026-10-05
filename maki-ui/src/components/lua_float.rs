@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::split_layout::SplitReq;
 use crate::components::{
-    Overlay,
+    Overlay, hint_footer,
     scrollbar::render_vertical_scrollbar,
     tool_display::{SPINNER_STYLE_NAME, SPINNER_STYLE_PREFIX, resolve_span_style},
 };
@@ -559,7 +559,7 @@ impl FloatManager {
                     .title_style(t.panel_title);
             }
             if !win.config.footer.is_empty() {
-                b = b.title_bottom(hint_footer(&win.config.footer).right_aligned());
+                b = b.title_bottom(hint_footer(&win.config.footer));
             }
             b
         } else {
@@ -690,23 +690,6 @@ fn send_key(win: &FloatWindow, key: Key) {
 
 fn stacks(win: &FloatWindow) -> bool {
     win.config.stack && win.config.split == Split::None
-}
-
-fn hint_footer<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> {
-    let t = crate::theme::current();
-    let mut spans = Vec::with_capacity(pairs.len() * 3);
-    for (key, desc) in pairs {
-        spans.push(Span::raw(" "));
-        for (i, part) in key.as_ref().split('/').enumerate() {
-            if i > 0 {
-                spans.push(Span::styled("/", t.tool_dim));
-            }
-            spans.push(Span::styled(part.to_string(), t.keybind_key));
-        }
-        spans.push(Span::styled(format!(" {}", desc.as_ref()), t.tool_dim));
-    }
-    spans.push(Span::raw(" "));
-    Line::from(spans)
 }
 
 /// Sits a window of {w} by {h} on the caret cell, and reports whether it
