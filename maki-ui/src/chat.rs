@@ -303,6 +303,16 @@ impl Chat {
         self.messages_panel.auto_scroll()
     }
 
+    /// What a UI shutdown carries into the next generation: where the viewport
+    /// sits and whether the bottom pin is on. Pairs with
+    /// [`Self::restore_scroll`].
+    pub fn scroll_state(&self) -> (ScrollPos, bool) {
+        (
+            self.messages_panel.scroll_pos(),
+            self.messages_panel.auto_scroll(),
+        )
+    }
+
     pub fn scroll_to_top(&mut self) {
         self.messages_panel.scroll_to_top();
     }

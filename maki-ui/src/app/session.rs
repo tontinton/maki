@@ -352,7 +352,11 @@ impl App {
             .end_session(self.state.session.id, SessionEndReason::Reset);
         // Swapping the claim is what gives the old session back: the snapshot
         // `checkpoint_now` just queued holds its own clone until it lands.
-        let OpenSession { session, claim } = self.blank_session();
+        let OpenSession {
+            session,
+            claim,
+            view: _,
+        } = self.blank_session();
         self.apply_stored_permissions(&session.meta);
         self.state.session = Arc::new(session);
         self.state.claim = claim;

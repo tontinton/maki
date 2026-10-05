@@ -58,7 +58,11 @@ impl SessionState {
     /// to drift apart, so this adopts what it is handed and stays the only
     /// writer of `session.model`. Drawn, sent and stored then agree for free.
     pub fn from_session(open: OpenSession, model: &Model, storage: &StateDir) -> Self {
-        let OpenSession { mut session, claim } = open;
+        let OpenSession {
+            mut session,
+            claim,
+            view: _,
+        } = open;
         session.set_model(model.spec());
         let model = model.clone();
 
@@ -547,6 +551,7 @@ mod tests {
             OpenSession {
                 session,
                 claim: claim.clone(),
+                view: None,
             },
             &model,
             &storage,

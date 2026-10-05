@@ -1572,7 +1572,14 @@ fn load_session_clears_plan() {
     let session = AppSession::load(app.state.session.id, &app.storage).unwrap();
     app.state.mode = Mode::Build;
     app.state.plan = PlanState::Ready(PathBuf::from("old-plan.md"));
-    app.apply_loaded_session(OpenSession { session, claim }, &test_model());
+    app.apply_loaded_session(
+        OpenSession {
+            session,
+            claim,
+            view: None,
+        },
+        &test_model(),
+    );
     assert_eq!(app.state.mode, Mode::Build);
     assert_eq!(app.state.plan.path(), None);
 }
@@ -7191,6 +7198,7 @@ fn loading_ends_the_previous_session_only_when_the_id_changes(same: bool) {
         OpenSession {
             session: (*app.state.session).clone(),
             claim: app.state.claim.clone(),
+            view: None,
         }
     } else {
         OpenSession::claimed(AppSession::new(TEST_MODEL_SPEC, TEST_CWD), &app.storage)
