@@ -16,6 +16,7 @@ mod components;
 mod decor_worker;
 pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand, PluginAccess, SUBMITS_PROMPT};
 pub use components::keybindings;
+pub use components::messages::ScrollPos;
 mod highlight;
 pub use highlight::highlight_ansi;
 pub mod image;
@@ -60,6 +61,10 @@ pub use maki_agent::session::StoredSession as AppSession;
 pub struct OpenSession {
     pub session: AppSession,
     pub claim: SessionClaim,
+    /// Where the main chat was reading when the UI generation ended, so a
+    /// `/reload` reopens the tab where it was instead of at the newest
+    /// message. `None` on every other entry path, which keeps the bottom pin.
+    pub view: Option<(ScrollPos, bool)>,
 }
 
 impl OpenSession {
@@ -67,12 +72,20 @@ impl OpenSession {
         let claim = SessionClaim::fresh(storage);
         let mut session = AppSession::new(model_spec, cwd);
         session.id = claim.id();
-        Self { session, claim }
+        Self {
+            session,
+            claim,
+            view: None,
+        }
     }
 
     pub fn load(id: MakiId, storage: &StateDir) -> Result<Self, SessionError> {
         let (session, claim) = AppSession::claim_and_load(id, storage)?;
-        Ok(Self { session, claim })
+        Ok(Self {
+            session,
+            claim,
+            view: None,
+        })
     }
 
     /// For a session no tab opens. The write lands before this returns, so a
@@ -88,7 +101,11 @@ impl OpenSession {
     /// reads, see [`Self::load`].
     pub(crate) fn claimed(session: AppSession, storage: &StateDir) -> Self {
         let claim = SessionClaim::acquire(session.id, storage).expect("a session no test holds");
-        Self { session, claim }
+        Self {
+            session,
+            claim,
+            view: None,
+        }
     }
 }
 
