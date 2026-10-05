@@ -7,7 +7,6 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use async_lock::Mutex as AsyncMutex;
 use futures_lite::FutureExt;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
@@ -19,6 +18,7 @@ use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::Timeouts;
 use mlua::{Lua, LuaString, Result as LuaResult, Table, UserDataRef};
 use regex::bytes::Regex;
+use smol::lock::Mutex as AsyncMutex;
 use smol::{Async, Timer, unblock};
 use thiserror::Error;
 use url::Url;

@@ -29,15 +29,15 @@ impl FileKey {
     }
 }
 
-type FileLock = Arc<async_lock::Mutex<()>>;
-pub type FileGuard = async_lock::MutexGuardArc<()>;
+type FileLock = Arc<smol::lock::Mutex<()>>;
+pub type FileGuard = smol::lock::MutexGuardArc<()>;
 
 /// Who read what and when, plus the per-file write locks that make one tool's
 /// read-modify-write safe against another's.
 #[derive(Default)]
 pub struct FileAccess {
     mtimes: Mutex<HashMap<FileKey, SystemTime>>,
-    locks: Mutex<HashMap<FileKey, Weak<async_lock::Mutex<()>>>>,
+    locks: Mutex<HashMap<FileKey, Weak<smol::lock::Mutex<()>>>>,
 }
 
 fn get_mtime(path: &Path) -> Option<SystemTime> {

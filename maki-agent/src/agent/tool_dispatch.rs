@@ -1086,11 +1086,11 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use async_lock::Mutex as AsyncMutex;
     use flume::Receiver;
     use maki_config::{
         Effect, Permission, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
     };
+    use smol::lock::Mutex as AsyncMutex;
     use test_case::test_case;
 
     use super::*;

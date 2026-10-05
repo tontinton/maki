@@ -2,7 +2,7 @@ use std::io;
 use std::process::ExitStatus;
 use std::time::Duration;
 
-use async_process::Child;
+use smol::process::Child;
 
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -47,7 +47,7 @@ impl ChildGuard {
                     let _ = child.status().await;
                 },
                 async {
-                    async_io::Timer::after(REAP_TIMEOUT).await;
+                    smol::Timer::after(REAP_TIMEOUT).await;
                 },
             )
             .await;
@@ -105,7 +105,7 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
 
-    use async_process::Child;
+    use smol::process::Child;
 
     use super::ChildGuard;
 
@@ -118,7 +118,7 @@ mod tests {
                 Ok(())
             });
         }
-        let mut cmd: async_process::Command = std_cmd.into();
+        let mut cmd: smol::process::Command = std_cmd.into();
         cmd.spawn().expect("failed to spawn sleep")
     }
 

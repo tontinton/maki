@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_lock::{Semaphore, SemaphoreGuardArc};
 use futures::future::join_all;
 use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
+use smol::lock::{Semaphore, SemaphoreGuardArc};
 
 use crate::docs::{FnDoc, ParamDoc};
 use crate::runtime::{

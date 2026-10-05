@@ -9,7 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 arc-swap = { workspace = true }
-async-lock = { workspace = true }
 base64 = { workspace = true }
 image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 crossterm = { workspace = true }

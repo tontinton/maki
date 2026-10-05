@@ -1667,7 +1667,7 @@ mod tests {
         let session = srv.session.as_ref().expect("a session is installed");
         let (guard, _events) = maki_agent::event_stream();
         let event_tx = guard.sender(0);
-        let rx = async_lock::Mutex::new(answer_rx.clone());
+        let rx = smol::lock::Mutex::new(answer_rx.clone());
         smol::block_on(session.handle.permissions.enforce(
             &ToolKey::native(NEXT_TURN_TOOL),
             &PermissionScopes::single(NEXT_TURN_SCOPE.to_owned()),

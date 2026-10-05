@@ -2981,7 +2981,6 @@ name = "maki-acp"
 version = "0.6.0"
 dependencies = [
  "agent-client-protocol-schema",
- "async-lock",
  "color-eyre",
  "flume",
  "maki-agent",
@@ -3002,9 +3001,6 @@ name = "maki-agent"
 version = "0.6.0"
 dependencies = [
  "arc-swap",
- "async-io",
- "async-lock",
- "async-process",
  "base64 0.23.1",
  "bitflags 2.13.2",
  "event-listener",
@@ -3114,7 +3110,6 @@ name = "maki-lua"
 version = "0.6.0"
 dependencies = [
  "arc-swap",
- "async-lock",
  "base64 0.23.1",
  "criterion",
  "crossterm",
@@ -3305,8 +3300,6 @@ version = "0.6.0"
 dependencies = [
  "arboard",
  "arc-swap",
- "async-lock",
- "async-process",
  "base64 0.23.1",
  "color-eyre",
  "criterion",

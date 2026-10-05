@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use async_lock::Mutex;
 use futures_lite::AsyncReadExt;
 use isahc::HttpClient;
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
@@ -14,6 +13,7 @@ use isahc::tls::{TlsConfig, TrustStore};
 use maki_storage::StateDir;
 use maki_storage::auth::load_mcp_auth;
 use serde_json::Value;
+use smol::lock::Mutex;
 
 use super::error::McpError;
 use super::oauth;

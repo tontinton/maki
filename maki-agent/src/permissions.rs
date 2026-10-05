@@ -697,7 +697,7 @@ impl PermissionManager {
         tool: &ToolKey,
         scopes: &crate::tools::PermissionScopes,
         event_tx: &EventSender,
-        user_response_rx: Option<&async_lock::Mutex<flume::Receiver<String>>>,
+        user_response_rx: Option<&smol::lock::Mutex<flume::Receiver<String>>>,
         request_id: &str,
         cancel: &crate::CancelToken,
         plan_path: Option<&Path>,
