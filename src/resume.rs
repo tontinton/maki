@@ -79,6 +79,7 @@ impl Resolved {
         OpenSession {
             session,
             claim: self.claim,
+            view: None,
         }
     }
 }

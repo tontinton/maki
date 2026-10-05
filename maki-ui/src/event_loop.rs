@@ -507,6 +507,7 @@ impl SpawnCtx {
                 host_prompt: Arc::clone(&self.host_prompt),
             },
         );
+        let view = open.view;
         let mut app = App::new(
             &slot.model,
             open,
@@ -530,6 +531,12 @@ impl SpawnCtx {
         handles.apply_to_app(&mut app);
         if resumed {
             app.restore_resumed_session();
+        }
+        // A carried view belongs to the transcript `restore_resumed_session`
+        // just rebuilt, so it lands only after that. `None` keeps the bottom
+        // pin a tab from disk or a fresh start opens on.
+        if let Some((scroll, auto_scroll)) = view {
+            app.main_chat().restore_scroll(scroll, auto_scroll);
         }
         let (shell_tx, shell_rx) = unbounded_channel::<ShellEvent>();
         let last_title = app.state.session.title.clone();
@@ -1629,10 +1636,14 @@ impl<'t> EventLoop<'t> {
                 let storage = self.ctx.storage.clone();
                 self.stored_writes.spawn_blocking(move || {
                     let reply = OpenSession::load(id, &storage)
-                        .and_then(|OpenSession { mut session, claim }| {
-                            session.set_title(title);
-                            claim.persist(&session)
-                        })
+                        .and_then(
+                            |OpenSession {
+                                 mut session, claim, ..
+                             }| {
+                                session.set_title(title);
+                                claim.persist(&session)
+                            },
+                        )
                         .map(|()| json!(true))
                         .map_err(|e| e.to_string());
                     let _ = reply_tx.send(reply);
@@ -2383,9 +2394,11 @@ impl<'t> EventLoop<'t> {
             app.checkpoint_now();
             // `app` drops at the end of this iteration, closing the
             // channels the agent loop waits on, so `join_all` can finish.
+            let view = Some(app.main_chat().scroll_state());
             tabs.push(OpenSession {
                 session: Arc::unwrap_or_clone(app.state.session),
                 claim: app.state.claim,
+                view,
             });
             mailboxes.push(handles.mailbox().clone());
             agent_tasks.push(handles.into_task());

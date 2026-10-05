@@ -252,7 +252,7 @@ mod tests {
     }
 
     fn fresh(dir: &StateDir) -> (AppSession, SessionClaim) {
-        let OpenSession { session, claim } = OpenSession::fresh(MODEL, CWD, dir);
+        let OpenSession { session, claim, .. } = OpenSession::fresh(MODEL, CWD, dir);
         (session, claim)
     }
 
