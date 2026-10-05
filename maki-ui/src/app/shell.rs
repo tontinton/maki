@@ -223,7 +223,7 @@ async fn run_command(
     #[cfg(unix)]
     unsafe {
         std_cmd.pre_exec(|| {
-            libc::setsid();
+            let _ = rustix::process::setsid();
             Ok(())
         });
     }

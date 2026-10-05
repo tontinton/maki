@@ -35,11 +35,13 @@ smol = { workspace = true }
 tempfile = { workspace = true }
 isahc = { workspace = true }
 thiserror = { workspace = true }
-libc = { workspace = true }
 uuid = { workspace = true }
 flume = { workspace = true }
 open = { workspace = true }
 unicode-width = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
 
 [dev-dependencies]
 maki-config = { workspace = true, features = ["test-util"] }
@@ -129,7 +131,7 @@ arboard = { version = "3", default-features = false, features = ["image-data"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 flume = { version = "0.12", default-features = false, features = ["async", "select"] }
 pin-project-lite = "0.2"
-rustix = { version = "1", default-features = false, features = ["process"] }
+rustix = { version = "1", default-features = false, features = ["event", "fs", "process"] }
 humantime = "2"
 semver = "1"
 toml = "1.1"

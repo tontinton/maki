@@ -1,5 +1,3 @@
-#[cfg(unix)]
-use std::ffi::CString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -112,10 +110,7 @@ fn needs_sudo(path: &Path) -> bool {
     let Some(dir) = path.parent() else {
         return false;
     };
-    let Ok(cpath) = CString::new(dir.as_os_str().as_encoded_bytes()) else {
-        return false;
-    };
-    unsafe { libc::access(cpath.as_ptr(), libc::W_OK) != 0 }
+    rustix::fs::access(dir, rustix::fs::Access::WRITE_OK).is_err()
 }
 
 #[cfg(not(unix))]

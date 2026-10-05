@@ -294,8 +294,9 @@ impl Drop for TerminalGuard {
 pub(crate) fn suspend(terminal: &mut ratatui::DefaultTerminal) {
     teardown();
     #[cfg(unix)]
-    unsafe {
-        libc::raise(libc::SIGTSTP);
+    {
+        use rustix::process::{Signal, getpid, kill_process};
+        let _ = kill_process(getpid(), Signal::TSTP);
     }
     resume(terminal);
 }

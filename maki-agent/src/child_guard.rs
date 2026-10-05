@@ -2,6 +2,8 @@ use std::io;
 use std::process::ExitStatus;
 use std::time::Duration;
 
+#[cfg(unix)]
+use rustix::process::{Pid, Signal, WaitOptions, kill_process_group, waitpid};
 use smol::process::Child;
 
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -56,10 +58,10 @@ impl ChildGuard {
 
     #[cfg(unix)]
     fn signal_kill(&self) {
-        if self.child.is_some() {
-            unsafe {
-                libc::killpg(self.pid as i32, libc::SIGKILL);
-            }
+        if self.child.is_some()
+            && let Some(pid) = unix_pid(self.pid)
+        {
+            let _ = kill_process_group(pid, Signal::KILL);
         }
     }
 
@@ -76,10 +78,10 @@ impl ChildGuard {
     // block the async executor.
     #[cfg(unix)]
     fn reap_nonblocking(&mut self) {
-        if self.child.take().is_some() {
-            unsafe {
-                libc::waitpid(self.pid as i32, std::ptr::null_mut(), libc::WNOHANG);
-            }
+        if self.child.take().is_some()
+            && let Some(pid) = unix_pid(self.pid)
+        {
+            let _ = waitpid(Some(pid), WaitOptions::NOHANG);
         }
     }
 
@@ -89,6 +91,11 @@ impl ChildGuard {
             let _ = child.try_status();
         }
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn unix_pid(pid: u32) -> Option<Pid> {
+    i32::try_from(pid).ok().and_then(Pid::from_raw)
 }
 
 impl Drop for ChildGuard {
@@ -107,14 +114,16 @@ mod tests {
 
     use smol::process::Child;
 
-    use super::ChildGuard;
+    use rustix::process::{setsid, test_kill_process};
+
+    use super::{ChildGuard, unix_pid};
 
     fn spawn_sleep() -> Child {
         let mut std_cmd = std::process::Command::new("sleep");
         std_cmd.arg("60");
         unsafe {
             std_cmd.pre_exec(|| {
-                libc::setsid();
+                let _ = setsid();
                 Ok(())
             });
         }
@@ -123,7 +132,7 @@ mod tests {
     }
 
     fn is_alive(pid: u32) -> bool {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        unix_pid(pid).is_some_and(|pid| test_kill_process(pid).is_ok())
     }
 
     fn wait_for_death(pid: u32) {

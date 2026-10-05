@@ -31,7 +31,6 @@ futures-lite = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
 isahc = { workspace = true }
-libc = { workspace = true }
 open = { workspace = true }
 sha2 = { workspace = true }
 serde_yaml = { workspace = true }
@@ -45,3 +44,5 @@ maki-config = { workspace = true, features = ["test-util"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }

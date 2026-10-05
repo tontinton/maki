@@ -1414,8 +1414,12 @@ fn spawn_persist_enabled(path: PathBuf, name: String, enabled: bool) {
 
 #[cfg(unix)]
 pub fn kill_process_groups(pids: &[u32]) {
-    for &pid in pids {
-        unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+    use rustix::process::{Signal, kill_process_group};
+
+    use crate::child_guard::unix_pid;
+
+    for pid in pids.iter().filter_map(|&pid| unix_pid(pid)) {
+        let _ = kill_process_group(pid, Signal::KILL);
     }
 }
 
