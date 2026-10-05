@@ -386,7 +386,11 @@ impl App {
             .end_session(self.state.session.id, SessionEndReason::Reset);
         // Swapping the claim is what gives the old session back: the snapshot
         // `checkpoint_now` just queued holds its own clone until it lands.
-        let OpenSession { session, claim } = self.blank_session();
+        let OpenSession {
+            session,
+            claim,
+            view: _,
+        } = self.blank_session();
         self.apply_stored_permissions(&session.meta);
         self.state.session = Arc::new(session);
         self.state.claim = claim;
@@ -439,7 +443,11 @@ impl App {
         // Without this a young session forks into "fork of New session".
         session.update_title_if_default();
         session.set_title(format!("{FORK_TITLE_PREFIX}{}", session.title));
-        vec![Action::OpenFork(Box::new(OpenSession { session, claim }))]
+        vec![Action::OpenFork(Box::new(OpenSession {
+            session,
+            claim,
+            view: None,
+        }))]
     }
 
     pub(super) fn open_rewind_picker(&mut self) -> Vec<Action> {
