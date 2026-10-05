@@ -74,7 +74,9 @@ pub fn carries_builtin_defaults(tool: &str) -> bool {
 #[derive(Debug)]
 pub enum PermissionCheck {
     Allowed,
-    Denied,
+    /// Denied, with the reason shown to the model: which deny rule matched
+    /// and where it came from, or which default answered.
+    Denied(String),
     NeedsPrompt {
         tool: ToolKey,
         scopes: Vec<String>,
@@ -86,6 +88,7 @@ pub enum PermissionCheck {
 pub struct PermissionError {
     tool: String,
     scope: String,
+    reason: String,
     guidance: Option<String>,
 }
 
@@ -93,8 +96,8 @@ impl std::fmt::Display for PermissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} `{}` ({}).",
-            PERMISSION_DENIED_PREFIX, self.tool, self.scope
+            "{} `{}` ({}): {}.",
+            PERMISSION_DENIED_PREFIX, self.tool, self.scope, self.reason
         )?;
         if let Some(g) = &self.guidance {
             write!(f, " User guidance: {}", g)
@@ -105,20 +108,39 @@ impl std::fmt::Display for PermissionError {
 }
 
 impl PermissionError {
-    fn new(tool: &str, scope: &str) -> Self {
+    fn new(tool: &str, scope: &str, reason: String) -> Self {
         Self {
             tool: tool.to_string(),
             scope: scope.to_string(),
+            reason,
             guidance: None,
         }
     }
 
-    fn with_guidance(tool: &str, scope: &str, guidance: String) -> Self {
+    fn with_guidance(tool: &str, scope: &str, reason: String, guidance: String) -> Self {
         Self {
             tool: tool.to_string(),
             scope: scope.to_string(),
+            reason,
             guidance: Some(guidance),
         }
+    }
+}
+
+/// Where a matched rule came from, named in the denial reason so the model
+/// can tell a session grant's counterpart from a persisted config rule.
+const ORIGIN_SESSION: &str = "session rules";
+const ORIGIN_CONFIG: &str = "the permissions config";
+const ORIGIN_BUILTIN: &str = "the built-in defaults";
+const ORIGIN_PLUGIN: &str = "a Lua plugin";
+
+const USER_REJECTED_REASON: &str = "rejected by the user";
+const PROMPT_UNANSWERED_REASON: &str = "permission prompt cancelled, unanswered";
+
+fn deny_rule_reason(origin: &str, rule: &PermissionRule) -> String {
+    match &rule.scope {
+        Some(scope) => format!("deny rule `{scope}` for `{}` in {origin}", rule.tool),
+        None => format!("blanket deny rule for `{}` in {origin}", rule.tool),
     }
 }
 
@@ -422,11 +444,12 @@ impl PermissionManager {
 
         for scope in scopes {
             let mut has_allow = false;
-            for r in session
+            for (origin, r) in session
                 .iter()
-                .chain(&self.config_rules)
-                .chain(&self.builtin_rules)
-                .chain(&plugin)
+                .map(|r| (ORIGIN_SESSION, r))
+                .chain(self.config_rules.iter().map(|r| (ORIGIN_CONFIG, r)))
+                .chain(self.builtin_rules.iter().map(|r| (ORIGIN_BUILTIN, r)))
+                .chain(plugin.iter().map(|r| (ORIGIN_PLUGIN, r)))
             {
                 let Some(approval) = rule_reach(&r.tool, tool) else {
                     continue;
@@ -436,8 +459,8 @@ impl PermissionManager {
                 }
                 match r.effect {
                     Effect::Deny => {
-                        info!(tool = %tool, scope = %scope, "permission denied");
-                        return PermissionCheck::Denied;
+                        info!(tool = %tool, scope = %scope, rule = ?r, "permission denied");
+                        return PermissionCheck::Denied(deny_rule_reason(origin, r));
                     }
                     Effect::Allow => has_allow |= gate.accepts(approval),
                 }
@@ -483,27 +506,28 @@ impl PermissionManager {
             }
         }
 
-        let eff = self
+        let tool_default = self
             .tool_defaults
             .get(tool)
-            .copied()
             .or_else(|| {
                 // McpTool falls back to McpServer-level default (Arc clone, ~2ns)
                 let server = match tool {
                     ToolKey::McpTool { server, .. } => server,
                     _ => return None,
                 };
-                self.tool_defaults
-                    .get(&ToolKey::McpServer {
-                        server: server.clone(),
-                    })
-                    .copied()
+                self.tool_defaults.get(&ToolKey::McpServer {
+                    server: server.clone(),
+                })
             })
-            .unwrap_or(self.default);
+            .copied();
+        let eff = tool_default.unwrap_or(self.default);
         match eff {
             DefaultEffect::Deny => {
                 info!(tool = %tool, "denied by default");
-                PermissionCheck::Denied
+                PermissionCheck::Denied(match tool_default {
+                    Some(_) => format!("deny default for `{tool}`"),
+                    None => "deny default from permissions config".to_string(),
+                })
             }
             DefaultEffect::Allow if gate.accepts(Approval::Standing) => PermissionCheck::Allowed,
             DefaultEffect::Allow | DefaultEffect::Prompt => PermissionCheck::NeedsPrompt {
@@ -678,7 +702,7 @@ impl PermissionManager {
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
         match self.check_inner(tool, scopes, true, plan_path) {
-            PermissionCheck::Denied => PermissionCheck::Denied,
+            PermissionCheck::Denied(reason) => PermissionCheck::Denied(reason),
             PermissionCheck::Allowed | PermissionCheck::NeedsPrompt { .. } => {
                 PermissionCheck::NeedsPrompt {
                     tool: tool.clone(),
@@ -712,11 +736,13 @@ impl PermissionManager {
         let scope_display = || scopes.scopes.join("; ");
         // Every deny is built here and every approval passes through
         // `allowed`, so reporting cannot drift from what the caller gets.
-        let deny = |source: &'static str, guidance: Option<String>| {
+        let deny = |source: &'static str, reason: String, guidance: Option<String>| {
             maki_otel::emit::tool_decision(&tool_string, maki_otel::emit::DECISION_REJECT, source);
             match guidance {
-                Some(g) => PermissionError::with_guidance(&tool_string, &scope_display(), g),
-                None => PermissionError::new(&tool_string, &scope_display()),
+                Some(g) => {
+                    PermissionError::with_guidance(&tool_string, &scope_display(), reason, g)
+                }
+                None => PermissionError::new(&tool_string, &scope_display(), reason),
             }
         };
         let allowed = |source: &'static str| {
@@ -733,7 +759,9 @@ impl PermissionManager {
 
         let (pt, ps, force_prompt) = match check(tool, &scope_refs, scopes.force_prompt) {
             PermissionCheck::Allowed => return allowed(by_rule()),
-            PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
+            PermissionCheck::Denied(reason) => {
+                return Err(deny(DECISION_SOURCE_RULE, reason, None));
+            }
             PermissionCheck::NeedsPrompt {
                 tool,
                 scopes,
@@ -743,14 +771,20 @@ impl PermissionManager {
 
         let Some(rx) = user_response_rx else {
             warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
-            return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+            return Err(deny(
+                DECISION_SOURCE_USER_ABORT,
+                PROMPT_UNANSWERED_REASON.to_owned(),
+                None,
+            ));
         };
 
         let guard = rx.lock().await;
         let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
         let (t2, s2) = match check(&pt, &refs, force_prompt) {
             PermissionCheck::Allowed => return allowed(by_rule()),
-            PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
+            PermissionCheck::Denied(reason) => {
+                return Err(deny(DECISION_SOURCE_RULE, reason, None));
+            }
             PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
         };
 
@@ -780,11 +814,19 @@ impl PermissionManager {
                 Ok(Err(_)) => {
                     drop(guard);
                     warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
-                    return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+                    return Err(deny(
+                        DECISION_SOURCE_USER_ABORT,
+                        PROMPT_UNANSWERED_REASON.to_owned(),
+                        None,
+                    ));
                 }
                 Err(_) => {
                     drop(guard);
-                    return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+                    return Err(deny(
+                        DECISION_SOURCE_USER_ABORT,
+                        PROMPT_UNANSWERED_REASON.to_owned(),
+                        None,
+                    ));
                 }
             }
         };
@@ -795,7 +837,11 @@ impl PermissionManager {
         if answer.is_allow() {
             allowed(source)
         } else {
-            Err(deny(source, answer.guidance().map(String::from)))
+            Err(deny(
+                source,
+                USER_REJECTED_REASON.to_owned(),
+                answer.guidance().map(String::from),
+            ))
         }
     }
 }
@@ -1016,7 +1062,7 @@ mod tests {
     fn outcome(check: PermissionCheck) -> &'static str {
         match check {
             PermissionCheck::Allowed => ALLOWED,
-            PermissionCheck::Denied => DENIED,
+            PermissionCheck::Denied(_) => DENIED,
             PermissionCheck::NeedsPrompt { .. } => PROMPTS,
         }
     }
@@ -1262,7 +1308,7 @@ mod tests {
                 false,
                 None
             ),
-            PermissionCheck::Denied
+            PermissionCheck::Denied(_)
         ));
     }
 
@@ -1365,7 +1411,7 @@ mod tests {
         mgr.add_session_rule(deny_rule("cargo *"));
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::Denied
+            PermissionCheck::Denied(_)
         ));
     }
 
@@ -1381,7 +1427,7 @@ mod tests {
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "rm -rf /", None),
-            PermissionCheck::Denied
+            PermissionCheck::Denied(_)
         ));
     }
 
@@ -1412,7 +1458,7 @@ mod tests {
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::Denied
+            PermissionCheck::Denied(_)
         ));
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo build", None),
@@ -1453,7 +1499,7 @@ mod tests {
         assert_eq!(project.path().join(PROJECT_PERMISSIONS).is_file(), trusted);
         let check = mgr.check(&ToolKey::native("bash"), "cargo test", None);
         assert_eq!(matches!(check, PermissionCheck::Allowed), allowed);
-        assert_eq!(matches!(check, PermissionCheck::Denied), !allowed);
+        assert_eq!(matches!(check, PermissionCheck::Denied(_)), !allowed);
     }
     #[test]
     fn boundary_inside_proceeds() {
@@ -1607,7 +1653,7 @@ mod tests {
         let mgr = mgr_with(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
         assert!(matches!(
             mgr.check_multi(&ToolKey::native("bash"), &["rm -rf /"], true, None),
-            PermissionCheck::Denied
+            PermissionCheck::Denied(_)
         ));
     }
 
@@ -1651,7 +1697,7 @@ mod tests {
     fn deny_rule_matches_a_chain_it_starts() {
         let mgr = mgr_with(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
         let check = mgr.check(&ToolKey::native("bash"), "rm -rf /tmp; sudo x", None);
-        assert!(matches!(check, PermissionCheck::Denied), "got {check:?}");
+        assert!(matches!(check, PermissionCheck::Denied(_)), "got {check:?}");
     }
 
     #[test]
@@ -1779,7 +1825,7 @@ mod tests {
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "anything", None),
-            PermissionCheck::Denied
+            PermissionCheck::Denied(_)
         ));
     }
 
@@ -1796,11 +1842,11 @@ mod tests {
         // Any deny wins: Wildcard deny blocks everything including builtins
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "ls", None),
-            PermissionCheck::Denied
+            PermissionCheck::Denied(_)
         ));
         assert!(matches!(
             mgr.check(&ToolKey::native("write"), "/tmp/x", None),
-            PermissionCheck::Denied
+            PermissionCheck::Denied(_)
         ));
     }
 
@@ -1821,12 +1867,12 @@ mod tests {
         // Different arguments: still denied.
         assert!(matches!(
             mgr.check(&tool, "{\"q\":\"safe\"}", None),
-            PermissionCheck::Denied
+            PermissionCheck::Denied(_)
         ));
         // Even wildcard scope: denied.
         assert!(matches!(
             mgr.check(&tool, "*", None),
-            PermissionCheck::Denied
+            PermissionCheck::Denied(_)
         ));
     }
 
@@ -1841,7 +1887,7 @@ mod tests {
         ));
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "rm -rf /", None),
-            PermissionCheck::Denied
+            PermissionCheck::Denied(_)
         ));
     }
 
@@ -1923,7 +1969,7 @@ mod tests {
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::Denied
+            PermissionCheck::Denied(_)
         ));
     }
 
@@ -1943,7 +1989,7 @@ mod tests {
         ));
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "rm -rf /", None),
-            PermissionCheck::Denied
+            PermissionCheck::Denied(_)
         ));
     }
 
@@ -2049,7 +2095,7 @@ mod tests {
         ));
         assert!(matches!(
             mgr.check(&ToolKey::native("write"), "/etc/passwd", None),
-            PermissionCheck::Denied
+            PermissionCheck::Denied(_)
         ));
     }
 
@@ -2195,7 +2241,7 @@ mod tests {
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("edit"), "/x/f", None),
-            PermissionCheck::Denied
+            PermissionCheck::Denied(_)
         ));
     }
 
@@ -2256,5 +2302,107 @@ mod tests {
                 "{scope}"
             );
         }
+    }
+
+    fn denied_reason(mgr: &PermissionManager, tool: &ToolKey, scope: &str) -> String {
+        match mgr.check(tool, scope, None) {
+            PermissionCheck::Denied(reason) => reason,
+            other => panic!("expected denied, got {other:?}"),
+        }
+    }
+
+    /// The model must learn which rule closed the door, not just that one did.
+    #[test]
+    fn deny_rule_reason_names_the_rule_and_its_source() {
+        let mgr = mgr_with(
+            make_config(vec![deny_rule("head *")]),
+            PathBuf::from("/tmp"),
+        );
+        let reason = denied_reason(&mgr, &ToolKey::native("bash"), "head -3");
+        assert!(reason.contains("head *"), "got: {reason}");
+        assert!(reason.contains(ORIGIN_CONFIG), "got: {reason}");
+    }
+
+    #[test]
+    fn session_deny_rule_reason_says_session() {
+        let mgr = mgr_with(make_config(vec![]), PathBuf::from("/tmp"));
+        mgr.add_session_rule(deny_rule("rm *"));
+        let reason = denied_reason(&mgr, &ToolKey::native("bash"), "rm -rf /");
+        assert!(reason.contains(ORIGIN_SESSION), "got: {reason}");
+    }
+
+    #[test]
+    fn blanket_deny_rule_reason_says_blanket() {
+        let mgr = mgr_with(
+            make_config(vec![PermissionRule {
+                tool: ToolKey::native("bash"),
+                scope: None,
+                effect: Effect::Deny,
+            }]),
+            PathBuf::from("/tmp"),
+        );
+        let reason = denied_reason(&mgr, &ToolKey::native("bash"), "anything");
+        assert!(reason.contains("blanket"), "got: {reason}");
+    }
+
+    #[test]
+    fn plugin_deny_rule_reason_names_the_plugin_store() {
+        let store = Arc::new(PluginRuleStore::default());
+        store.replace("guard", vec![plugin_edit_rule("/x/**", Effect::Deny)]);
+        let mgr = PermissionManager::new(
+            PermissionsConfig::default(),
+            PathBuf::from("/tmp"),
+            ProjectConfig::for_project(Path::new("/tmp")),
+            store,
+        );
+        let reason = denied_reason(&mgr, &ToolKey::native("edit"), "/x/f");
+        assert!(reason.contains(ORIGIN_PLUGIN), "got: {reason}");
+        assert!(reason.contains("/x/**"), "got: {reason}");
+    }
+
+    #[test]
+    fn default_deny_reason_names_the_default() {
+        let mgr = mgr_with(
+            PermissionsConfig {
+                default: DefaultEffect::Deny,
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        let reason = denied_reason(&mgr, &ToolKey::native("bash"), "cargo test");
+        assert!(reason.contains("default"), "got: {reason}");
+
+        let mgr = mgr_with(
+            PermissionsConfig {
+                tool_defaults: HashMap::from([(ToolKey::native("bash"), DefaultEffect::Deny)]),
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        );
+        let reason = denied_reason(&mgr, &ToolKey::native("bash"), "cargo test");
+        assert!(reason.contains("deny default for `bash`"), "got: {reason}");
+    }
+
+    #[test_case(None, DEFAULT_DENY_GUIDANCE; "plain")]
+    #[test_case(Some("use rg instead"), "User guidance: use rg instead"; "with_guidance")]
+    fn error_message_leads_with_tool_scope_and_reason(guidance: Option<&str>, tail: &str) {
+        let err = match guidance {
+            Some(g) => PermissionError::with_guidance(
+                "bash",
+                "head -3",
+                deny_rule_reason(ORIGIN_CONFIG, &deny_rule("head *")),
+                g.to_owned(),
+            ),
+            None => PermissionError::new(
+                "bash",
+                "head -3",
+                deny_rule_reason(ORIGIN_CONFIG, &deny_rule("head *")),
+            ),
+        };
+        let msg = err.to_string();
+        assert!(msg.starts_with(PERMISSION_DENIED_PREFIX), "got: {msg}");
+        assert!(msg.contains("`bash` (head -3):"), "got: {msg}");
+        assert!(msg.contains("deny rule `head *` for `bash`"), "got: {msg}");
+        assert!(msg.contains(tail), "got: {msg}");
     }
 }
