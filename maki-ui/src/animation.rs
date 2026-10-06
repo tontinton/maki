@@ -95,7 +95,7 @@ impl Typewriter {
     }
 
     pub fn is_animating(&self) -> bool {
-        self.visible_len < self.anim_target
+        self.visible_byte_offset < self.buffer.len()
     }
 
     pub fn is_empty(&self) -> bool {
