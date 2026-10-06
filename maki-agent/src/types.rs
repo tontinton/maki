@@ -695,6 +695,8 @@ pub enum AgentEvent {
     },
     Error {
         message: String,
+        /// The provider rejected the credentials, so a re-login is what fixes it.
+        auth: bool,
     },
     PermissionRequest {
         id: String,
@@ -749,6 +751,15 @@ pub enum AgentEvent {
     /// [`EventStreamGuard::drop`] and swallowed by [`SessionEvents::next`], so
     /// a consumer sees `None` and never this variant.
     StreamClosed,
+}
+
+impl AgentEvent {
+    pub fn error(error: &AgentError) -> Self {
+        Self::Error {
+            message: error.user_message(),
+            auth: error.is_auth_error(),
+        }
+    }
 }
 
 /// Wakes the UI loop so a change made on another thread is painted now, not on

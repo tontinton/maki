@@ -43,9 +43,7 @@ async fn connect(
         Ok(p) => Some(Arc::from(p)),
         Err(e) => {
             error!(error = %e, "provider error");
-            let _ = event_tx.send(AgentEvent::Error {
-                message: e.user_message(),
-            });
+            let _ = event_tx.send(AgentEvent::error(&e));
             None
         }
     }
@@ -250,9 +248,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
 
         if let Err(e) = result {
             error!(error = %e, "agent error");
-            let _ = error_tx.send(AgentEvent::Error {
-                message: e.user_message(),
-            });
+            let _ = error_tx.send(AgentEvent::error(&e));
         }
     }));
     (
@@ -437,9 +433,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
             if let Err(ref e) = result {
                 error!(error = %e, "agent error");
-                let _ = error_tx.send(AgentEvent::Error {
-                    message: e.user_message(),
-                });
+                let _ = error_tx.send(AgentEvent::error(e));
             }
 
             run_id += 1;
@@ -599,6 +593,7 @@ mod tests {
                 async move {
                     let _ = event_tx.send(AgentEvent::Error {
                         message: PROVIDER_ERROR.into(),
+                        auth: false,
                     });
                 }
             ));
@@ -613,7 +608,7 @@ mod tests {
             let envelope = events.next().await.expect(BODY_EVENT);
             assert!(matches!(
                 envelope.event,
-                AgentEvent::Error { message } if message == PROVIDER_ERROR
+                AgentEvent::Error { message, .. } if message == PROVIDER_ERROR
             ));
             assert!(
                 matches!(poll_once(events.next()).await, Some(None)),

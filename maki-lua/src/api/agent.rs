@@ -1120,6 +1120,7 @@ mod tests {
             turn(tokens(50, 10), 0.5),
             AgentEvent::Error {
                 message: IGNORED_ERROR.into(),
+                auth: false,
             },
             AgentEvent::Done {
                 usage: DONE_USAGE,

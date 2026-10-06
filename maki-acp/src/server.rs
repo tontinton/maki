@@ -1004,13 +1004,18 @@ fn start_event_pump(
                     }
                     continue;
                 }
-                AgentEvent::Error { message } => {
+                AgentEvent::Error { message, auth } => {
                     // A turn that dies on a provider 500 never reaches `Done`,
                     // and the pump outlives the session, so without this the
                     // whole file a `write` was carrying stays pinned forever.
                     tool_inputs.clear();
                     if let Some(id) = finish_turn(&pending) {
-                        let error = AcpError::internal_error().data(Value::String(message));
+                        let error = if auth {
+                            AcpError::auth_required()
+                        } else {
+                            AcpError::internal_error()
+                        };
+                        let error = error.data(Value::String(message));
                         send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
                     }
                     continue;
@@ -1758,12 +1763,34 @@ mod tests {
         assert!(pending(&srv).lock().unwrap().prompt.is_none());
     }
 
+    /// Clients only prompt a login on `auth_required`, so a rejected credential
+    /// must not come back as a generic failure.
+    #[test_case(true, AcpError::auth_required() ; "auth_error_asks_for_a_login")]
+    #[test_case(false, AcpError::internal_error() ; "other_error_is_internal")]
+    fn a_failed_turn_answers_the_prompt_with_its_error_kind(auth: bool, expected: AcpError) {
+        let (srv, .., out_rx) = test_server();
+        pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
+        run_pump(&srv, None, |sender| {
+            sender
+                .send(AgentEvent::Error {
+                    message: TURN_ERROR.to_owned(),
+                    auth,
+                })
+                .unwrap();
+        });
+
+        let answer = out_rx.try_recv().expect("the pending prompt is answered");
+        assert_eq!(answer["id"], PROMPT_ID);
+        assert_eq!(answer["error"]["code"], i32::from(expected.code));
+        assert_eq!(answer["error"]["data"], TURN_ERROR);
+    }
+
     /// A cached input holds the whole file a `write` is about to lay down, and
     /// this pump lives as long as the session does, so a turn that died on a
     /// provider error has to let go of it just like a turn that finished.
     #[test_case(None, true ; "a_live_turn_shows_the_file_its_tool_call_named")]
     #[test_case(Some(done_event()), false ; "a_finished_turn_releases_its_tool_inputs")]
-    #[test_case(Some(AgentEvent::Error { message: TURN_ERROR.to_owned() }), false ; "a_failed_turn_releases_its_tool_inputs")]
+    #[test_case(Some(AgentEvent::Error { message: TURN_ERROR.to_owned(), auth: false }), false ; "a_failed_turn_releases_its_tool_inputs")]
     fn a_terminal_event_releases_the_turns_tool_inputs(
         terminal: Option<AgentEvent>,
         keeps_input: bool,

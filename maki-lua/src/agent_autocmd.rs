@@ -103,7 +103,7 @@ pub fn autocmd_for(
                 "num_turns": num_turns,
             }),
         )),
-        AgentEvent::Error { message } => Some((
+        AgentEvent::Error { message, .. } => Some((
             "TurnError",
             json!({ "session_id": sid(), "message": message }),
         )),
@@ -207,6 +207,7 @@ mod tests {
             done(DoneReason::EndTurn),
             AgentEvent::Error {
                 message: "boom".into(),
+                auth: false,
             },
         ]
     }

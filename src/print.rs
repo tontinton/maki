@@ -387,7 +387,7 @@ pub fn run(params: PrintParams) -> Result<()> {
                 stop_reason = Some(*reason);
                 break;
             }
-            AgentEvent::Error { message } => {
+            AgentEvent::Error { message, .. } => {
                 is_error = true;
                 result_text = message.clone();
                 break;

@@ -362,9 +362,7 @@ impl AgentLoop {
     fn emit_error(&self, run_id: u64, error: AgentError) {
         error!(error = %error, "agent error");
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
-        let _ = event_tx.send(AgentEvent::Error {
-            message: error.user_message(),
-        });
+        let _ = event_tx.send(AgentEvent::error(&error));
     }
 }
 
