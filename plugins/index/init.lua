@@ -1,5 +1,6 @@
 local dir_listing = require("maki.dir_listing")
 local indexer = require("indexer")
+local ctags = require("ctags")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
 
@@ -160,7 +161,7 @@ Return a compact overview of a source file: imports, type definitions, function 
 
 - Use this FIRST to understand file structure before using read with offset/limit.
 - Supports source files in different programming languages and markdown.
-- Falls back with an error on unsupported languages. Use read instead.]],
+- Falls back to a flat ctags outline (names, start lines, and end lines when ctags reports them) for languages it has no extractor for, when universal-ctags is installed. Otherwise errors - use read instead.]],
 
   schema = {
     type = "object",
@@ -202,6 +203,18 @@ Return a compact overview of a source file: imports, type definitions, function 
       }
     end
 
+    local max_file_size = opts.max_file_size_mb * 1024 * 1024
+    if meta.size > max_file_size then
+      return {
+        llm_output = "error: File too large ("
+          .. meta.size
+          .. " bytes, max "
+          .. max_file_size
+          .. "). Use read with offset/limit instead.",
+        is_error = true,
+      }
+    end
+
     local filename = path:match("([^/]+)$")
     local lang = indexer.FILENAME_TO_LANG[filename]
 
@@ -213,20 +226,13 @@ Return a compact overview of a source file: imports, type definitions, function 
 
       lang = indexer.EXT_TO_LANG[ext]
       if not lang then
+        local outline = ctags.outline(path)
+        if outline then
+          local buf, header = render_index(outline, path, ctx, ext)
+          return { llm_output = outline, body = buf, header = header }
+        end
         return { llm_output = "Unsupported file type: ." .. ext .. ". Use the read tool instead.", is_error = true }
       end
-    end
-
-    local max_file_size = opts.max_file_size_mb * 1024 * 1024
-    if meta and meta.size > max_file_size then
-      return {
-        llm_output = "error: File too large ("
-          .. meta.size
-          .. " bytes, max "
-          .. max_file_size
-          .. "). Use read with offset/limit instead.",
-        is_error = true,
-      }
     end
 
     local source, err = maki.fs.read(path)
