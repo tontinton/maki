@@ -6,7 +6,6 @@
 //! anything but the plan file before they reach the tool.
 
 mod file_access;
-pub mod grep;
 pub mod hook;
 pub mod interpreter_bridge;
 pub mod registry;
@@ -22,13 +21,11 @@ pub use registry::{
 
 use std::collections::HashMap;
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use humantime::format_duration;
-use ignore::WalkBuilder;
 use maki_config::ProjectConfig;
 use serde_json::Value;
 
@@ -382,34 +379,6 @@ pub enum ToolLive {
     Usage(String),
 }
 
-pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
-    let expanded = if let Some(rest) = path.strip_prefix("~/") {
-        let home = HOME.as_deref().ok_or("cannot expand ~: HOME not set")?;
-        home.join(rest).to_string_lossy().into_owned()
-    } else if path == "~" {
-        let home = HOME.as_deref().ok_or("cannot expand ~: HOME not set")?;
-        home.to_string_lossy().into_owned()
-    } else {
-        path.to_string()
-    };
-
-    if Path::new(&expanded).is_relative() {
-        let cwd = env::current_dir().map_err(|e| format!("cwd error: {e}"))?;
-        Ok(cwd.join(&expanded).to_string_lossy().into_owned())
-    } else {
-        Ok(expanded)
-    }
-}
-
-pub fn resolve_search_path(path: Option<&str>) -> Result<String, String> {
-    match path {
-        Some(p) => resolve_path(p),
-        None => env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .map_err(|e| format!("cwd error: {e}")),
-    }
-}
-
 static CWD: LazyLock<Option<PathBuf>> = LazyLock::new(|| env::current_dir().ok());
 static HOME: LazyLock<Option<PathBuf>> = LazyLock::new(maki_storage::paths::home);
 
@@ -434,55 +403,6 @@ fn format_rel(prefix: &str, fallback: &str, rel: &Path) -> String {
         fallback.into()
     } else {
         format!("{prefix}{s}")
-    }
-}
-
-/// Convenience wrapper that always respects gitignore.
-pub fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder, String> {
-    walk_builder_opts(root, patterns, true)
-}
-
-/// `.git` is always excluded, even when `gitignore` is false.
-pub fn walk_builder_opts(
-    root: &str,
-    patterns: &[&str],
-    gitignore: bool,
-) -> Result<WalkBuilder, String> {
-    let mut ob = ignore::overrides::OverrideBuilder::new(root);
-    ob.add("!.git").expect("!.git is a valid glob");
-
-    for p in patterns {
-        ob.add(p)
-            .map_err(|e| format!("invalid glob pattern: {e}"))?;
-    }
-
-    let overrides = ob
-        .build()
-        .map_err(|e| format!("invalid glob pattern: {e}"))?;
-
-    let mut wb = WalkBuilder::new(root);
-    wb.hidden(false).overrides(overrides);
-    if !gitignore {
-        wb.ignore(false)
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false);
-    }
-    Ok(wb)
-}
-
-pub fn mtime(path: &Path) -> SystemTime {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH)
-}
-
-pub(crate) fn truncate_bytes(line: &str, max_bytes: usize) -> String {
-    if line.len() > max_bytes {
-        let boundary = line.floor_char_boundary(max_bytes);
-        format!("{}...", &line[..boundary])
-    } else {
-        line.to_owned()
     }
 }
 
@@ -801,14 +721,10 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{self, File};
-
-    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
 
-    const LINE_LIMIT: usize = 500;
     const TEST_MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
 
     /// The array a host hands in is the whole answer, but only where names can
@@ -869,16 +785,6 @@ mod tests {
         assert_eq!(expired.cap_timeout(120).unwrap_err(), DEADLINE_EXCEEDED);
     }
 
-    #[test_case("short",                            "short"                             ; "short_passthrough")]
-    #[test_case(&"x".repeat(LINE_LIMIT),       &"x".repeat(LINE_LIMIT)        ; "exact_boundary")]
-    #[test_case(&"x".repeat(LINE_LIMIT + 500), &format!("{}...", "x".repeat(LINE_LIMIT)) ; "long_truncated")]
-    #[test_case(&format!("{}\u{1F600}", "a".repeat(LINE_LIMIT - 1)), &format!("{}...", "a".repeat(LINE_LIMIT - 1)) ; "multibyte_char_boundary")]
-    #[test_case(&format!("{}\u{0430}tail", "a".repeat(LINE_LIMIT - 1)), &format!("{}...", "a".repeat(LINE_LIMIT - 1)) ; "two_byte_char_boundary")]
-    fn truncate_bytes_cases(input: &str, expected: &str) {
-        let result = truncate_bytes(input, LINE_LIMIT);
-        assert_eq!(result, expected);
-    }
-
     #[test]
     fn truncate_output_respects_line_and_byte_limits() {
         const MAX_LINES: usize = 2000;
@@ -894,195 +800,6 @@ mod tests {
         let many_bytes = "x".repeat(MAX_BYTES + 1000);
         let result = truncate_output(many_bytes, MAX_LINES, MAX_BYTES);
         assert!(result.ends_with("[truncated]"));
-    }
-
-    #[test]
-    fn grep_search_finds_filters_and_skips_binary() {
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("a.txt"), "hello world\ngoodbye world").unwrap();
-        fs::write(dir.path().join("b.rs"), "hello rust").unwrap();
-        fs::write(dir.path().join("bin.dat"), b"hello \x00 binary").unwrap();
-        let dir_str = dir.path().to_string_lossy().to_string();
-
-        let mut params = grep::GrepParams::new("hello".into());
-        params.path = Some(dir_str.clone());
-        let (_, entries) = grep::grep_search(params).unwrap();
-        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
-        assert!(paths.contains(&"a.txt"));
-        assert!(paths.contains(&"b.rs"));
-        assert!(!paths.contains(&"bin.dat"));
-
-        let mut params = grep::GrepParams::new("hello".into());
-        params.path = Some(dir_str.clone());
-        params.include = Some("*.rs".into());
-        let (_, entries) = grep::grep_search(params).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].path, "b.rs");
-
-        let mut params = grep::GrepParams::new("zzzznotfound".into());
-        params.path = Some(dir_str);
-        let (_, entries) = grep::grep_search(params).unwrap();
-        assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn grep_search_single_file_preserves_filename() {
-        let dir = TempDir::new().unwrap();
-        let file = dir.path().join("demo.rs");
-        fs::write(&file, "fn main() {}\n").unwrap();
-
-        let mut params = grep::GrepParams::new("fn main".into());
-        params.path = Some(file.to_string_lossy().into());
-        let (_, entries) = grep::grep_search(params).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].path, "demo.rs");
-    }
-
-    #[test]
-    fn grep_search_invalid_regex_returns_error() {
-        let dir = TempDir::new().unwrap();
-        let mut params = grep::GrepParams::new("[invalid".into());
-        params.path = Some(dir.path().to_string_lossy().into());
-        let err = grep::grep_search(params).unwrap_err();
-        assert!(err.contains(grep::INVALID_REGEX), "got: {err}");
-    }
-
-    #[test]
-    fn grep_search_multiline_groups_spanning_lines() {
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("span.rs"), "fn foo() {\n    bar\n}\n").unwrap();
-
-        let mut params = grep::GrepParams::new("(?s)foo.*\\n}".into());
-        params.path = Some(dir.path().to_string_lossy().into());
-        let (_, entries) = grep::grep_search(params).unwrap();
-        assert_eq!(entries.len(), 1);
-        let lines = &entries[0].groups[0].lines;
-        assert!(lines.iter().any(|l| l.text.contains("foo") && l.is_match));
-    }
-
-    #[test]
-    fn grep_search_context_lines_surround_matches() {
-        let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join("ctx.rs"),
-            "l1\nl2\nA\nl4\nl5\nl6\nl7\nl8\nB\nl10\n",
-        )
-        .unwrap();
-
-        let mut params = grep::GrepParams::new("A|B".into());
-        params.path = Some(dir.path().to_string_lossy().into());
-        params.context_before = 1;
-        params.context_after = 1;
-        let (_, entries) = grep::grep_search(params).unwrap();
-        assert_eq!(entries[0].groups.len(), 2);
-
-        let g0 = &entries[0].groups[0].lines;
-        assert!(g0.iter().any(|l| l.text == "l2" && !l.is_match));
-        assert!(g0.iter().any(|l| l.text == "A" && l.is_match));
-
-        let g1 = &entries[0].groups[1].lines;
-        assert!(g1.iter().any(|l| l.text == "B" && l.is_match));
-        assert!(g1.iter().any(|l| l.text == "l10" && !l.is_match));
-    }
-
-    #[test]
-    fn grep_search_parallel_stable_under_repeated_calls() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path();
-        let tied_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
-        for i in 0..20u32 {
-            let path = root.join(format!("f{i:03}.rs"));
-            fs::write(&path, format!("needle {i}\n")).unwrap();
-            let f = File::options().write(true).open(&path).unwrap();
-            f.set_modified(tied_mtime).unwrap();
-        }
-        let path_str = root.to_string_lossy().to_string();
-
-        let mut reference: Option<Vec<(String, usize, bool)>> = None;
-        for _ in 0..20 {
-            let mut params = grep::GrepParams::new("needle".into());
-            params.path = Some(path_str.clone());
-            params.limit = 1000;
-            let (_, entries) = grep::grep_search(params).unwrap();
-
-            let flat: Vec<(String, usize, bool)> = entries
-                .iter()
-                .flat_map(|e| {
-                    e.groups.iter().flat_map(|g| {
-                        g.lines
-                            .iter()
-                            .map(|l| (e.path.clone(), l.line_nr, l.is_match))
-                    })
-                })
-                .collect();
-            match &reference {
-                None => reference = Some(flat),
-                Some(prev) => assert_eq!(flat, *prev),
-            }
-        }
-    }
-
-    #[test]
-    fn grep_search_limit_truncates_groups_after_sort() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path();
-        for i in 0..10u32 {
-            fs::write(root.join(format!("m_{i}.rs")), "hit\n").unwrap();
-        }
-
-        let mut params = grep::GrepParams::new("hit".into());
-        params.path = Some(root.to_string_lossy().into());
-        params.limit = 3;
-        let (_, entries) = grep::grep_search(params).unwrap();
-
-        let total_groups: usize = entries.iter().map(|e| e.groups.len()).sum();
-        assert_eq!(total_groups, 3);
-    }
-
-    #[test]
-    fn walk_builder_excludes_dot_git_shows_dotfiles_and_filters_globs() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-
-        fs::create_dir_all(root.join(".git/objects")).unwrap();
-        fs::write(root.join(".git/config"), "stuff").unwrap();
-        fs::write(root.join(".git/objects/abc123"), "blob").unwrap();
-        fs::write(root.join(".env"), "SECRET=42").unwrap();
-        fs::write(root.join("lib.rs"), "pub fn foo() {}").unwrap();
-        fs::write(root.join("main.py"), "print('hi')").unwrap();
-
-        let root_str = root.to_string_lossy();
-        let collect = |patterns: &[&str]| -> Vec<String> {
-            // A developer's global gitignore decides for itself whether a
-            // dotfile like `.env` is ignored, and this test is about our
-            // filters, not theirs.
-            let mut wb = walk_builder(&root_str, patterns).unwrap();
-            wb.git_global(false);
-            wb.build()
-                .flatten()
-                .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
-                .map(|e| {
-                    e.path()
-                        .strip_prefix(root)
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .collect()
-        };
-
-        let all = collect(&[]);
-        assert!(all.contains(&"lib.rs".into()));
-        assert!(all.contains(&".env".into()), "dotfiles must be shown");
-        assert!(
-            !all.iter().any(|p| p.starts_with(".git")),
-            ".git must be excluded"
-        );
-
-        let rs_only = collect(&["*.rs"]);
-        assert!(rs_only.contains(&"lib.rs".into()));
-        assert!(!rs_only.contains(&"main.py".into()), "glob must filter");
-        assert!(!rs_only.iter().any(|p| p.starts_with(".git")));
     }
 
     #[test]
@@ -1105,98 +822,6 @@ mod tests {
 
         let no_partial = format!("{}sibling/file.txt", home.display());
         assert_eq!(relative_path(&no_partial), no_partial);
-    }
-
-    #[test]
-    fn resolve_path_cases() {
-        let cwd = env::current_dir().unwrap();
-        let home = maki_storage::paths::home().unwrap();
-
-        assert_eq!(
-            resolve_path("~/foo/bar").unwrap(),
-            home.join("foo/bar").to_string_lossy()
-        );
-        assert_eq!(resolve_path("~").unwrap(), home.to_string_lossy());
-        assert_eq!(
-            resolve_path("src/main.rs").unwrap(),
-            cwd.join("src/main.rs").to_string_lossy()
-        );
-
-        // `/etc/hosts` is absolute on Unix (passed through unchanged) but
-        // root-relative on Windows (no drive prefix, so `is_relative()` is
-        // true and it gets joined with cwd, producing e.g. `C:\etc\hosts`).
-        #[cfg(windows)]
-        {
-            #[allow(clippy::join_absolute_paths)]
-            let expected = cwd.join("/etc/hosts");
-            assert_eq!(
-                resolve_path("/etc/hosts").unwrap(),
-                expected.to_string_lossy()
-            );
-        }
-        #[cfg(not(windows))]
-        assert_eq!(resolve_path("/etc/hosts").unwrap(), "/etc/hosts");
-    }
-
-    #[test]
-    fn walk_builder_opts_gitignore_false_includes_ignored() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-
-        std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(root)
-            .status()
-            .unwrap();
-        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
-        fs::write(root.join("test.log"), "log data").unwrap();
-        fs::write(root.join("test.txt"), "text data").unwrap();
-
-        let root_str = root.to_string_lossy();
-
-        let collect = |wb: WalkBuilder| -> Vec<String> {
-            wb.build()
-                .flatten()
-                .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
-                .map(|e| e.into_path().to_string_lossy().to_string())
-                .collect::<Vec<_>>()
-        };
-
-        let with_ignored = collect(walk_builder_opts(&root_str, &[], false).unwrap());
-        assert!(
-            with_ignored.iter().any(|p| p.ends_with("test.log")),
-            "gitignore=false should include test.log, got: {with_ignored:?}"
-        );
-        assert!(
-            with_ignored.iter().any(|p| p.ends_with("test.txt")),
-            "gitignore=false should include test.txt, got: {with_ignored:?}"
-        );
-
-        let without_ignored = collect(walk_builder_opts(&root_str, &[], true).unwrap());
-        assert!(
-            !without_ignored.iter().any(|p| p.ends_with("test.log")),
-            "gitignore=true should exclude test.log, got: {without_ignored:?}"
-        );
-        assert!(
-            without_ignored.iter().any(|p| p.ends_with("test.txt")),
-            "gitignore=true should include test.txt, got: {without_ignored:?}"
-        );
-
-        assert!(
-            !with_ignored.iter().any(|p| p.contains(".git/")),
-            ".git/ must be excluded even with gitignore=false, got: {with_ignored:?}"
-        );
-    }
-
-    #[test]
-    fn walk_builder_invalid_pattern_returns_error() {
-        let tmp = TempDir::new().unwrap();
-        let root_str = tmp.path().to_string_lossy();
-        let err = walk_builder(&root_str, &["["]).unwrap_err();
-        assert!(
-            err.contains("invalid glob pattern"),
-            "expected 'invalid glob pattern', got: {err}"
-        );
     }
 
     #[test]

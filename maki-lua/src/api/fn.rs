@@ -1,24 +1,19 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::mem;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
 
+use maki_fs::{FsBackend, JobCommand, JobHandle, JobOut, JobRequest, JobSink, JobStream};
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::strip_provider_keys;
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
-use shell_words::join as shell_join;
 
 use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::backend::{bound_backend, host_backend};
 use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
 use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
 
@@ -26,8 +21,6 @@ const DEFAULT_TAIL: usize = 20;
 const MAX_TAIL_LINES: usize = 1024;
 const MAX_COMPLETED_SESSION_JOBS: usize = 256;
 const DEFAULT_WAIT_MS: u64 = 30_000;
-
-const READER_BUF_SIZE: usize = 8 * 1024;
 
 const NO_TASK_SCOPE_ERR: &str =
     "jobstart: no active task; use scope = \"plugin\" or { session = ... }";
@@ -59,62 +52,21 @@ pub(crate) enum JobOwner {
     },
 }
 
-/// A shell line, or an argv the plugin built itself so there are no quoting
-/// rules to get wrong.
-pub(crate) enum JobCommand {
-    Shell(String),
-    Argv(Vec<String>),
-}
+/// Queue a running job's output and exit into the store's channel, so the
+/// dispatch pump and `jobwait` see the same events in the same order.
+struct JobEvents(flume::Sender<JobEvent>);
 
-impl From<&str> for JobCommand {
-    fn from(cmd: &str) -> Self {
-        Self::Shell(cmd.to_string())
-    }
-}
-
-impl JobCommand {
-    fn build(&self) -> Command {
-        match self {
-            Self::Shell(cmd) => shell_command(cmd),
-            Self::Argv(argv) => {
-                let mut command = Command::new(&argv[0]);
-                command.args(&argv[1..]);
-                command
-            }
-        }
+impl JobSink for JobEvents {
+    fn line(&self, stream: JobStream, line: String) {
+        let event = match stream {
+            JobStream::Stdout => JobEvent::Stdout(line),
+            JobStream::Stderr => JobEvent::Stderr(line),
+        };
+        let _ = self.0.send(event);
     }
 
-    /// Only for `jobinfo` / `joblist` rows: an argv job spawns from the vec,
-    /// so nothing ever re-parses this.
-    fn display(&self) -> String {
-        match self {
-            Self::Shell(cmd) => cmd.clone(),
-            Self::Argv(argv) => shell_join(argv),
-        }
-    }
-}
-
-pub(crate) enum Redirect {
-    /// Piped to a reader thread, so callbacks and tails see the lines.
-    Capture,
-    Discard,
-    /// The child appends to the file on its own: no reader thread, no events,
-    /// no tail.
-    File(PathBuf),
-}
-
-impl Redirect {
-    fn stdio(&self) -> Result<Stdio, String> {
-        match self {
-            Self::Capture => Ok(Stdio::piped()),
-            Self::Discard => Ok(Stdio::null()),
-            Self::File(path) => File::options()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map(Stdio::from)
-                .map_err(|e| format!("cannot open {}: {e}", path.display())),
-        }
+    fn exit(&self, code: i32) {
+        let _ = self.0.send(JobEvent::Exit(code));
     }
 }
 
@@ -124,11 +76,13 @@ pub(crate) struct JobSpec {
     pub name: Option<String>,
     pub cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
-    pub stdout: Redirect,
-    pub stderr: Redirect,
+    pub stdout: JobOut,
+    pub stderr: JobOut,
     pub on_stdout: Option<RegistryKey>,
     pub on_stderr: Option<RegistryKey>,
     pub on_exit: Option<RegistryKey>,
+    /// The backend a routed handler runs in. Unset means the host.
+    pub backend: Option<Arc<dyn FsBackend>>,
 }
 
 impl JobSpec {
@@ -139,22 +93,27 @@ impl JobSpec {
             name: None,
             cwd: None,
             env: None,
-            stdout: Redirect::Capture,
-            stderr: Redirect::Capture,
+            stdout: JobOut::Capture,
+            stderr: JobOut::Capture,
             on_stdout: None,
             on_stderr: None,
             on_exit: None,
+            backend: None,
         }
     }
 }
 
 struct JobMeta {
     owner: JobOwner,
+    /// The command as one shell line, which is what a `jobinfo` / `joblist`
+    /// row shows: an argv job is re-quoted, never re-parsed.
     command: String,
     /// A reloaded plugin looks its job up by this instead of matching on the
     /// command string. See [`JobStore::find_named`].
     name: Option<String>,
-    pid: u32,
+    /// The job's process, and the pid `jobstop` signals. `jobinfo` reports 0
+    /// for a job the backend ran without a process of its own.
+    handle: JobHandle,
     started: Instant,
     on_stdout: Option<RegistryKey>,
     on_stderr: Option<RegistryKey>,
@@ -168,9 +127,6 @@ struct JobMeta {
     /// nothing ever reaches the tail there and an empty tail is no evidence
     /// the job stayed quiet.
     dropped_output: bool,
-    /// Set by the wait thread the moment the child is reaped, which is well
-    /// before `exit_code`. Read by [`kill_job`].
-    reaped: Arc<AtomicBool>,
     exit_code: Option<i32>,
     /// Recorded at exit so elapsed time stops counting once the process is gone.
     elapsed_secs: Option<u64>,
@@ -269,6 +225,8 @@ impl JobStore {
         }
     }
 
+    /// Start the job on the backend that will run it: a routed handler's
+    /// backend, or the host, which streams a process of its own.
     pub fn start(&mut self, spec: JobSpec) -> Result<u32, String> {
         let JobSpec {
             owner,
@@ -281,99 +239,31 @@ impl JobStore {
             on_stdout,
             on_stderr,
             on_exit,
+            backend,
         } = spec;
-        let mut command = cmd.build();
-        strip_provider_keys(&mut command)
-            .stdout(stdout.stdio()?)
-            .stderr(stderr.stdio()?)
-            .stdin(Stdio::null());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            // SAFETY: setsid is async-signal-safe, so it is sound to call in pre_exec.
-            unsafe {
-                command.pre_exec(|| {
-                    rustix::process::setsid()?;
-                    Ok(())
-                });
-            }
-        }
-
-        if let Some(dir) = cwd.as_deref().map(expand_tilde) {
-            if !dir.is_dir() {
-                return Err(format!("cwd is not a directory: {}", dir.display()));
-            }
-            command.current_dir(dir);
-        }
-        if let Some(ref env_map) = env {
-            for (k, v) in env_map {
-                command.env(k, v);
-            }
-        }
-
-        let mut child = command.spawn().map_err(|e| e.to_string())?;
-        let pid = child.id();
-        let id = self.next_id;
-        self.next_id += 1;
-
+        let command = cmd.display();
+        let dropped_output = !matches!((&stdout, &stderr), (JobOut::Capture, JobOut::Capture));
         let (event_tx, event_rx) = flume::unbounded();
-
-        macro_rules! spawn_reader {
-            ($stream:expr, $name:expr, $variant:ident) => {
-                if let Some(stream) = $stream {
-                    let tx = event_tx.clone();
-                    Some(
-                        thread::Builder::new()
-                            .name($name.into())
-                            .spawn(move || {
-                                for line in BufReader::with_capacity(READER_BUF_SIZE, stream)
-                                    .lines()
-                                    .map_while(Result::ok)
-                                {
-                                    if tx.send(JobEvent::$variant(line)).is_err() {
-                                        break;
-                                    }
-                                }
-                            })
-                            .map_err(|e| e.to_string())?,
-                    )
-                } else {
-                    None
-                }
-            };
-        }
-        let stdout_handle = spawn_reader!(child.stdout.take(), "job-stdout", Stdout);
-        let stderr_handle = spawn_reader!(child.stderr.take(), "job-stderr", Stderr);
-
-        let reaped = Arc::new(AtomicBool::new(false));
-        let wait_reaped = Arc::clone(&reaped);
-        thread::Builder::new()
-            .name("job-wait".into())
-            .spawn(move || {
-                // Reaping frees the pid, and that pid is the process group
-                // `kill_job` signals. The readers only return once every
-                // descendant dropped the pipes, so joining them first keeps a
-                // kill target around for as long as the job is really alive.
-                if let Some(h) = stdout_handle {
-                    let _ = h.join();
-                }
-                if let Some(h) = stderr_handle {
-                    let _ = h.join();
-                }
-                let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-                wait_reaped.store(true, Ordering::Relaxed);
-                let _ = event_tx.send(JobEvent::Exit(code));
+        let handle = backend
+            .unwrap_or_else(host_backend)
+            .exec_job(JobRequest {
+                command: cmd,
+                workdir: workdir(cwd.as_deref())?,
+                env,
+                stdout,
+                stderr,
+                sink: Arc::new(JobEvents(event_tx)),
             })
             .map_err(|e| e.to_string())?;
-
+        let id = self.next_id;
+        self.next_id += 1;
         self.jobs.insert(
             id,
             JobMeta {
                 owner,
-                command: cmd.display(),
+                command,
                 name,
-                pid,
+                handle,
                 started: Instant::now(),
                 on_stdout,
                 on_stderr,
@@ -382,11 +272,7 @@ impl JobStore {
                 stdout_tail: VecDeque::new(),
                 stderr_tail: VecDeque::new(),
                 tail_cap: DEFAULT_TAIL,
-                dropped_output: !matches!(
-                    (&stdout, &stderr),
-                    (Redirect::Capture, Redirect::Capture)
-                ),
-                reaped,
+                dropped_output,
                 exit_code: None,
                 elapsed_secs: None,
                 replay_exit: None,
@@ -639,7 +525,7 @@ impl JobStore {
         if let Some(job) = self.jobs.get(&job_id)
             && job.can_access(task_id, plugin)
         {
-            kill_job(job);
+            job.handle.kill();
         }
     }
 
@@ -662,7 +548,7 @@ impl JobStore {
     fn remove(&mut self, lua: &Lua, job_id: u32, kill: bool) {
         if let Some(job) = self.jobs.remove(&job_id) {
             if kill {
-                kill_job(&job);
+                job.handle.kill();
             }
             for key in [job.on_stdout, job.on_stderr, job.on_exit]
                 .into_iter()
@@ -675,7 +561,7 @@ impl JobStore {
 
     fn kill_all(&self) {
         for job in self.jobs.values() {
-            kill_job(job);
+            job.handle.kill();
         }
     }
 }
@@ -732,7 +618,7 @@ impl JobSnapshot {
             command: job.command.clone(),
             name: job.name.clone(),
             session: job.session(),
-            pid: job.pid,
+            pid: job.handle.pid(),
             elapsed_secs: job
                 .elapsed_secs
                 .unwrap_or_else(|| job.started.elapsed().as_secs()),
@@ -774,48 +660,16 @@ fn drop_callbacks(lua: &Lua, job: &mut JobMeta) {
     }
 }
 
-fn shell_command(cmd: &str) -> Command {
-    #[cfg(unix)]
-    {
-        let mut c = Command::new("bash");
-        c.arg("-c").arg(cmd);
-        c
+/// Expand {cwd} and check it is a directory, whichever backend ends up
+/// running the job.
+fn workdir(cwd: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let Some(dir) = cwd.map(expand_tilde) else {
+        return Ok(None);
+    };
+    if !dir.is_dir() {
+        return Err(format!("cwd is not a directory: {}", dir.display()));
     }
-    #[cfg(windows)]
-    {
-        let mut c = Command::new("cmd.exe");
-        c.arg("/C").arg(cmd);
-        c
-    }
-}
-
-/// Signalling a reaped pid would hit whoever the kernel handed it to next, so
-/// skip the jobs the wait thread already reaped. Until then the child is a
-/// zombie, and a zombie group leader keeps its pid and pgid off the free list,
-/// so the group is still the right target. The flag carries no data of its
-/// own, hence `Relaxed`.
-fn kill_job(job: &JobMeta) {
-    if job.reaped.load(Ordering::Relaxed) {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        use rustix::process::{Pid, Signal, kill_process_group};
-        if let Ok(raw) = i32::try_from(job.pid)
-            && let Some(pid) = Pid::from_raw(raw)
-        {
-            let _ = kill_process_group(pid, Signal::KILL);
-        }
-    }
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &job.pid.to_string()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+    Ok(Some(dir))
 }
 
 /// Run a command in the background. A string runs through `bash -c` on Unix
@@ -876,6 +730,7 @@ fn jobstart(
         .transpose()?
         .unwrap_or(Value::Nil);
     let mut spec = JobSpec::new(parse_scope(lua, &plugin, scope)?, parse_command(cmd)?);
+    spec.backend = bound_backend(lua);
     let mut tail = None;
 
     if let Some(ref opts) = opts {
@@ -934,10 +789,10 @@ fn parse_redirect(
     key: &str,
     has_callback: bool,
     fs_write: bool,
-) -> LuaResult<Redirect> {
+) -> LuaResult<JobOut> {
     let value = opts.get::<Value>(key)?;
     if value.is_nil() {
-        return Ok(Redirect::Capture);
+        return Ok(JobOut::Capture);
     }
     if has_callback {
         return Err(mlua::Error::runtime(format!(
@@ -945,12 +800,12 @@ fn parse_redirect(
         )));
     }
     match value {
-        Value::Boolean(false) => Ok(Redirect::Discard),
+        Value::Boolean(false) => Ok(JobOut::Discard),
         Value::String(path) => {
             if !fs_write {
                 return Err(denied_error(Permission::FsWrite));
             }
-            Ok(Redirect::File(expand_tilde(&path.to_str()?)))
+            Ok(JobOut::File(expand_tilde(&path.to_str()?)))
         }
         _ => Err(mlua::Error::runtime(format!(
             "jobstart: {key} must be a path string or false"
@@ -1423,6 +1278,8 @@ lua_table! {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, WinView};
 
@@ -1485,7 +1342,7 @@ mod tests {
             owner,
             command: String::new(),
             name: None,
-            pid: 0,
+            handle: JobHandle::none(),
             started: Instant::now(),
             on_stdout,
             on_stderr: None,
@@ -1495,7 +1352,6 @@ mod tests {
             stderr_tail: VecDeque::new(),
             tail_cap: DEFAULT_TAIL,
             dropped_output: false,
-            reaped: Arc::new(AtomicBool::new(false)),
             exit_code: None,
             elapsed_secs: None,
             replay_exit: None,
@@ -1536,7 +1392,7 @@ mod tests {
         let id = store
             .start(JobSpec::new(task_owner(1), "sleep 30"))
             .expect("job started");
-        let pid = store.jobs[&id].pid;
+        let pid = store.jobs[&id].handle.pid();
         assert!(group_alive(pid), "job should be running before the drop");
 
         drop(store);
@@ -1620,7 +1476,7 @@ mod tests {
         let id = store
             .start(JobSpec::new(task_owner(1), "sleep 30"))
             .unwrap();
-        let pid = store.jobs[&id].pid;
+        let pid = store.jobs[&id].handle.pid();
 
         store.kill(id, Some(2), TEST_PLUGIN);
         assert!(group_alive(pid));
@@ -1641,8 +1497,8 @@ mod tests {
         let plugin_id = store
             .start(JobSpec::new(plugin.clone(), "sleep 30"))
             .unwrap();
-        let task_pid = store.jobs[&task_id].pid;
-        let plugin_pid = store.jobs[&plugin_id].pid;
+        let task_pid = store.jobs[&task_id].handle.pid();
+        let plugin_pid = store.jobs[&plugin_id].handle.pid();
 
         store.kill_owner(&lua, &task);
 
@@ -2035,17 +1891,6 @@ mod tests {
         store.complete(lua, 1, code);
     }
 
-    #[test]
-    fn an_argv_row_reads_back_as_the_same_argv() {
-        const ARGV: [&str; 2] = ["echo", "a; echo pwned"];
-        let row = JobCommand::Argv(ARGV.map(String::from).to_vec()).display();
-        assert_eq!(
-            shell_words::split(&row).unwrap(),
-            ARGV,
-            "the row a user reads must quote what the shell would have eaten"
-        );
-    }
-
     #[cfg(unix)]
     #[test]
     fn redirected_streams_append_to_the_file_and_keep_no_tail() {
@@ -2056,8 +1901,8 @@ mod tests {
         let mut store = make_store();
         let id = store
             .start(JobSpec {
-                stdout: Redirect::File(path.clone()),
-                stderr: Redirect::Discard,
+                stdout: JobOut::File(path.clone()),
+                stderr: JobOut::Discard,
                 ..JobSpec::new(task_owner(1), "echo hi; echo err >&2")
             })
             .unwrap();
@@ -2336,10 +2181,7 @@ mod tests {
         for (_, event) in collect_until_exit(id, || store.next_plugin_event()) {
             store.record_event(id, &event);
         }
-        assert!(
-            store.jobs[&id].reaped.load(Ordering::Relaxed),
-            "{EXIT_WITHOUT_REAP}"
-        );
+        assert!(store.jobs[&id].handle.is_reaped(), "{EXIT_WITHOUT_REAP}");
         store.complete(&lua, id, 0);
         store.kill(id, None, TEST_PLUGIN);
         let snap = store

@@ -7503,3 +7503,14 @@ fn alt_m_opens_model_picker() {
     app.update(Msg::Key(key));
     assert!(app.model_picker.is_open());
 }
+
+/// Ctrl+I is a terminal alias for Tab, so the sandbox dialog must be bound to
+/// a letter crossterm can actually report.
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+#[test]
+fn ctrl_l_opens_sandbox_dialog() {
+    let mut app = test_app();
+    assert_eq!(kb::SANDBOX.code, KeyCode::Char('l'));
+    app.update(Msg::Key(kb::SANDBOX.to_key_event()));
+    assert!(app.sandbox_modal.is_open());
+}

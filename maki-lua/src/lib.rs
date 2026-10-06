@@ -1,5 +1,6 @@
 pub mod agent_autocmd;
 mod api;
+mod backend;
 pub mod docs;
 pub mod docs_render;
 mod error;
@@ -25,6 +26,7 @@ pub use api::util::command::{
     SessionRequest, Split, TaskRequest, TitlePos, UiAction, UiAttachment, UiReply, WinCommand,
     WinEvent, WinView,
 };
+pub use api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
 pub use key::{Key, RESERVED_KEYS, is_reserved};

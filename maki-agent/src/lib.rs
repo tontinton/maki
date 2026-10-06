@@ -33,6 +33,7 @@ pub use mailbox::{MailboxError, SessionMailbox};
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub mod command;
 pub mod diff;
+pub mod fs_backend;
 pub mod permissions;
 pub mod prompt;
 pub mod template;

@@ -1,0 +1,27 @@
+[package]
+name = "maki-fs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Filesystem/exec backend contract and search shared by the host and the sandbox"
+
+[dependencies]
+etcetera = { workspace = true }
+grep-regex = { workspace = true }
+grep-searcher = { workspace = true }
+ignore = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+shell-words = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+test-case = { workspace = true }

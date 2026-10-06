@@ -1,0 +1,38 @@
+[package]
+name = "maki-sandbox"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "sandbox-diag"
+path = "src/bin/diag.rs"
+required-features = ["sandbox"]
+
+[[bin]]
+name = "sandbox-shell"
+path = "src/bin/sandbox-shell.rs"
+required-features = ["sandbox"]
+
+[features]
+default = ["sandbox"]
+sandbox = []
+## Exposes constructors for tests in other crates (e.g. maki-ui) that need a
+## handle without a sandbox child behind it.
+testing = []
+
+[dependencies]
+maki-fs = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+nix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+test-case = { workspace = true }

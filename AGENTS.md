@@ -57,7 +57,11 @@ Rust workspace, key crates in root dir:
 - maki-storage: Persistent state across runs (e.g. sessions, auth)
 - maki-config: User config
 - maki-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir
+- maki-fs: Leaf crate owning the `FsBackend` trait, `FsError`, the shared grep types, and the glob/grep walks. Both backends implement it (`HostFs` in maki-agent, `SandboxFs` in maki-sandbox) so sandboxed and host tools agree byte-for-byte. Depends on no other workspace crate.
+- maki-sandbox: Filesystem and process sandboxing using Linux user/mount namespaces with pivot_root. Forks a child process that runs inside an isolated filesystem (workspace bind-mounted to `/home/maki/workspace`). The child communicates with the parent over a Unix socket IPC. Command execution uses raw `fork()+execve()` instead of `std::process::Command` because `posix_spawnp` fails inside user+mount namespaces. The child answers glob/grep by calling `maki_fs::search` directly. `sandbox-shell` binary provides an interactive CLI for testing sandbox behavior.
 - maki-acp: ACP ndjson stdio server
+
+The sandbox needs maki's AppArmor profile loaded whenever AppArmor restricts unprivileged user namespaces. With `kernel.apparmor_restrict_unprivileged_userns=1` AppArmor confines an unconfined process to `unprivileged_userns` on `unshare(CLONE_NEWUSER)`, denying the `CAP_SYS_ADMIN` that `unshare(CLONE_NEWNS)`/`mount`/`pivot_root` need inside the new namespace. Do not tell users to set the sysctl to 0: `bwrap` works with it at 1 because of `/etc/apparmor.d/bwrap-userns-restrict`. `maki-sandbox/src/apparmor.rs` renders the equivalent profile and prints the install commands.
 
 Built-in lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), bash, glob, question, skill, memory, webfetch, websearch, todo_write, read, write, edit, task, code_execution (python sandbox), batch.
 

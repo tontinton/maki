@@ -19,6 +19,8 @@ pub(crate) mod view;
 
 use std::collections::HashMap;
 use std::env;
+use std::fs::read_to_string;
+use std::iter::once;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,6 +47,8 @@ use crate::components::pack_review::{PackReview, PackReviewAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction, builtin_menu, builtin_rows};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+use crate::components::sandbox_modal::SandboxModal;
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::status_bar::StatusBar;
@@ -253,7 +257,7 @@ fn notification_preview<'a>(chunks: impl Iterator<Item = &'a str>) -> Option<Str
 }
 
 fn normalize_preview(text: &str) -> Option<String> {
-    notification_preview(std::iter::once(text))
+    notification_preview(once(text))
 }
 
 fn cap_error_text(message: &str) -> String {
@@ -354,6 +358,8 @@ pub struct App {
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    pub(super) sandbox_modal: SandboxModal,
     pub(super) file_picker: FilePickerModal,
     pub(super) pack_review: PackReview,
     pub(super) permission_prompt: PermissionPrompt,
@@ -479,6 +485,20 @@ impl App {
             btw_modal: BtwModal::new(typewriter, ui_config.show_thinking),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            sandbox_modal: SandboxModal::new(
+                crate::components::sandbox_modal::SandboxInfo {
+                    enabled: false,
+                    env_entries: vec![],
+                    allowed_env: vec![],
+                    workspace_dir: String::new(),
+                    workspace_name: String::new(),
+                    home_mounts: vec![],
+                    profiles: vec![],
+                    extra_workspace_dirs: vec![],
+                },
+                None,
+            ),
             file_picker: FilePickerModal::new(),
             pack_review: PackReview::new(),
             permission_prompt: PermissionPrompt::new(),
@@ -594,7 +614,7 @@ impl App {
         if spec == self.announced_model_spec {
             return;
         }
-        let previous_spec = std::mem::replace(&mut self.announced_model_spec, spec);
+        let previous_spec = mem::replace(&mut self.announced_model_spec, spec);
         self.fire_session_autocmd(
             "ModelChanged",
             serde_json::json!({ "model": self.model_state(), "previous_spec": previous_spec }),
@@ -893,6 +913,11 @@ impl App {
             self.usage_modal.scroll(delta);
             return None;
         }
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        if self.sandbox_modal.is_open() {
+            self.sandbox_modal.scroll(delta);
+            return None;
+        }
         let pos = Position::new(column, row);
         if self.float_mgr.is_open() && self.float_mgr.contains(pos) {
             self.float_mgr.scroll(delta);
@@ -934,6 +959,11 @@ impl App {
         }
         if key::HELP.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Help));
+        }
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        if key::SANDBOX.matches(key) {
+            self.sandbox_modal.toggle();
+            return Some(vec![]);
         }
         if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();
@@ -1058,6 +1088,13 @@ impl App {
                     vec![]
                 }
             });
+        }
+
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        if self.sandbox_modal.is_open() {
+            self.sandbox_modal.handle_key(key);
+            self.apply_sandbox_changes();
+            return Some(vec![]);
         }
 
         // The panel in a subagent chat shows that subagent's inbox, which
@@ -1434,7 +1471,7 @@ impl App {
     }
 
     pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
-        match std::mem::take(&mut self.pending_input) {
+        match mem::take(&mut self.pending_input) {
             PendingInput::AuthRetry { subagent_id } => {
                 self.send_to_agent(subagent_id.as_deref(), String::new());
                 return vec![];
@@ -1870,8 +1907,7 @@ impl App {
             }
             "/cd" => self.cmd_cd(&cmd.args),
             "/yolo" => {
-                let enabled = self.permissions.toggle_yolo();
-                let msg = if enabled {
+                let msg = if self.permissions.toggle_yolo() {
                     "YOLO mode enabled"
                 } else {
                     "YOLO mode disabled"
@@ -1925,6 +1961,13 @@ impl App {
                     }
                 }
             }
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            "/sandbox" => {
+                self.sandbox_modal.toggle();
+                vec![]
+            }
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            "/add-dir" => self.cmd_add_dir(&cmd.args),
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)
             }
@@ -2076,7 +2119,69 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    fn cmd_add_dir(&mut self, args: &str) -> Vec<Action> {
+        let path = args.trim();
+        if path.is_empty() {
+            self.flash("Usage: /add-dir <host-directory>".into());
+            return vec![];
+        }
+        match self.sandbox_modal.add_extra_dir(path) {
+            Ok(name) => {
+                let cwd = env::current_dir().unwrap_or_default();
+                let dirs = self.sandbox_modal.host_extra_dirs();
+                if let Err(e) = maki_config::save_sandbox_extra_dirs(&cwd, &dirs) {
+                    self.status_bar
+                        .flash(format!("failed to save sandbox extra dirs: {e}"));
+                }
+                let msg = if self.sandbox_modal.is_enabled() {
+                    if self.sandbox_modal.reinit_sandbox() {
+                        format!("mounted {path} at /home/maki/workspace/{name}")
+                    } else {
+                        format!(
+                            "saved {path}: mounts at /home/maki/workspace/{name} on the next sandbox restart"
+                        )
+                    }
+                } else {
+                    format!(
+                        "saved {path}: mounts at /home/maki/workspace/{name} once the sandbox is enabled"
+                    )
+                };
+                self.flash(msg);
+            }
+            Err(e) => self.flash(e),
+        }
+        vec![]
+    }
+
+    /// Persist any sandbox modal toggles (enabled/profiles) to config.
+    /// Called after key handling and after background modal events, so a
+    /// spawn completing on the event loop survives a restart too.
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    pub(crate) fn apply_sandbox_changes(&mut self) {
+        let changes = self.sandbox_modal.take_changes();
+        let cwd = env::current_dir().unwrap_or_else(|_| "..".into());
+        if let Some(enabled) = changes.enabled
+            && let Err(e) = maki_config::save_sandbox_enabled(&cwd, enabled)
+        {
+            self.status_bar
+                .flash(format!("failed to save sandbox setting: {e}"));
+        }
+        if let Some(profiles) = &changes.profiles
+            && let Err(e) = maki_config::save_sandbox_profiles(&cwd, profiles)
+        {
+            self.status_bar
+                .flash(format!("failed to save sandbox profiles: {e}"));
+        }
+    }
+
+    const OVERLAY_COUNT: usize = if cfg!(all(feature = "sandbox", target_os = "linux")) {
+        15
+    } else {
+        14
+    };
+
+    fn overlays(&self) -> [&dyn Overlay; Self::OVERLAY_COUNT] {
         [
             &self.alert_modal,
             &self.help_modal,
@@ -2084,6 +2189,8 @@ impl App {
             &self.btw_modal,
             &self.float_mgr,
             &self.search_modal,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            &self.sandbox_modal,
             &self.file_picker,
             &self.rewind_picker,
             &self.theme_picker,
@@ -2095,7 +2202,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; Self::OVERLAY_COUNT] {
         [
             &mut self.alert_modal,
             &mut self.help_modal,
@@ -2103,6 +2210,8 @@ impl App {
             &mut self.btw_modal,
             &mut self.float_mgr,
             &mut self.search_modal,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            &mut self.sandbox_modal,
             &mut self.file_picker,
             &mut self.rewind_picker,
             &mut self.theme_picker,
@@ -2400,6 +2509,10 @@ impl App {
         if self.float_mgr.handle_paste(text) {
             return;
         }
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        if self.sandbox_modal.is_open() && self.sandbox_modal.handle_paste(text) {
+            return;
+        }
         if self.search_modal.is_open() {
             self.search_modal.handle_paste(text);
             self.refresh_search_matches();
@@ -2497,10 +2610,7 @@ impl App {
         let path = self.state.plan.path().map(|p| p.display().to_string());
         let ready = self.state.plan.is_ready();
         let content = if ready {
-            self.state
-                .plan
-                .path()
-                .and_then(|p| std::fs::read_to_string(p).ok())
+            self.state.plan.path().and_then(|p| read_to_string(p).ok())
         } else {
             None
         };
@@ -2515,9 +2625,9 @@ impl App {
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
         let parallel = self.plan_form.parallel();
         self.plan_form.reset();
-        let plan_snapshot = match std::mem::take(&mut self.state.plan) {
+        let plan_snapshot = match mem::take(&mut self.state.plan) {
             PlanState::Ready(p) => Some((
-                std::fs::read_to_string(&p).unwrap_or_default(),
+                read_to_string(&p).unwrap_or_default(),
                 p.display().to_string(),
             )),
             _ => None,

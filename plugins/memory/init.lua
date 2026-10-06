@@ -184,6 +184,7 @@ end
 
 maki.api.register_tool({
   name = "memory",
+  host_access = true,
   description = "Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.\n\n"
     .. "- Notes are retrieved by tag; reuse the tags from your system prompt when they fit.\n"
     .. "- Save important context before compaction or to build up project knowledge.\n"
