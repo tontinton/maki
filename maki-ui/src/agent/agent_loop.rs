@@ -243,7 +243,8 @@ impl AgentLoop {
             &slot.model,
             self.timeouts,
             &self.model_policy,
-        );
+        )
+        .await;
         // The summary goes out under a fresh frame for the session's own model,
         // so the gauge and `/btw` read the prompt the next run sends.
         let next = context(&slot.model, compaction.workflow);
