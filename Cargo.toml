@@ -88,7 +88,7 @@ maki-highlight = { path = "maki-highlight" }
 maki-markdown = { path = "maki-markdown" }
 maki-otel = { path = "maki-otel" }
 maki-pack = { path = "maki-pack" }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 bs58 = "0.5"
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }
