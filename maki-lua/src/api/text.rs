@@ -26,10 +26,12 @@ thread_local! {
 /// if err then return end
 /// print(md) -- "# Hello\n\nworld"
 #[lua_fn]
-fn html_to_markdown(_lua: &Lua, html: LuaString) -> LuaResult<Pair<String>> {
-    let html = try_pair!(html.to_str());
+async fn html_to_markdown(_lua: Lua, html: LuaString) -> LuaResult<Pair<String>> {
+    let html = try_pair!(html.to_str()).to_owned();
     Ok(pair(
-        htmd::convert(&html).map_err(|e| format!("html_to_markdown: {e}")),
+        smol::unblock(move || htmd::convert(&html))
+            .await
+            .map_err(|e| format!("html_to_markdown: {e}")),
     ))
 }
 
