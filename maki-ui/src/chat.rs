@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::app::tasks::{TaskOutcome, TaskStatus};
 use crate::components::input::Submission;
-use crate::components::messages::{MessagesPanel, PromptProgress, ScrollPos};
+use crate::components::messages::{MessagesPanel, PromptProgress, ScrollPos, ScrollSnapshot};
 use crate::components::tool_display::append_annotation;
 use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
@@ -306,11 +306,8 @@ impl Chat {
     /// What a UI shutdown carries into the next generation: where the viewport
     /// sits and whether the bottom pin is on. Pairs with
     /// [`Self::restore_scroll`].
-    pub fn scroll_state(&self) -> (ScrollPos, bool) {
-        (
-            self.messages_panel.scroll_pos(),
-            self.messages_panel.auto_scroll(),
-        )
+    pub fn scroll_snapshot(&self) -> ScrollSnapshot {
+        self.messages_panel.scroll_snapshot()
     }
 
     pub fn scroll_to_top(&mut self) {
@@ -325,8 +322,8 @@ impl Chat {
         self.messages_panel.scroll_to_segment(segment_index);
     }
 
-    pub fn restore_scroll(&mut self, scroll: ScrollPos, auto_scroll: bool) {
-        self.messages_panel.restore_scroll(scroll, auto_scroll);
+    pub fn restore_scroll(&mut self, snapshot: ScrollSnapshot) {
+        self.messages_panel.restore_scroll(snapshot);
     }
 
     pub fn set_highlight_segment(&mut self, idx: Option<usize>) {

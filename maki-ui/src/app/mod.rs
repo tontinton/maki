@@ -1031,11 +1031,11 @@ impl App {
                     chat.set_highlight_segment(None);
                     self.search_modal.close();
                 }
-                SearchAction::Close(saved) => {
+                SearchAction::Close(snapshot) => {
                     let chat = &mut self.chats[self.active_chat];
                     chat.set_highlight_segment(None);
-                    if let Some((pos, auto)) = saved {
-                        chat.restore_scroll(pos, auto);
+                    if let Some(snapshot) = snapshot {
+                        chat.restore_scroll(snapshot);
                     }
                     self.search_modal.close();
                 }
@@ -1187,8 +1187,7 @@ impl App {
             }
             BuiltinAction::Search => {
                 let chat = &self.chats[self.active_chat];
-                self.search_modal
-                    .open(chat.scroll_pos(), chat.auto_scroll());
+                self.search_modal.open(chat.scroll_snapshot());
             }
             BuiltinAction::Help => self.help_modal.toggle(),
             BuiltinAction::PlanToggle => {

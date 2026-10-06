@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 
 use crate::components::Overlay;
 use crate::components::keybindings::key;
-use crate::components::messages::ScrollPos;
+use crate::components::messages::ScrollSnapshot;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::text_buffer::TextBuffer;
@@ -35,7 +35,7 @@ pub enum SearchAction {
     Consumed,
     Navigate,
     Select(usize),
-    Close(Option<(ScrollPos, bool)>),
+    Close(Option<ScrollSnapshot>),
 }
 
 pub struct SearchModal {
@@ -45,7 +45,7 @@ pub struct SearchModal {
     scroll_offset: usize,
     viewport_height: usize,
     open: bool,
-    saved_scroll: Option<(ScrollPos, bool)>,
+    snapshot: Option<ScrollSnapshot>,
     matcher: Matcher,
 }
 
@@ -58,15 +58,15 @@ impl SearchModal {
             scroll_offset: 0,
             viewport_height: 0,
             open: false,
-            saved_scroll: None,
+            snapshot: None,
             matcher: Matcher::new(Config::DEFAULT),
         }
     }
 
-    pub fn open(&mut self, scroll: ScrollPos, auto_scroll: bool) {
+    pub fn open(&mut self, snapshot: ScrollSnapshot) {
         self.reset();
         self.open = true;
-        self.saved_scroll = Some((scroll, auto_scroll));
+        self.snapshot = Some(snapshot);
     }
 
     pub fn close(&mut self) {
@@ -79,7 +79,7 @@ impl SearchModal {
         self.matches.clear();
         self.selected = 0;
         self.scroll_offset = 0;
-        self.saved_scroll = None;
+        self.snapshot = None;
     }
 
     pub fn is_open(&self) -> bool {
@@ -92,12 +92,12 @@ impl SearchModal {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> SearchAction {
         match key.code {
-            KeyCode::Esc => SearchAction::Close(self.saved_scroll.take()),
+            KeyCode::Esc => SearchAction::Close(self.snapshot.take()),
             KeyCode::Enter => {
                 if let Some(m) = self.matches.get(self.selected) {
                     SearchAction::Select(m.segment_index)
                 } else {
-                    SearchAction::Close(self.saved_scroll.take())
+                    SearchAction::Close(self.snapshot.take())
                 }
             }
             KeyCode::Up => {
@@ -368,7 +368,7 @@ mod tests {
 
     fn modal_with_query(query: &str, texts: &[&str]) -> SearchModal {
         let mut modal = SearchModal::new();
-        modal.open(ScrollPos::default(), true);
+        modal.open(ScrollSnapshot::default());
         modal.search = TextBuffer::new(query.into());
         modal.update_matches(|| texts.iter().map(|t| (*t).to_owned()).collect());
         modal

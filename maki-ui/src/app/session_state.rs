@@ -61,7 +61,7 @@ impl SessionState {
         let OpenSession {
             mut session,
             claim,
-            view: _,
+            snapshot: _,
         } = open;
         session.set_model(model.spec());
         let model = model.clone();
@@ -551,7 +551,7 @@ mod tests {
             OpenSession {
                 session,
                 claim: claim.clone(),
-                view: None,
+                snapshot: None,
             },
             &model,
             &storage,

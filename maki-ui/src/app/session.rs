@@ -355,7 +355,7 @@ impl App {
         let OpenSession {
             session,
             claim,
-            view: _,
+            snapshot: _,
         } = self.blank_session();
         self.apply_stored_permissions(&session.meta);
         self.state.session = Arc::new(session);

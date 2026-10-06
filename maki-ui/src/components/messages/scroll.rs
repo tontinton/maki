@@ -20,6 +20,15 @@ pub struct ScrollPos {
     pub row: u16,
 }
 
+/// A viewport snapshot: where the scroll sits and whether the bottom pin is
+/// on. The two must travel together -- restoring the position without the
+/// pin state re-pins to the bottom on the next frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScrollSnapshot {
+    pub scroll: ScrollPos,
+    pub auto_scroll: bool,
+}
+
 /// One frame's document: cached segments followed by the streaming tail.
 /// Every row walk goes through here, so both are counted the same way.
 pub(super) struct Layout<'a> {

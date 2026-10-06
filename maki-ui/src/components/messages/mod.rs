@@ -5,7 +5,7 @@ mod selection;
 #[cfg(test)]
 mod tests;
 
-pub use self::scroll::ScrollPos;
+pub use self::scroll::{ScrollPos, ScrollSnapshot};
 
 use self::render::RenderCursor;
 use self::scroll::{Layout, TailPart};
@@ -656,9 +656,23 @@ impl MessagesPanel {
         self.scroll_to(self.layout().at_row(doc_row));
     }
 
-    pub fn restore_scroll(&mut self, scroll: ScrollPos, auto_scroll: bool) {
+    pub fn restore_scroll(
+        &mut self,
+        ScrollSnapshot {
+            scroll,
+            auto_scroll,
+        }: ScrollSnapshot,
+    ) {
         self.scroll = scroll;
         self.auto_scroll = auto_scroll;
+    }
+
+    /// The viewport snapshot [`Self::restore_scroll`] takes back.
+    pub fn scroll_snapshot(&self) -> ScrollSnapshot {
+        ScrollSnapshot {
+            scroll: self.scroll,
+            auto_scroll: self.auto_scroll,
+        }
     }
 
     pub fn set_highlight_segment(&mut self, idx: Option<usize>) {
