@@ -343,6 +343,7 @@ impl AgentLoop {
         )
         .with_loaded_instructions(self.instructions.loaded.clone())
         .with_user_response_rx(Arc::clone(&self.answer_rx))
+        .with_reauth(true)
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn maki_agent::InterruptSource>)
         .with_cancel(cancel.clone())
         .with_model_sync(Arc::clone(&self.model_slot))
