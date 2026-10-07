@@ -14,7 +14,9 @@ on disk, or it can install one from a Git repository and lock it to one commit.
 A package directory holds sorted `plugin/*.lua` entry files, modules at
 `lua/<module>.lua` or `lua/<module>/init.lua`, and a `plugin.toml` manifest.
 The entry files share one environment and use the API the
-[plugin guide](/docs/plugins/) describes.
+[plugin guide](/docs/plugins/) describes. A global set in one file is visible
+to the others. Built-in globals such as `string` or `print` stay fixed, so
+defining your own `print` in one file does not change it in another.
 
 ## Install from Git
 

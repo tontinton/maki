@@ -1,5 +1,6 @@
 //! Measures Luau VM speed under the three cancellation strategies, with the
-//! Lua configured like the plugin runtime (sandbox, memory limit, O2):
+//! Lua configured like the plugin runtime (sandbox, memory limit, O2, code
+//! running in a per-plugin `safeenv` environment):
 //! - `mlua_hook`: mlua `set_interrupt` closure, fires at every safepoint
 //!   (what the runtime used before the watchdog)
 //! - `watchdog`: no resident interrupt; a thread arms a one-shot native
@@ -16,7 +17,7 @@ use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use mlua::chunk::Compiler;
-use mlua::{Lua, VmState, ffi};
+use mlua::{Function, Lua, Table, VmState, ffi};
 
 const MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 const OPT_LEVEL: u8 = 2;
@@ -35,6 +36,13 @@ const BUFFER_LOOP: &str = "\
     for i = 0, 16383 do buffer.writeu32(b, i * 4, i) end\n\
     local acc = 0\n\
     for i = 0, 16383 do acc = acc + buffer.readu32(b, i * 4) end\n\
+    return acc";
+
+const BUILTIN_LOOP: &str = "\
+    local t = {}\n\
+    for i = 1, 16384 do t[i] = i end\n\
+    local acc = 0\n\
+    for _, v in ipairs(t) do acc = acc + math.floor(v / 3) + math.abs(-v) end\n\
     return acc";
 
 #[derive(Clone, Copy)]
@@ -127,6 +135,23 @@ fn runtime_like_lua(jit: bool, cancellation: Cancellation) -> (Lua, Option<Watch
     (lua, guard)
 }
 
+/// Mirrors the runtime's `build_env`.
+fn plugin_env(lua: &Lua, safeenv: bool) -> Table {
+    let env = lua.create_table().unwrap();
+    let meta = lua.create_table().unwrap();
+    meta.set("__index", lua.globals()).unwrap();
+    env.set_metatable(Some(meta)).unwrap();
+    env.set_safeenv(safeenv);
+    env
+}
+
+fn load_in_env(lua: &Lua, src: &str, safeenv: bool) -> Function {
+    lua.load(src)
+        .set_environment(plugin_env(lua, safeenv))
+        .into_function()
+        .unwrap()
+}
+
 fn bench_source(c: &mut Criterion, group: &str, src: &'static str) {
     let mut g = c.benchmark_group(group);
     for (label, jit, cancellation) in [
@@ -138,7 +163,22 @@ fn bench_source(c: &mut Criterion, group: &str, src: &'static str) {
         ("interp_none", false, Cancellation::None),
     ] {
         let (lua, _guard) = runtime_like_lua(jit, cancellation);
-        let f = lua.load(src).into_function().unwrap();
+        let f = load_in_env(&lua, src, true);
+        g.bench_function(label, |b| b.iter(|| f.call::<i64>(()).unwrap()));
+    }
+    g.finish();
+}
+
+fn bench_plugin_env(c: &mut Criterion) {
+    let mut g = c.benchmark_group("plugin_env");
+    for (label, jit, safeenv) in [
+        ("jit_safeenv", true, true),
+        ("jit_unsafe", true, false),
+        ("interp_safeenv", false, true),
+        ("interp_unsafe", false, false),
+    ] {
+        let (lua, _guard) = runtime_like_lua(jit, Cancellation::Watchdog);
+        let f = load_in_env(&lua, BUILTIN_LOOP, safeenv);
         g.bench_function(label, |b| b.iter(|| f.call::<i64>(()).unwrap()));
     }
     g.finish();
@@ -147,6 +187,8 @@ fn bench_source(c: &mut Criterion, group: &str, src: &'static str) {
 fn benches(c: &mut Criterion) {
     bench_source(c, "fib", FIB);
     bench_source(c, "buffer_rw", BUFFER_LOOP);
+    bench_source(c, "builtins", BUILTIN_LOOP);
+    bench_plugin_env(c);
 }
 
 criterion_group!(luau_perf, benches);
