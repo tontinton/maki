@@ -46,6 +46,7 @@ const OTHER_PERMISSION_KEYED_TOOL: &str = "write";
 const PLAIN_TOOL: &str = "plain_helper";
 const FILE_WRITE_TOOLS_DRIFT: &str = "fs_write tool declarations drifted from FILE_WRITE_TOOLS, update the const or the \
      register_tool declaration";
+const KAGI_KEY_ENV: &str = "KAGI_API_KEY";
 const MEMORY_RULES_DROPPED: &str = "memory pre-approved tools nobody had registered yet, so it must load after the plugins owning them";
 
 /// Lua tools cannot publish `ToolLive::Usage` (only the subagent relay does), so
@@ -3756,10 +3757,22 @@ fn websearch_config(provider: &str) -> PluginsConfig {
 /// the one thing it leaks: the description the model gets.
 #[test_case::test_case("exa", "Exa AI" ; "default_backend")]
 #[test_case::test_case("youcom", "You.com" ; "opt_in_backend")]
+#[test_case::test_case("kagi", "Kagi" ; "keyed_backend")]
 fn websearch_provider_option_selects_the_backend(provider: &str, expected: &str) {
     let (reg, _host) = builtins_host_with(&websearch_config(provider));
     let description = tool_description(&reg, &maki_config::AgentConfig::default(), "websearch");
     assert!(description.contains(expected), "got: {description}");
+}
+
+/// Kagi answers a keyless request with a bodiless 401, which would leave the
+/// model guessing, so the missing key is named before anything goes out.
+#[test]
+fn websearch_kagi_without_key_names_the_env_var() {
+    unsafe { std::env::remove_var(KAGI_KEY_ENV) };
+    let (reg, _host) = builtins_host_with(&websearch_config("kagi"));
+    let err = exec_tool(&reg, "websearch", json!({ "query": "rust" }))
+        .expect_err("a keyless kagi search must fail");
+    assert!(err.contains(KAGI_KEY_ENV), "got: {err}");
 }
 
 #[test]

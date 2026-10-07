@@ -334,7 +334,7 @@ maki.setup({
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
-| `provider` | string | `"exa"` | - | Search backend: "exa" (default) or "youcom" (You.com MCP). |
+| `provider` | string | `"exa"` | - | Search backend: "exa" (default), "youcom" (You.com MCP) or "kagi" (Kagi MCP, needs KAGI_API_KEY). |
 
 ## Validation
 
