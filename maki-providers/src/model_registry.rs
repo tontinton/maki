@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use maki_config::providers::ProvidersConfig;
 use maki_storage::{StateDir, atomic_write};
 use tracing::warn;
 
@@ -50,9 +51,11 @@ pub fn spec_for_tier(provider: &str, tier: ModelTier) -> Option<String> {
 
 /// The model a tier resolves to, layering user overrides on top of provider
 /// defaults: the user's pick for the tier (whatever provider it names) first,
-/// then the tier within `provider`, then the tier in any provider.
+/// then the tier within `provider`, then the tier in any provider that
+/// `providers.toml` does not keep out with `auto_select = false`.
 pub fn resolve_tier(provider: Option<&str>, tier: ModelTier) -> Option<String> {
-    read().resolve_tier(provider, tier)
+    let config = ProvidersConfig::load_or_default();
+    read().resolve_tier(provider, tier, |slug| config.auto_selectable(slug))
 }
 
 pub fn discovered(provider: &str, model_id: &str) -> Option<ModelInfo> {
@@ -283,22 +286,36 @@ impl ModelRegistry {
         self.overrides.iter().any(|(&t, s)| s == spec && t != tier)
     }
 
-    fn resolve_tier(&self, provider: Option<&str>, tier: ModelTier) -> Option<String> {
+    /// An override, or the provider the caller is already on, is a choice
+    /// someone made, so it stands whatever `providers.toml` says. The walk over
+    /// every provider is the part nobody asked for, and that is where
+    /// `auto_select = false` takes a provider out.
+    fn resolve_tier(
+        &self,
+        provider: Option<&str>,
+        tier: ModelTier,
+        auto_selectable: impl Fn(&str) -> bool,
+    ) -> Option<String> {
         self.overrides
             .get(&tier)
             .cloned()
             .or_else(|| provider.and_then(|p| self.spec_for_tier(p, tier)))
-            .or_else(|| self.spec_for_tier_any(tier))
+            .or_else(|| self.spec_for_tier_any(tier, auto_selectable))
     }
 
     /// Slug order, so the pick is the same in every process.
-    fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
+    fn spec_for_tier_any(
+        &self,
+        tier: ModelTier,
+        auto_selectable: impl Fn(&str) -> bool,
+    ) -> Option<String> {
         self.known_models
             .keys()
             .chain(self.declared.keys())
             .map(String::as_str)
             .collect::<BTreeSet<_>>()
             .into_iter()
+            .filter(|provider| auto_selectable(provider))
             .find_map(|provider| self.spec_for_tier(provider, tier))
     }
 
@@ -525,15 +542,15 @@ mod tests {
     fn resolve_tier_override_beats_the_scoped_provider() {
         let reg = make_map(&[(ModelTier::Weak, "zai/glm-5")], &["big", "mid", "small"]);
         assert_eq!(
-            reg.resolve_tier(Some("ollama"), ModelTier::Weak),
+            reg.resolve_tier(Some("ollama"), ModelTier::Weak, |_| true),
             Some("zai/glm-5".into())
         );
         assert_eq!(
-            reg.resolve_tier(Some("ollama"), ModelTier::Medium),
+            reg.resolve_tier(Some("ollama"), ModelTier::Medium, |_| true),
             Some("ollama/mid".into())
         );
         assert_eq!(
-            reg.resolve_tier(None, ModelTier::Weak),
+            reg.resolve_tier(None, ModelTier::Weak, |_| true),
             Some("zai/glm-5".into())
         );
     }
@@ -557,6 +574,24 @@ mod tests {
 
         let conflict = make_map(&[(ModelTier::Weak, "ollama/big")], &["big", "mid", "small"]);
         assert_eq!(conflict.spec_for_tier("ollama", ModelTier::Strong), None);
+    }
+
+    #[test]
+    fn resolve_tier_walk_skips_what_is_not_auto_selectable() {
+        let reg = make_map(
+            &[(ModelTier::Strong, "ollama/big")],
+            &["big", "mid", "small"],
+        );
+        let never = |_: &str| false;
+        assert_eq!(
+            reg.resolve_tier(None, ModelTier::Strong, never),
+            Some("ollama/big".into())
+        );
+        assert_eq!(
+            reg.resolve_tier(Some("ollama"), ModelTier::Medium, never),
+            Some("ollama/mid".into())
+        );
+        assert_eq!(reg.resolve_tier(None, ModelTier::Medium, never), None);
     }
 
     #[test]
@@ -708,7 +743,7 @@ mod tests {
             reg.set_known_models(SESSION_SLUG, tiered_models(listed, None));
         }
         assert_eq!(
-            reg.resolve_tier(Some(SESSION_SLUG), ModelTier::Compaction),
+            reg.resolve_tier(Some(SESSION_SLUG), ModelTier::Compaction, |_| true),
             expected.map(String::from)
         );
     }
@@ -726,7 +761,7 @@ mod tests {
             reg.set_known_models(slug, tiered_models(&["m"], Some(ModelTier::Compaction)));
         }
         assert_eq!(
-            reg.resolve_tier(None, ModelTier::Compaction),
+            reg.resolve_tier(None, ModelTier::Compaction, |_| true),
             Some(expected.into())
         );
     }
