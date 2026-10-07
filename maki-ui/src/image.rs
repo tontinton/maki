@@ -29,8 +29,8 @@ pub fn media_type_for(path: &Path) -> Option<ImageMediaType> {
 pub(crate) fn try_parse_image_path(text: &str) -> Option<(PathBuf, ImageMediaType)> {
     let trimmed = text.trim().trim_matches('\'');
     let (path_str, was_file_uri) = match trimmed.strip_prefix("file://") {
-        Some(rest) => (rest.replace("\\ ", " "), true),
-        None => (trimmed.replace("\\ ", " "), false),
+        Some(rest) => (shell_unescape(rest), true),
+        None => (shell_unescape(trimmed), false),
     };
     if path_str.contains("://") {
         return None;
@@ -47,6 +47,24 @@ pub(crate) fn try_parse_image_path(text: &str) -> Option<(PathBuf, ImageMediaTyp
     };
     let media_type = media_type_for(&path)?;
     Some((path, media_type))
+}
+
+// Terminals escape every shell metacharacter in a dropped path, not only
+// spaces: `image (14).png` arrives as `image\ \(14\).png`.
+fn shell_unescape(s: &str) -> String {
+    if cfg!(windows) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        out.push(if c == '\\' {
+            chars.next().unwrap_or(c)
+        } else {
+            c
+        });
+    }
+    out
 }
 
 pub fn load_file_image(path: &Path, media_type: ImageMediaType) -> Result<ImageSource, String> {
@@ -99,6 +117,8 @@ mod tests {
     #[test_case("  /home/user/photo.jpg\n",          "/home/user/photo.jpg",  ImageMediaType::Jpeg ; "trimmed_whitespace")]
     #[test_case("'/home/user/photo.png'",            "/home/user/photo.png",  ImageMediaType::Png  ; "single_quoted")]
     #[test_case("/home/user/my\\ photo.png",         "/home/user/my photo.png", ImageMediaType::Png ; "escaped_space")]
+    #[test_case("/home/user/image\\ \\(14\\).png",   "/home/user/image (14).png", ImageMediaType::Png ; "escaped_parens")]
+    #[test_case("/home/user/a\\&b\\'c.png",          "/home/user/a&b'c.png",  ImageMediaType::Png  ; "escaped_metachars")]
     fn try_parse_image_path_valid(
         input: &str,
         expected_path: &str,
