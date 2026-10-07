@@ -9,6 +9,29 @@ local MULTI_CANDIDATE_THRESHOLD = 0.3
 local CONTEXT_AWARE_LINE_MIN = 3
 local CONTEXT_AWARE_MATCH_RATIO = 0.5
 local INDENT_PATTERN = "^[ \t]*"
+local DEDENT_PATTERN = "^%s*(.*)"
+local UNICODE_SPACE_LEAD_BYTES = "[\194\225\226\227]"
+local UNICODE_SPACES = {
+  "\u{85}",
+  "\u{A0}",
+  "\u{1680}",
+  "\u{2000}",
+  "\u{2001}",
+  "\u{2002}",
+  "\u{2003}",
+  "\u{2004}",
+  "\u{2005}",
+  "\u{2006}",
+  "\u{2007}",
+  "\u{2008}",
+  "\u{2009}",
+  "\u{200A}",
+  "\u{2028}",
+  "\u{2029}",
+  "\u{202F}",
+  "\u{205F}",
+  "\u{3000}",
+}
 
 local function split_lines(s)
   local lines = {}
@@ -203,40 +226,29 @@ local function unescape(s)
 end
 
 local function normalize_whitespace(s)
-  local result = {}
-  local prev_ws = false
-  for pos, cp in utf8.codes(s) do
-    local is_ws = cp == 0x20
-      or (cp >= 0x09 and cp <= 0x0D)
-      or cp == 0x85
-      or cp == 0xA0
-      or cp == 0x1680
-      or (cp >= 0x2000 and cp <= 0x200A)
-      or cp == 0x2028
-      or cp == 0x2029
-      or cp == 0x202F
-      or cp == 0x205F
-      or cp == 0x3000
-    if is_ws then
-      if not prev_ws and #result > 0 then
-        result[#result + 1] = " "
-      end
-      prev_ws = true
-    else
-      prev_ws = false
-      local next_pos = utf8.offset(s, 2, pos)
-      if next_pos then
-        result[#result + 1] = s:sub(pos, next_pos - 1)
-      else
-        result[#result + 1] = s:sub(pos)
-      end
+  if s:find(UNICODE_SPACE_LEAD_BYTES) then
+    for _, space in UNICODE_SPACES do
+      s = s:gsub(space, " ")
     end
   end
-  local r = table.concat(result)
-  if r:sub(-1) == " " then
-    r = r:sub(1, -2)
+  s = s:gsub("%s+", " ")
+  if s:sub(1, 1) == " " then
+    s = s:sub(2)
   end
-  return r
+  if s:sub(-1) == " " then
+    s = s:sub(1, -2)
+  end
+  return s
+end
+
+local function join_normalized(normalized_lines, start, count)
+  local parts = {}
+  for i = start, start + count - 1 do
+    if normalized_lines[i] ~= "" then
+      parts[#parts + 1] = normalized_lines[i]
+    end
+  end
+  return table.concat(parts, " ")
 end
 
 local function strip_common_indent(lines)
@@ -244,7 +256,7 @@ local function strip_common_indent(lines)
   for _, l in ipairs(lines) do
     local trimmed = trim(l)
     if trimmed ~= "" then
-      local indent = #l - #l:match("^%s*(.*)")
+      local indent = #l - #l:match(DEDENT_PATTERN)
       if indent < min_indent then
         min_indent = indent
       end
@@ -311,8 +323,7 @@ local function levenshtein(a, b)
   return prev[b_len]
 end
 
-local function substring_whitespace_match(line, normalized_find)
-  local normalized_line = normalize_whitespace(line)
+local function substring_whitespace_match(line, normalized_line, normalized_find)
   if not normalized_line:find(normalized_find, 1, true) or normalized_line == normalized_find then
     return nil
   end
@@ -396,12 +407,15 @@ local function indentation_flexible(content, find)
   end
 
   local normalized_find = strip_common_indent(find_lines)
+  local first_dedented = find_lines[1]:match(DEDENT_PATTERN)
   local results = {}
 
   for i = 1, #content_lines - #find_lines + 1 do
-    local block = table_slice(content_lines, i, #find_lines)
-    if strip_common_indent(block) == normalized_find then
-      results[#results + 1] = table.concat(block, "\n")
+    if content_lines[i]:match(DEDENT_PATTERN) == first_dedented then
+      local block = table_slice(content_lines, i, #find_lines)
+      if strip_common_indent(block) == normalized_find then
+        results[#results + 1] = table.concat(block, "\n")
+      end
     end
   end
   return results
@@ -444,18 +458,20 @@ local function block_anchor(content, find)
   local first_trimmed = trim(search_lines[1])
   local last_trimmed = trim(search_lines[#search_lines])
 
+  local trimmed = {}
+  for i, line in ipairs(content_lines) do
+    trimmed[i] = trim(line)
+  end
+  local next_last = {}
+  for i = #content_lines, 1, -1 do
+    next_last[i] = trimmed[i] == last_trimmed and i or next_last[i + 1]
+  end
+
   local candidates = {}
   for i = 1, #content_lines do
-    if trim(content_lines[i]) == first_trimmed then
-      local tail_start = i + 2
-      if tail_start <= #content_lines then
-        for j = tail_start, #content_lines do
-          if trim(content_lines[j]) == last_trimmed then
-            candidates[#candidates + 1] = { i, j }
-            break
-          end
-        end
-      end
+    local j = trimmed[i] == first_trimmed and next_last[i + 2]
+    if j then
+      candidates[#candidates + 1] = { i, j }
     end
   end
 
@@ -493,13 +509,16 @@ end
 local function whitespace_normalized(content, find)
   local normalized_find = normalize_whitespace(find)
   local content_lines = split_lines(content)
+  local normalized_lines = {}
   local results = {}
 
-  for _, line in ipairs(content_lines) do
-    if normalize_whitespace(line) == normalized_find then
+  for i, line in ipairs(content_lines) do
+    local normalized_line = normalize_whitespace(line)
+    normalized_lines[i] = normalized_line
+    if normalized_line == normalized_find then
       results[#results + 1] = line
     else
-      local matched = substring_whitespace_match(line, normalized_find)
+      local matched = substring_whitespace_match(line, normalized_line, normalized_find)
       if matched then
         results[#results + 1] = matched
       end
@@ -507,11 +526,12 @@ local function whitespace_normalized(content, find)
   end
 
   local find_lines = split_lines(find)
-  if #find_lines > 1 and #find_lines <= #content_lines then
-    for i = 1, #content_lines - #find_lines + 1 do
-      local joined = join_slice(content_lines, i, #find_lines)
-      if normalize_whitespace(joined) == normalized_find then
-        results[#results + 1] = joined
+  local count = #find_lines
+  if count > 1 and count <= #content_lines then
+    for i = 1, #content_lines - count + 1 do
+      local first = normalized_lines[i]
+      if normalized_find:sub(1, #first) == first and join_normalized(normalized_lines, i, count) == normalized_find then
+        results[#results + 1] = join_slice(content_lines, i, count)
       end
     end
   end
