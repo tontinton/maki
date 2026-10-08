@@ -26,17 +26,18 @@ pub fn animation_elapsed_ms() -> u128 {
 }
 
 const DEFAULT_MS_PER_CHAR: u64 = 4;
-const MIN_DURATION_MS: u64 = 30;
-const MAX_DURATION_MS: u64 = 1000;
+/// When text arrives faster than `ms_per_char`, the reveal speeds up so the
+/// whole backlog would be gone in this window. A big chunk then just types
+/// faster, and the screen stays at most about this far behind the stream.
+const BACKLOG_WINDOW_MS: u64 = 200;
 
 pub struct Typewriter {
     buffer: String,
     visible_len: usize,
     visible_byte_offset: usize,
-    anim_start_visible: usize,
     anim_target: usize,
-    anim_start_at: Instant,
-    anim_duration: Duration,
+    last_tick: Instant,
+    carry: f64,
     ms_per_char: u64,
 }
 
@@ -56,39 +57,49 @@ impl Typewriter {
             buffer: String::new(),
             visible_len: 0,
             visible_byte_offset: 0,
-            anim_start_visible: 0,
             anim_target: 0,
-            anim_start_at: Instant::now(),
-            anim_duration: Duration::ZERO,
+            last_tick: Instant::now(),
+            carry: 0.0,
             ms_per_char,
         }
     }
 
     pub fn push(&mut self, text: &str) {
+        // Once the reveal catches up we stop rendering, so nothing ticks. Without
+        // this the next tick would count that whole quiet gap as reveal time and
+        // show the new chunk in one go.
+        if !self.is_animating() {
+            self.last_tick = Instant::now();
+            self.carry = 0.0;
+        }
         self.buffer.push_str(text);
-        // Finish the in flight reveal, so a seal has no backlog to snap in.
-        self.advance_visible(self.anim_target);
-        self.anim_start_visible = self.visible_len;
         self.anim_target = self.buffer.chars().count();
         if self.ms_per_char == 0 {
             self.advance_visible(self.anim_target);
-            return;
         }
-        let unrevealed = self.anim_target - self.anim_start_visible;
-        let ms = (unrevealed as u64 * self.ms_per_char).clamp(MIN_DURATION_MS, MAX_DURATION_MS);
-        self.anim_duration = Duration::from_millis(ms);
-        self.anim_start_at = Instant::now();
     }
 
     pub fn tick(&mut self) {
-        if self.visible_len >= self.anim_target {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_tick);
+        self.last_tick = now;
+        self.advance(elapsed);
+    }
+
+    /// A frame can last longer than one char, so counting chars per frame would
+    /// type too slowly. We go by elapsed time instead and keep the leftover
+    /// fraction of a char for the next tick.
+    fn advance(&mut self, elapsed: Duration) {
+        let backlog = self.anim_target - self.visible_len;
+        if backlog == 0 {
             return;
         }
-        let elapsed = self.anim_start_at.elapsed();
-        let progress = (elapsed.as_secs_f64() / self.anim_duration.as_secs_f64()).min(1.0);
-        let delta = self.anim_target - self.anim_start_visible;
-        let new_len = self.anim_start_visible + (delta as f64 * progress).round() as usize;
-        self.advance_visible(new_len);
+        let base = 1.0 / self.ms_per_char as f64;
+        let catch_up = backlog as f64 / BACKLOG_WINDOW_MS as f64;
+        self.carry += base.max(catch_up) * elapsed.as_secs_f64() * 1_000.0;
+        let step = self.carry.floor();
+        self.carry -= step;
+        self.advance_visible((self.visible_len + step as usize).min(self.anim_target));
     }
 
     pub fn visible(&self) -> &str {
@@ -127,15 +138,12 @@ impl Typewriter {
         let len = self.buffer.chars().count();
         self.visible_len = len;
         self.visible_byte_offset = self.buffer.len();
-        self.anim_start_visible = len;
         self.anim_target = len;
-        self.anim_duration = Duration::ZERO;
     }
 
     fn reset_anim(&mut self) {
         self.visible_len = 0;
         self.visible_byte_offset = 0;
-        self.anim_start_visible = 0;
         self.anim_target = 0;
     }
 
@@ -170,6 +178,10 @@ impl std::fmt::Debug for Typewriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
+
+    const MS_PER_CHAR: u64 = 4;
+    const IDLE_GAP: Duration = Duration::from_secs(1);
 
     #[test]
     fn spinner_wraps_around() {
@@ -200,15 +212,46 @@ mod tests {
     }
 
     #[test]
-    fn push_finishes_an_in_flight_reveal() {
-        let mut tw = Typewriter::new();
+    fn push_leaves_an_in_flight_reveal_alone() {
+        let mut tw = Typewriter::with_speed(MS_PER_CHAR);
         tw.push("aaaaaaaaaa");
-        assert_eq!(tw.visible(), "");
-        assert!(tw.is_animating());
-
+        tw.advance(Duration::from_millis(9));
         tw.push("bbb");
-        assert_eq!(tw.visible(), "aaaaaaaaaa");
+        assert_eq!(tw.visible(), "aa");
         assert!(tw.is_animating());
+    }
+
+    #[test]
+    fn push_restarts_the_clock_only_when_idle() {
+        let mut tw = Typewriter::with_speed(MS_PER_CHAR);
+        let stale = Instant::now() - IDLE_GAP;
+
+        tw.last_tick = stale;
+        tw.push("abc");
+        assert!(
+            tw.last_tick > stale,
+            "the idle gap must not count as reveal time"
+        );
+
+        tw.last_tick = stale;
+        tw.push("def");
+        assert_eq!(
+            tw.last_tick, stale,
+            "a chunk landing mid reveal must not stall it"
+        );
+    }
+
+    #[test_case(3,   &[9],     2 ; "base_rate_on_a_small_backlog")]
+    #[test_case(100, &[9],     4 ; "catch_up_on_a_big_backlog")]
+    #[test_case(3,   &[3, 3],  1 ; "fractions_carry_across_ticks")]
+    #[test_case(3,   &[1_000], 3 ; "stops_at_the_end")]
+    fn advance_reveals_by_rate(chunk_len: usize, ticks_ms: &[u64], expected_len: usize) {
+        let mut tw = Typewriter::with_speed(MS_PER_CHAR);
+        tw.push(&"a".repeat(chunk_len));
+        for &ms in ticks_ms {
+            tw.advance(Duration::from_millis(ms));
+        }
+        assert_eq!(tw.visible().len(), expected_len);
     }
 
     #[test]
