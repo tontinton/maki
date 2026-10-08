@@ -125,7 +125,7 @@ jsonrepair = { version = "0.1", default-features = false, features = ["serde"] }
 jsonschema = { version = "0.58", default-features = false }
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
 keyring = "4"
-arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
+arboard = { version = "3", default-features = false, features = ["image-data"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 flume = { version = "0.12", default-features = false, features = ["async", "select"] }
 pin-project-lite = "0.2"

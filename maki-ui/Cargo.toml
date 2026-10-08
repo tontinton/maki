@@ -44,6 +44,9 @@ shell-words = { workspace = true }
 open = { workspace = true }
 
 
+[target.'cfg(not(target_os = "haiku"))'.dependencies]
+arboard = { workspace = true, features = ["wayland-data-control"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
