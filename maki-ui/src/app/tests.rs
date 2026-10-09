@@ -3491,6 +3491,18 @@ fn help_modal_consumes_keys_and_esc_closes() {
     &[KeybindContext::Editing]
     ; "rewind_picker"
 )]
+#[test_case(
+    |app: &mut App| { app.input_box.set_vim_enabled(true); },
+    &[KeybindContext::Editing],
+    &[KeybindContext::Vim]
+    ; "vim_insert_mode"
+)]
+#[test_case(
+    |app: &mut App| { app.input_box.set_vim_enabled(true); app.update(Msg::Key(key(KeyCode::Esc))); },
+    &[KeybindContext::Editing, KeybindContext::Vim],
+    &[]
+    ; "vim_normal_mode"
+)]
 fn active_contexts(setup: fn(&mut App), expected: &[KeybindContext], absent: &[KeybindContext]) {
     let mut app = test_app();
     setup(&mut app);

@@ -49,6 +49,8 @@ const SUBAGENT_QUEUE_PLACEHOLDER: &str = "Queue a message for this subagent...";
 const ASK_PREFIX: &str = "Ask maki to ";
 const ASK_SUFFIX: &str = "...";
 const BLANK_PLACEHOLDER: &str = " ";
+const NORMAL_MODE_TAG: &str = " NORMAL ";
+const INSERT_MODE_TAG: &str = " INSERT ";
 
 #[derive(Clone, Copy)]
 pub enum Placeholder {
@@ -574,6 +576,9 @@ impl InputBox {
         if let Some(hint) = top_right_hint {
             block = block.title_top(hint.right_aligned());
         }
+        if let Some(vim) = &self.vim {
+            block = with_vim_tags(block, vim);
+        }
         let paragraph = Paragraph::new(text)
             .style(Style::new().fg(theme::current().foreground))
             .scroll((self.scroll_y, 0))
@@ -680,6 +685,23 @@ impl InputBox {
         }
 
         None
+    }
+}
+
+/// The mode on the left of the bottom border, and a half-typed command on
+/// the right. The border keeps the input height what it was.
+fn with_vim_tags<'a>(block: Block<'a>, vim: &Vim) -> Block<'a> {
+    let theme = theme::current();
+    let mode = match vim.mode() {
+        VimMode::Normal => Span::styled(NORMAL_MODE_TAG, theme.keybind_key),
+        VimMode::Insert => Span::styled(INSERT_MODE_TAG, theme.tool_dim),
+    };
+    let block = block.title_bottom(Line::from(mode));
+    match vim.pending_label() {
+        "" => block,
+        pending => block.title_bottom(
+            Line::from(Span::styled(format!(" {pending} "), theme.keybind_key)).right_aligned(),
+        ),
     }
 }
 
@@ -1912,6 +1934,27 @@ mod tests {
 
         input.set_vim_enabled(false);
         assert_eq!(input.vim_mode(), None);
+    }
+
+    #[test]
+    fn vim_tags_the_bottom_border_with_the_mode_and_the_half_typed_command() {
+        const HEIGHT: u16 = 4;
+        let bottom = |input: &mut InputBox| {
+            rendered_row(&render_input(input, TEST_WIDTH, HEIGHT), HEIGHT - 1)
+        };
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        assert!(
+            !bottom(&mut input).contains(INSERT_MODE_TAG.trim()),
+            "no tag while vim is off"
+        );
+
+        input.set_vim_enabled(true);
+        assert!(bottom(&mut input).starts_with(INSERT_MODE_TAG));
+
+        press(&mut input, "<Esc>d");
+        let row = bottom(&mut input);
+        assert!(row.starts_with(NORMAL_MODE_TAG), "{row:?}");
+        assert!(row.ends_with(" d"), "{row:?}");
     }
 
     /// A wheel scroll pins the view, so an edit has to bring the cursor back

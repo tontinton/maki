@@ -33,9 +33,12 @@ const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::General,
     KeybindContext::Editing,
     KeybindContext::Streaming,
+    KeybindContext::Vim,
     KeybindContext::FormInput,
     KeybindContext::Picker,
 ];
+
+const VIM_INTRO: &str = "Vim mode is off by default. `/vim` turns it on or off and Maki keeps that choice for the next start. To turn it on in the config, set `ui.vim_mode = true`. A new prompt starts in insert mode, where every Editing key above works as usual. The input border shows `NORMAL` or `INSERT`. A plugin binding on a plain key, such as `j`, still wins over vim in normal mode.\n\n";
 
 fn label_str(label: KeyLabel) -> String {
     match label {
@@ -59,6 +62,9 @@ fn write_table_2col(out: &mut String, rows: &[(String, &str)]) {
 
 fn write_section(out: &mut String, ctx: KeybindContext) {
     out.push_str(&format!("\n## {}\n\n", ctx.label()));
+    if ctx == KeybindContext::Vim {
+        out.push_str(VIM_INTRO);
+    }
 
     let all_rows: Vec<_> = KEYBINDS.iter().filter(|kb| kb.context == ctx).collect();
 
