@@ -684,17 +684,26 @@ pub(crate) mod tests {
         assert_eq!(typed_in_normal_mode(start, notation), expected);
     }
 
-    #[test]
-    fn cb_at_the_start_of_the_text_changes_nothing() {
-        let (mut vim, mut buf) = normal("|abc");
+    #[test_case("|abc"                    ; "one_word")]
+    #[test_case("|abc\n\ndef"              ; "an_empty_line_between_words")]
+    #[test_case("|foo\nbar baz"            ; "several_words_across_lines")]
+    #[test_case("|  abc\n  def\n  ghi"     ; "indented_lines")]
+    #[test_case("|abc\n   \ndef"           ; "a_blank_line_between_words")]
+    #[test_case("|abc\n\n"                 ; "trailing_empty_lines")]
+    #[test_case("|a\nb\nc"                 ; "single_character_lines")]
+    #[test_case("|a.b, c!"                 ; "punctuation")]
+    #[test_case("|  abc"                   ; "leading_blanks")]
+    #[test_case("|é漢\nç好"                 ; "multibyte_characters")]
+    fn cb_at_the_start_of_the_text_changes_nothing(start: &str) {
+        let (mut vim, mut buf) = normal(start);
         let version = buf.version();
-        for key in keys("cb") {
+        for key in keys("cbZ<Esc>") {
             press(&mut vim, &mut buf, key);
         }
         assert_eq!(vim.mode(), VimMode::Normal);
-        assert_eq!(vim.pending_label(), "", "the c went with the motion");
+        assert_eq!(vim.pending_label(), "");
         assert_eq!(buf.version(), version);
-        assert_eq!(shown(&buf), "|abc");
+        assert_eq!(shown(&buf), start);
     }
 
     /// What vim 9.1 gives for the same keys: the text, the cursor, and what the
