@@ -1010,6 +1010,31 @@ impl<'t> EventLoop<'t> {
             UiAction::WinRestView { scroll_top } => {
                 self.focused_app().scroll_to_row(scroll_top);
             }
+            UiAction::ScrollToBlock {
+                kind,
+                index,
+                reply_tx,
+            } => {
+                let ok = self.focused_app().scroll_to_block(kind, index);
+                let _ = reply_tx.send(if ok {
+                    Ok(json!(true))
+                } else {
+                    let kind: &'static str = kind.into();
+                    Err(format!("no {kind} #{index} in the transcript"))
+                });
+            }
+            UiAction::TranscriptOutline { reply_tx } => {
+                let entries: Vec<_> = self
+                    .focused_app()
+                    .transcript_outline()
+                    .into_iter()
+                    .map(|(kind, text)| {
+                        let kind: &'static str = kind.into();
+                        json!({ "kind": kind, "text": text })
+                    })
+                    .collect();
+                let _ = reply_tx.send(Ok(json!(entries)));
+            }
             UiAction::Builtin(action) => {
                 let actions = self.focused_app().run_builtin(action);
                 self.dispatch(self.focused, actions);

@@ -8,6 +8,7 @@ use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
+use maki_lua::BlockKind;
 use maki_providers::ImageMediaType;
 use ratatui::backend::TestBackend;
 use std::collections::HashSet;
@@ -320,6 +321,144 @@ fn render(panel: &mut MessagesPanel, width: u16, height: u16) -> ratatui::Termin
 
 fn rebuild(panel: &mut MessagesPanel) {
     render(panel, 80, 24);
+}
+
+#[test]
+fn scroll_to_block_steps_each_visible_kind() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "first question".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Thinking,
+        "pondering".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "an answer".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "second question".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "another answer".into(),
+    ));
+    panel.push(DisplayMessage::plan(
+        "the plan text".into(),
+        "plans/x.md".into(),
+    ));
+    rebuild(&mut panel);
+
+    let seg_of = |panel: &MessagesPanel, msg_idx: usize| {
+        panel
+            .cache
+            .segments()
+            .iter()
+            .position(|s| s.msg_index == Some(msg_idx) && s.tool_id.is_none())
+    };
+
+    assert!(
+        panel.scroll_to_block(BlockKind::Turn, 2),
+        "the second turn exists"
+    );
+    assert_eq!(panel.scroll.seg, seg_of(&panel, 3).unwrap());
+    assert!(!panel.auto_scroll, "jumping releases the bottom pin");
+
+    assert!(panel.scroll_to_block(BlockKind::Turn, 1));
+    assert_eq!(panel.scroll.seg, seg_of(&panel, 0).unwrap());
+
+    assert!(panel.scroll_to_block(BlockKind::Thinking, 1));
+    assert_eq!(panel.scroll.seg, seg_of(&panel, 1).unwrap());
+
+    assert!(panel.scroll_to_block(BlockKind::Reply, 2));
+    assert_eq!(panel.scroll.seg, seg_of(&panel, 4).unwrap());
+
+    assert!(
+        !panel.scroll_to_block(BlockKind::Reply, 3),
+        "no third reply exists; the plan bubble is Assistant but must not count"
+    );
+    assert!(
+        !panel.scroll_to_block(BlockKind::Thinking, 2),
+        "one thinking block only"
+    );
+    assert!(
+        !panel.scroll_to_block(BlockKind::Turn, 0),
+        "blocks are 1-based"
+    );
+    assert!(
+        !panel.scroll_to_block(BlockKind::Turn, 3),
+        "no third turn was asked for in vain"
+    );
+}
+
+#[test]
+fn outline_lists_jumpable_blocks_with_first_line_previews() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "first line\nignored".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Tool(Box::new(ToolRole {
+            id: "t1".into(),
+            status: ToolStatus::Success,
+            name: "bash".into(),
+        })),
+        "tool noise".into(),
+    ));
+    panel.push(DisplayMessage::new(DisplayRole::Thinking, "hmm".into()));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "an answer\nignored".into(),
+    ));
+    panel.push(DisplayMessage::new(DisplayRole::Error, "boom".into()));
+    panel.push(DisplayMessage::plan(
+        "the plan text".into(),
+        "plans/x.md".into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "x".repeat(OUTLINE_PREVIEW_BYTES + 60),
+    ));
+    rebuild(&mut panel);
+
+    let outline = panel.outline();
+    let kinds: Vec<&str> = outline
+        .iter()
+        .map(|(kind, _)| <&'static str>::from(*kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        ["turn", "thinking", "reply", "turn"],
+        "tools, errors and plan announcements are not jumpable blocks"
+    );
+    assert_eq!(
+        outline[0].1, "first line",
+        "preview stops at the first line"
+    );
+    assert_eq!(outline[2].1, "an answer");
+    assert_eq!(
+        outline[3].1.len(),
+        OUTLINE_PREVIEW_BYTES,
+        "a long first line is cut at the cap"
+    );
+
+    let mut counted = [0usize; 3];
+    for (kind, _) in &outline {
+        let slot = match kind {
+            BlockKind::Turn => &mut counted[0],
+            BlockKind::Thinking => &mut counted[1],
+            BlockKind::Reply => &mut counted[2],
+        };
+        *slot += 1;
+        assert!(
+            panel.scroll_to_block(*kind, *slot),
+            "the ordinal counted here is the one the jump answers"
+        );
+    }
 }
 
 #[test]

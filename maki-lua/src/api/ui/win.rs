@@ -119,6 +119,12 @@ fn event_table(lua: &Lua, event: WinEvent) -> LuaResult<Table> {
             tbl.set("text", text)?;
             Ok(tbl)
         }
+        WinEvent::Click { row, col } => {
+            let tbl = tagged(lua, "click")?;
+            tbl.set("row", row)?;
+            tbl.set("col", col)?;
+            Ok(tbl)
+        }
         WinEvent::Close => tagged(lua, "close"),
     }
 }
@@ -137,6 +143,9 @@ const recv__doc: FnDoc = FnDoc {
         `\"<S-Tab>\"`.\n\
         - `{type=\"resize\", width, height}` -- terminal was resized.\n\
         - `{type=\"paste\", text}` -- bracketed paste.\n\
+        - `{type=\"click\", row, col}` -- left click landed on this window. \
+        {row} is the 1-based buffer line under the cursor, accounting for the \
+        window's own scroll, and {col} the 1-based column in the content area.\n\
         - `{type=\"close\"}` -- window was closed externally.\n\
         - `{type=\"timeout\"}` -- no event arrived within {timeout_ms}.",
     params: &[ParamDoc {
@@ -400,6 +409,15 @@ mod tests {
         let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
         let handle = WinHandle::new(event_rx, WinSender::new(cmd_tx, None), 80, 24, true);
         (event_tx, cmd_rx, handle)
+    }
+
+    #[test]
+    fn click_event_table_carries_row_and_col() {
+        let lua = Lua::new();
+        let tbl = event_table(&lua, WinEvent::Click { row: 4, col: 7 }).unwrap();
+        assert_eq!(tbl.get::<String>("type").unwrap(), "click");
+        assert_eq!(tbl.get::<u16>("row").unwrap(), 4);
+        assert_eq!(tbl.get::<u16>("col").unwrap(), 7);
     }
 
     #[test]

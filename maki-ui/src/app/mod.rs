@@ -66,7 +66,7 @@ use maki_agent::{
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, Key, KeymapReader,
+    BlockKind, BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, Key, KeymapReader,
     LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
     PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, WinView, is_reserved,
 };
@@ -829,6 +829,14 @@ impl App {
 
     pub(crate) fn scroll_to_row(&mut self, doc_row: u32) {
         self.active_chat().scroll_to_row(doc_row);
+    }
+
+    pub(crate) fn scroll_to_block(&mut self, kind: BlockKind, index: usize) -> bool {
+        self.active_chat().scroll_to_block(kind, index)
+    }
+
+    pub(crate) fn transcript_outline(&self) -> Vec<(BlockKind, String)> {
+        self.chats[self.active_chat].outline()
     }
 
     fn clear_selection_unless_pending_copy(&mut self) {

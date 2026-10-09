@@ -19,7 +19,7 @@ pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::pack::{Declared, PackOp};
 pub use api::session::SessionSnapshotFn;
 pub use api::util::command::{
-    Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
+    Anchor, Axis, BlockKind, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
     HintReader, HintSnapshot, InputEdit, InputRequest, LuaCommandInfo, LuaCommandReader,
     ModelRequest, NO_UI_ERR, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRequest, PlanRowAction,
     SessionRequest, Split, TaskRequest, TitlePos, UiAction, UiAttachment, UiReply, WinCommand,
