@@ -718,11 +718,20 @@ pub(crate) mod tests {
     #[test_case("abc\n|\ndef",     "de",       "|abc",          "\ndef", true  ; "de_from_an_empty_line_leaves_no_blank_line")]
     #[test_case("a b\n | \nc",     "de",       "|a b",          "  \nc", true  ; "de_from_a_blank_line_deletes_both_lines")]
     #[test_case("abc\n|\ndef x",   "de",       "abc\n| x",      "\ndef", false ; "de_that_leaves_text_stays_charwise")]
+    #[test_case("abc\n|\ndef",          "cbZ<Esc>", "|Z\n\ndef",          "abc",      true ; "cb_onto_an_empty_line_keeps_the_line_below")]
+    #[test_case("foo\n|bar baz",        "cbZ<Esc>", "|Z\nbar baz",        "foo",      true ; "cb_from_column_0_changes_the_unindented_line_above")]
     #[test_case("  abc\n|  def\n  ghi", "db",       "  |def\n  ghi",      "  abc",    true ; "db_preserves_the_lines_below_an_indented_line")]
+    #[test_case("  abc\n|  def\n  ghi", "cbZ<Esc>", "|Z\n  def\n  ghi",   "  abc",    true ; "cb_preserves_the_lines_below_an_indented_line")]
     #[test_case("  abc\n  def\n|  ghi", "db",       "  abc\n  |ghi",      "  def",    true ; "db_preserves_the_lines_above_an_indented_line")]
+    #[test_case("  abc\n  def\n|  ghi", "cbZ<Esc>", "  abc\n|Z\n  ghi",   "  def",    true ; "cb_preserves_the_lines_above_an_indented_line")]
     #[test_case("abc\n|   \ndef",       "db",       "  | \ndef",          "abc",      true ; "db_onto_a_blank_line_clamps_the_cursor_to_its_last_character")]
     #[test_case("abc\n |  \ndef",       "db",       "|def",               "abc\n   ", true ; "db_from_inside_a_blank_line_deletes_both_lines")]
     #[test_case("abc\n  | \ndef",       "db",       "|def",               "abc\n   ", true ; "db_from_the_end_of_a_blank_line_deletes_both_lines")]
+    #[test_case("abc\n|   \ndef",       "cbZ<Esc>", "|Z\n   \ndef",       "abc",      true ; "cb_onto_a_blank_line_keeps_its_indent")]
+    #[test_case("abc\n   \n|def",       "cbZ<Esc>", "|Z\ndef",            "abc\n   ", true ; "cb_across_a_blank_line_changes_both_lines")]
+    #[test_case("abc\n|\n",             "cbZ<Esc>", "|Z\n\n",             "abc",      true ; "cb_onto_a_trailing_empty_line_keeps_both_line_breaks")]
+    #[test_case("a\n|b\nc",             "cbZ<Esc>", "|Z\nb\nc",           "a",        true ; "cb_from_a_single_character_middle_line_keeps_the_lines_below")]
+    #[test_case("a\nb\n|c",             "cbZ<Esc>", "a\n|Z\nc",           "b",        true ; "cb_from_a_single_character_last_line_keeps_the_line_above")]
     fn an_operator_across_lines(
         start: &str,
         notation: &str,
