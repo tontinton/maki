@@ -128,6 +128,8 @@ const FAST_PENDING_MSG: &str = "Fast mode: pending model discovery";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
+pub(crate) const VIM_ON_MSG: &str = "Vim mode: on";
+pub(crate) const VIM_OFF_MSG: &str = "Vim mode: off";
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
 const PACK_CHANGES_DECLINED: &str = "Package changes declined";
@@ -445,7 +447,7 @@ impl App {
         let state = SessionState::from_session(session, model, &storage);
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
-        let input_box = InputBox::new(
+        let mut input_box = InputBox::new(
             InputHistory::load(
                 &storage,
                 &env::current_dir().unwrap_or_else(|_| PathBuf::from(&state.session.cwd)),
@@ -453,6 +455,7 @@ impl App {
             ),
             ui_config.max_input_lines,
         );
+        input_box.set_vim_enabled(ui_config.vim_mode);
         let mut app = Self {
             chats: vec![Chat::new(
                 state.session.id,
@@ -1914,6 +1917,12 @@ impl App {
                     Err(msg) => self.flash(msg),
                 }
                 vec![]
+            }
+            "/vim" => {
+                let enabled = self.input_box.vim_mode().is_none();
+                self.input_box.set_vim_enabled(enabled);
+                self.flash(if enabled { VIM_ON_MSG } else { VIM_OFF_MSG }.into());
+                vec![Action::SetVimMode(enabled)]
             }
             "/workflow" => {
                 self.state.workflow = !self.state.workflow;

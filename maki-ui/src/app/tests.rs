@@ -124,7 +124,14 @@ fn build_app_with_lua(
     lua_commands: LuaCommandReader,
 ) -> App {
     let tab = OpenSession::fresh(TEST_MODEL_SPEC, TEST_CWD, &dir);
-    build_app_with_session(dir, writer, lua_commands, tab, test_permissions(false))
+    build_app_with_session(
+        dir,
+        writer,
+        lua_commands,
+        tab,
+        test_permissions(false),
+        UiConfig::default(),
+    )
 }
 
 fn test_permissions(yolo: bool) -> Arc<PermissionManager> {
@@ -145,6 +152,7 @@ fn build_app_with_session(
     lua_commands: LuaCommandReader,
     tab: OpenSession,
     permissions: Arc<PermissionManager>,
+    ui_config: UiConfig,
 ) -> App {
     // Mirrors the event loop, where the session's own spec decides and the
     // startup model catches one that will not resolve.
@@ -160,7 +168,7 @@ fn build_app_with_session(
         KeymapReader::empty(),
         HintReader::empty(),
         writer,
-        UiConfig::default(),
+        ui_config,
         100,
         permissions,
         Arc::from([]),
@@ -180,13 +188,36 @@ pub(crate) fn test_app() -> App {
     )
 }
 
+/// A tab built from {ui_config}, the config the event loop hands every tab it
+/// spawns.
+pub(crate) fn app_with_ui_config(ui_config: UiConfig) -> App {
+    let dir = tmp_state();
+    let writer = Arc::new(test_writer(dir.clone()));
+    let tab = tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD));
+    build_app_with_session(
+        dir,
+        writer,
+        LuaCommandReader::empty(),
+        tab,
+        test_permissions(false),
+        ui_config,
+    )
+}
+
 /// A tab the way `Ctrl-N` and a resume build one. `App::new` takes the session
 /// plus a fork of the prototype manager, and everything the permissions do has
 /// to come back out of that meta.
 fn spawned_app(tab: OpenSession, permissions: Arc<PermissionManager>) -> App {
     let dir = tmp_state();
     let writer = Arc::new(test_writer(dir.clone()));
-    let mut app = build_app_with_session(dir, writer, LuaCommandReader::empty(), tab, permissions);
+    let mut app = build_app_with_session(
+        dir,
+        writer,
+        LuaCommandReader::empty(),
+        tab,
+        permissions,
+        UiConfig::default(),
+    );
     let (shared_queue, _rx) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
@@ -5539,6 +5570,23 @@ fn vim_a_popup_claiming_esc_answers_before_insert_mode_does() {
     let _ = app.float_mgr.tick();
     press_esc(&mut app);
     assert_eq!(app.input_box.vim_mode(), Some(VimMode::Normal));
+}
+
+/// The other tabs, the tabs opened later and the next start follow through
+/// the action, which `set_vim_mode` in the event loop answers.
+#[test]
+fn vim_command_toggles_this_tab_and_sends_the_mode_on() {
+    let mut app = test_app();
+
+    let actions = type_and_submit(&mut app, "/vim");
+    assert!(matches!(actions[..], [Action::SetVimMode(true)]));
+    assert_eq!(app.input_box.vim_mode(), Some(VimMode::Insert));
+    assert_eq!(app.status_bar.flash_text(), Some(VIM_ON_MSG));
+
+    let actions = app.execute_command(cmd("/vim"), 0);
+    assert!(matches!(actions[..], [Action::SetVimMode(false)]));
+    assert_eq!(app.input_box.vim_mode(), None);
+    assert_eq!(app.status_bar.flash_text(), Some(VIM_OFF_MSG));
 }
 
 /// With an empty draft, `/` in normal mode types itself and opens the
