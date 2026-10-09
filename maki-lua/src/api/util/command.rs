@@ -680,7 +680,11 @@ pub struct UiAttachment(Arc<AtomicBool>);
 impl Default for UiAttachment {
     /// Starts attached, so what a TUI host sends before its loop is up gets
     /// answered once it is. A headless host has no sender at all, so this bit
-    /// only ever tells of a loop that went away.
+    /// only ever tells of a loop that went away. A test harness (or other
+    /// embedder) that drains `ui_action_rx` itself without ever building an
+    /// `EventLoop` relies on this default too, so it stays `true`; real
+    /// cold-start plugin load closes its own gap instead by detaching
+    /// explicitly before `EventLoop::new` reattaches.
     fn default() -> Self {
         Self(Arc::new(AtomicBool::new(true)))
     }

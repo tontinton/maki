@@ -112,8 +112,18 @@ pub struct CancelSlot(u64);
 struct Entry {
     /// Held, never read. Dropping a trigger is what fires the token of the
     /// session that registered it.
-    registrations: Vec<(CancelSlot, CancelTrigger)>,
+    registrations: Vec<Registration>,
     cancelled: bool,
+}
+
+struct Registration {
+    slot: CancelSlot,
+    /// Held, never read. Dropping it is what fires the token.
+    #[allow(dead_code)]
+    trigger: CancelTrigger,
+    /// Detached (background) sessions outlive the run that spawned them, so
+    /// the run-end sweep must not fire their triggers.
+    detached: bool,
 }
 
 /// Triggers grouped under an id a user can name and stop from the outside. One
@@ -146,15 +156,21 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
     }
 
     /// Registers {trigger} under {id}, alongside any already there, and
-    /// returns the slot to hand back to [`retire`](Self::retire).
-    pub fn insert(&self, id: K, trigger: CancelTrigger) -> CancelSlot {
+    /// returns the slot to hand back to [`retire`](Self::retire). {detached}
+    /// marks the session as outliving the run, excluded from
+    /// [`end_run`](Self::end_run).
+    pub fn insert(&self, id: K, trigger: CancelTrigger, detached: bool) -> CancelSlot {
         let mut map = self.lock();
         let slot = CancelSlot(self.next_slot.fetch_add(1, Ordering::Relaxed));
         let entry = map.entry(id).or_default();
         // Under a cancelled id the trigger is dropped instead of stored, and
         // that drop is what fires the token, so the session is born cancelled.
         if !entry.cancelled {
-            entry.registrations.push((slot, trigger));
+            entry.registrations.push(Registration {
+                slot,
+                trigger,
+                detached,
+            });
         }
         slot
     }
@@ -168,16 +184,20 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
         };
         entry
             .registrations
-            .retain(|&(registered, _)| registered != slot);
+            .retain(|registered| registered.slot != slot);
     }
 
     /// Cancels every registration under {id} and marks the id, so a session
-    /// registering under it later is born cancelled too.
-    pub fn cancel(&self, id: K) {
+    /// registering under it later is born cancelled too. Returns whether any
+    /// live registration was cancelled; `false` is a pure precancel, i.e. the
+    /// caller addressed a session that does not exist.
+    pub fn cancel(&self, id: K) -> bool {
         let mut map = self.lock();
         let entry = map.entry(id).or_default();
         entry.cancelled = true;
+        let hit = !entry.registrations.is_empty();
         entry.registrations.clear();
+        hit
     }
 
     /// A plugin that loads again needs this, or every task it starts would be
@@ -188,8 +208,20 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
         }
     }
 
-    /// The run that owned these is over: stop what is still registered and drop
-    /// the marks with it, so no cancel of this run leaks into the next one.
+    /// The run that registered these is over: stop the sessions still attached
+    /// to it and drop their ids with it, so no cancel of this run leaks into
+    /// the next one. Detached registrations survive — a background session
+    /// must outlive the turn that spawned it, stopped only by a targeted
+    /// cancel or [`cancel_all`](Self::cancel_all).
+    pub fn end_run(&self) {
+        self.lock().retain(|_, entry| {
+            entry.registrations.retain(|registered| registered.detached);
+            !entry.registrations.is_empty() || entry.cancelled
+        });
+    }
+
+    /// Cancels every registration and drops the marks, so nothing survives a
+    /// respawn or a user cancel-all.
     pub fn cancel_all(&self) {
         self.lock().clear();
     }
@@ -321,10 +353,10 @@ mod tests {
         match shape {
             Shape::Empty => {}
             Shape::Occupied => {
-                map.insert(key(), earlier);
+                map.insert(key(), earlier, false);
             }
             Shape::Hole => {
-                let slot = map.insert(key(), earlier);
+                let slot = map.insert(key(), earlier, false);
                 map.retire(&key(), slot);
             }
         }
@@ -332,7 +364,7 @@ mod tests {
         map.cancel(key());
 
         let (trigger, token) = CancelToken::new();
-        map.insert(key(), trigger);
+        map.insert(key(), trigger, false);
         assert!(token.is_cancelled(), "{LOST_CANCEL}");
     }
 
@@ -341,8 +373,8 @@ mod tests {
         let map = CancelMap::new();
         let (t1, tok1) = CancelToken::new();
         let (t2, tok2) = CancelToken::new();
-        map.insert(key(), t1);
-        map.insert(OTHER_KEY.to_owned(), t2);
+        map.insert(key(), t1, false);
+        map.insert(OTHER_KEY.to_owned(), t2, false);
         map.cancel(key());
 
         map.cancel_all();
@@ -351,7 +383,7 @@ mod tests {
         assert!(!map.has_key(&key()));
 
         let (trigger, token) = CancelToken::new();
-        map.insert(key(), trigger);
+        map.insert(key(), trigger, false);
         assert!(!token.is_cancelled());
     }
 
@@ -362,8 +394,8 @@ mod tests {
         let map = CancelMap::new();
         let (t1, tok1) = CancelToken::new();
         let (t2, tok2) = CancelToken::new();
-        map.insert(key(), t1);
-        map.insert(key(), t2);
+        map.insert(key(), t1, false);
+        map.insert(key(), t2, false);
         assert!(!tok1.is_cancelled(), "a sibling must not evict the first");
         assert!(!tok2.is_cancelled());
 
@@ -377,8 +409,8 @@ mod tests {
         let map = CancelMap::new();
         let (t1, tok1) = CancelToken::new();
         let (t2, tok2) = CancelToken::new();
-        let slot1 = map.insert(key(), t1);
-        map.insert(key(), t2);
+        let slot1 = map.insert(key(), t1, false);
+        map.insert(key(), t2, false);
 
         map.retire(&key(), slot1);
         assert!(tok1.is_cancelled(), "retiring drops that trigger");
@@ -397,11 +429,11 @@ mod tests {
         assert!(!map.has_key(&key()), "reviving an unknown id must not leak");
 
         let (stale_trigger, _stale) = CancelToken::new();
-        let stale_slot = map.insert(key(), stale_trigger);
+        let stale_slot = map.insert(key(), stale_trigger, false);
         map.cancel(key());
         map.revive(&key());
         let (trigger, token) = CancelToken::new();
-        map.insert(key(), trigger);
+        map.insert(key(), trigger, false);
 
         map.retire(&key(), stale_slot);
         assert!(
@@ -411,5 +443,56 @@ mod tests {
 
         map.cancel(key());
         assert!(token.is_cancelled(), "a revived id can be cancelled again");
+    }
+
+    /// A detached session outlives the run that spawned it: the run-end sweep
+    /// stops only what is still attached. Losing this killed background
+    /// subagents the moment the parent's turn ended.
+    #[test]
+    fn end_run_stops_attached_but_spares_detached() {
+        let map = CancelMap::new();
+        let (attached, attached_tok) = CancelToken::new();
+        let (detached, detached_tok) = CancelToken::new();
+        map.insert(key(), attached, false);
+        map.insert(key(), detached, true);
+
+        map.end_run();
+        assert!(
+            attached_tok.is_cancelled(),
+            "the run-end sweep stops attached sessions"
+        );
+        assert!(
+            !detached_tok.is_cancelled(),
+            "the run-end sweep must not kill detached sessions"
+        );
+
+        // A targeted cancel still reaches the survivor.
+        map.cancel(key());
+        assert!(detached_tok.is_cancelled());
+    }
+
+    #[test]
+    fn end_run_forgets_swept_ids_but_keeps_detached_marks() {
+        let map = CancelMap::new();
+        let (t1, _tok1) = CancelToken::new();
+        let (t2, _tok2) = CancelToken::new();
+        map.insert(key(), t1, false);
+        map.insert(OTHER_KEY.to_owned(), t2, true);
+
+        map.end_run();
+        assert!(
+            !map.has_key(&key()),
+            "an id with nothing left must not leak"
+        );
+        assert!(
+            map.has_key(&OTHER_KEY.to_owned()),
+            "a detached session keeps its id"
+        );
+
+        // The cancelled mark survives while the id lives on.
+        map.cancel(OTHER_KEY.to_owned());
+        let (trigger, token) = CancelToken::new();
+        map.insert(OTHER_KEY.to_owned(), trigger, true);
+        assert!(token.is_cancelled(), "{LOST_CANCEL}");
     }
 }
