@@ -6,7 +6,7 @@ use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
-use crate::components::messages::ScrollPos;
+use crate::components::messages::{ScrollPos, ScrollSnapshot};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
@@ -1578,7 +1578,14 @@ fn load_session_clears_plan() {
     let session = AppSession::load(app.state.session.id, &app.storage).unwrap();
     app.state.mode = Mode::Build;
     app.state.plan = PlanState::Ready(PathBuf::from("old-plan.md"));
-    app.apply_loaded_session(OpenSession { session, claim }, &test_model());
+    app.apply_loaded_session(
+        OpenSession {
+            session,
+            claim,
+            snapshot: None,
+        },
+        &test_model(),
+    );
     assert_eq!(app.state.mode, Mode::Build);
     assert_eq!(app.state.plan.path(), None);
 }
@@ -2160,7 +2167,7 @@ fn open_help(app: &mut App) {
 }
 
 fn open_search(app: &mut App) {
-    app.search_modal.open(ScrollPos::default(), true);
+    app.search_modal.open(ScrollSnapshot::default());
 }
 
 fn focus_queue(app: &mut App) {
@@ -4338,18 +4345,18 @@ fn search_reaches_output_that_lands_while_the_modal_is_open(status: Status) {
     );
 }
 
-#[test_case(ScrollPos { seg: 4, row: 2 }, false ; "restores_scroll_position")]
-#[test_case(ScrollPos::default(),          true  ; "restores_auto_scroll")]
-fn search_escape_restores_scroll(scroll: ScrollPos, auto_scroll: bool) {
+#[test_case(ScrollSnapshot { scroll: ScrollPos { seg: 4, row: 2 }, auto_scroll: false } ; "restores_scroll_position")]
+#[test_case(ScrollSnapshot::default() ; "restores_auto_scroll")]
+fn search_escape_restores_scroll(snapshot: ScrollSnapshot) {
     let mut app = test_app();
-    app.active_chat().restore_scroll(scroll, auto_scroll);
+    app.active_chat().restore_scroll(snapshot);
 
     app.update(Msg::Key(kb::SEARCH.to_key_event()));
     app.update(Msg::Key(key(KeyCode::Esc)));
 
     assert!(!app.search_modal.is_open());
-    assert_eq!(app.active_chat().scroll_pos(), scroll);
-    assert_eq!(app.active_chat().auto_scroll(), auto_scroll);
+    assert_eq!(app.active_chat().scroll_pos(), snapshot.scroll);
+    assert_eq!(app.active_chat().auto_scroll(), snapshot.auto_scroll);
 }
 
 #[test]
@@ -7249,6 +7256,7 @@ fn loading_ends_the_previous_session_only_when_the_id_changes(same: bool) {
         OpenSession {
             session: (*app.state.session).clone(),
             claim: app.state.claim.clone(),
+            snapshot: None,
         }
     } else {
         OpenSession::claimed(AppSession::new(TEST_MODEL_SPEC, TEST_CWD), &app.storage)

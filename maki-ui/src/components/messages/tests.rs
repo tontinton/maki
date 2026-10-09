@@ -844,13 +844,13 @@ fn win_view_clamps_a_restored_offset_past_the_end() {
         .set_buffer(&"a\n".repeat(LINES as usize));
     render(&mut panel, 80, HEIGHT);
 
-    panel.restore_scroll(
-        ScrollPos {
+    panel.restore_scroll(ScrollSnapshot {
+        scroll: ScrollPos {
             seg: usize::MAX,
             row: u16::MAX,
         },
-        true,
-    );
+        auto_scroll: true,
+    });
 
     let view = panel.win_view();
     assert_eq!(view.scroll_top, u32::from(LINES - HEIGHT));
