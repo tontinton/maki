@@ -2068,6 +2068,12 @@ impl App {
                     self.state
                         .session_mut()
                         .set_cwd(canonical.to_string_lossy().into_owned());
+                    self.fire_session_autocmd(
+                        "SessionCwdChanged",
+                        serde_json::json!({
+                            "cwd": canonical.to_string_lossy(),
+                        }),
+                    );
                 }
                 self.status_bar.refresh_cwd();
                 self.flash(format!("cd {}", path.display()))

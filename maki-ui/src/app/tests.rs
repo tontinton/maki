@@ -3774,6 +3774,54 @@ fn cd_command_behavior() {
     assert!(flash.starts_with("cd: "), "error flash={flash:?}");
 }
 
+/// Plugins that track the working directory retitle windows and rerun
+/// project detection on this event, so it has to fire only on a real move.
+#[test]
+fn cd_fires_cwd_changed_with_the_new_directory() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.execute_command(
+        ParsedCommand {
+            name: "/cd".into(),
+            args: "/tmp".into(),
+            bang: false,
+        },
+        0,
+    );
+
+    let (event, data) = probe.try_recv_autocmd().expect("SessionCwdChanged fired");
+    assert_eq!(event, "SessionCwdChanged");
+    let resolved = maki_storage::paths::canonicalize_clean(Path::new("/tmp"));
+    assert_eq!(data["cwd"], serde_json::json!(resolved.to_string_lossy()));
+    assert_eq!(
+        data["session_id"],
+        serde_json::json!(app.state.session.id.to_string())
+    );
+}
+
+#[test]
+fn failed_cd_fires_no_cwd_changed() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.execute_command(
+        ParsedCommand {
+            name: "/cd".into(),
+            args: "/nonexistent_path_12345".into(),
+            bang: false,
+        },
+        0,
+    );
+
+    assert!(
+        probe.try_recv_autocmd().is_none(),
+        "no event on a failed cd"
+    );
+}
+
 #[test]
 fn cd_swaps_input_history_to_the_new_dir() {
     let (tmp, dir, _writer, mut app) = tempdir_app();
