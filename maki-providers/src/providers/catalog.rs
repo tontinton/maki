@@ -1847,6 +1847,7 @@ mod tests {
     #[test_case("openrouter", "openrouter", "@openrouter/ai-sdk-provider", Some("https://openrouter.ai/api/v1"); "bundled plugin with a vendor sdk")]
     #[test_case("mistral", "mistral", "@ai-sdk/mistral", None; "bundled plugin with no base url")]
     #[test_case("deepseek", "deepseek", "@ai-sdk/openai-compatible", Some("https://api.deepseek.com"); "bundled plugin the catalog could serve")]
+    #[test_case("runinfra", "runinfra", "@ai-sdk/openai-compatible", Some("https://api.runinfra.ai/v1"); "bundled official listing")]
     fn builtins_keep_their_catalog_metadata(
         catalog_id: &str,
         slug: &str,

@@ -1,0 +1,4 @@
+[permissions]
+net = true
+env = true
+net_hosts = ["api.runinfra.ai"]

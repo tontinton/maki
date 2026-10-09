@@ -14,8 +14,14 @@ use maki_agent::tools::ToolRegistry;
 use maki_config::providers::builtin_provider;
 use maki_config::{PROVIDER_BUILTINS, PluginsConfig};
 use maki_lua::PluginHost;
+use maki_providers::model::ModelPricing;
+use maki_providers::model_registry;
 use maki_providers::plugin;
+use maki_providers::test_support::{Canned, serve};
 use maki_providers::{Model, ResolvedAuth, ThinkingSupport, Timeouts};
+use maki_storage::StateDir;
+use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
+use serde_json::Value;
 use tempfile::TempDir;
 use test_case::test_case;
 
@@ -28,6 +34,13 @@ const MISTRAL_KEY_ENV: &str = "MISTRAL_API_KEY";
 const MISTRAL_KEY: &str = "sk-test";
 const MINISTRAL: &str = "ministral-14b-latest";
 const MEDIUM: &str = "mistral-medium-latest";
+const RUNINFRA: &str = "runinfra";
+const RUNINFRA_KEY_ENV: &str = "RUNINFRA_API_KEY";
+const RUNINFRA_BASE_URL_ENV: &str = "RUNINFRA_BASE_URL";
+const RUNINFRA_KEY: &str = "sk-existing-runinfra";
+const RUNINFRA_AUTHORIZATION: &str = "Bearer sk-existing-runinfra";
+const RUNINFRA_MODEL: &str = "runinfra/qwen3-8-27b";
+const RUNINFRA_MODELS_GOLDEN: &str = include_str!("../goldens/runinfra/models.json");
 
 const HOME_VARS: &[&str] = &[
     "HOME",
@@ -107,6 +120,42 @@ fn deepseek_bills_the_published_peak_hours() {
         .and_then(|spec| spec.pricing_schedule)
         .expect(NO_SCHEDULE);
     assert_eq!(schedule.to_string(), PUBLISHED_PEAK_HOURS);
+}
+
+#[test]
+fn runinfra_reuses_saved_credentials_and_resolves_live_metadata() {
+    let _state = isolated_state();
+    unsafe { std::env::remove_var(RUNINFRA_KEY_ENV) };
+    save_provider_credentials(
+        &StateDir::resolve().unwrap(),
+        RUNINFRA,
+        &ProviderCredentials {
+            api_key: RUNINFRA_KEY.to_owned(),
+            host: None,
+        },
+    )
+    .unwrap();
+    let fixture: Value = serde_json::from_str(RUNINFRA_MODELS_GOLDEN).unwrap();
+    let body = fixture["script"][0]["body"].as_str().unwrap().to_owned();
+    let (base_url, requests) = serve(Box::leak(Box::new([Canned::json(200, body.leak())])));
+    unsafe { std::env::set_var(RUNINFRA_BASE_URL_ENV, base_url) };
+    let _host = load_bundled(RUNINFRA);
+    let provider = plugin::create(RUNINFRA, Timeouts::default()).unwrap();
+    let models = smol::block_on(provider.list_models()).unwrap();
+    model_registry::set_known_models(RUNINFRA, models);
+
+    let model = Model::from_spec(RUNINFRA_MODEL).expect(UNKNOWN_MODEL);
+    assert_eq!(model.context_window, 262144);
+    assert_eq!(model.max_output_tokens, Some(262144));
+    assert_eq!(
+        model.pricing,
+        ModelPricing::per_million(0.1, 0.4, 0.0, 0.01)
+    );
+    assert!(model.supports_thinking());
+    assert!(model.supports_vision());
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].authorization(), RUNINFRA_AUTHORIZATION);
 }
 
 fn mistral_model(model_id: &str) -> Model {

@@ -1,0 +1,100 @@
+{
+  "call": {
+    "endpoint": "discovered",
+    "model": "runinfra/deepseek-v4-1-flash",
+    "thinking": {
+      "kind": "off"
+    }
+  },
+  "script": [
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"data\":[{\"id\":\"deepseek-v4-1-flash\",\"supported_endpoints\":[\"chat_completions\",\"responses\",\"messages\"],\"input_modalities\":[\"text\"],\"reasoning_efforts\":[\"none\",\"low\",\"high\",\"xhigh\",\"max\"],\"context_window\":1048576,\"max_output_tokens\":1048576,\"pricing\":{\"input\":0.14,\"output\":0.58},\"cached_input_price_usd_per_mtok\":0.03}]}"
+    },
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "text/event-stream"
+      },
+      "body": "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n\ndata: [DONE]\n\n"
+    }
+  ],
+  "expected": {
+    "discovery": {
+      "models": [
+        {
+          "id": "deepseek-v4-1-flash",
+          "context_window": 1048576,
+          "max_output_tokens": 1048576,
+          "pricing": {
+            "input": 0.14,
+            "output": 0.58,
+            "cache_write": 0.0,
+            "cache_read": 0.03,
+            "fast": null
+          },
+          "supports_thinking": true,
+          "supports_vision": false,
+          "tier": null
+        }
+      ]
+    },
+    "requests": [
+      {
+        "method": "GET",
+        "path": "/v1/models",
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "body": "{\"messages\":[{\"content\":\"You are a replay fixture.\",\"role\":\"system\"},{\"content\":\"read a.txt\",\"role\":\"user\"}],\"model\":\"deepseek-v4-1-flash\",\"reasoning_effort\":\"none\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"function\":{\"description\":\"Read a file\",\"name\":\"read\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}},\"type\":\"function\"}]}",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>",
+          "content-type": "application/json",
+          "content-length": "395"
+        }
+      }
+    ],
+    "events": [
+      {
+        "TextDelta": {
+          "text": "Hello"
+        }
+      }
+    ],
+    "outcome": {
+      "context_size": 9,
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello"
+          }
+        ]
+      },
+      "stop_reason": "end_turn",
+      "usage": {
+        "input_tokens": 6,
+        "output_tokens": 2,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 3
+      }
+    }
+  }
+}

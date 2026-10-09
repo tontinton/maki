@@ -45,7 +45,7 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 
 ## Built-in Providers
 
-`deepseek`, `mistral`, `openrouter`, `regolo`, `requesty`, `synthetic` and `tensorx` ship as bundled [plugins](/docs/plugins/) and are listed last. Turn one off with `plugins = { tensorx = { enabled = false } }` in [`maki.setup`](/docs/configuration/#plugins).
+`deepseek`, `mistral`, `openrouter`, `regolo`, `requesty`, `runinfra`, `synthetic` and `tensorx` ship as bundled [plugins](/docs/plugins/) and are listed last. Turn one off with `plugins = { tensorx = { enabled = false } }` in [`maki.setup`](/docs/configuration/#plugins).
 
 ### Anthropic
 
@@ -321,6 +321,14 @@ Defaults: qwen3.5-122b (strong), qwen3-coder-next (medium), qwen3.5-9b (weak)
 - **Features**: 700+ models behind one key, managed routing policies, EU region
 
 Models are listed live from the API. Managed policies come first, with short ids such as `requesty/claude-sonnet-4-5`, and their `@eu` variants use only EU providers. The full `<vendor>/<model>` catalog follows, e.g. `requesty/openai/gpt-4o-mini`. Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all traffic in the EU.
+
+### RunInfra
+
+- **Env var**: `RUNINFRA_API_KEY`
+- **API**: `https://api.runinfra.ai/v1`
+- **Features**: Open models, prompt caching, model-specific reasoning and image input
+
+Model IDs, limits, capabilities and USD token prices come from the authenticated [RunInfra model listing](https://runinfra.ai/docs/api-reference/models). Paused models stay listed with no published price.
 
 ### Synthetic
 

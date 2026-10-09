@@ -1,0 +1,94 @@
+{
+  "call": {
+    "endpoint": "models"
+  },
+  "script": [
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"data\":[{\"id\":\"paused\",\"supported_endpoints\":[\"chat_completions\"],\"availability\":\"paused\",\"context_window\":64000,\"max_output_tokens\":8192,\"input_modalities\":[\"text\"],\"reasoning_efforts\":[\"none\"]},{\"id\":\"aliases\",\"supported_endpoints\":[\"chat_completions\"],\"context_length\":128000,\"max_completion_tokens\":16384,\"input_modalities\":[\"image\",\"text\"],\"reasoning_efforts\":[\"low\",\"high\"],\"pricing\":{\"input\":0,\"output\":2.5},\"cached_input_price\":0.125},{\"id\":\"invalid\",\"supported_endpoints\":[\"chat_completions\"],\"context_window\":4294967296,\"max_output_tokens\":1.5,\"pricing\":{\"input\":-1,\"output\":2},\"input_modalities\":null,\"reasoning_efforts\":null},{\"id\":\"partial-price\",\"supported_endpoints\":[\"chat_completions\"],\"context_window\":0,\"max_output_tokens\":-1,\"pricing\":{\"input\":1}},{\"id\":\"undeclared\",\"supported_endpoints\":[\"chat_completions\"]},{\"id\":\"numeric-strings\",\"supported_endpoints\":[\"chat_completions\"],\"context_window\":\"64000\",\"max_output_tokens\":\"8192\",\"pricing\":{\"input\":\"0.1\",\"output\":\"0.4\"}},{\"id\":\"aliases\",\"supported_endpoints\":[\"chat_completions\"],\"context_window\":1},{\"id\":\"embedding\",\"supported_endpoints\":[\"embeddings\"]},{\"id\":\"image\",\"supported_endpoints\":[\"images\"]},{\"id\":\"\",\"supported_endpoints\":[\"chat_completions\"]},{\"supported_endpoints\":[\"chat_completions\"]},{\"id\":\"missing-endpoint\"},\"malformed row\"]}"
+    }
+  ],
+  "expected": {
+    "outcome": {
+      "models": [
+        {
+          "id": "aliases",
+          "context_window": 128000,
+          "max_output_tokens": 16384,
+          "pricing": {
+            "input": 0.0,
+            "output": 2.5,
+            "cache_write": 0.0,
+            "cache_read": 0.125,
+            "fast": null
+          },
+          "supports_thinking": true,
+          "supports_vision": true,
+          "tier": null
+        },
+        {
+          "id": "invalid",
+          "context_window": null,
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "id": "numeric-strings",
+          "context_window": null,
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "id": "partial-price",
+          "context_window": null,
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        },
+        {
+          "id": "paused",
+          "context_window": 64000,
+          "max_output_tokens": 8192,
+          "pricing": null,
+          "supports_thinking": true,
+          "supports_vision": false,
+          "tier": null
+        },
+        {
+          "id": "undeclared",
+          "context_window": null,
+          "max_output_tokens": null,
+          "pricing": null,
+          "supports_thinking": null,
+          "supports_vision": null,
+          "tier": null
+        }
+      ]
+    },
+    "requests": [
+      {
+        "method": "GET",
+        "path": "/v1/models",
+        "body": "",
+        "headers": {
+          "accept": "*/*",
+          "accept-encoding": "deflate, gzip",
+          "authorization": "Bearer sk-replay",
+          "host": "<volatile>",
+          "user-agent": "<volatile>"
+        }
+      }
+    ]
+  }
+}
