@@ -24,7 +24,31 @@ pub struct TextBuffer {
     raw_x: usize,
     cursor_y: usize,
     version: u64,
+    undo: Vec<Snapshot>,
+    edit_group: Option<EditGroup>,
 }
+
+/// The buffer before one undoable step. Restoring also restores the cursor,
+/// because an undo that leaves the caret somewhere else is a search for where
+/// the text went.
+#[derive(Clone)]
+struct Snapshot {
+    lines: Vec<String>,
+    raw_x: usize,
+    cursor_y: usize,
+}
+
+/// Which consecutive small edits share one snapshot. A paste, a word kill or
+/// a plugin write is never a group: each is already a step the user meant.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditGroup {
+    Typing,
+    Deleting,
+}
+
+/// Enough history for a long paste session typed over, and small enough that
+/// the buffer cannot grow without bound on a held key.
+const MAX_UNDO: usize = 64;
 
 /// Refuses an offset that splits a character. Rounding it would move an edit
 /// a plugin asked for onto text it never read.
@@ -63,6 +87,8 @@ impl TextBuffer {
             raw_x: 0,
             cursor_y: 0,
             version: 0,
+            undo: Vec::new(),
+            edit_group: None,
         }
     }
 
@@ -80,6 +106,46 @@ impl TextBuffer {
         self.raw_x = 0;
         self.cursor_y = 0;
         self.version += 1;
+        self.clear_undo();
+    }
+
+    fn snapshot(&mut self) {
+        self.undo.push(Snapshot {
+            lines: self.lines.clone(),
+            raw_x: self.raw_x,
+            cursor_y: self.cursor_y,
+        });
+        if self.undo.len() > MAX_UNDO {
+            self.undo.remove(0);
+        }
+        self.edit_group = None;
+    }
+
+    fn clear_undo(&mut self) {
+        self.undo.clear();
+        self.edit_group = None;
+    }
+
+    /// Undoes the last step: one paste, one typed word, one word of backspaces.
+    /// Snapshots taken before an edit that turned out to be a no-op (killing
+    /// a word at an empty prompt) are skipped, so one press always rewinds
+    /// something the user can see. `false` when there is nothing left to undo.
+    pub fn undo(&mut self) -> bool {
+        while let Some(snap) = self.undo.pop() {
+            let unchanged = snap.lines == self.lines
+                && snap.cursor_y == self.cursor_y
+                && snap.raw_x == self.raw_x.min(self.current_line_len());
+            if unchanged {
+                continue;
+            }
+            self.lines = snap.lines;
+            self.raw_x = snap.raw_x;
+            self.cursor_y = snap.cursor_y;
+            self.version += 1;
+            self.edit_group = None;
+            return true;
+        }
+        false
     }
 
     /// Counts every change to the value, never a cursor move. `maki.ui.input`
@@ -124,6 +190,19 @@ impl TextBuffer {
     }
 
     pub fn push_char(&mut self, c: char) {
+        // A typed word is one step, split at whitespace: undo after a run of
+        // typing rewinds to the last space, not one keystroke at a time.
+        let x = self.x();
+        let boundary = x > 0
+            && self
+                .current_line()
+                .chars()
+                .nth(x - 1)
+                .is_some_and(|prev| prev.is_whitespace());
+        if self.edit_group != Some(EditGroup::Typing) || boundary {
+            self.snapshot();
+        }
+        self.edit_group = Some(EditGroup::Typing);
         let bx = self.byte_x();
         self.lines[self.cursor_y].insert(bx, c);
         self.raw_x = self.x() + 1;
@@ -132,6 +211,12 @@ impl TextBuffer {
 
     pub fn insert_text(&mut self, text: &str) {
         let sanitized = sanitize(text);
+        if sanitized.is_empty() {
+            return;
+        }
+        // One paste, one step. The snapshot() clears the group so typing that
+        // follows the paste undoes separately from the paste itself.
+        self.snapshot();
         for (i, chunk) in sanitized.split('\n').enumerate() {
             if i > 0 {
                 self.add_line();
@@ -146,6 +231,8 @@ impl TextBuffer {
     }
 
     pub fn add_line(&mut self) {
+        self.snapshot();
+        self.edit_group = None;
         let bx = self.byte_x();
         let (left, right) = self.lines[self.cursor_y].split_at(bx);
         let (left, right) = (left.to_string(), right.to_string());
@@ -158,6 +245,20 @@ impl TextBuffer {
 
     pub fn remove_char(&mut self) {
         let x = self.x();
+        // Backspaces merge into one step, but a space deletes on its own:
+        // undo after mashing backspace should restore whole words.
+        let boundary = if x > 0 {
+            self.current_line()
+                .chars()
+                .nth(x - 1)
+                .is_some_and(|c| c.is_whitespace())
+        } else {
+            false
+        };
+        if self.edit_group != Some(EditGroup::Deleting) || boundary {
+            self.snapshot();
+        }
+        self.edit_group = Some(EditGroup::Deleting);
         if x == 0 {
             self.merge_with_previous_line();
         } else {
@@ -169,6 +270,8 @@ impl TextBuffer {
     }
 
     pub fn delete_char(&mut self) {
+        self.snapshot();
+        self.edit_group = None;
         let x = self.x();
         if x == self.current_line_len() {
             self.merge_with_next_line();
@@ -225,6 +328,8 @@ impl TextBuffer {
     }
 
     pub fn delete_word_after_cursor(&mut self) {
+        self.snapshot();
+        self.edit_group = None;
         let x = self.x();
         if x == self.current_line_len() {
             self.merge_with_next_line();
@@ -238,12 +343,16 @@ impl TextBuffer {
     }
 
     pub fn kill_to_end_of_line(&mut self) {
+        self.snapshot();
+        self.edit_group = None;
         let bx = self.byte_x();
         self.lines[self.cursor_y].truncate(bx);
         self.version += 1;
     }
 
     pub fn remove_word_before_cursor(&mut self) {
+        self.snapshot();
+        self.edit_group = None;
         let x = self.x();
         if x == 0 {
             self.merge_with_previous_line();
@@ -259,6 +368,7 @@ impl TextBuffer {
     }
 
     pub fn move_word_left(&mut self) {
+        self.edit_group = None;
         let x = self.x();
         if x == 0 {
             self.wrap_to_prev_line();
@@ -268,6 +378,7 @@ impl TextBuffer {
     }
 
     pub fn move_word_right(&mut self) {
+        self.edit_group = None;
         let x = self.x();
         if x == self.current_line_len() {
             self.wrap_to_next_line();
@@ -277,6 +388,7 @@ impl TextBuffer {
     }
 
     pub fn move_left(&mut self) {
+        self.edit_group = None;
         let x = self.x();
         if x > 0 {
             self.raw_x = x - 1;
@@ -286,6 +398,7 @@ impl TextBuffer {
     }
 
     pub fn move_right(&mut self) {
+        self.edit_group = None;
         let x = self.x();
         if x < self.current_line_len() {
             self.raw_x = x + 1;
@@ -295,30 +408,38 @@ impl TextBuffer {
     }
 
     pub fn move_up(&mut self) {
+        self.edit_group = None;
         if self.cursor_y > 0 {
             self.cursor_y -= 1;
         }
     }
 
     pub fn move_down(&mut self) {
+        self.edit_group = None;
         if self.cursor_y < self.lines.len().saturating_sub(1) {
             self.cursor_y += 1;
         }
     }
 
     pub fn move_home(&mut self) {
+        self.edit_group = None;
         self.raw_x = 0;
     }
 
     pub fn move_end(&mut self) {
+        self.edit_group = None;
         self.raw_x = self.current_line_len();
     }
 
+    /// Drops the value and the undo history with it: a submit, a swap or a
+    /// reset is the user putting the text down, and an undo that reaches back
+    /// past it would resurrect a prompt already sent.
     pub fn clear(&mut self) {
         self.lines = vec![String::new()];
         self.raw_x = 0;
         self.cursor_y = 0;
         self.version += 1;
+        self.clear_undo();
     }
 
     /// Bytes in the whole buffer, newlines counted as one each. The unit
@@ -341,6 +462,7 @@ impl TextBuffer {
     /// Clamps past the end of the buffer, the way every other cursor move
     /// here does, and refuses an offset inside a character.
     pub fn set_cursor_byte(&mut self, idx: usize) -> Result<(), String> {
+        self.edit_group = None;
         let mut left = idx.min(self.byte_len());
         for (y, line) in self.lines.iter().enumerate() {
             if left <= line.len() {
@@ -393,17 +515,20 @@ impl TextBuffer {
         let caret = cursor.unwrap_or(start + text.len()).min(next.len());
         check_boundary(&next, "cursor", caret)?;
 
+        self.snapshot();
         self.lines = next.split('\n').map(str::to_string).collect();
         self.version += 1;
         self.set_cursor_byte(caret)
     }
 
     pub fn set_cursor(&mut self, y: usize, x: usize) {
+        self.edit_group = None;
         self.cursor_y = y.min(self.lines.len().saturating_sub(1));
         self.raw_x = x.min(self.current_line_len());
     }
 
     pub fn move_to_end(&mut self) {
+        self.edit_group = None;
         self.cursor_y = self.lines.len().saturating_sub(1);
         self.raw_x = self.current_line_len();
     }
@@ -426,6 +551,8 @@ impl TextBuffer {
     }
 
     pub fn kill_to_start_of_line(&mut self) {
+        self.snapshot();
+        self.edit_group = None;
         let byte_x = Self::char_to_byte(&self.lines[self.cursor_y], self.x());
         self.lines[self.cursor_y].drain(..byte_x);
         self.raw_x = 0;
@@ -508,6 +635,16 @@ impl TextBuffer {
                     self.kill_to_start_of_line();
                     EditResult::Changed
                 }
+                // Cmd+Z where the terminal delivers it (kitty-protocol).
+                // Ctrl+Z is suspend and reserved; there is no notation for
+                // SUPER, so no plugin can want this key for itself.
+                KeyCode::Char('z') => {
+                    if self.undo() {
+                        EditResult::Changed
+                    } else {
+                        EditResult::Ignored
+                    }
+                }
                 _ => EditResult::Ignored,
             };
         }
@@ -556,7 +693,7 @@ impl TextBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{EditResult, TAB_SPACES, TextBuffer};
+    use super::{EditResult, TAB_SPACES, TextBuffer, MAX_UNDO};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use test_case::test_case;
 
@@ -990,5 +1127,100 @@ mod tests {
             buf.version() > typed,
             "a whole-value swap has to keep the counter climbing"
         );
+    }
+
+    #[test]
+    fn undo_restores_a_paste_in_one_step() {
+        let mut buf = TextBuffer::new("keep ".into());
+        buf.insert_text("pasted text");
+        assert!(buf.undo());
+        assert_eq!(buf.value(), "keep ");
+        assert!(!buf.undo(), "the fresh buffer has nothing older to give back");
+    }
+
+    #[test]
+    fn undo_rewinds_typing_word_by_word() {
+        let mut buf = TextBuffer::new(String::new());
+        for c in "hello world".chars() {
+            buf.push_char(c);
+        }
+        buf.undo();
+        assert_eq!(buf.value(), "hello ");
+        buf.undo();
+        assert_eq!(buf.value(), "");
+    }
+
+    #[test]
+    fn backspaces_undo_word_by_word() {
+        let mut buf = TextBuffer::new("hello world".into());
+        buf.move_to_end();
+        for _ in 0..6 {
+            buf.remove_char();
+        }
+        assert_eq!(buf.value(), "hello");
+        buf.undo();
+        assert_eq!(buf.value(), "hello ");
+        buf.undo();
+        assert_eq!(buf.value(), "hello world");
+    }
+
+    #[test]
+    fn a_cursor_move_ends_the_typing_group() {
+        let mut buf = TextBuffer::new("abc".into());
+        buf.set_cursor(0, 1);
+        buf.push_char('x');
+        buf.push_char('y');
+        assert_eq!(buf.value(), "axybc");
+        buf.undo();
+        assert_eq!(buf.value(), "abc");
+        assert_eq!((buf.x(), buf.y()), (1, 0), "undo restores where the caret was");
+    }
+
+    #[test]
+    fn a_plugin_write_undoes_in_one_step() {
+        let mut buf = TextBuffer::new("pick a file".into());
+        buf.replace_byte_range(7, 11, "/tmp/x.rs", None).unwrap();
+        assert!(buf.undo());
+        assert_eq!(buf.value(), "pick a file");
+    }
+
+    #[test]
+    fn clear_forgets_the_history() {
+        let mut buf = TextBuffer::new("sent".into());
+        buf.insert_text(" again");
+        buf.clear();
+        assert!(!buf.undo(), "a submitted prompt does not come back");
+    }
+
+    #[test]
+    fn no_op_steps_are_skipped() {
+        let mut buf = TextBuffer::new("word".into());
+        buf.move_to_end();
+        buf.remove_word_before_cursor();
+        buf.remove_word_before_cursor(); // snapshots a state that never changed
+        assert!(buf.undo());
+        assert_eq!(buf.value(), "word");
+    }
+
+    #[test]
+    fn history_is_capped() {
+        let mut buf = TextBuffer::new(String::new());
+        for _ in 0..(MAX_UNDO + 10) {
+            buf.insert_text("a ");
+        }
+        let mut undos = 0;
+        while buf.undo() {
+            undos += 1;
+        }
+        assert!(undos <= MAX_UNDO, "history must not grow without bound");
+    }
+
+    #[test]
+    fn super_z_undoes_through_handle_key() {
+        let mut buf = TextBuffer::new("hi".into());
+        buf.insert_text(" there");
+        let result = buf.handle_key(key(KeyCode::Char('z'), KeyModifiers::SUPER));
+        assert_eq!(result, EditResult::Changed);
+        assert_eq!(buf.value(), "hi");
     }
 }

@@ -555,6 +555,24 @@ fn altgr_chars_not_swallowed_by_ctrl_handler() {
     assert_eq!(app.input_box.buffer.value(), "hi\\");
 }
 
+#[test]
+fn undo_key_rewinds_the_last_paste_in_the_chat_input() {
+    let mut app = test_app();
+    app.update(Msg::Key(key(KeyCode::Char('h'))));
+    app.update(Msg::Key(key(KeyCode::Char('i'))));
+    app.update(Msg::Paste("pasted".into()));
+    let alt_z = KeyEvent {
+        code: KeyCode::Char('z'),
+        modifiers: KeyModifiers::ALT,
+        kind: crossterm::event::KeyEventKind::Press,
+        state: crossterm::event::KeyEventState::NONE,
+    };
+    app.update(Msg::Key(alt_z));
+    assert_eq!(app.input_box.buffer.value(), "hi");
+    app.update(Msg::Key(alt_z));
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
 #[test_case(Status::Idle      ; "idle")]
 #[test_case(Status::Streaming ; "streaming")]
 fn paste_works_regardless_of_status(status: Status) {

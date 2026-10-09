@@ -1333,6 +1333,12 @@ impl App {
         if key::MODEL_PICKER.matches(key) {
             return self.run_builtin(BuiltinAction::ModelPicker);
         }
+        if key::UNDO.matches(key) {
+            if let InputAction::Changed = self.input_box.undo() {
+                self.input_changed(InputWriter::Anyone);
+            }
+            return vec![];
+        }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
                 return self.run_builtin(BuiltinAction::PopQueue);
