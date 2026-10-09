@@ -5435,6 +5435,135 @@ fn the_first_esc_arms_the_streaming_cancel_with_no_popup_up() {
     assert_eq!(app.status, Status::Streaming, "and not taken in one press");
 }
 
+fn vim_app() -> App {
+    let mut app = test_app();
+    app.input_box.set_vim_enabled(true);
+    app.status_bar.flash_duration = WAIT_AHEAD;
+    app
+}
+
+fn press_esc(app: &mut App) -> Vec<Action> {
+    app.update(Msg::Key(key(KeyCode::Esc)))
+}
+
+/// The `Esc` that leaves insert mode is vim's. Counting it towards the double
+/// `Esc` would cancel a turn the user only meant to stop typing over.
+#[test]
+fn vim_esc_from_insert_mode_while_streaming_neither_cancels_nor_arms() {
+    let mut app = vim_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    assert!(press_esc(&mut app).is_empty());
+    assert_eq!(app.input_box.vim_mode(), Some(VimMode::Normal));
+    assert!(app.last_esc.is_none(), "leaving insert mode arms nothing");
+
+    press_esc(&mut app);
+    assert!(app.last_esc.is_some(), "the first Esc in normal mode arms");
+    let actions = press_esc(&mut app);
+    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
+}
+
+#[test]
+fn vim_double_esc_in_normal_mode_opens_rewind() {
+    let mut app = vim_app();
+    app.state
+        .session_mut()
+        .push_message(Message::user("hello".into()));
+
+    press_esc(&mut app);
+    press_esc(&mut app);
+    assert!(
+        !app.rewind_picker.is_open(),
+        "insert mode spent the first Esc"
+    );
+    press_esc(&mut app);
+    assert!(app.rewind_picker.is_open());
+}
+
+/// `Esc` `i` `Esc` is a trip into insert mode and back, so the press after it
+/// arms rewind again instead of opening it.
+#[test]
+fn vim_a_key_between_two_escs_disarms_rewind() {
+    let mut app = vim_app();
+    app.state
+        .session_mut()
+        .push_message(Message::user("hello".into()));
+    press_esc(&mut app);
+    press_esc(&mut app);
+    assert!(app.last_esc.is_some());
+
+    app.update(Msg::Key(key(KeyCode::Char('i'))));
+    press_esc(&mut app);
+    press_esc(&mut app);
+    assert!(!app.rewind_picker.is_open());
+    assert!(app.last_esc.is_some(), "the last Esc armed it afresh");
+}
+
+/// A binding on `<Esc>` would leave the user stuck in insert mode, so vim's
+/// `Esc` never reaches it. An idle normal mode has no use for the key, and
+/// the binding gets it back.
+#[test]
+fn vim_an_esc_binding_never_takes_the_esc_vim_needs() {
+    let mut app = vim_app();
+    let probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+    press_esc(&mut app);
+    assert!(
+        probe.try_recv_keybind().is_none(),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
+    assert_eq!(app.input_box.vim_mode(), Some(VimMode::Normal));
+
+    press_esc(&mut app);
+    assert!(probe.try_recv_keybind().is_some(), "{OVERRIDE_DISPATCHED}");
+}
+
+/// The completion popup claims `<Esc>`, so the first `Esc` in insert mode is
+/// the popup's. The claim goes with the window, and the next `Esc` leaves
+/// insert mode.
+#[test]
+fn vim_a_popup_claiming_esc_answers_before_insert_mode_does() {
+    let mut app = vim_app();
+    let (events, cmd_tx) = open_claiming_popup(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+    press_esc(&mut app);
+    assert!(took_a_key(&events), "{CLAIM_DELIVERED}");
+    assert_eq!(
+        app.input_box.vim_mode(),
+        Some(VimMode::Insert),
+        "the popup spent the first Esc"
+    );
+
+    drop(cmd_tx);
+    let _ = app.float_mgr.tick();
+    press_esc(&mut app);
+    assert_eq!(app.input_box.vim_mode(), Some(VimMode::Normal));
+}
+
+/// With an empty draft, `/` in normal mode types itself and opens the
+/// palette, which is how `/vim` turns vim off without going through `i`.
+#[test]
+fn vim_slash_in_normal_mode_opens_the_palette() {
+    let mut app = vim_app();
+    press_esc(&mut app);
+
+    type_slash(&mut app);
+    assert!(app.command_palette.is_active());
+    assert_eq!(app.input_box.vim_mode(), Some(VimMode::Insert));
+}
+
+#[test]
+fn vim_ctrl_c_clears_into_insert_mode() {
+    let mut app = vim_app();
+    app.update(Msg::Key(key(KeyCode::Char('x'))));
+    press_esc(&mut app);
+
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(app.input_box.is_empty());
+    assert_eq!(app.input_box.vim_mode(), Some(VimMode::Insert));
+}
+
 /// The list a plugin is refused and the list the host answers itself are one
 /// list. A key on one and not the other is either a binding that can never
 /// fire or a plugin binding the host silently preempts, and the two drifted

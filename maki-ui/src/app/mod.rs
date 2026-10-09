@@ -56,6 +56,7 @@ use crate::components::{
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
+use crate::vim::VimMode;
 use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
@@ -1294,8 +1295,15 @@ impl App {
     /// takes its claims in [`FloatManager::handle_claimed_key`], which runs
     /// above, so the popup takes the first `Esc` and the next one, with the
     /// popup gone, arms the cancel.
+    ///
+    /// So does an `Esc` that vim mode wants for leaving insert mode or for
+    /// cancelling a half-typed command. A binding on it would leave the user
+    /// stuck in insert mode.
     fn reserved_by_host(&self, key: KeyEvent) -> bool {
-        is_reserved(key) || (self.status == Status::Streaming && key.code == KeyCode::Esc)
+        is_reserved(key)
+            || (key.code == KeyCode::Esc
+                && (self.status == Status::Streaming
+                    || (self.chat_accepts_input() && self.input_box.vim_wants_esc())))
     }
 
     /// Whether a plugin binding claimed {key}. The binding the keymap matched
@@ -1344,14 +1352,14 @@ impl App {
                 return self.run_builtin(BuiltinAction::FilePicker);
             } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
                 self.start_image_paste();
-            } else if let InputAction::Changed = self.input_box.handle_key(key) {
+            } else if let InputAction::Changed = self.input_key(key) {
                 self.input_changed(InputWriter::Anyone);
             }
             return vec![];
         }
 
         let streaming = self.status == Status::Streaming;
-        match self.input_box.handle_key(key) {
+        match self.input_key(key) {
             InputAction::Submit(sub) => self.handle_submit(sub),
             InputAction::Changed => {
                 self.input_changed(InputWriter::Anyone);
@@ -1377,6 +1385,17 @@ impl App {
             }
             InputAction::ContinueLine | InputAction::None => vec![],
         }
+    }
+
+    /// In vim mode a key the input box used sits between two presses of
+    /// `Esc`, so they are not a double `Esc`. Without this, `Esc` `i` `Esc`
+    /// inside the flash time opens rewind.
+    fn input_key(&mut self, key: KeyEvent) -> InputAction {
+        let action = self.input_box.handle_key(key);
+        if self.input_box.vim_mode().is_some() && !matches!(action, InputAction::Passthrough(_)) {
+            self.last_esc = None;
+        }
+        action
     }
 
     fn handle_esc(&mut self, streaming: bool) -> Vec<Action> {
