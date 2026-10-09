@@ -11,7 +11,7 @@ local opts = maki.api.register_options(output_limits.extend({
   provider = {
     default = "exa",
     type = "string",
-    desc = 'Search backend: "exa" (default) or "youcom" (You.com MCP).',
+    desc = 'Search backend: "exa" (default), "youcom" (You.com MCP) or "kagi" (Kagi MCP, needs KAGI_API_KEY).',
   },
   max_response_bytes = {
     default = 5 * 1024 * 1024,
@@ -22,7 +22,18 @@ local opts = maki.api.register_options(output_limits.extend({
 
 local provider = providers[opts.provider]
 if not provider then
-  error('websearch: unknown provider "' .. tostring(opts.provider) .. '" (expected "exa" or "youcom")')
+  local names = {}
+  for name in pairs(providers) do
+    table.insert(names, '"' .. name .. '"')
+  end
+  table.sort(names)
+  error(
+    'websearch: unknown provider "'
+      .. tostring(opts.provider)
+      .. '" (expected one of '
+      .. table.concat(names, ", ")
+      .. ")"
+  )
 end
 
 -- An exported but blank variable is still truthy in lua, and a blank key
@@ -93,6 +104,12 @@ maki.api.register_tool({
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
     local key = api_key()
+    if not key and provider.key_required then
+      return {
+        llm_output = "error: " .. provider.label .. " search needs " .. provider.env .. " to be set",
+        is_error = true,
+      }
+    end
 
     local headers = {
       ["Content-Type"] = "application/json",
@@ -122,6 +139,9 @@ maki.api.register_tool({
     local text, parse_err = parse_sse_response(resp.body)
     if not text then
       return { llm_output = "error: " .. tostring(parse_err), is_error = true }
+    end
+    if provider.clean then
+      text = provider.clean(text)
     end
 
     local llm_output = truncate(text, max_lines, max_bytes)
