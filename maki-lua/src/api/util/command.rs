@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
@@ -651,6 +652,14 @@ pub enum UiAction {
     },
     Task {
         req: TaskRequest,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    HighlightTranscript {
+        row: u32,
+        error: bool,
+        duration: Duration,
+    },
+    TranscriptPositions {
         reply_tx: flume::Sender<UiReply>,
     },
     WinSaveView {

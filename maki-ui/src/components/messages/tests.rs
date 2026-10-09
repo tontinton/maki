@@ -2654,6 +2654,123 @@ fn winsaveview_round_trips_through_winrestview() {
     assert_eq!(panel.scroll_pos(), pos);
 }
 
+#[test_case(false ; "cached")]
+#[test_case(true ; "streaming")]
+fn transcript_positions_expose_rendered_conversation_rows(streaming: bool) {
+    const MESSAGE_LINES: usize = 20;
+    const VIEWPORT_HEIGHT: u16 = 5;
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "line\n".repeat(MESSAGE_LINES),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Thinking,
+        "thinking".into(),
+    ));
+    if streaming {
+        panel
+            .streaming_text
+            .set_buffer(&"response\n".repeat(MESSAGE_LINES));
+    } else {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            "response\n".repeat(MESSAGE_LINES),
+        ));
+    }
+    render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    panel.scroll_to_top();
+    let snapshot = panel.transcript_positions();
+    let positions = snapshot["positions"].as_array().unwrap();
+    assert_eq!(positions.len(), 2);
+    assert_eq!(positions[0]["role"], "user");
+    assert_eq!(positions[1]["role"], "assistant");
+    assert_eq!(snapshot["topline"], 1);
+    let row = positions[1]["topline"].as_u64().unwrap() as u32 - 1;
+    panel.scroll_to_row(row);
+    assert_eq!(panel.win_view().scroll_top, row);
+}
+
+#[test]
+fn transcript_positions_clamp_near_bottom() {
+    const MESSAGE_LINES: usize = 20;
+    const VIEWPORT_HEIGHT: u16 = 5;
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "line\n".repeat(MESSAGE_LINES),
+    ));
+    panel.push(DisplayMessage::new(DisplayRole::User, "last prompt".into()));
+    render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    let snapshot = panel.transcript_positions();
+    assert_eq!(snapshot["positions"][1]["topline"], snapshot["topline"]);
+}
+
+#[test]
+fn transcript_positions_on_empty_transcript_are_empty() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    assert!(
+        panel.transcript_positions()["positions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test_case(false ; "destination")]
+#[test_case(true ; "boundary")]
+fn transcript_highlight_styles_header_and_expires(error: bool) {
+    const MESSAGE_LINES: usize = 20;
+    const VIEWPORT_HEIGHT: u16 = 5;
+    const HIGHLIGHT_DURATION: Duration = Duration::from_millis(180);
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "line\n".repeat(MESSAGE_LINES),
+    ));
+    panel.push(DisplayMessage::new(DisplayRole::User, "last prompt".into()));
+    render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    let snapshot = panel.transcript_positions();
+    let last = &snapshot["positions"][1];
+    panel.scroll_to_row(last["topline"].as_u64().unwrap() as u32 - 1);
+    let baseline = render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    panel.highlight_transcript(
+        last["line"].as_u64().unwrap() as u32 - 1,
+        error,
+        HIGHLIGHT_DURATION,
+    );
+    let highlighted = render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    let highlight = panel.transcript_highlight.as_ref().unwrap();
+    let RowPos::At(row) = panel.project_row(DocPos {
+        seg: highlight.target.seg,
+        row: highlight.target.row,
+        col: 0,
+    }) else {
+        panic!("header must be visible");
+    };
+    assert!(row > 0);
+    let style = if error {
+        Style::new().bg(theme::current().error.fg.unwrap())
+    } else {
+        theme::current().item_selected
+    };
+    for y in 0..VIEWPORT_HEIGHT {
+        for x in 0..VIEW_WIDTH - 1 {
+            let mut expected = baseline.backend().buffer()[(x, y)].clone();
+            if y == row {
+                expected.set_style(style);
+            }
+            assert_eq!(highlighted.backend().buffer()[(x, y)], expected);
+        }
+    }
+    panel.transcript_highlight.as_mut().unwrap().expires = Instant::now();
+    assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+    assert!(panel.transcript_highlight.is_none());
+    panel.highlight_transcript(0, error, HIGHLIGHT_DURATION);
+    panel.scroll(1);
+    assert!(panel.transcript_highlight.is_none());
+}
+
 const THEME_CODE: &str = "fn main() { let x = 1; }";
 const THEME_CODE_KEYWORDS: [&str; 3] = ["fn", "main", "let"];
 

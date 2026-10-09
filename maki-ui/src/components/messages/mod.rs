@@ -35,7 +35,7 @@ use ratatui_image::picker::Picker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::scrollbar::{self, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
@@ -65,6 +65,12 @@ pub struct PromptProgress {
     pub cache: u32,
 }
 
+struct TranscriptHighlight {
+    target: ScrollPos,
+    error: bool,
+    expires: Instant,
+}
+
 pub struct MessagesPanel {
     messages: Vec<DisplayMessage>,
     streaming_thinking: StreamingContent,
@@ -84,6 +90,7 @@ pub struct MessagesPanel {
     image_generation: u64,
     theme_generation: u64,
     highlight_segment: Option<usize>,
+    transcript_highlight: Option<TranscriptHighlight>,
     idle_splash: Splash,
     accent: ColorTransition,
     expanded_tools: HashMap<String, SectionFlags>,
@@ -143,6 +150,7 @@ impl MessagesPanel {
             image_generation: terminal_image::generation(),
             theme_generation: theme::generation(),
             highlight_segment: None,
+            transcript_highlight: None,
             idle_splash: Splash::new(ui_config.splash_animation),
             accent: ColorTransition::new(theme::current().mode_build),
             expanded_tools: HashMap::new(),
@@ -227,6 +235,7 @@ impl MessagesPanel {
         self.watched_bufs.clear();
         self.rebake_requested.clear();
         self.highlight_segment = None;
+        self.transcript_highlight = None;
         self.thinking_collapsed = !self.show_thinking;
     }
 
@@ -627,6 +636,7 @@ impl MessagesPanel {
     /// Always unpins, and the next `view` re-pins if this lands on the
     /// bottom line.
     fn scroll_to(&mut self, pos: ScrollPos) {
+        self.transcript_highlight = None;
         self.scroll = pos;
         self.auto_scroll = false;
     }
@@ -640,7 +650,65 @@ impl MessagesPanel {
     }
 
     pub fn enable_auto_scroll(&mut self) {
+        self.transcript_highlight = None;
         self.auto_scroll = true;
+    }
+
+    pub fn transcript_positions(&mut self) -> serde_json::Value {
+        self.rebuild_line_cache();
+        let layout = self.layout();
+        let bottom = layout.bottom(self.viewport_height);
+        let current = if self.auto_scroll {
+            bottom
+        } else {
+            self.scroll.min(bottom)
+        };
+        let messages = self
+            .cache
+            .segments()
+            .iter()
+            .enumerate()
+            .filter_map(|(seg, cached)| {
+                let role = match self.messages.get(cached.msg_index?)?.role {
+                    DisplayRole::User => "user",
+                    DisplayRole::Assistant => "assistant",
+                    _ => return None,
+                };
+                Some((seg, role))
+            });
+        let streaming = self
+            .tail
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (part, _))| {
+                (*part == TailPart::Text).then_some((self.cache.len() + index, "assistant"))
+            });
+        let positions: Vec<_> = messages
+            .chain(streaming)
+            .map(|(seg, role)| {
+                let landing = ScrollPos { seg, row: 0 }.min(bottom);
+                serde_json::json!({
+                    "role": role,
+                    "line": u64::from(layout.doc_row(ScrollPos { seg, row: 0 })) + 1,
+                    "topline": u64::from(layout.doc_row(landing)) + 1,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "topline": u64::from(layout.doc_row(current)) + 1,
+            "positions": positions,
+        })
+    }
+
+    pub fn highlight_transcript(&mut self, row: u32, error: bool, duration: Duration) {
+        let Some(expires) = Instant::now().checked_add(duration) else {
+            return;
+        };
+        self.transcript_highlight = Some(TranscriptHighlight {
+            target: self.layout().at_row(row),
+            error,
+            expires,
+        });
     }
 
     pub fn scroll_to_segment(&mut self, segment_index: usize) {
@@ -657,6 +725,7 @@ impl MessagesPanel {
     }
 
     pub fn restore_scroll(&mut self, scroll: ScrollPos, auto_scroll: bool) {
+        self.transcript_highlight = None;
         self.scroll = scroll;
         self.auto_scroll = auto_scroll;
     }
@@ -789,6 +858,14 @@ impl MessagesPanel {
     /// them fed.
     pub fn tick(&mut self) -> Dirty {
         let mut dirty = self.drain_highlights() | self.poll_live_bufs() | self.refresh_images();
+        if self
+            .transcript_highlight
+            .as_ref()
+            .is_some_and(|highlight| Instant::now() >= highlight.expires)
+        {
+            self.transcript_highlight = None;
+            dirty |= Dirty::YES;
+        }
         if self.show_idle_splash() {
             dirty |= self.idle_splash.poll_update(update::latest_version());
         }
@@ -808,6 +885,7 @@ impl MessagesPanel {
             // `tick` reports that separately.
             Cadence::when(self.in_progress_count() > 0, Cadence::SPINNER),
             Cadence::when(smooth, Cadence::SMOOTH),
+            Cadence::when(self.transcript_highlight.is_some(), Cadence::PENDING),
             Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
         ])
     }
@@ -962,6 +1040,30 @@ impl MessagesPanel {
                 TailPart::Text => self.streaming_text.cached_lines(),
             };
             cursor.render(lines, h, None, false, frame);
+        }
+
+        if let Some(highlight) = &self.transcript_highlight {
+            let row = match self.project_row(DocPos {
+                seg: highlight.target.seg,
+                row: highlight.target.row,
+                col: 0,
+            }) {
+                RowPos::At(row) => Some(row),
+                RowPos::Above if highlight.error => Some(0),
+                _ => None,
+            };
+            if let Some(row) = row {
+                let theme = theme::current();
+                let style = if highlight.error {
+                    Style::new().bg(theme.error.fg.unwrap_or(Color::Reset))
+                } else {
+                    theme.item_selected
+                };
+                frame.buffer_mut().set_style(
+                    Rect::new(viewport.x, viewport.y + row, viewport.width, 1),
+                    style,
+                );
+            }
         }
 
         if let Some(pp) = self.prompt_progress

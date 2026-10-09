@@ -827,6 +827,15 @@ impl App {
         self.chats[self.active_chat].win_view()
     }
 
+    pub(crate) fn highlight_transcript(&mut self, row: u32, error: bool, duration: Duration) {
+        self.active_chat()
+            .highlight_transcript(row, error, duration);
+    }
+
+    pub(crate) fn transcript_positions(&mut self) -> serde_json::Value {
+        self.active_chat().transcript_positions()
+    }
+
     pub(crate) fn scroll_to_row(&mut self, doc_row: u32) {
         self.active_chat().scroll_to_row(doc_row);
     }

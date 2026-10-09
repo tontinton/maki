@@ -17,7 +17,7 @@ use crate::api::util::command::{
     ui_send,
 };
 use crate::api::util::convert::opt_bool;
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 use crate::key::Key;
 pub(crate) mod blit;
@@ -760,8 +760,50 @@ lua_table! {
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title, manual input, manual input_edit,
+        manual set_window_title, manual input, manual input_edit, manual transcript_positions, manual highlight_transcript,
     ]
+}
+
+/// Read the focused transcript's rendered conversation positions. Returns
+/// `{topline, positions}`, with one-based, bottom-clamped `topline` values and
+/// `role` (user or assistant) for each position, including streaming text.
+/// Each position also has `line`, its unclamped one-based header row.
+#[lua_fn]
+async fn transcript_positions(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+) -> LuaResult<Pair<mlua::Value>> {
+    ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| {
+        UiAction::TranscriptPositions { reply_tx }
+    })
+    .await
+}
+
+/// Highlight a one-based transcript line for `duration_ms` milliseconds.
+/// `error` selects error feedback instead of the selected-item style.
+/// @param line integer One-based transcript line.
+/// @param duration_ms integer Highlight duration in milliseconds.
+/// @param error boolean? Use error feedback styling.
+#[lua_fn]
+fn highlight_transcript(
+    _lua: &Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    line: u32,
+    duration_ms: u64,
+    error: Option<bool>,
+) -> LuaResult<Pair<bool>> {
+    let Some(row) = line.checked_sub(1) else {
+        return Ok(err_pair("line must be positive"));
+    };
+    try_pair!(ui_send(
+        tx.as_ref(),
+        UiAction::HighlightTranscript {
+            row,
+            error: error.unwrap_or(false),
+            duration: Duration::from_millis(duration_ms),
+        }
+    ));
+    Ok((Some(true), None))
 }
 
 pub(crate) fn create_ui_table(
@@ -775,6 +817,8 @@ pub(crate) fn create_ui_table(
     flash__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     set_window_title__register(&t, lua, ui_action_tx.clone())?;
     action__register(&t, lua, ui_action_tx.clone())?;
+    transcript_positions__register(&t, lua, ui_action_tx.clone())?;
+    highlight_transcript__register(&t, lua, ui_action_tx.clone())?;
     open_editor__register(&t, lua, ui_action_tx.clone())?;
     input__register(&t, lua, ui_action_tx.clone())?;
     input_edit__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
@@ -991,6 +1035,51 @@ mod tests {
         t.raw_set(1, key).unwrap();
         t.raw_set(2, label).unwrap();
         t
+    }
+
+    #[test_case(false ; "destination")]
+    #[test_case(true ; "boundary")]
+    fn transcript_highlight_forwards_style_and_duration(error: bool) {
+        const LINE: u32 = 3;
+        const DURATION_MS: u64 = 180;
+        let lua = Lua::new();
+        let (tx, rx) = flume::unbounded();
+        let (ok, err) =
+            highlight_transcript(&lua, Some(tx), LINE, DURATION_MS, Some(error)).unwrap();
+        assert_eq!(ok, Some(true));
+        assert!(err.is_none());
+        let UiAction::HighlightTranscript {
+            row,
+            error: actual_error,
+            duration,
+        } = rx.recv().unwrap()
+        else {
+            panic!("expected transcript highlight");
+        };
+        assert_eq!(row, LINE - 1);
+        assert_eq!(actual_error, error);
+        assert_eq!(duration, Duration::from_millis(DURATION_MS));
+    }
+
+    #[test]
+    fn transcript_positions_returns_renderer_snapshot() {
+        let lua = Lua::new();
+        let (tx, rx) = flume::unbounded();
+        let snapshot = serde_json::json!({
+            "topline": 1,
+            "positions": [{ "role": "user", "topline": 1 }],
+        });
+        let expected = snapshot.clone();
+        let worker = std::thread::spawn(move || {
+            let UiAction::TranscriptPositions { reply_tx } = rx.recv().unwrap() else {
+                panic!("expected transcript positions");
+            };
+            reply_tx.send(Ok(snapshot)).unwrap();
+        });
+        let (value, err) = smol::block_on(transcript_positions(lua.clone(), Some(tx))).unwrap();
+        assert!(err.is_none());
+        assert_eq!(lua_to_json(&lua, &value.unwrap()).unwrap(), expected);
+        worker.join().unwrap();
     }
 
     #[test]
