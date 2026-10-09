@@ -1033,6 +1033,13 @@ Maki fires two slots around the plan form, both with
 menu, and `ui.plan_form` asks whether the form opens at all. Both are
 documented under [maki.plan](/docs/lua-api/#maki-plan).
 
+Maki fires `ui.status_git` when the status bar's git segment is built
+or goes stale, with `ev = { cwd, branch, label }`: the raw working
+directory, the branch (`nil` when there is none), and the label the
+host would draw without a layer. A layer answers with the string to
+show, e.g. `prev(ev) .. " ±3"`. The event is inert strings, so
+layering it costs nothing.
+
 Maki fires two slots per tool itself: `tool.<name>.input` before
 permissions look at the call, and `tool.<name>.output` on the text it
 produced. Both take `function(prev, value, ctx)` and answer with a

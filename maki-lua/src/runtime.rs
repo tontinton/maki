@@ -46,8 +46,8 @@ use crate::api::plan::{
     install_row_handlers, row_handler_opts, rows_from_table, rows_to_table,
 };
 use crate::api::slot::{
-    ChainObserver, LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT, SlotStore, layer_plugins,
-    run_host_chain, run_host_chain_with,
+    ChainObserver, LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT, STATUS_GIT_SLOT,
+    SlotStore, layer_plugins, run_host_chain, run_host_chain_with,
 };
 use crate::api::tool::{
     LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission, resolve_rules,
@@ -156,6 +156,10 @@ pub const PLAN_FORM_SLOT_DEADLINE: Duration = Duration::from_secs(5);
 /// with every tool behind it, and it can keep a built-in row's wording while
 /// swapping the outcome under it. No narrower price would be honest.
 const PLAN_FORM_AUTHORITY: Authority = Authority::Unbounded;
+/// Wall clock the `ui.status_git` chain gets before the host stops waiting
+/// and keeps the built-in label. The bar polls for the answer rather than
+/// blocking on it, so this only bounds a layer parked off a git call.
+const STATUS_GIT_SLOT_DEADLINE: Duration = Duration::from_secs(5);
 /// Wall clock a picked plan row's handler gets. The row's built-in action
 /// waits behind it, so a handler that parks for good would cost the user the
 /// outcome the row promised as well as the one the plugin wanted.
@@ -410,6 +414,19 @@ pub enum Request {
         rows: Vec<PlanFormRow>,
         /// The menu to draw, or `None` when a layer took the form over.
         reply: flume::Sender<Option<PlanMenu>>,
+    },
+    /// Fires the `ui.status_git` chain for the status bar's git segment.
+    /// Only sent when a plugin layers the slot, so the idle case never
+    /// reaches the request loop at all.
+    StatusGit {
+        /// Raw working directory, where a layer runs its git commands.
+        cwd: String,
+        /// Current branch, `None` off a branch.
+        branch: Option<String>,
+        /// The label the host would draw without a layer.
+        label: String,
+        /// The string to draw, or `None` to keep the built-in label.
+        reply: flume::Sender<Option<String>>,
     },
     ComputeHeader {
         plugin: Arc<str>,
@@ -3905,6 +3922,96 @@ async fn open_plan_form(
     Some(plan_form_rows(lua, plugins, gate, deadline, session, args, rows).await)
 }
 
+/// The event the `ui.status_git` chain sees: where the bar is looking, and
+/// what it would show with nobody layering.
+fn status_git_event(
+    lua: &Lua,
+    cwd: &str,
+    branch: Option<&str>,
+    label: &str,
+) -> mlua::Result<MultiValue> {
+    let ev = lua.create_table()?;
+    ev.set("cwd", cwd)?;
+    ev.set("branch", branch)?;
+    ev.set("label", label)?;
+    Ok(MultiValue::from_vec(vec![LuaValue::Table(ev)]))
+}
+
+/// Asks the `ui.status_git` chain for the string the status bar draws in its
+/// git segment. The default answers with the built-in {label}, so a chain
+/// every layer deferred through keeps the built-in too, and `None` says the
+/// same. Layering costs nothing: the event is inert strings, and whatever a
+/// layer shells out to see costs the layer its own permissions.
+///
+/// The bar polls for the answer instead of waiting, so this runs without an
+/// [`InflightGate`] slot: a reload must not stall on a display refresh, and
+/// an answer that arrives after the deadline is simply dropped.
+async fn status_git_label(
+    lua: &Lua,
+    cwd: String,
+    branch: Option<String>,
+    label: String,
+) -> Option<String> {
+    let args = match status_git_event(lua, &cwd, branch.as_deref(), &label) {
+        Ok(args) => args,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not build the status git slot event");
+            return None;
+        }
+    };
+    let answered =
+        match lua.create_function(|_, ev: Table| -> mlua::Result<String> { ev.get("label") }) {
+            Ok(default) => {
+                let chain =
+                    run_host_chain_with(lua, &[STATUS_GIT_SLOT], default, args, &|_| true, None);
+                run_abandonable(
+                    lua,
+                    CancelToken::none(),
+                    Some(Instant::now() + STATUS_GIT_SLOT_DEADLINE),
+                    chain,
+                )
+                .await
+            }
+            Err(e) => Ok(Err(e)),
+        };
+    match answered {
+        Ok(Ok(Some(values))) => match values.into_iter().next() {
+            Some(LuaValue::String(s)) => Some(s.to_string_lossy()),
+            // A layer that answers with nothing leaves the value alone, same
+            // as every other host slot. Only a non-string rewrite is off
+            // contract.
+            None => None,
+            Some(_) => {
+                tracing::warn!(
+                    slot = STATUS_GIT_SLOT,
+                    plugins = %layer_plugins(lua, STATUS_GIT_SLOT),
+                    "status git slot answered off contract, keeping the built-in label"
+                );
+                None
+            }
+        },
+        Ok(Ok(None)) => None,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                slot = STATUS_GIT_SLOT,
+                plugins = %layer_plugins(lua, STATUS_GIT_SLOT),
+                error = %strip_traceback(&e),
+                "status git slot chain failed"
+            );
+            None
+        }
+        Err(reason) => {
+            tracing::warn!(
+                slot = STATUS_GIT_SLOT,
+                plugins = %layer_plugins(lua, STATUS_GIT_SLOT),
+                reason,
+                "status git slot chain abandoned, keeping the built-in label"
+            );
+            None
+        }
+    }
+}
+
 /// Fires a host-owned chain and reads back the one contract every host slot
 /// shares: a table replaces the value, `nil` leaves it alone, and
 /// `nil, reason` stops the call with a reason the model reads. A second value
@@ -4572,6 +4679,19 @@ pub fn spawn(
                                     // ever draw go with it.
                                     clear_menu_generation(&lua, &session, generation);
                                 }
+                            })
+                            .detach();
+                        }
+                        Request::StatusGit {
+                            cwd,
+                            branch,
+                            label,
+                            reply,
+                        } => {
+                            let lua = rt.lua.clone();
+                            ex.spawn(async move {
+                                let shown = status_git_label(&lua, cwd, branch, label).await;
+                                let _ = reply.send(shown);
                             })
                             .detach();
                         }

@@ -826,6 +826,7 @@ fn a_parked_layer_ends_at_the_window_it_was_given() {
 #[test_case("tool.bash.input" ; "tool_stage")]
 #[test_case("ui.plan_form" ; "ui_surface")]
 #[test_case("ui.plan_form.actions" ; "ui_menu")]
+#[test_case("ui.status_git" ; "status_git_surface")]
 #[test_case("agent.stop" ; "agent_slot")]
 fn host_slot_names_are_reserved(name: &str) {
     let (_reg, host) = host();
@@ -1757,6 +1758,108 @@ fn the_ctx_table_names_the_call(origin: CallOrigin, expected_origin: &str) {
         input_from(&reg, SLOT_TOOL, origin, COMMAND),
         (Some(format!("{TOOL_ID}|{expected_origin}")), None)
     );
+}
+
+// ------------------------------------------------------ ui.status_git slot
+
+const GIT_CWD: &str = "/home/user/projects/maki";
+const GIT_BRANCH: &str = "main";
+const GIT_LABEL: &str = "~/projects/maki:main";
+const GIT_PLUGIN: &str = "gitcount";
+
+fn status_git_layer(host: &PluginHost, body: &str) {
+    load(
+        host,
+        GIT_PLUGIN,
+        &format!(r#"maki.api.set_slot("ui.status_git", function(prev, ev) {body} end)"#),
+    );
+}
+
+fn ask_status_git_with(host: &PluginHost, branch: Option<&str>) -> Option<String> {
+    host.event_handle()
+        .refresh_status_git(
+            GIT_CWD.to_owned(),
+            branch.map(str::to_owned),
+            GIT_LABEL.to_owned(),
+        )
+        .recv_timeout(DISPATCH_TIMEOUT)
+        .expect("the status git chain must answer")
+}
+
+fn ask_status_git(host: &PluginHost) -> Option<String> {
+    ask_status_git_with(host, Some(GIT_BRANCH))
+}
+
+/// A layer rewrites the segment from what the host hands it: `prev` answers
+/// with the built-in label, and the bar draws whatever string comes back.
+#[test_case(r#"return prev(ev) .. " ±3""#, "~/projects/maki:main ±3" ; "layer_appends_the_count")]
+#[test_case(r#"return ev.cwd .. " clean""#, "/home/user/projects/maki clean" ; "layer_rebuilds_from_the_event")]
+fn the_status_git_slot_rewrites_the_bar_segment(body: &str, expected: &str) {
+    let (_reg, host) = host();
+    status_git_layer(&host, body);
+    assert_eq!(ask_status_git(&host).as_deref(), Some(expected));
+}
+
+/// The event is the whole story a layer needs: where to run git, which
+/// branch it sits on, and what the host would have shown.
+#[test]
+fn the_status_git_event_names_the_repo_and_the_builtin_label() {
+    let (_reg, host) = host();
+    status_git_layer(
+        &host,
+        r#"return ev.cwd .. "|" .. tostring(ev.branch) .. "|" .. ev.label"#,
+    );
+    assert_eq!(
+        ask_status_git(&host).as_deref(),
+        Some(format!("{GIT_CWD}|{GIT_BRANCH}|{GIT_LABEL}").as_str())
+    );
+}
+
+#[test]
+fn a_detached_repo_reaches_the_layer_as_nil() {
+    let (_reg, host) = host();
+    status_git_layer(
+        &host,
+        r#"return ev.branch == nil and "no-branch" or "branch""#,
+    );
+    assert_eq!(
+        ask_status_git_with(&host, None).as_deref(),
+        Some("no-branch")
+    );
+}
+
+/// Nobody owes the bar a rewrite. Deferring reaches the host default, which
+/// answers with the built-in label; throwing is skipped and the default
+/// answers for it. `None` from the chain keeps the built-in just as well.
+#[test_case("return prev(ev)" ; "layer_defers_to_the_builtin")]
+#[test_case("error('boom')" ; "broken_layer_leaves_the_builtin")]
+fn the_status_git_slot_keeps_the_builtin_when_no_one_rewrites(body: &str) {
+    let (_reg, host) = host();
+    status_git_layer(&host, body);
+    assert_eq!(ask_status_git(&host).as_deref(), Some(GIT_LABEL));
+}
+
+#[test]
+fn a_status_git_layer_answering_with_nothing_keeps_the_builtin() {
+    let (_reg, host) = host();
+    status_git_layer(&host, "return");
+    assert_eq!(ask_status_git(&host), None);
+}
+
+/// A layer parked off a git call runs no Lua for the watchdog to interrupt,
+/// so without a deadline the bar would wait on it forever.
+#[test]
+fn a_parked_status_git_layer_falls_back_to_the_builtin() {
+    let (_reg, host) = host();
+    status_git_layer(&host, &parked_layer_body());
+    assert_eq!(ask_status_git(&host), None);
+}
+
+#[test]
+fn an_off_contract_status_git_answer_keeps_the_builtin() {
+    let (_reg, host) = host();
+    status_git_layer(&host, "return 42");
+    assert_eq!(ask_status_git(&host), None);
 }
 
 // ---------------------------------------------------------------- slots

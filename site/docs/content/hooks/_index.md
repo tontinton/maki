@@ -329,6 +329,41 @@ end)
 Maki applies the pick itself, so a layer cannot split a tool call from its
 result.
 
+## Status bar slots
+
+`ui.status_git` fires when the status bar builds its `cwd:branch` segment, and
+again when the branch changes, a tool call finishes, or you `cd`. It gets
+`ev = { cwd, branch, label }`: the raw working directory, the branch (`nil`
+off a branch), and the label the bar would draw without a layer. Answer with
+the string to show. `prev(ev)` answers with the built-in label, and a layer
+that says nothing keeps it too. The event is inert strings, so layering the
+slot costs no permissions. Running git inside a layer costs `run`, same as
+anywhere else.
+
+The bar polls for the answer, so a slow layer delays the segment, never the
+UI. The chain gets 5 seconds before its answer is dropped, and a request
+already in flight is not stacked behind a new one.
+
+```lua
+maki.api.set_slot("ui.status_git", function(prev, ev)
+  if not ev.branch then
+    return
+  end
+  local out = maki.fn.system({ "git", "-C", ev.cwd, "status", "--porcelain" })
+  local n = 0
+  for _ in out:gmatch("[^\n]+") do
+    n = n + 1
+  end
+  if n == 0 then
+    return prev(ev)
+  end
+  return prev(ev) .. " ±" .. n
+end)
+```
+
+A layer that shells out pays for it on every refresh, so cache the count when
+the repo is big.
+
 ## Completion sources
 
 The bundled completion plugin offers files after `@`. Other plugins add entries

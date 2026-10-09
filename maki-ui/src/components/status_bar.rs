@@ -70,17 +70,26 @@ pub struct StatusBar {
     queued: VecDeque<String>,
     started_at: Instant,
     cwd_branch: String,
+    branch: Option<String>,
+    /// What a `ui.status_git` chain answered for the git segment, if anything.
+    git_label: Option<String>,
+    /// In-flight answer from the `ui.status_git` chain.
+    git_rx: Option<flume::Receiver<Option<String>>>,
     pub flash_duration: Duration,
     branch_update_rx: Option<flume::Receiver<()>>,
 }
 
 impl StatusBar {
     pub fn new(flash_duration: Duration) -> Self {
+        let (label, branch) = cwd_branch_label();
         Self {
             flash: None,
             queued: VecDeque::new(),
             started_at: Instant::now(),
-            cwd_branch: cwd_branch_label(),
+            cwd_branch: label,
+            branch,
+            git_label: None,
+            git_rx: None,
             flash_duration,
             branch_update_rx: spawn_branch_watcher(),
         }
@@ -108,8 +117,49 @@ impl StatusBar {
         self.flash.as_ref().map(|(s, _)| s.as_str())
     }
 
+    /// The built-in `cwd:branch` label, what the bar draws when no plugin
+    /// layered `ui.status_git` or the chain kept it.
+    pub fn builtin_label(&self) -> &str {
+        &self.cwd_branch
+    }
+
+    pub fn branch(&self) -> Option<&str> {
+        self.branch.as_deref()
+    }
+
+    /// Whether an answer from the `ui.status_git` chain is already in flight.
+    pub fn git_pending(&self) -> bool {
+        self.git_rx.is_some()
+    }
+
+    /// Takes the receiver of a `ui.status_git` request, dropping any answer
+    /// still owed for an older one.
+    pub fn request_git(&mut self, rx: flume::Receiver<Option<String>>) {
+        self.git_rx = Some(rx);
+    }
+
+    /// Picks up an answered `ui.status_git` request. `None` from the chain
+    /// means the built-in label stands.
+    pub fn poll_git_update(&mut self) -> Dirty {
+        let Some(rx) = &self.git_rx else {
+            return Dirty::NO;
+        };
+        let answered = match rx.try_recv() {
+            Ok(label) => label,
+            Err(flume::TryRecvError::Disconnected) => None,
+            Err(flume::TryRecvError::Empty) => return Dirty::NO,
+        };
+        self.git_rx = None;
+        let changed = answered != self.git_label;
+        self.git_label = answered;
+        Dirty::from(changed)
+    }
+
     pub fn refresh_cwd(&mut self) {
-        self.cwd_branch = cwd_branch_label();
+        let (label, branch) = cwd_branch_label();
+        self.cwd_branch = label;
+        self.branch = branch;
+        self.git_label = None;
     }
 
     pub fn poll_branch_update(&mut self) -> Dirty {
@@ -119,9 +169,13 @@ impl StatusBar {
         if rx.try_iter().next().is_none() {
             return Dirty::NO;
         }
-        let branch = cwd_branch_label();
-        let changed = branch != self.cwd_branch;
-        self.cwd_branch = branch;
+        let (label, branch) = cwd_branch_label();
+        let changed = label != self.cwd_branch;
+        self.cwd_branch = label;
+        self.branch = branch;
+        if changed {
+            self.git_label = None;
+        }
         Dirty::from(changed)
     }
 
@@ -300,7 +354,8 @@ impl StatusBar {
                     + CWD_MODEL_SEPARATOR.width();
                 let available = (area.width as usize).saturating_sub(reserved);
                 let model = truncate_tail(ctx.model_id, available / 2);
-                let cwd = truncate_tail(&self.cwd_branch, available.saturating_sub(model.width()));
+                let git = self.git_label.as_deref().unwrap_or(&self.cwd_branch);
+                let cwd = truncate_tail(git, available.saturating_sub(model.width()));
 
                 right_spans.push(Span::styled(cwd, theme::current().status_dim));
                 right_spans.push(Span::raw(CWD_MODEL_SEPARATOR));
@@ -361,15 +416,17 @@ fn collapse_home_with(path: &str, home: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-fn cwd_branch_label() -> String {
+fn cwd_branch_label() -> (String, Option<String>) {
     let cwd = env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".into());
-    let label = collapse_home(&cwd);
-    match detect_branch(&cwd) {
-        Some(branch) => format!("{label}:{branch}"),
-        None => label,
-    }
+    let collapsed = collapse_home(&cwd);
+    let branch = detect_branch(&cwd);
+    let label = match &branch {
+        Some(branch) => format!("{collapsed}:{branch}"),
+        None => collapsed,
+    };
+    (label, branch)
 }
 
 fn detect_branch(cwd: &str) -> Option<String> {
@@ -449,6 +506,7 @@ mod tests {
     const SESSION_COST: f64 = 1.5;
     const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
     const SIGMA: char = '\u{03a3}';
+    const GIT_ANSWER: &str = "some/repo:main ±3";
     const RETRY_MESSAGE: &str = "rate limited";
     const RETRY_ATTEMPT: u32 = 2;
     const COUNTDOWN: &str = "retrying in";
@@ -469,7 +527,10 @@ mod tests {
     }
 
     fn draw(ctx: &StatusBarContext<'_>) -> String {
-        let bar = StatusBar::new(FLASH_TTL);
+        draw_bar(&StatusBar::new(FLASH_TTL), ctx)
+    }
+
+    fn draw_bar(bar: &StatusBar, ctx: &StatusBarContext<'_>) -> String {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
         terminal.draw(|f| bar.view(f, f.area(), ctx)).unwrap();
@@ -722,7 +783,7 @@ mod tests {
     #[test_case(false => Dirty::NO  ; "unchanged_branch")]
     #[test_case(true  => Dirty::YES ; "switched_branch")]
     fn poll_branch_update_reports_only_real_changes(stale: bool) -> Dirty {
-        let label = cwd_branch_label();
+        let (label, _) = cwd_branch_label();
         let (tx, rx) = flume::bounded(1);
         let mut bar = StatusBar::new(FLASH_TTL);
         bar.cwd_branch = if stale {
@@ -762,6 +823,39 @@ mod tests {
             "the attempt number survives either way: {text}"
         );
         text.contains(COUNTDOWN)
+    }
+
+    /// The bar polls the `ui.status_git` answer instead of blocking on it, so
+    /// a chain that says nothing, or dies mid-answer, must leave the built-in
+    /// label standing.
+    #[test_case(Some(GIT_ANSWER) => true  ; "a_layer_rewrites_the_segment")]
+    #[test_case(None              => false ; "the_chain_defers_to_the_builtin")]
+    fn an_answered_git_request_reaches_the_bar(answer: Option<&str>) -> bool {
+        let (tx, rx) = flume::bounded(1);
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.request_git(rx);
+        assert!(bar.git_pending());
+        tx.send(answer.map(str::to_owned)).unwrap();
+
+        let ctx = context(&Status::Idle, None, false, false);
+        let text = draw_bar(&bar, &ctx);
+        assert!(!text.contains("±3"), "{text}");
+
+        let _ = bar.poll_git_update();
+        assert!(!bar.git_pending());
+        draw_bar(&bar, &ctx).contains("±3")
+    }
+
+    #[test]
+    fn a_dropped_git_answer_leaves_the_bar_alone() {
+        let (tx, rx) = flume::bounded(1);
+        drop(tx);
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.request_git(rx);
+
+        assert_eq!(bar.poll_git_update(), Dirty::NO, "{QUIET}");
+        assert!(!bar.git_pending());
+        assert_eq!(bar.git_label, None);
     }
 
     #[test]
