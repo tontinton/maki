@@ -2745,7 +2745,8 @@ fn input_snapshot_offsets_are_byte_offsets() {
 
 /// The line and column the cursor sits on are a slice of `text` and `cursor`,
 /// so Lua takes them for itself. A field is forever once it ships, and these
-/// two would have to be kept in step with a buffer that already answers.
+/// two would have to be kept in step with a buffer that already answers. The
+/// vim mode is no slice of anything, so it is there.
 #[test]
 fn input_snapshot_carries_nothing_a_slice_would_give() {
     const DRAFT: &str = "first\nsecond";
@@ -2760,6 +2761,7 @@ fn input_snapshot_carries_nothing_a_slice_would_give() {
             "text": DRAFT,
             "cursor": DRAFT.len(),
             "version": app.input_box.buffer.version(),
+            "vim_mode": null,
         })
     );
 }
@@ -5622,6 +5624,40 @@ fn vim_ctrl_c_clears_into_insert_mode() {
     app.update(Msg::Key(kb::QUIT.to_key_event()));
     assert!(app.input_box.is_empty());
     assert_eq!(app.input_box.vim_mode(), Some(VimMode::Insert));
+}
+
+#[test]
+fn vim_mode_reaches_plugins() {
+    let mut app = test_app();
+    assert_eq!(app.input_snapshot()["vim_mode"], serde_json::Value::Null);
+
+    app.input_box.set_vim_enabled(true);
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+    assert_eq!(
+        app.input_snapshot()["vim_mode"],
+        serde_json::json!("insert")
+    );
+
+    app.update(Msg::Key(key(KeyCode::Char('a'))));
+    app.update(Msg::Key(key(KeyCode::Char('b'))));
+    let _ = app.tick();
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert_eq!(data["vim_mode"], serde_json::json!("insert"));
+
+    press_esc(&mut app);
+    let _ = app.tick();
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert_eq!(
+        data["cursor_only"],
+        serde_json::json!(true),
+        "Esc moved the cursor one left"
+    );
+    assert_eq!(data["vim_mode"], serde_json::json!("normal"));
+    assert_eq!(
+        app.input_snapshot()["vim_mode"],
+        serde_json::json!("normal")
+    );
 }
 
 /// The list a plugin is refused and the list the host answers itself are one

@@ -461,6 +461,9 @@ fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
 /// - `cursor` (integer) byte offset of the cursor into `text`.
 /// - `version` (integer) counter of changes to the value. Pass it to
 ///   `input_edit`, which refuses once the value has moved on.
+/// - `vim_mode` (string|nil) `"normal"` or `"insert"` while vim mode is on,
+///   nil while it is off. Normal mode types nothing, so a plugin that reacts
+///   to typing can skip it.
 ///
 /// The cursor line and column are a slice of those two, so the table leaves
 /// them out: with `local before = st.text:sub(1, st.cursor)`,

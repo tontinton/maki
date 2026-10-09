@@ -832,8 +832,9 @@ name the session now running or focused. What each event adds:
 - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
   plus `data.previous_spec`. Picking the model already in use stays
   quiet, and so does startup.
-- `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
-  chat input as `maki.ui.input` reports it. `data.source` is the plugin
+- `"InputChanged"`: `data.text`, `data.cursor`, `data.version` and
+  `data.vim_mode`, the chat input as `maki.ui.input` reports it. A change
+  of vim mode alone fires nothing. `data.source` is the plugin
   name when that plugin's `maki.ui.input_edit` was the only writer this
   frame, and nil otherwise (including when the user moved the caret), so
   ignoring your own name never drops a change. `data.cursor_only` is true
@@ -6465,6 +6466,9 @@ The returned table has:
 - `cursor` (integer) byte offset of the cursor into `text`.
 - `version` (integer) counter of changes to the value. Pass it to
   `input_edit`, which refuses once the value has moved on.
+- `vim_mode` (string|nil) `"normal"` or `"insert"` while vim mode is on,
+  nil while it is off. Normal mode types nothing, so a plugin that reacts
+  to typing can skip it.
 
 The cursor line and column are a slice of those two, so the table leaves
 them out: with `local before = st.text:sub(1, st.cursor)`,

@@ -651,10 +651,11 @@ impl App {
         })
     }
 
-    /// What `maki.ui.input` hands to Lua: text and offsets only. The terminal
-    /// cell the caret sits in has no answer for half the modes the UI can be
-    /// in, and the line and column the cursor is on are a slice of the two
-    /// fields below, which Lua can take for itself.
+    /// What `maki.ui.input` hands to Lua: text and offsets only, plus the vim
+    /// mode, which no slice of them can give. The terminal cell the caret sits
+    /// in has no answer for half the modes the UI can be in, and the line and
+    /// column the cursor is on are a slice of the two fields below, which Lua
+    /// can take for itself.
     pub(crate) fn input_snapshot(&self) -> serde_json::Value {
         let buffer = &self.input_box.buffer;
         serde_json::json!({
@@ -662,7 +663,13 @@ impl App {
             "text": buffer.value(),
             "cursor": buffer.cursor_byte(),
             "version": buffer.version(),
+            "vim_mode": self.vim_mode_name(),
         })
+    }
+
+    /// `nil` in Lua while vim mode is off.
+    fn vim_mode_name(&self) -> Option<&'static str> {
+        self.input_box.vim_mode().map(VimMode::name)
     }
 
     /// Refuses an edit the input has moved on from: another tab now focused, a
@@ -783,6 +790,7 @@ impl App {
                 "version": self.input_box.buffer.version(),
                 "source": source,
                 "cursor_only": cursor_only,
+                "vim_mode": self.vim_mode_name(),
             }),
         );
     }
