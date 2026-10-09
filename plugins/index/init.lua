@@ -1,5 +1,6 @@
 local dir_listing = require("maki.dir_listing")
 local indexer = require("indexer")
+local ctags = require("ctags")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
 
@@ -141,6 +142,30 @@ local function render_index(skeleton, path, ctx, ext, line_meta)
   return buf, render_header(path, line_count)
 end
 
+local function render_outline(outline, path, ctx)
+  local tol = ctx:tool_output_lines()
+  local buf = maki.ui.buf()
+  local view = ToolView.new(buf, {
+    max_lines = (tol and tol.index) or 5,
+    keep = "head",
+  })
+  buf:on("click", function()
+    view:toggle()
+  end)
+  local hl_entries = render_skeleton(view, outline, nil)
+  view:finish()
+
+  local ext = path:match("%.([^%.]+)$")
+  if ext then
+    maki.async.run(function()
+      apply_highlights(view, hl_entries, ext)
+    end)
+  end
+
+  local line_count = select(2, outline:gsub("\n", "\n")) + 1
+  return buf, render_header(path, line_count)
+end
+
 maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = "- Use the **index** tool first on individual files to get their skeleton, then use the **read** tool with offset/limit for the specific section you need.",
@@ -159,7 +184,7 @@ Return a compact overview of a source file: imports, type definitions, function 
 
 - Use this FIRST to understand file structure before using read with offset/limit.
 - Supports source files in different programming languages and markdown.
-- Falls back with an error on unsupported languages. Use read instead.]],
+- Falls back to a flat ctags outline (names and start lines, no ranges) for languages it has no extractor for, when universal-ctags is installed. Otherwise errors - use read instead.]],
 
   schema = {
     type = "object",
@@ -212,6 +237,11 @@ Return a compact overview of a source file: imports, type definitions, function 
 
       lang = indexer.EXT_TO_LANG[ext]
       if not lang then
+        local outline = ctags.outline(path)
+        if outline then
+          local buf, outline_header = render_outline(outline, path, ctx)
+          return { llm_output = outline, body = buf, header = outline_header }
+        end
         return { llm_output = "Unsupported file type: ." .. ext .. ". Use the read tool instead.", is_error = true }
       end
     end
