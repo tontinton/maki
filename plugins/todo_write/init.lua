@@ -13,6 +13,13 @@ local live = {}
 local focused = { session = "", task = MAIN_TASK }
 local buf, win
 
+local opts = maki.api.register_options({
+  show_on_resume_or_reload = {
+    default = true,
+    desc = "Show the todo panel when a session with todos is resumed or reloaded.",
+  },
+})
+
 local STATUS_MARKERS = {
   completed = { "[✓]", "todo_completed" },
   in_progress = { "[•]", "todo_in_progress" },
@@ -161,6 +168,9 @@ maki.api.register_tool({
     local items = input.todos or {}
     local sid = ctx:session_id() or ""
     if not is_error and ctx:restore_reason() == "load" and not live[sid] then
+      if not opts.show_on_resume_or_reload then
+        hidden[sid] = true
+      end
       store(sid, ctx:task_id(), items)
     end
     if #items == 0 then
