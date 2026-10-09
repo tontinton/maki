@@ -10,6 +10,8 @@ use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
+#[cfg(test)]
+use crate::vim::VimMode;
 use maki_lua::Split;
 use maki_providers::RequestOptions;
 use ratatui::Frame;
@@ -498,6 +500,9 @@ impl App {
                 contexts.push(KeybindContext::Streaming);
             }
             contexts.push(KeybindContext::Editing);
+            if self.input_box.vim_mode() == Some(VimMode::Normal) {
+                contexts.push(KeybindContext::Vim);
+            }
         }
         contexts
     }

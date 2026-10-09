@@ -16,6 +16,7 @@ pub mod sessions;
 pub mod theme;
 pub mod trusted_folders;
 pub mod version;
+pub mod vim_mode;
 
 use std::fs;
 use std::io::Write;

@@ -43,6 +43,7 @@ use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::persist_model;
 use maki_storage::sessions::normalize_title;
+use maki_storage::vim_mode::{persist_vim_mode, read_vim_mode};
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
@@ -386,6 +387,28 @@ impl SessionRuntime {
     }
 }
 
+/// What a start comes up in: the mode `/vim` saved last, or the config's when
+/// it never ran, the way the last picked model wins over `default_model`.
+fn startup_vim_mode(storage: &StateDir, configured: bool) -> bool {
+    read_vim_mode(storage).unwrap_or(configured)
+}
+
+/// `/vim` in one tab is one mode for every tab: the open ones, the ones
+/// spawned later from {ui_config}, and the next start, which reads it back
+/// from {storage}.
+fn set_vim_mode<'a>(
+    apps: impl IntoIterator<Item = &'a mut App>,
+    ui_config: &mut UiConfig,
+    storage: &StateDir,
+    enabled: bool,
+) {
+    ui_config.vim_mode = enabled;
+    for app in apps {
+        app.input_box.set_vim_enabled(enabled);
+    }
+    persist_vim_mode(storage, enabled);
+}
+
 /// Everything needed to bring up a new session runtime after startup.
 struct SpawnCtx {
     storage: StateDir,
@@ -587,7 +610,7 @@ impl<'t> EventLoop<'t> {
             startup_alert,
             storage,
             config,
-            ui_config,
+            mut ui_config,
             input_history_size,
             permissions,
             timeouts,
@@ -606,6 +629,8 @@ impl<'t> EventLoop<'t> {
         // A `/reload` generation inherits the handles of the one before it,
         // so every loop has to claim the UI back for itself.
         ui_attachment.attach();
+
+        ui_config.vim_mode = startup_vim_mode(&storage, ui_config.vim_mode);
 
         // Apply the config theme before the warmup thread spawns, or warmup
         // could bake the syntax palette from the old theme. Only the
@@ -1771,6 +1796,12 @@ impl<'t> EventLoop<'t> {
             Action::RefreshModels => self.refresh_models(),
             Action::RefreshUsage => self.refresh_usage(),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
+            Action::SetVimMode(enabled) => set_vim_mode(
+                self.sessions.iter_mut().map(|rt| &mut rt.app),
+                &mut self.ctx.ui_config,
+                &self.ctx.storage,
+                enabled,
+            ),
         }
     }
 
@@ -1958,12 +1989,61 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::tests::{app_with_ui_config, test_app};
     use maki_agent::DoneReason;
     use maki_providers::TokenUsage;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
+
+    fn temp_storage() -> (TempDir, StateDir) {
+        let tmp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        (tmp, storage)
+    }
+
+    #[test_case(None,        false, false ; "nothing_saved_follows_the_config_off")]
+    #[test_case(None,        true,  true  ; "nothing_saved_follows_the_config_on")]
+    #[test_case(Some(false), true,  false ; "a_saved_off_wins_over_the_config")]
+    #[test_case(Some(true),  false, true  ; "a_saved_on_wins_over_the_config")]
+    fn the_saved_vim_mode_wins_over_the_config(
+        saved: Option<bool>,
+        configured: bool,
+        expected: bool,
+    ) {
+        let (_tmp, storage) = temp_storage();
+        if let Some(enabled) = saved {
+            persist_vim_mode(&storage, enabled);
+        }
+        assert_eq!(startup_vim_mode(&storage, configured), expected);
+    }
+
+    #[test]
+    fn a_vim_toggle_reaches_every_tab_and_the_next_start() {
+        let (_tmp, storage) = temp_storage();
+        let mut ui_config = UiConfig::default();
+        let mut tabs = [test_app(), test_app()];
+
+        set_vim_mode(tabs.iter_mut(), &mut ui_config, &storage, true);
+        assert!(tabs.iter().all(|app| app.input_box.vim_mode().is_some()));
+        assert!(
+            app_with_ui_config(ui_config.clone())
+                .input_box
+                .vim_mode()
+                .is_some(),
+            "a tab opened later starts in vim mode"
+        );
+        assert!(
+            startup_vim_mode(&storage, false),
+            "the next start comes back in vim mode"
+        );
+
+        set_vim_mode(tabs.iter_mut(), &mut ui_config, &storage, false);
+        assert!(tabs.iter().all(|app| app.input_box.vim_mode().is_none()));
+        assert!(!startup_vim_mode(&storage, true));
+    }
 
     fn done_event() -> AgentEvent {
         AgentEvent::Done {

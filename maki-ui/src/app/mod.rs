@@ -56,6 +56,7 @@ use crate::components::{
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
+use crate::vim::VimMode;
 use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
@@ -127,6 +128,8 @@ const FAST_PENDING_MSG: &str = "Fast mode: pending model discovery";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
+pub(crate) const VIM_ON_MSG: &str = "Vim mode: on";
+pub(crate) const VIM_OFF_MSG: &str = "Vim mode: off";
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
 const PACK_CHANGES_DECLINED: &str = "Package changes declined";
@@ -444,7 +447,7 @@ impl App {
         let state = SessionState::from_session(session, model, &storage);
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
-        let input_box = InputBox::new(
+        let mut input_box = InputBox::new(
             InputHistory::load(
                 &storage,
                 &env::current_dir().unwrap_or_else(|_| PathBuf::from(&state.session.cwd)),
@@ -452,6 +455,7 @@ impl App {
             ),
             ui_config.max_input_lines,
         );
+        input_box.set_vim_enabled(ui_config.vim_mode);
         let mut app = Self {
             chats: vec![Chat::new(
                 state.session.id,
@@ -647,10 +651,11 @@ impl App {
         })
     }
 
-    /// What `maki.ui.input` hands to Lua: text and offsets only. The terminal
-    /// cell the caret sits in has no answer for half the modes the UI can be
-    /// in, and the line and column the cursor is on are a slice of the two
-    /// fields below, which Lua can take for itself.
+    /// What `maki.ui.input` hands to Lua: text and offsets only, plus the vim
+    /// mode, which no slice of them can give. The terminal cell the caret sits
+    /// in has no answer for half the modes the UI can be in, and the line and
+    /// column the cursor is on are a slice of the two fields below, which Lua
+    /// can take for itself.
     pub(crate) fn input_snapshot(&self) -> serde_json::Value {
         let buffer = &self.input_box.buffer;
         serde_json::json!({
@@ -658,7 +663,13 @@ impl App {
             "text": buffer.value(),
             "cursor": buffer.cursor_byte(),
             "version": buffer.version(),
+            "vim_mode": self.vim_mode_name(),
         })
+    }
+
+    /// `nil` in Lua while vim mode is off.
+    fn vim_mode_name(&self) -> Option<&'static str> {
+        self.input_box.vim_mode().map(VimMode::name)
     }
 
     /// Refuses an edit the input has moved on from: another tab now focused, a
@@ -779,6 +790,7 @@ impl App {
                 "version": self.input_box.buffer.version(),
                 "source": source,
                 "cursor_only": cursor_only,
+                "vim_mode": self.vim_mode_name(),
             }),
         );
     }
@@ -1163,7 +1175,7 @@ impl App {
                 }
                 CommandAction::Complete(text) => {
                     self.input_box.set_input(text);
-                    self.input_box.buffer.move_to_end();
+                    self.input_box.move_to_end();
                     self.input_changed(InputWriter::Anyone);
                     return Some(vec![]);
                 }
@@ -1294,8 +1306,15 @@ impl App {
     /// takes its claims in [`FloatManager::handle_claimed_key`], which runs
     /// above, so the popup takes the first `Esc` and the next one, with the
     /// popup gone, arms the cancel.
+    ///
+    /// So does an `Esc` that vim mode wants for leaving insert mode or for
+    /// cancelling a half-typed command. A binding on it would leave the user
+    /// stuck in insert mode.
     fn reserved_by_host(&self, key: KeyEvent) -> bool {
-        is_reserved(key) || (self.status == Status::Streaming && key.code == KeyCode::Esc)
+        is_reserved(key)
+            || (key.code == KeyCode::Esc
+                && (self.status == Status::Streaming
+                    || (self.chat_accepts_input() && self.input_box.vim_wants_esc())))
     }
 
     /// Whether a plugin binding claimed {key}. The binding the keymap matched
@@ -1344,14 +1363,14 @@ impl App {
                 return self.run_builtin(BuiltinAction::FilePicker);
             } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
                 self.start_image_paste();
-            } else if let InputAction::Changed = self.input_box.handle_key(key) {
+            } else if let InputAction::Changed = self.input_key(key) {
                 self.input_changed(InputWriter::Anyone);
             }
             return vec![];
         }
 
         let streaming = self.status == Status::Streaming;
-        match self.input_box.handle_key(key) {
+        match self.input_key(key) {
             InputAction::Submit(sub) => self.handle_submit(sub),
             InputAction::Changed => {
                 self.input_changed(InputWriter::Anyone);
@@ -1377,6 +1396,17 @@ impl App {
             }
             InputAction::ContinueLine | InputAction::None => vec![],
         }
+    }
+
+    /// In vim mode a key the input box used sits between two presses of
+    /// `Esc`, so they are not a double `Esc`. Without this, `Esc` `i` `Esc`
+    /// inside the flash time opens rewind.
+    fn input_key(&mut self, key: KeyEvent) -> InputAction {
+        let action = self.input_box.handle_key(key);
+        if self.input_box.vim_mode().is_some() && !matches!(action, InputAction::Passthrough(_)) {
+            self.last_esc = None;
+        }
+        action
     }
 
     fn handle_esc(&mut self, streaming: bool) -> Vec<Action> {
@@ -1895,6 +1925,12 @@ impl App {
                     Err(msg) => self.flash(msg),
                 }
                 vec![]
+            }
+            "/vim" => {
+                let enabled = self.input_box.vim_mode().is_none();
+                self.input_box.set_vim_enabled(enabled);
+                self.flash(if enabled { VIM_ON_MSG } else { VIM_OFF_MSG }.into());
+                vec![Action::SetVimMode(enabled)]
             }
             "/workflow" => {
                 self.state.workflow = !self.state.workflow;

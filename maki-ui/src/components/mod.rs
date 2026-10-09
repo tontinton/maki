@@ -214,6 +214,8 @@ pub enum Action {
     Btw(String),
     PreparePack(PackCommand),
     Suspend,
+    /// `/vim` in one tab, which every other tab and the next start follow.
+    SetVimMode(bool),
 }
 
 const ERROR_DISPLAY: Duration = Duration::from_secs(5);

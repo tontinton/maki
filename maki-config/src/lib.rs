@@ -652,6 +652,7 @@ pub struct UiFileConfig {
     pub clock_format: Option<ClockFormat>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub max_input_lines: Option<u32>,
+    pub vim_mode: Option<bool>,
 }
 
 impl UiFileConfig {
@@ -669,7 +670,8 @@ impl UiFileConfig {
             show_thinking,
             theme,
             clock_format,
-            max_input_lines
+            max_input_lines,
+            vim_mode
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -1257,6 +1259,12 @@ pub struct UiConfig {
     pub max_input_lines: u32,
 
     #[config(
+        default = false,
+        desc = "Edit the chat input with vim keys. `/vim` turns it on or off and saves the choice, which wins over this option on later starts"
+    )]
+    pub vim_mode: bool,
+
+    #[config(
         default = true,
         desc = "When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes"
     )]
@@ -1289,6 +1297,7 @@ impl UiConfig {
                 .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
             max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
+            vim_mode: f.vim_mode.unwrap_or(false),
             show_thinking: f.show_thinking.unwrap_or(true),
             clock_format: f.clock_format.unwrap_or_default(),
             theme: f.theme,
@@ -4004,6 +4013,23 @@ mod tests {
 
         let raw: RawConfig = toml::from_str("[ui]\nmax_input_lines = 5\n").unwrap();
         assert_eq!(raw.ui.max_input_lines.unwrap(), 5);
+    }
+
+    #[test]
+    fn vim_mode_defaults_off_and_the_project_config_wins() {
+        let defaults = RawConfig::default().into_config(&[]).unwrap();
+        assert!(!defaults.ui.vim_mode);
+
+        let mut global: RawConfig = toml::from_str("[ui]\nvim_mode = true\n").unwrap();
+        global.merge(RawConfig::default());
+        assert_eq!(
+            global.ui.vim_mode,
+            Some(true),
+            "a project without it keeps it"
+        );
+
+        global.merge(toml::from_str("[ui]\nvim_mode = false\n").unwrap());
+        assert!(!global.into_config(&[]).unwrap().ui.vim_mode);
     }
 
     #[test_case("[ui]\nsplash_animaton = true\n" ; "top_level_typo")]

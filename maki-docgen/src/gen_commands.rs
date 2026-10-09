@@ -98,6 +98,11 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
+        "- **`/vim`**: vim keys in the chat input, for every tab. Maki keeps the choice for the next start. Config: `ui.vim_mode = true`. See [Keybindings](/docs/keybindings/#vim-normal-mode) for the keys."
+    )
+    .unwrap();
+    writeln!(
+        out,
         "- **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only)."
     )
     .unwrap();

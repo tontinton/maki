@@ -29,6 +29,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * SSRF protection on `webfetch` calls.
 * A `memory` tool to keep long term context, just tell maki to remember something (sometimes it uses it automatically). Managed via `/memory` (view / edit / delete memories).
 * Fuzzy search with Ctrl-F.
+* Vim keys in the chat input - toggle with `/vim` (remembered across restarts), or set `ui.vim_mode = true` in the config. [Supported keys](https://maki.sh/docs/keybindings/#vim-normal-mode).
 * `/btw` to run a command with the chat history without interfering with the current session.
 * Rewind on Escape-Escape (no code rewind yet, only chat history).
 * Attach images in prompts.
