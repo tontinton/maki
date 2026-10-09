@@ -229,11 +229,18 @@ impl ModelRegistry {
         self.overrides.iter().any(|(&t, s)| s == spec && t != tier)
     }
 
+    /// An override is a choice someone made by hand, so it stands whatever
+    /// `providers.toml` says about picking the provider on its own. The walk
+    /// below is the part nobody asked for, and that is where `auto = false`
+    /// takes a provider out.
     fn spec_for_tier_any(&self, tier: ModelTier) -> Option<String> {
         if let Some(spec) = self.overrides.get(&tier) {
             return Some(spec.clone());
         }
         for provider in self.known_models.keys() {
+            if !maki_config::providers::auto_selectable(provider) {
+                continue;
+            }
             if let Some(spec) = self.spec_for_tier(provider, tier) {
                 return Some(spec);
             }
