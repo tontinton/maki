@@ -219,7 +219,7 @@ impl App {
         main.context_size = context_size;
         if let Some(draft) = self.state.session.meta.input_draft.clone() {
             self.input_box.set_input(draft);
-            self.input_box.buffer.move_to_end();
+            self.input_box.move_to_end();
         }
 
         self.chats[0].request_restores(restore_items);
@@ -395,7 +395,7 @@ impl App {
         self.restore_display();
 
         self.input_box.set_input(entry.prompt_text);
-        self.input_box.buffer.move_to_end();
+        self.input_box.move_to_end();
 
         vec![Action::RestartAgent(self.install_local_history())]
     }

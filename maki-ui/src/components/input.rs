@@ -6,6 +6,7 @@ use crate::app::shell::parse_shell_prefix;
 use crate::highlight;
 use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
 use crate::theme;
+use crate::vim::{EditStart, Vim, VimMode, VimOutcome};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_storage::input_history::InputHistory;
@@ -89,12 +90,41 @@ pub struct InputBox {
     max_input_lines: u16,
     last_total_lines: u16,
     last_content_height: u16,
+    /// `None` while vim mode is off, which leaves the box as it always was.
+    vim: Option<Vim>,
 }
 
 impl InputBox {
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
         self.follow_cursor = true;
+        let version = self.buffer.version();
+        let outcome = self
+            .vim
+            .as_mut()
+            .map(|vim| vim.handle_key(key, &mut self.buffer));
+        match outcome {
+            None => self.edit_key(key),
+            Some(VimOutcome::Unhandled) => {
+                let start = self.begin_vim_edit();
+                let action = self.edit_key(key);
+                self.end_vim_edit(start);
+                action
+            }
+            Some(VimOutcome::Handled) if self.buffer.version() == version => InputAction::None,
+            Some(VimOutcome::Handled) => InputAction::Changed,
+            Some(VimOutcome::Submit) => self.submit_action(),
+            Some(VimOutcome::HistoryPrev) => {
+                self.history_up();
+                InputAction::None
+            }
+            Some(VimOutcome::HistoryNext) => {
+                self.history_down();
+                InputAction::None
+            }
+        }
+    }
 
+    fn edit_key(&mut self, key: KeyEvent) -> InputAction {
         match key.code {
             KeyCode::Up if self.is_at_first_line() => {
                 self.history_up();
@@ -113,12 +143,7 @@ impl InputBox {
                 self.continue_line();
                 return InputAction::ContinueLine;
             }
-            KeyCode::Enter => {
-                return match self.submit() {
-                    Some(sub) => InputAction::Submit(sub),
-                    None => InputAction::Submit(Submission::default()),
-                };
-            }
+            KeyCode::Enter => return self.submit_action(),
             _ => {}
         }
 
@@ -128,9 +153,17 @@ impl InputBox {
         }
     }
 
+    fn submit_action(&mut self) -> InputAction {
+        InputAction::Submit(self.submit().unwrap_or_default())
+    }
+
+    /// In normal mode the paste is one undo step, and the cursor ends on the
+    /// character after it.
     pub fn handle_paste(&mut self, text: &str) -> InputAction {
         self.follow_cursor = true;
+        let start = self.begin_vim_edit();
         self.buffer.insert_text(text);
+        self.end_vim_edit(start);
         InputAction::Changed
     }
 
@@ -182,6 +215,48 @@ impl InputBox {
             max_input_lines,
             last_total_lines: 1,
             last_content_height: 1,
+            vim: None,
+        }
+    }
+
+    /// Off drops every vim state with it. On keeps a running one as it is, so
+    /// a second tab turning vim on does not throw this one out of normal
+    /// mode.
+    pub fn set_vim_enabled(&mut self, enabled: bool) {
+        match (enabled, &self.vim) {
+            (true, None) => self.vim = Some(Vim::new(&self.buffer)),
+            (false, Some(_)) => self.vim = None,
+            _ => {}
+        }
+    }
+
+    /// `None` while vim mode is off.
+    pub fn vim_mode(&self) -> Option<VimMode> {
+        self.vim.as_ref().map(Vim::mode)
+    }
+
+    /// Whether the next `Esc` leaves insert mode or cancels a half-typed
+    /// command, rather than reaching the app.
+    pub fn vim_wants_esc(&self) -> bool {
+        self.vim.as_ref().is_some_and(Vim::wants_esc)
+    }
+
+    fn begin_vim_edit(&self) -> Option<EditStart> {
+        self.vim.as_ref().map(|vim| vim.begin_edit(&self.buffer))
+    }
+
+    fn end_vim_edit(&mut self, start: Option<EditStart>) {
+        if let (Some(vim), Some(start)) = (self.vim.as_mut(), start) {
+            vim.end_edit(start, &mut self.buffer);
+        }
+    }
+
+    /// The end of the text, where a recalled entry or a restored draft puts
+    /// the cursor. Normal mode moves it back onto the last character.
+    pub fn move_to_end(&mut self) {
+        self.buffer.move_to_end();
+        if let Some(vim) = self.vim.as_mut() {
+            vim.cursor_moved(&mut self.buffer);
         }
     }
 
@@ -258,7 +333,15 @@ impl InputBox {
         Some(Submission { text, images })
     }
 
+    /// A fresh draft, which vim mode starts in insert mode.
     pub fn discard(&mut self) {
+        self.clear();
+        if let Some(vim) = self.vim.as_mut() {
+            vim.reset(&self.buffer);
+        }
+    }
+
+    fn clear(&mut self) {
         self.pending_images.clear();
         self.history_index = None;
         self.draft.clear();
@@ -289,7 +372,7 @@ impl InputBox {
     pub fn swap_draft(&mut self, draft: Submission) -> Submission {
         let text = self.draft_text();
         let images = mem::take(&mut self.pending_images);
-        self.discard();
+        self.clear();
         self.set_input(draft.text);
         self.pending_images = draft.images;
         Submission { text, images }
@@ -302,7 +385,8 @@ impl InputBox {
     /// The way a plugin writes to the input. It carries the box's own state
     /// the way the paste path does: the view follows the cursor again, and the
     /// value stops counting as a recalled history entry, so the next history
-    /// key does not throw the edit away.
+    /// key does not throw the edit away. In vim normal mode it is one undo
+    /// step.
     ///
     /// See [`TextBuffer::replace_byte_range`] for what the offsets refuse.
     pub fn replace_range(
@@ -312,7 +396,9 @@ impl InputBox {
         text: &str,
         cursor: Option<usize>,
     ) -> Result<(), String> {
+        let edit = self.begin_vim_edit();
         self.buffer.replace_byte_range(start, stop, text, cursor)?;
+        self.end_vim_edit(edit);
         self.follow_cursor = true;
         self.history_index = None;
         self.draft.clear();
@@ -323,8 +409,14 @@ impl InputBox {
     /// restored draft, a rewind prompt, what came back from `$EDITOR`. The
     /// text lands verbatim, because the user composed it elsewhere and a
     /// rewrite here is what the model would be sent.
+    ///
+    /// Vim keeps its mode and drops its undo steps, which belong to the text
+    /// that left.
     pub fn set_input(&mut self, s: String) {
         self.buffer.set_value(s);
+        if let Some(vim) = self.vim.as_mut() {
+            vim.text_replaced(&mut self.buffer);
+        }
     }
 
     pub fn history_up(&mut self) {
@@ -342,7 +434,7 @@ impl InputBox {
         self.history_index = Some(new_index);
         let entry = self.history.get(new_index).unwrap().to_string();
         self.set_input(entry);
-        self.buffer.move_to_end();
+        self.move_to_end();
     }
 
     pub fn history_down(&mut self) {
@@ -529,6 +621,9 @@ impl InputBox {
             return;
         };
         self.buffer.set_cursor(y, x);
+        if let Some(vim) = self.vim.as_mut() {
+            vim.cursor_moved(&mut self.buffer);
+        }
         self.follow_cursor = true;
     }
 
@@ -844,6 +939,7 @@ mod tests {
     use super::*;
     use crate::components::scrollbar::SCROLLBAR_THUMB;
     use crate::selection::{ContentRegion, ScreenSelection, extract_selected_text};
+    use crate::vim::tests::keys;
     use ratatui::layout::{Position, Rect};
     use ratatui::style::Color;
     use test_case::test_case;
@@ -1638,6 +1734,184 @@ mod tests {
             .unwrap();
         input.history_down();
         assert_eq!(input.buffer.value(), "written");
+    }
+
+    /// Every key of {notation}, answering with what the last one did.
+    fn press(input: &mut InputBox, notation: &str) -> InputAction {
+        let mut last = InputAction::None;
+        for key in keys(notation) {
+            last = input.handle_key(key);
+        }
+        last
+    }
+
+    /// Vim on and {text} typed, then `Esc`: normal mode with the cursor on
+    /// the last character.
+    fn vim_normal(text: &str) -> InputBox {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.set_vim_enabled(true);
+        input.handle_paste(text);
+        press(&mut input, "<Esc>");
+        input
+    }
+
+    #[test]
+    fn vim_k_and_j_walk_history_from_the_edges() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.set_vim_enabled(true);
+        submit_text(&mut input, RECALLED);
+        input.handle_paste(DRAFT);
+        press(&mut input, "<Esc>");
+
+        press(&mut input, "k");
+        assert_eq!(input.buffer.value(), RECALLED);
+        assert_eq!(
+            input.buffer.x(),
+            RECALLED.len() - 1,
+            "normal mode keeps the cursor on the last character"
+        );
+
+        press(&mut input, "j");
+        assert_eq!(input.buffer.value(), DRAFT);
+    }
+
+    /// A backslash before the cursor continues the line in insert mode. Normal
+    /// mode has no line to continue, so `Enter` sends the text as it is.
+    #[test]
+    fn vim_enter_in_normal_mode_submits_past_a_backslash() {
+        const TEXT: &str = "a\\b";
+        let mut input = vim_normal(TEXT);
+        assert!(input.char_before_cursor_is_backslash());
+
+        let InputAction::Submit(sub) = press(&mut input, "<CR>") else {
+            panic!("Enter in normal mode must submit");
+        };
+        assert_eq!(sub.text, TEXT);
+        assert_eq!(
+            input.vim_mode(),
+            Some(VimMode::Insert),
+            "the next draft starts in insert mode"
+        );
+    }
+
+    #[test_case("/" ; "slash_opens_the_palette")]
+    #[test_case("!" ; "bang_starts_shell_input")]
+    fn vim_an_empty_draft_types_its_first_character_in_normal_mode(typed: &str) {
+        let mut input = vim_normal("");
+        assert!(matches!(press(&mut input, typed), InputAction::Changed));
+        assert_eq!(input.buffer.value(), typed);
+        assert_eq!(input.vim_mode(), Some(VimMode::Insert));
+    }
+
+    #[test]
+    fn vim_a_click_past_the_line_end_lands_on_the_last_character() {
+        let mut input = vim_normal("abc");
+        input.handle_click(area(10), 0, 9);
+        assert_eq!(input.buffer.x(), 2);
+    }
+
+    #[test_case(false, "",      true  ; "off_passes_it_on")]
+    #[test_case(true,  "",      false ; "insert_mode_takes_it")]
+    #[test_case(true,  "<Esc>", true  ; "idle_normal_mode_passes_it_on")]
+    #[test_case(true,  "<Esc>d", false ; "a_half_typed_command_takes_it")]
+    fn esc_reaches_the_app(vim: bool, before: &str, passes: bool) {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.set_vim_enabled(vim);
+        press(&mut input, before);
+        assert_eq!(input.vim_wants_esc(), !passes);
+        assert_eq!(
+            matches!(press(&mut input, "<Esc>"), InputAction::Passthrough(_)),
+            passes
+        );
+    }
+
+    #[test]
+    fn vim_a_paste_in_normal_mode_is_one_undo_step() {
+        let mut input = vim_normal("ab");
+        input.handle_paste("XY");
+        assert_eq!(input.buffer.value(), "aXYb");
+
+        press(&mut input, "u");
+        assert_eq!(input.buffer.value(), "ab");
+    }
+
+    #[test]
+    fn vim_a_plugin_edit_in_normal_mode_is_one_undo_step() {
+        let mut input = vim_normal("hello");
+        input.replace_range(0, "hello".len(), "bye", None).unwrap();
+        assert_eq!(input.buffer.x(), 2, "the cursor stays on a character");
+
+        press(&mut input, "u");
+        assert_eq!(input.buffer.value(), "hello");
+    }
+
+    /// A refused edit changed nothing, so it must not cancel the command the
+    /// user is typing or leave an undo step behind.
+    #[test]
+    fn vim_a_refused_plugin_edit_leaves_the_half_typed_command() {
+        let mut input = vim_normal("abc");
+        press(&mut input, "d");
+        let (version, cursor) = (input.buffer.version(), input.buffer.cursor_byte());
+
+        let past_the_end = input.buffer.byte_len() + 1;
+        assert!(input.replace_range(0, past_the_end, "x", None).is_err());
+        assert!(input.vim_wants_esc(), "the half-typed d is still there");
+        assert_eq!(input.buffer.version(), version);
+        assert_eq!(input.buffer.cursor_byte(), cursor);
+
+        press(&mut input, "w");
+        assert_eq!(input.buffer.value(), "ab", "the d finished as dw");
+        press(&mut input, "u");
+        assert_eq!(input.buffer.value(), "abc", "one undo takes back the dw");
+    }
+
+    /// `Ctrl+W` and the rest of the editor keys work in normal mode too, and
+    /// what they change is a step like any other.
+    #[test]
+    fn vim_an_editor_key_in_normal_mode_is_one_undo_step() {
+        let mut input = vim_normal("one two");
+        press(&mut input, "<C-w>");
+        assert_eq!(input.buffer.value(), "one o");
+
+        press(&mut input, "u");
+        assert_eq!(input.buffer.value(), "one two");
+    }
+
+    #[test]
+    fn vim_a_submit_forgets_the_undo_steps() {
+        let mut input = vim_normal("first");
+        press(&mut input, "x");
+        input.submit();
+        input.handle_paste("second");
+        press(&mut input, "<Esc>uu");
+        assert_eq!(
+            input.buffer.value(),
+            "",
+            "undo stops at the draft the submit started"
+        );
+    }
+
+    #[test]
+    fn vim_a_draft_swap_keeps_the_mode() {
+        const MAIN: &str = "main draft";
+        let mut input = vim_normal(MAIN);
+        let parked = input.swap_draft(Submission {
+            text: DRAFT.into(),
+            images: Vec::new(),
+        });
+        assert_eq!(parked.text, MAIN);
+        assert_eq!(input.buffer.value(), DRAFT);
+        assert_eq!(input.vim_mode(), Some(VimMode::Normal));
+    }
+
+    #[test]
+    fn vim_turning_vim_on_again_keeps_the_mode() {
+        let mut input = vim_normal("text");
+        input.set_vim_enabled(true);
+        assert_eq!(input.vim_mode(), Some(VimMode::Normal));
+
+        input.set_vim_enabled(false);
+        assert_eq!(input.vim_mode(), None);
     }
 
     /// A wheel scroll pins the view, so an edit has to bring the cursor back

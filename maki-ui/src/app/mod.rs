@@ -1163,7 +1163,7 @@ impl App {
                 }
                 CommandAction::Complete(text) => {
                     self.input_box.set_input(text);
-                    self.input_box.buffer.move_to_end();
+                    self.input_box.move_to_end();
                     self.input_changed(InputWriter::Anyone);
                     return Some(vec![]);
                 }
