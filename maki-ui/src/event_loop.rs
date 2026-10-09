@@ -1085,6 +1085,7 @@ impl<'t> EventLoop<'t> {
                 json!({
                     "session_id": rt.id(),
                     "title": rt.last_title,
+                    "title_user_set": rt.app.state.session.is_title_user_set(),
                     "focused": i == self.focused,
                 }),
             );
@@ -1316,7 +1317,11 @@ impl<'t> EventLoop<'t> {
                 let reply = (|| {
                     let id = parse_session_id(&id)?;
                     if let Some(i) = self.position(id) {
-                        self.sessions[i].app.state.session_mut().set_title(title);
+                        self.sessions[i]
+                            .app
+                            .state
+                            .session_mut()
+                            .set_user_title(title);
                     } else {
                         let OpenSession { mut session, claim } =
                             OpenSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
@@ -1434,6 +1439,7 @@ impl<'t> EventLoop<'t> {
             id: rt.id().to_string(),
             cwd: app.state.session.cwd.clone(),
             title: Some(app.state.session.title.clone()),
+            title_user_set: app.state.session.is_title_user_set(),
             model: app.state.model.spec(),
             mode: if app.state.mode == Mode::Plan {
                 MODE_PLAN

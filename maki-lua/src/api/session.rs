@@ -77,6 +77,7 @@ async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 ///   cost,
 ///   queue = { count }, -- nil under headless drivers
 ///   title,             -- nil under headless drivers
+///   title_user_set,    -- false under headless drivers
 /// }
 /// ```
 ///
@@ -672,6 +673,28 @@ mod tests {
         });
         lua.set_app_data(SessionSnapshotSlot(provider));
         lua
+    }
+
+    /// A plugin decides how much weight a title carries by whether the user
+    /// chose it, so the snapshot has to carry the flag next to the title.
+    #[test]
+    fn read_reports_whether_the_title_is_user_set() {
+        const USER_TITLED: &str = "my session";
+
+        let id = MakiId::generate();
+        let lua = lua_with_session(None);
+        let snapshot = json!({
+            "id": id.to_string(),
+            "title": USER_TITLED,
+            "title_user_set": true,
+        });
+        lua.set_app_data(SessionSnapshotSlot(Box::new(move |_| Ok(snapshot.clone()))));
+        let (val, err): (Value, Option<String>) =
+            smol::block_on(lua.load("return session.read()").eval_async()).unwrap();
+        assert_eq!(err, None);
+        let snap = val.as_table().unwrap();
+        assert_eq!(snap.get::<String>("title").unwrap(), USER_TITLED);
+        assert!(snap.get::<bool>("title_user_set").unwrap());
     }
 
     /// The UI answers `Current` with the bare id, not a snapshot.

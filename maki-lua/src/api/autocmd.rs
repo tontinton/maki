@@ -185,8 +185,10 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   first focus at startup.
 /// - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
 ///   or `"idle"`), `data.title`, and `data.focused` (boolean).
-/// - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
-///   when the title changes (rename or auto-generation).
+/// - `"SessionTitleChanged"`: `data.title`, `data.title_user_set` (boolean,
+///   whether the user named the session rather than auto-generation), and
+///   `data.focused` (boolean), when the title changes (rename or
+///   auto-generation).
 /// - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
 ///   (`"working"`, `"done"`, or `"error"`), when a subagent starts or
 ///   changes status. A task that comes back from disk already finished

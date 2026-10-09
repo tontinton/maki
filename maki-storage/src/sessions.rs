@@ -413,6 +413,12 @@ pub struct Session<M, U, T> {
     pub version: u32,
     pub id: MakiId,
     pub title: String,
+    /// True once the user names the session. Auto-generated titles then
+    /// stop overwriting it: [`Self::set_user_title`] sets it, and
+    /// [`Self::update_title_if_default`] respects it. Private, so
+    /// `set_user_title` and the deserializer are its only writers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    title_user_set: bool,
     pub cwd: String,
     pub model: String,
     messages: Arc<Vec<M>>,
@@ -714,6 +720,10 @@ enum LogRecord<M, U, T> {
     #[serde(rename = "meta")]
     Meta {
         title: String,
+        /// Absent on sessions written before rename tracking; the title
+        /// stays auto-generated for those.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        title_user_set: bool,
         token_usage: U,
         updated_at: u64,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1160,6 +1170,7 @@ where
         &mut buf,
         &LogRecord::<&M, &U, &T>::Meta {
             title: session.title.clone(),
+            title_user_set: session.title_user_set,
             token_usage: &session.token_usage,
             updated_at: session.updated_at,
             subagents: session.subagents.clone(),
@@ -1255,6 +1266,7 @@ where
     let mut tool_outputs = HashMap::new();
     let mut subagent_messages: HashMap<String, Vec<M>> = HashMap::new();
     let mut title = DEFAULT_TITLE.to_string();
+    let mut title_user_set = false;
     let mut token_usage = U::default();
     let mut updated_at = 0u64;
     let mut subagents = Vec::new();
@@ -1320,6 +1332,7 @@ where
             LogRecord::Frame { d } => frame = Some(d),
             LogRecord::Meta {
                 title: m_title,
+                title_user_set: m_title_user_set,
                 token_usage: m_usage,
                 updated_at: m_updated,
                 subagents: m_subagents,
@@ -1327,6 +1340,7 @@ where
                 meta: m_meta,
             } => {
                 title = m_title;
+                title_user_set = m_title_user_set;
                 token_usage = m_usage;
                 updated_at = m_updated;
                 subagents = m_subagents;
@@ -1347,6 +1361,7 @@ where
         version: SESSION_VERSION,
         id,
         title,
+        title_user_set,
         cwd,
         model,
         messages: Arc::new(messages),
@@ -1748,6 +1763,9 @@ where
         }
         session
     };
+    // The legacy loader runs outside the TitleSource impl, and a whitespace
+    // normalize of a title read back from disk does not change where that
+    // title came from.
     session.title = normalize_title(&session.title);
     Ok(session)
 }
@@ -1766,6 +1784,7 @@ where
             version: SESSION_VERSION,
             id: MakiId::generate(),
             title: DEFAULT_TITLE.into(),
+            title_user_set: false,
             cwd: cwd.into(),
             model: model.into(),
             messages: Arc::default(),
@@ -2001,6 +2020,21 @@ where
         &mut self.usage_by_model
     }
 
+    /// The user names the session: the title sticks, and auto-generation
+    /// never overwrites it afterwards.
+    pub fn set_user_title(&mut self, title: String) {
+        self.set_title(title);
+        self.title_user_set = true;
+    }
+
+    /// Whether [`Self::set_user_title`] set the title, rather than
+    /// auto-generation.
+    pub fn is_title_user_set(&self) -> bool {
+        self.title_user_set
+    }
+
+    /// Sets the title. Auto-generation may still replace it; the user path
+    /// is [`Self::set_user_title`].
     pub fn set_title(&mut self, title: String) {
         if self.title == title {
             return;
@@ -2188,8 +2222,10 @@ where
         load_session_at(&path)
     }
 
+    /// Auto-generation: fills in a title only while the session still has
+    /// the default one and the user has not named it.
     pub fn update_title_if_default(&mut self) {
-        if self.title == DEFAULT_TITLE {
+        if !self.title_user_set && self.title == DEFAULT_TITLE {
             self.set_title(generate_title(&self.messages));
         }
     }
@@ -3781,6 +3817,61 @@ mod tests {
         let title = generate_title(&[user_message(&input)]);
         assert!(title.len() <= MAX_TITLE_LEN * 4);
         assert!(title.is_char_boundary(title.len()));
+    }
+
+    #[test]
+    fn renamed_title_survives_auto_generation_and_reload() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/p");
+        let claim = claim_for(dir, &session);
+        session.set_user_title("my name".into());
+        session.push_message(user_message("later text"));
+        let mut log = SessionLog::rewrite(dir, &claim, &session).unwrap();
+        log.append(&claim, &session).unwrap();
+
+        // The checkpoint path auto-titles only sessions still on the default.
+        session.update_title_if_default();
+        assert_eq!(session.title, "my name");
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.title, "my name");
+        assert!(loaded.is_title_user_set());
+    }
+
+    #[test]
+    fn auto_title_still_generated_without_rename() {
+        let mut session: TestSession = Session::new("m", "/p");
+        session.push_message(user_message("hello world title source"));
+        session.update_title_if_default();
+        assert_ne!(session.title, "New session");
+        assert!(!session.is_title_user_set());
+    }
+
+    /// Logs written before the flag existed carry no `title_user_set` field;
+    /// those sessions must load as auto-generated, not fail or guess `true`.
+    #[test]
+    fn old_meta_records_without_the_flag_load_as_auto_generated() {
+        const OLD_TITLE: &str = "written by an older maki";
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/p");
+        let claim = claim_for(dir, &session);
+        session.set_title(OLD_TITLE.into());
+        let mut log = SessionLog::rewrite(dir, &claim, &session).unwrap();
+        log.append(&claim, &session).unwrap();
+
+        let path = jsonl_path(dir, session.id);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("title_user_set"),
+            "the fixture must look like an old log"
+        );
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.title, OLD_TITLE);
+        assert!(!loaded.is_title_user_set());
     }
 
     #[test]
