@@ -785,8 +785,8 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
 `"TaskStatusChanged"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
-and `"FileIndexReady"`. Plugins can also fire their own events with
-`exec_autocmds`.
+`"FileIndexReady"`, `"JobStart"`, and `"JobExit"`. Plugins can also fire
+their own events with `exec_autocmds`.
 
 Every host event carries `data.session_id` except `"FileIndexReady"`,
 which is about a directory rather than a session. For `"SessionReset"` and
@@ -832,6 +832,10 @@ name the session now running or focused. What each event adds:
 - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
   plus `data.previous_spec`. Picking the model already in use stays
   quiet, and so does startup.
+- `"JobStart"`, `"JobExit"`: session-owned jobs (`scope = { session =
+  ... }`) only. Both carry `data.id`, `data.session`, and `data.plugin`;
+  `"JobStart"` adds `data.name` (absent when unnamed) and `data.command`,
+  `"JobExit"` adds `data.exit_code` (`-1` when the job was killed).
 - `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
   chat input as `maki.ui.input` reports it. `data.source` is the plugin
   name when that plugin's `maki.ui.input_edit` was the only writer this
@@ -1438,6 +1442,12 @@ and tool set.
     `"max"`), or a budget integer (token count). Inherits the parent
     setting if omitted, and is capped at it otherwise.
   - `fast` (`boolean?`) use fast mode. Inherits parent setting if omitted.
+  - `scope` (`string?`) `"session"` detaches the session from the call that
+    spawned it: it survives the call returning and the turn ending,
+    instead of being cancelled the moment either does. Esc on its chat
+    still cancels it. Keep the returned handle to `prompt` and `close`.
+    Omit for the default: tied to the call that spawned it. Invalid
+    inside a subagent.
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
 
@@ -1510,7 +1520,7 @@ print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
 ### `Session:close()` {#Session-close}
 
 ```lua
-Session:close()
+Session:close({err?})
 ```
 
 Close the session and flush its history back to the parent agent. Calling
@@ -1519,6 +1529,10 @@ it more than once is safe.
 Close on every path, error paths included. Dropping the session instead
 leaves the work to the Lua garbage collector, which may never run while
 the VM sits idle, and the subagent's event relay stays alive until it does.
+
+**Parameters:**
+
+- `{err?}` (`string?`) Pass the failure reason when the run failed, so the session's UI item ends as errored even without a following tool result.
 
 
 ## maki.async {#maki-async}
@@ -1542,7 +1556,7 @@ local results = maki.async.gather({
 ### `maki.async.run()` {#maki-async-run}
 
 ```lua
-maki.async.run({fn}, {on_finish?})
+maki.async.run({fn}, {on_finish_or_opts?})
 ```
 
 Start {fn} as a background task without waiting for it. Pass
@@ -1550,10 +1564,25 @@ Start {fn} as a background task without waiting for it. Pass
 and stopped after 60 seconds. For work that outlives the caller, use
 `maki.async.spawn`.
 
+The task has no deadline by default: pass {deadline_ms} (integer
+milliseconds) to cap it. The cap is opt-in so a plugin that loops in
+`async.run` keeps running until cancelled, not until a hidden timer
+fires.
+
+By default the task inherits the caller's cancellation, so ending the
+calling tool call ends it too. Pass {scope = "session"} for work that
+must outlive the calling turn, such as a background subagent waiting
+on a session: the task then only ends on its deadline or when its
+function returns.
+
+A task abandoned by its deadline or a cancel it inherited still reports
+through {on_finish} exactly once, with the reason (`"timeout"` or
+`"cancelled"`) as the error, so background work cannot vanish silently.
+
 **Parameters:**
 
 - `{fn}` (`function`) Zero-argument function to execute.
-- `{on_finish?}` (`function?`) Optional callback `function(err, result)`. Called once {fn} completes.
+- `{on_finish_or_opts?}` (`function|table?`) The legacy form passes the {on_finish} callback directly: `function(err, result)`. The table form: {on_finish} is `function(err, result)`, called once {fn} completes or the task is abandoned; {deadline_ms} is integer milliseconds to opt into a cap; {scope} is `"session"` to escape the caller's cancellation.
 
 **Example:**
 
@@ -1561,7 +1590,7 @@ and stopped after 60 seconds. For work that outlives the caller, use
 maki.async.run(function()
   local data = expensive_fetch()
   process(data)
-end)
+end, { deadline_ms = 30_000 })
 ```
 
 ---
@@ -1614,7 +1643,8 @@ maki.async.sleep({ms})
 ```
 
 Suspend the calling task for {ms} milliseconds. Other tasks and the UI
-keep running, and a cancel still lands while you sleep.
+keep running, and a cancel still lands while you sleep: the timer races
+the owning task's cancel token.
 
 All plugins share one Lua thread. Code that runs for 5 seconds without
 yielding is stopped with an error. `sleep(0)` lets every other ready
@@ -1626,14 +1656,14 @@ dismisses itself, use `maki.defer_fn`.
 
 **Parameters:**
 
-- `{ms}` (`integer`) Milliseconds to sleep. Zero only yields.
+- `{ms}` (`integer`) Milliseconds to wait. Must be >= 0. Zero only yields.
 
 **Example:**
 
 ```lua
 maki.async.run(function()
-  maki.async.sleep(4000)
-  win:close()
+  maki.async.sleep(250)
+  retry()
 end)
 
 -- A long loop that keeps the rest of maki responsive:
@@ -1797,7 +1827,8 @@ still call `ctx:finish`; the host prefers that reply over the generic
 cancelled/timeout error. Mark it `is_error = true` and end it with a
 marker, so the model knows the output it gets is cut short.
 
-The callback runs outside your coroutine, so it must not yield. It
+The callback runs on its own coroutine on the runtime executor, outside
+your handler's stack, so it may await host calls (`ctx:finish`). It
 fires at most once, immediately if the task is already cancelled. An
 error inside it is logged and never reaches your handler, and the
 other hooks still run.
@@ -2096,6 +2127,12 @@ Requires the `run` [plugin permission](#plugin-permissions).
     (default 20, 0 disables, max 1024).
   - `name` (`string?`) handle for `jobfind`, unique among the live jobs this
     plugin can see. Starting a second job under a live name is an error.
+    Session jobs also show it in the /tasks picker and on the `JobStart`
+    autocmd, so name long-running work even when you never look it up.
+  - `spawned_by` (`string?`) id of the subagent task that spawned the job
+    (from `ctx:task_id()`). Session jobs carry it on the `JobStart`
+    autocmd and the joblist row, so the activity list can group by
+    subagent.
 
 **Returns:** (`integer?`, `string?`) Job id, or nil plus an error message when the
   process could not start (binary not found, bad `cwd`, redirect file not
@@ -2428,10 +2465,10 @@ if err then return end
 ### `maki.fs.read()` {#maki-fs-read}
 
 ```lua
-maki.fs.read({path})
+maki.fs.read({path}, {opts?})
 ```
 
-Read the entire file at {path} as a UTF-8 string.
+Read the file at {path} as a UTF-8 string.
 Files over 512 MiB or not valid UTF-8 return nil plus an error message.
 Use `read_bytes` for binary files.
 
@@ -2440,17 +2477,26 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Absolute or relative file path. `~/` is expanded to the home directory.
+- `{opts?}` (`table?`) `{ offset = integer, len = integer }` window to read. A negative
+
+  `offset` counts back from the end of the file, so `{ offset = -1024 }` reads the
+
+
+  last 1024 bytes, and `len` caps how many bytes are read from `offset`. A window
+
+
+  that splits a multibyte character replaces the broken sequence. Omit `opts` to
+
+
+  read the whole file.
+
 
 **Returns:** (`string?`, `string?`) File contents, or nil plus an error message.
 
 **Example:**
 
 ```lua
-local text, err = maki.fs.read("config.toml")
-if err then
-  maki.log.warn("could not read config: " .. err)
-  return
-end
+local tail = maki.fs.read("server.log", { offset = -4096 })
 ```
 
 ---

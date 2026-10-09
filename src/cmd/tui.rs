@@ -157,6 +157,11 @@ fn build_stack(
         !cli.no_jit,
     )
     .context("initialize lua plugin host")?;
+    // Nobody drains `UiAction` until `EventLoop::new` below calls `attach()`,
+    // so a plugin that roundtrips to the UI while loading (or at any point
+    // before then) fails fast instead of parking on a reply that can never
+    // arrive.
+    plugin_host.ui_attachment().detach();
 
     let (fallback_config, fallback_model) = fallback.unzip();
     let (mut config, mut warnings) = super::load_plugins(

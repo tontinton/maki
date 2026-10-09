@@ -863,6 +863,7 @@ async fn gate(
             &ctx.cancel,
             ctx.mode.plan_path(),
             ask,
+            ctx.unattended,
         )
         .await
         .map_err(|e| e.to_string())
