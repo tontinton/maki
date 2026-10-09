@@ -28,6 +28,7 @@ mod trust_card;
 pub use theme::BUNDLED_THEMES;
 pub use trust_card::ask_trust;
 pub mod update;
+mod vim;
 pub mod wrap;
 
 mod agent;
