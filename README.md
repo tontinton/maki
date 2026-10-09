@@ -87,6 +87,12 @@ curl -fsSL https://maki.sh/install.sh | sh
 
 Installs to `~/.local/bin`. Override with `MAKI_INSTALL_DIR`.
 
+### Homebrew
+
+```sh
+brew install maki
+```
+
 ### Windows (PowerShell)
 
 ```powershell
