@@ -718,6 +718,11 @@ pub(crate) mod tests {
     #[test_case("abc\n|\ndef",     "de",       "|abc",          "\ndef", true  ; "de_from_an_empty_line_leaves_no_blank_line")]
     #[test_case("a b\n | \nc",     "de",       "|a b",          "  \nc", true  ; "de_from_a_blank_line_deletes_both_lines")]
     #[test_case("abc\n|\ndef x",   "de",       "abc\n| x",      "\ndef", false ; "de_that_leaves_text_stays_charwise")]
+    #[test_case("  abc\n|  def\n  ghi", "db",       "  |def\n  ghi",      "  abc",    true ; "db_preserves_the_lines_below_an_indented_line")]
+    #[test_case("  abc\n  def\n|  ghi", "db",       "  abc\n  |ghi",      "  def",    true ; "db_preserves_the_lines_above_an_indented_line")]
+    #[test_case("abc\n|   \ndef",       "db",       "  | \ndef",          "abc",      true ; "db_onto_a_blank_line_clamps_the_cursor_to_its_last_character")]
+    #[test_case("abc\n |  \ndef",       "db",       "|def",               "abc\n   ", true ; "db_from_inside_a_blank_line_deletes_both_lines")]
+    #[test_case("abc\n  | \ndef",       "db",       "|def",               "abc\n   ", true ; "db_from_the_end_of_a_blank_line_deletes_both_lines")]
     fn an_operator_across_lines(
         start: &str,
         notation: &str,
