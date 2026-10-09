@@ -306,6 +306,7 @@ fn subagent_info_with_tx(
         opts: None,
         answer_tx,
         inbox: None,
+        detached: false,
     }
 }
 
