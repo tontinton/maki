@@ -10,7 +10,7 @@ use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
-use maki_lua::Split;
+use maki_lua::{PanelPosition, Split};
 use maki_providers::RequestOptions;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -107,6 +107,19 @@ impl App {
 
         let below_active = splits.rect(Split::Below).is_some();
         let bottom_takeover = self.form_visible() || below_active;
+        let (above_panels, below_panels) = if bottom_takeover {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                self.float_mgr.panel_reqs(PanelPosition::AboveInput),
+                self.float_mgr.panel_reqs(PanelPosition::BelowInput),
+            )
+        };
+        let panel_h: u16 = above_panels
+            .iter()
+            .chain(&below_panels)
+            .map(|&(_, h)| h)
+            .sum();
         let max_bottom = inner.height.saturating_sub(MIN_CHAT_ROWS);
         let bottom_height = if self.permission_prompt.is_open() {
             self.permission_prompt.height(inner.width).min(max_bottom)
@@ -117,25 +130,19 @@ impl App {
         } else if self.form_visible() {
             self.plan_form.height(max_bottom).min(max_bottom)
         } else if self.chat_accepts_input() {
-            let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
             queue_panel::height(self.active_queue_len())
                 + panel_h
                 + self.input_box.height(inner.width).min(max_bottom)
+        } else if panel_h > 0 {
+            panel_h + 1
         } else {
-            let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
-            if panel_h > 0 { panel_h + 1 } else { 1 }
+            1
         };
 
         // The `below` split lives outside `inner` (drawn by render_splits), so
         // the bottom panel only ever splits the chat region.
         let [msg_area, bottom_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_height)]).areas(inner);
-
-        let panel_reqs = if bottom_takeover {
-            Vec::new()
-        } else {
-            self.float_mgr.panel_reqs()
-        };
 
         let queue_height = if bottom_takeover {
             0
@@ -144,19 +151,21 @@ impl App {
         };
 
         let mut constraints = vec![Constraint::Length(queue_height)];
-        for &(_, h) in &panel_reqs {
-            constraints.push(Constraint::Length(h));
-        }
+        constraints.extend(above_panels.iter().map(|&(_, h)| Constraint::Length(h)));
         constraints.push(Constraint::Min(1));
+        constraints.extend(below_panels.iter().map(|&(_, h)| Constraint::Length(h)));
 
         let areas = Layout::vertical(constraints).split(bottom_area);
         let queue_area = areas[0];
-        let panel_windows: Vec<(usize, Rect)> = panel_reqs
+        let input_slot = 1 + above_panels.len();
+        let input_area = areas[input_slot];
+        let panel_rects = areas[1..input_slot].iter().chain(&areas[input_slot + 1..]);
+        let panel_windows: Vec<(usize, Rect)> = above_panels
             .iter()
-            .enumerate()
-            .map(|(i, &(idx, _))| (idx, areas[1 + i]))
+            .chain(&below_panels)
+            .zip(panel_rects)
+            .map(|(&(idx, _), &rect)| (idx, rect))
             .collect();
-        let input_area = areas[areas.len() - 1];
 
         ViewLayout {
             msg_area,

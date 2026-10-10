@@ -25,8 +25,8 @@ use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, Tool
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{
     BuiltinAction, Dimension, FloatConfig, HintReader, KeymapReader, LuaCommandInfo,
-    LuaCommandReader, PackCommand, PackPlan, PackPreparation, PackReport, SessionEndReason, Split,
-    WinCommand, WinEvent,
+    LuaCommandReader, PackCommand, PackPlan, PackPreparation, PackReport, PanelPosition,
+    SessionEndReason, Split, WinCommand, WinEvent,
 };
 use maki_providers::{
     ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, ThinkingSupport,
@@ -6541,6 +6541,93 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
     assert!(
         splits.rect(maki_lua::Split::Above).is_some(),
         "the prompt must leave an above split untouched",
+    );
+}
+
+const PANEL_EXTENT: u16 = 3;
+const ABOVE_PANEL_MARK: &str = "xqabovepanel";
+const BELOW_PANEL_MARK: &str = "xqbelowpanel";
+const PANEL_DRAWN: &str = "the panel has to be on screen";
+
+/// A borderless, unfocused panel whose first row holds {mark}, so a test can
+/// find the row it was painted on.
+fn open_panel(app: &mut App, position: PanelPosition, mark: &str) {
+    let buf = Arc::new(SharedBuf::new());
+    buf.append(maki_agent::SnapshotLine {
+        spans: vec![maki_agent::SnapshotSpan {
+            text: mark.into(),
+            style: maki_agent::SpanStyle::Default,
+        }],
+    });
+    let config = FloatConfig {
+        width: Dimension::Percent(100),
+        height: Dimension::Abs(PANEL_EXTENT),
+        border: maki_lua::Border::None,
+        split: Split::Panel,
+        position,
+        ..FloatConfig::default()
+    };
+    let (event_tx, _event_rx) = flume::bounded::<WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    app.float_mgr.open(buf, config, false, event_tx, cmd_rx);
+}
+
+#[test]
+fn panels_stack_on_their_side_of_the_input_box() {
+    let mut app = test_app();
+    let (msg_bare, _b, _s, input_bare, _sp) = app.layout_geometry(TEST_AREA);
+
+    open_panel(&mut app, PanelPosition::BelowInput, BELOW_PANEL_MARK);
+    open_panel(&mut app, PanelPosition::AboveInput, ABOVE_PANEL_MARK);
+    let (msg, _bottom, status, input, _splits) = app.layout_geometry(TEST_AREA);
+    let (_cursor, buffer) = draw_to_buffer(&mut app);
+    let above_row = row_with(&buffer, ABOVE_PANEL_MARK).expect(PANEL_DRAWN);
+    let below_row = row_with(&buffer, BELOW_PANEL_MARK).expect(PANEL_DRAWN);
+
+    assert_eq!(
+        above_row + PANEL_EXTENT,
+        input.y,
+        "above panel ends on the input box"
+    );
+    assert_eq!(
+        below_row,
+        input.bottom(),
+        "below panel starts under the input box"
+    );
+    assert_eq!(
+        below_row + PANEL_EXTENT,
+        status.y,
+        "below panel ends on the status bar"
+    );
+    assert_eq!(
+        input.height, input_bare.height,
+        "the input box keeps its height"
+    );
+    assert_eq!(
+        msg.height,
+        msg_bare.height - 2 * PANEL_EXTENT,
+        "the chat gives up the rows of both panels",
+    );
+}
+
+#[test]
+fn form_hides_below_panel_with_the_input_box() {
+    let mut app = test_app();
+    open_panel(&mut app, PanelPosition::BelowInput, BELOW_PANEL_MARK);
+    app.permission_prompt.push(
+        "perm-1".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["ls".into()],
+        None,
+        true,
+        None,
+    );
+
+    let (_cursor, buffer) = draw_to_buffer(&mut app);
+    assert_eq!(
+        row_with(&buffer, BELOW_PANEL_MARK),
+        None,
+        "a prompt owns the bottom area, below panels included",
     );
 }
 
