@@ -26,17 +26,21 @@ pub fn animation_elapsed_ms() -> u128 {
 }
 
 const DEFAULT_MS_PER_CHAR: u64 = 4;
-const MIN_DURATION_MS: u64 = 30;
-const MAX_DURATION_MS: u64 = 1000;
+/// Draining the whole backlog takes this long, so the typewriter never falls
+/// further behind than roughly this. A big chunk speeds the reveal up instead
+/// of queueing a jump for later.
+const BACKLOG_WINDOW_MS: u64 = 200;
 
 pub struct Typewriter {
     buffer: String,
     visible_len: usize,
     visible_byte_offset: usize,
-    anim_start_visible: usize,
     anim_target: usize,
-    anim_start_at: Instant,
-    anim_duration: Duration,
+    #[cfg(not(test))]
+    last_tick: Instant,
+    #[cfg(test)]
+    forced_elapsed_ms: Option<f64>,
+    carry: f64,
     ms_per_char: u64,
 }
 
@@ -56,39 +60,58 @@ impl Typewriter {
             buffer: String::new(),
             visible_len: 0,
             visible_byte_offset: 0,
-            anim_start_visible: 0,
             anim_target: 0,
-            anim_start_at: Instant::now(),
-            anim_duration: Duration::ZERO,
+            #[cfg(not(test))]
+            last_tick: Instant::now(),
+            #[cfg(test)]
+            forced_elapsed_ms: None,
+            carry: 0.0,
             ms_per_char,
         }
     }
 
     pub fn push(&mut self, text: &str) {
         self.buffer.push_str(text);
-        // Finish the in flight reveal, so a seal has no backlog to snap in.
-        self.advance_visible(self.anim_target);
-        self.anim_start_visible = self.visible_len;
         self.anim_target = self.buffer.chars().count();
+        if self.ms_per_char == 0 {
+            self.advance_visible(self.anim_target);
+        }
+    }
+
+    pub fn tick(&mut self) {
+        let elapsed_ms = self.elapsed_ms();
+        let backlog = self.anim_target - self.visible_len;
+        if backlog == 0 {
+            return;
+        }
         if self.ms_per_char == 0 {
             self.advance_visible(self.anim_target);
             return;
         }
-        let unrevealed = self.anim_target - self.anim_start_visible;
-        let ms = (unrevealed as u64 * self.ms_per_char).clamp(MIN_DURATION_MS, MAX_DURATION_MS);
-        self.anim_duration = Duration::from_millis(ms);
-        self.anim_start_at = Instant::now();
+        let base = 1.0 / self.ms_per_char as f64;
+        let catch_up = backlog as f64 / BACKLOG_WINDOW_MS as f64;
+        self.carry += base.max(catch_up) * elapsed_ms;
+        let step = self.carry.floor();
+        self.carry -= step;
+        if step > 0.0 {
+            let new_len = (self.visible_len + step as usize).min(self.anim_target);
+            self.advance_visible(new_len);
+        }
     }
 
-    pub fn tick(&mut self) {
-        if self.visible_len >= self.anim_target {
-            return;
-        }
-        let elapsed = self.anim_start_at.elapsed();
-        let progress = (elapsed.as_secs_f64() / self.anim_duration.as_secs_f64()).min(1.0);
-        let delta = self.anim_target - self.anim_start_visible;
-        let new_len = self.anim_start_visible + (delta as f64 * progress).round() as usize;
-        self.advance_visible(new_len);
+    #[cfg(not(test))]
+    fn elapsed_ms(&mut self) -> f64 {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_tick);
+        self.last_tick = now;
+        elapsed.as_secs_f64() * 1_000.0
+    }
+
+    /// Tests drive the rate math off an exact injected elapsed time, so the
+    /// microsecond gap between two `Instant::now` calls never shifts a reveal.
+    #[cfg(test)]
+    fn elapsed_ms(&mut self) -> f64 {
+        std::mem::take(&mut self.forced_elapsed_ms).unwrap_or(0.0)
     }
 
     pub fn visible(&self) -> &str {
@@ -127,16 +150,22 @@ impl Typewriter {
         let len = self.buffer.chars().count();
         self.visible_len = len;
         self.visible_byte_offset = self.buffer.len();
-        self.anim_start_visible = len;
         self.anim_target = len;
-        self.anim_duration = Duration::ZERO;
+        self.carry = 0.0;
+    }
+
+    /// Hands the next `tick` an exact elapsed time, so the rate math is
+    /// deterministic instead of chasing the wall clock.
+    #[cfg(test)]
+    fn set_elapsed(&mut self, elapsed: Duration) {
+        self.forced_elapsed_ms = Some(elapsed.as_secs_f64() * 1_000.0);
     }
 
     fn reset_anim(&mut self) {
         self.visible_len = 0;
         self.visible_byte_offset = 0;
-        self.anim_start_visible = 0;
         self.anim_target = 0;
+        self.carry = 0.0;
     }
 
     fn advance_visible(&mut self, new_len: usize) {
@@ -200,15 +229,57 @@ mod tests {
     }
 
     #[test]
-    fn push_finishes_an_in_flight_reveal() {
-        let mut tw = Typewriter::new();
+    fn push_does_not_snap_an_in_flight_reveal() {
+        let mut tw = Typewriter::with_speed(1_000);
         tw.push("aaaaaaaaaa");
         assert_eq!(tw.visible(), "");
-        assert!(tw.is_animating());
 
         tw.push("bbb");
-        assert_eq!(tw.visible(), "aaaaaaaaaa");
+        assert_eq!(tw.visible(), "", "a new chunk must not jump the pending reveal");
         assert!(tw.is_animating());
+    }
+
+    #[test]
+    fn backlog_drains_within_the_window() {
+        let mut tw = Typewriter::with_speed(10_000);
+        tw.push(&"a".repeat(BACKLOG_WINDOW_MS as usize + 1));
+        tw.set_elapsed(Duration::from_millis(BACKLOG_WINDOW_MS + 1));
+        tw.tick();
+        assert_eq!(tw.visible().chars().count(), tw.anim_target);
+    }
+
+    #[test]
+    fn base_rate_dominates_a_small_backlog() {
+        let mut tw = Typewriter::with_speed(DEFAULT_MS_PER_CHAR);
+        tw.push("abc");
+        tw.set_elapsed(Duration::from_millis(DEFAULT_MS_PER_CHAR));
+        tw.tick();
+        assert_eq!(tw.visible().chars().count(), 1, "one char per ms_per_char");
+    }
+
+    #[test]
+    fn catch_up_dominates_a_large_backlog() {
+        let mut tw = Typewriter::with_speed(DEFAULT_MS_PER_CHAR);
+        tw.push(&"a".repeat(BACKLOG_WINDOW_MS as usize));
+        tw.set_elapsed(Duration::from_millis(DEFAULT_MS_PER_CHAR));
+        tw.tick();
+        assert_eq!(
+            tw.visible().chars().count(),
+            DEFAULT_MS_PER_CHAR as usize,
+            "a full backlog drains a char per window step, beating the base rate"
+        );
+    }
+
+    #[test]
+    fn carry_accumulates_across_ticks() {
+        let mut tw = Typewriter::with_speed(DEFAULT_MS_PER_CHAR);
+        tw.push("abc");
+        tw.set_elapsed(Duration::from_millis(1));
+        tw.tick();
+        assert_eq!(tw.visible().chars().count(), 0, "a sub-char tick reveals nothing");
+        tw.set_elapsed(Duration::from_millis(3));
+        tw.tick();
+        assert_eq!(tw.visible().chars().count(), 1, "the carry adds up across ticks");
     }
 
     #[test]
