@@ -86,9 +86,21 @@ function Install-Maki([string]$Tag) {
         }
 
         $dest = Join-Path $InstallDir $exeName
+        $oldDest = "$dest.old"
+        $movedAside = $false
+        if (Test-Path -LiteralPath $dest) {
+            if (Test-Path -LiteralPath $oldDest) {
+                Remove-Item -LiteralPath $oldDest -Force
+            }
+            Move-Item -LiteralPath $dest -Destination $oldDest -Force
+            $movedAside = $true
+        }
         try {
             Move-Item -LiteralPath $src -Destination $dest -Force
         } catch {
+            if ($movedAside) {
+                Move-Item -LiteralPath $oldDest -Destination $dest -Force -ErrorAction SilentlyContinue
+            }
             Write-Err "failed to install to $dest (try running as Administrator or set MAKI_INSTALL_DIR): $_"
         }
 
