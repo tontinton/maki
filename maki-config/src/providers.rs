@@ -583,11 +583,14 @@ fn ignored_local_model_fields(models: &[ModelDef]) -> Vec<&'static str> {
 /// Callers decide what counts as built-in (the inventory misses the `opencode`
 /// slugs) and when to report it.
 ///
-/// [`overlays_local_thinking`] slugs are the exception: their `models` table is
-/// half read, so only the keys nobody reads are named.
+/// [`overlays_local_thinking`] slugs are the exception on both counts: they read
+/// their `models` table (so only the keys nobody reads are named) and they take
+/// `protocol` from the config, because `LocalEndpoint` branches on it to pick
+/// the Responses wire.
 pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str> {
+    let local = overlays_local_thinking(slug);
     let mut ignored = Vec::new();
-    if def.protocol.is_some() {
+    if def.protocol.is_some() && !local {
         ignored.push("protocol");
     }
     if def.api_key_env.is_some() {
@@ -597,7 +600,7 @@ pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str
         ignored.push("discover_models");
     }
     if !def.models.is_empty() {
-        if overlays_local_thinking(slug) {
+        if local {
             ignored.extend(ignored_local_model_fields(&def.models));
         } else {
             ignored.push("models");
@@ -1009,6 +1012,44 @@ tier = "{input}"
     fn ignored_builtin_fields_on_declared_models(slug: &str, entry: &str, expected: Vec<&str>) {
         let def: ProviderDef = toml::from_str(entry).unwrap();
         assert_eq!(ignored_builtin_fields(slug, &def), expected);
+    }
+
+    /// `LocalEndpoint` reads `protocol` to choose the Responses wire, so a
+    /// local slug that sets it is honored. Warning about it would tell the
+    /// user to undo a change that took effect.
+    #[test_case("ollama", Vec::new() ; "ollama")]
+    #[test_case("llama-cpp", Vec::new() ; "llama_cpp")]
+    #[test_case("anthropic", vec!["protocol"] ; "anthropic")]
+    #[test_case("openai", vec!["protocol"] ; "openai")]
+    #[test_case("zai", vec!["protocol"] ; "zai")]
+    fn protocol_is_ignored_only_where_it_really_is(slug: &str, expected: Vec<&str>) {
+        let def = ProviderDef {
+            protocol: Some(Protocol::OpenaiResponses),
+            ..ProviderDef::default()
+        };
+        assert_eq!(ignored_builtin_fields(slug, &def), expected);
+    }
+
+    /// The exemption rides on [`overlays_local_thinking`], so a slug added to
+    /// `LOCAL_OVERLAY_SLUGS` without a `resolve_protocol` call in its
+    /// constructor would silently claim a `protocol` nobody reads.
+    #[test]
+    fn every_exempt_slug_really_resolves_its_configured_protocol() {
+        let def = ProviderDef {
+            protocol: Some(Protocol::OpenaiResponses),
+            ..ProviderDef::default()
+        };
+        for slug in LOCAL_OVERLAY_SLUGS {
+            assert!(
+                !ignored_builtin_fields(slug, &def).contains(&"protocol"),
+                "{slug} is reported as ignoring protocol; fix the warning or drop it from the overlay"
+            );
+            assert_eq!(
+                resolve_protocol(slug, Some(&def)),
+                Some(Protocol::OpenaiResponses),
+                "{slug} exempts protocol but does not read it"
+            );
+        }
     }
 
     /// The literal below stops compiling when [`ModelDef`] grows a field, which

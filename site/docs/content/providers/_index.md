@@ -41,7 +41,7 @@ You can also set `base_url` for a built-in provider in `~/.config/maki/providers
 base_url = "http://xxxx:1234/v1"
 ```
 
-The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those.
+The built-in provider still owns the slug, so `api_key_env`, `discover_models` and `models` are ignored with a warning, as is `protocol` for every provider but the local ones (`ollama`, `llama-cpp`, `localai`), which read it to choose between the completions and responses wires. Use a custom slug if you need those.
 
 ## Built-in Providers
 
