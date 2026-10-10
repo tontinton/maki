@@ -21,6 +21,8 @@ use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
 use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
+use crate::shell_settings::shell_preference;
+use maki_providers::child_env;
 
 const DEFAULT_TAIL: usize = 20;
 const MAX_TAIL_LINES: usize = 1024;
@@ -775,18 +777,7 @@ fn drop_callbacks(lua: &Lua, job: &mut JobMeta) {
 }
 
 fn shell_command(cmd: &str) -> Command {
-    #[cfg(unix)]
-    {
-        let mut c = Command::new("bash");
-        c.arg("-c").arg(cmd);
-        c
-    }
-    #[cfg(windows)]
-    {
-        let mut c = Command::new("cmd.exe");
-        c.arg("/C").arg(cmd);
-        c
-    }
+    child_env::shell_command(cmd, &shell_preference())
 }
 
 /// Signalling a reaped pid would hit whoever the kernel handed it to next, so
@@ -818,9 +809,12 @@ fn kill_job(job: &JobMeta) {
     }
 }
 
-/// Run a command in the background. A string runs through `bash -c` on Unix
-/// or `cmd /C` on Windows; a table is spawned as argv, with no shell in
-/// between (nothing in it can be read as a redirect, a pipe, or `$(...)`).
+/// Run a command in the background. A string runs through `bash -c` on Unix.
+/// On Windows it uses `agent.shell` (see Configuration): Git Bash next to
+/// `git` on PATH when `auto` (the default), `cmd.exe /C` when `cmd`, or the
+/// executable you name. A table is spawned as argv, with no
+/// shell in between (nothing in it can be read as a redirect, a pipe, or
+/// `$(...)`).
 /// You get back a job id that you can pass to `jobstop` or `jobwait` to
 /// control the process.
 ///

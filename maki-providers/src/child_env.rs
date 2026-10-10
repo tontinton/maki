@@ -1,5 +1,6 @@
 use std::process::Command;
 
+use maki_config::ShellPreference;
 use maki_config::providers::{ProvidersConfig, resolve_api_key_env};
 use maki_config::{PROVIDER_BUILTINS, env_var_refs};
 
@@ -77,10 +78,239 @@ fn provider_key_vars(config: &ProvidersConfig, catalog_vars: Vec<String>) -> Vec
         .collect()
 }
 
+pub fn shell_command(cmd: &str, pref: &ShellPreference) -> Command {
+    #[cfg(unix)]
+    {
+        let _ = pref;
+        let mut c = Command::new("bash");
+        c.arg("-c").arg(cmd);
+        c
+    }
+    #[cfg(windows)]
+    {
+        windows_shell_command(cmd, pref)
+    }
+}
+
+#[cfg(any(windows, test))]
+mod windows {
+    use std::env;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use maki_config::ShellPreference;
+
+    const GIT_EXE: &str = "git.exe";
+    const BASH_EXE: &str = "bash.exe";
+    const CMD_EXE: &str = "cmd.exe";
+
+    pub fn shell_command(cmd: &str, pref: &ShellPreference) -> Command {
+        match resolve_shell(pref) {
+            ResolvedShell::Cmd => {
+                let mut c = Command::new(CMD_EXE);
+                c.arg("/C").arg(cmd);
+                c
+            }
+            ResolvedShell::BashLike(program) => {
+                let mut c = Command::new(program);
+                c.arg("-c").arg(cmd);
+                c
+            }
+        }
+    }
+
+    enum ResolvedShell {
+        Cmd,
+        BashLike(PathBuf),
+    }
+
+    fn resolve_shell(pref: &ShellPreference) -> ResolvedShell {
+        match pref {
+            ShellPreference::Cmd => ResolvedShell::Cmd,
+            ShellPreference::Program(path) => program_shell(path),
+            ShellPreference::Auto => discover_git_bash()
+                .map(ResolvedShell::BashLike)
+                .unwrap_or(ResolvedShell::Cmd),
+        }
+    }
+
+    fn program_shell(path: &Path) -> ResolvedShell {
+        let s = path.to_string_lossy();
+        let name = s.rsplit(['/', '\\']).next().unwrap_or(&s);
+        if name.eq_ignore_ascii_case("cmd.exe") || name.eq_ignore_ascii_case("cmd") {
+            ResolvedShell::Cmd
+        } else {
+            ResolvedShell::BashLike(path.to_path_buf())
+        }
+    }
+
+    pub fn discover_git_bash() -> Option<PathBuf> {
+        discover_git_bash_on_path().or_else(fallback_git_bash)
+    }
+
+    fn discover_git_bash_on_path() -> Option<PathBuf> {
+        let git = find_on_path(GIT_EXE)?;
+        bash_next_to_git(&git).filter(|bash| !is_wsl_bash(bash))
+    }
+
+    pub fn bash_next_to_git(git: &Path) -> Option<PathBuf> {
+        if git.is_symlink()
+            && let Ok(target) = std::fs::canonicalize(git)
+            && let Some(bash) = bash_next_to_git_path(&target)
+        {
+            return Some(bash);
+        }
+        bash_next_to_git_path(git)
+    }
+
+    fn bash_next_to_git_path(git: &Path) -> Option<PathBuf> {
+        let parent = git.parent()?;
+        let file_name = parent.file_name()?;
+
+        if file_name.eq_ignore_ascii_case("cmd")
+            && let Some(root) = parent.parent()
+        {
+            let candidate = root.join("bin").join(BASH_EXE);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+
+        if file_name.eq_ignore_ascii_case("bin") {
+            let candidate = parent.join(BASH_EXE);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+
+        if file_name.eq_ignore_ascii_case("shims")
+            && let Some(scoop_root) = parent.parent()
+        {
+            let candidate = scoop_root
+                .join("apps")
+                .join("git")
+                .join("current")
+                .join("bin")
+                .join(BASH_EXE);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+
+        let direct_candidates = [parent.join(BASH_EXE), parent.join("bin").join(BASH_EXE)];
+        direct_candidates
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+    }
+
+    pub fn fallback_git_bash() -> Option<PathBuf> {
+        fallback_git_bash_candidates()
+            .into_iter()
+            .find(|candidate| candidate.is_file() && !is_wsl_bash(candidate))
+    }
+
+    pub fn fallback_git_bash_candidates() -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+
+        if let Some(scoop) = env::var_os("SCOOP") {
+            candidates.push(
+                PathBuf::from(scoop)
+                    .join("apps")
+                    .join("git")
+                    .join("current")
+                    .join("bin")
+                    .join(BASH_EXE),
+            );
+        } else if let Some(user_profile) = env::var_os("USERPROFILE") {
+            candidates.push(
+                PathBuf::from(user_profile)
+                    .join("scoop")
+                    .join("apps")
+                    .join("git")
+                    .join("current")
+                    .join("bin")
+                    .join(BASH_EXE),
+            );
+        }
+
+        if let Some(prog_data) = env::var_os("ProgramData") {
+            candidates.push(
+                PathBuf::from(prog_data)
+                    .join("scoop")
+                    .join("apps")
+                    .join("git")
+                    .join("current")
+                    .join("bin")
+                    .join(BASH_EXE),
+            );
+        }
+
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+            candidates.push(
+                PathBuf::from(local_app_data)
+                    .join("Programs")
+                    .join("Git")
+                    .join("bin")
+                    .join(BASH_EXE),
+            );
+        }
+
+        if let Some(prog_files) = env::var_os("ProgramFiles") {
+            candidates.push(
+                PathBuf::from(prog_files)
+                    .join("Git")
+                    .join("bin")
+                    .join(BASH_EXE),
+            );
+        }
+        if let Some(prog_files_x86) = env::var_os("ProgramFiles(x86)") {
+            candidates.push(
+                PathBuf::from(prog_files_x86)
+                    .join("Git")
+                    .join("bin")
+                    .join(BASH_EXE),
+            );
+        }
+
+        candidates.push(PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"));
+        candidates.push(PathBuf::from(r"C:\Program Files (x86)\Git\bin\bash.exe"));
+
+        candidates
+    }
+
+    fn find_on_path(name: &str) -> Option<PathBuf> {
+        let path_var = env::var_os("PATH")?;
+        env::split_paths(&path_var)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    }
+
+    pub fn is_wsl_bash(path: &Path) -> bool {
+        if let Some(sys_root) = env::var_os("SystemRoot").or_else(|| env::var_os("windir")) {
+            let wsl = PathBuf::from(sys_root).join("System32").join(BASH_EXE);
+            if path.as_os_str().eq_ignore_ascii_case(wsl.as_os_str()) {
+                return true;
+            }
+        }
+        let s = path.to_string_lossy();
+        s.replace('/', "\\")
+            .to_ascii_lowercase()
+            .ends_with(r"\system32\bash.exe")
+    }
+}
+
+#[cfg(any(windows, test))]
+pub use windows::{
+    bash_next_to_git, discover_git_bash, fallback_git_bash_candidates, is_wsl_bash,
+    shell_command as windows_shell_command,
+};
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+    use std::path::PathBuf;
 
+    use maki_config::ShellPreference;
     use maki_config::providers::ProviderDef;
     use test_case::test_case;
 
@@ -161,5 +391,130 @@ mod tests {
         let env = String::from_utf8(output.stdout).unwrap();
         assert!(!env.contains(&format!("{inherited}=")));
         assert!(env.contains(&format!("{explicit}={SECRET}")));
+    }
+
+    mod windows_shell {
+        use std::path::{Path, PathBuf};
+
+        use maki_config::ShellPreference;
+        use test_case::test_case;
+
+        const CMD: &str = "echo hello";
+        const BASH_EXE_NAME: &str = "bash.exe";
+        const GIT_EXE_NAME: &str = "git.exe";
+
+        #[test]
+        fn shell_command_uses_configured_bash() {
+            let dir = tempfile::tempdir().unwrap();
+            let bash_path = dir.path().join(BASH_EXE_NAME);
+            std::fs::write(&bash_path, []).unwrap();
+            let pref = ShellPreference::Program(bash_path.clone());
+
+            let cmd = crate::child_env::windows_shell_command(CMD, &pref);
+            assert_eq!(cmd.get_program(), bash_path.as_os_str());
+            let args: Vec<_> = cmd.get_args().collect();
+            assert_eq!(args, ["-c", CMD]);
+        }
+
+        #[test]
+        fn shell_command_uses_cmd_when_configured() {
+            let pref = ShellPreference::Cmd;
+            let cmd = crate::child_env::windows_shell_command(CMD, &pref);
+            assert_eq!(cmd.get_program(), "cmd.exe");
+            let args: Vec<_> = cmd.get_args().collect();
+            assert_eq!(args, ["/C", CMD]);
+        }
+
+        #[test]
+        fn shell_command_uses_cmd_when_custom_program_is_cmd() {
+            let pref = ShellPreference::Program(PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+            let cmd = crate::child_env::windows_shell_command(CMD, &pref);
+            assert_eq!(cmd.get_program(), "cmd.exe");
+            let args: Vec<_> = cmd.get_args().collect();
+            assert_eq!(args, ["/C", CMD]);
+        }
+
+        #[test]
+        fn bash_next_to_git_cmd_layout() {
+            let dir = tempfile::tempdir().unwrap();
+            let cmd_dir = dir.path().join("Git").join("cmd");
+            let bin_dir = dir.path().join("Git").join("bin");
+            std::fs::create_dir_all(&cmd_dir).unwrap();
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let git = cmd_dir.join(GIT_EXE_NAME);
+            let bash = bin_dir.join(BASH_EXE_NAME);
+            std::fs::write(&git, []).unwrap();
+            std::fs::write(&bash, []).unwrap();
+
+            assert_eq!(
+                crate::child_env::bash_next_to_git(&git).as_deref(),
+                Some(bash.as_path())
+            );
+        }
+
+        #[test]
+        fn bash_next_to_git_bin_layout() {
+            let dir = tempfile::tempdir().unwrap();
+            let bin_dir = dir.path().join("Git").join("bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let git = bin_dir.join(GIT_EXE_NAME);
+            let bash = bin_dir.join(BASH_EXE_NAME);
+            std::fs::write(&git, []).unwrap();
+            std::fs::write(&bash, []).unwrap();
+
+            assert_eq!(
+                crate::child_env::bash_next_to_git(&git).as_deref(),
+                Some(bash.as_path())
+            );
+        }
+
+        #[test]
+        fn bash_next_to_git_scoop_shims_layout() {
+            let dir = tempfile::tempdir().unwrap();
+            let shims_dir = dir.path().join("scoop").join("shims");
+            let git_bin_dir = dir
+                .path()
+                .join("scoop")
+                .join("apps")
+                .join("git")
+                .join("current")
+                .join("bin");
+            std::fs::create_dir_all(&shims_dir).unwrap();
+            std::fs::create_dir_all(&git_bin_dir).unwrap();
+            let git_shim = shims_dir.join(GIT_EXE_NAME);
+            let bash = git_bin_dir.join(BASH_EXE_NAME);
+            std::fs::write(&git_shim, []).unwrap();
+            std::fs::write(&bash, []).unwrap();
+
+            assert_eq!(
+                crate::child_env::bash_next_to_git(&git_shim).as_deref(),
+                Some(bash.as_path())
+            );
+        }
+
+        #[test_case(r"C:\Windows\System32\bash.exe", true ; "wsl_bash_uppercase")]
+        #[test_case(r"c:\windows\system32\bash.exe", true ; "wsl_bash_lowercase")]
+        #[test_case(r"C:\Program Files\Git\bin\bash.exe", false ; "git_bash")]
+        #[test_case(r"D:\scoop\apps\git\current\bin\bash.exe", false ; "scoop_git_bash")]
+        fn wsl_bash_detection(path: &str, is_wsl: bool) {
+            assert_eq!(crate::child_env::is_wsl_bash(Path::new(path)), is_wsl);
+        }
+
+        #[test]
+        fn fallback_candidates_include_standard_paths() {
+            let candidates = crate::child_env::fallback_git_bash_candidates();
+            assert!(candidates.iter().any(|c| {
+                c.to_string_lossy()
+                    .replace('/', "\\")
+                    .ends_with(r"\Git\bin\bash.exe")
+            }));
+        }
+    }
+
+    #[test_case("auto", ShellPreference::Auto ; "auto")]
+    #[test_case("cmd", ShellPreference::Cmd ; "cmd")]
+    #[test_case(r"C:\tools\bash.exe", ShellPreference::Program(PathBuf::from(r"C:\tools\bash.exe")) ; "path")]
+    fn shell_preference_parse(value: &str, expected: ShellPreference) {
+        assert_eq!(ShellPreference::parse(value), expected);
     }
 }

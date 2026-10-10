@@ -1,4 +1,4 @@
-mod child_env;
+pub mod child_env;
 pub(crate) mod error;
 pub(crate) mod image;
 pub(crate) mod manifest;
