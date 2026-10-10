@@ -195,6 +195,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         name: "openrouter",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/openrouter"),
     },
+    BundledPlugin {
+        name: "greenpt",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/greenpt"),
+    },
 ];
 
 /// Every bundled name, not just the default-enabled ones. An external package

@@ -93,6 +93,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "deepseek",
     "edit",
     "glob",
+    "greenpt",
     "grep",
     "index",
     "list",
@@ -120,6 +121,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
 /// their names stay free for MCP servers and are not valid tool names.
 pub const PROVIDER_BUILTINS: &[&str] = &[
     "deepseek",
+    "greenpt",
     "mistral",
     "openrouter",
     "regolo",
