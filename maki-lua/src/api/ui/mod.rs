@@ -13,8 +13,8 @@ use strum::VariantNames;
 use crate::api::keymap::accept_key;
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
-    InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_roundtrip,
-    ui_send,
+    InputRequest, PanelPosition, Split, TitlePos, UiAction, WinCommand, WinEvent,
+    ui_json_roundtrip, ui_roundtrip, ui_send,
 };
 use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, try_pair};
@@ -606,6 +606,7 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
 ///   - reserved_top (integer): rows reserved at the top of the content area. Default 0.
 ///   - reserved_bottom (integer): rows reserved at the bottom of the content area. Default 0.
 ///   - split (string): dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
+///   - position (string): which side of the chat input box a `panel` window stacks on. One of "above_input" (default) or "below_input". A "below_input" panel sits between the input box and the status bar. Ignored by other splits and floats.
 ///   - order (integer): paint order among split windows at the same edge. Default 50.
 ///   - focus (boolean): whether the window takes keyboard focus on open. Default true.
 ///   - keys (table): keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or `maki.keymap.set` bindings. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
@@ -649,6 +650,7 @@ fn open_win(
     let border = parse_border(&opts);
     let title_pos = parse_title_pos(&opts);
     let split = parse_split(&opts);
+    let position = parse_position(&opts);
     let order: u16 = opts.get("order").unwrap_or(50);
     let visible = opt_bool(&opts, "visible").unwrap_or(true);
     let needs_input = opt_bool(&opts, "needs_input").unwrap_or(false);
@@ -669,6 +671,7 @@ fn open_win(
         reserved_bottom,
         reserved_top,
         split,
+        position,
         order,
         visible,
         needs_input,
@@ -845,6 +848,12 @@ fn parse_anchor(tbl: &Table) -> Anchor {
 fn parse_split(tbl: &Table) -> Split {
     tbl.get::<String>("split")
         .map(|s| Split::parse(&s))
+        .unwrap_or_default()
+}
+
+fn parse_position(tbl: &Table) -> PanelPosition {
+    tbl.get::<String>("position")
+        .map(|s| PanelPosition::parse(&s))
         .unwrap_or_default()
 }
 
@@ -1221,6 +1230,14 @@ mod tests {
         let tbl = lua.create_table().unwrap();
         tbl.raw_set("title_pos", input).unwrap();
         assert_eq!(parse_title_pos(&tbl), expected);
+    }
+
+    #[test]
+    fn parse_position_reads_its_key() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("position", "below_input").unwrap();
+        assert_eq!(parse_position(&tbl), PanelPosition::BelowInput);
     }
 
     fn seg(text: &str, bold: bool) -> StyledSegment {
