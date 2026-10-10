@@ -129,6 +129,13 @@ impl StreamingContent {
         self.typewriter.is_animating()
     }
 
+    /// Drives the character reveal off an exact elapsed time, so a replay test
+    /// measures a deterministic rate instead of chasing the wall clock.
+    #[cfg(test)]
+    pub(crate) fn set_elapsed(&mut self, elapsed: std::time::Duration) {
+        self.typewriter.set_elapsed(elapsed);
+    }
+
     pub fn set_style(&mut self, prefix: &'static str, text_style: Style, prefix_style: Style) {
         self.prefix = prefix;
         self.text_style = text_style;

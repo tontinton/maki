@@ -1,4 +1,5 @@
 use super::segment::SegmentCache;
+use std::cell::OnceCell;
 
 /// One drawable part of the streaming tail, sitting where the segment that
 /// replaces it will sit once the turn flushes.
@@ -26,22 +27,78 @@ pub(super) struct Layout<'a> {
     cache: &'a SegmentCache,
     tail: &'a [(TailPart, u16)],
     width: u16,
+    /// Rows the document may show, counted from the top. A part shows the rows
+    /// the cursor has reached and no more, so a part below the frontier cannot
+    /// appear ahead of one above it. A `u32` because a transcript can pass
+    /// `u16::MAX` rows.
+    revealed: u32,
+    /// `starts[i]` is the total full height of the parts before `i`, so a part
+    /// gets `revealed - starts[i]` rows without rescanning the document. Built
+    /// on the first cursored lookup: the walkers that only need full heights,
+    /// which is most of them, never pay for it.
+    starts: OnceCell<Vec<u32>>,
 }
 
 impl<'a> Layout<'a> {
-    pub fn new(cache: &'a SegmentCache, tail: &'a [(TailPart, u16)], width: u16) -> Self {
-        Self { cache, tail, width }
+    pub fn new(
+        cache: &'a SegmentCache,
+        tail: &'a [(TailPart, u16)],
+        width: u16,
+        revealed: u32,
+    ) -> Self {
+        Self {
+            cache,
+            tail,
+            width,
+            revealed,
+            starts: OnceCell::new(),
+        }
+    }
+
+    fn starts(&self) -> &[u32] {
+        self.starts.get_or_init(|| {
+            let n = self.cache.len() + self.tail.len();
+            let mut starts = Vec::with_capacity(n);
+            let mut acc: u32 = 0;
+            for i in 0..n {
+                starts.push(acc);
+                acc = acc.saturating_add(u32::from(self.full_height(i)));
+            }
+            starts
+        })
     }
 
     fn len(&self) -> usize {
         self.cache.len() + self.tail.len()
     }
 
-    fn height(&self, i: usize) -> u16 {
-        match self.cache.get(i) {
-            Some(seg) => seg.height(self.width),
-            None => self.tail.get(i - self.cache.len()).map_or(0, |&(_, h)| h),
+    fn full_height(&self, i: usize) -> u16 {
+        full_height_of(self.cache, self.tail, self.width, i)
+    }
+
+    /// Rows part `i` shows when drawn. A cached segment is bounded by how much
+    /// of the cursor is left after the parts above it have taken their share,
+    /// which spreads a block that arrived whole over several frames. The
+    /// streaming tail is not: its height already comes from the typewriter, so
+    /// capping it here would hold typed rows back behind the cursor's rate.
+    ///
+    /// Drawing only. The walkers that move and clamp a scroll position use
+    /// [`Self::full_height`], because the cursor paces growth, not navigation:
+    /// the reader can scroll anywhere in the document the moment it exists.
+    pub(super) fn height(&self, i: usize) -> u16 {
+        if i >= self.cache.len() {
+            return self.full_height(i);
         }
+        let before = self.starts().get(i).copied().unwrap_or(u32::MAX);
+        let remaining = self.revealed.saturating_sub(before);
+        self.full_height(i).min(remaining.min(u32::from(u16::MAX)) as u16)
+    }
+
+    /// Total rows the cursored document shows, the number a draw produces.
+    /// Used by the jank harness to measure growth.
+    #[cfg(test)]
+    pub(super) fn drawn_total(&self) -> u32 {
+        (0..self.len()).map(|i| u32::from(self.height(i))).sum()
     }
 
     /// One past the last addressable row, so `retreat` from here is "the last
@@ -60,7 +117,7 @@ impl<'a> Layout<'a> {
     pub fn clamp(&self, pos: ScrollPos) -> ScrollPos {
         ScrollPos {
             seg: pos.seg,
-            row: pos.row.min(self.height(pos.seg).saturating_sub(1)),
+            row: pos.row.min(self.full_height(pos.seg).saturating_sub(1)),
         }
     }
 
@@ -68,7 +125,7 @@ impl<'a> Layout<'a> {
     /// wheel tick stays cheap however tall the transcript is.
     pub fn advance(&self, mut pos: ScrollPos, mut rows: u32) -> ScrollPos {
         while pos.seg < self.len() {
-            let left = u32::from(self.height(pos.seg).saturating_sub(pos.row));
+            let left = u32::from(self.full_height(pos.seg).saturating_sub(pos.row));
             if rows < left {
                 pos.row += rows as u16;
                 return pos;
@@ -93,14 +150,34 @@ impl<'a> Layout<'a> {
                 return ScrollPos::default();
             }
             pos.seg -= 1;
-            pos.row = self.height(pos.seg);
+            pos.row = self.full_height(pos.seg);
         }
         pos
     }
 
-    /// The lowest position that still fills the viewport.
+    /// The lowest drawn position that still fills the viewport: the pin every
+    /// frame aims at. Walks the *cursored* heights, so it lands on the last row
+    /// that is actually drawn rather than on the end of a document still being
+    /// revealed, which would scroll the reader past the reveal.
     pub fn bottom(&self, viewport: u16) -> ScrollPos {
-        self.retreat(self.end(), u32::from(viewport))
+        let mut pos = ScrollPos {
+            seg: self.len(),
+            row: 0,
+        };
+        let mut rows = u32::from(viewport);
+        while rows > 0 {
+            if u32::from(pos.row) >= rows {
+                pos.row -= rows as u16;
+                return pos;
+            }
+            rows -= u32::from(pos.row);
+            if pos.seg == 0 {
+                return ScrollPos::default();
+            }
+            pos.seg -= 1;
+            pos.row = self.height(pos.seg);
+        }
+        pos
     }
 
     /// Rows between two positions, or 0 when `to` is not below `from`. Only
@@ -111,7 +188,7 @@ impl<'a> Layout<'a> {
             return 0;
         }
         (from.seg..to.seg.min(self.len()))
-            .map(|i| u32::from(self.height(i)))
+            .map(|i| u32::from(self.full_height(i)))
             .fold(u32::from(to.row), u32::saturating_add)
             .saturating_sub(u32::from(from.row))
     }
@@ -132,6 +209,15 @@ impl<'a> Layout<'a> {
     }
 }
 
+/// Full height of one part, ignoring the reveal cursor. Shared by the cursor
+/// build and every walker, so a part is measured the same way everywhere.
+fn full_height_of(cache: &SegmentCache, tail: &[(TailPart, u16)], width: u16, i: usize) -> u16 {
+    match cache.get(i) {
+        Some(seg) => seg.height(width),
+        None => tail.get(i - cache.len()).map_or(0, |&(_, h)| h),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +226,12 @@ mod tests {
     use test_case::test_case;
 
     const WIDTH: u16 = 80;
+
+    /// A layout that hides nothing, since these walk the document rather than
+    /// the reveal.
+    fn layout<'a>(cache: &'a SegmentCache, tail: &'a [(TailPart, u16)]) -> Layout<'a> {
+        Layout::new(cache, tail, WIDTH, u32::MAX)
+    }
 
     fn cache(heights: &[u16]) -> SegmentCache {
         let mut cache = SegmentCache::new();
@@ -162,7 +254,7 @@ mod tests {
     fn advance_walks_rows(from: ScrollPos, rows: u32, expected: ScrollPos) {
         let cache = cache(&[3, 1, 2]);
         assert_eq!(
-            Layout::new(&cache, &[], WIDTH).advance(from, rows),
+            layout(&cache, &[]).advance(from, rows),
             expected
         );
     }
@@ -174,7 +266,7 @@ mod tests {
     fn retreat_walks_rows(from: ScrollPos, rows: u32, expected: ScrollPos) {
         let cache = cache(&[3, 1, 2]);
         assert_eq!(
-            Layout::new(&cache, &[], WIDTH).retreat(from, rows),
+            layout(&cache, &[]).retreat(from, rows),
             expected
         );
     }
@@ -182,7 +274,7 @@ mod tests {
     #[test]
     fn the_tail_extends_the_document_past_the_cache() {
         let cache = cache(&[3]);
-        let layout = Layout::new(&cache, &[(TailPart::Spacer, 1), (TailPart::Text, 4)], WIDTH);
+        let layout = layout(&cache, &[(TailPart::Spacer, 1), (TailPart::Text, 4)]);
         assert_eq!(layout.total_rows(), 8);
         assert_eq!(layout.at_row(4), pos(2, 0));
         assert_eq!(layout.doc_row(pos(2, 3)), 7);
@@ -194,7 +286,7 @@ mod tests {
     fn rows_from_counts_down(from: ScrollPos, to: ScrollPos, expected: u32) {
         let cache = cache(&[3, 2]);
         assert_eq!(
-            Layout::new(&cache, &[], WIDTH).rows_from(from, to),
+            layout(&cache, &[]).rows_from(from, to),
             expected
         );
     }

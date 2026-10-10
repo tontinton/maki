@@ -35,7 +35,7 @@ use ratatui_image::picker::Picker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::scrollbar::{self, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
@@ -57,6 +57,13 @@ use tracing::warn;
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
 /// How far outside the drawn range an image keeps its encoded protocol.
 const IMAGE_KEEP_MARGIN_SEGMENTS: usize = 8;
+/// Rows the cursor advances per second while the document is still growing. A
+/// rate rather than a step per frame, because a frame is not a fixed amount of
+/// time and the reveal would otherwise follow the redraw cadence.
+const ROWS_PER_SEC: f64 = 6.0;
+/// Longest gap credited to the cursor, one smooth frame. A longer step would
+/// advance several rows at once and show them together.
+const MAX_REVEAL_STEP: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Copy)]
 pub struct PromptProgress {
@@ -105,6 +112,14 @@ pub struct MessagesPanel {
     /// only bumps when colors actually land.
     rebake_requested: HashMap<String, u64>,
     prompt_progress: Option<PromptProgress>,
+    /// Rows of the document the cursor has reached, counted from the top. Every
+    /// part below it is hidden, so the transcript grows one row at a time
+    /// whatever landed. `INFINITY` until the first tick claims what is already
+    /// on screen as read.
+    revealed_rows: f64,
+    /// When the cursor last advanced, so its rate is per second rather than per
+    /// frame and a slow frame does not slow the reveal to match.
+    last_reveal: Instant,
     /// The chat this panel shows, stamped on every restore it requests so a
     /// plugin files the call where the live one went.
     session_id: Option<SessionRef>,
@@ -157,6 +172,8 @@ impl MessagesPanel {
             clock_format: ui_config.clock_format,
             rebake_requested: HashMap::new(),
             prompt_progress: None,
+            revealed_rows: f64::INFINITY,
+            last_reveal: Instant::now(),
             session_id: None,
             task_id: None,
         }
@@ -598,6 +615,18 @@ impl MessagesPanel {
         self.flush_thinking();
         self.prompt_progress = None;
         if !self.streaming_text.is_empty() {
+            // Rows the typewriter had actually revealed. The buffer may hold
+            // more, and that remainder becomes a cached segment the cursor
+            // paces, so advancing by the whole buffer would dump text that was
+            // never typed. Advance by what was on screen and let the cursor
+            // finish the rest.
+            let shown = wrap::total_rows(
+                self.streaming_text.render_lines(self.viewport_width),
+                self.viewport_width,
+            );
+            if self.revealed_rows.is_finite() {
+                self.revealed_rows += f64::from(shown);
+            }
             self.messages.push(DisplayMessage::new(
                 DisplayRole::Assistant,
                 self.streaming_text.take_all(),
@@ -606,7 +635,12 @@ impl MessagesPanel {
     }
 
     fn layout(&self) -> Layout<'_> {
-        Layout::new(&self.cache, &self.tail, self.viewport_width)
+        Layout::new(
+            &self.cache,
+            &self.tail,
+            self.viewport_width,
+            self.revealed_rows as u32,
+        )
     }
 
     /// Positive scrolls up. Clamping is immediate rather than deferred to the
@@ -788,11 +822,65 @@ impl MessagesPanel {
     /// running tool had to claim it was animating: it was the only way to keep
     /// them fed.
     pub fn tick(&mut self) -> Dirty {
-        let mut dirty = self.drain_highlights() | self.poll_live_bufs() | self.refresh_images();
+        let mut dirty = self.drain_highlights()
+            | self.poll_live_bufs()
+            | self.refresh_images()
+            | self.advance_reveal(Instant::now());
         if self.show_idle_splash() {
             dirty |= self.idle_splash.poll_update(update::latest_version());
         }
         dirty
+    }
+
+    /// Rows the cached segments hold at the current width. Computed fresh
+    /// rather than cached in a field, so a tick between a commit and the next
+    /// frame cannot read a stale height and clamp the cursor back down.
+    fn cached_rows(&self) -> u16 {
+        self.cache
+            .segments()
+            .iter()
+            .map(|seg| seg.height(self.viewport_width))
+            .fold(0u16, u16::saturating_add)
+    }
+
+    /// Advances the row cursor by the time since the last call and reports
+    /// whether a row crossed, which is the only thing that keeps the panel
+    /// asking to be redrawn. `now` is a parameter so a test can drive the clock
+    /// instead of sleeping for one.
+    fn advance_reveal(&mut self, now: Instant) -> Dirty {
+        let dt = now
+            .saturating_duration_since(self.last_reveal)
+            .min(MAX_REVEAL_STEP)
+            .as_secs_f64();
+        self.last_reveal = now;
+
+        let content = f64::from(self.cached_rows());
+        if self.revealed_rows.is_infinite() {
+            // Take the cached document as already read rather than revealing
+            // it, so restoring a session does not replay it.
+            self.revealed_rows = content;
+            return Dirty::NO;
+        }
+        // Grow toward the content but never shrink: `cached_rows` is read
+        // before the segment for a freshly committed message is built, so a
+        // plain `min` would clamp the cursor back down over text that is
+        // already on screen.
+        let ceiling = content.max(self.revealed_rows);
+        let rendered = (self.revealed_rows + dt * ROWS_PER_SEC).min(ceiling);
+        let moved = rendered as u32 > self.revealed_rows as u32;
+        self.revealed_rows = rendered;
+        Dirty::from(moved)
+    }
+
+    /// Drives the reveal clock by `elapsed` and then drains, so a replay test
+    /// measures a deterministic rate instead of chasing the wall clock. The
+    /// character reveal is fed the same step, so both clocks advance together.
+    #[cfg(test)]
+    pub(crate) fn tick_for_test(&mut self, elapsed: Duration) -> Dirty {
+        self.streaming_text.set_elapsed(elapsed);
+        self.streaming_thinking.set_elapsed(elapsed);
+        let advance = self.advance_reveal(self.last_reveal + elapsed);
+        advance | self.drain_highlights() | self.poll_live_bufs() | self.refresh_images()
     }
 
     pub fn cadence(&self) -> Cadence {
@@ -802,7 +890,11 @@ impl MessagesPanel {
         // for the whole reasoning phase.
         let smooth = self.streaming_text.is_animating()
             || self.accent.is_animating()
-            || (self.streaming_thinking.is_animating() && !self.streaming_thinking_collapsed());
+            || (self.streaming_thinking.is_animating() && !self.streaming_thinking_collapsed())
+            // A frame spends the cursor's budget, so a segment still being
+            // revealed has to claim motion or it stops advancing.
+            || (self.revealed_rows.is_finite()
+                && (self.revealed_rows as u32) < u32::from(self.cached_rows()));
         Cadence::any([
             // A running tool draws a spinner. Its output arriving is data, and
             // `tick` reports that separately.
@@ -867,10 +959,19 @@ impl MessagesPanel {
         let width = area.width.saturating_sub(1);
         let theme_gen = theme::generation();
         let theme_changed = self.theme_generation != theme_gen;
-        let needs_reflow = self.viewport_width != width || theme_changed;
+        let width_changed = self.viewport_width != width;
+        let needs_reflow = width_changed || theme_changed;
         if needs_reflow {
             self.viewport_width = width;
             self.theme_generation = theme_gen;
+        }
+        if width_changed && self.auto_scroll && self.revealed_rows.is_finite() {
+            // A re-wrap lays the same text out taller or shorter, and those
+            // rows were already read. `INFINITY` makes the next tick claim the
+            // re-wrapped height as read, the same way the first tick claims a
+            // restored document, instead of revealing it again a row at a time.
+            // A resize is not growth; only growth is paced.
+            self.revealed_rows = f64::INFINITY;
         }
         if theme_changed {
             self.rebake_stale_snapshots(theme_gen);
@@ -922,6 +1023,15 @@ impl MessagesPanel {
         let viewport = Rect::new(area.x, area.y, width, area.height);
         let mut cursor = RenderCursor::new(self.scroll.row, viewport);
 
+        // Heights the cursor grants each part this frame, read before the
+        // mutable walk so a segment below the cursor reveals its rows in order
+        // rather than drawing its full height at once. `Layout::new` is cheap
+        // now: it builds `starts` only when a cursored height is first read,
+        // which is here, once per frame rather than at every `layout()` call.
+        let cursored: Vec<u16> = {
+            let layout = self.layout();
+            (0..self.cache.len()).map(|i| layout.height(i)).collect()
+        };
         let mut last_drawn = self.scroll.seg;
         for (i, seg) in self
             .cache
@@ -933,7 +1043,7 @@ impl MessagesPanel {
             if cursor.past_bottom() {
                 break;
             }
-            let h = seg.text_height(width);
+            let h = cursored.get(i).copied().unwrap_or_else(|| seg.text_height(width));
             let highlight = self.highlight_segment == Some(i);
             let style = seg.tool_id.as_ref().map(|_| theme::current().tool_bg);
             cursor.render(seg.lines(), h, style, highlight, frame);

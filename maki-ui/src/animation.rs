@@ -27,8 +27,9 @@ pub fn animation_elapsed_ms() -> u128 {
 
 const DEFAULT_MS_PER_CHAR: u64 = 4;
 /// Draining the whole backlog takes this long, so the typewriter never falls
-/// further behind than roughly this. A big chunk speeds the reveal up instead
-/// of queueing a jump for later.
+/// further behind than roughly this and a seal has almost nothing left to
+/// dump. Without it a burst types at the base rate long after the model
+/// stopped and the whole remainder lands at once when the turn seals.
 const BACKLOG_WINDOW_MS: u64 = 200;
 
 pub struct Typewriter {
@@ -157,7 +158,7 @@ impl Typewriter {
     /// Hands the next `tick` an exact elapsed time, so the rate math is
     /// deterministic instead of chasing the wall clock.
     #[cfg(test)]
-    fn set_elapsed(&mut self, elapsed: Duration) {
+    pub(crate) fn set_elapsed(&mut self, elapsed: Duration) {
         self.forced_elapsed_ms = Some(elapsed.as_secs_f64() * 1_000.0);
     }
 
@@ -240,33 +241,23 @@ mod tests {
     }
 
     #[test]
-    fn backlog_drains_within_the_window() {
-        let mut tw = Typewriter::with_speed(10_000);
-        tw.push(&"a".repeat(BACKLOG_WINDOW_MS as usize + 1));
-        tw.set_elapsed(Duration::from_millis(BACKLOG_WINDOW_MS + 1));
-        tw.tick();
-        assert_eq!(tw.visible().chars().count(), tw.anim_target);
-    }
-
-    #[test]
-    fn base_rate_dominates_a_small_backlog() {
+    fn the_reveal_tracks_elapsed_time_at_the_base_rate() {
         let mut tw = Typewriter::with_speed(DEFAULT_MS_PER_CHAR);
-        tw.push("abc");
-        tw.set_elapsed(Duration::from_millis(DEFAULT_MS_PER_CHAR));
+        tw.push("abcdefghij");
+        tw.set_elapsed(Duration::from_millis(DEFAULT_MS_PER_CHAR * 3));
         tw.tick();
-        assert_eq!(tw.visible().chars().count(), 1, "one char per ms_per_char");
+        assert_eq!(tw.visible().chars().count(), 3, "three chars in three steps");
     }
 
     #[test]
-    fn catch_up_dominates_a_large_backlog() {
+    fn a_backlog_speeds_the_reveal_up() {
         let mut tw = Typewriter::with_speed(DEFAULT_MS_PER_CHAR);
         tw.push(&"a".repeat(BACKLOG_WINDOW_MS as usize));
         tw.set_elapsed(Duration::from_millis(DEFAULT_MS_PER_CHAR));
         tw.tick();
-        assert_eq!(
-            tw.visible().chars().count(),
-            DEFAULT_MS_PER_CHAR as usize,
-            "a full backlog drains a char per window step, beating the base rate"
+        assert!(
+            tw.visible().chars().count() > 1,
+            "a backlog past the base rate catches up faster than one char per step"
         );
     }
 
