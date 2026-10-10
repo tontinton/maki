@@ -801,6 +801,7 @@ pub struct AgentFileConfig {
     pub post_compaction_instructions: Option<String>,
     pub stale_read_check: Option<bool>,
     pub rtk: Option<bool>,
+    pub shell: Option<String>,
 }
 
 impl AgentFileConfig {
@@ -816,7 +817,8 @@ impl AgentFileConfig {
             compaction_instructions,
             post_compaction_instructions,
             stale_read_check,
-            rtk
+            rtk,
+            shell
         );
     }
 }
@@ -1406,6 +1408,32 @@ impl Default for ToolOutputLines {
     }
 }
 
+/// How string shell commands run on Windows (`jobstart` with a string, UI `!`
+/// commands). Unix always uses `bash -c`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellPreference {
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "cmd")]
+    Cmd,
+    #[serde(untagged)]
+    Program(PathBuf),
+}
+
+impl ShellPreference {
+    pub fn parse(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("auto") {
+            Self::Auto
+        } else if trimmed.eq_ignore_ascii_case("cmd") {
+            Self::Cmd
+        } else {
+            Self::Program(PathBuf::from(trimmed))
+        }
+    }
+}
+
 #[derive(Debug, Clone, ConfigSection, Serialize)]
 #[config(section = "agent")]
 pub struct AgentConfig {
@@ -1450,6 +1478,14 @@ pub struct AgentConfig {
     )]
     pub rtk: bool,
 
+    #[config(
+        default = ShellPreference::Auto,
+        ty = "string",
+        default_doc = "auto",
+        desc = "Shell for string commands on Windows (`jobstart`, UI `!`): `auto` (Git Bash next to `git` on PATH, else `cmd.exe`), `cmd`, or a path to an executable"
+    )]
+    pub shell: ShellPreference,
+
     #[config(skip, default = "None")]
     pub max_turns: Option<u32>,
 
@@ -1476,6 +1512,11 @@ impl AgentConfig {
             post_compaction_instructions: file.post_compaction_instructions,
             stale_read_check: file.stale_read_check.unwrap_or(true),
             rtk: file.rtk.unwrap_or(true),
+            shell: file
+                .shell
+                .as_deref()
+                .map(ShellPreference::parse)
+                .unwrap_or_default(),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),

@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,6 +10,7 @@ use futures_lite::io::{AsyncBufReadExt, BufReader};
 use maki_agent::{
     AgentConfig, CancelToken, CancelTrigger, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
 };
+use maki_providers::child_env;
 use maki_providers::{Message, strip_provider_keys};
 use smol::process::{Command, Stdio};
 
@@ -180,6 +180,7 @@ pub(crate) fn spawn_shell(
             command: command.clone(),
         });
 
+        let shell = config.shell.clone();
         let result = run_command(
             &command,
             &id,
@@ -187,6 +188,7 @@ pub(crate) fn spawn_shell(
             &cancel,
             config.max_output_lines,
             config.max_output_bytes,
+            &shell,
         )
         .await;
 
@@ -213,12 +215,10 @@ async fn run_command(
     cancel: &CancelToken,
     max_output_lines: usize,
     max_output_bytes: usize,
+    shell: &maki_config::ShellPreference,
 ) -> Result<String, String> {
-    let mut std_cmd = StdCommand::new("bash");
-    strip_provider_keys(&mut std_cmd)
-        .arg("-c")
-        .arg(command)
-        .env("GIT_TERMINAL_PROMPT", "0");
+    let mut std_cmd = child_env::shell_command(command, shell);
+    strip_provider_keys(&mut std_cmd).env("GIT_TERMINAL_PROMPT", "0");
 
     #[cfg(unix)]
     unsafe {

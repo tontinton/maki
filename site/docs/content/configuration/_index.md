@@ -130,6 +130,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
 | `rtk` | bool | `true` | - | Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
+| `shell` | string | `auto` | - | Shell for string commands on Windows (`jobstart`, UI `!`): `auto` (Git Bash next to `git` on PATH, else `cmd.exe`), `cmd`, or a path to an executable |
 
 ### `provider`
 

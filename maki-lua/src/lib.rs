@@ -12,6 +12,7 @@ mod pack;
 pub(crate) mod plugin_permissions;
 mod runtime;
 pub mod session_snapshot;
+mod shell_settings;
 
 pub use api::keymap::{KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use api::net::set_allowed_private_hosts;
@@ -45,6 +46,7 @@ pub use runtime::{
     RestoreItem, RestoreReason, WARM_TOOL_CAP,
 };
 pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
+pub use shell_settings::set_shell_preference;
 
 pub mod test_support {
     use std::sync::Arc;
