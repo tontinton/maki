@@ -73,11 +73,21 @@ impl CancelToken {
 
     pub fn child(&self) -> (CancelTrigger, Self) {
         let (child_trigger, child_token) = Self::new();
+        if self.is_cancelled() {
+            child_token.0.fire();
+            return (child_trigger, child_token);
+        }
         let parent = self.clone();
-        let child_shared = Arc::clone(&child_token.0);
+        let child = child_token.clone();
         smol::spawn(async move {
-            parent.cancelled().await;
-            child_shared.fire();
+            futures_lite::future::or(
+                async {
+                    parent.cancelled().await;
+                    child.0.fire();
+                },
+                child.cancelled(),
+            )
+            .await;
         })
         .detach();
         (child_trigger, child_token)
@@ -206,9 +216,13 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use test_case::test_case;
 
     use super::*;
+
+    const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[test]
     fn trigger_wakes_token() {
@@ -242,6 +256,44 @@ mod tests {
             assert!(child_token.is_cancelled());
             assert!(!parent_token.is_cancelled());
         });
+    }
+
+    #[test]
+    fn child_of_cancelled_parent_is_born_cancelled() {
+        let (trigger, parent) = CancelToken::new();
+        trigger.cancel();
+
+        let (_trigger, child) = parent.child();
+
+        assert!(child.is_cancelled());
+    }
+
+    #[test_case(false ; "child_cancelled")]
+    #[test_case(true ; "child_trigger_dropped")]
+    fn child_completion_releases_the_propagation_task(drop_trigger: bool) {
+        let parent = CancelToken::none();
+        let (trigger, child) = parent.child();
+        let child_state = Arc::downgrade(&child.0);
+        if drop_trigger {
+            drop(trigger);
+        } else {
+            trigger.cancel();
+        }
+        drop(child);
+
+        smol::block_on(futures_lite::future::or(
+            async {
+                while child_state.strong_count() != 0 || Arc::strong_count(&parent.0) != 1 {
+                    smol::future::yield_now().await;
+                }
+            },
+            async {
+                smol::Timer::after(PROPAGATION_TIMEOUT).await;
+                panic!("child cancellation left its propagation task running");
+            },
+        ));
+        assert_eq!(Arc::strong_count(&parent.0), 1);
+        assert!(!parent.is_cancelled());
     }
 
     #[test]
