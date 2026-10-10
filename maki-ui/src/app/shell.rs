@@ -1,13 +1,11 @@
 use std::collections::HashSet;
-use std::process::Command as StdCommand;
+use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-
 use futures_lite::StreamExt;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
+use maki_agent::spawn::detached_command;
 use maki_agent::{
     AgentConfig, CancelToken, CancelTrigger, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
 };
@@ -214,19 +212,8 @@ async fn run_command(
     max_output_lines: usize,
     max_output_bytes: usize,
 ) -> Result<String, String> {
-    let mut std_cmd = StdCommand::new("bash");
-    strip_provider_keys(&mut std_cmd)
-        .arg("-c")
-        .arg(command)
-        .env("GIT_TERMINAL_PROMPT", "0");
-
-    #[cfg(unix)]
-    unsafe {
-        std_cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
+    let mut std_cmd = detached_command(OsStr::new("bash"), [OsStr::new("-c"), OsStr::new(command)]);
+    strip_provider_keys(&mut std_cmd).env("GIT_TERMINAL_PROMPT", "0");
 
     let mut cmd: Command = std_cmd.into();
     cmd.stdin(Stdio::null())

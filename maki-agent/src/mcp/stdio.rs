@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::ffi::OsStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -17,6 +16,7 @@ use tracing::{debug, info, warn};
 use super::error::McpError;
 use super::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 use super::transport::{BoxFuture, McpTransport};
+use crate::spawn::detached_command;
 
 type PendingMap = HashMap<u64, channel::Sender<Result<Value, McpError>>>;
 
@@ -44,18 +44,8 @@ impl StdioTransport {
         environment: &HashMap<String, String>,
         timeout: Duration,
     ) -> Result<Self, McpError> {
-        let mut std_cmd = std::process::Command::new(program);
-        strip_provider_keys(&mut std_cmd)
-            .args(args)
-            .envs(environment);
-
-        #[cfg(unix)]
-        unsafe {
-            std_cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
+        let mut std_cmd = detached_command(OsStr::new(program), args);
+        strip_provider_keys(&mut std_cmd).envs(environment);
 
         let mut cmd: smol::process::Command = std_cmd.into();
         cmd.stdin(smol::process::Stdio::piped())

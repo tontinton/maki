@@ -18,6 +18,7 @@ use cli::Cli;
 const TELEMETRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() {
+    maki_agent::spawn::run_detached_if_marked();
     color_eyre::install().ok();
     let result = cmd::dispatch(Cli::parse());
     // Detached export tasks die with the process; drain them here, before

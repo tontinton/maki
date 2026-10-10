@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use maki_agent::spawn::detached_command;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::strip_provider_keys;
 use maki_storage::id::MakiId;
@@ -282,23 +283,12 @@ impl JobStore {
             on_stderr,
             on_exit,
         } = spec;
-        let mut command = cmd.build();
+        let built = cmd.build();
+        let mut command = detached_command(built.get_program(), built.get_args());
         strip_provider_keys(&mut command)
             .stdout(stdout.stdio()?)
             .stderr(stderr.stdio()?)
             .stdin(Stdio::null());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            // SAFETY: setsid is async-signal-safe, so it is sound to call in pre_exec.
-            unsafe {
-                command.pre_exec(|| {
-                    rustix::process::setsid()?;
-                    Ok(())
-                });
-            }
-        }
 
         if let Some(dir) = cwd.as_deref().map(expand_tilde) {
             if !dir.is_dir() {
