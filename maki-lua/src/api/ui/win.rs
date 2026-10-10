@@ -8,7 +8,7 @@ use mlua::{AnyUserData, Lua, Result as LuaResult, Table};
 
 use super::{parse_footer, try_parse_dimension};
 use crate::api::util::command::{
-    Anchor, Border, FloatConfigPatch, Split, TitlePos, WinCommand, WinEvent,
+    Anchor, Border, FloatConfigPatch, PanelPosition, Split, TitlePos, WinCommand, WinEvent,
 };
 use crate::api::util::convert::opt_bool;
 use crate::docs::{FnDoc, ParamDoc};
@@ -214,6 +214,7 @@ fn win_extra<M: mlua::UserDataMethods<WinHandle>>(methods: &mut M) {
 ///   - cursor_line (boolean): highlight the focused row.
 ///   - reserved_top (integer): rows reserved at the top of the content area.
 ///   - split (string): edge docking, "above", "below", "left", "right", "panel", or "".
+///   - position (string): side of the chat input box a `panel` window stacks on, "above_input" or "below_input".
 ///   - order (integer): paint order among split windows.
 ///   - needs_input (boolean): whether the window means the session needs user input.
 /// @return
@@ -251,6 +252,9 @@ fn set_config(_lua: &Lua, this: &WinHandle, opts: Table) -> LuaResult<()> {
     }
     if let Ok(s) = opts.get::<String>("split") {
         patch.split = Some(Split::parse(&s));
+    }
+    if let Ok(p) = opts.get::<String>("position") {
+        patch.position = Some(PanelPosition::parse(&p));
     }
     if let Ok(o) = opts.get::<u16>("order") {
         patch.order = Some(o);
@@ -554,6 +558,20 @@ mod tests {
             panic!("expected SetConfig command");
         };
         assert_eq!(patch.needs_input, Some(false));
+    }
+
+    #[test]
+    fn set_config_parses_position() {
+        let lua = mlua::Lua::new();
+        let (_event_tx, cmd_rx, handle) = make_channels();
+        lua.globals().set("win", handle).unwrap();
+        lua.load("win:set_config({ position = \"below_input\" })")
+            .exec()
+            .unwrap();
+        let Ok(WinCommand::SetConfig(patch)) = cmd_rx.try_recv() else {
+            panic!("expected SetConfig command");
+        };
+        assert_eq!(patch.position, Some(PanelPosition::BelowInput));
     }
 
     #[test]
