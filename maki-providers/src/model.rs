@@ -458,14 +458,14 @@ fn deferral_endpoint(
 }
 
 /// The thinking keys a `providers.toml` entry may lend a builtin local model
-/// (see [`maki_config::providers::overlays_local_thinking`]). Everything else
-/// about those slugs stays compiled in, so this reads no base URLs and no
-/// keys, and leaves auth wiring alone.
+/// (see [`maki_config::providers::is_local_endpoint`]). Base URL and protocol
+/// are read by `LocalEndpoint` itself, so this reads only the thinking keys
+/// and leaves auth wiring alone.
 fn local_thinking_overlay(
     slug: &str,
     model_id: &str,
 ) -> (Option<ThinkingSupport>, Option<Box<ThinkingFields>>) {
-    if !maki_config::providers::overlays_local_thinking(slug) {
+    if !maki_config::providers::is_local_endpoint(slug) {
         return (None, None);
     }
     let config = maki_config::providers::ProvidersConfig::load();

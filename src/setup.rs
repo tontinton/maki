@@ -178,7 +178,7 @@ fn user_provider_models() -> impl Iterator<Item = Model> {
 
 /// Built-in slugs keep their compiled protocol, model catalog and auth wiring,
 /// so a `providers.toml` entry setting those fields is only partly honored
-/// (#597). A bundled plugin's slug counts once its declaration registered,
+/// (#597). Local endpoints read some of them, see `ignored_builtin_fields`. A bundled plugin's slug counts once its declaration registered,
 /// since it keeps the slug over a `protocol` the same way. Call this after
 /// `init_logging` and the bundled load, or the warning has nowhere to go and
 /// no declaration to check.
