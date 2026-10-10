@@ -66,7 +66,8 @@ impl Typewriter {
 
     pub fn push(&mut self, text: &str) {
         self.buffer.push_str(text);
-        self.tick();
+        // Finish the in flight reveal, so a seal has no backlog to snap in.
+        self.advance_visible(self.anim_target);
         self.anim_start_visible = self.visible_len;
         self.anim_target = self.buffer.chars().count();
         if self.ms_per_char == 0 {
@@ -196,6 +197,18 @@ mod tests {
         tw.set_buffer("héllo 🌍");
         assert_eq!(tw.visible(), "héllo 🌍");
         assert!(!tw.is_animating());
+    }
+
+    #[test]
+    fn push_finishes_an_in_flight_reveal() {
+        let mut tw = Typewriter::new();
+        tw.push("aaaaaaaaaa");
+        assert_eq!(tw.visible(), "");
+        assert!(tw.is_animating());
+
+        tw.push("bbb");
+        assert_eq!(tw.visible(), "aaaaaaaaaa");
+        assert!(tw.is_animating());
     }
 
     #[test]
