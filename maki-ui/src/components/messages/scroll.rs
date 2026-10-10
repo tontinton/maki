@@ -80,13 +80,6 @@ impl<'a> Layout<'a> {
             .min(remaining.min(u32::from(u16::MAX)) as u16)
     }
 
-    /// Total rows the cursored document shows, the number a draw produces.
-    /// Used by the jank harness to measure growth.
-    #[cfg(test)]
-    pub(super) fn drawn_total(&self) -> u32 {
-        (0..self.len()).map(|i| u32::from(self.height(i))).sum()
-    }
-
     /// One past the last addressable row, so `retreat` from here is "the last
     /// N rows of the document".
     fn end(&self) -> ScrollPos {
@@ -230,10 +223,7 @@ mod tests {
     #[test_case(pos(1, 0), 99, pos(3, 0) ; "clamps_at_the_end")]
     fn advance_walks_rows(from: ScrollPos, rows: u32, expected: ScrollPos) {
         let cache = cache(&[3, 1, 2]);
-        assert_eq!(
-            layout(&cache).advance(from, rows),
-            expected
-        );
+        assert_eq!(layout(&cache).advance(from, rows), expected);
     }
 
     #[test_case(pos(2, 1), 1, pos(2, 0) ; "inside_a_segment")]
@@ -242,10 +232,7 @@ mod tests {
     #[test_case(pos(1, 0), 99, pos(0, 0) ; "clamps_at_the_start")]
     fn retreat_walks_rows(from: ScrollPos, rows: u32, expected: ScrollPos) {
         let cache = cache(&[3, 1, 2]);
-        assert_eq!(
-            layout(&cache).retreat(from, rows),
-            expected
-        );
+        assert_eq!(layout(&cache).retreat(from, rows), expected);
     }
 
     #[test]
@@ -264,9 +251,6 @@ mod tests {
     #[test_case(pos(1, 1), pos(0, 2), 0 ; "target_above_never_underflows")]
     fn rows_from_counts_down(from: ScrollPos, to: ScrollPos, expected: u32) {
         let cache = cache(&[3, 2]);
-        assert_eq!(
-            layout(&cache).rows_from(from, to),
-            expected
-        );
+        assert_eq!(layout(&cache).rows_from(from, to), expected);
     }
 }

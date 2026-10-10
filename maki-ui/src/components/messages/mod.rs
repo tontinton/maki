@@ -31,7 +31,6 @@ use crate::splash::{ColorTransition, Splash};
 use crate::terminal_image;
 use crate::theme;
 use crate::update;
-use crate::wrap;
 use maki_config::{ClockFormat, ToolOutputLines, UiConfig};
 use ratatui_image::picker::Picker;
 
@@ -62,7 +61,7 @@ const IMAGE_KEEP_MARGIN_SEGMENTS: usize = 8;
 /// Rows the cursor advances per second while the document is still growing. A
 /// rate rather than a step per frame, because a frame is not a fixed amount of
 /// time and the reveal would otherwise follow the redraw cadence.
-const ROWS_PER_SEC: f64 = 6.0;
+const ROWS_PER_SEC: f64 = 120.0;
 /// Longest gap credited to the cursor, one smooth frame. A longer step would
 /// advance several rows at once and show them together.
 const MAX_REVEAL_STEP: Duration = Duration::from_millis(16);
@@ -619,19 +618,27 @@ impl MessagesPanel {
         self.flush_thinking();
         self.prompt_progress = None;
         if !self.streaming_text.is_empty() {
-            // The live segment already shows this text, so the message takes
-            // its place at the same rows next frame and the cursor does not
-            // move. Committing the buffer here is what used to dump whatever
-            // the typewriter had not revealed.
+            // The live segment drew this text uncapped, so it was on screen
+            // whatever the cursor had reached. Claim the rows as read, or the
+            // commit makes them a capped segment and hides text the reader is
+            // looking at until the cursor climbs back. Pacing is for a block
+            // that arrives whole with nothing of it on screen; this is not one.
+            let drawn = f64::from(self.layout().total_rows());
             self.messages.push(DisplayMessage::new(
                 DisplayRole::Assistant,
                 self.streaming_text.take_all(),
             ));
+            self.revealed_rows = self.revealed_rows.max(drawn);
         }
     }
 
     fn layout(&self) -> Layout<'_> {
-        Layout::new(&self.cache, self.viewport_width, self.revealed_rows as u32, self.live_start)
+        Layout::new(
+            &self.cache,
+            self.viewport_width,
+            self.revealed_rows as u32,
+            self.live_start,
+        )
     }
 
     /// Positive scrolls up. Clamping is immediate rather than deferred to the
@@ -834,11 +841,7 @@ impl MessagesPanel {
     /// rather than cached in a field, so a tick between a commit and the next
     /// frame cannot read a stale height and clamp the cursor back down.
     fn cached_rows(&self) -> u16 {
-        self.cache
-            .segments()
-            .iter()
-            .map(|seg| seg.height(self.viewport_width))
-            .fold(0u16, u16::saturating_add)
+        self.layout().total_rows().min(u32::from(u16::MAX)) as u16
     }
 
     /// Advances the row cursor by the time since the last call and reports

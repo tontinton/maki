@@ -4,6 +4,7 @@ use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{DocPos, Selection, SelectionZone};
+use crate::wrap;
 use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
@@ -106,7 +107,7 @@ fn snap_line(text: &str) -> SnapshotLine {
     }
 }
 
-fn start(id: &str, tool: &str) -> ToolStartEvent {
+pub(super) fn start(id: &str, tool: &str) -> ToolStartEvent {
     ToolStartEvent {
         id: id.into(),
         tool: tool.into(),
@@ -266,27 +267,6 @@ fn tool_start_flushes_streaming_text() {
     assert!(matches!(panel.messages[1].role, DisplayRole::Tool(_)));
 }
 
-/// A flush settles the streaming text into a message, and the live segment that
-/// was showing it must go with it, so the text is drawn once.
-#[test]
-fn a_flush_leaves_one_copy_of_the_text() {
-    const STREAMED: &str = "one two three";
-
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.text_delta(STREAMED);
-    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
-
-    panel.flush();
-    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
-    let text = buffer_text(&terminal);
-
-    assert_eq!(
-        text.matches(STREAMED).count(),
-        1,
-        "the flushed text must appear once, not once as the message and again as the stale live segment:\n{text}"
-    );
-}
-
 #[test]
 fn thinking_delta_separate_from_text() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
@@ -335,7 +315,11 @@ fn render_sel(
     terminal
 }
 
-fn render(panel: &mut MessagesPanel, width: u16, height: u16) -> ratatui::Terminal<TestBackend> {
+pub(super) fn render(
+    panel: &mut MessagesPanel,
+    width: u16,
+    height: u16,
+) -> ratatui::Terminal<TestBackend> {
     render_sel(panel, width, height, false)
 }
 

@@ -145,6 +145,12 @@ impl StreamingContent {
         self.cache.invalidate();
     }
 
+    /// Read by the btw modal's own tests, which compare the two streams' styles.
+    #[cfg(test)]
+    pub fn cached_lines(&self) -> &[Line<'static>] {
+        &self.cache.lines
+    }
+
     pub fn render_lines(&mut self, width: u16) -> &[Line<'static>] {
         self.typewriter.tick();
         self.cache.get_or_update(
@@ -155,10 +161,6 @@ impl StreamingContent {
             self.prefix_style,
             width,
         );
-        &self.cache.lines
-    }
-
-    pub fn cached_lines(&self) -> &[Line<'static>] {
         &self.cache.lines
     }
 

@@ -27,21 +27,14 @@ const MAX_ROWS_PER_FRAME: usize = 2;
 /// burst, which is tens of rows. The bound allows that catch-up frame.
 const MAX_BURST_ROWS_PER_FRAME: usize = 8;
 
-fn render(panel: &mut MessagesPanel, width: u16, height: u16) {
-    let backend = ratatui::backend::TestBackend::new(width, height);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|f| {
-            panel.view(f, f.area(), false, true);
-        })
-        .unwrap();
-}
-
 /// Rows the document currently draws: the cursored heights, not the full
 /// document, because the cursor is what paces what appears on screen.
 fn drawn_rows(panel: &mut MessagesPanel) -> u32 {
-    render(panel, VIEW_WIDTH, VIEW_HEIGHT);
-    panel.layout().drawn_total()
+    super::tests::render(panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let layout = panel.layout();
+    (0..panel.cache.len())
+        .map(|i| u32::from(layout.height(i)))
+        .sum()
 }
 
 /// A step in a replay script: append text, land a tool block, or seal the
@@ -163,12 +156,12 @@ fn a_resize_does_not_reveal_the_transcript_again() {
             "a fairly long line of text that wraps around".into(),
         ));
     }
-    render(&mut panel, 120, 20);
+    super::tests::render(&mut panel, 120, 20);
     let wide = drawn_rows(&mut panel);
 
     // Shrink until the re-wrap is taller, then one tick must land the whole
     // re-wrapped document rather than pacing it back in.
-    render(&mut panel, 40, 20);
+    super::tests::render(&mut panel, 40, 20);
     let _ = panel.tick_for_test(FRAME);
     let narrow = drawn_rows(&mut panel);
 
@@ -180,5 +173,27 @@ fn a_resize_does_not_reveal_the_transcript_again() {
         narrow,
         panel.layout().total_rows(),
         "the resize must not leave rows hidden behind the cursor"
+    );
+}
+
+/// A tool call commits the streaming text into a message. The live segment drew
+/// that text uncapped, so the rows were on screen; committing them must not hand
+/// them to the cursor's cap and hide what the reader is looking at.
+#[test]
+fn a_tool_call_keeps_the_text_it_commits_on_screen() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.text_delta(&"streamed line\n".repeat(120));
+    for _ in 0..20 {
+        let _ = panel.tick_for_test(FRAME);
+        drawn_rows(&mut panel);
+    }
+    let before = drawn_rows(&mut panel);
+
+    panel.tool_start(super::tests::start("t1", BASH_TOOL_NAME));
+    let after = drawn_rows(&mut panel);
+
+    assert!(
+        after >= before,
+        "committing the streaming text must not hide rows: {before} -> {after}"
     );
 }
