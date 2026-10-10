@@ -91,6 +91,7 @@ Some pickers add extra bindings on top of the defaults:
 | Thinking Picker | `0`-`9` | Type a token budget |
 | Thinking Picker | `Enter` | Apply and close |
 | Thinking Picker | `Esc` | Close without changing anything |
+| Task Picker | `Ctrl+D` | Delete finished task (press twice) |
 
 ## Plugins
 

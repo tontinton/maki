@@ -12,7 +12,8 @@ local M = {}
 
 -- The main chat comes first and has no status. The subagents follow, running
 -- ones above finished ones so a long job never gets buried under the ones that
--- already returned. Within a section, chat order.
+-- already returned. Within a section, newest first (`tasks` is chat order), so
+-- the task that just spawned or just finished sits near the top.
 --
 -- Returns { rows, sections }. A row carries a section header only when it opens
 -- one, and `sections` counts what survived the filter.
@@ -36,11 +37,18 @@ function M.build(tasks, query)
     rows[#rows + 1] = { task = main }
   end
   for _, group in ipairs({ { RUNNING_SECTION, running }, { FINISHED_SECTION, finished } }) do
-    for i, task in ipairs(group[2]) do
-      rows[#rows + 1] = { task = task, section = i == 1 and group[1] or nil }
+    for i = #group[2], 1, -1 do
+      rows[#rows + 1] = { task = group[2][i], section = i == #group[2] and group[1] or nil }
     end
   end
   return { rows = rows, sections = { running = #running, finished = #finished } }
+end
+
+-- Only a finished subagent may leave the list: the main chat is the session
+-- itself, and dropping a running task would orphan its transcript. The host
+-- refuses these too; this check only decides who gets to ask.
+function M.deletable(task)
+  return task.status ~= nil and task.status ~= "working"
 end
 
 -- Position of {id} among {rows}, or nil. The selection is kept as an id and
