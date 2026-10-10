@@ -976,8 +976,9 @@ tool declaring no capability charges. You can only name permissions your
 own plugin holds.
 
 Throws if another plugin already owns a slot with the same {name}, or
-if {name} starts with `"tool."`, `"ui."`, or `"agent."`, which the host
-fires itself. The name stays yours across an unload: nobody else can take it over, or
+if {name} starts with `"tool."`, `"ui."`, `"agent."`, or `"permission."`,
+which the host fires itself.
+The name stays yours across an unload: nobody else can take it over, or
 re-declare it cheaper, while maki runs.
 
 The chain is async: the default and every layer may park (`maki.fs.*`,
@@ -1047,6 +1048,13 @@ The agent loop fires `agent.user_message`, `agent.stop`,
 `agent.compact.before`, and `agent.compact.prepare`, with the same
 contract. Wrapping one costs every permission. See
 [Hooks](/docs/hooks/).
+
+`permission.prompt` fires where the permission prompt would show, with
+the prompt as its default. A layer takes `function(prev, req, ctx)` and
+answers `{ decision = "allow" }` or `{ decision = "deny", guidance = … }`,
+or passes the call on with `prev(req, ctx)`. A verdict decides that one call
+and records no rule, and an escalated call (`ask`) is never offered to a
+layer. See [Hooks](/docs/hooks/#permission-prompt).
 
 Wrapping a slot another plugin declared steers a chain that plugin's
 callers trust, so it costs whatever the owner priced it at in

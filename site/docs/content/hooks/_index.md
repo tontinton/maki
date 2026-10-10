@@ -377,6 +377,52 @@ shows no rows, and the error is logged.
 `complete` runs with the permissions of the plugin that wrote it, so the example
 needs `run`.
 
+## Permission prompt
+
+`permission.prompt` fires where the permission prompt would show, once the
+rules and YOLO have had their say. The prompt is its default, so a layer either
+answers for the user or passes the call on:
+
+```lua
+maki.api.set_slot("permission.prompt", function(prev, req, ctx)
+  if req.tool == "bash" and req.input.command:match("^git status") then
+    return { decision = "allow" }
+  end
+  return prev(req, ctx)
+end)
+```
+
+`req` carries `tool`, `tool_id`, `input` and the `scopes` the prompt would ask
+about. A layer answers `decision = "allow"` or `decision = "deny"`, and a
+`"deny"` may carry `guidance`, which the model reads under the plugin's name
+rather than as the user's words. Anything else leaves the call to the prompt.
+
+A verdict settles the call in front of it and records nothing. The prompt's
+wider answers — `"allow_session"`, `"allow_always_global"` and the rest — are
+not a layer's to give: they write rules, so allowing `git status` with
+`allow_session` would leave a `git *` rule behind and a later
+`git push --force` would never reach the layer at all. A layer that wants to
+avoid asking its model about the same call twice caches the exact scopes on its
+own side.
+
+An **escalated** call never reaches the layers. When another plugin's
+`tool.*.input` layer returns `ask`, it has sent that call to a human on
+purpose; escalation only ever makes a call harder to run, so no
+`permission.prompt` layer may answer it. Under YOLO those escalated calls are
+the only ones that would reach a layer at all, which is exactly where a guard
+plugin's "show this to the user" must not be answered by another plugin.
+
+`ctx` is the agent ctx of the call. `ctx:session_id()` and `ctx:task_id()` say
+whose call it is, a subagent included, and `maki.agent.session(ctx, ...)` with
+no tools can ask a model, billed to that session.
+
+When a layer allows a call, its tool row shows which plugin allowed it, since
+the user never saw a prompt. A layer that throws, answers something the prompt
+does not offer, or is still running after the same 60 second window, leaves the
+call to the prompt. Where nobody can answer a prompt, as with `maki -p`, the
+default denies, the same as without a layer. Wrapping costs the capability the
+tool declares, the same price a `tool.<name>.input` layer pays.
+
 ## Plugin slots
 
 A plugin can define an extension point of its own with
@@ -416,8 +462,8 @@ Unloading the owner stops the chain firing, but does not free the name: nobody
 else can take it over, or re-declare it at a cheaper price and inherit the
 layers that trusted the old one.
 
-Names starting with `tool.`, `ui.`, and `agent.` are reserved for maki, which
-fires them at points whose ordering it guarantees.
+Names starting with `tool.`, `ui.`, `agent.`, and `permission.` are reserved for
+maki, which fires them at points whose ordering it guarantees.
 
 Use `maki.api.get_slots()` to see who owns and who wraps each slot.
 

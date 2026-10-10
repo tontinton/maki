@@ -1647,7 +1647,10 @@ mod tests {
             &CancelToken::none(),
             None,
             None,
+            None,
         ))
+        // No layers here, so nothing can have answered in a plugin's name.
+        .map(|_| ())
     }
 
     fn queue_answer(srv: &Server, request_id: &str, answer: PermissionAnswer) {

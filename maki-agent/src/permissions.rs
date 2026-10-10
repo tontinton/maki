@@ -10,6 +10,7 @@ use maki_config::{
 use thiserror::Error;
 use tracing::{info, warn};
 
+use crate::tools::registry::BoxFuture;
 use crate::{AgentEvent, EventSender};
 
 pub const DEFAULT_DENY_GUIDANCE: &str =
@@ -25,6 +26,7 @@ pub const DECISION_SOURCE_USER_ONCE: &str = "user_once";
 pub const DECISION_SOURCE_USER_SESSION: &str = "user_session";
 pub const DECISION_SOURCE_USER_ALWAYS: &str = "user_always";
 pub const DECISION_SOURCE_USER_ABORT: &str = "user_abort";
+pub const DECISION_SOURCE_PLUGIN: &str = "plugin";
 
 const TASK_TOOL: &str = "task";
 const BASH_TOOL: &str = "bash";
@@ -90,6 +92,9 @@ pub struct PermissionError {
     scope: String,
     reason: String,
     guidance: Option<String>,
+    /// Set when a plugin answered instead of the user. Its guidance is still
+    /// text the agent reads, so it must not arrive dressed as the user's.
+    plugin: Option<Arc<str>>,
 }
 
 impl std::fmt::Display for PermissionError {
@@ -99,30 +104,29 @@ impl std::fmt::Display for PermissionError {
             "{} `{}` ({}): {}.",
             PERMISSION_DENIED_PREFIX, self.tool, self.scope, self.reason
         )?;
-        if let Some(g) = &self.guidance {
-            write!(f, " User guidance: {}", g)
-        } else {
-            write!(f, " {}", DEFAULT_DENY_GUIDANCE)
+        match (&self.plugin, &self.guidance) {
+            (Some(p), Some(g)) => write!(f, " Plugin `{p}` denied it: {g}"),
+            (Some(p), None) => write!(f, " Plugin `{p}` denied it. {DEFAULT_DENY_GUIDANCE}"),
+            (None, Some(g)) => write!(f, " User guidance: {g}"),
+            (None, None) => write!(f, " {DEFAULT_DENY_GUIDANCE}"),
         }
     }
 }
 
 impl PermissionError {
-    fn new(tool: &str, scope: &str, reason: String) -> Self {
+    fn denied(
+        tool: &str,
+        scope: &str,
+        reason: String,
+        guidance: Option<String>,
+        plugin: Option<Arc<str>>,
+    ) -> Self {
         Self {
             tool: tool.to_string(),
             scope: scope.to_string(),
             reason,
-            guidance: None,
-        }
-    }
-
-    fn with_guidance(tool: &str, scope: &str, reason: String, guidance: String) -> Self {
-        Self {
-            tool: tool.to_string(),
-            scope: scope.to_string(),
-            reason,
-            guidance: Some(guidance),
+            guidance,
+            plugin,
         }
     }
 }
@@ -136,6 +140,7 @@ const ORIGIN_PLUGIN: &str = "a Lua plugin";
 
 const USER_REJECTED_REASON: &str = "rejected by the user";
 const PROMPT_UNANSWERED_REASON: &str = "permission prompt cancelled, unanswered";
+const PLUGIN_DENIED_REASON: &str = "denied by a plugin answering the prompt";
 
 fn deny_rule_reason(origin: &str, rule: &PermissionRule) -> String {
     match &rule.scope {
@@ -287,6 +292,33 @@ impl TaggedAnswer {
         let (request_id, answer) = raw.split_once(ANSWER_ID_SEPARATOR)?;
         Some(Self::new(request_id, PermissionAnswer::decode(answer)?))
     }
+}
+
+/// What a layer may answer about one call: allow it, or deny it with optional
+/// guidance.
+///
+/// Deliberately narrower than [`PermissionAnswer`]. The prompt's own answers
+/// widen scopes and persist rules — allowing `git status` with `allow_session`
+/// leaves a `git *` rule behind — so a plugin answering in the user's place
+/// would quietly grant everything that rule covers, including calls the layer
+/// never saw. A verdict decides this call and records nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayerVerdict {
+    Allow,
+    Deny { guidance: Option<String> },
+}
+
+/// A plugin's verdict on a call that would have prompted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerAnswer {
+    pub plugin: Arc<str>,
+    pub verdict: LayerVerdict,
+}
+
+/// Whatever sits in front of the permission prompt. `None` leaves the call to
+/// the prompt, exactly as if nothing were there.
+pub trait PromptLayers: Sync {
+    fn answer<'a>(&'a self, scopes: &'a [String]) -> BoxFuture<'a, Option<LayerAnswer>>;
 }
 
 /// Permission rules declared by Lua plugins via
@@ -714,7 +746,8 @@ impl PermissionManager {
     }
 
     /// `ask` is a plugin's reason to show this call to the user whatever the
-    /// rules say. See [`Self::check_escalated`].
+    /// rules say. See [`Self::check_escalated`]. `layers` is the chain that may
+    /// answer the prompt in the user's place, and runs before it opens.
     #[allow(clippy::too_many_arguments)]
     pub async fn enforce(
         &self,
@@ -726,7 +759,8 @@ impl PermissionManager {
         cancel: &crate::CancelToken,
         plan_path: Option<&Path>,
         ask: Option<&str>,
-    ) -> Result<(), PermissionError> {
+        layers: Option<&dyn PromptLayers>,
+    ) -> Result<Option<Arc<str>>, PermissionError> {
         let check = |tool: &ToolKey, scopes: &[&str], force_prompt: bool| match ask {
             Some(_) => self.check_escalated(tool, scopes, plan_path),
             None => self.check_inner(tool, scopes, force_prompt, plan_path),
@@ -736,18 +770,16 @@ impl PermissionManager {
         let scope_display = || scopes.scopes.join("; ");
         // Every deny is built here and every approval passes through
         // `allowed`, so reporting cannot drift from what the caller gets.
-        let deny = |source: &'static str, reason: String, guidance: Option<String>| {
+        let deny = |source: &'static str,
+                    reason: String,
+                    guidance: Option<String>,
+                    plugin: Option<Arc<str>>| {
             maki_otel::emit::tool_decision(&tool_string, maki_otel::emit::DECISION_REJECT, source);
-            match guidance {
-                Some(g) => {
-                    PermissionError::with_guidance(&tool_string, &scope_display(), reason, g)
-                }
-                None => PermissionError::new(&tool_string, &scope_display(), reason),
-            }
+            PermissionError::denied(&tool_string, &scope_display(), reason, guidance, plugin)
         };
         let allowed = |source: &'static str| {
             maki_otel::emit::tool_decision(&tool_string, maki_otel::emit::DECISION_ACCEPT, source);
-            Ok(())
+            Ok(None)
         };
         let by_rule = || {
             if self.yolo.load(Ordering::Relaxed) {
@@ -760,7 +792,7 @@ impl PermissionManager {
         let (pt, ps, force_prompt) = match check(tool, &scope_refs, scopes.force_prompt) {
             PermissionCheck::Allowed => return allowed(by_rule()),
             PermissionCheck::Denied(reason) => {
-                return Err(deny(DECISION_SOURCE_RULE, reason, None));
+                return Err(deny(DECISION_SOURCE_RULE, reason, None, None));
             }
             PermissionCheck::NeedsPrompt {
                 tool,
@@ -769,11 +801,49 @@ impl PermissionManager {
             } => (tool, scopes, force_prompt),
         };
 
+        // Runs before the prompt's lock, so a slow layer never holds up a
+        // prompt the user could already be answering, and before the missing
+        // channel check, since a run nobody watches is where a layer earns
+        // its keep.
+        //
+        // Never on an escalated call. `ask` means another layer's
+        // `tool.*.input` sent this call to a human on purpose, and
+        // `check_escalated` only ever makes a call harder to run — so letting a
+        // `permission.prompt` layer allow it would undo the escalation. Under
+        // yolo the escalated calls are the *only* ones that reach here, which
+        // is exactly where a guard plugin's "show this to the user" must not be
+        // answered by another plugin.
+        if ask.is_none()
+            && let Some(layers) = layers
+            && let Ok(Some(LayerAnswer { plugin, verdict })) = cancel.race(layers.answer(&ps)).await
+        {
+            // No `apply_decision`: a verdict settles this call and leaves no
+            // rule behind, so nothing a layer allows widens into a scope the
+            // layer never judged.
+            if let LayerVerdict::Deny { guidance } = verdict {
+                return Err(deny(
+                    DECISION_SOURCE_PLUGIN,
+                    PLUGIN_DENIED_REASON.to_owned(),
+                    guidance,
+                    Some(plugin),
+                ));
+            }
+            maki_otel::emit::tool_decision(
+                &tool_string,
+                maki_otel::emit::DECISION_ACCEPT,
+                DECISION_SOURCE_PLUGIN,
+            );
+            // The caller owns the mark: a nested call has no row of its own to
+            // annotate, and only the dispatcher knows which it is.
+            return Ok(Some(plugin));
+        }
+
         let Some(rx) = user_response_rx else {
             warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
             return Err(deny(
                 DECISION_SOURCE_USER_ABORT,
                 PROMPT_UNANSWERED_REASON.to_owned(),
+                None,
                 None,
             ));
         };
@@ -783,7 +853,7 @@ impl PermissionManager {
         let (t2, s2) = match check(&pt, &refs, force_prompt) {
             PermissionCheck::Allowed => return allowed(by_rule()),
             PermissionCheck::Denied(reason) => {
-                return Err(deny(DECISION_SOURCE_RULE, reason, None));
+                return Err(deny(DECISION_SOURCE_RULE, reason, None, None));
             }
             PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
         };
@@ -818,6 +888,7 @@ impl PermissionManager {
                         DECISION_SOURCE_USER_ABORT,
                         PROMPT_UNANSWERED_REASON.to_owned(),
                         None,
+                        None,
                     ));
                 }
                 Err(_) => {
@@ -825,6 +896,7 @@ impl PermissionManager {
                     return Err(deny(
                         DECISION_SOURCE_USER_ABORT,
                         PROMPT_UNANSWERED_REASON.to_owned(),
+                        None,
                         None,
                     ));
                 }
@@ -841,6 +913,7 @@ impl PermissionManager {
                 source,
                 USER_REJECTED_REASON.to_owned(),
                 answer.guidance().map(String::from),
+                None,
             ))
         }
     }
@@ -2386,23 +2459,113 @@ mod tests {
     #[test_case(None, DEFAULT_DENY_GUIDANCE; "plain")]
     #[test_case(Some("use rg instead"), "User guidance: use rg instead"; "with_guidance")]
     fn error_message_leads_with_tool_scope_and_reason(guidance: Option<&str>, tail: &str) {
-        let err = match guidance {
-            Some(g) => PermissionError::with_guidance(
-                "bash",
-                "head -3",
-                deny_rule_reason(ORIGIN_CONFIG, &deny_rule("head *")),
-                g.to_owned(),
-            ),
-            None => PermissionError::new(
-                "bash",
-                "head -3",
-                deny_rule_reason(ORIGIN_CONFIG, &deny_rule("head *")),
-            ),
-        };
+        let err = PermissionError::denied(
+            "bash",
+            "head -3",
+            deny_rule_reason(ORIGIN_CONFIG, &deny_rule("head *")),
+            guidance.map(str::to_owned),
+            None,
+        );
         let msg = err.to_string();
         assert!(msg.starts_with(PERMISSION_DENIED_PREFIX), "got: {msg}");
         assert!(msg.contains("`bash` (head -3):"), "got: {msg}");
         assert!(msg.contains("deny rule `head *` for `bash`"), "got: {msg}");
         assert!(msg.contains(tail), "got: {msg}");
+    }
+
+    const LAYER_PLUGIN: &str = "guard";
+
+    const LAYER_SCOPE: &str = "rm -rf build";
+
+    const LAYER_GUIDANCE: &str = "use trash instead";
+
+    struct Layer(Option<LayerVerdict>);
+
+    impl PromptLayers for Layer {
+        fn answer<'a>(&'a self, _scopes: &'a [String]) -> BoxFuture<'a, Option<LayerAnswer>> {
+            let answer = self.0.clone().map(|verdict| LayerAnswer {
+                plugin: Arc::from(LAYER_PLUGIN),
+                verdict,
+            });
+            Box::pin(std::future::ready(answer))
+        }
+    }
+
+    /// Runs one call that would prompt, with no answer channel behind the
+    /// layer, the way `maki -p` does. `ask` escalates the call, as another
+    /// layer's `tool.*.input` does.
+    fn enforce_behind(
+        mgr: &PermissionManager,
+        layer: Layer,
+        ask: Option<&str>,
+    ) -> Result<Option<Arc<str>>, PermissionError> {
+        let (guard, _events) = crate::event_stream();
+        let result = smol::block_on(mgr.enforce(
+            &ToolKey::native(BASH_TOOL),
+            &crate::tools::PermissionScopes::single(LAYER_SCOPE.to_owned()),
+            &guard.sender(0),
+            None,
+            TAGGED_REQUEST_ID,
+            &crate::CancelToken::none(),
+            None,
+            ask,
+            Some(&layer),
+        ));
+        drop(guard);
+        result
+    }
+
+    /// A verdict settles the call it was given and nothing else: the next call
+    /// on the same scope still prompts, because an allow records no rule.
+    #[test_case(Some(LayerVerdict::Allow), true ; "allow")]
+    #[test_case(Some(LayerVerdict::Deny { guidance: None }), false ; "deny")]
+    #[test_case(None, false ; "no_answer_falls_to_the_prompt")]
+    fn a_layer_answers_in_place_of_the_prompt(verdict: Option<LayerVerdict>, allowed: bool) {
+        let mgr = default_mgr();
+        let result = enforce_behind(&mgr, Layer(verdict), None);
+        assert_eq!(result.is_ok(), allowed, "{result:?}");
+        assert_eq!(
+            result.unwrap_or_default().is_some(),
+            allowed,
+            "an allow has to name the plugin, so the call can be marked"
+        );
+        assert_eq!(
+            outcome(mgr.check(&ToolKey::native(BASH_TOOL), LAYER_SCOPE, None)),
+            PROMPTS,
+            "a layer's verdict left a rule behind"
+        );
+    }
+
+    /// An escalated call is one another layer sent to a human on purpose.
+    /// Escalation only ever makes a call harder to run, so no layer may answer
+    /// it — and under yolo these are the only calls that reach a layer at all.
+    #[test_case(LayerVerdict::Allow ; "allow")]
+    #[test_case(LayerVerdict::Deny { guidance: None } ; "deny")]
+    fn an_escalated_call_never_reaches_a_layer(verdict: LayerVerdict) {
+        let result = enforce_behind(&default_mgr(), Layer(Some(verdict)), Some("look at this"));
+        let err = result.expect_err("no channel, so the prompt cannot answer");
+        let err = err.to_string();
+        assert!(
+            !err.contains(LAYER_PLUGIN),
+            "a layer answered an escalated call: {err}"
+        );
+    }
+
+    /// A plugin's reason is shaped by the very call it judged, so the agent
+    /// has to be told whose voice it is reading.
+    #[test_case(None, DEFAULT_DENY_GUIDANCE ; "bare")]
+    #[test_case(Some(LAYER_GUIDANCE.to_owned()), LAYER_GUIDANCE ; "with_guidance")]
+    fn a_layer_deny_is_labelled_by_plugin(guidance: Option<String>, expected: &str) {
+        let result = enforce_behind(
+            &default_mgr(),
+            Layer(Some(LayerVerdict::Deny { guidance })),
+            None,
+        );
+        let err = result.expect_err("a deny").to_string();
+        assert!(
+            err.contains(&format!("Plugin `{LAYER_PLUGIN}` denied it")),
+            "{err}"
+        );
+        assert!(err.contains(expected), "{err}");
     }
 }

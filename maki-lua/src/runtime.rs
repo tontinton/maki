@@ -17,7 +17,7 @@ use event_listener::Event;
 
 use include_dir::Dir;
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
-use maki_agent::permissions::PluginRuleStore;
+use maki_agent::permissions::{LayerAnswer, LayerVerdict, PluginRuleStore};
 use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use maki_agent::tools::hook::{Authority, Verdict};
 use maki_agent::tools::{
@@ -46,8 +46,8 @@ use crate::api::plan::{
     install_row_handlers, row_handler_opts, rows_from_table, rows_to_table,
 };
 use crate::api::slot::{
-    ChainObserver, LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT, SlotStore, layer_plugins,
-    run_host_chain, run_host_chain_with,
+    ChainObserver, LayeredTools, PERMISSION_PROMPT_SLOT, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT,
+    SlotStore, layer_plugins, run_host_chain, run_host_chain_with,
 };
 use crate::api::tool::{
     LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission, resolve_rules,
@@ -324,6 +324,15 @@ pub(crate) struct HookRun {
     pub may_ask: bool,
 }
 
+/// One call that would have prompted, for the `permission.prompt` chain.
+pub(crate) struct PromptRun {
+    pub authority: Authority,
+    pub cancel: CancelToken,
+    pub deadline: Instant,
+    pub req: Value,
+    pub ctx: Box<LuaCtx>,
+}
+
 /// Load/clear drain in-flight tools first so we never mutate a
 /// plugin environment while a tool call is still running.
 pub enum Request {
@@ -429,6 +438,11 @@ pub enum Request {
     RunHook {
         run: HookRun,
         reply: flume::Sender<Verdict>,
+    },
+    /// The `permission.prompt` chain, sent only when it has layers.
+    RunPrompt {
+        run: PromptRun,
+        reply: flume::Sender<Option<LayerAnswer>>,
     },
     ClearPlugin {
         plugin: Arc<str>,
@@ -4011,6 +4025,109 @@ async fn run_hook(
     }
 }
 
+/// Fires `permission.prompt` for a call that would have prompted. The host
+/// default answers nothing, which is what leaves the call to the real prompt,
+/// and so does every layer failure: a broken layer costs the user a prompt,
+/// never an approval.
+async fn run_prompt(
+    lua: &Lua,
+    plugins: &PluginMap,
+    gate: &Rc<InflightGate>,
+    run: PromptRun,
+) -> Option<LayerAnswer> {
+    let slot = PERMISSION_PROMPT_SLOT;
+    let PromptRun {
+        authority,
+        cancel,
+        deadline,
+        req,
+        ctx,
+    } = run;
+    let (Ok(req), Ok(ctx), Ok(default)) = (
+        json_to_lua(lua, &req),
+        lua.create_userdata(*ctx),
+        lua.create_function(|_, _: MultiValue| Ok(())),
+    ) else {
+        return None;
+    };
+    let args = MultiValue::from_vec(vec![req, LuaValue::UserData(ctx)]);
+    // The answer a layer passes back up still belongs to the layer that
+    // built it, and the chain unwinds innermost first, so the first layer to
+    // return a given table is the one that decided.
+    let decided = Arc::new(Mutex::new(None::<(Table, Arc<str>)>));
+    let observer = Arc::clone(&decided);
+    let observe: ChainObserver = Arc::new(move |plugin: &Arc<str>, values: &MultiValue| {
+        let Some(LuaValue::Table(table)) = values.iter().next() else {
+            return;
+        };
+        let mut decided = observer.lock().expect("prompt decider");
+        if decided.as_ref().is_none_or(|(seen, _)| seen != table) {
+            *decided = Some((table.clone(), Arc::clone(plugin)));
+        }
+    });
+    let allow_layer = layer_delegation(plugins, authority, slot);
+    let names = [slot];
+    let chain = run_host_chain_with(lua, &names, default, args, &allow_layer, Some(observe));
+    let table = match run_awaited(lua, gate, cancel, deadline, chain).await {
+        Ok(Ok(Some(values))) => match values.into_iter().next() {
+            Some(LuaValue::Table(table)) => table,
+            _ => return None,
+        },
+        Ok(Ok(None)) => return None,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                slot,
+                plugins = %layer_plugins(lua, slot),
+                error = %strip_traceback(&e),
+                "slot chain failed, prompting"
+            );
+            return None;
+        }
+        Err(reason) => {
+            tracing::warn!(
+                slot,
+                plugins = %layer_plugins(lua, slot),
+                reason,
+                "slot chain abandoned, prompting"
+            );
+            return None;
+        }
+    };
+    let (_, plugin) = decided
+        .lock()
+        .expect("prompt decider")
+        .take()
+        .filter(|(seen, _)| *seen == table)?;
+    match prompt_answer(&table) {
+        Ok(verdict) => Some(LayerAnswer { plugin, verdict }),
+        Err(e) => {
+            tracing::warn!(slot, %plugin, error = %e, "slot answered off contract, prompting");
+            None
+        }
+    }
+}
+
+/// Reads a `permission.prompt` answer, `{ decision, guidance? }`.
+///
+/// Only `allow` and `deny` — not the prompt's own wider answers. Those record
+/// rules (`allow_session` on `git status` leaves `git *` behind, `always` writes
+/// it to `permissions.toml`), which would hand a plugin's judgement of one call
+/// to every call that rule covers. A plugin that wants to avoid asking its model
+/// twice caches the exact scopes on its own side.
+fn prompt_answer(table: &Table) -> mlua::Result<LayerVerdict> {
+    let decision: String = table.get("decision")?;
+    let guidance: Option<String> = table.get("guidance")?;
+    match decision.as_str() {
+        "allow" => Ok(LayerVerdict::Allow),
+        "deny" => Ok(LayerVerdict::Deny {
+            guidance: guidance.filter(|g| !g.is_empty()),
+        }),
+        other => Err(mlua::Error::runtime(format!(
+            "a permission.prompt layer answers 'allow' or 'deny', not '{other}'"
+        ))),
+    }
+}
+
 /// Sends no `ToolSnapshot` on completion: the preview buf must stay live so
 /// the UI keeps polling it until the handler's own `LiveToolBuf` takes over.
 async fn run_tool_start(
@@ -4635,6 +4752,16 @@ pub fn spawn(
                             ex.spawn(async move {
                                 let verdict = run_hook(&lua, &plugins, &gate, run).await;
                                 let _ = reply.send(verdict);
+                            })
+                            .detach();
+                        }
+                        Request::RunPrompt { run, reply } => {
+                            let lua = rt.lua.clone();
+                            let plugins = Rc::clone(&rt.plugins);
+                            let gate = Rc::clone(&gate);
+                            ex.spawn(async move {
+                                let answer = run_prompt(&lua, &plugins, &gate, run).await;
+                                let _ = reply.send(answer);
                             })
                             .detach();
                         }

@@ -22,9 +22,14 @@ pub(crate) const HOST_PREFIX: &str = "tool.";
 /// over, and the points the agent loop fires itself.
 pub(crate) const UI_PREFIX: &str = "ui.";
 pub(crate) const AGENT_PREFIX: &str = "agent.";
-const HOST_PREFIXES: [&str; 3] = [HOST_PREFIX, UI_PREFIX, AGENT_PREFIX];
+const PERMISSION_PREFIX: &str = "permission.";
+const HOST_PREFIXES: [&str; 4] = [HOST_PREFIX, UI_PREFIX, AGENT_PREFIX, PERMISSION_PREFIX];
 /// `tool.*.input` wraps every call, whichever tool it names.
 pub(crate) const ANY_TOOL: &str = "*";
+
+/// Fired where the permission prompt would show. The default is the prompt
+/// itself, so a layer either answers for the user or passes the call on.
+pub(crate) const PERMISSION_PROMPT_SLOT: &str = "permission.prompt";
 
 /// Fired when the agent finishes writing a plan. The default opens the
 /// built-in plan form, so a layer that answers `false` owns the surface for
@@ -110,7 +115,10 @@ impl SlotStore {
             if let Some((tool, stage)) = host_slot_target(name) {
                 stages[stage as usize].insert(Arc::from(tool));
             }
-            if name.starts_with(UI_PREFIX) || name.starts_with(AGENT_PREFIX) {
+            if name.starts_with(UI_PREFIX)
+                || name.starts_with(AGENT_PREFIX)
+                || name.starts_with(PERMISSION_PREFIX)
+            {
                 surfaces.insert(Arc::from(name.as_str()));
             }
         }
@@ -131,11 +139,11 @@ type StageSets = [HashSet<Arc<str>>; HookStage::ALL.len()];
 #[derive(Default)]
 pub struct LayeredTools {
     stages: ArcSwap<StageSets>,
-    /// The `ui.` and `agent.` slots with at least one layer. The UI reads this
-    /// before it asks a chain anything, so a stock install draws its built-in
-    /// surface in the same frame instead of waiting on a roundtrip. The agent
-    /// loop reads it too, so it never leaves its thread for a slot nobody
-    /// wrapped.
+    /// The `ui.`, `agent.` and `permission.` slots with at least one layer. The
+    /// host reads this before it asks a chain anything, so a stock install draws
+    /// its built-in surface in the same frame instead of waiting on a
+    /// roundtrip. The agent loop reads it too, so it never leaves its thread for
+    /// a slot nobody wrapped.
     surfaces: ArcSwap<HashSet<Arc<str>>>,
 }
 
@@ -497,8 +505,9 @@ fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
 /// own plugin holds.
 ///
 /// Throws if another plugin already owns a slot with the same {name}, or
-/// if {name} starts with `"tool."`, `"ui."`, or `"agent."`, which the host
-/// fires itself. The name stays yours across an unload: nobody else can take it over, or
+/// if {name} starts with `"tool."`, `"ui."`, `"agent."`, or `"permission."`,
+/// which the host fires itself.
+/// The name stays yours across an unload: nobody else can take it over, or
 /// re-declare it cheaper, while maki runs.
 ///
 /// The chain is async: the default and every layer may park (`maki.fs.*`,
@@ -635,6 +644,12 @@ fn parse_slot_capability(
 /// `agent.compact.before`, and `agent.compact.prepare`, with the same
 /// contract. Wrapping one costs every permission. See
 /// [Hooks](/docs/hooks/).
+///
+/// `permission.prompt` fires where the permission prompt would show, with
+/// the prompt as its default. A layer takes `function(prev, req, ctx)` and
+/// answers with one of the prompt's options, like
+/// `{ decision = "allow_session" }`, or passes the call on with
+/// `prev(req, ctx)`. See [Hooks](/docs/hooks/#permission-prompt).
 ///
 /// Wrapping a slot another plugin declared steers a chain that plugin's
 /// callers trust, so it costs whatever the owner priced it at in

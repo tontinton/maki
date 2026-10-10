@@ -633,6 +633,12 @@ pub enum SessionEndReason {
     Completed,
 }
 
+/// How a call a `permission.prompt` layer allowed is marked, wherever it is
+/// marked: a top-level row from [`AgentEvent::AllowedByPlugin`], a nested call
+/// from an annotation on its parent's live stream. One spelling, so the two
+/// paths cannot drift.
+pub const ALLOWED_BY: &str = "allowed by";
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -705,6 +711,15 @@ pub enum AgentEvent {
         /// Why a plugin escalated this call to the user, if one did.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+    /// A `permission.prompt` layer allowed a call that would have prompted.
+    /// The prompt is where the user learns what the agent is about to do, so
+    /// a frontend marks the call instead. Only for a call with a row of its
+    /// own: a nested call is marked through its parent's live stream, which is
+    /// why the text lives in [`ALLOWED_BY`] rather than in the frontend.
+    AllowedByPlugin {
+        id: String,
+        plugin: String,
     },
     AuthRequired,
     Nudge,

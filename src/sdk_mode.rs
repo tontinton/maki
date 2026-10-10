@@ -1057,6 +1057,7 @@ impl EventPump {
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
+            | AgentEvent::AllowedByPlugin { .. }
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }
