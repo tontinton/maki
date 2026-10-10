@@ -6370,6 +6370,7 @@ and close the window when you are done.
   - `reserved_top` (`integer`) rows reserved at the top of the content area. Default 0.
   - `reserved_bottom` (`integer`) rows reserved at the bottom of the content area. Default 0.
   - `split` (`string`) dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
+  - `position` (`string`) which side of the chat input box a `panel` window stacks on. One of "above_input" (default) or "below_input". A "below_input" panel sits between the input box and the status bar. Ignored by other splits and floats.
   - `order` (`integer`) paint order among split windows at the same edge. Default 50.
   - `focus` (`boolean`) whether the window takes keyboard focus on open. Default true.
   - `keys` (`table`) keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or `maki.keymap.set` bindings. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
@@ -6621,6 +6622,7 @@ Updates the window layout on the fly. Only the fields you include in
   - `cursor_line` (`boolean`) highlight the focused row.
   - `reserved_top` (`integer`) rows reserved at the top of the content area.
   - `split` (`string`) edge docking, "above", "below", "left", "right", "panel", or "".
+  - `position` (`string`) side of the chat input box a `panel` window stacks on, "above_input" or "below_input".
   - `order` (`integer`) paint order among split windows.
   - `needs_input` (`boolean`) whether the window means the session needs user input.
 

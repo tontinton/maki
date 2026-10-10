@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
 use maki_agent::{SharedBuf, SnapshotLine, SpanStyle};
-use maki_lua::{Anchor, Axis, Border, FloatConfig, Key, Split, TitlePos, WinCommand, WinEvent};
+use maki_lua::{
+    Anchor, Axis, Border, FloatConfig, Key, PanelPosition, Split, TitlePos, WinCommand, WinEvent,
+};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
@@ -507,10 +509,10 @@ impl FloatManager {
         self.render_window(frame, idx, rect);
     }
 
-    pub fn panel_reqs(&self) -> Vec<(usize, u16)> {
+    pub fn panel_reqs(&self, position: PanelPosition) -> Vec<(usize, u16)> {
         let mut reqs: Vec<(usize, u16)> = self
             .laid_out()
-            .filter(|(_, w)| w.config.split == Split::Panel)
+            .filter(|(_, w)| w.config.split == Split::Panel && w.config.position == position)
             .map(|(i, w)| (i, w.config.height.resolve(100)))
             .collect();
         reqs.sort_by_key(|(i, _)| self.windows[*i].config.order);
@@ -2943,7 +2945,8 @@ mod tests {
     fn draw_one_frame(mgr: &mut FloatManager, area: Rect) -> usize {
         let split_reqs = mgr.split_reqs(area);
         let splits = crate::components::split_layout::carve(area, &split_reqs);
-        let panels = mgr.panel_reqs();
+        let mut panels = mgr.panel_reqs(PanelPosition::AboveInput);
+        panels.extend(mgr.panel_reqs(PanelPosition::BelowInput));
         let room_asked = split_reqs.len() + panels.len();
 
         render_into(mgr, area, |m, f| {
@@ -3030,10 +3033,35 @@ mod tests {
         mgr.open(make_buf(&["a"]), cfg1, false, tx1, rx1);
         mgr.open(make_buf(&["b"]), cfg2, false, tx2, rx2);
 
-        let reqs = mgr.panel_reqs();
+        let reqs = mgr.panel_reqs(PanelPosition::AboveInput);
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0].1, 3, "order=10 should come first");
         assert_eq!(reqs[1].1, 5, "order=20 should come second");
+    }
+
+    #[test]
+    fn panel_reqs_keeps_each_position_apart() {
+        let mut mgr = FloatManager::new();
+        let (tx1, rx1, _, _) = make_channels();
+        let (tx2, rx2, _, _) = make_channels();
+
+        let above = FloatConfig {
+            split: Split::Panel,
+            height: Dimension::Abs(5),
+            ..FloatConfig::default()
+        };
+        let below = FloatConfig {
+            split: Split::Panel,
+            position: PanelPosition::BelowInput,
+            height: Dimension::Abs(3),
+            ..FloatConfig::default()
+        };
+
+        mgr.open(make_buf(&["a"]), above, false, tx1, rx1);
+        mgr.open(make_buf(&["b"]), below, false, tx2, rx2);
+
+        assert_eq!(mgr.panel_reqs(PanelPosition::AboveInput), vec![(0, 5)]);
+        assert_eq!(mgr.panel_reqs(PanelPosition::BelowInput), vec![(1, 3)]);
     }
 
     #[test]
@@ -3051,7 +3079,7 @@ mod tests {
         mgr.open(make_buf(&["a"]), cfg.clone(), false, tx1, rx1);
         mgr.open(make_buf(&["b"]), cfg, false, tx2, rx2);
 
-        assert_eq!(mgr.panel_reqs().len(), 2);
+        assert_eq!(mgr.panel_reqs(PanelPosition::AboveInput).len(), 2);
     }
 
     #[test]
@@ -3067,15 +3095,15 @@ mod tests {
         };
 
         mgr.open(make_buf(&["a"]), cfg, false, tx, cmd_rx);
-        assert_eq!(mgr.panel_reqs().len(), 1);
+        assert_eq!(mgr.panel_reqs(PanelPosition::AboveInput).len(), 1);
 
         cmd_tx.send(WinCommand::SetVisible(false)).unwrap();
         let _ = mgr.tick();
-        assert_eq!(mgr.panel_reqs().len(), 0);
+        assert_eq!(mgr.panel_reqs(PanelPosition::AboveInput).len(), 0);
 
         cmd_tx.send(WinCommand::SetVisible(true)).unwrap();
         let _ = mgr.tick();
-        assert_eq!(mgr.panel_reqs().len(), 1);
+        assert_eq!(mgr.panel_reqs(PanelPosition::AboveInput).len(), 1);
     }
 
     #[test]
