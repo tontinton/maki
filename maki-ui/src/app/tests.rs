@@ -2647,16 +2647,18 @@ fn draw_to_buffer(app: &mut App) -> (Option<Position>, ratatui::buffer::Buffer) 
 /// caret-anchored float landed on.
 fn draw_caret_float(app: &mut App) -> (Option<Position>, u16) {
     let (cursor, buffer) = draw_to_buffer(app);
-    let row = (0..buffer.area.height)
-        .find(|&y| {
-            (0..buffer.area.width)
-                .filter_map(|x| buffer.cell(Position::new(x, y)))
-                .map(ratatui::buffer::Cell::symbol)
-                .collect::<String>()
-                .contains(CARET_FLOAT_MARK)
-        })
-        .expect(CARET_FLOAT_DRAWN);
+    let row = row_with(&buffer, CARET_FLOAT_MARK).expect(CARET_FLOAT_DRAWN);
     (cursor, row)
+}
+
+fn row_with(buffer: &ratatui::buffer::Buffer, mark: &str) -> Option<u16> {
+    (0..buffer.area.height).find(|&y| {
+        (0..buffer.area.width)
+            .filter_map(|x| buffer.cell(Position::new(x, y)))
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>()
+            .contains(mark)
+    })
 }
 
 /// A focused float reads keys, and the help modal is the other overlay that
