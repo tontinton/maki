@@ -1,10 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
-use humantime::format_duration;
 use maki_agent::UiWaker;
+use maki_agent::tools::compact_duration;
 use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
@@ -293,9 +292,7 @@ async fn markdown(lua: Lua, text: String, width: u16) -> LuaResult<Table> {
 /// maki.ui.humantime(3661) -- "1h1m1s"
 #[lua_fn]
 fn humantime(_lua: &Lua, secs: u64) -> LuaResult<String> {
-    Ok(format_duration(Duration::from_secs(secs))
-        .to_string()
-        .replace(' ', ""))
+    Ok(compact_duration(secs))
 }
 
 /// Returns the current terminal size. Handy for sizing floating windows

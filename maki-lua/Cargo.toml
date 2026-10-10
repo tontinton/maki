@@ -43,7 +43,6 @@ url = { workspace = true }
 regex = { workspace = true }
 include_dir = { workspace = true }
 maki-storage = { workspace = true }
-humantime = { workspace = true }
 isahc = { workspace = true }
 htmd = { workspace = true }
 jsonschema = { workspace = true }
