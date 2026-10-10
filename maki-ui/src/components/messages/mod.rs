@@ -1054,7 +1054,7 @@ impl MessagesPanel {
                 .unwrap_or_else(|| seg.text_height(width));
             let highlight = self.highlight_segment == Some(i);
             let style = seg.tool_id.as_ref().map(|_| theme::current().tool_bg);
-            cursor.render(seg.lines(), h, style, highlight, frame);
+            cursor.render_segment(seg, h, style, highlight, frame);
             for image in &mut seg.images {
                 cursor.render_image(image, self.image_picker.as_ref(), images_visible, frame);
             }
