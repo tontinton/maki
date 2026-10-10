@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
@@ -38,6 +39,8 @@ fn footer_line() -> Line<'static> {
         Span::styled(" weak", t.tool_dim),
         Span::styled("  $", t.keybind_key),
         Span::styled(" compaction", t.tool_dim),
+        Span::styled("  %", t.keybind_key),
+        Span::styled(" fold", t.tool_dim),
     ])
 }
 
@@ -60,22 +63,51 @@ fn tier_for_shortcut(key: KeyEvent) -> Option<ModelTier> {
     }
 }
 
+/// Shift+5, which arrives as the character it types, exactly as the tier
+/// shortcuts above do.
+fn is_collapse_shortcut(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('%'))
+}
+
+/// The row a folded provider gets in place of its drawn-on section header, so
+/// the fold has something to land on and still says how much is behind it.
+fn provider_entry(model: &ModelEntry, count: usize) -> ModelEntry {
+    let plural = if count == 1 { "model" } else { "models" };
+    ModelEntry {
+        spec: model.provider.clone(),
+        id: model.provider_display.clone(),
+        provider: model.provider.clone(),
+        provider_display: model.provider_display.clone(),
+        suffix: None,
+        detail: format!("{count} {plural}"),
+        override_tiers: Vec::new(),
+        free: false,
+        is_provider: true,
+    }
+}
+
 pub enum ModelPickerAction {
     Consumed,
     Select(String),
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
+    /// A provider folded away, or unfolded. Persisted by the caller, since the
+    /// picker owns no state dir.
+    Collapse(String, bool),
     Close,
 }
 
 struct ModelEntry {
+    /// The qualified spec, or the bare slug on a provider row.
     spec: String,
     id: String,
+    provider: String,
     provider_display: String,
     suffix: Option<String>,
     detail: String,
     override_tiers: Vec<ModelTier>,
     free: bool,
+    is_provider: bool,
 }
 
 impl PickerItem for ModelEntry {
@@ -98,6 +130,10 @@ impl PickerItem for ModelEntry {
     fn is_highlighted(&self) -> bool {
         !self.override_tiers.is_empty()
     }
+
+    fn is_section_row(&self) -> bool {
+        self.is_provider
+    }
 }
 
 pub struct ModelPicker {
@@ -109,6 +145,10 @@ pub struct ModelPicker {
     needs_rebuild: bool,
     /// User-moved entry to restore on refresh: `(was_recent, spec)`.
     anchor: Option<(bool, String)>,
+    /// Providers folded away, by slug. Seeded from the state dir and handed
+    /// back to it on every change, so a fold outlives the session the way a
+    /// tier override does.
+    collapsed: BTreeSet<String>,
 }
 
 impl ModelPicker {
@@ -121,7 +161,24 @@ impl ModelPicker {
             current_spec: String::new(),
             needs_rebuild: false,
             anchor: None,
+            collapsed: BTreeSet::new(),
         }
+    }
+
+    pub fn is_collapsed(&self, slug: &str) -> bool {
+        self.collapsed.contains(slug)
+    }
+
+    /// Seeded from the state dir when the app is built, before the picker has
+    /// ever been opened.
+    pub fn set_collapsed(&mut self, collapsed: BTreeSet<String>) {
+        self.collapsed = collapsed;
+        self.needs_rebuild = true;
+    }
+
+    /// What the state dir should hold after the last fold or unfold.
+    pub fn collapsed_providers(&self) -> &BTreeSet<String> {
+        &self.collapsed
     }
 
     pub fn set_recents(&mut self, recents: Vec<String>) {
@@ -175,31 +232,56 @@ impl ModelPicker {
         let specs = self.available.get().map(|list| &list.specs);
         let mut entries = Vec::new();
         for spec in &self.recents {
-            if let Some(mut e) = parse_model_entry(spec) {
+            if let Some(mut e) = self.parse_entry(spec) {
                 e.suffix = Some(std::mem::take(&mut e.provider_display));
                 e.provider_display = RECENT_SECTION.to_string();
                 entries.push(e);
             }
         }
         let mut full: Vec<ModelEntry> = specs
-            .map(|s| s.iter().filter_map(|s| parse_model_entry(s)).collect())
+            .map(|s| s.iter().filter_map(|s| self.parse_entry(s)).collect())
             .unwrap_or_default();
         full.sort_by(|a, b| {
             a.provider_display
                 .cmp(&b.provider_display)
+                .then_with(|| a.provider.cmp(&b.provider))
                 .then_with(|| b.free.cmp(&a.free))
                 .then_with(|| a.id.cmp(&b.id))
         });
-        entries.extend(full);
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for entry in &full {
+            *counts.entry(entry.provider.clone()).or_default() += 1;
+        }
+        let mut last: Option<String> = None;
+        for entry in full {
+            let folded = self.is_collapsed(&entry.provider);
+            if folded && last.as_deref() != Some(entry.provider.as_str()) {
+                let count = counts.get(&entry.provider).copied().unwrap_or_default();
+                entries.push(provider_entry(&entry, count));
+            }
+            last = Some(entry.provider.clone());
+            if !folded {
+                entries.push(entry);
+            }
+        }
         entries
     }
 
+    fn parse_entry(&self, spec: &str) -> Option<ModelEntry> {
+        parse_model_entry(spec)
+    }
+
     fn preselect_current_model(&mut self) {
-        if !self
+        if self
             .picker
             .select_item_by(|e| e.spec == self.current_spec && e.suffix().is_none())
+            || self.picker.select_item_by(|e| e.spec == self.current_spec)
         {
-            self.picker.select_item_by(|e| e.spec == self.current_spec);
+            return;
+        }
+        // Nothing to land on by name, and the first row is a provider row.
+        if !self.picker.select_item_by(|e| !e.is_provider) {
+            self.picker.select(0);
         }
     }
 
@@ -241,7 +323,46 @@ impl ModelPicker {
         self.track_anchor(|p| p.handle_key_inner(key))
     }
 
+    /// Folds a provider away, or unfolds it, and names it so the caller can
+    /// write the set to the state dir.
+    fn fold(&mut self, slug: String, collapse: bool) -> ModelPickerAction {
+        if collapse {
+            self.collapsed.insert(slug.clone());
+        } else {
+            self.collapsed.remove(&slug);
+        }
+        self.needs_rebuild = true;
+        ModelPickerAction::Collapse(slug, collapse)
+    }
+
     fn handle_key_inner(&mut self, key: KeyEvent) -> ModelPickerAction {
+        if let Some(slug) = self
+            .picker
+            .selected_item()
+            .filter(|e| e.is_provider)
+            .map(|e| e.provider.clone())
+        {
+            // Enter would otherwise close the picker on a bare slug, and the
+            // tier shortcuts have nothing to assign.
+            if is_collapse_shortcut(key) || key.code == KeyCode::Enter {
+                return self.fold(slug, false);
+            }
+            if tier_for_shortcut(key).is_some() {
+                return ModelPickerAction::Consumed;
+            }
+        }
+        if is_collapse_shortcut(key) {
+            // Swallowed even with nothing to act on, so that an empty or
+            // fully-filtered list does not type the shortcut into the search.
+            let Some(slug) = self
+                .picker
+                .selected_item()
+                .map(|entry| entry.provider.clone())
+            else {
+                return ModelPickerAction::Consumed;
+            };
+            return self.fold(slug, true);
+        }
         if let Some(tier) = tier_for_shortcut(key)
             && let Some(entry) = self.picker.selected_item()
         {
@@ -338,11 +459,13 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
     Some(ModelEntry {
         spec: spec.to_string(),
         id,
+        provider: provider_str.to_string(),
         provider_display,
         suffix: None,
         detail,
         override_tiers,
         free,
+        is_provider: false,
     })
 }
 
@@ -423,6 +546,121 @@ mod tests {
         models
     }
 
+    const FOLD_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
+    const KEPT_OPEN: &str = "the fold is not a choice, so the picker stays up";
+    const PROVIDER: &str = "anthropic";
+
+    fn select_provider_row(p: &mut ModelPicker, slug: &str) {
+        assert!(
+            p.picker
+                .select_item_by(|e| e.is_provider && e.provider == slug),
+            "a folded provider gets a row of its own to put the cursor on"
+        );
+    }
+
+    /// Nothing changes for anyone who never presses the key: until a provider
+    /// is folded there is no row for its header, so the cursor cannot land on
+    /// one and every list reads as it did.
+    #[test]
+    fn a_header_is_only_selectable_once_its_provider_is_folded() {
+        let mut p = ModelPicker::new(test_models());
+        p.open(FOLD_SPEC);
+        assert!(
+            !p.load_entries().iter().any(|e| e.is_provider),
+            "an unfolded list has no provider rows at all"
+        );
+
+        let action = p.handle_key(key(KeyCode::Char('%')));
+        assert!(
+            matches!(&action, ModelPickerAction::Collapse(slug, true) if slug == PROVIDER),
+            "the key folds the provider of whichever row is selected"
+        );
+        assert!(p.is_open(), "{KEPT_OPEN}");
+
+        let entries = p.load_entries();
+        let row = entries
+            .iter()
+            .find(|e| e.is_provider && e.provider == PROVIDER)
+            .expect("the folded provider keeps a row");
+        assert!(row.detail.contains('2'), "saying how much is behind it");
+        assert!(
+            !entries
+                .iter()
+                .any(|e| !e.is_provider && e.provider == PROVIDER),
+            "and its models are folded away"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| !e.is_provider && e.provider == "zai"),
+            "other providers are untouched"
+        );
+    }
+
+    #[test_case(key(KeyCode::Char('%')) ; "the_fold_key")]
+    #[test_case(key(KeyCode::Enter)     ; "enter")]
+    fn a_folded_provider_unfolds_again(unfold: KeyEvent) {
+        let mut p = ModelPicker::new(test_models());
+        p.set_collapsed(BTreeSet::from([PROVIDER.to_owned()]));
+        p.open("zai/glm-5");
+        select_provider_row(&mut p, PROVIDER);
+
+        let action = p.handle_key(unfold);
+        assert!(
+            matches!(&action, ModelPickerAction::Collapse(slug, false) if slug == PROVIDER),
+            "the row answers the key with an unfold"
+        );
+        assert!(p.is_open(), "{KEPT_OPEN}");
+        assert!(!p.is_collapsed(PROVIDER));
+        assert!(
+            p.load_entries()
+                .iter()
+                .any(|e| !e.is_provider && e.provider == PROVIDER),
+            "its models come back"
+        );
+    }
+
+    /// What the caller writes to the state dir, so a fold outlives the session.
+    #[test]
+    fn the_folded_set_is_what_persistence_is_handed() {
+        let mut p = ModelPicker::new(test_models());
+        p.open(FOLD_SPEC);
+
+        p.handle_key(key(KeyCode::Char('%')));
+        assert_eq!(
+            p.collapsed_providers(),
+            &BTreeSet::from([PROVIDER.to_owned()])
+        );
+
+        // The row the fold created arrives with the next rebuild, as it does on
+        // the next frame in the app.
+        let _ = p.refresh();
+        select_provider_row(&mut p, PROVIDER);
+        p.handle_key(key(KeyCode::Char('%')));
+        assert!(p.collapsed_providers().is_empty());
+    }
+
+    /// A seeded fold is in place before the picker is ever opened.
+    #[test]
+    fn a_fold_read_back_from_the_state_dir_opens_folded() {
+        let mut p = ModelPicker::new(test_models());
+        p.set_collapsed(BTreeSet::from([PROVIDER.to_owned()]));
+        p.open("zai/glm-5");
+
+        let entries = p.load_entries();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.is_provider && e.provider == PROVIDER),
+            "the folded provider is listed, not hidden"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| !e.is_provider && e.provider == PROVIDER),
+            "its models start folded away"
+        );
+    }
     #[test_case(key(KeyCode::Esc)          ; "esc_closes")]
     #[test_case(kb::QUIT.to_key_event()    ; "ctrl_c_closes")]
     fn close_keys(cancel_key: KeyEvent) {
@@ -563,6 +801,8 @@ mod tests {
             "anthropic/claude-sonnet-4-20250514".into(),
         ]);
         p.open("anthropic/claude-sonnet-4-20250514");
+        // Past the Z.AI row that now heads its own section, onto the model.
+        p.handle_key(key(KeyCode::Down));
         p.handle_key(key(KeyCode::Down));
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
@@ -751,7 +991,11 @@ mod tests {
         let mut p = ModelPicker::new(models);
         p.open("");
         let entries = p.load_entries();
-        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        let ids: Vec<&str> = entries
+            .iter()
+            .filter(|e| !e.is_provider)
+            .map(|e| e.id.as_str())
+            .collect();
         assert_eq!(ids, ["stealth/ox-alpha", PAID_ID]);
     }
 }
