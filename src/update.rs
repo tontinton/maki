@@ -6,7 +6,16 @@ use std::path::{Path, PathBuf};
 use maki_storage::version::{self, VersionError};
 use maki_storage::{StateDir, StorageError};
 
-const INSTALL_SCRIPT_URL: &str = "https://maki.sh/install.sh";
+#[cfg(not(windows))]
+const SCRIPT_URL: &str = "https://maki.sh/install.sh";
+#[cfg(windows)]
+const SCRIPT_URL: &str = "https://maki.sh/install.ps1";
+
+#[cfg(not(windows))]
+const SCRIPT_LANG: &str = "bash";
+#[cfg(windows)]
+const SCRIPT_LANG: &str = "powershell";
+
 const BACKUP_FILENAME: &str = "maki_backup";
 const INSTALL_DIR_ENV: &str = "MAKI_INSTALL_DIR";
 
@@ -57,14 +66,14 @@ pub enum UpdateError {
 
 fn fetch_script() -> Result<String, UpdateError> {
     use isahc::ReadResponseExt;
-    isahc::get(INSTALL_SCRIPT_URL)
+    isahc::get(SCRIPT_URL)
         .and_then(|mut r| r.text().map_err(Into::into))
         .map_err(|source| UpdateError::Fetch {
-            url: INSTALL_SCRIPT_URL,
+            url: SCRIPT_URL,
             source,
         })
         .or_else(|e| {
-            version::curl_fetch(INSTALL_SCRIPT_URL)
+            version::curl_fetch(SCRIPT_URL)
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .map_err(|_| e)
         })
@@ -84,13 +93,27 @@ fn backup_binary(exe_path: &Path, backup_path: &Path) -> Result<(), UpdateError>
 }
 
 fn execute_script(script: &str, install_dir: &Path) -> Result<(), UpdateError> {
-    let mut tmp = tempfile::NamedTempFile::new().map_err(UpdateError::WriteScript)?;
+    let suffix = if cfg!(windows) { ".ps1" } else { ".sh" };
+    let mut tmp = tempfile::Builder::new()
+        .suffix(suffix)
+        .tempfile()
+        .map_err(UpdateError::WriteScript)?;
     tmp.write_all(script.as_bytes())
         .map_err(UpdateError::WriteScript)?;
     tmp.flush().map_err(UpdateError::WriteScript)?;
 
-    let status = std::process::Command::new("sh")
-        .arg(tmp.path())
+    #[cfg(not(windows))]
+    let mut cmd = std::process::Command::new("sh");
+    #[cfg(not(windows))]
+    cmd.arg(tmp.path());
+
+    #[cfg(windows)]
+    let mut cmd = std::process::Command::new("powershell");
+    #[cfg(windows)]
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(tmp.path());
+
+    let status = cmd
         .env(INSTALL_DIR_ENV, install_dir)
         .status()
         .map_err(UpdateError::ExecScript)?;
@@ -149,7 +172,21 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
         }
     } else {
         std::fs::copy(backup_path, &tmp).map_err(err)?;
-        std::fs::rename(&tmp, exe_path).map_err(err)?;
+        #[cfg(windows)]
+        let moved_exe_aside = {
+            let old = exe_path.with_extension("exe.old");
+            let _ = std::fs::remove_file(&old);
+            std::fs::rename(exe_path, &old).is_ok()
+        };
+        if let Err(e) = std::fs::rename(&tmp, exe_path) {
+            #[cfg(windows)]
+            if moved_exe_aside {
+                let old = exe_path.with_extension("exe.old");
+                let _ = std::fs::rename(&old, exe_path);
+            }
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err(e));
+        }
     }
     Ok(())
 }
@@ -194,7 +231,7 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
     if no_color {
         println!("{script}");
     } else {
-        println!("{}", maki_ui::highlight_ansi("bash", &script));
+        println!("{}", maki_ui::highlight_ansi(SCRIPT_LANG, &script));
     }
 
     if !skip_confirm && !prompt_yes(&install_dir) {
@@ -227,4 +264,41 @@ pub fn rollback() -> Result<(), UpdateError> {
     println!("Restored previous version.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    const CURRENT_EXE_CONTENT: &str = "current_version";
+    const BACKUP_EXE_CONTENT: &str = "backup_version";
+    const STALE_OLD_CONTENT: &str = "stale_old_version";
+
+    #[test_case(false; "clean")]
+    #[test_case(true; "with_stale_old_file")]
+    fn test_restore_backup(has_stale_old: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("maki.exe");
+        let backup_path = dir.path().join("maki_backup");
+        let old_path = exe_path.with_extension("exe.old");
+
+        std::fs::write(&exe_path, CURRENT_EXE_CONTENT).unwrap();
+        std::fs::write(&backup_path, BACKUP_EXE_CONTENT).unwrap();
+        if has_stale_old {
+            std::fs::write(&old_path, STALE_OLD_CONTENT).unwrap();
+        }
+
+        restore_backup(&backup_path, &exe_path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&exe_path).unwrap(),
+            BACKUP_EXE_CONTENT
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            std::fs::read_to_string(&old_path).unwrap(),
+            CURRENT_EXE_CONTENT
+        );
+    }
 }
