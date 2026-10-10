@@ -1214,6 +1214,7 @@ mod tests {
             area: Rect::new(0, 1, WIDTH, HEIGHT - 2),
             raw_text: &copy_text,
             line_breaks: input.line_breaks(WIDTH),
+            exclude: Vec::new(),
         }];
         // Leaving the first drawn row out keeps the region partly selected, so
         // the copy walks cells and the row counting decides where it breaks.

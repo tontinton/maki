@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ratatui::Frame;
@@ -9,6 +10,10 @@ pub const SCROLLBAR_THUMB: &str = "\u{2590}";
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
+thread_local! {
+    static PAINTED_RAILS: RefCell<Vec<Rect>> = const { RefCell::new(Vec::new()) };
+}
+
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
@@ -19,8 +24,22 @@ pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// Reset the painted-rail record. Called once at the top of each `App::view`
+/// so the record only ever describes the frame currently being drawn.
+pub fn begin_frame() {
+    PAINTED_RAILS.with(|rails| rails.borrow_mut().clear());
+}
+
+/// Cells scrollbars painted over during this frame. Overlay zones register
+/// content rects that can overlap a rail, so copy skips these cells no matter
+/// where a widget decided to draw (#917).
+pub fn painted_rails() -> Vec<Rect> {
+    PAINTED_RAILS.with(|rails| rails.borrow().clone())
+}
+
 pub fn render_vertical_scrollbar(frame: &mut Frame, area: Rect, content_len: u32, position: u32) {
-    if !is_enabled() {
+    let area = area.intersection(frame.area());
+    if !is_enabled() || area.is_empty() {
         return;
     }
     let max_scroll = content_len.saturating_sub(u32::from(area.height));
@@ -37,5 +56,14 @@ pub fn render_vertical_scrollbar(frame: &mut Frame, area: Rect, content_len: u32
         .begin_symbol(None)
         .end_symbol(None);
 
+    let rail = area.right() - 1;
+    let before: Vec<String> = (area.y..area.bottom())
+        .map(|row| frame.buffer_mut()[(rail, row)].symbol().to_string())
+        .collect();
     frame.render_stateful_widget(scrollbar, area, &mut state);
+    let painted = (area.y..area.bottom())
+        .enumerate()
+        .filter(|(i, row)| frame.buffer_mut()[(rail, *row)].symbol() != before[*i])
+        .map(|(_, row)| Rect::new(rail, row, 1, 1));
+    PAINTED_RAILS.with(|rails| rails.borrow_mut().extend(painted));
 }

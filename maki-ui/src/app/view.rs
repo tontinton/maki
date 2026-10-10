@@ -5,6 +5,7 @@ use crate::components::input::{BORDER_ROWS, Placeholder};
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
+use crate::components::scrollbar;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
 use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::components::usage_modal::UsageModalContext;
@@ -71,6 +72,7 @@ impl App {
     /// or a window on it would jump to the middle of the screen the moment it
     /// started reading keys.
     pub fn view(&mut self, frame: &mut Frame) -> Option<Position> {
+        scrollbar::begin_frame();
         let layout = self.compute_layout(frame.area());
         let render_chat = self.active_chat;
 

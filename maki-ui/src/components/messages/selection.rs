@@ -91,6 +91,7 @@ pub(super) fn extract_selection_text(
                 rel_start..rel_end,
                 &mut out,
                 &LineBreaks::from_lines(lines, width),
+                &[],
                 &mut carry,
             );
         }

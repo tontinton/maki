@@ -8,10 +8,13 @@ use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::messages::ScrollPos;
 use crate::components::rewind_picker::RewindEntry;
+use crate::components::scrollbar::{self, SCROLLBAR_THUMB};
 use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
-use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
+use crate::selection::{
+    self, ContentRegion, RowPos, ScreenSelection, SelectableZone, SelectionState, SelectionZone,
+};
 use crate::theme;
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -4519,6 +4522,53 @@ fn overlay_zone_click_gating() {
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 20, 5));
     let state = app.selection_state.as_ref().unwrap();
     assert_eq!(state.sel().zone, SelectionZone::Overlay);
+}
+
+/// A modal's rail lands on content cells, and a copy of the overlay must not
+/// pick the ▐ up (#917). The rail record lives per frame, so the test draws
+/// once, reads back the cells the modal painted, and drives the same
+/// extraction `copy_selection` runs.
+#[test]
+fn overlay_copy_skips_painted_rail_cells() {
+    let mut app = test_app();
+    app.help_modal.toggle();
+    let (_cursor, buffer) = draw_to_buffer(&mut app);
+
+    let rails = scrollbar::painted_rails();
+    assert!(!rails.is_empty(), "help modal paints a rail");
+    assert!(
+        rails
+            .iter()
+            .all(|r| buffer[(r.x, r.y)].symbol() == SCROLLBAR_THUMB),
+        "recorded cells hold the rail glyph"
+    );
+
+    let rail = rails
+        .iter()
+        .find(|r| {
+            app.zone_at(r.y, r.x)
+                .is_some_and(|z| z.zone == SelectionZone::Overlay)
+        })
+        .expect("an overlay zone owns a rail cell");
+    let zone = app.zone_at(rail.y, rail.x).unwrap();
+
+    let sel = ScreenSelection {
+        start_row: zone.area.y,
+        start_col: zone.area.x,
+        end_row: zone.area.bottom() - 1,
+        end_col: zone.area.right() - 1,
+    };
+    let regions = [ContentRegion {
+        area: zone.area,
+        exclude: rails,
+        ..Default::default()
+    }];
+    let text = selection::extract_selected_text(&buffer, &sel, &regions);
+    assert!(
+        !text.contains(SCROLLBAR_THUMB),
+        "copy kept rail cells: {text:?}"
+    );
+    assert!(text.contains("General"), "copy lost modal text: {text:?}");
 }
 
 fn streaming_app_with_history() -> App {
