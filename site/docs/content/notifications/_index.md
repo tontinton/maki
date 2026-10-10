@@ -46,6 +46,7 @@ maki.setup({
 | `auto` | Use OSC 9 in a supported terminal. Use BEL otherwise. |
 | `osc9` | Always send an OSC 9 notification. |
 | `bell` | Always send the terminal bell. |
+| `notify` | Show an operating-system notification. |
 | `off` | Do not send notifications. |
 
 `auto` supports Ghostty, iTerm2, Kitty, Warp, and WezTerm. An unknown terminal
@@ -54,6 +55,10 @@ visual alert.
 
 Maki also recognizes `xterm-ghostty` and `xterm-kitty` from `TERM`. This lets
 OSC 9 work when an SSH connection does not preserve `TERM_PROGRAM`.
+
+`notify` shows an operating-system notification. notify-rust supports Linux,
+macOS, BSD, and Windows. On Linux the desktop environment needs a running
+D-Bus session bus for the popup to appear.
 
 ## tmux
 

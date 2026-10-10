@@ -75,7 +75,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `splash_animation` | bool | `true` | - | Show splash animation on startup |
 | `scrollbar` | bool | `true` | - | Show vertical scrollbar in scrollable areas |
 | `inline_images` | bool | `true` | - | Render inline images in terminals with graphics support, falling back to an [image] line where nothing else names the image |
-| `notifications` | string | `auto` | - | Terminal notification method: auto, osc9, bell, or off |
+| `notifications` | string | `auto` | - | Terminal notification method: auto, osc9, bell, notify, or off |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |

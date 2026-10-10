@@ -207,12 +207,23 @@ pub(crate) enum Notification {
     AuthenticationRequired,
     QuestionRequested,
     PlanReady,
+    AgentError { message: String },
 }
-
 impl Notification {
     /// Prompts blocking the agent outrank turn completions.
     pub(crate) fn is_urgent(&self) -> bool {
-        !matches!(self, Self::TurnComplete { .. })
+        !matches!(self, Self::TurnComplete { .. } | Self::AgentError { .. })
+    }
+
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            Self::TurnComplete { .. } => "Turn complete",
+            Self::PermissionRequested { .. } => "Permission requested",
+            Self::AuthenticationRequired => "Authentication required",
+            Self::QuestionRequested => "Question requested",
+            Self::PlanReady => "Plan ready",
+            Self::AgentError { .. } => "Agent error",
+        }
     }
 
     pub(crate) fn message(&self) -> String {
@@ -227,12 +238,13 @@ impl Notification {
             Self::AuthenticationRequired => "Authentication required".into(),
             Self::QuestionRequested => "Question requested".into(),
             Self::PlanReady => "Plan ready".into(),
+            Self::AgentError { message } => message.clone(),
         }
     }
 
     pub(crate) fn error_completion() -> Self {
-        Self::TurnComplete {
-            response: Some("Agent stopped with an error".into()),
+        Self::AgentError {
+            message: "Agent stopped with an error".into(),
         }
     }
 }
