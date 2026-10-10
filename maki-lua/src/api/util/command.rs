@@ -284,6 +284,24 @@ impl Split {
     pub const ALL: [Split; 4] = [Split::Left, Split::Right, Split::Above, Split::Below];
 }
 
+/// Which side of the chat input box a `panel` window stacks on. Other splits
+/// and floats ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PanelPosition {
+    #[default]
+    AboveInput,
+    BelowInput,
+}
+
+impl PanelPosition {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "below_input" => Self::BelowInput,
+            _ => Self::AboveInput,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TitlePos {
     #[default]
@@ -318,6 +336,7 @@ pub struct FloatConfig {
     pub reserved_bottom: usize,
     pub reserved_top: usize,
     pub split: Split,
+    pub position: PanelPosition,
     pub order: u16,
     pub visible: bool,
     pub needs_input: bool,
@@ -349,6 +368,7 @@ impl Default for FloatConfig {
             reserved_bottom: 0,
             reserved_top: 0,
             split: Split::None,
+            position: PanelPosition::default(),
             order: 50,
             visible: true,
             needs_input: false,
@@ -383,6 +403,7 @@ impl FloatConfig {
             reserved_bottom,
             reserved_top,
             split,
+            position,
             order,
             visible,
             needs_input
@@ -406,6 +427,7 @@ pub struct FloatConfigPatch {
     pub reserved_bottom: Option<usize>,
     pub reserved_top: Option<usize>,
     pub split: Option<Split>,
+    pub position: Option<PanelPosition>,
     pub order: Option<u16>,
     pub visible: Option<bool>,
     pub needs_input: Option<bool>,
@@ -975,6 +997,29 @@ mod tests {
         cfg.apply_patch(patch);
         assert_eq!(cfg.split, Split::Below);
         assert_eq!(cfg.border, Border::Rounded, "untouched fields stay");
+    }
+
+    #[test_case("below_input" => PanelPosition::BelowInput ; "below_input")]
+    #[test_case("above_input" => PanelPosition::AboveInput ; "above_input")]
+    #[test_case("" => PanelPosition::AboveInput ; "empty_defaults_above")]
+    #[test_case("below" => PanelPosition::AboveInput ; "split_name_is_not_a_position")]
+    fn panel_position_parse(s: &str) -> PanelPosition {
+        PanelPosition::parse(s)
+    }
+
+    #[test]
+    fn apply_patch_sets_position() {
+        let mut cfg = FloatConfig {
+            split: Split::Panel,
+            ..FloatConfig::default()
+        };
+        let patch = FloatConfigPatch {
+            position: Some(PanelPosition::BelowInput),
+            ..FloatConfigPatch::default()
+        };
+        cfg.apply_patch(patch);
+        assert_eq!(cfg.position, PanelPosition::BelowInput);
+        assert_eq!(cfg.split, Split::Panel, "untouched fields stay");
     }
 
     #[test]
