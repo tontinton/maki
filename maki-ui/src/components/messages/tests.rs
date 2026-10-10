@@ -4,6 +4,7 @@ use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{DocPos, Selection, SelectionZone};
+use crate::wrap;
 use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
@@ -106,7 +107,7 @@ fn snap_line(text: &str) -> SnapshotLine {
     }
 }
 
-fn start(id: &str, tool: &str) -> ToolStartEvent {
+pub(super) fn start(id: &str, tool: &str) -> ToolStartEvent {
     ToolStartEvent {
         id: id.into(),
         tool: tool.into(),
@@ -314,7 +315,11 @@ fn render_sel(
     terminal
 }
 
-fn render(panel: &mut MessagesPanel, width: u16, height: u16) -> ratatui::Terminal<TestBackend> {
+pub(super) fn render(
+    panel: &mut MessagesPanel,
+    width: u16,
+    height: u16,
+) -> ratatui::Terminal<TestBackend> {
     render_sel(panel, width, height, false)
 }
 

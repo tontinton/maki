@@ -7,3 +7,5 @@ runs.csv
 /.playwright-mcp/
 /result
 AGENTS.local.md
+
+DESIGN_*.md

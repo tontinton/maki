@@ -376,6 +376,14 @@ impl SegmentCache {
         self.segments.push(seg);
     }
 
+    /// Drops every segment from `len` on. The live segments are built as a
+    /// trailing run, but a commit can append a cached segment after them before
+    /// the next frame, so they are removed by their recorded start rather than
+    /// from the end.
+    pub fn truncate(&mut self, len: usize) {
+        self.segments.truncate(len);
+    }
+
     /// Books the spacer and instruction slots a tool fills in later, when its
     /// output finally arrives. Splicing them in at that point would shift
     /// every segment after them, and plenty of things hold a segment index by

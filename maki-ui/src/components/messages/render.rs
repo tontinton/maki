@@ -11,6 +11,8 @@ use ratatui_image::{
 
 use crate::terminal_image::InlineImage;
 
+use super::segment::Segment;
+
 pub(super) struct RenderCursor {
     skip: u16,
     y: u16,
@@ -122,6 +124,38 @@ impl RenderCursor {
         }
         frame.render_widget(p, seg_area);
         self.y += visible_h;
+    }
+
+    /// Draws the segment's visible rows only. `render` hands the whole segment
+    /// to a `Paragraph` and scrolls it, which re-wraps every row above the
+    /// viewport: a tall segment costs its full height again on each frame, and
+    /// more the further it is scrolled. Walking the wrap instead draws the rows
+    /// on screen, so the cost is the viewport rather than the document.
+    pub fn render_segment(
+        &mut self,
+        seg: &Segment,
+        h: u16,
+        style: Option<Style>,
+        highlight: bool,
+        frame: &mut Frame,
+    ) {
+        if self.skip >= h {
+            self.skip -= h;
+            return;
+        }
+        let mut walk = seg.rows_from(self.skip, self.viewport.width);
+        let mut lead = self.skip;
+        while self.y < self.bottom {
+            let Some((lines, rows)) = walk.next_chunk(self.bottom - self.y) else {
+                break;
+            };
+            // `skip` can land mid-line, so the first chunk drops the rows above
+            // it within its first line; later chunks start on a row boundary.
+            self.skip = lead.saturating_sub(rows.start);
+            lead = 0;
+            self.render(lines, rows.end - rows.start, style, highlight, frame);
+        }
+        self.skip = 0;
     }
 }
 

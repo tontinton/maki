@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod jank;
 mod render;
 mod scroll;
 mod segment;
@@ -8,7 +10,7 @@ mod tests;
 pub use self::scroll::ScrollPos;
 
 use self::render::RenderCursor;
-use self::scroll::{Layout, TailPart};
+use self::scroll::Layout;
 use self::segment::{Segment, SegmentCache};
 
 use super::tool_display::{
@@ -29,13 +31,12 @@ use crate::splash::{ColorTransition, Splash};
 use crate::terminal_image;
 use crate::theme;
 use crate::update;
-use crate::wrap;
 use maki_config::{ClockFormat, ToolOutputLines, UiConfig};
 use ratatui_image::picker::Picker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::scrollbar::{self, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
@@ -57,6 +58,13 @@ use tracing::warn;
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
 /// How far outside the drawn range an image keeps its encoded protocol.
 const IMAGE_KEEP_MARGIN_SEGMENTS: usize = 8;
+/// Rows the cursor advances per second while the document is still growing. A
+/// rate rather than a step per frame, because a frame is not a fixed amount of
+/// time and the reveal would otherwise follow the redraw cadence.
+const ROWS_PER_SEC: f64 = 120.0;
+/// Longest gap credited to the cursor, one smooth frame. A longer step would
+/// advance several rows at once and show them together.
+const MAX_REVEAL_STEP: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Copy)]
 pub struct PromptProgress {
@@ -75,9 +83,6 @@ pub struct MessagesPanel {
     viewport_height: u16,
     viewport_width: u16,
     cache: SegmentCache,
-    /// The streaming tail the last `view` drew, in the order it drew it. Lets
-    /// the row walk and clicks address the tail between frames.
-    tail: Vec<(TailPart, u16)>,
     hl_worker: RenderWorker,
     image_picker: Option<Picker>,
     inline_images: bool,
@@ -105,10 +110,23 @@ pub struct MessagesPanel {
     /// only bumps when colors actually land.
     rebake_requested: HashMap<String, u64>,
     prompt_progress: Option<PromptProgress>,
+    /// Rows of the document the cursor has reached, counted from the top. Every
+    /// part below it is hidden, so the transcript grows one row at a time
+    /// whatever landed. `INFINITY` until the first tick claims what is already
+    /// on screen as read.
+    revealed_rows: f64,
+    /// When the cursor last advanced, so its rate is per second rather than per
+    /// frame and a slow frame does not slow the reveal to match.
+    last_reveal: Instant,
     /// The chat this panel shows, stamped on every restore it requests so a
     /// plugin files the call where the live one went.
     session_id: Option<SessionRef>,
     task_id: Option<Arc<str>>,
+    /// Index where the trailing live streaming segments begin, so they can be
+    /// dropped next frame. They are rebuilt each frame and removed before the
+    /// next build; a commit can append a cached segment after them in between,
+    /// so this is their start rather than a count from the end.
+    live_start: usize,
 }
 
 impl MessagesPanel {
@@ -136,7 +154,6 @@ impl MessagesPanel {
             viewport_height: 24,
             viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
             cache: SegmentCache::new(),
-            tail: Vec::new(),
             hl_worker: RenderWorker::new(),
             image_picker: terminal_image::picker(ui_config.inline_images),
             inline_images: ui_config.inline_images,
@@ -157,8 +174,11 @@ impl MessagesPanel {
             clock_format: ui_config.clock_format,
             rebake_requested: HashMap::new(),
             prompt_progress: None,
+            revealed_rows: f64::INFINITY,
+            last_reveal: Instant::now(),
             session_id: None,
             task_id: None,
+            live_start: 0,
         }
     }
 
@@ -598,15 +618,27 @@ impl MessagesPanel {
         self.flush_thinking();
         self.prompt_progress = None;
         if !self.streaming_text.is_empty() {
+            // The live segment drew this text uncapped, so it was on screen
+            // whatever the cursor had reached. Claim the rows as read, or the
+            // commit makes them a capped segment and hides text the reader is
+            // looking at until the cursor climbs back. Pacing is for a block
+            // that arrives whole with nothing of it on screen; this is not one.
+            let drawn = f64::from(self.layout().total_rows());
             self.messages.push(DisplayMessage::new(
                 DisplayRole::Assistant,
                 self.streaming_text.take_all(),
             ));
+            self.revealed_rows = self.revealed_rows.max(drawn);
         }
     }
 
     fn layout(&self) -> Layout<'_> {
-        Layout::new(&self.cache, &self.tail, self.viewport_width)
+        Layout::new(
+            &self.cache,
+            self.viewport_width,
+            self.revealed_rows as u32,
+            self.live_start,
+        )
     }
 
     /// Positive scrolls up. Clamping is immediate rather than deferred to the
@@ -685,11 +717,14 @@ impl MessagesPanel {
             .layout()
             .advance(self.scroll, u32::from(row.saturating_sub(area.y)));
         let width = self.viewport_width;
-        // Both fallbacks toggle thinking: a position past the cached segments
-        // belongs to the still-streaming indicator, and a segment without a
-        // tool_id is a finished message's text.
-        let Some(seg) = self.cache.get(pos.seg) else {
+        // A position in the live segments belongs to the streaming indicator
+        // when thinking is collapsed; a segment without a tool_id is a finished
+        // message's text, which toggles the same way.
+        if pos.seg >= self.live_start {
             return self.try_toggle_collapsed_thinking(pos);
+        }
+        let Some(seg) = self.cache.get(pos.seg) else {
+            return false;
         };
         if !seg.images.is_empty() && pos.row >= seg.text_height(width) {
             return false;
@@ -788,11 +823,65 @@ impl MessagesPanel {
     /// running tool had to claim it was animating: it was the only way to keep
     /// them fed.
     pub fn tick(&mut self) -> Dirty {
-        let mut dirty = self.drain_highlights() | self.poll_live_bufs() | self.refresh_images();
+        self.tick_drains()
+    }
+
+    fn tick_drains(&mut self) -> Dirty {
+        let mut dirty = self.drain_highlights()
+            | self.poll_live_bufs()
+            | self.refresh_images()
+            | self.advance_reveal();
         if self.show_idle_splash() {
             dirty |= self.idle_splash.poll_update(update::latest_version());
         }
         dirty
+    }
+
+    /// Rows the cached segments hold at the current width. Computed fresh
+    /// rather than cached in a field, so a tick between a commit and the next
+    /// frame cannot read a stale height and clamp the cursor back down.
+    fn cached_rows(&self) -> u16 {
+        self.layout().total_rows().min(u32::from(u16::MAX)) as u16
+    }
+
+    /// Advances the row cursor by the time since the last call and reports
+    /// whether a row crossed, which is the only thing that keeps the panel
+    /// asking to be redrawn.
+    fn advance_reveal(&mut self) -> Dirty {
+        let now = Instant::now();
+        let dt = now
+            .saturating_duration_since(self.last_reveal)
+            .min(MAX_REVEAL_STEP)
+            .as_secs_f64();
+        self.last_reveal = now;
+
+        let content = f64::from(self.cached_rows());
+        if self.revealed_rows.is_infinite() {
+            // Take the cached document as already read rather than revealing
+            // it, so restoring a session does not replay it.
+            self.revealed_rows = content;
+            return Dirty::NO;
+        }
+        // Grow toward the content but never shrink: `cached_rows` is read
+        // before the segment for a freshly committed message is built, so a
+        // plain `min` would clamp the cursor back down over text that is
+        // already on screen.
+        let ceiling = content.max(self.revealed_rows);
+        let rendered = (self.revealed_rows + dt * ROWS_PER_SEC).min(ceiling);
+        let moved = rendered as u32 > self.revealed_rows as u32;
+        self.revealed_rows = rendered;
+        Dirty::from(moved)
+    }
+
+    /// Drives the reveal clock by `elapsed` and then drains, so a replay test
+    /// measures a deterministic rate instead of chasing the wall clock. The
+    /// character reveal is fed the same step, so both clocks advance together.
+    #[cfg(test)]
+    pub(crate) fn tick_for_test(&mut self, elapsed: Duration) -> Dirty {
+        self.streaming_text.set_elapsed(elapsed);
+        self.streaming_thinking.set_elapsed(elapsed);
+        self.last_reveal -= elapsed;
+        self.tick_drains()
     }
 
     pub fn cadence(&self) -> Cadence {
@@ -802,7 +891,11 @@ impl MessagesPanel {
         // for the whole reasoning phase.
         let smooth = self.streaming_text.is_animating()
             || self.accent.is_animating()
-            || (self.streaming_thinking.is_animating() && !self.streaming_thinking_collapsed());
+            || (self.streaming_thinking.is_animating() && !self.streaming_thinking_collapsed())
+            // A frame spends the cursor's budget, so a segment still being
+            // revealed has to claim motion or it stops advancing.
+            || (self.revealed_rows.is_finite()
+                && (self.revealed_rows as u32) < u32::from(self.cached_rows()));
         Cadence::any([
             // A running tool draws a spinner. Its output arriving is data, and
             // `tick` reports that separately.
@@ -867,19 +960,29 @@ impl MessagesPanel {
         let width = area.width.saturating_sub(1);
         let theme_gen = theme::generation();
         let theme_changed = self.theme_generation != theme_gen;
-        let needs_reflow = self.viewport_width != width || theme_changed;
+        let width_changed = self.viewport_width != width;
+        let needs_reflow = width_changed || theme_changed;
         if needs_reflow {
             self.viewport_width = width;
             self.theme_generation = theme_gen;
+        }
+        if width_changed && self.auto_scroll && self.revealed_rows.is_finite() {
+            // A re-wrap lays the same text out taller or shorter, and those
+            // rows were already read. `INFINITY` makes the next tick claim the
+            // re-wrapped height as read, the same way the first tick claims a
+            // restored document, instead of revealing it again a row at a time.
+            // A resize is not growth; only growth is paced.
+            self.revealed_rows = f64::INFINITY;
         }
         if theme_changed {
             self.rebake_stale_snapshots(theme_gen);
         }
 
         if self.show_idle_splash() {
-            // Every other exit rebuilds the tail; this one has to drop it, or
-            // `Layout` keeps answering with rows nothing draws any more.
-            self.tail.clear();
+            // Every other exit rebuilds the live segments; this one has to drop
+            // them, or `Layout` keeps answering with rows nothing draws.
+            self.cache.truncate(self.live_start);
+            self.live_start = self.cache.len();
             let accent = self.accent.resolve();
             self.idle_splash.render(area, frame.buffer_mut(), accent);
             return;
@@ -900,6 +1003,12 @@ impl MessagesPanel {
                 assistant.prefix_style,
             );
         }
+        // Drop the live segments before the cache rebuild, so a message the
+        // flush just committed appends after the cached segments rather than
+        // after the live ones. Otherwise the live text would sit between two
+        // cached segments and survive, rendering beside the message it became.
+        self.cache.truncate(self.live_start);
+        self.live_start = self.cache.len();
         self.rebuild_line_cache();
         if self.in_progress_count() > 0 {
             self.update_spinners();
@@ -910,7 +1019,7 @@ impl MessagesPanel {
         } else {
             Vec::new()
         };
-        self.tail = self.build_tail(width, &collapsed_thinking_lines);
+        self.rebuild_live_segments(width, &collapsed_thinking_lines);
 
         // The reflow window is picked from `scroll` and the bottom pin, and
         // the reflow changes the heights both are derived from: resolve
@@ -922,6 +1031,15 @@ impl MessagesPanel {
         let viewport = Rect::new(area.x, area.y, width, area.height);
         let mut cursor = RenderCursor::new(self.scroll.row, viewport);
 
+        // Heights the cursor grants each part this frame, read before the
+        // mutable walk so a segment below the cursor reveals its rows in order
+        // rather than drawing its full height at once. `Layout::new` is cheap
+        // now: it builds `starts` only when a cursored height is first read,
+        // which is here, once per frame rather than at every `layout()` call.
+        let cursored: Vec<u16> = {
+            let layout = self.layout();
+            (0..self.cache.len()).map(|i| layout.height(i)).collect()
+        };
         let mut last_drawn = self.scroll.seg;
         for (i, seg) in self
             .cache
@@ -933,36 +1051,19 @@ impl MessagesPanel {
             if cursor.past_bottom() {
                 break;
             }
-            let h = seg.text_height(width);
+            let h = cursored
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| seg.text_height(width));
             let highlight = self.highlight_segment == Some(i);
             let style = seg.tool_id.as_ref().map(|_| theme::current().tool_bg);
-            cursor.render(seg.lines(), h, style, highlight, frame);
+            cursor.render_segment(seg, h, style, highlight, frame);
             for image in &mut seg.images {
                 cursor.render_image(image, self.image_picker.as_ref(), images_visible, frame);
             }
             last_drawn = i;
         }
         self.release_images_outside(last_drawn);
-
-        let spacer_lines: [Line<'static>; 1] = [Line::default()];
-        for &(part, h) in self
-            .tail
-            .iter()
-            .skip(self.scroll.seg.saturating_sub(self.cache.len()))
-        {
-            if cursor.past_bottom() {
-                break;
-            }
-            let lines = match part {
-                TailPart::Spacer => &spacer_lines[..],
-                TailPart::Thinking if !collapsed_thinking_lines.is_empty() => {
-                    &collapsed_thinking_lines
-                }
-                TailPart::Thinking => self.streaming_thinking.cached_lines(),
-                TailPart::Text => self.streaming_text.cached_lines(),
-            };
-            cursor.render(lines, h, None, false, frame);
-        }
 
         if let Some(pp) = self.prompt_progress
             && pp.total > 0
@@ -1006,33 +1107,47 @@ impl MessagesPanel {
     /// `rebuild_line_cache` uses when the turn flushes. A [`ScrollPos`] in the
     /// tail keeps pointing at the same content across that flush only while
     /// the two agree, so anything added here needs its segment there.
-    fn build_tail(
-        &mut self,
-        width: u16,
-        collapsed_thinking: &[Line<'static>],
-    ) -> Vec<(TailPart, u16)> {
-        let has_cached = self.cache.len() > 0;
-        let mut tail: Vec<(TailPart, u16)> = Vec::new();
-        // Mirrors `SegmentCache::push_spacer_if_needed`: a part is separated
-        // from whatever precedes it in the document.
-        let mut push = |part, height| {
-            if has_cached || !tail.is_empty() {
-                tail.push((TailPart::Spacer, 1));
-            }
-            tail.push((part, height));
+    /// Builds the streaming thinking and text into the cache as live segments,
+    /// replacing the ones the last frame built. Live segments carry no
+    /// `msg_index`: nothing looks them up, they exist to be drawn until the run
+    /// ends and `flush` settles them into a message.
+    fn rebuild_live_segments(&mut self, width: u16, collapsed_thinking: &[Line<'static>]) {
+        // Render first: `render_lines` ticks the typewriter and rebuilds the
+        // line cache this reads, so the segments carry the revealed text. It
+        // also borrows the streaming content, which is why the lines are
+        // collected before the cache is touched.
+        let thinking: Option<Vec<Line<'static>>> = if self.streaming_thinking_collapsed() {
+            Some(collapsed_thinking.to_vec())
+        } else if !self.streaming_thinking.is_empty() {
+            Some(self.streaming_thinking.render_lines(width).to_vec())
+        } else {
+            None
+        };
+        let text: Option<Vec<Line<'static>>> = if self.streaming_text.is_empty() {
+            None
+        } else {
+            Some(self.streaming_text.render_lines(width).to_vec())
         };
 
-        if self.streaming_thinking_collapsed() {
-            push(TailPart::Thinking, collapsed_thinking.len() as u16);
-        } else if !self.streaming_thinking.is_empty() {
-            let h = wrap::total_rows(self.streaming_thinking.render_lines(width), width);
-            push(TailPart::Thinking, h);
+        self.live_start = self.cache.len();
+
+        if let Some(lines) = thinking {
+            self.push_live(lines);
         }
-        if !self.streaming_text.is_empty() {
-            let h = wrap::total_rows(self.streaming_text.render_lines(width), width);
-            push(TailPart::Text, h);
+        if let Some(lines) = text {
+            self.push_live(lines);
         }
-        tail
+    }
+
+    /// Appends a live part, separated from whatever precedes it by a spacer,
+    /// the same rule `SegmentCache::push_spacer_if_needed` follows. Nothing
+    /// precedes the first part, so it takes no spacer: a leading blank row is
+    /// not what the stream is.
+    fn push_live(&mut self, lines: Vec<Line<'static>>) {
+        if self.cache.len() > 0 {
+            self.cache.push(Segment::spacer());
+        }
+        self.cache.push(Segment::with_lines(lines, None));
     }
 
     pub fn scroll_pos(&self) -> ScrollPos {
@@ -1351,15 +1466,11 @@ impl MessagesPanel {
         thinking_indicator(logical_line_count(text), true)
     }
 
-    /// `pos` is past the cached segments, so it names a tail part: the click
-    /// toggles only when that part is the collapsed thinking indicator.
+    /// The collapsed thinking indicator is a live segment, so a click on it
+    /// toggles the stream back open.
     fn try_toggle_collapsed_thinking(&mut self, pos: ScrollPos) -> bool {
-        let part = pos
-            .seg
-            .checked_sub(self.cache.len())
-            .and_then(|i| self.tail.get(i))
-            .map(|&(p, _)| p);
-        if part != Some(TailPart::Thinking) || !self.streaming_thinking_collapsed() {
+        let live_start = self.live_start;
+        if pos.seg < live_start || !self.streaming_thinking_collapsed() {
             return false;
         }
         self.thinking_collapsed = false;
