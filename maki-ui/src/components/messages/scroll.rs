@@ -91,7 +91,8 @@ impl<'a> Layout<'a> {
         }
         let before = self.starts().get(i).copied().unwrap_or(u32::MAX);
         let remaining = self.revealed.saturating_sub(before);
-        self.full_height(i).min(remaining.min(u32::from(u16::MAX)) as u16)
+        self.full_height(i)
+            .min(remaining.min(u32::from(u16::MAX)) as u16)
     }
 
     /// Total rows the cursored document shows, the number a draw produces.

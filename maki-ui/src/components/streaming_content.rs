@@ -6,6 +6,8 @@ use maki_markdown::render::Renderer;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use std::hash::{DefaultHasher, Hash, Hasher};
+#[cfg(test)]
+use std::time::Duration;
 
 const STREAMING_MAX_LINE_BYTES: usize = 5_000;
 
@@ -132,7 +134,7 @@ impl StreamingContent {
     /// Drives the character reveal off an exact elapsed time, so a replay test
     /// measures a deterministic rate instead of chasing the wall clock.
     #[cfg(test)]
-    pub(crate) fn set_elapsed(&mut self, elapsed: std::time::Duration) {
+    pub(crate) fn set_elapsed(&mut self, elapsed: Duration) {
         self.typewriter.set_elapsed(elapsed);
     }
 

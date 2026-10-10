@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod jank;
 mod render;
 mod scroll;
 mod segment;
@@ -822,10 +824,14 @@ impl MessagesPanel {
     /// running tool had to claim it was animating: it was the only way to keep
     /// them fed.
     pub fn tick(&mut self) -> Dirty {
+        self.tick_drains()
+    }
+
+    fn tick_drains(&mut self) -> Dirty {
         let mut dirty = self.drain_highlights()
             | self.poll_live_bufs()
             | self.refresh_images()
-            | self.advance_reveal(Instant::now());
+            | self.advance_reveal();
         if self.show_idle_splash() {
             dirty |= self.idle_splash.poll_update(update::latest_version());
         }
@@ -845,9 +851,9 @@ impl MessagesPanel {
 
     /// Advances the row cursor by the time since the last call and reports
     /// whether a row crossed, which is the only thing that keeps the panel
-    /// asking to be redrawn. `now` is a parameter so a test can drive the clock
-    /// instead of sleeping for one.
-    fn advance_reveal(&mut self, now: Instant) -> Dirty {
+    /// asking to be redrawn.
+    fn advance_reveal(&mut self) -> Dirty {
+        let now = Instant::now();
         let dt = now
             .saturating_duration_since(self.last_reveal)
             .min(MAX_REVEAL_STEP)
@@ -879,8 +885,8 @@ impl MessagesPanel {
     pub(crate) fn tick_for_test(&mut self, elapsed: Duration) -> Dirty {
         self.streaming_text.set_elapsed(elapsed);
         self.streaming_thinking.set_elapsed(elapsed);
-        let advance = self.advance_reveal(self.last_reveal + elapsed);
-        advance | self.drain_highlights() | self.poll_live_bufs() | self.refresh_images()
+        self.last_reveal -= elapsed;
+        self.tick_drains()
     }
 
     pub fn cadence(&self) -> Cadence {
@@ -1043,7 +1049,10 @@ impl MessagesPanel {
             if cursor.past_bottom() {
                 break;
             }
-            let h = cursored.get(i).copied().unwrap_or_else(|| seg.text_height(width));
+            let h = cursored
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| seg.text_height(width));
             let highlight = self.highlight_segment == Some(i);
             let style = seg.tool_id.as_ref().map(|_| theme::current().tool_bg);
             cursor.render(seg.lines(), h, style, highlight, frame);

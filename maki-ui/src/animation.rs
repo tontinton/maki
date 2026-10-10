@@ -37,10 +37,7 @@ pub struct Typewriter {
     visible_len: usize,
     visible_byte_offset: usize,
     anim_target: usize,
-    #[cfg(not(test))]
     last_tick: Instant,
-    #[cfg(test)]
-    forced_elapsed_ms: Option<f64>,
     carry: f64,
     ms_per_char: u64,
 }
@@ -62,10 +59,7 @@ impl Typewriter {
             visible_len: 0,
             visible_byte_offset: 0,
             anim_target: 0,
-            #[cfg(not(test))]
             last_tick: Instant::now(),
-            #[cfg(test)]
-            forced_elapsed_ms: None,
             carry: 0.0,
             ms_per_char,
         }
@@ -100,19 +94,13 @@ impl Typewriter {
         }
     }
 
-    #[cfg(not(test))]
+    /// Milliseconds since the last tick, and marks this one, so a tick is
+    /// credited exactly the time that passed rather than a share of a window.
     fn elapsed_ms(&mut self) -> f64 {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_tick);
         self.last_tick = now;
         elapsed.as_secs_f64() * 1_000.0
-    }
-
-    /// Tests drive the rate math off an exact injected elapsed time, so the
-    /// microsecond gap between two `Instant::now` calls never shifts a reveal.
-    #[cfg(test)]
-    fn elapsed_ms(&mut self) -> f64 {
-        std::mem::take(&mut self.forced_elapsed_ms).unwrap_or(0.0)
     }
 
     pub fn visible(&self) -> &str {
@@ -155,11 +143,12 @@ impl Typewriter {
         self.carry = 0.0;
     }
 
-    /// Hands the next `tick` an exact elapsed time, so the rate math is
-    /// deterministic instead of chasing the wall clock.
+    /// Backdates the tick clock so the next `tick` sees exactly `elapsed`
+    /// passed, letting tests drive the real rate math without the microsecond
+    /// gap between two `Instant::now` calls shifting a reveal.
     #[cfg(test)]
     pub(crate) fn set_elapsed(&mut self, elapsed: Duration) {
-        self.forced_elapsed_ms = Some(elapsed.as_secs_f64() * 1_000.0);
+        self.last_tick = Instant::now() - elapsed;
     }
 
     fn reset_anim(&mut self) {
@@ -236,7 +225,11 @@ mod tests {
         assert_eq!(tw.visible(), "");
 
         tw.push("bbb");
-        assert_eq!(tw.visible(), "", "a new chunk must not jump the pending reveal");
+        assert_eq!(
+            tw.visible(),
+            "",
+            "a new chunk must not jump the pending reveal"
+        );
         assert!(tw.is_animating());
     }
 
@@ -246,7 +239,11 @@ mod tests {
         tw.push("abcdefghij");
         tw.set_elapsed(Duration::from_millis(DEFAULT_MS_PER_CHAR * 3));
         tw.tick();
-        assert_eq!(tw.visible().chars().count(), 3, "three chars in three steps");
+        assert_eq!(
+            tw.visible().chars().count(),
+            3,
+            "three chars in three steps"
+        );
     }
 
     #[test]
@@ -267,10 +264,18 @@ mod tests {
         tw.push("abc");
         tw.set_elapsed(Duration::from_millis(1));
         tw.tick();
-        assert_eq!(tw.visible().chars().count(), 0, "a sub-char tick reveals nothing");
+        assert_eq!(
+            tw.visible().chars().count(),
+            0,
+            "a sub-char tick reveals nothing"
+        );
         tw.set_elapsed(Duration::from_millis(3));
         tw.tick();
-        assert_eq!(tw.visible().chars().count(), 1, "the carry adds up across ticks");
+        assert_eq!(
+            tw.visible().chars().count(),
+            1,
+            "the carry adds up across ticks"
+        );
     }
 
     #[test]
