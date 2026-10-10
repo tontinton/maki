@@ -1,19 +1,42 @@
 use crate::components::Overlay;
+use crate::components::keybindings::Bind;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
+use crate::theme;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_providers::{Message, Role};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
+use ratatui::text::{Line, Span};
 
 const TITLE: &str = " Rewind ";
 const PREVIEW_MAX_LEN: usize = 80;
 pub(crate) const NO_TURNS_MSG: &str = "No user turns to rewind to";
+const FORK_KEY: Bind = Bind {
+    code: KeyCode::Char('f'),
+    modifiers: KeyModifiers::CONTROL,
+    label: "Ctrl+F",
+};
+
+fn footer_line() -> Line<'static> {
+    let t = theme::current();
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled("Enter", t.keybind_key),
+        Span::styled(" rewind", t.tool_dim),
+        Span::raw(" "),
+        Span::styled("Ctrl+F", t.keybind_key),
+        Span::styled(" fork", t.tool_dim),
+        Span::raw(" "),
+    ])
+    .right_aligned()
+}
 
 pub enum RewindPickerAction {
     Consumed,
     Select(RewindEntry),
+    Fork(RewindEntry),
     Close,
 }
 
@@ -36,7 +59,7 @@ pub struct RewindPicker {
 impl RewindPicker {
     pub fn new() -> Self {
         Self {
-            picker: ListPicker::new(),
+            picker: ListPicker::new().with_footer_builder(footer_line),
         }
     }
 
@@ -104,6 +127,12 @@ impl RewindPicker {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> RewindPickerAction {
+        if FORK_KEY.matches(key) {
+            return match self.picker.take_selected() {
+                Some(entry) => RewindPickerAction::Fork(entry),
+                None => RewindPickerAction::Consumed,
+            };
+        }
         match self.picker.handle_key(key) {
             PickerAction::Consumed => RewindPickerAction::Consumed,
             PickerAction::Select(entry) => RewindPickerAction::Select(entry),
@@ -249,5 +278,18 @@ mod tests {
         picker.open(&msgs).unwrap();
         let top = picker.picker.selected_item().unwrap();
         assert!(top.label().starts_with("2: second"));
+    }
+
+    #[test]
+    fn fork_key_takes_the_selected_entry_and_closes() {
+        let mut picker = RewindPicker::new();
+        picker
+            .open(&[user_msg("first"), assistant_msg(), user_msg("second")])
+            .unwrap();
+        match picker.handle_key(FORK_KEY.to_key_event()) {
+            RewindPickerAction::Fork(entry) => assert_eq!(entry.turn_index, 2),
+            _ => panic!("Ctrl+F commits the selection as a fork"),
+        }
+        assert!(!picker.is_open(), "committing a fork closes the picker");
     }
 }

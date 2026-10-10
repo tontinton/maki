@@ -1084,6 +1084,7 @@ impl App {
             return Some(match self.rewind_picker.handle_key(key) {
                 RewindPickerAction::Consumed => vec![],
                 RewindPickerAction::Select(entry) => self.rewind_to(entry),
+                RewindPickerAction::Fork(entry) => self.fork_to(entry),
                 RewindPickerAction::Close => vec![],
             });
         }
@@ -1849,6 +1850,7 @@ impl App {
                 }
             }
             "/new" => self.reset_session(),
+            "/fork" => self.fork_session(),
             "/queue" => {
                 self.queue.set_focus();
                 vec![]
