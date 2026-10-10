@@ -208,27 +208,13 @@ impl App {
         } else if self.pack_review.is_open() {
             self.pack_review.view(frame, layout.bottom_area);
         } else if !self.chat_accepts_input() {
-            let panel_reqs = self.float_mgr.panel_reqs();
-            let panel_h: u16 = panel_reqs.iter().map(|(_, h)| *h).sum();
-            let sep_area = if panel_h > 0 {
-                let [panels, sep] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
-                    .areas(layout.bottom_area);
-                let constraints: Vec<_> = panel_reqs
-                    .iter()
-                    .map(|&(_, h)| Constraint::Length(h))
-                    .collect();
-                let areas = Layout::vertical(constraints).split(panels);
-                for (i, &(idx, _)) in panel_reqs.iter().enumerate() {
-                    self.float_mgr.view_panel(frame, idx, areas[i]);
-                }
-                sep
-            } else {
-                layout.bottom_area
-            };
+            for &(idx, rect) in &layout.panel_windows {
+                self.float_mgr.view_panel(frame, idx, rect);
+            }
             let sep = Block::default()
                 .borders(Borders::TOP)
                 .border_style(self.separator_style());
-            frame.render_widget(sep, sep_area);
+            frame.render_widget(sep, layout.input_area);
         } else if self.plan_form_active() {
             self.plan_form.view(frame, layout.bottom_area);
         } else if layout.bottom_area.height > 0 {

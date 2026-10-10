@@ -6610,6 +6610,35 @@ fn panels_stack_on_their_side_of_the_input_box() {
     );
 }
 
+/// The chat of a finished subagent has no input box, only a separator line,
+/// and a below panel still belongs under that line.
+#[test]
+fn below_panel_sits_under_the_separator_of_a_finished_subagent() {
+    let mut app = app_with_subagent();
+    finish_subagent_task(&mut app, false);
+    app.run_builtin(BuiltinAction::NextChat);
+    assert!(!app.chat_accepts_input());
+
+    open_panel(&mut app, PanelPosition::AboveInput, ABOVE_PANEL_MARK);
+    open_panel(&mut app, PanelPosition::BelowInput, BELOW_PANEL_MARK);
+    let (_msg, bottom, status, _input, _splits) = app.layout_geometry(TEST_AREA);
+    let (_cursor, buffer) = draw_to_buffer(&mut app);
+    let above_row = row_with(&buffer, ABOVE_PANEL_MARK).expect(PANEL_DRAWN);
+    let below_row = row_with(&buffer, BELOW_PANEL_MARK).expect(PANEL_DRAWN);
+
+    assert_eq!(above_row, bottom.y, "above panel opens the bottom area");
+    assert_eq!(
+        below_row,
+        above_row + PANEL_EXTENT + 1,
+        "below panel comes after the separator row",
+    );
+    assert_eq!(
+        below_row + PANEL_EXTENT,
+        status.y,
+        "below panel ends on the status bar"
+    );
+}
+
 #[test]
 fn form_hides_below_panel_with_the_input_box() {
     let mut app = test_app();
