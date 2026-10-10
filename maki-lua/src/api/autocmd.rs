@@ -198,8 +198,9 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
 ///   plus `data.previous_spec`. Picking the model already in use stays
 ///   quiet, and so does startup.
-/// - `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
-///   chat input as `maki.ui.input` reports it. `data.source` is the plugin
+/// - `"InputChanged"`: `data.text`, `data.cursor`, `data.version` and
+///   `data.vim_mode`, the chat input as `maki.ui.input` reports it. A change
+///   of vim mode alone fires nothing. `data.source` is the plugin
 ///   name when that plugin's `maki.ui.input_edit` was the only writer this
 ///   frame, and nil otherwise (including when the user moved the caret), so
 ///   ignoring your own name never drops a change. `data.cursor_only` is true

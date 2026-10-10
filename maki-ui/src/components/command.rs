@@ -112,6 +112,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         bang: false,
     },
     BuiltinCommand {
+        name: "/vim",
+        description: "Toggle vim keys in the chat input",
+        max_args: 0,
+        bang: false,
+    },
+    BuiltinCommand {
         name: "/exit",
         description: "Exit the application",
         max_args: 0,

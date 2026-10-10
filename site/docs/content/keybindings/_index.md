@@ -56,6 +56,30 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `↑` / `↓` | Navigate input history |
 | `Esc Esc` | Cancel agent |
 
+## Vim Normal Mode
+
+Vim mode is off by default. `/vim` turns it on or off and Maki keeps that choice for the next start. To turn it on in the config, set `ui.vim_mode = true`. A new prompt starts in insert mode, where every Editing key above works as usual. The input border shows `NORMAL` or `INSERT`. A plugin binding on a plain key, such as `j`, still wins over vim in normal mode.
+
+| Key | Action |
+|-----|--------|
+| `Esc` | Leave insert mode / cancel a half-typed command |
+| `h j k l` | Move left / down / up / right |
+| `w b e` | Next word / previous word / end of word |
+| `0 ^ $` | Line start / first non-blank / line end |
+| `gg G` | First line / last line |
+| `k` / `j` | Navigate input history from the first / last line |
+| `i a I A` | Insert before / after the cursor, at the line start / end |
+| `o O` | Open a line below / above |
+| `x X` | Delete the character under / before the cursor |
+| `d c y + motion` | Delete / change / yank over a motion |
+| `dd cc yy` | Delete / change / yank the line |
+| `D C` | Delete / change to the line end |
+| `s S Y` | Change the character / change the line / yank the line |
+| `p P` | Paste after / before the cursor |
+| `u` / `Ctrl+R` | Undo / redo |
+| `Enter` | Submit prompt |
+| `Esc Esc` | Rewind, or cancel the agent while it runs |
+
 ## Form
 
 | Key | Action |

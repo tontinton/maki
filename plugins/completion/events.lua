@@ -19,6 +19,13 @@ Events.PLUGIN = "completion"
 -- refresh below reads nothing back and the rows answer the keystroke a round
 -- trip sooner.
 function Events.input_changed(data)
+  -- Vim normal mode types nothing, so no mention can be under way, and a
+  -- popup left up would hold the `<CR>` and `<Esc>` that normal mode needs.
+  -- A `x` next to an `@` must not open one either.
+  if data.vim_mode == "normal" then
+    Menu.close()
+    return
+  end
   -- An accept is an `input_edit`, which fires an `InputChanged` of its own
   -- naming this plugin. Acting on it would reopen the popup on the path it
   -- just inserted. The host stamps the name only on a frame this plugin wrote

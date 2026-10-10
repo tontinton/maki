@@ -819,6 +819,51 @@ case("events_let_a_caret_move_close_a_popup_that_is_up", function()
   end)
 end)
 
+-- `x` beside an `@` in vim normal mode changes the text right under a
+-- mention, and still nothing is being typed into it.
+case("events_open_no_popup_in_vim_normal_mode", function()
+  harness(function()
+    Events.input_changed({
+      text = INPUT.text,
+      cursor = INPUT.cursor,
+      version = INPUT.version,
+      session_id = SESSION,
+      vim_mode = "normal",
+    })
+    eq(Menu.session_id(), nil, "normal mode types nothing, so nothing opens")
+  end)
+end)
+
+case("events_close_a_popup_when_vim_leaves_insert_mode", function()
+  harness(function(hh)
+    Menu.refresh(hh.input)
+    eq(Menu.session_id(), SESSION)
+
+    Events.input_changed({
+      text = INPUT.text,
+      cursor = INPUT.cursor - 1,
+      version = INPUT.version,
+      session_id = SESSION,
+      cursor_only = true,
+      vim_mode = "normal",
+    })
+    eq(Menu.session_id(), nil, "the popup would hold keys normal mode needs")
+  end)
+end)
+
+case("events_still_open_a_popup_in_vim_insert_mode", function()
+  harness(function()
+    Events.input_changed({
+      text = INPUT.text,
+      cursor = INPUT.cursor,
+      version = INPUT.version,
+      session_id = SESSION,
+      vim_mode = "insert",
+    })
+    eq(Menu.session_id(), SESSION, "insert mode is the regular editor")
+  end)
+end)
+
 case("events_close_a_popup_when_another_tab_takes_focus", function()
   harness(function(hh)
     Menu.refresh(hh.input)

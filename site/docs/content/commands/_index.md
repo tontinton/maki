@@ -27,6 +27,7 @@ Type `/` in the input box to open the command palette.
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |
 | `/fast` | Toggle fast mode (Anthropic Opus or Codex subscription models) |
 | `/workflow` | Toggle workflow mode (task callable inside code_execution) |
+| `/vim` | Toggle vim keys in the chat input |
 | `/exit` | Exit the application |
 | `/reload` | Reload plugins and config |
 | `/trust` | Trust this folder and load its shared project config |
@@ -48,6 +49,7 @@ Sessions run concurrently. `/new` starts a fresh session while the old one keeps
 - **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker that shows what each level costs in tokens. With an argument it sets the level directly: `off`, `adaptive`, `minimal` to `max`, or a token budget. New sessions start at the last level you set, in `-p`, SDK and ACP too. Config: `always_thinking` pins a level.
 - **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`.
 - **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.
+- **`/vim`**: vim keys in the chat input, for every tab. Maki keeps the choice for the next start. Config: `ui.vim_mode = true`. See [Keybindings](/docs/keybindings/#vim-normal-mode) for the keys.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).
 - **`/reload`**: rebuild plugins and config without leaving the app.
 - **`/btw`**: one-shot side question with no tools and no history pollution.

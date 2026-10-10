@@ -124,7 +124,14 @@ fn build_app_with_lua(
     lua_commands: LuaCommandReader,
 ) -> App {
     let tab = OpenSession::fresh(TEST_MODEL_SPEC, TEST_CWD, &dir);
-    build_app_with_session(dir, writer, lua_commands, tab, test_permissions(false))
+    build_app_with_session(
+        dir,
+        writer,
+        lua_commands,
+        tab,
+        test_permissions(false),
+        UiConfig::default(),
+    )
 }
 
 fn test_permissions(yolo: bool) -> Arc<PermissionManager> {
@@ -145,6 +152,7 @@ fn build_app_with_session(
     lua_commands: LuaCommandReader,
     tab: OpenSession,
     permissions: Arc<PermissionManager>,
+    ui_config: UiConfig,
 ) -> App {
     // Mirrors the event loop, where the session's own spec decides and the
     // startup model catches one that will not resolve.
@@ -160,7 +168,7 @@ fn build_app_with_session(
         KeymapReader::empty(),
         HintReader::empty(),
         writer,
-        UiConfig::default(),
+        ui_config,
         100,
         permissions,
         Arc::from([]),
@@ -180,13 +188,36 @@ pub(crate) fn test_app() -> App {
     )
 }
 
+/// A tab built from {ui_config}, the config the event loop hands every tab it
+/// spawns.
+pub(crate) fn app_with_ui_config(ui_config: UiConfig) -> App {
+    let dir = tmp_state();
+    let writer = Arc::new(test_writer(dir.clone()));
+    let tab = tmp_tab(AppSession::new(TEST_MODEL_SPEC, TEST_CWD));
+    build_app_with_session(
+        dir,
+        writer,
+        LuaCommandReader::empty(),
+        tab,
+        test_permissions(false),
+        ui_config,
+    )
+}
+
 /// A tab the way `Ctrl-N` and a resume build one. `App::new` takes the session
 /// plus a fork of the prototype manager, and everything the permissions do has
 /// to come back out of that meta.
 fn spawned_app(tab: OpenSession, permissions: Arc<PermissionManager>) -> App {
     let dir = tmp_state();
     let writer = Arc::new(test_writer(dir.clone()));
-    let mut app = build_app_with_session(dir, writer, LuaCommandReader::empty(), tab, permissions);
+    let mut app = build_app_with_session(
+        dir,
+        writer,
+        LuaCommandReader::empty(),
+        tab,
+        permissions,
+        UiConfig::default(),
+    );
     let (shared_queue, _rx) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
@@ -2714,7 +2745,8 @@ fn input_snapshot_offsets_are_byte_offsets() {
 
 /// The line and column the cursor sits on are a slice of `text` and `cursor`,
 /// so Lua takes them for itself. A field is forever once it ships, and these
-/// two would have to be kept in step with a buffer that already answers.
+/// two would have to be kept in step with a buffer that already answers. The
+/// vim mode is no slice of anything, so it is there.
 #[test]
 fn input_snapshot_carries_nothing_a_slice_would_give() {
     const DRAFT: &str = "first\nsecond";
@@ -2729,6 +2761,7 @@ fn input_snapshot_carries_nothing_a_slice_would_give() {
             "text": DRAFT,
             "cursor": DRAFT.len(),
             "version": app.input_box.buffer.version(),
+            "vim_mode": null,
         })
     );
 }
@@ -3459,6 +3492,18 @@ fn help_modal_consumes_keys_and_esc_closes() {
     &[KeybindContext::RewindPicker],
     &[KeybindContext::Editing]
     ; "rewind_picker"
+)]
+#[test_case(
+    |app: &mut App| { app.input_box.set_vim_enabled(true); },
+    &[KeybindContext::Editing],
+    &[KeybindContext::Vim]
+    ; "vim_insert_mode"
+)]
+#[test_case(
+    |app: &mut App| { app.input_box.set_vim_enabled(true); app.update(Msg::Key(key(KeyCode::Esc))); },
+    &[KeybindContext::Editing, KeybindContext::Vim],
+    &[]
+    ; "vim_normal_mode"
 )]
 fn active_contexts(setup: fn(&mut App), expected: &[KeybindContext], absent: &[KeybindContext]) {
     let mut app = test_app();
@@ -5433,6 +5478,186 @@ fn the_first_esc_arms_the_streaming_cancel_with_no_popup_up() {
 
     assert!(app.last_esc.is_some(), "the cancel is armed");
     assert_eq!(app.status, Status::Streaming, "and not taken in one press");
+}
+
+fn vim_app() -> App {
+    let mut app = test_app();
+    app.input_box.set_vim_enabled(true);
+    app.status_bar.flash_duration = WAIT_AHEAD;
+    app
+}
+
+fn press_esc(app: &mut App) -> Vec<Action> {
+    app.update(Msg::Key(key(KeyCode::Esc)))
+}
+
+/// The `Esc` that leaves insert mode is vim's. Counting it towards the double
+/// `Esc` would cancel a turn the user only meant to stop typing over.
+#[test]
+fn vim_esc_from_insert_mode_while_streaming_neither_cancels_nor_arms() {
+    let mut app = vim_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    assert!(press_esc(&mut app).is_empty());
+    assert_eq!(app.input_box.vim_mode(), Some(VimMode::Normal));
+    assert!(app.last_esc.is_none(), "leaving insert mode arms nothing");
+
+    press_esc(&mut app);
+    assert!(app.last_esc.is_some(), "the first Esc in normal mode arms");
+    let actions = press_esc(&mut app);
+    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
+}
+
+#[test]
+fn vim_double_esc_in_normal_mode_opens_rewind() {
+    let mut app = vim_app();
+    app.state
+        .session_mut()
+        .push_message(Message::user("hello".into()));
+
+    press_esc(&mut app);
+    press_esc(&mut app);
+    assert!(
+        !app.rewind_picker.is_open(),
+        "insert mode spent the first Esc"
+    );
+    press_esc(&mut app);
+    assert!(app.rewind_picker.is_open());
+}
+
+/// `Esc` `i` `Esc` is a trip into insert mode and back, so the press after it
+/// arms rewind again instead of opening it.
+#[test]
+fn vim_a_key_between_two_escs_disarms_rewind() {
+    let mut app = vim_app();
+    app.state
+        .session_mut()
+        .push_message(Message::user("hello".into()));
+    press_esc(&mut app);
+    press_esc(&mut app);
+    assert!(app.last_esc.is_some());
+
+    app.update(Msg::Key(key(KeyCode::Char('i'))));
+    press_esc(&mut app);
+    press_esc(&mut app);
+    assert!(!app.rewind_picker.is_open());
+    assert!(app.last_esc.is_some(), "the last Esc armed it afresh");
+}
+
+/// A binding on `<Esc>` would leave the user stuck in insert mode, so vim's
+/// `Esc` never reaches it. An idle normal mode has no use for the key, and
+/// the binding gets it back.
+#[test]
+fn vim_an_esc_binding_never_takes_the_esc_vim_needs() {
+    let mut app = vim_app();
+    let probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+    press_esc(&mut app);
+    assert!(
+        probe.try_recv_keybind().is_none(),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
+    assert_eq!(app.input_box.vim_mode(), Some(VimMode::Normal));
+
+    press_esc(&mut app);
+    assert!(probe.try_recv_keybind().is_some(), "{OVERRIDE_DISPATCHED}");
+}
+
+/// The completion popup claims `<Esc>`, so the first `Esc` in insert mode is
+/// the popup's. The claim goes with the window, and the next `Esc` leaves
+/// insert mode.
+#[test]
+fn vim_a_popup_claiming_esc_answers_before_insert_mode_does() {
+    let mut app = vim_app();
+    let (events, cmd_tx) = open_claiming_popup(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+    press_esc(&mut app);
+    assert!(took_a_key(&events), "{CLAIM_DELIVERED}");
+    assert_eq!(
+        app.input_box.vim_mode(),
+        Some(VimMode::Insert),
+        "the popup spent the first Esc"
+    );
+
+    drop(cmd_tx);
+    let _ = app.float_mgr.tick();
+    press_esc(&mut app);
+    assert_eq!(app.input_box.vim_mode(), Some(VimMode::Normal));
+}
+
+/// The other tabs, the tabs opened later and the next start follow through
+/// the action, which `set_vim_mode` in the event loop answers.
+#[test]
+fn vim_command_toggles_this_tab_and_sends_the_mode_on() {
+    let mut app = test_app();
+
+    let actions = type_and_submit(&mut app, "/vim");
+    assert!(matches!(actions[..], [Action::SetVimMode(true)]));
+    assert_eq!(app.input_box.vim_mode(), Some(VimMode::Insert));
+    assert_eq!(app.status_bar.flash_text(), Some(VIM_ON_MSG));
+
+    let actions = app.execute_command(cmd("/vim"), 0);
+    assert!(matches!(actions[..], [Action::SetVimMode(false)]));
+    assert_eq!(app.input_box.vim_mode(), None);
+    assert_eq!(app.status_bar.flash_text(), Some(VIM_OFF_MSG));
+}
+
+/// With an empty draft, `/` in normal mode types itself and opens the
+/// palette, which is how `/vim` turns vim off without going through `i`.
+#[test]
+fn vim_slash_in_normal_mode_opens_the_palette() {
+    let mut app = vim_app();
+    press_esc(&mut app);
+
+    type_slash(&mut app);
+    assert!(app.command_palette.is_active());
+    assert_eq!(app.input_box.vim_mode(), Some(VimMode::Insert));
+}
+
+#[test]
+fn vim_ctrl_c_clears_into_insert_mode() {
+    let mut app = vim_app();
+    app.update(Msg::Key(key(KeyCode::Char('x'))));
+    press_esc(&mut app);
+
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(app.input_box.is_empty());
+    assert_eq!(app.input_box.vim_mode(), Some(VimMode::Insert));
+}
+
+#[test]
+fn vim_mode_reaches_plugins() {
+    let mut app = test_app();
+    assert_eq!(app.input_snapshot()["vim_mode"], serde_json::Value::Null);
+
+    app.input_box.set_vim_enabled(true);
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+    assert_eq!(
+        app.input_snapshot()["vim_mode"],
+        serde_json::json!("insert")
+    );
+
+    app.update(Msg::Key(key(KeyCode::Char('a'))));
+    app.update(Msg::Key(key(KeyCode::Char('b'))));
+    let _ = app.tick();
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert_eq!(data["vim_mode"], serde_json::json!("insert"));
+
+    press_esc(&mut app);
+    let _ = app.tick();
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert_eq!(
+        data["cursor_only"],
+        serde_json::json!(true),
+        "Esc moved the cursor one left"
+    );
+    assert_eq!(data["vim_mode"], serde_json::json!("normal"));
+    assert_eq!(
+        app.input_snapshot()["vim_mode"],
+        serde_json::json!("normal")
+    );
 }
 
 /// The list a plugin is refused and the list the host answers itself are one
