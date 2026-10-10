@@ -596,6 +596,11 @@ async fn session(
     let cancel_slot = agent_ctx
         .subagent_cancels
         .insert(ui_id.clone(), child_trigger);
+    let cancellation = Arc::new(SessionCancellation {
+        parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
+        ui_id,
+        slot: cancel_slot,
+    });
 
     let name = name.unwrap_or_default();
     info!(name = %name, model = %model.id, "subagent session opened");
@@ -616,7 +621,7 @@ async fn session(
             tool_output_lines: maki_config::ToolOutputLines::default(),
             permissions: Arc::clone(&agent_ctx.permissions),
             session_id: agent_ctx.session_id.clone(),
-            task_id: Some(Arc::from(ui_id.as_str())),
+            task_id: Some(Arc::from(cancellation.ui_id.as_str())),
             mailbox: None,
             timeouts: agent_ctx.timeouts,
             // Shared with the parent, not fresh: a lock that a subagent does
@@ -648,9 +653,7 @@ async fn session(
         answer_tx: Some(answer_tx),
         reauth: agent_ctx.reauth,
         inbox: Arc::new(SubagentInbox::default()),
-        parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
-        ui_id,
-        cancel_slot,
+        cancellation: Arc::clone(&cancellation),
         parent_event_tx: parent_tx,
         subagent_info,
         local_tools: Arc::new(local_map),
@@ -663,6 +666,7 @@ async fn session(
 
     let sess = lua.create_userdata(LuaSession {
         inner: Arc::new(AsyncMutex::new(state)),
+        cancellation,
     })?;
     Ok((Some(sess), None))
 }
@@ -780,13 +784,7 @@ struct SessionState {
     /// Shared with the host through [`SubagentInfo`], so a user watching this
     /// session can queue messages that its next turn boundary picks up.
     inbox: Arc<SubagentInbox>,
-    parent_cancels: Arc<CancelMap<String>>,
-    /// Stable identity for UI, cancel, and history. Falls back to a synthetic
-    /// id for workflow-mode sessions (no model-issued tool call exists).
-    /// Shared with any sibling session the same tool call opened.
-    ui_id: String,
-    /// Which registration under [`ui_id`](Self::ui_id) is ours.
-    cancel_slot: CancelSlot,
+    cancellation: Arc<SessionCancellation>,
     parent_event_tx: EventSender,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     local_tools: LocalTools,
@@ -804,10 +802,10 @@ impl SessionState {
         }
         self.closed = true;
         self.stream_guard.take();
-        self.parent_cancels.retire(&self.ui_id, self.cancel_slot);
+        self.cancellation.cancel();
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
         let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
-            tool_use_id: self.ui_id.clone(),
+            tool_use_id: self.cancellation.ui_id.clone(),
             messages,
         });
         info!(
@@ -822,10 +820,30 @@ impl SessionState {
 
 struct LuaSession {
     inner: Arc<AsyncMutex<SessionState>>,
+    cancellation: Arc<SessionCancellation>,
+}
+
+struct SessionCancellation {
+    parent_cancels: Arc<CancelMap<String>>,
+    ui_id: String,
+    slot: CancelSlot,
+}
+
+impl SessionCancellation {
+    fn cancel(&self) {
+        self.parent_cancels.retire(&self.ui_id, self.slot);
+    }
+}
+
+impl Drop for SessionCancellation {
+    fn drop(&mut self) {
+        self.cancel();
+    }
 }
 
 impl Drop for LuaSession {
     fn drop(&mut self) {
+        self.cancellation.cancel();
         match self.inner.try_lock() {
             Some(mut s) => s.close(),
             // Prompt still in flight: close asynchronously so history
@@ -871,7 +889,7 @@ async fn prompt(
     }
     if s.subagent_info.get().is_none() {
         let _ = s.subagent_info.set(SubagentInfo {
-            parent_tool_use_id: s.ui_id.clone(),
+            parent_tool_use_id: s.cancellation.ui_id.clone(),
             name: s.name.clone(),
             prompt: Some(message.clone()),
             model: Some(s.params.model.spec()),
@@ -1001,6 +1019,17 @@ async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> 
     Ok(())
 }
 
+/// Stop this session without waiting for an active prompt. That prompt returns
+/// a cancelled error and any partial text. Future prompts also return cancelled.
+/// Calling this more than once is safe. Call `:close()` to flush the history.
+///
+/// @return
+#[lua_fn]
+fn cancel(_lua: &Lua, this: &LuaSession) -> LuaResult<()> {
+    this.cancellation.cancel();
+    Ok(())
+}
+
 lua_class! {
     /// A subagent session with its own conversation history.
     ///
@@ -1011,7 +1040,7 @@ lua_class! {
     /// Always call `:close()` when you are done, on error paths too. The
     /// garbage collector is a fallback that may never run while the VM sits
     /// idle, so a session you only drop can stay open for the rest of the run.
-    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close]
+    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close, cancel]
 }
 
 /// Weak Lua ref avoids a reference cycle when the session is stored in userdata.
@@ -1028,11 +1057,181 @@ fn call_local_tool(
 
 #[cfg(test)]
 mod tests {
+    use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::{DoneReason, TurnCompleteEvent};
-    use maki_providers::Message;
+    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::{AgentError, Message, ModelInfo, ProviderEvent, StreamResponse};
+    use maki_storage::id::SessionRef;
+    use mlua::AnyUserData;
     use serde_json::json;
+    use test_case::test_case;
 
     use super::*;
+
+    const SESSION_PROMPT: &str = "work until cancelled";
+    const PARTIAL_TEXT: &str = "partial response";
+    const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
+    const CANCEL_SESSION: &str = "function(sess) sess:cancel() end";
+
+    struct PendingProvider(flume::Sender<()>);
+
+    impl Provider for PendingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a JsonValue,
+            events: &'a flume::Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                events
+                    .send(ProviderEvent::TextDelta {
+                        text: PARTIAL_TEXT.into(),
+                    })
+                    .unwrap();
+                self.0.send(()).unwrap();
+                std::future::pending().await
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    async fn native_session(lua: &Lua, ctx: &ToolContext) -> AnyUserData {
+        let ctx = lua.create_userdata(LuaCtx::handler(ctx)).unwrap();
+        let (session, error) = session(
+            lua.clone(),
+            ctx.borrow().unwrap(),
+            lua.create_table().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        session.unwrap()
+    }
+
+    #[test_case(false ; "cancel_during_prompt")]
+    #[test_case(true ; "drop_during_prompt")]
+    fn session_cancellation_does_not_wait_for_the_prompt_lock(drop_session: bool) {
+        let lua = Lua::new();
+        let (started_tx, started_rx) = flume::unbounded();
+        let (event_tx, events) = flume::unbounded();
+        let event_tx = EventSender::new(event_tx, RUN_ID);
+        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(PARENT_ID));
+        ctx.provider = Arc::new(PendingProvider(started_tx));
+        smol::block_on(futures_lite::future::or(
+            async {
+                let sess = native_session(&lua, &ctx).await;
+                let (result, ()) = futures::future::join(
+                    prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into()),
+                    async {
+                        started_rx.recv_async().await.unwrap();
+                        if drop_session {
+                            drop(sess.take::<LuaSession>().unwrap());
+                        } else {
+                            let cancel: Function = lua.load(CANCEL_SESSION).eval().unwrap();
+                            cancel.call::<()>(sess.clone()).unwrap();
+                            cancel.call::<()>(sess.clone()).unwrap();
+                        }
+                    },
+                )
+                .await;
+                let (partial, error) = result.unwrap();
+                assert_eq!(error.as_deref(), Some(CANCELLED_MSG));
+                assert!(
+                    partial
+                        .unwrap()
+                        .get::<String>("text")
+                        .unwrap()
+                        .starts_with(PARTIAL_TEXT)
+                );
+                if !drop_session {
+                    let (_, error) =
+                        prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into())
+                            .await
+                            .unwrap();
+                    assert_eq!(error.as_deref(), Some(CANCELLED_MSG));
+                    assert!(started_rx.is_empty());
+                    close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+                    close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+                }
+                loop {
+                    if let AgentEvent::SubagentHistory {
+                        tool_use_id,
+                        messages,
+                    } = events.recv_async().await.unwrap().event
+                    {
+                        assert_eq!(tool_use_id, PARENT_ID);
+                        assert!(messages.iter().any(|message| {
+                            matches!(message.role, Role::Assistant)
+                                && message.content.iter().any(|block| {
+                                    matches!(block, ContentBlock::Text { text } if text.starts_with(PARTIAL_TEXT))
+                                })
+                        }));
+                        break;
+                    }
+                }
+                assert!(
+                    !events
+                        .try_iter()
+                        .any(|event| matches!(event.event, AgentEvent::SubagentHistory { .. }))
+                );
+            },
+            async {
+                smol::Timer::after(SESSION_TIMEOUT).await;
+                panic!("session cancellation waited for the active prompt");
+            },
+        ));
+    }
+
+    #[test_case(false ; "cancel_before_first_prompt")]
+    #[test_case(true ; "cancel_after_close")]
+    fn cancelling_a_session_leaves_its_siblings_running(close_first: bool) {
+        let lua = Lua::new();
+        let ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        smol::block_on(async {
+            let first = native_session(&lua, &ctx).await;
+            let sibling = native_session(&lua, &ctx).await;
+            if close_first {
+                close(lua.clone(), first.borrow().unwrap()).await.unwrap();
+            }
+            let replacement = native_session(&lua, &ctx).await;
+
+            let cancel: Function = lua.load(CANCEL_SESSION).eval().unwrap();
+            cancel.call::<()>(first.clone()).unwrap();
+            cancel.call::<()>(first.clone()).unwrap();
+            let (_, error) = prompt(lua.clone(), first.borrow().unwrap(), SESSION_PROMPT.into())
+                .await
+                .unwrap();
+            assert_eq!(
+                error.as_deref(),
+                Some(if close_first {
+                    SESSION_CLOSED_ERR
+                } else {
+                    CANCELLED_MSG
+                })
+            );
+
+            for session in [sibling, replacement] {
+                assert!(
+                    !session
+                        .borrow::<LuaSession>()
+                        .unwrap()
+                        .inner
+                        .lock()
+                        .await
+                        .child_cancel
+                        .is_cancelled()
+                );
+                close(lua.clone(), session.borrow().unwrap()).await.unwrap();
+            }
+        });
+    }
 
     fn call(src: &str, input: JsonValue) -> Result<String, String> {
         let lua = Lua::new();

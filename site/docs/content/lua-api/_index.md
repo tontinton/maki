@@ -1520,6 +1520,18 @@ Close on every path, error paths included. Dropping the session instead
 leaves the work to the Lua garbage collector, which may never run while
 the VM sits idle, and the subagent's event relay stays alive until it does.
 
+---
+
+### `Session:cancel()` {#Session-cancel}
+
+```lua
+Session:cancel()
+```
+
+Stop this session without waiting for an active prompt. That prompt returns
+a cancelled error and any partial text. Future prompts also return cancelled.
+Calling this more than once is safe. Call `:close()` to flush the history.
+
 
 ## maki.async {#maki-async}
 
