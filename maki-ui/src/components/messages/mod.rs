@@ -10,7 +10,7 @@ mod tests;
 pub use self::scroll::ScrollPos;
 
 use self::render::RenderCursor;
-use self::scroll::{Layout, TailPart};
+use self::scroll::Layout;
 use self::segment::{Segment, SegmentCache};
 
 use super::tool_display::{
@@ -84,9 +84,6 @@ pub struct MessagesPanel {
     viewport_height: u16,
     viewport_width: u16,
     cache: SegmentCache,
-    /// The streaming tail the last `view` drew, in the order it drew it. Lets
-    /// the row walk and clicks address the tail between frames.
-    tail: Vec<(TailPart, u16)>,
     hl_worker: RenderWorker,
     image_picker: Option<Picker>,
     inline_images: bool,
@@ -126,6 +123,11 @@ pub struct MessagesPanel {
     /// plugin files the call where the live one went.
     session_id: Option<SessionRef>,
     task_id: Option<Arc<str>>,
+    /// Index where the trailing live streaming segments begin, so they can be
+    /// dropped next frame. They are rebuilt each frame and removed before the
+    /// next build; a commit can append a cached segment after them in between,
+    /// so this is their start rather than a count from the end.
+    live_start: usize,
 }
 
 impl MessagesPanel {
@@ -153,7 +155,6 @@ impl MessagesPanel {
             viewport_height: 24,
             viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
             cache: SegmentCache::new(),
-            tail: Vec::new(),
             hl_worker: RenderWorker::new(),
             image_picker: terminal_image::picker(ui_config.inline_images),
             inline_images: ui_config.inline_images,
@@ -178,6 +179,7 @@ impl MessagesPanel {
             last_reveal: Instant::now(),
             session_id: None,
             task_id: None,
+            live_start: 0,
         }
     }
 
@@ -617,18 +619,10 @@ impl MessagesPanel {
         self.flush_thinking();
         self.prompt_progress = None;
         if !self.streaming_text.is_empty() {
-            // Rows the typewriter had actually revealed. The buffer may hold
-            // more, and that remainder becomes a cached segment the cursor
-            // paces, so advancing by the whole buffer would dump text that was
-            // never typed. Advance by what was on screen and let the cursor
-            // finish the rest.
-            let shown = wrap::total_rows(
-                self.streaming_text.render_lines(self.viewport_width),
-                self.viewport_width,
-            );
-            if self.revealed_rows.is_finite() {
-                self.revealed_rows += f64::from(shown);
-            }
+            // The live segment already shows this text, so the message takes
+            // its place at the same rows next frame and the cursor does not
+            // move. Committing the buffer here is what used to dump whatever
+            // the typewriter had not revealed.
             self.messages.push(DisplayMessage::new(
                 DisplayRole::Assistant,
                 self.streaming_text.take_all(),
@@ -637,12 +631,7 @@ impl MessagesPanel {
     }
 
     fn layout(&self) -> Layout<'_> {
-        Layout::new(
-            &self.cache,
-            &self.tail,
-            self.viewport_width,
-            self.revealed_rows as u32,
-        )
+        Layout::new(&self.cache, self.viewport_width, self.revealed_rows as u32, self.live_start)
     }
 
     /// Positive scrolls up. Clamping is immediate rather than deferred to the
@@ -721,11 +710,14 @@ impl MessagesPanel {
             .layout()
             .advance(self.scroll, u32::from(row.saturating_sub(area.y)));
         let width = self.viewport_width;
-        // Both fallbacks toggle thinking: a position past the cached segments
-        // belongs to the still-streaming indicator, and a segment without a
-        // tool_id is a finished message's text.
-        let Some(seg) = self.cache.get(pos.seg) else {
+        // A position in the live segments belongs to the streaming indicator
+        // when thinking is collapsed; a segment without a tool_id is a finished
+        // message's text, which toggles the same way.
+        if pos.seg >= self.live_start {
             return self.try_toggle_collapsed_thinking(pos);
+        }
+        let Some(seg) = self.cache.get(pos.seg) else {
+            return false;
         };
         if !seg.images.is_empty() && pos.row >= seg.text_height(width) {
             return false;
@@ -984,9 +976,10 @@ impl MessagesPanel {
         }
 
         if self.show_idle_splash() {
-            // Every other exit rebuilds the tail; this one has to drop it, or
-            // `Layout` keeps answering with rows nothing draws any more.
-            self.tail.clear();
+            // Every other exit rebuilds the live segments; this one has to drop
+            // them, or `Layout` keeps answering with rows nothing draws.
+            self.cache.truncate(self.live_start);
+            self.live_start = self.cache.len();
             let accent = self.accent.resolve();
             self.idle_splash.render(area, frame.buffer_mut(), accent);
             return;
@@ -1007,6 +1000,12 @@ impl MessagesPanel {
                 assistant.prefix_style,
             );
         }
+        // Drop the live segments before the cache rebuild, so a message the
+        // flush just committed appends after the cached segments rather than
+        // after the live ones. Otherwise the live text would sit between two
+        // cached segments and survive, rendering beside the message it became.
+        self.cache.truncate(self.live_start);
+        self.live_start = self.cache.len();
         self.rebuild_line_cache();
         if self.in_progress_count() > 0 {
             self.update_spinners();
@@ -1017,7 +1016,7 @@ impl MessagesPanel {
         } else {
             Vec::new()
         };
-        self.tail = self.build_tail(width, &collapsed_thinking_lines);
+        self.rebuild_live_segments(width, &collapsed_thinking_lines);
 
         // The reflow window is picked from `scroll` and the bottom pin, and
         // the reflow changes the heights both are derived from: resolve
@@ -1063,26 +1062,6 @@ impl MessagesPanel {
         }
         self.release_images_outside(last_drawn);
 
-        let spacer_lines: [Line<'static>; 1] = [Line::default()];
-        for &(part, h) in self
-            .tail
-            .iter()
-            .skip(self.scroll.seg.saturating_sub(self.cache.len()))
-        {
-            if cursor.past_bottom() {
-                break;
-            }
-            let lines = match part {
-                TailPart::Spacer => &spacer_lines[..],
-                TailPart::Thinking if !collapsed_thinking_lines.is_empty() => {
-                    &collapsed_thinking_lines
-                }
-                TailPart::Thinking => self.streaming_thinking.cached_lines(),
-                TailPart::Text => self.streaming_text.cached_lines(),
-            };
-            cursor.render(lines, h, None, false, frame);
-        }
-
         if let Some(pp) = self.prompt_progress
             && pp.total > 0
         {
@@ -1125,33 +1104,47 @@ impl MessagesPanel {
     /// `rebuild_line_cache` uses when the turn flushes. A [`ScrollPos`] in the
     /// tail keeps pointing at the same content across that flush only while
     /// the two agree, so anything added here needs its segment there.
-    fn build_tail(
-        &mut self,
-        width: u16,
-        collapsed_thinking: &[Line<'static>],
-    ) -> Vec<(TailPart, u16)> {
-        let has_cached = self.cache.len() > 0;
-        let mut tail: Vec<(TailPart, u16)> = Vec::new();
-        // Mirrors `SegmentCache::push_spacer_if_needed`: a part is separated
-        // from whatever precedes it in the document.
-        let mut push = |part, height| {
-            if has_cached || !tail.is_empty() {
-                tail.push((TailPart::Spacer, 1));
-            }
-            tail.push((part, height));
+    /// Builds the streaming thinking and text into the cache as live segments,
+    /// replacing the ones the last frame built. Live segments carry no
+    /// `msg_index`: nothing looks them up, they exist to be drawn until the run
+    /// ends and `flush` settles them into a message.
+    fn rebuild_live_segments(&mut self, width: u16, collapsed_thinking: &[Line<'static>]) {
+        // Render first: `render_lines` ticks the typewriter and rebuilds the
+        // line cache this reads, so the segments carry the revealed text. It
+        // also borrows the streaming content, which is why the lines are
+        // collected before the cache is touched.
+        let thinking: Option<Vec<Line<'static>>> = if self.streaming_thinking_collapsed() {
+            Some(collapsed_thinking.to_vec())
+        } else if !self.streaming_thinking.is_empty() {
+            Some(self.streaming_thinking.render_lines(width).to_vec())
+        } else {
+            None
+        };
+        let text: Option<Vec<Line<'static>>> = if self.streaming_text.is_empty() {
+            None
+        } else {
+            Some(self.streaming_text.render_lines(width).to_vec())
         };
 
-        if self.streaming_thinking_collapsed() {
-            push(TailPart::Thinking, collapsed_thinking.len() as u16);
-        } else if !self.streaming_thinking.is_empty() {
-            let h = wrap::total_rows(self.streaming_thinking.render_lines(width), width);
-            push(TailPart::Thinking, h);
+        self.live_start = self.cache.len();
+
+        if let Some(lines) = thinking {
+            self.push_live(lines);
         }
-        if !self.streaming_text.is_empty() {
-            let h = wrap::total_rows(self.streaming_text.render_lines(width), width);
-            push(TailPart::Text, h);
+        if let Some(lines) = text {
+            self.push_live(lines);
         }
-        tail
+    }
+
+    /// Appends a live part, separated from whatever precedes it by a spacer,
+    /// the same rule `SegmentCache::push_spacer_if_needed` follows. Nothing
+    /// precedes the first part, so it takes no spacer: a leading blank row is
+    /// not what the stream is.
+    fn push_live(&mut self, lines: Vec<Line<'static>>) {
+        if self.cache.len() > 0 {
+            self.cache.push(Segment::spacer());
+        }
+        self.cache.push(Segment::with_lines(lines, None));
     }
 
     pub fn scroll_pos(&self) -> ScrollPos {
@@ -1470,15 +1463,11 @@ impl MessagesPanel {
         thinking_indicator(logical_line_count(text), true)
     }
 
-    /// `pos` is past the cached segments, so it names a tail part: the click
-    /// toggles only when that part is the collapsed thinking indicator.
+    /// The collapsed thinking indicator is a live segment, so a click on it
+    /// toggles the stream back open.
     fn try_toggle_collapsed_thinking(&mut self, pos: ScrollPos) -> bool {
-        let part = pos
-            .seg
-            .checked_sub(self.cache.len())
-            .and_then(|i| self.tail.get(i))
-            .map(|&(p, _)| p);
-        if part != Some(TailPart::Thinking) || !self.streaming_thinking_collapsed() {
+        let live_start = self.live_start;
+        if pos.seg < live_start || !self.streaming_thinking_collapsed() {
             return false;
         }
         self.thinking_collapsed = false;

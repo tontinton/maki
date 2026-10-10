@@ -1,18 +1,8 @@
 use super::segment::SegmentCache;
 use std::cell::OnceCell;
 
-/// One drawable part of the streaming tail, sitting where the segment that
-/// replaces it will sit once the turn flushes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum TailPart {
-    Spacer,
-    Thinking,
-    Text,
-}
-
 /// Top of the viewport as a place in the document. `seg` indexes the segment
-/// cache; indices past its end address the streaming tail, which `view` lays
-/// out in the same order the cache will hold once it flushes.
+/// cache, the one ordered list every row walk shares.
 ///
 /// Nothing here depends on the width, so a resize is not a scroll.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -21,17 +11,19 @@ pub struct ScrollPos {
     pub row: u16,
 }
 
-/// One frame's document: cached segments followed by the streaming tail.
-/// Every row walk goes through here, so both are counted the same way.
+/// One frame's document: the segment list, every row walk goes through here.
 pub(super) struct Layout<'a> {
     cache: &'a SegmentCache,
-    tail: &'a [(TailPart, u16)],
     width: u16,
     /// Rows the document may show, counted from the top. A part shows the rows
     /// the cursor has reached and no more, so a part below the frontier cannot
     /// appear ahead of one above it. A `u32` because a transcript can pass
     /// `u16::MAX` rows.
     revealed: u32,
+    /// First index of the live streaming segments. They are paced by the
+    /// typewriter, not the cursor, so they are never capped: capping them would
+    /// hold typed rows back behind the cursor's rate.
+    live_start: usize,
     /// `starts[i]` is the total full height of the parts before `i`, so a part
     /// gets `revealed - starts[i]` rows without rescanning the document. Built
     /// on the first cursored lookup: the walkers that only need full heights,
@@ -40,24 +32,19 @@ pub(super) struct Layout<'a> {
 }
 
 impl<'a> Layout<'a> {
-    pub fn new(
-        cache: &'a SegmentCache,
-        tail: &'a [(TailPart, u16)],
-        width: u16,
-        revealed: u32,
-    ) -> Self {
+    pub fn new(cache: &'a SegmentCache, width: u16, revealed: u32, live_start: usize) -> Self {
         Self {
             cache,
-            tail,
             width,
             revealed,
+            live_start,
             starts: OnceCell::new(),
         }
     }
 
     fn starts(&self) -> &[u32] {
         self.starts.get_or_init(|| {
-            let n = self.cache.len() + self.tail.len();
+            let n = self.cache.len();
             let mut starts = Vec::with_capacity(n);
             let mut acc: u32 = 0;
             for i in 0..n {
@@ -69,24 +56,22 @@ impl<'a> Layout<'a> {
     }
 
     fn len(&self) -> usize {
-        self.cache.len() + self.tail.len()
+        self.cache.len()
     }
 
     fn full_height(&self, i: usize) -> u16 {
-        full_height_of(self.cache, self.tail, self.width, i)
+        self.cache.get(i).map_or(0, |seg| seg.height(self.width))
     }
 
-    /// Rows part `i` shows when drawn. A cached segment is bounded by how much
-    /// of the cursor is left after the parts above it have taken their share,
-    /// which spreads a block that arrived whole over several frames. The
-    /// streaming tail is not: its height already comes from the typewriter, so
-    /// capping it here would hold typed rows back behind the cursor's rate.
+    /// Rows segment `i` shows when drawn, bounded by how much of the cursor is
+    /// left after the segments above it have taken their share, which spreads a
+    /// block that arrived whole over several frames.
     ///
     /// Drawing only. The walkers that move and clamp a scroll position use
     /// [`Self::full_height`], because the cursor paces growth, not navigation:
     /// the reader can scroll anywhere in the document the moment it exists.
     pub(super) fn height(&self, i: usize) -> u16 {
-        if i >= self.cache.len() {
+        if i >= self.live_start {
             return self.full_height(i);
         }
         let before = self.starts().get(i).copied().unwrap_or(u32::MAX);
@@ -210,15 +195,6 @@ impl<'a> Layout<'a> {
     }
 }
 
-/// Full height of one part, ignoring the reveal cursor. Shared by the cursor
-/// build and every walker, so a part is measured the same way everywhere.
-fn full_height_of(cache: &SegmentCache, tail: &[(TailPart, u16)], width: u16, i: usize) -> u16 {
-    match cache.get(i) {
-        Some(seg) => seg.height(width),
-        None => tail.get(i - cache.len()).map_or(0, |&(_, h)| h),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,9 +205,9 @@ mod tests {
     const WIDTH: u16 = 80;
 
     /// A layout that hides nothing, since these walk the document rather than
-    /// the reveal.
-    fn layout<'a>(cache: &'a SegmentCache, tail: &'a [(TailPart, u16)]) -> Layout<'a> {
-        Layout::new(cache, tail, WIDTH, u32::MAX)
+    /// the reveal. No segment is live, so every one takes its full height.
+    fn layout<'a>(cache: &'a SegmentCache) -> Layout<'a> {
+        Layout::new(cache, WIDTH, u32::MAX, cache.len())
     }
 
     fn cache(heights: &[u16]) -> SegmentCache {
@@ -255,7 +231,7 @@ mod tests {
     fn advance_walks_rows(from: ScrollPos, rows: u32, expected: ScrollPos) {
         let cache = cache(&[3, 1, 2]);
         assert_eq!(
-            layout(&cache, &[]).advance(from, rows),
+            layout(&cache).advance(from, rows),
             expected
         );
     }
@@ -267,15 +243,17 @@ mod tests {
     fn retreat_walks_rows(from: ScrollPos, rows: u32, expected: ScrollPos) {
         let cache = cache(&[3, 1, 2]);
         assert_eq!(
-            layout(&cache, &[]).retreat(from, rows),
+            layout(&cache).retreat(from, rows),
             expected
         );
     }
 
     #[test]
-    fn the_tail_extends_the_document_past_the_cache() {
-        let cache = cache(&[3]);
-        let layout = layout(&cache, &[(TailPart::Spacer, 1), (TailPart::Text, 4)]);
+    fn the_document_is_the_segment_list() {
+        // 3 + 1 + 4 = 8 rows across three segments, addressed the same way the
+        // tail used to be.
+        let cache = cache(&[3, 1, 4]);
+        let layout = layout(&cache);
         assert_eq!(layout.total_rows(), 8);
         assert_eq!(layout.at_row(4), pos(2, 0));
         assert_eq!(layout.doc_row(pos(2, 3)), 7);
@@ -287,7 +265,7 @@ mod tests {
     fn rows_from_counts_down(from: ScrollPos, to: ScrollPos, expected: u32) {
         let cache = cache(&[3, 2]);
         assert_eq!(
-            layout(&cache, &[]).rows_from(from, to),
+            layout(&cache).rows_from(from, to),
             expected
         );
     }

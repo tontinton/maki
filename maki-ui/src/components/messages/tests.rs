@@ -266,6 +266,27 @@ fn tool_start_flushes_streaming_text() {
     assert!(matches!(panel.messages[1].role, DisplayRole::Tool(_)));
 }
 
+/// A flush settles the streaming text into a message, and the live segment that
+/// was showing it must go with it, so the text is drawn once.
+#[test]
+fn a_flush_leaves_one_copy_of_the_text() {
+    const STREAMED: &str = "one two three";
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.text_delta(STREAMED);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    panel.flush();
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let text = buffer_text(&terminal);
+
+    assert_eq!(
+        text.matches(STREAMED).count(),
+        1,
+        "the flushed text must appear once, not once as the message and again as the stale live segment:\n{text}"
+    );
+}
+
 #[test]
 fn thinking_delta_separate_from_text() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
