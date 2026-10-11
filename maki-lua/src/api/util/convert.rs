@@ -11,6 +11,7 @@ const UNSUPPORTED_JSON_KEY_ERR: &str = "cannot make a JSON object key from a key
 const RECURSIVE_TABLE_ERR: &str = "cannot convert to JSON a table that contains itself";
 const TOO_DEEP_ERR: &str = "cannot convert to JSON tables nested deeper than";
 pub(crate) const UNKNOWN_FIELD_ERR: &str = "unknown field";
+pub(crate) const REQUIRED_ERR: &str = "is required";
 
 /// How many nulls an array encoding may invent for keys the table does not
 /// hold. A JSON null arrives as an absent Lua key, so a round trip has to be
@@ -63,6 +64,11 @@ impl TableExt for Table {
     fn opt<T: FromLua>(&self, key: &str) -> LuaResult<Option<T>> {
         Ok(self.get::<NilAsNone<T>>(key)?.0)
     }
+}
+
+pub(crate) fn required<T: mlua::FromLua>(opts: &Table, context: &str, key: &str) -> LuaResult<T> {
+    opts.opt::<T>(key)?
+        .ok_or_else(|| mlua::Error::runtime(format!("{context}: '{key}' {REQUIRED_ERR}")))
 }
 
 /// Throws on a key of {table} outside {allowed}, so a typo is an error
@@ -429,12 +435,13 @@ mod tests {
     const SRC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
     const TEST_MODULE_ATTR: &str = "#[cfg(test)]";
     /// Table reads that would take `maki.NIL` for a real value: a turbofish
-    /// `get::<Option<..>>` or `get::<bool>`, or a `get` into a binding typed
-    /// `Option<..>` or `bool`. A `HashMap::get` answers an `Option` with no
-    /// `?`, `.ok()` or `.unwrap_or` after it, so it doesn't match.
-    const BYPASS_PATTERN: &str = r"\.(?:raw_)?get::<(?:Option<|bool>)|let\s+(?:mut\s+)?\w+\s*:\s*(?:Option<[^=;]*>|bool)\s*=\s*[\w.]+\s*\.(?:raw_)?get\([^()]*\)\s*(?:\?|\.ok\(\)|\.unwrap_or)";
-    const BYPASS_MSG: &str =
-        "read optional keys with `TableExt::opt` / `opt_bool` so `maki.NIL` counts as absent";
+    /// `get::<Option<..>>` or `get::<bool>`, a `get` into a binding typed
+    /// `Option<..>` or `bool`, or a `get` of a named key whose type is
+    /// inferred from a field, an argument or a match, where an `Option` hides.
+    /// A `HashMap::get` answers an `Option` with no `?`, `.ok()` or
+    /// `.unwrap_or` after it, so it doesn't match.
+    const BYPASS_PATTERN: &str = r#"\.(?:raw_)?get::<(?:Option<|bool>)|let\s+(?:mut\s+)?\w+\s*:\s*(?:Option<[^=;]*>|bool)\s*=\s*[\w.]+\s*\.(?:raw_)?get\([^()]*\)\s*(?:\?|\.ok\(\)|\.unwrap_or)|(?:[(,:]|match)\s*\w+\.(?:raw_)?get\("[^"]*"\)\?"#;
+    const BYPASS_MSG: &str = "read optional keys with `TableExt::opt` / `opt_bool` so `maki.NIL` counts as absent, and spell the type of a required one with `get::<T>`";
 
     /// The name `LAYER_CASES` snippets edit through, standing in for the
     /// `value` argument a real hook layer is handed.

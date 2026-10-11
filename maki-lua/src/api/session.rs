@@ -774,8 +774,8 @@ async fn set_title(
     opts: Table,
 ) -> LuaResult<Pair<Value>> {
     let req = SessionRequest::SetTitle {
-        id: opts.get("id")?,
-        title: opts.get("title")?,
+        id: opts.get::<String>("id")?,
+        title: opts.get::<String>("title")?,
     };
     roundtrip(lua, tx, req).await
 }

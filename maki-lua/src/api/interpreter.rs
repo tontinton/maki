@@ -16,11 +16,12 @@ use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table};
 use serde_json::Value;
 
-use crate::api::util::convert::{TableExt, json_to_lua, lua_tool_result};
+use crate::api::util::convert::{TableExt, json_to_lua, lua_tool_result, required};
 use crate::api::util::pair::Pair;
 use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::{TaskHandle, lock_cell};
 
+const INTERPRETER_RUN: &str = "interpreter.run";
 const BRIDGE_CLOSED: &str = "tool bridge closed (cancelled)";
 const FILE_OP_DENIED: &str = "not permitted in this sandbox";
 /// A backlog of lines is ready on every recv, so the loop must yield on its
@@ -34,11 +35,6 @@ enum BridgeMsg {
     Line(String),
     Calls(Vec<PendingCall>, flume::Sender<CallResults>),
     File(FileOp, flume::Sender<FileResult>),
-}
-
-fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
-    opts.opt::<T>(key)?
-        .ok_or_else(|| mlua::Error::runtime(format!("interpreter.run: '{key}' is required")))
 }
 
 fn forward_calls(
@@ -116,9 +112,9 @@ async fn call_lua_tool(lua: Lua, f: Option<Function>, pc: &PendingCall) -> Resul
 /// if result.stdout then print(result.stdout) end
 #[lua_fn(guard = Run, name = "run")]
 async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<Table>> {
-    let timeout_secs: u64 = required(&opts, "timeout")?;
-    let max_memory_mb: usize = required(&opts, "max_memory_mb")?;
-    let on_output: Function = required(&opts, "on_output")?;
+    let timeout_secs: u64 = required(&opts, INTERPRETER_RUN, "timeout")?;
+    let max_memory_mb: usize = required(&opts, INTERPRETER_RUN, "max_memory_mb")?;
+    let on_output: Function = required(&opts, INTERPRETER_RUN, "on_output")?;
     let preamble: String = opts.opt::<String>("preamble")?.unwrap_or_default();
     let tools_tbl: Option<Table> = opts.opt("tools")?;
     let (read_fn, write_fn): (Option<Function>, Option<Function>) =

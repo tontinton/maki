@@ -6566,7 +6566,38 @@ still work. The calls that need a screen behave like this:
 - `action`, `input`, and `input_edit` return `nil, "no interactive UI attached"`.
 - `open_editor` returns -1.
 - `flash` writes to the log.
-- `open_win`, `set_status_hint`, and `set_window_title` have no effect.
+- `open_win`, `set_status_hint`, `set_window_title`, and `input_rules` have no effect.
+  `input_rules` still throws on a bad rule, so a plugin's tests catch it.
+
+### Chat input
+
+Plugins can read, change and style what the user types in the chat
+input. Pick the call by the job:
+
+| Job | Call |
+| --- | --- |
+| Read the text and the cursor | [`input`](#maki-ui-input) |
+| Style text by what it says, like a `$skill:go` chip | [`input_rules`](#maki-ui-input_rules) |
+| Change the text or the cursor | [`input_edit`](#maki-ui-input_edit) |
+| React when the input changes | the `InputChanged` [event](#maki-api-create_autocmd) |
+
+`input` and `input_edit` wait for the UI to answer. They work from any
+callback, like a key handler, an autocmd or `maki.defer_fn`, but not
+while your plugin loads.
+
+Changing the chat input needs the `input` permission. That covers its
+text and its cursor, since your next Enter sends the text and your
+next key lands at the cursor. Without `input`, `input_edit` raises
+`permission denied`. A plugin without it can still read the input
+and style it with `input_rules`. Your own `init.lua` needs a
+`plugin.toml` next to it for this, like any plugin, see
+[plugin permissions](#plugin-permissions).
+
+Upgrading: `input_edit` needed no permission in earlier releases.
+Plugins and `init.lua` files that call it need `input` now. A
+`plugin.toml` you wrote yourself grants it unless it sets
+`input = false`. A package needs its author to add `input`, and you to
+approve the package again.
 
 ---
 
@@ -6855,7 +6886,11 @@ and call this from it.
 
 Valid names: `"file_picker"`, `"search"`, `"help"`,
 `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
-`"prev_chat"`, `"next_chat"`, `"model_picker"`.
+`"prev_chat"`, `"next_chat"`, `"model_picker"`, `"input_raw"`.
+
+`"input_raw"` has no default key. It switches the chat input between
+drawing what plugins conceal and showing the text under it, which is
+what gets sent. Run it again to switch back.
 
 Most actions are free, since they open something the user then sees and
 drives. `"pop_queue"` needs `session_write`, because it throws away a
@@ -7104,17 +7139,7 @@ start, while typing right where the edit lands does. Edits are refused:
 
 Read again and retry on any of them.
 
-A change to the text or the cursor needs the `input` permission, since
-your next Enter sends the text and your next key lands at the cursor.
-Without it the call raises `permission denied`. Your own `init.lua` needs
-a `plugin.toml` next to it for this, like any plugin, see
-[plugin permissions](#plugin-permissions).
-
-Upgrading: `input_edit` needed no permission in earlier releases.
-Plugins and `init.lua` files that call it need `input` now. A
-`plugin.toml` you wrote yourself grants it unless it sets
-`input = false`. A package needs its author to add `input`, and you to
-approve the package again.
+What a change needs is in [chat input](#chat-input).
 
 Tabs and carriage returns in `text` become spaces and newlines, and the
 other control characters are dropped, the way a paste is rewritten. With
@@ -7163,6 +7188,103 @@ local r, err = maki.ui.input_edit({
   cursor = e + 2,
   version = st.version,
   session_id = st.session_id,
+})
+```
+
+---
+
+### `maki.ui.input_rules()` {#maki-ui-input_rules}
+
+```lua
+maki.ui.input_rules({opts})
+```
+
+Decorates the chat input in every session, from a regex or from a
+tree-sitter query. No Lua runs per keystroke.
+
+Each `ns` of a plugin holds one rule. Calling again with the same `ns`
+replaces it, and leaving out `pattern`, `mark` and `treesitter` removes
+it. Rules go away when the plugin unloads.
+
+A regex rule marks every match with `mark`. The UI matches a line the
+first time it needs it and keeps the result until the line changes, so
+the marks never lag behind the text. The pattern uses
+[Rust regex syntax](https://docs.rs/regex/latest/regex/#syntax). It is
+matched one line at a time, so a match never spans lines. It still sees
+the text before its line: `\A` is the start of the input,
+which only the first line can match, while `$` is the end of the line
+and `(?m)^` the start of one. An empty match marks a point, which only
+`virt_text` shows. In `conceal` and the text of `virt_text`, `$1` is the
+text of capture group 1, `$0` the whole match, and `$$` a plain `$`.
+
+A tree-sitter rule parses the input as `lang` and runs a query per
+language. Each capture is marked with the template of the same name in
+`captures`, and every capture needs one, except `@injection.content`,
+whose template is optional, `@injection.language`, which names the
+language of injected code, and names starting with `_`, which only feed
+predicates. Templates are drawn as written, `$` included. Conditions are
+the predicates of `maki.treesitter.query`, and `#set!` only takes
+`injection.language`. Code captured as `@injection.content` is in the
+language `@injection.language` caught, or the one
+`#set! injection.language` names. When the rule has a query for that
+language, the code is parsed again with it and that query runs there.
+Otherwise it gets a `lang` mark. Markdown leaves the text of its blocks
+to `markdown_inline`, so a `markdown` rule runs its `markdown_inline`
+query there by itself.
+
+The parse runs on a worker thread and never holds up typing. Until the
+worker catches up with an edit, its marks move with the text, so a bold
+or a code block grows with what is typed inside it. Only a conceal or an
+`atomic` mark the edit lands inside is gone until then.
+
+A rule whose `ns` was first set later is drawn over one set earlier, and
+replacing a rule keeps its place. Within a tree-sitter rule a later
+pattern is drawn over an earlier one, and `markdown_inline` over
+`markdown`.
+
+maki draws the `!` of a shell command and its bash colors itself, under
+every rule.
+
+**Parameters:**
+
+- `{opts}` (`table`) Options:
+  - `ns` (`string`) the name of the rule, unique per plugin. Code in the global and the project `init.lua` runs as plugins `"global/init.lua"` and `"project/init.lua"`.
+  - `pattern` (`string|nil`) the regex to match.
+  - `mark` (`table|nil`) what each match gets, with the fields below.
+  - `mark.hl` (`string|table|nil`) a theme style name like `"accent"`, or an inline style `{ fg, bg, bold, italic, underline, dim, strikethrough, reversed }`.
+  - `mark.conceal` (`string|nil`) text drawn instead of the match, `""` hides it.
+  - `mark.reveal` (`string|nil`) `"cursor"` shows the raw text while the cursor is inside the match or on its edge.
+  - `mark.atomic` (`boolean|nil`) the cursor steps over the match, and a delete that cuts into it removes all of it.
+  - `mark.virt_text` (`table|nil`) spans drawn but never part of the text, `{ { text, hl? }, ... }`.
+  - `mark.virt_text_pos` (`string|nil`) `"eol"` (default) after the line, or `"inline"` before the match.
+  - `mark.lang` (`string|nil`) highlight the match as code in this language.
+  - `treesitter` (`table|nil`) a tree-sitter rule instead of `pattern` and `mark`.
+  - `treesitter.lang` (`string`) the language the input is parsed as, like `"markdown"`.
+  - `treesitter.query` (`string|table`) the query for `lang`, or a table of language = query.
+  - `treesitter.captures` (`table|nil`) capture name = template, with the fields of `mark`.
+
+**Example:**
+
+```lua
+-- Draw `$skill:go` as a ` go ` chip the cursor steps over:
+maki.ui.input_rules({
+  ns = "skill",
+  pattern = [[\$skill:([\w-]+)]],
+  mark = { conceal = " $1 ", hl = "accent", atomic = true },
+})
+-- And remove it again:
+maki.ui.input_rules({ ns = "skill" })
+-- Bold text without its stars, unless the cursor is on it:
+maki.ui.input_rules({
+  ns = "md",
+  treesitter = {
+    lang = "markdown",
+    query = { markdown_inline = [[ (strong_emphasis (emphasis_delimiter) @hidden) @strong ]] },
+    captures = {
+      hidden = { conceal = "", reveal = "cursor" },
+      strong = { hl = { bold = true } },
+    },
+  },
 })
 ```
 

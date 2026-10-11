@@ -15,16 +15,20 @@ use crate::api::util::command::{
     InputRequest, Split, TextEdit, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip,
     ui_roundtrip, ui_send,
 };
-use crate::api::util::convert::{TableExt, reject_unknown_fields};
+use crate::api::util::convert::{TableExt, reject_unknown_fields, required};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 use crate::key::Key;
 use crate::plugin_permissions::{PluginPermissions, PluginReach, denied_error};
 pub(crate) mod blit;
 pub(crate) mod buf;
+pub(crate) mod marks;
+pub(crate) mod syntax;
 pub(crate) mod win;
 
 use crate::runtime::with_task_bufs;
+use marks::{InputRule, InputRuleStore, PatternRule, parse_mark};
+use syntax::parse_syntax;
 use win::{WinHandle, WinSender};
 
 /// `fg`, `bg` and six modifiers.
@@ -44,6 +48,11 @@ const EDIT_OPTIONS: &[&str] = &[
     "cursor",
     "strict",
 ];
+const INPUT_RULES: &str = "input_rules";
+const RULE_OPTIONS: &[&str] = &["ns", "pattern", "mark", "treesitter"];
+const RULE_HALVES_ERR: &str = "input_rules: 'pattern' and 'mark' go together";
+const SYNTAX_ALONE_ERR: &str =
+    "input_rules: 'treesitter' takes the place of 'pattern' and 'mark', not both";
 
 /// A focused window is handed every key the host does not answer itself, so a
 /// list of keys to take on top of that claims nothing it does not already
@@ -418,7 +427,11 @@ fn set_window_title(
 ///
 /// Valid names: `"file_picker"`, `"search"`, `"help"`,
 /// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
-/// `"prev_chat"`, `"next_chat"`, `"model_picker"`.
+/// `"prev_chat"`, `"next_chat"`, `"model_picker"`, `"input_raw"`.
+///
+/// `"input_raw"` has no default key. It switches the chat input between
+/// drawing what plugins conceal and showing the text under it, which is
+/// what gets sent. Run it again to switch back.
 ///
 /// Most actions are free, since they open something the user then sees and
 /// drives. `"pop_queue"` needs `session_write`, because it throws away a
@@ -462,11 +475,6 @@ async fn input_roundtrip(
     req: InputRequest,
 ) -> LuaResult<Pair<mlua::Value>> {
     ui_json_roundtrip(&lua, tx, |reply_tx| UiAction::Input { req, reply_tx }).await
-}
-
-fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
-    opts.opt::<T>(key)?
-        .ok_or_else(|| mlua::Error::runtime(format!("input_edit: '{key}' is required")))
 }
 
 /// Reads the chat input text and the cursor position.
@@ -556,17 +564,7 @@ fn table_list(list: Table, func: &str, key: &str) -> LuaResult<Vec<Table>> {
 ///
 /// Read again and retry on any of them.
 ///
-/// A change to the text or the cursor needs the `input` permission, since
-/// your next Enter sends the text and your next key lands at the cursor.
-/// Without it the call raises `permission denied`. Your own `init.lua` needs
-/// a `plugin.toml` next to it for this, like any plugin, see
-/// [plugin permissions](#plugin-permissions).
-///
-/// Upgrading: `input_edit` needed no permission in earlier releases.
-/// Plugins and `init.lua` files that call it need `input` now. A
-/// `plugin.toml` you wrote yourself grants it unless it sets
-/// `input = false`. A package needs its author to add `input`, and you to
-/// approve the package again.
+/// What a change needs is in [chat input](#chat-input).
 ///
 /// Tabs and carriage returns in `text` become spaces and newlines, and the
 /// other control characters are dropped, the way a paste is rewritten. With
@@ -640,19 +638,128 @@ async fn input_edit(
     let req = InputRequest::Edit(InputEdit {
         edits,
         cursor: opts.opt("cursor")?,
-        version: required(&opts, "version")?,
+        version: required(&opts, INPUT_EDIT, "version")?,
         strict: opts.opt_bool("strict").unwrap_or_default(),
-        session_id: required(&opts, "session_id")?,
+        session_id: required(&opts, INPUT_EDIT, "session_id")?,
         plugin,
     });
     input_roundtrip(lua, tx.as_ref(), req).await
 }
 
+/// Decorates the chat input in every session, from a regex or from a
+/// tree-sitter query. No Lua runs per keystroke.
+///
+/// Each `ns` of a plugin holds one rule. Calling again with the same `ns`
+/// replaces it, and leaving out `pattern`, `mark` and `treesitter` removes
+/// it. Rules go away when the plugin unloads.
+///
+/// A regex rule marks every match with `mark`. The UI matches a line the
+/// first time it needs it and keeps the result until the line changes, so
+/// the marks never lag behind the text. The pattern uses
+/// [Rust regex syntax](https://docs.rs/regex/latest/regex/#syntax). It is
+/// matched one line at a time, so a match never spans lines. It still sees
+/// the text before its line: `\A` is the start of the input,
+/// which only the first line can match, while `$` is the end of the line
+/// and `(?m)^` the start of one. An empty match marks a point, which only
+/// `virt_text` shows. In `conceal` and the text of `virt_text`, `$1` is the
+/// text of capture group 1, `$0` the whole match, and `$$` a plain `$`.
+///
+/// A tree-sitter rule parses the input as `lang` and runs a query per
+/// language. Each capture is marked with the template of the same name in
+/// `captures`, and every capture needs one, except `@injection.content`,
+/// whose template is optional, `@injection.language`, which names the
+/// language of injected code, and names starting with `_`, which only feed
+/// predicates. Templates are drawn as written, `$` included. Conditions are
+/// the predicates of `maki.treesitter.query`, and `#set!` only takes
+/// `injection.language`. Code captured as `@injection.content` is in the
+/// language `@injection.language` caught, or the one
+/// `#set! injection.language` names. When the rule has a query for that
+/// language, the code is parsed again with it and that query runs there.
+/// Otherwise it gets a `lang` mark. Markdown leaves the text of its blocks
+/// to `markdown_inline`, so a `markdown` rule runs its `markdown_inline`
+/// query there by itself.
+///
+/// The parse runs on a worker thread and never holds up typing. Until the
+/// worker catches up with an edit, its marks move with the text, so a bold
+/// or a code block grows with what is typed inside it. Only a conceal or an
+/// `atomic` mark the edit lands inside is gone until then.
+///
+/// A rule whose `ns` was first set later is drawn over one set earlier, and
+/// replacing a rule keeps its place. Within a tree-sitter rule a later
+/// pattern is drawn over an earlier one, and `markdown_inline` over
+/// `markdown`.
+///
+/// maki draws the `!` of a shell command and its bash colors itself, under
+/// every rule.
+///
+/// @param opts table Options:
+///   `ns` (string) the name of the rule, unique per plugin. Code in the global and the project `init.lua` runs as plugins `"global/init.lua"` and `"project/init.lua"`.
+///   `pattern` (string|nil) the regex to match.
+///   `mark` (table|nil) what each match gets, with the fields below.
+///   `mark.hl` (string|table|nil) a theme style name like `"accent"`, or an inline style `{ fg, bg, bold, italic, underline, dim, strikethrough, reversed }`.
+///   `mark.conceal` (string|nil) text drawn instead of the match, `""` hides it.
+///   `mark.reveal` (string|nil) `"cursor"` shows the raw text while the cursor is inside the match or on its edge.
+///   `mark.atomic` (boolean|nil) the cursor steps over the match, and a delete that cuts into it removes all of it.
+///   `mark.virt_text` (table|nil) spans drawn but never part of the text, `{ { text, hl? }, ... }`.
+///   `mark.virt_text_pos` (string|nil) `"eol"` (default) after the line, or `"inline"` before the match.
+///   `mark.lang` (string|nil) highlight the match as code in this language.
+///   `treesitter` (table|nil) a tree-sitter rule instead of `pattern` and `mark`.
+///   `treesitter.lang` (string) the language the input is parsed as, like `"markdown"`.
+///   `treesitter.query` (string|table) the query for `lang`, or a table of language = query.
+///   `treesitter.captures` (table|nil) capture name = template, with the fields of `mark`.
+/// @return
+/// @example
+/// -- Draw `$skill:go` as a ` go ` chip the cursor steps over:
+/// maki.ui.input_rules({
+///   ns = "skill",
+///   pattern = [[\$skill:([\w-]+)]],
+///   mark = { conceal = " $1 ", hl = "accent", atomic = true },
+/// })
+/// -- And remove it again:
+/// maki.ui.input_rules({ ns = "skill" })
+/// -- Bold text without its stars, unless the cursor is on it:
+/// maki.ui.input_rules({
+///   ns = "md",
+///   treesitter = {
+///     lang = "markdown",
+///     query = { markdown_inline = [[ (strong_emphasis (emphasis_delimiter) @hidden) @strong ]] },
+///     captures = {
+///       hidden = { conceal = "", reveal = "cursor" },
+///       strong = { hl = { bold = true } },
+///     },
+///   },
+/// })
+#[lua_fn]
+fn input_rules(lua: &Lua, #[ctx] plugin: Arc<str>, opts: Table) -> LuaResult<()> {
+    let fail = |msg: String| mlua::Error::runtime(format!("{INPUT_RULES}: {msg}"));
+    reject_unknown_fields(&opts, RULE_OPTIONS, INPUT_RULES)?;
+    let ns: String = required(&opts, INPUT_RULES, "ns")?;
+    let rule = match (
+        opts.opt::<String>("pattern")?,
+        opts.opt::<Table>("mark")?,
+        opts.opt::<Table>("treesitter")?,
+    ) {
+        (None, None, None) => None,
+        (Some(pattern), Some(mark), None) => Some(InputRule::Pattern(
+            PatternRule::new(&pattern, parse_mark(&mark)?).map_err(fail)?,
+        )),
+        (None, None, Some(syntax)) => Some(InputRule::Syntax(Arc::new(
+            parse_syntax(&syntax)?.map_err(fail)?,
+        ))),
+        (_, _, Some(_)) => return Err(mlua::Error::runtime(SYNTAX_ALONE_ERR)),
+        _ => return Err(mlua::Error::runtime(RULE_HALVES_ERR)),
+    };
+    if let Some(mut store) = lua.app_data_mut::<InputRuleStore>() {
+        store.set(plugin, ns, rule);
+    }
+    Ok(())
+}
+
 fn text_edit(edit: &Table) -> LuaResult<TextEdit> {
     Ok(TextEdit {
-        start: required(edit, "start")?,
-        stop: required(edit, "stop")?,
-        text: required(edit, "text")?,
+        start: required(edit, INPUT_EDIT, "start")?,
+        stop: required(edit, INPUT_EDIT, "stop")?,
+        text: required(edit, INPUT_EDIT, "text")?,
     })
 }
 
@@ -869,12 +976,43 @@ lua_table! {
     /// - `action`, `input`, and `input_edit` return `nil, "no interactive UI attached"`.
     /// - `open_editor` returns -1.
     /// - `flash` writes to the log.
-    /// - `open_win`, `set_status_hint`, and `set_window_title` have no effect.
+    /// - `open_win`, `set_status_hint`, `set_window_title`, and `input_rules` have no effect.
+    ///   `input_rules` still throws on a bad rule, so a plugin's tests catch it.
+    ///
+    /// ### Chat input
+    ///
+    /// Plugins can read, change and style what the user types in the chat
+    /// input. Pick the call by the job:
+    ///
+    /// | Job | Call |
+    /// | --- | --- |
+    /// | Read the text and the cursor | [`input`](#maki-ui-input) |
+    /// | Style text by what it says, like a `$skill:go` chip | [`input_rules`](#maki-ui-input_rules) |
+    /// | Change the text or the cursor | [`input_edit`](#maki-ui-input_edit) |
+    /// | React when the input changes | the `InputChanged` [event](#maki-api-create_autocmd) |
+    ///
+    /// `input` and `input_edit` wait for the UI to answer. They work from any
+    /// callback, like a key handler, an autocmd or `maki.defer_fn`, but not
+    /// while your plugin loads.
+    ///
+    /// Changing the chat input needs the `input` permission. That covers its
+    /// text and its cursor, since your next Enter sends the text and your
+    /// next key lands at the cursor. Without `input`, `input_edit` raises
+    /// `permission denied`. A plugin without it can still read the input
+    /// and style it with `input_rules`. Your own `init.lua` needs a
+    /// `plugin.toml` next to it for this, like any plugin, see
+    /// [plugin permissions](#plugin-permissions).
+    ///
+    /// Upgrading: `input_edit` needed no permission in earlier releases.
+    /// Plugins and `init.lua` files that call it need `input` now. A
+    /// `plugin.toml` you wrote yourself grants it unless it sets
+    /// `input = false`. A package needs its author to add `input`, and you to
+    /// approve the package again.
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title, manual input, manual input_edit,
+        manual set_window_title, manual input, manual input_edit, manual input_rules,
     ]
 }
 
@@ -899,6 +1037,7 @@ pub(crate) fn create_ui_table(
         ui_action_tx.clone(),
         Arc::clone(&plugin),
     )?;
+    input_rules__register(&t, lua, Arc::clone(&plugin))?;
     open_win__register(&t, lua, ui_action_tx, Arc::clone(&plugin))?;
 
     let p = Arc::clone(&plugin);

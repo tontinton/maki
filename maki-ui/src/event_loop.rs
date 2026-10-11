@@ -34,9 +34,9 @@ use maki_lua::session_snapshot::{
     SessionSnapshot,
 };
 use maki_lua::{
-    EventHandle, HintReader, InputRequest, Key, KeymapReader, LuaCommandReader, ModelRequest,
-    PackCommand, PackPreparation, PlanRequest, SessionEndReason, SessionRequest, TaskRequest,
-    UiAction, UiAttachment, UiReply,
+    EventHandle, HintReader, InputRequest, InputRulesReader, Key, KeymapReader, LuaCommandReader,
+    ModelRequest, PackCommand, PackPreparation, PlanRequest, SessionEndReason, SessionRequest,
+    TaskRequest, UiAction, UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
@@ -64,6 +64,7 @@ use crate::components::input::Submission;
 use crate::components::keybindings::key;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
+use crate::decor_worker;
 use crate::input::InputReader;
 use crate::repaint::{Dirty, IDLE_POLL};
 use crate::theme;
@@ -115,6 +116,7 @@ pub struct EventLoopParams {
     pub lua_command_reader: LuaCommandReader,
     pub keymap_reader: KeymapReader,
     pub hint_reader: HintReader,
+    pub input_rules_reader: InputRulesReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub ui_wake_rx: flume::Receiver<()>,
     pub ui_attachment: UiAttachment,
@@ -406,6 +408,7 @@ struct SpawnCtx {
     lua_command_reader: LuaCommandReader,
     keymap_reader: KeymapReader,
     hint_reader: HintReader,
+    input_rules_reader: InputRulesReader,
     lua_event_handle: EventHandle,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
@@ -452,6 +455,7 @@ impl SpawnCtx {
             self.lua_command_reader.clone(),
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
+            self.input_rules_reader.clone(),
             Arc::clone(&self.storage_writer),
             self.ui_config.clone(),
             self.input_history_size,
@@ -517,6 +521,9 @@ enum Wake {
     /// Nothing to handle. The tick after every wake is what reads plugin
     /// windows.
     PluginWindow,
+    /// Nothing to handle either. The tick takes in what the worker finished
+    /// for the chat input.
+    Decor,
     Agent(usize, Box<maki_agent::Envelope>),
     Shell(usize, ShellEvent),
     Warn(String),
@@ -600,6 +607,7 @@ impl<'t> EventLoop<'t> {
             lua_command_reader,
             keymap_reader,
             hint_reader,
+            input_rules_reader,
             ui_action_rx,
             ui_wake_rx,
             ui_attachment,
@@ -661,6 +669,7 @@ impl<'t> EventLoop<'t> {
             lua_command_reader,
             keymap_reader,
             hint_reader,
+            input_rules_reader,
             lua_event_handle,
             mcp_handle,
             mcp_config_errors,
@@ -837,6 +846,7 @@ impl<'t> EventLoop<'t> {
                 res.ok().map(|()| Wake::PluginWindow)
             });
         }
+        sel = sel.recv(decor_worker::wakes(), |res| res.ok().map(|()| Wake::Decor));
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
         sel = sel.recv(&self.pack_rx, |res| res.ok().map(Wake::Pack));
         sel = sel.recv(&self.models_rx, |res| {
@@ -860,7 +870,7 @@ impl<'t> EventLoop<'t> {
             Wake::Input(ev) => self.handle_input(ev),
             Wake::InputGone => return Err(eyre!("terminal input reader stopped")),
             Wake::Ui(action) => self.handle_ui_action(action),
-            Wake::PluginWindow => {}
+            Wake::PluginWindow | Wake::Decor => {}
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
@@ -1898,6 +1908,7 @@ impl<'t> EventLoop<'t> {
                 };
                 self.focus.on_resume();
                 match result {
+                    Ok(edited) if edited == current_text => {}
                     Ok(edited) => self.sessions[idx].app.input_box.set_input(&edited),
                     Err(e) => self.sessions[idx].app.flash(e),
                 }

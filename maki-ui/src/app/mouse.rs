@@ -228,15 +228,7 @@ impl App {
                     self.selection_state = None;
                     return;
                 };
-                let copy_text = self.input_box.copy_text();
-                let input_area = sel.area;
-                let line_breaks = self.input_box.line_breaks(input_area.width);
-                let regions = [ContentRegion {
-                    area: input_area,
-                    raw_text: &copy_text,
-                    line_breaks,
-                }];
-                selection::extract_selected_text(buf, &screen_sel, &regions)
+                self.input_box.selected_text(sel.area, &screen_sel)
             }
             SelectionZone::Overlay => {
                 let Some(screen_sel) = self.screen_selection(sel, render_chat) else {

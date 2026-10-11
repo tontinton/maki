@@ -4,13 +4,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Lua, MultiValue, Value as LuaValue};
-use regex::Regex;
+use regex::{Error as RegexError, Regex};
 use tree_sitter::{Query, QueryCursor, QueryPredicateArg, StreamingIterator};
 
 use crate::docs::{FnDoc, ParamDoc};
 use crate::language::Language;
 
 use super::node::LuaNode;
+
+const KNOWN_PREDICATES: &[&str] = &[
+    "eq?",
+    "match?",
+    "lua-match?",
+    "contains?",
+    "has-ancestor?",
+    "has-parent?",
+];
 
 #[allow(non_upper_case_globals)]
 const iter_captures__doc: FnDoc = FnDoc {
@@ -376,7 +385,43 @@ fn evaluate_predicates(
             metadata.insert(prop.key.to_string(), val.to_string());
         }
     }
+    predicates_hold(query, pattern_index, captures, source, regex_cache)
+}
 
+/// Whether {op}, with its `not-` and `any-` prefixes, is one
+/// [`predicates_hold`] knows. Tree-sitter itself only checks `eq?`,
+/// `match?` and `any-of?`, and hands the rest over untouched.
+pub(crate) fn is_known_predicate(op: &str) -> bool {
+    KNOWN_PREDICATES.contains(&parse_predicate_op(op).1)
+}
+
+/// The first regex of a `match?` or `lua-match?` in {pattern}, `not-` and
+/// `any-` forms included, that [`predicates_hold`] could not compile, since
+/// there it only makes the predicate fail.
+pub(crate) fn broken_regex(query: &Query, pattern: usize) -> Option<(&str, RegexError)> {
+    query
+        .general_predicates(pattern)
+        .iter()
+        .find_map(|predicate| {
+            let (_, base_op) = parse_predicate_op(&predicate.operator);
+            let ("match?" | "lua-match?", Some(QueryPredicateArg::String(regex))) =
+                (base_op, predicate.args.get(1))
+            else {
+                return None;
+            };
+            Regex::new(regex).err().map(|e| (regex.as_ref(), e))
+        })
+}
+
+/// The predicates tree-sitter leaves to its caller. `#set!` never gets
+/// here: tree-sitter files it under the pattern's property settings.
+pub(crate) fn predicates_hold(
+    query: &Query,
+    pattern_index: usize,
+    captures: &[tree_sitter::QueryCapture<'_>],
+    source: &[u8],
+    regex_cache: &mut HashMap<String, Option<Regex>>,
+) -> bool {
     for predicate in query.general_predicates(pattern_index) {
         let (mods, base_op) = parse_predicate_op(predicate.operator.as_ref());
         let args = &predicate.args;
@@ -401,9 +446,6 @@ fn evaluate_predicates(
             }
             "has-parent?" if eval_has_parent(captures, args) == mods.negated => {
                 return false;
-            }
-            "set!" => {
-                eval_set(args, metadata);
             }
             _ => {}
         }
@@ -552,15 +594,6 @@ fn eval_has_parent(captures: &[tree_sitter::QueryCapture<'_>], args: &[QueryPred
     cap.node
         .parent()
         .is_some_and(|p| p.kind() == type_name.as_ref())
-}
-
-fn eval_set(args: &[QueryPredicateArg], metadata: &mut HashMap<String, String>) {
-    let (Some(QueryPredicateArg::String(key)), Some(QueryPredicateArg::String(value))) =
-        (args.first(), args.get(1))
-    else {
-        return;
-    };
-    metadata.insert(key.to_string(), value.to_string());
 }
 
 fn lua_to_usize(v: LuaValue) -> Option<usize> {

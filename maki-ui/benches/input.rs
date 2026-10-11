@@ -9,7 +9,7 @@ use criterion::{BenchmarkGroup, BenchmarkId, Criterion, criterion_group, criteri
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_storage::StateDir;
 use maki_ui::app::{App, Msg};
-use maki_ui::bench_support;
+use maki_ui::bench_support::{self, Rules};
 use maki_ui::keybindings::key;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -17,11 +17,16 @@ use ratatui::layout::Rect;
 use tempfile::TempDir;
 
 const SIZES: &[usize] = &[1_000, 10_000, 50_000];
+const MARKED_LINES: usize = 10_000;
+const MARKS: usize = 100_000;
 const PASTE_LINES: usize = 100;
 const SINGLE_LINE_BYTES: usize = 1 << 20;
 const MIDDLE_COLUMN: usize = SINGLE_LINE_BYTES / 2;
 const WORD: &str = "lorem ";
 const UNBROKEN: &str = "x";
+const RULES_BYTES: usize = 1 << 20;
+const BOLD_LINE: usize = 2;
+const BOLD_COLUMN: usize = 22;
 const AREA: Rect = Rect::new(0, 0, 120, 40);
 const SAMPLES: usize = 10;
 const TYPED: char = 'x';
@@ -84,21 +89,43 @@ impl Fixture {
     }
 
     fn loaded(doc: &str) -> Self {
-        let mut fixture = Self::empty();
-        fixture.app.update(Msg::Paste(doc.to_owned()));
-        assert!(
-            bench_support::input_value(&fixture.app) == doc,
-            "the paste never reached the input"
-        );
-        let _ = fixture.app.tick();
-        fixture.frame();
-        fixture
+        Self::empty().filled(doc)
     }
 
     /// Holding {doc} the way history recall lands it, cursor at the start.
     fn holding(doc: &str) -> Self {
         let mut fixture = Self::empty();
         bench_support::set_input(&mut fixture.app, doc);
+        fixture
+    }
+
+    /// Pasted like a user would, so the cursor sits at the end. The assert
+    /// is there because a paste some overlay swallows would not crash, it
+    /// would just make every bench look fast. The tick and frame pay off what
+    /// the paste left behind, so later ticks really are idle.
+    fn filled(mut self, doc: &str) -> Self {
+        self.app.update(Msg::Paste(doc.to_owned()));
+        assert!(
+            bench_support::input_value(&self.app) == doc,
+            "the paste never reached the input"
+        );
+        let _ = self.app.tick();
+        self.frame();
+        self
+    }
+
+    /// Loaded under {rules}, parsed to the end, and with the cursor inside a
+    /// bold span in the middle of the text, where the bench types.
+    fn typing_in(doc: &str, rules: Option<Rules>) -> Self {
+        let mut fixture = Self::empty();
+        if let Some(rules) = rules {
+            bench_support::set_rules(&mut fixture.app, rules);
+        }
+        let mut fixture = fixture.filled(doc);
+        bench_support::settle_parse(&mut fixture.app);
+        let middle = (doc.matches('\n').count() / 2).next_multiple_of(MARKDOWN.len());
+        bench_support::set_cursor(&mut fixture.app, middle + BOLD_LINE, BOLD_COLUMN);
+        fixture.frame();
         fixture
     }
 
@@ -222,6 +249,20 @@ fn bench_input(c: &mut Criterion) {
         });
     }
 
+    // `keystroke_frame` with ten marks a line, so it shows what the marks
+    // add to a keystroke: mapping them through the edit and drawing the ones
+    // on screen.
+    let mut marked = Fixture::loaded(&markdown(MARKED_LINES));
+    bench_support::decorate(&mut marked.app, MARKS);
+    marked.frame();
+    bench_with_reset(
+        &mut group,
+        BenchmarkId::new("keystroke_frame_marked", MARKED_LINES),
+        marked,
+        type_and_draw,
+        backspace,
+    );
+
     // One enormous line is a different load from many short ones: wrapping
     // splits it into thousands of rows, and the cursor, sitting at the end
     // of it, is a column far from the line start.
@@ -254,6 +295,34 @@ fn bench_input(c: &mut Criterion) {
             fixture,
             type_and_draw,
             backspace,
+        );
+    }
+
+    // A keystroke inside a bold span in a megabyte of markdown, with the tick
+    // that hands the edit to the parse worker and the frame that draws the
+    // last parse mapped through it: what the UI thread pays while a parse is
+    // in flight. The untimed reset waits for the parse, so every pass starts
+    // from a settled tree. `none` has only the core rules.
+    let cycle_bytes = markdown(MARKDOWN.len()).len() + 1;
+    let doc = markdown(RULES_BYTES / cycle_bytes * MARKDOWN.len());
+    for (label, rules) in [
+        ("none", None),
+        ("regex", Some(Rules::Regex)),
+        ("syntax", Some(Rules::Syntax)),
+    ] {
+        bench_with_reset(
+            &mut group,
+            BenchmarkId::new("keystroke_frame_rules", label),
+            Fixture::typing_in(&doc, rules),
+            |f| {
+                f.app.update(Msg::Key(KeyCode::Char(TYPED).into()));
+                let _ = f.app.tick();
+                f.frame();
+            },
+            |f| {
+                backspace(f);
+                bench_support::settle_parse(&mut f.app);
+            },
         );
     }
     group.finish();

@@ -445,6 +445,7 @@ named_styles!(t => {
     "background" => Style::new().bg(t.background),
     "foreground" => Style::new().fg(t.foreground),
     "accent" => t.accent,
+    "shell_prefix" => t.shell_prefix,
     "active" => t.active,
     "keybind_key" => t.keybind_key,
     "keybind_desc" => t.keybind_desc,

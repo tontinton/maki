@@ -644,6 +644,7 @@ pub enum BuiltinAction {
     PrevChat,
     NextChat,
     ModelPicker,
+    InputRaw,
 }
 
 impl BuiltinAction {
@@ -665,7 +666,8 @@ impl BuiltinAction {
             | Self::EditInput
             | Self::PrevChat
             | Self::NextChat
-            | Self::ModelPicker => &[],
+            | Self::ModelPicker
+            | Self::InputRaw => &[],
             Self::PopQueue => &[Permission::SessionWrite],
         }
     }

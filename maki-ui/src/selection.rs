@@ -333,22 +333,6 @@ fn get_bit(bits: &[u64], row: u16) -> bool {
 }
 
 impl LineBreaks {
-    pub fn from_heights(heights: impl Iterator<Item = u16>) -> Self {
-        let mut line_starts = Vec::new();
-        let mut row: u16 = 0;
-        for h in heights {
-            if h == 0 {
-                continue;
-            }
-            set_bit(&mut line_starts, row);
-            row = row.saturating_add(h);
-        }
-        Self::Bitmap {
-            line_starts,
-            word_wraps: Vec::new(),
-        }
-    }
-
     pub fn from_lines(lines: &[Line<'_>], width: u16) -> Self {
         if width == 0 {
             return Self::EveryRow;
@@ -661,6 +645,20 @@ mod tests {
         (buf, area)
     }
 
+    /// Breaks for lines of {heights} rows each, none word wrapped.
+    fn from_heights(heights: &[u16]) -> LineBreaks {
+        let mut line_starts = Vec::new();
+        let mut row: u16 = 0;
+        for &h in heights {
+            set_bit(&mut line_starts, row);
+            row = row.saturating_add(h);
+        }
+        LineBreaks::Bitmap {
+            line_starts,
+            word_wraps: Vec::new(),
+        }
+    }
+
     fn ss(sr: u16, sc: u16, er: u16, ec: u16) -> ScreenSelection {
         ScreenSelection {
             start_row: sr,
@@ -897,24 +895,9 @@ mod tests {
         assert_eq!(text, "continued");
     }
 
-    #[test_case(&[1, 1, 1], &[0, 1, 2]    ; "no_wrapping")]
-    #[test_case(&[1, 3, 1], &[0, 1, 4]    ; "middle_line_wraps")]
-    #[test_case(&[3, 3],    &[0, 3]        ; "all_lines_wrap")]
-    fn line_breaks_from_heights(heights: &[u16], expected_starts: &[u16]) {
-        let lb = LineBreaks::from_heights(heights.iter().copied());
-        for row in 0..heights.iter().sum::<u16>().max(1) {
-            let should_be_start = expected_starts.contains(&row);
-            assert_eq!(
-                lb.is_line_start(row),
-                should_be_start,
-                "row {row}: expected is_line_start={should_be_start}"
-            );
-        }
-    }
-
     #[test]
     fn line_breaks_beyond_64_rows() {
-        let lb = LineBreaks::from_heights([65, 1].iter().copied());
+        let lb = from_heights(&[65, 1]);
         assert!(lb.is_line_start(0));
         assert!(!lb.is_line_start(64));
         assert!(lb.is_line_start(65));
@@ -958,7 +941,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         buf.set_string(0, 0, "hello               ", Style::default());
         buf.set_string(0, 1, "world               ", Style::default());
-        let breaks = LineBreaks::from_heights([2].iter().copied());
+        let breaks = from_heights(&[2]);
         let region = ContentRegion {
             area,
             line_breaks: breaks,
@@ -977,7 +960,7 @@ mod tests {
         buf.set_string(2, 0, "long_variable_na", Style::default());
         buf.set_string(0, 1, "│", code_style);
         buf.set_string(1, 1, "me_here         ", Style::default());
-        let breaks = LineBreaks::from_heights([2].iter().copied());
+        let breaks = from_heights(&[2]);
         let region = ContentRegion {
             area,
             line_breaks: breaks,
@@ -988,16 +971,8 @@ mod tests {
     }
 
     #[test]
-    fn line_breaks_bitmap_zero_height_ignored() {
-        let lb = LineBreaks::from_heights([1, 0, 0, 1].iter().copied());
-        assert!(lb.is_line_start(0));
-        assert!(lb.is_line_start(1));
-        assert!(!lb.is_line_start(2));
-    }
-
-    #[test]
     fn line_breaks_query_beyond_stored_bits() {
-        let lb = LineBreaks::from_heights([1].iter().copied());
+        let lb = from_heights(&[1]);
         assert!(!lb.is_line_start(100));
         assert!(!lb.needs_space(200));
     }

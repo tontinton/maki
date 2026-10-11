@@ -17,6 +17,7 @@ use crate::agent_autocmd::HostEvent;
 use crate::api::keymap::{KeybindTicket, KeymapReader};
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
+use crate::api::ui::marks::InputRulesReader;
 use crate::api::util::command::{
     HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
 };
@@ -1056,6 +1057,10 @@ impl PluginHost {
 
     pub fn hint_reader(&self) -> HintReader {
         self.inner.hint_reader.clone()
+    }
+
+    pub fn input_rules_reader(&self) -> InputRulesReader {
+        self.inner.input_rules_reader.clone()
     }
 
     pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {

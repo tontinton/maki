@@ -23,6 +23,9 @@ pub enum Language {
     Lua,
     Elixir,
     Markdown,
+    /// The inline half of markdown: emphasis, code spans, links. Markdown
+    /// parses blocks only and leaves each paragraph's text to this grammar.
+    MarkdownInline,
     Starlark,
     V,
     Zig,
@@ -63,6 +66,7 @@ impl Language {
             "lua" => Some(Self::Lua),
             "elixir" => Some(Self::Elixir),
             "markdown" => Some(Self::Markdown),
+            "markdown_inline" => Some(Self::MarkdownInline),
             "starlark" => Some(Self::Starlark),
             "v" => Some(Self::V),
             "zig" => Some(Self::Zig),
@@ -145,6 +149,7 @@ impl Language {
             Self::Lua => tree_sitter_lua::LANGUAGE.into(),
             Self::Elixir => tree_sitter_elixir::LANGUAGE.into(),
             Self::Markdown => tree_sitter_md::LANGUAGE.into(),
+            Self::MarkdownInline => tree_sitter_md::INLINE_LANGUAGE.into(),
             Self::Starlark => tree_sitter_starlark::LANGUAGE.into(),
             Self::V => tree_sitter_vlang::LANGUAGE.into(),
             Self::Zig => tree_sitter_zig::LANGUAGE.into(),

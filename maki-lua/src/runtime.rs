@@ -55,6 +55,7 @@ use crate::api::tool::{
     LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission, resolve_rules,
 };
 use crate::api::ui::buf::{BufHandle, BufferStore};
+use crate::api::ui::marks::{InputRuleStore, InputRulesReader};
 use crate::api::ui::{HintStore, WinStore};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::util::command::{
@@ -3351,6 +3352,9 @@ impl LuaRuntime {
                 writer.publish(entries);
             }
         }
+        if let Some(mut store) = self.lua.app_data_mut::<InputRuleStore>() {
+            store.clear_plugin(plugin);
+        }
         // Last of the revocations, and the only one the user can see: a float
         // left up by an unloaded plugin still holds the keys it claimed, with
         // the loop that answered them cancelled along with the load.
@@ -4450,6 +4454,7 @@ pub(crate) struct LuaThread {
     pub command_reader: LuaCommandReader,
     pub keymap_reader: KeymapReader,
     pub hint_reader: crate::api::util::command::HintReader,
+    pub input_rules_reader: InputRulesReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub ui_wake_rx: flume::Receiver<()>,
     pub ui_attachment: UiAttachment,
@@ -4483,6 +4488,7 @@ pub fn spawn(
     let (command_writer, command_reader) = LuaCommandWriter::new();
     let (keymap_writer, keymap_reader) = KeymapWriter::new();
     let (hint_writer, hint_reader) = HintWriter::new();
+    let (input_rule_store, input_rules_reader) = InputRuleStore::new();
     let key_lint = KeyLint::default();
     let key_lint_thread = key_lint.clone();
     let background = BackgroundSessions::default();
@@ -4511,6 +4517,7 @@ pub fn spawn(
                 Ok(r) => {
                     r.lua.set_app_data(key_lint_thread);
                     r.lua.set_app_data(background_thread);
+                    r.lua.set_app_data(input_rule_store);
                     r.lua.set_app_data(ui_waker);
                     let _ = init_tx.send(Ok(()));
                     r
@@ -5154,6 +5161,7 @@ pub fn spawn(
         command_reader,
         keymap_reader,
         hint_reader,
+        input_rules_reader,
         ui_action_rx,
         ui_wake_rx,
         ui_attachment,

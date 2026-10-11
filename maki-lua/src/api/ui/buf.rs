@@ -420,7 +420,7 @@ fn parse_span(val: &LuaValue) -> LuaResult<SnapshotSpan> {
     Ok(SnapshotSpan { text, style })
 }
 
-fn parse_style(val: &LuaValue) -> LuaResult<SpanStyle> {
+pub(crate) fn parse_style(val: &LuaValue) -> LuaResult<SpanStyle> {
     match val {
         LuaValue::Nil => Ok(SpanStyle::Default),
         v if v.is_null() => Ok(SpanStyle::Default),

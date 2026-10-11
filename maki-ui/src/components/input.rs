@@ -1,12 +1,12 @@
+mod decor;
 mod layout;
 
 use std::cell::{RefCell, RefMut};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use self::layout::{Layout, Row, char_width};
-use crate::app::shell::parse_shell_prefix;
-use crate::highlight;
-use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
+use self::decor::{LangCache, LineDecor};
+use self::layout::{Layout, Piece, Row};
+use crate::text_buffer::{EditResult, Mark, Marks, Prompt, TextBuffer, is_newline_key};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -23,7 +23,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 use super::apply_scroll_delta;
 use super::scrollbar::render_vertical_scrollbar;
-use crate::selection::LineBreaks;
+use crate::selection::ScreenSelection;
 
 const CHEVRON: &str = super::CHEVRON;
 const NEWLINE_PAD: &str = "  ";
@@ -80,11 +80,21 @@ impl Submission {
     }
 }
 
+/// What a chat keeps of the input while another chat has the box.
+#[derive(Default)]
+pub struct Draft {
+    pub text: String,
+    pub images: Vec<ImageSource>,
+    marks: Marks,
+}
+
 pub struct InputBox {
     pub(crate) buffer: TextBuffer,
     history: InputHistory,
     history_index: Option<usize>,
-    draft: String,
+    /// What a history recall covers, marks and all, put back when the user
+    /// walks past the newest entry.
+    draft: Prompt,
     scroll_y: u16,
     follow_cursor: bool,
     placeholder_hint: &'static str,
@@ -95,6 +105,7 @@ pub struct InputBox {
     /// `height` only gets `&self`, yet it has to bring this cache up to date
     /// too, hence the `RefCell`.
     layout: RefCell<Layout>,
+    langs: LangCache,
 }
 
 impl InputBox {
@@ -193,7 +204,7 @@ impl InputBox {
             buffer: TextBuffer::new(String::new()),
             history,
             history_index: None,
-            draft: String::new(),
+            draft: Prompt::default(),
             scroll_y: 0,
             follow_cursor: true,
             placeholder_hint: random_placeholder_hint(),
@@ -202,6 +213,7 @@ impl InputBox {
             last_total_lines: 1,
             last_content_height: 1,
             layout: RefCell::default(),
+            langs: LangCache::default(),
         }
     }
 
@@ -223,16 +235,49 @@ impl InputBox {
         layout
     }
 
-    /// Where the drawn rows start a new buffer line, for a selection copied out
-    /// of the box. It reads the row counts the box draws with, cursor row
-    /// included, since a count off by one row moves every later line start and
-    /// scatters the newlines.
-    pub fn line_breaks(&self, content_width: u16) -> LineBreaks {
-        LineBreaks::from_heights(
-            self.layout(content_width)
-                .heights()
-                .map(|rows| u16::try_from(rows).unwrap_or(u16::MAX)),
-        )
+    /// The source text under a selection dragged over the box at {area},
+    /// laid out like [`Self::copy_text`]. Reading the cells instead would
+    /// copy virtual text and the text drawn over conceals, which are not
+    /// part of the prompt. A conceal or a char cut by either end is taken
+    /// whole.
+    pub fn selected_text(&self, area: Rect, selection: &ScreenSelection) -> String {
+        if selection.covers_rect(area) {
+            return self.copy_text();
+        }
+        let len = self.buffer.value().len();
+        let (start_row, start_col) = if selection.start_row < area.y {
+            (area.y, area.x)
+        } else {
+            (selection.start_row, selection.start_col)
+        };
+        let start_hit = self.hit(area, start_row, start_col);
+        let prefix = match &start_hit {
+            Some(hit) if matches!(hit.spot, Spot::Prefix) && hit.row.index == 0 => {
+                if hit.row.line == 0 {
+                    CHEVRON
+                } else {
+                    NEWLINE_PAD
+                }
+            }
+            _ => "",
+        };
+        let start = start_hit.map_or(len, |hit| hit.byte(|piece, _| piece.bytes.start));
+        let end = self
+            .hit(area, selection.end_row, selection.end_col)
+            .map_or(len, |hit| {
+                hit.byte(|piece, col| {
+                    if col < piece.virt {
+                        piece.bytes.start
+                    } else {
+                        piece.bytes.end
+                    }
+                })
+            });
+        if start > end {
+            return String::new();
+        }
+        let text = self.buffer.value()[start..end].replace('\n', &format!("\n{NEWLINE_PAD}"));
+        format!("{prefix}{text}")
     }
 
     pub fn height(&self, width: u16) -> u16 {
@@ -242,11 +287,11 @@ impl InputBox {
     }
 
     pub fn is_at_first_line(&self) -> bool {
-        self.buffer.y() == 0
+        self.buffer.display_lines(self.buffer.y()).start == 0
     }
 
     pub fn is_at_last_line(&self) -> bool {
-        self.buffer.y() == self.buffer.line_count().saturating_sub(1)
+        self.buffer.display_lines(self.buffer.y()).end == self.buffer.line_count()
     }
 
     pub fn char_before_cursor_is_backslash(&self) -> bool {
@@ -271,10 +316,12 @@ impl InputBox {
         Some(Submission { text, images })
     }
 
+    /// The marks go with the text, so ghost text pushed for it never turns
+    /// up in the next prompt.
     pub fn discard(&mut self) {
         self.pending_images.clear();
         self.history_index = None;
-        self.draft.clear();
+        self.draft = Prompt::default();
         self.buffer.clear();
         self.scroll_y = 0;
     }
@@ -287,25 +334,56 @@ impl InputBox {
     /// is the draft it covers, since the recall is still in history. An edited
     /// recall is new work and wins over the draft, as it does on submit.
     pub fn draft_text(&self) -> String {
-        let text = self.buffer.value();
-        let untouched_recall = self
-            .history_index
-            .and_then(|i| self.history.get(i))
-            .is_some_and(|entry| entry == text);
-        if untouched_recall {
-            self.draft.clone()
+        if self.is_untouched_recall() {
+            self.draft.text.clone()
         } else {
-            text.to_owned()
+            self.buffer.value().to_owned()
         }
     }
 
-    pub fn swap_draft(&mut self, draft: Submission) -> Submission {
-        let text = self.draft_text();
-        let images = mem::take(&mut self.pending_images);
-        self.discard();
-        self.set_input(&draft.text);
-        self.pending_images = draft.images;
-        Submission { text, images }
+    fn is_untouched_recall(&self) -> bool {
+        self.history_index
+            .and_then(|i| self.history.get(i))
+            .is_some_and(|entry| entry == self.buffer.value())
+    }
+
+    /// The marks go with the text they were made for, so under an untouched
+    /// history recall the draft it covers is parked with its own marks.
+    pub fn swap_draft(&mut self, draft: Draft) -> Draft {
+        let parks_the_draft = self.is_untouched_recall();
+        let images = mem::replace(&mut self.pending_images, draft.images);
+        let shown = self.buffer.swap_prompt(Prompt {
+            text: draft.text,
+            marks: draft.marks,
+        });
+        let covered = mem::take(&mut self.draft);
+        self.history_index = None;
+        self.scroll_y = 0;
+        let Prompt { text, marks } = if parks_the_draft { covered } else { shown };
+        Draft {
+            text,
+            images,
+            marks,
+        }
+    }
+
+    /// Marks leave the text and its version alone, so the layout would never
+    /// notice a line growing or shrinking by its virtual text or conceals. It
+    /// is told here.
+    pub fn set_marks(&mut self, plugin: &str, ns: &str, marks: Vec<Mark>) -> Result<(), String> {
+        let moved = self.buffer.set_marks(plugin, ns, marks)?;
+        self.layout.get_mut().relayout(&self.buffer, &moved);
+        Ok(())
+    }
+
+    /// Takes in what the worker finished for this input, and recounts the
+    /// lines whose marks it changed. `true` when the frame has to show it.
+    pub fn poll_decor(&mut self) -> bool {
+        let syntax = self.buffer.poll_syntax();
+        if let Some(changed) = &syntax {
+            self.layout.get_mut().relayout(&self.buffer, changed);
+        }
+        self.langs.poll() | syntax.is_some()
     }
 
     pub fn attach_image(&mut self, source: ImageSource) {
@@ -330,15 +408,17 @@ impl InputBox {
         self.follow_cursor = true;
         if self.buffer.version() != before {
             self.history_index = None;
-            self.draft.clear();
+            self.draft = Prompt::default();
         }
         Ok(caret)
     }
 
-    /// Whole-value writes that are not plugin writes: a history entry, a
-    /// restored draft, a rewind prompt, what came back from `$EDITOR`. The
-    /// text lands verbatim, because the user composed it elsewhere and a
-    /// rewrite here is what the model would be sent.
+    /// Whole-prompt writes that are not plugin writes: a restored draft, a
+    /// rewind prompt, a completed command, what `$EDITOR` changed.
+    /// The text lands verbatim, because the user composed it elsewhere and a
+    /// rewrite here is what the model would be sent. It is another prompt
+    /// even when it reads the same, so the marks of the old one go, see
+    /// [`TextBuffer::swap_prompt`].
     pub fn set_input(&mut self, s: &str) {
         self.buffer.set_value(s);
     }
@@ -348,29 +428,38 @@ impl InputBox {
             return;
         }
         let new_index = match self.history_index {
-            None => {
-                self.draft = self.buffer.value().to_owned();
-                self.history.len() - 1
-            }
+            None => self.history.len() - 1,
             Some(0) => return,
             Some(i) => i - 1,
         };
-        self.history_index = Some(new_index);
-        self.buffer.set_value(self.history.get(new_index).unwrap());
+        let entry = self.history_entry(new_index);
+        let shown = self.buffer.swap_prompt(entry);
+        if self.history_index.replace(new_index).is_none() {
+            self.draft = shown;
+        }
         self.buffer.move_to_end();
+    }
+
+    /// History keeps text only, so a recalled entry comes in with no marks.
+    fn history_entry(&self, index: usize) -> Prompt {
+        Prompt {
+            text: self.history.get(index).unwrap().to_owned(),
+            marks: Marks::default(),
+        }
     }
 
     pub fn history_down(&mut self) {
         let Some(i) = self.history_index else {
             return;
         };
-        if i + 1 < self.history.len() {
+        let next = if i + 1 < self.history.len() {
             self.history_index = Some(i + 1);
-            self.buffer.set_value(self.history.get(i + 1).unwrap());
+            self.history_entry(i + 1)
         } else {
             self.history_index = None;
-            self.buffer.set_value(&mem::take(&mut self.draft));
-        }
+            mem::take(&mut self.draft)
+        };
+        self.buffer.swap_prompt(next);
     }
 
     /// Returns the screen cell the caret was drawn in, reversed or not.
@@ -389,10 +478,10 @@ impl InputBox {
         top_right_hint: Option<Line<'_>>,
     ) -> Option<Position> {
         let content_height = area.height.saturating_sub(BORDER_ROWS);
-        let (cursor_row, text_rows) = {
-            let layout = self.layout(area.width);
-            (layout.cursor_row(&self.buffer), layout.total_rows())
-        };
+        let layout = self.layout.get_mut();
+        layout.sync(&self.buffer, effective_width(area.width.into()));
+        let cursor_row = layout.cursor_row(&self.buffer);
+        let text_rows = layout.total_rows();
 
         if self.follow_cursor {
             let cursor_row = u16::try_from(cursor_row).unwrap_or(u16::MAX);
@@ -436,28 +525,37 @@ impl InputBox {
             let rows: Vec<Row> = self
                 .layout
                 .get_mut()
-                .rows_from(&self.buffer, self.scroll_y.into())
-                .take(content_height.into())
+                .rows(&self.buffer, self.scroll_y.into(), content_height.into())
                 .collect();
-            let shell_spans = rows
-                .first()
-                .filter(|row| row.line == 0)
-                .and_then(|_| shell_highlight_spans(self.buffer.line(0)));
-            let caret = self.buffer.cursor_byte_in_line();
+            let window = match (rows.first(), rows.last()) {
+                (Some(first), Some(last)) => first.text.start..=last.text.end,
+                _ => 0..=0,
+            };
+            let marks = self.buffer.overlapping(window.clone());
+            let conceals = self.buffer.concealed(window);
+            self.langs.next_frame(&self.buffer);
+            let caret = self.buffer.cursor_byte();
             let mut lines = Vec::with_capacity(rows.len() + 1);
-            for (screen_row, row) in (0..).zip(rows) {
-                let owns_caret = u32::from(self.scroll_y) + u32::from(screen_row) == cursor_row;
-                let (drawn, col) = draw_row(
-                    self.buffer.line(row.line),
-                    &row,
-                    shell_spans.as_deref().filter(|_| row.line == 0),
-                    owns_caret.then_some(caret),
-                    show_cursor,
+            for line_rows in rows.chunk_by(|a, b| a.line == b.line) {
+                let text = line_rows[0].text.clone();
+                let line = &self.buffer.value()[text.clone()];
+                let decor = LineDecor::new(
+                    self.buffer.value(),
+                    text.clone(),
+                    &marks,
+                    &conceals,
+                    &mut self.langs,
                 );
-                if let Some(col) = col {
-                    cursor_cell = Some(Position::new(col, screen_row));
+                for row in line_rows {
+                    let screen_row = lines.len() as u16;
+                    let owns_caret = u32::from(self.scroll_y) + u32::from(screen_row) == cursor_row;
+                    let caret = owns_caret.then(|| caret - text.start);
+                    let (drawn, col) = draw_row(line, row, &decor, caret, show_cursor);
+                    if let Some(col) = col {
+                        cursor_cell = Some(Position::new(col, screen_row));
+                    }
+                    lines.push(drawn);
                 }
-                lines.push(drawn);
             }
             lines
         };
@@ -535,31 +633,82 @@ impl InputBox {
     /// Convert a mouse click at terminal (row, col) within the input content
     /// area into a (line_index, char_index) in the text buffer, accounting
     /// for scroll offset, word-wrap, and the chevron/padding prefix.
+    ///
+    /// A click on virtual text lands on the char it sits before, and one on
+    /// the text drawn over a conceal on the nearer edge of the conceal.
     fn click_position(&self, area: Rect, row: u16, col: u16) -> Option<(usize, usize)> {
+        let hit = self.hit(area, row, col)?;
+        let at = hit.byte(|piece, col| {
+            if piece.concealed && col >= piece.virt && (col - piece.virt) * 2 >= piece.width {
+                piece.bytes.end
+            } else {
+                piece.bytes.start
+            }
+        });
+        let y = self.buffer.line_of(at);
+        let line_start = self.buffer.line_range(y).start;
+        Some((y, self.buffer.value()[line_start..at].chars().count()))
+    }
+
+    /// The drawn row under terminal cell (row, col) of the content area, and
+    /// what of it the cell shows.
+    fn hit(&self, area: Rect, row: u16, col: u16) -> Option<Hit> {
         let content_y = row.checked_sub(area.y)?;
         let content_x = col.checked_sub(area.x)?;
-
-        let layout = self.layout(area.width);
-        let row = layout
-            .rows_from(
+        let row = self
+            .layout(area.width)
+            .rows(
                 &self.buffer,
                 u32::from(self.scroll_y) + u32::from(content_y),
+                1,
             )
             .next()?;
-        let line = self.buffer.line(row.line);
-
         let prefix = if row.index == 0 { PREFIX_WIDTH } else { 0 };
-        let mut col = usize::from(content_x.saturating_sub(prefix));
-        let mut hit = row.bytes.end;
-        for (i, c) in line[row.bytes.clone()].char_indices() {
-            let w = char_width(c);
-            if w > col {
-                hit = row.bytes.start + i;
+        let Some(col) = content_x.checked_sub(prefix) else {
+            return Some(Hit {
+                row,
+                spot: Spot::Prefix,
+            });
+        };
+        let mut col = usize::from(col);
+        let line = &self.buffer.value()[row.text.clone()];
+        let mut spot = Spot::PastEnd;
+        for found in row.shape.pieces(line, row.bytes.clone()) {
+            let width = found.virt + found.width;
+            if width > col {
+                spot = Spot::Piece(found, col);
                 break;
             }
-            col -= w;
+            col -= width;
         }
-        Some((row.line, line[..hit].chars().count()))
+        Some(Hit { row, spot })
+    }
+}
+
+/// A screen cell of the box: the row it is on and what of the row it shows.
+struct Hit {
+    row: Row,
+    spot: Spot,
+}
+
+enum Spot {
+    /// The chevron or the pad before the text.
+    Prefix,
+    /// A piece of the row, and how many columns into it.
+    Piece(Piece, usize),
+    PastEnd,
+}
+
+impl Hit {
+    /// The byte of the value it lands on: the row's start in the prefix, its
+    /// end past it, and inside a piece what {pick} chooses.
+    fn byte(&self, pick: impl FnOnce(&Piece, usize) -> usize) -> usize {
+        let at = match &self.spot {
+            Spot::Prefix => self.row.bytes.start,
+            Spot::Piece(piece, col) => pick(piece, *col),
+            Spot::PastEnd => self.row.bytes.end,
+        };
+        self.row.text.start + at
     }
 }
 
@@ -583,7 +732,7 @@ const fn effective_width(content_width: usize) -> usize {
 fn draw_row(
     line: &str,
     row: &Row,
-    shell_spans: Option<&[Span<'static>]>,
+    decor: &LineDecor,
     caret: Option<usize>,
     reversed: bool,
 ) -> (Line<'static>, Option<u16>) {
@@ -593,66 +742,14 @@ fn draw_row(
         _ => Vec::new(),
     };
     let prefix_width = display_width(&spans);
-    let text = &line[row.bytes.clone()];
-    let chunk = match shell_spans {
-        Some(styled) => {
-            let start = line[..row.bytes.start].chars().count();
-            slice_styled_spans(styled, start, start + text.chars().count())
-        }
-        None => vec![Span::raw(text.to_owned())],
-    };
-    let Some(caret) = caret else {
-        spans.extend(chunk);
+    let (content, caret_chars) = decor.draw(line, row, caret);
+    let Some(caret_chars) = caret_chars else {
+        spans.extend(content);
         return (Line::from(spans), None);
     };
-    let (with_cursor, col) = overlay_cursor(
-        chunk,
-        line[row.bytes.start..caret].chars().count(),
-        reversed,
-    );
+    let (with_cursor, col) = overlay_cursor(content, caret_chars, reversed);
     spans.extend(with_cursor);
     (Line::from(spans), Some(prefix_width + col))
-}
-
-fn shell_highlight_spans(line: &str) -> Option<Vec<Span<'static>>> {
-    if !highlight::is_ready() {
-        return None;
-    }
-    let parsed = parse_shell_prefix(line)?;
-    let prefix = &line[..parsed.prefix_len];
-    let command = &line[parsed.prefix_len..];
-    let shell_style = theme::current().shell_prefix;
-    let mut spans = vec![Span::styled(prefix.to_owned(), shell_style)];
-    let mut hl = maki_highlight::Highlighter::for_token("bash");
-    for span in highlight::highlight_line(&mut hl, command) {
-        spans.push(span);
-    }
-    Some(spans)
-}
-
-fn slice_styled_spans(
-    spans: &[Span<'static>],
-    char_start: usize,
-    char_end: usize,
-) -> Vec<Span<'static>> {
-    let mut result = Vec::new();
-    let mut pos = 0;
-    for span in spans {
-        let span_len = span.content.chars().count();
-        let span_end = pos + span_len;
-        if span_end <= char_start || pos >= char_end {
-            pos = span_end;
-            continue;
-        }
-        let lo = char_start.saturating_sub(pos);
-        let hi = (char_end - pos).min(span_len);
-        let slice: String = span.content.chars().skip(lo).take(hi - lo).collect();
-        if !slice.is_empty() {
-            result.push(Span::styled(slice, span.style));
-        }
-        pos = span_end;
-    }
-    result
 }
 
 fn display_width(spans: &[Span<'_>]) -> u16 {
@@ -716,12 +813,20 @@ fn overlay_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::shell::parse_shell_prefix;
     use crate::components::scrollbar::SCROLLBAR_THUMB;
-    use crate::selection::{ContentRegion, ScreenSelection, extract_selected_text};
-    use crate::text_buffer::test_support::text_edit;
+    use crate::components::tool_display::resolve_span_style;
+    use crate::decor_worker;
+    use crate::text_buffer::test_support::{mark_ranges, text_edit};
+    use crate::text_buffer::{Decoration, Reveal, RuleSet, VirtTextPos};
+    use maki_agent::types::InlineStyle;
+    use maki_agent::{SnapshotSpan, SpanColor, SpanStyle};
+    use maki_lua::{InputRule, PatternRule, SyntaxRule};
+    use maki_providers::ImageMediaType;
     use ratatui::layout::{Position, Rect};
     use ratatui::style::Color;
     use std::ops::Range;
+    use std::sync::Arc;
     use test_case::test_case;
 
     fn type_text(input: &mut InputBox, text: &str) {
@@ -887,10 +992,7 @@ mod tests {
         }
         assert_eq!(input.draft_text(), parked);
 
-        let swapped = input.swap_draft(Submission {
-            text: String::new(),
-            images: Vec::new(),
-        });
+        let swapped = input.swap_draft(Draft::default());
 
         assert_eq!(swapped.text, parked);
     }
@@ -1113,16 +1215,9 @@ mod tests {
         type_text(&mut input, WIDE_LINE);
         input.buffer.add_line();
         type_text(&mut input, TAIL);
-        let terminal = render_input(&mut input, WIDTH, HEIGHT);
 
-        let copy_text = input.copy_text();
-        let regions = [ContentRegion {
-            area: Rect::new(0, 1, WIDTH, HEIGHT - 2),
-            raw_text: &copy_text,
-            line_breaks: input.line_breaks(WIDTH),
-        }];
-        // Leaving the first drawn row out keeps the region partly selected, so
-        // the copy walks cells and the row counting decides where it breaks.
+        // Leaving the first drawn row out keeps the box partly selected, so
+        // the copy maps the cells back to the text.
         let selection = ScreenSelection {
             start_row: 2,
             start_col: 0,
@@ -1130,7 +1225,7 @@ mod tests {
             end_col: WIDTH - 1,
         };
 
-        let text = extract_selected_text(terminal.backend().buffer(), &selection, &regions);
+        let text = input.selected_text(Rect::new(0, 1, WIDTH, HEIGHT - 2), &selection);
         assert_eq!(text, format!("六七八九十百\n{NEWLINE_PAD}{TAIL}"));
     }
 
@@ -1159,8 +1254,6 @@ mod tests {
     }
 
     fn test_image() -> ImageSource {
-        use maki_providers::ImageMediaType;
-        use std::sync::Arc;
         ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="))
     }
 
@@ -1585,5 +1678,625 @@ mod tests {
         assert_eq!(input.buffer.value(), BEFORE);
         assert_eq!(input.buffer.cursor_byte(), BEFORE.len());
         assert!(matches!(input.undo(), InputAction::None));
+    }
+
+    type Rgb = (u8, u8, u8);
+
+    const MARKS_PLUGIN: &str = "test";
+    const MARKS_NS: &str = "marks";
+    const RED: Rgb = (200, 0, 0);
+    const BLUE: Rgb = (0, 0, 200);
+
+    fn mark(bytes: Range<usize>, decoration: Decoration) -> Mark {
+        Mark {
+            start: bytes.start,
+            stop: (!bytes.is_empty()).then_some(bytes.end),
+            decoration: Arc::new(decoration),
+        }
+    }
+
+    fn virt(text: &str, pos: VirtTextPos) -> Decoration {
+        Decoration {
+            virt_text: vec![SnapshotSpan {
+                text: text.into(),
+                style: SpanStyle::Default,
+            }],
+            virt_text_pos: pos,
+            ..Decoration::default()
+        }
+    }
+
+    fn hl(style: InlineStyle) -> Decoration {
+        Decoration {
+            hl: Some(SpanStyle::Inline(style)),
+            ..Decoration::default()
+        }
+    }
+
+    fn fg(rgb: Rgb) -> InlineStyle {
+        InlineStyle {
+            fg: Some(SpanColor::Rgb(rgb)),
+            ..InlineStyle::default()
+        }
+    }
+
+    /// The caret goes to the end, so it never covers a cell a test reads.
+    fn marked(text: &str, marks: Vec<Mark>) -> InputBox {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.set_input(text);
+        input.buffer.move_to_end();
+        input.set_marks(MARKS_PLUGIN, MARKS_NS, marks).unwrap();
+        input
+    }
+
+    /// The cell {x} columns into the text of screen row {row}, past the
+    /// chevron.
+    fn text_cell(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        x: u16,
+        row: u16,
+    ) -> ratatui::buffer::Cell {
+        let col = PREFIX_WIDTH + x;
+        terminal
+            .backend()
+            .buffer()
+            .cell((col, row))
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn hl_paints_only_its_range() {
+        let bold = InlineStyle {
+            bold: true,
+            ..InlineStyle::default()
+        };
+        let mut input = marked("plain bold", vec![mark(6..10, hl(bold))]);
+        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        let is_bold = |x| text_cell(&terminal, x, 1).modifier.contains(Modifier::BOLD);
+        assert!(!is_bold(5));
+        assert!((6..10).all(is_bold));
+    }
+
+    #[test_case(&[RED], &[BLUE] => BLUE ; "a_later_namespace_wins")]
+    #[test_case(&[], &[RED, BLUE] => BLUE ; "the_later_mark_wins_within_a_namespace")]
+    fn composition(first: &[Rgb], second: &[Rgb]) -> Rgb {
+        let marks = |set: &[Rgb]| set.iter().map(|&rgb| mark(0..2, hl(fg(rgb)))).collect();
+        let mut input = marked("xy", marks(first));
+        input
+            .set_marks(MARKS_PLUGIN, "second", marks(second))
+            .unwrap();
+        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        let drawn = text_cell(&terminal, 0, 1).fg;
+        *[RED, BLUE]
+            .iter()
+            .find(|&&rgb| resolve_span_style(&SpanStyle::Inline(fg(rgb))).fg == Some(drawn))
+            .expect("one of the two colors is drawn")
+    }
+
+    /// Ten columns of text: the virtual text pushes `h` onto a row of its own.
+    #[test]
+    fn inline_virtual_text_takes_columns_and_wraps() {
+        let mut input = marked(
+            "abcdefgh",
+            vec![mark(4..4, virt("XYZ", VirtTextPos::Inline))],
+        );
+        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        assert_eq!(rendered_row(&terminal, 1), format!("{CHEVRON}abcdXYZefg"));
+        assert_eq!(rendered_row(&terminal, 2), "h");
+        assert_eq!(input.height(CURSOR_WIDTH), 2 + BORDER_ROWS);
+    }
+
+    #[test]
+    fn eol_virtual_text_is_cut_rather_than_wrapped() {
+        let mut input = marked("abcdefgh", vec![mark(0..0, virt("TAIL", VirtTextPos::Eol))]);
+        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        assert_eq!(rendered_row(&terminal, 1), format!("{CHEVRON}abcdefgh T"));
+        assert_eq!(input.height(CURSOR_WIDTH), 1 + BORDER_ROWS);
+    }
+
+    /// Ghost text reads on from where the user types, so the caret sits on
+    /// its first cell rather than past it.
+    #[test]
+    fn the_caret_comes_before_virtual_text_at_it() {
+        let mut input = marked("ab", vec![mark(2..2, virt("cd", VirtTextPos::Inline))]);
+        let rendered = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        assert_eq!(
+            rendered_row(&rendered.terminal, 1),
+            format!("{CHEVRON}abcd")
+        );
+        assert_cursor_at(&rendered, Some(Position::new(PREFIX_WIDTH + 2, 1)));
+    }
+
+    #[test_case(PREFIX_WIDTH + 2 => Some((0, 2)) ; "on_the_virtual_text")]
+    #[test_case(PREFIX_WIDTH + 4 => Some((0, 2)) ; "on_the_char_after_it")]
+    #[test_case(PREFIX_WIDTH + 5 => Some((0, 3)) ; "past_it")]
+    fn a_click_on_virtual_text_lands_on_the_char_after_it(col: u16) -> Option<(usize, usize)> {
+        let input = marked("abcd", vec![mark(2..2, virt("XY", VirtTextPos::Inline))]);
+        input.click_position(area(CURSOR_WIDTH), 0, col)
+    }
+
+    /// The same code sits on two lines and only the first is marked, so the
+    /// second shows what the text looks like without the mark.
+    #[test]
+    fn lang_colors_its_range_as_code() {
+        const CODE: &str = "fn x";
+        crate::highlight::warmup();
+        let rust = Decoration {
+            lang: Some("rust".into()),
+            ..Decoration::default()
+        };
+        let mut input = marked(&format!("{CODE}\n{CODE}"), vec![mark(0..CODE.len(), rust)]);
+        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        assert_ne!(text_cell(&terminal, 0, 1).fg, text_cell(&terminal, 0, 2).fg);
+    }
+
+    #[test]
+    fn marks_follow_the_draft_to_another_chat_and_back() {
+        let mut input = marked("draft", vec![mark(0..5, hl(fg(RED)))]);
+
+        let parked = input.swap_draft(Draft::default());
+        assert!(mark_ranges(&input.buffer).is_empty());
+
+        input.swap_draft(parked);
+        assert_eq!(input.buffer.value(), "draft");
+        assert_eq!(mark_ranges(&input.buffer), vec![0..5]);
+    }
+
+    #[test_case(|input| { input.submit(); } ; "submit")]
+    #[test_case(InputBox::discard           ; "discard")]
+    fn ghost_text_goes_with_the_prompt(put_away: fn(&mut InputBox)) {
+        let ghost = mark(DRAFT.len()..DRAFT.len(), virt("ghost", VirtTextPos::Inline));
+        let mut input = marked(DRAFT, vec![ghost]);
+
+        put_away(&mut input);
+        type_text(&mut input, DRAFT);
+
+        assert!(mark_ranges(&input.buffer).is_empty());
+    }
+
+    #[test_case(|input| { input.history_down(); } ; "history_down")]
+    #[test_case(|input| { let parked = input.swap_draft(Draft::default()); input.swap_draft(parked); } ; "a_chat_switch_and_back")]
+    fn the_draft_keeps_its_marks_under_a_history_recall(come_back: fn(&mut InputBox)) {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, RECALLED);
+        type_text(&mut input, DRAFT);
+        let marks = vec![mark(0..DRAFT.len(), hl(fg(RED)))];
+        input.set_marks(MARKS_PLUGIN, MARKS_NS, marks).unwrap();
+
+        input.history_up();
+        assert!(mark_ranges(&input.buffer).is_empty(), "an entry has none");
+        come_back(&mut input);
+
+        assert_eq!(input.buffer.value(), DRAFT);
+        assert_eq!(mark_ranges(&input.buffer), vec![0..DRAFT.len()]);
+    }
+
+    /// `$s:go` is drawn as the four columns of `[go]`, so the row reads
+    /// `a [go] b` and the chip takes text columns 2 to 5.
+    const CHIP_TEXT: &str = "a $s:go b";
+    const CHIP: Range<usize> = 2..7;
+    const CHIP_DRAWN: &str = "a [go] b";
+
+    fn chip(reveal: Reveal) -> InputBox {
+        let decoration = Decoration {
+            conceal: Some("[go]".into()),
+            reveal,
+            atomic: true,
+            ..Decoration::default()
+        };
+        marked(CHIP_TEXT, vec![mark(CHIP, decoration)])
+    }
+
+    #[test]
+    fn a_conceal_is_drawn_until_the_raw_text_is_asked_for() {
+        let mut input = chip(Reveal::Never);
+        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        assert_eq!(rendered_row(&terminal, 1), format!("{CHEVRON}{CHIP_DRAWN}"));
+
+        input.buffer.toggle_raw();
+        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        assert_eq!(rendered_row(&terminal, 1), format!("{CHEVRON}{CHIP_TEXT}"));
+    }
+
+    #[test]
+    fn a_revealing_conceal_shows_its_text_while_the_caret_is_on_an_edge() {
+        let mut input = chip(Reveal::Cursor);
+        input.buffer.set_cursor(0, CHIP.end);
+        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        assert_eq!(rendered_row(&terminal, 1), format!("{CHEVRON}{CHIP_TEXT}"));
+
+        input.buffer.move_to_end();
+        let terminal = render_input(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        assert_eq!(rendered_row(&terminal, 1), format!("{CHEVRON}{CHIP_DRAWN}"));
+    }
+
+    #[test_case(2, CHIP.end, 6 ; "left_onto_its_end")]
+    #[test_case(3, CHIP.start, 2 ; "left_again_onto_its_start")]
+    fn the_caret_steps_over_a_chip(lefts: usize, byte: usize, col: u16) {
+        let mut input = chip(Reveal::Never);
+        for _ in 0..lefts {
+            input.handle_key(KeyCode::Left.into());
+        }
+        assert_eq!(input.buffer.cursor_byte(), byte);
+        let rendered = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        assert_cursor_at(&rendered, Some(Position::new(PREFIX_WIDTH + col, 1)));
+    }
+
+    #[test_case(PREFIX_WIDTH + 3 => CHIP.start ; "on_its_first_half")]
+    #[test_case(PREFIX_WIDTH + 4 => CHIP.end ; "on_its_second_half")]
+    #[test_case(PREFIX_WIDTH + 7 => CHIP_TEXT.find('b').unwrap() ; "on_the_char_after_it")]
+    fn clicking_a_chip_row(col: u16) -> usize {
+        let mut input = chip(Reveal::Never);
+        input.handle_click(area(CURSOR_WIDTH), 0, col);
+        input.buffer.cursor_byte()
+    }
+
+    /// Ghost text `XY` before the `b`: the cells copy as the text under them,
+    /// never as what is drawn.
+    #[test_case(3, 6 => " $s:go" ; "a_chip_cut_by_the_end_is_taken_whole")]
+    #[test_case(5, 9 => "$s:go " ; "ending_on_virtual_text_leaves_it_out")]
+    #[test_case(0, 11 => format!("{CHEVRON}{CHIP_TEXT}") ; "starting_on_the_prefix_takes_it")]
+    fn copying_part_of_a_chip_row_copies_the_source(start_col: u16, end_col: u16) -> String {
+        let mut input = chip(Reveal::Never);
+        let ghost = mark(8..8, virt("XY", VirtTextPos::Inline));
+        input.set_marks(MARKS_PLUGIN, "ghost", vec![ghost]).unwrap();
+        let selection = ScreenSelection {
+            start_row: 1,
+            start_col,
+            end_row: 1,
+            end_col,
+        };
+        input.selected_text(Rect::new(0, 1, CURSOR_WIDTH, CURSOR_HEIGHT - 2), &selection)
+    }
+
+    const SHELL_WIDTH: u16 = 30;
+
+    /// The `!` used to be painted by hand, and the two core rules took over.
+    /// So the old look is rebuilt here from `parse_shell_prefix` and a bash
+    /// mark, and every cell has to match it.
+    #[test_case("!ls -la"       ; "bang")]
+    #[test_case("!  ls"         ; "bang_with_extra_spaces")]
+    #[test_case("!!x=1 && ls"   ; "double_bang")]
+    #[test_case("!!!ls"         ; "triple_bang")]
+    #[test_case("!"             ; "lone_bang")]
+    #[test_case("!!"            ; "lone_double_bang")]
+    #[test_case("!! "           ; "double_bang_and_space")]
+    #[test_case("!\nls"         ; "bang_then_command_on_the_next_line")]
+    #[test_case("ls\n!ls"       ; "bang_on_a_later_line")]
+    fn a_shell_prompt_draws_like_parse_shell_prefix_reads_it(text: &str) {
+        crate::highlight::warmup();
+        let first_line = text.split('\n').next().unwrap();
+        let prefix = parse_shell_prefix(first_line).map_or(0, |parsed| parsed.prefix_len);
+        let bash = Decoration {
+            lang: Some("bash".into()),
+            ..Decoration::default()
+        };
+        let command = (prefix > 0).then(|| mark(prefix..first_line.len(), bash));
+        let expected = render_input(
+            &mut marked(text, command.into_iter().collect()),
+            SHELL_WIDTH,
+            CURSOR_HEIGHT,
+        );
+        let mut shell = marked(text, Vec::new());
+        shell.buffer.set_rules(RuleSet::with_plugins(&[]));
+        let shell = render_input(&mut shell, SHELL_WIDTH, CURSOR_HEIGHT);
+
+        let prefix_cols = PREFIX_WIDTH..PREFIX_WIDTH + prefix as u16;
+        let expected = expected.backend().buffer();
+        for (i, cell) in shell.backend().buffer().content.iter().enumerate() {
+            let (col, row) = expected.pos_of(i);
+            let mut want = expected.content[i].clone();
+            if row == 1 && prefix_cols.contains(&col) {
+                want.set_style(theme::current().shell_prefix);
+            }
+            assert_eq!(cell, &want, "cell ({col}, {row})");
+        }
+    }
+
+    fn chip_rule(conceal: &str) -> Arc<RuleSet> {
+        let mark = Decoration {
+            conceal: Some(conceal.into()),
+            atomic: true,
+            ..Decoration::default()
+        };
+        RuleSet::with_plugins(&[InputRule::Pattern(
+            PatternRule::new(r"\$s:(\w+)", mark).unwrap(),
+        )])
+    }
+
+    /// The half typed chip is drawn first, so its line is matched and kept
+    /// before the chip exists. A stale cache would never show the chip.
+    #[test]
+    fn a_rule_chip_appears_once_typed_and_deletes_whole() {
+        let mut input = ruled(chip_rule("[$1]"));
+        let drawn_row = |input: &mut InputBox| {
+            rendered_row(&render_input(input, CURSOR_WIDTH, CURSOR_HEIGHT), 1)
+        };
+        let (head, tail) = CHIP_TEXT.split_at(CHIP.start + 2);
+        type_text(&mut input, head);
+        assert_eq!(drawn_row(&mut input), format!("{CHEVRON}{head}"));
+
+        type_text(&mut input, tail);
+        assert_eq!(drawn_row(&mut input), format!("{CHEVRON}{CHIP_DRAWN}"));
+
+        input.buffer.set_cursor(0, CHIP.end);
+        input.handle_key(KeyCode::Backspace.into());
+        assert_eq!(input.buffer.value(), "a  b");
+    }
+
+    /// Each line is two rows raw and one as a chip. Nothing is ever drawn, so
+    /// the totals only add up if the layout matches lines on its own. The
+    /// paste on top shifts every cached line down by one, which must not mix
+    /// up whose marks are whose.
+    #[test]
+    fn rule_chips_count_rows_on_lines_never_drawn() {
+        const LINES: u32 = 30;
+        let line = format!("$s:{}", "w".repeat(CURSOR_EW - 2));
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.set_input(&vec![line.as_str(); LINES as usize].join("\n"));
+        input.buffer.set_cursor(0, 0);
+        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), 2 * LINES);
+
+        input.buffer.set_rules(chip_rule("$1"));
+        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), LINES);
+
+        input.handle_paste(&format!("{line}\n"));
+        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), LINES + 1);
+    }
+
+    const PREVIEW_BLOCK: &str = r#"
+        (fenced_code_block
+          (info_string (language) @injection.language)
+          (code_fence_content) @injection.content)
+        (fenced_code_block_delimiter) @hidden
+    "#;
+    const PREVIEW_INLINE: &str = "(strong_emphasis (emphasis_delimiter) @hidden) @strong";
+
+    /// Bold without its stars. The block query only puts the markdown
+    /// grammar in the rule, and that is what runs the inline one under it.
+    fn preview_rules() -> Arc<RuleSet> {
+        let hidden = Decoration {
+            conceal: Some(String::new()),
+            reveal: Reveal::Cursor,
+            ..Decoration::default()
+        };
+        let strong = hl(InlineStyle {
+            bold: true,
+            ..InlineStyle::default()
+        });
+        let rule = SyntaxRule::new(
+            "markdown",
+            vec![
+                ("markdown".into(), PREVIEW_BLOCK.into()),
+                ("markdown_inline".into(), PREVIEW_INLINE.into()),
+            ],
+            vec![("hidden".into(), hidden), ("strong".into(), strong)],
+        )
+        .unwrap();
+        RuleSet::with_plugins(&[InputRule::Syntax(Arc::new(rule))])
+    }
+
+    fn ruled(rules: Arc<RuleSet>) -> InputBox {
+        decor_worker::manual();
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.buffer.set_rules(rules);
+        input
+    }
+
+    /// Runs the worker until it has nothing left, taking each reply in like
+    /// the event loop's ticks would.
+    fn settle(input: &mut InputBox) {
+        input.poll_decor();
+        while decor_worker::run_queued() > 0 {
+            input.poll_decor();
+        }
+    }
+
+    /// The worker has not seen the edits yet. A `z` typed inside the bold,
+    /// right after its stars, and one typed inside the code grow those marks
+    /// like placed ones grow, so neither flashes plain and no star comes
+    /// back. A backtick typed inside a fence lands inside what it conceals,
+    /// the one place the raw text shows until the worker is back.
+    #[test]
+    fn a_stale_result_grows_with_what_is_typed_inside_its_marks() {
+        const DOC: &str = "**a** x\n```rust\nlet y\n```\n";
+        const WIDTH: u16 = 30;
+        const HEIGHT: u16 = 8;
+        const FIRST_ROW: u16 = 1;
+        const CODE_ROW: u16 = 3;
+        const SETTLED: [&str; 4] = ["a x", "rust", "let y", ""];
+        const STALE: [&str; 4] = ["za x", "````rust", "let zy", "````"];
+        const EDITED: [&str; 4] = ["za x", "rust", "let zy", ""];
+        let draw = |input: &mut InputBox| {
+            let terminal = render_input(input, WIDTH, HEIGHT);
+            let rows: Vec<String> = (FIRST_ROW..FIRST_ROW + SETTLED.len() as u16)
+                .map(|row| {
+                    let text = rendered_row(&terminal, row);
+                    text.chars().skip(PREFIX_WIDTH.into()).collect()
+                })
+                .collect();
+            (terminal, rows)
+        };
+        let insert = |start, text| text_edit(start, start, text);
+        crate::highlight::warmup();
+        let mut input = ruled(preview_rules());
+        input.set_input(DOC);
+        let x = DOC.find('x').unwrap();
+        input.buffer.set_cursor(0, x);
+        settle(&mut input);
+        let (terminal, rows) = draw(&mut input);
+        assert_eq!(rows, SETTLED);
+        let code = text_cell(&terminal, 0, CODE_ROW).style();
+        assert_ne!(code, text_cell(&terminal, 2, FIRST_ROW).style());
+
+        let fences = DOC.match_indices("```").map(|(at, _)| insert(at + 1, "`"));
+        let mut edits = vec![insert(2, "z"), insert(DOC.find('y').unwrap(), "z")];
+        edits.extend(fences);
+        edits.sort_by_key(|edit| edit.start);
+        let cursor = Some(x + "z".len());
+        input
+            .apply_edits(input.buffer.version(), edits, cursor)
+            .unwrap();
+        let (terminal, rows) = draw(&mut input);
+        assert_eq!(rows, STALE);
+        let bold = text_cell(&terminal, 0, FIRST_ROW).modifier;
+        assert!(bold.contains(Modifier::BOLD));
+        assert_eq!(text_cell(&terminal, 0, CODE_ROW).style(), code);
+
+        settle(&mut input);
+        assert_eq!(draw(&mut input).1, EDITED);
+    }
+
+    /// Opening a fence turns every line under it into code, so their stars
+    /// come back and each one wraps onto a second row. Those lines are far
+    /// from the edit and never drawn, so only the result can tell the layout
+    /// to count them again.
+    #[test]
+    fn a_result_recounts_lines_far_from_the_edit() {
+        const LINES: u32 = 20;
+        let mut input = ruled(preview_rules());
+        let bold = format!("**{}**", "w".repeat(CURSOR_EW - 2));
+        let text = format!("top\n{}", vec![bold.as_str(); LINES as usize].join("\n"));
+        input.set_input(&text);
+        input.buffer.set_cursor(0, 0);
+        settle(&mut input);
+        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), 1 + LINES);
+
+        let fence = text_edit("top\n".len(), "top\n".len(), "```\n");
+        input
+            .apply_edits(input.buffer.version(), vec![fence], None)
+            .unwrap();
+        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), 2 + LINES);
+
+        settle(&mut input);
+        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), 2 + 2 * LINES);
+    }
+
+    /// The block draws a badge wide enough to wrap the line it starts on.
+    /// Typing inside the atomic block drops it before the worker is back,
+    /// lines away from the edit, so that line has to be counted again.
+    #[test]
+    fn a_stale_mark_dropped_lines_away_recounts_them() {
+        const DOC: &str = "```\na\nb\n```";
+        const LINES: u32 = 4;
+        let badge = Decoration {
+            atomic: true,
+            ..virt(&"b".repeat(CURSOR_EW), VirtTextPos::Inline)
+        };
+        let rule = SyntaxRule::new(
+            "markdown",
+            vec![("markdown".into(), "(fenced_code_block) @badge".into())],
+            vec![("badge".into(), badge)],
+        )
+        .unwrap();
+        let mut input = ruled(RuleSet::with_plugins(&[InputRule::Syntax(Arc::new(rule))]));
+        input.set_input(DOC);
+        input.buffer.set_cursor(0, 0);
+        settle(&mut input);
+        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), LINES + 1);
+
+        let b = DOC.find('b').unwrap();
+        let edit = text_edit(b, b, "z");
+        input
+            .apply_edits(input.buffer.version(), vec![edit], None)
+            .unwrap();
+        assert_eq!(input.layout(CURSOR_WIDTH).total_rows(), LINES);
+    }
+
+    const ABOVE_CODE: &str = "top\n";
+    const BLOCK_COMMENT_START: &str = "/*\nx\n";
+    const BLOCK_COMMENT_END: &str = "*/";
+    /// Past what a frame colors by itself, so the range goes to the worker.
+    const LONG_FILLER: usize = 3000;
+
+    /// A line of text, then a block comment marked as rust, made {filler}
+    /// bytes longer.
+    fn commented(filler: usize) -> InputBox {
+        crate::highlight::warmup();
+        decor_worker::manual();
+        let code = format!(
+            "{BLOCK_COMMENT_START}{}{BLOCK_COMMENT_END}",
+            "y\n".repeat(filler / 2)
+        );
+        let rust = Decoration {
+            lang: Some("rust".into()),
+            ..Decoration::default()
+        };
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.set_input(&format!("{ABOVE_CODE}{code}"));
+        let range = ABOVE_CODE.len()..ABOVE_CODE.len() + code.len();
+        input
+            .set_marks(MARKS_PLUGIN, MARKS_NS, vec![mark(range, rust)])
+            .unwrap();
+        input.buffer.set_cursor(0, 0);
+        input
+    }
+
+    /// Types at the top, or inside the comment under the line of `x`.
+    fn type_in_commented(input: &mut InputBox, inside: bool) {
+        let at = if inside {
+            ABOVE_CODE.len() + BLOCK_COMMENT_START.len()
+        } else {
+            0
+        };
+        let edit = text_edit(at, at, "z");
+        input
+            .apply_edits(input.buffer.version(), vec![edit], None)
+            .unwrap();
+    }
+
+    /// Whether `x` looks like the `*` of the line that opens its comment.
+    /// Colored on its own, `x` would look like a plain identifier.
+    fn colored_whole(input: &mut InputBox) -> bool {
+        let terminal = render_input(input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        text_cell(&terminal, 1, 2).style() == text_cell(&terminal, 0, 3).style()
+    }
+
+    #[test]
+    fn a_short_lang_range_is_colored_whole_in_the_frame() {
+        let mut input = commented(0);
+        assert!(colored_whole(&mut input));
+        assert_eq!(decor_worker::run_queued(), 0);
+    }
+
+    /// Until the worker is back, each line is colored on its own, so the
+    /// code never flashes plain. Once colored, a frame reads none of the
+    /// range's text again until an edit lands inside it.
+    #[test_case(false ; "an_edit_above_it_moves_its_colors")]
+    #[test_case(true  ; "an_edit_inside_it_colors_it_again")]
+    fn a_long_range_is_colored_again_only_when_an_edit_touches_it(inside: bool) {
+        let mut input = commented(LONG_FILLER);
+        assert!(!colored_whole(&mut input));
+        assert_eq!(decor_worker::run_queued(), 1);
+        assert!(input.poll_decor());
+        assert!(colored_whole(&mut input));
+        decor::take_bytes_read();
+
+        type_in_commented(&mut input, inside);
+        assert_eq!(colored_whole(&mut input), !inside);
+        assert_eq!(decor::take_bytes_read() > 0, inside);
+        assert_eq!(decor_worker::run_queued(), usize::from(inside));
+    }
+
+    /// Here the edit lands while the worker is still coloring. Its colors
+    /// move along with an edit above the range. An edit inside makes them
+    /// wrong, so they are thrown away and the range is colored again. Either
+    /// way the result asks for a frame, or nothing would hand the range to
+    /// the worker again until some other redraw.
+    #[test_case(false ; "an_edit_above_it_moves_them")]
+    #[test_case(true  ; "an_edit_inside_it_drops_them")]
+    fn colors_from_the_worker_land_on_the_text_now(inside: bool) {
+        let mut input = commented(LONG_FILLER);
+        assert!(!colored_whole(&mut input));
+        type_in_commented(&mut input, inside);
+        assert!(!colored_whole(&mut input));
+        assert_eq!(decor_worker::run_queued(), 1);
+        assert!(input.poll_decor());
+        assert_eq!(colored_whole(&mut input), !inside);
+
+        assert_eq!(decor_worker::run_queued(), usize::from(inside));
+        input.poll_decor();
+        assert!(colored_whole(&mut input));
     }
 }

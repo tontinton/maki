@@ -56,6 +56,7 @@ use crate::components::{
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
+use crate::text_buffer::RuleSet;
 use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
@@ -67,9 +68,10 @@ use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, Key, KeymapReader,
-    LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
-    PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, PluginReach, WinView, is_reserved,
+    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, InputRule, InputRulesReader,
+    Key, KeymapReader, LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE,
+    PackCommand, PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, PluginReach, WinView,
+    is_reserved,
 };
 use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
@@ -430,6 +432,8 @@ pub struct App {
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     hints: Watch<HintSnapshot>,
+    pub(super) input_rules_reader: InputRulesReader,
+    input_rules: Watch<Vec<InputRule>>,
     pub(super) plan_answers: PlanAnswers,
     /// Actions produced outside key handling, drained by the event loop. A
     /// plan row handler answers long after the key press that started it.
@@ -451,6 +455,7 @@ impl App {
         lua_command_reader: LuaCommandReader,
         keymap_reader: KeymapReader,
         hint_reader: HintReader,
+        input_rules_reader: InputRulesReader,
         storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
@@ -463,7 +468,7 @@ impl App {
         let state = SessionState::from_session(session, model, &storage);
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
-        let input_box = InputBox::new(
+        let mut input_box = InputBox::new(
             InputHistory::load(
                 &storage,
                 &env::current_dir().unwrap_or_else(|_| PathBuf::from(&state.session.cwd)),
@@ -471,6 +476,10 @@ impl App {
             ),
             ui_config.max_input_lines,
         );
+        let input_rules = input_rules_reader.load_full();
+        input_box
+            .buffer
+            .set_rules(RuleSet::with_plugins(&input_rules));
         let mut app = Self {
             chats: vec![Chat::new(
                 state.session.id,
@@ -539,6 +548,8 @@ impl App {
             hints: Watch::seeded(hint_reader.load_full()),
             keymap_reader,
             hint_reader,
+            input_rules: Watch::seeded(input_rules),
+            input_rules_reader,
             plan_answers: PlanAnswers::default(),
             pending_actions: Vec::new(),
             restore_event_tx: None,
@@ -1234,6 +1245,7 @@ impl App {
                 self.model_picker.open(&self.state.model.spec());
                 return vec![Action::RefreshModels];
             }
+            BuiltinAction::InputRaw => self.input_box.buffer.toggle_raw(),
         }
         vec![]
     }
@@ -2310,6 +2322,8 @@ impl App {
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
             | self.hints.poll(self.hint_reader.load_full())
+            | self.poll_input_rules()
+            | Dirty::from(self.input_box.poll_decor())
             | self.tick_plan()
             | self.tick_file_picker()
             | self.tick_input_changed()
@@ -2451,6 +2465,21 @@ impl App {
         self.input_fired_this_frame = false;
         let _ = self.float_mgr.tick();
         let _ = self.tick_plan();
+        let _ = self.poll_input_rules();
+        let _ = self.input_box.poll_decor();
+    }
+
+    /// Rules hold for every session, so a background tab takes them up too
+    /// and comes back to the front already matching them.
+    fn poll_input_rules(&mut self) -> Dirty {
+        let plugin_rules = self.input_rules_reader.load_full();
+        let dirty = self.input_rules.poll(Arc::clone(&plugin_rules));
+        if dirty == Dirty::YES {
+            self.input_box
+                .buffer
+                .set_rules(RuleSet::with_plugins(&plugin_rules));
+        }
+        dirty
     }
 
     fn tick_file_picker(&mut self) -> Dirty {

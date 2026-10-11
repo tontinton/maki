@@ -1,6 +1,7 @@
 pub mod agent_autocmd;
 mod api;
 mod background;
+pub mod chunks;
 pub mod docs;
 pub mod docs_render;
 mod error;
@@ -20,6 +21,10 @@ pub use api::net::set_allowed_private_hosts;
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::pack::{Declared, PackOp};
 pub use api::session::SessionSnapshotFn;
+pub use api::ui::marks::{
+    Decoration, InputRule, InputRulesReader, PatternRule, Reveal, VirtTextPos,
+};
+pub use api::ui::syntax::{SyntaxDoc, SyntaxEdit, SyntaxIndex, SyntaxInput, SyntaxRule};
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
     HintReader, HintSnapshot, InputEdit, InputRequest, LuaCommandInfo, LuaCommandReader,

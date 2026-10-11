@@ -93,6 +93,7 @@ rustix = { workspace = true }
 [dev-dependencies]
 base64 = { workspace = true }
 criterion = { workspace = true }
+fastrand = { workspace = true }
 image = { workspace = true }
 jiff = { workspace = true }
 maki-agent = { workspace = true }

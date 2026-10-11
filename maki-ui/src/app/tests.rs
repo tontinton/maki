@@ -12,6 +12,7 @@ use crate::components::messages::ScrollPos;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
+use crate::decor_worker;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
 use crate::text_buffer::{EDIT_CONFLICT_ERR, INPUT_REPLACED_ERR};
@@ -22,6 +23,7 @@ use maki_agent::agent::TranscriptError;
 use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::session::NOTHING_TO_STORE;
+use maki_agent::tools::ToolRegistry;
 use maki_agent::{
     AgentMode, DoneReason, HistorySnapshot, ImageMediaType, McpConfigErrors, McpServerInfo,
     McpServerStatus, McpSnapshot, McpSnapshotReader, SharedBuf, SteerKind, SubagentInbox,
@@ -30,9 +32,10 @@ use maki_agent::{
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{
-    BuiltinAction, Dimension, FloatConfig, HintReader, KeymapReader, LuaCommandInfo,
-    LuaCommandReader, Missing, PackCommand, PackPlan, PackPreparation, PackReport, Permission,
-    PluginPermissions, SessionEndReason, Split, TextEdit, WinCommand, WinEvent,
+    BuiltinAction, Dimension, FloatConfig, HintReader, InputRulesReader, KeymapReader,
+    LuaCommandInfo, LuaCommandReader, Missing, PackCommand, PackPlan, PackPreparation, PackReport,
+    Permission, PluginHost, PluginPermissions, SessionEndReason, Split, TextEdit, WinCommand,
+    WinEvent,
 };
 use maki_providers::{
     ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, ThinkingSupport,
@@ -47,7 +50,9 @@ use maki_storage::sessions::{
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
+use ratatui::style::{Modifier, Style};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -187,6 +192,7 @@ fn build_app_with_session(
         lua_commands,
         KeymapReader::empty(),
         HintReader::empty(),
+        InputRulesReader::empty(),
         writer,
         UiConfig::default(),
         100,
@@ -3081,15 +3087,146 @@ fn status_hints_published_by_a_plugin_reach_the_screen() {
     assert!(!rendered(&mut app).contains(HINT_TEXT));
 }
 
-fn rendered(app: &mut App) -> String {
-    let backend = ratatui::backend::TestBackend::new(80, 24);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            app.view(frame);
+const RENDERED_WIDTH: u16 = 80;
+const RENDERED_HEIGHT: u16 = 24;
+const CHIP_PLUGIN_NAME: &str = "chips";
+const CHIP_PLUGIN: &str = r#"
+maki.ui.input_rules({
+  ns = "skill",
+  pattern = [[\$skill:([\w-]+)]],
+  mark = { conceal = "[$1]", atomic = true },
+})
+"#;
+const CHIP_PROMPT: &str = "use $skill:go now";
+const CHIP_SOURCE: &str = "$skill:go";
+const CHIP_DRAWN: &str = "use [go] now";
+const CHIP_TAIL: &str = " now";
+
+/// The rule goes from the Lua thread to the screen with no frame asked for,
+/// so only `tick` can pick it up, and the same goes for its removal.
+#[test]
+fn a_plugin_rule_draws_a_chip_until_the_plugin_unloads() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(CHIP_PLUGIN_NAME, CHIP_PLUGIN).unwrap();
+    let mut app = test_app();
+    app.input_rules_reader = host.input_rules_reader();
+    assert_eq!(app.tick(), Dirty::YES, "{OWED}");
+
+    for c in CHIP_PROMPT.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    assert!(rendered(&mut app).contains(CHIP_DRAWN));
+
+    for _ in 0..=CHIP_TAIL.len() {
+        app.update(Msg::Key(key(KeyCode::Left)));
+    }
+    let chip_start = CHIP_PROMPT.find(CHIP_SOURCE).unwrap();
+    assert_eq!(app.input_box.buffer.cursor_byte(), chip_start);
+    app.update(Msg::Key(key(KeyCode::Right)));
+    assert_eq!(
+        app.input_box.buffer.cursor_byte(),
+        chip_start + CHIP_SOURCE.len()
+    );
+
+    host.unload(CHIP_PLUGIN_NAME).unwrap();
+    assert_eq!(app.tick(), Dirty::YES, "{OWED}");
+    assert!(rendered(&mut app).contains(CHIP_SOURCE));
+}
+
+const PREVIEW_PLUGIN_NAME: &str = "preview";
+const PREVIEW_PLUGIN: &str = r#"
+maki.ui.input_rules({
+  ns = "md",
+  treesitter = {
+    lang = "markdown",
+    query = {
+      markdown = [[
+        (atx_heading (atx_h1_marker) @hidden) @heading
+        (fenced_code_block (fenced_code_block_delimiter) @fence)
+        (fenced_code_block
+          (info_string (language) @injection.language)
+          (code_fence_content) @injection.content)
+      ]],
+      markdown_inline = [[
+        (strong_emphasis (emphasis_delimiter) @hidden) @strong
+        (emphasis (emphasis_delimiter) @hidden) @em
+        (code_span (code_span_delimiter) @hidden) @code
+      ]],
+    },
+    captures = {
+      hidden = { conceal = "", reveal = "cursor" },
+      heading = { hl = { underline = true } },
+      strong = { hl = { bold = true } },
+      em = { hl = { italic = true } },
+      code = { hl = { reversed = true } },
+      fence = { hl = { dim = true } },
+    },
+  },
+})
+"#;
+const PREVIEW_PROMPT: &str =
+    "# Title\nsay **hi** to *you* and `snippet`\n```rust\nfn main() {}\n```";
+const PREVIEW_RAW: &str = "say **hi** to *you* and `snippet`";
+const PREVIEW_DRAWN: &str = "say hi to you and snippet";
+
+/// The style of the first cell of {needle} on the screen.
+fn style_of(buffer: &Buffer, needle: &str) -> Style {
+    let area = buffer.area;
+    let (col, row) = (0..area.height)
+        .find_map(|row| {
+            let line: String = (0..area.width)
+                .map(|col| buffer[(col, row)].symbol())
+                .collect();
+            let at = line.find(needle)?;
+            Some((line[..at].chars().count() as u16, row))
         })
+        .unwrap_or_else(|| panic!("{needle:?} is not on the screen"));
+    buffer[(col, row)].style()
+}
+
+/// Bold, italic, a heading, a code span and fenced code, all from one Lua
+/// rule. The tick after the paste can only hand the parse to the worker,
+/// which runs when the test says so. A raw frame after that tick shows the
+/// UI thread never parsed, and the size of the paste does not change that.
+#[test]
+fn a_markdown_preview_plugin_draws_the_prompt_once_parsed() {
+    crate::highlight::warmup();
+    decor_worker::manual();
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(PREVIEW_PLUGIN_NAME, PREVIEW_PLUGIN)
         .unwrap();
-    buffer_text(terminal.backend().buffer())
+    let mut app = test_app();
+    app.input_rules_reader = host.input_rules_reader();
+    let _ = app.tick();
+    while decor_worker::run_queued() > 0 {
+        let _ = app.tick();
+    }
+
+    app.update(Msg::Paste(PREVIEW_PROMPT.into()));
+    let _ = app.tick();
+    assert!(rendered(&mut app).contains(PREVIEW_RAW));
+    assert_eq!(decor_worker::run_queued(), 1);
+    assert_eq!(app.tick(), Dirty::YES, "{OWED}");
+
+    let screen = rendered_buffer(&mut app);
+    let text = buffer_text(&screen);
+    assert!(text.contains(PREVIEW_DRAWN), "{text}");
+    assert!(!text.contains("# Title"), "{text}");
+    let modifiers = |needle| style_of(&screen, needle).add_modifier;
+    assert!(modifiers("Title").contains(Modifier::UNDERLINED));
+    assert!(modifiers("hi to").contains(Modifier::BOLD));
+    assert!(modifiers("you and").contains(Modifier::ITALIC));
+    assert!(modifiers("snippet").contains(Modifier::REVERSED));
+    assert!(modifiers("```rust").contains(Modifier::DIM));
+    assert_ne!(style_of(&screen, "fn main").fg, style_of(&screen, "say").fg);
+}
+
+fn rendered_buffer(app: &mut App) -> Buffer {
+    draw_sized(app, RENDERED_WIDTH, RENDERED_HEIGHT).1
+}
+
+fn rendered(app: &mut App) -> String {
+    buffer_text(&rendered_buffer(app))
 }
 
 /// The event loop parks the terminal cursor on whatever `view` reports, so an

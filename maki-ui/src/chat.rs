@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::app::tasks::{TaskOutcome, TaskStatus};
-use crate::components::input::Submission;
+use crate::components::input::Draft;
 use crate::components::messages::{MessagesPanel, PromptProgress, ScrollPos};
 use crate::components::tool_display::append_annotation;
 use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
@@ -79,7 +79,7 @@ pub struct Chat {
     /// the chat finishes, since nothing would drain it after that.
     pub(crate) inbox: Option<Arc<SubagentInbox>>,
     /// Parked while another chat is in front, see `App::set_active_chat`.
-    pub(crate) draft: Submission,
+    pub(crate) draft: Draft,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     /// The ending and the index of the bubble announcing it, so a later, better
@@ -110,7 +110,7 @@ impl Chat {
             model_id: None,
             opts: None,
             inbox: None,
-            draft: Submission::default(),
+            draft: Draft::default(),
             pending_turn_usage: None,
             messages_panel,
             finish: None,

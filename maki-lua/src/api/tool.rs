@@ -606,7 +606,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table, target: PromptTarget) -> LuaResul
     if !spec.contains_key("content")? {
         return Err(mlua::Error::runtime("'content' is required"));
     }
-    match spec.get("content")? {
+    match spec.get::<LuaValue>("content")? {
         LuaValue::String(s) => {
             let text = s.to_string_lossy();
             if text.is_empty()

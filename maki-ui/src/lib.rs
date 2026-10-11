@@ -13,6 +13,7 @@ mod clipboard;
 mod clock;
 mod color_compat;
 mod components;
+mod decor_worker;
 pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand, PluginAccess, SUBMITS_PROMPT};
 pub use components::keybindings;
 mod highlight;

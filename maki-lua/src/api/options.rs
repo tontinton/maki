@@ -139,7 +139,7 @@ fn parse_spec(name: &str, spec: &Table) -> LuaResult<OptionSpec> {
         }
     }
 
-    let default = default_to_json(name, spec.get("default")?)?;
+    let default = default_to_json(name, spec.get::<LuaValue>("default")?)?;
     let ty = match spec.opt::<String>("type")? {
         Some(s) => OptionType::parse(&s).ok_or_else(|| {
             spec_error(

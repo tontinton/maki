@@ -3331,6 +3331,7 @@ dependencies = [
  "criterion",
  "crossterm",
  "event-listener",
+ "fastrand",
  "flume",
  "futures",
  "futures-lite",
