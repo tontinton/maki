@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::thread::sleep;
@@ -287,6 +288,16 @@ pub type PluginAuthData = serde_json::Map<String, serde_json::Value>;
 
 pub fn load_plugin_auth(dir: &StateDir, slug: &str) -> Option<PluginAuthData> {
     load_auth(&plugin_auth_path(dir, slug))
+}
+
+/// A fingerprint of what a plugin stored, or `None` when it stored nothing.
+/// A process compares two of these to notice that another one swapped the
+/// credentials. Hashing means it never keeps a second copy of the secret.
+pub fn plugin_auth_stamp(dir: &StateDir, slug: &str) -> Option<u64> {
+    let bytes = fs::read(plugin_auth_path(dir, slug)).ok()?;
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 pub fn save_plugin_auth(

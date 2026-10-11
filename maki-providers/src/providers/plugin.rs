@@ -9,7 +9,7 @@ use flume::Sender;
 use maki_config::host_allowed;
 use maki_config::providers::{Protocol, ProvidersConfig, base_url_override, plan_base_url};
 use maki_storage::StateDir;
-use maki_storage::auth::lock_credentials;
+use maki_storage::auth::{lock_credentials, plugin_auth_stamp};
 use maki_storage::id::SessionRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,6 +36,10 @@ const BASE_URL_OPTION: &str = "base_url";
 const HTTPS_SCHEME: &str = "https";
 const HTTP_SCHEME: &str = "http";
 const LOCALHOST: &str = "localhost";
+/// The first recovery after a 401 often just picks up a token that a peer
+/// request or another maki process minted, and that one can be dead too. So we
+/// allow a second round, which then refreshes for real.
+const MAX_AUTH_REPLAYS: usize = 2;
 
 /// One plugin-supplied callback. Generic both ways so every hook on
 /// [`ProviderHooks`] has the same shape and presence is one `Option` check.
@@ -55,8 +59,9 @@ pub struct ProviderHooks {
 }
 
 /// Why the auth hook is being asked for credentials. `Reload` only re-reads
-/// what a login wrote, which is what lets it skip the cross-process lock.
-#[derive(Serialize, Clone, Copy)]
+/// what is stored, after a login or another maki process changed it. It spends
+/// no token, and that is why it can skip the cross-process lock.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthPurpose {
     Resolve,
@@ -828,6 +833,9 @@ struct AuthState {
     hosts: Mutex<Arc<[String]>>,
     keys: Mutex<DeclaredKeys>,
     gate: RefreshGate,
+    /// How the store looked right after our last mint. If it looks different
+    /// now, another maki process rotated the token behind our back.
+    store_seen: Mutex<Option<u64>>,
 }
 
 impl AuthState {
@@ -841,6 +849,7 @@ impl AuthState {
             hosts: Mutex::default(),
             keys: Mutex::new(DeclaredKeys::Hooked),
             gate: RefreshGate::default(),
+            store_seen: Mutex::default(),
         }
     }
 
@@ -906,20 +915,41 @@ impl AuthState {
     /// [`Self::mint`] under the cross-process lock: serialised against other
     /// maki processes on the same credentials, and re-entrant in this one so
     /// the hook can store what it minted.
+    ///
+    /// If another process rotated the store since our last mint, a refresh
+    /// turns into a reload. The server revokes the old token on every rotation,
+    /// so refreshing again would kill the token that process just got. It
+    /// would then refresh on its next 401 and kill ours, and the two would go
+    /// on knocking each other out.
     async fn locked_mint(
         &self,
         slug: &str,
         hook: &dyn Hook<AuthPurpose, PluginAuth>,
         purpose: AuthPurpose,
-    ) -> Result<(), AgentError> {
+    ) -> Result<Recovery, AgentError> {
         let owned = slug.to_owned();
-        let _lock = smol::unblock(move || {
-            StateDir::resolve()
-                .ok()
-                .map(|dir| lock_credentials(&dir, &owned))
+        let (_lock, stored) = smol::unblock(move || match StateDir::resolve() {
+            Ok(dir) => (
+                Some(lock_credentials(&dir, &owned)),
+                plugin_auth_stamp(&dir, &owned),
+            ),
+            Err(_) => (None, None),
         })
         .await;
-        self.mint(slug, hook, purpose).await
+        let purpose = match purpose {
+            AuthPurpose::Refresh
+                if self.gate.ran() && *self.store_seen.lock().unwrap() != stored =>
+            {
+                debug!(slug, "stored credentials rotated elsewhere, adopting them");
+                AuthPurpose::Reload
+            }
+            purpose => purpose,
+        };
+        self.mint(slug, hook, purpose).await?;
+        Ok(match purpose {
+            AuthPurpose::Reload => Recovery::Adopted,
+            _ => Recovery::Minted,
+        })
     }
 
     /// Runs the auth hook and makes what it answered the credentials every
@@ -934,6 +964,9 @@ impl AuthState {
             .call(purpose)
             .await?
             .into_resolved(slug, &self.hosts())?;
+        let owned = slug.to_owned();
+        let stamp =
+            smol::unblock(move || plugin_auth_stamp(&StateDir::resolve().ok()?, &owned)).await;
         let mut current = self.current.lock().unwrap();
         // A hook that omits base_url keeps the resolved one. Falling back to
         // the provider's default origin would silently repoint the token.
@@ -941,6 +974,7 @@ impl AuthState {
             fresh.base_url = current.base_url.take();
         }
         *current = fresh;
+        *self.store_seen.lock().unwrap() = stamp;
         Ok(())
     }
 }
@@ -958,28 +992,40 @@ impl PluginEntry {
     /// The only place the auth hook is called. A plugin without one keeps the
     /// credentials its registration declared.
     ///
-    /// Answers whether credentials were actually minted, which is a different
-    /// question from whether the call failed: with no auth hook this succeeds
-    /// having changed nothing, and a caller that replayed a request on that
-    /// would only re-send the credentials it already had.
+    /// Answers where the credentials came from, which is a different question
+    /// from whether the call failed: with no auth hook this succeeds having
+    /// changed nothing, and a caller that replayed a request on that would only
+    /// re-send the credentials it already had.
     ///
     /// Callable from the plugin host's own thread, because the hook goes to the
     /// host's priority lane and the dispatch loop serves it while this future
     /// is parked. What may not reach here is a *blocking* caller, and that is
     /// held by construction rather than by a check: every path in is `async`,
     /// and `create` builds a provider without running a hook at all.
-    async fn run_auth(&self, purpose: AuthPurpose) -> Result<bool, AgentError> {
+    async fn run_auth(&self, purpose: AuthPurpose) -> Result<Recovery, AgentError> {
+        self.run_auth_since(purpose, self.auth.gate.generation())
+            .await
+    }
+
+    /// [`Self::run_auth`] for a caller whose credentials came from generation
+    /// `seen`. If something minted since, the caller just uses the newer
+    /// credentials and the hook stays quiet. Refreshing would revoke the
+    /// token everyone else already moved to.
+    async fn run_auth_since(
+        &self,
+        purpose: AuthPurpose,
+        seen: u64,
+    ) -> Result<Recovery, AgentError> {
         let Some(hook) = self.hooks.auth.clone() else {
-            return Ok(false);
+            return Ok(Recovery::Unhooked);
         };
         let slug = self.decl.slug.clone();
-        // A reload re-reads what a login wrote, so it spends no token. It
-        // waits for neither the gate nor the cross-process lock, and it runs
-        // under `block_on` on the ui thread, where either wait would freeze the
-        // ui.
+        // A reload re-reads what is stored, so it spends no token. It waits
+        // for neither the gate nor the cross-process lock, and it runs under
+        // `block_on` on the ui thread, where either wait would freeze the ui.
         if matches!(purpose, AuthPurpose::Reload) {
             self.auth.mint(&slug, hook.as_ref(), purpose).await?;
-            return Ok(true);
+            return Ok(Recovery::Adopted);
         }
         // Everything else spends a single-use token, so it runs to completion
         // on its own task. A caller that goes away mid-flight, an Esc or a turn
@@ -990,7 +1036,7 @@ impl PluginEntry {
         smol::spawn(async move {
             let minted = auth
                 .gate
-                .single_flight(auth.locked_mint(&slug, hook.as_ref(), purpose))
+                .single_flight(seen, auth.locked_mint(&slug, hook.as_ref(), purpose))
                 .await;
             let _ = done.send(minted);
         })
@@ -998,8 +1044,7 @@ impl PluginEntry {
         outcome
             .recv_async()
             .await
-            .map_err(|_| AgentError::Channel)??;
-        Ok(true)
+            .map_err(|_| AgentError::Channel)?
     }
 }
 
@@ -1009,35 +1054,58 @@ impl PluginEntry {
 /// token family. They queue here instead, and the late arrival returns to find
 /// the shared credentials already holding what the winner minted. That is why
 /// the gate hangs off the per-slug auth state rather than the provider.
+///
+/// "Late" is judged by the credentials a caller was rejected with, not by when
+/// it reached the gate. A request sent before a peer's refresh can get its 401
+/// long after that refresh finished, and it must not refresh again.
 #[derive(Default)]
 struct RefreshGate {
     lock: smol::lock::Mutex<()>,
-    /// Counted, not compared: a refresh can hand back byte-identical
-    /// credentials, so the count is the only thing that can tell a parked
-    /// caller the work is already done. Written only under `lock`.
-    runs: AtomicU64,
+    /// Bumped by every hook run that went through the gate, so not by a
+    /// reload. We count instead of comparing tokens because a refresh can hand
+    /// back the very same bytes.
+    generation: AtomicU64,
+}
+
+/// What [`PluginEntry::run_auth`] did about the credentials in hand.
+#[derive(Debug, PartialEq, Eq)]
+enum Recovery {
+    /// No auth hook, so nothing new to send.
+    Unhooked,
+    /// Took credentials that a login, a peer or another process minted.
+    Adopted,
+    /// Ran the hook for credentials of our own.
+    Minted,
 }
 
 impl RefreshGate {
-    /// Whether the hook has ever run to completion, which is also what makes
-    /// the lazy first resolve happen once.
+    /// Whether a resolve or refresh has ever minted, which is also what makes
+    /// the lazy first resolve happen once. A reload alone does not count, as it
+    /// may skip what a plugin only does on resolve.
     fn ran(&self) -> bool {
-        self.runs.load(Ordering::Acquire) > 0
+        self.generation() > 0
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     async fn single_flight(
         &self,
-        work: impl Future<Output = Result<(), AgentError>>,
-    ) -> Result<(), AgentError> {
-        let before = self.runs.load(Ordering::Acquire);
+        seen: u64,
+        work: impl Future<Output = Result<Recovery, AgentError>>,
+    ) -> Result<Recovery, AgentError> {
         let _guard = self.lock.lock().await;
-        if self.runs.load(Ordering::Acquire) != before {
-            debug!("peer refreshed while we waited, skipping auth hook");
-            return Ok(());
+        if self.generation() != seen {
+            debug!(
+                seen,
+                "credentials replaced since the caller got them, skipping auth hook"
+            );
+            return Ok(Recovery::Adopted);
         }
-        work.await?;
-        self.runs.fetch_add(1, Ordering::Release);
-        Ok(())
+        let recovery = work.await?;
+        self.generation.fetch_add(1, Ordering::Release);
+        Ok(recovery)
     }
 }
 
@@ -1144,56 +1212,65 @@ impl Provider for PluginProvider {
         Box::pin(async move {
             let result = async {
                 self.entry.ensure_auth().await?;
-
-                // First attempt streams through a counting relay: a 401 is only
-                // retried when it preceded every event. Replaying deltas onto a
-                // channel that already delivered part of the answer would
-                // duplicate text in the UI and, after a cancel, in the history.
-                let (tx, rx) = flume::unbounded();
-                let attempt = async {
-                    let result = self
-                        .inner
-                        .stream_message(model, messages, system, tools, &tx, opts, session_id)
-                        .await;
-                    drop(tx);
-                    result
-                };
-                let forward = async move {
-                    let mut forwarded = false;
-                    while let Ok(ev) = rx.recv_async().await {
-                        forwarded = true;
-                        if event_tx.send_async(ev).await.is_err() {
-                            break;
-                        }
-                    }
-                    forwarded
-                };
-                let (result, forwarded) = futures_lite::future::zip(attempt, forward).await;
-                match result {
-                    // The plugin mints credentials without the user, so an
-                    // expired token costs one silent refresh instead of a
-                    // re-login prompt. Only a refresh that minted something
-                    // earns the replay: a declaration keyed off an
-                    // `api_key_env` has no hook to run, so a second try would
-                    // re-send the key the server just rejected.
-                    Err(e) if e.is_auth_error() && !forwarded => {
-                        debug!(error = %e, "auth error, refreshing plugin-backed credentials");
-                        match self.entry.run_auth(AuthPurpose::Refresh).await {
-                            Ok(true) => {
-                                self.inner
-                                    .stream_message(
-                                        model, messages, system, tools, event_tx, opts, session_id,
-                                    )
-                                    .await
-                            }
-                            Ok(false) => Err(e),
-                            Err(refresh_err) => {
-                                warn!(error = %refresh_err, "silent refresh failed, falling back to re-login");
-                                Err(e)
+                let mut replays = 0;
+                let mut refreshed = false;
+                loop {
+                    let seen = self.entry.auth.gate.generation();
+                    // Streams through a counting relay, so a 401 is only
+                    // replayed when no event got out yet. Replaying onto a
+                    // channel that already delivered part of the answer would
+                    // duplicate text in the UI and, after a cancel, in the
+                    // history.
+                    let (tx, rx) = flume::unbounded();
+                    let attempt = async {
+                        let result = self
+                            .inner
+                            .stream_message(model, messages, system, tools, &tx, opts, session_id)
+                            .await;
+                        drop(tx);
+                        result
+                    };
+                    let forward = async move {
+                        let mut forwarded = false;
+                        while let Ok(ev) = rx.recv_async().await {
+                            forwarded = true;
+                            if event_tx.send_async(ev).await.is_err() {
+                                break;
                             }
                         }
+                        forwarded
+                    };
+                    let (result, forwarded) = futures_lite::future::zip(attempt, forward).await;
+                    match result {
+                        // The plugin mints credentials without the user, so a
+                        // dead token costs a silent recovery instead of a
+                        // re-login prompt. Only a hook earns the replay. A
+                        // declaration keyed off an `api_key_env` has none, and
+                        // would just re-send the key the server rejected. And a
+                        // 401 on a token we just minted is not about the token,
+                        // so refreshing again would only revoke our peers'.
+                        Err(e)
+                            if e.is_auth_error()
+                                && !forwarded
+                                && !refreshed
+                                && replays < MAX_AUTH_REPLAYS =>
+                        {
+                            debug!(error = %e, replays, "auth error, recovering plugin-backed credentials");
+                            match self.entry.run_auth_since(AuthPurpose::Refresh, seen).await {
+                                Ok(Recovery::Adopted) => replays += 1,
+                                Ok(Recovery::Minted) => {
+                                    refreshed = true;
+                                    replays += 1;
+                                }
+                                Ok(Recovery::Unhooked) => return Err(e),
+                                Err(refresh_err) => {
+                                    warn!(error = %refresh_err, "silent refresh failed, falling back to re-login");
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        result => return result,
                     }
-                    result => result,
                 }
             }
             .await;
@@ -1485,6 +1562,7 @@ mod tests {
     use futures_lite::future::zip;
     use maki_config::PROVIDER_BUILTINS;
     use maki_config::providers::{ProviderDef, base_url_env_var};
+    use maki_storage::auth::{PluginAuthData, save_plugin_auth};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -1507,6 +1585,10 @@ mod tests {
     const HOOK_CALLED: &str = "a hook ran on a synchronous path";
     const ONE_HOOK_CALL: &str = "concurrent callers share one auth hook run";
     const SINGLE_FLIGHT_RERUN: &str = "a refresh that overlaps nobody runs the hook again";
+    const STALE_401_REFRESHED: &str = "a 401 on already replaced credentials spent a token";
+    const FOREIGN_ROTATION_REFRESHED: &str =
+        "a refresh must adopt another process's rotation before spending a token";
+    const RESOLVE_SKIPPED: &str = "a reload before the first request stood in for resolve";
     const INNER_UNUSED: &str = "the inner provider is not exercised here";
 
     const DISPLAY_NAME: &str = "Plugin";
@@ -1583,7 +1665,7 @@ mod tests {
     }
 
     struct CountingAuth {
-        calls: AtomicUsize,
+        purposes: Mutex<Vec<AuthPurpose>>,
         rotating: bool,
         /// The origin this hook leases. A hook is the only way an origin ever
         /// reaches the auth cell, a declared one being the codec's last resort.
@@ -1593,7 +1675,7 @@ mod tests {
     impl CountingAuth {
         fn new(rotating: bool) -> Self {
             Self {
-                calls: AtomicUsize::new(0),
+                purposes: Mutex::default(),
                 rotating,
                 base_url: None,
             }
@@ -1607,7 +1689,11 @@ mod tests {
         }
 
         fn calls(&self) -> usize {
-            self.calls.load(Ordering::Acquire)
+            self.purposes.lock().unwrap().len()
+        }
+
+        fn purposes(&self) -> Vec<AuthPurpose> {
+            self.purposes.lock().unwrap().clone()
         }
     }
 
@@ -1616,10 +1702,14 @@ mod tests {
         /// in flight when its peer is next polled. Without that the fence would
         /// only hold for as long as [`PluginEntry::run_auth`] keeps an await
         /// ahead of the hook, which is the caller's business and not the gate's.
-        fn call(&self, _purpose: AuthPurpose) -> BoxFuture<'_, Result<PluginAuth, AgentError>> {
+        fn call(&self, purpose: AuthPurpose) -> BoxFuture<'_, Result<PluginAuth, AgentError>> {
             Box::pin(async move {
                 smol::future::yield_now().await;
-                let run = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+                let run = {
+                    let mut purposes = self.purposes.lock().unwrap();
+                    purposes.push(purpose);
+                    purposes.len()
+                };
                 Ok(PluginAuth {
                     base_url: self.base_url.clone(),
                     headers: HashMap::from([(
@@ -1729,6 +1819,21 @@ mod tests {
         }
     }
 
+    /// Points every per-user directory at a fresh temp dir, so the credential
+    /// store a test writes is its own.
+    fn isolated_home() -> TempDir {
+        let home = TempDir::new().unwrap();
+        for var in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+        ] {
+            unsafe { std::env::set_var(var, home.path()) };
+        }
+        home
+    }
+
     fn token(entry: &PluginEntry) -> String {
         entry.auth.current.lock().unwrap().headers[0].1.clone()
     }
@@ -1783,13 +1888,68 @@ mod tests {
             assert_eq!(hook.calls(), 1, "{ONE_HOOK_CALL}");
             assert_eq!(token(&entry), after_one);
 
-            // The late caller snapshots the count before locking, so a refresh
-            // that overlaps nobody still runs the hook.
+            // A 401 on the credentials from before that refresh shows up late.
+            entry.run_auth_since(AuthPurpose::Refresh, 0).await.unwrap();
+            assert_eq!(hook.calls(), 1, "{STALE_401_REFRESHED}");
+
             entry.run_auth(AuthPurpose::Refresh).await.unwrap();
         });
 
         assert_eq!(hook.calls(), 2, "{SINGLE_FLIGHT_RERUN}");
         assert_eq!(token(&entry), after_two);
+    }
+
+    /// Another maki process rotated the store and so killed our token. The
+    /// first refresh only reloads, to pick up the new one. Once we have seen
+    /// the store, the next 401 is ours to refresh.
+    #[test]
+    fn a_refresh_after_a_foreign_rotation_reloads() {
+        let _home = isolated_home();
+        let hook = Arc::new(CountingAuth::new(true));
+        let entry = entry_with(ProviderHooks {
+            auth: Some(hook.clone()),
+            ..ProviderHooks::default()
+        });
+
+        smol::block_on(async {
+            entry.run_auth(AuthPurpose::Resolve).await.unwrap();
+            let dir = StateDir::resolve().unwrap();
+            save_plugin_auth(&dir, &entry.decl.slug, &PluginAuthData::default()).unwrap();
+            entry.run_auth(AuthPurpose::Refresh).await.unwrap();
+            entry.run_auth(AuthPurpose::Refresh).await.unwrap();
+        });
+
+        assert_eq!(
+            hook.purposes(),
+            [
+                AuthPurpose::Resolve,
+                AuthPurpose::Reload,
+                AuthPurpose::Refresh
+            ],
+            "{FOREIGN_ROTATION_REFRESHED}"
+        );
+    }
+
+    /// A respawn reloads before any request, and the plugin may only do some
+    /// of its work on resolve.
+    #[test]
+    fn a_reload_before_the_first_request_still_resolves() {
+        let hook = Arc::new(CountingAuth::new(true));
+        let entry = entry_with(ProviderHooks {
+            auth: Some(hook.clone()),
+            ..ProviderHooks::default()
+        });
+
+        smol::block_on(async {
+            entry.run_auth(AuthPurpose::Reload).await.unwrap();
+            entry.ensure_auth().await.unwrap();
+        });
+
+        assert_eq!(
+            hook.purposes(),
+            [AuthPurpose::Reload, AuthPurpose::Resolve],
+            "{RESOLVE_SKIPPED}"
+        );
     }
 
     #[test]
@@ -1804,15 +1964,7 @@ mod tests {
             Canned::json(200, r#"{"data":[]}"#),
             Canned::json(200, r#"{"data":[]}"#),
         ];
-        let home = TempDir::new().unwrap();
-        for var in [
-            "HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_STATE_HOME",
-            "XDG_CACHE_HOME",
-        ] {
-            unsafe { std::env::set_var(var, home.path()) };
-        }
+        let _home = isolated_home();
         let (base, requests) = serve(MODELS);
         let first = Arc::new(CountingAuth::new(true));
         let next = Arc::new(CountingAuth::new(false));
@@ -2148,39 +2300,39 @@ mod tests {
         assert_eq!(token(&entry), FIRST_TOKEN, "{MINT_DROPPED}");
     }
 
-    /// The 401 replay is a credential refresh, not a retry: a declaration
-    /// whose key comes from an `api_key_env` has no hook to mint a new one, so
-    /// a second request would only spend the key the server just rejected.
-    #[test]
-    fn a_hookless_decl_does_not_replay_a_401() {
-        const SLUG: &str = "hookless-401-plugin";
-        const ENV_VAR: &str = "MAKI_TEST_HOOKLESS_401_KEY";
-        /// `<SLUG>_BASE_URL`, which is how the codec reaches loopback.
-        const BASE_URL_ENV: &str = "HOOKLESS_401_PLUGIN_BASE_URL";
+    /// The 401 replay is a credential refresh, not a retry. A declaration whose
+    /// key comes from an `api_key_env` has no hook to mint a new one, so a
+    /// replay would only re-send the key the server just rejected. With a hook,
+    /// a 401 on the token we just minted is not about the token, so it ends
+    /// there instead of spending another.
+    #[test_case("hookless-401-plugin", false, 1 ; "hookless_does_not_replay")]
+    #[test_case("hooked-401-plugin", true, 2 ; "hooked_refreshes_once")]
+    fn a_401_is_replayed_only_on_fresh_credentials(slug: &str, hooked: bool, expected: usize) {
+        const KEY_ENV: &str = "MAKI_TEST_401_KEY";
         const KEY: &str = "sk-rejected";
         const PROMPT: &str = "read a.txt";
         const UNAUTHORIZED: u16 = 401;
-        const UNAUTHORIZED_BODY: &str = r#"{"error":{"message":"invalid api key"}}"#;
-        const REJECTED_TWICE: &str = "a decl with no auth hook re-sent the rejected key";
-        const STILL_AUTHORIZED: &str = "the auth error must reach the caller";
-        /// Two answers so a replaying provider is recorded rather than parked
-        /// on an `accept` that never returns.
-        const SCRIPT: &[Canned] = &[
-            Canned::json(UNAUTHORIZED, UNAUTHORIZED_BODY),
-            Canned::json(UNAUTHORIZED, UNAUTHORIZED_BODY),
-        ];
+        const REJECTED: Canned = Canned::json(UNAUTHORIZED, r#"{"error":{"message":"revoked"}}"#);
+        /// One answer more than a correct provider asks for, so an extra replay
+        /// is recorded rather than parked on an `accept` that never returns.
+        const SCRIPT: &[Canned] = &[REJECTED; 3];
+        const WRONG_REPLAYS: &str = "a 401 replayed stale credentials or past the bound";
+        const STILL_UNAUTHORIZED: &str = "the auth error must reach the caller";
 
+        let _home = isolated_home();
         let (base_url, requests) = serve(SCRIPT);
-        unsafe {
-            std::env::set_var(ENV_VAR, KEY);
-            std::env::set_var(BASE_URL_ENV, &base_url);
+        unsafe { std::env::set_var(base_url_env_var(slug), &base_url) };
+        let mut reg = registration(slug);
+        if hooked {
+            reg.hooks.auth = Some(Arc::new(CountingAuth::new(true)));
+        } else {
+            unsafe { std::env::set_var(KEY_ENV, KEY) };
+            reg.decl.api_key_env = Some(KEY_ENV.to_string());
         }
-        let mut reg = registration(SLUG);
-        reg.decl.api_key_env = Some(ENV_VAR.to_string());
         register_loaded(reg).unwrap();
 
-        let provider = create(SLUG, Timeouts::default()).unwrap();
-        let model = Model::from_spec(&format!("{SLUG}/{MODEL_ID}")).unwrap();
+        let provider = create(slug, Timeouts::default()).unwrap();
+        let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
         let messages = [Message::user(PROMPT.to_owned())];
         let (tx, _rx) = flume::unbounded();
         let result = smol::block_on(provider.stream_message(
@@ -2195,9 +2347,9 @@ mod tests {
 
         assert!(
             result.as_ref().err().is_some_and(AgentError::is_auth_error),
-            "{STILL_AUTHORIZED}"
+            "{STILL_UNAUTHORIZED}"
         );
-        assert_eq!(requests.lock().unwrap().len(), 1, "{REJECTED_TWICE}");
+        assert_eq!(requests.lock().unwrap().len(), expected, "{WRONG_REPLAYS}");
     }
 
     /// Anthropic and Google know their vendor's host, so before they took the

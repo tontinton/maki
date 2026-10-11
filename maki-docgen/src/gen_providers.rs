@@ -371,7 +371,7 @@ Every hook is optional. Without any, the provider reads its key from `api_key_en
 
 | Hook | Runs |
 |------|------|
-| `auth(ctx, purpose)` | `"resolve"` before the first request, `"refresh"` after a 401 (then retries once), `"reload"` after a login changed the stored credentials |
+| `auth(ctx, purpose)` | `"resolve"` before the first request, `"refresh"` after a 401 on the newest credentials (then retries), `"reload"` to re-read stored credentials after a login or another maki process changed them |
 | `list_models(ctx)` | When the picker or `maki models` lists models |
 | `build_body(ctx, body, model, opts)` | On every request, with the final body |
 | `map_error(ctx, status, message)` | On an API error, before it reaches the UI |

@@ -725,8 +725,10 @@ fn is_selected(_lua: &Lua, #[ctx] plugin: Arc<str>, slug: String) -> LuaResult<b
 ///            [model rows](/docs/providers/#model-rows).
 ///   `auth` (function) `function(ctx, purpose)` returning
 ///            `{ base_url = ..., headers = { ... } }`. `purpose` is
-///            `"resolve"` before the first request, `"refresh"` after a 401,
-///            or `"reload"` after a login changed the stored credentials.
+///            `"resolve"` before the first request, `"refresh"` after a 401
+///            on the newest credentials, or `"reload"` to re-read stored
+///            credentials after a login or another maki process changed them.
+///            Spend a refresh token only on `"refresh"`.
 ///            Omitting `base_url` keeps the current one.
 ///   `list_models` (function) `function(ctx)` returning model rows for a
 ///            catalogue only known at runtime. Without it, the provider
