@@ -19,7 +19,8 @@ use crate::tools::{
     truncate_bytes,
 };
 use crate::{
-    AgentError, AgentEvent, CallRecord, TextOutput, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentError, AgentEvent, AgentSeed, CallRecord, TextOutput, ToolDoneEvent, ToolOutput,
+    ToolStartEvent,
 };
 use maki_config::ToolKey;
 use maki_storage::id::SessionRef;
@@ -630,6 +631,18 @@ async fn run_native_tool(
     let mutated = invocation.mutable_path().map(FileKey::new);
 
     if let Some(key) = &mutated {
+        if let Some(chat) = ctx.background_for
+            && let Some(reason) = AgentSeed::background_write_block(chat)
+        {
+            warn!(
+                tool = %name,
+                %chat,
+                target = %key.as_path().display(),
+                reason = %reason,
+                "blocked background write"
+            );
+            return done_error(reason);
+        }
         let is_plan_target = ctx
             .mode
             .plan_path()
@@ -1093,11 +1106,13 @@ mod tests {
     use maki_config::{
         Effect, Permission, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
     };
+    use maki_storage::id::MakiId;
     use smol::lock::Mutex as AsyncMutex;
     use test_case::test_case;
 
     use super::*;
     use crate::cancel::CancelToken;
+    use crate::live_session::{BACKGROUND_PLAN_WRITE_DENIED, SessionMailbox};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::{ToolDeferral, tool_names};
     use crate::permissions::{
@@ -1108,7 +1123,7 @@ mod tests {
     use crate::tools::schema::{JsonPath, ToolInputErrorKind};
     use crate::tools::test_support::{
         GUARDED_TOOL_NAME, GuardedMock, mock_tool, mock_tool_with_schema, stub_ctx,
-        stub_ctx_with_permissions,
+        stub_ctx_with_permissions, stub_seed,
     };
     use crate::tools::{
         BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
@@ -1812,6 +1827,45 @@ mod tests {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
             let (ctx, _hook) = hooked_with(stub_ctx(&plan), None, hook);
             let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(PLAN_PATH)).await;
+
+            assert_eq!(done.output.as_text(), expected);
+        });
+    }
+
+    fn planning() -> AgentMode {
+        AgentMode::Plan(PathBuf::from(PLAN_PATH))
+    }
+
+    /// Background work runs in build mode, so this gate is the only place the
+    /// chat's plan mode reaches it. Even the plan file gets no pass, because
+    /// nobody asked a monitor to write the user's plan. A write from inside
+    /// batch or code_execution must not slip past it either.
+    #[test_case(planning(),       PLAN_PATH,         CallOrigin::Model,  BACKGROUND_PLAN_WRITE_DENIED.to_owned() ; "plan_file_while_the_chat_plans")]
+    #[test_case(planning(),       HOOK_ESCAPED_PATH, CallOrigin::Nested, BACKGROUND_PLAN_WRITE_DENIED.to_owned() ; "nested_write_while_the_chat_plans")]
+    #[test_case(AgentMode::Build, PLAN_PATH,         CallOrigin::Model,  ran(PLAN_PATH)                          ; "building_chat_follows_the_rules")]
+    fn background_write_follows_the_chat_mode(
+        chat_mode: AgentMode,
+        target: &str,
+        origin: CallOrigin,
+        expected: String,
+    ) {
+        smol::block_on(async {
+            let chat = MakiId::generate();
+            let mailbox = SessionMailbox::register(chat);
+            let seed = mailbox.publish_seed(stub_seed(chat));
+            seed.set_chat_settings(Default::default(), &chat_mode);
+            let mut ctx = build_ctx();
+            ctx.registry = registered(Arc::new(HookMock(None)));
+            ctx.background_for = Some(chat);
+
+            let done = run(
+                TEST_ID.into(),
+                HOOK_TOOL_NAME,
+                &call_input(target),
+                &ctx,
+                origin,
+            )
+            .await;
 
             assert_eq!(done.output.as_text(), expected);
         });

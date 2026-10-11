@@ -164,6 +164,15 @@ impl History {
         self.edit(|msgs| msgs.push(msg));
     }
 
+    /// A run future that gets dropped never reaches its cancel path, so the tool
+    /// calls it already recorded stay open. Closing them is an append, which
+    /// keeps the prefix and any thinking bound to it valid.
+    pub fn close_dangling_tool_calls(&mut self, note: &str) {
+        if let Some(results) = dangling_results(self.as_slice(), note) {
+            self.push(results);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.snapshot.messages.len()
     }
@@ -340,20 +349,26 @@ fn sanitize_restored(messages: &mut Vec<Message>) {
 }
 
 pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
-    let Some(last) = messages.last() else { return };
+    if let Some(results) = dangling_results(messages, note) {
+        messages.push(results);
+    }
+}
+
+fn dangling_results(messages: &[Message], note: &str) -> Option<Message> {
+    let last = messages.last()?;
     if !matches!(last.role, Role::Assistant) || !last.has_tool_calls() {
-        return;
+        return None;
     }
     let error_results: Vec<ContentBlock> = last
         .tool_uses()
         .map(|(id, _, _)| ContentBlock::tool_result(id.to_owned(), note.to_owned(), true))
         .collect();
-    messages.push(Message {
+    Some(Message {
         role: Role::User,
         content: error_results,
         display_text: Some(String::new()),
         ..Default::default()
-    });
+    })
 }
 
 pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: usize) {

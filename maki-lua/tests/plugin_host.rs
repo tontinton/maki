@@ -4,15 +4,18 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use maki_agent::ToolOutput;
+use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
 use maki_agent::template::Vars;
+use maki_agent::tools::test_support::stub_seed;
 use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolAudience,
     ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
     timeout_annotation,
 };
+use maki_agent::{AgentMode, AgentSeed, CancelToken, ModelSlot, SessionMailbox, ToolOutput};
 use maki_config::{
     AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission, PluginsConfig,
     ThinkingLines, ToolKey, ToolOutputLines,
@@ -22,8 +25,12 @@ use maki_lua::{
     PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason,
     WARM_TOOL_CAP, set_allowed_private_hosts,
 };
-use maki_providers::Model;
-use maki_storage::id::SessionRef;
+use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::{
+    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
+    StopReason, StreamResponse, ThinkingConfig, TokenUsage,
+};
+use maki_storage::id::{MakiId, SessionRef};
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
@@ -7198,4 +7205,669 @@ fn a_ui_roundtrip_on_a_headless_host_fails_fast() {
 
     let reply = exec_tool(&reg, "ask_ui", json!({})).unwrap();
     assert_eq!(reply, format!("nil {NO_UI_ERR}"));
+}
+
+const BACKGROUND_NAME: &str = "ci-monitor";
+const BACKGROUND_PLUGIN: &str = "background_monitor";
+const OPTS_RECORDER: &str = "recorded the request options";
+const CANCELLED_MSG: &str = "cancelled";
+const PAID_TOOL_USE_ID: &str = "toolu_paid";
+const PAID_TOOL_NAME: &str = "not_a_tool";
+const PAID_TURN_INPUT: u32 = 1234;
+
+/// The spawned task outlives the tool call that started it, so only the chat
+/// session ending can take its session off the list.
+fn background_monitor_src(sid: &str) -> String {
+    format!(
+        r#"
+local sess
+maki.api.register_tool({{
+    name = "open_background",
+    description = "opens a background session from a spawned task",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local gate = maki.async.semaphore(1)
+        local opened = gate:acquire()
+        local err
+        maki.async.spawn(function()
+            sess, err = maki.agent.session({{ session = "{sid}", name = "{BACKGROUND_NAME}" }})
+            opened:release()
+            if sess then maki.async.sleep(1000000000) end
+        end)
+        gate:acquire():release()
+        return tostring(err)
+    end,
+}})
+maki.api.register_tool({{
+    name = "list_background",
+    description = "lists the chat session's background sessions",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local parts = {{}}
+        for _, s in ipairs(maki.agent.background({{ session = "{sid}" }})) do
+            parts[#parts + 1] = table.concat({{ s.plugin, s.name, s.status, tostring(s.started_at > 0) }}, ":")
+        end
+        return table.concat(parts, ",")
+    end,
+}})
+maki.api.register_tool({{
+    name = "prompt_background",
+    description = "prompts the open background session once",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local _, err = sess:prompt("check")
+        return tostring(err)
+    end,
+}})
+local prompting, prompt_err, prompt_settled
+maki.api.register_tool({{
+    name = "prompt_in_task",
+    description = "prompts the open background session from a second spawned task",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        prompt_settled = maki.async.semaphore(1)
+        local running = prompt_settled:acquire()
+        prompting = maki.async.spawn(function()
+            prompt_err = select(2, sess:prompt("check"))
+            running:release()
+        end)
+        return ""
+    end,
+}})
+maki.api.register_tool({{
+    name = "close_background",
+    description = "closes the open background session and reports how its prompt ended",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        sess:close()
+        prompt_settled:acquire():release()
+        return tostring(prompt_err)
+    end,
+}})
+maki.api.register_tool({{
+    name = "cancel_prompt",
+    description = "cancels the prompting task and lets it unwind",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        prompting:cancel()
+        -- The cancel only wakes the task. One yield lets it unwind before we
+        -- answer, so the test's next call already sees the prompt settled.
+        maki.async.sleep(0)
+        return ""
+    end,
+}})
+"#
+    )
+}
+
+/// A prompt that never ends would park the calling thread for good, so the
+/// call runs on its own thread and a broken test fails after a timeout
+/// instead of hanging the whole run.
+fn call_on_thread(
+    reg: &Arc<ToolRegistry>,
+    name: &'static str,
+    cancel: CancelToken,
+) -> flume::Receiver<Result<String, String>> {
+    let (reply_tx, reply) = flume::bounded(1);
+    let reg = Arc::clone(reg);
+    std::thread::spawn(move || {
+        let mut ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+        ctx.cancel = cancel;
+        reply_tx
+            .send(exec_with_ctx(&reg, name, json!({}), &ctx))
+            .ok();
+    });
+    reply
+}
+
+/// Pays for one turn that calls a tool, then parks the next request forever
+/// and tells the test. So the prompt is cut mid-run with a paid turn behind it.
+struct TurnThenPark {
+    billed: AtomicBool,
+    parked: flume::Sender<()>,
+}
+
+impl TurnThenPark {
+    fn install(seed: &AgentSeed) -> flume::Receiver<()> {
+        let (parked, parked_rx) = flume::unbounded();
+        seed.model_slot.store(Arc::new(ModelSlot {
+            model: seed.model_slot.load().model.clone(),
+            provider: Arc::new(Self {
+                billed: AtomicBool::new(false),
+                parked,
+            }),
+        }));
+        parked_rx
+    }
+}
+
+impl Provider for TurnThenPark {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a Model,
+        _: &'a [Message],
+        _: &'a str,
+        _: &'a Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        _: RequestOptions,
+        _: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        if self.billed.swap(true, Ordering::SeqCst) {
+            let _ = self.parked.send(());
+            return Box::pin(std::future::pending());
+        }
+        Box::pin(async {
+            Ok(StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::tool_use(
+                        PAID_TOOL_USE_ID,
+                        PAID_TOOL_NAME,
+                        json!({}),
+                    )],
+                    ..Default::default()
+                },
+                usage: TokenUsage {
+                    input: PAID_TURN_INPUT,
+                    ..Default::default()
+                },
+                stop_reason: Some(StopReason::ToolUse),
+                input_transformations: Vec::new(),
+            })
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+/// One task opens the session and stays alive, another prompts it and gets
+/// cancelled. The cancel drops the prompt future mid-run, so nothing after its
+/// `await` runs. The entry must still go back to idle.
+#[test]
+fn cancelled_background_prompt_leaves_its_entry_idle() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let seed = mailbox.publish_seed(stub_seed(session));
+    let parked = TurnThenPark::install(&seed);
+    host.load_source(
+        BACKGROUND_PLUGIN,
+        &background_monitor_src(&session.to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        exec_tool(&reg, "open_background", json!({})).unwrap(),
+        "nil"
+    );
+
+    exec_tool(&reg, "prompt_in_task", json!({})).unwrap();
+    parked
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("the prompt must reach its second turn");
+    exec_tool(&reg, "cancel_prompt", json!({})).unwrap();
+
+    assert_eq!(
+        exec_tool(&reg, "list_background", json!({})).unwrap(),
+        format!("{BACKGROUND_PLUGIN}:{BACKGROUND_NAME}:idle:true")
+    );
+}
+
+/// The provider parks the second turn forever, so only a cancel can end this
+/// prompt. If `close` waited for it instead, a `SessionEnd` callback that
+/// closes its own session would hang.
+#[test]
+fn closing_a_background_session_cancels_its_running_prompt() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let seed = mailbox.publish_seed(stub_seed(session));
+    let parked = TurnThenPark::install(&seed);
+    host.load_source(
+        BACKGROUND_PLUGIN,
+        &background_monitor_src(&session.to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        exec_tool(&reg, "open_background", json!({})).unwrap(),
+        "nil"
+    );
+    exec_tool(&reg, "prompt_in_task", json!({})).unwrap();
+    parked
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("the prompt must reach its second turn");
+
+    let closed = call_on_thread(&reg, "close_background", CancelToken::none())
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("close must not wait for the parked prompt");
+    assert_eq!(closed, Ok(CANCELLED_MSG.to_owned()));
+    assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
+}
+
+/// A spawned task opens the session and lives on, so Esc on the handler that
+/// prompts it only reaches the prompt because `prompt` watches the caller's
+/// token. Otherwise the handler sits in the prompt until the host gives up on
+/// it.
+#[test]
+fn cancelling_the_prompting_handler_cuts_its_background_prompt() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let seed = mailbox.publish_seed(stub_seed(session));
+    let parked = TurnThenPark::install(&seed);
+    host.load_source(
+        BACKGROUND_PLUGIN,
+        &background_monitor_src(&session.to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        exec_tool(&reg, "open_background", json!({})).unwrap(),
+        "nil"
+    );
+    let (trigger, token) = CancelToken::new();
+    let reply = call_on_thread(&reg, "prompt_background", token);
+
+    parked
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("the prompt must reach its second turn");
+    trigger.cancel();
+
+    let reply = reply
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("the cancelled handler must settle");
+    assert_eq!(reply, Ok(CANCELLED_MSG.to_owned()));
+}
+
+/// A spawned task holds the session in a parked prompt, so the handler queues
+/// for the session lock. Esc must reach it there too, not only once its own
+/// run starts.
+#[test]
+fn cancelling_a_handler_queued_behind_another_prompt_cuts_it() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let seed = mailbox.publish_seed(stub_seed(session));
+    let parked = TurnThenPark::install(&seed);
+    host.load_source(
+        BACKGROUND_PLUGIN,
+        &background_monitor_src(&session.to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        exec_tool(&reg, "open_background", json!({})).unwrap(),
+        "nil"
+    );
+    exec_tool(&reg, "prompt_in_task", json!({})).unwrap();
+    parked
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("the first prompt must park holding the session");
+
+    let (trigger, token) = CancelToken::new();
+    let reply = call_on_thread(&reg, "prompt_background", token);
+    trigger.cancel();
+
+    let reply = reply
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("the queued handler must settle");
+    assert_eq!(reply, Ok(CANCELLED_MSG.to_owned()));
+}
+
+/// Hands the test the options of each request, then ends the prompt there.
+struct OptsRecorder(flume::Sender<RequestOptions>);
+
+impl Provider for OptsRecorder {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a Model,
+        _: &'a [Message],
+        _: &'a str,
+        _: &'a Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        opts: RequestOptions,
+        _: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        let _ = self.0.send(opts);
+        Box::pin(async {
+            Err(AgentError::Tool {
+                tool: OPTS_RECORDER.into(),
+                message: OPTS_RECORDER.into(),
+            })
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+/// The user can lower the effort while a monitor sits idle, and its next
+/// prompt has to obey without being reopened.
+#[test]
+fn background_prompt_is_capped_by_the_chat_settings_of_that_moment() {
+    const OPENED_UNDER: RequestOptions = RequestOptions {
+        thinking: ThinkingConfig::Adaptive,
+        fast: false,
+    };
+    const LOWERED_TO: RequestOptions = RequestOptions {
+        thinking: ThinkingConfig::Off,
+        fast: false,
+    };
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let seed = mailbox.publish_seed(stub_seed(session));
+    let (opts_tx, opts_rx) = flume::unbounded();
+    seed.model_slot.store(Arc::new(ModelSlot {
+        model: seed.model_slot.load().model.clone(),
+        provider: Arc::new(OptsRecorder(opts_tx)),
+    }));
+    seed.set_chat_settings(OPENED_UNDER, &AgentMode::Build);
+    host.load_source(
+        BACKGROUND_PLUGIN,
+        &background_monitor_src(&session.to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        exec_tool(&reg, "open_background", json!({})).unwrap(),
+        "nil"
+    );
+
+    seed.set_chat_settings(LOWERED_TO, &AgentMode::Build);
+    exec_tool(&reg, "prompt_background", json!({})).unwrap();
+
+    assert_eq!(opts_rx.try_recv(), Ok(LOWERED_TO));
+}
+
+const SCRIBBLE_PLUGIN: &str = "background_scribbler";
+const SCRIBBLE_TOOL: &str = "background_scribble";
+const SCRIBBLE_ENTRY: &str = "scribble_in_background";
+const CALL_ONCE_TOOL_USE_ID: &str = "toolu_call_once";
+const SCRIBBLED: &str = "scribbled";
+const CALL_ONCE_DONE: &str = "done";
+const PLAN_FILE: &str = "plan.md";
+
+/// A background session dispatches through the global registry, so the write
+/// tool has to live there. No other test uses these names, so even `cargo test`,
+/// which runs tests side by side in one process, can't load or unload them
+/// under our feet.
+fn scribbler_src(sid: &str) -> String {
+    format!(
+        r#"
+maki.api.register_tool({{
+    name = "{SCRIBBLE_TOOL}",
+    description = "writes a file",
+    schema = {{ type = "object", properties = {{ path = {{ type = "string" }} }}, required = {{ "path" }} }},
+    permission = "fs_write",
+    permission_scopes = "path",
+    mutable_path = "path",
+    audiences = {{ "general_sub" }},
+    handler = function(input)
+        assert(maki.fs.write(input.path, "{SCRIBBLED}"))
+        return "{SCRIBBLED}"
+    end,
+}})
+maki.api.register_tool({{
+    name = "{SCRIBBLE_ENTRY}",
+    description = "prompts a background session that has the write tool",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local tools = assert(maki.agent.tools({{ session = "{sid}", audience = "general_sub", only = {{ "{SCRIBBLE_TOOL}" }} }}))
+        local sess = assert(maki.agent.session({{ session = "{sid}", tools = tools }}))
+        local _, err = sess:prompt("scribble")
+        sess:close()
+        return tostring(err)
+    end,
+}})
+"#
+    )
+}
+
+/// Asks for one tool call, then answers every later request with plain text.
+/// The test gets a copy of each request.
+struct CallOnce {
+    tool: &'static str,
+    input: Value,
+    asked: AtomicBool,
+    requests: flume::Sender<Vec<Message>>,
+}
+
+impl CallOnce {
+    fn install(
+        seed: &AgentSeed,
+        tool: &'static str,
+        input: Value,
+    ) -> flume::Receiver<Vec<Message>> {
+        let (requests, requests_rx) = flume::unbounded();
+        seed.model_slot.store(Arc::new(ModelSlot {
+            model: seed.model_slot.load().model.clone(),
+            provider: Arc::new(Self {
+                tool,
+                input,
+                asked: AtomicBool::new(false),
+                requests,
+            }),
+        }));
+        requests_rx
+    }
+}
+
+impl Provider for CallOnce {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a Model,
+        messages: &'a [Message],
+        _: &'a str,
+        _: &'a Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        _: RequestOptions,
+        _: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        let _ = self.requests.send(messages.to_vec());
+        let (block, stop) = if self.asked.swap(true, Ordering::SeqCst) {
+            (
+                ContentBlock::Text {
+                    text: CALL_ONCE_DONE.into(),
+                },
+                StopReason::EndTurn,
+            )
+        } else {
+            (
+                ContentBlock::tool_use(CALL_ONCE_TOOL_USE_ID, self.tool, self.input.clone()),
+                StopReason::ToolUse,
+            )
+        };
+        Box::pin(async move {
+            Ok(StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![block],
+                    ..Default::default()
+                },
+                usage: TokenUsage::default(),
+                stop_reason: Some(stop),
+                input_transformations: Vec::new(),
+            })
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+fn tool_result_text(request: &[Message]) -> &str {
+    request
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|b| match b {
+            ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .expect("the second request must carry the write's result")
+}
+
+/// Plan mode used to reach background sessions as is. The plan prompt landed in
+/// a monitor's history, and the plan file was the one file it could write
+/// without asking. We aim at the plan file because that was the hole.
+#[test]
+fn background_session_never_plans_and_cannot_write_while_the_chat_does() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let plan = dir.path().join(PLAN_FILE);
+    let reg = Arc::clone(ToolRegistry::global_arc());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let seed = mailbox.publish_seed(stub_seed(session));
+    let requests = CallOnce::install(
+        &seed,
+        SCRIBBLE_TOOL,
+        json!({ "path": plan.display().to_string() }),
+    );
+    seed.set_chat_settings(RequestOptions::default(), &AgentMode::Plan(plan.clone()));
+    host.load_source(SCRIBBLE_PLUGIN, &scribbler_src(&session.to_string()))
+        .unwrap();
+
+    let reply = exec_tool(&reg, SCRIBBLE_ENTRY, json!({}));
+    host.unload(SCRIBBLE_PLUGIN).unwrap();
+
+    assert_eq!(reply, Ok("nil".to_owned()));
+    let first = requests.try_recv().unwrap();
+    assert!(
+        !format!("{first:?}").contains(&plan.display().to_string()),
+        "the plan prompt reached a background session: {first:?}"
+    );
+    assert_eq!(
+        tool_result_text(&requests.try_recv().unwrap()),
+        BACKGROUND_PLAN_WRITE_DENIED
+    );
+    assert!(!plan.exists());
+}
+
+const PARK_PLUGIN: &str = "background_parker";
+const PARK_TOOL: &str = "background_park";
+const PARK_ENTRY: &str = "cut_background_prompt_mid_tool";
+
+/// Global registry for the same reason as [`scribbler_src`]. The first prompt
+/// is cut by cancelling its task once the tool runs, so the run future drops
+/// with the tool call recorded and no result behind it.
+fn parker_src(sid: &str) -> String {
+    format!(
+        r#"
+local in_tool, parked
+maki.api.register_tool({{
+    name = "{PARK_TOOL}",
+    description = "parks until the test is done",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "general_sub" }},
+    handler = function()
+        in_tool:release()
+        parked:acquire():release()
+    end,
+}})
+maki.api.register_tool({{
+    name = "{PARK_ENTRY}",
+    description = "cuts a background prompt while its tool runs, then prompts again",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local tools = assert(maki.agent.tools({{ session = "{sid}", audience = "general_sub", only = {{ "{PARK_TOOL}" }} }}))
+        local sess = assert(maki.agent.session({{ session = "{sid}", tools = tools }}))
+        local gate = maki.async.semaphore(1)
+        in_tool = gate:acquire()
+        parked = maki.async.semaphore(1)
+        local unpark = parked:acquire()
+        local first = maki.async.spawn(function() sess:prompt("first") end)
+        gate:acquire():release()
+        first:cancel()
+        local r, err = sess:prompt("second")
+        unpark:release()
+        sess:close()
+        return tostring(err) .. ":" .. tostring(r and r.text)
+    end,
+}})
+"#
+    )
+}
+
+fn unanswered_tool_uses(request: &[Message]) -> Vec<&str> {
+    request
+        .iter()
+        .enumerate()
+        .flat_map(|(i, m)| {
+            let next = request.get(i + 1).map_or(&[][..], |n| &n.content[..]);
+            m.tool_uses().map(|(id, _, _)| id).filter(move |id| {
+                !next.iter().any(
+                    |b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id),
+                )
+            })
+        })
+        .collect()
+}
+
+/// A cancelled task drops its prompt future mid-run, so the agent never gets
+/// to close the tool call it already recorded. The session stays usable, and
+/// a provider rejects a request with a tool call nobody answered.
+#[test]
+fn prompt_after_a_prompt_dropped_mid_tool_sends_no_dangling_tool_calls() {
+    let reg = Arc::clone(ToolRegistry::global_arc());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let seed = mailbox.publish_seed(stub_seed(session));
+    let requests = CallOnce::install(&seed, PARK_TOOL, json!({}));
+    host.load_source(PARK_PLUGIN, &parker_src(&session.to_string()))
+        .unwrap();
+
+    let reply = call_on_thread(&reg, PARK_ENTRY, CancelToken::none())
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("the second prompt must settle");
+    host.unload(PARK_PLUGIN).unwrap();
+
+    assert_eq!(reply, Ok(format!("nil:{CALL_ONCE_DONE}")));
+    let second = requests
+        .drain()
+        .last()
+        .expect("the second prompt must reach the provider");
+    assert_eq!(unanswered_tool_uses(&second), Vec::<&str>::new());
+}
+
+#[test]
+fn background_session_is_listed_until_its_chat_session_ends() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let _seed = mailbox.publish_seed(stub_seed(session));
+    host.load_source(
+        BACKGROUND_PLUGIN,
+        &background_monitor_src(&session.to_string()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exec_tool(&reg, "open_background", json!({})).unwrap(),
+        "nil"
+    );
+    assert_eq!(
+        exec_tool(&reg, "list_background", json!({})).unwrap(),
+        format!("{BACKGROUND_PLUGIN}:{BACKGROUND_NAME}:idle:true")
+    );
+
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+
+    assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }

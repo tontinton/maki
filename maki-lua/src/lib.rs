@@ -1,5 +1,6 @@
 pub mod agent_autocmd;
 mod api;
+mod background;
 pub mod docs;
 pub mod docs_render;
 mod error;

@@ -35,7 +35,7 @@ use crate::{
     TurnCompleteEvent,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 /// One compaction is the whole remedy for an overflowing prompt, so a second
@@ -105,6 +105,11 @@ pub struct AgentParams {
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<SessionRef>,
+    /// The chat session a plugin runs this agent for in the background, `None`
+    /// for anything the user watches. Its file writes are denied while the
+    /// chat plans, see [`crate::AgentSeed::background_write_block`]. Subagents
+    /// inherit it, or a monitor could get around the block by starting one.
+    pub background_for: Option<MakiId>,
     pub task_id: Option<Arc<str>>,
     pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
@@ -162,6 +167,7 @@ pub struct Agent<'h> {
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
+    background_for: Option<MakiId>,
     task_id: Option<Arc<str>>,
     mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
@@ -208,6 +214,7 @@ impl<'h> Agent<'h> {
             overflow_recoveries: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
+            background_for: params.background_for,
             task_id: params.task_id,
             mailbox: params.mailbox,
             file_access: params.file_access,
@@ -922,6 +929,7 @@ impl<'h> Agent<'h> {
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
             session_id: self.session_id.clone(),
+            background_for: self.background_for,
             task_id: self.task_id.clone(),
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
@@ -1374,6 +1382,7 @@ mod tests {
                     Arc::default(),
                 )),
                 session_id: None,
+                background_for: None,
                 task_id: None,
                 mailbox: None,
                 timeouts: maki_providers::Timeouts::default(),

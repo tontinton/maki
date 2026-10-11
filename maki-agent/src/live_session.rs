@@ -13,6 +13,8 @@ use crate::permissions::PermissionManager;
 use crate::tools::{FileAccess, ToolContext, ToolRegistry, interpreter_ctx};
 use crate::{AgentConfig, AgentMode, EventSender, ModelSlot, ToolOutputLines};
 
+pub const BACKGROUND_PLAN_WRITE_DENIED: &str =
+    "the chat is in plan mode, so background sessions can't change files";
 const MAILBOX_CAPACITY: usize = 100;
 /// Nobody listens on an unattended context's events, so its run id is never read.
 const UNATTENDED_RUN_ID: u64 = 0;
@@ -58,9 +60,12 @@ pub struct AgentSeed {
     pub timeouts: Timeouts,
     pub file_access: Arc<FileAccess>,
     pub model_policy: Arc<ModelPolicy>,
-    /// Copied from the latest run, so background work never thinks harder
-    /// than the user asked for.
-    opts: Mutex<RequestOptions>,
+    /// The chat's thinking and whether it plans, as the user has them right
+    /// now. The UI keeps them fresh even before the first message, so
+    /// background work never thinks harder than the user asked. We keep a bool
+    /// and not the mode on purpose. Handed to a background run, the mode would
+    /// bring the plan prompt along, plus a free pass to write the plan file.
+    chat_settings: Mutex<(RequestOptions, bool)>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -113,16 +118,24 @@ impl SessionMailbox {
     }
 
     /// The registry only keeps a weak link, so the caller has to hold on to
-    /// the seed. After a rewind the new loop starts with the old options, so
-    /// background work keeps the effort the user picked.
-    pub fn publish_seed(&self, seed: AgentSeed) -> Arc<AgentSeed> {
+    /// the seed. A rewind publishes a new seed, and it starts with the old chat
+    /// settings, so background work never sees the defaults in the short gap
+    /// before the UI sends them again. The file locks carry over too, because
+    /// background sessions opened before the rewind still edit through the old
+    /// ones, and their edits have to keep taking turns with the new loop's.
+    pub fn publish_seed(&self, mut seed: AgentSeed) -> Arc<AgentSeed> {
         let mut published = lock(&self.live.seed);
         if let Some(previous) = published.upgrade() {
-            seed.set_opts(previous.opts());
+            *lock(&seed.chat_settings) = *lock(&previous.chat_settings);
+            seed.file_access = previous.file_access.sharing_locks();
         }
         let seed = Arc::new(seed);
         *published = Arc::downgrade(&seed);
         seed
+    }
+
+    pub fn seed(&self) -> Option<Arc<AgentSeed>> {
+        lock(&self.live.seed).upgrade()
     }
 }
 
@@ -165,7 +178,7 @@ impl AgentSeed {
             timeouts,
             file_access: FileAccess::fresh(),
             model_policy,
-            opts: Mutex::default(),
+            chat_settings: Mutex::default(),
         }
     }
 
@@ -176,12 +189,26 @@ impl AgentSeed {
         lock(&live.seed).upgrade()
     }
 
-    pub fn set_opts(&self, opts: RequestOptions) {
-        *lock(&self.opts) = opts;
+    pub fn set_chat_settings(&self, opts: RequestOptions, mode: &AgentMode) {
+        *lock(&self.chat_settings) = (opts, mode.plan_path().is_some());
     }
 
-    fn opts(&self) -> RequestOptions {
-        *lock(&self.opts)
+    pub fn chat_opts(&self) -> RequestOptions {
+        lock(&self.chat_settings).0
+    }
+
+    /// Why background work for `chat` may not change a file right now.
+    ///
+    /// That work always runs in build mode, but plan mode still means "leave
+    /// my files alone". So every write asks here, and a switch to plan mode
+    /// also covers the next write of a prompt that is already running. A chat
+    /// that is gone can't say it isn't planning, so that is a no too.
+    pub fn background_write_block(chat: MakiId) -> Option<String> {
+        let Some(seed) = Self::live(chat) else {
+            return Some(MailboxError(chat).to_string());
+        };
+        let (_, planning) = *lock(&seed.chat_settings);
+        planning.then(|| BACKGROUND_PLAN_WRITE_DENIED.to_owned())
     }
 
     /// No chat shows this work, so its events go to a channel nobody reads.
@@ -194,14 +221,15 @@ impl AgentSeed {
             provider: Arc::clone(&slot.provider),
             model: Arc::new(slot.model.clone()),
             session_id: Some(self.session_id.clone()),
+            background_for: Some(self.session_id.id()),
             mcp: self.mcp.clone(),
             config: self.config.clone(),
             tool_output_lines: self.tool_output_lines,
             timeouts: self.timeouts,
-            opts: self.opts(),
+            opts: self.chat_opts(),
             model_policy: Arc::clone(&self.model_policy),
             ..interpreter_ctx(
-                &AgentMode::default(),
+                &AgentMode::Build,
                 &EventSender::new(sink, UNATTENDED_RUN_ID),
                 cancel,
                 Arc::clone(&self.permissions),
@@ -215,33 +243,21 @@ impl AgentSeed {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use futures_lite::future::poll_once;
     use maki_providers::ThinkingConfig;
 
     use super::*;
-    use crate::tools::test_support::stub_ctx;
+    use crate::tools::FileKey;
+    use crate::tools::test_support::{future_mtime, stub_seed};
 
-    const LATEST_OPTS: RequestOptions = RequestOptions {
+    const CHAT_OPTS: RequestOptions = RequestOptions {
         thinking: ThinkingConfig::Adaptive,
         fast: true,
     };
-
-    fn seed(id: MakiId) -> AgentSeed {
-        let ctx = stub_ctx(&AgentMode::Build);
-        let slot = ModelSlot {
-            model: (*ctx.model).clone(),
-            provider: ctx.provider,
-        };
-        AgentSeed::new(
-            SessionRef::from(id),
-            Arc::new(ArcSwap::from_pointee(slot)),
-            AgentConfig::default(),
-            ToolOutputLines::default(),
-            ctx.permissions,
-            None,
-            Timeouts::default(),
-            Arc::default(),
-        )
-    }
+    const PLAN_FILE: &str = "/tmp/plan.md";
+    const EDITED_FILE: &str = "foo.rs";
 
     fn text(message: &Message) -> &str {
         message.user_text().unwrap()
@@ -367,7 +383,7 @@ mod tests {
         let mailbox = SessionMailbox::register(id);
         assert!(AgentSeed::live(id).is_none());
 
-        let owned = mailbox.publish_seed(seed(id));
+        let owned = mailbox.publish_seed(stub_seed(id));
         assert!(Arc::ptr_eq(&AgentSeed::live(id).unwrap(), &owned));
 
         drop(owned);
@@ -377,17 +393,70 @@ mod tests {
     }
 
     #[test]
-    fn respawned_seed_wins_and_its_tool_context_keeps_the_latest_opts() {
+    fn respawned_seed_wins_and_keeps_the_chat_settings() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
-        let old = mailbox.publish_seed(seed(id));
-        old.set_opts(LATEST_OPTS);
+        let old = mailbox.publish_seed(stub_seed(id));
+        old.set_chat_settings(CHAT_OPTS, &AgentMode::Plan(PLAN_FILE.into()));
 
-        let new = mailbox.publish_seed(seed(id));
+        let new = mailbox.publish_seed(stub_seed(id));
         drop(old);
 
         let live = AgentSeed::live(id).unwrap();
         assert!(Arc::ptr_eq(&live, &new));
-        assert_eq!(live.tool_context(CancelToken::none()).opts, LATEST_OPTS);
+        let ctx = live.tool_context(CancelToken::none());
+        assert_eq!(ctx.opts, CHAT_OPTS);
+        assert_eq!(ctx.mode, AgentMode::Build);
+        assert_eq!(ctx.background_for, Some(id));
+        assert_eq!(
+            AgentSeed::background_write_block(id).as_deref(),
+            Some(BACKGROUND_PLAN_WRITE_DENIED)
+        );
+    }
+
+    /// A chat that is gone can't tell us it stopped planning.
+    #[test]
+    fn background_writes_stop_once_the_chat_is_gone() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let seed = mailbox.publish_seed(stub_seed(id));
+        assert_eq!(AgentSeed::background_write_block(id), None);
+
+        drop(seed);
+        assert_eq!(
+            AgentSeed::background_write_block(id),
+            Some(MailboxError(id).to_string())
+        );
+    }
+
+    /// The loop reads a file, the user edits it, and a monitor reads it too.
+    /// The loop must still be told its view is stale. After a rewind the
+    /// monitor's edits must still wait for the new loop's.
+    #[test]
+    fn background_reads_stay_apart_but_locks_survive_a_respawn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(EDITED_FILE);
+        fs::write(&path, "").unwrap();
+        let key = FileKey::new(&path);
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let old = mailbox.publish_seed(stub_seed(id));
+        let background = old.tool_context(CancelToken::none());
+
+        old.file_access.record_read(&key);
+        future_mtime(&path);
+        background.file_access.record_read(&key);
+        assert!(old.file_access.check_before_edit(&key).is_err());
+
+        let respawned = mailbox.publish_seed(stub_seed(id));
+        drop(old);
+        smol::block_on(async {
+            let _held = respawned.file_access.acquire(&key).await;
+            assert!(
+                poll_once(background.file_access.acquire(&key))
+                    .await
+                    .is_none()
+            );
+        });
     }
 }

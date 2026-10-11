@@ -1280,17 +1280,22 @@ if err then error(err) end
 ### `maki.agent.tools()` {#maki-agent-tools}
 
 ```lua
-maki.agent.tools({ctx}, {opts})
+maki.agent.tools({ctx}, {opts?})
 ```
 
 Get the list of tool definitions for a given audience. Pass the result
 straight into `maki.agent.session()` or use it to inspect what tools are
 available.
 
+Outside a tool call, skip `ctx` and name a live chat session in `opts`
+instead: `maki.agent.tools({ session = id, audience = ... })`. Its model,
+config and MCP stand in for the ctx.
+
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Agent context.
-- `{opts}` (`table`) Required fields:
+- `{ctx}` (`LuaCtx|table`) Agent context, or the opts table of the ctx-less form.
+- `{opts?}` (`table?`) Required with a ctx. Fields:
+  - `session` (`string`) ctx-less form only: id of the live chat session.
   - `audience` (`string`) tool audience filter, e.g. `"general"`, `"subagent"`,
     `"general_sub"`.
 
@@ -1411,7 +1416,7 @@ print(out)
 ### `maki.agent.session()` {#maki-agent-session}
 
 ```lua
-maki.agent.session({ctx}, {opts})
+maki.agent.session({ctx}, {opts?})
 ```
 
 Create a new subagent session. The session inherits the parent model and
@@ -1421,10 +1426,26 @@ you can send messages to with `:prompt()`.
 This is the main way to spin up a sub-conversation with its own history
 and tool set.
 
+Skip `ctx` to run one in the background: `maki.agent.session({ session =
+id, ... })` borrows its settings from that live chat session, so it works
+outside a tool call too. Open and prompt it from a task (a
+`maki.async.spawn` task, an autocmd callback or a tool handler). It lives
+until the task that opened it ends, the plugin unloads, the chat session
+ends, or you close it. An autocmd callback ends when it returns, so long
+running monitors belong in `maki.async.spawn`. Turns ending, Esc and
+rewinds in the chat leave it running, but Esc on a tool call cancels a
+prompt its handler waits on. Nobody is around to answer its permission prompts, so anything
+without an allow rule is denied. It always runs in build mode, and while the
+chat is in plan mode its file-write tools are denied.
+`maki.agent.background()` lists these sessions.
+
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Agent context.
-- `{opts}` (`table`) Optional fields:
+- `{ctx}` (`LuaCtx|table`) Agent context, or the opts table of the ctx-less form.
+- `{opts?}` (`table?`) Required with a ctx. Optional fields:
+  - `session` (`string`) ctx-less form only, and required there: id of the
+    live chat session that owns this one. A session that is not live
+    answers `(nil, "session not live: <id>")`.
   - `model_spec` (`string?`) model spec string to use instead of the parent model.
   - `system` (`string?`) system prompt. Defaults to empty.
   - `tools` (`table?`) tool definitions array (from `maki.agent.tools()`).
@@ -1463,6 +1484,36 @@ if err then error(err) end
 local result, prompt_err = sess:prompt("Summarize this file.")
 sess:close()
 if prompt_err then error(prompt_err) end
+```
+
+---
+
+### `maki.agent.background()` {#maki-agent-background}
+
+```lua
+maki.agent.background({opts})
+```
+
+List the background sessions a chat session owns, the ones opened with
+`maki.agent.session({ session = id })`. Closed or ended ones are not listed.
+
+Each entry has `id` (string), `plugin` (string) that opened it, `name`
+(string) given at open, `status` (`"running"` while a `:prompt()` runs,
+`"idle"` otherwise) and `started_at` (integer, unix seconds).
+
+**Parameters:**
+
+- `{opts}` (`table`) Required fields:
+  - `session` (`string`) id of the chat session.
+
+**Returns:** (`table?`, `string?`) Array of entries, or `(nil, err)` on failure.
+
+**Example:**
+
+```lua
+for _, s in ipairs(maki.agent.background({ session = id })) do
+  print(s.plugin, s.name, s.status, os.time() - s.started_at)
+end
 ```
 
 
@@ -1526,6 +1577,9 @@ it more than once is safe.
 Close on every path, error paths included. Dropping the session instead
 leaves the work to the Lua garbage collector, which may never run while
 the VM sits idle, and the subagent's event relay stays alive until it does.
+
+Closing a background session cancels a prompt another task is still
+running on it, instead of waiting for that prompt to finish.
 
 
 ## maki.async {#maki-async}

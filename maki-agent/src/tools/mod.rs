@@ -43,7 +43,7 @@ use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
 
 pub(crate) const TOOL_NAME_FIELD: &str = "name";
 const COMPACT_DURATION: SpanPrinter = SpanPrinter::new()
@@ -327,6 +327,9 @@ pub struct ToolContext {
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `maki index` one-shot.
     pub session_id: Option<SessionRef>,
+    /// See [`crate::AgentParams::background_for`]. Every nested call clones
+    /// this context, so batch and code_execution children carry it too.
+    pub background_for: Option<MakiId>,
     /// `None` in the agent that owns the session ([`MAIN_TASK_ID`]), the
     /// spawning call's `tool_use_id` in a subagent. A subagent shares
     /// `session_id` with its parent on purpose (provider affinity, hooks,
@@ -569,6 +572,7 @@ pub fn interpreter_ctx(
         event_tx: event_tx.clone(),
         mode: mode.clone(),
         session_id: None,
+        background_for: None,
         task_id: None,
         tool_use_id: None,
         user_response_rx,
@@ -627,7 +631,12 @@ pub fn cli_tool_ctx() -> ToolContext {
 pub mod test_support {
     use std::borrow::Cow;
 
-    use crate::{Envelope, EventSender, ToolOutput};
+    use arc_swap::ArcSwap;
+    use maki_providers::Timeouts;
+    use maki_storage::id::MakiId;
+
+    use crate::live_session::AgentSeed;
+    use crate::{Envelope, EventSender, ModelSlot, ToolOutput};
 
     use super::*;
 
@@ -773,6 +782,24 @@ pub mod test_support {
 
     pub fn stub_ctx(mode: &AgentMode) -> ToolContext {
         stub_ctx_with(mode, None, None)
+    }
+
+    pub fn stub_seed(id: MakiId) -> AgentSeed {
+        let ctx = stub_ctx(&AgentMode::Build);
+        let slot = ModelSlot {
+            model: (*ctx.model).clone(),
+            provider: ctx.provider,
+        };
+        AgentSeed::new(
+            SessionRef::from(id),
+            Arc::new(ArcSwap::from_pointee(slot)),
+            AgentConfig::default(),
+            ToolOutputLines::default(),
+            ctx.permissions,
+            None,
+            Timeouts::default(),
+            Arc::default(),
+        )
     }
 
     #[cfg(test)]

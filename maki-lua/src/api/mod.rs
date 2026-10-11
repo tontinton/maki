@@ -142,7 +142,10 @@ pub(crate) fn create_maki_global(
         "interpreter",
         interpreter::create_interpreter_table(lua, permissions)?,
     )?;
-    maki.set("agent", agent::create_agent_table(lua)?)?;
+    maki.set(
+        "agent",
+        agent::create_agent_table(lua, Arc::clone(&plugin))?,
+    )?;
     maki.set(
         "keymap",
         keymap::create_keymap_table(lua, Arc::clone(&plugin))?,

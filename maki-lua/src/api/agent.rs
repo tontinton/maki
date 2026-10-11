@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::{Either, select};
 use maki_agent::agent::{LoadedInstructions, tool_dispatch};
-use maki_agent::cancel::{CancelMap, CancelSlot};
+use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
@@ -17,35 +17,46 @@ use maki_agent::tools::{
     ToolContext, ToolFilter, ToolLive, ToolOutputMode,
 };
 use maki_agent::{
-    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
+    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed, DoneReason,
     EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, InputSource, McpSession,
     RunContext, RunContextBuilder, RunLedger, SessionEvents, SubagentInbox, SubagentInfo,
-    ToolDoneEvent, event_stream,
+    ToolDoneEvent, UNAVAILABLE_RESULT, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{
-    ContentBlock, ContextGauge, Model, RequestOptions, Role, ThinkingConfig, TokenUsage, add_cost,
+    ContentBlock, ContextGauge, Model, RequestOptions, Role, ThinkingConfig, add_cost,
 };
 use maki_storage::id::MakiId;
+use maki_storage::now_epoch;
 use maki_storage::sessions::StoredThinking;
-use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
+use mlua::{
+    Either as LuaEither, Function, IntoLuaMulti, Lua, Result as LuaResult, Table, UserDataRef,
+    Value as LuaValue,
+};
 use serde_json::Value as JsonValue;
 use smol::lock::Mutex as AsyncMutex;
 use tracing::info;
 
+use crate::api::session::{not_live, required_session};
 use crate::api::tool::{audiences_to_lua, parse_audience};
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
-use crate::runtime::CANCELLED_MSG;
+use crate::background::{BackgroundInfo, BackgroundSession, BackgroundSessions};
+use crate::runtime::{CANCELLED_MSG, active_task_cancel};
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const PROMPT_DROPPED_ERR: &str = "an `agent.user_message` layer dropped the prompt";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 const OUTPUT_MODE_ERR: &str = "output_mode must be 'full' or 'compact'";
+const OPTS_REQUIRED_ERR: &str = "opts table is required";
+const RUNNING_STATUS: &str = "running";
+const IDLE_STATUS: &str = "idle";
+const TASK_REQUIRED_ERR: &str = "maki.agent.session({ session = id }) and its prompts must run \
+     in a task: maki.async.spawn, an autocmd callback or a tool handler";
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
     let Some(tier_str) = tier else {
@@ -82,15 +93,49 @@ fn dispatch_ctx<'a>(ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, S
         .ok_or_else(|| ctx.cap_err(&format!("maki.agent.{method}")))
 }
 
+fn required_opts(opts: Option<Table>) -> LuaResult<Table> {
+    opts.ok_or_else(|| mlua::Error::runtime(OPTS_REQUIRED_ERR))
+}
+
+/// Settings left out come from the parent, and a thinking level the plugin
+/// asks for can't go above the parent's. We clamp to the model once, right
+/// here, so the status badge, `AgentInput` and the request all agree on what
+/// this session really runs.
+fn session_opts(
+    thinking: Option<ThinkingConfig>,
+    fast: Option<bool>,
+    parent: RequestOptions,
+    model: &Model,
+) -> RequestOptions {
+    RequestOptions {
+        thinking: thinking.map_or(parent.thinking, |t| t.clamp_to(parent.thinking)),
+        fast: fast.unwrap_or(parent.fast),
+    }
+    .clamped(model)
+}
+
+/// The ctx-less form borrows a live chat session's settings by id. We copy
+/// what we need and let the seed go, because holding it would keep an ended
+/// chat session looking live.
+fn seed_ctx(
+    opts: &Table,
+    cancel: CancelToken,
+) -> LuaResult<Result<(MakiId, AgentContext), String>> {
+    Ok(required_session(Some(opts))?.and_then(|session| {
+        let seed = AgentSeed::live(session).ok_or_else(|| not_live(session))?;
+        Ok((session, AgentContext::from(&seed.tool_context(cancel))))
+    }))
+}
+
 /// Forwards subagent events to the parent, stamped with the subagent identity.
-/// Usage takes two paths: live on the tool header while the run goes on (last
-/// turn's tokens plus the run's summed cost), and one total per run on
-/// `usage_tx`, which `prompt` waits for.
+/// Usage goes live on the tool header while the run goes on (last turn's tokens
+/// plus the run's summed cost). `Done` only pings `done_tx`, which tells
+/// `prompt` that every turn of the run has passed through.
 async fn relay_session_events(
     mut sub_events: SessionEvents,
     parent_tx: EventSender,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
-    usage_tx: flume::Sender<TokenUsage>,
+    done_tx: flume::Sender<()>,
     live_sink: Option<flume::Sender<ToolLive>>,
 ) {
     let mut cost = None;
@@ -102,8 +147,8 @@ async fn relay_session_events(
                     let _ = sink.send(ToolLive::Usage(turn.usage.format_sum_cost(cost)));
                 }
             }
-            AgentEvent::Done { usage, .. } => {
-                let _ = usage_tx.send(*usage);
+            AgentEvent::Done { .. } => {
+                let _ = done_tx.send(());
                 continue;
             }
             AgentEvent::Error { .. }
@@ -212,8 +257,13 @@ async fn system_prompt(
 /// straight into `maki.agent.session()` or use it to inspect what tools are
 /// available.
 ///
-/// @param ctx LuaCtx Agent context.
-/// @param opts table Required fields:
+/// Outside a tool call, skip `ctx` and name a live chat session in `opts`
+/// instead: `maki.agent.tools({ session = id, audience = ... })`. Its model,
+/// config and MCP stand in for the ctx.
+///
+/// @param ctx LuaCtx|table Agent context, or the opts table of the ctx-less form.
+/// @param opts table? Required with a ctx. Fields:
+///   `session` (string) - ctx-less form only: id of the live chat session.
 ///   `audience` (string) - tool audience filter, e.g. `"general"`, `"subagent"`,
 ///     `"general_sub"`.
 /// Optional fields:
@@ -233,8 +283,18 @@ async fn system_prompt(
 /// if err then error(err) end
 /// print(#defs .. " tools available")
 #[lua_fn]
-async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResult<Pair<LuaValue>> {
-    let agent = try_pair!(dispatch_ctx(&ctx, "tools"));
+async fn tools(
+    lua: Lua,
+    ctx: LuaEither<UserDataRef<LuaCtx>, Table>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<LuaValue>> {
+    let (agent, opts) = match ctx {
+        LuaEither::Left(ctx) => (
+            try_pair!(dispatch_ctx(&ctx, "tools")).clone(),
+            required_opts(opts)?,
+        ),
+        LuaEither::Right(opts) => (try_pair!(seed_ctx(&opts, CancelToken::none())?).1, opts),
+    };
     let audience_str: String = opts.get("audience")?;
     let audience = try_pair!(
         ToolAudience::parse_name(&audience_str)
@@ -423,8 +483,24 @@ async fn call_tool(
 /// This is the main way to spin up a sub-conversation with its own history
 /// and tool set.
 ///
-/// @param ctx LuaCtx Agent context.
-/// @param opts table Optional fields:
+/// Skip `ctx` to run one in the background: `maki.agent.session({ session =
+/// id, ... })` borrows its settings from that live chat session, so it works
+/// outside a tool call too. Open and prompt it from a task (a
+/// `maki.async.spawn` task, an autocmd callback or a tool handler). It lives
+/// until the task that opened it ends, the plugin unloads, the chat session
+/// ends, or you close it. An autocmd callback ends when it returns, so long
+/// running monitors belong in `maki.async.spawn`. Turns ending, Esc and
+/// rewinds in the chat leave it running, but Esc on a tool call cancels a
+/// prompt its handler waits on. Nobody is around to answer its permission prompts, so anything
+/// without an allow rule is denied. It always runs in build mode, and while the
+/// chat is in plan mode its file-write tools are denied.
+/// `maki.agent.background()` lists these sessions.
+///
+/// @param ctx LuaCtx|table Agent context, or the opts table of the ctx-less form.
+/// @param opts table? Required with a ctx. Optional fields:
+///   `session` (string) - ctx-less form only, and required there: id of the
+///     live chat session that owns this one. A session that is not live
+///     answers `(nil, "session not live: <id>")`.
 ///   `model_spec` (string?) - model spec string to use instead of the parent model.
 ///   `system` (string?) - system prompt. Defaults to empty.
 ///   `tools` (table?) - tool definitions array (from `maki.agent.tools()`).
@@ -462,11 +538,31 @@ async fn call_tool(
 #[lua_fn]
 async fn session(
     lua: Lua,
-    ctx: mlua::UserDataRef<LuaCtx>,
-    opts: Table,
+    #[ctx] plugin: Arc<str>,
+    ctx: LuaEither<UserDataRef<LuaCtx>, Table>,
+    opts: Option<Table>,
 ) -> LuaResult<Pair<mlua::AnyUserData>> {
-    let agent_ctx = try_pair!(dispatch_ctx(&ctx, "session")).clone();
-    drop(ctx);
+    // The ctx borrow ends inside its arm, before any wait: a cancel hook
+    // firing meanwhile needs `ctx:finish`, which takes it mutably.
+    let (agent_ctx, opts, owner) = match ctx {
+        LuaEither::Left(ctx) => (
+            try_pair!(dispatch_ctx(&ctx, "session")).clone(),
+            required_opts(opts)?,
+            None,
+        ),
+        LuaEither::Right(opts) => {
+            let Some((task, _)) = active_task_cancel(&lua) else {
+                return Ok(err_pair(TASK_REQUIRED_ERR));
+            };
+            // A child of the task's token would leave a watcher waiting on it
+            // until it fires. An autocmd's token never fires, so every open
+            // would leak one. The entry keeps this trigger instead, and the
+            // entry goes away when the task ends.
+            let (cancel, token) = CancelToken::new();
+            let (session, agent_ctx) = try_pair!(seed_ctx(&opts, token)?);
+            (agent_ctx, opts, Some((session, task, cancel)))
+        }
+    };
     let model_spec: Option<String> = opts.get("model_spec")?;
     let system: Option<String> = opts.get("system")?;
     let tools_val: Option<LuaValue> = opts.get("tools")?;
@@ -479,9 +575,7 @@ async fn session(
         }
         None => DEFAULT_SESSION_AUDIENCE,
     };
-    let fast: bool = opts
-        .get::<Option<bool>>("fast")?
-        .unwrap_or(agent_ctx.opts.fast);
+    let fast: Option<bool> = opts.get("fast")?;
     let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true);
 
     let (model, provider): (Model, Arc<dyn provider::Provider>) = if let Some(ref spec) = model_spec
@@ -568,13 +662,7 @@ async fn session(
             }
         }
     };
-    // Omitting inherits the parent as-is; an explicit level is capped at it
-    // first, then reconciled once with the model so the status badge,
-    // `AgentInput` and the request itself all report what this session runs.
-    let thinking = requested_thinking.map_or(agent_ctx.opts.thinking, |t| {
-        t.clamp_to(agent_ctx.opts.thinking)
-    });
-    let opts = RequestOptions { thinking, fast }.clamped(&model);
+    let opts = session_opts(requested_thinking, fast, agent_ctx.opts, &model);
 
     let (stream_guard, sub_events) = event_stream();
     let sub_event_tx = stream_guard.sender(agent_ctx.event_tx.run_id());
@@ -619,7 +707,36 @@ async fn session(
         .insert(ui_id.clone(), child_trigger);
 
     let name = name.unwrap_or_default();
-    info!(name = %name, model = %model.id, "subagent session opened");
+    let background = match owner {
+        Some((session, task, cancel)) => {
+            let registry = BackgroundSessions::of(&lua);
+            try_pair!(registry.register(BackgroundSession {
+                info: BackgroundInfo {
+                    id: ui_id.clone(),
+                    plugin,
+                    name: name.clone(),
+                    running: false,
+                    started_at: now_epoch(),
+                },
+                session,
+                task,
+                _cancel: cancel,
+            }));
+            Some(Background {
+                registry,
+                session,
+                thinking: requested_thinking,
+                fast,
+            })
+        }
+        None => None,
+    };
+    info!(
+        name = %name,
+        model = %model.id,
+        background = background.is_some(),
+        "subagent session opened"
+    );
 
     // The array is the caller's, and the filter comes out of it, so whatever
     // the caller left out is also a name this session cannot dispatch or bind
@@ -637,6 +754,7 @@ async fn session(
             tool_output_lines: maki_config::ToolOutputLines::default(),
             permissions: Arc::clone(&agent_ctx.permissions),
             session_id: agent_ctx.session_id.clone(),
+            background_for: agent_ctx.background_for,
             task_id: Some(Arc::from(ui_id.as_str())),
             mailbox: None,
             timeouts: agent_ctx.timeouts,
@@ -676,16 +794,53 @@ async fn session(
         subagent_info,
         local_tools: Arc::new(local_map),
         name,
-        usage: TokenUsage::default(),
-        usage_rx,
+        dones: RunDones::new(usage_rx),
         start: Instant::now(),
         closed: false,
+        background,
     };
 
+    let background_id = state.background.as_ref().map(|_| state.ui_id.clone());
     let sess = lua.create_userdata(LuaSession {
         inner: Arc::new(AsyncMutex::new(state)),
+        background_id,
     })?;
     Ok((Some(sess), None))
+}
+
+/// List the background sessions a chat session owns, the ones opened with
+/// `maki.agent.session({ session = id })`. Closed or ended ones are not listed.
+///
+/// Each entry has `id` (string), `plugin` (string) that opened it, `name`
+/// (string) given at open, `status` (`"running"` while a `:prompt()` runs,
+/// `"idle"` otherwise) and `started_at` (integer, unix seconds).
+///
+/// @param opts table Required fields:
+///   `session` (string) - id of the chat session.
+/// @return (table?, string?) Array of entries, or `(nil, err)` on failure.
+/// @example
+/// for _, s in ipairs(maki.agent.background({ session = id })) do
+///   print(s.plugin, s.name, s.status, os.time() - s.started_at)
+/// end
+#[lua_fn]
+fn background(lua: &Lua, opts: Table) -> LuaResult<Pair<Table>> {
+    let session = try_pair!(required_session(Some(&opts))?);
+    let out = lua.create_table()?;
+    for entry in BackgroundSessions::of(lua).list(session) {
+        let status = if entry.running {
+            RUNNING_STATUS
+        } else {
+            IDLE_STATUS
+        };
+        let t = lua.create_table()?;
+        t.set("status", status)?;
+        t.set("id", entry.id)?;
+        t.set("plugin", &*entry.plugin)?;
+        t.set("name", entry.name)?;
+        t.set("started_at", entry.started_at)?;
+        out.push(t)?;
+    }
+    Ok((Some(out), None))
 }
 
 lua_table! {
@@ -708,8 +863,9 @@ lua_table! {
     /// print(r.text)
     /// sess:close()
     /// ```
-    "maki.agent" => pub(crate) fn create_agent_table(), DOCS [
-        resolve_model, system_prompt, tools, callable_tools, call_tool, session,
+    "maki.agent" => pub(crate) fn create_agent_table(plugin: Arc<str>), DOCS [
+        resolve_model, system_prompt, tools, callable_tools, call_tool, session(plugin),
+        background,
     ]
 }
 
@@ -812,10 +968,75 @@ struct SessionState {
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     local_tools: LocalTools,
     name: String,
-    usage: TokenUsage,
-    usage_rx: flume::Receiver<TokenUsage>,
+    dones: RunDones,
     start: Instant,
     closed: bool,
+    background: Option<Background>,
+}
+
+/// Every run that ends `Ok` leaves exactly one `Done` on the relay's channel,
+/// and one that errs or is dropped mid-flight leaves none. A prompt cut short
+/// does not wait for its `Done`, and neither does one dropped while waiting.
+/// Events carry no prompt tag, so the next prompt can't tell a leftover from
+/// its own. It counts how many it is owed instead and reads past the old ones.
+struct RunDones {
+    rx: flume::Receiver<()>,
+    unread: usize,
+}
+
+impl RunDones {
+    fn new(rx: flume::Receiver<()>) -> Self {
+        Self { rx, unread: 0 }
+    }
+
+    fn expect_one(&mut self) {
+        self.unread += 1;
+    }
+
+    /// Safe to drop mid-wait, because a `Done` only stops being owed once it
+    /// has been read.
+    async fn caught_up(&mut self) -> Result<(), flume::RecvError> {
+        while self.unread > 0 {
+            self.rx.recv_async().await?;
+            self.unread -= 1;
+        }
+        Ok(())
+    }
+}
+
+struct Background {
+    registry: BackgroundSessions,
+    session: MakiId,
+    /// What the plugin asked for at open. We keep it because every prompt caps
+    /// it again against the chat as it is at that moment.
+    thinking: Option<ThinkingConfig>,
+    fast: Option<bool>,
+}
+
+impl Background {
+    fn start_prompt(&self, id: &str) -> PromptSettle {
+        self.registry.update(id, |e| e.running = true);
+        PromptSettle {
+            registry: self.registry.clone(),
+            id: id.to_owned(),
+        }
+    }
+}
+
+/// Wraps up a background prompt when it drops. A cancelled task drops the
+/// prompt future in the middle of the run, so the code after its `await` never
+/// runs. Without this the entry would say "running" forever. It can drop while
+/// Lua is tearing down the cancelled coroutine, so it only touches Rust state
+/// and never calls into Lua.
+struct PromptSettle {
+    registry: BackgroundSessions,
+    id: String,
+}
+
+impl Drop for PromptSettle {
+    fn drop(&mut self) {
+        self.registry.update(&self.id, |e| e.running = false);
+    }
 }
 
 impl SessionState {
@@ -826,6 +1047,10 @@ impl SessionState {
         self.closed = true;
         self.stream_guard.take();
         self.parent_cancels.retire(&self.ui_id, self.cancel_slot);
+        if let Some(background) = &self.background {
+            background.registry.remove(&self.ui_id);
+        }
+        let usage = self.params.ledger.totals().usage;
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
         let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
             tool_use_id: self.ui_id.clone(),
@@ -834,8 +1059,8 @@ impl SessionState {
         info!(
             name = %self.name,
             duration_ms = self.start.elapsed().as_millis() as u64,
-            input_tokens = self.usage.total_input(),
-            output_tokens = self.usage.output,
+            input_tokens = usage.total_input(),
+            output_tokens = usage.output,
             "subagent session closed",
         );
     }
@@ -843,6 +1068,9 @@ impl SessionState {
 
 struct LuaSession {
     inner: Arc<AsyncMutex<SessionState>>,
+    /// A background session's registry id, kept out here because a running
+    /// prompt holds `inner` until it ends, and that can be never.
+    background_id: Option<String>,
 }
 
 impl Drop for LuaSession {
@@ -883,13 +1111,48 @@ async fn prompt(
     this: mlua::UserDataRef<LuaSession>,
     message: String,
 ) -> LuaResult<Pair<Table>> {
+    // The session's own token fires only when the task that opened it ends.
+    // Esc on a tool handler fires that handler's token, and the handler may not
+    // be the opener. So a background prompt races the caller's token, from the
+    // wait for the session lock to the end of the run, or the handler would sit
+    // there until the host gives up on it. Only the caller's own stack knows
+    // which task it is, so this has to happen before the first await.
+    let caller_cancel = match (this.background_id.is_some(), active_task_cancel(&lua)) {
+        (false, _) => None,
+        (true, Some((_, cancel))) => Some(cancel),
+        (true, None) => return Ok(err_pair(TASK_REQUIRED_ERR)),
+    };
     let inner = Arc::clone(&this.inner);
     drop(this);
-    let mut guard = inner.lock().await;
+    let mut guard = match &caller_cancel {
+        Some(cancel) => match cancel.race(inner.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => return Ok(err_pair(CANCELLED_MSG)),
+        },
+        None => inner.lock().await,
+    };
     let s = &mut *guard;
     if s.closed {
         return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
     }
+    // The user can lower the effort while a monitor sits idle, so we ask the
+    // seed again on every prompt. Plan mode is left out on purpose. Each write
+    // checks it instead, see `AgentSeed::background_write_block`.
+    let watch = match (&s.background, caller_cancel) {
+        (Some(background), Some(caller_cancel)) => {
+            let Some(seed) = AgentSeed::live(background.session) else {
+                return Ok(err_pair(not_live(background.session)));
+            };
+            s.opts = session_opts(
+                background.thinking,
+                background.fast,
+                seed.chat_opts(),
+                &s.params.model,
+            );
+            Some((caller_cancel, background.start_prompt(&s.ui_id)))
+        }
+        _ => None,
+    };
     if s.subagent_info.get().is_none() {
         let _ = s.subagent_info.set(SubagentInfo {
             parent_tool_use_id: s.ui_id.clone(),
@@ -902,6 +1165,11 @@ async fn prompt(
         });
     }
 
+    // A cancel drops the run future, here in the race or with the whole task,
+    // so the last run never got to clean up after itself. It may have left tool
+    // calls without results, and the provider rejects those. The session lives
+    // on, so we close them before going again.
+    s.history.close_dangling_tool_calls(UNAVAILABLE_RESULT);
     let history_len = s.history.len();
     let mut agent = Agent::new(
         s.params.clone(),
@@ -934,8 +1202,17 @@ async fn prompt(
         prompt: None,
         source: InputSource::Plugin,
     };
-    let result = agent.run(input).await;
+    let run = agent.run(input);
+    let finished = match &watch {
+        Some((caller_cancel, _)) => caller_cancel.race(run).await.ok(),
+        None => Some(run.await),
+    };
     drop(agent);
+    drop(watch);
+    if let Some(Ok(_)) = finished {
+        s.dones.expect_one();
+    }
+    let result = finished.unwrap_or(Ok(DoneReason::Cancelled));
     // Only this call's messages count: older turns may hold stale preamble
     // text, and the agent loop's empty-response retry leaves a synthetic
     // "(empty)" assistant marker that must not pass for a real response.
@@ -977,16 +1254,13 @@ async fn prompt(
         };
         return Ok((tbl, Some(err)));
     }
-    // Waiting here doubles as an ordering barrier: the relay reaches `Done` only
-    // after every `TurnComplete`, so all our `ToolLive::Usage` messages sit in the
-    // live channel before `dispatch_racing_live` drains it for the last time.
-    match s.usage_rx.recv_async().await {
-        Ok(usage) => s.usage += usage,
-        Err(_) => tracing::warn!(
-            name = %s.name,
-            "subagent usage tracker stopped, token counts may lag"
-        ),
+    // The relay reaches `Done` only after every `TurnComplete`, so once it has,
+    // all our `ToolLive::Usage` messages sit in the live channel before
+    // `dispatch_racing_live` drains it for the last time.
+    if s.dones.caught_up().await.is_err() {
+        tracing::warn!(name = %s.name, "subagent event relay stopped, live usage may lag");
     }
+    let usage = s.params.ledger.totals().usage;
 
     let text = turn
         .iter()
@@ -1002,8 +1276,8 @@ async fn prompt(
     let tbl = lua.create_table()?;
     tbl.set("text", text)?;
     tbl.set("duration_ms", s.start.elapsed().as_millis() as u64)?;
-    tbl.set("input_tokens", s.usage.total_input())?;
-    tbl.set("output_tokens", s.usage.output)?;
+    tbl.set("input_tokens", usage.total_input())?;
+    tbl.set("output_tokens", usage.output)?;
     Ok((Some(tbl), None))
 }
 
@@ -1014,10 +1288,21 @@ async fn prompt(
 /// leaves the work to the Lua garbage collector, which may never run while
 /// the VM sits idle, and the subagent's event relay stays alive until it does.
 ///
+/// Closing a background session cancels a prompt another task is still
+/// running on it, instead of waiting for that prompt to finish.
+///
 /// @return
 #[lua_fn]
-async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> {
+async fn close(lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> {
     let inner = Arc::clone(&this.inner);
+    // Dropping the entry cancels the prompt, so the lock below frees up soon.
+    // Taking the lock first would wait on a prompt that may never end. Worst
+    // case is a `SessionEnd` callback: the host cancels the session's
+    // background work only after the callbacks return, so it would wait on
+    // itself and hold up every hook behind it.
+    if let Some(id) = &this.background_id {
+        BackgroundSessions::of(&lua).remove(id);
+    }
     drop(this);
     let mut s = inner.lock().await;
     s.close();
@@ -1051,11 +1336,15 @@ fn call_local_tool(
 
 #[cfg(test)]
 mod tests {
+    use futures_lite::future::poll_once;
     use maki_agent::{DoneReason, TurnCompleteEvent};
-    use maki_providers::Message;
+    use maki_providers::{Message, TokenUsage};
     use serde_json::json;
 
     use super::*;
+    use crate::runtime::{TaskCell, TaskScope};
+
+    const PLUGIN: &str = "monitor";
 
     fn call(src: &str, input: JsonValue) -> Result<String, String> {
         let lua = Lua::new();
@@ -1082,6 +1371,46 @@ mod tests {
         assert!(raised.contains("boom"), "got: {raised}");
         let wrong = call("function() return 42 end", input).unwrap_err();
         assert!(wrong.contains("expected string"), "got: {wrong}");
+    }
+
+    #[test]
+    fn ctx_less_session_needs_a_task_and_a_live_session() {
+        let lua = Lua::new();
+        let agent = create_agent_table(&lua, Arc::from(PLUGIN)).unwrap();
+        lua.globals().set("agent", agent).unwrap();
+        let session = MakiId::generate();
+        lua.globals().set("sid", session.to_string()).unwrap();
+        let open = || {
+            lua.load("return select(2, agent.session({ session = sid }))")
+                .eval_async::<Option<String>>()
+        };
+        let task = TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None, None));
+
+        assert_eq!(
+            smol::block_on(open()).unwrap().as_deref(),
+            Some(TASK_REQUIRED_ERR)
+        );
+        assert_eq!(
+            smol::block_on(task.scope_future(open())).unwrap(),
+            Some(not_live(session))
+        );
+    }
+
+    /// A prompt cut short leaves its run's `Done` unread. The next prompt must
+    /// read past it and keep waiting for its own, even when it gets dropped
+    /// halfway and asked again.
+    #[test]
+    fn next_prompt_waits_past_a_leftover_done() {
+        let (tx, rx) = flume::unbounded();
+        let mut dones = RunDones::new(rx);
+        dones.expect_one();
+        tx.send(()).unwrap();
+        dones.expect_one();
+        assert!(smol::block_on(poll_once(dones.caught_up())).is_none());
+
+        tx.send(()).unwrap();
+        assert_eq!(smol::block_on(dones.caught_up()), Ok(()));
+        assert!(tx.is_empty());
     }
 
     const RUN_ID: u64 = 7;
@@ -1135,7 +1464,7 @@ mod tests {
         let (guard, sub_events) = event_stream();
         let sub_tx = guard.sender(RUN_ID);
         let (parent_raw_tx, parent_rx) = flume::unbounded();
-        let (usage_tx, usage_rx) = flume::unbounded();
+        let (done_tx, done_rx) = flume::unbounded();
         let (live_tx, live_rx) = flume::unbounded();
 
         for event in [
@@ -1163,7 +1492,7 @@ mod tests {
             sub_events,
             EventSender::new(parent_raw_tx, RUN_ID),
             subagent_info(),
-            usage_tx,
+            done_tx,
             Some(live_tx),
         ));
 
@@ -1179,7 +1508,7 @@ mod tests {
             tokens(50, 10).format_sum_cost(Some(0.75)),
         ];
         assert_eq!(live, expected);
-        assert_eq!(usage_rx.try_recv(), Ok(DONE_USAGE));
+        assert_eq!(done_rx.try_recv(), Ok(()));
 
         let forwarded = parent_rx.drain().collect::<Vec<_>>();
         assert_eq!(forwarded.len(), expected.len());

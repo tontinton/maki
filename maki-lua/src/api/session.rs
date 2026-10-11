@@ -27,6 +27,23 @@ const SESSION_REQUIRED_ERR: &str = "session is required";
 const NOT_LIVE_ERR: &str = "session not live";
 const NO_FOCUSED_ERR: &str = "no focused session";
 
+pub(crate) fn not_live(session: MakiId) -> String {
+    format!("{NOT_LIVE_ERR}: {session}")
+}
+
+/// Some calls must name their session. Falling back to the focused tab would
+/// make them follow the user from tab to tab.
+pub(crate) fn required_session(opts: Option<&Table>) -> LuaResult<Result<MakiId, String>> {
+    let Some(raw) = opts
+        .map(|t| t.get::<Option<String>>("session"))
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(Err(SESSION_REQUIRED_ERR.to_owned()));
+    };
+    Ok(raw.parse::<MakiId>().map_err(|e| e.to_string()))
+}
+
 async fn roundtrip(
     lua: Lua,
     tx: Option<flume::Sender<UiAction>>,
@@ -240,7 +257,7 @@ async fn messages(
     };
     let session: MakiId = try_pair!(raw.parse());
     let Some(history) = live_history(session) else {
-        return Ok(err_pair(format!("{NOT_LIVE_ERR}: {session}")));
+        return Ok(err_pair(not_live(session)));
     };
     let skip = last.map_or(0, |n| history.len().saturating_sub(n));
     let out = lua.create_table()?;
@@ -352,17 +369,8 @@ fn notify(_lua: &Lua, text: String, opts: Option<Table>) -> LuaResult<Pair<bool>
     if text.trim().is_empty() {
         return Ok(err_pair(BLANK_NOTIFY_ERR));
     }
-    let Some(opts) = opts else {
-        return Ok(err_pair(SESSION_REQUIRED_ERR));
-    };
-    let Some(raw_id) = opts.get::<Option<String>>("session")? else {
-        return Ok(err_pair(SESSION_REQUIRED_ERR));
-    };
-    let session_id: MakiId = match raw_id.parse() {
-        Ok(id) => id,
-        Err(error) => return Ok(err_pair(error)),
-    };
-    let wake = opts.get("wake").unwrap_or(false);
+    let session_id = try_pair!(required_session(opts.as_ref())?);
+    let wake = opts.and_then(|t| t.get("wake").ok()).unwrap_or(false);
     if let Err(error) = SessionMailbox::notify(session_id, text, wake) {
         return Ok(err_pair(error));
     }

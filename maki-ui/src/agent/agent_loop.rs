@@ -17,7 +17,7 @@ use maki_agent::{
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
-use maki_providers::{AgentError, ContextGauge, Message, Model, RequestOptions};
+use maki_providers::{AgentError, ContextGauge, Message, Model};
 use tracing::error;
 
 use super::ModelSlot;
@@ -273,10 +273,6 @@ impl AgentLoop {
         event_tx: EventSender,
         cancel: &CancelToken,
     ) -> Result<DoneReason, AgentError> {
-        self.seed.set_opts(RequestOptions {
-            thinking: input.thinking,
-            fast: input.fast,
-        });
         let (context, prompt_slots) = self.context_builder().await;
 
         if let Some(ref prompt_ref) = input.prompt {
@@ -322,6 +318,7 @@ impl AgentLoop {
                 tool_output_lines: self.seed.tool_output_lines,
                 permissions: Arc::clone(&self.seed.permissions),
                 session_id: Some(self.seed.session_id.clone()),
+                background_for: None,
                 task_id: None,
                 mailbox: Some(self.mailbox.clone()),
                 timeouts: self.seed.timeouts,

@@ -98,6 +98,17 @@ impl AgentHandles {
         for chat in &mut app.chats {
             chat.set_restore_channel(Some(restore_tx.clone()));
         }
+        self.publish_chat_settings(app);
+    }
+
+    /// Background subagents read the chat's mode and thinking from the seed. A
+    /// fresh loop gets them right away, before any monitor can look. The event
+    /// loop then sends them again on every pass, so code that changes a
+    /// setting never has to remember to.
+    pub(crate) fn publish_chat_settings(&self, app: &App) {
+        if let Some(seed) = self.mailbox.seed() {
+            seed.set_chat_settings(app.request_options(), &app.agent_mode());
+        }
     }
 
     /// Esc: stops {run_id} and everything queued behind it.
@@ -281,7 +292,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
-    use maki_agent::{AgentEvent, AgentInput, AgentMode, InputSource};
+    use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
+    use maki_agent::{AgentEvent, AgentInput, AgentMode, AgentSeed, InputSource};
     use maki_config::{PermissionsConfig, ProjectConfig};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -290,6 +302,7 @@ mod tests {
 
     use super::shared_queue::{QueueItem, QueuedInput};
     use super::*;
+    use crate::app::Mode;
 
     const LONG_TIMEOUT: Duration = Duration::from_secs(60);
     const SHORT_TIMEOUT: Duration = Duration::from_millis(50);
@@ -305,6 +318,7 @@ mod tests {
     const NO_CALL: &str = "the agent never reached the provider";
     const NO_TURN_END: &str = "the run never reported that it was over";
     const GATE_CLOSED: &str = "the in-flight call is no longer waiting to be released";
+    const SEED_NOT_LIVE: &str = "the respawned loop publishes a seed for the app's session";
 
     struct StubProvider;
 
@@ -671,6 +685,27 @@ mod tests {
             "a checkpoint right after respawn must not see the seeded empty snapshot"
         );
         assert_eq!(snapshot.messages[0].user_text(), Some(RESUMED_HISTORY_TEXT));
+    }
+
+    /// A monitor can prompt before the user sends anything, so the seed has to
+    /// know whether the chat plans, and its effort, from the moment the loop
+    /// exists.
+    /// `/new` and loads respawn under a new id with no settings to inherit.
+    #[test]
+    fn a_respawned_seed_starts_with_the_chat_settings() {
+        let (mut handles, model_slot, permissions) = stub_spawn();
+        let mut app = crate::app::tests::test_app();
+        app.set_mode(Mode::Plan);
+        app.state.thinking = ThinkingConfig::Adaptive;
+
+        respawn(&mut handles, &model_slot, &permissions, &mut app);
+        let id = app.state.session.id;
+        let seed = AgentSeed::live(id).expect(SEED_NOT_LIVE);
+        assert_eq!(seed.chat_opts(), app.request_options());
+        assert_eq!(
+            AgentSeed::background_write_block(id).as_deref(),
+            Some(BACKGROUND_PLAN_WRITE_DENIED)
+        );
     }
 
     #[test]
