@@ -10,8 +10,7 @@ use ratatui::widgets::{Paragraph, Widget, Wrap};
 /// tall the selected segment is.
 const COPY_CHUNK_ROWS: u16 = 256;
 
-/// Copies the segments the selection spans. The streaming tail lives past the
-/// cache, so text still arriving is not copyable.
+/// Copies the segments the selection spans.
 pub(super) fn extract_selection_text(
     cache: &SegmentCache,
     width: u16,

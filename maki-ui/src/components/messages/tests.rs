@@ -4,6 +4,7 @@ use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{DocPos, Selection, SelectionZone};
+use crate::wrap;
 use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
@@ -264,6 +265,21 @@ fn tool_start_flushes_streaming_text() {
     assert!(panel.streaming_text.is_empty());
     assert_eq!(panel.messages[0].role, DisplayRole::Assistant);
     assert!(matches!(panel.messages[1].role, DisplayRole::Tool(_)));
+}
+
+#[test]
+fn a_flush_leaves_one_copy_of_the_text() {
+    const STREAMED: &str = "one two three";
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.text_delta(STREAMED);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    panel.flush();
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let text = buffer_text(&terminal);
+
+    assert_eq!(text.matches(STREAMED).count(), 1, "{text}");
 }
 
 #[test]
@@ -1516,6 +1532,24 @@ fn handle_click_returns_nothing_when_no_segment_at_row() {
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     assert!(!panel.handle_click(23, area));
+}
+
+#[test_case(|end, _| end - 1         => true  ; "indicator")]
+#[test_case(|end, height| end - height - 1 => false ; "spacer_above_it")]
+#[test_case(|end, _| end             => false ; "empty_rows_below")]
+fn only_the_indicator_expands_streaming_thinking(click_row: fn(u32, u32) -> u32) -> bool {
+    let config = UiConfig {
+        show_thinking: false,
+        ..UiConfig::default()
+    };
+    let mut panel = MessagesPanel::new(config, EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "hi".into()));
+    panel.thinking_delta(THINKING_TEXT);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    let indicator_height = panel.build_streaming_collapsed_lines().len() as u32;
+    let row = click_row(panel.layout().total_rows(), indicator_height);
+    panel.handle_click(row as u16, Rect::new(0, 0, VIEW_WIDTH, VIEW_HEIGHT))
 }
 
 #[test]

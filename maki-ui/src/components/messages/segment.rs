@@ -376,6 +376,10 @@ impl SegmentCache {
         self.segments.push(seg);
     }
 
+    pub fn truncate(&mut self, len: usize) {
+        self.segments.truncate(len);
+    }
+
     /// Books the spacer and instruction slots a tool fills in later, when its
     /// output finally arrives. Splicing them in at that point would shift
     /// every segment after them, and plenty of things hold a segment index by

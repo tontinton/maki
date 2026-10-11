@@ -1,17 +1,7 @@
 use super::segment::SegmentCache;
 
-/// One drawable part of the streaming tail, sitting where the segment that
-/// replaces it will sit once the turn flushes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum TailPart {
-    Spacer,
-    Thinking,
-    Text,
-}
-
 /// Top of the viewport as a place in the document. `seg` indexes the segment
-/// cache; indices past its end address the streaming tail, which `view` lays
-/// out in the same order the cache will hold once it flushes.
+/// cache, streaming segments included.
 ///
 /// Nothing here depends on the width, so a resize is not a scroll.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -20,28 +10,23 @@ pub struct ScrollPos {
     pub row: u16,
 }
 
-/// One frame's document: cached segments followed by the streaming tail.
-/// Every row walk goes through here, so both are counted the same way.
+/// One frame's document. Every row walk goes through here.
 pub(super) struct Layout<'a> {
     cache: &'a SegmentCache,
-    tail: &'a [(TailPart, u16)],
     width: u16,
 }
 
 impl<'a> Layout<'a> {
-    pub fn new(cache: &'a SegmentCache, tail: &'a [(TailPart, u16)], width: u16) -> Self {
-        Self { cache, tail, width }
+    pub fn new(cache: &'a SegmentCache, width: u16) -> Self {
+        Self { cache, width }
     }
 
     fn len(&self) -> usize {
-        self.cache.len() + self.tail.len()
+        self.cache.len()
     }
 
     fn height(&self, i: usize) -> u16 {
-        match self.cache.get(i) {
-            Some(seg) => seg.height(self.width),
-            None => self.tail.get(i - self.cache.len()).map_or(0, |&(_, h)| h),
-        }
+        self.cache.get(i).map_or(0, |seg| seg.height(self.width))
     }
 
     /// One past the last addressable row, so `retreat` from here is "the last
@@ -161,10 +146,7 @@ mod tests {
     #[test_case(pos(1, 0), 99, pos(3, 0) ; "clamps_at_the_end")]
     fn advance_walks_rows(from: ScrollPos, rows: u32, expected: ScrollPos) {
         let cache = cache(&[3, 1, 2]);
-        assert_eq!(
-            Layout::new(&cache, &[], WIDTH).advance(from, rows),
-            expected
-        );
+        assert_eq!(Layout::new(&cache, WIDTH).advance(from, rows), expected);
     }
 
     #[test_case(pos(2, 1), 1, pos(2, 0) ; "inside_a_segment")]
@@ -173,16 +155,13 @@ mod tests {
     #[test_case(pos(1, 0), 99, pos(0, 0) ; "clamps_at_the_start")]
     fn retreat_walks_rows(from: ScrollPos, rows: u32, expected: ScrollPos) {
         let cache = cache(&[3, 1, 2]);
-        assert_eq!(
-            Layout::new(&cache, &[], WIDTH).retreat(from, rows),
-            expected
-        );
+        assert_eq!(Layout::new(&cache, WIDTH).retreat(from, rows), expected);
     }
 
     #[test]
-    fn the_tail_extends_the_document_past_the_cache() {
-        let cache = cache(&[3]);
-        let layout = Layout::new(&cache, &[(TailPart::Spacer, 1), (TailPart::Text, 4)], WIDTH);
+    fn doc_rows_map_to_positions_and_back() {
+        let cache = cache(&[3, 1, 4]);
+        let layout = Layout::new(&cache, WIDTH);
         assert_eq!(layout.total_rows(), 8);
         assert_eq!(layout.at_row(4), pos(2, 0));
         assert_eq!(layout.doc_row(pos(2, 3)), 7);
@@ -193,9 +172,6 @@ mod tests {
     #[test_case(pos(1, 1), pos(0, 2), 0 ; "target_above_never_underflows")]
     fn rows_from_counts_down(from: ScrollPos, to: ScrollPos, expected: u32) {
         let cache = cache(&[3, 2]);
-        assert_eq!(
-            Layout::new(&cache, &[], WIDTH).rows_from(from, to),
-            expected
-        );
+        assert_eq!(Layout::new(&cache, WIDTH).rows_from(from, to), expected);
     }
 }
