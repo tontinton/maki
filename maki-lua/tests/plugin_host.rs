@@ -7214,6 +7214,7 @@ const CANCELLED_MSG: &str = "cancelled";
 const PAID_TOOL_USE_ID: &str = "toolu_paid";
 const PAID_TOOL_NAME: &str = "not_a_tool";
 const PAID_TURN_INPUT: u32 = 1234;
+const COST_DECIMALS: usize = 12;
 
 /// The spawned task outlives the tool call that started it, so only the chat
 /// session ending can take its session off the list.
@@ -7260,6 +7261,16 @@ maki.api.register_tool({{
     handler = function()
         local _, err = sess:prompt("check")
         return tostring(err)
+    end,
+}})
+maki.api.register_tool({{
+    name = "background_cost",
+    description = "reports what the open background session has cost so far",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local cost = maki.agent.background({{ session = "{sid}" }})[1].cost
+        return cost and string.format("%.{COST_DECIMALS}f", cost) or "nil"
     end,
 }})
 local prompting, prompt_err, prompt_settled
@@ -7390,15 +7401,18 @@ impl Provider for TurnThenPark {
 
 /// One task opens the session and stays alive, another prompts it and gets
 /// cancelled. The cancel drops the prompt future mid-run, so nothing after its
-/// `await` runs. The entry must still go back to idle.
+/// `await` runs, yet the entry must still go back to idle. The paid turn has to
+/// be billed before the cancel, because on quit the UI stops listening before
+/// anything gets cancelled. Billing it again on the cancel would count it twice.
 #[test]
-fn cancelled_background_prompt_leaves_its_entry_idle() {
+fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let session = MakiId::generate();
     let mailbox = SessionMailbox::register(session);
     let seed = mailbox.publish_seed(stub_seed(session));
     let parked = TurnThenPark::install(&seed);
+    let ui = host.ui_action_rx();
     host.load_source(
         BACKGROUND_PLUGIN,
         &background_monitor_src(&session.to_string()),
@@ -7413,12 +7427,37 @@ fn cancelled_background_prompt_leaves_its_entry_idle() {
     parked
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("the prompt must reach its second turn");
+    let action = ui
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("the paid turn must be billed while the prompt still runs");
+    let maki_lua::UiAction::BackgroundUsage {
+        session: billed,
+        usage,
+        ..
+    } = action
+    else {
+        panic!("only background usage goes to the UI here");
+    };
+    assert_eq!((billed, usage.input), (session, PAID_TURN_INPUT));
+    let billed_cost = usage.cost.expect("the paid turn must have a price");
+    let listed_cost = format!("{billed_cost:.COST_DECIMALS$}");
+    assert_eq!(
+        exec_tool(&reg, "background_cost", json!({})).unwrap(),
+        listed_cost,
+        "`/tasks` must show the paid turn while the prompt still runs"
+    );
+
     exec_tool(&reg, "cancel_prompt", json!({})).unwrap();
 
     assert_eq!(
         exec_tool(&reg, "list_background", json!({})).unwrap(),
         format!("{BACKGROUND_PLUGIN}:{BACKGROUND_NAME}:idle:true")
     );
+    assert_eq!(
+        exec_tool(&reg, "background_cost", json!({})).unwrap(),
+        listed_cost
+    );
+    assert!(ui.is_empty(), "the cancel must not bill the turn again");
 }
 
 /// The provider parks the second turn forever, so only a cancel can end this

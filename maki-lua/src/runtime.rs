@@ -1308,9 +1308,12 @@ pub(crate) struct PluginEnvs(HashMap<Arc<str>, usize>);
 struct HostUi(Option<flume::Sender<UiAction>>);
 
 fn host_flash(lua: &Lua, msg: String) {
-    if let Some(ui) = lua.app_data_ref::<HostUi>() {
-        let _ = ui_send(ui.0.as_ref(), UiAction::Flash(msg));
-    }
+    let _ = ui_send(host_ui(lua).as_ref(), UiAction::Flash(msg));
+}
+
+/// For host code that has the VM but no `#[ctx]` sender of its own.
+pub(crate) fn host_ui(lua: &Lua) -> Option<flume::Sender<UiAction>> {
+    lua.app_data_ref::<HostUi>()?.0.clone()
 }
 
 /// Who to name for the code a watchdog interrupt caught running.

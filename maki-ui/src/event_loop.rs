@@ -1034,6 +1034,15 @@ impl<'t> EventLoop<'t> {
                     }
                 }
             }
+            UiAction::BackgroundUsage {
+                session,
+                model,
+                usage,
+            } => {
+                for rt in &mut self.sessions {
+                    rt.app.add_background_usage(session, &model, usage);
+                }
+            }
         }
     }
 

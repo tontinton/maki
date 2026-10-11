@@ -1428,13 +1428,12 @@ and tool set.
 
 Skip `ctx` to run one in the background: `maki.agent.session({ session =
 id, ... })` borrows its settings from that live chat session, so it works
-outside a tool call too. Open and prompt it from a task (a
-`maki.async.spawn` task, an autocmd callback or a tool handler). It lives
-until the task that opened it ends, the plugin unloads, the chat session
-ends, or you close it. An autocmd callback ends when it returns, so long
-running monitors belong in `maki.async.spawn`. Turns ending, Esc and
-rewinds in the chat leave it running, but Esc on a tool call cancels a
-prompt its handler waits on. Nobody is around to answer its permission prompts, so anything
+outside a tool call too. Call it from a task (a `maki.async.spawn` task, an
+autocmd callback or a tool handler). It lives until that task ends, the
+plugin unloads, the chat session ends, or you close it. An autocmd callback
+ends when it returns, so long running monitors belong in
+`maki.async.spawn`. Turns ending, Esc and rewinds in the chat leave it
+running. Nobody is around to answer its permission prompts, so anything
 without an allow rule is denied. It always runs in build mode, and while the
 chat is in plan mode its file-write tools are denied.
 `maki.agent.background()` lists these sessions.
@@ -1499,7 +1498,8 @@ List the background sessions a chat session owns, the ones opened with
 
 Each entry has `id` (string), `plugin` (string) that opened it, `name`
 (string) given at open, `status` (`"running"` while a `:prompt()` runs,
-`"idle"` otherwise) and `started_at` (integer, unix seconds).
+`"idle"` otherwise), `started_at` (integer, unix seconds) and `cost`
+(number?, dollars spent so far, nil when the model has no price).
 
 **Parameters:**
 

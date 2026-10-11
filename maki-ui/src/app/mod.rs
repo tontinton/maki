@@ -71,10 +71,12 @@ use maki_lua::{
     PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, WinView, is_reserved,
 };
 use maki_providers::models_cache::ModelList;
-use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
+use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
 use maki_storage::StateDir;
+use maki_storage::id::MakiId;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_thinking;
+use maki_storage::sessions::StoredTokenUsage;
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
@@ -1530,6 +1532,34 @@ impl App {
         vec![Action::CancelSubagent { tool_use_id }]
     }
 
+    /// A background subagent has no chat of its own, so its cost goes on the
+    /// main chat. That is also where a resumed session shows its whole past bill.
+    pub(crate) fn add_background_usage(
+        &mut self,
+        session: MakiId,
+        model: &str,
+        usage: StoredTokenUsage,
+    ) {
+        if session == self.state.session.id {
+            self.bill(0, model, usage);
+        }
+    }
+
+    fn bill(&mut self, chat_idx: usize, model: &str, usage: StoredTokenUsage) {
+        self.state.token_usage += TokenUsage::from(usage);
+        add_cost(&mut self.state.cost, usage.cost);
+        add_cost(&mut self.chats[chat_idx].cost, usage.cost);
+        add_cost(
+            &mut self.state.subsidised_list_cost,
+            usage.subsidised_list_cost,
+        );
+        add_cost(
+            &mut self.chats[chat_idx].list_cost,
+            usage.subsidised_list_cost,
+        );
+        self.state.session_mut().add_model_usage(model, usage);
+    }
+
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
         if envelope.run_id == RESTORE_RUN_ID {
             let (id, snapshot, theme_gen, is_header) = match envelope.event {
@@ -1652,15 +1682,8 @@ impl App {
         self.retry_info = None;
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
-            self.state.token_usage += tc.usage;
-            add_cost(&mut self.state.cost, tc.cost);
-            add_cost(&mut self.chats[chat_idx].cost, tc.cost);
-            add_cost(
-                &mut self.state.subsidised_list_cost,
-                tc.subsidised_list_cost,
-            );
-            add_cost(&mut self.chats[chat_idx].list_cost, tc.subsidised_list_cost);
-            self.state.session_mut().add_model_usage(
+            self.bill(
+                chat_idx,
                 &tc.model,
                 tc.usage
                     .billed_with_subsidised_list_cost(tc.cost, tc.subsidised_list_cost),

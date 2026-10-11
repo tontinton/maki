@@ -29,6 +29,7 @@ pub(crate) struct BackgroundInfo {
     pub(crate) name: String,
     pub(crate) running: bool,
     pub(crate) started_at: u64,
+    pub(crate) cost: Option<f64>,
 }
 
 /// Each session handle keeps a clone, and a handle dropped mid-prompt can
@@ -123,6 +124,7 @@ mod tests {
                 name: String::new(),
                 running: false,
                 started_at: 0,
+                cost: None,
             },
             session,
             task,

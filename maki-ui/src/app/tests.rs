@@ -34,7 +34,9 @@ use maki_providers::{
 };
 use maki_storage::id::MakiId;
 use maki_storage::model::read_thinking;
-use maki_storage::sessions::{SessionClaim, SessionMeta, StoredMode, StoredThinking};
+use maki_storage::sessions::{
+    SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage,
+};
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -1976,6 +1978,32 @@ fn turn_complete_accumulates_usage_by_model() {
     let sub = &by_model["sub-model"];
     assert_eq!(sub.input, 200);
     assert_eq!(sub.output, 75);
+}
+
+const BACKGROUND_MODEL: &str = "background-model";
+const BACKGROUND_USAGE: StoredTokenUsage = StoredTokenUsage {
+    input: 300,
+    output: 40,
+    cache_creation: 0,
+    cache_read: 0,
+    cost: Some(0.011),
+    subsidised_list_cost: None,
+};
+
+#[test]
+fn background_usage_bills_only_the_tab_showing_its_session() {
+    let mut app = test_app();
+
+    app.add_background_usage(MakiId::generate(), BACKGROUND_MODEL, BACKGROUND_USAGE);
+    app.add_background_usage(app.state.session.id, BACKGROUND_MODEL, BACKGROUND_USAGE);
+
+    assert_eq!(app.state.cost, BACKGROUND_USAGE.cost);
+    assert_eq!(app.chats[0].cost, BACKGROUND_USAGE.cost);
+    assert_eq!(app.state.token_usage, TokenUsage::from(BACKGROUND_USAGE));
+    assert_eq!(
+        app.state.session.usage_by_model().get(BACKGROUND_MODEL),
+        Some(&BACKGROUND_USAGE)
+    );
 }
 
 #[test]

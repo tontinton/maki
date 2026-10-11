@@ -42,11 +42,12 @@ use tracing::info;
 use crate::api::session::{not_live, required_session};
 use crate::api::tool::{audiences_to_lua, parse_audience};
 use crate::api::ui::buf::BufHandle;
+use crate::api::util::command::UiAction;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::background::{BackgroundInfo, BackgroundSession, BackgroundSessions};
-use crate::runtime::{CANCELLED_MSG, active_task_cancel};
+use crate::runtime::{CANCELLED_MSG, active_task_cancel, host_ui};
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const PROMPT_DROPPED_ERR: &str = "an `agent.user_message` layer dropped the prompt";
@@ -127,16 +128,33 @@ fn seed_ctx(
     }))
 }
 
+/// A background session reports to a sink nobody reads, so its turns would
+/// never reach the chat's totals on their own. We send each one to the tab the
+/// moment it is paid for. A quit or `/new` in the middle of a long prompt then
+/// loses only the turn still streaming, just like the main chat. The registry
+/// entry adds up the same turns, so `/tasks` matches the chat totals even in
+/// the middle of a long prompt.
+struct TurnBilling {
+    session: MakiId,
+    ui: flume::Sender<UiAction>,
+    registry: BackgroundSessions,
+    id: String,
+}
+
 /// Forwards subagent events to the parent, stamped with the subagent identity.
 /// Usage goes live on the tool header while the run goes on (last turn's tokens
 /// plus the run's summed cost). `Done` only pings `done_tx`, which tells
-/// `prompt` that every turn of the run has passed through.
+/// `prompt` that every turn of the run has passed through. A background session bills
+/// every turn it sees, compactions and nested subagents too, each under the
+/// model that ran it. Nested relays hand their turns up here instead of billing
+/// them, and `Done` only repeats the run's total, so no turn gets paid twice.
 async fn relay_session_events(
     mut sub_events: SessionEvents,
     parent_tx: EventSender,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     done_tx: flume::Sender<()>,
     live_sink: Option<flume::Sender<ToolLive>>,
+    billing: Option<TurnBilling>,
 ) {
     let mut cost = None;
     while let Some(mut envelope) = sub_events.next().await {
@@ -145,6 +163,18 @@ async fn relay_session_events(
                 add_cost(&mut cost, turn.cost);
                 if let Some(sink) = &live_sink {
                     let _ = sink.send(ToolLive::Usage(turn.usage.format_sum_cost(cost)));
+                }
+                if let Some(billing) = &billing {
+                    // Before the UI hears of it, so whoever sees the bill also
+                    // sees it in `maki.agent.background()`.
+                    billing.registry.update(&billing.id, |e| e.cost = cost);
+                    let _ = billing.ui.try_send(UiAction::BackgroundUsage {
+                        session: billing.session,
+                        model: turn.model.clone(),
+                        usage: turn
+                            .usage
+                            .billed_with_subsidised_list_cost(turn.cost, turn.subsidised_list_cost),
+                    });
                 }
             }
             AgentEvent::Done { .. } => {
@@ -485,13 +515,12 @@ async fn call_tool(
 ///
 /// Skip `ctx` to run one in the background: `maki.agent.session({ session =
 /// id, ... })` borrows its settings from that live chat session, so it works
-/// outside a tool call too. Open and prompt it from a task (a
-/// `maki.async.spawn` task, an autocmd callback or a tool handler). It lives
-/// until the task that opened it ends, the plugin unloads, the chat session
-/// ends, or you close it. An autocmd callback ends when it returns, so long
-/// running monitors belong in `maki.async.spawn`. Turns ending, Esc and
-/// rewinds in the chat leave it running, but Esc on a tool call cancels a
-/// prompt its handler waits on. Nobody is around to answer its permission prompts, so anything
+/// outside a tool call too. Call it from a task (a `maki.async.spawn` task, an
+/// autocmd callback or a tool handler). It lives until that task ends, the
+/// plugin unloads, the chat session ends, or you close it. An autocmd callback
+/// ends when it returns, so long running monitors belong in
+/// `maki.async.spawn`. Turns ending, Esc and rewinds in the chat leave it
+/// running. Nobody is around to answer its permission prompts, so anything
 /// without an allow rule is denied. It always runs in build mode, and while the
 /// chat is in plan mode its file-write tools are denied.
 /// `maki.agent.background()` lists these sessions.
@@ -679,17 +708,7 @@ async fn session(
         .unzip();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
-    let (usage_tx, usage_rx) = flume::unbounded();
-
-    smol::spawn(relay_session_events(
-        sub_events,
-        parent_tx.clone(),
-        Arc::clone(&subagent_info),
-        usage_tx,
-        agent_ctx.live_sink.clone(),
-    ))
-    .detach();
-
+    let (done_tx, done_rx) = flume::unbounded();
     // Doubles as the task id tools see. The fallback gets its own id: it keys
     // `subagent_cancels`, where two subagents sharing the session id would
     // collide.
@@ -697,6 +716,25 @@ async fn session(
         .tool_use_id
         .clone()
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
+    let billing = owner.as_ref().and_then(|&(session, ..)| {
+        Some(TurnBilling {
+            session,
+            ui: host_ui(&lua)?,
+            registry: BackgroundSessions::of(&lua),
+            id: ui_id.clone(),
+        })
+    });
+
+    smol::spawn(relay_session_events(
+        sub_events,
+        parent_tx.clone(),
+        Arc::clone(&subagent_info),
+        done_tx,
+        agent_ctx.live_sink.clone(),
+        billing,
+    ))
+    .detach();
+
     // Registered before the session runs so the child token does not fire
     // on drop and kill the subagent at birth.
     let (child_trigger, child_cancel) = agent_ctx.cancel.child();
@@ -717,6 +755,7 @@ async fn session(
                     name: name.clone(),
                     running: false,
                     started_at: now_epoch(),
+                    cost: None,
                 },
                 session,
                 task,
@@ -794,7 +833,7 @@ async fn session(
         subagent_info,
         local_tools: Arc::new(local_map),
         name,
-        dones: RunDones::new(usage_rx),
+        dones: RunDones::new(done_rx),
         start: Instant::now(),
         closed: false,
         background,
@@ -813,7 +852,8 @@ async fn session(
 ///
 /// Each entry has `id` (string), `plugin` (string) that opened it, `name`
 /// (string) given at open, `status` (`"running"` while a `:prompt()` runs,
-/// `"idle"` otherwise) and `started_at` (integer, unix seconds).
+/// `"idle"` otherwise), `started_at` (integer, unix seconds) and `cost`
+/// (number?, dollars spent so far, nil when the model has no price).
 ///
 /// @param opts table Required fields:
 ///   `session` (string) - id of the chat session.
@@ -838,6 +878,7 @@ fn background(lua: &Lua, opts: Table) -> LuaResult<Pair<Table>> {
         t.set("plugin", &*entry.plugin)?;
         t.set("name", entry.name)?;
         t.set("started_at", entry.started_at)?;
+        t.set("cost", entry.cost)?;
         out.push(t)?;
     }
     Ok((Some(out), None))
@@ -1417,6 +1458,8 @@ mod tests {
     const PARENT_ID: &str = "task-1";
     const IGNORED_ERROR: &str = "handled by the session caller";
     const DONE_USAGE: TokenUsage = tokens(150, 30);
+    const SESSION_MODEL: &str = "test-model";
+    const NESTED_MODEL: &str = "nested-model";
 
     const fn tokens(input: u32, output: u32) -> TokenUsage {
         TokenUsage {
@@ -1428,11 +1471,11 @@ mod tests {
         }
     }
 
-    fn turn(usage: TokenUsage, cost: f64) -> AgentEvent {
+    fn turn(model: &str, usage: TokenUsage, cost: f64) -> AgentEvent {
         AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
             message: Message::default(),
             usage,
-            model: "test-model".into(),
+            model: model.into(),
             cost: Some(cost),
             subsidised_list_cost: None,
             context_size: None,
@@ -1459,17 +1502,22 @@ mod tests {
     /// sender alive past the run, so disconnect never comes. The forwarded
     /// count also pins down that the close marker itself stays behind, since
     /// passing it on would end the *parent's* stream at the first subagent.
+    ///
+    /// The first turn plays one handed up by a nested subagent, so it has to
+    /// be billed under that subagent's model, not the session's.
     #[test]
-    fn relay_session_events_reports_live_usage_and_done_total() {
+    fn relay_session_events_reports_and_bills_each_turn_once() {
+        let session = MakiId::generate();
         let (guard, sub_events) = event_stream();
         let sub_tx = guard.sender(RUN_ID);
         let (parent_raw_tx, parent_rx) = flume::unbounded();
         let (done_tx, done_rx) = flume::unbounded();
         let (live_tx, live_rx) = flume::unbounded();
+        let (ui_tx, ui_rx) = flume::unbounded();
 
         for event in [
-            turn(tokens(100, 20), 0.25),
-            turn(tokens(50, 10), 0.5),
+            turn(NESTED_MODEL, tokens(100, 20), 0.25),
+            turn(SESSION_MODEL, tokens(50, 10), 0.5),
             AgentEvent::Error {
                 message: IGNORED_ERROR.into(),
                 auth: false,
@@ -1494,6 +1542,12 @@ mod tests {
             subagent_info(),
             done_tx,
             Some(live_tx),
+            Some(TurnBilling {
+                session,
+                ui: ui_tx,
+                registry: BackgroundSessions::default(),
+                id: PARENT_ID.into(),
+            }),
         ));
 
         let live = live_rx
@@ -1509,6 +1563,29 @@ mod tests {
         ];
         assert_eq!(live, expected);
         assert_eq!(done_rx.try_recv(), Ok(()));
+
+        let billed = ui_rx
+            .drain()
+            .map(|action| match action {
+                UiAction::BackgroundUsage {
+                    session: billed_session,
+                    model,
+                    usage,
+                } if billed_session == session => (model, usage),
+                _ => panic!("relay must only bill this chat session"),
+            })
+            .collect::<Vec<_>>();
+        let expected_billed = [
+            (
+                NESTED_MODEL.to_owned(),
+                tokens(100, 20).billed_with_subsidised_list_cost(Some(0.25), None),
+            ),
+            (
+                SESSION_MODEL.to_owned(),
+                tokens(50, 10).billed_with_subsidised_list_cost(Some(0.5), None),
+            ),
+        ];
+        assert_eq!(billed, expected_billed);
 
         let forwarded = parent_rx.drain().collect::<Vec<_>>();
         assert_eq!(forwarded.len(), expected.len());
