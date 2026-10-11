@@ -3333,6 +3333,8 @@ dependencies = [
  "criterion",
  "crossterm",
  "event-listener",
+ "fancy-regex 0.19.2",
+ "fastrand",
  "flume",
  "futures",
  "futures-lite",

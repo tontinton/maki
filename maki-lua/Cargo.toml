@@ -41,6 +41,7 @@ tree-sitter = { workspace = true }
 unicode-width = { workspace = true }
 url = { workspace = true }
 regex = { workspace = true }
+fancy-regex = { workspace = true }
 include_dir = { workspace = true }
 maki-storage = { workspace = true }
 isahc = { workspace = true }
@@ -88,6 +89,7 @@ rustix = { workspace = true }
 [dev-dependencies]
 base64 = { workspace = true }
 criterion = { workspace = true }
+fastrand = { workspace = true }
 image = { workspace = true }
 jiff = { workspace = true }
 maki-agent = { workspace = true }

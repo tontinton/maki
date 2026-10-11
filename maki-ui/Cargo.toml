@@ -75,5 +75,9 @@ harness = false
 name = "input"
 harness = false
 
+[[bench]]
+name = "input_memory"
+harness = false
+
 [lints]
 workspace = true

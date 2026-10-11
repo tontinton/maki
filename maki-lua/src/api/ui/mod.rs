@@ -21,9 +21,13 @@ use crate::docs::{FnDoc, ParamDoc};
 use crate::key::Key;
 pub(crate) mod blit;
 pub(crate) mod buf;
+pub(crate) mod marks;
+pub(crate) mod syntax;
 pub(crate) mod win;
 
 use crate::runtime::with_task_bufs;
+use marks::{InputRule, InputRuleStore, PatternRule, parse_mark};
+use syntax::parse_syntax;
 use win::{WinHandle, WinSender};
 
 /// `fg`, `bg` and six modifiers.
@@ -43,6 +47,11 @@ const EDIT_OPTIONS: &[&str] = &[
     "cursor",
     "strict",
 ];
+const RULE_OPTIONS: &[&str] = &["ns", "pattern", "mark", "treesitter"];
+const RULE_HALVES_ERR: &str = "input_rules: 'pattern' and 'mark' go together";
+const SYNTAX_ALONE_ERR: &str =
+    "input_rules: 'treesitter' takes the place of 'pattern' and 'mark', not both";
+const NS_REQUIRED_ERR: &str = "input_rules: 'ns' is required";
 
 /// A focused window is handed every key the host does not answer itself, so a
 /// list of keys to take on top of that claims nothing it does not already
@@ -417,7 +426,11 @@ fn set_window_title(
 ///
 /// Valid names: `"file_picker"`, `"search"`, `"help"`,
 /// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
-/// `"prev_chat"`, `"next_chat"`, `"model_picker"`.
+/// `"prev_chat"`, `"next_chat"`, `"model_picker"`, `"input_raw"`.
+///
+/// `"input_raw"` has no default key. It switches the chat input between
+/// drawing what plugins conceal and showing the text under it, which is
+/// what gets sent. Run it again to switch back.
 ///
 /// There is no action for sending the user's message. To take keys like
 /// `<CR>` while a popup is open, use the `keys` option of `maki.ui.open_win`.
@@ -620,6 +633,123 @@ async fn input_edit(
         plugin,
     });
     input_roundtrip(lua, tx.as_ref(), req).await
+}
+
+/// Decorates the chat input in every session, from a regex or from a
+/// tree-sitter query. No Lua runs per keystroke.
+///
+/// Each `ns` of a plugin holds one rule. Calling again with the same `ns`
+/// replaces it, and leaving out `pattern`, `mark` and `treesitter` removes
+/// it. Rules go away when the plugin unloads.
+///
+/// A regex rule marks every match with `mark`. The UI matches a line the
+/// first time it needs it and keeps the result until the line changes, so
+/// the marks never lag behind the text. The pattern uses Rust regex syntax
+/// plus lookaround (`(?=)`, `(?!)`, `(?<=)`, `(?<!)`), atomic groups `(?>)`,
+/// backreferences and `\K`, which leaves what it matched so far out of the
+/// match. A pattern without those runs on an engine that never backtracks.
+/// One with them can, and a line that takes it too long gets no more marks
+/// from it. It is matched one line at a time, so a match never spans lines.
+/// It still sees the text before its line: `\A` is the start of the input,
+/// which only the first line can match, while `$` is the end of the line
+/// and `(?m)^` the start of one. An empty match marks a point, which only
+/// `virt_text` shows. In `conceal` and the text of `virt_text`, `$1` is the
+/// text of capture group 1, `$0` the whole match, and `$$` a plain `$`.
+///
+/// A tree-sitter rule parses the input as `lang` and runs a query per
+/// language. Each capture is marked with the template of the same name in
+/// `captures`, and every capture needs one, except `@injection.content`,
+/// whose template is optional, `@injection.language`, which names the
+/// language of injected code, and names starting with `_`, which only feed
+/// predicates. A capture has no groups, so `$1` in a template is refused,
+/// and `$$` is a plain `$`.
+/// Conditions are the predicates of `maki.treesitter.query`. `#set!` takes
+/// `conceal` and `priority`, which change the template for the pattern or,
+/// with a capture first, for that capture only. Code captured as
+/// `@injection.content` is in the language `@injection.language` caught, or
+/// the one `#set! injection.language` names. When the rule has a query for
+/// that language, the code is parsed again with it and that query runs
+/// there. Otherwise it gets a `lang` mark. Markdown leaves the text of its
+/// blocks to `markdown_inline`, so a `markdown` rule runs its
+/// `markdown_inline` query there by itself.
+///
+/// The parse runs on a worker thread and never holds up typing. Until the
+/// worker catches up with an edit, its marks move with the text, so a bold
+/// or a code block grows with what is typed inside it. Only a conceal or an
+/// `atomic` mark the edit lands inside is gone until then.
+///
+/// Marks compose by `priority`. At the same priority, a rule whose `ns` was
+/// first set later is drawn over one set earlier, and replacing a rule keeps
+/// its place. Within a tree-sitter rule a later pattern is drawn over an
+/// earlier one, and `markdown_inline` over `markdown`.
+///
+/// The `!` of a shell command and its bash colors come from two built-in
+/// rules.
+///
+/// @param opts table Options:
+///   `ns` (string) the name of the rule, unique per plugin. Code in the global and the project `init.lua` runs as plugins `"global/init.lua"` and `"project/init.lua"`.
+///   `pattern` (string|nil) the regex to match.
+///   `mark` (table|nil) what each match gets, with the fields below.
+///   `mark.hl` (string|table|nil) a theme style name like `"accent"`, or an inline style `{ fg, bg, bold, italic, underline, dim, strikethrough, reversed }`.
+///   `mark.conceal` (string|nil) text drawn instead of the match, `""` hides it.
+///   `mark.reveal` (string|nil) `"cursor"` shows the raw text while the cursor is inside the match or on its edge.
+///   `mark.atomic` (boolean|nil) the cursor steps over the match, and a delete that cuts into it removes all of it.
+///   `mark.virt_text` (table|nil) spans drawn but never part of the text, `{ { text, hl? }, ... }`.
+///   `mark.virt_text_pos` (string|nil) `"eol"` (default) after the line, or `"inline"` before the match.
+///   `mark.lang` (string|nil) highlight the match as code in this language.
+///   `mark.priority` (integer|nil) higher is drawn on top. Default 0.
+///   `treesitter` (table|nil) a tree-sitter rule instead of `pattern` and `mark`.
+///   `treesitter.lang` (string) the language the input is parsed as, like `"markdown"`.
+///   `treesitter.query` (string|table) the query for `lang`, or a table of language = query.
+///   `treesitter.captures` (table|nil) capture name = template, with the fields of `mark`.
+/// @return
+/// @example
+/// -- Draw `$skill:go` as a ` go ` chip the cursor steps over:
+/// maki.ui.input_rules({
+///   ns = "skill",
+///   pattern = [[\$skill:([\w-]+)]],
+///   mark = { conceal = " $1 ", hl = "accent", atomic = true },
+/// })
+/// -- And remove it again:
+/// maki.ui.input_rules({ ns = "skill" })
+/// -- Bold text without its stars, unless the cursor is on it:
+/// maki.ui.input_rules({
+///   ns = "md",
+///   treesitter = {
+///     lang = "markdown",
+///     query = { markdown_inline = [[ (strong_emphasis (emphasis_delimiter) @hidden) @strong ]] },
+///     captures = {
+///       hidden = { conceal = "", reveal = "cursor" },
+///       strong = { hl = { bold = true } },
+///     },
+///   },
+/// })
+#[lua_fn]
+fn input_rules(lua: &Lua, #[ctx] plugin: Arc<str>, opts: Table) -> LuaResult<()> {
+    let fail = |msg: String| mlua::Error::runtime(format!("input_rules: {msg}"));
+    reject_unknown_fields(&opts, RULE_OPTIONS, "input_rules")?;
+    let ns: String = opts
+        .get::<Option<String>>("ns")?
+        .ok_or_else(|| mlua::Error::runtime(NS_REQUIRED_ERR))?;
+    let rule = match (
+        opts.get::<Option<String>>("pattern")?,
+        opts.get::<Option<Table>>("mark")?,
+        opts.get::<Option<Table>>("treesitter")?,
+    ) {
+        (None, None, None) => None,
+        (Some(pattern), Some(mark), None) => Some(InputRule::Pattern(
+            PatternRule::new(&pattern, parse_mark(&mark)?).map_err(fail)?,
+        )),
+        (None, None, Some(syntax)) => Some(InputRule::Syntax(Arc::new(
+            parse_syntax(&syntax)?.map_err(fail)?,
+        ))),
+        (_, _, Some(_)) => return Err(mlua::Error::runtime(SYNTAX_ALONE_ERR)),
+        _ => return Err(mlua::Error::runtime(RULE_HALVES_ERR)),
+    };
+    if let Some(mut store) = lua.app_data_mut::<InputRuleStore>() {
+        store.set(plugin, ns, rule);
+    }
+    Ok(())
 }
 
 fn text_edit(edit: &Table) -> LuaResult<TextEdit> {
@@ -842,12 +972,29 @@ lua_table! {
     /// - `action`, `input`, and `input_edit` return `nil, "no interactive UI attached"`.
     /// - `open_editor` returns -1.
     /// - `flash` writes to the log.
-    /// - `open_win`, `set_status_hint`, and `set_window_title` have no effect.
+    /// - `open_win`, `set_status_hint`, `set_window_title`, and `input_rules` have no effect.
+    ///   `input_rules` still throws on a bad rule, so a plugin's tests catch it.
+    ///
+    /// ### Chat input
+    ///
+    /// Plugins can read, change and style what the user types in the chat
+    /// input. Pick the call by the job:
+    ///
+    /// | Job | Call |
+    /// | --- | --- |
+    /// | Read the text and the cursor | [`input`](#maki-ui-input) |
+    /// | Style text by what it says, like a `$skill:go` chip | [`input_rules`](#maki-ui-input_rules) |
+    /// | Change the text or the cursor | [`input_edit`](#maki-ui-input_edit) |
+    /// | React when the input changes | the `InputChanged` [event](#maki-api-create_autocmd) |
+    ///
+    /// `input` and `input_edit` wait for the UI to answer. They work from any
+    /// callback, like a key handler, an autocmd or `maki.defer_fn`, but not
+    /// while your plugin loads.
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title, manual input, manual input_edit,
+        manual set_window_title, manual input, manual input_edit, manual input_rules,
     ]
 }
 
@@ -865,6 +1012,7 @@ pub(crate) fn create_ui_table(
     open_editor__register(&t, lua, ui_action_tx.clone())?;
     input__register(&t, lua, ui_action_tx.clone())?;
     input_edit__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
+    input_rules__register(&t, lua, Arc::clone(&plugin))?;
     open_win__register(&t, lua, ui_action_tx, Arc::clone(&plugin))?;
 
     let p = Arc::clone(&plugin);

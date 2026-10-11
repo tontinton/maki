@@ -9,7 +9,7 @@ use criterion::{BenchmarkGroup, BenchmarkId, Criterion, criterion_group, criteri
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_storage::StateDir;
 use maki_ui::app::{App, Msg};
-use maki_ui::bench_support;
+use maki_ui::bench_support::{self, Rules};
 use maki_ui::keybindings::key;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -17,11 +17,16 @@ use ratatui::layout::Rect;
 use tempfile::TempDir;
 
 const SIZES: &[usize] = &[1_000, 10_000, 50_000];
+const MARKED_LINES: usize = 10_000;
+const MARKS: usize = 100_000;
 const PASTE_LINES: usize = 100;
 const SINGLE_LINE_BYTES: usize = 1 << 20;
 const MIDDLE_COLUMN: usize = SINGLE_LINE_BYTES / 2;
 const WORD: &str = "lorem ";
 const UNBROKEN: &str = "x";
+const RULES_BYTES: usize = 1 << 20;
+const BOLD_LINE: usize = 2;
+const BOLD_COLUMN: usize = 22;
 const AREA: Rect = Rect::new(0, 0, 120, 40);
 const SAMPLES: usize = 10;
 const TYPED: char = 'x';
@@ -62,6 +67,21 @@ fn markdown(lines: usize) -> String {
         .join("\n")
 }
 
+/// Whole {MARKDOWN} cycles until the text is at least {bytes} long.
+fn markdown_bytes(bytes: usize) -> String {
+    let mut doc = String::with_capacity(bytes);
+    for line in MARKDOWN.iter().cycle() {
+        if doc.len() >= bytes {
+            return doc;
+        }
+        if !doc.is_empty() {
+            doc.push('\n');
+        }
+        doc.push_str(line);
+    }
+    unreachable!("the cycle never ends")
+}
+
 /// One line of {bytes} bytes with no newline in it, made of {piece}.
 fn single_line(bytes: usize, piece: &str) -> String {
     piece.repeat(bytes / piece.len())
@@ -88,13 +108,31 @@ impl Fixture {
     /// would just make every bench look fast. The tick and frame pay off what
     /// the paste left behind, so later ticks really are idle.
     fn loaded(doc: &str) -> Self {
-        let mut fixture = Self::empty();
-        fixture.app.update(Msg::Paste(doc.to_owned()));
+        Self::empty().filled(doc)
+    }
+
+    fn filled(mut self, doc: &str) -> Self {
+        self.app.update(Msg::Paste(doc.to_owned()));
         assert!(
-            bench_support::input_value(&fixture.app) == doc,
+            bench_support::input_value(&self.app) == doc,
             "the paste never reached the input"
         );
-        let _ = fixture.app.tick();
+        let _ = self.app.tick();
+        self.frame();
+        self
+    }
+
+    /// Loaded under {rules}, parsed to the end, and with the cursor inside a
+    /// bold span in the middle of the text, where the bench types.
+    fn typing_in(doc: &str, rules: Option<Rules>) -> Self {
+        let mut fixture = Self::empty();
+        if let Some(rules) = rules {
+            bench_support::set_rules(&mut fixture.app, rules);
+        }
+        let mut fixture = fixture.filled(doc);
+        bench_support::settle_parse(&mut fixture.app);
+        let middle = (doc.matches('\n').count() / 2).next_multiple_of(MARKDOWN.len());
+        bench_support::set_cursor(&mut fixture.app, middle + BOLD_LINE, BOLD_COLUMN);
         fixture.frame();
         fixture
     }
@@ -219,6 +257,25 @@ fn bench_input(c: &mut Criterion) {
         });
     }
 
+    // `keystroke_frame` with ten marks a line, so it shows what the marks
+    // add to a keystroke: mapping them through the edit and drawing the ones
+    // on screen.
+    let mut marked = Fixture::loaded(&markdown(MARKED_LINES));
+    bench_support::decorate(&mut marked.app, MARKS);
+    marked.frame();
+    bench_with_reset(
+        &mut group,
+        BenchmarkId::new("keystroke_frame_marked", MARKED_LINES),
+        marked,
+        |f| {
+            f.app.update(Msg::Key(KeyCode::Char(TYPED).into()));
+            f.frame();
+        },
+        |f| {
+            f.app.update(Msg::Key(KeyCode::Backspace.into()));
+        },
+    );
+
     // One enormous line is a different load from many short ones: wrapping
     // splits it into thousands of rows, and the cursor, sitting at the end
     // of it, is a column far from the line start.
@@ -262,6 +319,39 @@ fn bench_input(c: &mut Criterion) {
             },
             |f| {
                 f.app.update(Msg::Key(KeyCode::Backspace.into()));
+            },
+        );
+    }
+
+    // A keystroke inside a bold span, in the middle of a megabyte of
+    // markdown, after the tick that hands the edit to the parse thread and
+    // the frame that draws it. The rules are the ones that change row
+    // widths, so the layout recounts what the edit touched.
+    //
+    // The parse runs on the worker next to the draw, and the frame shows the
+    // last result mapped through the edit, so this is what the UI thread
+    // pays while a parse is in flight. The reset waits for the parse to land
+    // and costs nothing, so every pass starts from a settled tree, which is
+    // where typing sits between pauses. `none` has only the core rules and
+    // is the baseline.
+    let doc = markdown_bytes(RULES_BYTES);
+    for (label, rules) in [
+        ("none", None),
+        ("regex", Some(Rules::Regex)),
+        ("syntax", Some(Rules::Syntax)),
+    ] {
+        bench_with_reset(
+            &mut group,
+            BenchmarkId::new("keystroke_frame_rules", label),
+            Fixture::typing_in(&doc, rules),
+            |f| {
+                f.app.update(Msg::Key(KeyCode::Char(TYPED).into()));
+                let _ = f.app.tick();
+                f.frame();
+            },
+            |f| {
+                f.app.update(Msg::Key(KeyCode::Backspace.into()));
+                bench_support::settle_parse(&mut f.app);
             },
         );
     }

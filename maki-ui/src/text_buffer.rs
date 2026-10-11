@@ -1,10 +1,23 @@
+mod marks;
+mod rules;
+mod syntax;
+
 use std::collections::VecDeque;
-use std::ops::Range;
+use std::mem;
+use std::ops::{Range, RangeInclusive};
+use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use maki_lua::TextEdit;
+use maki_lua::{SyntaxInput, TextEdit};
 
 use crate::highlight::TAB_SPACES;
+
+#[cfg(test)]
+pub use self::marks::Reveal;
+pub use self::marks::{Concealed, Decoration, Mark, Marks, Placed, VirtTextPos};
+use self::rules::RuleMarks;
+pub use self::rules::RuleSet;
+use self::syntax::{SyntaxMarks, edit_since};
 
 /// How many versions back a reader can fall and still catch up through the
 /// log. A reader that catches up every frame never falls far behind, and one
@@ -75,6 +88,38 @@ pub struct Change {
     pub old_end_line: usize,
     pub new_end_line: usize,
     pub kind: ChangeKind,
+}
+
+impl Change {
+    /// Where {pos} lands after this change, read as a delete followed by an
+    /// insert: a position inside the removed text falls to where it started,
+    /// and a position where text is inserted ends up after that text when
+    /// {after}.
+    pub fn map_pos(&self, pos: usize, after: bool) -> usize {
+        if pos < self.start {
+            pos
+        } else if pos > self.old_end {
+            pos - self.old_end + self.new_end
+        } else if after {
+            self.new_end
+        } else {
+            self.start
+        }
+    }
+
+    /// Where {bytes} lands after this change, grown over text inserted at
+    /// either end.
+    pub fn map_range(&self, bytes: Range<usize>) -> Range<usize> {
+        self.map_pos(bytes.start, false)..self.map_pos(bytes.end, true)
+    }
+}
+
+/// Which way the cursor leaves a range it may not stop inside.
+#[derive(Clone, Copy)]
+enum Toward {
+    Start,
+    End,
+    Nearest,
 }
 
 /// Plain typing and plain backspaces run together into one step per word. A
@@ -194,6 +239,21 @@ pub struct TextBuffer {
     /// Oldest first, so `changes_since` can binary search for a version.
     changes: VecDeque<Change>,
     undo: UndoHistory,
+    /// Mapped in [`Self::splice`], so they move with every change there is.
+    marks: Marks,
+    /// Never mapped like {marks}. [`Self::splice`] just forgets the lines it
+    /// changed, and they are matched again from the text.
+    rules: RuleMarks,
+    /// Never mapped either: each lookup maps the worker's last result
+    /// forward through {changes}.
+    syntax: SyntaxMarks,
+    /// Bumped when the marks change how wide a line is drawn in a way the
+    /// change log cannot point at: a mark with inline virtual text or a
+    /// conceal dropped far from the edit, another draft's marks swapped in,
+    /// conceals turned on or off, new rules.
+    decor_epoch: u64,
+    /// Shows the text under every conceal, for checking what is really sent.
+    raw: bool,
 }
 
 /// Refuses an offset that splits a character. Rounding it would move an edit
@@ -244,6 +304,10 @@ fn sanitize(text: &str) -> String {
         .replace(|c: char| c.is_control() && c != '\n', "")
 }
 
+fn hull(a: Range<usize>, b: Range<usize>) -> Range<usize> {
+    a.start.min(b.start)..a.end.max(b.end)
+}
+
 fn line_starts_in(text: &str, offset: usize) -> impl Iterator<Item = usize> {
     text.match_indices('\n').map(move |(i, _)| offset + i + 1)
 }
@@ -269,8 +333,10 @@ fn changed_span(old: &str, new: &str) -> (usize, usize, usize) {
 
 impl TextBuffer {
     pub fn new(text: String) -> Self {
-        let line_starts = [0].into_iter().chain(line_starts_in(&text, 0)).collect();
+        let line_starts: Vec<usize> = [0].into_iter().chain(line_starts_in(&text, 0)).collect();
         Self {
+            rules: RuleMarks::new(Arc::default(), line_starts.len()),
+            syntax: SyntaxMarks::new(Arc::default()),
             text,
             line_starts,
             raw_x: 0,
@@ -278,6 +344,9 @@ impl TextBuffer {
             version: 0,
             changes: VecDeque::new(),
             undo: UndoHistory::default(),
+            marks: Marks::default(),
+            decor_epoch: 0,
+            raw: false,
         }
     }
 
@@ -363,7 +432,10 @@ impl TextBuffer {
     /// The changes that led from {version} to now, in the order they were
     /// applied. `None` when {version} is older than the log reaches back, or
     /// newer than the buffer.
-    pub fn changes_since(&self, version: u64) -> Option<impl Iterator<Item = &Change>> {
+    pub fn changes_since(
+        &self,
+        version: u64,
+    ) -> Option<impl DoubleEndedIterator<Item = &Change> + Clone> {
         let oldest = self
             .changes
             .front()
@@ -390,7 +462,7 @@ impl TextBuffer {
         self.line_starts.partition_point(|&s| s <= idx) - 1
     }
 
-    fn line_range(&self, y: usize) -> Range<usize> {
+    pub fn line_range(&self, y: usize) -> Range<usize> {
         let end = self
             .line_starts
             .get(y + 1)
@@ -428,11 +500,6 @@ impl TextBuffer {
         self.line_starts[self.cursor_y] + Self::char_to_byte(self.current_line(), char_x)
     }
 
-    /// The cursor as a byte offset into its own line.
-    pub fn cursor_byte_in_line(&self) -> usize {
-        Self::char_to_byte(self.current_line(), self.x())
-    }
-
     /// Every change to the value goes through here, so the text, the line
     /// index and the log always agree. The change is logged under the next
     /// version, and [`Self::commit`] makes that version current, so all the
@@ -460,17 +527,299 @@ impl TextBuffer {
             line_starts_in(text, start),
         );
 
-        self.changes.push_back(Change {
+        let new_end_line = self.line_of(new_end);
+        self.rules
+            .splice(start_line..old_end_line + 1, new_end_line + 1 - start_line);
+        let change = Change {
             version: self.version + 1,
             start,
             old_end,
             new_end,
             start_line,
             old_end_line,
-            new_end_line: self.line_of(new_end),
+            new_end_line,
             kind,
-        });
+        };
+        // A chip deleted whole sits on the lines the change already points
+        // the layout at. Only a mark dropped lines away from them needs a
+        // full recount, and that goes for the marks of the last parse too.
+        let lines = start_line..=new_end_line;
+        let syntax_dropped = self.syntax_dropped(&change);
+        let dropped_away = self
+            .marks
+            .map(&change)
+            .into_iter()
+            .chain(syntax_dropped)
+            .any(|bytes| {
+                !lines.contains(&self.line_of(bytes.start))
+                    || !lines.contains(&self.line_of(bytes.end))
+            });
+        if dropped_away {
+            self.decor_epoch += 1;
+        }
+        self.changes.push_back(change);
         true
+    }
+
+    #[cfg(test)]
+    pub fn marks(&self) -> &Marks {
+        &self.marks
+    }
+
+    pub fn decor_epoch(&self) -> u64 {
+        self.decor_epoch
+    }
+
+    /// Replaces what {plugin} has in namespace {ns}, with offsets into the
+    /// current value. Returns where marks that change how rows wrap came or
+    /// went. Refused whole when one mark does not fit the text, like an edit
+    /// is.
+    pub fn set_marks(
+        &mut self,
+        plugin: &str,
+        ns: &str,
+        marks: Vec<Mark>,
+    ) -> Result<Vec<Range<usize>>, String> {
+        let len = self.text.len();
+        for mark in &marks {
+            let stop = mark.stop.unwrap_or(mark.start);
+            if mark.start > stop {
+                return Err(format!("start {} is past stop {stop}", mark.start));
+            }
+            if stop > len {
+                return Err(format!("stop {stop} is past the end of the input ({len})"));
+            }
+            check_boundary(self.text.is_char_boundary(mark.start), "start", mark.start)?;
+            check_boundary(self.text.is_char_boundary(stop), "stop", stop)?;
+            mark.decoration.check_drawn_text()?;
+        }
+        Ok(self.marks.set(plugin, ns, marks))
+    }
+
+    pub fn toggle_raw(&mut self) {
+        self.raw = !self.raw;
+        self.decor_epoch += 1;
+    }
+
+    pub fn set_rules(&mut self, rules: Arc<RuleSet>) {
+        self.syntax = SyntaxMarks::new(Arc::clone(rules.syntax()));
+        self.rules = RuleMarks::new(rules, self.line_count());
+        self.decor_epoch += 1;
+    }
+
+    /// Takes in what the worker finished, and hands it the text when it lags
+    /// behind. Returns where the tree-sitter marks changed in the text now,
+    /// or `None` when no result came in. A result that cannot say where
+    /// recounts every line, and so does one replacing a result the log no
+    /// longer reaches back to: none of that one was shown, so even lines
+    /// where both results agree changed on screen.
+    pub fn poll_syntax(&mut self) -> Option<Vec<Range<usize>>> {
+        let was_shown = self.syntax_changes().is_some();
+        let changed = self.syntax.receive();
+        if self.syntax.wants_parse(self.version) {
+            let edit = self.syntax_changes().and_then(edit_since);
+            let input = match edit {
+                Some(edit) => SyntaxInput::Edit {
+                    inserted: self.text[edit.start..edit.new_end].to_owned(),
+                    start_row: self.line_of(edit.start),
+                    edit,
+                },
+                None => SyntaxInput::Whole(self.text.clone()),
+            };
+            self.syntax.parse(input, self.version);
+        }
+        let now = changed?.filter(|_| was_shown).and_then(|ranges| {
+            let changes = self.syntax_changes()?;
+            let moved = ranges.into_iter().map(|bytes| {
+                changes
+                    .clone()
+                    .fold(bytes, |bytes, change| change.map_range(bytes))
+            });
+            Some(moved.collect())
+        });
+        Some(now.unwrap_or_else(|| {
+            self.decor_epoch += 1;
+            Vec::new()
+        }))
+    }
+
+    /// Whether the worker has parsed the text as it is now, which a bench
+    /// waits for to measure edits against a settled tree.
+    pub fn syntax_is_current(&self) -> bool {
+        self.syntax.is_current(self.version)
+    }
+
+    /// Where the tree-sitter marks that shape rows and that {change}, not
+    /// logged yet, drops would have landed.
+    fn syntax_dropped(&self, change: &Change) -> Vec<Range<usize>> {
+        if !self.rules.shapes_rows() {
+            return Vec::new();
+        }
+        self.syntax
+            .touching(change.start..=change.old_end, self.syntax_changes())
+            .filter(|mark| {
+                mark.decoration.shapes_rows()
+                    && marks::remap(mark.bytes.clone(), mark.decoration, change).is_none()
+            })
+            .map(|mark| change.map_range(mark.bytes))
+            .collect()
+    }
+
+    fn derived(&self, bytes: RangeInclusive<usize>) -> impl Iterator<Item = Placed<'_>> {
+        let (from, to) = (*bytes.start(), *bytes.end());
+        let changes = self.syntax_changes();
+        (self.line_of(from)..=self.line_of(to))
+            .flat_map(move |y| self.rules.line(y, &self.text, self.line_range(y)))
+            .filter(move |mark| mark.bytes.start <= to && mark.bytes.end >= from)
+            .chain(self.syntax.touching(bytes, changes))
+    }
+
+    /// Placed and rule marks touching {bytes}, ends included, unsorted.
+    fn touching(&self, bytes: RangeInclusive<usize>) -> impl Iterator<Item = Placed<'_>> {
+        self.marks
+            .touching(bytes.clone())
+            .chain(self.derived(bytes))
+    }
+
+    /// The layout asks this for every line it counts, so when no rule can
+    /// change how rows wrap, it skips matching altogether.
+    fn shaping(&self, bytes: RangeInclusive<usize>) -> impl Iterator<Item = Placed<'_>> {
+        let derived = self
+            .rules
+            .shapes_rows()
+            .then(|| self.derived(bytes.clone()));
+        self.marks.shaping(bytes).chain(
+            derived
+                .into_iter()
+                .flatten()
+                .filter(|mark| mark.decoration.shapes_rows()),
+        )
+    }
+
+    /// The marks touching {bytes}, ends included, in the order they compose.
+    pub fn overlapping(&self, bytes: RangeInclusive<usize>) -> Vec<Placed<'_>> {
+        marks::composed(self.touching(bytes).collect())
+    }
+
+    pub fn inline_virts(&self, bytes: RangeInclusive<usize>) -> impl Iterator<Item = Placed<'_>> {
+        self.shaping(bytes)
+            .filter(|mark| mark.decoration.is_inline_virt())
+    }
+
+    /// The concealed ranges touching {bytes} as they are drawn now, sorted
+    /// and disjoint. None while the raw text is shown, and none the cursor
+    /// reveals.
+    pub fn concealed(&self, bytes: RangeInclusive<usize>) -> Vec<Concealed<'_>> {
+        if self.raw {
+            return Vec::new();
+        }
+        marks::concealed(self.shaping(bytes), || self.cursor_byte())
+    }
+
+    /// The conceals the cursor shows the text of. Moving the cursor in or
+    /// out of one changes how its lines wrap.
+    pub fn revealed(&self) -> Vec<Range<usize>> {
+        if self.raw {
+            return Vec::new();
+        }
+        let cursor = self.cursor_byte();
+        marks::revealed(self.shaping(cursor..=cursor), cursor)
+    }
+
+    fn hidden_at(&self, at: usize) -> Option<Range<usize>> {
+        self.concealed(at..=at)
+            .into_iter()
+            .map(|concealed| concealed.bytes)
+            .find(|bytes| bytes.contains(&at))
+    }
+
+    /// Where the caret is drawn. Inside a concealed range there is no
+    /// character to draw it on, so it sits where the range starts.
+    pub fn shown_caret(&self) -> usize {
+        let at = self.cursor_byte();
+        self.hidden_at(at).map_or(at, |bytes| bytes.start)
+    }
+
+    /// The lines drawn as one with line {y}. A concealed range over a line
+    /// break hides it, which joins the lines on both sides, so a conceal
+    /// spanning lines takes them all onto the line where it starts.
+    pub fn display_lines(&self, y: usize) -> Range<usize> {
+        let mut first = y;
+        while first > 0
+            && let Some(hidden) = self.hidden_at(self.line_starts[first] - 1)
+        {
+            first = self.line_of(hidden.start);
+        }
+        let mut last = y;
+        while let Some(hidden) = self.hidden_at(self.line_range(last).end) {
+            last = self.line_of(hidden.end);
+        }
+        first..last + 1
+    }
+
+    /// Where lines {lines} sit in the value, line breaks between them
+    /// included.
+    pub fn lines_bytes(&self, lines: Range<usize>) -> Range<usize> {
+        self.line_starts[lines.start]..self.line_range(lines.end - 1).end
+    }
+
+    fn atomic(&self, bytes: RangeInclusive<usize>) -> impl Iterator<Item = Range<usize>> + '_ {
+        self.touching(bytes)
+            .filter(|mark| mark.decoration.atomic)
+            .map(|mark| mark.bytes)
+    }
+
+    /// The range around byte {at} the cursor may not stop inside: an atomic
+    /// range, or a concealed one, which shows nothing to stand on.
+    fn blocked_at(&self, at: usize) -> Option<Range<usize>> {
+        self.atomic(at..=at)
+            .chain(self.hidden_at(at))
+            .filter(|bytes| bytes.start < at && at < bytes.end)
+            .reduce(hull)
+    }
+
+    /// Moves the cursor out of a range it may not stop inside. The way out
+    /// is picked once, so ranges that overlap cannot bounce it back and forth.
+    fn snap_cursor(&mut self, toward: Toward) {
+        let mut at = self.cursor_byte();
+        let Some(blocked) = self.blocked_at(at) else {
+            return;
+        };
+        let forward = match toward {
+            Toward::Start => false,
+            Toward::End => true,
+            Toward::Nearest => at - blocked.start > blocked.end - at,
+        };
+        let mut next = Some(blocked);
+        while let Some(blocked) = next {
+            at = if forward { blocked.end } else { blocked.start };
+            next = self.blocked_at(at);
+        }
+        self.place_cursor(at);
+    }
+
+    /// Grows {range} over every atomic range it cuts into, so a delete takes
+    /// a chip whole instead of leaving half of it behind.
+    fn widen(&self, mut range: Range<usize>) -> Range<usize> {
+        if range.is_empty() {
+            return range;
+        }
+        loop {
+            let grown = self
+                .atomic(range.start..=range.end)
+                .filter(|bytes| bytes.start < range.end && bytes.end > range.start)
+                .fold(range.clone(), hull);
+            if grown == range {
+                return range;
+            }
+            range = grown;
+        }
+    }
+
+    /// Puts {marks}, made for the current value, in place of the ones here.
+    pub fn swap_marks(&mut self, marks: Marks) -> Marks {
+        self.decor_epoch += 1;
+        mem::replace(&mut self.marks, marks)
     }
 
     fn commit(&mut self) {
@@ -482,6 +831,7 @@ impl TextBuffer {
             return;
         }
         self.version += 1;
+        let syntax_shown = self.syntax_shapes_rows();
         while self
             .changes
             .front()
@@ -489,10 +839,35 @@ impl TextBuffer {
         {
             self.changes.pop_front();
         }
+        if syntax_shown && !self.syntax_shapes_rows() {
+            self.decor_epoch += 1;
+        }
     }
 
+    /// Whether some rule can shape rows, which the rule set knows, and the log
+    /// still reaches back to the last parse, so its marks are on screen. Once
+    /// it no longer does, none of them can be moved to the text, so they all
+    /// go at once, lines away from any change.
+    fn syntax_shapes_rows(&self) -> bool {
+        self.rules.shapes_rows() && self.syntax_changes().is_some()
+    }
+
+    /// What led from the text of the last parse to now, which its marks need
+    /// to be shown at all.
+    fn syntax_changes(&self) -> Option<impl DoubleEndedIterator<Item = &Change> + Clone> {
+        self.changes_since(self.syntax.shown_version()?)
+    }
+
+    /// The edits the keys make. One that cuts into an atomic range takes all
+    /// of it, which a plugin edit never does: a plugin asks for exact bytes.
     fn edit(&mut self, range: Range<usize>, text: &str, caret: usize) {
-        self.edit_all([(range, text)], caret);
+        let whole = self.widen(range.clone());
+        let caret = if whole == range {
+            caret
+        } else {
+            whole.start + text.len()
+        };
+        self.edit_all([(whole, text)], caret);
     }
 
     /// Replaces sorted, disjoint ranges of the current value as one version,
@@ -628,7 +1003,7 @@ impl TextBuffer {
 
     pub fn kill_to_end_of_line(&mut self) {
         let at = self.cursor_byte();
-        let end = self.line_range(self.cursor_y).end;
+        let end = self.lines_bytes(self.display_lines(self.cursor_y)).end;
         self.edit(at..end, "", at);
     }
 
@@ -647,18 +1022,20 @@ impl TextBuffer {
         let x = self.x();
         if x == 0 {
             self.wrap_to_prev_line();
-            return;
+        } else {
+            self.raw_x = self.find_prev_word_boundary(x);
         }
-        self.raw_x = self.find_prev_word_boundary(x);
+        self.snap_cursor(Toward::Start);
     }
 
     pub fn move_word_right(&mut self) {
         let x = self.x();
         if x == self.current_line_len() {
             self.wrap_to_next_line();
-            return;
+        } else {
+            self.raw_x = self.find_next_word_boundary(x);
         }
-        self.raw_x = self.find_next_word_boundary(x);
+        self.snap_cursor(Toward::End);
     }
 
     pub fn move_left(&mut self) {
@@ -668,6 +1045,7 @@ impl TextBuffer {
         } else {
             self.wrap_to_prev_line();
         }
+        self.snap_cursor(Toward::Start);
     }
 
     pub fn move_right(&mut self) {
@@ -677,26 +1055,37 @@ impl TextBuffer {
         } else {
             self.wrap_to_next_line();
         }
+        self.snap_cursor(Toward::End);
     }
 
+    /// Lines joined by a conceal are one line on screen, so up goes to the
+    /// first line of the one drawn above.
     pub fn move_up(&mut self) {
-        if self.cursor_y > 0 {
-            self.cursor_y -= 1;
+        let first = self.display_lines(self.cursor_y).start;
+        if first > 0 {
+            self.cursor_y = self.display_lines(first - 1).start;
+            self.snap_cursor(Toward::Nearest);
         }
     }
 
     pub fn move_down(&mut self) {
-        if self.cursor_y < self.line_count() - 1 {
-            self.cursor_y += 1;
+        let end = self.display_lines(self.cursor_y).end;
+        if end < self.line_count() {
+            self.cursor_y = end;
+            self.snap_cursor(Toward::Nearest);
         }
     }
 
     pub fn move_home(&mut self) {
+        self.cursor_y = self.display_lines(self.cursor_y).start;
         self.raw_x = 0;
+        self.snap_cursor(Toward::Start);
     }
 
     pub fn move_end(&mut self) {
+        self.cursor_y = self.display_lines(self.cursor_y).end - 1;
         self.raw_x = self.current_line_len();
+        self.snap_cursor(Toward::End);
     }
 
     pub fn clear(&mut self) {
@@ -864,9 +1253,12 @@ impl TextBuffer {
         self.apply_edits(self.version, vec![edit], cursor).map(drop)
     }
 
+    /// Puts the cursor on line {y}, column {x}, or at the nearer edge of a
+    /// range it may not stop inside.
     pub fn set_cursor(&mut self, y: usize, x: usize) {
         self.cursor_y = y.min(self.line_count() - 1);
         self.raw_x = x.min(self.current_line_len());
+        self.snap_cursor(Toward::Nearest);
     }
 
     pub fn move_to_end(&mut self) {
@@ -875,7 +1267,7 @@ impl TextBuffer {
     }
 
     pub fn kill_to_start_of_line(&mut self) {
-        let from = self.line_starts[self.cursor_y];
+        let from = self.line_starts[self.display_lines(self.cursor_y).start];
         let at = self.cursor_byte();
         self.edit(from..at, "", from);
     }
@@ -1027,7 +1419,10 @@ mod tests {
         INPUT_REPLACED_ERR, MAX_UNDO, NOTHING_TO_APPLY_ERR, OVERLAPPING_EDITS_ERR, TAB_SPACES,
         TextBuffer, TextEdit, UNCLEAN_TEXT_ERR, VERSION_TOO_OLD_ERR,
     };
+    use super::{Decoration, Mark, Reveal};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use std::ops::Range;
+    use std::sync::Arc;
     use test_case::test_case;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
@@ -1804,5 +2199,88 @@ mod tests {
         }
         assert_eq!(undo_all(&mut buf).len(), MAX_UNDO);
         assert_eq!(buf.value(), "a");
+    }
+
+    const PLUGIN: &str = "test";
+    const NS: &str = "marks";
+
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Atomic,
+        Hidden,
+        Revealing,
+        Raw,
+    }
+
+    fn marked(text: &str, bytes: Range<usize>, kind: Kind, cursor: usize) -> TextBuffer {
+        let mut buf = TextBuffer::new(text.into());
+        let decoration = Decoration {
+            atomic: matches!(kind, Kind::Atomic),
+            conceal: (!matches!(kind, Kind::Atomic)).then(|| "[chip]".into()),
+            reveal: match kind {
+                Kind::Revealing => Reveal::Cursor,
+                _ => Reveal::Never,
+            },
+            ..Decoration::default()
+        };
+        let mark = Mark {
+            start: bytes.start,
+            stop: Some(bytes.end),
+            decoration: Arc::new(decoration),
+        };
+        buf.set_marks(PLUGIN, NS, vec![mark]).unwrap();
+        if matches!(kind, Kind::Raw) {
+            buf.toggle_raw();
+        }
+        buf.place_cursor(cursor);
+        buf
+    }
+
+    #[test_case("a one two b", 2..9, Kind::Atomic, 9, TextBuffer::move_left => 2 ; "left_steps_over_an_atomic_range")]
+    #[test_case("a one two b", 2..9, Kind::Atomic, 2, TextBuffer::move_right => 9 ; "right_steps_over_an_atomic_range")]
+    #[test_case("a one two b", 2..9, Kind::Atomic, 1, TextBuffer::move_word_right => 9 ; "word_right_stops_after_an_atomic_range")]
+    #[test_case("a one two b", 2..9, Kind::Atomic, 9, TextBuffer::move_word_left => 2 ; "word_left_stops_before_an_atomic_range")]
+    #[test_case("a one two b", 2..9, Kind::Hidden, 2, TextBuffer::move_right => 9 ; "right_steps_over_concealed_text")]
+    #[test_case("a one two b", 2..9, Kind::Revealing, 2, TextBuffer::move_right => 3 ; "right_walks_into_text_the_cursor_reveals")]
+    #[test_case("a one two b", 2..9, Kind::Raw, 2, TextBuffer::move_right => 3 ; "right_walks_into_raw_text")]
+    #[test_case("abcdefgh\nab one two", 12..19, Kind::Atomic, 6, TextBuffer::move_down => 12 ; "down_lands_on_the_nearer_edge_before")]
+    #[test_case("abcdefgh\nab one two", 12..19, Kind::Atomic, 7, TextBuffer::move_down => 19 ; "down_lands_on_the_nearer_edge_after")]
+    #[test_case("a\nb\nc\nd", 1..4, Kind::Hidden, 0, TextBuffer::move_down => 6 ; "down_skips_the_lines_a_conceal_joined")]
+    #[test_case("a\nb\nc\nd", 1..4, Kind::Hidden, 6, TextBuffer::move_up => 0 ; "up_skips_the_lines_a_conceal_joined")]
+    #[test_case("a\nb\nc\nd", 1..4, Kind::Hidden, 5, TextBuffer::move_home => 0 ; "home_goes_to_the_start_of_joined_lines")]
+    #[test_case("a\nb\nc\nd", 1..4, Kind::Hidden, 0, TextBuffer::move_end => 5 ; "end_goes_to_the_end_of_joined_lines")]
+    #[test_case("a one two b", 2..9, Kind::Atomic, 0, |b| b.set_cursor(0, 3) => 2 ; "placing_inside_an_atomic_range_snaps_to_the_nearer_start")]
+    #[test_case("a one two b", 2..9, Kind::Atomic, 0, |b| b.set_cursor(0, 7) => 9 ; "placing_inside_an_atomic_range_snaps_to_the_nearer_end")]
+    fn cursor_motion(
+        text: &str,
+        bytes: Range<usize>,
+        kind: Kind,
+        from: usize,
+        motion: fn(&mut TextBuffer),
+    ) -> usize {
+        let mut buf = marked(text, bytes, kind, from);
+        motion(&mut buf);
+        buf.cursor_byte()
+    }
+
+    /// The grown delete is still one splice, so one undo brings the whole
+    /// chip back, caret and all.
+    #[test_case("say CHIP now", 4..8, 8, TextBuffer::remove_char => ("say  now".into(), 4) ; "backspace_takes_a_chip_whole")]
+    #[test_case("say CHIP now", 4..8, 4, TextBuffer::delete_char => ("say  now".into(), 4) ; "delete_takes_a_chip_whole")]
+    #[test_case("say CHIP now", 2..6, 9, TextBuffer::remove_word_before_cursor => ("sanow".into(), 2) ; "a_word_kill_that_cuts_in_takes_the_chip")]
+    #[test_case("ab CHIP\ncd ef", 5..10, 3, TextBuffer::kill_to_end_of_line => ("ab  ef".into(), 3) ; "a_line_kill_takes_a_chip_over_the_line_break")]
+    fn deleting_into_an_atomic_range(
+        text: &str,
+        bytes: Range<usize>,
+        from: usize,
+        delete: fn(&mut TextBuffer),
+    ) -> (String, usize) {
+        let mut buf = marked(text, bytes, Kind::Atomic, from);
+        delete(&mut buf);
+        let deleted = (buf.value().to_owned(), buf.cursor_byte());
+        assert!(buf.undo());
+        assert_eq!((buf.value(), buf.cursor_byte()), (text, from));
+        assert!(!buf.undo());
+        deleted
     }
 }

@@ -117,6 +117,7 @@ strum = { version = "0.28", features = ["derive"] }
 htmd = "0.5"
 tempfile = "3"
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
+fancy-regex = "0.19"
 globset = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
