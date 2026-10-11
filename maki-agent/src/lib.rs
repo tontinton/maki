@@ -11,7 +11,7 @@ pub use file_index::{
     invalidate_for, on_walk_end, resolved_index,
 };
 pub mod headless;
-pub mod mailbox;
+pub mod live_session;
 pub mod mcp;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};
 pub use mcp::protocol::PromptRole;
@@ -29,7 +29,7 @@ pub use agent::{
     close_dangling_tool_calls, find_subdirectory_instructions, is_instruction_file,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
-pub use mailbox::{MailboxError, SessionMailbox};
+pub use live_session::{AgentSeed, MailboxError, SessionMailbox};
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub mod command;
 pub mod diff;

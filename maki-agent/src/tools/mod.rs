@@ -795,6 +795,19 @@ pub mod test_support {
         ctx.output_mode = ToolOutputMode::Compact;
         ctx
     }
+
+    /// Plays someone else's edit. It pushes the mtime ahead instead of writing
+    /// again, because two writes close together can share one mtime on
+    /// filesystems with coarse timestamps.
+    #[cfg(test)]
+    pub(crate) fn future_mtime(path: &Path) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(10))
+            .unwrap();
+    }
 }
 
 #[cfg(test)]

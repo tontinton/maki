@@ -31,13 +31,15 @@ impl FileKey {
 
 type FileLock = Arc<smol::lock::Mutex<()>>;
 pub type FileGuard = smol::lock::MutexGuardArc<()>;
+type FileLocks = Mutex<HashMap<FileKey, Weak<smol::lock::Mutex<()>>>>;
 
-/// Who read what and when, plus the per-file write locks that make one tool's
-/// read-modify-write safe against another's.
+/// What one agent read and when, plus the per-file write locks that make one
+/// tool's read-modify-write safe against another's. The locks can be shared
+/// with agents working next to this one, see [`FileAccess::sharing_locks`].
 #[derive(Default)]
 pub struct FileAccess {
     mtimes: Mutex<HashMap<FileKey, SystemTime>>,
-    locks: Mutex<HashMap<FileKey, Weak<smol::lock::Mutex<()>>>>,
+    locks: Arc<FileLocks>,
 }
 
 fn get_mtime(path: &Path) -> Option<SystemTime> {
@@ -47,6 +49,18 @@ fn get_mtime(path: &Path) -> Option<SystemTime> {
 impl FileAccess {
     pub fn fresh() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// For an agent that runs next to this one instead of under it. Its reads
+    /// stay its own. Say the user changes a file we read earlier: if its fresh
+    /// read counted for us too, we would never hear our copy is stale, and our
+    /// next edit would quietly undo the user's. The locks are shared, so two
+    /// edits of one file still take turns.
+    pub fn sharing_locks(&self) -> Arc<Self> {
+        Arc::new(Self {
+            mtimes: Mutex::default(),
+            locks: Arc::clone(&self.locks),
+        })
     }
 
     /// The write lock for one file, held for a tool's entire execution so its
@@ -124,25 +138,14 @@ impl FileAccess {
 /// rather than again for every map.
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use futures_lite::future::poll_once;
     use test_case::test_case;
 
     use super::*;
+    use crate::tools::test_support::future_mtime;
 
     const FILE: &str = "f.rs";
     const CONTENT: &str = "content";
-
-    fn future_mtime(path: &Path) {
-        let future = SystemTime::now() + Duration::from_secs(10);
-        fs::File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_modified(future)
-            .unwrap();
-    }
 
     /// `meanwhile` stands in for everything that can happen between a read and
     /// the edit that follows it. Only a file we read and someone else changed

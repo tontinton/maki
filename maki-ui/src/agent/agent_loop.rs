@@ -9,16 +9,15 @@ use maki_agent::prompt::ResolvedSlots;
 use maki_agent::session::Resumed;
 use maki_agent::template;
 use maki_agent::template::Vars;
-use maki_agent::tools::{FileAccess, RequestTools, ToolAudience, ToolRegistry};
+use maki_agent::tools::{RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
+    Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, AgentSeed, CancelMap,
     CancelToken, DoneReason, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
     RunContext, RunContextBuilder, RunLedger, SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
-use maki_providers::{AgentError, ContextGauge, Message, Model};
-use maki_storage::id::SessionRef;
+use maki_providers::{AgentError, ContextGauge, Message, Model, RequestOptions};
 use tracing::error;
 
 use super::ModelSlot;
@@ -44,28 +43,22 @@ fn base_tools(
 }
 
 pub(super) struct AgentLoop {
-    model_slot: Arc<ArcSwap<ModelSlot>>,
-    config: AgentConfig,
-    tool_output_lines: ToolOutputLines,
+    /// The registry only holds the seed weakly, so plugins can reach it for
+    /// exactly as long as this loop lives.
+    seed: Arc<AgentSeed>,
     vars: Vars,
     instructions: Instructions,
-    mcp: Option<McpSession>,
     history: History,
     /// Owned beside `history` because it describes that transcript and outlives
     /// every run over it, so the provider's own counts pile up between turns.
     gauge: ContextGauge,
     cancels: Arc<RunCancels>,
-    permissions: Arc<PermissionManager>,
-    file_access: Arc<FileAccess>,
     agent_tx: flume::Sender<Envelope>,
     answer_rx: Arc<smol::lock::Mutex<flume::Receiver<String>>>,
     queue: Arc<QueueReceiver>,
-    session_id: SessionRef,
     mailbox: SessionMailbox,
-    timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
-    model_policy: Arc<ModelPolicy>,
 }
 
 impl AgentLoop {
@@ -89,29 +82,31 @@ impl AgentLoop {
         model_policy: Arc<ModelPolicy>,
     ) -> Self {
         let mcp = mcp_handle.map(|h| McpSession::new(h, &resumed.history));
-        Self {
-            session_id: resumed.id,
+        let seed = mailbox.publish_seed(AgentSeed::new(
+            resumed.id,
             model_slot,
             config,
             tool_output_lines,
+            permissions,
+            mcp,
+            timeouts,
+            model_policy,
+        ));
+        Self {
+            seed,
             vars: Vars::default(),
             instructions: Instructions::default(),
-            mcp,
             history: History::restored(resumed.history)
                 .with_frame(resumed.frame)
                 .with_mirror(shared_history),
             gauge: ContextGauge::restored(resumed.context_size),
             cancels,
-            permissions,
-            file_access: FileAccess::fresh(),
             agent_tx,
             answer_rx: Arc::new(smol::lock::Mutex::new(answer_rx)),
             queue,
             mailbox,
-            timeouts,
             lua_handle,
             subagent_cancels,
-            model_policy,
         }
     }
 
@@ -197,7 +192,7 @@ impl AgentLoop {
             return false;
         }
 
-        if let Some(ref mcp) = self.mcp {
+        if let Some(ref mcp) = self.seed.mcp {
             // The queue is drained right after this, and a prompt typed during
             // startup must still carry the MCP tools.
             if teardown.race(mcp.ready()).await.is_err() {
@@ -221,8 +216,8 @@ impl AgentLoop {
         let vars = self.vars.clone();
         let instructions = self.instructions.text.clone();
         let slots = Arc::clone(&prompt_slots);
-        let config = self.config.clone();
-        let has_mcp = self.mcp.is_some();
+        let config = self.seed.config.clone();
+        let has_mcp = self.seed.mcp.is_some();
         let context: RunContextBuilder = Arc::new(move |model, workflow| {
             let tools = base_tools(&vars, model, &config, has_mcp, workflow);
             RunContext::render(&vars, &instructions, &slots, model, tools)
@@ -237,12 +232,12 @@ impl AgentLoop {
         cancel: &CancelToken,
     ) -> Result<DoneReason, AgentError> {
         let (context, _) = self.context_builder().await;
-        let slot = self.model_slot.load();
+        let slot = self.seed.model_slot.load();
         let (provider, model) = agent::resolve_compaction_model(
             &slot.provider,
             &slot.model,
-            self.timeouts,
-            &self.model_policy,
+            self.seed.timeouts,
+            &self.seed.model_policy,
         )
         .await;
         // The summary goes out under a fresh frame for the session's own model,
@@ -250,7 +245,7 @@ impl AgentLoop {
         let next = context(&slot.model, compaction.workflow);
         let hooks = AgentHooks {
             registry: ToolRegistry::global(),
-            session_id: Some(&self.session_id),
+            session_id: Some(&self.seed.session_id),
             task_id: None,
             model: &slot.model,
             cancel,
@@ -262,12 +257,12 @@ impl AgentLoop {
             &mut self.history,
             &mut self.gauge,
             next,
-            self.mcp.as_ref(),
+            self.seed.mcp.as_ref(),
             event_tx,
             &hooks,
-            &self.config,
+            &self.seed.config,
             compaction.instructions.as_deref(),
-            self.timeouts.retry,
+            self.seed.timeouts.retry,
         )
         .await
     }
@@ -278,10 +273,14 @@ impl AgentLoop {
         event_tx: EventSender,
         cancel: &CancelToken,
     ) -> Result<DoneReason, AgentError> {
+        self.seed.set_opts(RequestOptions {
+            thinking: input.thinking,
+            fast: input.fast,
+        });
         let (context, prompt_slots) = self.context_builder().await;
 
         if let Some(ref prompt_ref) = input.prompt {
-            let Some(ref mcp) = self.mcp else {
+            let Some(ref mcp) = self.seed.mcp else {
                 return Err(AgentError::Tool {
                     tool: "mcp_prompt".into(),
                     message: "MCP not available".into(),
@@ -311,7 +310,7 @@ impl AgentLoop {
         // Read after the awaits above, not before: a switch can land while the
         // run is still starting up, and the frame and the request both have to
         // name the model that is current now.
-        let slot = self.model_slot.load();
+        let slot = self.seed.model_slot.load();
 
         while self.answer_rx.lock().await.try_recv().is_ok() {}
 
@@ -319,20 +318,20 @@ impl AgentLoop {
             AgentParams {
                 provider: Arc::clone(&slot.provider),
                 model: slot.model.clone(),
-                config: self.config.clone(),
-                tool_output_lines: self.tool_output_lines,
-                permissions: Arc::clone(&self.permissions),
-                session_id: Some(self.session_id.clone()),
+                config: self.seed.config.clone(),
+                tool_output_lines: self.seed.tool_output_lines,
+                permissions: Arc::clone(&self.seed.permissions),
+                session_id: Some(self.seed.session_id.clone()),
                 task_id: None,
                 mailbox: Some(self.mailbox.clone()),
-                timeouts: self.timeouts,
-                file_access: Arc::clone(&self.file_access),
+                timeouts: self.seed.timeouts,
+                file_access: Arc::clone(&self.seed.file_access),
                 prompt_slots: Arc::clone(&prompt_slots),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
                 ledger: Arc::new(RunLedger::default()),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
-                model_policy: Arc::clone(&self.model_policy),
+                model_policy: Arc::clone(&self.seed.model_policy),
             },
             AgentRunParams {
                 history: &mut self.history,
@@ -346,8 +345,8 @@ impl AgentLoop {
         .with_reauth(true)
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn maki_agent::InterruptSource>)
         .with_cancel(cancel.clone())
-        .with_model_sync(Arc::clone(&self.model_slot))
-        .with_mcp(self.mcp.clone());
+        .with_model_sync(Arc::clone(&self.seed.model_slot))
+        .with_mcp(self.seed.mcp.clone());
 
         let result = agent.run(input).await;
         drop(agent);
