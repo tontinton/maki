@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::env;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +47,17 @@ const HTTPS_SCHEME: &str = "https://";
 const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
 const DNS_ATTEMPTS: u32 = 3;
+/// Behind a proxy our lookup is only a second opinion, since the proxy
+/// resolves the name itself. One try is enough, and in a sandbox with no DNS
+/// every retry would just be a wait.
+const PROXIED_DNS_ATTEMPTS: u32 = 1;
+const NO_PROXY_ALL: &str = "*";
+const NO_PROXY_SEPARATOR: char = ',';
+const NO_PROXY_BLANKS: [char; 2] = [' ', '\t'];
+const SCHEME_SEPARATOR: &str = "://";
+/// `socks4` and `socks5` are missing on purpose: with them curl looks the name
+/// up itself and hands the proxy an address.
+const NAME_RESOLVING_PROXY_SCHEMES: [&str; 4] = ["http", "https", "socks4a", "socks5h"];
 const DNS_RETRY_DELAY: Duration = Duration::from_millis(150);
 const MAX_POOLED_CLIENTS: usize = 8;
 /// A pooled client holds a curl thread and open sockets, so an endpoint nobody
@@ -90,6 +102,9 @@ const CROSS_AUTHORITY_HEADERS: [&str; 5] = [
 /// the config: every `maki.net` call, in any plugin, on any Lua thread, reads
 /// the same list, and `/reload` swaps it.
 static ALLOWED_PRIVATE_HOSTS: LazyLock<ArcSwap<HostAllowlist>> = LazyLock::new(ArcSwap::default);
+
+static PROXY_ENV: LazyLock<ProxyEnv> =
+    LazyLock::new(|| ProxyEnv::from_env(|name| env::var(name).ok()));
 
 thread_local! {
     /// Cancelling a plugin's tasks on unload misses a conn it keeps in a plain
@@ -193,6 +208,88 @@ fn ip_in_net(ip: IpAddr, net: IpAddr, prefix: u8) -> bool {
 /// would panic.
 fn leading_bits_match(ip: u128, net: u128, prefix: u8, width: u32) -> bool {
     prefix == 0 || (ip ^ net) >> (width - u32::from(prefix)) == 0
+}
+
+/// Tells the guard when curl will hand the host name to a proxy to resolve.
+/// Sandboxes like nono block DNS and only let traffic out through their proxy,
+/// so there the proxy has to resolve names for us.
+///
+/// We have to agree with curl exactly. If we think the proxy resolves a name
+/// but curl resolves it, curl connects to an address the guard never checked.
+#[derive(Debug, Default)]
+struct ProxyEnv {
+    http: bool,
+    https: bool,
+    no_proxy: String,
+}
+
+impl ProxyEnv {
+    /// Same rules as curl. An empty variable counts as unset. Plain http only
+    /// reads lowercase `http_proxy`, because under CGI a request's `Proxy:`
+    /// header turns into `HTTP_PROXY` and would let a client pick our proxy.
+    fn from_env(var: impl Fn(&str) -> Option<String>) -> Self {
+        let var = |name: &str| var(name).filter(|value| !value.is_empty());
+        let all = || var("all_proxy").or_else(|| var("ALL_PROXY"));
+        let resolves = |proxy: Option<String>| proxy.is_some_and(|p| proxy_resolves_names(&p));
+        Self {
+            http: resolves(var("http_proxy").or_else(all)),
+            https: resolves(
+                var("https_proxy")
+                    .or_else(|| var("HTTPS_PROXY"))
+                    .or_else(all),
+            ),
+            no_proxy: var("no_proxy")
+                .or_else(|| var("NO_PROXY"))
+                .unwrap_or_default(),
+        }
+    }
+
+    fn proxies(&self, https: bool, host: &str) -> bool {
+        let configured = if https { self.https } else { self.http };
+        configured && !no_proxy_matches(&self.no_proxy, host)
+    }
+}
+
+/// curl reads a proxy without a scheme as http.
+fn proxy_resolves_names(proxy: &str) -> bool {
+    proxy
+        .split_once(SCHEME_SEPARATOR)
+        .is_none_or(|(scheme, _)| {
+            NAME_RESOLVING_PROXY_SCHEMES
+                .iter()
+                .any(|known| scheme.eq_ignore_ascii_case(known))
+        })
+}
+
+/// curl's `NO_PROXY` rule for a host name: an entry matches the name itself
+/// and every subdomain, with leading and trailing dots ignored.
+fn no_proxy_matches(no_proxy: &str, host: &str) -> bool {
+    if no_proxy == NO_PROXY_ALL {
+        return true;
+    }
+    let host = host.trim_end_matches('.').as_bytes();
+    for segment in no_proxy.split(NO_PROXY_SEPARATOR) {
+        let segment = segment.trim_matches(NO_PROXY_BLANKS);
+        let entry = segment
+            .split_once(NO_PROXY_BLANKS)
+            .map_or(segment, |(entry, _)| entry);
+        if domain_matches(entry.trim_matches('.').as_bytes(), host) {
+            return true;
+        }
+        // curl stops reading the list at a blank inside an entry.
+        if entry.len() < segment.len() {
+            return false;
+        }
+    }
+    false
+}
+
+fn domain_matches(entry: &[u8], host: &[u8]) -> bool {
+    !entry.is_empty()
+        && host.len().checked_sub(entry.len()).is_some_and(|split| {
+            let (head, tail) = host.split_at(split);
+            tail.eq_ignore_ascii_case(entry) && (head.is_empty() || head.ends_with(b"."))
+        })
 }
 
 /// The address the SSRF guard actually vetted for the host in the URL.
@@ -435,7 +532,8 @@ async fn open_stream(
     check_declared(host, port, egress)?;
     // No vetted addresses means a literal, which needs no real lookup, or an
     // allowlisted name, which the user trusts wherever it points.
-    let addrs = match guard(host, port, allowed).await? {
+    // Raw TCP is dialled directly, so no proxy can resolve the name for us.
+    let addrs = match guard(host, port, allowed, false).await? {
         Some(vetted) => vetted,
         None => lookup(host, port).await?,
     };
@@ -670,7 +768,7 @@ async fn vet(
         return Ok((parsed.into(), Route::Provider));
     }
     let url = validate_and_upgrade_url(url, allowed)?;
-    let pin = check_ssrf(&url, allowed).await?;
+    let pin = check_ssrf(&url, allowed, &PROXY_ENV).await?;
     check_declared_host(&url, egress)?;
     Ok((url, Route::Guarded(pin)))
 }
@@ -1130,14 +1228,14 @@ fn extract_host_port(url: &str) -> Option<(&str, u16)> {
 /// getaddrinfo blocks, so it runs on the blocking pool rather than on the
 /// executor thread every other plugin future shares. A resolver saying "try
 /// again" (a cold cache, a link that just came back) has not answered yet, so a
-/// couple of retries go out before the lookup counts as a failure.
-async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+/// few retries go out before the lookup counts as a failure.
+async fn resolve(host: &str, port: u16, attempts: u32) -> io::Result<Vec<SocketAddr>> {
     let mut attempt = 1;
     loop {
         let target = (host.to_string(), port);
         match unblock(move || target.to_socket_addrs()).await {
             Ok(addrs) => return Ok(addrs.collect()),
-            Err(e) if attempt == DNS_ATTEMPTS => return Err(e),
+            Err(e) if attempt >= attempts => return Err(e),
             Err(e) => {
                 tracing::debug!(host, port, attempt, error = %e, "name lookup failed, retrying")
             }
@@ -1148,7 +1246,7 @@ async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
 }
 
 async fn lookup(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
-    resolve(host, port)
+    resolve(host, port, DNS_ATTEMPTS)
         .await
         .map_err(|e| format!("cannot resolve {host}: {e}"))
 }
@@ -1156,12 +1254,14 @@ async fn lookup(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
 /// The address check for everything in `maki.net` that opens a socket.
 /// It answers `Some` when it had to ask DNS, with every address the name
 /// resolved to (all passed, never empty, resolver order). The caller must use
-/// those and not look the name up again. It answers `None` for a literal
-/// address or an allowlisted name, where DNS had no say.
+/// those and not look the name up again. It answers `None` when DNS had no
+/// say: a literal address, an allowlisted name, or a name only the proxy can
+/// resolve.
 async fn guard(
     host: &str,
     port: u16,
     allowed: &HostAllowlist,
+    via_proxy: bool,
 ) -> Result<Option<Vec<SocketAddr>>, String> {
     if allowed.allows_host(host, port) {
         return Ok(None);
@@ -1179,7 +1279,20 @@ async fn guard(
     // A host we cannot resolve is a host we cannot vouch for, and that covers
     // being offline: the answer the guard would have judged never arrives. The
     // failure is the network's and not a verdict, so it is not worded as one.
-    let addrs = lookup(host, port).await?;
+    // Behind a proxy it is different. The proxy resolves the name, so our
+    // failed lookup proves nothing. We still try, because a name that does
+    // resolve to a private address must be refused either way.
+    let addrs = if via_proxy {
+        match resolve(host, port, PROXIED_DNS_ATTEMPTS).await {
+            Ok(addrs) => addrs,
+            Err(error) => {
+                tracing::debug!(host, port, %error, "name lookup failed, leaving it to the proxy");
+                return Ok(None);
+            }
+        }
+    } else {
+        lookup(host, port).await?
+    };
     if let Some(sa) = addrs
         .iter()
         .find(|sa| is_private_ip(&sa.ip()) && !allowed.allows_ip(sa.ip(), port))
@@ -1199,15 +1312,22 @@ async fn guard(
 
 /// Runs the guard and, when it had to resolve a name to reach its verdict,
 /// hands back the address the request must then be pinned to.
-async fn check_ssrf(url: &str, allowed: &HostAllowlist) -> Result<Option<DnsPin>, String> {
+async fn check_ssrf(
+    url: &str,
+    allowed: &HostAllowlist,
+    proxy_env: &ProxyEnv,
+) -> Result<Option<DnsPin>, String> {
     let (host, port) = extract_host_port(url).ok_or("cannot extract host from URL")?;
+    let via_proxy = proxy_env.proxies(url.starts_with(HTTPS_SCHEME), host);
     // curl takes one pinned address per host and port. We give it the first,
     // which is the one curl would have tried first anyway.
-    Ok(guard(host, port, allowed).await?.map(|addrs| DnsPin {
-        host: host.to_string(),
-        port,
-        addr: addrs[0].ip(),
-    }))
+    Ok(guard(host, port, allowed, via_proxy)
+        .await?
+        .map(|addrs| DnsPin {
+            host: host.to_string(),
+            port,
+            addr: addrs[0].ip(),
+        }))
 }
 
 fn is_private_ip(ip: &IpAddr) -> bool {
@@ -1310,6 +1430,8 @@ mod tests {
     const BLOCKED_PREFIX: &str = "blocked:";
     /// Reserved by RFC 6761, so every resolver answers NXDOMAIN for it.
     const UNRESOLVABLE_HOST: &str = "maki.invalid";
+    const PROXY_URL: &str = "http://127.0.0.1:3128";
+    const SOCKS_PROXY_URL: &str = "socks5://127.0.0.1:1080";
     const PAYLOAD: &str = "payload";
     const AUTH_HEADER: &str = "Authorization";
     const AUTH_VALUE: &str = "Bearer tok";
@@ -1347,7 +1469,7 @@ mod tests {
     /// The guard went async when the name lookup moved off the executor thread.
     /// Driving it to completion here keeps the tests below about the verdict.
     fn ssrf(url: &str, allowed: &HostAllowlist) -> Result<Option<DnsPin>, String> {
-        smol::block_on(check_ssrf(url, allowed))
+        smol::block_on(check_ssrf(url, allowed, &ProxyEnv::default()))
     }
 
     fn redirect(
@@ -1435,6 +1557,71 @@ mod tests {
         let err = ssrf(&url, &HostAllowlist::default()).expect_err(UNRESOLVABLE_HOST);
         assert!(!err.starts_with(BLOCKED_PREFIX), "{err}");
         assert!(err.contains(UNRESOLVABLE_HOST), "{err}");
+    }
+
+    fn https_proxy(no_proxy: &str) -> ProxyEnv {
+        ProxyEnv {
+            https: true,
+            no_proxy: no_proxy.to_string(),
+            ..ProxyEnv::default()
+        }
+    }
+
+    fn ssrf_via(url: &str, proxy_env: &ProxyEnv) -> Result<Option<DnsPin>, String> {
+        smol::block_on(check_ssrf(url, &HostAllowlist::default(), proxy_env))
+    }
+
+    #[test_case("", true ; "left_to_the_proxy")]
+    #[test_case(UNRESOLVABLE_HOST, false ; "no_proxy_keeps_the_strict_lookup")]
+    fn an_unresolvable_host_behind_a_proxy(no_proxy: &str, left_to_proxy: bool) {
+        let url = format!("https://{UNRESOLVABLE_HOST}/");
+        assert_eq!(
+            ssrf_via(&url, &https_proxy(no_proxy)).is_ok(),
+            left_to_proxy
+        );
+    }
+
+    #[test]
+    fn a_proxy_does_not_open_a_name_resolving_to_loopback() {
+        let err = ssrf_via("https://localhost/", &https_proxy("")).unwrap_err();
+        assert!(err.starts_with(BLOCKED_PREFIX), "{err}");
+    }
+
+    #[test_case("HTTPS_PROXY", PROXY_URL, false, true ; "uppercase_https_proxy")]
+    #[test_case("ALL_PROXY", PROXY_URL, true, true ; "all_proxy_covers_both")]
+    #[test_case("http_proxy", PROXY_URL, true, false ; "http_proxy_leaves_https_direct")]
+    #[test_case("HTTP_PROXY", PROXY_URL, false, false ; "uppercase_http_proxy_ignored_like_curl")]
+    #[test_case("HTTPS_PROXY", "", false, false ; "empty_counts_as_unset")]
+    #[test_case("ALL_PROXY", SOCKS_PROXY_URL, false, false ; "socks5_resolves_locally")]
+    #[test_case("ALL_PROXY", "SOCKS5H://127.0.0.1:1080", true, true ; "socks5h_resolves_remotely")]
+    #[test_case("ALL_PROXY", "127.0.0.1:3128", true, true ; "no_scheme_is_http")]
+    fn proxy_env_reads_what_curl_reads(var: &str, value: &str, http: bool, https: bool) {
+        let proxy_env = ProxyEnv::from_env(|name| (name == var).then(|| value.to_string()));
+        assert_eq!((proxy_env.http, proxy_env.https), (http, https));
+    }
+
+    #[test]
+    fn a_scheme_proxy_shadows_all_proxy() {
+        let proxy_env = ProxyEnv::from_env(|name| match name {
+            "https_proxy" => Some(SOCKS_PROXY_URL.to_string()),
+            "ALL_PROXY" => Some(PROXY_URL.to_string()),
+            _ => None,
+        });
+        assert!(!proxy_env.https);
+    }
+
+    #[test_case("*", "example.com", true ; "wildcard")]
+    #[test_case("example.com", "example.com", true ; "exact")]
+    #[test_case("example.com", "API.Example.com", true ; "subdomain_any_case")]
+    #[test_case(".example.com", "example.com", true ; "leading_dot")]
+    #[test_case("example.com.", "example.com.", true ; "trailing_dots")]
+    #[test_case("localhost, example.com", "example.com", true ; "comma_and_space_list")]
+    #[test_case("localhost,\texample.com", "example.com", true ; "tab_after_comma")]
+    #[test_case("localhost example.com", "example.com", false ; "blank_ends_the_list")]
+    #[test_case("example.com", "badexample.com", false ; "suffix_without_dot")]
+    #[test_case("api.example.com", "example.com", false ; "longer_entry")]
+    fn no_proxy_matches_cases(no_proxy: &str, host: &str, expected: bool) {
+        assert_eq!(no_proxy_matches(no_proxy, host), expected);
     }
 
     fn redirect_params(url: &str) -> RequestParams {
