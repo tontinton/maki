@@ -2,6 +2,7 @@ use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde_json::Value as JsonValue;
 
 pub(crate) const NIL_TOOL_RESULT_ERR: &str = "tool returned nil without an error message";
+pub(crate) const UNKNOWN_FIELD_ERR: &str = "unknown field";
 
 /// How many nulls an array encoding may invent for keys the table does not
 /// hold. A JSON null arrives as an absent Lua key, so a round trip has to be
@@ -16,6 +17,30 @@ const MAX_ARRAY_HOLES: usize = 4096;
 /// an explicit `false`.
 pub(crate) fn opt_bool(tbl: &Table, key: &str) -> Option<bool> {
     tbl.get::<Option<bool>>(key).ok().flatten()
+}
+
+/// Throws on a key of {table} outside {allowed}, so a typo is an error
+/// instead of an option that silently does nothing.
+pub(crate) fn reject_unknown_fields(
+    table: &Table,
+    allowed: &[&str],
+    context: &str,
+) -> LuaResult<()> {
+    for pair in table.pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        let Value::String(key) = key else {
+            return Err(mlua::Error::runtime(format!(
+                "{context}: field names must be strings"
+            )));
+        };
+        let key = key.to_str()?;
+        if !allowed.contains(&key.as_ref()) {
+            return Err(mlua::Error::runtime(format!(
+                "{context}: {UNKNOWN_FIELD_ERR} {key:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String> {

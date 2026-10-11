@@ -134,8 +134,8 @@ end
 -- The range, the version and the session all came with the snapshot the row
 -- was ranked for, and writing that range back is the same edit the user
 -- pressed Enter on. Nothing is re-read: `maki.ui.input_edit` weighs that
--- snapshot itself and refuses an edit the input has moved past, which is where
--- staleness belongs.
+-- snapshot itself, which is where staleness belongs. It moves the edit past
+-- text typed elsewhere and refuses it once the mention itself was touched.
 --
 -- The popup closes first, which hands the keys back before the edit fires the
 -- `InputChanged` this plugin is listening to.
@@ -162,14 +162,14 @@ function M.accept()
     return M.close()
   end
   M.close()
-  local ok, err = maki.ui.input_edit({
+  local edited, err = maki.ui.input_edit({
     start = view.start,
     stop = choice.st.cursor,
     text = choice.insert .. " ",
     version = choice.st.version,
     session_id = choice.st.session_id,
   })
-  if not ok then
+  if not edited then
     maki.ui.flash(EDIT_REFUSED .. tostring(err))
   end
 end

@@ -7,6 +7,7 @@ use maki_lua_macro::{lua_fn, lua_table};
 use maki_pack::Spec;
 use mlua::{Lua, MultiValue, RegistryKey, Result as LuaResult, Table, Value as LuaValue};
 
+use crate::api::util::convert::reject_unknown_fields;
 use crate::api::util::pair::{Pair, err_pair};
 
 /// What `pack.add` and `packadd` refuse once startup has loaded the declared
@@ -61,24 +62,6 @@ pub enum PackOp {
 }
 
 pub type PackStore = Arc<Mutex<PackDeclarations>>;
-
-fn reject_unknown_fields(table: &Table, allowed: &[&str], context: &str) -> LuaResult<()> {
-    for pair in table.clone().pairs::<LuaValue, LuaValue>() {
-        let (key, _) = pair?;
-        let LuaValue::String(key) = key else {
-            return Err(mlua::Error::runtime(format!(
-                "{context}: field names must be strings"
-            )));
-        };
-        let key = key.to_str()?;
-        if !allowed.contains(&key.as_ref()) {
-            return Err(mlua::Error::runtime(format!(
-                "{context}: unknown field {key:?}"
-            )));
-        }
-    }
-    Ok(())
-}
 
 fn finish(spec: Spec) -> LuaResult<Spec> {
     if maki_pack::git::http_source_has_userinfo(&spec.src) {

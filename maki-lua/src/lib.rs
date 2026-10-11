@@ -24,8 +24,8 @@ pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
     HintReader, HintSnapshot, InputEdit, InputRequest, LuaCommandInfo, LuaCommandReader,
     ModelRequest, NO_UI_ERR, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRequest, PlanRowAction,
-    SessionRequest, Split, TaskRequest, TitlePos, UiAction, UiAttachment, UiReply, WinCommand,
-    WinEvent, WinView,
+    SessionRequest, Split, TaskRequest, TextEdit, TitlePos, UiAction, UiAttachment, UiReply,
+    WinCommand, WinEvent, WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;

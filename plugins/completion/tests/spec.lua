@@ -189,7 +189,7 @@ local function harness(body)
     if h.refuse_edit then
       return nil, h.refuse_edit
     end
-    return true
+    return { version = edit.version + 1, cursor = edit.start + #edit.text }
   end
   maki.ui.buf = function()
     return {
