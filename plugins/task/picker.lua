@@ -4,6 +4,10 @@
 -- The host keeps the transcripts, so there is no task state here. Every
 -- refresh rebuilds the rows from maki.task.list(), and previewing is just
 -- maki.task.focus() with a restore on cancel.
+--
+-- Background sessions from plugins get their own section, and you can only look
+-- at them. Who may stop another plugin's work is still an open question (the same
+-- one as for shell jobs), so there is no key for it yet.
 
 local TextInput = require("maki.text_input")
 local ListPicker = require("maki.list_picker")
@@ -21,6 +25,7 @@ local RUNNING_COUNT_ICON = "● "
 local DONE_ICON = "✓ "
 local ERROR_ICON = "✗ "
 local NO_MATCHES_HINT = "  No matches"
+local BACKGROUND_SECTION = "Background"
 local CONFIRM_HINT = "  Ctrl+D again to delete"
 local MAIN_TASK_ID = "main"
 local FOOTER_KEYS = { { "Enter", "open" }, { "Ctrl+D", "delete" }, { "Esc", "cancel" } }
@@ -94,14 +99,46 @@ local function rebuild()
   update_footer(built.sections)
 end
 
-local function render()
-  local lines = {}
-  local inner = board.width - 4
-  board.reserved = ListPicker.render_header(board.win, lines, board.input, FILTER_PREFIX, inner)
-  local cursor_line = board.reserved
+local function background_rows()
+  return Rows.background(board.background, board.input:value(), os.time())
+end
+
+local function add_background(lines, background)
+  if #background == 0 then
+    return
+  end
+  lines[#lines + 1] = { { "  " .. BACKGROUND_SECTION, "keybind_section" } }
+  for _, row in ipairs(background) do
+    local label = "    " .. row.name .. "  " .. row.plugin
+    local pad = math.max(board.width - 3 - dispw(label) - dispw(row.detail), 1)
+    lines[#lines + 1] = { { label, "dim" }, { string.rep(" ", pad) .. row.detail .. " ", "dim" } }
+  end
+end
+
+-- The tick passes `passive` when only the Background text changed. No key was
+-- pressed, so the query block is still the one drawn last time.
+--
+-- Background sits under the main chat and above Running. Below a long task list
+-- it would end past the last row the cursor can reach, so only the mouse wheel
+-- could show it, and the next redraw would scroll it away again.
+local function render(passive)
+  if not passive then
+    board.header = {}
+    ListPicker.render_header(board.win, board.header, board.input, FILTER_PREFIX, board.width - 4)
+  end
+  -- `table.unpack` has an argument limit, and a long pasted query can wrap
+  -- into more lines than that.
+  local lines = table.move(board.header, 1, #board.header, 1, {})
+  local cursor_line = #lines
   local words = ListPicker.split_words(board.input:value())
+  local background
+  background, board.background_sig = background_rows()
   for _, row in ipairs(board.rows) do
     if row.section then
+      if background then
+        add_background(lines, background)
+        background = nil
+      end
       lines[#lines + 1] = { { "  " .. row.section, "keybind_section" } }
     end
     local task = row.task
@@ -136,11 +173,24 @@ local function render()
       cursor_line = #lines
     end
   end
-  if #board.rows == 0 then
+  if background then
+    add_background(lines, background)
+  end
+  if #lines == #board.header then
     lines[#lines + 1] = { { NO_MATCHES_HINT, "dim" } }
   end
   board.buf:set_lines(lines)
+  -- Passive renders send it too. The host keeps the cursor as a line number, so
+  -- when a Background session comes or goes it would sit on the wrong task.
+  -- This scrolls nothing new, as every buffer change already pulls the view
+  -- back to the cursor.
   board.win:set_cursor(cursor_line)
+end
+
+-- Background sessions send no events, so every tick asks again. That is cheap
+-- because the list lives right here in this Lua VM, with no trip to the host.
+local function load_background()
+  board.background = maki.agent.background({ session = board.session }) or {}
 end
 
 -- The one host round-trip. `list()` suspends this coroutine and the picker can
@@ -156,6 +206,7 @@ local function refresh()
     return
   end
   board.tasks = tasks
+  load_background()
   rebuild()
   render()
 end
@@ -199,7 +250,7 @@ local function move_sel(delta, wrap)
 end
 
 local function page_size()
-  return math.max(board.height - board.reserved - 1, 1)
+  return math.max(board.height - #board.header - 1, 1)
 end
 
 local function open_selected()
@@ -289,31 +340,9 @@ local function handle_key(key)
   end
 end
 
-local function open()
-  if board then
-    return
-  end
-  local buf = maki.ui.buf()
-  local win = maki.ui.open_win(buf, {
-    title = TITLE,
-    width = "70%",
-    height = "70%",
-    border = "rounded",
-    focus = true,
-    footer = FOOTER_KEYS,
-  })
-  board = {
-    win = win,
-    buf = buf,
-    width = win.width,
-    height = win.height,
-    input = TextInput.new(),
-    -- Owned by render(), the only place that knows how tall the query block
-    -- ended up once it wrapped.
-    reserved = 0,
-    tasks = {},
-    rows = {},
-  }
+local function browse()
+  -- Asking once is enough because switching chats closes the picker.
+  board.session = maki.session.current()
   refresh()
   if not board then
     return
@@ -337,6 +366,12 @@ local function open()
       elseif board.dirty then
         board.dirty = false
         refresh()
+      else
+        load_background()
+        local _, sig = background_rows()
+        if sig ~= board.background_sig then
+          render(true)
+        end
       end
     elseif ev.type == "key" then
       handle_key(ev.key)
@@ -349,6 +384,46 @@ local function open()
       board.height = ev.height
       render()
     end
+  end
+end
+
+local function open()
+  if board then
+    return
+  end
+  local buf = maki.ui.buf()
+  local win = maki.ui.open_win(buf, {
+    title = TITLE,
+    width = "70%",
+    height = "70%",
+    border = "rounded",
+    focus = true,
+    footer = FOOTER_KEYS,
+  })
+  board = {
+    win = win,
+    buf = buf,
+    width = win.width,
+    height = win.height,
+    input = TextInput.new(),
+    -- The query block as render() last drew it. Only render() knows how tall
+    -- it ended up once it wrapped, and a passive render reuses it as is.
+    header = {},
+    tasks = {},
+    rows = {},
+    background = {},
+  }
+  -- Without this an error leaves a frozen float behind, and `/tasks` refuses
+  -- to open again until a restart. By the time the error lands our board may
+  -- be closed already, or replaced by a newer `/tasks`, so we only close our
+  -- own.
+  local this_board = board
+  local ok, err = pcall(browse)
+  if not ok then
+    if board == this_board then
+      finish(false)
+    end
+    error(err, 0)
   end
 end
 

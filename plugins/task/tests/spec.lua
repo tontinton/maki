@@ -131,4 +131,34 @@ case("only_finished_subagents_are_deletable", function()
   eq(Rows.deletable(BENCH), true, "an errored task still counts as finished")
 end)
 
+case("background_rows_show_status_elapsed_and_cost", function()
+  local now = 10000
+  local entries = {
+    { name = "ci-monitor", plugin = "ci", status = "running", started_at = now - 125, cost = 0.0123 },
+    { name = "lint-watch", plugin = "lint", status = "idle", started_at = now + 5 },
+    { name = "nightly", plugin = "ci", status = "idle", started_at = now - 7300 },
+  }
+  local rows = Rows.background(entries, "", now)
+  eq(#rows, 3)
+  eq(rows[1].detail, "running · 2m · $0.012")
+  eq(rows[2].detail, "idle · <1m", "no price means no cost, and clock skew reads as fresh")
+  eq(rows[3].detail, "idle · 2h")
+  local filtered = Rows.background(entries, "lint", now)
+  eq(#filtered, 1)
+  eq(filtered[1].name, "lint-watch")
+end)
+
+case("background_signature_moves_only_when_the_drawn_text_does", function()
+  local function signature(status, age)
+    local entry = { name = "ci-monitor", plugin = "ci", status = status, started_at = 0 }
+    return select(2, Rows.background(status and { entry } or {}, "", age))
+  end
+  local before = signature("running", 125)
+  eq(signature("running", 155), before, "2m still reads 2m")
+  eq(signature("running", 5), signature("running", 59), "the first minute never ticks")
+  assert(signature("running", 185) ~= before, "2m turns 3m")
+  assert(signature("idle", 125) ~= before, "a status change")
+  assert(signature(nil, 125) ~= before, "the last session leaves")
+end)
+
 th.report()

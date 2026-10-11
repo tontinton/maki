@@ -7,6 +7,8 @@ local ListPicker = require("maki.list_picker")
 
 local RUNNING_SECTION = "Running"
 local FINISHED_SECTION = "Finished"
+local ELAPSED_UNITS = { { 3600, "h" }, { 60, "m" } }
+local UNDER_A_MINUTE = "<1m"
 
 local M = {}
 
@@ -43,6 +45,43 @@ function M.build(tasks, query)
     end
   end
   return { rows = rows, sections = { running = #running, finished = #finished } }
+end
+
+-- Minutes are the smallest unit. Seconds would change the text every second,
+-- and each redraw pulls a mouse-scrolled view back to the cursor.
+local function elapsed(secs)
+  for _, unit in ipairs(ELAPSED_UNITS) do
+    if secs >= unit[1] then
+      return math.floor(secs / unit[1]) .. unit[2]
+    end
+  end
+  return UNDER_A_MINUTE
+end
+
+-- A model with no price has no cost, and we leave it out rather than show a
+-- made up $0. `now` comes in from outside so tests can pin the clock.
+--
+-- The second result sums up the drawn text in one string. The picker checks it
+-- on every tick and redraws only when it changed, which keeps a mouse-scrolled
+-- view where the user left it.
+function M.background(entries, query, now)
+  local words = ListPicker.split_words(query)
+  local rows, parts = {}, {}
+  for _, entry in ipairs(entries) do
+    if ListPicker.matches(entry.name, words) then
+      local detail = entry.status .. " · " .. elapsed(now - entry.started_at)
+      if entry.cost then
+        detail = detail .. string.format(" · $%.3f", entry.cost)
+      end
+      rows[#rows + 1] = {
+        name = entry.name,
+        plugin = entry.plugin,
+        detail = detail,
+      }
+      parts[#parts + 1] = table.concat({ entry.name, entry.plugin, detail }, "\0")
+    end
+  end
+  return rows, table.concat(parts, "\n")
 end
 
 -- Only a finished subagent may leave the list. The main chat is the session
