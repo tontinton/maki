@@ -287,13 +287,12 @@ async fn system_prompt(
 /// straight into `maki.agent.session()` or use it to inspect what tools are
 /// available.
 ///
-/// Outside a tool call, skip `ctx` and name a live chat session in `opts`
-/// instead: `maki.agent.tools({ session = id, audience = ... })`. Its model,
-/// config and MCP stand in for the ctx.
+/// Without a `ctx`, pass `session = id` in `opts` to get the tools a
+/// background session of that chat would have.
 ///
-/// @param ctx LuaCtx|table Agent context, or the opts table of the ctx-less form.
+/// @param ctx LuaCtx|table Agent context, or `opts` when called without one.
 /// @param opts table? Required with a ctx. Fields:
-///   `session` (string) - ctx-less form only: id of the live chat session.
+///   `session` (string) - only without a ctx: id of a live chat session.
 ///   `audience` (string) - tool audience filter, e.g. `"general"`, `"subagent"`,
 ///     `"general_sub"`.
 /// Optional fields:
@@ -513,23 +512,42 @@ async fn call_tool(
 /// This is the main way to spin up a sub-conversation with its own history
 /// and tool set.
 ///
-/// Skip `ctx` to run one in the background: `maki.agent.session({ session =
-/// id, ... })` borrows its settings from that live chat session, so it works
-/// outside a tool call too. Call it from a task (a `maki.async.spawn` task, an
-/// autocmd callback or a tool handler). It lives until that task ends, the
-/// plugin unloads, the chat session ends, or you close it. An autocmd callback
-/// ends when it returns, so long running monitors belong in
-/// `maki.async.spawn`. Turns ending, Esc and rewinds in the chat leave it
-/// running. Nobody is around to answer its permission prompts, so anything
-/// without an allow rule is denied. It always runs in build mode, and while the
-/// chat is in plan mode its file-write tools are denied.
-/// `maki.agent.background()` lists these sessions.
+/// Without a `ctx`, `maki.agent.session({ session = id, ... })` opens a
+/// background session. It borrows the model, permissions and MCP of the live
+/// chat session `id` and is not tied to any turn. Call it and its `:prompt()`
+/// from a task: a `maki.async.spawn` task, an autocmd callback or a tool
+/// handler.
 ///
-/// @param ctx LuaCtx|table Agent context, or the opts table of the ctx-less form.
+/// It ends at the first of these:
+///
+/// - the task that opened it ends (an autocmd callback when it returns, a tool
+///   handler with its tool call)
+/// - `:close()`
+/// - the chat session ends (`/new`, closing the tab)
+/// - the plugin unloads (`/reload`)
+///
+/// Open long-running monitors from `maki.async.spawn`. Turn ends, Esc and
+/// rewinds leave them alone. Esc on a tool call still cancels a prompt that
+/// the tool's handler is waiting on.
+///
+/// Nobody can answer its permission prompts, so a call that would prompt is
+/// denied and the subagent is told why. Your rules, "allow for this session"
+/// answers and YOLO still apply, so add allow rules for what it runs (see
+/// [Permissions](/docs/permissions/)). It always runs in build mode. While the
+/// chat is in plan mode its file-write tools are denied. Its thinking never
+/// goes above the chat's current setting.
+///
+/// Its spend counts in the chat's totals after each turn, and `/tasks` lists
+/// it but cannot stop it yet. Setting `plugins.<name>.enabled = false` stops a
+/// plugin's monitors from the next `/reload`. Under `maki -p` and ACP there is
+/// no live chat session, so opening one fails with "session not live". The
+/// [maki.agent](#maki-agent) overview has a full monitor.
+///
+/// @param ctx LuaCtx|table Agent context, or `opts` when called without one.
 /// @param opts table? Required with a ctx. Optional fields:
-///   `session` (string) - ctx-less form only, and required there: id of the
-///     live chat session that owns this one. A session that is not live
-///     answers `(nil, "session not live: <id>")`.
+///   `session` (string) - required without a ctx: id of the live chat session
+///     that owns it. Returns `(nil, "session not live: <id>")` once that
+///     session has ended.
 ///   `model_spec` (string?) - model spec string to use instead of the parent model.
 ///   `system` (string?) - system prompt. Defaults to empty.
 ///   `tools` (table?) - tool definitions array (from `maki.agent.tools()`).
@@ -847,13 +865,16 @@ async fn session(
     Ok((Some(sess), None))
 }
 
-/// List the background sessions a chat session owns, the ones opened with
-/// `maki.agent.session({ session = id })`. Closed or ended ones are not listed.
+/// List the open background sessions of a chat session.
 ///
-/// Each entry has `id` (string), `plugin` (string) that opened it, `name`
-/// (string) given at open, `status` (`"running"` while a `:prompt()` runs,
-/// `"idle"` otherwise), `started_at` (integer, unix seconds) and `cost`
-/// (number?, dollars spent so far, nil when the model has no price).
+/// Each entry has these fields:
+///   `id` (string) Session id.
+///   `plugin` (string) Plugin that opened it.
+///   `name` (string) Name given at open.
+///   `status` (string) `"running"` during a `:prompt()`, otherwise `"idle"`.
+///   `started_at` (integer) Unix seconds.
+///   `cost` (number?) Dollars billed so far, updated after each turn. nil until
+///     a priced turn ends.
 ///
 /// @param opts table Required fields:
 ///   `session` (string) - id of the chat session.
@@ -903,6 +924,56 @@ lua_table! {
     /// local r = sess:prompt("Hello!")
     /// print(r.text)
     /// sess:close()
+    /// ```
+    ///
+    /// A CI monitor for each chat session the user opens. It wakes the agent
+    /// once when CI turns red and stays quiet until CI is green again. Each
+    /// wake costs a full agent turn, and the model words the same failure
+    /// differently every round, so comparing replies would wake it every time.
+    /// `SessionFocusChanged` also fires after `/reload`, so the monitor comes
+    /// back on its own.
+    ///
+    /// ```lua
+    /// local tasks, failing = {}, {}
+    ///
+    /// local function start(sid)
+    ///   if tasks[sid] then return end
+    ///   tasks[sid] = maki.async.spawn(function()
+    ///     while true do
+    ///       maki.async.sleep(5 * 60 * 1000)
+    ///       -- Prompts are denied here, so this needs an allow rule like `gh run list *`.
+    ///       local sess = maki.agent.session({
+    ///         session = sid,
+    ///         name = "ci-monitor",
+    ///         system = "Run `gh run list -L 3`. Reply exactly OK if all runs passed, else a 3-line failure summary.",
+    ///         tools = (maki.agent.tools({ session = sid, audience = "general_sub", only = { "bash" } })),
+    ///       })
+    ///       -- nil once the chat session is gone. SessionEnd below stops the loop.
+    ///       if sess then
+    ///         local r, err = sess:prompt("Check CI now.")
+    ///         sess:close()
+    ///         local text = not err and r.text:match("^%s*(.-)%s*$")
+    ///         if text == "OK" or text == "OK." then
+    ///           failing[sid] = nil
+    ///         elseif text and text ~= "" and not failing[sid] then
+    ///           failing[sid] = true
+    ///           maki.session.notify("[ci-monitor] " .. text, { session = sid, wake = true })
+    ///         end
+    ///       end
+    ///     end
+    ///   end)
+    /// end
+    ///
+    /// maki.api.create_autocmd("SessionFocusChanged", {
+    ///   callback = function(ev) start(ev.data.session_id) end,
+    /// })
+    /// maki.api.create_autocmd("SessionEnd", {
+    ///   callback = function(ev)
+    ///     local sid = ev.data.session_id
+    ///     if tasks[sid] then tasks[sid]:cancel() end
+    ///     tasks[sid], failing[sid] = nil, nil
+    ///   end,
+    /// })
     /// ```
     "maki.agent" => pub(crate) fn create_agent_table(plugin: Arc<str>), DOCS [
         resolve_model, system_prompt, tools, callable_tools, call_tool, session(plugin),
@@ -1329,8 +1400,8 @@ async fn prompt(
 /// leaves the work to the Lua garbage collector, which may never run while
 /// the VM sits idle, and the subagent's event relay stays alive until it does.
 ///
-/// Closing a background session cancels a prompt another task is still
-/// running on it, instead of waiting for that prompt to finish.
+/// On a background session, `close` cancels a running prompt rather than
+/// waiting for it.
 ///
 /// @return
 #[lua_fn]

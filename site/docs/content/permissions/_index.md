@@ -182,6 +182,11 @@ ACP clients offer the four options the protocol defines. "Allow always" lasts
 for the session, and "Reject always" is a project answer that follows folder
 trust like the TUI, reading "Reject for this session" in an untrusted folder.
 
+Plugin [background subagents](/docs/lua-api/#maki-agent-session) follow these
+rules, but nobody can answer their prompts, so a call that would prompt is
+denied. Give them allow rules for what they run. In plan mode their file writes
+are denied too.
+
 ### Scope Generalization
 
 When you pick "always allow" (or always deny for MCP), the saved scope is generalized so it stays useful beyond that one call:
