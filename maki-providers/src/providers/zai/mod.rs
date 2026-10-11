@@ -284,7 +284,6 @@ impl Provider for Zai {
 }
 
 /// `glm-5.3` -> `(5, 3)`, `glm-5.3-flash` -> `(5, 3)`, `glm-5-code` -> `(5, 0)`.
-/// Same trick as `claude_version`.
 fn glm_version(model_id: &str) -> Option<(u32, u32)> {
     let mut parts = model_id.strip_prefix("glm-")?.split(['-', '.']);
     let major = parts.next()?.parse().ok()?;

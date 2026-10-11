@@ -574,26 +574,55 @@ pub(crate) const FALLBACK_MAX_THINKING_BUDGET: u32 = 32_768;
 const ADAPTIVE_SINCE: (u32, u32) = (5, 0);
 const ADAPTIVE_SINCE_OPUS: (u32, u32) = (4, 7);
 const OPUS: &str = "opus";
+const CLAUDE: &str = "claude";
+const SNAPSHOT_DATE_LEN: usize = "20250514".len();
 
 /// `claude-opus-4.7` -> `("opus", (4, 7))`, `claude-opus-5-1m` -> `("opus", (5, 0))`.
-/// Copilot writes the version with a dot, hence the two separators. Legacy ids
-/// put the version first (`claude-3-5-sonnet-20241022`), so a numeric family
-/// tells us there is no modern version to read here. Gateway ids keep a
-/// vendor prefix (`anthropic/claude-opus-4-7`), so read the last path segment.
+/// Every provider dresses the id up its own way. Copilot writes `claude-opus-4.7`,
+/// Bedrock `us.anthropic.claude-opus-4-7-v1:0`, Vertex `claude-opus-4-1@20250805`
+/// and OpenRouter `anthropic/claude-opus-4.7:thinking`. So any char that is not
+/// a letter or digit splits the id, and we read what follows the `claude` word.
+/// Old ids put the version first (`claude-3-5-sonnet`), and a numeric family
+/// tells us there is no modern version to read.
 fn claude_version(model_id: &str) -> Option<(&str, (u32, u32))> {
-    let bare = model_id.rsplit('/').next().unwrap_or(model_id);
-    let mut parts = bare.strip_prefix("claude-")?.split(['-', '.']);
-    let family = parts.next().filter(|f| f.parse::<u32>().is_err())?;
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let mut tokens = model_id
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .skip_while(|token| *token != CLAUDE)
+        .skip(1);
+    let family = tokens.next().filter(|f| f.parse::<u32>().is_err())?;
+    let major = tokens.next().and_then(version_number)?;
+    let minor = tokens.next().and_then(version_number).unwrap_or(0);
     Some((family, (major, minor)))
+}
+
+/// Snapshot dates can sit right where the minor goes (`claude-opus-4-20250514`).
+/// We once read that date as the minor, and Opus 4 looked newer than 4.7.
+fn version_number(token: &str) -> Option<u32> {
+    token
+        .parse()
+        .ok()
+        .filter(|_| token.len() < SNAPSHOT_DATE_LEN)
+}
+
+/// Models from [`ADAPTIVE_SINCE`] on reject `type: "enabled"` with a 400. A
+/// version check, not an allowlist, so future releases and new families work
+/// automatically. Reads the id, not the provider, so a gateway serving Claude
+/// is covered too.
+fn requires_adaptive(model_id: &str) -> bool {
+    claude_version(model_id).is_some_and(|(family, version)| {
+        let since = if family == OPUS {
+            ADAPTIVE_SINCE_OPUS
+        } else {
+            ADAPTIVE_SINCE
+        };
+        version >= since
+    })
 }
 
 /// The releases that made thinking adaptive-only also reject any sampling
 /// parameter (`top_p`, `temperature`) with a 400, even with thinking off.
-/// Reads the id, not the provider, so a gateway serving Claude is covered too.
 pub(crate) fn rejects_sampling(model_id: &str) -> bool {
-    ThinkingConfig::requires_adaptive(model_id)
+    requires_adaptive(model_id)
 }
 
 /// How a provider's effort knob speaks: which levels its API accepts, what
@@ -924,7 +953,7 @@ impl ThinkingConfig {
     /// adaptive knob plus `output_config.effort`; legacy models get a plain
     /// token budget.
     pub fn apply_to_body(self, body: &mut Value, model: &Model) {
-        if Self::requires_adaptive(&model.id) {
+        if requires_adaptive(&model.id) {
             if matches!(self, Self::Off) {
                 return;
             }
@@ -944,20 +973,6 @@ impl ThinkingConfig {
                 body["thinking"] = json!({"type": "enabled", "budget_tokens": n});
             }
         }
-    }
-
-    /// Models from [`ADAPTIVE_SINCE`] on reject `type: "enabled"` with a 400. A
-    /// version check, not an allowlist, so future releases and new families
-    /// work automatically.
-    fn requires_adaptive(model_id: &str) -> bool {
-        claude_version(model_id).is_some_and(|(family, version)| {
-            version
-                >= if family == OPUS {
-                    ADAPTIVE_SINCE_OPUS
-                } else {
-                    ADAPTIVE_SINCE
-                }
-        })
     }
 
     pub fn apply_reasoning_effort(self, body: &mut Value, dialect: &EffortDialect, model: &Model) {
@@ -1712,16 +1727,26 @@ mod tests {
     #[test_case(ThinkingConfig::Adaptive, "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}}) ; "adaptive_adaptive_model")]
     #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_7")]
     #[test_case(ThinkingConfig::Effort(Low), "claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "low"}}) ; "effort_low_passthrough")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-8-1m", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_8_long_context")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-5-1m", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_5_unparsable_minor")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4.7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_copilot_dotted_id")]
     #[test_case(ThinkingConfig::Budget(10000), "claude-sonnet-5", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_sonnet_5")]
-    #[test_case(ThinkingConfig::Budget(10000), "anthropic/claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_gateway_prefixed_id")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-3-5-sonnet-20241022", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_dated_id")]
     fn thinking_apply_to_body(config: ThinkingConfig, model_id: &str, expected: Value) {
         let mut body = json!({});
         config.apply_to_body(&mut body, &thinking_model(model_id));
         assert_eq!(body, expected);
+    }
+
+    #[test_case("claude-opus-4-7", Some(("opus", (4, 7))) ; "anthropic")]
+    #[test_case("claude-opus-4.7", Some(("opus", (4, 7))) ; "copilot_dotted")]
+    #[test_case("claude-opus-5-1m", Some(("opus", (5, 0))) ; "long_context_suffix")]
+    #[test_case("anthropic/claude-opus-4-7", Some(("opus", (4, 7))) ; "gateway_prefix")]
+    #[test_case("anthropic/claude-opus-5:thinking", Some(("opus", (5, 0))) ; "openrouter_variant")]
+    #[test_case("anthropic.claude-opus-5-5", Some(("opus", (5, 5))) ; "bedrock")]
+    #[test_case("us.anthropic.claude-sonnet-5-v1:0", Some(("sonnet", (5, 0))) ; "bedrock_region")]
+    #[test_case("claude-opus-4-8@20260101", Some(("opus", (4, 8))) ; "vertex_snapshot")]
+    #[test_case("claude-opus-4-20250514", Some(("opus", (4, 0))) ; "date_is_not_a_minor")]
+    #[test_case("claude-3-5-sonnet-20241022", None ; "legacy_version_first")]
+    #[test_case("gpt-5", None ; "not_claude")]
+    fn claude_version_parses(model_id: &str, expected: Option<(&str, (u32, u32))>) {
+        assert_eq!(claude_version(model_id), expected);
     }
 
     const TRIMMED_TURN: u32 = 8_192;
