@@ -393,7 +393,7 @@ impl<'h> Agent<'h> {
                 self.history.push(message);
             }
         }
-        self.tell_changes()?;
+        self.tell_changes();
         if !message.content.is_empty() {
             self.history.push(message);
         }
@@ -443,26 +443,19 @@ impl<'h> Agent<'h> {
     /// heard. Every fact is compared every time, so no path that changes one
     /// (a run start, an interrupt switching modes, a model switch, a
     /// compaction) has to remember to tell it.
-    fn tell_changes(&mut self) -> Result<(), AgentError> {
+    fn tell_changes(&mut self) {
         // Plan mode is in no rendered prompt, so only the agent knows it.
         let now = LiveFacts {
             plan: self.mode.plan_path().map(Path::to_path_buf),
             prompt: self.prompt_facts.clone(),
         };
-        let Some(update) = self
+        if let Some(update) = self
             .history
             .told()
             .and_then(|told| context_update(&told, &now))
-        else {
-            return Ok(());
-        };
-        if let Some(summary) = &update.display_text {
-            self.event_tx.send(AgentEvent::Notice {
-                text: summary.clone(),
-            })?;
+        {
+            self.history.push(update);
         }
-        self.history.push(update);
-        Ok(())
     }
 
     /// Picks up a model selected or refreshed while the run was working. The
@@ -520,7 +513,7 @@ impl<'h> Agent<'h> {
             .last()
             .is_some_and(|m| matches!(m.role, Role::Assistant));
         if !continues_answer {
-            self.tell_changes()?;
+            self.tell_changes();
         }
         Ok(())
     }

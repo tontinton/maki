@@ -497,7 +497,6 @@ mod tests {
     const NEW_TEXT: &str = "fn main() { run() }\n";
     const MONITOR_NOTE: &str = "[monitor] build failed";
     const CONTEXT_UPDATE_TEXT: &str = "<context-update>date: tomorrow</context-update>";
-    const CONTEXT_UPDATE_SUMMARY: &str = "Date changed";
 
     #[test_case("1: mod render\n2: mod segment", "```\n1: mod render\n2: mod segment\n```" ; "plain_text_gets_default_fence")]
     #[test_case("has ```rust\ncode\n``` inside", "````\nhas ```rust\ncode\n``` inside\n````" ; "fence_longer_than_inner_backticks")]
@@ -592,13 +591,7 @@ mod tests {
     }
 
     #[test_case(Message::observation(MONITOR_NOTE.into()) ; "observation")]
-    #[test_case(
-        Message::context_update(
-            CONTEXT_UPDATE_TEXT.into(),
-            CONTEXT_UPDATE_SUMMARY.into(),
-            Default::default(),
-        ) ; "context_update"
-    )]
+    #[test_case(Message::context_update(CONTEXT_UPDATE_TEXT.into(), Default::default()) ; "context_update")]
     fn replay_never_speaks_host_text_as_the_user(msg: Message) {
         assert!(updates_json(&[msg]).is_empty());
     }

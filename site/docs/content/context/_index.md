@@ -27,7 +27,7 @@ The left column is the fixed overhead of every single request, so Maki keeps it 
 
 Maki builds the system prompt and tool definitions once per session and sends the same bytes on every request. Providers cache by prefix, so an edit near the front makes the next request pay for the whole conversation again. On Claude models it also drops earlier thinking.
 
-When something changes mid-session (the date, the model, plan mode, the directory after `/cd`, a new memory tag), Maki appends a short update before your next message. The transcript shows it as one dim line, such as `Told the model: date, plan mode`.
+When something changes mid-session (the date, the model, plan mode, the directory after `/cd`, a new memory tag), Maki appends a short update before your next message.
 
 A fresh prompt is built only on compaction, or for a change an update cannot carry: different tools (`/reload`, `/workflow`, a model with other capabilities) or a different system prompt passed in [headless](../headless/) mode. Such a change starts the cache over, and Maki tells you when it happens.
 

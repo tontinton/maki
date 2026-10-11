@@ -35,7 +35,6 @@ const UPDATE_OPEN: &str = "<context-update>\nThis changed since the conversation
 const UPDATE_CLOSE: &str = "\n</context-update>";
 pub(crate) const PLAN_ENDED: &str = "Plan mode ended. You may edit files again.";
 const INSTRUCTIONS_GONE: &str = "No project instructions apply anymore.";
-const SUMMARY_PREFIX: &str = "Told the model: ";
 const FINGERPRINT_BYTES: usize = 16;
 pub(crate) const FRAME_REBUILT: &str =
     "The tools or the system prompt changed, so the prompt was rebuilt and its cache starts over.";
@@ -236,44 +235,34 @@ pub(crate) fn context_update(told: &LiveFacts, now: &LiveFacts) -> Option<Messag
         return None;
     }
     let mut parts = Vec::new();
-    let mut topics = Vec::new();
-    let mut note = |topic: &str, text: String| {
-        topics.push(topic.to_owned());
-        parts.push(text);
-    };
     if let Some(date) = &update.date {
-        note("date", format!("Date is now {date}."));
+        parts.push(format!("Date is now {date}."));
     }
     if let Some(model) = &update.model {
-        note("model", format!("You are now running as {model}."));
+        parts.push(format!("You are now running as {model}."));
     }
     if let Some(cwd) = &update.cwd {
-        note("cwd", format!("Working directory is now {cwd}."));
+        parts.push(format!("Working directory is now {cwd}."));
     }
     if let Some(instructions) = &update.instructions {
-        let text = if instructions.trim().is_empty() {
+        parts.push(if instructions.trim().is_empty() {
             INSTRUCTIONS_GONE.to_owned()
         } else {
             format!("Project instructions now read:{instructions}")
-        };
-        note("instructions", text);
+        });
     }
     match &update.plan {
-        Some(PlanChange::Entered(path)) => note("plan mode", plan_text(path)),
-        Some(PlanChange::Ended) => note("build mode", PLAN_ENDED.to_owned()),
+        Some(PlanChange::Entered(path)) => parts.push(plan_text(path)),
+        Some(PlanChange::Ended) => parts.push(PLAN_ENDED.to_owned()),
         None => {}
     }
     for (key, content) in &update.hints {
-        match content {
-            Some(content) => note(key, format!("Updated `{key}`:\n{}", content.trim())),
-            None => note(key, format!("`{key}` no longer applies.")),
-        }
+        parts.push(match content {
+            Some(content) => format!("Updated `{key}`:\n{}", content.trim()),
+            None => format!("`{key}` no longer applies."),
+        });
     }
-    Some(Message::context_update(
-        wrap_update(&parts),
-        format!("{SUMMARY_PREFIX}{}", topics.join(", ")),
-        update,
-    ))
+    Some(Message::context_update(wrap_update(&parts), update))
 }
 
 #[cfg(test)]

@@ -720,11 +720,7 @@ mod tests {
 
         let mut grown_tools = tools.clone();
         grown_tools.as_array_mut().unwrap().push(deferred("late"));
-        messages.push(Message::context_update(
-            "date".into(),
-            "date".into(),
-            Default::default(),
-        ));
+        messages.push(Message::context_update("date".into(), Default::default()));
         messages.push(Message::user("more".into()));
         let after = encode(&messages, &grown_tools);
 

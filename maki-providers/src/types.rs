@@ -317,8 +317,8 @@ pub enum MessageKind {
     Observation,
     /// Something the system prompt said has changed (date, model, plan
     /// mode...). Editing the prompt would void the cache and every thinking
-    /// block bound to it, so we append this instead. Views only show its
-    /// `display_text` summary.
+    /// block bound to it, so we append this instead. Views hide it, since it
+    /// mostly repeats what the user just did (`/cd`, a model switch).
     ///
     /// It carries the facts it told, so what the model holds true can be read
     /// off the transcript, even after a resume or a rewind.
@@ -396,12 +396,12 @@ impl Message {
         self.kind == MessageKind::Observation
     }
 
-    pub fn context_update(text: String, summary: String, update: FactsUpdate) -> Self {
+    pub fn context_update(text: String, update: FactsUpdate) -> Self {
         Self {
             role: Role::User,
             content: vec![ContentBlock::Text { text }],
-            display_text: Some(summary),
             kind: MessageKind::ContextUpdate(Arc::new(update)),
+            ..Default::default()
         }
     }
 
@@ -1282,7 +1282,6 @@ mod tests {
 
     const PROMPT: &str = "fix the flaky login test";
     const UPDATE_TEXT: &str = "<context-update>plan mode is on</context-update>";
-    const UPDATE_SUMMARY: &str = "Plan mode on";
     const UPDATE_DATE: &str = "2026-10-02";
     const UPDATE_PLAN: &str = "/project/.maki/plan.md";
     const UPDATE_HINT_SLOT: &str = "memory/tags";
@@ -1362,26 +1361,23 @@ mod tests {
         let stored = json!({
             "role": "user",
             "content": [{ "type": "text", "text": UPDATE_TEXT }],
-            "display_text": UPDATE_SUMMARY,
             "kind": { "context_update": {
                 "date": UPDATE_DATE,
                 "plan": { "entered": UPDATE_PLAN },
                 "hints": { UPDATE_HINT_SLOT: UPDATE_HINT, GONE_HINT_SLOT: null }
             } }
         });
-        let update =
-            Message::context_update(UPDATE_TEXT.into(), UPDATE_SUMMARY.into(), plan_mode_facts());
+        let update = Message::context_update(UPDATE_TEXT.into(), plan_mode_facts());
         assert_eq!(serde_json::to_value(&update).unwrap(), stored);
 
         let loaded: Message = serde_json::from_value(stored).unwrap();
         assert_eq!(loaded.facts_update(), Some(&plan_mode_facts()));
-        assert_eq!(loaded.display_text.as_deref(), Some(UPDATE_SUMMARY));
     }
 
     /// A first run in plan mode tells the model before the user's prompt, and
     /// the session must still be named after what the user typed.
-    #[test_case(Message::context_update(UPDATE_TEXT.into(), UPDATE_SUMMARY.into(), plan_mode_facts()) ; "context_update")]
-    #[test_case(Message::observation(UPDATE_TEXT.into())                                               ; "observation")]
+    #[test_case(Message::context_update(UPDATE_TEXT.into(), plan_mode_facts()) ; "context_update")]
+    #[test_case(Message::observation(UPDATE_TEXT.into())                       ; "observation")]
     fn title_skips_what_the_host_wrote(host: Message) {
         assert_eq!(
             generate_title(&[host, Message::user(PROMPT.into())]),

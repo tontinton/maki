@@ -222,7 +222,7 @@ mod tests {
     }
 
     fn context_update() -> Message {
-        Message::context_update("plan mode".into(), "plan mode".into(), Default::default())
+        Message::context_update("plan mode".into(), Default::default())
     }
 
     /// Left behind, an update would sit in front of whatever is sent next,
