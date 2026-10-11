@@ -15,8 +15,8 @@ use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
 use crate::tools::registry::{InstalledHook, RegisteredTool, Tool, ToolInvocation};
 use crate::tools::{
-    CallOrigin, Deadline, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience,
-    ToolContext, truncate_bytes,
+    CallOrigin, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience, ToolContext,
+    truncate_bytes,
 };
 use crate::{
     AgentError, AgentEvent, CallRecord, TextOutput, ToolDoneEvent, ToolOutput, ToolStartEvent,
@@ -339,10 +339,7 @@ impl<'a> Hook<'a> {
     /// answer would inherit a window the call already used up.
     fn window(&self) -> Instant {
         let cap = Instant::now() + HOOK_CHAIN_MAX;
-        match self.ctx.deadline {
-            Deadline::At(at) => at.min(cap),
-            Deadline::None => cap,
-        }
+        self.ctx.deadline.at().map_or(cap, |at| at.min(cap))
     }
 }
 
@@ -847,6 +844,9 @@ async fn enforce_permission(
     }
 }
 
+/// Every permission check passes through here, so this is where the clock
+/// stops while the user decides. Someone who answers a minute later should
+/// not find the call already timed out before it even started.
 async fn gate(
     ctx: &ToolContext,
     tool: &ToolKey,
@@ -854,17 +854,18 @@ async fn gate(
     id: &str,
     ask: Option<&str>,
 ) -> Result<(), String> {
-    ctx.permissions
-        .enforce(
-            tool,
-            scopes,
-            &ctx.event_tx,
-            ctx.user_response_rx.as_deref(),
-            id,
-            &ctx.cancel,
-            ctx.mode.plan_path(),
-            ask,
-        )
+    let decision = ctx.permissions.enforce(
+        tool,
+        scopes,
+        &ctx.event_tx,
+        ctx.user_response_rx.as_deref(),
+        id,
+        &ctx.cancel,
+        ctx.mode.plan_path(),
+        ask,
+    );
+    ctx.deadline
+        .paused_while(decision)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1109,9 +1110,9 @@ mod tests {
         stub_ctx_with_permissions,
     };
     use crate::tools::{
-        BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-        PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience, ToolExecResult,
-        ToolHook, local_tool,
+        BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
+        ParseError, PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience,
+        ToolExecResult, ToolHook, local_tool,
     };
     use crate::{AgentMode, Envelope, EventSender, InstructionBlock};
 
@@ -1157,6 +1158,7 @@ mod tests {
     const SCOPELESS_TOOL_NAME: &str = "scopeless";
     const SEARCH_QUERY_FIELD: &str = "query";
     const SEARCH_QUERY: &str = "probe";
+    const PROMPT_THINK_TIME: Duration = Duration::from_millis(20);
 
     fn recent_calls(entries: &[(&str, Value)]) -> RecentCalls {
         let mut rc = RecentCalls::new();
@@ -1667,9 +1669,9 @@ mod tests {
     #[test]
     fn a_firing_carries_the_calls_cancellation_and_deadline() {
         smol::block_on(async {
-            let at = Instant::now() + HOOK_CALL_DEADLINE;
             let mut ctx = build_ctx();
-            ctx.deadline = Deadline::At(at);
+            ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
+            let at = ctx.deadline.at();
             ctx.cancel = cancelled_token();
             let (ctx, hook) = hooked_ctx(ctx);
 
@@ -1677,7 +1679,11 @@ mod tests {
 
             let firing = hook.at(HookStage::Input).expect("the input stage fired");
             assert!(firing.cancelled, "the call's own token, not a fresh one");
-            assert_eq!(firing.deadline, at, "and no later than the call itself");
+            assert_eq!(
+                Some(firing.deadline),
+                at,
+                "and no later than the call itself"
+            );
         });
     }
 
@@ -2588,6 +2594,48 @@ mod tests {
                 done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
                 "error should be the permission-denied message, got: {}",
                 done.output.as_text()
+            );
+        });
+    }
+
+    /// We measure the pause on the output hook's window instead of racing the
+    /// tool against a tiny budget, so a slow machine can't fail this. The tool
+    /// shares that same deadline, so it gets the time back too.
+    #[test]
+    fn time_on_a_permission_prompt_does_not_spend_the_deadline() {
+        smol::block_on(async {
+            let mut ctx = rules_ctx(&AgentMode::Build, Vec::new());
+            ctx.registry = registered(Arc::new(GuardedMock));
+            let hook = RecordingHook::default();
+            ctx.registry.set_hook(hook.clone());
+            let (event_tx, events) = flume::unbounded();
+            let (answer_tx, answer_rx) = flume::unbounded();
+            ctx.event_tx = EventSender::new(event_tx, 0);
+            ctx.user_response_rx = Some(Arc::new(AsyncMutex::new(answer_rx)));
+            ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
+
+            let user = async {
+                while !matches!(
+                    events.recv_async().await.unwrap().event,
+                    AgentEvent::PermissionRequest { .. }
+                ) {}
+                smol::Timer::after(PROMPT_THINK_TIME).await;
+                answer_tx
+                    .send(TaggedAnswer::new(TEST_ID, PermissionAnswer::AllowOnce).encode())
+                    .unwrap();
+            };
+            let (done, ()) = futures_lite::future::zip(
+                dispatch(&ctx, GUARDED_TOOL_NAME, &serde_json::json!({})),
+                user,
+            )
+            .await;
+
+            assert!(!done.is_error, "got: {}", done.output.as_text());
+            let input = hook.at(HookStage::Input).expect("the input stage fired");
+            let output = hook.at(HookStage::Output).expect("the output stage fired");
+            assert!(
+                output.deadline - input.deadline >= PROMPT_THINK_TIME,
+                "the prompt ate into the call's budget"
             );
         });
     }

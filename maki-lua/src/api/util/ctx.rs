@@ -53,7 +53,7 @@ pub(crate) struct AgentContext(ToolContext);
 impl From<&ToolContext> for AgentContext {
     fn from(ctx: &ToolContext) -> Self {
         let mut c = ctx.clone();
-        c.deadline = Deadline::None;
+        c.deadline = Deadline::default();
         c.tool_output_lines = ToolOutputLines::default();
         Self(c)
     }
@@ -464,7 +464,7 @@ mod tests {
             Some(session_ref()),
             "the session owns the whole run, so it is not per-call state"
         );
-        assert!(matches!(agent.deadline, Deadline::None));
+        assert!(agent.deadline.at().is_none());
         assert_eq!(agent.tool_output_lines, ToolOutputLines::default());
         assert!(
             agent.local_tools.contains_key(LOCAL_TOOL_NAME),

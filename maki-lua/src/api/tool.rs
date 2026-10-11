@@ -13,7 +13,7 @@ use maki_agent::tools::Tool;
 use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
-    BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
+    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
     PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
     is_tool_enabled, timeout_annotation,
 };
@@ -442,7 +442,6 @@ impl ToolInvocation for LuaToolInvocation {
         // tool dispatched is built while its parent is being polled, and that
         // is the only moment we can tell it runs under the parent's slot.
         let nested = crate::runtime::under_inflight_slot();
-        let deadline = ctx.deadline;
         let plugin = self.plugin;
         let tool = self.tool;
         let input = self.input;
@@ -450,18 +449,15 @@ impl ToolInvocation for LuaToolInvocation {
         let tool_timeout = self.timeout;
 
         Box::pin(async move {
-            let effective_secs: Option<u64> = match tool_timeout {
-                Some(d) => match deadline.cap_timeout(d.as_secs()) {
-                    Ok(s) => Some(s),
-                    Err(e) => return Err(e).into(),
-                },
-                None => match deadline {
-                    Deadline::At(_) => match deadline.cap_timeout(u64::MAX) {
-                        Ok(s) => Some(s),
-                        Err(e) => return Err(e).into(),
-                    },
-                    Deadline::None => None,
-                },
+            let deadline_at = ctx.deadline.at();
+            let effective_secs = match tool_timeout
+                .map(|timeout| timeout.as_secs())
+                .or(deadline_at.map(|_| u64::MAX))
+                .map(|secs| ctx.deadline.cap_timeout(secs))
+                .transpose()
+            {
+                Ok(secs) => secs,
+                Err(e) => return Err(e).into(),
             };
 
             let (reply_tx, reply_rx) = flume::bounded::<ToolCallReply>(1);
@@ -477,10 +473,7 @@ impl ToolInvocation for LuaToolInvocation {
                     tool: Arc::clone(&tool),
                     input,
                     ctx: Box::new(lua_ctx),
-                    deadline: match deadline {
-                        Deadline::At(t) => Some(t),
-                        Deadline::None => None,
-                    },
+                    deadline: deadline_at,
                     reply: reply_tx,
                     live,
                     nested,

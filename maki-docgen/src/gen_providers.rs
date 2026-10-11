@@ -301,18 +301,20 @@ The [Lua API](/docs/lua-api/#maki-provider-register) lists every field. This sec
 
 ### Select a provider package
 
-Models.dev is a public metadata catalog. Maki uses its connection metadata to build generic clients for providers it does not implement locally. A package can supply its own discovery and request policy for one of those names when you select it in `providers.toml`:
+Maki builds a generic client for each [models.dev](https://models.dev/) provider it does not implement itself. A plugin cannot register one of those names unless you select its [package](/docs/packages/) in `providers.toml`:
 
 ```toml
 [acme]
 plugin = "acme-provider"
 ```
 
-Use the installed package's name. This selects the package that may receive the existing credentials saved under `acme`. Other packages cannot register that name. Compiled and bundled provider names remain reserved. An entry cannot select both a `plugin` and a custom `protocol`.
+Only the selected package can then register `acme`, and it receives any credentials already saved under that name. `plugin` cannot be combined with `protocol`, and built-in names stay [reserved](#slug-rules).
 
-The setting grants no permissions. Install and approve the package as usual. A selected package that is missing, fails to load, or no longer registers the provider makes that provider unavailable. Maki does not silently use a generic catalog client in its place. Ownership is checked when plugins load. The loaded provider remains available until the next reload, even if the selection or catalog changes.
+Selection grants no permissions, so the package still needs its usual approval. If the package is missing, fails to load, or does not register the provider, the provider is unavailable. Maki does not fall back to the generic client.
 
-Reload plugins or restart Maki after changing the selection. Remove `plugin` and reload to restore the default catalog fallback. Optional providers in a larger package can check the selection before registering:
+Maki reads the selection when plugins load. Run `/reload` or restart after changing it. Until then the loaded provider keeps working. To return to the generic client, remove `plugin` and reload.
+
+A package that ships several providers can skip the ones you did not select:
 
 ```lua
 if not maki.provider.is_selected("acme") then
@@ -403,7 +405,8 @@ The value is any JSON object. Each slug gets its own file at `~/.local/state/mak
 
 - Starts with a letter or digit, then only letters, digits, `_` and `-`
 - Not a slug Maki ships, built in or as a bundled plugin, even one you turned off. Your plugin would otherwise get the API key saved for that provider
-- Not a slug from `providers.toml` or another plugin
+- Not a models.dev provider name, unless you [selected](#select-a-provider-package) the package for it
+- Not a custom provider from `providers.toml` or a slug another plugin registered
 
 ### Migrating from provider scripts
 

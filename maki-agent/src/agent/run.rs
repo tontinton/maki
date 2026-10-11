@@ -930,7 +930,7 @@ impl<'h> Agent<'h> {
             call_instructions: CallInstructions::default(),
             cancel: self.cancel.clone(),
             mcp: self.mcp.clone(),
-            deadline: Deadline::None,
+            deadline: Deadline::default(),
             config: self.config.clone(),
             tool_filter,
             tool_output_lines: self.tool_output_lines,
