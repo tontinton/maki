@@ -7,7 +7,7 @@ use std::sync::Arc;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{McpConfigErrors, McpSnapshotReader};
 use maki_config::{ModelPolicy, PermissionsConfig, ProjectConfig, UiConfig};
-use maki_lua::{EventHandle, HintReader, InputEdit, KeymapReader, LuaCommandReader};
+use maki_lua::{EventHandle, HintReader, InputEdit, KeymapReader, LuaCommandReader, TextEdit};
 use maki_providers::{Model, ModelTier};
 use maki_storage::StateDir;
 use ratatui::layout::Rect;
@@ -75,11 +75,14 @@ pub fn plugin_edit(
     text: &str,
 ) -> Result<(), String> {
     let edit = InputEdit {
-        start,
-        stop,
-        text: text.to_owned(),
+        edits: vec![TextEdit {
+            start,
+            stop,
+            text: text.to_owned(),
+        }],
         cursor: None,
         version: app.input_box.buffer.version(),
+        strict: false,
         session_id: app.state.session.id.to_string(),
         plugin: Arc::from(PLUGIN),
     };

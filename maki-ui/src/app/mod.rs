@@ -154,6 +154,7 @@ pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (ali
 
 pub(crate) const INPUT_NOT_LIVE_ERR: &str =
     "the chat input is not on screen, so it cannot be edited";
+pub(crate) const STALE_VERSION_ERR: &str = "input changed since version";
 
 /// Who has moved the chat input since the last tick, and the buffer version
 /// that writer left behind.
@@ -683,9 +684,12 @@ impl App {
         })
     }
 
-    /// Refuses an edit the input has moved on from: another tab now focused, a
-    /// version the buffer has left behind, or a range it has outgrown. See
-    /// [`InputBox::replace_range`].
+    /// Refuses an edit the input has moved on from: another tab now focused,
+    /// a version the edit cannot be mapped forward from (any older one when
+    /// it is strict), or a range the value has outgrown. See
+    /// [`InputBox::apply_edits`]. Answers the version and the cursor the edit
+    /// left, which the caller cannot work out for itself when its own version
+    /// was stale.
     ///
     /// The version cannot stand in for the session check. The counter is per
     /// buffer and every buffer starts at 0, so two tabs typed in about as much
@@ -694,6 +698,8 @@ impl App {
     /// An input the user cannot see is refused too, or the text would be sent
     /// later without ever having been seen. {area} is the terminal the answer
     /// is worked out against; see [`App::input_live`] for what hides the box.
+    ///
+    /// The Lua side already checked `input`.
     pub(crate) fn apply_input_edit(
         &mut self,
         edit: InputEdit,
@@ -710,19 +716,18 @@ impl App {
             return Err(INPUT_NOT_LIVE_ERR.to_string());
         }
         let current = self.input_box.buffer.version();
-        if edit.version != current {
+        if edit.strict && edit.version != current {
             return Err(format!(
-                "input changed since version {} (it is now {current})",
+                "{STALE_VERSION_ERR} {} (it is now {current})",
                 edit.version
             ));
         }
-        self.input_box
-            .replace_range(edit.start, edit.stop, &edit.text, edit.cursor)?;
-        self.input_changed(InputWriter::Plugin(
-            edit.plugin,
-            self.input_box.buffer.version(),
-        ));
-        Ok(serde_json::json!(true))
+        let cursor = self
+            .input_box
+            .apply_edits(edit.version, edit.edits, edit.cursor)?;
+        let version = self.input_box.buffer.version();
+        self.input_changed(InputWriter::Plugin(edit.plugin, version));
+        Ok(serde_json::json!({ "version": version, "cursor": cursor }))
     }
 
     /// The only path that can name a writer, see [`InputWriter`].

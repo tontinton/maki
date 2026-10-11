@@ -2797,9 +2797,11 @@ mod bundled_manifests {
                 }
                 // A bundled plugin opening a session hands over whatever the
                 // chat has, and a session pays for everything it hands over.
+                // That leaves out what no tool reaches, as the session's own
+                // check does.
                 if calls(source, AGENT_SESSION) {
                     for &permission in Permission::ALL {
-                        if permission != Permission::Agent {
+                        if !matches!(permission, Permission::Agent | Permission::Input) {
                             needed
                                 .entry(permission)
                                 .or_insert_with(|| AGENT_SESSION.to_owned());

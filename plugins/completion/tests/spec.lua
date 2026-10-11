@@ -189,7 +189,7 @@ local function harness(body)
     if h.refuse_edit then
       return nil, h.refuse_edit
     end
-    return true
+    return { version = edit.version + 1, cursor = edit.start + #edit.text }
   end
   maki.ui.buf = function()
     return {
@@ -865,6 +865,16 @@ local ISSUE_TRIGGER = "#"
 local ISSUE_INPUT = { text = "fix #cr", cursor = 7, version = 5, session_id = SESSION }
 local ISSUE = "#12"
 local ISSUE_LABEL = "#12 crash on start"
+local ISSUE_LINES = "#12\nrm -rf ~"
+local ZERO_WIDTH_SPACE = "\u{200B}"
+local RIGHT_TO_LEFT_OVERRIDE = "\u{202E}"
+local NEXT_LINE = "\u{85}"
+local HANGUL_FILLER = "\u{3164}"
+local GRAPHEME_JOINER = "\u{34F}"
+-- Combining marks draw on the letter before them, so they stay.
+local ACCENTED = "#cafe\u{301}"
+local DEVANAGARI = "#\u{928}\u{92E}\u{938}\u{94D}\u{924}\u{947}"
+local LABEL_GAP = "  "
 
 -- A source that answers {items} and records every call it got.
 local function source(name, trigger, items)
@@ -892,14 +902,18 @@ case("a_source_answers_the_trigger_it_listens_on", function()
   local h = harness(function(hh)
     issues = source("issues", ISSUE_TRIGGER, { { text = ISSUE, label = ISSUE_LABEL } })
     Menu.refresh(ISSUE_INPUT)
-    eq(row(hh, 1), " " .. ISSUE_LABEL, "the label is what the row shows")
+    eq(
+      styled(hh, 1),
+      "[ :selected][" .. ISSUE .. ":selected][" .. LABEL_GAP .. ISSUE_LABEL .. ":dim]",
+      "the label is drawn dim after the text"
+    )
     Menu.accept()
   end)
   eq(issues.calls[1].query, "cr")
   eq(issues.calls[1].ctx.trigger, ISSUE_TRIGGER)
   eq(issues.calls[1].ctx.session_id, SESSION)
   eq(h.rank_opts, nil, "files are the `@` trigger's, not every trigger's")
-  eq(h.edits[1].text, ISSUE .. " ", "the text is what the accept inserts")
+  eq(h.edits[1].text, ISSUE .. " ", "the text is what the accept inserts, never the label")
   eq(h.edits[1].start, 4, "over the mention, trigger included")
 end)
 
@@ -931,6 +945,50 @@ case("a_broken_source_costs_only_its_own_rows", function()
     eq(row(hh, 2), nil, "an item with nothing to insert is not a row")
   end)
   th.has(table.concat(h.warnings, "\n"), "raising", "the failure is logged under the source's name")
+end)
+
+-- Enter inserts what the row shows and nothing else, so text that would not
+-- show whole on one row is no row at all.
+case("a_row_inserts_only_text_it_shows_whole", function()
+  local h = harness(function(hh)
+    source("tricky", ISSUE_TRIGGER, {
+      { text = ISSUE_LINES, score = 3 },
+      { text = "#1\t2", score = 3 },
+      { text = "#1" .. ZERO_WIDTH_SPACE .. "2", score = 3 },
+      { text = "#1" .. RIGHT_TO_LEFT_OVERRIDE .. "2", score = 3 },
+      { text = "#1" .. NEXT_LINE .. "2", score = 3 },
+      { text = "#1" .. HANGUL_FILLER .. "2", score = 3 },
+      { text = "#1" .. GRAPHEME_JOINER .. "2", score = 3 },
+      { text = "#" .. string.rep("9", 200), score = 3 },
+      { text = ISSUE, score = 2 },
+      { text = ACCENTED, score = 1 },
+      { text = DEVANAGARI },
+    })
+    Menu.refresh(ISSUE_INPUT)
+    eq(row(hh, 1), " " .. ISSUE)
+    eq(row(hh, 2), " " .. ACCENTED, "combining marks show on their letter")
+    eq(row(hh, 3), " " .. DEVANAGARI)
+    eq(row(hh, 4), nil, "a line break, a tab, an invisible or reordering character or a long text is no row")
+    Menu.accept()
+  end)
+  eq(h.edits[1].text, ISSUE .. " ", "what the row showed")
+end)
+
+-- A label is only looked at, so it is cleaned rather than refused: a
+-- control becomes a space, a character that hides or reorders text goes, and
+-- a long one is cut.
+case("a_label_shows_on_one_line", function()
+  harness(function(hh)
+    source("labels", ISSUE_TRIGGER, {
+      { text = ISSUE, label = "crash\non" .. RIGHT_TO_LEFT_OVERRIDE .. " start" .. ZERO_WIDTH_SPACE, score = 1 },
+      { text = "#13", label = string.rep("x", 100) },
+      { text = "#14", label = " \t" },
+    })
+    Menu.refresh(ISSUE_INPUT)
+    eq(row(hh, 1), " " .. ISSUE .. LABEL_GAP .. "crash on start")
+    eq(row(hh, 2), " #13" .. LABEL_GAP .. string.rep("x", 60) .. "…")
+    eq(row(hh, 3), " #14", "a label with nothing left to show adds nothing")
+  end)
 end)
 
 case("a_malformed_source_is_skipped_and_logged_once", function()

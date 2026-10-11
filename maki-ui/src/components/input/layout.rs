@@ -7,6 +7,7 @@
 //! Running totals over those counts find the line under any row without
 //! walking the lines above it, so a frame only wraps the rows it draws.
 
+use std::iter::repeat_n;
 use std::ops::Range;
 
 use unicode_width::UnicodeWidthChar;
@@ -114,45 +115,54 @@ impl Layout {
         rows
     }
 
-    /// All changes since the last sync fit in one byte span, from their lowest
-    /// start to their highest end, so only the lines in that span get
-    /// recounted. The lines below it are the same lines in the old and the new
-    /// text, so counting them up from the bottom finds where the span ended in
-    /// the old counts, without ever knowing what the changes removed. `None`
-    /// when the log does not reach back far enough.
-    ///
-    /// A change that ends inside the span moves its end by however much the
-    /// change grew or shrank the text. One that ends past it makes the span end
-    /// where the change's new text does.
+    /// Walks the changes since the last sync in order. Each one swaps the
+    /// counts of the lines it replaced for placeholders, one per line it left,
+    /// and marks them dirty. Dirty lines below it shift with it, and the ones
+    /// it overlaps join it. Then only the dirty lines are recounted, on the
+    /// final text, so the untouched text between two edits keeps its counts.
+    /// `None` when the log does not reach back far enough.
     ///
     /// When no line came or went, each recount is one Fenwick update.
     /// Otherwise the counts shift and the sums are built again, one pass over
     /// plain integers, like the buffer does for its own line starts.
     fn apply_changes(&mut self, buffer: &TextBuffer) -> Option<()> {
-        let mut changes = buffer.changes_since(self.version)?;
-        let Some(oldest) = changes.next() else {
-            return Some(());
-        };
-        let span = changes.fold(oldest.start..oldest.new_end, |span, change| {
-            span.start.min(change.start)
-                ..(span.end.max(change.old_end) - change.old_end + change.new_end)
-        });
-        let first = buffer.line_of(span.start);
-        let last = buffer.line_of(span.end);
-        let lines_below = buffer.line_count() - 1 - last;
-        let old_end = self
-            .counts
-            .len()
-            .checked_sub(lines_below)
-            .filter(|&end| end >= first)?;
-        let fresh = (first..=last).map(|y| count_rows(buffer.line(y), self.width));
-        if old_end == last + 1 {
-            for (y, rows) in (first..).zip(fresh) {
-                self.sums.add(y, rows as i32 - self.counts[y] as i32);
-                self.counts[y] = rows;
+        // Sorted and disjoint, in the numbering of the text seen so far.
+        let mut dirty: Vec<Range<usize>> = Vec::new();
+        let mut shifted = false;
+        for change in buffer.changes_since(self.version)? {
+            let old = change.start_line..change.old_end_line + 1;
+            let new = change.start_line..change.new_end_line + 1;
+            if old.end > self.counts.len() {
+                return None;
             }
-        } else {
-            self.counts.splice(first..old_end, fresh);
+            if old.len() != new.len() {
+                self.counts.splice(old.clone(), repeat_n(0, new.len()));
+                shifted = true;
+            }
+            let mut joined = new.clone();
+            dirty.retain_mut(|lines| {
+                if lines.end <= old.start {
+                    return true;
+                }
+                let end = lines.end.max(old.end) - old.end + new.end;
+                if lines.start >= old.end {
+                    *lines = lines.start - old.end + new.end..end;
+                    return true;
+                }
+                joined = joined.start.min(lines.start)..joined.end.max(end);
+                false
+            });
+            let at = dirty.partition_point(|lines| lines.end <= joined.start);
+            dirty.insert(at, joined);
+        }
+        for y in dirty.into_iter().flatten() {
+            let rows = count_rows(buffer.line(y), self.width);
+            if !shifted {
+                self.sums.add(y, rows as i32 - self.counts[y] as i32);
+            }
+            self.counts[y] = rows;
+        }
+        if shifted {
             self.sums = RowSums::new(&self.counts);
         }
         self.version = buffer.version();
@@ -278,6 +288,7 @@ impl RowSums {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_buffer::test_support::text_edit;
     use test_case::test_case;
 
     const WIDTH: usize = 8;
@@ -298,6 +309,18 @@ mod tests {
         (layout.heights().collect(), layout.cursor_row(buffer), rows)
     }
 
+    /// Swaps the first match of each `old` for its `new`, all as one version.
+    fn swap_all(buffer: &mut TextBuffer, swaps: &[(&str, &str)]) {
+        let edits = swaps
+            .iter()
+            .map(|&(old, new)| {
+                let start = buffer.value().find(old).unwrap();
+                text_edit(start, start + old.len(), new)
+            })
+            .collect();
+        buffer.apply_edits(buffer.version(), edits, None).unwrap();
+    }
+
     fn synced(buffer: &TextBuffer, width: usize) -> Layout {
         let mut layout = Layout::default();
         layout.sync(buffer, width);
@@ -312,6 +335,9 @@ mod tests {
     #[test_case(|b| { b.insert_text("a\nb"); b.undo(); }, WIDTH ; "undone_paste")]
     #[test_case(|b| { b.set_cursor(3, 0); b.insert_text("wrapped "); b.set_cursor(0, 0); b.insert_text("top\nlines\n"); }, WIDTH ; "edit_low_then_paste_above_it")]
     #[test_case(|b| b.set_value("brand\nnew value"), WIDTH ; "whole_value_swap")]
+    #[test_case(|b| swap_all(b, &[("short", "**short"), ("wide", "**wide")]), WIDTH ; "one_version_editing_lines_apart")]
+    #[test_case(|b| swap_all(b, &[("ort", "\n"), ("twice", "and twice\n"), ("五", "五 more")]), WIDTH ; "one_version_adding_lines_apart")]
+    #[test_case(|b| { swap_all(b, &[("short", "a\nb\nshort"), ("end\n", "")]); b.undo(); }, WIDTH ; "undone_version_moving_lines_apart")]
     #[test_case(|b| { let seen = b.version(); b.set_cursor(1, 0); b.remove_char(); b.move_to_end(); while b.changes_since(seen).is_some() { b.push_char('x'); } }, WIDTH ; "more_edits_than_the_log_holds")]
     #[test_case(|_| {}, WIDTH + 3 ; "width_change")]
     fn catching_up_matches_a_fresh_build(edit: fn(&mut TextBuffer), width: usize) {

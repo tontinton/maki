@@ -167,6 +167,7 @@ pub enum Permission {
     SessionRead,
     SessionWrite,
     SessionSettings,
+    Input,
 }
 
 impl Permission {
@@ -203,6 +204,7 @@ impl Permission {
             Permission::SessionRead => "session_read",
             Permission::SessionWrite => "session_write",
             Permission::SessionSettings => "session_settings",
+            Permission::Input => "input",
         }
     }
 
@@ -228,6 +230,7 @@ impl Permission {
             Permission::SessionSettings => {
                 "changing how a session runs without touching its content: mode, title, model, thinking, fast mode, working directory, and workflow"
             }
+            Permission::Input => "changing the chat input, which is what your next Enter sends",
         }
     }
 }

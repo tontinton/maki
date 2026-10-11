@@ -131,7 +131,12 @@ pub(crate) fn create_maki_global(
     )?;
     maki.set(
         "ui",
-        ui::create_ui_table(lua, ui_action_tx.clone(), Arc::clone(&plugin), permissions)?,
+        ui::create_ui_table(
+            lua,
+            ui_action_tx.clone(),
+            Arc::clone(&plugin),
+            reach.clone(),
+        )?,
     )?;
     maki.set(
         "fn",

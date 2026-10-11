@@ -584,16 +584,26 @@ pub struct PlanMenu {
 
 /// Offsets are flat byte counts into the whole input, newlines counted as one
 /// byte each, because Lua indexes strings by byte.
-#[derive(Default)]
-pub struct InputEdit {
+#[derive(Debug)]
+pub struct TextEdit {
     pub start: usize,
     pub stop: usize,
     pub text: String,
-    /// Where to leave the cursor, the end of {text} when absent.
+}
+
+pub struct InputEdit {
+    /// All planned against the value at {version}, and applied together as
+    /// one change.
+    pub edits: Vec<TextEdit>,
+    /// Where to leave the cursor, in the value the edits produce. The end of
+    /// the text of the edit with the highest start when absent.
     pub cursor: Option<usize>,
     /// The value counter the reader was handed. Required, because an optional
     /// guard makes the shortest call the unguarded one.
     pub version: u64,
+    /// Refuses any {version} but the current one instead of mapping the edits
+    /// past what changed since.
+    pub strict: bool,
     /// The tab the offsets were read from, refused once another is focused.
     /// Required for the same reason as {version}.
     pub session_id: String,

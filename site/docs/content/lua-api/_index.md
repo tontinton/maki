@@ -67,6 +67,7 @@ permission raises `permission denied: '<name>' not granted for this plugin`.
 - `session_read`: reading conversation content: session history, the chat input draft, and the content fields of events
 - `session_write`: adding to, removing, or creating conversation content: new sessions, prompts, notices, and deleting sessions or task transcripts
 - `session_settings`: changing how a session runs without touching its content: mode, title, model, thinking, fast mode, working directory, and workflow
+- `input`: changing the chat input, which is what your next Enter sends
 
 Grants come from a `plugin.toml` next to the Lua file (for
 `~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
@@ -84,6 +85,7 @@ agent = true
 session_read = true
 session_write = true
 session_settings = true
+input = true
 ```
 
 The rules:
@@ -7032,7 +7034,8 @@ The returned table has:
 - `text` (string) the whole value, newlines included.
 - `cursor` (integer) byte offset of the cursor into `text`.
 - `version` (integer) counter of changes to the value. Pass it to
-  `input_edit`, which refuses once the value has moved on.
+  `input_edit`, which moves the edit past what changed since or refuses
+  it.
 
 The cursor line and column are a slice of those two, so the table leaves
 them out: with `local before = st.text:sub(1, st.cursor)`,
@@ -7061,47 +7064,82 @@ local before = st.text:sub(1, st.cursor)
 maki.ui.input_edit({opts})
 ```
 
-Replaces a byte range of the chat input, as if the user had selected it
-and typed {text}. The cursor lands after the inserted text unless you
-say otherwise.
+Replaces byte ranges of the chat input, as if the user had selected each
+one and typed its `text`. All of them land together as one change: one
+new version and one undo step.
 
-A handler runs after the key that woke it, so the user may have typed on
-or switched tab in between. Five checks refuse the edit:
+With `edits = {}` and a `cursor`, the call only moves the cursor. The
+version stays, no undo step is made, and a recalled history entry stays
+recalled. An empty list with no cursor is refused, since there is nothing
+to do.
 
-- `stop` past the end of the value.
-- An offset inside a multi-byte character.
-- `version` no longer current.
-- `session_id` naming a tab that is not focused. Both guards are
+Every range is planned against the value `maki.ui.input` returned at
+`version`, so offsets never account for the other edits in the list.
+Ranges must not overlap, and no two may start at the same offset.
+
+A handler runs after the key that woke it, so the user may have typed in
+between. An edit planned against an older version is moved past what
+changed since, as long as nothing changed at or next to any of its
+ranges: typing at the far end of the prompt does not refuse a fix at the
+start, while typing right where the edit lands does. Edits are refused:
+
+- When a later change overlaps or touches one of the ranges. Two inserts
+  at the same offset count, because neither order is right for both.
+- When `cursor` lands inside text changed since.
+- When the value was replaced since: history recall, a draft restored on
+  a tab switch, `$EDITOR`, or a submit.
+- When the version is so old that the input no longer remembers what
+  changed since then.
+- When the version is not current and `strict` is set.
+- When a range ends past the end of the value, or an offset lands inside
+  a multi-byte character.
+- When `session_id` names a tab that is not focused. Both guards are
   required and neither substitutes for the other: every tab counts
   versions from zero.
-- A chat input the user cannot see, since text written there would be
-  sent later without ever being read. A permission prompt, the plan form,
-  a pack review, a `below` split, a finished subagent's chat and a
+- When the user cannot see the chat input, since text written there would
+  be sent later without ever being read. A permission prompt, the plan
+  form, a pack review, a `below` split, a finished subagent's chat and a
   terminal too short to give the box a text row all take it off screen,
   and a picker, a modal or a focused plugin window covers it.
 
 Read again and retry on any of them.
 
-Tabs and carriage returns in {text} become spaces and newlines, and the
-other control characters are dropped, the way a paste is rewritten.
+A change to the text or the cursor needs the `input` permission, since
+your next Enter sends the text and your next key lands at the cursor.
+Without it the call raises `permission denied`. Your own `init.lua` needs
+a `plugin.toml` next to it for this, like any plugin, see
+[plugin permissions](#plugin-permissions).
 
-It costs what `maki.ui.input` costs. A plugin keymap sees keys before
-the input does, so with this call alone a plugin could note every key and
-type it back unseen.
+Upgrading: `input_edit` needed no permission in earlier releases.
+Plugins and `init.lua` files that call it need `input` now. A
+`plugin.toml` you wrote yourself grants it unless it sets
+`input = false`. A package needs its author to add `input`, and you to
+approve the package again.
 
-Requires the `session_read` [plugin permission](#plugin-permissions).
+Tabs and carriage returns in `text` become spaces and newlines, and the
+other control characters are dropped, the way a paste is rewritten. With
+`cursor` given, such text is refused instead, since the cursor counts
+bytes that would not land. Clean it first.
+
+It also needs `session_read`, like `maki.ui.input`. Its answer and its
+errors tell where the user typed since `version`, so a plugin could
+learn the input from them.
+
+Requires the `session_read` and `input` [plugin permissions](#plugin-permissions).
 
 **Parameters:**
 
 - `{opts}` (`table`) Options:
+  - `edits` (`table|nil`) list of `{ start, stop, text }` tables, the ranges to replace, `{}` for none. Without it, `start`, `stop` and `text` are read from {opts} itself as a single edit.
   - `start` (`integer`) byte offset the replaced range starts at.
   - `stop` (`integer`) byte offset it ends at. `start == stop` inserts.
   - `text` (`string`) what to put there, `""` to delete the range. Required, so a misspelled key cannot empty it by accident.
   - `version` (`integer`) the version `maki.ui.input` returned, which the offsets were planned against.
   - `session_id` (`string`) the session `maki.ui.input` read the offsets from.
-  - `cursor` (`integer|nil`) byte offset to leave the cursor at, default is the end of the inserted text.
+  - `cursor` (`integer|nil`) byte offset to leave the cursor at, counted in the value the edits produce, as if no one else had changed it. Default is the end of the text of the edit with the highest `start`, wherever it sits in `edits`.
+  - `strict` (`boolean|nil`) refuse any version but the current one instead of moving the edits forward. Default false.
 
-**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) `{ version, cursor }` of the input after the edit, or nil and an error.
 
 **Example:**
 
@@ -7112,6 +7150,17 @@ maki.ui.input_edit({
   start = 8,
   stop = st.cursor,
   text = "src/main.rs",
+  version = st.version,
+  session_id = st.session_id,
+})
+
+-- Wrap bytes s..e in bold, leaving the cursor before the closing "**":
+local r, err = maki.ui.input_edit({
+  edits = {
+    { start = s, stop = s, text = "**" },
+    { start = e, stop = e, text = "**" },
+  },
+  cursor = e + 2,
   version = st.version,
   session_id = st.session_id,
 })

@@ -14,6 +14,7 @@ use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
+use crate::text_buffer::{EDIT_CONFLICT_ERR, INPUT_REPLACED_ERR};
 use crate::theme;
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -31,7 +32,7 @@ use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{
     BuiltinAction, Dimension, FloatConfig, HintReader, KeymapReader, LuaCommandInfo,
     LuaCommandReader, Missing, PackCommand, PackPlan, PackPreparation, PackReport, Permission,
-    PluginPermissions, SessionEndReason, Split, WinCommand, WinEvent,
+    PluginPermissions, SessionEndReason, Split, TextEdit, WinCommand, WinEvent,
 };
 use maki_providers::{
     ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, ThinkingSupport,
@@ -3265,13 +3266,16 @@ fn input_snapshot_carries_nothing_a_slice_would_give() {
 fn planned_edit(app: &App, start: usize, stop: usize, text: &str) -> InputEdit {
     let st = app.input_snapshot();
     InputEdit {
-        start,
-        stop,
-        text: text.into(),
+        edits: vec![TextEdit {
+            start,
+            stop,
+            text: text.into(),
+        }],
         version: st["version"].as_u64().unwrap(),
         session_id: st["session_id"].as_str().unwrap().into(),
         plugin: Arc::from(EDIT_PLUGIN),
-        ..InputEdit::default()
+        cursor: None,
+        strict: false,
     }
 }
 
@@ -3282,25 +3286,60 @@ fn apply_edit(app: &mut App, edit: InputEdit) -> Result<serde_json::Value, Strin
     app.apply_input_edit(edit, TEST_AREA)
 }
 
-/// The bounds check alone passes an edit the user has typed in front of: a
-/// plugin reads "hello" and plans to replace 0..5, the user presses home and
-/// types "x", and 5 still fits "xhello". Only the version catches it.
+/// Typing elsewhere is the common race, and refusing it would make a plugin
+/// lose to every keystroke. The plugin cannot work out the new version or
+/// cursor from the text it read, so the answer hands both back.
 #[test]
-fn an_input_edit_planned_against_an_older_value_fails_on_the_version() {
+fn a_stale_input_edit_lands_past_typing_elsewhere() {
+    const FIXED: &str = "please fix src/main.rs";
     let mut app = test_app();
-    app.input_box.set_input("hello");
-    let planned = planned_edit(&app, 0, 5, "bye");
+    app.input_box.set_input("fix @src");
+    let planned = planned_edit(&app, 4, 8, "src/main.rs");
 
     app.input_box.buffer.set_cursor(0, 0);
-    app.input_box.buffer.push_char('x');
+    app.input_box.buffer.insert_text("please ");
 
-    let err = apply_edit(&mut app, planned).unwrap_err();
-    assert!(err.contains("version"), "the error has to name why: {err}");
-    assert_eq!(app.input_box.buffer.value(), "xhello");
+    let answer = apply_edit(&mut app, planned).unwrap();
+    assert_eq!(app.input_box.buffer.value(), FIXED);
+    assert_eq!(
+        answer,
+        serde_json::json!({
+            "version": app.input_box.buffer.version(),
+            "cursor": FIXED.len(),
+        })
+    );
+}
 
-    let fresh = planned_edit(&app, 0, 6, "bye");
-    assert!(apply_edit(&mut app, fresh).is_ok());
-    assert_eq!(app.input_box.buffer.value(), "bye");
+/// Reading again and retrying is what the docs tell a plugin to do after any
+/// refusal, so the retry has to land. For `strict` that is also the proof it
+/// still takes the current version.
+#[test_case(false, |input| { input.buffer.set_cursor(0, 0); input.buffer.push_char('x') }, EDIT_CONFLICT_ERR ; "typed_where_the_edit_lands")]
+#[test_case(false, InputBox::history_up,                                                    INPUT_REPLACED_ERR ; "history_recall")]
+#[test_case(true,  |input| { input.buffer.move_to_end(); input.buffer.push_char('!') },    STALE_VERSION_ERR  ; "strict_after_typing_elsewhere")]
+fn a_refused_input_edit_lands_once_read_again(strict: bool, user: fn(&mut InputBox), err: &str) {
+    // Recalling this logs a diff far from the edit, since it shares its start
+    // with the prompt. The offsets still point into another prompt.
+    const RECALLED: &str = "hello world, again";
+    let mut app = test_app();
+    app.input_box.set_input(RECALLED);
+    let _ = app.input_box.submit();
+    app.input_box.set_input("hello world");
+    let plan = |app: &App| InputEdit {
+        strict,
+        ..planned_edit(app, 0, 0, "> ")
+    };
+    let planned = plan(&app);
+
+    user(&mut app.input_box);
+    let seen = app.input_box.buffer.value().to_owned();
+
+    let refused = apply_edit(&mut app, planned).unwrap_err();
+    assert!(refused.starts_with(err), "{refused}");
+    assert_eq!(app.input_box.buffer.value(), seen);
+
+    let retry = plan(&app);
+    apply_edit(&mut app, retry).unwrap();
+    assert_eq!(app.input_box.buffer.value(), format!("> {seen}"));
 }
 
 /// Focus can move between the read and the write, and the version cannot tell

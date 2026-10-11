@@ -1,3 +1,5 @@
 [permissions]
 fs_read = true
 session_read = true
+# Accepting a row writes it into the chat input.
+input = true

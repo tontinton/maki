@@ -10,6 +10,7 @@ use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
+use maki_lua::TextEdit;
 use maki_storage::input_history::InputHistory;
 use std::mem;
 
@@ -312,23 +313,26 @@ impl InputBox {
     }
 
     /// The way a plugin writes to the input. It carries the box's own state
-    /// the way the paste path does: the view follows the cursor again, and the
-    /// value stops counting as a recalled history entry, so the next history
-    /// key does not throw the edit away.
+    /// the way the paste path does: the view follows the cursor again, and a
+    /// value the edits changed stops counting as a recalled history entry, so
+    /// the next history key does not throw the edit away. A call that only
+    /// moves the cursor leaves the recall and the draft under it alone.
     ///
-    /// See [`TextBuffer::replace_byte_range`] for what the offsets refuse.
-    pub fn replace_range(
+    /// See [`TextBuffer::apply_edits`] for what the offsets refuse.
+    pub fn apply_edits(
         &mut self,
-        start: usize,
-        stop: usize,
-        text: &str,
+        version: u64,
+        edits: Vec<TextEdit>,
         cursor: Option<usize>,
-    ) -> Result<(), String> {
-        self.buffer.replace_byte_range(start, stop, text, cursor)?;
+    ) -> Result<usize, String> {
+        let before = self.buffer.version();
+        let caret = self.buffer.apply_edits(version, edits, cursor)?;
         self.follow_cursor = true;
-        self.history_index = None;
-        self.draft.clear();
-        Ok(())
+        if self.buffer.version() != before {
+            self.history_index = None;
+            self.draft.clear();
+        }
+        Ok(caret)
     }
 
     /// Whole-value writes that are not plugin writes: a history entry, a
@@ -714,8 +718,10 @@ mod tests {
     use super::*;
     use crate::components::scrollbar::SCROLLBAR_THUMB;
     use crate::selection::{ContentRegion, ScreenSelection, extract_selected_text};
+    use crate::text_buffer::test_support::text_edit;
     use ratatui::layout::{Position, Rect};
     use ratatui::style::Color;
+    use std::ops::Range;
     use test_case::test_case;
 
     fn type_text(input: &mut InputBox, text: &str) {
@@ -887,6 +893,24 @@ mod tests {
         });
 
         assert_eq!(swapped.text, parked);
+    }
+
+    #[test_case(Vec::new(), Some(1), DRAFT ; "a_cursor_move_keeps_the_recall")]
+    #[test_case(vec![text_edit(0, RECALLED.len(), EDITED_RECALL)], None, EDITED_RECALL ; "an_edit_is_new_work")]
+    fn plugin_write_over_a_history_recall(
+        edits: Vec<TextEdit>,
+        cursor: Option<usize>,
+        parked: &str,
+    ) {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, RECALLED);
+        type_text(&mut input, DRAFT);
+        input.history_up();
+
+        let version = input.buffer.version();
+        input.apply_edits(version, edits, cursor).unwrap();
+
+        assert_eq!(input.draft_text(), parked);
     }
 
     #[test]
@@ -1505,6 +1529,12 @@ mod tests {
         );
     }
 
+    fn plugin_write(input: &mut InputBox, range: Range<usize>, text: &str) {
+        let edit = text_edit(range.start, range.end, text);
+        let version = input.buffer.version();
+        input.apply_edits(version, vec![edit], None).unwrap();
+    }
+
     /// A plugin edit lands on a recalled history entry, so the value is the
     /// user's own text again. Left in the browse state, the next history key
     /// would put the entry back over the edit.
@@ -1515,9 +1545,7 @@ mod tests {
         input.history_up();
         assert_eq!(input.buffer.value(), "recalled");
 
-        input
-            .replace_range(0, "recalled".len(), "written", None)
-            .unwrap();
+        plugin_write(&mut input, 0.."recalled".len(), "written");
         input.history_down();
         assert_eq!(input.buffer.value(), "written");
     }
@@ -1535,7 +1563,7 @@ mod tests {
         assert_eq!(input.scroll_y(), 0, "the wheel scrolled back to the top");
 
         let end = input.buffer.value().len();
-        input.replace_range(end - 1, end, "b", None).unwrap();
+        plugin_write(&mut input, end - 1..end, "b");
         let rendered = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
         assert!(
             input.scroll_y() > 0,
@@ -1545,7 +1573,7 @@ mod tests {
     }
 
     #[test_case(|input| { input.handle_key(KeyCode::Enter.into()); }                  ; "backslash_continuation")]
-    #[test_case(|input| input.replace_range(0, 1, "plugin\nwrite", None).unwrap()    ; "plugin_write")]
+    #[test_case(|input| plugin_write(input, 0..1, "plugin\nwrite")                   ; "plugin_write")]
     fn each_action_undoes_in_one_step(action: fn(&mut InputBox)) {
         const BEFORE: &str = "a\\";
         let mut input = InputBox::new(InputHistory::default(), 20);

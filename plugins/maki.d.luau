@@ -208,7 +208,7 @@ declare maki: {
     set_status_hint: @checked (spans: any) -> (),
     set_window_title: @checked (title: string) -> (),
     input: @checked () -> (any, string?),
-    input_edit: @checked (opts: any) -> (boolean?, string?),
+    input_edit: @checked (opts: any) -> (any, string?),
   },
   uv: {
     cwd: @checked () -> (string?),

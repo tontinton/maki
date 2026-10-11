@@ -234,6 +234,8 @@ Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to th
 It runs after [folder trust](/docs/folder-trust/) has let the Lua file load, and
 limits which APIs the file reaches rather than sandboxing the file.
 
+A plugin that changes the chat input needs `input`, see [`maki.ui.input_edit`](/docs/lua-api/#maki-ui-input_edit).
+
 ### Session permissions
 
 Three keys cover the session APIs, split by what a call does to the transcript:

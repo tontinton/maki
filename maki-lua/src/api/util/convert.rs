@@ -10,6 +10,7 @@ pub(crate) const UNSUPPORTED_JSON_VALUE_ERR: &str = "cannot convert to JSON a va
 const UNSUPPORTED_JSON_KEY_ERR: &str = "cannot make a JSON object key from a key of type";
 const RECURSIVE_TABLE_ERR: &str = "cannot convert to JSON a table that contains itself";
 const TOO_DEEP_ERR: &str = "cannot convert to JSON tables nested deeper than";
+pub(crate) const UNKNOWN_FIELD_ERR: &str = "unknown field";
 
 /// How many nulls an array encoding may invent for keys the table does not
 /// hold. A JSON null arrives as an absent Lua key, so a round trip has to be
@@ -62,6 +63,30 @@ impl TableExt for Table {
     fn opt<T: FromLua>(&self, key: &str) -> LuaResult<Option<T>> {
         Ok(self.get::<NilAsNone<T>>(key)?.0)
     }
+}
+
+/// Throws on a key of {table} outside {allowed}, so a typo is an error
+/// instead of an option that silently does nothing.
+pub(crate) fn reject_unknown_fields(
+    table: &Table,
+    allowed: &[&str],
+    context: &str,
+) -> LuaResult<()> {
+    for pair in table.pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        let Value::String(key) = key else {
+            return Err(mlua::Error::runtime(format!(
+                "{context}: field names must be strings"
+            )));
+        };
+        let key = key.to_str()?;
+        if !allowed.contains(&key.as_ref()) {
+            return Err(mlua::Error::runtime(format!(
+                "{context}: {UNKNOWN_FIELD_ERR} {key:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String> {

@@ -199,12 +199,13 @@ impl PluginPermissions {
     /// since no narrower price would be honest. `agent` is not one of them:
     /// it is about starting turns, and every tool already runs inside one, so
     /// a plugin that may not start turns can still steer a call in one.
+    /// `input` is not either, since no built-in tool changes the chat input.
     pub fn holds_all_reach(&self) -> bool {
         !self.lacking().any(Self::is_reach)
     }
 
     pub(crate) fn is_reach(perm: Permission) -> bool {
-        perm != Permission::Agent
+        !matches!(perm, Permission::Agent | Permission::Input)
     }
 
     pub fn from_manifest(manifest: &toml::Value) -> Self {
@@ -711,9 +712,10 @@ mod tests {
     }
 
     #[test]
-    fn full_reach_does_not_need_agent_but_misses_any_capability() {
+    fn full_reach_needs_neither_agent_nor_input_but_misses_any_capability() {
         let mut p = PluginPermissions::trusted();
         p.set(Permission::Agent, false);
+        p.set(Permission::Input, false);
         assert!(p.holds_all_reach());
 
         p.set(Permission::Env, false);

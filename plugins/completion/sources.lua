@@ -19,8 +19,37 @@ local FAILED = "completion: source failed: "
 -- A source claims a place above the files with a positive score, and ties go
 -- to the files.
 local FILE_SCORE = 0
--- A label has to fit on one row, whatever the source put in it.
-local BREAKS = "[\r\n\t]"
+-- A row shows its `text`, and Enter inserts it and a space, so a source
+-- cannot put words in the input that the user did not read. Text that would
+-- not show whole on one row is dropped: a line break or another control
+-- character, one of {HIDDEN}, or more than this many bytes.
+local MAX_TEXT = 120
+-- A `label` is drawn dim after the text, cut to this many characters.
+local MAX_LABEL = 60
+local ELLIPSIS = "…"
+local LABEL_GAP = "  "
+-- Code points that draw as nothing or turn the text around them: the C1
+-- controls, the Unicode format characters that hide or reorder text, the
+-- Hangul fillers and the combining grapheme joiner. Other combining marks
+-- stay, and so does the zero width joiner, which emoji are built with.
+local HIDDEN = {
+  { 0x80, 0x9F },
+  { 0xAD, 0xAD },
+  { 0x34F, 0x34F },
+  { 0x61C, 0x61C },
+  { 0x115F, 0x1160 },
+  { 0x180E, 0x180E },
+  { 0x200B, 0x200B },
+  { 0x200E, 0x200F },
+  { 0x2028, 0x202E },
+  { 0x2060, 0x2064 },
+  { 0x2066, 0x206F },
+  { 0x3164, 0x3164 },
+  { 0xFEFF, 0xFEFF },
+  { 0xFFA0, 0xFFA0 },
+  { 0xFFF9, 0xFFFB },
+  { 0xE0000, 0xE007F },
+}
 
 local collect = nil
 -- The list is gathered on every keystroke in a mention, so without this one
@@ -114,6 +143,58 @@ local function score_of(item)
   return score
 end
 
+-- Most text is ASCII, which none of the ranges touch.
+local function hidden(code)
+  if code < HIDDEN[1][1] then
+    return false
+  end
+  for _, range in ipairs(HIDDEN) do
+    if code >= range[1] and code <= range[2] then
+      return true
+    end
+  end
+  return false
+end
+
+local function has_hidden(text)
+  for _, code in utf8.codes(text) do
+    if hidden(code) then
+      return true
+    end
+  end
+  return false
+end
+
+-- See {MAX_TEXT}.
+local function shows_whole(text: string)
+  return text ~= "" and #text <= MAX_TEXT and not text:find("%c") and utf8.len(text) ~= nil and not has_hidden(text)
+end
+
+-- {label} as one dim line after the row's text: controls become spaces, the
+-- characters in {HIDDEN} go, and the rest is cut to {MAX_LABEL}. Nil when
+-- nothing is left to show.
+local function detail_of(label)
+  if type(label) ~= "string" or not utf8.len(label) then
+    return nil
+  end
+  local out, count = {}, 0
+  for _, code in utf8.codes(label) do
+    if count == MAX_LABEL then
+      out[#out + 1] = ELLIPSIS
+      break
+    end
+    if code < 0x20 or code == 0x7F then
+      out[#out + 1] = " "
+      count = count + 1
+    elseif not hidden(code) then
+      out[#out + 1] = utf8.char(code)
+      count = count + 1
+    end
+  end
+  local detail = table.concat(out):match("^%s*(.-)%s*$")
+  return detail ~= "" and LABEL_GAP .. detail or nil
+end
+
 -- An item without `text` has nothing to insert, so it is skipped rather than
 -- drawn as a row Enter cannot use.
 local function rows_of(items)
@@ -122,10 +203,10 @@ local function rows_of(items)
     return rows
   end
   for _, item in ipairs(items) do
-    if type(item) == "table" and type(item.text) == "string" and item.text ~= "" then
-      local label = type(item.label) == "string" and item.label or item.text
+    if type(item) == "table" and type(item.text) == "string" and shows_whole(item.text) then
       rows[#rows + 1] = {
-        label = label:gsub(BREAKS, " "),
+        label = item.text,
+        detail = detail_of(item.label),
         insert = item.text,
         score = score_of(item),
         highlights = {},

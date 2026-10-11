@@ -12,14 +12,14 @@ use strum::VariantNames;
 use crate::api::keymap::accept_key;
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
-    InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_roundtrip,
-    ui_send,
+    InputRequest, Split, TextEdit, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip,
+    ui_roundtrip, ui_send,
 };
-use crate::api::util::convert::TableExt;
+use crate::api::util::convert::{TableExt, reject_unknown_fields};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 use crate::key::Key;
-use crate::plugin_permissions::{PluginPermissions, denied_error};
+use crate::plugin_permissions::{PluginPermissions, PluginReach, denied_error};
 pub(crate) mod blit;
 pub(crate) mod buf;
 pub(crate) mod win;
@@ -29,6 +29,21 @@ use win::{WinHandle, WinSender};
 
 /// `fg`, `bg` and six modifiers.
 const UI_STYLE_FIELDS: usize = 8;
+const INPUT_EDIT: &str = "input_edit";
+const SINGLE_EDIT_KEYS: [&str; 3] = ["start", "stop", "text"];
+const NOT_A_LIST_ERR: &str = "is a list of tables, so wrap a single one in {}";
+const MIXED_EDIT_SHAPES_ERR: &str =
+    "input_edit: pass either 'edits' or 'start'/'stop'/'text', not both";
+const EDIT_OPTIONS: &[&str] = &[
+    "edits",
+    "start",
+    "stop",
+    "text",
+    "version",
+    "session_id",
+    "cursor",
+    "strict",
+];
 
 /// A focused window is handed every key the host does not answer itself, so a
 /// list of keys to take on top of that claims nothing it does not already
@@ -467,7 +482,8 @@ fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
 /// - `text` (string) the whole value, newlines included.
 /// - `cursor` (integer) byte offset of the cursor into `text`.
 /// - `version` (integer) counter of changes to the value. Pass it to
-///   `input_edit`, which refuses once the value has moved on.
+///   `input_edit`, which moves the edit past what changed since or refuses
+///   it.
 ///
 /// The cursor line and column are a slice of those two, so the table leaves
 /// them out: with `local before = st.text:sub(1, st.cursor)`,
@@ -489,42 +505,88 @@ async fn input(
     input_roundtrip(lua, tx.as_ref(), InputRequest::Read).await
 }
 
-/// Replaces a byte range of the chat input, as if the user had selected it
-/// and typed {text}. The cursor lands after the inserted text unless you
-/// say otherwise.
+/// Read as a `Vec`, a table keeps only its list part, so a single item
+/// passed in place of the list {key} of {func} would quietly read as none.
+fn table_list(list: Table, func: &str, key: &str) -> LuaResult<Vec<Table>> {
+    if list.pairs::<mlua::Value, mlua::Value>().count() != list.raw_len() {
+        return Err(mlua::Error::runtime(format!(
+            "{func}: '{key}' {NOT_A_LIST_ERR}"
+        )));
+    }
+    list.sequence_values().collect()
+}
+
+/// Replaces byte ranges of the chat input, as if the user had selected each
+/// one and typed its `text`. All of them land together as one change: one
+/// new version and one undo step.
 ///
-/// A handler runs after the key that woke it, so the user may have typed on
-/// or switched tab in between. Five checks refuse the edit:
+/// With `edits = {}` and a `cursor`, the call only moves the cursor. The
+/// version stays, no undo step is made, and a recalled history entry stays
+/// recalled. An empty list with no cursor is refused, since there is nothing
+/// to do.
 ///
-/// - `stop` past the end of the value.
-/// - An offset inside a multi-byte character.
-/// - `version` no longer current.
-/// - `session_id` naming a tab that is not focused. Both guards are
+/// Every range is planned against the value `maki.ui.input` returned at
+/// `version`, so offsets never account for the other edits in the list.
+/// Ranges must not overlap, and no two may start at the same offset.
+///
+/// A handler runs after the key that woke it, so the user may have typed in
+/// between. An edit planned against an older version is moved past what
+/// changed since, as long as nothing changed at or next to any of its
+/// ranges: typing at the far end of the prompt does not refuse a fix at the
+/// start, while typing right where the edit lands does. Edits are refused:
+///
+/// - When a later change overlaps or touches one of the ranges. Two inserts
+///   at the same offset count, because neither order is right for both.
+/// - When `cursor` lands inside text changed since.
+/// - When the value was replaced since: history recall, a draft restored on
+///   a tab switch, `$EDITOR`, or a submit.
+/// - When the version is so old that the input no longer remembers what
+///   changed since then.
+/// - When the version is not current and `strict` is set.
+/// - When a range ends past the end of the value, or an offset lands inside
+///   a multi-byte character.
+/// - When `session_id` names a tab that is not focused. Both guards are
 ///   required and neither substitutes for the other: every tab counts
 ///   versions from zero.
-/// - A chat input the user cannot see, since text written there would be
-///   sent later without ever being read. A permission prompt, the plan form,
-///   a pack review, a `below` split, a finished subagent's chat and a
+/// - When the user cannot see the chat input, since text written there would
+///   be sent later without ever being read. A permission prompt, the plan
+///   form, a pack review, a `below` split, a finished subagent's chat and a
 ///   terminal too short to give the box a text row all take it off screen,
 ///   and a picker, a modal or a focused plugin window covers it.
 ///
 /// Read again and retry on any of them.
 ///
-/// Tabs and carriage returns in {text} become spaces and newlines, and the
-/// other control characters are dropped, the way a paste is rewritten.
+/// A change to the text or the cursor needs the `input` permission, since
+/// your next Enter sends the text and your next key lands at the cursor.
+/// Without it the call raises `permission denied`. Your own `init.lua` needs
+/// a `plugin.toml` next to it for this, like any plugin, see
+/// [plugin permissions](#plugin-permissions).
 ///
-/// It costs what `maki.ui.input` costs. A plugin keymap sees keys before
-/// the input does, so with this call alone a plugin could note every key and
-/// type it back unseen.
+/// Upgrading: `input_edit` needed no permission in earlier releases.
+/// Plugins and `init.lua` files that call it need `input` now. A
+/// `plugin.toml` you wrote yourself grants it unless it sets
+/// `input = false`. A package needs its author to add `input`, and you to
+/// approve the package again.
+///
+/// Tabs and carriage returns in `text` become spaces and newlines, and the
+/// other control characters are dropped, the way a paste is rewritten. With
+/// `cursor` given, such text is refused instead, since the cursor counts
+/// bytes that would not land. Clean it first.
+///
+/// It also needs `session_read`, like `maki.ui.input`. Its answer and its
+/// errors tell where the user typed since `version`, so a plugin could
+/// learn the input from them.
 ///
 /// @param opts table Options:
+///   `edits` (table|nil) list of `{ start, stop, text }` tables, the ranges to replace, `{}` for none. Without it, `start`, `stop` and `text` are read from {opts} itself as a single edit.
 ///   `start` (integer) byte offset the replaced range starts at.
 ///   `stop` (integer) byte offset it ends at. `start == stop` inserts.
 ///   `text` (string) what to put there, `""` to delete the range. Required, so a misspelled key cannot empty it by accident.
 ///   `version` (integer) the version `maki.ui.input` returned, which the offsets were planned against.
 ///   `session_id` (string) the session `maki.ui.input` read the offsets from.
-///   `cursor` (integer|nil) byte offset to leave the cursor at, default is the end of the inserted text.
-/// @return (boolean|nil, string|nil) `true` on success, or nil and an error.
+///   `cursor` (integer|nil) byte offset to leave the cursor at, counted in the value the edits produce, as if no one else had changed it. Default is the end of the text of the edit with the highest `start`, wherever it sits in `edits`.
+///   `strict` (boolean|nil) refuse any version but the current one instead of moving the edits forward. Default false.
+/// @return (table|nil, string|nil) `{ version, cursor }` of the input after the edit, or nil and an error.
 /// @example
 /// local st = maki.ui.input()
 /// -- Replace the "@src/ma" before the cursor with a full path:
@@ -535,23 +597,63 @@ async fn input(
 ///   version = st.version,
 ///   session_id = st.session_id,
 /// })
-#[lua_fn(guard = SessionRead)]
+///
+/// -- Wrap bytes s..e in bold, leaving the cursor before the closing "**":
+/// local r, err = maki.ui.input_edit({
+///   edits = {
+///     { start = s, stop = s, text = "**" },
+///     { start = e, stop = e, text = "**" },
+///   },
+///   cursor = e + 2,
+///   version = st.version,
+///   session_id = st.session_id,
+/// })
+#[lua_fn(guard = [SessionRead, Input])]
 async fn input_edit(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     opts: Table,
 ) -> LuaResult<Pair<mlua::Value>> {
+    reject_unknown_fields(&opts, EDIT_OPTIONS, INPUT_EDIT)?;
+    let edits = match opts
+        .opt::<Table>("edits")?
+        .map(|edits| table_list(edits, INPUT_EDIT, "edits"))
+        .transpose()?
+    {
+        None => vec![text_edit(&opts)?],
+        Some(_)
+            if SINGLE_EDIT_KEYS
+                .iter()
+                .any(|key| opts.contains_key(*key).unwrap_or(false)) =>
+        {
+            return Err(mlua::Error::runtime(MIXED_EDIT_SHAPES_ERR));
+        }
+        Some(edits) => edits
+            .iter()
+            .map(|edit| {
+                reject_unknown_fields(edit, &SINGLE_EDIT_KEYS, INPUT_EDIT)?;
+                text_edit(edit)
+            })
+            .collect::<LuaResult<_>>()?,
+    };
     let req = InputRequest::Edit(InputEdit {
-        start: opts.get("start")?,
-        stop: opts.get("stop")?,
-        text: required(&opts, "text")?,
+        edits,
         cursor: opts.opt("cursor")?,
         version: required(&opts, "version")?,
+        strict: opts.opt_bool("strict").unwrap_or_default(),
         session_id: required(&opts, "session_id")?,
         plugin,
     });
     input_roundtrip(lua, tx.as_ref(), req).await
+}
+
+fn text_edit(edit: &Table) -> LuaResult<TextEdit> {
+    Ok(TextEdit {
+        start: required(edit, "start")?,
+        stop: required(edit, "stop")?,
+        text: required(edit, "text")?,
+    })
 }
 
 /// Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and suspends the
@@ -780,17 +882,23 @@ pub(crate) fn create_ui_table(
     lua: &Lua,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     plugin: Arc<str>,
-    perms: &PluginPermissions,
+    reach: PluginReach,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     add_ui_fns(&t, lua)?;
 
     flash__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     set_window_title__register(&t, lua, ui_action_tx.clone())?;
-    action__register(&t, lua, ui_action_tx.clone(), perms.clone())?;
+    action__register(&t, lua, ui_action_tx.clone(), reach.permissions().clone())?;
     open_editor__register(&t, lua, ui_action_tx.clone())?;
-    input__register(&t, lua, perms, ui_action_tx.clone())?;
-    input_edit__register(&t, lua, perms, ui_action_tx.clone(), Arc::clone(&plugin))?;
+    input__register(&t, lua, reach.permissions(), ui_action_tx.clone())?;
+    input_edit__register(
+        &t,
+        lua,
+        reach.permissions(),
+        ui_action_tx.clone(),
+        Arc::clone(&plugin),
+    )?;
     open_win__register(&t, lua, ui_action_tx, Arc::clone(&plugin))?;
 
     let p = Arc::clone(&plugin);
@@ -991,7 +1099,7 @@ fn markdown_lines_to_lua(lua: &Lua, lines: &[maki_markdown::render::Line]) -> Lu
 mod tests {
     use super::*;
     use crate::api::util::command::UiReply;
-    use crate::api::util::convert::lua_to_json;
+    use crate::api::util::convert::{UNKNOWN_FIELD_ERR, lua_to_json};
     use crate::plugin_permissions::{Missing, Permission};
     use maki_highlight::StyledSegment;
     use mlua::Lua;
@@ -1771,7 +1879,7 @@ mod tests {
             &lua,
             Some(tx),
             Arc::from(INPUT_PLUGIN),
-            &PluginPermissions::trusted(),
+            PluginReach::new(PluginPermissions::trusted()),
         )
         .unwrap();
         lua.globals().set("ui", t).unwrap();
@@ -1781,12 +1889,16 @@ mod tests {
     /// Echoes the request back, so a test can assert on what the UI would have
     /// been asked to do.
     fn echo_edit(edit: InputEdit) -> UiReply {
+        let edits: Vec<_> = edit
+            .edits
+            .iter()
+            .map(|e| serde_json::json!({ "start": e.start, "stop": e.stop, "text": e.text }))
+            .collect();
         Ok(serde_json::json!({
-            "start": edit.start,
-            "stop": edit.stop,
-            "text": edit.text,
+            "edits": edits,
             "cursor": edit.cursor,
             "version": edit.version,
+            "strict": edit.strict,
             "session_id": edit.session_id,
             "plugin": edit.plugin,
         }))
@@ -1809,6 +1921,12 @@ mod tests {
         (lua_to_json(lua, &val).unwrap(), err)
     }
 
+    fn eval_err(lua: &Lua, script: &str) -> String {
+        smol::block_on(lua.load(script).eval_async::<mlua::Value>())
+            .unwrap_err()
+            .to_string()
+    }
+
     #[test]
     fn input_reports_text_cursor_and_version() {
         let lua = ui_with_input(echo_edit);
@@ -1820,15 +1938,64 @@ mod tests {
         assert_eq!(val["session_id"], READ_SESSION_ID);
     }
 
-    #[test]
-    fn input_edit_forwards_the_range_and_defaults_the_cursor() {
+    #[test_case(
+        r#"start = 1, stop = 3, text = "xy""#,
+        serde_json::json!({ "edits": [{ "start": 1, "stop": 3, "text": "xy" }], "cursor": null, "strict": false })
+        ; "single_edit_with_defaults"
+    )]
+    #[test_case(
+        r#"edits = { { start = 0, stop = 0, text = "**" }, { start = 5, stop = 5, text = "**" } }, cursor = 7, strict = true"#,
+        serde_json::json!({
+            "edits": [{ "start": 0, "stop": 0, "text": "**" }, { "start": 5, "stop": 5, "text": "**" }],
+            "cursor": 7,
+            "strict": true,
+        })
+        ; "edits_list_with_options"
+    )]
+    #[test_case(
+        "edits = {}, cursor = 2",
+        serde_json::json!({ "edits": [], "cursor": 2, "strict": false })
+        ; "no_edits_with_a_cursor"
+    )]
+    fn input_edit_forwards_the_edits_and_options(fields: &str, expected: serde_json::Value) {
         let lua = ui_with_input(echo_edit);
-        let (val, err) = eval(&lua, &edit_script("start = 1, stop = 3, text = \"xy\""));
+        let (val, err) = eval(&lua, &edit_script(fields));
         assert_eq!(err, None);
-        assert_eq!(val["start"], 1);
-        assert_eq!(val["stop"], 3);
-        assert_eq!(val["text"], "xy");
-        assert_eq!(val["cursor"], serde_json::Value::Null);
+        assert_eq!(
+            serde_json::json!({ "edits": val["edits"], "cursor": val["cursor"], "strict": val["strict"] }),
+            expected
+        );
+    }
+
+    /// Only the list part of `edits` is read, so a single edit in its place
+    /// would read as no edits and the call would just move the cursor.
+    #[test_case(r#"edits = { start = 0, stop = 0, text = "x" }, cursor = 1"# ; "a_single_edit_in_place_of_the_list")]
+    #[test_case(r#"edits = { { start = 0, stop = 0, text = "x" }, cursor = 1 }"# ; "an_option_inside_the_list")]
+    fn input_edit_refuses_edits_that_are_not_a_list(fields: &str) {
+        let lua = ui_with_input(echo_edit);
+        let err = eval_err(&lua, &edit_script(fields));
+        assert!(err.contains(NOT_A_LIST_ERR), "{err}");
+    }
+
+    /// Mixing both shapes would leave one of them silently unapplied.
+    #[test]
+    fn input_edit_refuses_an_edits_list_next_to_a_single_edit() {
+        let lua = ui_with_input(echo_edit);
+        let err = eval_err(
+            &lua,
+            &edit_script(r#"edits = { { start = 0, stop = 0, text = "a" } }, text = "b""#),
+        );
+        assert!(err.contains(MIXED_EDIT_SHAPES_ERR), "{err}");
+    }
+
+    /// A misspelled option would quietly drop what it asks for, like
+    /// `strict` keeping a stale edit from landing.
+    #[test_case(r#"start = 0, stop = 0, text = "x", strcit = true"# ; "a_misspelled_option")]
+    #[test_case(r#"edits = { { start = 0, stop = 0, text = "x", cursor = 1 } }"# ; "an_option_inside_an_edit")]
+    fn input_edit_throws_on_an_unknown_field(fields: &str) {
+        let lua = ui_with_input(echo_edit);
+        let err = eval_err(&lua, &edit_script(fields));
+        assert!(err.contains(UNKNOWN_FIELD_ERR), "{err}");
     }
 
     /// Leaving a required key out has to fail loudly instead of writing
@@ -1901,8 +2068,9 @@ mod tests {
         let (tx, _rx) = flume::unbounded();
         let run = |perms: &PluginPermissions| {
             let lua = Lua::new();
+            let reach = PluginReach::new(perms.clone());
             let t =
-                create_ui_table(&lua, Some(tx.clone()), Arc::from(INPUT_PLUGIN), perms).unwrap();
+                create_ui_table(&lua, Some(tx.clone()), Arc::from(INPUT_PLUGIN), reach).unwrap();
             lua.globals().set("ui", t).unwrap();
             lua.load(format!("return ui.action('{name}')"))
                 .eval::<Option<bool>>()
