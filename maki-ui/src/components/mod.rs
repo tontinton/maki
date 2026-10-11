@@ -26,6 +26,7 @@ pub(crate) mod split_layout;
 pub mod status_bar;
 pub(crate) mod streaming_content;
 pub(crate) mod theme_picker;
+pub(crate) mod thinking;
 pub(crate) mod tool_display;
 pub(crate) mod usage_modal;
 
@@ -298,7 +299,9 @@ pub struct DisplayMessage {
     pub render_snapshot: Option<BufferSnapshot>,
     pub render_header: Option<BufferSnapshot>,
     pub snapshot_theme_gen: u64,
-    pub thinking_collapsed: bool,
+    /// Only a click sets it, so thinking starts the way `ui.thinking_lines`
+    /// says however the message got here.
+    pub thinking_expanded: bool,
 }
 
 impl DisplayMessage {
@@ -319,7 +322,7 @@ impl DisplayMessage {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            thinking_expanded: false,
         }
     }
 
@@ -352,7 +355,7 @@ impl DisplayMessage {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            thinking_collapsed: false,
+            thinking_expanded: false,
         }
     }
 

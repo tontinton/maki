@@ -14,8 +14,8 @@ use maki_agent::tools::{
     timeout_annotation,
 };
 use maki_config::{
-    AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission, PluginsConfig, ToolKey,
-    ToolOutputLines,
+    AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission, PluginsConfig,
+    ThinkingLines, ToolKey, ToolOutputLines,
 };
 use maki_lua::{
     InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, NO_UI_ERR, PERMISSION_NAME_WARNING,
@@ -3342,6 +3342,20 @@ fn setup_happy_path() {
         .unwrap();
     let raw = raw.expect("expected Some(RawConfig)");
     assert_eq!(raw.agent.max_output_lines, Some(3000));
+}
+
+#[test]
+fn setup_reads_a_negative_thinking_lines() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            "maki.setup({ ui = { thinking_lines = -1 } })".to_owned(),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("expected Some(RawConfig)");
+    assert_eq!(raw.ui.thinking_lines, Some(ThinkingLines::Never));
 }
 
 #[test]

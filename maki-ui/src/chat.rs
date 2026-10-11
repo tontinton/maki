@@ -662,7 +662,7 @@ pub fn history_to_display(
                                 render_snapshot: None,
                                 render_header: None,
                                 snapshot_theme_gen: 0,
-                                thinking_collapsed: false,
+                                thinking_expanded: false,
                             });
                         }
                         _ => {}

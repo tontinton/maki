@@ -8,7 +8,8 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use maki_config_macro::ConfigSection;
 use maki_storage::paths;
 use maki_storage::sessions::{SessionMeta, StoredThinking, ThinkingParseError};
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as DeError, IgnoredAny};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use strum::VariantArray;
 use thiserror::Error;
@@ -31,6 +32,10 @@ pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
 pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
 pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
+pub const DEFAULT_THINKING_LINES: usize = 3;
+const NEVER_COLLAPSE_THINKING: i64 = -1;
+const THINKING_LINES_RANGE: &str =
+    "thinking_lines must be -1 (never collapse), 0 (header only) or a row count";
 
 pub const MIN_MAX_INPUT_LINES: u32 = 1;
 
@@ -429,6 +434,11 @@ pub enum ConfigError {
          A .bak backup is left next to the file."
     )]
     RenamedToolsTable,
+    #[error(
+        "invalid config: ui.show_thinking was replaced by ui.thinking_lines. \
+         Use thinking_lines = -1 for show_thinking = true, or 0 for show_thinking = false"
+    )]
+    RenamedShowThinking,
     #[error("invalid config: provider.{field} contains invalid glob pattern `{pattern}`: {source}")]
     InvalidModelPattern {
         field: &'static str,
@@ -569,6 +579,9 @@ impl RawConfig {
     /// state: it is not written in any config file and must not survive a
     /// merge between two of them.
     pub fn into_config(self, packages: &[String]) -> Result<Config, ConfigError> {
+        if self.ui.show_thinking.is_some() {
+            return Err(ConfigError::RenamedShowThinking);
+        }
         self.validate_plugin_tables(packages)?;
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
@@ -647,7 +660,10 @@ pub struct UiFileConfig {
     pub flash_duration_ms: Option<u64>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
-    pub show_thinking: Option<bool>,
+    pub thinking_lines: Option<ThinkingLines>,
+    /// Gone, replaced by `thinking_lines`. We still read it so an old config
+    /// gets told about the new key, not a vague unknown-field error.
+    show_thinking: Option<IgnoredAny>,
     pub theme: Option<String>,
     pub clock_format: Option<ClockFormat>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
@@ -666,6 +682,7 @@ impl UiFileConfig {
             flash_duration_ms,
             typewriter_ms_per_char,
             mouse_scroll_lines,
+            thinking_lines,
             show_thinking,
             theme,
             clock_format,
@@ -675,6 +692,25 @@ impl UiFileConfig {
             (Some(base), Some(over)) => base.merge(over),
             (None, Some(over)) => self.tool_output_lines = Some(over),
             _ => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingLines {
+    Never,
+    /// Rows as wrapped on screen, not source lines, so a long paragraph
+    /// cannot sneak past the limit.
+    Tail(usize),
+}
+
+impl<'de> Deserialize<'de> for ThinkingLines {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match i64::deserialize(deserializer)? {
+            NEVER_COLLAPSE_THINKING => Ok(Self::Never),
+            rows => usize::try_from(rows)
+                .map(Self::Tail)
+                .map_err(|_| D::Error::custom(THINKING_LINES_RANGE)),
         }
     }
 }
@@ -1260,10 +1296,12 @@ pub struct UiConfig {
     pub max_input_lines: u32,
 
     #[config(
-        default = true,
-        desc = "When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes"
+        default = ThinkingLines::Tail(DEFAULT_THINKING_LINES),
+        ty = "integer",
+        default_doc = "3",
+        desc = "Model reasoning starts collapsed to a header and its last N rows. Click it to expand or collapse it. 0 shows the header only, -1 never collapses"
     )]
-    pub show_thinking: bool,
+    pub thinking_lines: ThinkingLines,
 
     #[config(default = ClockFormat::System, ty = "String", default_doc = "system", desc = "Clock format for timestamps: \"12h\", \"24h\", or \"system\" (follow the OS preference, 24h when unknown)")]
     pub clock_format: ClockFormat,
@@ -1292,7 +1330,9 @@ impl UiConfig {
                 .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
             max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
-            show_thinking: f.show_thinking.unwrap_or(true),
+            thinking_lines: f
+                .thinking_lines
+                .unwrap_or(ThinkingLines::Tail(DEFAULT_THINKING_LINES)),
             clock_format: f.clock_format.unwrap_or_default(),
             theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
@@ -4008,23 +4048,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn show_thinking_deserializes_true() {
-        let raw: RawConfig = toml::from_str("[ui]\nshow_thinking = true\n").unwrap();
-        assert!(raw.ui.show_thinking.unwrap());
+    #[test_case(-1 => ThinkingLines::Never ; "minus_one_never_collapses")]
+    #[test_case(0 => ThinkingLines::Tail(0) ; "zero_is_header_only")]
+    #[test_case(5 => ThinkingLines::Tail(5) ; "positive_is_a_row_count")]
+    fn thinking_lines_deserializes(value: i64) -> ThinkingLines {
+        let raw: RawConfig = toml::from_str(&format!("[ui]\nthinking_lines = {value}\n")).unwrap();
+        raw.into_config(&[]).unwrap().ui.thinking_lines
     }
 
     #[test]
-    fn show_thinking_deserializes_false() {
+    fn thinking_lines_rejects_below_minus_one() {
+        let err = toml::from_str::<RawConfig>("[ui]\nthinking_lines = -2\n").unwrap_err();
+        assert!(err.to_string().contains(THINKING_LINES_RANGE), "got: {err}");
+    }
+
+    #[test]
+    fn show_thinking_points_to_thinking_lines() {
         let raw: RawConfig = toml::from_str("[ui]\nshow_thinking = false\n").unwrap();
-        assert!(!raw.ui.show_thinking.unwrap());
-    }
-
-    #[test]
-    fn show_thinking_missing_defaults_true() {
-        let raw: RawConfig = toml::from_str("").unwrap();
-        let config = raw.into_config(&[]).unwrap();
-        assert!(config.ui.show_thinking);
+        assert!(matches!(
+            raw.into_config(&[]),
+            Err(ConfigError::RenamedShowThinking)
+        ));
     }
 
     #[test]

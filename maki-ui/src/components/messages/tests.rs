@@ -2,6 +2,7 @@ use super::segment;
 use super::*;
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::scrollbar::SCROLLBAR_THUMB;
+use crate::markdown::{EXPAND_HINT, TRUNCATION_PREFIX};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{DocPos, Selection, SelectionZone};
 use crate::wrap;
@@ -9,6 +10,7 @@ use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
+use maki_config::DEFAULT_THINKING_LINES;
 use maki_providers::ImageMediaType;
 use ratatui::backend::TestBackend;
 use std::collections::HashSet;
@@ -548,20 +550,19 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
 }
 
 const THINKING_TEXT: &str = "a long chain of reasoning";
+const TAIL_ROWS: usize = DEFAULT_THINKING_LINES;
+const STEP_COUNT: usize = 10;
 const HIGHLIGHTED_CODE: &str = "fn main() {}";
 const HIGHLIGHT_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Only `view` advances a typewriter, and collapsed thinking is never drawn,
-/// so its reveal can never finish. Believing it would hold the loop at full
-/// frame rate for as long as the model reasons.
-#[test_case(true  => Cadence::SMOOTH ; "expanded_thinking_reveals")]
-#[test_case(false => Cadence::IDLE   ; "collapsed_thinking_reveals_nothing")]
-fn thinking_animates_only_while_it_is_on_screen(show_thinking: bool) -> Cadence {
-    let config = UiConfig {
-        show_thinking,
-        ..UiConfig::default()
-    };
-    let mut panel = MessagesPanel::new(config, EventHandle::disconnected_for_test());
+/// Only `view` advances a typewriter, and thinking collapsed to its header
+/// never draws the text, so its reveal can never finish. Believing it would
+/// hold the loop at full frame rate for as long as the model reasons.
+#[test_case(ThinkingLines::Never   => Cadence::SMOOTH ; "expanded_thinking_reveals")]
+#[test_case(ThinkingLines::Tail(3) => Cadence::SMOOTH ; "the_tail_reveals")]
+#[test_case(ThinkingLines::Tail(0) => Cadence::IDLE   ; "header_only_reveals_nothing")]
+fn thinking_animates_only_while_it_is_on_screen(thinking_lines: ThinkingLines) -> Cadence {
+    let mut panel = thinking_panel(thinking_lines);
 
     panel.thinking_delta(THINKING_TEXT);
 
@@ -1534,21 +1535,27 @@ fn handle_click_returns_nothing_when_no_segment_at_row() {
     assert!(!panel.handle_click(23, area));
 }
 
-#[test_case(|end, _| end - 1         => true  ; "indicator")]
+#[test_case(|end, _| end - 1         => true  ; "its_last_row")]
+#[test_case(|end, height| end - height => true ; "its_header")]
 #[test_case(|end, height| end - height - 1 => false ; "spacer_above_it")]
 #[test_case(|end, _| end             => false ; "empty_rows_below")]
-fn only_the_indicator_expands_streaming_thinking(click_row: fn(u32, u32) -> u32) -> bool {
-    let config = UiConfig {
-        show_thinking: false,
-        ..UiConfig::default()
-    };
-    let mut panel = MessagesPanel::new(config, EventHandle::disconnected_for_test());
+fn only_the_collapsed_view_expands_streaming_thinking(click_row: fn(u32, u32) -> u32) -> bool {
+    let mut panel = thinking_panel(ThinkingLines::Tail(TAIL_ROWS));
     panel.push(DisplayMessage::new(DisplayRole::User, "hi".into()));
-    panel.thinking_delta(THINKING_TEXT);
+    panel.streaming_thinking.set_buffer(&steps(STEP_COUNT));
     render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
 
-    let indicator_height = panel.build_streaming_collapsed_lines().len() as u32;
-    let row = click_row(panel.layout().total_rows(), indicator_height);
+    let collapsed_height = panel
+        .cache
+        .get(panel.cache.len() - 1)
+        .unwrap()
+        .height(VIEW_WIDTH - 1) as u32;
+    assert_eq!(
+        collapsed_height,
+        TAIL_ROWS as u32 + 1,
+        "header plus the tail"
+    );
+    let row = click_row(panel.layout().total_rows(), collapsed_height);
     panel.handle_click(row as u16, Rect::new(0, 0, VIEW_WIDTH, VIEW_HEIGHT))
 }
 
@@ -2109,207 +2116,213 @@ fn rebake_without_channel_is_noop() {
     );
 }
 
-#[test]
-fn hide_collapses_streaming_thinking() {
-    let mut panel = MessagesPanel::new(
-        UiConfig {
-            show_thinking: false,
-            ..UiConfig::default()
-        },
-        EventHandle::disconnected_for_test(),
-    );
+fn thinking_panel(thinking_lines: ThinkingLines) -> MessagesPanel {
+    let config = UiConfig {
+        thinking_lines,
+        ..UiConfig::default()
+    };
+    MessagesPanel::new(config, EventHandle::disconnected_for_test())
+}
+
+fn steps(count: usize) -> String {
+    (1..=count)
+        .map(|n| format!("- {}", step(n)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn step(n: usize) -> String {
+    format!("step {n:02}")
+}
+
+fn collapsed_header(line_count: usize) -> String {
+    format!(
+        "{}{TRUNCATION_PREFIX} ({line_count} lines)",
+        thinking_style().prefix
+    )
+}
+
+/// Streaming thinking goes in through `set_buffer` so the typewriter has
+/// already revealed all of it; flushed thinking is a cached message.
+fn add_thinking(panel: &mut MessagesPanel, text: &str, flushed: bool) {
+    if flushed {
+        panel.thinking_delta(text);
+        panel.flush();
+    } else {
+        panel.streaming_thinking.set_buffer(text);
+    }
+}
+
+/// The thinking segment is the only one these panels hold.
+fn thinking_rows(panel: &MessagesPanel) -> Vec<String> {
     panel
-        .streaming_thinking
-        .set_buffer("line one\nline two\nline three");
-    let terminal = render(&mut panel, 80, 10);
-    let text = buffer_text(&terminal);
-    assert!(
-        text.contains("thinking> ..."),
-        "collapsed view should show hint; got: {text}"
-    );
-    assert!(
-        text.contains("3 lines"),
-        "should show live line counter; got: {text}"
-    );
-    assert!(
-        text.contains("click to expand"),
-        "should hint click-to-expand; got: {text}"
-    );
-    assert!(
-        !text.contains("line one"),
-        "reasoning must stay hidden; got: {text}"
-    );
+        .cache
+        .get(0)
+        .unwrap()
+        .lines()
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect()
 }
 
-#[test]
-fn hide_click_expands_streaming_thinking() {
-    let mut panel = MessagesPanel::new(
-        UiConfig {
-            show_thinking: false,
-            ..UiConfig::default()
-        },
-        EventHandle::disconnected_for_test(),
-    );
-    panel.streaming_thinking.set_buffer("secret reasoning");
-    let area = Rect::new(0, 0, 80, 10);
-    render(&mut panel, 80, 10);
-    assert!(
-        panel.handle_click(0, area),
-        "clicking collapsed thinking should toggle expand"
-    );
-    assert!(!panel.thinking_collapsed);
-    let terminal = render(&mut panel, 80, 10);
-    let text = buffer_text(&terminal);
-    assert!(
-        text.contains("secret reasoning"),
-        "expanded view should show reasoning; got: {text}"
-    );
-    assert!(
-        !text.contains("click to expand"),
-        "collapsed hint should not appear after expand; got: {text}"
-    );
+fn view_text(panel: &mut MessagesPanel) -> String {
+    buffer_text(&render(panel, VIEW_WIDTH, VIEW_HEIGHT))
 }
 
-#[test]
-fn hide_keeps_cached_thinking_as_indicator() {
-    let mut panel = MessagesPanel::new(
-        UiConfig {
-            show_thinking: false,
-            ..UiConfig::default()
-        },
-        EventHandle::disconnected_for_test(),
-    );
-    panel.thinking_delta("reasoning here");
-    panel.flush();
-    assert!(matches!(
-        panel.last_message_role(),
-        Some(DisplayRole::Thinking)
-    ));
-    let terminal = render(&mut panel, 80, 10);
-    let text = buffer_text(&terminal);
-    assert!(
-        text.contains("thinking> ..."),
-        "cached thinking should persist as an indicator, not hide; got: {text}"
-    );
-    assert!(
-        text.contains("(1 lines)"),
-        "footer always shows the line count; got: {text}"
-    );
-    assert!(
-        text.contains("click to expand"),
-        "footer should hint click-to-expand; got: {text}"
-    );
-    assert!(
-        !text.contains("reasoning here"),
-        "reasoning must stay hidden in the indicator; got: {text}"
-    );
+fn view_area() -> Rect {
+    Rect::new(0, 0, VIEW_WIDTH, VIEW_HEIGHT)
 }
 
-#[test]
-fn full_default_renders_streaming_thinking() {
+#[test_case(false ; "streaming")]
+#[test_case(true  ; "cached")]
+fn default_collapses_to_header_and_last_rows(flushed: bool) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.streaming_thinking.set_buffer("visible reasoning");
-    let terminal = render(&mut panel, 80, 10);
-    let text = buffer_text(&terminal);
+    add_thinking(&mut panel, &steps(STEP_COUNT), flushed);
+    let text = view_text(&mut panel);
+
+    assert!(text.contains(&collapsed_header(STEP_COUNT)), "{text}");
+    assert!(text.contains(EXPAND_HINT), "{text}");
+    for n in STEP_COUNT - TAIL_ROWS + 1..=STEP_COUNT {
+        assert!(text.contains(&step(n)), "tail row {n} missing: {text}");
+    }
     assert!(
-        text.contains("visible reasoning"),
-        "default config renders reasoning; got: {text}"
+        !text.contains(&step(STEP_COUNT - TAIL_ROWS)),
+        "rows above the tail must stay hidden: {text}"
+    );
+    assert_eq!(thinking_rows(&panel).len(), TAIL_ROWS + 1);
+}
+
+#[test_case(false ; "streaming")]
+#[test_case(true  ; "cached")]
+fn click_expands_then_collapses_thinking(flushed: bool) {
+    let mut panel = thinking_panel(ThinkingLines::Tail(TAIL_ROWS));
+    add_thinking(&mut panel, &steps(STEP_COUNT), flushed);
+    view_text(&mut panel);
+
+    assert!(
+        panel.handle_click(0, view_area()),
+        "collapsed thinking expands"
+    );
+    let expanded = view_text(&mut panel);
+    assert!(expanded.contains(&step(1)), "{expanded}");
+    assert!(!expanded.contains(TRUNCATION_PREFIX), "{expanded}");
+
+    assert!(
+        panel.handle_click(0, view_area()),
+        "expanded thinking collapses"
+    );
+    let collapsed = view_text(&mut panel);
+    assert!(
+        collapsed.contains(&collapsed_header(STEP_COUNT)),
+        "{collapsed}"
+    );
+    assert!(!collapsed.contains(&step(1)), "{collapsed}");
+}
+
+#[test_case(false ; "streaming")]
+#[test_case(true  ; "cached")]
+fn never_collapsing_shows_everything_and_ignores_clicks(flushed: bool) {
+    let mut panel = thinking_panel(ThinkingLines::Never);
+    add_thinking(&mut panel, &steps(STEP_COUNT), flushed);
+    let text = view_text(&mut panel);
+
+    assert!(
+        text.contains(&step(1)) && text.contains(&step(STEP_COUNT)),
+        "{text}"
+    );
+    assert!(!text.contains(TRUNCATION_PREFIX), "{text}");
+    assert!(!panel.handle_click(0, view_area()));
+}
+
+#[test_case(false ; "streaming")]
+#[test_case(true  ; "cached")]
+fn zero_rows_collapses_to_the_header(flushed: bool) {
+    let mut panel = thinking_panel(ThinkingLines::Tail(0));
+    add_thinking(&mut panel, &steps(STEP_COUNT), flushed);
+    let text = view_text(&mut panel);
+
+    assert_eq!(
+        thinking_rows(&panel),
+        [format!("{} {EXPAND_HINT}", collapsed_header(STEP_COUNT))]
+    );
+    assert!(!text.contains(&step(STEP_COUNT)), "{text}");
+}
+
+/// Collapsing would hide a single row, which is not worth a click.
+#[test_case(false ; "streaming")]
+#[test_case(true  ; "cached")]
+fn thinking_that_fits_is_shown_in_full_and_not_clickable(flushed: bool) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    add_thinking(&mut panel, &steps(TAIL_ROWS + 1), flushed);
+    let text = view_text(&mut panel);
+
+    assert!(
+        text.contains(&step(1)) && text.contains(&step(TAIL_ROWS + 1)),
+        "{text}"
+    );
+    assert!(!text.contains(TRUNCATION_PREFIX), "{text}");
+    assert!(!panel.handle_click(0, view_area()));
+}
+
+#[test]
+fn collapsed_tail_rewraps_on_resize() {
+    const NARROW: u16 = 40;
+    let mut panel = thinking_panel(ThinkingLines::Tail(TAIL_ROWS));
+    add_thinking(&mut panel, &"word ".repeat(80), true);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let wide = thinking_rows(&panel);
+
+    render(&mut panel, NARROW, VIEW_HEIGHT);
+    let narrow = thinking_rows(&panel);
+
+    assert_eq!(narrow.len(), TAIL_ROWS + 1);
+    assert_ne!(wide, narrow, "the tail must be rebuilt for the new width");
+    assert!(
+        narrow
+            .iter()
+            .skip(1)
+            .all(|row| row.chars().count() < usize::from(NARROW)),
+        "{narrow:?}"
     );
 }
 
 #[test]
-fn hide_cached_thinking_persists_as_indicator() {
-    let mut panel = MessagesPanel::new(
-        UiConfig {
-            show_thinking: false,
-            ..UiConfig::default()
-        },
-        EventHandle::disconnected_for_test(),
-    );
-    let lines: Vec<String> = (1..=7).map(|n| format!("cached line {n}")).collect();
-    panel.thinking_delta(&lines.join("\n"));
-    panel.flush();
-    assert!(matches!(
-        panel.last_message_role(),
-        Some(DisplayRole::Thinking)
-    ));
-    let terminal = render(&mut panel, 80, 12);
-    let text = buffer_text(&terminal);
-    assert!(
-        text.contains("thinking> ..."),
-        "cached thinking should persist as an indicator, not hide; got: {text}"
-    );
-    assert!(text.contains("(7 lines)"), "footer line count; got: {text}");
-    assert!(
-        text.contains("click to expand"),
-        "footer should hint click-to-expand; got: {text}"
-    );
-    assert!(
-        !text.contains("cached line 7"),
-        "reasoning must stay hidden in the indicator; got: {text}"
-    );
-    assert!(
-        !text.contains("cached line 1"),
-        "reasoning must stay hidden in the indicator; got: {text}"
-    );
-}
+fn expanded_live_thinking_stays_expanded_after_the_flush() {
+    let mut panel = thinking_panel(ThinkingLines::Tail(TAIL_ROWS));
+    add_thinking(&mut panel, &steps(STEP_COUNT), false);
+    view_text(&mut panel);
+    assert!(panel.handle_click(0, view_area()));
 
-#[test]
-fn hide_cached_thinking_click_expands() {
-    let mut panel = MessagesPanel::new(
-        UiConfig {
-            show_thinking: false,
-            ..UiConfig::default()
-        },
-        EventHandle::disconnected_for_test(),
-    );
-    panel.thinking_delta("hidden cached reasoning");
     panel.flush();
-    let area = Rect::new(0, 0, 80, 12);
-    render(&mut panel, 80, 12);
+    let text = view_text(&mut panel);
+
+    assert!(text.contains(&step(1)), "{text}");
     assert!(
-        panel.handle_click(0, area),
-        "clicking persisted thinking should toggle expand"
-    );
-    let terminal = render(&mut panel, 80, 12);
-    let text = buffer_text(&terminal);
-    assert!(
-        text.contains("hidden cached reasoning"),
-        "expanded view shows full reasoning; got: {text}"
-    );
-    assert!(
-        !text.contains("click to expand"),
-        "footer should disappear when expanded; got: {text}"
+        !panel.live_thinking_expanded,
+        "the next stream starts collapsed"
     );
 }
 
 #[test]
 fn stream_reset_clears_thinking_expand_state() {
-    let mut panel = MessagesPanel::new(
-        UiConfig {
-            show_thinking: false,
-            ..UiConfig::default()
-        },
-        EventHandle::disconnected_for_test(),
-    );
+    let mut panel = thinking_panel(ThinkingLines::Tail(0));
     panel.streaming_thinking.set_buffer("secret reasoning");
-    let area = Rect::new(0, 0, 80, 10);
     render(&mut panel, 80, 10);
     assert!(
-        panel.handle_click(0, area),
+        panel.handle_click(0, view_area()),
         "clicking collapsed thinking should toggle expand"
     );
-    assert!(!panel.thinking_collapsed);
+    assert!(panel.live_thinking_expanded);
     panel.stream_reset();
     assert!(
-        panel.thinking_collapsed,
+        !panel.live_thinking_expanded,
         "stream_reset must restore the collapsed default so it does not leak into retries"
     );
     panel.streaming_thinking.set_buffer("fresh reasoning");
     let terminal = render(&mut panel, 80, 10);
     let text = buffer_text(&terminal);
     assert!(
-        text.contains("thinking> ..."),
+        text.contains(&collapsed_header(1)),
         "new stream after reset should collapse again; got: {text}"
     );
     assert!(
@@ -2496,10 +2509,11 @@ fn msg_seg_text(panel: &MessagesPanel, msg_idx: usize) -> String {
 #[test]
 fn reflow_rebuilds_collapsed_thinking_instead_of_only_stamping() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.show_thinking = false;
-    let mut m = DisplayMessage::new(DisplayRole::Thinking, "one\ntwo".to_string());
-    m.thinking_collapsed = true;
-    panel.push(m);
+    panel.thinking_lines = ThinkingLines::Tail(0);
+    panel.push(DisplayMessage::new(
+        DisplayRole::Thinking,
+        "one\ntwo".to_string(),
+    ));
     render(&mut panel, 80, 10);
     assert!(
         msg_seg_text(&panel, 0).contains("(2 lines)"),

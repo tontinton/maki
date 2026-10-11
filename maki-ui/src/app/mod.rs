@@ -488,7 +488,7 @@ impl App {
             alert_modal: AlertModal::new(),
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
-            btw_modal: BtwModal::new(typewriter, ui_config.show_thinking),
+            btw_modal: BtwModal::new(typewriter, ui_config.thinking_lines),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),

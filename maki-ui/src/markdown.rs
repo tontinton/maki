@@ -8,7 +8,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 pub const TRUNCATION_PREFIX: &str = "...";
-const MIN_TRUNCATABLE_LINES: usize = 2;
+pub const EXPAND_HINT: &str = "click to expand";
+pub(crate) const MIN_TRUNCATABLE_LINES: usize = 2;
 
 /// Add `over`'s modifiers on top of `base`, keeping `base`'s colors.
 fn apply_modifiers(base: Style, over: Style) -> Style {
@@ -129,7 +130,7 @@ pub fn truncation_notice(count: usize) -> String {
         should_truncate(count),
         "truncation_notice called with count={count} below threshold"
     );
-    format!("{TRUNCATION_PREFIX} ({count} lines) click to expand")
+    format!("{TRUNCATION_PREFIX} ({count} lines) {EXPAND_HINT}")
 }
 
 pub struct Truncated<'a> {

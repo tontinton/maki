@@ -3,8 +3,11 @@ use crate::components::Overlay;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::components::streaming_content::StreamingContent;
-use crate::components::tool_display::{assistant_style, thinking_indicator, thinking_style};
+use crate::components::thinking;
+use crate::components::tool_display::{assistant_style, thinking_style};
 use crate::theme;
+
+use maki_config::ThinkingLines;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -18,6 +21,10 @@ const TITLE: &str = " /btw ";
 const H_PAD: u16 = 2;
 const WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 80;
+/// Clicks never reach the modal, so its thinking stays the way the config
+/// draws it and never promises to open.
+const CLICK_EXPANDED: bool = false;
+const CLICKABLE: bool = false;
 
 pub enum BtwEvent {
     TextDelta(String),
@@ -31,8 +38,8 @@ pub struct BtwModal {
     question: String,
     answer: StreamingContent,
     thinking: StreamingContent,
-    /// A copy of the transcript's setting, so both hide thinking the same way.
-    show_thinking: bool,
+    /// Same setting as the transcript, so thinking looks the same in both.
+    thinking_lines: ThinkingLines,
     /// `StreamingContent` keeps its styles by value and the modal outlives any
     /// number of theme switches, so this is what tells us to hand it new ones.
     theme_generation: u64,
@@ -41,7 +48,7 @@ pub struct BtwModal {
 }
 
 impl BtwModal {
-    pub fn new(ms_per_char: u64, show_thinking: bool) -> Self {
+    pub fn new(ms_per_char: u64, thinking_lines: ThinkingLines) -> Self {
         let thinking = thinking_style();
         let answer = assistant_style();
         Self {
@@ -54,7 +61,7 @@ impl BtwModal {
                 thinking.prefix_style,
                 ms_per_char,
             ),
-            show_thinking,
+            thinking_lines,
             theme_generation: theme::generation(),
             scroll: ModalScroll::new(),
             rx: None,
@@ -86,11 +93,9 @@ impl BtwModal {
     /// A pending stream is drained by [`Self::poll`], which reports its own
     /// [`Dirty`].
     pub fn cadence(&self) -> Cadence {
-        // Hidden thinking draws a line count, so its typewriter reveals
-        // nothing; believing it would pin the loop at full frame rate for the
-        // whole reasoning phase (same guard as the transcript's cadence).
-        let smooth =
-            self.answer.is_animating() || (self.show_thinking && self.thinking.is_animating());
+        let smooth = self.answer.is_animating()
+            || (thinking::reveals_text(self.thinking_lines, CLICK_EXPANDED)
+                && self.thinking.is_animating());
         Cadence::when(self.open && smooth, Cadence::SMOOTH)
     }
 
@@ -191,10 +196,15 @@ impl BtwModal {
             Line::default(),
         ];
         if !self.thinking.is_empty() {
-            if self.show_thinking {
-                lines.extend_from_slice(self.thinking.render_lines(width));
-            } else {
-                lines.extend(thinking_indicator(self.thinking.line_count(), false));
+            let collapsed = thinking::collapsed_view(
+                thinking::tail_rows(self.thinking_lines, CLICK_EXPANDED),
+                self.thinking.line_count(),
+                CLICKABLE,
+                |rows| self.thinking.render_tail(rows, width).map(<[_]>::to_vec),
+            );
+            match collapsed {
+                Some(collapsed) => lines.extend(collapsed),
+                None => lines.extend_from_slice(self.thinking.render_lines(width)),
             }
             lines.push(Line::default());
         }
@@ -245,13 +255,15 @@ impl Overlay for BtwModal {
 mod tests {
     use super::*;
     use crate::components::key as key_ev;
+    use crate::markdown::EXPAND_HINT;
     use crossterm::event::KeyCode;
     use ratatui::style::Style;
     use test_case::test_case;
 
     const INSTANT: u64 = 0;
-    const SHOW_THINKING: bool = true;
     const WIDTH: u16 = 80;
+    const TAIL_ROWS: usize = 2;
+    const IDEA_COUNT: usize = 6;
     const THEME_A: &str = "dracula";
     const THEME_B: &str = "tokyonight";
     const REASONING: &str = "hmm, sqlite";
@@ -259,7 +271,18 @@ mod tests {
     const HIDDEN_COUNT: &str = "(1 lines)";
 
     fn modal() -> BtwModal {
-        BtwModal::new(INSTANT, SHOW_THINKING)
+        BtwModal::new(INSTANT, ThinkingLines::Never)
+    }
+
+    fn idea(n: usize) -> String {
+        format!("idea {n:02}")
+    }
+
+    fn ideas() -> String {
+        (1..=IDEA_COUNT)
+            .map(|n| format!("- {}", idea(n)))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn open_modal(m: &mut BtwModal, question: &str) -> flume::Sender<BtwEvent> {
@@ -428,12 +451,28 @@ mod tests {
     /// which never advances here because nothing draws it.
     #[test]
     fn hidden_thinking_is_summarised_not_printed() {
-        let mut m = BtwModal::new(INSTANT, false);
+        let mut m = BtwModal::new(INSTANT, ThinkingLines::Tail(0));
         answer_a_question(&mut m);
         let body = body_text(&mut m);
         assert!(!body.contains(REASONING), "reasoning leaked: {body}");
         assert!(body.contains(HIDDEN_COUNT), "no line count: {body}");
+        assert!(!body.contains(EXPAND_HINT), "nothing to click: {body}");
         assert!(body.contains(ANSWER), "answer missing: {body}");
+    }
+
+    /// Nothing in the modal can be clicked open, so it must never offer to.
+    #[test_case(ThinkingLines::Never, 1 ; "never_shows_it_all")]
+    #[test_case(ThinkingLines::Tail(TAIL_ROWS), IDEA_COUNT - TAIL_ROWS + 1 ; "tail_shows_the_last_rows")]
+    fn thinking_is_shown_from(thinking_lines: ThinkingLines, first_shown: usize) {
+        let mut m = BtwModal::new(INSTANT, thinking_lines);
+        let tx = open_modal(&mut m, "q");
+        tx.send(BtwEvent::ThinkingDelta(ideas())).unwrap();
+        let _ = m.poll();
+        let body = body_text(&mut m);
+        assert!(!body.contains(EXPAND_HINT), "nothing to click: {body}");
+        for n in 1..=IDEA_COUNT {
+            assert_eq!(body.contains(&idea(n)), n >= first_shown, "{n}: {body}");
+        }
     }
 
     /// The modal is built once at startup and lives through every theme switch,

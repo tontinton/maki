@@ -80,7 +80,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |
 | `max_input_lines` | u32 | `20` | 1 | Maximum visible input lines |
-| `show_thinking` | bool | `true` | - | When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes |
+| `thinking_lines` | integer | `3` | - | Model reasoning starts collapsed to a header and its last N rows. Click it to expand or collapse it. 0 shows the header only, -1 never collapses |
 | `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
 
 ### `ui.theme`

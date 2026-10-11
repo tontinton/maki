@@ -57,10 +57,12 @@ pub(super) struct Segment {
     pub images: Vec<InlineImage>,
     pub tool_id: Option<String>,
     /// Backlink to `self.messages`, set only by `with_lines`. A click on a
-    /// collapsed thinking indicator has no tool_id to route by, so this is
-    /// how the click finds its message. It looks unused; delete it and the
-    /// show_thinking toggle breaks.
+    /// collapsed thinking view has no tool_id to route by, so this is how
+    /// the click finds its message. It looks unused; delete it and the
+    /// thinking_lines toggle breaks.
     pub msg_index: Option<usize>,
+    /// What a click can expand. On thinking, `output` means it is drawn
+    /// collapsed: the click answers what the reader sees, not the config.
     pub truncation: SectionFlags,
     cached_height: Cell<Option<CachedHeight>>,
     pending_highlight: Option<u64>,

@@ -128,9 +128,9 @@ pub enum Block {
 
 pub fn parse(text: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
-    let mut rest = text;
-    while let Some(fence) = find_code_fence(rest) {
-        let before = rest[..fence.before_end].trim_end_matches('\n');
+    let mut fences = CodeFences { text, pos: 0 };
+    for (base, fence) in &mut fences {
+        let before = text[base..base + fence.before_end].trim_end_matches('\n');
         if !before.is_empty() {
             blocks.extend(split_normal_blocks(before));
         }
@@ -138,14 +138,49 @@ pub fn parse(text: &str) -> Vec<Block> {
             lang: fence.lang.to_owned(),
             code: fence.code.to_owned(),
         });
-        let skip = fence.block_end + rest[fence.block_end..].len()
-            - rest[fence.block_end..].trim_start_matches('\n').len();
-        rest = &rest[skip..];
     }
+    let rest = &text[fences.pos..];
     if !rest.is_empty() {
         blocks.extend(split_normal_blocks(rest));
     }
     blocks
+}
+
+/// Moves `offset` back to the opening fence when it lands inside a code block.
+/// Rendering from the middle of a block would turn its code into prose. It
+/// walks the same fences as [`parse`], so the two always agree on where
+/// blocks are.
+pub fn code_block_start(text: &str, offset: usize) -> usize {
+    for (base, fence) in (CodeFences { text, pos: 0 }) {
+        let open = base + fence.before_end;
+        if offset <= open {
+            break;
+        }
+        if offset < base + fence.block_end {
+            return open;
+        }
+    }
+    offset
+}
+
+/// Yields each fence with its base offset, because [`CodeFence`] positions
+/// count from where the search started, not from the start of the text.
+struct CodeFences<'a> {
+    text: &'a str,
+    pos: usize,
+}
+
+impl<'a> Iterator for CodeFences<'a> {
+    type Item = (usize, CodeFence<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let rest = &self.text[self.pos..];
+        let fence = find_code_fence(rest)?;
+        let base = self.pos;
+        let after = &rest[fence.block_end..];
+        self.pos += fence.block_end + after.len() - after.trim_start_matches('\n').len();
+        Some((base, fence))
+    }
 }
 
 fn split_normal_blocks(text: &str) -> Vec<Block> {
@@ -1106,6 +1141,20 @@ mod tests {
         };
         assert_eq!(lang, "");
         assert_eq!(code, "```\ninner\n```");
+    }
+
+    const FENCED: &str = "intro\n```rust\nlet a = 1;\n```\nafter";
+
+    #[test_case(FENCED, 0 => 0 ; "before_any_fence")]
+    #[test_case(FENCED, 14 => 6 ; "inside_a_fence")]
+    #[test_case(FENCED, 29 => 29 ; "after_a_closed_fence")]
+    #[test_case("```\nfoo\nbar", 8 => 0 ; "inside_an_unclosed_fence")]
+    #[test_case(FOUR_BACKTICK_FENCE, 9 => 0 ; "inner_fence_does_not_close_the_outer")]
+    #[test_case("```\na\n  ```\nb\n```\n", 12 => 0 ; "indented_backticks_do_not_close_a_fence")]
+    #[test_case("  ```\nnot code\n", 6 => 6 ; "indented_backticks_are_not_a_fence")]
+    #[test_case("~~~\nnot code\n", 4 => 4 ; "tildes_are_not_a_fence")]
+    fn code_block_start_backs_up_to_the_opening_fence(text: &str, offset: usize) -> usize {
+        code_block_start(text, offset)
     }
 
     #[test]

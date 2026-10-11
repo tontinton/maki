@@ -14,8 +14,8 @@ use self::segment::{Segment, SegmentCache};
 use super::tool_display::{
     RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info, assistant_style,
     build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
-    instructions_search_text, notice_style, search_text_for, thinking_indicator, thinking_style,
-    truncate_to_header, user_style,
+    instructions_search_text, notice_style, search_text_for, thinking_style, truncate_to_header,
+    user_style,
 };
 use super::{
     DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER, ToolRole, ToolStatus, code_view::SectionFlags,
@@ -29,15 +29,17 @@ use crate::splash::{ColorTransition, Splash};
 use crate::terminal_image;
 use crate::theme;
 use crate::update;
-use maki_config::{ClockFormat, ToolOutputLines, UiConfig};
+use maki_config::{ClockFormat, ThinkingLines, ToolOutputLines, UiConfig};
 use ratatui_image::picker::Picker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem;
 use std::sync::Arc;
 use std::time::Instant;
 
 use super::scrollbar::{self, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
+use super::thinking;
 use maki_agent::{
     BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND, SharedBuf,
     ToolDoneEvent, ToolOutput, ToolStartEvent,
@@ -56,6 +58,8 @@ use tracing::warn;
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
 /// How far outside the drawn range an image keeps its encoded protocol.
 const IMAGE_KEEP_MARGIN_SEGMENTS: usize = 8;
+/// A click on transcript thinking expands or collapses it.
+const CLICKABLE: bool = true;
 
 #[derive(Clone, Copy)]
 pub struct PromptProgress {
@@ -94,8 +98,10 @@ pub struct MessagesPanel {
     tool_output_lines: ToolOutputLines,
     lua_event_handle: EventHandle,
     restore_event_tx: Option<EventSender>,
-    show_thinking: bool,
-    thinking_collapsed: bool,
+    thinking_lines: ThinkingLines,
+    /// The reader's click on the live thinking, handed to its message by
+    /// [`Self::flush_thinking`].
+    live_thinking_expanded: bool,
     clock_format: ClockFormat,
     /// One re-bake per tool per generation; `snapshot_theme_gen`
     /// only bumps when colors actually land.
@@ -150,8 +156,8 @@ impl MessagesPanel {
             tool_output_lines: ui_config.tool_output_lines,
             lua_event_handle,
             restore_event_tx: None,
-            show_thinking: ui_config.show_thinking,
-            thinking_collapsed: !ui_config.show_thinking,
+            thinking_lines: ui_config.thinking_lines,
+            live_thinking_expanded: false,
             clock_format: ui_config.clock_format,
             rebake_requested: HashMap::new(),
             prompt_progress: None,
@@ -210,14 +216,7 @@ impl MessagesPanel {
         self.cache.clear();
     }
 
-    pub fn load_messages(&mut self, mut msgs: Vec<DisplayMessage>) {
-        if !self.show_thinking {
-            for msg in &mut msgs {
-                if matches!(msg.role, DisplayRole::Thinking) {
-                    msg.thinking_collapsed = true;
-                }
-            }
-        }
+    pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
         self.messages = msgs;
         self.cache.clear();
         self.expanded_tools.clear();
@@ -226,7 +225,7 @@ impl MessagesPanel {
         self.watched_bufs.clear();
         self.rebake_requested.clear();
         self.highlight_segment = None;
-        self.thinking_collapsed = !self.show_thinking;
+        self.live_thinking_expanded = false;
     }
 
     pub fn thinking_delta(&mut self, text: &str) {
@@ -437,7 +436,7 @@ impl MessagesPanel {
     pub fn stream_reset(&mut self) {
         self.streaming_thinking.clear();
         self.streaming_text.clear();
-        self.thinking_collapsed = !self.show_thinking;
+        self.live_thinking_expanded = false;
         self.cancel_in_progress();
     }
 
@@ -685,7 +684,7 @@ impl MessagesPanel {
             .advance(self.scroll, u32::from(row.saturating_sub(area.y)));
         let width = self.viewport_width;
         if pos.seg >= self.live_start {
-            return self.try_toggle_collapsed_thinking(pos);
+            return self.try_toggle_live_thinking(pos);
         }
         let Some(seg) = self.cache.get(pos.seg) else {
             return false;
@@ -694,8 +693,7 @@ impl MessagesPanel {
             return false;
         }
         let Some(tool_id) = seg.tool_id.as_deref() else {
-            let msg_idx = seg.msg_index;
-            return self.try_toggle_cached_thinking(msg_idx, width);
+            return self.try_toggle_cached_thinking(pos.seg, width);
         };
 
         if self.has_snapshot(tool_id) {
@@ -795,13 +793,10 @@ impl MessagesPanel {
     }
 
     pub fn cadence(&self) -> Cadence {
-        // Collapsed thinking draws a line count, not the text, so its
-        // typewriter reveals nothing and never advances either, since only
-        // `view` ticks it. Believing it would pin the loop at full frame rate
-        // for the whole reasoning phase.
         let smooth = self.streaming_text.is_animating()
             || self.accent.is_animating()
-            || (self.streaming_thinking.is_animating() && !self.streaming_thinking_collapsed());
+            || (self.streaming_thinking.is_animating()
+                && thinking::reveals_text(self.thinking_lines, self.live_thinking_expanded));
         Cadence::any([
             // A running tool draws a spinner. Its output arriving is data, and
             // `tick` reports that separately.
@@ -809,10 +804,6 @@ impl MessagesPanel {
             Cadence::when(smooth, Cadence::SMOOTH),
             Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
         ])
-    }
-
-    fn streaming_thinking_collapsed(&self) -> bool {
-        self.thinking_collapsed && !self.streaming_thinking.is_empty()
     }
 
     fn show_idle_splash(&self) -> bool {
@@ -979,22 +970,33 @@ impl MessagesPanel {
     /// so a [`ScrollPos`] still points at the same text after the flush.
     fn rebuild_live_segments(&mut self, width: u16) {
         self.live_start = self.cache.len();
-        let thinking = if self.streaming_thinking_collapsed() {
-            Some(self.build_streaming_collapsed_lines())
-        } else if !self.streaming_thinking.is_empty() {
-            Some(self.streaming_thinking.render_lines(width).to_vec())
-        } else {
-            None
-        };
-        let text = if self.streaming_text.is_empty() {
-            None
-        } else {
-            Some(self.streaming_text.render_lines(width).to_vec())
-        };
-        for lines in [thinking, text].into_iter().flatten() {
-            self.cache.push_spacer_if_needed();
-            self.cache.push(Segment::with_lines(lines, None));
+        if !self.streaming_thinking.is_empty() {
+            let collapsed = thinking::collapsed_view(
+                thinking::tail_rows(self.thinking_lines, self.live_thinking_expanded),
+                self.streaming_thinking.line_count(),
+                CLICKABLE,
+                |rows| {
+                    self.streaming_thinking
+                        .render_tail(rows, width)
+                        .map(<[_]>::to_vec)
+                },
+            );
+            let drawn_collapsed = collapsed.is_some();
+            let lines =
+                collapsed.unwrap_or_else(|| self.streaming_thinking.render_lines(width).to_vec());
+            self.push_live_segment(lines, drawn_collapsed);
         }
+        if !self.streaming_text.is_empty() {
+            let lines = self.streaming_text.render_lines(width).to_vec();
+            self.push_live_segment(lines, false);
+        }
+    }
+
+    fn push_live_segment(&mut self, lines: Vec<Line<'static>>, collapsed: bool) {
+        self.cache.push_spacer_if_needed();
+        let mut seg = Segment::with_lines(lines, None);
+        seg.truncation.output = collapsed;
+        self.cache.push(seg);
     }
 
     pub fn scroll_pos(&self) -> ScrollPos {
@@ -1300,76 +1302,43 @@ impl MessagesPanel {
         }
         let mut msg =
             DisplayMessage::new(DisplayRole::Thinking, self.streaming_thinking.take_all());
-        msg.thinking_collapsed = self.thinking_collapsed;
-        self.thinking_collapsed = !self.show_thinking;
+        msg.thinking_expanded = mem::take(&mut self.live_thinking_expanded);
         self.messages.push(msg);
     }
 
-    fn build_streaming_collapsed_lines(&self) -> Vec<Line<'static>> {
-        thinking_indicator(self.streaming_thinking.line_count(), true)
-    }
-
-    fn build_cached_thinking_indicator(&self, text: &str) -> Vec<Line<'static>> {
-        thinking_indicator(logical_line_count(text), true)
-    }
-
-    fn try_toggle_collapsed_thinking(&mut self, pos: ScrollPos) -> bool {
+    fn try_toggle_live_thinking(&mut self, pos: ScrollPos) -> bool {
         // Thinking is always the first live segment, so it sits right after
         // the spacer that separates it from whatever came before.
         let thinking_seg = self.live_start + usize::from(self.live_start > 0);
-        if pos.seg != thinking_seg || !self.streaming_thinking_collapsed() {
+        if pos.seg != thinking_seg || self.streaming_thinking.is_empty() {
             return false;
         }
-        self.thinking_collapsed = false;
+        let drawn_collapsed = self.cache.get(pos.seg).is_some_and(|s| s.truncation.output);
+        if !thinking::click_toggles(self.live_thinking_expanded, drawn_collapsed) {
+            return false;
+        }
+        self.live_thinking_expanded = !self.live_thinking_expanded;
         true
     }
 
-    fn try_toggle_cached_thinking(&mut self, msg_idx: Option<usize>, width: u16) -> bool {
-        if self.show_thinking {
-            return false;
-        }
-        let Some(idx) = msg_idx else { return false };
-        let Some(msg) = self.messages.get_mut(idx) else {
+    fn try_toggle_cached_thinking(&mut self, seg_idx: usize, width: u16) -> bool {
+        let Some(seg) = self.cache.get(seg_idx) else {
             return false;
         };
-        if !matches!(msg.role, DisplayRole::Thinking) {
-            return false;
-        }
-        msg.thinking_collapsed = !msg.thinking_collapsed;
-        self.rebuild_thinking_segment(idx, width);
-        true
-    }
-
-    fn rebuild_thinking_segment(&mut self, msg_idx: usize, width: u16) {
-        let Some((text, collapsed)) = self
-            .messages
-            .get(msg_idx)
-            .map(|m| (m.text.clone(), m.thinking_collapsed))
+        let drawn_collapsed = seg.truncation.output;
+        let Some(msg) = seg
+            .msg_index
+            .and_then(|idx| self.messages.get_mut(idx))
+            .filter(|m| matches!(m.role, DisplayRole::Thinking))
         else {
-            return;
+            return false;
         };
-        let lines = if collapsed {
-            self.build_cached_thinking_indicator(&text)
-        } else {
-            let style = thinking_style();
-            text_to_lines(
-                &text,
-                style.prefix,
-                style.text_style,
-                style.prefix_style,
-                width,
-                None,
-            )
-        };
-        let seg_idx = self
-            .cache
-            .segments()
-            .iter()
-            .position(|s| s.msg_index == Some(msg_idx) && s.tool_id.is_none());
-        let Some(seg_idx) = seg_idx else { return };
-        if let Some(seg) = self.cache.get_mut(seg_idx) {
-            seg.set_lines(lines);
+        if !thinking::click_toggles(msg.thinking_expanded, drawn_collapsed) {
+            return false;
         }
+        msg.thinking_expanded = !msg.thinking_expanded;
+        self.reflow_text_segment(seg_idx, width);
+        true
     }
 
     fn update_spinners(&mut self) {
@@ -1463,16 +1432,11 @@ impl MessagesPanel {
                     self.upsert_instruction_segment(&id, &blocks);
                 }
             } else {
-                if matches!(&msg.role, DisplayRole::Thinking) && msg.thinking_collapsed {
-                    let text = msg.text.clone();
-                    let lines = self.build_cached_thinking_indicator(&text);
-                    self.cache.push_spacer_if_needed();
-                    self.cache.push(Segment::with_lines(lines, Some(i)));
-                    continue;
-                }
-                let lines = build_message_lines(msg, self.viewport_width);
+                let (lines, truncated) =
+                    message_view(msg, self.thinking_lines, self.viewport_width);
                 self.cache.push_spacer_if_needed();
                 let mut seg = Segment::with_lines(lines, Some(i));
+                seg.truncation.output = truncated;
                 seg.set_images(message_images(msg));
                 self.cache.push(seg);
             }
@@ -1549,31 +1513,14 @@ impl MessagesPanel {
             return;
         };
         seg.stale = false;
-        let (tool_id, msg_idx) = (seg.tool_id.clone(), seg.msg_index);
-
-        if let Some(tid) = tool_id {
-            let parent = segment::instruction_parent(&tid)
-                .map(str::to_string)
-                .unwrap_or(tid);
-            self.rebuild_tool_segment(&parent);
-            return;
-        }
-
-        let Some(msg_idx) = msg_idx else {
+        let Some(tid) = seg.tool_id.clone() else {
+            self.reflow_text_segment(seg_idx, width);
             return;
         };
-
-        let collapsed = self
-            .messages
-            .get(msg_idx)
-            .is_some_and(|m| matches!(m.role, DisplayRole::Thinking) && m.thinking_collapsed);
-        if collapsed {
-            // Geometry is width-independent, but a theme change marks segments
-            // stale too; rebuild so spans pick up the new palette.
-            self.rebuild_thinking_segment(msg_idx, width);
-        } else {
-            self.reflow_text_segment(seg_idx, width);
-        }
+        let parent = segment::instruction_parent(&tid)
+            .map(str::to_string)
+            .unwrap_or(tid);
+        self.rebuild_tool_segment(&parent);
     }
 
     fn reflow_text_segment(&mut self, seg_idx: usize, width: u16) {
@@ -1583,11 +1530,12 @@ impl MessagesPanel {
         let Some(msg) = self.messages.get(msg_idx) else {
             return;
         };
-        let lines = build_message_lines(msg, width);
+        let (lines, truncated) = message_view(msg, self.thinking_lines, width);
         let Some(seg) = self.cache.get_mut(seg_idx) else {
             return;
         };
         seg.set_lines(lines);
+        seg.truncation.output = truncated;
     }
 }
 
@@ -1635,16 +1583,28 @@ fn message_search_text(msg: &DisplayMessage) -> String {
     format!("{}{}", message_prefix(msg, &style), msg.text)
 }
 
-fn logical_line_count(text: &str) -> usize {
-    if text.is_empty() {
-        0
-    } else {
-        text.bytes().filter(|&b| b == b'\n').count() + 1
+/// A non-Tool message's lines at `width`, and whether they are thinking drawn
+/// collapsed, which is what makes a click on them expand it.
+fn message_view(
+    msg: &DisplayMessage,
+    mode: ThinkingLines,
+    width: u16,
+) -> (Vec<Line<'static>>, bool) {
+    if matches!(msg.role, DisplayRole::Thinking)
+        && let Some(lines) = thinking::collapsed_view(
+            thinking::tail_rows(mode, msg.thinking_expanded),
+            thinking::line_count(&msg.text),
+            CLICKABLE,
+            |rows| thinking::render_tail(&msg.text, rows, width, thinking_style().text_style),
+        )
+    {
+        return (lines, true);
     }
+    (build_message_lines(msg, width), false)
 }
 
-/// Builds ratatui lines for a non-Tool, non-collapsed-Thinking message at the
-/// given width. Shared by `rebuild_line_cache` (new messages) and
+/// Builds ratatui lines for a non-Tool message shown in full at the given
+/// width. Shared by `rebuild_line_cache` (new messages) and
 /// `reflow_text_segment` (stale-on-resize messages) so both paths produce
 /// identical segments.
 fn build_message_lines(msg: &DisplayMessage, width: u16) -> Vec<Line<'static>> {

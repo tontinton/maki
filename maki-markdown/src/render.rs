@@ -577,7 +577,14 @@ fn wrap_spans(spans: Vec<Span>, max_width: usize) -> Vec<Vec<Span>> {
 
         while !text.is_empty() {
             let fits = fit_width(text, remaining);
-            if fits == 0 {
+            let word_end = if fits == text.len() || text.as_bytes()[fits] == b' ' {
+                Some(fits)
+            } else {
+                text[..fits].rfind(' ').filter(|&sp| sp > 0)
+            };
+            // The row already holds earlier spans, so a word here that does
+            // not fit whole (inline code, say) moves down instead of being cut.
+            if fits == 0 || (word_end.is_none() && !current.is_empty()) {
                 if current.is_empty() {
                     let head = first_grapheme_len(text);
                     current.push(Span::with_emphasis(
@@ -592,14 +599,8 @@ fn wrap_spans(spans: Vec<Span>, max_width: usize) -> Vec<Vec<Span>> {
                 text = text.strip_prefix(' ').unwrap_or(text);
                 continue;
             }
-            let (take, skip) = if fits < text.len() {
-                match text[..fits].rfind(' ') {
-                    Some(sp) if sp > 0 => (sp, sp + 1),
-                    _ => (fits, fits),
-                }
-            } else {
-                (fits, fits)
-            };
+            let take = word_end.unwrap_or(fits);
+            let skip = take + usize::from(text[take..].starts_with(' '));
             current.push(Span::with_emphasis(
                 text[..take].to_owned(),
                 style.clone(),
@@ -1271,14 +1272,15 @@ mod tests {
     fn paragraph_wrapping_preserves_all_content() {
         const INPUT: &str = "The **quick** brown _fox_ jumps over the `lazy` dog repeatedly";
         let lines = render(INPUT, 20);
-        let rendered: String = lines
+        let rendered = lines
             .iter()
-            .flat_map(|l| &l.spans)
-            .map(|s| s.text.as_str())
-            .collect();
+            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" ");
         let expected = INPUT.replace("**", "").replace(['_', '`'], "");
         assert_eq!(
-            rendered, expected,
+            rendered.split_whitespace().collect::<Vec<_>>(),
+            expected.split_whitespace().collect::<Vec<_>>(),
             "wrapped output must preserve all visible text"
         );
     }
@@ -1330,6 +1332,23 @@ mod tests {
         assert!(wrapped.len() >= 3);
         assert_eq!(joined(&wrapped), long_word);
         assert!(wrapped.iter().all(|row| spans_width(row) <= 10));
+    }
+
+    #[test_case(&["call ", "collapsed"], 12 => vec!["call", "collapsed"] ; "span_starting_after_a_space")]
+    #[test_case(&["call", " collapsed"], 12 => vec!["call", "collapsed"] ; "span_starting_with_a_space")]
+    #[test_case(&["abcd efgh"], 4 => vec!["abcd", "efgh"] ; "space_right_after_the_fit")]
+    fn wrap_spans_keeps_words_whole(spans: &[&str], width: usize) -> Vec<String> {
+        let spans = spans
+            .iter()
+            .map(|text| Span::new(*text, StyleToken::Text))
+            .collect();
+        wrap_spans(spans, width)
+            .iter()
+            .map(|row| {
+                let text: String = row.iter().map(|s| s.text.as_str()).collect();
+                text.trim().to_owned()
+            })
+            .collect()
     }
 
     #[test_case(WARNING_CELL ; "emoji_presentation_sequence")]
