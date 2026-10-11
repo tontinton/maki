@@ -30,7 +30,9 @@ local NUDGE_SUMMARY =
   "You finished your work but did not provide a summary. Reply with a concise summary of what you did and found."
 local INVALID_INPUT_PREFIX =
   "Input does not match the required schema. Fix the errors and call structured_output again:\n"
-local BODY_INDENT_COLS = 4
+-- Worst case is a batch child: tool body + batch body indents (2 + 2),
+-- plus the transcript's scrollbar column.
+local BODY_CHROME_COLS = 5
 local MIN_MD_WIDTH = 20
 local DEFAULT_OUTPUT_LINES = 5
 
@@ -261,7 +263,7 @@ local function restore(_input, output, is_error, ctx)
     max_lines = (tol and tol.task) or DEFAULT_OUTPUT_LINES,
     keep = "head",
     max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
-    width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH),
+    width = math.max(maki.ui.terminal_size().cols - BODY_CHROME_COLS, MIN_MD_WIDTH),
   })
 end
 
