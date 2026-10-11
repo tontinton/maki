@@ -185,6 +185,8 @@ impl AgentSeed {
     }
 
     /// No chat shows this work, so its events go to a channel nobody reads.
+    /// Nobody can answer a permission prompt either, so there is no answer
+    /// channel and `enforce` denies the call instead of waiting.
     pub fn tool_context(&self, cancel: CancelToken) -> ToolContext {
         let (sink, _) = flume::unbounded();
         let slot = self.model_slot.load();

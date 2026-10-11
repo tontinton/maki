@@ -857,6 +857,7 @@ async fn gate(
     let decision = ctx.permissions.enforce(
         tool,
         scopes,
+        ctx.session_id.as_ref(),
         &ctx.event_tx,
         ctx.user_response_rx.as_deref(),
         id,

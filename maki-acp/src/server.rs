@@ -1641,6 +1641,7 @@ mod tests {
         smol::block_on(session.handle.permissions.enforce(
             &ToolKey::native(NEXT_TURN_TOOL),
             &PermissionScopes::single(NEXT_TURN_SCOPE.to_owned()),
+            None,
             &event_tx,
             Some(&rx),
             request_id,

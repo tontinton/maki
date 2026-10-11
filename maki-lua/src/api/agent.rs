@@ -579,7 +579,16 @@ async fn session(
     let (stream_guard, sub_events) = event_stream();
     let sub_event_tx = stream_guard.sender(agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
+    // A subagent can only ask the user if its parent can. Under `maki -p` or
+    // a background session nobody reads the subagent's chat, so a fresh
+    // channel would leave every prompt waiting until cancel. Without one,
+    // `enforce` denies the call right away.
+    let (answer_tx, answer_rx) = agent_ctx
+        .user_response_rx
+        .is_some()
+        .then(flume::unbounded::<String>)
+        .map(|(tx, rx)| (tx, Arc::new(AsyncMutex::new(rx))))
+        .unzip();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
     let (usage_tx, usage_rx) = flume::unbounded();
@@ -656,8 +665,8 @@ async fn session(
         sub_event_tx,
         stream_guard: Some(stream_guard),
         child_cancel,
-        answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
-        answer_tx: Some(answer_tx),
+        answer_rx,
+        answer_tx,
         reauth: agent_ctx.reauth,
         inbox: Arc::new(SubagentInbox::default()),
         parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
@@ -786,7 +795,7 @@ struct SessionState {
     /// sender disconnect.
     stream_guard: Option<EventStreamGuard>,
     child_cancel: maki_agent::cancel::CancelToken,
-    answer_rx: Arc<AsyncMutex<flume::Receiver<String>>>,
+    answer_rx: Option<Arc<AsyncMutex<flume::Receiver<String>>>>,
     answer_tx: Option<flume::Sender<String>>,
     reauth: bool,
     /// Shared with the host through [`SubagentInfo`], so a user watching this
@@ -903,13 +912,15 @@ async fn prompt(
             context: Arc::clone(&s.context),
         },
     )
-    .with_user_response_rx(Arc::clone(&s.answer_rx))
     .with_reauth(s.reauth)
     .with_interrupt_source(Arc::clone(&s.inbox) as Arc<dyn maki_agent::InterruptSource>)
     .with_loaded_instructions(s.loaded_instructions.clone())
     .with_cancel(s.child_cancel.clone())
     .with_mcp(s.mcp.clone())
     .with_local_tools(Arc::clone(&s.local_tools));
+    if let Some(rx) = &s.answer_rx {
+        agent = agent.with_user_response_rx(Arc::clone(rx));
+    }
 
     let input = AgentInput {
         message,
