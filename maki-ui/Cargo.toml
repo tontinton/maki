@@ -71,5 +71,9 @@ harness = false
 name = "reflow"
 harness = false
 
+[[bench]]
+name = "input"
+harness = false
+
 [lints]
 workspace = true

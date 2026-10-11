@@ -243,7 +243,7 @@ impl App {
         let main = self.main_chat();
         main.cost = cost;
         main.context_size = context_size;
-        if let Some(draft) = self.state.session.meta.input_draft.clone() {
+        if let Some(draft) = self.state.session.meta.input_draft.as_deref() {
             self.input_box.set_input(draft);
             self.input_box.buffer.move_to_end();
         }
@@ -462,7 +462,7 @@ impl App {
         self.reset_ui_chrome();
         self.restore_display();
 
-        self.input_box.set_input(entry.prompt_text);
+        self.input_box.set_input(&entry.prompt_text);
         self.input_box.buffer.move_to_end();
 
         vec![Action::RestartAgent(self.install_local_history())]

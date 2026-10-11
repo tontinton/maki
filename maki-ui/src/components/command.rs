@@ -357,7 +357,7 @@ impl CommandPalette {
                 self.close();
                 CommandAction::Consumed
             }
-            KeyCode::Enter => match self.confirm(&input.value()) {
+            KeyCode::Enter => match self.confirm(input.value()) {
                 Some(cmd) => {
                     self.close();
                     CommandAction::Execute(cmd)
@@ -397,7 +397,7 @@ impl CommandPalette {
         let version = Some(input.version());
         if self.synced_version != version {
             self.synced_version = version;
-            self.sync(&input.value());
+            self.sync(input.value());
         }
     }
 
@@ -1297,10 +1297,10 @@ mod tests {
         p.handle_key(key(KeyCode::Esc), &input);
         assert!(!p.is_active(&input));
 
-        input.set_value("/hel".into());
+        input.set_value("/hel");
         assert!(p.is_active(&input));
 
-        input.set_value("hello".into());
+        input.set_value("hello");
         assert!(!p.is_active(&input));
     }
 

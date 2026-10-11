@@ -778,7 +778,7 @@ fn step_modal(title: &str) -> Modal<'_> {
 fn input_line_with_cursor(input: &TextBuffer) -> Line<'static> {
     let t = theme::current();
     let value = input.value();
-    let cursor_byte = TextBuffer::char_to_byte(&value, input.x());
+    let cursor_byte = TextBuffer::char_to_byte(value, input.x());
     let (before, rest) = value.split_at(cursor_byte);
     let mut chars = rest.chars();
     let cursor_char = chars.next().unwrap_or(' ');

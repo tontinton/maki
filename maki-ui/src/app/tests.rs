@@ -568,21 +568,16 @@ fn altgr_chars_not_swallowed_by_ctrl_handler() {
     assert_eq!(app.input_box.buffer.value(), "hi\\");
 }
 
-#[test]
-fn undo_key_rewinds_the_last_paste_in_the_chat_input() {
+#[test_case(kb::UNDO.to_key_event()                                ; "alt_z")]
+#[test_case(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::SUPER) ; "super_z")]
+fn undo_key_rewinds_a_multi_line_paste_then_the_typing(undo: KeyEvent) {
     let mut app = test_app();
     app.update(Msg::Key(key(KeyCode::Char('h'))));
     app.update(Msg::Key(key(KeyCode::Char('i'))));
-    app.update(Msg::Paste("pasted\nacross\nlines".into()));
-    let alt_z = KeyEvent {
-        code: KeyCode::Char('z'),
-        modifiers: KeyModifiers::ALT,
-        kind: crossterm::event::KeyEventKind::Press,
-        state: crossterm::event::KeyEventState::NONE,
-    };
-    app.update(Msg::Key(alt_z));
+    app.update(Msg::Paste("one\ntwo\nthree".into()));
+    app.update(Msg::Key(undo));
     assert_eq!(app.input_box.buffer.value(), "hi");
-    app.update(Msg::Key(alt_z));
+    app.update(Msg::Key(undo));
     assert_eq!(app.input_box.buffer.value(), "");
 }
 
@@ -939,7 +934,7 @@ fn blank_session_carries_the_settings_that_outlive_a_turn() {
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
     app.state.context_size = MEASURED_CONTEXT;
-    app.input_box.set_input("half a thought".into());
+    app.input_box.set_input("half a thought");
     app.queue_and_notify(queued_msg("q"));
     app.permissions.load_session_rules(vec![session_rule()]);
     app.permissions.set_session_yolo(Some(true));
@@ -2986,7 +2981,7 @@ fn a_caret_anchored_float_falls_back_when_the_input_box_is_off_screen() {
 #[test]
 fn input_snapshot_offsets_are_byte_offsets() {
     let mut app = test_app();
-    app.input_box.set_input("日本".into());
+    app.input_box.set_input("日本");
     app.input_box.buffer.move_to_end();
 
     let st = app.input_snapshot();
@@ -3003,7 +2998,7 @@ fn input_snapshot_offsets_are_byte_offsets() {
 fn input_snapshot_carries_nothing_a_slice_would_give() {
     const DRAFT: &str = "first\nsecond";
     let mut app = test_app();
-    app.input_box.set_input(DRAFT.into());
+    app.input_box.set_input(DRAFT);
     app.input_box.buffer.move_to_end();
 
     assert_eq!(
@@ -3045,10 +3040,10 @@ fn apply_edit(app: &mut App, edit: InputEdit) -> Result<serde_json::Value, Strin
 #[test]
 fn an_input_edit_planned_against_an_older_value_fails_on_the_version() {
     let mut app = test_app();
-    app.input_box.set_input("hello".into());
+    app.input_box.set_input("hello");
     let planned = planned_edit(&app, 0, 5, "bye");
 
-    app.input_box.buffer.set_cursor_byte(0).unwrap();
+    app.input_box.buffer.set_cursor(0, 0);
     app.input_box.buffer.push_char('x');
 
     let err = apply_edit(&mut app, planned).unwrap_err();
@@ -3066,7 +3061,7 @@ fn an_input_edit_planned_against_an_older_value_fails_on_the_version() {
 #[test]
 fn an_input_edit_naming_another_session_is_refused() {
     let mut app = test_app();
-    app.input_box.set_input("hello".into());
+    app.input_box.set_input("hello");
 
     let stale = InputEdit {
         session_id: OTHER_SESSION_ID.into(),
@@ -3086,7 +3081,7 @@ fn an_input_edit_naming_another_session_is_refused() {
 #[test]
 fn an_input_edit_is_refused_while_the_input_is_off_screen() {
     let mut app = test_app();
-    app.input_box.set_input("hello".into());
+    app.input_box.set_input("hello");
     open_split_window(&mut app, Split::Below);
 
     let planned = planned_edit(&app, 0, 5, "bye");
@@ -3107,7 +3102,7 @@ fn an_input_edit_is_refused_while_the_input_is_off_screen() {
 #[test]
 fn an_input_edit_meets_a_prompt_opened_since_the_last_frame() {
     let mut app = test_app();
-    app.input_box.set_input("hello".into());
+    app.input_box.set_input("hello");
     draw_to_buffer(&mut app);
 
     app.permission_prompt.push(
@@ -3130,7 +3125,7 @@ fn an_input_edit_meets_a_prompt_opened_since_the_last_frame() {
 #[test]
 fn an_input_edit_is_refused_while_an_overlay_is_up() {
     let mut app = test_app();
-    app.input_box.set_input("hello".into());
+    app.input_box.set_input("hello");
 
     let tmp = TempDir::new().unwrap();
     app.file_picker.open(&tmp.path().to_string_lossy());
@@ -3151,7 +3146,7 @@ fn an_input_edit_is_refused_while_an_overlay_is_up() {
 fn an_input_edit_is_refused_when_the_terminal_cannot_fit_the_input_box() {
     const TOO_SHORT: u16 = MIN_CHAT_ROWS + 1;
     let mut app = test_app();
-    app.input_box.set_input("hello".into());
+    app.input_box.set_input("hello");
     let cramped = Rect::new(0, 0, TEST_AREA.width, TOO_SHORT);
 
     let planned = planned_edit(&app, 0, 5, "bye");
@@ -3173,7 +3168,7 @@ fn editor_text_keeps_its_tabs() {
 	println!();
 }";
     let mut app = test_app();
-    app.input_box.set_input(EDITED.into());
+    app.input_box.set_input(EDITED);
     assert_eq!(app.input_snapshot()["text"], serde_json::json!(EDITED));
 }
 
@@ -4199,7 +4194,7 @@ fn run_cmdline_splits_args_off_the_name() {
 #[test]
 fn run_cmdline_keeps_typed_input() {
     let mut app = test_app();
-    app.input_box.set_input("half written".into());
+    app.input_box.set_input("half written");
 
     app.run_cmdline("/usage", 0, &trusted()).unwrap();
 
@@ -5591,7 +5586,7 @@ const HIDDEN_DRAFT: &str = "half a thought";
 #[test_case(KeyCode::Backspace ; "backspace")]
 fn a_key_no_notation_names_never_reaches_the_chat_behind_a_focused_float(code: KeyCode) {
     let mut app = test_app();
-    app.input_box.set_input(HIDDEN_DRAFT.into());
+    app.input_box.set_input(HIDDEN_DRAFT);
     app.input_box.buffer.move_to_end();
     let mode = app.state.mode;
     let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
@@ -5894,7 +5889,7 @@ fn ctrl_c_closes_overlay_instead_of_quitting() {
 fn bash_prefix_overrides_mode() {
     let mut app = test_app();
 
-    app.input_box.set_input("! ls".into());
+    app.input_box.set_input("! ls");
     assert_eq!(&*app.mode_label().0, "[BASH]");
 
     app.update(Msg::Key(key(KeyCode::Tab)));
@@ -5904,7 +5899,7 @@ fn bash_prefix_overrides_mode() {
         "tab must not toggle while bash prefix present"
     );
 
-    app.input_box.set_input("ls".into());
+    app.input_box.set_input("ls");
     assert_eq!(&*app.mode_label().0, "[BUILD]");
 }
 
@@ -6396,7 +6391,7 @@ fn focusing_a_tab_announces_the_input_it_holds() {
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
 
-    app.input_box.set_input(FOCUSED_DRAFT.into());
+    app.input_box.set_input(FOCUSED_DRAFT);
     app.announce_input();
 
     let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
@@ -6427,7 +6422,7 @@ fn a_focus_switch_fires_one_input_change() {
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
 
-    app.input_box.set_input(RESTORED_DRAFT.into());
+    app.input_box.set_input(RESTORED_DRAFT);
     let _ = app.tick();
     app.announce_input();
 
@@ -6484,7 +6479,7 @@ fn focusing_a_tab_holding_what_it_announced_fires_one_input_change() {
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
 
-    app.input_box.set_input(HELD_DRAFT.into());
+    app.input_box.set_input(HELD_DRAFT);
     let _ = app.tick();
     next_input_change(&probe).expect("the tab announced the draft while it was focused");
 
@@ -7130,8 +7125,8 @@ fn exit_in_subagent_chat_quits() {
 
 /// These change the text without a keypress, and `Enter` must still act on
 /// what the box shows.
-#[test_case(false, |app| app.input_box.set_input(HELP_COMMAND.into()), true ; "set_directly_opens_it")]
-#[test_case(true, |app| app.input_box.set_input(MAIN_DRAFT.into()), false ; "replaced_directly_closes_it")]
+#[test_case(false, |app| app.input_box.set_input(HELP_COMMAND), true ; "set_directly_opens_it")]
+#[test_case(true, |app| app.input_box.set_input(MAIN_DRAFT), false ; "replaced_directly_closes_it")]
 #[test_case(true, |app| { app.run_builtin(BuiltinAction::PrevChat); }, false ; "chat_switch_closes_it")]
 fn enter_acts_on_what_the_box_shows(open_first: bool, change: fn(&mut App), runs_command: bool) {
     let (mut app, _inbox) = app_with_subagent_inbox();
@@ -7834,7 +7829,7 @@ fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
         .unwrap();
 
     let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
-    app.input_box.set_input(UNSENT_DRAFT.into());
+    app.input_box.set_input(UNSENT_DRAFT);
     app.checkpoint();
     let (live_id, sent_revision) = (app.state.session.id, app.state.session.revision());
 
@@ -7849,7 +7844,7 @@ fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
     while session.revision() + 1 < sent_revision {
         session.set_title(format!("{BUMP_TITLE}{}", session.revision()));
     }
-    app.input_box.set_input(SWITCHED_DRAFT.into());
+    app.input_box.set_input(SWITCHED_DRAFT);
     app.checkpoint();
     assert_eq!(
         app.state.session.revision(),

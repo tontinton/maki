@@ -119,7 +119,7 @@ impl<T: PickerItem> State<T> {
             self.filtered = (0..self.items.len()).collect();
         } else {
             let pattern = Pattern::new(
-                &query,
+                query,
                 CaseMatching::Smart,
                 Normalization::Smart,
                 AtomKind::Fuzzy,

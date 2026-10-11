@@ -1,10 +1,12 @@
+mod layout;
+
+use std::cell::{RefCell, RefMut};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use unicode_width::UnicodeWidthChar;
-
+use self::layout::{Layout, Row, char_width};
 use crate::app::shell::parse_shell_prefix;
 use crate::highlight;
-use crate::text_buffer::{EditKind, EditResult, TextBuffer, is_newline_key};
+use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -89,6 +91,9 @@ pub struct InputBox {
     max_input_lines: u16,
     last_total_lines: u16,
     last_content_height: u16,
+    /// `height` only gets `&self`, yet it has to bring this cache up to date
+    /// too, hence the `RefCell`.
+    layout: RefCell<Layout>,
 }
 
 impl InputBox {
@@ -106,7 +111,7 @@ impl InputBox {
             }
             KeyCode::Tab | KeyCode::Esc => return InputAction::Passthrough(key),
             _ if is_newline_key(&key) => {
-                self.buffer.edit(EditKind::Other, TextBuffer::add_line);
+                self.buffer.add_line();
                 return InputAction::ContinueLine;
             }
             KeyCode::Enter if self.char_before_cursor_is_backslash() => {
@@ -130,19 +135,18 @@ impl InputBox {
 
     pub fn handle_paste(&mut self, text: &str) -> InputAction {
         self.follow_cursor = true;
-        self.buffer
-            .edit(EditKind::Other, |buf| buf.insert_text(text));
+        self.buffer.insert_text(text);
         InputAction::Changed
     }
 
     /// Inserting a file path mid-word looks broken ("read/tmp/x" instead of
     /// "read /tmp/x"). This adds spaces around the paste only when needed.
     pub fn handle_paste_with_spaces(&mut self, text: &str) -> InputAction {
-        let line = &self.buffer.lines()[self.buffer.y()];
-        let bx = TextBuffer::char_to_byte(line, self.buffer.x());
+        let value = self.buffer.value();
+        let at = self.buffer.cursor_byte();
 
-        let char_before = line[..bx].chars().next_back();
-        let char_after = line[bx..].chars().next();
+        let char_before = value[..at].chars().next_back();
+        let char_after = value[at..].chars().next();
 
         let is_word_boundary =
             |c: char| -> bool { c.is_alphanumeric() || c == '_' || ")]}>".contains(c) };
@@ -196,13 +200,13 @@ impl InputBox {
             max_input_lines,
             last_total_lines: 1,
             last_content_height: 1,
+            layout: RefCell::default(),
         }
     }
 
     pub fn copy_text(&self) -> String {
         self.buffer
             .lines()
-            .iter()
             .enumerate()
             .map(|(i, l)| {
                 let prefix = if i == 0 { CHEVRON } else { NEWLINE_PAD };
@@ -212,30 +216,28 @@ impl InputBox {
             .join("\n")
     }
 
+    fn layout(&self, width: u16) -> RefMut<'_, Layout> {
+        let mut layout = self.layout.borrow_mut();
+        layout.sync(&self.buffer, effective_width(width.into()));
+        layout
+    }
+
     /// Where the drawn rows start a new buffer line, for a selection copied out
-    /// of the box. It walks the same greedy wrap the box draws with, cursor row
+    /// of the box. It reads the row counts the box draws with, cursor row
     /// included, since a count off by one row moves every later line start and
     /// scatters the newlines.
     pub fn line_breaks(&self, content_width: u16) -> LineBreaks {
-        let ew = effective_width(content_width as usize);
-        let cursor_y = self.buffer.y();
         LineBreaks::from_heights(
-            self.buffer
-                .lines()
-                .iter()
-                .enumerate()
-                .map(|(i, line)| wrapped_row_count(line, ew, i == cursor_y) as u16),
+            self.layout(content_width)
+                .heights()
+                .map(|rows| u16::try_from(rows).unwrap_or(u16::MAX)),
         )
     }
 
     pub fn height(&self, width: u16) -> u16 {
-        let ew = effective_width(width as usize);
-        let mut visual_lines = total_visual_lines(&self.buffer, ew);
-        if !self.pending_images.is_empty() {
-            visual_lines += 1;
-        }
-        let capped = visual_lines.min(self.max_input_lines as usize);
-        (capped as u16).saturating_add(BORDER_ROWS)
+        let rows = self.layout(width).total_rows() + u32::from(!self.pending_images.is_empty());
+        let capped = rows.min(self.max_input_lines.into()) as u16;
+        capped.saturating_add(BORDER_ROWS)
     }
 
     pub fn is_at_first_line(&self) -> bool {
@@ -247,17 +249,11 @@ impl InputBox {
     }
 
     pub fn char_before_cursor_is_backslash(&self) -> bool {
-        let line = &self.buffer.lines()[self.buffer.y()];
-        let x = self.buffer.x();
-        if x == 0 {
-            return false;
-        }
-        let byte_idx = TextBuffer::char_to_byte(line, x - 1);
-        line.as_bytes()[byte_idx] == b'\\'
+        self.buffer.value()[..self.buffer.cursor_byte()].ends_with('\\')
     }
 
     pub fn continue_line(&mut self) {
-        self.buffer.edit(EditKind::Other, |buf| {
+        self.buffer.undoable(|buf| {
             buf.remove_char();
             buf.add_line();
         });
@@ -298,7 +294,7 @@ impl InputBox {
         if untouched_recall {
             self.draft.clone()
         } else {
-            text
+            text.to_owned()
         }
     }
 
@@ -306,7 +302,7 @@ impl InputBox {
         let text = self.draft_text();
         let images = mem::take(&mut self.pending_images);
         self.discard();
-        self.set_input(draft.text);
+        self.set_input(&draft.text);
         self.pending_images = draft.images;
         Submission { text, images }
     }
@@ -328,9 +324,7 @@ impl InputBox {
         text: &str,
         cursor: Option<usize>,
     ) -> Result<(), String> {
-        self.buffer.edit(EditKind::Other, |buf| {
-            buf.replace_byte_range(start, stop, text, cursor)
-        })?;
+        self.buffer.replace_byte_range(start, stop, text, cursor)?;
         self.follow_cursor = true;
         self.history_index = None;
         self.draft.clear();
@@ -341,7 +335,7 @@ impl InputBox {
     /// restored draft, a rewind prompt, what came back from `$EDITOR`. The
     /// text lands verbatim, because the user composed it elsewhere and a
     /// rewrite here is what the model would be sent.
-    pub fn set_input(&mut self, s: String) {
+    pub fn set_input(&mut self, s: &str) {
         self.buffer.set_value(s);
     }
 
@@ -351,15 +345,14 @@ impl InputBox {
         }
         let new_index = match self.history_index {
             None => {
-                self.draft = self.buffer.value();
+                self.draft = self.buffer.value().to_owned();
                 self.history.len() - 1
             }
             Some(0) => return,
             Some(i) => i - 1,
         };
         self.history_index = Some(new_index);
-        let entry = self.history.get(new_index).unwrap().to_string();
-        self.set_input(entry);
+        self.buffer.set_value(self.history.get(new_index).unwrap());
         self.buffer.move_to_end();
     }
 
@@ -369,26 +362,11 @@ impl InputBox {
         };
         if i + 1 < self.history.len() {
             self.history_index = Some(i + 1);
-            let entry = self.history.get(i + 1).unwrap().to_string();
-            self.set_input(entry);
+            self.buffer.set_value(self.history.get(i + 1).unwrap());
         } else {
             self.history_index = None;
-            let draft = mem::take(&mut self.draft);
-            self.set_input(draft);
+            self.buffer.set_value(&mem::take(&mut self.draft));
         }
-    }
-
-    /// The row the cursor is drawn on, counted from the top of the buffer, so
-    /// the scroll can bring exactly that row into view.
-    fn visual_cursor_y(&self, ew: usize) -> u16 {
-        let lines = self.buffer.lines();
-        let lines_above: usize = lines
-            .iter()
-            .take(self.buffer.y())
-            .map(|line| wrapped_row_count(line, ew, false))
-            .sum();
-        let row = lines_above + wrapped_cursor_row(&lines[self.buffer.y()], ew, self.buffer.x());
-        u16::try_from(row).unwrap_or(u16::MAX)
     }
 
     /// Returns the screen cell the caret was drawn in, reversed or not.
@@ -407,27 +385,27 @@ impl InputBox {
         top_right_hint: Option<Line<'_>>,
     ) -> Option<Position> {
         let content_height = area.height.saturating_sub(BORDER_ROWS);
-        let ew = effective_width(area.width as usize);
+        let (cursor_row, text_rows) = {
+            let layout = self.layout(area.width);
+            (layout.cursor_row(&self.buffer), layout.total_rows())
+        };
 
         if self.follow_cursor {
-            let visual_cursor_y = self.visual_cursor_y(ew);
-            if visual_cursor_y < self.scroll_y {
-                self.scroll_y = visual_cursor_y;
-            } else if visual_cursor_y >= self.scroll_y + content_height {
-                self.scroll_y = visual_cursor_y - content_height + 1;
+            let cursor_row = u16::try_from(cursor_row).unwrap_or(u16::MAX);
+            if cursor_row < self.scroll_y {
+                self.scroll_y = cursor_row;
+            } else if cursor_row >= self.scroll_y + content_height {
+                self.scroll_y = cursor_row - content_height + 1;
             }
         }
 
-        let mut total_vl = total_visual_lines(&self.buffer, ew) as u16;
-        if !self.pending_images.is_empty() {
-            total_vl += 1;
-        }
+        let total_vl = u16::try_from(text_rows + u32::from(!self.pending_images.is_empty()))
+            .unwrap_or(u16::MAX);
         self.last_total_lines = total_vl;
         self.last_content_height = content_height.max(1);
         let max_scroll = self.max_scroll();
         self.scroll_y = self.scroll_y.min(max_scroll);
-
-        let is_empty = self.buffer.value().is_empty();
+        let is_empty = self.buffer.is_empty();
         let mut cursor_cell: Option<Position> = None;
         let mut styled_lines: Vec<Line> = if is_empty && self.pending_images.is_empty() {
             let base = theme::current().input_placeholder;
@@ -451,36 +429,38 @@ impl InputBox {
             spans.extend(tail);
             vec![Line::from(spans)]
         } else {
-            let cursor_y = self.buffer.y();
-            let cursor_x = self.buffer.x();
-            let mut lines: Vec<Line> = Vec::new();
-            for (i, line) in self.buffer.lines().iter().enumerate() {
-                let is_cursor_line = i == cursor_y;
-                let shell_spans = if i == 0 {
-                    shell_highlight_spans(line)
-                } else {
-                    None
-                };
-                let (rows, cursor) = wrap_line(
-                    line,
-                    ew,
-                    is_cursor_line,
-                    cursor_x,
-                    i == 0,
-                    shell_spans.as_deref(),
+            let rows: Vec<Row> = self
+                .layout
+                .get_mut()
+                .rows_from(&self.buffer, self.scroll_y.into())
+                .take(content_height.into())
+                .collect();
+            let shell_spans = rows
+                .first()
+                .filter(|row| row.line == 0)
+                .and_then(|_| shell_highlight_spans(self.buffer.line(0)));
+            let caret = self.buffer.cursor_byte_in_line();
+            let mut lines = Vec::with_capacity(rows.len() + 1);
+            for (screen_row, row) in (0..).zip(rows) {
+                let owns_caret = u32::from(self.scroll_y) + u32::from(screen_row) == cursor_row;
+                let (drawn, col) = draw_row(
+                    self.buffer.line(row.line),
+                    &row,
+                    shell_spans.as_deref().filter(|_| row.line == 0),
+                    owns_caret.then_some(caret),
                     show_cursor,
                 );
-                if let Some(cell) = cursor
-                    && let Ok(row) = u16::try_from(lines.len() + usize::from(cell.y))
-                {
-                    cursor_cell = Some(Position::new(cell.x, row));
+                if let Some(col) = col {
+                    cursor_cell = Some(Position::new(col, screen_row));
                 }
-                lines.extend(rows);
+                lines.push(drawn);
             }
             lines
         };
 
-        if !self.pending_images.is_empty() {
+        // Only the visible rows were drawn, so the label, which sits right
+        // after the text, fits only when the text ends inside the box.
+        if !self.pending_images.is_empty() && styled_lines.len() < usize::from(content_height) {
             let n = self.pending_images.len();
             let label = match n {
                 1 => "1 image".to_string(),
@@ -502,7 +482,6 @@ impl InputBox {
         }
         let paragraph = Paragraph::new(text)
             .style(Style::new().fg(theme::current().foreground))
-            .scroll((self.scroll_y, 0))
             .block(block);
         frame.render_widget(paragraph, area);
 
@@ -512,9 +491,8 @@ impl InputBox {
         }
 
         let cell = cursor_cell?;
-        let y = cell.y.checked_sub(self.scroll_y)?;
-        (y < content_height && cell.x < area.width)
-            .then(|| Position::new(area.x + cell.x, area.y + 1 + y))
+        (cell.y < content_height && cell.x < area.width)
+            .then(|| Position::new(area.x + cell.x, area.y + 1 + cell.y))
     }
 
     fn max_scroll(&self) -> u16 {
@@ -557,52 +535,27 @@ impl InputBox {
         let content_y = row.checked_sub(area.y)?;
         let content_x = col.checked_sub(area.x)?;
 
-        let ew = effective_width(area.width as usize);
-        let visual_line = content_y as usize + self.scroll_y as usize;
+        let layout = self.layout(area.width);
+        let row = layout
+            .rows_from(
+                &self.buffer,
+                u32::from(self.scroll_y) + u32::from(content_y),
+            )
+            .next()?;
+        let line = self.buffer.line(row.line);
 
-        let cursor_line = self.buffer.y();
-        let mut visual = 0usize;
-
-        for (buf_line_idx, line) in self.buffer.lines().iter().enumerate() {
-            let chars: Vec<char> = line.chars().collect();
-            let widths: Vec<usize> = chars.iter().copied().map(char_width).collect();
-
-            let ranges = wrap_ranges(&widths, ew, buf_line_idx == cursor_line);
-
-            let n_visual_rows = ranges.len();
-
-            if visual_line < visual + n_visual_rows {
-                let wrap_row = visual_line - visual;
-                let (row_char_start, row_char_end) = ranges[wrap_row];
-
-                let row_display_width: usize = widths[row_char_start..row_char_end].iter().sum();
-
-                // The first visual row of each buffer line has a 2-cell prefix
-                // (chevron or continuation padding).  Wrapped rows have none.
-                let text_col = if wrap_row == 0 {
-                    (content_x as usize).saturating_sub(PREFIX_WIDTH as usize)
-                } else {
-                    content_x as usize
-                };
-                let text_col = text_col.min(row_display_width);
-
-                // Walk character widths to find which char the column hits.
-                let mut accum = 0;
-                let mut char_idx = row_char_start;
-                for &w in &widths[row_char_start..row_char_end] {
-                    if accum + w > text_col {
-                        break;
-                    }
-                    accum += w;
-                    char_idx += 1;
-                }
-
-                return Some((buf_line_idx, char_idx));
+        let prefix = if row.index == 0 { PREFIX_WIDTH } else { 0 };
+        let mut col = usize::from(content_x.saturating_sub(prefix));
+        let mut hit = row.bytes.end;
+        for (i, c) in line[row.bytes.clone()].char_indices() {
+            let w = char_width(c);
+            if w > col {
+                hit = row.bytes.start + i;
+                break;
             }
-            visual += n_visual_rows;
+            col -= w;
         }
-
-        None
+        Some((row.line, line[..hit].chars().count()))
     }
 }
 
@@ -618,134 +571,43 @@ const fn effective_width(content_width: usize) -> usize {
     content_width.saturating_sub(PREFIX_WIDTH as usize)
 }
 
-/// Wraps one buffer line into rendered rows. When the line holds the cursor it
-/// also reports the cell the caret sits in, `y` rows down from the start of the
-/// line and `x` columns into that row. Only this function knows where the
-/// cursor was drawn, so a terminal cursor placed from it can never drift off
-/// that cell. {reversed} paints it as a block cursor, and it is reported
-/// either way.
-fn wrap_line(
+/// Draws one row of {line}. When the row owns the caret, {caret} is its byte in
+/// the line and the column it lands in comes back too. Only this function
+/// knows where the caret was drawn, so a terminal cursor placed from that
+/// column can never drift off the cell. {reversed} paints it as a block
+/// cursor, and the column is reported either way.
+fn draw_row(
     line: &str,
-    ew: usize,
-    is_cursor_line: bool,
-    cursor_x: usize,
-    is_first_line: bool,
+    row: &Row,
     shell_spans: Option<&[Span<'static>]>,
+    caret: Option<usize>,
     reversed: bool,
-) -> (Vec<Line<'static>>, Option<Position>) {
-    let chars: Vec<char> = line.chars().collect();
-    let widths: Vec<usize> = chars.iter().copied().map(char_width).collect();
-
-    let ranges = wrap_ranges(&widths, ew, is_cursor_line);
-    let row_count = ranges.len();
-    let mut cursor_cell = None;
-    let rows = ranges
-        .into_iter()
-        .enumerate()
-        .map(|(row, (start, end))| {
-            let prefix_span = if row == 0 && is_first_line {
-                super::chevron_span()
-            } else if row == 0 {
-                Span::raw(NEWLINE_PAD)
-            } else {
-                Span::raw("")
-            };
-            let prefix_width = prefix_span.width() as u16;
-            let mut spans = vec![prefix_span];
-
-            let chunk_spans = if let Some(styled) = &shell_spans {
-                slice_styled_spans(styled, start, end)
-            } else {
-                let chunk_text: String = chars[start..end].iter().collect();
-                vec![Span::raw(chunk_text)]
-            };
-
-            // A cursor sitting on a wrap boundary belongs to the row that
-            // starts there, otherwise both rows would draw it.
-            let owns_cursor =
-                is_cursor_line && cursor_x >= start && (cursor_x < end || row + 1 == row_count);
-            if owns_cursor {
-                let (with_cursor, col) = overlay_cursor(chunk_spans, cursor_x - start, reversed);
-                cursor_cell = Some(Position::new(prefix_width + col, row as u16));
-                spans.extend(with_cursor);
-            } else {
-                spans.extend(chunk_spans);
-            }
-
-            Line::from(spans)
-        })
-        .collect();
-    (rows, cursor_cell)
-}
-
-fn char_width(c: char) -> usize {
-    c.width().unwrap_or(1)
-}
-
-/// The one place that knows how a line breaks into rows: greedy wrapping, where
-/// a char that no longer fits moves to the next row and leaves the gap behind.
-/// Calls `emit` with the char range of every row, and appends an empty row when
-/// the cursor sits just past a completely full last row.
-///
-/// Everything that needs row numbers goes through here. Dividing the cursor
-/// column by the width instead looks close enough for plain text, but it cannot
-/// see those gaps, so with wide chars it lands on the wrong row.
-fn walk_wrap_rows(
-    widths: impl IntoIterator<Item = usize>,
-    ew: usize,
-    is_cursor_line: bool,
-    mut emit: impl FnMut(usize, usize),
-) {
-    let row_width = ew.max(1);
-    let mut char_count = 0;
-    let mut row_start = 0;
-    let mut row_col = 0;
-    for (i, w) in widths.into_iter().enumerate() {
-        if row_col + w > row_width && row_col > 0 {
-            emit(row_start, i);
-            row_start = i;
-            row_col = 0;
+) -> (Line<'static>, Option<u16>) {
+    let mut spans = match row.index {
+        0 if row.line == 0 => vec![super::chevron_span()],
+        0 => vec![Span::raw(NEWLINE_PAD)],
+        _ => Vec::new(),
+    };
+    let prefix_width = display_width(&spans);
+    let text = &line[row.bytes.clone()];
+    let chunk = match shell_spans {
+        Some(styled) => {
+            let start = line[..row.bytes.start].chars().count();
+            slice_styled_spans(styled, start, start + text.chars().count())
         }
-        row_col += w;
-        char_count = i + 1;
-    }
-    emit(row_start, char_count);
-    if is_cursor_line && row_col + 1 > row_width {
-        emit(char_count, char_count);
-    }
-}
-
-/// Row ranges of char indices, for the callers that need to slice the text.
-fn wrap_ranges(widths: &[usize], ew: usize, is_cursor_line: bool) -> Vec<(usize, usize)> {
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    walk_wrap_rows(widths.iter().copied(), ew, is_cursor_line, |start, end| {
-        ranges.push((start, end));
-    });
-    ranges
-}
-
-/// How many rows a line takes once wrapped. Counting instead of collecting
-/// keeps this allocation free, which matters because it runs per line per frame.
-fn wrapped_row_count(line: &str, ew: usize, is_cursor_line: bool) -> usize {
-    let mut rows = 0;
-    walk_wrap_rows(line.chars().map(char_width), ew, is_cursor_line, |_, _| {
-        rows += 1;
-    });
-    rows
-}
-
-/// Which row of the wrapped line holds `cursor_x`, that is the last row that
-/// starts at or before it. Rows are contiguous, so this picks the same row the
-/// renderer reverses a cell on, including on a wrap boundary.
-fn wrapped_cursor_row(line: &str, ew: usize, cursor_x: usize) -> usize {
-    let (mut row, mut owner) = (0, 0);
-    walk_wrap_rows(line.chars().map(char_width), ew, true, |start, _| {
-        if start <= cursor_x {
-            owner = row;
-        }
-        row += 1;
-    });
-    owner
+        None => vec![Span::raw(text.to_owned())],
+    };
+    let Some(caret) = caret else {
+        spans.extend(chunk);
+        return (Line::from(spans), None);
+    };
+    let (with_cursor, col) = overlay_cursor(
+        chunk,
+        line[row.bytes.start..caret].chars().count(),
+        reversed,
+    );
+    spans.extend(with_cursor);
+    (Line::from(spans), Some(prefix_width + col))
 }
 
 fn shell_highlight_spans(line: &str) -> Option<Vec<Span<'static>>> {
@@ -847,16 +709,6 @@ fn overlay_cursor(
     (result, col)
 }
 
-fn total_visual_lines(buffer: &TextBuffer, ew: usize) -> usize {
-    let cursor_y = buffer.y();
-    buffer
-        .lines()
-        .iter()
-        .enumerate()
-        .map(|(i, line)| wrapped_row_count(line, ew, i == cursor_y))
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,7 +755,7 @@ mod tests {
         type_text(&mut input, "hello\\");
         assert!(input.char_before_cursor_is_backslash());
         input.continue_line();
-        assert_eq!(input.buffer.lines(), &["hello", ""]);
+        assert_eq!(input.buffer.value(), "hello\n");
 
         let mut input = InputBox::new(InputHistory::default(), 20);
         type_text(&mut input, "asd\\asd");
@@ -912,7 +764,7 @@ mod tests {
         }
         assert!(input.char_before_cursor_is_backslash());
         input.continue_line();
-        assert_eq!(input.buffer.lines(), &["asd", "asd"]);
+        assert_eq!(input.buffer.value(), "asd\nasd");
     }
 
     const TEST_WIDTH: u16 = 80;
@@ -994,9 +846,9 @@ mod tests {
         input.history_down();
         assert_eq!(input.buffer.value(), "");
 
-        input.set_input("alpha\nbeta".into());
+        input.set_input("alpha\nbeta");
         input.submit();
-        input.set_input("gamma\ndelta".into());
+        input.set_input("gamma\ndelta");
         input.submit();
 
         input.history_up();
@@ -1122,7 +974,7 @@ mod tests {
         let scroll_before = input.scroll_y;
         assert!(scroll_before > 0);
 
-        input.buffer = TextBuffer::new("short".into());
+        input.set_input("short");
         let _ = render_input(&mut input, 40, area_height);
         assert_eq!(input.scroll_y, 0);
     }
@@ -1670,7 +1522,7 @@ mod tests {
         input.scroll(LINES as i32);
         assert_eq!(input.scroll_y(), 0, "the wheel scrolled back to the top");
 
-        let end = input.buffer.byte_len();
+        let end = input.buffer.value().len();
         input.replace_range(end - 1, end, "b", None).unwrap();
         let rendered = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
         assert!(
@@ -1678,5 +1530,21 @@ mod tests {
             "the edit put the cursor on the last row, so the view has to follow"
         );
         assert!(rendered.cursor.is_some(), "{}", CURSOR_ON_THE_EDIT);
+    }
+
+    #[test_case(|input| { input.handle_key(KeyCode::Enter.into()); }                  ; "backslash_continuation")]
+    #[test_case(|input| { input.handle_paste("one\ntwo"); }                          ; "multi_line_paste")]
+    #[test_case(|input| input.replace_range(0, 1, "plugin\nwrite", None).unwrap()    ; "plugin_write")]
+    fn each_action_undoes_in_one_step(action: fn(&mut InputBox)) {
+        const BEFORE: &str = "a\\";
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.set_input(BEFORE);
+        input.buffer.move_to_end();
+        action(&mut input);
+
+        assert!(matches!(input.undo(), InputAction::Changed));
+        assert_eq!(input.buffer.value(), BEFORE);
+        assert_eq!(input.buffer.cursor_byte(), BEFORE.len());
+        assert!(matches!(input.undo(), InputAction::None));
     }
 }

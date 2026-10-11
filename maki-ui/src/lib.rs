@@ -5,6 +5,8 @@
 
 pub mod animation;
 pub mod app;
+#[doc(hidden)]
+pub mod bench_support;
 pub mod chat;
 mod clipboard;
 mod clock;

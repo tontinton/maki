@@ -1781,11 +1781,11 @@ impl<'t> EventLoop<'t> {
                 let current_text = self.sessions[idx].app.input_box.buffer.value();
                 let result = {
                     let _pause = self.input.pause();
-                    terminal::edit_temp_content(&current_text, self.terminal)
+                    terminal::edit_temp_content(current_text, self.terminal)
                 };
                 self.focus.on_resume();
                 match result {
-                    Ok(edited) => self.sessions[idx].app.input_box.set_input(edited),
+                    Ok(edited) => self.sessions[idx].app.input_box.set_input(&edited),
                     Err(e) => self.sessions[idx].app.flash(e),
                 }
             }

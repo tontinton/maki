@@ -20,6 +20,11 @@ test *ARGS:
 lint:
     cargo clippy --all --tests -- -D warnings
 
+# Dev profile on purpose: a release build of maki-ui takes too long to wait on.
+# Narrow it down, e.g. `just bench -p maki-ui --bench input`.
+bench *ARGS:
+    cargo bench --profile dev {{ARGS}}
+
 lint-fix:
     cargo clippy --all --tests --fix
 

@@ -877,8 +877,8 @@ name the session now running or focused. What each event adds:
   ignoring your own name never drops a change. `data.cursor_only` is true
   when only the caret moved. Handlers that only care about the text
   should return early on it. Fires at most once per frame, and only when
-  the text or caret changed. Focusing another session republishes that
-  session's input.
+  `data.version` or the caret changed. Focusing another session
+  republishes that session's input.
 - `"FileIndexReady"`: `data.root`, the absolute directory that was
   walked, `data.files`, how many paths the walk left, and `data.crashed`
   and `data.truncated`, the two ways that list is not the whole tree.

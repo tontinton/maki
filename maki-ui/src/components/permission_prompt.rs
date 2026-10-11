@@ -388,7 +388,7 @@ impl PermissionPrompt {
             let (display_text, cursor_pos) = if text.is_empty() {
                 (DEFAULT_DENY_GUIDANCE, 0)
             } else {
-                (text.as_str(), TextBuffer::char_to_byte(&text, buffer.x()))
+                (text, TextBuffer::char_to_byte(text, buffer.x()))
             };
             let (before, after) = display_text.split_at(cursor_pos);
             let mut chars = after.chars();
