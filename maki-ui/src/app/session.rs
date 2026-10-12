@@ -14,7 +14,7 @@ use maki_storage::sessions::{SessionMeta, StoredMode, StoredSubagent};
 use crate::{AppSession, OpenSession};
 
 use super::session_state::{SessionState, rules_to_stored, stored_to_rules};
-use super::{App, Mode, PendingInput, PlanState, Status};
+use super::{App, MAIN_CHAT, Mode, PendingInput, PlanState, Status};
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
@@ -172,7 +172,7 @@ impl App {
     /// stamped with that session for life.
     pub(super) fn reset_ui_chrome(&mut self) {
         // Brings the main draft back to the box before the chats holding it go.
-        self.set_active_chat(0);
+        self.set_active_chat(MAIN_CHAT);
         self.chats.clear();
         let mut main = Chat::new(
             self.state.session.id,
@@ -183,7 +183,7 @@ impl App {
         );
         main.set_restore_channel(self.restore_event_tx.clone());
         self.chats.push(main);
-        self.active_chat = 0;
+        self.active_chat = MAIN_CHAT;
         self.chat_index.clear();
         self.deleted_tasks.clear();
         self.status = Status::Idle;
@@ -223,7 +223,7 @@ impl App {
             self.input_box.buffer.move_to_end();
         }
 
-        self.chats[0].request_restores(restore_items);
+        self.chats[MAIN_CHAT].request_restores(restore_items);
 
         // Read, not taken: the live chats below are the source `sync_subagents`
         // mirrors back, so emptying the session here would only make the next

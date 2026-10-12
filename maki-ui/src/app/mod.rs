@@ -89,6 +89,8 @@ pub(crate) use session::session_has_content;
 use session_state::SessionState;
 
 const CANCEL_MSG: &str = "Cancelled.";
+const MAIN_CHAT: usize = 0;
+const EXIT_WORD: &str = "exit";
 /// Bypasses the per-run staleness filter because re-bake replies
 /// don't belong to any real agent run.
 pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
@@ -556,11 +558,11 @@ impl App {
     }
 
     pub(crate) fn main_chat(&mut self) -> &mut Chat {
-        &mut self.chats[0]
+        &mut self.chats[MAIN_CHAT]
     }
 
     fn is_main_chat(&self) -> bool {
-        self.active_chat == 0
+        self.active_chat == MAIN_CHAT
     }
 
     /// Whether the chat in front shows the input box. A running subagent's
@@ -588,7 +590,7 @@ impl App {
         if self.is_main_chat() {
             self.input_box.draft_text()
         } else {
-            self.chats[0].draft.text.clone()
+            self.chats[MAIN_CHAT].draft.text.clone()
         }
     }
 
@@ -720,13 +722,11 @@ impl App {
         Ok(serde_json::json!(true))
     }
 
-    /// The paths that keep the command palette in step with the input, and
-    /// the only ones that can name a writer. Submit, discard, history recall
+    /// The only paths that can name a writer. Submit, discard, history recall
     /// and `$EDITOR` change the value without coming through here, and the
     /// tick diff reports those unlabelled: the version stamped here no longer
     /// matches what they left.
     fn input_changed(&mut self, writer: InputWriter) {
-        self.command_palette.sync(&self.input_box.buffer.value());
         self.input_writer = self.input_writer.take().merge(writer);
     }
 
@@ -1165,17 +1165,16 @@ impl App {
         // modal above is drawn over it.
         //
         // Ctrl keys pass it by, as they always did: `Ctrl+C` closes it and the
-        // rest belong to the input box and the built-in bindings. So does every
-        // key in a subagent chat, where the text is for the subagent and slash
-        // commands would act on the session behind it.
-        if self.is_main_chat() && !is_ctrl(&key) {
-            match self
-                .command_palette
-                .handle_key(key, &self.input_box.buffer.value())
-            {
+        // rest belong to the input box and the built-in bindings.
+        if self.chat_accepts_input() && !is_ctrl(&key) {
+            match self.command_palette.handle_key(key, &self.input_box.buffer) {
                 CommandAction::Consumed => return Some(vec![]),
                 CommandAction::Execute(cmd) => {
+                    // Commands act on the session, so the main chat comes to
+                    // front. Clear the box first, or the command would stay
+                    // behind as the subagent chat's draft.
                     self.input_box.discard();
+                    self.set_active_chat(MAIN_CHAT);
                     return Some(self.execute_command(cmd, 0));
                 }
                 CommandAction::Complete(text) => {
@@ -1462,29 +1461,33 @@ impl App {
         if sub.is_empty() {
             return vec![];
         }
-        if !self.is_main_chat() {
-            return self.queue_for_subagent(sub.into());
-        }
-        if sub.text.trim() == "exit" {
+        if sub.text.trim() == EXIT_WORD {
             return self.quit();
         }
 
-        if let Some(prefix) = shell::parse_shell_prefix(&sub.text) {
-            let cmd = prefix.command.trim();
-            if cmd == "cd" || cmd.starts_with("cd ") {
-                self.flash("Only /cd can change the working directory".into());
-            }
-            let id = self.shell.reserve_id();
-            let sigil = if prefix.visible { "!" } else { "!!" };
-            let display = format!("{sigil} {}", prefix.command);
-            self.main_chat().show_user_message(display, Vec::new());
-            return vec![Action::ShellCommand {
-                id,
-                command: prefix.command,
-                visible: prefix.visible,
-            }];
+        let Some(prefix) = shell::parse_shell_prefix(&sub.text) else {
+            return if self.is_main_chat() {
+                self.submit_or_queue(sub.into())
+            } else {
+                self.queue_for_subagent(sub.into())
+            };
+        };
+        // The shell belongs to the session, not to the subagent being watched,
+        // so the main chat comes to front where the output lands.
+        self.set_active_chat(MAIN_CHAT);
+        let cmd = prefix.command.trim();
+        if cmd == "cd" || cmd.starts_with("cd ") {
+            self.flash("Only /cd can change the working directory".into());
         }
-        self.submit_or_queue(sub.into())
+        let id = self.shell.reserve_id();
+        let sigil = if prefix.visible { "!" } else { "!!" };
+        let display = format!("{sigil} {}", prefix.command);
+        self.main_chat().show_user_message(display, Vec::new());
+        vec![Action::ShellCommand {
+            id,
+            command: prefix.command,
+            visible: prefix.visible,
+        }]
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
@@ -1670,7 +1673,7 @@ impl App {
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
             if let Some(tool_id) = &subagent_id {
                 let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
-                self.chats[0].set_tool_turn_usage(tool_id, formatted);
+                self.chats[MAIN_CHAT].set_tool_turn_usage(tool_id, formatted);
             }
         }
 
@@ -1791,9 +1794,9 @@ impl App {
         if let Some(ref tx) = subagent.answer_tx {
             self.subagent_answers.insert(id.clone(), tx.clone());
         }
-        self.chats[0].update_tool_summary(id, &subagent.name);
+        self.chats[MAIN_CHAT].update_tool_summary(id, &subagent.name);
         if let Some(ref model) = subagent.model {
-            self.chats[0].update_tool_model(id, model);
+            self.chats[MAIN_CHAT].update_tool_model(id, model);
         }
         let mut chat = Chat::new(
             self.state.session.id,
@@ -2389,7 +2392,7 @@ impl App {
     /// shell commands that outlive the agent.
     fn terminalize_turn(&mut self, message: &str) {
         self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
-        self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
+        self.chats[MAIN_CHAT].fail_in_progress_except(message.into(), self.shell.active_ids());
         for chat in self.chats.iter_mut().skip(1) {
             chat.fail_in_progress_with_message(message.into());
         }
