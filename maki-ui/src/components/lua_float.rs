@@ -223,6 +223,14 @@ impl FloatManager {
         let id = self.next_id;
         self.next_id += 1;
 
+        // One dock per edge, so a new dock on an occupied edge replaces the old
+        // one. Routing through `remove_windows` is what guarantees the evicted
+        // window hears its close.
+        if config.split != Split::None {
+            let dir = config.split;
+            self.remove_windows(|w| w.config.split == dir);
+        }
+
         let visible = config.visible;
         let win = FloatWindow {
             id,
@@ -465,11 +473,10 @@ impl FloatManager {
         union
     }
 
-    /// The docks this frame lays out, as `(window index, req)` in stacking
-    /// order. `carve` turns each into a rect, stacking docks that share an edge.
+    /// The docks this frame lays out, as `(window index, req)`. `carve` turns
+    /// each into a rect.
     pub fn dock_reqs(&self, area: Rect) -> Vec<(usize, SplitReq)> {
-        let mut reqs: Vec<(usize, SplitReq)> = self
-            .laid_out()
+        self.laid_out()
             .filter_map(|(i, w)| {
                 let split = w.config.split;
                 let edge = split.edge()?;
@@ -479,9 +486,7 @@ impl FloatManager {
                 };
                 Some((i, SplitReq { split, extent }))
             })
-            .collect();
-        reqs.sort_by_key(|(i, _)| self.windows[*i].config.order);
-        reqs
+            .collect()
     }
 
     /// Whether any visible dock displaces the chat input box. Floats ignore
@@ -2769,16 +2774,17 @@ mod tests {
     }
 
     #[test]
-    fn same_direction_docks_stack_instead_of_replacing() {
+    fn second_dock_on_an_edge_replaces_the_first() {
         let mut mgr = FloatManager::new();
         let dir = Split::Left;
-        let _ = open_split(&mut mgr, dir, 5, true);
+        let (erx1, _ctx1) = open_split(&mut mgr, dir, 5, true);
         let _ = open_split(&mut mgr, dir, 5, true);
 
         let count = mgr.windows.iter().filter(|w| w.config.split == dir).count();
-        assert_eq!(
-            count, 2,
-            "a second dock on an edge stacks, it does not evict"
+        assert_eq!(count, 1, "one dock per edge");
+        assert!(
+            erx1.drain().any(|e| matches!(e, WinEvent::Close)),
+            "the replaced dock must hear its close",
         );
     }
 
@@ -3008,54 +3014,6 @@ mod tests {
             "and its claim is back"
         );
         assert!(took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
-    }
-
-    #[test]
-    fn dock_reqs_returns_visible_docks_sorted_by_order() {
-        let mut mgr = FloatManager::new();
-        let (tx1, rx1, _, _) = make_channels();
-        let (tx2, rx2, _, _) = make_channels();
-
-        let cfg1 = FloatConfig {
-            split: Split::Below,
-            height: Dimension::Abs(5),
-            order: 20,
-            ..FloatConfig::default()
-        };
-        let cfg2 = FloatConfig {
-            split: Split::Below,
-            height: Dimension::Abs(3),
-            order: 10,
-            ..FloatConfig::default()
-        };
-
-        mgr.open(make_buf(&["a"]), cfg1, false, tx1, rx1);
-        mgr.open(make_buf(&["b"]), cfg2, false, tx2, rx2);
-
-        let area = Rect::new(0, 0, 80, 40);
-        let reqs = mgr.dock_reqs(area);
-        assert_eq!(reqs.len(), 2);
-        assert_eq!(reqs[0].1.extent, 3, "order=10 should come first");
-        assert_eq!(reqs[1].1.extent, 5, "order=20 should come second");
-    }
-
-    #[test]
-    fn second_bottom_dock_stacks() {
-        let mut mgr = FloatManager::new();
-        let (tx1, rx1, _, _) = make_channels();
-        let (tx2, rx2, _, _) = make_channels();
-
-        let cfg = FloatConfig {
-            split: Split::Below,
-            height: Dimension::Abs(3),
-            ..FloatConfig::default()
-        };
-
-        mgr.open(make_buf(&["a"]), cfg.clone(), false, tx1, rx1);
-        mgr.open(make_buf(&["b"]), cfg, false, tx2, rx2);
-
-        let area = Rect::new(0, 0, 80, 40);
-        assert_eq!(mgr.dock_reqs(area).len(), 2);
     }
 
     #[test]

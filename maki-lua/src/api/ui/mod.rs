@@ -602,8 +602,7 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
 ///   - cursor_line (boolean): highlight the focused row. Default false.
 ///   - reserved_top (integer): rows reserved at the top of the content area. Default 0.
 ///   - reserved_bottom (integer): rows reserved at the bottom of the content area. Default 0.
-///   - split (string): dock the window to an edge instead of floating. One of "above", "below", "left", "right", or "" (floating, default). A "below" dock sits in the input column above the input box; several docks on one edge stack in `order`.
-///   - order (integer): paint order among split windows at the same edge. Default 50.
+///   - split (string): dock the window to an edge instead of floating. One of "above", "below", "left", "right", or "" (floating, default). A "below" dock sits just above the input box. One dock per edge: a new dock on an occupied edge replaces the old one.
 ///   - focus (boolean): whether the window takes keyboard focus on open. Default true.
 ///   - keys (table): keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or `maki.keymap.set` bindings. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C...
 ///   - visible (boolean): whether the window is initially visible. Default true. See `win:hide()` for what hiding does.
@@ -647,7 +646,6 @@ fn open_win(
     let border = parse_border(&opts);
     let title_pos = parse_title_pos(&opts);
     let split = parse_split(&opts);
-    let order: u16 = opts.get("order").unwrap_or(50);
     let visible = opt_bool(&opts, "visible").unwrap_or(true);
     let needs_input = opt_bool(&opts, "needs_input").unwrap_or(false);
     let hide_input = opt_bool(&opts, "hide_input").unwrap_or(false);
@@ -668,7 +666,6 @@ fn open_win(
         reserved_bottom,
         reserved_top,
         split,
-        order,
         visible,
         needs_input,
         hide_input,

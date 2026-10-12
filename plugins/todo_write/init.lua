@@ -54,7 +54,6 @@ local function ensure_win()
   win = maki.ui.open_win(buf, {
     split = "below",
     height = 4,
-    order = 10,
     title = " Todos ",
     border = "rounded",
     focus = false,
