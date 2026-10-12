@@ -465,37 +465,20 @@ impl FloatManager {
         union
     }
 
-    /// The edge docks this frame lays out, as `(window index, req)` in
-    /// stacking order. `carve` turns each into a rect. Bottom docks are not
-    /// here: they live in the input column, see [`Self::bottom_reqs`].
+    /// The docks this frame lays out, as `(window index, req)` in stacking
+    /// order. `carve` turns each into a rect, stacking docks that share an edge.
     pub fn dock_reqs(&self, area: Rect) -> Vec<(usize, SplitReq)> {
         let mut reqs: Vec<(usize, SplitReq)> = self
             .laid_out()
             .filter_map(|(i, w)| {
                 let split = w.config.split;
                 let edge = split.edge()?;
-                if split == Split::Below {
-                    return None;
-                }
                 let extent = match edge.axis {
                     Axis::Vertical => w.config.height.resolve(area.height),
                     Axis::Horizontal => w.config.width.resolve(area.width),
                 };
                 Some((i, SplitReq { split, extent }))
             })
-            .collect();
-        reqs.sort_by_key(|(i, _)| self.windows[*i].config.order);
-        reqs
-    }
-
-    /// The bottom docks, as `(window index, height)` in stacking order. These
-    /// sit in the same column as the input box, so a lower `order` rests closer
-    /// to the input.
-    pub fn bottom_reqs(&self) -> Vec<(usize, u16)> {
-        let mut reqs: Vec<(usize, u16)> = self
-            .laid_out()
-            .filter(|(_, w)| w.config.split == Split::Below)
-            .map(|(i, w)| (i, w.config.height.resolve(100)))
             .collect();
         reqs.sort_by_key(|(i, _)| self.windows[*i].config.order);
         reqs
@@ -2710,14 +2693,22 @@ mod tests {
         assert_eq!(reqs, vec![(0, SplitReq { split: dir, extent })]);
     }
 
-    /// A bottom dock lives in the input column, so it never reaches `carve`.
+    /// A bottom dock is just another edge dock: it reaches `carve` like the rest.
     #[test]
-    fn bottom_dock_is_not_an_edge_req() {
+    fn bottom_dock_is_an_edge_req() {
         let mut mgr = FloatManager::new();
         let _ = open_split(&mut mgr, Split::Below, 10, true);
         let area = Rect::new(0, 0, 80, 40);
-        assert!(mgr.dock_reqs(area).is_empty(), "{EXPECT_NO_REQS}");
-        assert_eq!(mgr.bottom_reqs(), vec![(0, 10)]);
+        assert_eq!(
+            mgr.dock_reqs(area),
+            vec![(
+                0,
+                SplitReq {
+                    split: Split::Below,
+                    extent: 10
+                }
+            )]
+        );
     }
 
     #[test]
@@ -2788,9 +2779,12 @@ mod tests {
             "left dock must survive opening a below dock",
         );
         assert_eq!(
-            mgr.bottom_reqs().len(),
+            mgr.dock_reqs(area)
+                .iter()
+                .filter(|(_, r)| r.split == Split::Below)
+                .count(),
             1,
-            "a below dock lives in the input column",
+            "a below dock is an edge req too",
         );
         assert!(
             !erx_left.drain().any(|e| matches!(e, WinEvent::Close)),
@@ -2935,25 +2929,19 @@ mod tests {
     const EXPECT_NO_CLAIM: &str = "a hidden window must claim no keys";
     const HIDDEN_EXTENT: u16 = 6;
 
-    /// Draws one frame in the same order the app does: edge docks, then bottom
-    /// docks, then floats. Returns how many docks asked for room.
+    /// Draws one frame the way the app does: carve every dock off the area,
+    /// then draw them and the floats. Returns how many docks asked for room.
     fn draw_one_frame(mgr: &mut FloatManager, area: Rect) -> usize {
         let dock_reqs = mgr.dock_reqs(area);
         let reqs: Vec<_> = dock_reqs.iter().map(|(_, r)| *r).collect();
         let splits = crate::components::split_layout::carve(area, &reqs);
-        let bottom = mgr.bottom_reqs();
-        let room_asked = dock_reqs.len() + bottom.len();
+        let room_asked = dock_reqs.len();
 
         render_into(mgr, area, |m, f| {
             for ((idx, _), rect) in dock_reqs.iter().zip(splits.rects()) {
                 if let Some(rect) = rect {
                     m.view_dock(f, *idx, *rect);
                 }
-            }
-            let mut y = splits.inner.y;
-            for (idx, h) in bottom {
-                m.view_dock(f, idx, Rect::new(splits.inner.x, y, splits.inner.width, h));
-                y += h;
             }
             m.view(f, splits.inner, NO_CARET);
         });
@@ -3006,7 +2994,7 @@ mod tests {
     }
 
     #[test]
-    fn bottom_reqs_returns_visible_docks_sorted_by_order() {
+    fn dock_reqs_returns_visible_docks_sorted_by_order() {
         let mut mgr = FloatManager::new();
         let (tx1, rx1, _, _) = make_channels();
         let (tx2, rx2, _, _) = make_channels();
@@ -3027,10 +3015,11 @@ mod tests {
         mgr.open(make_buf(&["a"]), cfg1, false, tx1, rx1);
         mgr.open(make_buf(&["b"]), cfg2, false, tx2, rx2);
 
-        let reqs = mgr.bottom_reqs();
+        let area = Rect::new(0, 0, 80, 40);
+        let reqs = mgr.dock_reqs(area);
         assert_eq!(reqs.len(), 2);
-        assert_eq!(reqs[0].1, 3, "order=10 should come first");
-        assert_eq!(reqs[1].1, 5, "order=20 should come second");
+        assert_eq!(reqs[0].1.extent, 3, "order=10 should come first");
+        assert_eq!(reqs[1].1.extent, 5, "order=20 should come second");
     }
 
     #[test]
@@ -3048,7 +3037,8 @@ mod tests {
         mgr.open(make_buf(&["a"]), cfg.clone(), false, tx1, rx1);
         mgr.open(make_buf(&["b"]), cfg, false, tx2, rx2);
 
-        assert_eq!(mgr.bottom_reqs().len(), 2);
+        let area = Rect::new(0, 0, 80, 40);
+        assert_eq!(mgr.dock_reqs(area).len(), 2);
     }
 
     #[test]
@@ -3063,15 +3053,16 @@ mod tests {
             ..FloatConfig::default()
         };
 
+        let area = Rect::new(0, 0, 80, 40);
         mgr.open(make_buf(&["a"]), cfg, false, tx, cmd_rx);
-        assert_eq!(mgr.bottom_reqs().len(), 1);
+        assert_eq!(mgr.dock_reqs(area).len(), 1);
 
         cmd_tx.send(WinCommand::SetVisible(false)).unwrap();
         let _ = mgr.tick();
-        assert_eq!(mgr.bottom_reqs().len(), 0);
+        assert_eq!(mgr.dock_reqs(area).len(), 0);
 
         cmd_tx.send(WinCommand::SetVisible(true)).unwrap();
         let _ = mgr.tick();
-        assert_eq!(mgr.bottom_reqs().len(), 1);
+        assert_eq!(mgr.dock_reqs(area).len(), 1);
     }
 }
