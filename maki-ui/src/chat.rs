@@ -387,6 +387,15 @@ impl Chat {
         self.messages_panel.scroll(delta);
     }
 
+    pub(crate) fn highlight_transcript(&mut self, row: u32, error: bool, duration: Duration) {
+        self.messages_panel
+            .highlight_transcript(row, error, duration);
+    }
+
+    pub fn transcript_positions(&mut self) -> serde_json::Value {
+        self.messages_panel.transcript_positions()
+    }
+
     pub fn scroll_to_row(&mut self, doc_row: u32) {
         self.messages_panel.scroll_to_row(doc_row);
     }
