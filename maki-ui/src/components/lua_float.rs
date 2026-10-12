@@ -177,12 +177,6 @@ impl FloatManager {
         self.windows.iter().enumerate().filter(|(_, w)| w.visible)
     }
 
-    fn split_window_idx(&self, dir: Split) -> Option<usize> {
-        self.laid_out()
-            .find(|(_, w)| w.config.split == dir)
-            .map(|(i, _)| i)
-    }
-
     /// The one path windows take to leave the manager. Routing every removal
     /// here is what keeps the close event, the window list, and `focused_id`
     /// from ever drifting apart.
@@ -211,7 +205,7 @@ impl FloatManager {
                 .windows
                 .iter()
                 .rev()
-                .find(|w| w.opened_focused && w.config.split != Split::Panel)
+                .find(|w| w.opened_focused)
                 .map(|w| w.id);
             self.focused_rect = None;
         }
@@ -228,13 +222,6 @@ impl FloatManager {
         let cached_lines = buf.read_if_dirty().unwrap_or_default();
         let id = self.next_id;
         self.next_id += 1;
-
-        // One split per direction, so evicting the old same-direction window
-        // goes through the same removal path that guarantees it hears its close.
-        if config.split != Split::None && config.split != Split::Panel {
-            let dir = config.split;
-            self.remove_windows(|w| w.config.split == dir);
-        }
 
         let visible = config.visible;
         let win = FloatWindow {
@@ -478,46 +465,53 @@ impl FloatManager {
         union
     }
 
-    /// Turns each split this frame lays out into a cell count. `carve` then
-    /// clamps that against the chat minimum.
-    pub fn split_reqs(&self, area: Rect) -> Vec<SplitReq> {
-        self.laid_out()
-            .filter_map(|(_, w)| {
+    /// The edge docks this frame lays out, as `(window index, req)` in
+    /// stacking order. `carve` turns each into a rect. Bottom docks are not
+    /// here: they live in the input column, see [`Self::bottom_reqs`].
+    pub fn dock_reqs(&self, area: Rect) -> Vec<(usize, SplitReq)> {
+        let mut reqs: Vec<(usize, SplitReq)> = self
+            .laid_out()
+            .filter_map(|(i, w)| {
                 let split = w.config.split;
                 let edge = split.edge()?;
+                if split == Split::Below {
+                    return None;
+                }
                 let extent = match edge.axis {
                     Axis::Vertical => w.config.height.resolve(area.height),
                     Axis::Horizontal => w.config.width.resolve(area.width),
                 };
-                Some(SplitReq { split, extent })
+                Some((i, SplitReq { split, extent }))
             })
-            .collect()
+            .collect();
+        reqs.sort_by_key(|(i, _)| self.windows[*i].config.order);
+        reqs
     }
 
-    /// The layout owns the geometry; we only fill the rect it carved.
-    /// render_window records focused_rect for the focused window alone, so a
-    /// mouse click never lands on an unfocused split.
-    pub fn view_split(&mut self, frame: &mut Frame, dir: Split, rect: Rect) {
-        let Some(idx) = self.split_window_idx(dir) else {
-            return;
-        };
-        if rect.width == 0 || rect.height == 0 {
-            return;
-        }
-        self.render_window(frame, idx, rect);
-    }
-
-    pub fn panel_reqs(&self) -> Vec<(usize, u16)> {
+    /// The bottom docks, as `(window index, height)` in stacking order. These
+    /// sit in the same column as the input box, so a lower `order` rests closer
+    /// to the input.
+    pub fn bottom_reqs(&self) -> Vec<(usize, u16)> {
         let mut reqs: Vec<(usize, u16)> = self
             .laid_out()
-            .filter(|(_, w)| w.config.split == Split::Panel)
+            .filter(|(_, w)| w.config.split == Split::Below)
             .map(|(i, w)| (i, w.config.height.resolve(100)))
             .collect();
         reqs.sort_by_key(|(i, _)| self.windows[*i].config.order);
         reqs
     }
 
-    pub fn view_panel(&mut self, frame: &mut Frame, idx: usize, rect: Rect) {
+    /// Whether any visible dock displaces the chat input box. Floats ignore
+    /// `hide_input`, so only docked windows count.
+    pub fn hides_input(&self) -> bool {
+        self.laid_out()
+            .any(|(_, w)| w.config.hide_input && w.config.split != Split::None)
+    }
+
+    /// The layout owns the geometry; we only fill the rect it carved.
+    /// render_window records focused_rect for the focused window alone, so a
+    /// mouse click never lands on an unfocused dock.
+    pub fn view_dock(&mut self, frame: &mut Frame, idx: usize, rect: Rect) {
         if rect.width == 0 || rect.height == 0 {
             return;
         }
@@ -677,6 +671,11 @@ impl FloatManager {
 
     pub fn is_open(&self) -> bool {
         !self.windows.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn split_of(&self, idx: usize) -> Split {
+        self.windows[idx].config.split
     }
 
     pub fn close_all(&mut self) {
@@ -2674,7 +2673,6 @@ mod tests {
     }
 
     const EXPECT_NO_REQS: &str = "expected no split reqs without a split window";
-    const EXPECT_SINGLE_SPLIT: &str = "expected exactly one same-direction window after re-open";
     const EXPECT_SPLIT_DRAWN: &str = "expected the split window to receive its layout rect";
 
     fn split_config(dir: Split, extent: Dimension) -> FloatConfig {
@@ -2712,21 +2710,31 @@ mod tests {
     }
 
     #[test]
-    fn split_reqs_empty_without_split_window() {
+    fn dock_reqs_empty_without_docked_window() {
         let mut mgr = FloatManager::new();
         open_with_lines(&mut mgr, &["a"]);
         let area = Rect::new(0, 0, 80, 40);
-        assert!(mgr.split_reqs(area).is_empty(), "{EXPECT_NO_REQS}");
+        assert!(mgr.dock_reqs(area).is_empty(), "{EXPECT_NO_REQS}");
     }
 
-    #[test_case(Split::Below, 10 ; "vertical_uses_height")]
+    #[test_case(Split::Above, 10 ; "vertical_uses_height")]
     #[test_case(Split::Left, 30 ; "horizontal_uses_width")]
-    fn split_reqs_resolves_extent_per_axis(dir: Split, extent: u16) {
+    fn dock_reqs_resolves_extent_per_axis(dir: Split, extent: u16) {
         let mut mgr = FloatManager::new();
         let _ = open_split(&mut mgr, dir, extent, true);
         let area = Rect::new(0, 0, 80, 40);
-        let reqs = mgr.split_reqs(area);
-        assert_eq!(reqs, vec![SplitReq { split: dir, extent }]);
+        let reqs = mgr.dock_reqs(area);
+        assert_eq!(reqs, vec![(0, SplitReq { split: dir, extent })]);
+    }
+
+    /// A bottom dock lives in the input column, so it never reaches `carve`.
+    #[test]
+    fn bottom_dock_is_not_an_edge_req() {
+        let mut mgr = FloatManager::new();
+        let _ = open_split(&mut mgr, Split::Below, 10, true);
+        let area = Rect::new(0, 0, 80, 40);
+        assert!(mgr.dock_reqs(area).is_empty(), "{EXPECT_NO_REQS}");
+        assert_eq!(mgr.bottom_reqs(), vec![(0, 10)]);
     }
 
     #[test]
@@ -2753,7 +2761,7 @@ mod tests {
         let rect = Rect::new(0, 30, 80, 10);
         let (event_rx, _ctx) = open_split(&mut mgr, dir, 10, true);
         let area = Rect::new(0, 0, 80, 40);
-        render_into(&mut mgr, area, |m, f| m.view_split(f, dir, rect));
+        render_into(&mut mgr, area, |m, f| m.view_dock(f, 0, rect));
 
         let resize = event_rx
             .drain()
@@ -2770,34 +2778,40 @@ mod tests {
     }
 
     #[test]
-    fn second_split_of_same_direction_replaces_first() {
+    fn same_direction_docks_stack_instead_of_replacing() {
         let mut mgr = FloatManager::new();
-        let dir = Split::Below;
-        let (erx1, _ctx1) = open_split(&mut mgr, dir, 5, true);
+        let dir = Split::Left;
+        let _ = open_split(&mut mgr, dir, 5, true);
         let _ = open_split(&mut mgr, dir, 5, true);
 
-        let split_count = mgr.windows.iter().filter(|w| w.config.split == dir).count();
-        assert_eq!(split_count, 1, "{EXPECT_SINGLE_SPLIT}");
-        assert!(
-            erx1.drain().any(|e| matches!(e, WinEvent::Close)),
-            "the replaced split must receive a Close event",
+        let count = mgr.windows.iter().filter(|w| w.config.split == dir).count();
+        assert_eq!(
+            count, 2,
+            "a second dock on an edge stacks, it does not evict"
         );
     }
 
     #[test]
-    fn splits_of_different_directions_coexist() {
+    fn docks_of_different_directions_coexist() {
         let mut mgr = FloatManager::new();
         let (erx_left, _) = open_split(&mut mgr, Split::Left, 20, true);
         let (erx_below, _) = open_split(&mut mgr, Split::Below, 10, true);
 
+        let area = Rect::new(0, 0, 80, 40);
         assert!(
-            mgr.split_window_idx(Split::Left).is_some(),
-            "left split must survive opening a below split",
+            mgr.dock_reqs(area)
+                .iter()
+                .any(|(_, r)| r.split == Split::Left),
+            "left dock must survive opening a below dock",
         );
-        assert!(mgr.split_window_idx(Split::Below).is_some());
+        assert_eq!(
+            mgr.bottom_reqs().len(),
+            1,
+            "a below dock lives in the input column",
+        );
         assert!(
             !erx_left.drain().any(|e| matches!(e, WinEvent::Close)),
-            "a different-direction split must not evict the left split",
+            "a different-direction dock must not evict the left dock",
         );
         let _ = erx_below;
     }
@@ -2813,7 +2827,7 @@ mod tests {
         let _ = open_split(&mut mgr, Split::Below, 10, false);
         let area = Rect::new(0, 0, 80, 40);
         let rect = Rect::new(0, 30, 80, 10);
-        render_into(&mut mgr, area, |m, f| m.view_split(f, Split::Below, rect));
+        render_into(&mut mgr, area, |m, f| m.view_dock(f, 0, rect));
         assert!(
             !mgr.contains(ratatui::layout::Position::new(rect.x + 1, rect.y + 1)),
             "{EXPECT_UNFOCUSED_NO_RECT}",
@@ -2865,7 +2879,7 @@ mod tests {
         let mut mgr = FloatManager::new();
         let (event_rx, _ctx) = open_split(&mut mgr, Split::Below, 10, true);
         let area = Rect::new(0, 0, 80, 40);
-        render_into(&mut mgr, area, |m, f| m.view_split(f, Split::Below, rect));
+        render_into(&mut mgr, area, |m, f| m.view_dock(f, 0, rect));
 
         assert!(
             !event_rx
@@ -2913,10 +2927,10 @@ mod tests {
         );
 
         let rect = Rect::new(0, 30, 80, 10);
-        render_into(&mut mgr, area, |m, f| m.view_split(f, Split::Below, rect));
+        render_into(&mut mgr, area, |m, f| m.view_dock(f, 1, rect));
         assert!(
             serx.drain().any(|e| matches!(e, WinEvent::Resize { .. })),
-            "{EXPECT_SPLIT_DRAWN}: split joins layout via view_split",
+            "{EXPECT_SPLIT_DRAWN}: split joins layout via view_dock",
         );
     }
 
@@ -2938,23 +2952,24 @@ mod tests {
     const EXPECT_NO_CLAIM: &str = "a hidden window must claim no keys";
     const HIDDEN_EXTENT: u16 = 6;
 
-    /// Draws one frame in the same order the app does: splits, then panels,
-    /// then floats. Returns how many splits and panels asked for room.
+    /// Draws one frame in the same order the app does: edge docks, then bottom
+    /// docks, then floats. Returns how many docks asked for room.
     fn draw_one_frame(mgr: &mut FloatManager, area: Rect) -> usize {
-        let split_reqs = mgr.split_reqs(area);
-        let splits = crate::components::split_layout::carve(area, &split_reqs);
-        let panels = mgr.panel_reqs();
-        let room_asked = split_reqs.len() + panels.len();
+        let dock_reqs = mgr.dock_reqs(area);
+        let reqs: Vec<_> = dock_reqs.iter().map(|(_, r)| *r).collect();
+        let splits = crate::components::split_layout::carve(area, &reqs);
+        let bottom = mgr.bottom_reqs();
+        let room_asked = dock_reqs.len() + bottom.len();
 
         render_into(mgr, area, |m, f| {
-            for dir in Split::ALL {
-                if let Some(rect) = splits.rect(dir) {
-                    m.view_split(f, dir, rect);
+            for ((idx, _), rect) in dock_reqs.iter().zip(splits.rects()) {
+                if let Some(rect) = rect {
+                    m.view_dock(f, *idx, *rect);
                 }
             }
             let mut y = splits.inner.y;
-            for (idx, h) in panels {
-                m.view_panel(f, idx, Rect::new(splits.inner.x, y, splits.inner.width, h));
+            for (idx, h) in bottom {
+                m.view_dock(f, idx, Rect::new(splits.inner.x, y, splits.inner.width, h));
                 y += h;
             }
             m.view(f, splits.inner, NO_CARET);
@@ -2971,7 +2986,6 @@ mod tests {
     #[test_case(Split::Below ; "split_below")]
     #[test_case(Split::Left ; "split_left")]
     #[test_case(Split::Right ; "split_right")]
-    #[test_case(Split::Panel ; "panel")]
     fn a_hidden_window_of_any_kind_is_out_of_the_layout(split: Split) {
         let area = Rect::new(0, 0, 80, 40);
         let mut mgr = FloatManager::new();
@@ -3009,19 +3023,19 @@ mod tests {
     }
 
     #[test]
-    fn panel_reqs_returns_visible_panels_sorted_by_order() {
+    fn bottom_reqs_returns_visible_docks_sorted_by_order() {
         let mut mgr = FloatManager::new();
         let (tx1, rx1, _, _) = make_channels();
         let (tx2, rx2, _, _) = make_channels();
 
         let cfg1 = FloatConfig {
-            split: Split::Panel,
+            split: Split::Below,
             height: Dimension::Abs(5),
             order: 20,
             ..FloatConfig::default()
         };
         let cfg2 = FloatConfig {
-            split: Split::Panel,
+            split: Split::Below,
             height: Dimension::Abs(3),
             order: 10,
             ..FloatConfig::default()
@@ -3030,20 +3044,20 @@ mod tests {
         mgr.open(make_buf(&["a"]), cfg1, false, tx1, rx1);
         mgr.open(make_buf(&["b"]), cfg2, false, tx2, rx2);
 
-        let reqs = mgr.panel_reqs();
+        let reqs = mgr.bottom_reqs();
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0].1, 3, "order=10 should come first");
         assert_eq!(reqs[1].1, 5, "order=20 should come second");
     }
 
     #[test]
-    fn panel_window_not_evicted_on_second_open() {
+    fn second_bottom_dock_stacks() {
         let mut mgr = FloatManager::new();
         let (tx1, rx1, _, _) = make_channels();
         let (tx2, rx2, _, _) = make_channels();
 
         let cfg = FloatConfig {
-            split: Split::Panel,
+            split: Split::Below,
             height: Dimension::Abs(3),
             ..FloatConfig::default()
         };
@@ -3051,63 +3065,30 @@ mod tests {
         mgr.open(make_buf(&["a"]), cfg.clone(), false, tx1, rx1);
         mgr.open(make_buf(&["b"]), cfg, false, tx2, rx2);
 
-        assert_eq!(mgr.panel_reqs().len(), 2);
+        assert_eq!(mgr.bottom_reqs().len(), 2);
     }
 
     #[test]
-    fn hidden_panel_excluded_from_reqs() {
+    fn hidden_bottom_dock_excluded_from_reqs() {
         let mut mgr = FloatManager::new();
         let (tx, _rx, _, _) = make_channels();
         let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
 
         let cfg = FloatConfig {
-            split: Split::Panel,
+            split: Split::Below,
             height: Dimension::Abs(5),
             ..FloatConfig::default()
         };
 
         mgr.open(make_buf(&["a"]), cfg, false, tx, cmd_rx);
-        assert_eq!(mgr.panel_reqs().len(), 1);
+        assert_eq!(mgr.bottom_reqs().len(), 1);
 
         cmd_tx.send(WinCommand::SetVisible(false)).unwrap();
         let _ = mgr.tick();
-        assert_eq!(mgr.panel_reqs().len(), 0);
+        assert_eq!(mgr.bottom_reqs().len(), 0);
 
         cmd_tx.send(WinCommand::SetVisible(true)).unwrap();
         let _ = mgr.tick();
-        assert_eq!(mgr.panel_reqs().len(), 1);
-    }
-
-    #[test]
-    fn focus_fallback_skips_panel_windows() {
-        let mut mgr = FloatManager::new();
-
-        let (tx_panel, rx_panel, _, _cmd_tx_panel) = make_channels();
-        let panel_cfg = FloatConfig {
-            split: Split::Panel,
-            height: Dimension::Abs(5),
-            ..FloatConfig::default()
-        };
-        mgr.open(make_buf(&["panel"]), panel_cfg, false, tx_panel, rx_panel);
-
-        let (tx_modal, rx_modal, _, cmd_tx_modal) = make_channels();
-        mgr.open(
-            make_buf(&["modal"]),
-            make_config(),
-            true,
-            tx_modal,
-            rx_modal,
-        );
-
-        assert_eq!(mgr.focused_id, Some(1));
-
-        cmd_tx_modal.send(WinCommand::Close).unwrap();
-        let _ = mgr.tick();
-
-        assert_eq!(
-            mgr.focused_id, None,
-            "focus must not fall back to a panel window"
-        );
-        assert_eq!(mgr.windows.len(), 1, "panel window must survive");
+        assert_eq!(mgr.bottom_reqs().len(), 1);
     }
 }

@@ -52,7 +52,7 @@ local function ensure_win()
   end
   buf = maki.ui.buf()
   win = maki.ui.open_win(buf, {
-    split = "panel",
+    split = "below",
     height = 4,
     order = 10,
     title = " Todos ",

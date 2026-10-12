@@ -5,11 +5,12 @@ use crate::components::input::{BORDER_ROWS, Placeholder};
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
-use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
+use crate::components::split_layout::{MIN_CHAT_ROWS, carve};
 use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
+#[cfg(test)]
 use maki_lua::Split;
 use maki_providers::RequestOptions;
 use ratatui::Frame;
@@ -24,10 +25,24 @@ struct ViewLayout {
     bottom_area: Rect,
     status_area: Rect,
     queue_area: Rect,
-    panel_windows: Vec<(usize, Rect)>,
+    /// Bottom docks, in the input column, as `(window index, rect)`.
+    bottom_windows: Vec<(usize, Rect)>,
+    /// Edge docks carved off the content, as `(window index, rect)`.
+    dock_windows: Vec<(usize, Rect)>,
     input_area: Rect,
-    splits: SplitLayout,
     bottom_takeover: bool,
+}
+
+/// Every dock drawn this frame, keyed by direction, for tests to assert on.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DockRects(Vec<(Split, Rect)>);
+
+#[cfg(test)]
+impl DockRects {
+    pub(super) fn rect(&self, split: Split) -> Option<Rect> {
+        self.0.iter().find(|(s, _)| *s == split).map(|(_, r)| *r)
+    }
 }
 
 impl App {
@@ -87,74 +102,85 @@ impl App {
     }
 
     fn compute_layout(&self, area: Rect) -> ViewLayout {
-        let prompt_open = self.prompt_open();
-
         // Carve the full-width status bar first so the split carving below only
         // ever deals with the content region above it.
         let [content, status_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
-        // A confirmation prompt owns the bottom area, so drop any `below` split
-        // here at the source instead of fixing it up further down.
-        let reqs: Vec<_> = self
-            .float_mgr
-            .split_reqs(content)
-            .into_iter()
-            .filter(|r| !(prompt_open && r.split == Split::Below))
-            .collect();
+        // Edge docks (above/left/right) carve off the content. Bottom docks
+        // live in the input column below, so they never reach `carve`.
+        let dock_reqs = self.float_mgr.dock_reqs(content);
+        let reqs: Vec<_> = dock_reqs.iter().map(|(_, req)| *req).collect();
         let splits = carve(content, &reqs);
         let inner = splits.inner;
+        let dock_windows: Vec<(usize, Rect)> = dock_reqs
+            .iter()
+            .zip(splits.rects())
+            .filter_map(|((idx, _), rect)| rect.map(|rect| (*idx, rect)))
+            .collect();
 
-        let below_active = splits.rect(Split::Below).is_some();
-        let bottom_takeover = self.form_visible() || below_active;
+        let hides_input = self.float_mgr.hides_input();
+        let bottom_takeover = self.form_visible() || hides_input;
         let max_bottom = inner.height.saturating_sub(MIN_CHAT_ROWS);
+
+        let bottom_reqs = if self.form_visible() {
+            Vec::new()
+        } else {
+            self.float_mgr.bottom_reqs()
+        };
+        let bottom_h: u16 = bottom_reqs.iter().map(|(_, h)| *h).sum();
+        let queue_height = if self.form_visible() || hides_input || !self.chat_accepts_input() {
+            0
+        } else {
+            queue_panel::height(self.active_queue_len())
+        };
+        let input_shown = self.chat_accepts_input() && !hides_input && !self.form_visible();
+        let input_h = if input_shown {
+            self.input_box.height(inner.width)
+        } else {
+            0
+        };
+
         let bottom_height = if self.permission_prompt.is_open() {
             self.permission_prompt.height(inner.width).min(max_bottom)
         } else if self.pack_review.is_open() {
             self.pack_review.height(inner.width).min(max_bottom)
-        } else if below_active {
-            0
-        } else if self.form_visible() {
+        } else if self.plan_form_active() {
             self.plan_form.height(max_bottom).min(max_bottom)
         } else if self.chat_accepts_input() {
-            let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
-            queue_panel::height(self.active_queue_len())
-                + panel_h
-                + self.input_box.height(inner.width).min(max_bottom)
+            (queue_height + bottom_h + input_h).min(max_bottom)
+        } else if bottom_h > 0 {
+            bottom_h + 1
         } else {
-            let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
-            if panel_h > 0 { panel_h + 1 } else { 1 }
+            1
         };
 
-        // The `below` split lives outside `inner` (drawn by render_splits), so
-        // the bottom panel only ever splits the chat region.
+        // The bottom column is `[queue, bottom docks..., input]`. A dock that
+        // hides the input drops that last row, so it reaches the screen edge.
         let [msg_area, bottom_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_height)]).areas(inner);
 
-        let panel_reqs = if bottom_takeover {
-            Vec::new()
-        } else {
-            self.float_mgr.panel_reqs()
-        };
-
-        let queue_height = if bottom_takeover {
-            0
-        } else {
-            queue_panel::height(self.active_queue_len())
-        };
-
         let mut constraints = vec![Constraint::Length(queue_height)];
-        for &(_, h) in &panel_reqs {
+        for &(_, h) in &bottom_reqs {
             constraints.push(Constraint::Length(h));
         }
-        constraints.push(Constraint::Min(1));
+        // The tail row is the input box, or a one-row separator when the chat
+        // takes no input (a finished subagent transcript).
+        let tail = if input_shown {
+            Constraint::Min(1)
+        } else if !self.chat_accepts_input() && !bottom_reqs.is_empty() {
+            Constraint::Length(1)
+        } else {
+            Constraint::Length(0)
+        };
+        constraints.push(tail);
 
         let areas = Layout::vertical(constraints).split(bottom_area);
         let queue_area = areas[0];
-        let panel_windows: Vec<(usize, Rect)> = panel_reqs
+        let bottom_windows: Vec<(usize, Rect)> = bottom_reqs
             .iter()
             .enumerate()
-            .map(|(i, &(idx, _))| (idx, areas[1 + i]))
+            .map(|(n, &(idx, _))| (idx, areas[1 + n]))
             .collect();
         let input_area = areas[areas.len() - 1];
 
@@ -163,9 +189,9 @@ impl App {
             bottom_area,
             status_area,
             queue_area,
-            panel_windows,
+            bottom_windows,
+            dock_windows,
             input_area,
-            splits,
             bottom_takeover,
         }
     }
@@ -199,22 +225,13 @@ impl App {
         } else if self.pack_review.is_open() {
             self.pack_review.view(frame, layout.bottom_area);
         } else if !self.chat_accepts_input() {
-            let panel_reqs = self.float_mgr.panel_reqs();
-            let panel_h: u16 = panel_reqs.iter().map(|(_, h)| *h).sum();
-            let sep_area = if panel_h > 0 {
-                let [panels, sep] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
-                    .areas(layout.bottom_area);
-                let constraints: Vec<_> = panel_reqs
-                    .iter()
-                    .map(|&(_, h)| Constraint::Length(h))
-                    .collect();
-                let areas = Layout::vertical(constraints).split(panels);
-                for (i, &(idx, _)) in panel_reqs.iter().enumerate() {
-                    self.float_mgr.view_panel(frame, idx, areas[i]);
-                }
-                sep
-            } else {
+            for &(idx, rect) in &layout.bottom_windows {
+                self.float_mgr.view_dock(frame, idx, rect);
+            }
+            let sep_area = if layout.bottom_windows.is_empty() {
                 layout.bottom_area
+            } else {
+                layout.input_area
             };
             let sep = Block::default()
                 .borders(Borders::TOP)
@@ -226,8 +243,11 @@ impl App {
             let queue_entries = self.active_queue_entries();
             let focus = self.queue.focus().filter(|_| self.is_main_chat());
             queue_panel::view(frame, layout.queue_area, &queue_entries, focus);
-            for &(idx, rect) in &layout.panel_windows {
-                self.float_mgr.view_panel(frame, idx, rect);
+            for &(idx, rect) in &layout.bottom_windows {
+                self.float_mgr.view_dock(frame, idx, rect);
+            }
+            if self.float_mgr.hides_input() {
+                return None;
             }
             let placeholder = if !self.is_main_chat() {
                 Placeholder::SubagentQueue
@@ -257,10 +277,8 @@ impl App {
     }
 
     fn render_splits(&mut self, frame: &mut Frame, layout: &ViewLayout) {
-        for dir in Split::ALL {
-            if let Some(rect) = layout.splits.rect(dir) {
-                self.float_mgr.view_split(frame, dir, rect);
-            }
+        for &(idx, rect) in &layout.dock_windows {
+            self.float_mgr.view_dock(frame, idx, rect);
         }
     }
 
@@ -402,7 +420,7 @@ impl App {
             self.zones.push_overlay(layout.bottom_area);
         }
 
-        for &(_, rect) in &layout.panel_windows {
+        for &(_, rect) in &layout.bottom_windows {
             self.zones.push_overlay(selection::inset_border(rect));
         }
 
@@ -410,10 +428,8 @@ impl App {
             self.zones.push_overlay(layout.queue_area);
         }
 
-        for dir in Split::ALL {
-            if let Some(rect) = layout.splits.rect(dir) {
-                self.zones.push_overlay(selection::inset_border(rect));
-            }
+        for &(_, rect) in &layout.dock_windows {
+            self.zones.push_overlay(selection::inset_border(rect));
         }
 
         if overlay_rect.width > 0 {
@@ -446,16 +462,22 @@ impl App {
     }
 
     /// Layout geometry for tests: `(msg_area, bottom_area, status_area,
-    /// input_area, splits)`.
+    /// input_area, docks)`.
     #[cfg(test)]
-    pub(super) fn layout_geometry(&self, area: Rect) -> (Rect, Rect, Rect, Rect, SplitLayout) {
+    pub(super) fn layout_geometry(&self, area: Rect) -> (Rect, Rect, Rect, Rect, DockRects) {
         let layout = self.compute_layout(area);
+        let docks = layout
+            .dock_windows
+            .iter()
+            .chain(layout.bottom_windows.iter())
+            .map(|&(idx, rect)| (self.float_mgr.split_of(idx), rect))
+            .collect();
         (
             layout.msg_area,
             layout.bottom_area,
             layout.status_area,
             layout.input_area,
-            layout.splits,
+            DockRects(docks),
         )
     }
 
