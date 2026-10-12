@@ -25,9 +25,7 @@ struct ViewLayout {
     bottom_area: Rect,
     status_area: Rect,
     queue_area: Rect,
-    /// Bottom docks, in the input column, as `(window index, rect)`.
-    bottom_windows: Vec<(usize, Rect)>,
-    /// Edge docks carved off the content, as `(window index, rect)`.
+    /// Every dock drawn this frame, as `(window index, rect)`.
     dock_windows: Vec<(usize, Rect)>,
     input_area: Rect,
     bottom_takeover: bool,
@@ -102,97 +100,69 @@ impl App {
     }
 
     fn compute_layout(&self, area: Rect) -> ViewLayout {
-        // Carve the full-width status bar first so the split carving below only
-        // ever deals with the content region above it.
+        // Carve the full-width status bar first so everything below deals only
+        // with the content region above it.
         let [content, status_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
-        // Edge docks (above/left/right) carve off the content. Bottom docks
-        // live in the input column below, so they never reach `carve`.
-        let dock_reqs = self.float_mgr.dock_reqs(content);
+        // The chat input (with the queue above it) is a full-width strip pinned
+        // to the bottom of the content. Docks frame the chat above it, so a
+        // `below` dock rests just above the input, and `hide_input` drops the
+        // strip so it reaches the bottom of the screen.
+        let hides_input = self.float_mgr.hides_input();
+        let form_visible = self.form_visible();
+        let input_shown = self.chat_accepts_input() && !hides_input && !form_visible;
+        let queue_height = if form_visible || hides_input || !self.chat_accepts_input() {
+            0
+        } else {
+            queue_panel::height(self.active_queue_len())
+        };
+        let input_h = if input_shown {
+            self.input_box.height(content.width)
+        } else {
+            0
+        };
+        let max_bottom = content.height.saturating_sub(MIN_CHAT_ROWS);
+        let bottom_height = if self.permission_prompt.is_open() {
+            self.permission_prompt.height(content.width).min(max_bottom)
+        } else if self.pack_review.is_open() {
+            self.pack_review.height(content.width).min(max_bottom)
+        } else if self.plan_form_active() {
+            self.plan_form.height(max_bottom).min(max_bottom)
+        } else if self.chat_accepts_input() {
+            (queue_height + input_h).min(max_bottom)
+        } else {
+            1
+        };
+
+        let [chat_area, bottom_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_height)])
+                .areas(content);
+
+        // Every dock carves off the chat region above the strip, stacked per
+        // edge by `order`.
+        let dock_reqs = self.float_mgr.dock_reqs(chat_area);
         let reqs: Vec<_> = dock_reqs.iter().map(|(_, req)| *req).collect();
-        let splits = carve(content, &reqs);
-        let inner = splits.inner;
+        let splits = carve(chat_area, &reqs);
+        let msg_area = splits.inner;
         let dock_windows: Vec<(usize, Rect)> = dock_reqs
             .iter()
             .zip(splits.rects())
             .filter_map(|((idx, _), rect)| rect.map(|rect| (*idx, rect)))
             .collect();
 
-        let hides_input = self.float_mgr.hides_input();
-        let bottom_takeover = self.form_visible() || hides_input;
-        let max_bottom = inner.height.saturating_sub(MIN_CHAT_ROWS);
-
-        let bottom_reqs = if self.form_visible() {
-            Vec::new()
-        } else {
-            self.float_mgr.bottom_reqs()
-        };
-        let bottom_h: u16 = bottom_reqs.iter().map(|(_, h)| *h).sum();
-        let queue_height = if self.form_visible() || hides_input || !self.chat_accepts_input() {
-            0
-        } else {
-            queue_panel::height(self.active_queue_len())
-        };
-        let input_shown = self.chat_accepts_input() && !hides_input && !self.form_visible();
-        let input_h = if input_shown {
-            self.input_box.height(inner.width)
-        } else {
-            0
-        };
-
-        let bottom_height = if self.permission_prompt.is_open() {
-            self.permission_prompt.height(inner.width).min(max_bottom)
-        } else if self.pack_review.is_open() {
-            self.pack_review.height(inner.width).min(max_bottom)
-        } else if self.plan_form_active() {
-            self.plan_form.height(max_bottom).min(max_bottom)
-        } else if self.chat_accepts_input() {
-            (queue_height + bottom_h + input_h).min(max_bottom)
-        } else if bottom_h > 0 {
-            bottom_h + 1
-        } else {
-            1
-        };
-
-        // The bottom column is `[queue, bottom docks..., input]`. A dock that
-        // hides the input drops that last row, so it reaches the screen edge.
-        let [msg_area, bottom_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_height)]).areas(inner);
-
-        let mut constraints = vec![Constraint::Length(queue_height)];
-        for &(_, h) in &bottom_reqs {
-            constraints.push(Constraint::Length(h));
-        }
-        // The tail row is the input box, or a one-row separator when the chat
-        // takes no input (a finished subagent transcript).
-        let tail = if input_shown {
-            Constraint::Min(1)
-        } else if !self.chat_accepts_input() && !bottom_reqs.is_empty() {
-            Constraint::Length(1)
-        } else {
-            Constraint::Length(0)
-        };
-        constraints.push(tail);
-
-        let areas = Layout::vertical(constraints).split(bottom_area);
-        let queue_area = areas[0];
-        let bottom_windows: Vec<(usize, Rect)> = bottom_reqs
-            .iter()
-            .enumerate()
-            .map(|(n, &(idx, _))| (idx, areas[1 + n]))
-            .collect();
-        let input_area = areas[areas.len() - 1];
+        let [queue_area, input_area] =
+            Layout::vertical([Constraint::Length(queue_height), Constraint::Min(1)])
+                .areas(bottom_area);
 
         ViewLayout {
             msg_area,
             bottom_area,
             status_area,
             queue_area,
-            bottom_windows,
             dock_windows,
             input_area,
-            bottom_takeover,
+            bottom_takeover: form_visible || hides_input,
         }
     }
 
@@ -225,30 +195,16 @@ impl App {
         } else if self.pack_review.is_open() {
             self.pack_review.view(frame, layout.bottom_area);
         } else if !self.chat_accepts_input() {
-            for &(idx, rect) in &layout.bottom_windows {
-                self.float_mgr.view_dock(frame, idx, rect);
-            }
-            let sep_area = if layout.bottom_windows.is_empty() {
-                layout.bottom_area
-            } else {
-                layout.input_area
-            };
             let sep = Block::default()
                 .borders(Borders::TOP)
                 .border_style(self.separator_style());
-            frame.render_widget(sep, sep_area);
+            frame.render_widget(sep, layout.bottom_area);
         } else if self.plan_form_active() {
             self.plan_form.view(frame, layout.bottom_area);
         } else if layout.bottom_area.height > 0 {
             let queue_entries = self.active_queue_entries();
             let focus = self.queue.focus().filter(|_| self.is_main_chat());
             queue_panel::view(frame, layout.queue_area, &queue_entries, focus);
-            for &(idx, rect) in &layout.bottom_windows {
-                self.float_mgr.view_dock(frame, idx, rect);
-            }
-            if self.float_mgr.hides_input() {
-                return None;
-            }
             let placeholder = if !self.is_main_chat() {
                 Placeholder::SubagentQueue
             } else if self.status == Status::Streaming {
@@ -420,10 +376,6 @@ impl App {
             self.zones.push_overlay(layout.bottom_area);
         }
 
-        for &(_, rect) in &layout.bottom_windows {
-            self.zones.push_overlay(selection::inset_border(rect));
-        }
-
         if layout.queue_area.height > 0 && !layout.bottom_takeover {
             self.zones.push_overlay(layout.queue_area);
         }
@@ -469,7 +421,6 @@ impl App {
         let docks = layout
             .dock_windows
             .iter()
-            .chain(layout.bottom_windows.iter())
             .map(|&(idx, rect)| (self.float_mgr.split_of(idx), rect))
             .collect();
         (

@@ -6529,8 +6529,10 @@ fn closing_split_restores_layout() {
     assert_eq!(after, before, "closing the split restores the layout");
 }
 
+/// A prompt owns the input strip. Docks frame the chat above it, so every dock
+/// survives — including `below`, which used to be a bottom band that yielded.
 #[test]
-fn permission_prompt_takes_bottom_precedence_over_below_split() {
+fn permission_prompt_does_not_displace_docks() {
     let mut app = test_app();
     open_split_window(&mut app, maki_lua::Split::Below);
     open_split_window(&mut app, maki_lua::Split::Left);
@@ -6544,19 +6546,20 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
         None,
     );
 
-    let (_msg, _bottom, _status, _input, splits) = app.layout_geometry(TEST_AREA);
+    let (_msg, bottom, _status, _input, docks) = app.layout_geometry(TEST_AREA);
     assert!(
-        splits.rect(maki_lua::Split::Below).is_none(),
-        "below split must yield the bottom area to an open permission prompt",
+        docks.rect(maki_lua::Split::Below).is_some(),
+        "the prompt takes the strip, so the below dock survives",
     );
     assert!(
-        splits.rect(maki_lua::Split::Left).is_some(),
-        "the prompt must leave a left split untouched",
+        docks.rect(maki_lua::Split::Left).is_some(),
+        "the prompt must leave a left dock untouched",
     );
     assert!(
-        splits.rect(maki_lua::Split::Above).is_some(),
-        "the prompt must leave an above split untouched",
+        docks.rect(maki_lua::Split::Above).is_some(),
+        "the prompt must leave an above dock untouched",
     );
+    assert!(bottom.height > 0, "the prompt owns the input strip");
 }
 
 fn app_with_active_subagent() -> App {
