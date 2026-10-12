@@ -18,6 +18,17 @@ const TITLE: &str = " Keybindings ";
 const KEY_COL_GAP: usize = 2;
 const PREFIX_TOP: &str = "  ";
 const PREFIX_CHILD: &str = "    ";
+const MIN_WIDTH_PERCENT: u16 = 50;
+const H_PADDING: u16 = 4;
+
+/// A fixed 50% leaves the description clipped on narrow screens, so widen the
+/// popup until the widest row fits.
+fn width_percent(content_width: u16, screen_width: u16) -> u16 {
+    let needed = content_width.saturating_add(H_PADDING);
+    (needed as u32 * 100)
+        .div_ceil(screen_width.max(1) as u32)
+        .clamp(u32::from(MIN_WIDTH_PERCENT), 100) as u16
+}
 
 const INPUT_PREFIXES: &[(&str, &str)] = &[
     ("!", "Run shell command (visible to agent)"),
@@ -201,9 +212,10 @@ impl HelpModal {
         }
 
         let total = lines.len() as u16;
+        let content_width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
         let modal = Modal {
             title: TITLE,
-            width_percent: 50,
+            width_percent: width_percent(content_width, area.width),
             max_height_percent: 80,
         };
         let (popup, inner) = modal.render(frame, area, total);
@@ -238,6 +250,13 @@ mod tests {
     use crate::components::key as key_ev;
     use crossterm::event::KeyCode;
     use test_case::test_case;
+
+    #[test_case(200, 72, MIN_WIDTH_PERCENT ; "wide_screen_keeps_the_default")]
+    #[test_case(80, 72, 95                ; "narrow_screen_widens_to_fit")]
+    #[test_case(60, 72, 100               ; "tiny_screen_saturates")]
+    fn popup_width_fits_content(screen: u16, content: u16, expected: u16) {
+        assert_eq!(width_percent(content, screen), expected);
+    }
 
     #[test_case(key_ev(KeyCode::Esc)       ; "esc_closes")]
     #[test_case(key::QUIT.to_key_event()    ; "ctrl_c_closes")]
