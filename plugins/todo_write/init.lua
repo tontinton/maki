@@ -24,6 +24,27 @@ local DESCRIPTION = [[Create or update a structured todo list to track tasks.
 - Use ONLY for multi-step work (3+ steps).
 - Skip for trivial tasks.]]
 
+local DOCK_EDGES = { "above", "below", "left", "right" }
+
+local opts = maki.api.register_options({
+  position = {
+    default = "below",
+    desc = "Edge the todo panel docks to: above, below, left or right.",
+  },
+})
+
+-- A value outside the four edges would parse as a float in `open_win`, so the
+-- panel would leave the dock and float in the middle of the screen. Fall back
+-- to the default instead.
+local function dock_edge()
+  for _, edge in ipairs(DOCK_EDGES) do
+    if opts.position == edge then
+      return edge
+    end
+  end
+  return "below"
+end
+
 local function items_of(sid, task)
   return todos[sid] and todos[sid][task] or {}
 end
@@ -52,7 +73,7 @@ local function ensure_win()
   end
   buf = maki.ui.buf()
   win = maki.ui.open_win(buf, {
-    split = "below",
+    split = dock_edge(),
     height = 4,
     title = " Todos ",
     border = "rounded",
