@@ -609,6 +609,7 @@ function QuestionForm.open(questions)
     focus = true,
     needs_input = true,
     split = "below",
+    hide_input = true,
   })
 
   local width = win.width

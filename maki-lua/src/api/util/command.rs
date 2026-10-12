@@ -230,7 +230,6 @@ pub enum Split {
     Below,
     Left,
     Right,
-    Panel,
 }
 
 /// The renderer and layout read `Axis` rather than matching on `Split`, so a
@@ -257,7 +256,10 @@ impl Split {
             "below" => Self::Below,
             "left" => Self::Left,
             "right" => Self::Right,
-            "panel" => Self::Panel,
+            // Deprecated alias from when panels were a distinct split. A
+            // `below` dock keeps the input unless `hide_input` is set, which is
+            // the slot panels used to occupy.
+            "panel" => Self::Below,
             _ => Self::None,
         }
     }
@@ -266,7 +268,7 @@ impl Split {
     /// single spot. `None` means the split is off.
     pub fn edge(self) -> Option<Edge> {
         Some(match self {
-            Self::None | Self::Panel => return None,
+            Self::None => return None,
             Self::Above => Edge {
                 axis: Axis::Vertical,
                 at_start: true,
@@ -329,6 +331,10 @@ pub struct FloatConfig {
     pub order: u16,
     pub visible: bool,
     pub needs_input: bool,
+    /// Whether this dock displaces the chat input box. Floats ignore it. A
+    /// dock that keeps the input sits above it; one that hides it takes the
+    /// bottom of the screen.
+    pub hide_input: bool,
     /// Opt in to corner stacking: the UI offsets this window past the other
     /// stacked windows sharing its anchor. Open time only, so no patch field.
     pub stack: bool,
@@ -360,6 +366,7 @@ impl Default for FloatConfig {
             order: 50,
             visible: true,
             needs_input: false,
+            hide_input: false,
             stack: false,
             keys: Vec::new(),
         }
@@ -393,7 +400,8 @@ impl FloatConfig {
             split,
             order,
             visible,
-            needs_input
+            needs_input,
+            hide_input,
         );
     }
 }
@@ -417,6 +425,7 @@ pub struct FloatConfigPatch {
     pub order: Option<u16>,
     pub visible: Option<bool>,
     pub needs_input: Option<bool>,
+    pub hide_input: Option<bool>,
 }
 
 pub enum WinEvent {
@@ -913,7 +922,6 @@ mod tests {
         TitlePos::parse(s)
     }
 
-    #[test_case("panel" => Split::Panel ; "panel")]
     #[test_case("above" => Split::Above ; "above")]
     #[test_case("below" => Split::Below ; "below")]
     #[test_case("left" => Split::Left ; "left")]
@@ -922,11 +930,11 @@ mod tests {
     #[test_case("" => Split::None ; "empty_defaults_none")]
     #[test_case("Below" => Split::None ; "exact_match_is_case_sensitive")]
     #[test_case("garbage" => Split::None ; "unknown_defaults_none")]
+    #[test_case("panel" => Split::Below ; "panel_is_deprecated_alias_for_below")]
     fn split_parse(s: &str) -> Split {
         Split::parse(s)
     }
 
-    #[test_case(Split::Panel => None ; "panel_has_no_edge")]
     #[test_case(Split::None => None ; "none_has_no_edge")]
     #[test_case(Split::Above => Some(Edge { axis: Axis::Vertical, at_start: true }) ; "above_is_vertical_start")]
     #[test_case(Split::Below => Some(Edge { axis: Axis::Vertical, at_start: false }) ; "below_is_vertical_end")]
@@ -944,7 +952,6 @@ mod tests {
     #[test_case(Split::Below)]
     #[test_case(Split::Left)]
     #[test_case(Split::Right)]
-    #[test_case(Split::Panel)]
     fn all_lists_exactly_the_edge_bearing_variants(variant: Split) {
         assert_eq!(
             variant.edge().is_some(),

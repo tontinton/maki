@@ -2972,7 +2972,7 @@ fn a_caret_anchored_float_stays_on_the_caret_when_an_overlay_takes_the_keyboard(
 fn a_caret_anchored_float_falls_back_when_the_input_box_is_off_screen() {
     let mut app = test_app();
     open_caret_float(&mut app);
-    open_split_window(&mut app, Split::Below);
+    open_dock_window(&mut app, Split::Below, true);
 
     let (cursor, row) = draw_caret_float(&mut app);
     assert_eq!(cursor, None, "{OVERLAY_TAKES_THE_CURSOR}");
@@ -6726,12 +6726,17 @@ const TEST_AREA: Rect = Rect {
 const SPLIT_EXTENT: u16 = 8;
 
 fn open_split_window(app: &mut App, dir: maki_lua::Split) {
+    open_dock_window(app, dir, false);
+}
+
+fn open_dock_window(app: &mut App, dir: maki_lua::Split, hide_input: bool) {
     let buf = Arc::new(maki_agent::SharedBuf::new());
     let config = maki_lua::FloatConfig {
         width: maki_lua::Dimension::Abs(SPLIT_EXTENT),
         height: maki_lua::Dimension::Abs(SPLIT_EXTENT),
         border: maki_lua::Border::None,
         split: dir,
+        hide_input,
         ..maki_lua::FloatConfig::default()
     };
     let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
@@ -6850,38 +6855,50 @@ fn split_question_keeps_transcript_selectable_and_keyboard_focus(dir: Split) {
 }
 
 #[test]
-fn below_split_reserves_bottom_and_suppresses_input() {
+fn below_dock_keeps_input_by_default() {
     let mut app = test_app();
     let (msg_before, _b, _s, input_before, splits_before) = app.layout_geometry(TEST_AREA);
     assert!(
         splits_before.rect(maki_lua::Split::Below).is_none(),
-        "no split open yet"
+        "no dock open yet"
     );
-    assert!(input_before.height > 0, "input box visible before split");
+    assert!(input_before.height > 0, "input box visible before the dock");
 
     open_split_window(&mut app, maki_lua::Split::Below);
     let (msg_after, _bottom, _s, input_after, splits_after) = app.layout_geometry(TEST_AREA);
 
     let band = splits_after
         .rect(maki_lua::Split::Below)
-        .expect("below split should reserve a bottom band");
+        .expect("below dock should reserve a row band");
     assert_eq!(
         band.height, SPLIT_EXTENT,
-        "below band reserves the requested rows",
+        "below dock reserves the requested rows",
     );
     assert!(
         msg_after.height < msg_before.height,
-        "chat must shrink to make room for the below split",
+        "chat must shrink to make room for the below dock",
     );
-    assert_eq!(
-        input_after.height, 0,
-        "input box is suppressed under a below split"
+    assert!(
+        input_after.height > 0,
+        "a below dock keeps the input box above it",
     );
 }
 
+#[test]
+fn below_dock_with_hide_input_drops_the_input_box() {
+    let mut app = test_app();
+    open_dock_window(&mut app, maki_lua::Split::Below, true);
+    let (_msg, _bottom, _status, input, splits) = app.layout_geometry(TEST_AREA);
+    assert!(
+        splits.rect(maki_lua::Split::Below).is_some(),
+        "the dock still reserves a band",
+    );
+    assert_eq!(input.height, 0, "hide_input drops the input box");
+}
+
 /// `carve` already tests the per-direction geometry; this pins the app wiring:
-/// a split shrinks the chat while the full-width status bar stays put. Below is
-/// tested separately since it also hides the input box.
+/// a dock shrinks the chat while the full-width status bar stays put. `below`
+/// is tested separately since it lives in the input column.
 #[test_case(maki_lua::Split::Above ; "above")]
 #[test_case(maki_lua::Split::Left ; "left")]
 #[test_case(maki_lua::Split::Right ; "right")]
