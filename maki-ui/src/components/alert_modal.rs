@@ -1,5 +1,5 @@
 use crate::components::keybindings::key;
-use crate::components::modal::Modal;
+use crate::components::modal::{BORDER, Modal, inset};
 use crate::components::{Overlay, hint_line};
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -11,7 +11,6 @@ use ratatui::widgets::{Paragraph, Wrap};
 const TITLE: &str = " Action Required ";
 const HINTS: &[(&str, &str)] = &[("Enter/Esc", "Dismiss")];
 const H_PAD: u16 = 2;
-const BORDER_WIDTH: u16 = 2;
 const WIDTH_PERCENT: u16 = 60;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 
@@ -53,19 +52,15 @@ impl AlertModal {
             .chain([Line::default(), hint_line(HINTS), Line::default()])
             .collect();
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        let padded_width = (area.width as u32 * WIDTH_PERCENT as u32 / 100)
-            .saturating_sub((BORDER_WIDTH + H_PAD * 2) as u32) as u16;
         let modal = Modal {
             title: TITLE,
             width_percent: WIDTH_PERCENT,
+            min_width: 0,
             max_height_percent: MAX_HEIGHT_PERCENT,
         };
+        let padded_width = modal.width(area.width).saturating_sub(BORDER + H_PAD * 2);
         let (popup, inner) = modal.render(frame, area, paragraph.line_count(padded_width) as u16);
-        let padded = Rect {
-            x: inner.x + H_PAD,
-            width: inner.width.saturating_sub(H_PAD * 2),
-            ..inner
-        };
+        let padded = inset(inner, H_PAD);
         frame.render_widget(paragraph, padded);
         popup
     }

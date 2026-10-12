@@ -208,6 +208,7 @@ impl SearchModal {
         let modal = Modal {
             title: MODAL_TITLE,
             width_percent: MODAL_WIDTH_PERCENT,
+            min_width: 0,
             max_height_percent: MODAL_MAX_HEIGHT_PERCENT,
         };
         let (popup, inner) = modal.render(frame, area, content_rows + SEARCH_ROW);

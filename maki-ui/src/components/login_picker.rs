@@ -665,11 +665,7 @@ impl LoginPicker {
             Step::PickProvider(picker) => picker.view(frame, area),
             Step::PickPlan { picker, .. } => picker.view(frame, area),
             Step::CustomName { input } => {
-                let modal = Modal {
-                    title: " Provider name ",
-                    width_percent: 65,
-                    max_height_percent: 40,
-                };
+                let modal = step_modal(" Provider name ");
                 let (popup, inner) = modal.render(frame, area, 2);
                 let t = theme::current();
                 let hint = Span::styled("Enter provider name, then Enter", t.input_placeholder);
@@ -684,11 +680,7 @@ impl LoginPicker {
             }
             Step::CustomProtocol { picker, .. } => picker.view(frame, area),
             Step::CustomUrl { input, .. } => {
-                let modal = Modal {
-                    title: " Base URL ",
-                    width_percent: 65,
-                    max_height_percent: 40,
-                };
+                let modal = step_modal(" Base URL ");
                 let (popup, inner) = modal.render(frame, area, 2);
                 let t = theme::current();
                 let hint = Span::styled("Enter base URL, then Enter", t.input_placeholder);
@@ -706,11 +698,8 @@ impl LoginPicker {
                 display_name,
                 ..
             } => {
-                let modal = Modal {
-                    title: &format!(" {display_name} "),
-                    width_percent: 65,
-                    max_height_percent: 40,
-                };
+                let title = format!(" {display_name} ");
+                let modal = step_modal(&title);
                 let (popup, inner) = modal.render(frame, area, 2);
                 let t = theme::current();
                 let hint = Span::styled("Edit host URL, or Enter to confirm", t.input_placeholder);
@@ -729,11 +718,8 @@ impl LoginPicker {
                 api_key_optional,
                 ..
             } => {
-                let modal = Modal {
-                    title: &format!(" {display_name} "),
-                    width_percent: 65,
-                    max_height_percent: 40,
-                };
+                let title = format!(" {display_name} ");
+                let modal = step_modal(&title);
                 let (popup, inner) = modal.render(frame, area, 2);
                 let t = theme::current();
                 let hint_text = if *api_key_optional {
@@ -755,6 +741,7 @@ impl LoginPicker {
                 let modal = Modal {
                     title: " Login ",
                     width_percent: 50,
+                    min_width: 0,
                     max_height_percent: 30,
                 };
                 let (popup, inner) = modal.render(frame, area, 1);
@@ -776,6 +763,15 @@ impl Overlay for LoginPicker {
 
     fn close(&mut self) {
         self.step = Step::Closed;
+    }
+}
+
+fn step_modal(title: &str) -> Modal<'_> {
+    Modal {
+        title,
+        width_percent: 65,
+        min_width: 0,
+        max_height_percent: 40,
     }
 }
 

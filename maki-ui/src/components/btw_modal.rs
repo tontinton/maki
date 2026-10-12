@@ -1,6 +1,6 @@
 use crate::components::ModalScroll;
 use crate::components::Overlay;
-use crate::components::modal::Modal;
+use crate::components::modal::{BORDER, Modal, inset};
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::components::streaming_content::StreamingContent;
 use crate::components::thinking;
@@ -148,25 +148,20 @@ impl BtwModal {
             return Rect::default();
         }
 
-        let border_chrome: u16 = 2;
-        let padded_width = (area.width as u32 * WIDTH_PERCENT as u32 / 100)
-            .saturating_sub((border_chrome + H_PAD * 2) as u32) as u16;
+        let modal = Modal {
+            title: TITLE,
+            width_percent: WIDTH_PERCENT,
+            min_width: 0,
+            max_height_percent: MAX_HEIGHT_PERCENT,
+        };
+        let padded_width = modal.width(area.width).saturating_sub(BORDER + H_PAD * 2);
 
         let lines = self.body_lines(padded_width);
         let total = Paragraph::new(lines.clone())
             .wrap(Wrap { trim: false })
             .line_count(padded_width) as u16;
-        let modal = Modal {
-            title: TITLE,
-            width_percent: WIDTH_PERCENT,
-            max_height_percent: MAX_HEIGHT_PERCENT,
-        };
         let (popup, inner) = modal.render(frame, area, total);
-        let padded = Rect {
-            x: inner.x + H_PAD,
-            width: inner.width.saturating_sub(H_PAD * 2),
-            ..inner
-        };
+        let padded = inset(inner, H_PAD);
         let viewport_h = padded.height;
         self.scroll.update_dimensions(total, viewport_h);
         let scroll = self.scroll.offset();

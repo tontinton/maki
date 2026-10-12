@@ -119,6 +119,7 @@ impl UsageModal {
         let modal = Modal {
             title: TITLE,
             width_percent: 60,
+            min_width: 0,
             max_height_percent: 70,
         };
         let (popup, inner) = modal.render(frame, area, total);

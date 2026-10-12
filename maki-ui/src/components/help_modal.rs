@@ -3,7 +3,7 @@ use crate::components::Overlay;
 use crate::components::keybindings::{
     ALT_SEP, KEYBINDS, KeybindContext, ResolvedLabel, all_contexts, key,
 };
-use crate::components::modal::Modal;
+use crate::components::modal::{BORDER, Modal};
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::theme;
 
@@ -201,9 +201,11 @@ impl HelpModal {
         }
 
         let total = lines.len() as u16;
+        let content_cols = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
         let modal = Modal {
             title: TITLE,
             width_percent: 50,
+            min_width: content_cols + BORDER,
             max_height_percent: 80,
         };
         let (popup, inner) = modal.render(frame, area, total);

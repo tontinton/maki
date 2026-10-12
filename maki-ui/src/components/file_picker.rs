@@ -319,6 +319,7 @@ impl FilePickerModal {
         let modal = Modal {
             title: s.walk.title(),
             width_percent: WIDTH_PERCENT,
+            min_width: 0,
             max_height_percent: MAX_HEIGHT_PERCENT,
         };
         let (popup, inner) = modal.render(frame, area, content_rows + SEARCH_ROW);
