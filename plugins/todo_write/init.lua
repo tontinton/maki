@@ -5,11 +5,7 @@ local MAIN_TASK = "main"
 local todos = {}
 -- Sessions where Ctrl+T hid the panel; forgotten when the turn ends.
 local hidden = {}
--- Sessions that ran a turn since they were loaded. Restores of their
--- transcript are still in flight while the turn runs, so they are stale.
-local live = {}
--- Nothing is focused until the first TaskFocusChanged; restores that land
--- before it still file under their own session, so they show up then.
+-- Nothing is focused until the first TaskFocusChanged.
 local focused = { session = "", task = MAIN_TASK }
 local buf, win
 
@@ -104,14 +100,6 @@ local function sync_panel()
   end
 end
 
-local function store(sid, task, items)
-  todos[sid] = todos[sid] or {}
-  todos[sid][task] = items
-  if sid == focused.session and task == focused.task then
-    sync_panel()
-  end
-end
-
 maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = "- Use todo_write for multi-step tasks (3+ steps); update **after EACH step** (done + next in_progress), never batched at the end.",
@@ -151,18 +139,12 @@ maki.api.register_tool({
     return string.format("%d todos", #(input.todos or {}))
   end,
 
-  -- A session load replays the transcript in order, so the last call wins
-  -- and the panel picks up where the session left off. A rerender (click,
-  -- theme change) replays one call that may be long superseded. A failed
-  -- call never reached the handler, so it must not reach the panel either:
-  -- denied, cancelled, and the entries a batch drops past its size cap all
-  -- arrive here with the input intact.
-  restore = function(input, _output, is_error, ctx)
+  -- The panel is live-only, filled by handler calls during a turn. Replaying
+  -- a transcript here would resurrect a finished list — and pop the panel —
+  -- every time a session is reopened, so this only draws the call's list into
+  -- the chat. A failed call renders the same, since the input is intact.
+  restore = function(input)
     local items = input.todos or {}
-    local sid = ctx:session_id() or ""
-    if not is_error and ctx:restore_reason() == "load" and not live[sid] then
-      store(sid, ctx:task_id(), items)
-    end
     if #items == 0 then
       return nil
     end
@@ -173,7 +155,12 @@ maki.api.register_tool({
 
   handler = function(input, ctx)
     local items = input.todos or {}
-    store(ctx:session_id() or "", ctx:task_id(), items)
+    local sid, task = ctx:session_id() or "", ctx:task_id()
+    todos[sid] = todos[sid] or {}
+    todos[sid][task] = items
+    if sid == focused.session and task == focused.task then
+      sync_panel()
+    end
     return #items == 0 and "Todos cleared" or ""
   end,
 })
@@ -188,20 +175,11 @@ end
 
 maki.keymap.set("n", "<C-t>", toggle, { desc = "Toggle todo panel" })
 
-maki.api.create_autocmd("TurnStart", {
-  callback = function(ev)
-    live[ev.data.session_id] = true
-  end,
-})
-
 -- Subagents run inside the parent's turn, so its end clears their lists too.
 maki.api.create_autocmd({ "TurnEnd", "SessionReset", "SessionEnd" }, {
   callback = function(ev)
     local sid = ev.data and ev.data.session_id or ""
     todos[sid], hidden[sid] = nil, nil
-    if ev.event ~= "TurnEnd" then
-      live[sid] = nil
-    end
     if sid == focused.session then
       sync_panel()
     end
