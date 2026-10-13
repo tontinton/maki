@@ -1,6 +1,6 @@
 //! What a long editing session leaves behind in the input box. Not a timing
-//! bench: it replays 100k edits in rounds of typing, pastes, undo and plugin
-//! edits with a frame every few of them, and prints the heap in use
+//! bench: it replays 100k edits in rounds of typing, pastes, undo, redo and
+//! plugin edits with a frame every few of them, and prints the heap in use
 //! at checkpoints. Every round puts the text back as it was, so the heap
 //! should settle after the first few and stay put. A line that keeps
 //! climbing is the undo stack, the change log, the marks or a cache growing
@@ -24,7 +24,7 @@ mod report {
     const DOC_LINES: usize = 1_000;
     const MARKS: usize = 10_000;
     const OPS: usize = 100_000;
-    const OPS_PER_ROUND: usize = 8;
+    const OPS_PER_ROUND: usize = 10;
     const ROUNDS: usize = OPS / OPS_PER_ROUND;
     const CHECKPOINT_EVERY: usize = 10_000;
     const FRAME_EVERY: usize = 3;
@@ -93,11 +93,12 @@ mod report {
             let end = bench_support::input_value(&self.app).len();
             match step {
                 0 | 1 => self.key(KeyCode::Char(TYPED[step])),
-                2 | 7 => self.key(KeyCode::Backspace),
+                2 | 9 => self.key(KeyCode::Backspace),
                 3 => drop(self.app.update(Msg::Paste(paste.to_owned()))),
-                4 => self.key(UNDO),
-                5 => bench_support::plugin_edit(&mut self.app, AREA, end, end, "x").unwrap(),
-                6 => bench_support::plugin_edit(&mut self.app, AREA, end - 1, end, "").unwrap(),
+                4 | 6 => self.key(UNDO),
+                5 => assert!(bench_support::redo(&mut self.app), "nothing to redo"),
+                7 => bench_support::plugin_edit(&mut self.app, AREA, end, end, "x").unwrap(),
+                8 => bench_support::plugin_edit(&mut self.app, AREA, end - 1, end, "").unwrap(),
                 _ => unreachable!("a round has {OPS_PER_ROUND} steps"),
             }
         }

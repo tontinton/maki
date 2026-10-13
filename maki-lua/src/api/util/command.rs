@@ -638,6 +638,11 @@ pub enum BuiltinAction {
     NextChat,
     ModelPicker,
     InputRaw,
+    Undo,
+    Redo,
+    HistoryPrev,
+    HistoryNext,
+    Newline,
 }
 
 pub enum UiAction {
@@ -680,7 +685,20 @@ pub enum UiAction {
     WinRestView {
         scroll_top: u32,
     },
-    Builtin(BuiltinAction),
+    /// `reply_tx` answers whether the action did anything, which is what lets
+    /// a key handler try one action and fall back to another.
+    Builtin {
+        action: BuiltinAction,
+        reply_tx: flume::Sender<bool>,
+    },
+    /// The handler of the keystroke with this ticket id returned. It comes
+    /// after everything the handler asked of the UI, so the keys typed after
+    /// that keystroke can go.
+    KeybindDone(u64),
+    /// The handler of the keystroke with this ticket id called
+    /// `ev.fallback()`: run what the host itself does for that key, before
+    /// the keys typed after it.
+    KeybindFallback(u64),
     /// `reply_tx` answers whether {cmdline} resolved to a known command, not
     /// how the command itself went: `/compact` streams for a minute, and the
     /// Lua caller must not park for that long.

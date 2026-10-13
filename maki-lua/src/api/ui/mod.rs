@@ -7,18 +7,19 @@ use maki_agent::tools::compact_duration;
 use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
-use strum::VariantNames;
 
-use crate::api::keymap::accept_key;
+use crate::api::action::run_plugin_action;
+use crate::api::keymap::{InputMode, accept_key, switch_mode};
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
     InputRequest, Split, TextEdit, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip,
     ui_roundtrip, ui_send,
 };
 use crate::api::util::convert::{opt_bool, reject_unknown_fields};
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::pair::{Pair, pair};
 use crate::docs::{FnDoc, ParamDoc};
 use crate::key::Key;
+use crate::plugin_permissions::PluginReach;
 pub(crate) mod blit;
 pub(crate) mod buf;
 pub(crate) mod marks;
@@ -419,44 +420,109 @@ fn set_window_title(
     Ok(())
 }
 
-/// Runs a built-in UI action by name, exactly as its default keybinding
-/// would. Handy when a default key never reaches maki because tmux or
-/// your terminal grabs it first: bind a new key with `maki.keymap.set`
-/// and call this from it.
+/// Switches the chat input to normal mode (`"n"`) or insert mode (`"i"`),
+/// like leaving and entering insert mode in Neovim. See
+/// [Modes](/docs/lua-api/#modes).
 ///
-/// Valid names: `"file_picker"`, `"search"`, `"help"`,
-/// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
-/// `"prev_chat"`, `"next_chat"`, `"model_picker"`, `"input_raw"`.
+/// The mode is global and stays until a plugin switches it again. It applies
+/// at once: `maki.fn.mode()` returns it and the next key is matched against
+/// it. While a picker, modal or focused window has the keyboard the mode is
+/// `"n"`, and yours comes back with the keyboard. If your plugin unloads while
+/// the input is in normal mode, maki switches it back to insert mode.
 ///
-/// `"input_raw"` has no default key. It switches the chat input between
-/// drawing what plugins conceal and showing the text under it, which is
-/// what gets sent. Run it again to switch back.
+/// Throws on any mode but `"n"` and `"i"`.
 ///
-/// There is no action for sending the user's message. To take keys like
-/// `<CR>` while a popup is open, use the `keys` option of `maki.ui.open_win`.
-///
-/// For slash commands rather than keybound actions, see
-/// `maki.api.run_command`.
-///
-/// @param name string Action name, e.g. `"file_picker"`.
-/// @return (boolean|nil, string|nil) `true` on success, or nil and an error for an unknown name or a missing UI.
+/// @param mode string `"n"` or `"i"`.
+/// @return
 /// @example
-/// -- Open the built-in file picker with Ctrl+Q instead of Ctrl+S:
-/// maki.keymap.set("n", "<C-q>", function()
-///   maki.ui.action("file_picker")
-/// end)
+/// maki.keymap.set("n", "i", function() maki.ui.set_mode("i") end)
 #[lua_fn]
-fn action(
-    _lua: &Lua,
+fn set_mode(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String) -> LuaResult<()> {
+    switch_mode(lua, InputMode::parse(&mode)?, &plugin);
+    Ok(())
+}
+
+/// Runs a built-in or plugin action by name, and returns whether it handled
+/// the request.
+///
+/// A built-in does exactly what its default key does, so you can put it on
+/// another key, for example when your terminal grabs the default one. It
+/// needs no permission.
+///
+/// | Built-in | What it does | `false` when |
+/// | --- | --- | --- |
+/// | `"file_picker"` | Opens the file picker | |
+/// | `"search"` | Opens message search | |
+/// | `"help"` | Opens or closes `/help` | |
+/// | `"model_picker"` | Opens the model picker | |
+/// | `"plan_toggle"` | Opens or closes the plan form | no plan is ready |
+/// | `"plan_editor"` | Opens the plan in your editor | there is no plan |
+/// | `"edit_input"` | Opens the chat input in your editor | |
+/// | `"pop_queue"` | Removes the first queued message | |
+/// | `"prev_chat"`, `"next_chat"` | Shows the previous or next chat | |
+/// | `"input_raw"` | Switches the input between concealed text and the raw text that gets sent | |
+/// | `"undo"`, `"redo"` | Undoes or redoes one input edit | nothing to undo or redo |
+/// | `"history_prev"`, `"history_next"` | Recalls the previous or next prompt | at either end of the history |
+/// | `"newline"` | Inserts a new line | |
+///
+/// `"undo"`, `"redo"`, `"history_prev"`, `"history_next"` and `"newline"`
+/// edit the chat input. They also run in normal mode, so a vim plugin can
+/// bind `u` to `"undo"`. They return `false` in a finished subagent's chat,
+/// which has no input.
+///
+/// A built-in runs in the UI after your earlier `maki.ui` calls, and
+/// `action` waits for its answer, so an `"undo"` with nothing to undo
+/// returns `false`. Like the [chat input](#chat-input) calls, it does not
+/// work while your plugin loads.
+///
+/// A plugin action has a dot in its name, like `"completion.accept"`, and
+/// comes from `maki.api.register_action`. The ones in your `init.lua` start
+/// with `user.`. It runs at once, as the plugin that registered it, and your
+/// plugin must hold the permissions it asks for, by default all of its
+/// owner's. It returns what the action returned, `true` or `false`.
+///
+/// It returns `nil` and an error, which an `if` treats as not handled, when:
+///
+/// - The action's plugin is not loaded: it is disabled, not installed or
+///   unloaded.
+/// - The action threw.
+/// - Your plugin lacks a permission the action needs. The status bar shows
+///   this too.
+/// - A built-in runs without a UI.
+///
+/// It throws on a name that cannot be right: no dot and not a built-in, or
+/// one its loaded plugin never registered.
+///
+/// To try several actions on one key, see
+/// [Composing keys](/docs/keybindings/#composing-keys). For slash commands,
+/// see `maki.api.run_command`.
+///
+/// @param name string Action name, e.g. `"file_picker"` or `"completion.accept"`.
+/// @return (boolean|nil, string|nil) Whether the action handled it, or nil and an error.
+/// @example
+/// -- A vim plugin's undo in normal mode:
+/// maki.keymap.set("n", "u", function() maki.ui.action("undo") end)
+///
+/// -- A key for a built-in that has none:
+/// maki.keymap.set({ "n", "i" }, "<M-r>", function() maki.ui.action("input_raw") end)
+#[lua_fn]
+async fn action(
+    lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] plugin: Arc<str>,
+    #[ctx] caller: PluginReach,
     name: String,
 ) -> LuaResult<Pair<bool>> {
-    let builtin = try_pair!(name.parse::<BuiltinAction>().map_err(|_| format!(
-        "unknown action '{name}' (valid: {})",
-        BuiltinAction::VARIANTS.join(", ")
-    )));
-    try_pair!(ui_send(tx.as_ref(), UiAction::Builtin(builtin)));
-    Ok((Some(true), None))
+    let Ok(builtin) = name.parse::<BuiltinAction>() else {
+        return run_plugin_action(&lua, tx.as_ref(), &name, &plugin, &caller).await;
+    };
+    Ok(pair(
+        ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::Builtin {
+            action: builtin,
+            reply_tx,
+        })
+        .await,
+    ))
 }
 
 async fn input_roundtrip(
@@ -825,7 +891,7 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
 ///   - split (string): dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
 ///   - order (integer): paint order among split windows at the same edge. Default 50.
 ///   - focus (boolean): whether the window takes keyboard focus on open. Default true.
-///   - keys (table): keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or `maki.keymap.set` bindings. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
+///   - keys (table): keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. The older way to give a popup keys: `maki.keymap.set` with `{ buffer = buf }` does the same with a handler per key, a mode, and `ev.fallback()`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or global `maki.keymap.set` bindings. The window's buffer bindings are asked first. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
 ///   - visible (boolean): whether the window is initially visible. Default true. See `win:hide()` for what hiding does.
 ///   - needs_input (boolean): whether the window means the session needs user input. Default false.
 ///   - stack (boolean): offset the window past the other stacked windows sharing its anchor, in open order, with a one row gap. Closing one moves the rest up. Floating windows only. Default false.
@@ -969,10 +1035,11 @@ lua_table! {
     /// Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
     /// still work. The calls that need a screen behave like this:
     ///
-    /// - `action`, `input`, and `input_edit` return `nil, "no interactive UI attached"`.
+    /// - `input`, `input_edit`, and `action` on a built-in name return
+    ///   `nil, "no interactive UI attached"`. Plugin actions still run.
     /// - `open_editor` returns -1.
     /// - `flash` writes to the log.
-    /// - `open_win`, `set_status_hint`, `set_window_title`, and `input_rules` have no effect.
+    /// - `open_win`, `set_status_hint`, `set_window_title`, `set_mode` and `input_rules` have no effect.
     ///   `input_rules` still throws on a bad rule, so a plugin's tests catch it.
     ///
     /// ### Chat input
@@ -993,7 +1060,7 @@ lua_table! {
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
-        manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
+        manual set_mode, manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
         manual set_window_title, manual input, manual input_edit, manual input_rules,
     ]
 }
@@ -1002,13 +1069,15 @@ pub(crate) fn create_ui_table(
     lua: &Lua,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     plugin: Arc<str>,
+    reach: PluginReach,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     add_ui_fns(&t, lua)?;
 
     flash__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     set_window_title__register(&t, lua, ui_action_tx.clone())?;
-    action__register(&t, lua, ui_action_tx.clone())?;
+    set_mode__register(&t, lua, Arc::clone(&plugin))?;
+    action__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin), reach)?;
     open_editor__register(&t, lua, ui_action_tx.clone())?;
     input__register(&t, lua, ui_action_tx.clone())?;
     input_edit__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
@@ -1214,6 +1283,7 @@ mod tests {
     use super::*;
     use crate::api::util::command::UiReply;
     use crate::api::util::convert::{UNKNOWN_FIELD_ERR, lua_to_json};
+    use crate::plugin_permissions::PluginPermissions;
     use maki_highlight::StyledSegment;
     use mlua::Lua;
     use test_case::test_case;
@@ -1988,7 +2058,13 @@ mod tests {
             }
         });
         let lua = Lua::new();
-        let t = create_ui_table(&lua, Some(tx), Arc::from(INPUT_PLUGIN)).unwrap();
+        let t = create_ui_table(
+            &lua,
+            Some(tx),
+            Arc::from(INPUT_PLUGIN),
+            PluginReach::new(PluginPermissions::trusted()),
+        )
+        .unwrap();
         lua.globals().set("ui", t).unwrap();
         lua
     }

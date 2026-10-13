@@ -15,6 +15,7 @@ pub(crate) mod shell;
 pub(crate) mod tasks;
 #[cfg(test)]
 pub(crate) mod tests;
+mod typeahead;
 pub(crate) mod view;
 
 use std::collections::{HashMap, HashSet};
@@ -32,7 +33,9 @@ use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
 use crate::components::alert_modal::AlertModal;
 use crate::components::btw_modal::BtwModal;
-use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
+use crate::components::command::{
+    CommandAction, CommandPalette, ParsedCommand, PluginAccess, STARTS_TURNS,
+};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
@@ -62,15 +65,15 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SharedMessages, SubagentInfo,
+    SharedBuf, SharedMessages, SubagentInfo,
 };
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, InputRule, InputRulesReader,
-    Key, KeymapReader, LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE,
-    PackCommand, PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, PluginReach, WinView,
-    is_reserved,
+    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, InputMode, InputRule,
+    InputRulesReader, Key, KeymapReader, LuaCommandReader, PLAN_FORM_SLOT_DEADLINE,
+    PLAN_ROW_HANDLER_DEADLINE, PackCommand, PackPreparation, Permission, PlanActionOutcome,
+    PlanMenu, PlanRowAction, PluginReach, WinView, is_reserved,
 };
 use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
@@ -90,6 +93,8 @@ pub(crate) use queue::{MessageQueue, SubmitOutcome};
 use session::Sent;
 pub(crate) use session::session_has_content;
 use session_state::SessionState;
+use shell::ShellPrefix;
+use typeahead::{Hold, KeyboardFocus, Pressed, Typeahead};
 
 const CANCEL_MSG: &str = "Cancelled.";
 const MAIN_CHAT: usize = 0;
@@ -137,6 +142,8 @@ const TRUSTED_PREFIX: &str = "Trusted this folder: ";
 const PROVIDER_FOLDED_SUFFIX: &str = ": folded away";
 const PROVIDER_UNFOLDED_SUFFIX: &str = ": unfolded";
 const PACK_CHANGES_DECLINED: &str = "Package changes declined";
+pub(crate) const HELD_KEYS_DROPPED: &str =
+    "Dropped the keys typed before a prompt opened, so they could not answer it";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
@@ -156,6 +163,35 @@ pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (ali
 pub(crate) const INPUT_NOT_LIVE_ERR: &str =
     "the chat input is not on screen, so it cannot be edited";
 pub(crate) const STALE_VERSION_ERR: &str = "input changed since version";
+pub(crate) const SEND_MESSAGE: &str = "sending a chat message";
+pub(crate) const RUN_SHELL_LINE: &str = "running a shell line";
+const RUNS_SHELL: PluginAccess = PluginAccess::Needs(Permission::Run);
+
+/// What Enter does with the input once the command palette passed it on.
+/// The send and the check a plugin's send passes first both read it here,
+/// so the two cannot disagree.
+enum Sending {
+    /// Retries the turn a login cut short, whatever the input holds.
+    AuthRetry,
+    Nothing,
+    /// `exit`, which quits like `/exit`.
+    Exit,
+    Shell(ShellPrefix),
+    Message,
+}
+
+impl Sending {
+    /// A plugin needs what the direct way needs: `/exit` is open, a shell
+    /// line starts a process, and a message starts a turn, even one that
+    /// waits in the queue first.
+    fn refusal(&self, caller: &PluginReach) -> Option<String> {
+        match self {
+            Self::Nothing | Self::Exit => None,
+            Self::Shell(_) => RUNS_SHELL.refusal(RUN_SHELL_LINE, caller),
+            Self::AuthRetry | Self::Message => STARTS_TURNS.refusal(SEND_MESSAGE, caller),
+        }
+    }
+}
 
 /// Who has moved the chat input since the last tick, and the buffer version
 /// that writer left behind.
@@ -390,6 +426,9 @@ pub struct App {
     recoverable_queue: Vec<String>,
     pub answer_tx: Option<flume::Sender<String>>,
     pub(super) pending_input: PendingInput,
+    /// Bumped whenever the host opens a prompt the agent waits on. The plugin
+    /// windows that need input count their own, see [`Self::keyboard_focus`].
+    prompts_opened: u64,
     pub(crate) run_id: u64,
     pub(super) retry_info: Option<RetryInfo>,
     pub(super) zones: ZoneRegistry,
@@ -441,6 +480,7 @@ pub struct App {
     /// Actions produced outside key handling, drained by the event loop. A
     /// plan row handler answers long after the key press that started it.
     pub(super) pending_actions: Vec<Action>,
+    typeahead: Typeahead,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
@@ -524,6 +564,7 @@ impl App {
             recoverable_queue: Vec::new(),
             answer_tx: None,
             pending_input: PendingInput::None,
+            prompts_opened: 0,
             run_id: 0,
             retry_info: None,
             zones: ZoneRegistry::new(),
@@ -555,6 +596,7 @@ impl App {
             input_rules_reader,
             plan_answers: PlanAnswers::default(),
             pending_actions: Vec::new(),
+            typeahead: Typeahead::default(),
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
@@ -587,6 +629,50 @@ impl App {
     /// watched. A finished one is a transcript, so it does not.
     pub(super) fn chat_accepts_input(&self) -> bool {
         self.is_main_chat() || !self.chats[self.active_chat].is_finished()
+    }
+
+    /// Stores this tab's focus into the mode every tab shares, so only the
+    /// focused tab may call it. `Insert` only while typed keys reach the chat
+    /// input. Pickers count as taking the keyboard even though they have a
+    /// search field, because they answer their keys before any binding, and
+    /// the mode is about the chat input.
+    pub(crate) fn sync_input_mode(&self) -> InputMode {
+        self.keymap_reader.sync_mode(self.input_focused())
+    }
+
+    fn input_focused(&self) -> bool {
+        self.chat_accepts_input()
+            && !self.any_overlay_open()
+            && !self.plan_form_active()
+            && !self.queue_focused()
+    }
+
+    /// The panel in a subagent chat shows that subagent's inbox, which
+    /// the session queue's focus does not reach.
+    fn queue_focused(&self) -> bool {
+        self.is_main_chat() && self.queue.focus().is_some()
+    }
+
+    fn keyboard_focus(&self) -> KeyboardFocus {
+        KeyboardFocus {
+            window: self.float_mgr.focused_id(),
+            input: self.input_focused(),
+            agent_prompt: (self.awaiting_input() || self.plan_form_active())
+                .then(|| self.prompts_opened + self.float_mgr.prompts_opened()),
+        }
+    }
+
+    /// The mode is global, so the caller keeps {announced} across tabs, and a
+    /// tab switch that leaves the mode alone stays quiet.
+    pub(crate) fn announce_mode(&self, announced: &mut InputMode) {
+        let mode = self.sync_input_mode();
+        let old = mem::replace(announced, mode);
+        if old != mode {
+            self.lua_event_handle.fire_autocmd(
+                "ModeChanged",
+                serde_json::json!({ "old_mode": old.letter(), "new_mode": mode.letter() }),
+            );
+        }
     }
 
     /// One input box serves every chat, so the draft in it moves to the chat
@@ -876,15 +962,18 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
+        let Some(msg) = self.typeahead.defer(msg) else {
+            return vec![];
+        };
         match msg {
             Msg::Key(key) => self.handle_key(key),
             Msg::Paste(text) => {
                 if text.is_empty() {
-                    if self.chat_accepts_input() && self.image_paste_rx.is_empty() {
+                    if self.input_focused() && self.image_paste_rx.is_empty() {
                         self.start_image_paste();
                     }
                 } else {
-                    self.insert_pasted(text);
+                    self.route_text_paste(&text);
                 }
                 vec![]
             }
@@ -991,6 +1080,8 @@ impl App {
         None
     }
 
+    /// [`Self::route_text_paste`] walks the same order, so a new overlay goes
+    /// in both.
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         // Drawn above everything else, so it answers keys before anything else.
         if self.alert_modal.is_open() {
@@ -1045,12 +1136,8 @@ impl App {
             return Some(vec![]);
         }
 
-        // A focused plugin window is the thing the user is typing into, so it
-        // goes ahead of the rest. The keys an *unfocused* window claimed are
-        // settled far below, after every modal here: a claim is up while the
-        // user works under it, and a popup that holds `<CR>` must not answer
-        // the Enter meant for the file picker opened over it.
-        if self.float_mgr.handle_focused_key(key) {
+        // Step 3 of `handle_key`, among the overlays, see there for why.
+        if self.dispatch_focused_window(&Pressed::Key(key)) {
             return Some(vec![]);
         }
 
@@ -1095,9 +1182,7 @@ impl App {
             });
         }
 
-        // The panel in a subagent chat shows that subagent's inbox, which
-        // the session queue's focus does not reach.
-        if self.is_main_chat() && self.queue.focus().is_some() {
+        if self.queue_focused() {
             match key.code {
                 KeyCode::Up => self.queue.move_focus_up(),
                 KeyCode::Down => self.queue.move_focus_down(),
@@ -1200,6 +1285,12 @@ impl App {
         // Ctrl keys pass it by, as they always did: `Ctrl+C` closes it and the
         // rest belong to the input box and the built-in bindings.
         if self.chat_accepts_input() && !is_ctrl(&key) {
+            if key.code == KeyCode::Enter
+                && let Some(refusal) = self.palette_refusal()
+            {
+                self.flash(refusal);
+                return Some(vec![]);
+            }
             match self.command_palette.handle_key(key, &self.input_box.buffer) {
                 CommandAction::Consumed => return Some(vec![]),
                 CommandAction::Execute(cmd) => {
@@ -1223,69 +1314,137 @@ impl App {
         None
     }
 
+    /// The command Enter would run, checked for every sender the way
+    /// `maki.api.run_command` checks it, see [`Self::senders`].
+    fn palette_refusal(&mut self) -> Option<String> {
+        let name = self.command_palette.enter_target(&self.input_box.buffer)?;
+        self.senders()
+            .iter()
+            .find_map(|sender| self.command_palette.resolve_for_plugin(&name, sender).err())
+    }
+
     fn plan_toggle_ready(&self) -> bool {
         self.state.mode == Mode::Plan && self.state.plan.is_ready()
     }
 
-    /// Single implementation behind both the default keybindings and
-    /// `maki.ui.action`, so a Lua rebind can never drift from the
-    /// original key's behavior.
+    /// [`Self::run_action`] for a default key, which has no one to answer.
     pub(crate) fn run_builtin(&mut self, action: BuiltinAction) -> Vec<Action> {
-        match action {
+        self.run_action(action).1
+    }
+
+    /// Single implementation behind both the default keybindings and
+    /// `maki.ui.action`, so a Lua rebind can never drift from the original
+    /// key's behavior. The `bool` says whether the action did anything, so a
+    /// handler can try something else when it did not.
+    pub(crate) fn run_action(&mut self, action: BuiltinAction) -> (bool, Vec<Action>) {
+        let handled = match action {
             BuiltinAction::FilePicker => {
                 self.file_picker.open(&self.state.session.cwd);
+                true
             }
             BuiltinAction::Search => {
                 let chat = &self.chats[self.active_chat];
                 self.search_modal
                     .open(chat.scroll_pos(), chat.auto_scroll());
+                true
             }
-            BuiltinAction::Help => self.help_modal.toggle(),
+            BuiltinAction::Help => {
+                self.help_modal.toggle();
+                true
+            }
             BuiltinAction::PlanToggle => {
-                if self.plan_toggle_ready() {
+                let ready = self.plan_toggle_ready();
+                if ready {
                     self.plan_form.toggle();
                 }
+                ready
             }
             BuiltinAction::PlanEditor => {
                 return match self.state.plan.path() {
-                    Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
+                    Some(p) => (true, vec![Action::OpenEditor(p.to_path_buf())]),
                     None => {
                         self.flash(FLASH_NO_PLAN.into());
-                        vec![]
+                        (false, vec![])
                     }
                 };
             }
-            BuiltinAction::EditInput => return vec![Action::EditInputInEditor],
-            BuiltinAction::PopQueue => self.pop_active_queue(),
-            BuiltinAction::PrevChat => self.set_active_chat(self.active_chat.saturating_sub(1)),
+            BuiltinAction::EditInput => return (true, vec![Action::EditInputInEditor]),
+            BuiltinAction::PopQueue => {
+                self.pop_active_queue();
+                true
+            }
+            BuiltinAction::PrevChat => {
+                self.set_active_chat(self.active_chat.saturating_sub(1));
+                true
+            }
             BuiltinAction::NextChat => {
                 self.set_active_chat((self.active_chat + 1).min(self.chats.len() - 1));
+                true
             }
             BuiltinAction::ModelPicker => {
                 self.model_picker.open(&self.state.model.spec());
-                return vec![Action::RefreshModels];
+                return (true, vec![Action::RefreshModels]);
             }
-            BuiltinAction::InputRaw => self.input_box.toggle_raw(),
-        }
-        vec![]
+            BuiltinAction::InputRaw => {
+                self.input_box.toggle_raw();
+                true
+            }
+            BuiltinAction::Undo => self.input_action(InputBox::undo),
+            BuiltinAction::Redo => self.input_action(InputBox::redo),
+            BuiltinAction::HistoryPrev => self.input_action(InputBox::history_up),
+            BuiltinAction::HistoryNext => self.input_action(InputBox::history_down),
+            BuiltinAction::Newline => self.input_action(|input| {
+                input.newline();
+                true
+            }),
+        };
+        (handled, vec![])
     }
 
-    /// One chain, in one order: `Ctrl+Z`, then the focused plugin window, then
-    /// the host's own overlays and modals, then the keys an unfocused window
-    /// claimed, then `Esc` while the agent streams, then a plugin's global
-    /// bindings, then the built-in keys.
+    /// The input actions skip the mode check the keys make. The mode decides
+    /// what a typed key does, and an action is a plugin asking on purpose: a
+    /// vim plugin's `u` runs `undo` from normal mode.
+    fn input_action(&mut self, edit: impl FnOnce(&mut InputBox) -> bool) -> bool {
+        if !self.chat_accepts_input() {
+            return false;
+        }
+        let changed = edit(&mut self.input_box);
+        if changed {
+            self.input_changed(InputWriter::Anyone);
+        }
+        changed
+    }
+
+    /// One handler per key, the first match in one order. Same list as the
+    /// Key resolution docs, keep both in step.
     ///
-    /// A focused window is above the overlays because it is the window the
-    /// user is in. A claim is below them because it is not: the popup it
-    /// belongs to is up while the user works underneath, so a modal opened
-    /// over it outranks it, and the claim comes back the moment the modal
-    /// closes. The command palette is one of those overlays, answered in
-    /// [`Self::dispatch_overlay`] with the rest, so a plugin's claim on
-    /// `<Tab>` or `<CR>` leaves the `/` command being typed alone.
+    /// 1. `<C-c>` and `<C-z>`. `Ctrl+Z` suspends right here. `Ctrl+C` is not
+    ///    answered here: no binding can take it and [`Self::reserved_by_host`]
+    ///    skips the global bindings for it, but the modals and a focused
+    ///    window still see it.
+    /// 2. maki's modals and prompts, in [`Self::dispatch_overlay`].
+    /// 3. The focused window, [`Self::dispatch_focused_window`], which
+    ///    `dispatch_overlay` runs below the modals.
+    /// 4. maki's pickers, the search, the focused queue, the `/` command list
+    ///    and `<C-t>` on a ready plan, in the rest of `dispatch_overlay`.
+    /// 5. Windows on screen, front first, [`Self::dispatch_on_screen_windows`].
+    /// 6. `<Esc>` while the agent runs, which [`Self::reserved_by_host`] keeps
+    ///    from the global bindings, so it reaches the cancel in step 8.
+    /// 7. Global bindings, [`Self::dispatch_binding`] without a buffer.
+    /// 8. maki's built-in keys and the chat input, [`Self::handle_builtin_key`].
+    ///
+    /// A focused window is above the overlays opened under it because it is
+    /// the window the user is in. An unfocused one is below them because it
+    /// is not: the popup is up while the user works underneath, so a modal
+    /// opened over it outranks it, and its keys come back the moment the
+    /// modal closes. The command palette is one of those overlays, so a
+    /// popup's `<Tab>` or `<CR>` leaves the `/` command being typed alone.
     ///
     /// Every step either answers the key or passes it on untouched, and no key
     /// is ever handed back after the fact, because a keystroke replayed into a
-    /// UI that has moved on lands somewhere the user never aimed it.
+    /// UI that has moved on lands somewhere the user never aimed it. The one
+    /// way back is `ev.fallback()`, which runs step 8, or the focused window's
+    /// `recv` for its own buffer's binding, while the keys after it still wait.
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
         self.clear_selection_unless_pending_copy();
 
@@ -1297,14 +1456,21 @@ impl App {
             return actions;
         }
 
-        if self.float_mgr.handle_claimed_key(key) {
+        let pressed = Pressed::Key(key);
+
+        if self.dispatch_on_screen_windows(&pressed) {
             return vec![];
         }
 
-        if !self.reserved_by_host(key) && self.dispatch_override(key) {
+        if !self.reserved_by_host(key) && self.dispatch_binding(None, &pressed) {
             return vec![];
         }
 
+        self.handle_builtin_key(key)
+    }
+
+    /// Step 8, also what `ev.fallback()` runs for a key.
+    fn handle_builtin_key(&mut self, key: KeyEvent) -> Vec<Action> {
         if let Some(actions) = self.handle_ctrl(key) {
             return actions;
         }
@@ -1321,6 +1487,37 @@ impl App {
         }
 
         self.handle_chat_key(key)
+    }
+
+    /// Step 3: the focused window's buffer bindings, then its `recv`. False
+    /// only when no window has focus, since a focused window takes everything.
+    fn dispatch_focused_window(&mut self, pressed: &Pressed) -> bool {
+        let Some(buf) = self.float_mgr.focused_buf() else {
+            return false;
+        };
+        self.dispatch_binding(Some(&buf), pressed) || self.send_to_focused_window(pressed)
+    }
+
+    /// A press no notation names is still spent on the window, see
+    /// [`FloatManager::handle_focused_key`].
+    fn send_to_focused_window(&self, pressed: &Pressed) -> bool {
+        match pressed {
+            Pressed::Key(key) => self.float_mgr.handle_focused_key(*key),
+            Pressed::Paste(text) => self.float_mgr.handle_paste(text),
+        }
+    }
+
+    /// Step 5. Only keys reach a window's `keys` claims: a paste goes to a
+    /// window's `recv` only while it is focused.
+    fn dispatch_on_screen_windows(&mut self, pressed: &Pressed) -> bool {
+        let claim = match pressed {
+            Pressed::Key(key) => Key::from_event(*key),
+            Pressed::Paste(_) => None,
+        };
+        self.float_mgr.on_screen_bufs().iter().any(|(window, buf)| {
+            self.dispatch_binding(Some(buf), pressed)
+                || claim.is_some_and(|key| self.float_mgr.take_claimed(*window, key))
+        })
     }
 
     /// The keys the host answers before any plugin *binding* sees them.
@@ -1341,28 +1538,133 @@ impl App {
     /// `Esc` joins them while the agent runs, because stopping a turn is the
     /// other thing a user cannot be made to wait for. A popup that put
     /// `Esc close` in its own footer is already past this: an unfocused window
-    /// takes its claims in [`FloatManager::handle_claimed_key`], which runs
+    /// takes its keys in [`Self::dispatch_on_screen_windows`], which runs
     /// above, so the popup takes the first `Esc` and the next one, with the
     /// popup gone, arms the cancel.
     fn reserved_by_host(&self, key: KeyEvent) -> bool {
         is_reserved(key) || (self.status == Status::Streaming && key.code == KeyCode::Esc)
     }
 
-    /// Whether a plugin binding claimed {key}. The binding the keymap matched
-    /// travels with the request, so one dropped on the Lua thread cannot leave
-    /// this having consumed a key nothing will act on.
+    /// Whether a plugin binding in {buffer}'s scope, or a global one when it is
+    /// `None`, claimed {pressed}. The binding the keymap matched travels with the
+    /// request, so one dropped on the Lua thread cannot leave this having
+    /// consumed a key nothing will act on.
     ///
     /// `false` is the only fall-through there is, and it is answered here, in
-    /// the keystroke the user pressed: no binding matched, the plugin has too
-    /// many callbacks in flight, or its load is gone. The built-in binding
-    /// then runs below, with the UI exactly as the user left it. Nothing comes
-    /// back from the Lua thread to be replayed. A key no notation names is one
-    /// no plugin could have bound, so it falls through too.
-    fn dispatch_override(&self, key: KeyEvent) -> bool {
-        Key::from_event(key).is_some_and(|k| {
-            self.keymap_reader
-                .dispatch(k, |bind| self.lua_event_handle.run_keybind_callback(bind))
-        })
+    /// the keystroke the user pressed: no binding matched or its load is gone.
+    /// The next step then runs with the UI exactly as the user left it.
+    ///
+    /// A claimed key makes the keys after it wait for its handler, see
+    /// [`Typeahead`]. The handler gets the input as it was at the press, so it
+    /// works on the text the user pressed the key on, even if we stopped
+    /// waiting and later keys landed first. The hold keeps {pressed} for
+    /// `ev.fallback()`.
+    fn dispatch_binding(&mut self, buffer: Option<&Arc<SharedBuf>>, pressed: &Pressed) -> bool {
+        let Some(key) = pressed.key() else {
+            return false;
+        };
+        let mut hold = None;
+        let claimed = self
+            .keymap_reader
+            .dispatch(key, self.sync_input_mode(), buffer, |ticket| {
+                let mut ticket = ticket.with_input(self.input_snapshot());
+                if let Pressed::Paste(text) = pressed {
+                    ticket = ticket.with_text(text.clone());
+                }
+                hold = Some(Hold::new(
+                    &ticket,
+                    self.keyboard_focus(),
+                    pressed.clone(),
+                    self.input_box.buffer.version(),
+                ));
+                self.lua_event_handle.run_keybind_callback(ticket)
+            });
+        if let Some(hold) = hold.filter(|_| claimed) {
+            self.typeahead.hold(hold);
+        }
+        claimed
+    }
+
+    /// Everything the handler of {ticket} asked of the UI arrived before this,
+    /// so the keys typed after it can go now.
+    pub(crate) fn keybind_done(&mut self, ticket: u64) -> Vec<Action> {
+        if !self.typeahead.held_by(ticket) {
+            return vec![];
+        }
+        // The handler's window changes come on their own channel, so they land
+        // before its held keys follow the keyboard.
+        let _ = self.float_mgr.drain_commands();
+        self.release_typeahead()
+    }
+
+    /// `ev.fallback()` from the handler of {ticket}. While a window has focus
+    /// only its own bindings run, so the fallback is its `recv` and not the
+    /// chat input hidden behind it.
+    ///
+    /// The press is only still around while it holds the keys typed after it
+    /// and the keyboard has not moved. Any later and the key would land behind
+    /// those keys, or somewhere the user never aimed it.
+    pub(crate) fn keybind_fallback(&mut self, ticket: u64) -> Vec<Action> {
+        // The handler's window changes come on their own channel, so they land
+        // before the focus is read.
+        let _ = self.float_mgr.drain_commands();
+        let focus = self.keyboard_focus();
+        let version = self.input_box.buffer.version();
+        let Some(pressed) = self.typeahead.take_fallback(ticket, focus, version) else {
+            tracing::debug!(
+                ticket,
+                "ev.fallback() dropped: its key no longer holds the keys after it, or the keyboard moved"
+            );
+            return vec![];
+        };
+        if self.send_to_focused_window(&pressed) {
+            return vec![];
+        }
+        match pressed {
+            Pressed::Key(key) => self.handle_builtin_key(key),
+            Pressed::Paste(text) => {
+                self.builtin_paste(&text);
+                vec![]
+            }
+        }
+    }
+
+    fn release_typeahead(&mut self) -> Vec<Action> {
+        let version = self.input_box.buffer.version();
+        let dropped = self.typeahead.release(version, self.keyboard_focus());
+        if dropped > 0 {
+            self.flash(HELD_KEYS_DROPPED.to_owned());
+        }
+        let mut actions = Vec::new();
+        while let Some(msg) = self.typeahead.next() {
+            actions.extend(self.update(msg));
+        }
+        actions
+    }
+
+    /// The keys held for a key handler, for the tab the keyboard moves to.
+    /// Replaying them here would send them, Enter and all, to a tab the user
+    /// already left. They keep waiting there for the same handler, which is
+    /// usually still at work on that tab after switching to it.
+    pub(crate) fn hand_typeahead_to(&mut self, to: &mut App) {
+        // A prompt already open on that tab is not where these keys were
+        // typed, so it must not take them.
+        let focus = KeyboardFocus {
+            agent_prompt: None,
+            ..to.keyboard_focus()
+        };
+        let version = to.input_box.buffer.version();
+        to.typeahead
+            .adopt(mem::take(&mut self.typeahead), focus, version);
+    }
+
+    fn tick_typeahead(&mut self) -> Dirty {
+        if !self.typeahead.stale(|| self.keyboard_focus()) {
+            return Dirty::NO;
+        }
+        let actions = self.release_typeahead();
+        self.pending_actions.extend(actions);
+        Dirty::YES
     }
 
     /// A message typed while watching a running subagent is for that
@@ -1383,8 +1685,9 @@ impl App {
         if key::MODEL_PICKER.matches(key) {
             return self.run_builtin(BuiltinAction::ModelPicker);
         }
+        let mode = self.sync_input_mode();
         if key::UNDO.matches(key) {
-            if let InputAction::Changed = self.input_box.undo() {
+            if mode == InputMode::Insert && self.input_box.undo() {
                 self.input_changed(InputWriter::Anyone);
             }
             return vec![];
@@ -1400,15 +1703,18 @@ impl App {
                 return self.run_builtin(BuiltinAction::FilePicker);
             } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
                 self.start_image_paste();
-            } else if let InputAction::Changed = self.input_box.handle_key(key) {
+            } else if let InputAction::Changed = self.input_box.handle_key(key, mode) {
                 self.input_changed(InputWriter::Anyone);
             }
             return vec![];
         }
 
         let streaming = self.status == Status::Streaming;
-        match self.input_box.handle_key(key) {
-            InputAction::Submit(sub) => self.handle_submit(sub),
+        match self.input_box.handle_key(key, mode) {
+            InputAction::Submit => self.send_input().unwrap_or_else(|refusal| {
+                self.flash(refusal);
+                vec![]
+            }),
             InputAction::Changed => {
                 self.input_changed(InputWriter::Anyone);
                 vec![]
@@ -1490,28 +1796,59 @@ impl App {
         self.exit_request = ExitRequest::None;
     }
 
-    pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
-        match std::mem::take(&mut self.pending_input) {
-            PendingInput::AuthRetry { subagent_id } => {
-                self.send_to_agent(subagent_id.as_deref(), String::new());
-                return vec![];
-            }
-            PendingInput::None => {}
-        }
-        if sub.is_empty() {
-            return vec![];
-        }
-        if sub.text.trim() == EXIT_WORD {
-            return self.quit();
-        }
+    /// The plugins a send is held to: those whose edit the user's keys were
+    /// typed blind to, see [`Typeahead`]. The user's own Enter on what they
+    /// saw needs no grant.
+    fn senders(&self) -> &[PluginReach] {
+        self.typeahead.blind_to()
+    }
 
-        let Some(prefix) = shell::parse_shell_prefix(&sub.text) else {
-            return if self.is_main_chat() {
-                self.submit_or_queue(sub.into())
-            } else {
-                self.queue_for_subagent(sub.into())
-            };
-        };
+    /// Sends the input the way Enter does, once every sender may.
+    fn send_input(&mut self) -> Result<Vec<Action>, String> {
+        let input = &self.input_box;
+        let sending = self.sending(input.buffer.value().trim(), input.has_images());
+        if let Some(refusal) = self
+            .senders()
+            .iter()
+            .find_map(|sender| sending.refusal(sender))
+        {
+            return Err(refusal);
+        }
+        let sub = self.input_box.submit().unwrap_or_default();
+        Ok(self.handle_submit(sub))
+    }
+
+    fn sending(&self, text: &str, has_images: bool) -> Sending {
+        if self.pending_input != PendingInput::None {
+            return Sending::AuthRetry;
+        }
+        if text.is_empty() && !has_images {
+            return Sending::Nothing;
+        }
+        if text.trim() == EXIT_WORD {
+            return Sending::Exit;
+        }
+        shell::parse_shell_prefix(text).map_or(Sending::Message, Sending::Shell)
+    }
+
+    pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
+        match self.sending(&sub.text, !sub.images.is_empty()) {
+            Sending::AuthRetry => {
+                if let PendingInput::AuthRetry { subagent_id } = mem::take(&mut self.pending_input)
+                {
+                    self.send_to_agent(subagent_id.as_deref(), String::new());
+                }
+                vec![]
+            }
+            Sending::Nothing => vec![],
+            Sending::Exit => self.quit(),
+            Sending::Shell(prefix) => self.run_shell_line(prefix),
+            Sending::Message if self.is_main_chat() => self.submit_or_queue(sub.into()),
+            Sending::Message => self.queue_for_subagent(sub.into()),
+        }
+    }
+
+    fn run_shell_line(&mut self, prefix: ShellPrefix) -> Vec<Action> {
         // The shell belongs to the session, not to the subagent being watched,
         // so the main chat comes to front where the output lands.
         self.set_active_chat(MAIN_CHAT);
@@ -1797,6 +2134,7 @@ impl App {
         } = result
         {
             let project_trusted = self.permissions.project_is_trusted();
+            self.prompts_opened += 1;
             self.permission_prompt.push(
                 id,
                 tool,
@@ -1825,6 +2163,7 @@ impl App {
                 ));
             }
             self.pending_input = PendingInput::AuthRetry { subagent_id };
+            self.prompts_opened += 1;
             return vec![];
         }
 
@@ -2340,6 +2679,7 @@ impl App {
     pub fn tick(&mut self) -> Dirty {
         // `|` never short-circuits: every poller must run on every tick.
         self.float_mgr.tick()
+            | self.tick_typeahead()
             | self.tick_edge_scroll()
             | self.tick_error_expiry()
             | self.poll_image_paste()
@@ -2392,7 +2732,7 @@ impl App {
             Err(flume::TryRecvError::Empty) => return Dirty::NO,
         };
         self.plan_answers.abandon();
-        self.plan_form.open_with(menu);
+        self.open_plan_form(menu);
         if slow {
             self.flash(FLASH_PLAN_FORM_SLOW.into());
         }
@@ -2470,7 +2810,7 @@ impl App {
             self.flash(FLASH_PLAN_ACTION_LOST.into());
         }
         let Some(path) = path.filter(|_| self.lua_event_handle.plan_form_layered()) else {
-            self.plan_form.open_with(builtin_menu());
+            self.open_plan_form(builtin_menu());
             return;
         };
         // The last draft's menu is not this draft's, and the chain has not
@@ -2484,12 +2824,18 @@ impl App {
         self.plan_answers.form = Some((Instant::now() + PLAN_FORM_ANSWER_WAIT, answer));
     }
 
+    fn open_plan_form(&mut self, menu: PlanMenu) {
+        self.plan_form.open_with(menu);
+        self.prompts_opened += 1;
+    }
+
     /// What a tab nobody is looking at still owes the frame. Its floats have
     /// to drain, or a plugin writing to a window off screen would lose the
     /// output, and its plan form too, or a draft in a background tab would
     /// sit unanswered until the user focused it. Nothing it holds was
     /// announced this frame, because it never diffed its input, so the
-    /// announcement has to speak when this tab takes focus.
+    /// announcement has to speak when this tab takes focus. It holds no keys:
+    /// those left with the focus, see [`Self::hand_typeahead_to`].
     pub fn tick_background(&mut self) {
         self.input_fired_this_frame = false;
         let _ = self.float_mgr.tick();
@@ -2572,14 +2918,28 @@ impl App {
         }
     }
 
-    fn route_text_paste(&mut self, text: &str) {
-        if self.plan_form_active() {
+    /// A paste walks the steps of [`Self::handle_key`] as the `<Paste>` key.
+    /// The host's prompts and pickers have no bindings, they just take the
+    /// text. Line endings become `\n` first, because `ev.text` promises that.
+    ///
+    /// The first step that owns the keyboard owns the paste as well, and one
+    /// with no field for it drops it. The chat input and the bindings under a
+    /// modal get none of its keys, so they get none of its pastes either.
+    pub(super) fn route_text_paste(&mut self, text: &str) {
+        let text = &text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.alert_modal.is_open() || self.permission_prompt.handle_paste(text) {
             return;
         }
-        if self.permission_prompt.handle_paste(text) {
+        if self.pack_review.is_open()
+            || self.plan_form_active()
+            || self.help_modal.is_open()
+            || self.usage_modal.is_open()
+            || self.btw_modal.is_open()
+        {
             return;
         }
-        if self.float_mgr.handle_paste(text) {
+        let pressed = Pressed::Paste(text.to_owned());
+        if self.dispatch_focused_window(&pressed) {
             return;
         }
         if self.search_modal.is_open() {
@@ -2595,17 +2955,18 @@ impl App {
             };
         }
         try_picker!(self.file_picker);
+        if self.queue_focused() {
+            return;
+        }
         try_picker!(self.rewind_picker);
         try_picker!(self.theme_picker);
         try_picker!(self.model_picker);
-        try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
-        if !self.chat_accepts_input() {
+        try_picker!(self.mcp_picker);
+        if self.dispatch_on_screen_windows(&pressed) || self.dispatch_binding(None, &pressed) {
             return;
         }
-        if let InputAction::Changed = self.input_box.handle_paste(text) {
-            self.input_changed(InputWriter::Anyone);
-        }
+        self.builtin_paste(text);
     }
 
     fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {

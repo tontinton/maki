@@ -1,3 +1,4 @@
+pub(crate) mod action;
 pub(crate) mod agent;
 pub(crate) mod r#async;
 pub(crate) mod autocmd;
@@ -76,6 +77,7 @@ pub(crate) fn create_maki_global(
         ui_action_tx.clone(),
     )?;
     autocmd::add_autocmd_methods(&api, lua, Arc::clone(&plugin))?;
+    action::add_action_methods(&api, lua, Arc::clone(&plugin), reach.clone())?;
     slot::add_slot_methods(&api, lua, Arc::clone(&plugin), permissions.clone())?;
     maki.set("api", api)?;
     maki.set("env", env::create_env_table(lua, permissions)?)?;
@@ -127,7 +129,12 @@ pub(crate) fn create_maki_global(
     maki.set("task", task::create_task_table(lua, ui_action_tx.clone())?)?;
     maki.set(
         "ui",
-        ui::create_ui_table(lua, ui_action_tx.clone(), Arc::clone(&plugin))?,
+        ui::create_ui_table(
+            lua,
+            ui_action_tx.clone(),
+            Arc::clone(&plugin),
+            reach.clone(),
+        )?,
     )?;
     maki.set(
         "fn",
@@ -155,7 +162,7 @@ pub(crate) fn create_maki_global(
     )?;
     maki.set(
         "keymap",
-        keymap::create_keymap_table(lua, Arc::clone(&plugin))?,
+        keymap::create_keymap_table(lua, Arc::clone(&plugin), reach.clone())?,
     )?;
     pack::add_packadd(lua, &maki)?;
     maki.set("pack", pack::create_pack_read_table(lua)?)?;

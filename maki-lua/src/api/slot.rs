@@ -23,6 +23,8 @@ pub(crate) const HOST_PREFIX: &str = "tool.";
 pub(crate) const UI_PREFIX: &str = "ui.";
 pub(crate) const AGENT_PREFIX: &str = "agent.";
 const PERMISSION_PREFIX: &str = "permission.";
+const DECLARE_SLOT: &str = "declare_slot";
+const LAYERS: &str = "layers";
 const HOST_PREFIXES: [&str; 4] = [HOST_PREFIX, UI_PREFIX, AGENT_PREFIX, PERMISSION_PREFIX];
 /// `tool.*.input` wraps every call, whichever tool it names.
 pub(crate) const ANY_TOOL: &str = "*";
@@ -542,7 +544,7 @@ fn declare_slot(
             name.trim_start_matches(prefix)
         )));
     }
-    let capability = parse_slot_capability(opts.as_ref(), &name, &permissions)?;
+    let capability = parse_capability(opts.as_ref(), DECLARE_SLOT, &name, LAYERS, &permissions)?;
     {
         let mut store = slot_store_mut(lua)?;
         let entry = store.slots.entry(name.clone()).or_default();
@@ -563,13 +565,16 @@ fn declare_slot(
     make_callable(lua, name)
 }
 
-/// The price the owner set, weighed against what the owner itself holds: a
-/// plugin cannot price its slot in a capability it was never granted, the same
+/// The price the owner set in `opts.capability` for what {payers} from other
+/// plugins pay, weighed against what the owner itself holds: a plugin cannot
+/// price its slot or action in a capability it was never granted, the same
 /// rule `register_tool` applies to the capability a tool exposes. Otherwise a
 /// denied plugin could mint a toll booth on reach it has no claim to.
-fn parse_slot_capability(
+pub(crate) fn parse_capability(
     opts: Option<&Table>,
+    api: &str,
     name: &str,
+    payers: &str,
     permissions: &PluginPermissions,
 ) -> LuaResult<SlotPrice> {
     let Some(opts) = opts else {
@@ -580,7 +585,7 @@ fn parse_slot_capability(
         Value::Table(declared) => declared,
         _ => {
             return Err(mlua::Error::runtime(format!(
-                "declare_slot: '{name}' must give 'capability' as a list of permission names, \
+                "{api}: '{name}' must give 'capability' as a list of permission names, \
                  e.g. {{ capability = {{ \"net\" }} }} (valid: {})",
                 permission_keys()
             )));
@@ -591,13 +596,13 @@ fn parse_slot_capability(
         let key = key?;
         let permission = Permission::from_key(&key).ok_or_else(|| {
             mlua::Error::runtime(format!(
-                "declare_slot: '{name}' prices layers at unknown permission '{key}' (valid: {})",
+                "{api}: '{name}' prices {payers} at unknown permission '{key}' (valid: {})",
                 permission_keys()
             ))
         })?;
         if !permissions.is_allowed(permission) {
             return Err(mlua::Error::runtime(format!(
-                "declare_slot: '{name}' prices layers at '{permission}', which this plugin was not granted. \
+                "{api}: '{name}' prices {payers} at '{permission}', which this plugin was not granted. \
                  Add `{permission} = true` under `[permissions]` in the {MANIFEST_FILE} next to the plugin file"
             )));
         }

@@ -8,16 +8,24 @@ use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
+use maki_lua::{BuiltinAction, InputMode, KeymapEntry, KeymapReader};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use strum::VariantNames;
 use unicode_width::UnicodeWidthStr;
 
 const TITLE: &str = " Keybindings ";
 const KEY_COL_GAP: usize = 2;
 const PREFIX_TOP: &str = "  ";
 const PREFIX_CHILD: &str = "    ";
+const PLUGIN_KEYS_TITLE: &str = "  Plugin Keys";
+const ACTIONS_TITLE: &str = "  Actions";
+const BUILTIN_OWNER: &str = "built-in";
+const NO_DESC: &str = "-";
+const BOTH_MODES: &str = "n i";
+const MODES_WIDTH: usize = BOTH_MODES.len();
 
 const INPUT_PREFIXES: &[(&str, &str)] = &[
     ("!", "Run shell command (visible to agent)"),
@@ -77,6 +85,116 @@ fn multi_key_spans(
     spans
 }
 
+/// A key a plugin holds, in the modes where its binding is the one that fires.
+struct PluginKey<'a> {
+    entry: &'a KeymapEntry,
+    normal: bool,
+    insert: bool,
+}
+
+impl PluginKey<'_> {
+    fn modes(&self) -> &'static str {
+        match (self.normal, self.insert) {
+            (true, true) => BOTH_MODES,
+            (true, false) => InputMode::Normal.letter(),
+            _ => InputMode::Insert.letter(),
+        }
+    }
+}
+
+/// The global bindings that win their key in each mode, newest first like
+/// dispatch, so a key two plugins bind shows only the one that fires. One
+/// binding set in several modes is one row.
+fn plugin_keys(entries: &[KeymapEntry]) -> Vec<PluginKey<'_>> {
+    let mut won: Vec<&KeymapEntry> = Vec::new();
+    for entry in entries.iter().filter(|e| e.is_global()) {
+        if !won
+            .iter()
+            .any(|w| w.key == entry.key && w.mode == entry.mode)
+        {
+            won.push(entry);
+        }
+    }
+    let mut keys: Vec<PluginKey> = Vec::new();
+    for entry in won {
+        let row = match keys.iter_mut().find(|k| {
+            k.entry.key == entry.key && k.entry.plugin == entry.plugin && k.entry.desc == entry.desc
+        }) {
+            Some(row) => row,
+            None => {
+                keys.push(PluginKey {
+                    entry,
+                    normal: false,
+                    insert: false,
+                });
+                keys.last_mut().expect("just pushed")
+            }
+        };
+        match entry.mode {
+            InputMode::Normal => row.normal = true,
+            InputMode::Insert => row.insert = true,
+        }
+    }
+    keys
+}
+
+/// Who answers each key plugins took, and every action `maki.ui.action` can
+/// run, with its owner. Built from the published snapshots on every frame the
+/// modal is open, which is a walk over a few dozen bindings.
+fn plugin_lines(keymaps: &KeymapReader) -> Vec<Line<'static>> {
+    let snapshot = keymaps.load();
+    let keys: Vec<(String, String)> = plugin_keys(&snapshot.entries)
+        .into_iter()
+        .map(|key| {
+            let desc = Some(key.entry.desc.as_str())
+                .filter(|desc| !desc.is_empty())
+                .unwrap_or(NO_DESC);
+            let owner = &key.entry.plugin;
+            (
+                key.entry.key.notation(),
+                format!("{:<MODES_WIDTH$} {desc} ({owner})", key.modes()),
+            )
+        })
+        .collect();
+    let actions = keymaps.actions();
+    let builtins = BuiltinAction::VARIANTS
+        .iter()
+        .map(|name| (*name, BUILTIN_OWNER));
+    let plugins = actions.iter().map(|a| (a.name.as_ref(), a.plugin.as_ref()));
+    let actions: Vec<(String, String)> = builtins
+        .chain(plugins)
+        .map(|(name, owner)| (name.to_owned(), owner.to_owned()))
+        .collect();
+
+    let pad = keys
+        .iter()
+        .chain(&actions)
+        .map(|(name, _)| UnicodeWidthStr::width(name.as_str()))
+        .max()
+        .unwrap_or(0)
+        + KEY_COL_GAP;
+    let theme = theme::current();
+    let mut lines = Vec::new();
+    for (title, rows) in [(PLUGIN_KEYS_TITLE, keys), (ACTIONS_TITLE, actions)] {
+        if rows.is_empty() {
+            continue;
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(title, theme.keybind_section)));
+        for (name, rest) in rows {
+            let trailing = pad - UnicodeWidthStr::width(name.as_str());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{PREFIX_CHILD}{name}{:trailing$}", ""),
+                    theme.keybind_key,
+                ),
+                Span::styled(rest, theme.keybind_desc),
+            ]));
+        }
+    }
+    lines
+}
+
 impl HelpModal {
     pub fn new() -> Self {
         Self {
@@ -115,7 +233,7 @@ impl HelpModal {
         true
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    pub fn view(&mut self, frame: &mut Frame, area: Rect, keymaps: &KeymapReader) -> Rect {
         if !self.open {
             return Rect::default();
         }
@@ -200,6 +318,8 @@ impl HelpModal {
             }
         }
 
+        lines.extend(plugin_lines(keymaps));
+
         let total = lines.len() as u16;
         let content_cols = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
         let modal = Modal {
@@ -239,6 +359,9 @@ mod tests {
     use super::*;
     use crate::components::key as key_ev;
     use crossterm::event::KeyCode;
+    use maki_agent::tools::ToolRegistry;
+    use maki_lua::PluginHost;
+    use std::sync::Arc;
     use test_case::test_case;
 
     #[test_case(key_ev(KeyCode::Esc)       ; "esc_closes")]
@@ -257,5 +380,39 @@ mod tests {
         modal.toggle();
         assert!(modal.handle_key(key_ev(KeyCode::Char('a'))));
         assert!(modal.is_open());
+    }
+
+    const HELPER_PLUGIN: &str = r#"
+maki.api.register_action("helper.ping", function() end)
+maki.keymap.set({ "n", "i" }, "<C-t>", function() end, { desc = "Ping" })
+"#;
+    const LATER_PLUGIN: &str = r#"
+maki.keymap.set("i", "<C-t>", function() end, { desc = "Pong" })
+"#;
+
+    /// The later plugin takes `<C-t>` in `"i"` only, so the first one still
+    /// answers it in `"n"`.
+    #[test]
+    fn plugin_lines_name_who_answers_each_key_and_every_action() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("helper", HELPER_PLUGIN).unwrap();
+        host.load_source("later", LATER_PLUGIN).unwrap();
+
+        let text: Vec<String> = plugin_lines(&host.keymap_reader())
+            .iter()
+            .map(|line| {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                text.split_whitespace().collect::<Vec<_>>().join(" ")
+            })
+            .collect();
+
+        for row in [
+            "<C-t> i Pong (later)",
+            "<C-t> n Ping (helper)",
+            "undo built-in",
+            "helper.ping helper",
+        ] {
+            assert!(text.iter().any(|line| line == row), "{row} in {text:?}");
+        }
     }
 }

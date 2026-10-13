@@ -27,13 +27,15 @@ use maki_agent::{
     McpSnapshot, McpSnapshotReader, SharedBuf, SubagentInbox, ToolDoneEvent, ToolOutput,
     ToolStartEvent, TurnCompleteEvent,
 };
-use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
-use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
+use maki_config::{
+    Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey, UiConfig,
+};
+use maki_lua::test_support::{HintWriterHandle, RequestProbe, TestBinding, hint_writer_pair};
 use maki_lua::{
-    BuiltinAction, Dimension, FloatConfig, HintReader, InputRulesReader, KeymapReader,
-    LuaCommandInfo, LuaCommandReader, Missing, PackCommand, PackPlan, PackPreparation, PackReport,
-    Permission, PluginHost, PluginPermissions, SessionEndReason, Split, TextEdit, WinCommand,
-    WinEvent,
+    BuiltinAction, Dimension, FloatConfig, HintReader, InputRequest, InputRulesReader,
+    KeymapReader, LuaCommandInfo, LuaCommandReader, Missing, PackCommand, PackPlan,
+    PackPreparation, PackReport, Permission, PluginHost, PluginPermissions, SessionEndReason,
+    Split, TextEdit, UiAction, WinCommand, WinEvent,
 };
 use maki_providers::{
     ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, ThinkingSupport,
@@ -52,6 +54,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use std::env;
 use std::fs;
+use std::iter;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -86,6 +89,9 @@ const FIXED_ADAPTIVE_PROVIDER: &str = "xai";
 const MODEL_CHANGED_EVENT: &str = "ModelChanged";
 const INPUT_CHANGED_EVENT: &str = "InputChanged";
 const PLAN_READY_EVENT: &str = "PlanReady";
+const MODE_CHANGED_EVENT: &str = "ModeChanged";
+const NORMAL_MODE_TEXT: &str = "ab\\";
+const PASTED: &str = "pasted ";
 const PLAN_DRAFT_PATH: &str = "/tmp/plan.md";
 /// The draft of the session a tab switch loads, which is not the one the
 /// abandoned pick was made against.
@@ -3158,7 +3164,11 @@ fn input_snapshot_carries_nothing_a_slice_would_give() {
 /// The edit a plugin plans right after reading, both guards naming the value
 /// it read. Tests spoil one guard at a time from here.
 fn planned_edit(app: &App, start: usize, stop: usize, text: &str) -> InputEdit {
-    let st = app.input_snapshot();
+    edit_planned_on(&app.input_snapshot(), start, stop, text)
+}
+
+/// Plans against {st}, an input snapshot as a handler is handed it.
+fn edit_planned_on(st: &serde_json::Value, start: usize, stop: usize, text: &str) -> InputEdit {
     InputEdit {
         edits: vec![TextEdit {
             start,
@@ -3207,7 +3217,7 @@ fn a_stale_input_edit_lands_past_typing_elsewhere() {
 /// refusal, so the retry has to land. For `strict` that is also the proof it
 /// still takes the current version.
 #[test_case(false, |input| { input.buffer.set_cursor(0, 0); input.buffer.push_char('x') }, EDIT_CONFLICT_ERR ; "typed_where_the_edit_lands")]
-#[test_case(false, InputBox::history_up,                                                    INPUT_REPLACED_ERR ; "history_recall")]
+#[test_case(false, |input| { input.history_up(); },                                         INPUT_REPLACED_ERR ; "history_recall")]
 #[test_case(true,  |input| { input.buffer.move_to_end(); input.buffer.push_char('!') },    STALE_VERSION_ERR  ; "strict_after_typing_elsewhere")]
 fn a_refused_input_edit_lands_once_read_again(strict: bool, user: fn(&mut InputBox), err: &str) {
     // Recalling this logs a diff far from the edit, since it shares its start
@@ -5604,16 +5614,983 @@ fn plugin_key(code: KeyCode, modifiers: KeyModifiers) -> maki_lua::Key {
     maki_lua::Key::from_event(KeyEvent::new(code, modifiers)).expect(EXPECT_NAMEABLE)
 }
 
+const EVERY_MODE: &[InputMode] = &[InputMode::Normal, InputMode::Insert];
+const INSERT: &[InputMode] = &[InputMode::Insert];
+const NORMAL: &[InputMode] = &[InputMode::Normal];
+
 fn install_override(
     app: &mut App,
     key: KeyCode,
     modifiers: KeyModifiers,
 ) -> maki_lua::test_support::RequestProbe {
+    install_binding(app, EVERY_MODE, key, modifiers)
+}
+
+fn install_binding(
+    app: &mut App,
+    modes: &[InputMode],
+    key: KeyCode,
+    modifiers: KeyModifiers,
+) -> maki_lua::test_support::RequestProbe {
     app.keymap_reader =
-        maki_lua::test_support::keymap_reader_with(vec![plugin_key(key, modifiers)]);
+        maki_lua::test_support::keymap_reader_with(modes, vec![plugin_key(key, modifiers)]);
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
     probe
+}
+
+/// A vim plugin binds plain letters in normal mode. If those fired while
+/// typing, nobody could type a `j` anymore.
+#[test]
+fn a_normal_binding_rests_while_typing_and_fires_in_normal_mode() {
+    let mut app = test_app();
+    let probe = install_binding(&mut app, NORMAL, KeyCode::Char('j'), KeyModifiers::NONE);
+
+    app.update(Msg::Key(key(KeyCode::Char('j'))));
+    assert!(
+        probe.try_recv_keybind().is_none(),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
+    assert_eq!(app.input_box.buffer.value(), "j");
+
+    maki_lua::test_support::set_mode(&app.keymap_reader, InputMode::Normal);
+    app.update(Msg::Key(key(KeyCode::Char('j'))));
+    assert!(probe.try_recv_keybind().is_some(), "{OVERRIDE_DISPATCHED}");
+    assert_eq!(app.input_box.buffer.value(), "j");
+}
+
+fn type_keys(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+}
+
+/// Typed key by key, so the undo keys have something to take back.
+fn app_in_normal_mode(text: &str) -> App {
+    let mut app = test_app();
+    type_keys(&mut app, text);
+    maki_lua::test_support::set_mode(&app.keymap_reader, InputMode::Normal);
+    app
+}
+
+/// Normal mode belongs to a vim plugin. A key it leaves unbound has to land
+/// nowhere, not in the text.
+#[test_case(key(KeyCode::Char('x'))                                   ; "typing")]
+#[test_case(key(KeyCode::Backspace)                                   ; "backspace")]
+#[test_case(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)  ; "ctrl_w")]
+#[test_case(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)        ; "shift_enter")]
+#[test_case(kb::UNDO.to_key_event()                                   ; "alt_z")]
+#[test_case(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::SUPER)    ; "cmd_z")]
+fn normal_mode_never_edits(edit: KeyEvent) {
+    let mut app = app_in_normal_mode(NORMAL_MODE_TEXT);
+    app.update(Msg::Key(edit));
+    assert_eq!(app.input_box.buffer.value(), NORMAL_MODE_TEXT);
+}
+
+/// The text ends in `\`, which would make `Enter` start a new line while
+/// typing. In normal mode nothing types, so `Enter` sends.
+#[test]
+fn normal_mode_still_moves_pastes_and_sends() {
+    let mut app = app_in_normal_mode(NORMAL_MODE_TEXT);
+
+    app.update(Msg::Key(key(KeyCode::Home)));
+    assert_eq!(app.input_box.buffer.cursor_byte(), 0);
+    app.update(Msg::Paste(PASTED.into()));
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!("{PASTED}{NORMAL_MODE_TEXT}")
+    );
+    app.update(Msg::Key(key(KeyCode::End)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.input_box.buffer.is_empty(), "Enter sends");
+}
+
+/// Every `ModeChanged` the event loop would fire now, as `[old, new]`.
+fn mode_changes(
+    app: &App,
+    announced: &mut InputMode,
+    probe: &maki_lua::test_support::RequestProbe,
+) -> Vec<[String; 2]> {
+    app.announce_mode(announced);
+    iter::from_fn(|| probe.try_recv_autocmd())
+        .filter(|(event, _)| event == MODE_CHANGED_EVENT)
+        .map(|(_, data)| ["old_mode", "new_mode"].map(|f| data[f].as_str().unwrap().to_owned()))
+        .collect()
+}
+
+/// A mode indicator is drawn from `ModeChanged` alone, so it has to fire when
+/// a plugin switches, when a modal takes the keyboard and when it gives it
+/// back. A switch the user cannot see, like a plugin going back to insert
+/// mode under an open modal, stays quiet.
+#[test]
+fn mode_changed_fires_on_real_changes_only() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+    let mut announced = InputMode::Insert;
+    let mut changes = |app: &App| mode_changes(app, &mut announced, &probe);
+    let (n, i) = (InputMode::Normal.letter(), InputMode::Insert.letter());
+
+    maki_lua::test_support::set_mode(&app.keymap_reader, InputMode::Normal);
+    assert_eq!(changes(&app), [[i, n]], "a plugin switched");
+    app.run_builtin(BuiltinAction::Help);
+    assert!(changes(&app).is_empty(), "already normal");
+    maki_lua::test_support::set_mode(&app.keymap_reader, InputMode::Insert);
+    assert!(changes(&app).is_empty(), "the modal still has the keyboard");
+    app.run_builtin(BuiltinAction::Help);
+    assert_eq!(changes(&app), [[n, i]], "the modal gave the keyboard back");
+    app.run_builtin(BuiltinAction::Help);
+    assert_eq!(changes(&app), [[i, n]], "a modal took the keyboard");
+}
+
+/// An app where a plugin binds {code} in insert mode.
+fn app_binding(code: KeyCode) -> (App, maki_lua::test_support::RequestProbe) {
+    let mut app = test_app();
+    let probe = install_binding(&mut app, INSERT, code, KeyModifiers::NONE);
+    (app, probe)
+}
+
+/// Presses the bound {code} and takes the ticket the Lua thread would run,
+/// so the test can play the handler and report it done.
+fn press_bound(
+    app: &mut App,
+    probe: &maki_lua::test_support::RequestProbe,
+    code: KeyCode,
+) -> maki_lua::KeybindTicket {
+    app.update(Msg::Key(key(code)));
+    probe.try_recv_ticket().expect(OVERRIDE_DISPATCHED)
+}
+
+/// The `dd` typed right after a vim `<Esc>` has to wait for the switch to
+/// normal mode, or it lands in the text as two letters.
+#[test]
+fn keys_typed_behind_a_mode_switch_land_in_the_new_mode() {
+    let (mut app, probe) = app_binding(KeyCode::Esc);
+
+    let esc = press_bound(&mut app, &probe, KeyCode::Esc);
+    type_keys(&mut app, "dd");
+    maki_lua::test_support::set_mode(&app.keymap_reader, InputMode::Normal);
+    app.keybind_done(esc.id());
+
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+/// The accept is planned against the input at the press. If the `x` typed
+/// right after it went in first, the input version would move on and the
+/// accept would be refused.
+#[test]
+fn a_completion_tab_lands_before_the_key_typed_after_it() {
+    const WORD: &str = "@src/ma";
+    const ACCEPTED: &str = "@src/main.rs";
+    let (mut app, probe) = app_binding(KeyCode::Tab);
+    type_keys(&mut app, WORD);
+
+    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    type_keys(&mut app, "x");
+    let seen = tab.input().expect("the ticket carries the input");
+    let accept = edit_planned_on(seen, 0, WORD.len(), ACCEPTED);
+    apply_edit(&mut app, accept).expect("nothing was typed over the word");
+    app.keybind_done(tab.id());
+
+    assert_eq!(app.input_box.buffer.value(), format!("{ACCEPTED}x"));
+}
+
+/// A handler that opens a modal may not return until the user closes it, so
+/// the held keys have to follow the keyboard there.
+#[test]
+fn held_keys_follow_the_keyboard_to_a_modal() {
+    let (mut app, probe) = app_binding(KeyCode::Tab);
+
+    press_bound(&mut app, &probe, KeyCode::Tab);
+    app.run_builtin(BuiltinAction::Help);
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+
+    assert!(!app.help_modal.is_open(), "the held Esc reached the modal");
+}
+
+/// Streams a turn on {app}, and returns where its answers to the agent go.
+fn answer_channel(app: &mut App) -> flume::Receiver<String> {
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (answer_tx, answer_rx) = flume::unbounded();
+    app.answer_tx = Some(answer_tx);
+    answer_rx
+}
+
+fn ask_permission(app: &mut App) {
+    app.update(agent_msg(AgentEvent::PermissionRequest {
+        id: FIRST_ASK.into(),
+        tool: ToolKey::native("bash"),
+        scopes: vec!["ls".into()],
+        reason: None,
+    }));
+}
+
+/// The `y` was typed before the agent asked, so it must not approve the
+/// call. That holds whether the handler finishes or the prompt taking the
+/// keyboard lets the keys go first.
+#[test_case(true  ; "when_the_handler_is_done")]
+#[test_case(false ; "when_the_prompt_takes_the_keyboard")]
+fn held_keys_never_answer_a_prompt_that_opened_while_they_waited(handler_done: bool) {
+    let (mut app, probe) = app_binding(KeyCode::Tab);
+    let answer_rx = answer_channel(&mut app);
+
+    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    type_keys(&mut app, "y");
+    ask_permission(&mut app);
+    if handler_done {
+        app.keybind_done(tab.id());
+    } else {
+        let _ = app.tick();
+    }
+
+    assert!(app.permission_prompt.is_open());
+    assert!(answer_rx.is_empty(), "the held y answered the prompt");
+    assert_eq!(app.status_bar.flash_text(), Some(HELD_KEYS_DROPPED));
+}
+
+/// The plan form already waited on the user when the key was pressed, so
+/// the keyboard looks the same before and after the permission prompt opens
+/// in front of it. The `y` still was not typed at that prompt.
+#[test]
+fn held_keys_never_answer_a_prompt_that_opened_over_another() {
+    let mut app = test_app();
+    let probe = install_binding(&mut app, EVERY_MODE, KeyCode::Tab, KeyModifiers::NONE);
+    app.state.mode = Mode::Plan;
+    app.plan_form.on_plan_ready();
+    let answer_rx = answer_channel(&mut app);
+
+    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    type_keys(&mut app, "y");
+    ask_permission(&mut app);
+    app.keybind_done(tab.id());
+
+    assert!(app.permission_prompt.is_open());
+    assert!(answer_rx.is_empty(), "the held y answered the prompt");
+    assert_eq!(app.status_bar.flash_text(), Some(HELD_KEYS_DROPPED));
+}
+
+/// A prompt already up when the key was pressed does not stop the keys after
+/// it from following the keyboard into a window the handler opened.
+#[test]
+fn held_keys_follow_a_window_the_handler_opened_over_a_prompt() {
+    let mut app = test_app();
+    let probe = install_binding(&mut app, EVERY_MODE, KeyCode::Tab, KeyModifiers::NONE);
+    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+
+    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    type_keys(&mut app, "x");
+    let (event_tx, events) = flume::unbounded();
+    let (_cmd_tx, cmd_rx) = flume::unbounded();
+    app.float_mgr.open(
+        Arc::new(SharedBuf::new()),
+        FloatConfig::default(),
+        true,
+        event_tx,
+        cmd_rx,
+    );
+    app.keybind_done(tab.id());
+
+    assert!(took_a_key(&events), "the held key reached the window");
+    assert_ne!(app.status_bar.flash_text(), Some(HELD_KEYS_DROPPED));
+}
+
+/// A handler we stopped waiting for can finish while a later key holds, and
+/// its report must not let that key's followers go early.
+#[test]
+fn only_the_holding_handler_lets_the_keys_go() {
+    let (mut app, probe) = app_binding(KeyCode::Tab);
+
+    let tab = press_bound(&mut app, &probe, KeyCode::Tab);
+    type_keys(&mut app, "x");
+    app.keybind_done(tab.id() + 1);
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "",
+        "another keystroke's report"
+    );
+    app.keybind_done(tab.id());
+    assert_eq!(app.input_box.buffer.value(), "x");
+}
+
+/// A handler that switches tabs: what was typed after its key was aimed at
+/// the tab the user went to, and an Enter in the old one would prompt the
+/// wrong agent. The handler is still at work on the new tab, so they wait
+/// there for it.
+#[test]
+fn held_keys_follow_a_tab_switch() {
+    const WRITTEN: &str = "/ask ";
+    const TYPED: &str = "hi";
+    let (mut left, probe) = app_binding(KeyCode::Tab);
+    let mut entered = test_app();
+
+    let tab = press_bound(&mut left, &probe, KeyCode::Tab);
+    type_keys(&mut left, TYPED);
+    left.hand_typeahead_to(&mut entered);
+    let _ = entered.tick();
+    assert_eq!(entered.input_box.buffer.value(), "", "landed before done");
+
+    let write = planned_edit(&entered, 0, 0, WRITTEN);
+    apply_edit(&mut entered, write).expect("nothing was typed yet");
+    entered.keybind_done(tab.id());
+    left.tick_background();
+
+    assert_eq!(
+        entered.input_box.buffer.value(),
+        format!("{WRITTEN}{TYPED}")
+    );
+    assert_eq!(left.input_box.buffer.value(), "");
+}
+
+const FRONT_PLUGIN: &str = "front";
+const UNDER_PLUGIN: &str = "under";
+const FOCUSED_PLUGIN: &str = "focused";
+const GLOBAL_PLUGIN: &str = "global";
+const WINDOW_Z: u16 = 50;
+const BOUND_CHAR: char = 'x';
+
+/// Painted once, because only a window on screen is asked for keys. Keep the
+/// command sender alive, dropping it closes the window.
+fn open_window(
+    app: &mut App,
+    buf: &Arc<SharedBuf>,
+    focus: bool,
+    zindex: u16,
+) -> (flume::Receiver<WinEvent>, flume::Sender<WinCommand>) {
+    let (event_tx, event_rx) = flume::unbounded::<WinEvent>();
+    let (cmd_tx, cmd_rx) = flume::unbounded::<WinCommand>();
+    let config = FloatConfig {
+        zindex,
+        ..FloatConfig::default()
+    };
+    app.float_mgr
+        .open(Arc::clone(buf), config, focus, event_tx, cmd_rx);
+    let _ = draw_to_buffer(app);
+    (event_rx, cmd_tx)
+}
+
+/// Who binds the key, in which modes, and for which buffer. `None` is global.
+type Bind<'a> = (&'a str, &'a [InputMode], Option<&'a Arc<SharedBuf>>);
+
+fn bind_all(app: &mut App, code: KeyCode, binds: &[Bind]) -> RequestProbe {
+    let key = plugin_key(code, KeyModifiers::NONE);
+    let binds: Vec<TestBinding> = binds
+        .iter()
+        .map(|&(plugin, modes, buffer)| TestBinding {
+            plugin,
+            modes,
+            key,
+            buffer,
+        })
+        .collect();
+    app.keymap_reader = maki_lua::test_support::keymap_reader_from(&binds);
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+    probe
+}
+
+fn owner(probe: &RequestProbe) -> Option<String> {
+    probe.try_recv_ticket().map(|t| t.plugin().to_string())
+}
+
+/// The windows are opened back to front on purpose, so the front one wins by
+/// its `zindex` and not by when it opened.
+#[test_case(&[FRONT_PLUGIN, UNDER_PLUGIN, GLOBAL_PLUGIN] => Some(FRONT_PLUGIN.into()) ; "front_popup_beats_the_one_under_it")]
+#[test_case(&[UNDER_PLUGIN, GLOBAL_PLUGIN] => Some(UNDER_PLUGIN.into()) ; "popup_beats_a_global_binding")]
+#[test_case(&[GLOBAL_PLUGIN] => Some(GLOBAL_PLUGIN.into()) ; "global_binding_beats_the_built_in_key")]
+#[test_case(&[] => None ; "built_in_key_comes_last")]
+fn a_key_goes_to_the_first_binding_in_resolution_order(bound: &[&str]) -> Option<String> {
+    let mut app = test_app();
+    let (front, under) = (Arc::new(SharedBuf::new()), Arc::new(SharedBuf::new()));
+    let _under = open_window(&mut app, &under, false, WINDOW_Z);
+    let _front = open_window(&mut app, &front, false, WINDOW_Z + 1);
+    let binds: Vec<Bind> = bound
+        .iter()
+        .map(|&plugin| {
+            let buffer = match plugin {
+                FRONT_PLUGIN => Some(&front),
+                UNDER_PLUGIN => Some(&under),
+                _ => None,
+            };
+            (plugin, INSERT, buffer)
+        })
+        .collect();
+    let probe = bind_all(&mut app, KeyCode::Char(BOUND_CHAR), &binds);
+
+    app.update(Msg::Key(key(KeyCode::Char(BOUND_CHAR))));
+
+    let owner = owner(&probe);
+    assert_eq!(
+        app.input_box.buffer.is_empty(),
+        owner.is_some(),
+        "the chat input typed the key only when no binding took it"
+    );
+    owner
+}
+
+/// A focused window gets every key, so its own bindings go first and nothing
+/// under it sees the key. The chat input is hidden behind the window, so the
+/// fallback goes to the window's `recv` instead.
+#[test]
+fn a_focused_windows_binding_beats_its_recv_and_falls_back_to_it() {
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let (events, _cmd_tx) = open_window(&mut app, &buf, true, WINDOW_Z);
+    let probe = bind_all(
+        &mut app,
+        KeyCode::Enter,
+        &[
+            (FOCUSED_PLUGIN, EVERY_MODE, Some(&buf)),
+            (GLOBAL_PLUGIN, EVERY_MODE, None),
+        ],
+    );
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let ticket = probe.try_recv_ticket().expect(OVERRIDE_DISPATCHED);
+    assert_eq!(ticket.plugin().as_ref(), FOCUSED_PLUGIN);
+    assert!(
+        !took_a_key(&events),
+        "the binding took it before the window"
+    );
+
+    app.keybind_fallback(ticket.id());
+    assert!(took_a_key(&events), "the window got the key back");
+}
+
+/// A picker's `<CR>` selects and closes. The close comes over the window's
+/// own channel, so it may still be waiting when the done report arrives, and
+/// the keys typed after the `<CR>` must not go to the window that is gone.
+#[test]
+fn keys_held_behind_a_window_that_closed_itself_reach_the_chat_input() {
+    const TYPED: &str = "hi";
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let (events, cmd_tx) = open_window(&mut app, &buf, true, WINDOW_Z);
+    let probe = bind_all(
+        &mut app,
+        KeyCode::Enter,
+        &[(FOCUSED_PLUGIN, EVERY_MODE, Some(&buf))],
+    );
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let ticket = probe.try_recv_ticket().expect(OVERRIDE_DISPATCHED);
+    type_keys(&mut app, TYPED);
+    cmd_tx.send(WinCommand::Close).unwrap();
+    app.keybind_done(ticket.id());
+
+    assert!(!took_a_key(&events));
+    assert_eq!(app.input_box.buffer.value(), TYPED);
+}
+
+/// The popup's keys come back as soon as the modal over it closes.
+#[test]
+fn a_host_modal_outranks_a_popups_bindings() {
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let _window = open_window(&mut app, &buf, false, WINDOW_Z);
+    let probe = bind_all(
+        &mut app,
+        KeyCode::Esc,
+        &[(FRONT_PLUGIN, EVERY_MODE, Some(&buf))],
+    );
+
+    app.run_builtin(BuiltinAction::Help);
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.help_modal.is_open(), "the modal took the Esc");
+    assert_eq!(owner(&probe), None);
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert_eq!(owner(&probe).as_deref(), Some(FRONT_PLUGIN));
+}
+
+/// A vim plugin in normal mode must keep its `<Esc>` even while the completion
+/// popup is up, so the popup's insert mode binding has to step aside.
+#[test]
+fn a_popup_binding_rests_outside_its_mode() {
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let _window = open_window(&mut app, &buf, false, WINDOW_Z);
+    let probe = bind_all(
+        &mut app,
+        KeyCode::Esc,
+        &[
+            (GLOBAL_PLUGIN, NORMAL, None),
+            (FRONT_PLUGIN, INSERT, Some(&buf)),
+        ],
+    );
+    maki_lua::test_support::set_mode(&app.keymap_reader, InputMode::Normal);
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert_eq!(owner(&probe).as_deref(), Some(GLOBAL_PLUGIN));
+}
+
+/// The fallback types the key in the spot the user pressed it: after the
+/// handler, before the `b` typed behind it. Once the handler is done the `b`
+/// has gone ahead, so a late fallback would land out of order.
+#[test]
+fn fallback_runs_the_built_in_key_once_before_the_keys_typed_after_it() {
+    let (mut app, probe) = app_binding(KeyCode::Char('a'));
+
+    let pressed = press_bound(&mut app, &probe, KeyCode::Char('a'));
+    type_keys(&mut app, "b");
+    app.keybind_fallback(pressed.id());
+    app.keybind_fallback(pressed.id());
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "a",
+        "typed once, and b still waits"
+    );
+
+    app.keybind_done(pressed.id());
+    app.keybind_fallback(pressed.id());
+    assert_eq!(app.input_box.buffer.value(), "ab");
+}
+
+/// The handler opened a window, so the key would land in it, or in the input
+/// the user already left. Neither is where they aimed it.
+#[test]
+fn fallback_is_dropped_once_the_keyboard_moved() {
+    let (mut app, probe) = app_binding(KeyCode::Char('a'));
+    let pressed = press_bound(&mut app, &probe, KeyCode::Char('a'));
+    let (events, _cmd_tx) = open_window(&mut app, &Arc::new(SharedBuf::new()), true, WINDOW_Z);
+
+    app.keybind_fallback(pressed.id());
+
+    assert!(!took_a_key(&events));
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+#[test]
+fn a_paste_binding_gets_the_text_and_its_fallback_pastes_it() {
+    const MULTILINE: &str = "line one\nline two";
+    let mut app = test_app();
+    app.keymap_reader = maki_lua::test_support::keymap_reader_with(INSERT, vec![maki_lua::PASTE]);
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.update(Msg::Paste(MULTILINE.replace('\n', "\r\n")));
+    let ticket = probe.try_recv_ticket().expect(OVERRIDE_DISPATCHED);
+    assert_eq!(
+        ticket.text(),
+        Some(MULTILINE),
+        "line endings are already `\\n`"
+    );
+    assert_eq!(app.input_box.buffer.value(), "");
+
+    app.keybind_fallback(ticket.id());
+    assert_eq!(app.input_box.buffer.value(), MULTILINE);
+}
+
+fn open_permission_prompt(app: &mut App) {
+    app.permission_prompt.push(
+        "perm-1".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+        true,
+        None,
+    );
+}
+
+fn open_alert(app: &mut App) {
+    app.alert_modal.open("alert".into());
+}
+
+/// A modal owns the keyboard, so a paste it has no field for goes nowhere:
+/// not into the chat input under it, nor to a global `<Paste>` binding.
+#[test_case(open_permission_prompt as fn(&mut App) ; "permission_prompt")]
+#[test_case(open_alert                             ; "alert_modal")]
+#[test_case(open_help                              ; "help_modal")]
+#[test_case(focus_queue                            ; "queue_focus")]
+fn a_modal_drops_a_paste_it_has_no_field_for(open: fn(&mut App)) {
+    let mut app = test_app();
+    app.keymap_reader = maki_lua::test_support::keymap_reader_with(INSERT, vec![maki_lua::PASTE]);
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+    open(&mut app);
+
+    app.update(Msg::Paste(PASTED.into()));
+
+    assert!(probe.try_recv_ticket().is_none());
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+/// The `\` + Enter continuation, written as a plugin. The built-in editor
+/// already does this, so the test also has to check which path ran.
+const CONTINUATION_PLUGIN: &str = r#"
+maki.keymap.set("i", "<CR>", function(ev)
+    local st = ev.input
+    if st.text:sub(st.cursor, st.cursor) ~= "\\" then
+        return ev.fallback()
+    end
+    maki.ui.input_edit({
+        start = st.cursor - 1, stop = st.cursor, text = "\n",
+        version = st.version, session_id = st.session_id,
+    })
+end)
+"#;
+const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+const HANDLER_NEVER_DONE: &str = "the key handler never reported done";
+const ASKED_EDIT: &str = "edit";
+const ASKED_FALLBACK: &str = "fallback";
+
+/// Wires {host} into a fresh app the way the event loop does.
+fn hosted_app(host: &PluginHost) -> (App, flume::Receiver<UiAction>) {
+    let mut app = test_app();
+    app.keymap_reader = host.keymap_reader();
+    app.lua_event_handle = host.event_handle();
+    (app, host.ui_action_rx())
+}
+
+/// Plays the event loop for one key handler until it reports done. Returns
+/// what it asked for, in order, with the text of each flash, and the actions
+/// its fallback and built-in actions made.
+fn serve_handler(app: &mut App, ui: &flume::Receiver<UiAction>) -> (Vec<String>, Vec<Action>) {
+    let (mut asked, mut actions) = (Vec::new(), Vec::new());
+    loop {
+        match ui.recv_timeout(HANDLER_TIMEOUT).expect(HANDLER_NEVER_DONE) {
+            UiAction::Input {
+                req: InputRequest::Edit(edit),
+                reply_tx,
+            } => {
+                asked.push(ASKED_EDIT.into());
+                let _ = reply_tx.send(app.apply_input_edit(edit, TEST_AREA));
+            }
+            UiAction::KeybindFallback(ticket) => {
+                asked.push(ASKED_FALLBACK.into());
+                actions.extend(app.keybind_fallback(ticket));
+            }
+            UiAction::Builtin { action, reply_tx } => {
+                let (handled, made) = app.run_action(action);
+                let _ = reply_tx.send(handled);
+                actions.extend(made);
+            }
+            UiAction::Flash(msg) => asked.push(msg),
+            UiAction::KeybindDone(ticket) => {
+                app.keybind_done(ticket);
+                return (asked, actions);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn backslash_enter_works_as_a_plugin_built_on_fallback() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("continuation", CONTINUATION_PLUGIN)
+        .unwrap();
+    let (mut app, ui) = hosted_app(&host);
+
+    type_keys(&mut app, "a\\");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    type_keys(&mut app, "b");
+    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT]);
+    assert_eq!(app.input_box.buffer.value(), "a\nb");
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let (asked, actions) = serve_handler(&mut app, &ui);
+    assert_eq!(asked, [ASKED_FALLBACK]);
+    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == "a\nb"));
+}
+
+const GRANTED_PLUGIN: &str = "granted";
+const PASSING_ENTER_PLUGIN: &str = r#"
+maki.keymap.set("i", "<CR>", function(ev) ev.fallback() end)
+"#;
+const EDITING_ENTER_PLUGIN: &str = r#"
+maki.keymap.set("i", "<CR>", function(ev)
+    local st = ev.input
+    maki.ui.input_edit({
+        start = #st.text, stop = #st.text, text = "!",
+        version = st.version, session_id = st.session_id,
+    })
+    ev.fallback()
+end)
+"#;
+const IDLE_X_PLUGIN: &str = r#"maki.keymap.set("i", "x", function() end)"#;
+
+/// A host running {source} with only {grants}.
+fn granted_host(source: &str, grants: &[&str]) -> PluginHost {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source_with_permissions(
+        GRANTED_PLUGIN,
+        source,
+        PluginPermissions::from_approved(grants.iter().copied()),
+    )
+    .unwrap();
+    host
+}
+
+/// The user pressed Enter on what they typed, so passing it on needs no
+/// grant. A handler that changed the text first sends its own text, and
+/// needs what sending it directly would.
+#[test_case(PASSING_ENTER_PLUGIN, &[], "hi" ; "passed_on_needs_nothing")]
+#[test_case(EDITING_ENTER_PLUGIN, &["agent"], "hi!" ; "edited_with_agent")]
+fn a_fallback_enter_sends(source: &str, grants: &[&str], sent: &str) {
+    let host = granted_host(source, grants);
+    let (mut app, ui) = hosted_app(&host);
+
+    type_keys(&mut app, "hi");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let (_, actions) = serve_handler(&mut app, &ui);
+    assert!(matches!(&actions[..], [Action::SendMessage(s)] if s.message == sent));
+}
+
+#[test]
+fn a_fallback_enter_on_edited_text_is_refused_without_agent() {
+    let host = granted_host(EDITING_ENTER_PLUGIN, &[]);
+    let (mut app, ui) = hosted_app(&host);
+
+    type_keys(&mut app, "hi");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let (asked, actions) = serve_handler(&mut app, &ui);
+    assert_eq!(asked, [ASKED_EDIT, ASKED_FALLBACK]);
+    assert!(actions.is_empty());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(missing_refusal(SEND_MESSAGE, &Missing::Permission(Permission::Agent)).as_str())
+    );
+    assert_eq!(app.input_box.buffer.value(), "hi!");
+}
+
+/// Binds `x` to put {text} in place of the input.
+fn rewriting_plugin(text: &str) -> String {
+    format!(
+        r#"
+maki.keymap.set("i", "x", function(ev)
+    local st = ev.input
+    maki.ui.input_edit({{
+        start = 0, stop = #st.text, text = "{text}",
+        version = st.version, session_id = st.session_id,
+    }})
+end)
+"#
+    )
+}
+
+/// The Enter typed while the `x` handler ran waited for it, so it lands on
+/// text the user never saw, and the send is held to the plugin's grants.
+#[test_case(&rewriting_plugin("/yolo"), &["agent"], "/yolo", Some(format!("/yolo{USER_ONLY_SUFFIX}")) ; "a_user_only_command")]
+#[test_case(&rewriting_plugin("hello"), &[], "hello", Some(missing_refusal(SEND_MESSAGE, &Missing::Permission(Permission::Agent))) ; "a_message_without_agent")]
+#[test_case(&rewriting_plugin("hello"), &["agent"], "", None ; "a_message_with_agent")]
+#[test_case(IDLE_X_PLUGIN, &[], "", None ; "an_untouched_input_needs_nothing")]
+fn an_enter_held_behind_a_handler_sends_what_the_handler_may(
+    source: &str,
+    grants: &[&str],
+    left: &str,
+    refusal: Option<String>,
+) {
+    let host = granted_host(source, grants);
+    let (mut app, ui) = hosted_app(&host);
+
+    type_keys(&mut app, "hix");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    serve_handler(&mut app, &ui);
+
+    assert_eq!(app.input_box.buffer.value(), left);
+    assert_eq!(app.status_bar.flash_text(), refusal.as_deref());
+    assert!(!app.permissions.is_yolo());
+}
+
+const BURST_PLUGIN: &str = "burst";
+const BURST_BOUND: char = 'x';
+const BURST_KEYS: usize = 1000;
+const BURST_PATTERN: &str = "abxcdxxe fx";
+const BURST_EDIT: &str = r#"
+    local st = ev.input
+    maki.ui.input_edit({
+        start = st.cursor, stop = st.cursor, text = "X",
+        version = st.version, session_id = st.session_id,
+    })"#;
+const BURST_EDIT_THEN_RAISE: &str = r#"
+    local st = ev.input
+    maki.ui.input_edit({
+        start = st.cursor, stop = st.cursor, text = "X",
+        version = st.version, session_id = st.session_id,
+    })
+    error("boom")"#;
+
+/// Every key is typed before the first handler gets an answer, so each
+/// handler is still at work while the keys behind it pile up. A key lost,
+/// doubled or swapped shows in the text, a hold left behind keeps the last
+/// key out, and a deadlock trips the serve timeout.
+#[test_case(BURST_EDIT, "X" ; "edits")]
+#[test_case(BURST_EDIT_THEN_RAISE, "X" ; "edits_then_raises")]
+#[test_case("ev.fallback()", "x" ; "falls_back")]
+#[test_case("", "" ; "spends_the_key")]
+fn a_burst_through_slow_handlers_lands_in_order(body: &str, bound_lands_as: &str) {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(
+        BURST_PLUGIN,
+        &format!(r#"maki.keymap.set("i", "{BURST_BOUND}", function(ev) {body} end)"#),
+    )
+    .unwrap();
+    let (mut app, ui) = hosted_app(&host);
+    let typed: String = BURST_PATTERN.chars().cycle().take(BURST_KEYS).collect();
+
+    type_keys(&mut app, &typed);
+    for _ in typed.matches(BURST_BOUND) {
+        serve_handler(&mut app, &ui);
+    }
+    type_keys(&mut app, "z");
+
+    let expected = typed.replace(BURST_BOUND, bound_lands_as);
+    assert_eq!(app.input_box.buffer.value(), format!("{expected}z"));
+}
+
+/// The handler moves the keyboard from tab to tab before it is done. The
+/// keys typed in between were all aimed at wherever it ended up, so they
+/// land there once, and every tab it passed through is left with nothing.
+#[test]
+fn held_keys_hop_tabs_with_the_handler_and_land_once() {
+    let (mut first, probe) = app_binding(KeyCode::Tab);
+    let mut second = test_app();
+    second.keymap_reader = first.keymap_reader.clone();
+
+    let tab = press_bound(&mut first, &probe, KeyCode::Tab);
+    type_keys(&mut first, "a");
+    first.hand_typeahead_to(&mut second);
+    type_keys(&mut second, "b");
+    second.hand_typeahead_to(&mut first);
+    type_keys(&mut first, "c");
+    first.hand_typeahead_to(&mut second);
+    first.keybind_done(tab.id());
+    let _ = first.tick();
+    assert_eq!(second.input_box.buffer.value(), "", "still held");
+
+    second.keybind_done(tab.id());
+    let _ = second.tick();
+    type_keys(&mut first, "d");
+
+    assert_eq!(second.input_box.buffer.value(), "abc");
+    assert_eq!(first.input_box.buffer.value(), "d");
+}
+
+/// A source for `$` that answers at once, so the real completion popup opens
+/// without walking a tree.
+const SKILL_SOURCE_PLUGIN: &str = r#"
+maki.api.set_slot("completion.sources", function(prev, list)
+  table.insert(list, {
+    name = "skills",
+    trigger = "$",
+    complete = function() return { { text = "$review" } } end,
+  })
+  return prev(list)
+end)
+"#;
+const USER_CONFIG: &str = "global/init.lua";
+/// The `<Tab>` a user composes in `init.lua`. `ghost.accept` belongs to a
+/// plugin that is not loaded.
+const TAB_COMPOSITION: &str = r#"
+maki.keymap.set("i", "<Tab>", function(ev)
+  if maki.ui.action("completion.accept") then return end
+  if maki.ui.action("ghost.accept") then return end
+  ev.fallback()
+end)
+"#;
+const POPUP_NEVER_SHOWN: &str = "the completion popup never came up";
+
+/// Plays the event loop until the completion popup is on screen with its
+/// rows, which it shows only after painting them.
+fn serve_until_popup(ui: &flume::Receiver<UiAction>) -> flume::Receiver<WinCommand> {
+    loop {
+        match ui.recv_timeout(HANDLER_TIMEOUT).expect(POPUP_NEVER_SHOWN) {
+            UiAction::Session { reply_tx, .. } => {
+                let _ = reply_tx.send(Ok(serde_json::json!({ "cwd": "/" })));
+            }
+            UiAction::OpenWin { cmd_rx, .. } => loop {
+                let cmd = cmd_rx
+                    .recv_timeout(HANDLER_TIMEOUT)
+                    .expect(POPUP_NEVER_SHOWN);
+                if matches!(cmd, WinCommand::SetVisible(true)) {
+                    return cmd_rx;
+                }
+            },
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn tab_composed_in_init_lua_accepts_a_completion_or_falls_back() {
+    let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_builtins(&PluginsConfig {
+        enabled: true,
+        names: vec!["completion".into()],
+        ..PluginsConfig::default()
+    })
+    .unwrap();
+    host.load_source("skills", SKILL_SOURCE_PLUGIN).unwrap();
+    host.load_source(USER_CONFIG, TAB_COMPOSITION).unwrap();
+    let (mut app, ui) = hosted_app(&host);
+
+    type_keys(&mut app, "$re");
+    let _ = app.tick();
+    let _popup = serve_until_popup(&ui);
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT]);
+    assert_eq!(app.input_box.buffer.value(), "$review ");
+
+    let mode = app.state.mode;
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_FALLBACK]);
+    assert_ne!(app.state.mode, mode, "the built-in Tab toggled the mode");
+}
+
+/// A vim plugin's `u`. In normal mode the key itself would never edit, so
+/// only the action can, and its answer travels back to the handler.
+const UNDO_PLUGIN: &str = r#"
+maki.keymap.set("n", "u", function()
+  maki.ui.flash(tostring(maki.ui.action("undo")))
+end)
+"#;
+
+#[test]
+fn a_builtin_action_answers_the_handler_in_normal_mode() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("vim", UNDO_PLUGIN).unwrap();
+    let (mut app, ui) = hosted_app(&host);
+    type_keys(&mut app, "ab");
+    maki_lua::test_support::set_mode(&app.keymap_reader, InputMode::Normal);
+
+    app.update(Msg::Key(key(KeyCode::Char('u'))));
+    assert_eq!(serve_handler(&mut app, &ui).0, ["true"]);
+    assert_eq!(app.input_box.buffer.value(), "");
+
+    app.update(Msg::Key(key(KeyCode::Char('u'))));
+    assert_eq!(serve_handler(&mut app, &ui).0, ["false"]);
+}
+
+#[test]
+fn input_actions_say_when_there_was_nothing_to_do() {
+    const SENT: &str = "sent";
+    const TYPED: &str = "ab";
+    const TYPED_LINE: &str = "ab\n";
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    app.input_box.set_input(SENT);
+    app.input_box.submit();
+    type_keys(&mut app, TYPED);
+
+    for (action, handled, value) in [
+        (BuiltinAction::Newline, true, TYPED_LINE),
+        (BuiltinAction::Undo, true, TYPED),
+        (BuiltinAction::Redo, true, TYPED_LINE),
+        (BuiltinAction::Redo, false, TYPED_LINE),
+        (BuiltinAction::HistoryPrev, true, SENT),
+        (BuiltinAction::HistoryPrev, false, SENT),
+        (BuiltinAction::HistoryNext, true, TYPED_LINE),
+        (BuiltinAction::HistoryNext, false, TYPED_LINE),
+    ] {
+        let answered = app.run_action(action).0;
+        assert_eq!(
+            (answered, app.input_box.buffer.value()),
+            (handled, value),
+            "{action:?}"
+        );
+    }
 }
 
 const EXPECT_NAMEABLE: &str = "the test named a key no notation spells";

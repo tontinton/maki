@@ -1342,9 +1342,11 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::keymap::TAKEN_ERR;
-    use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
+    use crate::api::keymap::{InputMode, TAKEN_ERR};
+    use crate::api::util::command::{InputRequest, LuaCommandInfo, LuaCommandWriter};
+    use crate::key::{Key, PASTE};
     use crate::plugin_permissions::PluginReach;
+    use crate::runtime::FALLBACK_SPENT_ERR;
     use crossterm::event::KeyCode;
     use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, assemble};
     use maki_agent::tools::ToolRegistry;
@@ -1574,8 +1576,9 @@ mod tests {
     }
 
     const FIRED_COMMAND: &str = "/fired";
-    const KEYBIND_NEVER_RAN: &str = "the keybind callback never registered its command";
-    const KEYBIND_TIMEOUT: Duration = Duration::from_secs(2);
+    const KEYBIND_NEVER_RAN: &str = "the keybind callback never ran";
+    const KEYBIND_NEVER_DONE: &str = "the keybind handler never reported done";
+    const KEYBIND_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// Waits for the command a keybind callback registers, which is how a test
     /// on this side of the channel sees that the handler ran.
@@ -1630,8 +1633,270 @@ mod tests {
         );
 
         let handle = host.event_handle();
-        assert!(reader.dispatch(key, |ticket| handle.run_keybind_callback(ticket)));
+        assert!(reader.dispatch(key, InputMode::Normal, None, |ticket| {
+            handle.run_keybind_callback(ticket)
+        }));
         wait_for_fired_command(&host);
+    }
+
+    const VIM_PLUGIN: &str = "vim";
+
+    /// A tiny vim plugin: `<Esc>` leaves insert mode and `i` goes back. Each
+    /// handler flashes `maki.fn.mode()` right after it switches, so the test
+    /// waits on that reply instead of polling, and it also proves the switch
+    /// is visible inside the handler that made it.
+    #[test]
+    fn a_vim_style_plugin_switches_modes() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            VIM_PLUGIN,
+            r#"
+            local function switch(mode)
+                return function()
+                    maki.ui.set_mode(mode)
+                    maki.ui.flash(maki.fn.mode())
+                end
+            end
+            maki.keymap.set("i", "<Esc>", switch("n"))
+            maki.keymap.set("n", "i", switch("i"))
+            "#,
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        let handle = host.event_handle();
+        let ui = host.ui_action_rx();
+        let press = |lhs| {
+            let mode = reader.sync_mode(true);
+            reader.dispatch(Key::parse(lhs).unwrap(), mode, None, |t| {
+                handle.run_keybind_callback(t)
+            })
+        };
+        let flashed_mode = || {
+            let Ok(UiAction::Flash(mode)) = ui.recv_timeout(KEYBIND_TIMEOUT) else {
+                panic!("{KEYBIND_NEVER_RAN}");
+            };
+            let Ok(UiAction::KeybindDone(_)) = ui.recv_timeout(KEYBIND_TIMEOUT) else {
+                panic!("{KEYBIND_NEVER_DONE}");
+            };
+            mode
+        };
+
+        assert!(!press("i"), "typing an i reaches the input");
+        assert!(press("<Esc>"));
+        assert_eq!(flashed_mode(), InputMode::Normal.letter());
+        assert!(!press("<Esc>"), "the insert binding rests in normal mode");
+        assert!(press("i"));
+        assert_eq!(flashed_mode(), InputMode::Insert.letter());
+        assert!(!press("i"), "back in insert mode, an i types again");
+    }
+
+    const ENTER_NORMAL: &str = r#"maki.ui.set_mode("n")"#;
+    const ENTER_NORMAL_THEN_FAIL: &str = r#"maki.ui.set_mode("n") error("broken")"#;
+
+    fn unload_vim(host: &PluginHost) {
+        host.unload(VIM_PLUGIN).unwrap();
+    }
+
+    fn reload_vim(host: &PluginHost) {
+        host.load_source(VIM_PLUGIN, "").unwrap();
+    }
+
+    fn reload_vim_broken(host: &PluginHost) {
+        assert!(
+            host.load_source(VIM_PLUGIN, ENTER_NORMAL_THEN_FAIL)
+                .is_err()
+        );
+    }
+
+    /// Only the plugin that switched to normal mode can switch back, so the
+    /// mode goes with its load. Another plugin going away leaves it alone.
+    #[test_case(unload_vim ; "unloaded")]
+    #[test_case(reload_vim ; "reloaded")]
+    #[test_case(reload_vim_broken ; "reload_fails")]
+    fn normal_mode_goes_with_the_plugin_that_set_it(teardown: fn(&PluginHost)) {
+        const OTHER_PLUGIN: &str = "other";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(OTHER_PLUGIN, "").unwrap();
+        host.load_source(VIM_PLUGIN, ENTER_NORMAL).unwrap();
+        let reader = host.keymap_reader();
+        host.unload(OTHER_PLUGIN).unwrap();
+        assert_eq!(reader.sync_mode(true), InputMode::Normal);
+
+        teardown(&host);
+        assert_eq!(reader.sync_mode(true), InputMode::Insert);
+    }
+
+    const PARKED_COMMAND: &str = "/park";
+    const PARKED_DONE: &str = "parked done";
+    const PARKED_NEVER_RAN: &str = "the command never parked on the UI";
+    const PARKED_NEVER_DONE: &str = "the command never finished";
+
+    /// An unload never waits for a command handler, so one parked on the UI
+    /// wakes up with its load gone. A normal mode it switched to then would
+    /// belong to nothing that could ever switch it back, and the chat input
+    /// could not be typed in again.
+    #[test]
+    fn a_mode_switch_from_an_unloaded_plugin_is_dropped() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            VIM_PLUGIN,
+            &format!(
+                r#"
+            maki.api.register_command({{
+                name = "{PARKED_COMMAND}",
+                description = "parks on the UI",
+                handler = function()
+                    maki.ui.input()
+                    maki.ui.set_mode("n")
+                    maki.ui.flash("{PARKED_DONE}")
+                end,
+            }})
+            "#
+            ),
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        let ui = host.ui_action_rx();
+        host.event_handle().run_command(
+            Arc::from(VIM_PLUGIN),
+            Arc::from(PARKED_COMMAND),
+            String::new(),
+            0,
+        );
+        let parked = loop {
+            if let UiAction::Input { reply_tx, .. } =
+                ui.recv_timeout(KEYBIND_TIMEOUT).expect(PARKED_NEVER_RAN)
+            {
+                break reply_tx;
+            }
+        };
+
+        host.unload(VIM_PLUGIN).unwrap();
+        parked.send(Ok(serde_json::Value::Null)).unwrap();
+        while !matches!(
+            ui.recv_timeout(KEYBIND_TIMEOUT).expect(PARKED_NEVER_DONE),
+            UiAction::Flash(said) if said == PARKED_DONE
+        ) {}
+
+        assert_eq!(reader.sync_mode(true), InputMode::Insert);
+    }
+
+    /// The UI lets the held keys go when the done report arrives. If it came
+    /// before the handler's edit or mode switch, those keys would race them
+    /// all over again.
+    #[test]
+    fn a_keybind_handler_reports_done_after_its_edit_and_mode_switch() {
+        const SESSION: &str = "s1";
+        const VERSION: u64 = 7;
+        const TEXT: &str = "ab";
+        const TAB: &str = "<Tab>";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "accept",
+            r#"
+            maki.keymap.set("i", "<Tab>", function(ev)
+                local st = ev.input
+                maki.ui.input_edit({
+                    start = 0, stop = st.cursor, text = ev.key,
+                    version = st.version, session_id = st.session_id,
+                })
+                maki.ui.set_mode("n")
+            end)
+            "#,
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        let handle = host.event_handle();
+        let ui = host.ui_action_rx();
+
+        let mut pressed = None;
+        assert!(reader.dispatch(
+            Key::parse(TAB).unwrap(),
+            reader.sync_mode(true),
+            None,
+            |t| {
+                let t = t.with_input(serde_json::json!({
+                    "session_id": SESSION, "text": TEXT, "cursor": TEXT.len(), "version": VERSION,
+                }));
+                pressed = Some(t.id());
+                handle.run_keybind_callback(t)
+            }
+        ));
+
+        let Ok(UiAction::Input {
+            req: InputRequest::Edit(edit),
+            reply_tx,
+        }) = ui.recv_timeout(KEYBIND_TIMEOUT)
+        else {
+            panic!("{KEYBIND_NEVER_RAN}");
+        };
+        assert_eq!(
+            (edit.session_id.as_str(), edit.version, edit.edits[0].stop),
+            (SESSION, VERSION, TEXT.len()),
+            "the edit was planned against `ev.input`"
+        );
+        assert_eq!(edit.edits[0].text, TAB, "`ev.key` names the key");
+        reply_tx.send(Ok(serde_json::Value::Null)).unwrap();
+
+        let Ok(UiAction::KeybindDone(done)) = ui.recv_timeout(KEYBIND_TIMEOUT) else {
+            panic!("{KEYBIND_NEVER_DONE}");
+        };
+        assert_eq!(Some(done), pressed);
+        assert_eq!(reader.sync_mode(true), InputMode::Normal);
+    }
+
+    /// The UI runs a fallback only for the key it still holds the later keys
+    /// for, so a second call, or one made after the handler returned, would
+    /// do nothing. The plugin is told so instead of being answered `true`.
+    #[test]
+    fn fallback_asks_once_and_only_while_the_handler_runs() {
+        const PASTED: &str = "pasted";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "fallback",
+            r#"
+            local stashed
+            maki.keymap.set("i", "<Paste>", function(ev)
+                stashed = ev
+                local first = ev.fallback()
+                local _, again = ev.fallback()
+                maki.ui.flash(table.concat({ ev.text, tostring(first), again }, "|"))
+            end)
+            maki.keymap.set("i", "<Tab>", function()
+                local _, late = stashed.fallback()
+                maki.ui.flash(late)
+            end)
+            "#,
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        let handle = host.event_handle();
+        let ui = host.ui_action_rx();
+        let press = |key: Key| {
+            let mut id = None;
+            assert!(reader.dispatch(key, reader.sync_mode(true), None, |t| {
+                let t = t.with_text(PASTED.into());
+                id = Some(t.id());
+                handle.run_keybind_callback(t)
+            }));
+            id.unwrap()
+        };
+        let next = || ui.recv_timeout(KEYBIND_TIMEOUT).expect(KEYBIND_NEVER_RAN);
+
+        let paste = press(PASTE);
+        assert!(matches!(next(), UiAction::KeybindFallback(id) if id == paste));
+        let UiAction::Flash(said) = next() else {
+            panic!("{KEYBIND_NEVER_RAN}");
+        };
+        assert_eq!(said, format!("{PASTED}|true|{FALLBACK_SPENT_ERR}"));
+        assert!(matches!(next(), UiAction::KeybindDone(id) if id == paste));
+
+        let tab = press(Key::parse("<Tab>").unwrap());
+        let UiAction::Flash(said) = next() else {
+            panic!("a late fallback must not reach the UI");
+        };
+        assert_eq!(said, FALLBACK_SPENT_ERR);
+        assert!(matches!(next(), UiAction::KeybindDone(id) if id == tab));
     }
 
     /// `<C-c>` never reaches a binding, so accepting one publishes a mapping
@@ -1722,8 +1987,13 @@ mod tests {
             entry.key
         };
 
-        assert!(reader.dispatch(key_of('g'), |t| handle.run_keybind_callback(t)));
-        assert!(reader.dispatch(key_of('h'), |t| handle.run_keybind_callback(t)));
+        let run = |code| {
+            reader.dispatch(key_of(code), InputMode::Normal, None, |t| {
+                handle.run_keybind_callback(t)
+            })
+        };
+        assert!(run('g'));
+        assert!(run('h'));
 
         wait_for_fired_command(&host);
     }

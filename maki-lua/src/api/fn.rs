@@ -19,6 +19,7 @@ use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use shell_words::join as shell_join;
 
 use crate::api::fs::expand_tilde;
+use crate::api::keymap::{InputMode, KeymapWriter};
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
@@ -1393,6 +1394,23 @@ fn winrestview(
     Ok((Some(true), None))
 }
 
+/// The current mode, like `vim.fn.mode()`: `"i"` while the chat input has
+/// the keyboard and takes typed text, `"n"` otherwise. See
+/// [Modes](/docs/lua-api/#modes). Always `"n"` without a UI.
+///
+/// @return (string) `"n"` or `"i"`.
+/// @example
+/// maki.keymap.set({ "n", "i" }, "<M-m>", function()
+///   maki.ui.set_mode(maki.fn.mode() == "n" and "i" or "n")
+/// end)
+#[lua_fn]
+fn mode(lua: &Lua) -> LuaResult<&'static str> {
+    let mode = lua
+        .app_data_ref::<KeymapWriter>()
+        .map_or(InputMode::Normal, |writer| writer.mode.get());
+    Ok(mode.letter())
+}
+
 lua_table! {
     /// Process and environment helpers, modeled after Neovim's `vim.fn` job
     /// control. Use these to run shell commands, wait for output, and check
@@ -1413,7 +1431,7 @@ lua_table! {
         jobwait(perms, plugin), jobinfo(perms, plugin), joblist(perms, plugin),
         jobattach(perms, plugin), jobfind(perms, plugin),
         executable(perms),
-        winsaveview(tx), winrestview(tx),
+        winsaveview(tx), winrestview(tx), mode,
     ]
 }
 

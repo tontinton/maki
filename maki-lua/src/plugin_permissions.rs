@@ -17,6 +17,9 @@ pub use maki_config::Permission;
 pub(crate) const MANIFEST_FILE: &str = "plugin.toml";
 pub(crate) const NET_HOSTS_KEY: &str = "net_hosts";
 const MIN_MAKI_VERSION: &str = "min_maki_version";
+const PERMISSION_DENIED: &str = "permission denied";
+const PROVIDER_ORIGIN_SHORTFALL: &str =
+    "reaches a provider address only its own plugin, or one granted 'run', may use";
 const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The hosts a plugin declared it talks to, or `None` when it declared no
@@ -44,7 +47,7 @@ pub type OwnedSlugs = Arc<Mutex<Vec<String>>>;
 /// it out made a provider's own `fetch_usage` unreachable for exactly the
 /// users who need it, while the codec went to that very origin with the very
 /// same credentials and was never questioned.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct NetEgress {
     declared: NetHosts,
     providers: OwnedSlugs,
@@ -263,7 +266,7 @@ impl PluginPermissions {
 /// about each provider as the plugin registers it, so a command has to carry
 /// this very value. A fresh one would know none of them and let through the
 /// borrowing it is meant to catch.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PluginReach {
     permissions: PluginPermissions,
     egress: NetEgress,
@@ -288,6 +291,21 @@ impl PluginReach {
 
     pub(crate) fn egress(&self) -> &NetEgress {
         &self.egress
+    }
+
+    /// This reach cut down to {perms}, the part of it an owner says a caller
+    /// has to match. The egress stays, so a `net` among them is still
+    /// weighed host by host.
+    pub(crate) fn only(&self, perms: &[Permission]) -> Self {
+        let mut permissions = PluginPermissions::denied();
+        for &perm in perms {
+            permissions.set(perm, true);
+        }
+        permissions.set_net_hosts(self.permissions.net_hosts());
+        Self {
+            permissions,
+            egress: self.egress.clone(),
+        }
     }
 
     /// Asked when one plugin runs another's command. The handler runs with
@@ -320,20 +338,51 @@ pub enum Missing {
     ProviderOrigin,
 }
 
+impl Missing {
+    /// What the plugin lacks, after the name of what it tried to run.
+    fn shortfall(&self) -> String {
+        match self {
+            Self::Permission(perm) => format!("needs '{perm}'"),
+            Self::Hosts => format!("reaches hosts this plugin's {NET_HOSTS_KEY} leaves out"),
+            Self::ProviderOrigin => PROVIDER_ORIGIN_SHORTFALL.to_owned(),
+        }
+    }
+
+    fn fix(&self) -> Option<String> {
+        let fix = match self {
+            Self::Permission(_) => "grant it",
+            Self::Hosts => "list them",
+            Self::ProviderOrigin => return None,
+        };
+        Some(format!("{fix} in {MANIFEST_FILE} next to the plugin file"))
+    }
+
+    /// The refusal for {name}, short enough to flash: the name, what is
+    /// missing and the fix come first, so a line cut to the screen's width
+    /// still says all three.
+    pub(crate) fn refusal(&self, name: &str) -> String {
+        let shortfall = self.shortfall();
+        match self.fix() {
+            Some(fix) => format!("{name} {shortfall}: {fix}"),
+            None => format!("{name} {shortfall}"),
+        }
+    }
+}
+
 impl fmt::Display for Missing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Permission(perm) => write!(
                 f,
-                "permission denied: '{perm}' not granted for this plugin (grant it in {MANIFEST_FILE} next to the plugin file)"
-            ),
-            Self::Hosts => write!(
-                f,
-                "permission denied: the command reaches hosts this plugin's {NET_HOSTS_KEY} leaves out (list them in {MANIFEST_FILE} next to the plugin file)"
-            ),
-            Self::ProviderOrigin => f.write_str(
-                "permission denied: the command reaches a provider address only its own plugin, or one granted 'run', may use",
-            ),
+                "{PERMISSION_DENIED}: '{perm}' not granted for this plugin"
+            )?,
+            Self::Hosts | Self::ProviderOrigin => {
+                write!(f, "{PERMISSION_DENIED}: the command {}", self.shortfall())?
+            }
+        }
+        match self.fix() {
+            Some(fix) => write!(f, " ({fix})"),
+            None => Ok(()),
         }
     }
 }

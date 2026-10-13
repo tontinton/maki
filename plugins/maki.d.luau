@@ -29,6 +29,7 @@ declare maki: {
     create_autocmd: @checked (event: any, opts: any) -> (number),
     del_autocmd: @checked (id: number) -> (),
     exec_autocmds: @checked (event: any, opts: any) -> (),
+    register_action: @checked (name: string, callback: any, opts: any) -> (),
     declare_slot: @checked (name: string, default: any, opts: any) -> (any),
     set_slot: @checked (name: string, wrapper: any) -> (),
     get_slots: @checked () -> (any),
@@ -66,6 +67,7 @@ declare maki: {
     executable: @checked (name: string) -> (number),
     winsaveview: @checked () -> (any, string?),
     winrestview: @checked (view: any) -> (boolean?, string?),
+    mode: @checked () -> (string),
   },
   fs: {
     read: @checked (path: string, opts: any) -> (string?, string?),
@@ -103,8 +105,8 @@ declare maki: {
     schema_validator: @checked (schema: any) -> (any, string?),
   },
   keymap: {
-    set: @checked (mode: string, lhs: string, rhs: any, opts: any) -> (),
-    del: @checked (mode: string, lhs: string) -> (),
+    set: @checked (mode: any, lhs: string, rhs: any, opts: any) -> (),
+    del: @checked (mode: any, lhs: string, opts: any) -> (),
     normalize: @checked (lhs: string) -> (string?, string?),
   },
   log: {
@@ -197,6 +199,7 @@ declare maki: {
     terminal_size: @checked () -> (any),
     display_width: @checked (text: string) -> (number),
     truncate_text: @checked (text: string, max_width: number) -> (any),
+    set_mode: @checked (mode: string) -> (),
     flash: @checked (msg: string) -> (),
     action: @checked (name: string) -> (boolean?, string?),
     open_editor: @checked (path: string) -> (number),

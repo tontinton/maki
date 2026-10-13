@@ -244,3 +244,7 @@ pub fn settle_parse(app: &mut App) {
             .expect("the parse never finished");
     }
 }
+
+pub fn redo(app: &mut App) -> bool {
+    app.input_box.redo()
+}

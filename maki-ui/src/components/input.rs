@@ -10,7 +10,7 @@ use crate::text_buffer::{EditResult, Mark, Marks, TextBuffer, is_newline_key};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use maki_lua::TextEdit;
+use maki_lua::{InputMode, TextEdit};
 use maki_storage::input_history::InputHistory;
 use std::mem;
 
@@ -61,7 +61,9 @@ pub enum Placeholder {
 }
 
 pub enum InputAction {
-    Submit(Submission),
+    /// Enter sends. The input is still there, so whoever sends it can look at
+    /// it first.
+    Submit,
     ContinueLine,
     Changed,
     Passthrough(KeyEvent),
@@ -72,12 +74,6 @@ pub enum InputAction {
 pub struct Submission {
     pub text: String,
     pub images: Vec<ImageSource>,
-}
-
-impl Submission {
-    pub fn is_empty(&self) -> bool {
-        self.text.is_empty() && self.images.is_empty()
-    }
 }
 
 /// What a chat keeps of the input while another chat has the box.
@@ -107,8 +103,12 @@ pub struct InputBox {
 }
 
 impl InputBox {
-    pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
+    /// In normal mode a key never types or deletes. It still moves the
+    /// cursor, walks the history and sends, and `Enter` always sends, since a
+    /// `\` before the cursor only means a new line while typing.
+    pub fn handle_key(&mut self, key: KeyEvent, mode: InputMode) -> InputAction {
         self.follow_cursor = true;
+        let insert = mode == InputMode::Insert;
 
         match key.code {
             KeyCode::Up if self.is_at_first_line() => {
@@ -121,23 +121,26 @@ impl InputBox {
             }
             KeyCode::Tab | KeyCode::Esc => return InputAction::Passthrough(key),
             _ if is_newline_key(&key) => {
-                self.buffer.add_line();
+                if !insert {
+                    return InputAction::None;
+                }
+                self.newline();
                 return InputAction::ContinueLine;
             }
-            KeyCode::Enter if self.char_before_cursor_is_backslash() => {
+            KeyCode::Enter if insert && self.char_before_cursor_is_backslash() => {
                 self.continue_line();
                 return InputAction::ContinueLine;
             }
-            KeyCode::Enter => {
-                return match self.submit() {
-                    Some(sub) => InputAction::Submit(sub),
-                    None => InputAction::Submit(Submission::default()),
-                };
-            }
+            KeyCode::Enter => return InputAction::Submit,
             _ => {}
         }
 
-        match self.buffer.handle_key(key) {
+        let result = if insert {
+            self.buffer.handle_key(key)
+        } else {
+            self.buffer.handle_motion_key(key)
+        };
+        match result {
             EditResult::Changed => InputAction::Changed,
             EditResult::Moved | EditResult::Ignored => InputAction::None,
         }
@@ -187,13 +190,19 @@ impl InputBox {
     /// middle of a sentence is one step back; a run of typing rewinds word
     /// by word. Cmd+Z is also answered inside the buffer itself, for the
     /// terminals that deliver it; Alt+Z is the portable spelling.
-    pub fn undo(&mut self) -> InputAction {
+    pub fn undo(&mut self) -> bool {
         self.follow_cursor = true;
-        if self.buffer.undo() {
-            InputAction::Changed
-        } else {
-            InputAction::None
-        }
+        self.buffer.undo()
+    }
+
+    pub fn redo(&mut self) -> bool {
+        self.follow_cursor = true;
+        self.buffer.redo()
+    }
+
+    pub fn newline(&mut self) {
+        self.follow_cursor = true;
+        self.buffer.add_line();
     }
 
     pub fn new(history: InputHistory, max_input_lines: u32) -> Self {
@@ -323,7 +332,11 @@ impl InputBox {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buffer.value().trim().is_empty() && self.pending_images.is_empty()
+        self.buffer.value().trim().is_empty() && !self.has_images()
+    }
+
+    pub fn has_images(&self) -> bool {
+        !self.pending_images.is_empty()
     }
 
     /// The text the user is composing. Under an untouched history recall that
@@ -422,26 +435,31 @@ impl InputBox {
         self.buffer.set_value(s);
     }
 
-    pub fn history_up(&mut self) {
+    /// `false` when there is no older entry to recall.
+    pub fn history_up(&mut self) -> bool {
+        self.follow_cursor = true;
         if self.history.is_empty() {
-            return;
+            return false;
         }
         let new_index = match self.history_index {
             None => {
                 self.draft = self.buffer.value().to_owned();
                 self.history.len() - 1
             }
-            Some(0) => return,
+            Some(0) => return false,
             Some(i) => i - 1,
         };
         self.history_index = Some(new_index);
         self.buffer.set_value(self.history.get(new_index).unwrap());
         self.buffer.move_to_end();
+        true
     }
 
-    pub fn history_down(&mut self) {
+    /// `false` when no entry is recalled, so there is nothing newer to go to.
+    pub fn history_down(&mut self) -> bool {
+        self.follow_cursor = true;
         let Some(i) = self.history_index else {
-            return;
+            return false;
         };
         if i + 1 < self.history.len() {
             self.history_index = Some(i + 1);
@@ -450,6 +468,7 @@ impl InputBox {
             self.history_index = None;
             self.buffer.set_value(&mem::take(&mut self.draft));
         }
+        true
     }
 
     /// Returns the screen cell the caret was drawn in, reversed or not.
@@ -1653,7 +1672,7 @@ mod tests {
         assert!(rendered.cursor.is_some(), "{}", CURSOR_ON_THE_EDIT);
     }
 
-    #[test_case(|input| { input.handle_key(KeyCode::Enter.into()); }                  ; "backslash_continuation")]
+    #[test_case(|input| { input.handle_key(KeyCode::Enter.into(), InputMode::Insert); } ; "backslash_continuation")]
     #[test_case(|input| { input.handle_paste("one\ntwo"); }                          ; "multi_line_paste")]
     #[test_case(|input| plugin_write(input, 0..1, "plugin\nwrite")                   ; "plugin_write")]
     fn each_action_undoes_in_one_step(action: fn(&mut InputBox)) {
@@ -1663,10 +1682,10 @@ mod tests {
         input.buffer.move_to_end();
         action(&mut input);
 
-        assert!(matches!(input.undo(), InputAction::Changed));
+        assert!(input.undo());
         assert_eq!(input.buffer.value(), BEFORE);
         assert_eq!(input.buffer.cursor_byte(), BEFORE.len());
-        assert!(matches!(input.undo(), InputAction::None));
+        assert!(!input.undo());
     }
 
     type Rgb = (u8, u8, u8);
@@ -1887,7 +1906,7 @@ mod tests {
     fn the_caret_steps_over_a_chip(lefts: usize, byte: usize, col: u16) {
         let mut input = chip(Reveal::Never);
         for _ in 0..lefts {
-            input.handle_key(KeyCode::Left.into());
+            input.handle_key(KeyCode::Left.into(), InputMode::Insert);
         }
         assert_eq!(input.buffer.cursor_byte(), byte);
         let rendered = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
@@ -1993,7 +2012,7 @@ mod tests {
         assert_eq!(drawn_row(&mut input), format!("{CHEVRON}{CHIP_DRAWN}"));
 
         input.buffer.set_cursor(0, CHIP.end);
-        input.handle_key(KeyCode::Backspace.into());
+        input.handle_key(KeyCode::Backspace.into(), InputMode::Insert);
         assert_eq!(input.buffer.value(), "a  b");
     }
 

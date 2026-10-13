@@ -819,11 +819,12 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
 `"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
-and `"FileIndexReady"`. Plugins can also fire their own events with
-`exec_autocmds`.
+`"ModeChanged"` and `"FileIndexReady"`. Plugins can also fire their own
+events with `exec_autocmds`.
 
 Every host event carries `data.session_id` except `"FileIndexReady"`,
-which is about a directory rather than a session. For `"SessionReset"` and
+which is about a directory rather than a session, and `"ModeChanged"`,
+since the mode is the same in every session. For `"SessionReset"` and
 `"SessionEnd"` that is the session being left behind, the other events
 name the session now running or focused. What each event adds:
 
@@ -879,6 +880,10 @@ name the session now running or focused. What each event adds:
   should return early on it. Fires at most once per frame, and only when
   `data.version` or the caret changed. Focusing another session
   republishes that session's input.
+- `"ModeChanged"`: `data.old_mode` and `data.new_mode`, each `"n"` or
+  `"i"`. Fires whenever `maki.fn.mode()` changes: on `maki.ui.set_mode`,
+  and when the chat input gains or loses the keyboard, as when a picker
+  opens. Use it to draw a mode indicator. Never fires without a UI.
 - `"FileIndexReady"`: `data.root`, the absolute directory that was
   walked, `data.files`, how many paths the walk left, and `data.crashed`
   and `data.truncated`, the two ways that list is not the whole tree.
@@ -989,6 +994,64 @@ maki.api.exec_autocmds("MyEvent", {
   pattern = "init",
   data = { msg = "hello" },
 })
+```
+
+---
+
+### `maki.api.register_action()` {#maki-api-register_action}
+
+```lua
+maki.api.register_action({name}, {callback}, {opts?})
+```
+
+Registers {callback} as an action that `maki.ui.action(name)` runs. This
+is how a user's `init.lua` reaches your plugin, since `require` only sees
+the calling plugin's own files.
+
+{name} is your plugin's name, a dot, and a name of your choice, like
+`"completion.accept"`. In the global or project `init.lua` the prefix is
+`user`, like `"user.paste_plain"`. A plugin named `user` cannot register
+actions, so no plugin can replace the ones a user's keys call.
+
+The callback runs as your plugin, inside the caller's key handler. Return
+`true` when it handled the request, and `false` or nothing when it did not,
+so the caller can try something else. `maki.ui.action` returns that value.
+Registering a name again replaces the callback, so the project `init.lua`
+wins over the global one. The action goes away when your plugin unloads.
+
+The callback runs with all your plugin's permissions, so by default a
+caller must hold all of them too. `opts.capability` lowers that to the
+permissions you list, and `{}` lets any caller in. The callback still runs
+with all of yours and acts on what the caller set up, like the input
+text. Choose a capability that makes the action safe for any caller
+holding only those permissions. `completion.accept` writes file paths
+into the input, so a caller must hold `fs_read`. A caller that falls
+short gets `nil` and an error naming the missing permission, which the
+status bar shows too.
+
+Also bind a default key to the action, for users who never compose keys.
+Plugins load after `init.lua`, so your binding shadows a user's binding
+on the same key. Pick a key that a user who composes keys is unlikely to
+bind, like an Alt chord, over `<Tab>` or `<CR>`.
+
+Throws when {name} has the wrong prefix, or `capability` lists a
+permission your plugin does not hold.
+
+**Parameters:**
+
+- `{name}` (`string`) `"<plugin>.<name>"`, or `"user.<name>"` in `init.lua`.
+- `{callback}` (`function`) Called with no arguments. Return `true` when handled.
+- `{opts?}` (`table|nil`) `{ capability = { "fs_read", ... } }`: what a caller must hold. Default: every permission your plugin holds.
+
+**Example:**
+
+```lua
+-- Inserts a file path, so a caller must be allowed to read files itself:
+maki.api.register_action("completion.accept", function()
+  if not Menu.open() then return false end
+  Menu.accept()
+  return true
+end, { capability = { "fs_read" } })
 ```
 
 ---
@@ -2614,6 +2677,28 @@ the bottom re-pins it so streaming output keeps following.
 maki.fn.winrestview({ topline = 1 })
 ```
 
+---
+
+### `maki.fn.mode()` {#maki-fn-mode}
+
+```lua
+maki.fn.mode()
+```
+
+The current mode, like `vim.fn.mode()`: `"i"` while the chat input has
+the keyboard and takes typed text, `"n"` otherwise. See
+[Modes](/docs/lua-api/#modes). Always `"n"` without a UI.
+
+**Returns:** (`string`) `"n"` or `"i"`.
+
+**Example:**
+
+```lua
+maki.keymap.set({ "n", "i" }, "<M-m>", function()
+  maki.ui.set_mode(maki.fn.mode() == "n" and "i" or "n")
+end)
+```
+
 
 ## maki.fs {#maki-fs}
 
@@ -3591,10 +3676,87 @@ end
 Key mappings, modeled after `vim.keymap`.
 
 ```lua
-maki.keymap.set("n", "<C-t>", function()
+maki.keymap.set({ "n", "i" }, "<C-t>", function()
   print("hello")
 end, { desc = "Say hello" })
 ```
+
+## Modes
+
+As in Neovim, maki is in one mode at a time, and a binding fires only
+in the modes it was set for.
+
+| Mode | When |
+| --- | --- |
+| `"i"` (insert, the default) | The chat input has the keyboard, and keys type into it. |
+| `"n"` (normal) | Everything else: a plugin called `maki.ui.set_mode("n")`, a picker, modal, prompt or focused plugin window has the keyboard, or the chat shown is a finished subagent's transcript. |
+
+In normal mode, keys never type or delete in the chat input. Moving the
+cursor, history, pasting and `<CR>` to send still work.
+
+Bind a shortcut in `{ "n", "i" }` to make it work everywhere, as the
+built-in plugins do. Read the mode with `maki.fn.mode()`, and watch it
+with the `"ModeChanged"` autocmd.
+
+```lua
+-- A tiny vim mode: Esc leaves insert mode, i goes back.
+maki.keymap.set("i", "<Esc>", function() maki.ui.set_mode("n") end)
+maki.keymap.set("n", "i", function() maki.ui.set_mode("i") end)
+
+-- dd deletes the cursor's line. A lone d expires after 500 ms.
+local pending
+maki.keymap.set("n", "d", function(ev)
+  if not pending then
+    pending = maki.defer_fn(function() pending = nil end, 500)
+    return
+  end
+  pending:stop()
+  pending = nil
+  local st = ev.input
+  local head = st.text:sub(1, st.cursor):match("^.*\n")
+  maki.ui.input_edit({
+    start = head and #head or 0,
+    stop = st.text:find("\n", st.cursor + 1, true) or #st.text,
+    text = "", version = st.version, session_id = st.session_id,
+  })
+end)
+```
+
+With this `<Esc>` binding, Rewind's `Esc Esc` works only from normal
+mode.
+
+Older versions fired `"n"` bindings while you typed. See
+[Upgrading old keymaps](/docs/keybindings/#upgrading-old-keymaps).
+
+## Key resolution
+
+Each key runs one handler: the first match in this list, for the
+current mode.
+
+1. `<C-c>` and `<C-z>`. No binding can take them.
+2. maki's modals and prompts, like the permission prompt or `/help`.
+   Each takes every key, except the plan form, which passes on the
+   keys it does not use.
+3. The focused window: its buffer's bindings, then its `win:recv`. It
+   takes every key, so nothing below runs while it has focus.
+4. maki's pickers, the search and the focused message queue, which
+   take every key. The queue answers `<Up>`, `<Down>`, `<CR>` and
+   `<Esc>`. The `/` command list takes only `<Up>`, `<Down>`, `<Tab>`,
+   `<CR>` and `<Esc>`, and `<C-t>` stops here while a plan is ready.
+5. Windows on screen, front first: each one's buffer bindings, then
+   the keys it claimed with the `keys` option of `maki.ui.open_win`.
+6. `<Esc>` while the agent runs, in either mode. maki takes it, and a
+   second one in a row cancels the turn. A popup in step 5 still gets
+   it first.
+7. Global bindings, the last `set` first.
+8. maki's built-in keys and the chat input.
+
+`ev.fallback()` jumps to step 8, or to `win:recv` for a binding on the
+focused window's buffer. `<Paste>` follows the same list.
+
+To share one key between plugins, see
+[Composing keys](/docs/keybindings/#composing-keys).
+
 
 ## Key notation
 
@@ -3621,6 +3783,7 @@ go in angle brackets, after any modifiers.
 | Arrows | `<Up>`, `<Down>`, `<Left>`, `<Right>` | |
 | Navigation | `<Home>`, `<End>`, `<PageUp>`, `<PageDown>`, `<Insert>` | |
 | Function keys | `<F1>` through `<F24>` | |
+| Bracketed paste | `<Paste>` | |
 
 Modifiers are `C-` (control), `M-` (alt) and `S-` (shift), in that
 order: `<C-M-x>`. `Ctrl-`, `Alt-`, `A-` and `Shift-` are accepted as
@@ -3653,41 +3816,87 @@ spellings.
 maki.keymap.set({mode}, {lhs}, {rhs}, {opts?})
 ```
 
-Bind a key to a Lua function, like `vim.keymap.set`. Only normal mode
-(`"n"`) is supported.
+Bind a key to a Lua function, like `vim.keymap.set`.
 
-Bindings are global and belong to the plugin that set them. They stack:
-the last `set` wins, and when that plugin calls `del` or unloads, the
-previous holder gets the key back. Shadowing another plugin's binding logs
-a warning naming both. Setting a key you already hold replaces your
-binding.
+The binding fires only in the [modes](/docs/lua-api/#modes) you list. A
+key bound in `"i"` no longer types, so bind keys like `<Tab>` or `<C-x>`
+there, rarely a letter. [Key resolution](/docs/lua-api/#key-resolution)
+shows which binding gets a key.
 
-For a key a popup should own only while it is on screen, use the `keys`
-option of `maki.ui.open_win` instead.
+Bindings belong to the plugin that set them and stack per mode. The last
+`set` wins and logs a warning naming the plugin it shadows. When that
+plugin calls `del` or unloads, the shadowed binding comes back. Setting a
+key you already hold replaces your binding. The global `init.lua` runs
+first, then the project one, then the built-in plugins and packages, so a
+plugin that binds a key while it loads shadows your `init.lua` on that key.
 
-A handler that runs consumes the key, even if it raises (the error is
-logged). If the plugin has too many callbacks in flight, the key goes to
-maki's built-in binding rather than to the binding underneath.
+With `opts.buffer`, the binding fires only while a window showing that
+buffer is on screen, before any global binding. Use it for the keys of a
+popup. It goes away with the buffer, but a handler that refers to the
+buffer keeps it alive, so `del` it when the popup closes.
 
-`<C-c>` and `<C-z>` are reserved so quit and suspend always work. Binding
-either is an error.
+The handler consumes the key, even when it throws (the error is logged).
+Call `ev.fallback()` to let maki handle the key after all.
+
+While a handler runs, the keys, pastes and clicks after it wait, so its
+edits and `maki.ui.set_mode` are in place before the next key lands. A
+fast `<Esc>dd` with the vim mode in [Modes](/docs/lua-api/#modes) never
+types `dd`. Keys wait one second at most, and stop waiting when another
+window takes the keyboard, like a picker the handler opened. If a
+permission prompt or a question opens meanwhile, the waiting keys are
+dropped so they cannot answer it, and the status bar says so.
+
+When your handler changed the input and a waiting `<CR>` or
+`ev.fallback()` then sends it, the send needs your
+[plugin permissions](/docs/lua-api/#plugin-permissions): `agent` for a
+message, `run` for a `!` shell line, and for a `/` command what
+`maki.api.run_command` needs. Without them the input stays as it is and
+the status bar shows the refusal.
+
+Throws on an invalid mode or key, on `<C-c>` and `<C-z>`, which stay
+reserved for quit and suspend, and on a taken key with `unique`.
 
 **Parameters:**
 
-- `{mode}` (`string`) Mode letter. Currently only `"n"` is accepted.
-- `{lhs}` (`string`) Key in Vim notation, e.g. `"<C-t>"`, `"<Space>"`, `"a"`.
-- `{rhs}` (`function`) Called when the key is pressed. The return value is ignored.
+- `{mode}` (`string|string[]`) `"n"`, `"i"`, or a list of them.
+- `{lhs}` (`string`) Key in Vim notation, e.g. `"<C-t>"`, `"a"`, or `"<Paste>"` for bracketed paste.
+- `{rhs}` (`function`) Called with an event table `ev`. The return value is ignored. `ev` has:
+  - `key` (`string`) the key, in canonical notation.
+  - `input` (`table`) the chat input at the press, as `maki.ui.input` returns it. Pass its `version` and `session_id` to `maki.ui.input_edit`.
+  - `text` (`string?`) `<Paste>` only: the pasted text, with `\n` line endings. maki does not insert it.
+  - `fallback` (`function`) runs maki's own handling of the key, as if no plugin had bound it. Call it once, before the handler returns.
+    - It types, moves or sends in the chat input, or hands the key to a focused window's `win:recv`. It never runs another plugin's binding.
+    - It lands after the handler's earlier `maki.ui` calls and before the waiting keys.
+    - It returns `true` once the key is queued, or `nil` and an error. `true` does not promise the key ran: maki drops it when the waiting keys already went ahead.
 - `{opts?}` (`table?`) Options:
-  - `desc` (`string`) short description shown in the keymap list.
-  - `unique` (`boolean`) fail the call, naming the owner, when anything
-    already maps the key. Default false.
+  - `desc` (`string`) shown next to the key in `/help`.
+  - `unique` (`boolean`) throw, naming the owner, when the key is already
+    bound in one of the modes. Default false.
+  - `buffer` (`Buf`) bind the key only while a window showing this buffer is
+    on screen.
 
 **Example:**
 
 ```lua
-maki.keymap.set("n", "<C-t>", function()
-  print("toggle!")
-end, { desc = "Toggle panel" })
+-- Tab in an empty input starts a review prompt, else it switches plan/build:
+maki.keymap.set("i", "<Tab>", function(ev)
+  local st = ev.input
+  if st.text ~= "" then
+    return ev.fallback()
+  end
+  maki.ui.input_edit({
+    start = 0, stop = 0, text = "Review the staged changes: ",
+    version = st.version, session_id = st.session_id,
+  })
+end)
+
+-- Keys of a popup, live only while it is on screen:
+local buf = maki.ui.buf()
+local win = maki.ui.open_win(buf, { focus = false, width = 20, height = 3 })
+maki.keymap.set("i", "<Esc>", function()
+  maki.keymap.del("i", "<Esc>", { buffer = buf })
+  win:close()
+end, { buffer = buf })
 ```
 
 ---
@@ -3695,26 +3904,29 @@ end, { desc = "Toggle panel" })
 ### `maki.keymap.del()` {#maki-keymap-del}
 
 ```lua
-maki.keymap.del({mode}, {lhs})
+maki.keymap.del({mode}, {lhs}, {opts?})
 ```
 
-Remove your plugin's mapping for {lhs} in {mode}, like `vim.keymap.del`.
-The key goes back to whoever held it before you, or to maki's default
-binding.
+Remove your plugin's binding for {lhs} in {mode}, like `vim.keymap.del`.
+The key goes back to the binding yours shadowed, or to maki's default.
 
-A plugin can only remove its own mappings. If another plugin maps {lhs},
-nothing changes and a warning names that plugin. Does nothing if nothing
-maps {lhs}.
+Only your own bindings go. If another plugin holds {lhs}, nothing
+changes and a warning names it. Only the modes you list are removed: a
+binding set in `{ "n", "i" }` and removed in `"n"` stays in `"i"`.
+Throws on an invalid mode or key.
 
 **Parameters:**
 
-- `{mode}` (`string`) Mode letter (reserved for future modes).
+- `{mode}` (`string|string[]`) `"n"`, `"i"`, or a list of them.
 - `{lhs}` (`string`) Key to unmap, in Vim notation.
+- `{opts?}` (`table?`) Options:
+  - `buffer` (`Buf`) remove the binding set for this buffer instead of the
+    global one.
 
 **Example:**
 
 ```lua
-maki.keymap.del("n", "<C-t>")
+maki.keymap.del({ "n", "i" }, "<C-t>")
 ```
 
 ---
@@ -3928,7 +4140,7 @@ Answers with the new state, in the same shape `get` returns.
 ```lua
 maki.model.set("anthropic/claude-opus-4-6")
 maki.model.set({ spec = "zai/glm-5", thinking = "high" })
-maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
+maki.keymap.set({ "n", "i" }, "<M-t>", function() maki.model.set({ thinking = "" }) end)
 ```
 
 ---
@@ -6263,10 +6475,11 @@ local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 
 Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
 still work. The calls that need a screen behave like this:
 
-- `action`, `input`, and `input_edit` return `nil, "no interactive UI attached"`.
+- `input`, `input_edit`, and `action` on a built-in name return
+  `nil, "no interactive UI attached"`. Plugin actions still run.
 - `open_editor` returns -1.
 - `flash` writes to the log.
-- `open_win`, `set_status_hint`, `set_window_title`, and `input_rules` have no effect.
+- `open_win`, `set_status_hint`, `set_window_title`, `set_mode` and `input_rules` have no effect.
   `input_rules` still throws on a bad rule, so a plugin's tests catch it.
 
 ### Chat input
@@ -6538,6 +6751,36 @@ local t = maki.ui.truncate_text("hello world", 5)
 
 ---
 
+### `maki.ui.set_mode()` {#maki-ui-set_mode}
+
+```lua
+maki.ui.set_mode({mode})
+```
+
+Switches the chat input to normal mode (`"n"`) or insert mode (`"i"`),
+like leaving and entering insert mode in Neovim. See
+[Modes](/docs/lua-api/#modes).
+
+The mode is global and stays until a plugin switches it again. It applies
+at once: `maki.fn.mode()` returns it and the next key is matched against
+it. While a picker, modal or focused window has the keyboard the mode is
+`"n"`, and yours comes back with the keyboard. If your plugin unloads while
+the input is in normal mode, maki switches it back to insert mode.
+
+Throws on any mode but `"n"` and `"i"`.
+
+**Parameters:**
+
+- `{mode}` (`string`) `"n"` or `"i"`.
+
+**Example:**
+
+```lua
+maki.keymap.set("n", "i", function() maki.ui.set_mode("i") end)
+```
+
+---
+
 ### `maki.ui.flash()` {#maki-ui-flash}
 
 ```lua
@@ -6565,38 +6808,75 @@ maki.ui.flash("Copied to clipboard!")
 maki.ui.action({name})
 ```
 
-Runs a built-in UI action by name, exactly as its default keybinding
-would. Handy when a default key never reaches maki because tmux or
-your terminal grabs it first: bind a new key with `maki.keymap.set`
-and call this from it.
+Runs a built-in or plugin action by name, and returns whether it handled
+the request.
 
-Valid names: `"file_picker"`, `"search"`, `"help"`,
-`"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
-`"prev_chat"`, `"next_chat"`, `"model_picker"`, `"input_raw"`.
+A built-in does exactly what its default key does, so you can put it on
+another key, for example when your terminal grabs the default one. It
+needs no permission.
 
-`"input_raw"` has no default key. It switches the chat input between
-drawing what plugins conceal and showing the text under it, which is
-what gets sent. Run it again to switch back.
+| Built-in | What it does | `false` when |
+| --- | --- | --- |
+| `"file_picker"` | Opens the file picker | |
+| `"search"` | Opens message search | |
+| `"help"` | Opens or closes `/help` | |
+| `"model_picker"` | Opens the model picker | |
+| `"plan_toggle"` | Opens or closes the plan form | no plan is ready |
+| `"plan_editor"` | Opens the plan in your editor | there is no plan |
+| `"edit_input"` | Opens the chat input in your editor | |
+| `"pop_queue"` | Removes the first queued message | |
+| `"prev_chat"`, `"next_chat"` | Shows the previous or next chat | |
+| `"input_raw"` | Switches the input between concealed text and the raw text that gets sent | |
+| `"undo"`, `"redo"` | Undoes or redoes one input edit | nothing to undo or redo |
+| `"history_prev"`, `"history_next"` | Recalls the previous or next prompt | at either end of the history |
+| `"newline"` | Inserts a new line | |
 
-There is no action for sending the user's message. To take keys like
-`<CR>` while a popup is open, use the `keys` option of `maki.ui.open_win`.
+`"undo"`, `"redo"`, `"history_prev"`, `"history_next"` and `"newline"`
+edit the chat input. They also run in normal mode, so a vim plugin can
+bind `u` to `"undo"`. They return `false` in a finished subagent's chat,
+which has no input.
 
-For slash commands rather than keybound actions, see
-`maki.api.run_command`.
+A built-in runs in the UI after your earlier `maki.ui` calls, and
+`action` waits for its answer, so an `"undo"` with nothing to undo
+returns `false`. Like the [chat input](#chat-input) calls, it does not
+work while your plugin loads.
+
+A plugin action has a dot in its name, like `"completion.accept"`, and
+comes from `maki.api.register_action`. The ones in your `init.lua` start
+with `user.`. It runs at once, as the plugin that registered it, and your
+plugin must hold the permissions it asks for, by default all of its
+owner's. It returns what the action returned, `true` or `false`.
+
+It returns `nil` and an error, which an `if` treats as not handled, when:
+
+- The action's plugin is not loaded: it is disabled, not installed or
+  unloaded.
+- The action threw.
+- Your plugin lacks a permission the action needs. The status bar shows
+  this too.
+- A built-in runs without a UI.
+
+It throws on a name that cannot be right: no dot and not a built-in, or
+one its loaded plugin never registered.
+
+To try several actions on one key, see
+[Composing keys](/docs/keybindings/#composing-keys). For slash commands,
+see `maki.api.run_command`.
 
 **Parameters:**
 
-- `{name}` (`string`) Action name, e.g. `"file_picker"`.
+- `{name}` (`string`) Action name, e.g. `"file_picker"` or `"completion.accept"`.
 
-**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error for an unknown name or a missing UI.
+**Returns:** (`boolean|nil`, `string|nil`) Whether the action handled it, or nil and an error.
 
 **Example:**
 
 ```lua
--- Open the built-in file picker with Ctrl+Q instead of Ctrl+S:
-maki.keymap.set("n", "<C-q>", function()
-  maki.ui.action("file_picker")
-end)
+-- A vim plugin's undo in normal mode:
+maki.keymap.set("n", "u", function() maki.ui.action("undo") end)
+
+-- A key for a built-in that has none:
+maki.keymap.set({ "n", "i" }, "<M-r>", function() maki.ui.action("input_raw") end)
 ```
 
 ---
@@ -6658,7 +6938,7 @@ and close the window when you are done.
   - `split` (`string`) dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
   - `order` (`integer`) paint order among split windows at the same edge. Default 50.
   - `focus` (`boolean`) whether the window takes keyboard focus on open. Default true.
-  - `keys` (`table`) keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or `maki.keymap.set` bindings. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
+  - `keys` (`table`) keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. The older way to give a popup keys: `maki.keymap.set` with `{ buffer = buf }` does the same with a handler per key, a mode, and `ev.fallback()`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or global `maki.keymap.set` bindings. The window's buffer bindings are asked first. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
   - `visible` (`boolean`) whether the window is initially visible. Default true. See `win:hide()` for what hiding does.
   - `needs_input` (`boolean`) whether the window means the session needs user input. Default false.
   - `stack` (`boolean`) offset the window past the other stacked windows sharing its anchor, in open order, with a one row gap. Closing one moves the rest up. Floating windows only. Default false.

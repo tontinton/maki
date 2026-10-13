@@ -35,11 +35,12 @@ use maki_config::RawConfig;
 use maki_providers::plugin::DeclAuthority;
 use maki_storage::id::{MakiId, SessionRef};
 
+use crate::api::action::{ActionStore, clear_plugin_actions};
 use crate::api::autocmd::AutocmdStore;
 use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::fs::publish_walks;
 use crate::api::keymap::KeymapReader;
-use crate::api::keymap::{KeybindTicket, KeymapStore, KeymapWriter};
+use crate::api::keymap::{KeybindTicket, KeymapStore, KeymapWriter, release_mode};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
 use crate::api::plan::{
     PlanRowHandlers, RowOwners, clear_menu_generation, clear_plugin_rows, clear_session_rows,
@@ -62,6 +63,7 @@ use crate::api::util::command::{
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
+use crate::api::util::pair::{Pair, err_pair};
 use crate::api::util::setup::ConfigStore;
 use crate::api::{Owner, create_maki_global};
 use crate::background::BackgroundSessions;
@@ -101,8 +103,9 @@ const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub const KILL_GRACE: Duration = Duration::from_millis(500);
 /// A slice is one poll of a task, the stretch where it holds the one Lua
 /// thread and every plugin, keymap and the UI wait behind it. A slice this
-/// long gets a log line naming the plugin, so its author knows to yield.
-const SLICE_WARN: Duration = Duration::from_secs(1);
+/// long gets a log line naming the plugin, so its author knows to yield. The
+/// UI waits just as long for a key handler before it lets the next keys go.
+pub const SLICE_WARN: Duration = Duration::from_secs(1);
 /// A slice this long is raised even with no deadline in sight. A deadline
 /// caps how long a task runs in total, this caps how long it starves the rest.
 const SLICE_KILL: Duration = Duration::from_secs(5);
@@ -118,12 +121,11 @@ const OPT_LEVEL_JIT: u8 = 2;
 const OPT_LEVEL_DEBUGGABLE: u8 = 1;
 const DEBUG_INFO_FULL: u8 = 2;
 const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
-/// How long a keystroke waits for its handler before the host stops holding
-/// one of the plugin's in-flight slots and one drain-barrier slot for it. Long
-/// enough for a handler that makes a round-trip or two, short enough that eight
-/// parked ones do not take the plugin's keys away for the rest of the run, nor
-/// a picker left open hold up a `/reload`.
-const KEYBIND_TICKET_HOLD: Duration = Duration::from_secs(10);
+/// How long a keystroke's handler holds a drain-barrier slot. Long enough for
+/// a handler that makes a round-trip or two, short enough that a picker left
+/// open does not hold up a `/reload`.
+const KEYBIND_GATE_HOLD: Duration = Duration::from_secs(10);
+pub(crate) const FALLBACK_SPENT_ERR: &str = "fallback already ran, or the key handler has returned";
 /// Async tasks spawned during restore may spawn further tasks; cap the rounds.
 const RESTORE_SPAWN_ROUNDS: usize = 8;
 /// Keeps a buggy plugin's restore task from freezing the lua loop.
@@ -1324,6 +1326,19 @@ fn interrupt_reason(state: *mut ffi::lua_State) -> Option<Cow<'static, str>> {
 #[derive(Default)]
 pub(crate) struct PluginEnvs(HashMap<Arc<str>, usize>);
 
+/// Whether {plugin} has a load in place: from the moment its chunks start
+/// running until it is unloaded.
+pub(crate) fn plugin_loaded(lua: &Lua, plugin: &str) -> bool {
+    lua.app_data_ref::<PluginEnvs>()
+        .is_some_and(|envs| envs.0.contains_key(plugin))
+}
+
+/// Whether any plugin with a load in place passes {test}.
+pub(crate) fn any_plugin_loaded(lua: &Lua, mut test: impl FnMut(&str) -> bool) -> bool {
+    lua.app_data_ref::<PluginEnvs>()
+        .is_some_and(|envs| envs.0.keys().any(|plugin| test(plugin)))
+}
+
 /// Lets the watchdog tell the user which plugin it stopped. It flashes
 /// instead of going through `maki.notify`, because a notify handler is
 /// plugin code too. If that handler were the one stuck, every kill would
@@ -1331,7 +1346,11 @@ pub(crate) struct PluginEnvs(HashMap<Arc<str>, usize>);
 struct HostUi(Option<flume::Sender<UiAction>>);
 
 fn host_flash(lua: &Lua, msg: String) {
-    let _ = ui_send(host_ui(lua).as_ref(), UiAction::Flash(msg));
+    host_ui_send(lua, UiAction::Flash(msg));
+}
+
+fn host_ui_send(lua: &Lua, action: UiAction) {
+    let _ = ui_send(host_ui(lua).as_ref(), action);
 }
 
 /// For host code that has the VM but no `#[ctx]` sender of its own.
@@ -2359,35 +2378,44 @@ fn spawn_deferred_callback(
 /// meantime approves its default answer. Fall-through is the host's decision,
 /// taken on the UI thread before any of this runs.
 ///
-/// The budget slot and the handler are two tasks, because they are two
-/// lifetimes. A key that opens a float and loops on `win:recv()` runs for as
-/// long as the user keeps it up, and a deadline on the handler would close the
-/// session browser under them. The ticket goes once the handler is done or
-/// after [`KEYBIND_TICKET_HOLD`], whichever is first: holding it to the end
-/// means eight presses that park take every key the plugin binds away for the
-/// rest of the run.
+/// Every way out ends in [`report_keybind_done`], because the UI holds the keys
+/// typed after this one until it hears back. It lets them go after a second
+/// anyway, so a report lost to a dying host only costs that second.
 ///
-/// A [`GateGuard`] rides along with the ticket, the way [`run_host_hook`] takes
-/// one, so a `/reload` waiting on [`drain_barrier`] cannot land in the middle
-/// of a handler. It is bounded by the same hold rather than by the handler,
-/// because a picker the user left open would otherwise hold the barrier for as
-/// long as it is on screen - which is why a command handler takes no guard at
-/// all.
+/// `ev.fallback()` is spent once the handler returns. The UI would ignore a
+/// late one anyway, because it only runs the fallback of the key it is still
+/// holding for, but the plugin deserves to hear that it did nothing.
+///
+/// The handler and its drain-barrier slot are two tasks, because they live
+/// for different times. A [`GateGuard`] goes with the keystroke, the way
+/// [`run_host_hook`] takes one, so a `/reload` waiting on [`drain_barrier`]
+/// cannot land in the middle of a handler. But a key that opens a float and
+/// loops on `win:recv()` runs for as long as the user keeps it up, and a
+/// picker left open would then hold up the barrier with it. So the guard goes
+/// after [`KEYBIND_GATE_HOLD`] even if the handler is still running, which is
+/// also why a command handler takes no guard at all.
 fn spawn_keybind_callback(
     lua: &Lua,
     ex: &Rc<smol::LocalExecutor<'_>>,
     gate: &Rc<InflightGate>,
     ticket: KeybindTicket,
 ) {
-    let key = ticket.key();
+    let (id, key) = (ticket.id(), ticket.key());
+    let plugin = Arc::clone(ticket.plugin());
     if !ticket.plugin_live() {
-        tracing::warn!(?key, plugin = %ticket.plugin(), "keybind key dropped: plugin unloaded");
+        tracing::warn!(key = %key.notation(), ticket = id, plugin = %plugin, "keybind key dropped: plugin unloaded");
+        report_keybind_done(lua, id);
         return;
     }
-    let func = match lua.registry_value::<Function>(ticket.callback()) {
-        Ok(func) => func,
+    let spent = Arc::new(AtomicBool::new(false));
+    let call = lua
+        .registry_value::<Function>(ticket.callback())
+        .and_then(|func| Ok((func, keybind_event(lua, &ticket, Arc::clone(&spent))?)));
+    let (func, ev) = match call {
+        Ok(call) => call,
         Err(e) => {
-            tracing::warn!(?key, error = %e, "keybind key dropped: callback missing");
+            tracing::warn!(key = %key.notation(), ticket = id, plugin = %plugin, error = %e, "keybind key dropped: callback unreachable");
+            report_keybind_done(lua, id);
             return;
         }
     };
@@ -2395,30 +2423,65 @@ fn spawn_keybind_callback(
     // may hand the slot back before the hold lapses.
     let (done_tx, done_rx) = flume::bounded::<()>(1);
     let handler_lua = lua.clone();
-    let plugin = Arc::clone(ticket.plugin());
+    let handler_plugin = Arc::clone(&plugin);
     ex.spawn(async move {
         let _done = done_tx;
-        if let Err(e) = run_detached(&handler_lua, func.call_async::<LuaValue>(())).await {
-            tracing::warn!(?key, plugin = %plugin, error = %strip_traceback(&e), "keybind callback failed, key spent");
+        if let Err(e) = run_detached(&handler_lua, func.call_async::<LuaValue>(ev)).await {
+            tracing::warn!(key = %key.notation(), ticket = id, plugin = %handler_plugin, error = %strip_traceback(&e), "keybind callback failed, key spent");
         }
+        spent.store(true, Ordering::Release);
+        report_keybind_done(&handler_lua, id);
     })
     .detach();
     let gate = Rc::clone(gate);
     ex.spawn(async move {
         let _guard = GateGuard::new(&gate);
-        let _ticket = ticket;
         futures_lite::future::or(
             async {
                 let _ = done_rx.recv_async().await;
             },
             async {
-                smol::Timer::after(KEYBIND_TICKET_HOLD).await;
-                tracing::warn!(?key, "keybind handler outlived its budget slot");
+                smol::Timer::after(KEYBIND_GATE_HOLD).await;
+                tracing::warn!(key = %key.notation(), ticket = id, plugin = %plugin, "keybind handler outlived its drain-barrier slot");
             },
         )
         .await;
     })
     .detach();
+}
+
+/// The `ev` a keybind handler is called with.
+///
+/// `fallback` only asks. The UI runs it as the host's own handling of the key
+/// it holds the later keys for, so it lands after every `maki.ui.*` call the
+/// handler made before it and before any key typed after this one.
+fn keybind_event(lua: &Lua, ticket: &KeybindTicket, spent: Arc<AtomicBool>) -> mlua::Result<Table> {
+    let ev = lua.create_table()?;
+    ev.set("key", ticket.key().notation())?;
+    if let Some(input) = ticket.input() {
+        ev.set("input", json_to_lua(lua, input)?)?;
+    }
+    if let Some(text) = ticket.text() {
+        ev.set("text", text)?;
+    }
+    let id = ticket.id();
+    let fallback = lua.create_function(move |lua, ()| -> mlua::Result<Pair<bool>> {
+        if spent.swap(true, Ordering::AcqRel) {
+            return Ok(err_pair(FALLBACK_SPENT_ERR));
+        }
+        host_ui_send(lua, UiAction::KeybindFallback(id));
+        Ok((Some(true), None))
+    })?;
+    ev.set("fallback", fallback)?;
+    Ok(ev)
+}
+
+/// The UI lets the keys typed after {ticket} go once this arrives, so it has
+/// to come after everything the handler did. It does for free: it shares the
+/// channel with every `maki.ui.*` call, `input_edit` waits for its answer,
+/// and `set_mode` is in place the moment it returns.
+fn report_keybind_done(lua: &Lua, ticket: u64) {
+    host_ui_send(lua, UiAction::KeybindDone(ticket));
 }
 
 fn spawn_async_task(
@@ -2667,6 +2730,7 @@ impl LuaRuntime {
             layered,
         });
         lua.set_app_data(KeymapStore::new());
+        lua.set_app_data(ActionStore::default());
         lua.set_app_data(keymap_writer);
         lua.set_app_data(HintStore::new());
         lua.set_app_data(WinStore::default());
@@ -2760,6 +2824,8 @@ impl LuaRuntime {
         // A row stays on screen with the layer that drew it gone, but its
         // handler captured the permissions the user just revoked.
         clear_plugin_rows(&self.lua, name);
+        clear_plugin_actions(&self.lua, name);
+        release_mode(&self.lua, name);
         let mut revision_guard = None;
         if let Some(owner) = self.plugins.borrow_mut().remove(name) {
             revision_guard = owner.revision_guard;

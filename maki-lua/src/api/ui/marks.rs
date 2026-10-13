@@ -405,6 +405,7 @@ mod tests {
     };
     use crate::api::ui::{NS_REQUIRED_ERR, RULE_HALVES_ERR, SYNTAX_ALONE_ERR, create_ui_table};
     use crate::api::util::convert::UNKNOWN_FIELD_ERR;
+    use crate::plugin_permissions::{PluginPermissions, PluginReach};
     use mlua::Lua;
     use test_case::test_case;
 
@@ -422,7 +423,13 @@ mod tests {
         let lua = Lua::new();
         let (store, reader) = InputRuleStore::new();
         lua.set_app_data(store);
-        let ui = create_ui_table(&lua, None, Arc::from(PLUGIN)).unwrap();
+        let ui = create_ui_table(
+            &lua,
+            None,
+            Arc::from(PLUGIN),
+            PluginReach::new(PluginPermissions::trusted()),
+        )
+        .unwrap();
         lua.globals().set("ui", ui).unwrap();
         (lua, reader)
     }
