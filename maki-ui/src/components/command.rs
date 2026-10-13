@@ -576,6 +576,10 @@ impl CommandPalette {
         self.lua_commands.iter().find(|c| c.name.as_ref() == name)
     }
 
+    pub fn lua_commands(&self) -> &[LuaCommandInfo] {
+        &self.lua_commands
+    }
+
     pub fn view(
         &mut self,
         frame: &mut Frame,

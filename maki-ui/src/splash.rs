@@ -2,6 +2,7 @@ use crate::components::keybindings::key;
 use crate::repaint::{Cadence, Dirty};
 use crate::theme::{self, lerp_u8};
 use crate::update;
+use maki_lua::LuaCommandInfo;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -18,27 +19,72 @@ const HELP_SEGMENTS: &[(&str, bool)] = &[
     (" in chat", false),
 ];
 
-const TIPS: &[(&str, &str)] = &[
+/// Label, description, and the plugin command the tip relies on. When that
+/// plugin is turned off, the tip would point at nothing, so we skip it.
+type Tip = (&'static str, &'static str, Option<&'static str>);
+
+const TIPS: &[Tip] = &[
     (
         key::FILE_PICKER.label,
         "to grab file paths with fuzzy search",
+        None,
     ),
-    (key::SEARCH.label, "to find things in the conversation"),
-    (key::MODEL_PICKER.label, "to switch models mid-session"),
-    (key::EDIT_INPUT.label, "to write your prompt in $EDITOR"),
-    ("Tab", "to toggle plan mode"),
-    ("Esc Esc", "to rewind to an earlier prompt"),
-    ("!cmd", "to run a shell command and share its output"),
-    ("!!cmd", "to run a shell command without telling the agent"),
-    (key::TASKS.label, "to see what your subagents are up to"),
-    ("/btw", "to ask something without interrupting the session"),
-    ("/memory", "to view, edit, and delete persistent notes"),
-    ("/cd", "to switch to a different directory"),
-    (key::SESSIONS.label, "to pick up where you left off"),
-    ("/compact", "with a hint to steer what gets kept"),
-    ("/thinking", "to set how hard the model thinks"),
-    ("/workflow", "to let code_execution spawn subagents"),
-    ("/reload", "to apply plugin and config changes"),
+    (
+        key::SEARCH.label,
+        "to find things in the conversation",
+        None,
+    ),
+    (
+        key::MODEL_PICKER.label,
+        "to switch models mid-session",
+        None,
+    ),
+    (
+        key::EDIT_INPUT.label,
+        "to write your prompt in $EDITOR",
+        None,
+    ),
+    ("Tab", "to toggle plan mode", None),
+    ("Esc Esc", "to rewind to an earlier prompt", None),
+    ("!cmd", "to run a shell command and share its output", None),
+    (
+        "!!cmd",
+        "to run a shell command without telling the agent",
+        None,
+    ),
+    (
+        key::TASKS.label,
+        "to see what your subagents are up to",
+        Some("/tasks"),
+    ),
+    (
+        "/btw",
+        "to ask something without interrupting the session",
+        None,
+    ),
+    (
+        "/memory",
+        "to view, edit, and delete persistent notes",
+        Some("/memory"),
+    ),
+    ("/cd", "to switch to a different directory", None),
+    (
+        key::SESSIONS.label,
+        "to pick up where you left off",
+        Some("/sessions"),
+    ),
+    ("/compact", "with a hint to steer what gets kept", None),
+    (
+        "/thinking",
+        "to set how hard the model thinks",
+        Some("/thinking"),
+    ),
+    (
+        "/workflow",
+        "to let code_execution spawn subagents",
+        Some("/tasks"),
+    ),
+    ("/reload", "to apply plugin and config changes", None),
 ];
 
 const COLOR_TRANSITION_SECS: f32 = 0.4;
@@ -143,7 +189,7 @@ pub struct Splash {
     start: Instant,
     field_offset: f32,
     animate: bool,
-    tip_idx: usize,
+    tip_seed: usize,
     latest_version: Option<&'static str>,
 }
 
@@ -157,12 +203,12 @@ impl Splash {
     pub fn new(animate: bool) -> Self {
         let mut rng = [0u8; 8];
         getrandom::fill(&mut rng).ok();
-        let tip_idx = u32::from_le_bytes([rng[4], rng[5], rng[6], rng[7]]) as usize % TIPS.len();
+        let tip_seed = u32::from_le_bytes([rng[4], rng[5], rng[6], rng[7]]) as usize;
         Self {
             start: Instant::now(),
             field_offset: (u64::from_le_bytes(rng) % 10_000) as f32,
             animate,
-            tip_idx,
+            tip_seed,
             latest_version: None,
         }
     }
@@ -189,7 +235,13 @@ impl Splash {
         )
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer, accent: Color) {
+    pub fn render(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        accent: Color,
+        lua_commands: &[LuaCommandInfo],
+    ) {
         if area.width < 20 || area.height < 5 {
             return;
         }
@@ -213,7 +265,7 @@ impl Splash {
         self.render_logo(area, buf, t, fade, top_y, accent);
         render_centered_faded(area, buf, fade, 0.75, tag_y, TAGLINE);
         self.render_help(area, buf, fade, help_y, accent);
-        self.render_tip(area, buf, fade, tip_y, accent);
+        self.render_tip(area, buf, fade, tip_y, accent, lua_commands);
         render_version(area, buf, fade, area.y, self.latest_version);
     }
 
@@ -416,16 +468,25 @@ impl Splash {
         render_segments(area, buf, help_y, x_start, &segments);
     }
 
-    fn render_tip(&self, area: Rect, buf: &mut Buffer, fade: f32, tip_y: u16, accent: Color) {
+    fn render_tip(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        fade: f32,
+        tip_y: u16,
+        accent: Color,
+        lua_commands: &[LuaCommandInfo],
+    ) {
         if tip_y >= area.y + area.height {
             return;
         }
-
+        let Some(&(label, desc, _)) = pick_tip(self.tip_seed, lua_commands) else {
+            return;
+        };
         let theme = theme::current();
         let bg = theme.background;
         let tip_fg = theme.todo_in_progress.fg.unwrap_or(Color::Yellow);
 
-        let (label, desc) = TIPS[self.tip_idx];
         let total_width = (5 + label.len() + 1 + desc.len()) as u16;
         let x_start = area.x + area.width.saturating_sub(total_width) / 2;
 
@@ -441,6 +502,15 @@ impl Splash {
 
         render_segments(area, buf, tip_y, x_start, segments);
     }
+}
+
+fn pick_tip(seed: usize, lua_commands: &[LuaCommandInfo]) -> Option<&'static Tip> {
+    let available = || {
+        TIPS.iter().filter(|(_, _, needs)| {
+            needs.is_none_or(|name| lua_commands.iter().any(|c| c.name.as_ref() == name))
+        })
+    };
+    available().nth(seed % available().count().max(1))
 }
 
 fn render_version(area: Rect, buf: &mut Buffer, fade: f32, y: u16, new_version: Option<&str>) {
@@ -556,11 +626,29 @@ mod tests {
     const UNPOLLED: &str = "an unpolled version must not appear on screen";
     const POLLED: &str = "a polled version must appear on screen";
 
+    const THINKING_COMMAND: &str = "/thinking";
+
     fn rendered(splash: &Splash) -> String {
         let area = Rect::new(0, 0, 80, 20);
         let mut buf = Buffer::empty(area);
-        splash.render(area, &mut buf, Color::Blue);
+        splash.render(area, &mut buf, Color::Blue, &[]);
         buffer_text(&buf)
+    }
+
+    #[test_case(false ; "hidden_while_its_plugin_is_disabled")]
+    #[test_case(true  ; "shown_once_its_plugin_registered_the_command")]
+    fn plugin_tip_follows_its_command(loaded: bool) {
+        let thinking = [LuaCommandInfo {
+            name: THINKING_COMMAND.into(),
+            description: "".into(),
+            plugin: "thinking".into(),
+            max_args: 0,
+        }];
+        let lua_commands: &[LuaCommandInfo] = if loaded { &thinking } else { &[] };
+        let shown = (0..TIPS.len()).any(|seed| {
+            pick_tip(seed, lua_commands).is_some_and(|(label, ..)| *label == THINKING_COMMAND)
+        });
+        assert_eq!(shown, loaded);
     }
 
     /// The check answers on its own, so the notice only reaches the screen
@@ -644,7 +732,7 @@ todo_in_progress = { fg = "yellow" }
         splash.start -= Duration::from_secs_f32(FADE_DURATION);
         let area = Rect::new(0, 0, 80, 20);
         let mut buf = Buffer::empty(area);
-        splash.render(area, &mut buf, Color::Blue);
+        splash.render(area, &mut buf, Color::Blue, &[]);
 
         let rgb = buf
             .content

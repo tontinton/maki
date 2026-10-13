@@ -44,7 +44,7 @@ use maki_agent::{
     BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND, SharedBuf,
     ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
-use maki_lua::{EventHandle, WARM_TOOL_CAP, WinView};
+use maki_lua::{EventHandle, LuaCommandInfo, WARM_TOOL_CAP, WinView};
 use maki_storage::id::{MakiId, SessionRef};
 
 use ratatui::Frame;
@@ -852,6 +852,7 @@ impl MessagesPanel {
         area: Rect,
         has_selection: bool,
         images_visible: bool,
+        lua_commands: &[LuaCommandInfo],
     ) {
         self.viewport_height = area.height;
         let width = area.width.saturating_sub(1);
@@ -871,7 +872,8 @@ impl MessagesPanel {
         self.cache.truncate(self.live_start);
         if self.show_idle_splash() {
             let accent = self.accent.resolve();
-            self.idle_splash.render(area, frame.buffer_mut(), accent);
+            self.idle_splash
+                .render(area, frame.buffer_mut(), accent, lua_commands);
             return;
         }
 

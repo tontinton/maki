@@ -2251,7 +2251,7 @@ fn page_keys_scroll_the_transcript_by_one_page() {
     let backend = ratatui::backend::TestBackend::new(area.width, area.bottom());
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| app.active_chat().view(frame, area, false, true))
+        .draw(|frame| app.active_chat().view(frame, area, false, true, &[]))
         .unwrap();
     let down = app.active_chat().win_view();
     assert_eq!(
@@ -2351,7 +2351,7 @@ fn app_with_transcript(zone: Rect) -> App {
     let backend = ratatui::backend::TestBackend::new(zone.width, zone.bottom());
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| app.active_chat().view(frame, zone, false, true))
+        .draw(|frame| app.active_chat().view(frame, zone, false, true, &[]))
         .unwrap();
     app
 }

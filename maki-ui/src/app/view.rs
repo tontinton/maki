@@ -185,6 +185,7 @@ impl App {
             layout.msg_area,
             self.selection_state.is_some(),
             images_visible,
+            self.command_palette.lua_commands(),
         );
     }
 

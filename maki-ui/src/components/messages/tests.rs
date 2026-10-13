@@ -326,7 +326,7 @@ fn render_sel(
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
         .draw(|f| {
-            panel.view(f, f.area(), has_selection, true);
+            panel.view(f, f.area(), has_selection, true, &[]);
         })
         .unwrap();
     terminal

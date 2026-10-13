@@ -18,7 +18,7 @@ use maki_agent::{
     AgentEvent, BufferSnapshot, SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
-use maki_lua::WinView;
+use maki_lua::{LuaCommandInfo, WinView};
 use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
 use maki_storage::id::MakiId;
 use ratatui::Frame;
@@ -341,9 +341,10 @@ impl Chat {
         area: Rect,
         has_selection: bool,
         images_visible: bool,
+        lua_commands: &[LuaCommandInfo],
     ) {
         self.messages_panel
-            .view(frame, area, has_selection, images_visible);
+            .view(frame, area, has_selection, images_visible, lua_commands);
     }
 
     pub fn scroll_pos(&self) -> ScrollPos {
