@@ -1,20 +1,16 @@
 [package]
 name = "maki"
 version.workspace = true
-edition = "2024"
-authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
+edition.workspace = true
+authors.workspace = true
 description = "AI coding agent. Native Rust TUI. Immediate startup, 60 FPS, low memory."
-license = "MIT"
-repository = "https://github.com/tontinton/maki"
+license.workspace = true
+repository.workspace = true
 homepage = "https://maki.sh"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "tui", "coding"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.99"
-
-[[bin]]
-name = "maki"
-path = "src/main.rs"
+rust-version.workspace = true
 
 [lints]
 workspace = true
@@ -55,17 +51,17 @@ members = [
   "maki-acp",
   "maki-agent",
   "maki-config",
+  "maki-config-macro",
   "maki-docgen",
   "maki-highlight",
   "maki-interpreter",
   "maki-lua",
+  "maki-lua-macro",
   "maki-markdown",
   "maki-otel",
   "maki-pack",
   "maki-providers",
   "maki-storage",
-  "maki-config-macro",
-  "maki-lua-macro",
   "maki-ui",
 ]
 resolver = "3"
@@ -200,7 +196,6 @@ notify-rust = "4.18.1"
 serde_yaml = "0.9"
 shell-words = "1"
 agent-client-protocol-schema = "1.10"
-
 wait-timeout = "0.2"
 inventory = "0.3"
 
