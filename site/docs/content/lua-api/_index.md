@@ -63,6 +63,7 @@ permission raises `permission denied: '<name>' not granted for this plugin`.
 - `net`: outbound network requests
 - `run`: starting processes
 - `env`: reading the process environment, where secrets live
+- `agent`: prompting the model on its own, outside a tool call
 
 Grants come from a `plugin.toml` next to the Lua file (for
 `~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
@@ -76,6 +77,7 @@ fs_write = true
 net = true
 run = true
 env = true
+agent = true
 ```
 
 The rules:
@@ -1479,19 +1481,20 @@ Without a `ctx`, `maki.agent.session({ session = id, ... })` opens a
 background session. It borrows the model, permissions and MCP of the live
 chat session `id` and is not tied to any turn. Call it and its `:prompt()`
 from a task: a `maki.async.spawn` task, an autocmd callback or a tool
-handler.
+handler. This form needs the `agent` plugin permission, because it spends
+outside any turn the user started.
 
-It ends at the first of these:
+`scope` says how long it lives. `"task"`, the default, ends it with the
+task that opened it: an autocmd callback when it returns, a tool handler
+with its tool call, a `maki.async.spawn` task when it finishes.
+`"session"` skips that. Both end at `:close()`, when the chat session
+ends (`/new`, closing the tab) and when the plugin unloads (`/reload`).
+Turn ends, Esc and rewinds leave it alone. Esc on a tool call still
+cancels a prompt that the tool's handler is waiting on.
 
-- the task that opened it ends (an autocmd callback when it returns, a tool
-  handler with its tool call)
-- `:close()`
-- the chat session ends (`/new`, closing the tab)
-- the plugin unloads (`/reload`)
-
-Open long-running monitors from `maki.async.spawn`. Turn ends, Esc and
-rewinds leave them alone. Esc on a tool call still cancels a prompt that
-the tool's handler is waiting on.
+A polling monitor opens one per round inside a `maki.async.spawn` loop. An
+event-driven one opens with `scope = "session"` once, keeps the handle and
+prompts it from autocmd callbacks.
 
 Nobody can answer its permission prompts, so a call that would prompt is
 denied and the subagent is told why. Your rules, "allow for this session"
@@ -1513,6 +1516,8 @@ no live chat session, so opening one fails with "session not live". The
   - `session` (`string`) required without a ctx: id of the live chat session
     that owns it. Returns `(nil, "session not live: <id>")` once that
     session has ended.
+  - `scope` (`string?`) only without a ctx: `"task"` (default) or
+    `"session"`, see above.
   - `model_spec` (`string?`) model spec string to use instead of the parent model.
   - `system` (`string?`) system prompt. Defaults to empty.
   - `tools` (`table?`) tool definitions array (from `maki.agent.tools()`).
@@ -1555,19 +1560,21 @@ if prompt_err then error(prompt_err) end
 
 ---
 
-### `maki.agent.background()` {#maki-agent-background}
+### `maki.agent.list()` {#maki-agent-list}
 
 ```lua
-maki.agent.background({opts})
+maki.agent.list({opts})
 ```
 
-List the open background sessions of a chat session.
+List the subagent sessions plugins opened on a chat session with
+`maki.agent.session({ session = id })`.
 
 Each entry has these fields:
 - `id` (`string`) Session id.
+- `session` (`string`) Chat session it belongs to.
 - `plugin` (`string`) Plugin that opened it.
 - `name` (`string`) Name given at open.
-- `status` (`string`) `"running"` during a `:prompt()`, otherwise `"idle"`.
+- `status` (`string`) `"working"` during a `:prompt()`, otherwise `"idle"`.
 - `started_at` (`integer`) Unix seconds.
 - `cost` (`number?`) Dollars billed so far, updated after each turn. nil until
   a priced turn ends.
@@ -1582,7 +1589,7 @@ Each entry has these fields:
 **Example:**
 
 ```lua
-for _, s in ipairs(maki.agent.background({ session = id })) do
+for _, s in ipairs(maki.agent.list({ session = id })) do
   print(s.plugin, s.name, s.status, os.time() - s.started_at)
 end
 ```

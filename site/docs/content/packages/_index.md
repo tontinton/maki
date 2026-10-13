@@ -152,6 +152,7 @@ fs_write = true
 net = true
 run = true
 env = true
+agent = true
 ```
 
 The manifest states what the package wants, and Maki asks about new permissions

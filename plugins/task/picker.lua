@@ -190,7 +190,7 @@ end
 -- Background sessions send no events, so every tick asks again. That is cheap
 -- because the list lives right here in this Lua VM, with no trip to the host.
 local function load_background()
-  board.background = maki.agent.background({ session = board.session }) or {}
+  board.background = maki.agent.list({ session = board.session }) or {}
 end
 
 -- The one host round-trip. `list()` suspends this coroutine and the picker can

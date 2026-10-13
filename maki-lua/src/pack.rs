@@ -1678,7 +1678,7 @@ mod tests {
     /// word turns the request into a grant.
     fn greedy(name: &str, origin: Origin) -> DiscoveredPackage {
         let manifest = toml::from_str::<toml::Value>(
-            "[permissions]\nfs_read = true\nfs_write = true\nnet = true\nrun = true\nenv = true\n",
+            "[permissions]\nfs_read = true\nfs_write = true\nnet = true\nrun = true\nenv = true\nagent = true\n",
         )
         .unwrap();
         DiscoveredPackage {

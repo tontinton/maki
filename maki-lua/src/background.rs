@@ -1,6 +1,7 @@
 //! Subagent sessions a plugin opened by chat session id instead of a tool
-//! ctx. One lives until the first of: the Lua task that opened it ends (a
-//! plugin unload ends its tasks too), its chat session ends, or it is closed.
+//! ctx. One lives until the first of: the Lua task that opened it ends (only
+//! under task scope), its chat session ends, its plugin unloads, or it is
+//! closed.
 //! The agent loop never knows about them, so a turn ending or a rewind that
 //! respawns the loop leaves them running.
 
@@ -16,12 +17,13 @@ use crate::api::session::not_live;
 pub(crate) struct BackgroundSession {
     pub(crate) info: BackgroundInfo,
     pub(crate) session: MakiId,
-    pub(crate) task: u64,
+    /// `None` under session scope: nothing but the chat and the plugin ends it.
+    pub(crate) task: Option<u64>,
     /// The subagent's cancel parent. Dropping the entry fires it.
     pub(crate) _cancel: CancelTrigger,
 }
 
-/// What `maki.agent.background()` shows.
+/// What `maki.agent.list()` shows.
 #[derive(Clone)]
 pub(crate) struct BackgroundInfo {
     pub(crate) id: String,
@@ -75,7 +77,11 @@ impl BackgroundSessions {
     }
 
     pub(crate) fn end_task(&self, task: u64) {
-        self.retire(|e| e.task == task);
+        self.retire(|e| e.task == Some(task));
+    }
+
+    pub(crate) fn end_plugin(&self, plugin: &str) {
+        self.retire(|e| &*e.info.plugin == plugin);
     }
 
     /// Hands out a copy, because building Lua tables can run the GC, and a
@@ -115,7 +121,7 @@ mod tests {
         (mailbox, seed)
     }
 
-    fn entry(session: MakiId, task: u64) -> (BackgroundSession, CancelToken) {
+    fn entry(session: MakiId, task: Option<u64>) -> (BackgroundSession, CancelToken) {
         let (cancel, token) = CancelToken::new();
         let entry = BackgroundSession {
             info: BackgroundInfo {
@@ -139,8 +145,8 @@ mod tests {
         let _ended_live = live(ended);
         let (respawned_box, old_seed) = live(respawned);
         let registry = BackgroundSessions::default();
-        let (ended_entry, ended_token) = entry(ended, 1);
-        let (kept_entry, kept_token) = entry(respawned, 1);
+        let (ended_entry, ended_token) = entry(ended, Some(1));
+        let (kept_entry, kept_token) = entry(respawned, Some(1));
         registry.register(ended_entry).unwrap();
         registry.register(kept_entry).unwrap();
 
@@ -155,18 +161,27 @@ mod tests {
     }
 
     #[test]
-    fn ending_the_opening_task_removes_its_entries() {
+    fn task_end_retires_task_scope_and_plugin_unload_retires_the_rest() {
         let lua = Lua::new();
         let registry = BackgroundSessions::of(&lua);
         let session = MakiId::generate();
         let _live = live(session);
         let scope = TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None, None));
-        let (opened, token) = entry(session, lock_cell(scope.handle()).id);
+        let task = lock_cell(scope.handle()).id;
+        let (opened, token) = entry(session, Some(task));
+        let (kept, kept_token) = entry(session, None);
         registry.register(opened).unwrap();
+        registry.register(kept).unwrap();
 
         drop(scope);
 
         assert!(token.is_cancelled());
+        assert!(!kept_token.is_cancelled());
+        assert_eq!(registry.list(session).len(), 1);
+
+        registry.end_plugin(PLUGIN);
+
+        assert!(kept_token.is_cancelled());
         assert_eq!(registry.list(session).len(), 0);
     }
 
@@ -175,7 +190,7 @@ mod tests {
         let session = MakiId::generate();
         drop(live(session));
         let registry = BackgroundSessions::default();
-        let (late, token) = entry(session, 1);
+        let (late, token) = entry(session, Some(1));
 
         assert_eq!(registry.register(late), Err(not_live(session)));
         assert!(token.is_cancelled());

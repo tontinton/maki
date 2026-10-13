@@ -2725,6 +2725,7 @@ impl LuaRuntime {
             store.kill_owner(&self.lua, &JobOwner::Plugin(Arc::from(name)));
             store.detach_plugin_callbacks(&self.lua, name);
         });
+        BackgroundSessions::of(&self.lua).end_plugin(name);
         if let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>() {
             store.remove(name);
         }

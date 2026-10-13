@@ -47,6 +47,7 @@ use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::background::{BackgroundInfo, BackgroundSession, BackgroundSessions};
+use crate::plugin_permissions::{Permission, denied_error};
 use crate::runtime::{CANCELLED_MSG, active_task_cancel, host_ui};
 
 const SESSION_CLOSED_ERR: &str = "session closed";
@@ -54,8 +55,10 @@ const PROMPT_DROPPED_ERR: &str = "an `agent.user_message` layer dropped the prom
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 const OUTPUT_MODE_ERR: &str = "output_mode must be 'full' or 'compact'";
 const OPTS_REQUIRED_ERR: &str = "opts table is required";
-const RUNNING_STATUS: &str = "running";
+const WORKING_STATUS: &str = "working";
 const IDLE_STATUS: &str = "idle";
+const TASK_SCOPE: &str = "task";
+const SESSION_SCOPE: &str = "session";
 const TASK_REQUIRED_ERR: &str = "maki.agent.session({ session = id }) and its prompts must run \
      in a task: maki.async.spawn, an autocmd callback or a tool handler";
 
@@ -128,6 +131,18 @@ fn seed_ctx(
     }))
 }
 
+/// Task scope remembers the opening task so its end can retire the entry.
+/// Session scope forgets it: only the chat or the plugin ends that one.
+fn parse_scope(scope: Option<String>, task: u64) -> LuaResult<Option<u64>> {
+    match scope.as_deref() {
+        None | Some(TASK_SCOPE) => Ok(Some(task)),
+        Some(SESSION_SCOPE) => Ok(None),
+        Some(other) => Err(mlua::Error::runtime(format!(
+            "maki.agent.session: unknown scope {other:?}; expected {TASK_SCOPE:?} or {SESSION_SCOPE:?}"
+        ))),
+    }
+}
+
 /// A background session reports to a sink nobody reads, so its turns would
 /// never reach the chat's totals on their own. We send each one to the tab the
 /// moment it is paid for. A quit or `/new` in the middle of a long prompt then
@@ -166,7 +181,7 @@ async fn relay_session_events(
                 }
                 if let Some(billing) = &billing {
                     // Before the UI hears of it, so whoever sees the bill also
-                    // sees it in `maki.agent.background()`.
+                    // sees it in `maki.agent.list()`.
                     billing.registry.update(&billing.id, |e| e.cost = cost);
                     let _ = billing.ui.try_send(UiAction::BackgroundUsage {
                         session: billing.session,
@@ -516,19 +531,20 @@ async fn call_tool(
 /// background session. It borrows the model, permissions and MCP of the live
 /// chat session `id` and is not tied to any turn. Call it and its `:prompt()`
 /// from a task: a `maki.async.spawn` task, an autocmd callback or a tool
-/// handler.
+/// handler. This form needs the `agent` plugin permission, because it spends
+/// outside any turn the user started.
 ///
-/// It ends at the first of these:
+/// `scope` says how long it lives. `"task"`, the default, ends it with the
+/// task that opened it: an autocmd callback when it returns, a tool handler
+/// with its tool call, a `maki.async.spawn` task when it finishes.
+/// `"session"` skips that. Both end at `:close()`, when the chat session
+/// ends (`/new`, closing the tab) and when the plugin unloads (`/reload`).
+/// Turn ends, Esc and rewinds leave it alone. Esc on a tool call still
+/// cancels a prompt that the tool's handler is waiting on.
 ///
-/// - the task that opened it ends (an autocmd callback when it returns, a tool
-///   handler with its tool call)
-/// - `:close()`
-/// - the chat session ends (`/new`, closing the tab)
-/// - the plugin unloads (`/reload`)
-///
-/// Open long-running monitors from `maki.async.spawn`. Turn ends, Esc and
-/// rewinds leave them alone. Esc on a tool call still cancels a prompt that
-/// the tool's handler is waiting on.
+/// A polling monitor opens one per round inside a `maki.async.spawn` loop. An
+/// event-driven one opens with `scope = "session"` once, keeps the handle and
+/// prompts it from autocmd callbacks.
 ///
 /// Nobody can answer its permission prompts, so a call that would prompt is
 /// denied and the subagent is told why. Your rules, "allow for this session"
@@ -548,6 +564,8 @@ async fn call_tool(
 ///   `session` (string) - required without a ctx: id of the live chat session
 ///     that owns it. Returns `(nil, "session not live: <id>")` once that
 ///     session has ended.
+///   `scope` (string?) - only without a ctx: `"task"` (default) or
+///     `"session"`, see above.
 ///   `model_spec` (string?) - model spec string to use instead of the parent model.
 ///   `system` (string?) - system prompt. Defaults to empty.
 ///   `tools` (table?) - tool definitions array (from `maki.agent.tools()`).
@@ -586,6 +604,7 @@ async fn call_tool(
 async fn session(
     lua: Lua,
     #[ctx] plugin: Arc<str>,
+    #[ctx] may_run_agents: bool,
     ctx: LuaEither<UserDataRef<LuaCtx>, Table>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<mlua::AnyUserData>> {
@@ -598,9 +617,13 @@ async fn session(
             None,
         ),
         LuaEither::Right(opts) => {
+            if !may_run_agents {
+                return Err(denied_error(Permission::Agent));
+            }
             let Some((task, _)) = active_task_cancel(&lua) else {
                 return Ok(err_pair(TASK_REQUIRED_ERR));
             };
+            let task = parse_scope(opts.get("scope")?, task)?;
             // A child of the task's token would leave a watcher waiting on it
             // until it fires. An autocmd's token never fires, so every open
             // would leak one. The entry keeps this trigger instead, and the
@@ -865,13 +888,15 @@ async fn session(
     Ok((Some(sess), None))
 }
 
-/// List the open background sessions of a chat session.
+/// List the subagent sessions plugins opened on a chat session with
+/// `maki.agent.session({ session = id })`.
 ///
 /// Each entry has these fields:
 ///   `id` (string) Session id.
+///   `session` (string) Chat session it belongs to.
 ///   `plugin` (string) Plugin that opened it.
 ///   `name` (string) Name given at open.
-///   `status` (string) `"running"` during a `:prompt()`, otherwise `"idle"`.
+///   `status` (string) `"working"` during a `:prompt()`, otherwise `"idle"`.
 ///   `started_at` (integer) Unix seconds.
 ///   `cost` (number?) Dollars billed so far, updated after each turn. nil until
 ///     a priced turn ends.
@@ -880,22 +905,23 @@ async fn session(
 ///   `session` (string) - id of the chat session.
 /// @return (table?, string?) Array of entries, or `(nil, err)` on failure.
 /// @example
-/// for _, s in ipairs(maki.agent.background({ session = id })) do
+/// for _, s in ipairs(maki.agent.list({ session = id })) do
 ///   print(s.plugin, s.name, s.status, os.time() - s.started_at)
 /// end
 #[lua_fn]
-fn background(lua: &Lua, opts: Table) -> LuaResult<Pair<Table>> {
+fn list(lua: &Lua, opts: Table) -> LuaResult<Pair<Table>> {
     let session = try_pair!(required_session(Some(&opts))?);
     let out = lua.create_table()?;
     for entry in BackgroundSessions::of(lua).list(session) {
         let status = if entry.running {
-            RUNNING_STATUS
+            WORKING_STATUS
         } else {
             IDLE_STATUS
         };
         let t = lua.create_table()?;
         t.set("status", status)?;
         t.set("id", entry.id)?;
+        t.set("session", session.to_string())?;
         t.set("plugin", &*entry.plugin)?;
         t.set("name", entry.name)?;
         t.set("started_at", entry.started_at)?;
@@ -975,9 +1001,9 @@ lua_table! {
     ///   end,
     /// })
     /// ```
-    "maki.agent" => pub(crate) fn create_agent_table(plugin: Arc<str>), DOCS [
-        resolve_model, system_prompt, tools, callable_tools, call_tool, session(plugin),
-        background,
+    "maki.agent" => pub(crate) fn create_agent_table(plugin: Arc<str>, may_run_agents: bool), DOCS [
+        resolve_model, system_prompt, tools, callable_tools, call_tool,
+        session(plugin, may_run_agents), list,
     ]
 }
 
@@ -1488,7 +1514,7 @@ mod tests {
     #[test]
     fn ctx_less_session_needs_a_task_and_a_live_session() {
         let lua = Lua::new();
-        let agent = create_agent_table(&lua, Arc::from(PLUGIN)).unwrap();
+        let agent = create_agent_table(&lua, Arc::from(PLUGIN), true).unwrap();
         lua.globals().set("agent", agent).unwrap();
         let session = MakiId::generate();
         lua.globals().set("sid", session.to_string()).unwrap();

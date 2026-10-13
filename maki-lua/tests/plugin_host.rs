@@ -5519,6 +5519,13 @@ fn perm_tool_src(name: &str, handler_body: &str) -> String {
     "run"
     ; "run_denied"
 )]
+#[test_case::test_case(
+    "agent_deny",
+    r#"local ok, err = pcall(function() maki.agent.session({ session = "x" }) end)
+                return tostring(err)"#,
+    "agent"
+    ; "agent_denied"
+)]
 fn denied_permission_blocks_api(tool_name: &str, handler_body: &str, expected_perm: &str) {
     let src = perm_tool_src(tool_name, handler_body);
     let result = exec_tool_with_perms(
@@ -7247,7 +7254,7 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function()
         local parts = {{}}
-        for _, s in ipairs(maki.agent.background({{ session = "{sid}" }})) do
+        for _, s in ipairs(maki.agent.list({{ session = "{sid}" }})) do
             parts[#parts + 1] = table.concat({{ s.plugin, s.name, s.status, tostring(s.started_at > 0) }}, ":")
         end
         return table.concat(parts, ",")
@@ -7269,7 +7276,7 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        local cost = maki.agent.background({{ session = "{sid}" }})[1].cost
+        local cost = maki.agent.list({{ session = "{sid}" }})[1].cost
         return cost and string.format("%.{COST_DECIMALS}f", cost) or "nil"
     end,
 }})
@@ -7907,6 +7914,49 @@ fn background_session_is_listed_until_its_chat_session_ends() {
 
     host.event_handle()
         .end_sessions_blocking([session], SessionEndReason::Shutdown);
+
+    assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
+}
+
+/// Opened straight from a tool handler, so the opening task is the tool
+/// call. The monitor source is loaded a second time under another name, so
+/// its list tool survives the opener's unload.
+#[test_case::test_case("task", false ; "task_scope_ends_with_the_handler")]
+#[test_case::test_case("session", true ; "session_scope_outlives_the_handler")]
+fn background_session_scope_decides_what_ends_it(scope: &str, outlives_handler: bool) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let _seed = mailbox.publish_seed(stub_seed(session));
+    let src = format!(
+        r#"maki.api.register_tool({{
+    name = "open_scoped",
+    description = "opens a background session with the given scope",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local _, err = maki.agent.session({{ session = "{session}", name = "{BACKGROUND_NAME}", scope = "{scope}" }})
+        return tostring(err)
+    end,
+}})"#
+    );
+    host.load_source(BACKGROUND_PLUGIN, &src).unwrap();
+    host.load_source("lister", &background_monitor_src(&session.to_string()))
+        .unwrap();
+    let listed = if outlives_handler {
+        format!("{BACKGROUND_PLUGIN}:{BACKGROUND_NAME}:idle:true")
+    } else {
+        String::new()
+    };
+
+    assert_eq!(exec_tool(&reg, "open_scoped", json!({})).unwrap(), "nil");
+    assert_eq!(
+        exec_tool(&reg, "list_background", json!({})).unwrap(),
+        listed
+    );
+
+    host.unload(BACKGROUND_PLUGIN).unwrap();
 
     assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }

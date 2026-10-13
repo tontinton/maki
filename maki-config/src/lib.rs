@@ -163,6 +163,7 @@ pub enum Permission {
     Net,
     Run,
     Env,
+    Agent,
 }
 
 impl Permission {
@@ -195,6 +196,7 @@ impl Permission {
             Permission::Net => "net",
             Permission::Run => "run",
             Permission::Env => "env",
+            Permission::Agent => "agent",
         }
     }
 
@@ -208,6 +210,7 @@ impl Permission {
             Permission::Net => "outbound network requests",
             Permission::Run => "starting processes",
             Permission::Env => "reading the process environment, where secrets live",
+            Permission::Agent => "prompting the model on its own, outside a tool call",
         }
     }
 }
