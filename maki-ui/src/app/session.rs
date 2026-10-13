@@ -5,20 +5,25 @@ use std::time::{Duration, Instant};
 use crate::app::tasks::TaskOutcome;
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::Action;
+use crate::components::command::PROMPT_NEEDS;
+use crate::components::input::{COMMAND_PREFIX, sent_text};
 use crate::components::rewind_picker::RewindEntry;
+use crate::text_buffer::Writers;
 use maki_agent::Transcript;
 use maki_agent::agent::SessionExport;
 use maki_agent::session::SessionHeader;
-use maki_lua::SessionEndReason;
 use maki_lua::agent_autocmd::HostEvent;
+use maki_lua::{PluginPermissions, PluginReach, SessionEndReason};
 use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionClaim, SessionMeta, StoredMode, StoredSubagent};
+use maki_storage::sessions::{
+    SessionClaim, SessionMeta, StoredMode, StoredSubagent, StoredWriters,
+};
 
 use crate::{AppSession, OpenSession};
 
 use super::session_state::{SessionState, rules_to_stored, stored_to_rules};
-use super::{App, MAIN_CHAT, Mode, PendingInput, PlanState, Status};
+use super::{App, MAIN_CHAT, Mode, PendingInput, PlanState, Sending, Status};
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
@@ -37,6 +42,41 @@ pub(super) struct Sent {
     pub revision: u64,
     pub content_revision: u64,
     pub at: Instant,
+}
+
+/// Every user turn was sent by the user or by a plugin that could send a
+/// prompt, and we do not keep which. So a turn that Enter would run rather
+/// than send comes back as written by a nameless plugin holding only what a
+/// prompt takes, see [`PROMPT_NEEDS`].
+fn turn_writers(text: &str) -> Option<StoredWriters> {
+    let sent = sent_text(text);
+    let runs = sent.starts_with(COMMAND_PREFIX) || Sending::of(sent, false).written_as().is_some();
+    runs.then_some(StoredWriters::Agent)
+}
+
+/// Grants held by fewer than all of {writers} cannot be vouched for once
+/// their names are gone, so only what a prompt takes is kept, and only when
+/// each of them held it.
+fn stored_writers(writers: &Writers) -> Option<StoredWriters> {
+    if writers.is_empty() {
+        return None;
+    }
+    let each_sends_prompts = writers
+        .iter()
+        .all(|writer| PROMPT_NEEDS.iter().all(|&perm| writer.is_allowed(perm)));
+    Some(if each_sends_prompts {
+        StoredWriters::Agent
+    } else {
+        StoredWriters::Unknown
+    })
+}
+
+fn unknown_writer(writers: StoredWriters) -> PluginReach {
+    let mut permissions = PluginPermissions::denied();
+    for &perm in PROMPT_NEEDS {
+        permissions.set(perm, writers == StoredWriters::Agent);
+    }
+    PluginReach::new(permissions)
 }
 
 /// The one content check. `App::checkpoint` saves a session only when this
@@ -144,14 +184,16 @@ impl App {
     /// and an empty `Vec` does not allocate.
     fn build_meta(&self) -> SessionMeta {
         let state = &self.state;
-        let draft = self.main_draft();
+        let (draft, writers) = self.main_draft();
+        let has_draft = !draft.is_empty();
         SessionMeta {
             mode: Some(state.mode.into()),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
             plan_written: state.plan.is_ready(),
             session_rules: rules_to_stored(&self.permissions.session_rules_snapshot()),
             context_size: state.context_size,
-            input_draft: (!draft.is_empty()).then_some(draft),
+            input_draft_writers: stored_writers(writers).filter(|_| has_draft),
+            input_draft: has_draft.then_some(draft),
             queued_messages: if self.recoverable_queue.is_empty() {
                 self.queue.text_messages()
             } else {
@@ -247,9 +289,10 @@ impl App {
         let main = self.main_chat();
         main.cost = cost;
         main.context_size = context_size;
-        if let Some(draft) = self.state.session.meta.input_draft.as_deref() {
-            self.input_box.set_input(draft);
-            self.input_box.buffer.move_to_end();
+        let meta = &self.state.session.meta;
+        if let Some(draft) = meta.input_draft.clone() {
+            let writers = meta.input_draft_writers;
+            self.restore_input(&draft, writers);
         }
 
         self.chats[MAIN_CHAT].request_restores(restore_items);
@@ -367,6 +410,7 @@ impl App {
             session_rules: Vec::new(),
             context_size: 0,
             input_draft: None,
+            input_draft_writers: None,
             queued_messages: Vec::new(),
             yolo: self.permissions.persisted_yolo(),
         };
@@ -454,6 +498,7 @@ impl App {
             // short copy would auto compact it on its first prompt.
             let context_size = forked.meta.context_size;
             forked.meta.context_size = truncate_to_turn(forked, entry.turn_index, context_size);
+            forked.meta.input_draft_writers = turn_writers(&entry.prompt_text);
             forked.meta.input_draft = Some(entry.prompt_text);
         })
     }
@@ -502,10 +547,20 @@ impl App {
         self.reset_ui_chrome();
         self.restore_display();
 
-        self.input_box.set_input(&entry.prompt_text);
-        self.input_box.buffer.move_to_end();
+        self.restore_input(&entry.prompt_text, turn_writers(&entry.prompt_text));
 
         vec![Action::RestartAgent(self.install_local_history())]
+    }
+
+    /// Puts back a draft from disk or a rewound turn. Its {writers} come back
+    /// as one nameless plugin holding what was kept of their grants, see
+    /// [`turn_writers`] for a turn.
+    fn restore_input(&mut self, text: &str, writers: Option<StoredWriters>) {
+        self.input_box.set_input(text);
+        if let Some(writers) = writers {
+            self.input_box.buffer.add_writer(&unknown_writer(writers));
+        }
+        self.input_box.buffer.move_to_end();
     }
 
     /// The event loop owns the policy and the providers, so it resolves the

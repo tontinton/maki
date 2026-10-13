@@ -999,6 +999,25 @@ case("a_label_shows_on_one_line", function()
   end)
 end)
 
+-- Completion holds no `run`, so Enter would refuse a `!` line it wrote
+-- into, and a `!` line gets no popup to accept. Enter reads the text
+-- trimmed, so a leading space changes neither a `!` line nor a command.
+case("a_shell_line_or_command_opens_no_popup", function()
+  for _, lead in ipairs({ "!", " !", "/", " /" }) do
+    local h = harness(function()
+      Menu.refresh({
+        text = lead .. INPUT.text,
+        cursor = INPUT.cursor + #lead,
+        version = INPUT.version,
+        session_id = SESSION,
+      })
+      eq(Menu.session_id(), nil, lead .. " opened a popup")
+      Menu.accept()
+    end)
+    eq(#h.edits, 0, lead .. " accepted a row")
+  end
+end)
+
 case("a_malformed_source_is_skipped_and_logged_once", function()
   local h = harness(function(hh)
     source("two_chars", "##", { { text = ISSUE } })

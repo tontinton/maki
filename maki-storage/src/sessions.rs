@@ -378,6 +378,10 @@ pub struct SessionMeta {
     pub context_size: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_draft: Option<String>,
+    /// The plugins that changed `input_draft`, `None` when none did. Enter
+    /// weighs them before it runs the draft as a command or a shell line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_draft_writers: Option<StoredWriters>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_messages: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -489,6 +493,22 @@ pub struct SessionSummary {
 pub enum StoredEffect {
     Allow,
     Deny,
+}
+
+/// What the plugins that wrote a draft held, kept only as far as a reload
+/// can vouch for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StoredWriters {
+    /// Each of them could send a prompt, which takes `agent` and
+    /// `session_write`, like the sender of a turn a rewind or a fork brought
+    /// back.
+    Agent,
+    /// Their grants were lost, so they hold nothing. A value from a newer
+    /// maki lands here too, so it costs the draft its writers and not the
+    /// whole meta line.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2342,7 +2362,7 @@ mod tests {
     use super::{
         HistorySnapshot, LOG_FORMAT_VERSION, NEWER_LOG_FORMAT, OLDEST_LOG_FORMAT_VERSION,
         SCAN_CACHE_FILE, Session, SessionClaim, SessionError, SessionLog, SessionMeta,
-        StorageError, TitleSource, check_log_format,
+        StorageError, StoredWriters, TitleSource, check_log_format,
     };
     use crate::StateDir;
     use crate::frame::PromptFacts;
@@ -4507,6 +4527,19 @@ mod tests {
 
         session.push_message(user_message("hello"));
         assert!(session.content_revision() > content);
+    }
+
+    /// A writer kind only a newer maki knows must not lose this one the meta
+    /// line it sits in.
+    #[test_case("agent", StoredWriters::Agent ; "known")]
+    #[test_case("from_the_future", StoredWriters::Unknown ; "from_a_newer_maki")]
+    fn draft_writers_load(stored: &str, loaded: StoredWriters) {
+        let mut meta = serde_json::to_value(SessionMeta::default()).unwrap();
+        meta["input_draft_writers"] = json!(stored);
+
+        let meta: SessionMeta = serde_json::from_value(meta).unwrap();
+
+        assert_eq!(meta.input_draft_writers, Some(loaded));
     }
 
     /// A mutator called with the value already there is not a change, and a

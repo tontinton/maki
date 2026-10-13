@@ -12,7 +12,7 @@ use maki_agent::agent::{SessionExport, live_header, live_history, live_snapshot}
 use maki_agent::session::{StoredSession, store_new};
 use maki_agent::{SessionMailbox, Transcript};
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::{ContentBlock, Message};
+use maki_providers::{ContentBlock, Message, Role};
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
 use mlua::{IntoLua, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
@@ -52,6 +52,9 @@ const BLOCK_IMAGE: &str = "image";
 const CWD_KEY: &str = "cwd";
 const PROMPT_KEY: &str = "prompt";
 const FOCUS_KEY: &str = "focus";
+/// What makes the chat input run a line on Enter rather than send it.
+const RUN_PREFIXES: [char; 2] = ['/', '!'];
+const EXIT_WORD: &str = "exit";
 /// What `new` takes from the export document. Anything else is ignored, like
 /// an importer ignores unknown envelope fields, so a newer export still goes
 /// back in.
@@ -65,6 +68,19 @@ const DOCUMENT_KEYS: [&str; 8] = [
     "facts",
     MESSAGES_KEY,
 ];
+
+/// Rewind and fork put a user turn back in the chat input, and Enter runs it
+/// as if a plugin that could send prompts wrote it. So a turn that runs
+/// needs what sending it took, which an import alone does not prove.
+fn runs_on_enter(message: &Message) -> bool {
+    message.role == Role::User
+        && !message.is_from_host()
+        && !message.is_context_update()
+        && message.user_text().is_some_and(|text| {
+            let text = text.trim();
+            text.starts_with(RUN_PREFIXES) || text == EXIT_WORD
+        })
+}
 
 pub(crate) fn not_live(session: MakiId) -> String {
     format!("{NOT_LIVE_ERR}: {session}")
@@ -597,7 +613,10 @@ fn headless_cwd(lua: &Lua) -> Result<String, String> {
 /// which keeps the tag. Fields `new` does not know are ignored.
 ///
 /// @param opts table? Optional fields:
-///   `messages` (table) what `export` or `messages` return.
+///   `messages` (table) what `export` or `messages` return. A user turn
+///     that starts with `/` or `!`, or is `exit`, needs the `agent`
+///     permission too, since a rewind puts it back in the input for Enter
+///     to run.
 ///   `facts` (table) what `export` returns: the date, working directory,
 ///     model, instructions and hints the model was last told.
 ///   `model` (string) model spec. Defaults to the focused tab's in the TUI,
@@ -644,6 +663,9 @@ async fn new(
     // Off the Lua thread, since parsing a long history is real work.
     let parsed = smol::unblock(move || serde_json::from_value::<Transcript>(doc)).await;
     let transcript = try_pair!(parsed.map_err(|e| e.to_string()));
+    if transcript.messages.iter().any(runs_on_enter) {
+        require(&lua, &grants, Permission::Agent)?;
+    }
     if has_ui {
         let req = SessionRequest::New {
             transcript: Box::new(transcript),
@@ -823,6 +845,7 @@ mod tests {
     use crate::api::image::create_image_table;
     use crate::api::json::create_json_table;
     use crate::api::top::add_top_methods;
+    use crate::plugin_permissions::denied_error;
     use crate::session_snapshot::{MODE_PLAN, STATUS_IDLE, STATUS_STORED};
     use mlua::Value;
     use serde_json::json;
@@ -845,14 +868,12 @@ mod tests {
     const ONE_MESSAGE: &str = "{ { role = 'user', content = { { type = 'text', text = 'hi' } } } }";
 
     fn lua_with_session(tx: Option<flume::Sender<UiAction>>) -> Lua {
+        lua_granted(tx, PluginPermissions::trusted())
+    }
+
+    fn lua_granted(tx: Option<flume::Sender<UiAction>>, grants: PluginPermissions) -> Lua {
         let lua = Lua::new();
-        let t = create_session_table(
-            &lua,
-            tx,
-            &PluginPermissions::trusted(),
-            PluginPermissions::trusted(),
-        )
-        .unwrap();
+        let t = create_session_table(&lua, tx, &grants, grants.clone()).unwrap();
         lua.globals().set("session", t).unwrap();
         lua
     }
@@ -1171,7 +1192,10 @@ mod tests {
     /// `session` plus the `maki` pieces a plugin round trips with, and
     /// `one_message`, the smallest history `new` stores.
     fn plugin_lua(tx: Option<flume::Sender<UiAction>>) -> Lua {
-        let lua = lua_with_session(tx);
+        with_plugin_globals(lua_with_session(tx))
+    }
+
+    fn with_plugin_globals(lua: Lua) -> Lua {
         let maki = lua.create_table().unwrap();
         maki.set("json", create_json_table(&lua).unwrap()).unwrap();
         maki.set("image", create_image_table(&lua).unwrap())
@@ -1189,8 +1213,12 @@ mod tests {
 
     /// No UI, and stored sessions in a temp dir.
     fn headless() -> (Lua, TempDir) {
+        headless_granted(PluginPermissions::trusted())
+    }
+
+    fn headless_granted(grants: PluginPermissions) -> (Lua, TempDir) {
         let dir = TempDir::new().unwrap();
-        let lua = plugin_lua(None);
+        let lua = with_plugin_globals(lua_granted(None, grants));
         lua.set_app_data(StateDir::from_path(dir.path().to_path_buf()));
         (lua, dir)
     }
@@ -1421,6 +1449,31 @@ mod tests {
         assert!(id.is_nil());
         assert_eq!(err, Some(expected));
         assert!(StoredSession::list_all(&storage(&lua)).unwrap().is_empty());
+    }
+
+    /// Rewind brings a turn that runs back as written by a plugin that
+    /// could send prompts, so importing one takes `agent` as well.
+    #[test_case("hi" => true ; "a_plain_turn")]
+    #[test_case("/compact" => false ; "a_command")]
+    #[test_case("!ls" => false ; "a_shell_line")]
+    #[test_case(" exit " => false ; "the_exit_word")]
+    fn new_with_session_write_alone_imports(text: &str) -> bool {
+        let (lua, _dir) = headless_granted(PluginPermissions::from_approved(["session_write"]));
+        let code = format!(
+            "return session.new({{ messages = {{ {{ role = 'user', content = {{ {{ type = 'text', text = '{text}' }} }} }} }} }})"
+        );
+        match smol::block_on(lua.load(code).eval_async::<(Value, Option<String>)>()) {
+            Ok((id, err)) => {
+                assert_eq!(err, None);
+                !id.is_nil()
+            }
+            Err(e) => {
+                let expected = denied_error(Permission::Agent).to_string();
+                assert!(e.to_string().contains(&expected), "{e}");
+                assert!(StoredSession::list_all(&storage(&lua)).unwrap().is_empty());
+                false
+            }
+        }
     }
 
     fn image_history(source: &str) -> String {

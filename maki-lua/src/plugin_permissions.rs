@@ -373,6 +373,16 @@ impl PluginReach {
         }
     }
 
+    /// The grants both this and {other} hold. The egress and owner are this
+    /// reach's, so {other} has to be the same plugin's reach, which shares
+    /// that egress.
+    pub fn intersect(&self, other: &Self) -> Self {
+        Self {
+            permissions: self.permissions.intersect(&other.permissions),
+            egress: self.egress.clone(),
+        }
+    }
+
     /// This reach cut down to {perms}, the part of it an owner says a caller
     /// has to match. The egress stays, so a `net` among them is still
     /// weighed host by host.

@@ -13,6 +13,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
+use crate::components::input::{COMMAND_PREFIX, sent_text};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -20,8 +21,8 @@ const TICK_TIMEOUT_MS: u64 = 10;
 pub(crate) const USER_ONLY_SUFFIX: &str = " can only be run by you";
 const STARTS_TURNS: PluginAccess = PluginAccess::Needs(&[Permission::Agent]);
 /// A prompt starts a turn and adds to the transcript, like `maki.session.prompt`.
-pub const SUBMITS_PROMPT: PluginAccess =
-    PluginAccess::Needs(&[Permission::Agent, Permission::SessionWrite]);
+pub const SUBMITS_PROMPT: PluginAccess = PluginAccess::Needs(PROMPT_NEEDS);
+pub(crate) const PROMPT_NEEDS: &[Permission] = &[Permission::Agent, Permission::SessionWrite];
 const WRITES_SESSION: PluginAccess = PluginAccess::Needs(&[Permission::SessionWrite]);
 const CHANGES_SETTINGS: PluginAccess = PluginAccess::Needs(&[Permission::SessionSettings]);
 
@@ -438,7 +439,7 @@ impl CommandPalette {
             self.lua_commands = lua_snap.commands.clone();
             self.nucleo = Self::build_nucleo(&self.custom, &self.mcp_prompts, &self.lua_commands);
         }
-        let Some(stripped) = input.strip_prefix('/') else {
+        let Some(stripped) = sent_text(input).strip_prefix(COMMAND_PREFIX) else {
             self.filtered.clear();
             self.current_arg_count = 0;
             self.current_bang = false;
@@ -451,13 +452,9 @@ impl CommandPalette {
             .strip_suffix('!')
             .map_or((raw_word, false), |word| (word, true));
         self.current_bang = bang;
-        let trailing_space = stripped.ends_with(char::is_whitespace);
-
-        self.current_arg_count = if trailing_space {
-            parts.len()
-        } else {
-            parts.len().saturating_sub(1)
-        };
+        // Read off the trimmed text, so a space after the last word is no
+        // argument yet and the palette stays on the command Enter would run.
+        self.current_arg_count = parts.len().saturating_sub(1);
 
         self.nucleo.pattern.reparse(
             0,
@@ -615,7 +612,7 @@ impl CommandPalette {
     fn confirm(&self, input: &str) -> Option<ParsedCommand> {
         let item = self.filtered.get(self.selected)?;
         let name = self.item_name(item);
-        let args = input
+        let args = sent_text(input)
             .strip_prefix('/')
             .and_then(|s| s.split_once(char::is_whitespace))
             .map(|(_, a)| a.trim())
@@ -929,12 +926,15 @@ mod tests {
         assert_eq!(name, "/cd");
     }
 
-    #[test_case("/help ", false     ; "zero_arg_help_with_space")]
+    #[test_case("/help ", true      ; "zero_arg_help_with_space")]
+    #[test_case(" /help", true      ; "zero_arg_help_after_a_space")]
+    #[test_case("/help me", false   ; "zero_arg_help_with_an_arg")]
     #[test_case("/compact ", true   ; "compact_stays_active_with_space")]
     #[test_case("/cd ", true        ; "one_arg_cmd_with_space")]
     #[test_case("/cd ~/foo", true   ; "one_arg_cmd_mid_arg")]
     #[test_case("/cd  ~/foo", true  ; "one_arg_cmd_double_space")]
-    #[test_case("/cd ~/foo ", false ; "one_arg_cmd_second_space")]
+    #[test_case("/cd ~/foo ", true  ; "one_arg_cmd_second_space")]
+    #[test_case("/cd ~/foo bar", false ; "one_arg_cmd_two_args")]
     #[test_case("/btw hello world", true ; "btw_stays_active_with_many_args")]
     fn sync_respects_nargs(input: &str, expect_active: bool) {
         let p = synced(input);
@@ -948,8 +948,8 @@ mod tests {
     }
 
     #[test]
-    fn custom_command_without_args_hides_on_space() {
-        let p = synced_with_custom("/user:fix ", sample_custom());
+    fn custom_command_without_args_hides_on_an_arg() {
+        let p = synced_with_custom("/user:fix now", sample_custom());
         assert!(!p.is_open());
     }
 
@@ -1039,8 +1039,8 @@ mod tests {
     }
 
     #[test]
-    fn mcp_prompt_without_args_hides_on_space() {
-        let p = synced_with_prompts("/myserver:summarize ");
+    fn mcp_prompt_without_args_hides_on_an_arg() {
+        let p = synced_with_prompts("/myserver:summarize now");
         assert!(
             !p.filtered
                 .iter()

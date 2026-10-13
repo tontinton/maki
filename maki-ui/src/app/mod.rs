@@ -33,10 +33,10 @@ use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
 use crate::components::alert_modal::AlertModal;
 use crate::components::btw_modal::BtwModal;
-use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
+use crate::components::command::{CommandAction, CommandPalette, ParsedCommand, PluginAccess};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
-use crate::components::input::{InputAction, InputBox, Submission};
+use crate::components::input::{InputAction, InputBox, Submission, sent_text};
 use crate::components::keybindings::key;
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
@@ -57,7 +57,7 @@ use crate::components::{
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
-use crate::text_buffer::RuleSet;
+use crate::text_buffer::{RuleSet, TextBuffer, Writers};
 use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
@@ -71,8 +71,8 @@ use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, InputMode, InputRule,
     InputRulesReader, InputSnapshot, Key, KeymapReader, LuaCommandReader, PLAN_FORM_SLOT_DEADLINE,
-    PLAN_ROW_HANDLER_DEADLINE, PackCommand, PackPreparation, PlanActionOutcome, PlanMenu,
-    PlanRowAction, PluginReach, WinView, is_reserved,
+    PLAN_ROW_HANDLER_DEADLINE, PackCommand, PackPreparation, Permission, PlanActionOutcome,
+    PlanMenu, PlanRowAction, PluginReach, WinView, is_reserved,
 };
 use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
@@ -165,7 +165,13 @@ pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (ali
 pub(crate) const INPUT_NOT_LIVE_ERR: &str =
     "the chat input is not on screen, so it cannot be edited";
 pub(crate) const STALE_VERSION_ERR: &str = "input changed since version";
-/// What `InputChanged` names a plugin by when it has no name.
+pub(crate) const RUN_SHELL_LINE: &str = "running a shell line";
+const RUNS_SHELL: PluginAccess = PluginAccess::Needs(&[Permission::Run]);
+pub(crate) const WRITTEN_COMMAND: &str = "command";
+pub(crate) const WRITTEN_SHELL_LINE: &str = "shell line";
+pub(crate) const WRITTEN_EXIT: &str = "exit line";
+pub(crate) const TYPE_IT_YOURSELF: &str = "retype it yourself in a fresh input";
+/// A writer whose name was lost, like that of a draft read back from disk.
 pub(crate) const UNKNOWN_WRITER: &str = "a plugin";
 
 /// What Enter does with the input once the command palette passed it on.
@@ -194,12 +200,66 @@ impl Sending {
         }
         Self::Message
     }
+
+    /// What the text is called when the plugins that wrote it are held to
+    /// [`Self::writer_refusal`], `None` when any writer may leave it.
+    fn written_as(&self) -> Option<&'static str> {
+        match self {
+            Self::Exit => Some(WRITTEN_EXIT),
+            Self::Shell(_) => Some(WRITTEN_SHELL_LINE),
+            Self::AuthRetry | Self::Nothing | Self::Message => None,
+        }
+    }
+
+    /// What each plugin that wrote the text has to hold for this to go out.
+    /// `exit` and a shell line run on the Enter alone, so they need what
+    /// `/exit` and `run` need. A message waits for the model, and the user
+    /// read it before pressing Enter, so `input` was enough to write it. A
+    /// login retry sends none of the text.
+    fn writer_refusal(&self, writer: &PluginReach, palette: &CommandPalette) -> Option<String> {
+        match self {
+            Self::Exit => palette.resolve_for_plugin(EXIT_COMMAND, writer).err(),
+            Self::Shell(_) => RUNS_SHELL.refusal(RUN_SHELL_LINE, writer),
+            Self::AuthRetry | Self::Nothing | Self::Message => None,
+        }
+    }
 }
 
 /// Why a send may not go out: a key typed blind to what it would send sends
 /// nothing, see [`Sight`].
 fn send_refusal(sight: Sight) -> Option<String> {
     sight.blind.then(|| INPUT_CHANGED_UNSENT.to_owned())
+}
+
+/// Why Enter may not send {what} the plugins that wrote {buffer} left
+/// there: {refusal}, asked of each of them. A plugin with `input` may write
+/// anything, so what one of them could not run itself waits for the user to
+/// retype it in a fresh input.
+fn written_refusal(
+    buffer: &TextBuffer,
+    what: &str,
+    refusal: impl Fn(&PluginReach) -> Option<String>,
+) -> Option<String> {
+    let refused: Vec<(&PluginReach, String)> = buffer
+        .writers()
+        .iter()
+        .filter_map(|writer| Some((writer, refusal(writer)?)))
+        .collect();
+    let (_, reason) = refused.first()?;
+    let names = refused
+        .iter()
+        .map(|(writer, _)| writer.owner().map_or(UNKNOWN_WRITER, AsRef::as_ref))
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::info!(
+        what,
+        writers = %names,
+        reason = %reason,
+        "send refused: a plugin wrote what it may not run"
+    );
+    Some(format!(
+        "{names} wrote part of this {what}: {TYPE_IT_YOURSELF} ({reason})"
+    ))
 }
 
 /// Who has moved the chat input since the last tick, and the buffer version
@@ -711,12 +771,13 @@ impl App {
     }
 
     /// The session's draft is the main agent's, which the box only holds while
-    /// the main chat is in front.
-    pub(super) fn main_draft(&self) -> String {
+    /// the main chat is in front. Its writers come from the same place.
+    pub(super) fn main_draft(&self) -> (String, &Writers) {
         if self.is_main_chat() {
-            self.input_box.draft_text()
+            (self.input_box.draft_text(), self.input_box.draft_writers())
         } else {
-            self.chats[MAIN_CHAT].draft.text.clone()
+            let draft = &self.chats[MAIN_CHAT].draft;
+            (draft.text.clone(), draft.writers())
         }
     }
 
@@ -826,7 +887,8 @@ impl App {
     /// later without ever having been seen. {area} is the terminal the answer
     /// is worked out against, see [`App::input_live`] for what hides the box.
     ///
-    /// The Lua side already checked `input`.
+    /// The Lua side already checked `input`. The plugin joins the writers of
+    /// the text it changes, see [`written_refusal`].
     pub(crate) fn apply_input_edit(
         &mut self,
         edit: InputEdit,
@@ -853,9 +915,10 @@ impl App {
             .caller
             .owner()
             .map_or_else(|| Arc::from(UNKNOWN_WRITER), Arc::clone);
-        let cursor = self
-            .input_box
-            .apply_edits(edit.version, edit.edits, edit.cursor)?;
+        let cursor = self.write_for(&edit.caller, |app| {
+            app.input_box
+                .apply_edits(edit.version, edit.edits, edit.cursor)
+        })?;
         let version = self.input_box.buffer.version();
         self.input_changed(InputWriter::Plugin(plugin, version));
         Ok(serde_json::json!({ "version": version, "cursor": cursor }))
@@ -1336,7 +1399,7 @@ impl App {
                     return Some(self.execute_command(cmd, 0));
                 }
                 CommandAction::Complete(text) => {
-                    self.input_box.set_input(&text);
+                    self.input_box.rewrite_input(&text);
                     self.input_box.buffer.move_to_end();
                     self.input_changed(InputWriter::Anyone);
                     return Some(vec![]);
@@ -1348,10 +1411,17 @@ impl App {
         None
     }
 
-    /// A blind Enter on a command runs nothing, see [`send_refusal`].
+    /// A blind Enter on a command runs nothing, see [`send_refusal`], and
+    /// neither does one on a command that one of the plugins that wrote the
+    /// text may not run, see [`written_refusal`].
     fn palette_refusal(&mut self, sight: Sight) -> Option<String> {
-        self.command_palette.enter_target(&self.input_box.buffer)?;
-        send_refusal(sight)
+        let name = self.command_palette.enter_target(&self.input_box.buffer)?;
+        let palette = &self.command_palette;
+        send_refusal(sight).or_else(|| {
+            written_refusal(&self.input_box.buffer, WRITTEN_COMMAND, |writer| {
+                palette.resolve_for_plugin(&name, writer).err()
+            })
+        })
     }
 
     fn plan_toggle_ready(&self) -> bool {
@@ -1360,7 +1430,7 @@ impl App {
 
     /// [`Self::run_action`] for a default key, which has no one to answer.
     pub(crate) fn run_builtin(&mut self, action: BuiltinAction) -> Vec<Action> {
-        self.run_action(action).1
+        self.run_action(action, None).1
     }
 
     /// Single implementation behind both the default keybindings and
@@ -1368,10 +1438,32 @@ impl App {
     /// key's behavior. The `bool` says whether the action did anything, so a
     /// handler can try something else when it did not.
     ///
-    /// The Lua side already checked `input` for an action that
-    /// [changes the input](BuiltinAction::changes_input).
-    pub(crate) fn run_action(&mut self, action: BuiltinAction) -> (bool, Vec<Action>) {
-        self.run_builtin_action(action)
+    /// {caller} is the plugin that ran it, `None` for the user. The Lua side
+    /// already checked `input` for an action that
+    /// [changes the input](BuiltinAction::changes_input), and the plugin
+    /// joins the writers of the text it changes, see [`written_refusal`]. A
+    /// chat switch is not one of them: the draft it brings back carries its
+    /// own writers.
+    pub(crate) fn run_action(
+        &mut self,
+        action: BuiltinAction,
+        caller: Option<&PluginReach>,
+    ) -> (bool, Vec<Action>) {
+        match caller {
+            Some(caller) if action.changes_input() => {
+                self.write_for(caller, |app| app.run_builtin_action(action))
+            }
+            _ => self.run_builtin_action(action),
+        }
+    }
+
+    /// Runs {write} for {writer}, who joins the writers of the text when it
+    /// changed.
+    fn write_for<T>(&mut self, writer: &PluginReach, write: impl FnOnce(&mut Self) -> T) -> T {
+        let before = self.input_box.buffer.version();
+        let written = write(self);
+        self.input_box.buffer.written_by(writer, before);
+        written
     }
 
     fn run_builtin_action(&mut self, action: BuiltinAction) -> (bool, Vec<Action>) {
@@ -1877,16 +1969,27 @@ impl App {
         self.exit_request = ExitRequest::None;
     }
 
-    /// Sends the input the way Enter does, see [`send_refusal`].
+    /// Sends the input the way Enter does, see [`send_refusal`], once the
+    /// plugins that wrote the text may too, see [`written_refusal`]. A login
+    /// retry sends none of the text, so it leaves the input as it was.
     fn send_input(&mut self, sight: Sight) -> Result<Vec<Action>, String> {
         let input = &self.input_box;
-        let sending = self.sending(input.buffer.value().trim(), input.has_images());
+        let sending = self.sending(sent_text(input.buffer.value()), input.has_images());
         if !matches!(sending, Sending::Nothing)
-            && let Some(refusal) = send_refusal(sight)
+            && let Some(refusal) = send_refusal(sight).or_else(|| {
+                let what = sending.written_as()?;
+                written_refusal(&input.buffer, what, |writer| {
+                    sending.writer_refusal(writer, &self.command_palette)
+                })
+            })
         {
             return Err(refusal);
         }
-        let sub = self.input_box.submit().unwrap_or_default();
+        let sub = if matches!(sending, Sending::AuthRetry) {
+            Submission::default()
+        } else {
+            self.input_box.submit().unwrap_or_default()
+        };
         Ok(self.handle_submit(sub))
     }
 

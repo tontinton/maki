@@ -1045,8 +1045,12 @@ impl<'t> EventLoop<'t> {
             }
             // Answered before dispatching, which can hold the loop for as long
             // as `$EDITOR` is open.
-            UiAction::Builtin { action, reply_tx } => {
-                let (handled, actions) = self.focused_app().run_action(action);
+            UiAction::Builtin {
+                action,
+                caller,
+                reply_tx,
+            } => {
+                let (handled, actions) = self.focused_app().run_action(action, Some(&caller));
                 let _ = reply_tx.send(handled);
                 self.dispatch(self.focused, actions);
             }
@@ -1962,7 +1966,7 @@ impl<'t> EventLoop<'t> {
                 self.focus.on_resume();
                 match result {
                     Ok(edited) if edited == current_text => {}
-                    Ok(edited) => self.sessions[idx].app.input_box.set_input(&edited),
+                    Ok(edited) => self.sessions[idx].app.input_box.rewrite_input(&edited),
                     Err(e) => self.sessions[idx].app.flash(e),
                 }
             }

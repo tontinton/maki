@@ -521,6 +521,7 @@ async fn action(
     let reply = try_pair!(
         ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::Builtin {
             action: builtin,
+            caller: caller.now(&lua),
             reply_tx,
         })
         .await
@@ -623,7 +624,8 @@ fn table_list(list: Table, func: &str, key: &str) -> LuaResult<Vec<Table>> {
 ///
 /// Read again and retry on any of them.
 ///
-/// A change needs `input`, see [chat input](#chat-input).
+/// A change needs `input`. What Enter does with text you wrote is in
+/// [chat input](#chat-input).
 ///
 /// Tabs and carriage returns in `text` become spaces and newlines, and the
 /// other control characters are dropped, the way a paste is rewritten. With
@@ -1067,6 +1069,23 @@ lua_table! {
     /// style it with `input_rules`. Your own `init.lua` needs a `plugin.toml`
     /// next to it for this, like any plugin, see
     /// [plugin permissions](#plugin-permissions).
+    ///
+    /// With `input` you may write any text. Enter then checks every plugin
+    /// that changed it:
+    ///
+    /// | Text starts with | Each plugin that wrote it needs |
+    /// | --- | --- |
+    /// | `!` | `run` |
+    /// | a `/` command | what that command needs from a plugin, see [`maki.api.run_command`](#maki-api-run_command). Only the user can run some commands, like `/yolo` |
+    /// | anything else | nothing beyond `input` |
+    ///
+    /// If one of them falls short, Enter leaves the text where it is and the
+    /// status bar names it. The text becomes the user's again only
+    /// once the input is sent, cleared or replaced.
+    ///
+    /// A draft restored after a restart and a rewound or forked turn that
+    /// starts with `/` or `!` count as written by `a plugin` that holds
+    /// `agent` and `session_write` at most.
     ///
     /// Upgrading: `input_edit` needed no permission in earlier releases.
     /// Plugins and `init.lua` files that call it or an editing built-in

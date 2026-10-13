@@ -244,7 +244,7 @@ Three keys cover the session APIs, split by what a call does to the transcript:
 - `session_write`: any call that adds to, removes, or creates conversation content, such as `new`, `prompt`, `notify`, `delete` and `maki.task.remove`.
 - `session_settings`: any call that changes how a session runs without touching its content, such as `set_mode`, `set_title` and `maki.model.set`.
 
-`maki.session.read`, `list`, `live`, `current` and `focus` need none of them. A call that also starts a turn, such as `prompt`, needs `agent` as well. `maki.api.run_command` follows the same rules. The [commands page](/docs/commands/#plugin-access) lists what each command needs.
+`maki.session.read`, `list`, `live`, `current` and `focus` need none of them. A call that also starts a turn, such as `prompt`, needs `agent` as well. So does `new` with a user turn that starts with `/` or `!`, or is `exit`. `maki.api.run_command` follows the same rules. The [commands page](/docs/commands/#plugin-access) lists what each command needs.
 
 A plugin without `session_read` still receives events, with only their metadata fields. That leaves out `data.text` on `TurnStart` and `InputChanged`, `data.input` on `ToolDone`, and `data.summary` on `CompactionDone`. Maki warns once per plugin and event, naming the event and the keys left out. Events a plugin fires under its own names arrive as fired.
 

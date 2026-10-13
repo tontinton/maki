@@ -25,9 +25,10 @@ use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::session::NOTHING_TO_STORE;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{
-    AgentMode, DoneReason, HistorySnapshot, ImageMediaType, McpConfigErrors, McpServerInfo,
-    McpServerStatus, McpSnapshot, McpSnapshotReader, SharedBuf, SteerKind, SubagentInbox,
-    ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent,
+    AgentMode, DoneReason, HistorySnapshot, ImageMediaType, McpConfigErrors, McpPromptArg,
+    McpPromptInfo, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, SharedBuf,
+    SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript,
+    TurnCompleteEvent,
 };
 use maki_config::{
     Effect, PermissionRule, PermissionsConfig, PluginsConfig, ProjectConfig, ToolKey, UiConfig,
@@ -49,8 +50,8 @@ use maki_providers::{
 use maki_storage::id::MakiId;
 use maki_storage::model::read_thinking;
 use maki_storage::sessions::{
-    SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage, THINKING_ADAPTIVE,
-    ThinkingParseError,
+    SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage, StoredWriters,
+    THINKING_ADAPTIVE, ThinkingParseError,
 };
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
@@ -6874,8 +6875,12 @@ fn serve_handler(app: &mut App, ui: &flume::Receiver<UiAction>) -> (Vec<String>,
                 asked.push(ASKED_FALLBACK.into());
                 actions.extend(app.keybind_fallback(ticket));
             }
-            UiAction::Builtin { action, reply_tx } => {
-                let (handled, made) = app.run_action(action);
+            UiAction::Builtin {
+                action,
+                caller,
+                reply_tx,
+            } => {
+                let (handled, made) = app.run_action(action, Some(&caller));
                 actions.extend(made);
                 let _ = reply_tx.send(handled);
             }
@@ -6999,6 +7004,8 @@ fn an_enter_held_while_a_handler_changed_the_input_sends_nothing(
     assert!(!app.permissions.is_yolo());
 }
 
+const PLAIN_LINE: &str = "say hi";
+const SHELL_LINE: &str = "!ls";
 const PLUGIN_MANIFEST: &str = "plugin.toml";
 const NO_GRANTS_EDIT: &str = r#"
 maki.keymap.set("i", "<C-x>", function(ev)
@@ -7008,6 +7015,390 @@ maki.keymap.set("i", "<C-x>", function(ev)
   maki.ui.flash(tostring(err))
 end)
 "#;
+
+fn holding(permissions: &[Permission]) -> PluginReach {
+    PluginReach::new(PluginPermissions::from_approved(
+        permissions
+            .iter()
+            .map(|permission| permission.manifest_key()),
+    ))
+}
+
+const WRITER: &str = "vim";
+const YOLO: &str = "/yolo";
+const COMPACT: &str = "/compact";
+
+fn named(reach: PluginReach) -> PluginReach {
+    reach.owned_by(Arc::from(WRITER))
+}
+
+fn user_only(command: &str) -> String {
+    format!("{command}{USER_ONLY_SUFFIX}")
+}
+
+fn written(writer: &str, what: &str, reason: &str) -> String {
+    format!("{writer} wrote part of this {what}: {TYPE_IT_YOURSELF} ({reason})")
+}
+
+fn run_refused() -> String {
+    Missing::Permission(Permission::Run).refusal(RUN_SHELL_LINE)
+}
+
+/// Writes {text} over the whole input as {writer} would with `input_edit`.
+fn write_as(app: &mut App, text: &str, writer: PluginReach) {
+    let len = app.input_box.buffer.value().len();
+    let edit = InputEdit {
+        caller: writer,
+        ..planned_edit(app, 0, len, text)
+    };
+    apply_edit(app, edit).unwrap();
+}
+
+/// Enter, and the flash when it left the input as it was.
+fn press_enter(app: &mut App) -> Result<(), String> {
+    let before = app.input_box.buffer.value().to_owned();
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    if app.input_box.buffer.value() == before {
+        return Err(app.status_bar.flash_text().unwrap_or_default().to_owned());
+    }
+    Ok(())
+}
+
+/// With `input` a plugin may write any text. Enter runs a command or a
+/// shell line it wrote only when the plugin could run that itself. `exit`
+/// needs what `/exit` needs, and a plain message needs only `input`. Enter
+/// reads the text trimmed like the palette does, so a space around a
+/// command leaves it a command.
+#[test_case(YOLO,       only(Permission::Input)                         => Err(written(WRITER, WRITTEN_COMMAND, &user_only(YOLO))) ; "a_user_only_command")]
+#[test_case("/yolo ",   only(Permission::Input)                         => Err(written(WRITER, WRITTEN_COMMAND, &user_only(YOLO))) ; "a_command_with_a_trailing_space")]
+#[test_case(" /yolo",   only(Permission::Input)                         => Err(written(WRITER, WRITTEN_COMMAND, &user_only(YOLO))) ; "a_command_with_a_leading_space")]
+#[test_case("/compact", only(Permission::Input)                         => Err(written(WRITER, WRITTEN_COMMAND, &Missing::Permission(Permission::Agent).refusal("/compact"))) ; "a_command_that_needs_more")]
+#[test_case("/usage",   only(Permission::Input)                         => Ok(()) ; "an_open_command")]
+#[test_case(SHELL_LINE, only(Permission::Input)                         => Err(written(WRITER, WRITTEN_SHELL_LINE, &run_refused())) ; "a_shell_line_without_run")]
+#[test_case(SHELL_LINE, holding(&[Permission::Input, Permission::Run]) => Ok(()) ; "a_shell_line_with_run")]
+#[test_case(PLAIN_LINE, only(Permission::Input)                         => Ok(()) ; "a_plain_message")]
+#[test_case(EXIT_WORD,  only(Permission::Input)                         => Ok(()) ; "exit")]
+fn enter_on_text_a_plugin_wrote(text: &str, writer: PluginReach) -> Result<(), String> {
+    let mut app = test_app();
+    write_as(&mut app, text, named(writer));
+    press_enter(&mut app)
+}
+
+const SECOND_WRITER: &str = "completion";
+
+fn backspaces(app: &mut App, count: usize) {
+    for _ in 0..count {
+        app.update(Msg::Key(key(KeyCode::Backspace)));
+    }
+}
+
+fn type_after(app: &mut App) {
+    type_keys(app, " fix tests");
+}
+
+fn undo_and_redo(app: &mut App) {
+    type_after(app);
+    assert!(app.run_action(BuiltinAction::Undo, None).0);
+    assert!(app.run_action(BuiltinAction::Redo, None).0);
+}
+
+fn clear_and_undo(app: &mut App) {
+    backspaces(app, app.input_box.buffer.value().len());
+    assert!(app.run_action(BuiltinAction::Undo, None).0);
+}
+
+fn edit_with_run(app: &mut App) {
+    let edit = InputEdit {
+        caller: holding(&[Permission::Input, Permission::Run]).owned_by(Arc::from(SECOND_WRITER)),
+        ..planned_edit(app, 1, 1, " ")
+    };
+    apply_edit(app, edit).unwrap();
+}
+
+fn complete_command(app: &mut App) {
+    app.update(Msg::Key(key(KeyCode::Tab)));
+}
+
+/// Nothing the user does to a line a plugin wrote makes it theirs: typing
+/// after it, undo and redo, or another plugin that holds `run` editing it.
+#[test_case(SHELL_LINE, type_after,       WRITTEN_SHELL_LINE ; "typing_after_the_line")]
+#[test_case(SHELL_LINE, undo_and_redo,    WRITTEN_SHELL_LINE ; "undo_and_redo")]
+#[test_case(SHELL_LINE, clear_and_undo,   WRITTEN_SHELL_LINE ; "an_undo_past_a_clear")]
+#[test_case(SHELL_LINE, edit_with_run,    WRITTEN_SHELL_LINE ; "a_second_plugin_with_run")]
+#[test_case("/yol",     complete_command, WRITTEN_COMMAND    ; "a_completed_command")]
+fn a_line_a_plugin_wrote_stays_its(text: &str, then: fn(&mut App), what: &str) {
+    let mut app = test_app();
+    write_as(&mut app, text, named(only(Permission::Input)));
+    then(&mut app);
+
+    let refusal = press_enter(&mut app).unwrap_err();
+    let reason = if what == WRITTEN_SHELL_LINE {
+        run_refused()
+    } else {
+        user_only(YOLO)
+    };
+    assert_eq!(refusal, written(WRITER, what, &reason));
+}
+
+/// The refusal names every plugin that wrote the line and could not run it.
+#[test]
+fn a_refusal_names_each_writer_once() {
+    let mut app = test_app();
+    write_as(&mut app, SHELL_LINE, named(only(Permission::Input)));
+    let second = InputEdit {
+        caller: only(Permission::Input).owned_by(Arc::from(SECOND_WRITER)),
+        ..planned_edit(&app, 1, 1, " ")
+    };
+    apply_edit(&mut app, second).unwrap();
+    write_as(&mut app, SHELL_LINE, named(only(Permission::Input)));
+
+    let names = format!("{WRITER}, {SECOND_WRITER}");
+    assert_eq!(
+        press_enter(&mut app).err(),
+        Some(written(&names, WRITTEN_SHELL_LINE, &run_refused()))
+    );
+}
+
+/// Clearing the input starts it over, so what the user types next is
+/// theirs.
+#[test]
+fn a_command_a_plugin_wrote_runs_once_the_user_retypes_it() {
+    let mut app = test_app();
+    write_as(&mut app, YOLO, named(only(Permission::Input)));
+    assert!(press_enter(&mut app).is_err());
+
+    backspaces(&mut app, YOLO.len());
+    type_keys(&mut app, YOLO);
+    press_enter(&mut app).unwrap();
+    assert!(app.permissions.is_yolo());
+}
+
+/// A login retry sends none of the text, so the input stays as it was and
+/// history does not keep it for a recall to bring back as the user's.
+#[test]
+fn a_login_retry_leaves_the_input_alone() {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+    write_as(&mut app, SHELL_LINE, named(only(Permission::Input)));
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.pending_input, PendingInput::None);
+    assert_eq!(app.input_box.buffer.value(), SHELL_LINE);
+    assert!(app.input_box.history().is_empty());
+}
+
+/// `Esc` closes the palette, and Enter then sends the text as a message.
+/// A recall would open the palette on a `/` text as the user's, so one a
+/// plugin wrote stays out of history.
+#[test_case(PARTIAL_YOLO, true  => false ; "a_command_prefix_a_plugin_wrote")]
+#[test_case(PARTIAL_YOLO, false => true  ; "a_command_prefix_the_user_typed")]
+#[test_case(PLAIN_LINE,   true  => true  ; "a_message_a_plugin_wrote")]
+fn enter_after_esc_keeps_in_history(text: &str, by_plugin: bool) -> bool {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    if by_plugin {
+        write_as(&mut app, text, named(only(Permission::Input)));
+    } else {
+        type_keys(&mut app, text);
+    }
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    press_enter(&mut app).unwrap();
+    assert!(!app.permissions.is_yolo());
+    !app.input_box.history().is_empty()
+}
+
+/// Spaces left behind are no text to send, so the user's typing after them
+/// is theirs.
+#[test]
+fn a_blank_text_a_plugin_left_is_no_ones() {
+    let mut app = test_app();
+    write_as(&mut app, " ", named(only(Permission::Input)));
+    type_keys(&mut app, YOLO);
+    press_enter(&mut app).unwrap();
+    assert!(app.permissions.is_yolo());
+}
+
+/// Switching chats changes no text, so it needs no `input`. The draft that
+/// comes back keeps the writers it left with, and the plugin that switched is
+/// not one of them.
+#[test_case(false => None                                                    ; "a_draft_the_user_typed")]
+#[test_case(true  => Some(written(WRITER, WRITTEN_SHELL_LINE, &run_refused())) ; "a_draft_a_plugin_wrote")]
+fn a_draft_a_plugin_brought_back_keeps_its_writers(plugin_draft: bool) -> Option<String> {
+    let mut app = app_with_subagent();
+    if plugin_draft {
+        write_as(&mut app, SHELL_LINE, named(only(Permission::Input)));
+    } else {
+        type_keys(&mut app, SHELL_LINE);
+    }
+    app.run_builtin(BuiltinAction::NextChat);
+    let switcher = holding(&[]).owned_by(Arc::from(SECOND_WRITER));
+
+    let (handled, _) = app.run_action(BuiltinAction::PrevChat, Some(&switcher));
+    assert!(handled);
+    assert_eq!(app.input_box.buffer.value(), SHELL_LINE);
+    press_enter(&mut app).err()
+}
+
+/// A plugin is one writer, held to the grants of every write it made.
+#[test]
+fn a_plugin_that_wrote_twice_is_named_once() {
+    let mut app = test_app();
+    write_as(
+        &mut app,
+        "/comp",
+        named(holding(&[Permission::Input, Permission::Run])),
+    );
+    write_as(
+        &mut app,
+        COMPACT,
+        named(holding(&[Permission::Input, Permission::Net])),
+    );
+    let reason = Missing::Permission(Permission::Agent).refusal(COMPACT);
+    assert_eq!(
+        press_enter(&mut app).err(),
+        Some(written(WRITER, WRITTEN_COMMAND, &reason))
+    );
+}
+
+/// What a line may do is weighed at Enter, so a vim mode moves and edits
+/// on a `/` or `!` line with `input` alone.
+#[test_case("/c", vec![TextEdit { start: 2, stop: 2, text: "ompact".into() }], "/compact" ; "an_edit_on_a_command")]
+#[test_case("!x", vec![TextEdit { start: 1, stop: 2, text: "ls".into() }],     "!ls"      ; "an_edit_on_a_shell_line")]
+#[test_case("/c", Vec::new(),                                                  "/c"       ; "a_move_on_a_command")]
+#[test_case("!x", Vec::new(),                                                  "!x"       ; "a_move_on_a_shell_line")]
+fn a_plugin_with_input_edits_any_line(typed: &str, edits: Vec<TextEdit>, left: &str) {
+    let mut app = test_app();
+    type_keys(&mut app, typed);
+    let edit = InputEdit {
+        edits,
+        cursor: Some(0),
+        caller: only(Permission::Input),
+        ..planned_edit(&app, 0, 0, "")
+    };
+    apply_edit(&mut app, edit).unwrap();
+    let buffer = &app.input_box.buffer;
+    assert_eq!((buffer.value(), buffer.cursor_byte()), (left, 0));
+    assert_eq!(app.status_bar.flash_text(), None);
+}
+
+fn sent_a_shell_line(app: &mut App) {
+    app.input_box.set_input(SHELL_LINE);
+    app.input_box.submit();
+}
+
+fn deleted_the_bang(app: &mut App) {
+    type_keys(app, SHELL_LINE);
+    app.update(Msg::Key(key(KeyCode::Home)));
+    app.update(Msg::Key(key(KeyCode::Delete)));
+}
+
+/// The text an editing built-in leaves is the plugin's that ran it, like
+/// an edit, so a recall or an undo cannot set up a `!` line for the
+/// user's next Enter. Run by the user it stays theirs.
+#[test_case(BuiltinAction::HistoryPrev, sent_a_shell_line,         true  ; "a_recall_by_a_plugin")]
+#[test_case(BuiltinAction::Undo,        deleted_the_bang,          true  ; "an_undo_by_a_plugin")]
+#[test_case(BuiltinAction::Undo,        deleted_the_bang,          false ; "an_undo_by_the_user")]
+fn a_shell_line_a_builtin_left(action: BuiltinAction, setup: fn(&mut App), by_plugin: bool) {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    setup(&mut app);
+    let caller = named(only(Permission::Input));
+
+    let (handled, _) = app.run_action(action, by_plugin.then_some(&caller));
+    assert!(handled);
+    assert_eq!(app.input_box.buffer.value().trim(), SHELL_LINE);
+    let refusal = written(WRITER, WRITTEN_SHELL_LINE, &run_refused());
+    assert_eq!(press_enter(&mut app).err(), by_plugin.then_some(refusal));
+}
+
+/// A draft goes to disk with what its writers held as far as it can be
+/// vouched for, `agent` when each of them held it and nothing otherwise.
+#[test_case(only(Permission::Input)                       => Some(StoredWriters::Unknown) ; "without_agent")]
+#[test_case(holding(&[Permission::Input, Permission::Agent, Permission::SessionWrite]) => Some(StoredWriters::Agent) ; "with_what_a_prompt_takes")]
+fn a_draft_a_plugin_wrote_goes_to_disk(writer: PluginReach) -> Option<StoredWriters> {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    write_as(&mut app, SHELL_LINE, named(writer));
+    app.checkpoint();
+    app.state.session.meta.input_draft_writers
+}
+
+/// A draft read back from disk comes back as written by a plugin with no
+/// name that holds what the disk kept.
+#[test_case(StoredWriters::Agent,   COMPACT_LINE => Ok(())                                                                          ; "a_turn_writer_runs_a_command_that_starts_turns")]
+#[test_case(StoredWriters::Agent,   YOLO         => Err(written(UNKNOWN_WRITER, WRITTEN_COMMAND, &user_only(YOLO)))                ; "a_turn_writer_leaves_user_only_commands")]
+#[test_case(StoredWriters::Unknown, COMPACT_LINE => Err(written(UNKNOWN_WRITER, WRITTEN_COMMAND, &Missing::Permission(Permission::Agent).refusal(COMPACT))) ; "an_unknown_writer_holds_nothing")]
+#[test_case(StoredWriters::Unknown, SHELL_LINE   => Err(written(UNKNOWN_WRITER, WRITTEN_SHELL_LINE, &run_refused()))              ; "an_unknown_writer_runs_no_shell_line")]
+fn enter_on_a_restored_draft(writers: StoredWriters, text: &str) -> Result<(), String> {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let meta = &mut app.state.session_mut().meta;
+    meta.input_draft = Some(text.into());
+    meta.input_draft_writers = Some(writers);
+    app.restore_display();
+    assert_eq!(app.input_box.buffer.value(), text);
+    press_enter(&mut app)
+}
+
+const PARTIAL_YOLO: &str = "/yol";
+const COMPACT_LINE: &str = "/compact keep the tests";
+const MCP_PROMPT: &str = "srv:review";
+const MCP_PROMPT_TURN: &str = "/srv:review x";
+
+fn with_mcp_prompt(app: &mut App) {
+    app.command_palette = CommandPalette::new(
+        Arc::from([]),
+        McpSnapshotReader::from_snapshot(McpSnapshot {
+            infos: vec![],
+            prompts: vec![McpPromptInfo {
+                display_name: MCP_PROMPT.into(),
+                qualified_name: MCP_PROMPT.replace(':', "/"),
+                description: String::new(),
+                arguments: vec![McpPromptArg {
+                    name: "target".into(),
+                    description: String::new(),
+                    required: false,
+                }],
+            }],
+            pids: vec![],
+            generation: 0,
+        }),
+        LuaCommandReader::empty(),
+    );
+}
+
+/// Every user turn was sent by the user or by a plugin that could start
+/// turns. So a rewound turn runs a command that starts turns, and leaves a
+/// user-only one, also one the palette matches loosely, to the user.
+#[test_case(MCP_PROMPT_TURN => Ok(())                                                              ; "an_mcp_prompt")]
+#[test_case(COMPACT_LINE    => Ok(())                                                              ; "compact")]
+#[test_case(EXIT_WORD       => Ok(())                                                              ; "exit")]
+#[test_case(YOLO            => Err(written(UNKNOWN_WRITER, WRITTEN_COMMAND, &user_only(YOLO)))     ; "a_user_only_command")]
+#[test_case(PARTIAL_YOLO    => Err(written(UNKNOWN_WRITER, WRITTEN_COMMAND, &user_only(YOLO)))     ; "a_prefix_of_a_user_only_command")]
+#[test_case(SHELL_LINE      => Err(written(UNKNOWN_WRITER, WRITTEN_SHELL_LINE, &run_refused()))   ; "a_shell_line")]
+fn enter_on_a_rewound_turn(text: &str) -> Result<(), String> {
+    let mut app = build_rewind_app();
+    with_mcp_prompt(&mut app);
+    app.rewind_to(rewind_to_prompt(&format!("\n\n{text}")));
+    let entered = press_enter(&mut app);
+    assert!(!app.permissions.is_yolo());
+    entered
+}
+
+#[test]
+fn a_rewound_message_is_the_users() {
+    let mut app = build_rewind_app();
+    app.rewind_to(rewind_to_prompt(PLAIN_LINE));
+    assert!(app.input_box.buffer.writers().is_empty());
+}
+
+#[test_case(SHELL_LINE      => Some(StoredWriters::Agent) ; "a_shell_line")]
+#[test_case(MCP_PROMPT_TURN => Some(StoredWriters::Agent) ; "a_command")]
+#[test_case(EXIT_WORD       => Some(StoredWriters::Agent) ; "exit")]
+#[test_case(PLAIN_LINE      => None                       ; "a_message")]
+fn a_forked_turn_keeps_its_writers(text: &str) -> Option<StoredWriters> {
+    let mut app = test_app();
+    seed_rewind_session(app.state.session_mut());
+    let fork = opened_fork(app.fork_to(rewind_to_prompt(text)));
+    fork.meta.input_draft_writers
+}
 
 /// `init.lua` with no `plugin.toml` next to it holds no grants, so its edit
 /// raises before it reaches the UI, saying where to grant `input`.
@@ -7133,6 +7524,49 @@ fn a_fallback_lands_where_the_user_typed(grants: &[&str], left: &str) {
     serve_handler(&mut app, &ui);
 
     assert_eq!(app.input_box.buffer.value(), left);
+}
+
+const PRICED_OWNER: &str = "owner";
+/// An action that writes a `!` in front of the input. Its owner holds every
+/// grant, `run` included, and its price leaves `run` out.
+const BANG_ACTION: &str = r#"
+maki.api.register_action("bang", function()
+    local st = maki.ui.input()
+    local _, err = maki.ui.input_edit({
+        start = 0, stop = 0, text = "!",
+        version = st.version, session_id = st.session_id,
+    })
+    return err == nil
+end, { capability = { "input", "session_read" } })
+"#;
+const BANG_CALLER: &str = r#"
+maki.keymap.set("i", "<C-x>", function()
+    maki.ui.flash(tostring(maki.ui.action("owner.bang")))
+end)
+"#;
+
+/// The callback holds only the price of its action, also in the UI. The `!`
+/// it writes is held to that price, so a caller holding `run` itself still
+/// cannot make Enter run it.
+#[test]
+fn an_action_writes_the_input_with_its_price_alone() {
+    let host = new_host();
+    host.load_source(PRICED_OWNER, BANG_ACTION).unwrap();
+    host.load_source(USER_CONFIG, BANG_CALLER).unwrap();
+    let (mut app, ui) = hosted_app(&host);
+    type_keys(&mut app, DRAFT);
+
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('x'),
+        KeyModifiers::CONTROL,
+    )));
+
+    assert_eq!(serve_handler(&mut app, &ui).0, [ASKED_EDIT, "true"]);
+    assert_eq!(app.input_box.buffer.value(), format!("!{DRAFT}"));
+    assert_eq!(
+        press_enter(&mut app).err(),
+        Some(written(PRICED_OWNER, WRITTEN_SHELL_LINE, &run_refused()))
+    );
 }
 
 /// A source for `$` that answers at once, so the real completion popup opens
@@ -7269,7 +7703,7 @@ fn input_actions_say_when_there_was_nothing_to_do() {
         (BuiltinAction::HistoryNext, true, TYPED_LINE),
         (BuiltinAction::HistoryNext, false, TYPED_LINE),
     ] {
-        let answered = app.run_action(action).0;
+        let answered = app.run_action(action, None).0;
         assert_eq!(
             (answered, app.input_box.buffer.value()),
             (handled, value),

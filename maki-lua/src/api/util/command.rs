@@ -660,8 +660,8 @@ pub enum BuiltinAction {
 
 impl BuiltinAction {
     /// The built-ins that change the chat input. A plugin runs them only
-    /// with `input`, like an edit. Switching chats is not one of them: it
-    /// shows another chat's own draft.
+    /// with `input`, like an edit, and the text they leave is the plugin's.
+    /// Switching chats is not one of them: it shows another chat's own draft.
     pub fn changes_input(self) -> bool {
         self.needs().contains(&Permission::Input)
     }
@@ -747,6 +747,7 @@ pub enum UiAction {
     /// a key handler try one action and fall back to another.
     Builtin {
         action: BuiltinAction,
+        caller: PluginReach,
         reply_tx: flume::Sender<bool>,
     },
     /// The handler of the keystroke with this ticket id returned. It comes

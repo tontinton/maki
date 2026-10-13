@@ -529,7 +529,10 @@ function M.refresh(st)
   -- A slash command owns the input while the command palette is up, so there
   -- is no mention to complete in one. The palette handles its keys before any
   -- binding, so this is about the rows and not about the keys.
-  if not start or st.text:sub(1, 1) == "/" then
+  -- Completion holds no `run`, so Enter would refuse a `!` line it wrote
+  -- into. The shell would also read a path with a space or a `;` in it as
+  -- more than one word.
+  if not start or st.text:match("^%s*[/!]") then
     return M.close()
   end
 

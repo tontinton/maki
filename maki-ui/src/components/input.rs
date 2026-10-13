@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::decor::{LangCache, LineDecor};
 use self::layout::{Layout, Piece, Row};
-use crate::text_buffer::{EditResult, Mark, Marks, Prompt, TextBuffer, is_newline_key};
+use crate::text_buffer::{EditResult, Mark, Marks, Prompt, TextBuffer, Writers, is_newline_key};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -52,6 +52,16 @@ const ASK_PREFIX: &str = "Ask maki to ";
 const ASK_SUFFIX: &str = "...";
 const BLANK_PLACEHOLDER: &str = " ";
 
+/// What opens the command palette at the start of [`sent_text`].
+pub(crate) const COMMAND_PREFIX: char = '/';
+
+/// The input as Enter reads it, trimmed. The command palette, the send and
+/// history all read it so, which keeps a `/yolo ` from going out as a
+/// message and coming back from history as a command.
+pub(crate) fn sent_text(value: &str) -> &str {
+    value.trim()
+}
+
 #[derive(Clone, Copy)]
 pub enum Placeholder {
     Suggestion,
@@ -82,6 +92,13 @@ pub struct Draft {
     pub text: String,
     pub images: Vec<ImageSource>,
     marks: Marks,
+    writers: Writers,
+}
+
+impl Draft {
+    pub fn writers(&self) -> &Writers {
+        &self.writers
+    }
 }
 
 pub struct InputBox {
@@ -314,13 +331,19 @@ impl InputBox {
         });
     }
 
+    /// A recall opens the command palette on a `/` text with nobody holding
+    /// it to the plugins that wrote it, and the palette matches loosely, so
+    /// a `/yol` a plugin wrote would come back as the user's `/yolo`. Such a
+    /// text stays out of history.
     pub fn submit(&mut self) -> Option<Submission> {
-        let text = self.buffer.value().trim().to_string();
+        let text = sent_text(self.buffer.value()).to_string();
         let images = mem::take(&mut self.pending_images);
         if text.is_empty() && images.is_empty() {
             return None;
         }
-        self.history.push(text.clone());
+        if !(text.starts_with(COMMAND_PREFIX) && !self.buffer.writers().is_empty()) {
+            self.history.push(text.clone());
+        }
         self.discard();
         Some(Submission { text, images })
     }
@@ -354,6 +377,15 @@ impl InputBox {
         }
     }
 
+    /// The plugins that wrote [`Self::draft_text`].
+    pub fn draft_writers(&self) -> &Writers {
+        if self.is_untouched_recall() {
+            &self.draft.writers
+        } else {
+            self.buffer.writers()
+        }
+    }
+
     fn is_untouched_recall(&self) -> bool {
         self.history_index
             .and_then(|i| self.history.get(i))
@@ -368,15 +400,21 @@ impl InputBox {
         let shown = self.buffer.swap_prompt(Prompt {
             text: draft.text,
             marks: draft.marks,
+            writers: draft.writers,
         });
         let covered = mem::take(&mut self.draft);
         self.history_index = None;
         self.scroll_y = 0;
-        let Prompt { text, marks } = if parks_the_draft { covered } else { shown };
+        let Prompt {
+            text,
+            marks,
+            writers,
+        } = if parks_the_draft { covered } else { shown };
         Draft {
             text,
             images,
             marks,
+            writers,
         }
     }
 
@@ -426,13 +464,25 @@ impl InputBox {
         Ok(caret)
     }
 
-    /// Whole-prompt writes that are not plugin writes: a restored draft, a
-    /// rewind prompt, a completed command, what `$EDITOR` changed. The text
-    /// lands verbatim, because the user composed it elsewhere and it is what
-    /// the model would be sent. It is another prompt even when it reads the
-    /// same, so the marks of the old one go, see [`TextBuffer::swap_prompt`].
+    /// A whole prompt no plugin wrote: a restored draft, a rewind prompt. The
+    /// text lands verbatim, because the user composed it elsewhere and it is
+    /// what the model would be sent. It is another prompt even when it reads
+    /// the same, so the marks of the old one go, see
+    /// [`TextBuffer::swap_prompt`].
     pub fn set_input(&mut self, s: &str) {
         self.buffer.set_value(s);
+    }
+
+    /// [`Self::set_input`] for text made from what the input holds: a
+    /// completed command, what `$EDITOR` changed. The plugins that wrote the
+    /// text it came from still count as its writers.
+    pub fn rewrite_input(&mut self, s: &str) {
+        let writers = self.buffer.writers().clone();
+        self.buffer.swap_prompt(Prompt {
+            text: s.to_owned(),
+            writers,
+            ..Prompt::default()
+        });
     }
 
     /// `false` when there is no older entry to recall.
@@ -450,7 +500,10 @@ impl InputBox {
         true
     }
 
-    /// History keeps text only, so a recalled entry comes in with no marks.
+    /// History keeps text only, so a recalled entry comes in with no marks,
+    /// and as the user's, who sent it. It holds only what went out, in the
+    /// form Enter read it, so it reads the same way again, see
+    /// [`sent_text`].
     fn history_entry(&self, index: usize) -> Prompt {
         Prompt {
             text: self.history.get(index).unwrap().to_owned(),

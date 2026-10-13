@@ -11,8 +11,9 @@ use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use maki_lua::{SyntaxInput, TextEdit};
+use maki_lua::{PluginReach, SyntaxInput, TextEdit};
 
+use crate::components::input::sent_text;
 use crate::highlight::TAB_SPACES;
 
 #[cfg(test)]
@@ -158,6 +159,9 @@ struct UndoStep {
     /// Undo puts the caret back here, or the user goes looking for the text
     /// that just changed.
     cursor: usize,
+    /// And who had written the text, so undoing past a clear brings a
+    /// plugin's line back as the plugin's.
+    writers: Writers,
     group: Option<EditGroup>,
 }
 
@@ -240,13 +244,49 @@ impl UndoHistory {
     }
 }
 
-/// One prompt the input can hold: its text and the marks plugins placed on
-/// it. The marks only make sense on that text, so a prompt put away keeps
-/// them and brings them back when it returns.
+/// The plugins that changed a prompt's text, each held to the grants it had
+/// in all of its changes. A user edit inside the text takes nobody out, so
+/// retyping a character never makes a plugin's line the user's. Only a blank
+/// text, a user edit over all of it or another prompt starts the set over.
+#[derive(Clone, Default)]
+pub struct Writers(Arc<[PluginReach]>);
+
+impl Writers {
+    /// One entry per plugin. A write with grants the entry lacks, as inside
+    /// an action another plugin ran, keeps only what both hold.
+    fn add(&mut self, writer: &PluginReach) {
+        match self
+            .0
+            .iter()
+            .position(|held| held.owner() == writer.owner())
+        {
+            Some(index) if writer.first_missing(&self.0[index]).is_none() => {}
+            Some(index) => {
+                let mut held = self.0.to_vec();
+                held[index] = held[index].intersect(writer);
+                self.0 = held.into();
+            }
+            None => self.0 = self.0.iter().cloned().chain([writer.clone()]).collect(),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &PluginReach> {
+        self.0.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// One prompt the input can hold: its text, the marks plugins placed on it
+/// and the plugins that wrote it. They only make sense on that text, so a
+/// prompt put away keeps them and brings them back when it returns.
 #[derive(Default)]
 pub struct Prompt {
     pub text: String,
     pub marks: Marks,
+    pub writers: Writers,
 }
 
 pub struct TextBuffer {
@@ -280,6 +320,10 @@ pub struct TextBuffer {
     decor_epoch: u64,
     /// Shows the text under every conceal, for checking what is really sent.
     raw: bool,
+    /// A plugin's change adds to it, see [`Self::written_by`]. A prompt
+    /// swapped in brings its own, and an undo step puts back the set it began
+    /// with.
+    writers: Writers,
 }
 
 /// Refuses an offset that splits a character. Rounding it would move an edit
@@ -374,6 +418,7 @@ impl TextBuffer {
             marks: Marks::default(),
             decor_epoch: 0,
             raw: false,
+            writers: Writers::default(),
         }
     }
 
@@ -403,6 +448,7 @@ impl TextBuffer {
         let old = Prompt {
             text: self.text.clone(),
             marks: mem::take(&mut self.marks),
+            writers: mem::replace(&mut self.writers, prompt.writers),
         };
         let (start, old_end, new_end) = changed_span(&self.text, &prompt.text);
         self.splice(
@@ -444,6 +490,7 @@ impl TextBuffer {
         self.undo.open = Some(UndoStep {
             inverses: Vec::new(),
             cursor: self.cursor_byte(),
+            writers: self.writers.clone(),
             group,
         });
         let out = action(self);
@@ -488,6 +535,7 @@ impl TextBuffer {
     /// replaces, so undo and redo stay O(edit) like the edit itself.
     fn revert(&mut self, step: UndoStep) -> UndoStep {
         let cursor = self.cursor_byte();
+        let writers = mem::replace(&mut self.writers, step.writers);
         let inverses = step
             .inverses
             .into_iter()
@@ -508,6 +556,7 @@ impl TextBuffer {
         UndoStep {
             inverses,
             cursor,
+            writers,
             group: None,
         }
     }
@@ -517,6 +566,26 @@ impl TextBuffer {
     /// of landing on text the user has typed since.
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    pub fn writers(&self) -> &Writers {
+        &self.writers
+    }
+
+    /// Adds {writer} when the text changed since version {since}, for a
+    /// change made for a plugin rather than by the user.
+    pub fn written_by(&mut self, writer: &PluginReach, since: u64) {
+        if self.version != since {
+            self.add_writer(writer);
+        }
+    }
+
+    /// Adds {writer} unless the text is blank, whatever changed to get it
+    /// here.
+    pub fn add_writer(&mut self, writer: &PluginReach) {
+        if !sent_text(&self.text).is_empty() {
+            self.writers.add(writer);
+        }
     }
 
     /// The changes that led from {version} to now, in the order they were
@@ -934,6 +1003,9 @@ impl TextBuffer {
             return;
         }
         self.version += 1;
+        if sent_text(&self.text).is_empty() {
+            self.writers = Writers::default();
+        }
         let syntax_shown = self.syntax_shapes_rows();
         while self
             .changes
@@ -981,7 +1053,16 @@ impl TextBuffer {
         } else {
             Toward::End
         };
-        self.edit_all([(whole, text)], caret);
+        let replaces_all = whole == (0..self.text.len());
+        self.undoable(|buf| {
+            // No byte a plugin wrote is left, so the text is the user's now.
+            // Done inside the step, so undo brings the plugin's text back as
+            // the plugin's.
+            if replaces_all {
+                buf.writers = Writers::default();
+            }
+            buf.edit_all([(whole, text)], caret);
+        });
         self.snap_cursor(toward);
     }
 

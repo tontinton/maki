@@ -637,7 +637,7 @@ mod tests {
         app.remove_task(TASK_ID).unwrap();
 
         assert_eq!(app.active_chat, 0);
-        assert_eq!(app.main_draft(), MAIN_DRAFT);
+        assert_eq!(app.main_draft().0, MAIN_DRAFT);
     }
 
     /// A plugin task shows up idle the moment it opens, long before its first

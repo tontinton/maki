@@ -5235,7 +5235,10 @@ Requires the `session_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{opts?}` (`table?`) Optional fields:
-  - `messages` (`table`) what `export` or `messages` return.
+  - `messages` (`table`) what `export` or `messages` return. A user turn
+    that starts with `/` or `!`, or is `exit`, needs the `agent`
+    permission too, since a rewind puts it back in the input for Enter
+    to run.
   - `facts` (`table`) what `export` returns: the date, working directory,
     model, instructions and hints the model was last told.
   - `model` (`string`) model spec. Defaults to the focused tab's in the TUI,
@@ -6836,6 +6839,23 @@ style it with `input_rules`. Your own `init.lua` needs a `plugin.toml`
 next to it for this, like any plugin, see
 [plugin permissions](#plugin-permissions).
 
+With `input` you may write any text. Enter then checks every plugin
+that changed it:
+
+| Text starts with | Each plugin that wrote it needs |
+| --- | --- |
+| `!` | `run` |
+| a `/` command | what that command needs from a plugin, see [`maki.api.run_command`](#maki-api-run_command). Only the user can run some commands, like `/yolo` |
+| anything else | nothing beyond `input` |
+
+If one of them falls short, Enter leaves the text where it is and the
+status bar names it. The text becomes the user's again only
+once the input is sent, cleared or replaced.
+
+A draft restored after a restart and a rewound or forked turn that
+starts with `/` or `!` count as written by `a plugin` that holds
+`agent` and `session_write` at most.
+
 Upgrading: `input_edit` needed no permission in earlier releases.
 Plugins and `init.lua` files that call it or an editing built-in
 action need `input` now. A `plugin.toml` you wrote yourself grants it
@@ -7443,7 +7463,8 @@ start, while typing right where the edit lands does. Edits are refused:
 
 Read again and retry on any of them.
 
-A change needs `input`, see [chat input](#chat-input).
+A change needs `input`. What Enter does with text you wrote is in
+[chat input](#chat-input).
 
 Tabs and carriage returns in `text` become spaces and newlines, and the
 other control characters are dropped, the way a paste is rewritten. With
