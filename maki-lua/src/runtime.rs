@@ -3147,7 +3147,7 @@ impl LuaRuntime {
                         header: t.header_key,
                         restore: t.restore_key,
                         start: t.start_key,
-                        permission_scopes: t.permission.and_then(|p| p.scopes.callback_key()),
+                        permission_scopes: t.permission.and_then(|p| p.scopes?.callback_key()),
                         describe: t.describe_key,
                     },
                 )

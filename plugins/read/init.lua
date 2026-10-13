@@ -152,6 +152,7 @@ maki.api.register_prompt_hint({
 
 maki.api.register_tool({
   name = "read",
+  permission = "fs_read",
   kind = "read",
   description = DESCRIPTION,
 

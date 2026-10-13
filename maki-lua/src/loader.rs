@@ -2246,6 +2246,7 @@ mod bundled_manifests {
     const REQUIRE_CALL: &str = "require(";
     const PROVIDER_REGISTER: &str = "maki.provider.register";
     const API_KEY_ENV_FIELD: &str = "api_key_env";
+    const AGENT_SESSION: &str = "maki.agent.session";
 
     /// Every guarded `maki.*` function under the dotted name lua calls it by.
     fn guarded_calls() -> Vec<(String, Permission)> {
@@ -2399,6 +2400,17 @@ mod bundled_manifests {
                     needed
                         .entry(Permission::Env)
                         .or_insert_with(|| format!("{PROVIDER_REGISTER} with {API_KEY_ENV_FIELD}"));
+                }
+                // A bundled plugin opening a session hands over whatever the
+                // chat has, and a session pays for everything it hands over.
+                if calls(source, AGENT_SESSION) {
+                    for &permission in Permission::ALL {
+                        if permission != Permission::Agent {
+                            needed
+                                .entry(permission)
+                                .or_insert_with(|| AGENT_SESSION.to_owned());
+                        }
+                    }
                 }
             }
 

@@ -443,7 +443,7 @@ only in compact mode.
   - `describe` (`function`) Optional. Returns a custom description string for the current context.
   - `examples` (`table`) Optional. Array of example input objects for documentation.
   - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
-  - `permission` (`string`) Required with `permission_scopes`. The capability the tool exposes to the model: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves this tool.
+  - `permission` (`string`) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
   - `mutable_path` (`string`) Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 
@@ -488,7 +488,9 @@ deny rules always win over a plugin allow.
 
 An allow is delegation, not escalation: it needs the `permission` the
 target tool declares, so a plugin can only pre-approve what it could
-already do itself. A deny needs no permission.
+already do itself. A deny needs no permission. An allow on a tool that
+never prompts (`permission` without `permission_scopes`) has nothing to
+pre-approve and is dropped.
 
 Allows are checked once the plugin finishes loading, so a plugin may
 pre-approve a tool it registers itself. One that does not hold up (no such
@@ -1356,7 +1358,7 @@ background session of that chat would have.
   - `except` (`string[]?`) exclude these tool names.
   - `workflow` (`boolean?`) use workflow-mode descriptions. Default: `false`.
   - `spec` (`string?`) evaluate capability exclusions against this model spec.
-  - `mcp` (`boolean?`) describe tools as if MCP is reachable. Default: `true`.
+  - `mcp` (`boolean?`) describe tools as if MCP is reachable. Default: `false`.
     Pass what you pass to `maki.agent.session()`. Otherwise the descriptions
     advertise MCP tools that the session has no way to call.
 
@@ -1490,14 +1492,14 @@ answers and YOLO still apply, so add allow rules for what it runs (see
 chat is in plan mode its file-write tools are denied. Its thinking never
 goes above the chat's current setting.
 
-Since nothing can prompt, the plugin must itself hold what its tools
-reach. A tool that declares a permission, like `bash` with `run`, needs
-that one. A tool that declares none, or `mcp` on a chat with MCP servers,
-needs every permission except `agent`. The read-only tools (`read`,
-`grep`, `glob`) declare none today, so handing them over takes all of
-them. `local_tools` need nothing, they run as the plugin. The ctx form
-follows the same rule when its own session cannot prompt: a tool handler
-inside such a session, or `maki -p`.
+With or without a ctx, the plugin must hold what its tools reach. A prompt
+is no gate under YOLO or an allow rule, and a background session has
+nobody to prompt. A tool declaring a permission (`bash` with `run`, `read`
+with `fs_read`) costs that one. A tool declaring none (`batch`,
+`code_execution`), or `mcp` on a chat with MCP servers, costs every
+permission except `agent`. `local_tools` cost nothing, they run as the
+plugin. The bundled `task` hands over the whole chat, so it holds all
+five.
 
 `scope` sets the lifetime. `"task"`, the default, ends the session with
 the task that opened it: an autocmd callback when it returns, a tool
@@ -1540,7 +1542,8 @@ no live chat session, so opening one fails with "session not live". The
   - `mcp` (`boolean?`) give the session access to MCP tools. Their
     definitions are injected automatically each turn (deferred behind
     `tool_search`), so don't put MCP definitions in `tools`. The session
-    starts with no loaded tools of its own. Default: `true`.
+    starts with no loaded tools of its own. Default: `false`. Like `tools`,
+    the session only gets what it asks for.
   - `thinking` (`string|integer?`) thinking mode: `"off"`, `"adaptive"`, an
     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
     `"max"`), or a budget integer (token count). Inherits the parent

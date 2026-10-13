@@ -194,6 +194,7 @@ maki.api.register_prompt_hint({
 
 maki.api.register_tool({
   name = "grep",
+  permission = "fs_read",
   kind = "search",
   description = [[Search file contents using regex.
 

@@ -213,8 +213,6 @@ const WRONG_TYPE_SCOPES_SRC: &str =
     r#"name = "num_scope", description = "test", permission = "fs_write", permission_scopes = 42"#;
 const SCOPES_WITHOUT_PERMISSION_SRC: &str =
     r#"name = "no_perm", description = "test", permission_scopes = "url""#;
-const PERMISSION_WITHOUT_SCOPES_SRC: &str =
-    r#"name = "no_scopes", description = "test", permission = "fs_write""#;
 const UNKNOWN_PERMISSION_SRC: &str = r#"name = "bad_perm", description = "test", permission = "filesystem", permission_scopes = "url""#;
 const FS_WRITE_WITHOUT_MUTABLE_PATH_SRC: &str = r#"name = "no_mpath", description = "test", permission = "fs_write", permission_scopes = "url""#;
 const NON_STRING_FIELD_SCHEMA: &str = r#"{
@@ -492,6 +490,14 @@ const UNCHECKED_EDIT_TOOL_SRC: &str = r#"maki.api.register_tool({
     schema = { type = "object", properties = {} },
     handler = function() return "" end,
 })"#;
+/// Declares what it reaches, still nothing to prompt.
+const READ_ONLY_EDIT_TOOL_SRC: &str = r#"maki.api.register_tool({
+    name = "edit",
+    description = "read-only",
+    schema = { type = "object", properties = {} },
+    permission = "fs_read",
+    handler = function() return "" end,
+})"#;
 
 /// A package is the only entry point that runs lua under a permission set the
 /// plugin did not pick for itself.
@@ -512,6 +518,7 @@ fn load_package_with(
 #[test_case::test_case(EDIT_TOOL_SRC, false => 0 ; "plugin_granted_nothing_pre_approves_nothing")]
 #[test_case::test_case(NO_RULE_SRC, true => 0 ; "no_such_tool_is_registered")]
 #[test_case::test_case(UNCHECKED_EDIT_TOOL_SRC, true => 0 ; "tool_is_never_permission_checked")]
+#[test_case::test_case(READ_ONLY_EDIT_TOOL_SRC, true => 0 ; "tool_declares_reach_but_never_prompts")]
 fn allow_rule_survives_only_when_delegated(owner_src: &str, granted: bool) -> usize {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -613,7 +620,6 @@ fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
 #[test_case::test_case(OLD_SCOPE_KEY_SRC, MINIMAL_SCHEMA, "'permission_scope' was removed" ; "old_permission_scope_key")]
 #[test_case::test_case(WRONG_TYPE_SCOPES_SRC, MINIMAL_SCHEMA, "'permission_scopes' must be a string field name or a function" ; "permission_scopes_wrong_type")]
 #[test_case::test_case(SCOPES_WITHOUT_PERMISSION_SRC, STRING_FIELD_SCHEMA, "must declare 'permission'" ; "scopes_without_permission")]
-#[test_case::test_case(PERMISSION_WITHOUT_SCOPES_SRC, STRING_FIELD_SCHEMA, "needs 'permission_scopes'" ; "permission_without_scopes")]
 #[test_case::test_case(UNKNOWN_PERMISSION_SRC, STRING_FIELD_SCHEMA, "unknown permission 'filesystem'" ; "unknown_permission")]
 #[test_case::test_case(FS_WRITE_WITHOUT_MUTABLE_PATH_SRC, STRING_FIELD_SCHEMA, "no 'mutable_path'" ; "fs_write_without_mutable_path")]
 fn registration_validation_rejects(fields: &str, schema: &str, expected_err: &str) {
@@ -631,6 +637,23 @@ fn registration_validation_rejects(fields: &str, schema: &str, expected_err: &st
         .expect_err("expected validation error");
     assert!(matches!(err, PluginError::Lua { .. }));
     assert!(err.to_string().contains(expected_err), "got: {err}");
+}
+
+/// `permission` alone is the read-only shape: it names what the tool reaches
+/// for hooks and sessions handed it, and no call ever stops at the prompt.
+#[test]
+fn permission_without_scopes_declares_reach_and_never_prompts() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("tool_owner", READ_ONLY_EDIT_TOOL_SRC)
+        .unwrap();
+
+    let tool = &reg.get("edit").unwrap().tool;
+    let inv = tool.parse(&json!({})).unwrap();
+
+    assert_eq!(tool.required_permission(), Some(Permission::FsRead));
+    assert!(!tool.permission_checked());
+    assert!(smol::block_on(inv.permission_scopes()).is_none());
 }
 
 #[test]
@@ -8040,13 +8063,12 @@ fn a_plugin_session_can_only_reach_what_its_plugin_holds(
     assert!(result.contains(expected), "got: {result}");
 }
 
-/// The ctx form is one hop away from a session nobody answers for: a tool
-/// the plugin registered gets a ctx inside its own background session, or
-/// under `maki -p`. There it pays the same price. With a user to ask, the
-/// prompt stays in its place and the session opens.
-#[test_case::test_case(false, "fs_write" ; "unanswerable_ctx_pays_for_reach")]
-#[test_case::test_case(true, "nil" ; "answerable_ctx_keeps_the_prompt")]
-fn a_ctx_session_pays_for_reach_only_when_nobody_can_answer(answerable: bool, expected: &str) {
+/// The ctx form pays the same price whether or not a user could answer: a
+/// prompt is no gate under YOLO or an allow rule, and a handler inside a
+/// background session or under `maki -p` has nobody to ask anyway.
+#[test_case::test_case(false ; "unanswerable_ctx")]
+#[test_case::test_case(true ; "answerable_ctx")]
+fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
     let (reg, _host) = reach_probe_host(r#"ctx, { tools = { { name = "edit" } }, mcp = false }"#);
     let inv = reg
         .get("open_reaching")
@@ -8063,5 +8085,5 @@ fn a_ctx_session_pays_for_reach_only_when_nobody_can_answer(answerable: bool, ex
     let Ok(maki_agent::ToolOutput::Plain(text)) = result else {
         panic!("unexpected output: {result:?}");
     };
-    assert!(text.text.contains(expected), "got: {}", text.text);
+    assert!(text.text.contains("fs_write"), "got: {}", text.text);
 }

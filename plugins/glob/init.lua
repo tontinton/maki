@@ -16,6 +16,7 @@ end
 
 maki.api.register_tool({
   name = "glob",
+  permission = "fs_read",
   kind = "search",
   description = [[Find files by glob pattern.
 

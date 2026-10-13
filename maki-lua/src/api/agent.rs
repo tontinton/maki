@@ -60,8 +60,8 @@ const IDLE_STATUS: &str = "idle";
 const TASK_SCOPE: &str = "task";
 const SESSION_SCOPE: &str = "session";
 const NO_REGISTRY_ERR: &str = "tool registry not available";
-const MCP_REACH_ERR: &str = "mcp reaches whatever its servers do, so a session of your own takes every \
-     permission, or pass mcp = false";
+const MCP_REACH_ERR: &str =
+    "mcp = true reaches whatever its servers do, so a session of your own takes every permission";
 const TASK_REQUIRED_ERR: &str = "maki.agent.session({ session = id }) and its prompts must run \
      in a task: maki.async.spawn, an autocmd callback or a tool handler";
 
@@ -134,10 +134,10 @@ fn seed_ctx(
     }))
 }
 
-/// Nobody answers a permission prompt in a session of the plugin's own, so a
-/// plugin denied `run` could hand `bash` to a model and let YOLO or an allow
-/// rule run it. The session pays for its reach the way a hook on the same
-/// tool does: a declared capability costs itself, undeclared reach costs
+/// A plugin denied `run` could hand `bash` to a model and let YOLO or an allow
+/// rule run it, and in a session of the plugin's own nobody answers a prompt
+/// at all. So a session pays for its reach the way a hook on the same tool
+/// does: a declared capability costs itself, undeclared reach costs
 /// everything. A name the registry does not know never dispatches, so it is
 /// free.
 fn delegated_reach(
@@ -157,7 +157,7 @@ fn delegated_reach(
         let Some(registered) = registry.get(name) else {
             continue;
         };
-        match registered.tool.required_permission() {
+        match registered.tool.reach().map(|reach| reach.permission) {
             Some(required) if !perms.is_allowed(required) => {
                 return Err(format!(
                     "tool '{name}' needs '{required}', which this plugin does not hold"
@@ -358,7 +358,7 @@ async fn system_prompt(
 ///   `except` (string[]?) - exclude these tool names.
 ///   `workflow` (boolean?) - use workflow-mode descriptions. Default: `false`.
 ///   `spec` (string?) - evaluate capability exclusions against this model spec.
-///   `mcp` (boolean?) - describe tools as if MCP is reachable. Default: `true`.
+///   `mcp` (boolean?) - describe tools as if MCP is reachable. Default: `false`.
 ///     Pass what you pass to `maki.agent.session()`. Otherwise the descriptions
 ///     advertise MCP tools that the session has no way to call.
 /// @return (table?, string?) Array of tool definition tables, or `(nil, err)` on failure.
@@ -392,7 +392,7 @@ async fn tools(
     let except: Option<Vec<String>> = opts.get("except")?;
     let workflow: bool = opts.get::<Option<bool>>("workflow")?.unwrap_or(false);
     let spec_str: Option<String> = opts.get("spec")?;
-    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true);
+    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(false);
 
     let parsed = spec_str
         .as_deref()
@@ -583,14 +583,14 @@ async fn call_tool(
 /// chat is in plan mode its file-write tools are denied. Its thinking never
 /// goes above the chat's current setting.
 ///
-/// Since nothing can prompt, the plugin must itself hold what its tools
-/// reach. A tool that declares a permission, like `bash` with `run`, needs
-/// that one. A tool that declares none, or `mcp` on a chat with MCP servers,
-/// needs every permission except `agent`. The read-only tools (`read`,
-/// `grep`, `glob`) declare none today, so handing them over takes all of
-/// them. `local_tools` need nothing, they run as the plugin. The ctx form
-/// follows the same rule when its own session cannot prompt: a tool handler
-/// inside such a session, or `maki -p`.
+/// With or without a ctx, the plugin must hold what its tools reach. A prompt
+/// is no gate under YOLO or an allow rule, and a background session has
+/// nobody to prompt. A tool declaring a permission (`bash` with `run`, `read`
+/// with `fs_read`) costs that one. A tool declaring none (`batch`,
+/// `code_execution`), or `mcp` on a chat with MCP servers, costs every
+/// permission except `agent`. `local_tools` cost nothing, they run as the
+/// plugin. The bundled `task` hands over the whole chat, so it holds all
+/// five.
 ///
 /// `scope` sets the lifetime. `"task"`, the default, ends the session with
 /// the task that opened it: an autocmd callback when it returns, a tool
@@ -631,7 +631,8 @@ async fn call_tool(
 ///   `mcp` (boolean?) - give the session access to MCP tools. Their
 ///     definitions are injected automatically each turn (deferred behind
 ///     `tool_search`), so don't put MCP definitions in `tools`. The session
-///     starts with no loaded tools of its own. Default: `true`.
+///     starts with no loaded tools of its own. Default: `false`. Like `tools`,
+///     the session only gets what it asks for.
 ///   `thinking` (string|integer?) - thinking mode: `"off"`, `"adaptive"`, an
 ///     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
 ///     `"max"`), or a budget integer (token count). Inherits the parent
@@ -697,7 +698,7 @@ async fn session(
         None => DEFAULT_SESSION_AUDIENCE,
     };
     let fast: Option<bool> = opts.get("fast")?;
-    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true);
+    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(false);
 
     let (model, provider): (Model, Arc<dyn provider::Provider>) = if let Some(ref spec) = model_spec
     {
@@ -723,13 +724,8 @@ async fn session(
         },
         None => vec![],
     };
-    // The ctx form gets no free pass: a tool this plugin registered runs inside
-    // its own background session (or under `maki -p`) with a ctx nobody
-    // answers for, and would open `bash` from there for nothing.
-    if agent_ctx.user_response_rx.is_none() {
-        let reaches_mcp = mcp_enabled && agent_ctx.mcp.is_some();
-        try_pair!(delegated_reach(&lua, &perms, &tools_json, reaches_mcp));
-    }
+    let reaches_mcp = mcp_enabled && agent_ctx.mcp.is_some();
+    try_pair!(delegated_reach(&lua, &perms, &tools_json, reaches_mcp));
 
     let mut local_map: HashMap<String, LocalTool> = HashMap::new();
     if let Some(tbl) = local_tools_tbl {

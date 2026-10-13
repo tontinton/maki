@@ -130,20 +130,19 @@ impl PermissionScopeSpec {
     }
 }
 
-/// What a tool exposes to the model: the capability, plus the scopes every
-/// call is checked against. One field rather than two, because a capability
-/// without scopes is never checked and scopes without a capability cannot be
-/// delegated, so neither half can exist alone.
+/// What a tool exposes to the model. Scopes never come alone, since without a
+/// capability there is nothing to delegate. A capability alone is the
+/// read-only shape: hooks and sessions still price it, no call ever prompts.
 pub(crate) struct ToolPermission<S> {
     pub(crate) permission: Permission,
-    pub(crate) scopes: S,
+    pub(crate) scopes: Option<S>,
 }
 
 impl ToolPermission<PermissionScopeSpec> {
     pub(crate) fn kind(&self) -> ToolPermission<PermissionScopeKind> {
         ToolPermission {
             permission: self.permission,
-            scopes: self.scopes.kind(),
+            scopes: self.scopes.as_ref().map(PermissionScopeSpec::kind),
         }
     }
 }
@@ -176,7 +175,7 @@ impl PendingTool {
             self.restore_key,
             self.start_key,
             self.describe_key,
-            self.permission.and_then(|p| p.scopes.callback_key()),
+            self.permission.and_then(|p| p.scopes?.callback_key()),
         ]
         .into_iter()
         .flatten()
@@ -274,9 +273,13 @@ impl Tool for LuaTool {
         Some(self.permission.as_ref()?.permission)
     }
 
+    fn permission_checked(&self) -> bool {
+        self.permission.as_ref().is_some_and(|p| p.scopes.is_some())
+    }
+
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
         let validated = validate(self.schema, input.clone())?;
-        let permission_state = match self.permission.as_ref().map(|p| &p.scopes) {
+        let permission_state = match self.permission.as_ref().and_then(|p| p.scopes.as_ref()) {
             Some(PermissionScopeKind::Field(field)) => {
                 let scope = validated.get(field.as_ref()).and_then(|v| v.as_str());
                 PermissionState::Ready(Some(match scope {
@@ -681,7 +684,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   describe        (function) Optional. Returns a custom description string for the current context.
 ///   examples        (table)    Optional. Array of example input objects for documentation.
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
-///   permission      (string)   Required with `permission_scopes`. The capability the tool exposes to the model: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves this tool.
+///   permission      (string)   The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
 ///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 /// @return
@@ -724,7 +727,9 @@ fn register_tool(
 ///
 /// An allow is delegation, not escalation: it needs the `permission` the
 /// target tool declares, so a plugin can only pre-approve what it could
-/// already do itself. A deny needs no permission.
+/// already do itself. A deny needs no permission. An allow on a tool that
+/// never prompts (`permission` without `permission_scopes`) has nothing to
+/// pre-approve and is dropped.
 ///
 /// Allows are checked once the plugin finishes loading, so a plugin may
 /// pre-approve a tool it registers itself. One that does not hold up (no such
@@ -862,7 +867,12 @@ fn allow_is_delegated(
         // Disabled by config, or owned by a plugin nobody loaded.
         return dropped("no such tool is registered");
     };
-    let Some(required) = registered.tool.required_permission() else {
+    let Some(required) = registered
+        .tool
+        .permission_checked()
+        .then(|| registered.tool.required_permission())
+        .flatten()
+    else {
         return dropped(
             "the tool declares no permission_scopes, so it is never permission checked",
         );
@@ -1428,20 +1438,14 @@ fn parse_tool_permission(
         .transpose()?;
     let scopes = spec.get::<LuaValue>("permission_scopes")?;
 
-    let permission = match (declared, scopes.is_nil()) {
-        (None, true) => return Ok(None),
-        (Some(permission), false) => permission,
-        (None, false) => {
+    let permission = match declared {
+        Some(permission) => permission,
+        None if scopes.is_nil() => return Ok(None),
+        None => {
             return Err(mlua::Error::runtime(format!(
                 "register_tool: '{tool}' has 'permission_scopes', so it must declare 'permission', the capability it exposes to the model. \
                  Add it next to 'permission_scopes' in the register_tool spec, one of: {}",
                 permission_keys()
-            )));
-        }
-        (Some(permission), true) => {
-            return Err(mlua::Error::runtime(format!(
-                "register_tool: '{tool}' declares permission '{permission}' but needs 'permission_scopes' too, without scopes the tool is never permission checked. \
-                 Add 'permission_scopes' next to it, either the name of the schema field holding the path or a function(input) returning the scopes"
             )));
         }
     };
@@ -1453,12 +1457,13 @@ fn parse_tool_permission(
     }
 
     let scopes = match scopes {
+        LuaValue::Nil => None,
         LuaValue::String(s) => {
             let field = s.to_str()?.to_owned();
             check_schema_field(schema, "permission_scopes", &field, "string")?;
-            PermissionScopeSpec::Field(Arc::from(field.as_str()))
+            Some(PermissionScopeSpec::Field(Arc::from(field.as_str())))
         }
-        LuaValue::Function(f) => PermissionScopeSpec::Callback(lua.create_registry_value(f)?),
+        LuaValue::Function(f) => Some(PermissionScopeSpec::Callback(lua.create_registry_value(f)?)),
         _ => {
             return Err(mlua::Error::runtime(
                 "register_tool: 'permission_scopes' must be a string field name or a function",
@@ -1941,7 +1946,7 @@ mod tests {
             has_header_fn: false,
             permission: scopes.map(|scopes| ToolPermission {
                 permission: Permission::FsWrite,
-                scopes,
+                scopes: Some(scopes),
             }),
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
