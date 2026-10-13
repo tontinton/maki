@@ -389,8 +389,14 @@ impl ContextSpec {
             self.background,
         )
         .await;
-        self.host_prompt
-            .context(&self.vars, &self.instructions, &self.slots, model, tools)
+        self.host_prompt.context(
+            &self.vars,
+            &self.instructions,
+            &self.slots,
+            model,
+            tools,
+            self.config.model_in_prompt,
+        )
     }
 
     fn builder(self) -> RunContextBuilder {
@@ -1462,6 +1468,28 @@ mod tests {
         assert_eq!(context.system, expected);
         assert_eq!(context.facts.is_none(), explicit.is_some());
         assert!(!context.system.contains(OMITTED_INSTRUCTIONS));
+    }
+
+    #[tokio::test]
+    async fn render_honors_model_in_prompt_config() {
+        let slots = ResolvedPrompts::default();
+        let instructions = agent::Instructions::default();
+        let config = AgentConfig {
+            model_in_prompt: false,
+            ..Default::default()
+        };
+        let spec = ContextSpec::new(
+            template::Vars::new(),
+            &instructions,
+            Arc::new(slots),
+            config,
+            Vec::new(),
+            None,
+        );
+        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let rendered = spec.render(&model, false).await;
+        assert!(!rendered.system.contains("- Model:"));
+        assert_eq!(rendered.facts.unwrap().model, "");
     }
 
     #[test]

@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use strum::IntoEnumIterator;
 
 use super::history::History;
-use super::instructions::build_system_prompt;
+use super::instructions::{MODEL_VAR, build_system_prompt};
 use crate::mcp::{McpSession, ToolDeferral};
 use crate::prompt::{PromptId, ResolvedPrompts, Slot, SlotKind};
 use crate::template::Vars;
@@ -36,6 +36,7 @@ const UPDATE_CLOSE: &str = "\n</context-update>";
 pub(crate) const PLAN_ENDED: &str = "Plan mode ended. You may edit files again.";
 const INSTRUCTIONS_GONE: &str = "No project instructions apply anymore.";
 const FINGERPRINT_BYTES: usize = 16;
+const MODEL_OMITTED_POLICY: &[u8] = b"\0model-omitted";
 pub(crate) const FRAME_REBUILT: &str =
     "The tools or the system prompt changed, so the prompt was rebuilt and its cache starts over.";
 
@@ -49,6 +50,8 @@ pub struct RunContext {
     /// Prompt text the host wrote itself. We can't describe a change to it in
     /// an update, so a frame is only reused while it stays the same.
     pub authored: String,
+    /// Whether a custom system template names the model, if one is in use.
+    pub model_in_template: Option<bool>,
 }
 
 impl RunContext {
@@ -58,16 +61,29 @@ impl RunContext {
         slots: &ResolvedPrompts,
         model: &Model,
         tools: RequestTools,
+        model_in_prompt: bool,
     ) -> Self {
         let slots = slots.for_tools(ToolRegistry::global(), tools.filter());
-        let system = build_system_prompt(vars, instructions, &slots, model);
+        let system = build_system_prompt(vars, instructions, &slots, model, model_in_prompt);
+        // A custom template states the model wherever it names `{model}`,
+        // whatever `model_in_prompt` says, so a switch has to be told then.
+        // Read it off the filtered slots: a template whose tools are not sent
+        // must not keep the frame.
+        let model_in_template = slots
+            .has_template(PromptId::System)
+            .then(|| slots.template(PromptId::System).contains(MODEL_VAR));
+        let states_model = model_in_template.unwrap_or(model_in_prompt);
         Self {
             system,
             tools,
             facts: Some(PromptFacts {
                 date: vars.apply("{date}").into_owned(),
                 cwd: vars.apply("{cwd}").into_owned(),
-                model: model.spec(),
+                model: if states_model {
+                    model.spec()
+                } else {
+                    String::new()
+                },
                 instructions: if slots.renders_instructions(PromptId::System) {
                     instructions.to_owned()
                 } else {
@@ -76,6 +92,7 @@ impl RunContext {
                 hints: hint_facts(&slots),
             }),
             authored: String::new(),
+            model_in_template,
         }
         .with_prompt_policy(&slots)
     }
@@ -87,6 +104,7 @@ impl RunContext {
             system,
             tools,
             facts: None,
+            model_in_template: None,
         }
     }
 
@@ -138,10 +156,11 @@ impl HostPrompt {
         slots: &ResolvedPrompts,
         model: &Model,
         tools: RequestTools,
+        model_in_prompt: bool,
     ) -> RunContext {
         let mut context = match &self.replace {
             Some(system) => RunContext::fixed(system.clone(), tools).with_prompt_policy(slots),
-            None => RunContext::render(vars, instructions, slots, model, tools),
+            None => RunContext::render(vars, instructions, slots, model, tools, model_in_prompt),
         };
         if let Some(append) = &self.append {
             for text in [&mut context.system, &mut context.authored] {
@@ -185,6 +204,15 @@ fn hint_facts(slots: &ResolvedPrompts) -> BTreeMap<String, String> {
 /// (it shapes every MCP entry) and the host's own prompt text. The hash is the
 /// same in every process, so a resumed session can tell if its frame still fits.
 pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model: &Model) -> String {
+    fingerprint_with_policy(context, mcp, model, true)
+}
+
+fn fingerprint_with_policy(
+    context: &RunContext,
+    mcp: Option<&McpSession>,
+    model: &Model,
+    include_policy: bool,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(context.tools.definitions().to_string());
     hasher.update([0]);
@@ -193,10 +221,51 @@ pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model:
         hasher.update([0]);
         hasher.update(format!("{:?}", ToolDeferral::for_model(model)));
     }
+    if include_policy
+        && context
+            .facts
+            .as_ref()
+            .is_some_and(|facts| facts.model.is_empty())
+    {
+        hasher.update(MODEL_OMITTED_POLICY);
+    }
     hasher.finalize()[..FINGERPRINT_BYTES]
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+pub(crate) fn frame_matches(
+    stored: &StoredFrame,
+    context: &RunContext,
+    mcp: Option<&McpSession>,
+    model: &Model,
+) -> bool {
+    if stored.fingerprint == fingerprint(context, mcp, model) {
+        // Enabled frames use the legacy hash, which disabled frames also used.
+        if context
+            .facts
+            .as_ref()
+            .is_some_and(|facts| !facts.model.is_empty())
+            && context.model_in_template.is_none()
+            && stored
+                .facts
+                .as_ref()
+                .is_some_and(|facts| facts.model.is_empty())
+        {
+            return false;
+        }
+        return true;
+    }
+    let Some(current) = &context.facts else {
+        return false;
+    };
+    let Some(previous) = &stored.facts else {
+        return false;
+    };
+    stored.fingerprint == fingerprint_with_policy(context, mcp, model, false)
+        && (context.model_in_template.is_some()
+            || current.model.is_empty() == previous.model.is_empty())
 }
 
 /// The in-memory half of a frame. The first run of a process rebuilds it from
@@ -300,7 +369,7 @@ pub(crate) fn fit_frame(
         .filter(|frame| frame.prefix().is_some())
         .cloned()
     {
-        Some(stored) if stored.fingerprint == fingerprint => {
+        Some(stored) if frame_matches(&stored, &context, mcp, model) => {
             if history.live_frame().is_none() {
                 history.adopt_frame(LiveFrame::restore(context.tools, &stored, model));
             } else {
@@ -378,7 +447,9 @@ pub(crate) fn context_update(
     if let Some(date) = &update.date {
         parts.push(format!("Date is now {date}."));
     }
-    if let Some(model) = &update.model {
+    if let Some(model) = &update.model
+        && !model.is_empty()
+    {
         parts.push(format!("You are now running as {model}."));
     }
     if let Some(cwd) = &update.cwd {
@@ -453,6 +524,17 @@ mod tests {
         assert!(context_update(&facts(), &facts(), &ResolvedPrompts::default()).is_none());
     }
 
+    #[test]
+    fn empty_model_tells_nothing() {
+        let mut now = facts();
+        prompt(&mut now).model.clear();
+        assert!(context_update(&facts(), &now, &ResolvedPrompts::default()).is_none());
+
+        let mut told = facts();
+        prompt(&mut told).model.clear();
+        assert!(context_update(&told, &now, &ResolvedPrompts::default()).is_none());
+    }
+
     #[test_case(|f: &mut LiveFacts| prompt(f).date = NEXT_DATE.into(), NEXT_DATE ; "date")]
     #[test_case(|f: &mut LiveFacts| prompt(f).model = "openai/gpt-6".into(), "openai/gpt-6" ; "model")]
     #[test_case(|f: &mut LiveFacts| prompt(f).cwd = "/other".into(), "/other" ; "cwd")]
@@ -483,6 +565,126 @@ mod tests {
                 &model(NATIVE_MODEL),
             ),
         )
+    }
+
+    fn rendered(model: &Model, enabled: bool, template: Option<&str>) -> RunContext {
+        let mut slots = ResolvedPrompts::default();
+        if let Some(template) = template {
+            slots.set_template(PromptId::System, template.into());
+        }
+        RunContext::render(
+            &Vars::new(),
+            "",
+            &slots,
+            model,
+            RequestTools::default(),
+            enabled,
+        )
+    }
+
+    #[test_case(true, true, false, FrameFit::Kept ; "legacy_enabled_unchanged")]
+    #[test_case(false, false, false, FrameFit::Kept ; "legacy_disabled_unchanged")]
+    #[test_case(true, false, false, FrameFit::Rebuilt ; "legacy_enabled_to_disabled")]
+    #[test_case(false, true, false, FrameFit::Rebuilt ; "legacy_disabled_to_enabled")]
+    #[test_case(true, false, true, FrameFit::Rebuilt ; "enabled_to_disabled")]
+    #[test_case(false, true, true, FrameFit::Rebuilt ; "disabled_to_enabled")]
+    fn model_policy_fits_legacy_and_current_frames(
+        before: bool,
+        after: bool,
+        current_hash: bool,
+        expected: FrameFit,
+    ) {
+        let model = model(NATIVE_MODEL);
+        let old = rendered(&model, before, None);
+        let hash = fingerprint_with_policy(&old, None, &model, current_hash);
+        let stored = StoredFrame::new(old.system, hash, old.facts, Vec::new());
+        let mut history = History::new(Vec::new()).with_frame(Some(Arc::new(stored)));
+        let next = rendered(&model, after, None);
+        assert_eq!(fit_frame(&mut history, next, None, &model), expected);
+    }
+
+    #[test_case("Running on {model}.", false, true ; "legacy_missing_model")]
+    #[test_case("A static policy.", true, false ; "legacy_spurious_model")]
+    fn legacy_template_policy_keeps_frame(template: &str, old_enabled: bool, states_model: bool) {
+        let first = model(NATIVE_MODEL);
+        let next = model(CLIENT_MODEL);
+        let mut old = rendered(&first, old_enabled, Some(template));
+        old.facts.as_mut().unwrap().model = if old_enabled {
+            first.spec()
+        } else {
+            String::new()
+        };
+        let hash = fingerprint_with_policy(&old, None, &first, false);
+        let stored = StoredFrame::new(old.system, hash, old.facts, Vec::new());
+        let mut history = History::new(Vec::new()).with_frame(Some(Arc::new(stored)));
+        let candidate = rendered(&next, !old_enabled, Some(template));
+        assert_eq!(
+            fit_frame(
+                &mut history,
+                rendered(&next, !old_enabled, Some(template)),
+                None,
+                &next
+            ),
+            FrameFit::Kept
+        );
+        let now = LiveFacts {
+            plan: None,
+            prompt: candidate.facts,
+        };
+        let update = context_update(&history.told().unwrap(), &now, &ResolvedPrompts::default());
+        assert_eq!(update.is_some(), states_model);
+        if let Some(update) = update {
+            assert_eq!(
+                update.facts_update().unwrap().model.as_deref(),
+                Some(next.spec().as_str())
+            );
+            history.push(update);
+            assert!(
+                context_update(&history.told().unwrap(), &now, &ResolvedPrompts::default())
+                    .is_none()
+            );
+            history.truncate(0);
+            assert!(
+                context_update(&history.told().unwrap(), &now, &ResolvedPrompts::default())
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_unknown_model_survives_rebuild_and_rewind() {
+        let first = model(NATIVE_MODEL);
+        let next = model(CLIENT_MODEL);
+        let template = Some("Running on {model}.");
+        let mut old = rendered(&first, false, template);
+        old.facts.as_mut().unwrap().model.clear();
+        let hash = fingerprint_with_policy(&old, None, &first, false);
+        let stored = StoredFrame::new(old.system, hash, old.facts, Vec::new());
+        let mut history = History::new(Vec::new()).with_frame(Some(Arc::new(stored)));
+        let mut candidate = rendered(&next, true, template);
+        candidate.authored.push_str(" changed");
+        let now = LiveFacts {
+            plan: None,
+            prompt: candidate.facts.clone(),
+        };
+        assert_eq!(
+            fit_frame(&mut history, candidate, None, &next),
+            FrameFit::Rebuilt
+        );
+        let update =
+            context_update(&history.told().unwrap(), &now, &ResolvedPrompts::default()).unwrap();
+        assert_eq!(
+            update.facts_update().unwrap().model.as_deref(),
+            Some(next.spec().as_str())
+        );
+        history.push(update);
+        assert!(
+            context_update(&history.told().unwrap(), &now, &ResolvedPrompts::default()).is_none()
+        );
+        history.truncate(0);
+        assert!(
+            context_update(&history.told().unwrap(), &now, &ResolvedPrompts::default()).is_some()
+        );
     }
 
     /// A side request sends the published array to share the session's cache,
@@ -552,6 +754,7 @@ mod tests {
             &ResolvedPrompts::default(),
             &model(NATIVE_MODEL),
             RequestTools::default(),
+            true,
         )
     }
 

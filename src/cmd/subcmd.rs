@@ -803,6 +803,7 @@ pub async fn prompt(
                     &slots,
                     &model,
                     RequestTools::default(),
+                    config.agent.model_in_prompt,
                 )
                 .system;
             // Plan mode reaches the model as a context update after the
