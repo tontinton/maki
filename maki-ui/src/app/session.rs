@@ -186,6 +186,7 @@ impl App {
         self.active_chat = MAIN_CHAT;
         self.chat_index.clear();
         self.deleted_tasks.clear();
+        self.detached_subagents.clear();
         self.status = Status::Idle;
         self.clear_exit_request();
         self.queue.clear();
