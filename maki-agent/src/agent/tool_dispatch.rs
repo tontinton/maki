@@ -398,6 +398,10 @@ struct Resolved<'a> {
 /// Precedence, highest first: client (ACP) tools, the registry, then MCP.
 /// The context is the only input, because resolving against one session and
 /// executing against another is how a tool escapes its audience.
+///
+/// A registry name the request's filter left out goes nowhere, and does not
+/// fall through to MCP either: a model told to call `bash` by a prompt that
+/// never published it must get nothing back.
 fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     // Names coming back from model JSON (batch children, `call_tool`, the
     // interpreter bridge) never passed through streaming.rs, so clean up here.
@@ -405,7 +409,11 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     let route = if let Some(local) = ctx.local_tools.get(name) {
         Route::Local(local)
     } else if let Some(entry) = ctx.registry.get(name) {
-        Route::Native(entry)
+        if ctx.tool_filter.matches(name) {
+            Route::Native(entry)
+        } else {
+            Route::Unknown
+        }
     } else if let Some(mcp) = ctx.mcp.as_ref() {
         match mcp.resolve(name) {
             Some(qualified) => Route::Mcp(mcp, qualified),
@@ -1128,7 +1136,7 @@ mod tests {
     use crate::tools::{
         BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
         ParseError, PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience,
-        ToolExecResult, ToolHook, local_tool,
+        ToolExecResult, ToolFilter, ToolHook, local_tool,
     };
     use crate::{AgentMode, Envelope, EventSender, InstructionBlock};
 
@@ -2459,6 +2467,23 @@ mod tests {
 
         assert_eq!(tool_names(tools.definitions()), [OTHER_WIRE]);
         assert_eq!(callable_names(&ctx), [OTHER_WIRE]);
+    }
+
+    /// The filter gates dispatch, not only the list the sandbox sees, or a
+    /// plugin pricing a session by the array it hands over would pay for less
+    /// than the session reaches.
+    #[test]
+    fn dispatch_refuses_a_registry_name_the_filter_left_out() {
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.registry = registry_with(&[PROBE_WIRE, OTHER_WIRE]);
+            ctx.tool_filter = Arc::new(ToolFilter::Only(vec![OTHER_WIRE.to_owned()]));
+
+            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
+
+            assert!(done.is_error);
+            assert!(done.output.as_text().starts_with(UNKNOWN_TOOL_PREFIX));
+        });
     }
 
     /// A host that trims the array it publishes (a Lua caller passing `except`)

@@ -5526,6 +5526,27 @@ fn perm_tool_src(name: &str, handler_body: &str) -> String {
     "agent"
     ; "agent_denied"
 )]
+#[test_case::test_case(
+    "prompt_deny",
+    r#"local ok, err = pcall(function() maki.session.prompt("go") end)
+                return tostring(err)"#,
+    "agent"
+    ; "agent_denied_for_session_prompt"
+)]
+#[test_case::test_case(
+    "wake_deny",
+    r#"local ok, err = pcall(function() maki.session.notify("ci red", { session = "x", wake = true }) end)
+                return tostring(err)"#,
+    "agent"
+    ; "agent_denied_for_a_waking_notify"
+)]
+#[test_case::test_case(
+    "new_prompt_deny",
+    r#"local ok, err = pcall(function() maki.session.new({ prompt = "go" }) end)
+                return tostring(err)"#,
+    "agent"
+    ; "agent_denied_for_new_with_a_prompt"
+)]
 fn denied_permission_blocks_api(tool_name: &str, handler_body: &str, expected_perm: &str) {
     let src = perm_tool_src(tool_name, handler_body);
     let result = exec_tool_with_perms(
@@ -7959,4 +7980,88 @@ fn background_session_scope_decides_what_ends_it(scope: &str, outlives_handler: 
     host.unload(BACKGROUND_PLUGIN).unwrap();
 
     assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
+}
+
+/// A host where `edit` (declares `fs_write`) and `echo_` (declares nothing)
+/// are registered, plus a plugin holding only `agent` whose `open_reaching`
+/// tool calls `maki.agent.session({session_args})` and returns the error, or
+/// "nil" when the session opened.
+fn reach_probe_host(session_args: &str) -> (Arc<ToolRegistry>, PluginHost) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("tool_owner", &format!("{EDIT_TOOL_SRC}\n{ECHO_PLUGIN}"))
+        .unwrap();
+    let mut perms = maki_lua::PluginPermissions::denied();
+    perms.set(maki_lua::Permission::Agent, true);
+    let src = format!(
+        r#"maki.api.register_tool({{
+    name = "open_reaching",
+    description = "opens a session with the given reach",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function(_, ctx)
+        local _, err = maki.agent.session({session_args})
+        return tostring(err)
+    end,
+}})"#
+    );
+    host.load_source_with_permissions(BACKGROUND_PLUGIN, &src, perms)
+        .unwrap();
+    (reg, host)
+}
+
+/// Nobody answers a prompt in a session of the plugin's own, so what it can
+/// reach is priced like a hook on the same tool. MCP reaches whatever its
+/// servers do, which is nothing on a chat without any.
+#[test_case::test_case(r#"{ { name = "edit" } }"#, false, false, "fs_write" ; "a_declared_capability_costs_itself")]
+#[test_case::test_case(r#"{ { name = "echo_" } }"#, false, false, "every permission" ; "undeclared_reach_costs_everything")]
+#[test_case::test_case("nil", true, true, "mcp" ; "mcp_costs_everything")]
+#[test_case::test_case("nil", true, false, "nil" ; "mcp_without_servers_costs_nothing")]
+#[test_case::test_case(r#"{ { name = "nobody_registered_this" } }"#, false, false, "nil" ; "an_unknown_name_never_dispatches")]
+fn a_plugin_session_can_only_reach_what_its_plugin_holds(
+    tools: &str,
+    mcp: bool,
+    servers: bool,
+    expected: &str,
+) {
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let mut seed = stub_seed(session);
+    if servers {
+        seed.mcp = Some(maki_agent::mcp::test_support::stub_session(&[]));
+    }
+    let _seed = mailbox.publish_seed(seed);
+    let (reg, _host) = reach_probe_host(&format!(
+        r#"{{ session = "{session}", tools = {tools}, mcp = {mcp} }}"#
+    ));
+
+    let result = exec_tool(&reg, "open_reaching", json!({})).unwrap();
+
+    assert!(result.contains(expected), "got: {result}");
+}
+
+/// The ctx form is one hop away from a session nobody answers for: a tool
+/// the plugin registered gets a ctx inside its own background session, or
+/// under `maki -p`. There it pays the same price. With a user to ask, the
+/// prompt stays in its place and the session opens.
+#[test_case::test_case(false, "fs_write" ; "unanswerable_ctx_pays_for_reach")]
+#[test_case::test_case(true, "nil" ; "answerable_ctx_keeps_the_prompt")]
+fn a_ctx_session_pays_for_reach_only_when_nobody_can_answer(answerable: bool, expected: &str) {
+    let (reg, _host) = reach_probe_host(r#"ctx, { tools = { { name = "edit" } }, mcp = false }"#);
+    let inv = reg
+        .get("open_reaching")
+        .unwrap()
+        .tool
+        .parse(&json!({}))
+        .unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    let (_answer_tx, answer_rx) = flume::unbounded::<String>();
+    ctx.user_response_rx = answerable.then(|| Arc::new(smol::lock::Mutex::new(answer_rx)));
+
+    let result = smol::block_on(inv.execute(&ctx)).output;
+
+    let Ok(maki_agent::ToolOutput::Plain(text)) = result else {
+        panic!("unexpected output: {result:?}");
+    };
+    assert!(text.text.contains(expected), "got: {}", text.text);
 }

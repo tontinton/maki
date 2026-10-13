@@ -157,10 +157,14 @@ impl PluginPermissions {
         self.allowed[perm as usize]
     }
 
-    /// Layering a call whose reach nobody declared takes full trust, since no
-    /// narrower price would be honest.
-    pub fn holds_all(&self) -> bool {
-        self.allowed.iter().all(|&allowed| allowed)
+    /// Reaching what nobody declared costs every capability a tool can reach,
+    /// since no narrower price would be honest. `agent` is not one of them:
+    /// it is about starting turns, and every tool already runs inside one, so
+    /// a plugin that may not start turns can still steer a call in one.
+    pub fn holds_all_reach(&self) -> bool {
+        Permission::ALL
+            .iter()
+            .all(|&perm| perm == Permission::Agent || self.is_allowed(perm))
     }
 
     pub fn from_manifest(manifest: &toml::Value) -> Self {
@@ -504,6 +508,16 @@ mod tests {
     fn denied_blocks_everything() {
         let p = PluginPermissions::denied();
         assert_denied(&p);
+    }
+
+    #[test]
+    fn full_reach_does_not_need_agent_but_misses_any_capability() {
+        let mut p = PluginPermissions::trusted();
+        p.set(Permission::Agent, false);
+        assert!(p.holds_all_reach());
+
+        p.set(Permission::Env, false);
+        assert!(!p.holds_all_reach());
     }
 
     #[test]

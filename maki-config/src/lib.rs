@@ -210,7 +210,9 @@ impl Permission {
             Permission::Net => "outbound network requests",
             Permission::Run => "starting processes",
             Permission::Env => "reading the process environment, where secrets live",
-            Permission::Agent => "prompting the model on its own, outside a tool call",
+            Permission::Agent => {
+                "starting model turns: prompting a chat, or running its own sessions"
+            }
         }
     }
 }

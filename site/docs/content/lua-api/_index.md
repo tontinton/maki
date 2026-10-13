@@ -63,7 +63,7 @@ permission raises `permission denied: '<name>' not granted for this plugin`.
 - `net`: outbound network requests
 - `run`: starting processes
 - `env`: reading the process environment, where secrets live
-- `agent`: prompting the model on its own, outside a tool call
+- `agent`: starting model turns: prompting a chat, or running its own sessions
 
 Grants come from a `plugin.toml` next to the Lua file (for
 `~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
@@ -1481,20 +1481,7 @@ Without a `ctx`, `maki.agent.session({ session = id, ... })` opens a
 background session. It borrows the model, permissions and MCP of the live
 chat session `id` and is not tied to any turn. Call it and its `:prompt()`
 from a task: a `maki.async.spawn` task, an autocmd callback or a tool
-handler. This form needs the `agent` plugin permission, because it spends
-outside any turn the user started.
-
-`scope` says how long it lives. `"task"`, the default, ends it with the
-task that opened it: an autocmd callback when it returns, a tool handler
-with its tool call, a `maki.async.spawn` task when it finishes.
-`"session"` skips that. Both end at `:close()`, when the chat session
-ends (`/new`, closing the tab) and when the plugin unloads (`/reload`).
-Turn ends, Esc and rewinds leave it alone. Esc on a tool call still
-cancels a prompt that the tool's handler is waiting on.
-
-A polling monitor opens one per round inside a `maki.async.spawn` loop. An
-event-driven one opens with `scope = "session"` once, keeps the handle and
-prompts it from autocmd callbacks.
+handler. This form needs the `agent` plugin permission.
 
 Nobody can answer its permission prompts, so a call that would prompt is
 denied and the subagent is told why. Your rules, "allow for this session"
@@ -1502,6 +1489,27 @@ answers and YOLO still apply, so add allow rules for what it runs (see
 [Permissions](/docs/permissions/)). It always runs in build mode. While the
 chat is in plan mode its file-write tools are denied. Its thinking never
 goes above the chat's current setting.
+
+Since nothing can prompt, the plugin must itself hold what its tools
+reach. A tool that declares a permission, like `bash` with `run`, needs
+that one. A tool that declares none, or `mcp` on a chat with MCP servers,
+needs every permission except `agent`. The read-only tools (`read`,
+`grep`, `glob`) declare none today, so handing them over takes all of
+them. `local_tools` need nothing, they run as the plugin. The ctx form
+follows the same rule when its own session cannot prompt: a tool handler
+inside such a session, or `maki -p`.
+
+`scope` sets the lifetime. `"task"`, the default, ends the session with
+the task that opened it: an autocmd callback when it returns, a tool
+handler with its tool call, a `maki.async.spawn` task when it finishes.
+`"session"` outlives the task. Both end at `:close()`, when the chat
+session ends (`/new`, closing the tab) and when the plugin unloads
+(`/reload`). Turn ends, Esc and rewinds leave it alone. Esc on a tool
+call still cancels a prompt that the tool's handler is waiting on.
+
+A polling monitor opens one per round inside a `maki.async.spawn` loop.
+An event-driven one opens once with `scope = "session"`, keeps the handle
+and prompts it from autocmd callbacks.
 
 Its spend counts in the chat's totals after each turn, and `/tasks` lists
 it but cannot stop it yet. Setting `plugins.<name>.enabled = false` stops a
@@ -1566,8 +1574,8 @@ if prompt_err then error(prompt_err) end
 maki.agent.list({opts})
 ```
 
-List the subagent sessions plugins opened on a chat session with
-`maki.agent.session({ session = id })`.
+List the sessions plugins opened on a chat session without a `ctx`, see
+[maki.agent.session](#maki-agent-session).
 
 Each entry has these fields:
 - `id` (`string`) Session id.
@@ -4680,10 +4688,10 @@ Starts a new session in the current project.
 
 **Parameters:**
 
-- `{opts?}` (`table?`) Optional fields: prompt (string) first user message
-
-  to submit right away; focus (boolean) switch the UI to the new session.
-
+- `{opts?}` (`table?`) Optional fields:
+  - `prompt` (`string`) first user message to submit right away. Needs the
+    `agent` permission.
+  - `focus` (`boolean`) switch the UI to the new session.
 
 **Returns:** (`string|nil`, `string|nil`) New session id, or nil and an error.
 
@@ -4705,6 +4713,8 @@ Sends {text} as a regular user prompt to a live session. The text is
 never interpreted: slash commands, `exit`, and `!` shell prefixes are
 all sent to the model verbatim. If the session is currently streaming,
 the prompt is queued and picked up when the agent reaches it.
+
+Requires the `agent` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -4738,7 +4748,8 @@ observation waits for the session's next agent run.
 - `{text}` (`string`) What to report. Must not be blank.
 - `{opts?}` (`table`) Options:
   - `session` (`string`) id of a live session.
-  - `wake` (`boolean`) start a TUI turn when it next becomes idle (default false).
+  - `wake` (`boolean`) start a TUI turn when it next becomes idle (default
+    false). Needs the `agent` permission.
 
 **Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error.
 
