@@ -32,6 +32,9 @@ fn permissions_section(anchored: bool) -> String {
 Sensitive APIs are gated per plugin file, and every gated function's entry in
 this reference names the permission it needs. A gated call without its
 permission raises `permission denied: '<name>' not granted for this plugin`.
+Inside an action of your plugin, a call also raises when the `capability`
+of the action leaves its permission out, see
+`maki.api.register_action`.
 
 {NAMES}
 

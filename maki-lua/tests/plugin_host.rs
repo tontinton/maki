@@ -24,9 +24,9 @@ use maki_config::{
     ThinkingLines, ToolKey, ToolOutputLines,
 };
 use maki_lua::{
-    InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, Missing, NO_UI_ERR,
-    PERMISSION_NAME_WARNING, PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING,
-    SessionEndReason, WARM_TOOL_CAP, set_allowed_private_hosts,
+    InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, NO_UI_ERR, PERMISSION_NAME_WARNING,
+    PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason,
+    WARM_TOOL_CAP, set_allowed_private_hosts,
 };
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -262,6 +262,7 @@ const TIMED_OUT_SUBSTR: &str = "timed out";
 const ALREADY_CALLED_ERR: &str = "already called";
 const UNKNOWN_FIELD_ERR: &str = "unknown field";
 const PERMISSION_DENIED_MSG: &str = "permission denied";
+const NOT_GRANTED: &str = "not granted for this plugin";
 
 #[test]
 fn stdlib_globals_accessible() {
@@ -5755,7 +5756,7 @@ fn run_call_with(held: &[Permission], call: &str) -> String {
 #[test_case::test_case(r#"maki.session.new({ prompt = "go" })"#, &[Permission::SessionWrite], Permission::Agent ; "new_with_a_prompt_with_only_write")]
 fn session_calls_need_their_own_permission(call: &str, held: &[Permission], missing: Permission) {
     let result = run_call_with(held, call);
-    let refusal = Missing::Permission(missing).to_string();
+    let refusal = format!("'{missing}' {NOT_GRANTED}");
     assert!(result.contains(&refusal), "got: {result}");
 }
 

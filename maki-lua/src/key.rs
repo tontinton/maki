@@ -59,6 +59,16 @@ const NAMEABLE_MODIFIERS: KeyModifiers = KeyModifiers::CONTROL
 /// Kitty reports past F12, and `<F13>` is valid vim notation.
 const MAX_FUNCTION_KEY: u8 = 24;
 
+const PASTE_NAME: &str = "Paste";
+const PASTE_MODIFIERS_ERR: &str = "<Paste> takes no modifiers";
+
+/// Bracketed paste, bound like a key so a plugin can take pastes the way it
+/// takes keys. [`Key::from_event`] refuses `Null`, so no keypress is ever this.
+pub const PASTE: Key = Key {
+    code: KeyCode::Null,
+    modifiers: KeyModifiers::NONE,
+};
+
 /// Keys the host answers before it looks at any binding, because quit and
 /// suspend have to work whatever a plugin is doing. A binding on one could
 /// never fire, so `maki.keymap.set` and a window's `keys` refuse them. The
@@ -126,6 +136,12 @@ impl Key {
 
         if s.len() > 2 && s.starts_with('<') && s.ends_with('>') {
             let (modifiers, name) = strip_modifiers(&s[1..s.len() - 1]);
+            if name.eq_ignore_ascii_case(PASTE_NAME) {
+                return match modifiers.is_empty() {
+                    true => Ok(PASTE),
+                    false => Err(PASTE_MODIFIERS_ERR.into()),
+                };
+            }
             return Ok(Self::new(code_of(name)?, modifiers));
         }
 
@@ -138,6 +154,9 @@ impl Key {
 
     /// The one spelling of this key, which [`Key::parse`] reads back into it.
     pub fn notation(&self) -> String {
+        if *self == PASTE {
+            return format!("<{PASTE_NAME}>");
+        }
         let name = name_of(self.code).unwrap_or_default();
         if self.modifiers.is_empty() && name.chars().count() == 1 {
             return name;
@@ -163,6 +182,16 @@ impl Key {
 
     pub fn is_reserved(&self) -> bool {
         RESERVED_KEYS.contains(self)
+    }
+
+    /// Whether the chat input takes this key as text: a paste, or a char
+    /// without control or alt. Normalizing already folded shift into the char.
+    pub fn types_text(&self) -> bool {
+        *self == PASTE
+            || matches!(self.code, KeyCode::Char(_))
+                && !self
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     }
 
     fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
@@ -477,8 +506,18 @@ mod tests {
     #[test_case("<F25>" ; "function_key_past_the_end")]
     #[test_case("<lt>" ; "vim_escape_we_do_not_need")]
     #[test_case("abc" ; "a_word")]
+    #[test_case("<C-Paste>" ; "paste_with_a_modifier")]
     fn parse_refuses(input: &str) {
         assert!(Key::parse(input).is_err(), "{input} must not parse");
+    }
+
+    /// `<Paste>` is bound like any key, so it has to read back the same way,
+    /// and no press may ever turn into it.
+    #[test]
+    fn paste_round_trips_and_no_press_is_a_paste() {
+        assert_eq!(Key::parse("<paste>"), Ok(PASTE));
+        assert_eq!(Key::parse(&PASTE.notation()), Ok(PASTE));
+        assert_eq!(Key::from_event(event(PASTE.code(), NONE)), None);
     }
 
     #[test_case(KeyCode::Media(MediaKeyCode::Play), NONE ; "media")]
@@ -488,6 +527,21 @@ mod tests {
     #[test_case(KeyCode::Char('a'), KeyModifiers::SUPER ; "modifier_notation_cannot_spell")]
     fn from_event_refuses_what_notation_cannot_name(code: KeyCode, mods: KeyModifiers) {
         assert_eq!(Key::from_event(event(code, mods)), None);
+    }
+
+    #[test_case("a" => true ; "letter")]
+    #[test_case("<S-a>" => true ; "shifted_letter")]
+    #[test_case("<Space>" => true ; "space")]
+    #[test_case("<Paste>" => true ; "paste")]
+    #[test_case("<C-g>" => false ; "ctrl_chord")]
+    #[test_case("<M-x>" => false ; "alt_chord")]
+    #[test_case("<F5>" => false ; "function_key")]
+    #[test_case("<CR>" => false ; "enter")]
+    #[test_case("<BS>" => false ; "backspace")]
+    #[test_case("<Tab>" => false ; "tab")]
+    #[test_case("<Left>" => false ; "arrow")]
+    fn types_text_cases(lhs: &str) -> bool {
+        Key::parse(lhs).unwrap().types_text()
     }
 
     /// A reserved key no terminal can deliver would quietly reserve nothing.

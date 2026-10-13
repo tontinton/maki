@@ -2531,7 +2531,7 @@ fn a_plugin_cannot_price_a_slot_in_a_capability_it_lacks() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("prices layers at") && err.contains("not granted"),
+        err.contains("in 'capability'") && err.contains("not granted"),
         "unexpected error: {err}"
     );
 }

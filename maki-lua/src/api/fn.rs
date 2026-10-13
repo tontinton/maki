@@ -19,11 +19,12 @@ use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use shell_words::join as shell_join;
 
 use crate::api::fs::expand_tilde;
+use crate::api::keymap::{InputMode, KeymapWriter};
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
-use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
-use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
+use crate::plugin_permissions::{Ceiling, Permission, PluginPermissions, require};
+use crate::runtime::{Narrowed, active_task_id, job_task_id, strip_traceback, with_jobs};
 
 const DEFAULT_TAIL: usize = 20;
 const MAX_TAIL_LINES: usize = 1024;
@@ -140,6 +141,9 @@ pub(crate) struct JobSpec {
     pub on_stdout: Option<RegistryKey>,
     pub on_stderr: Option<RegistryKey>,
     pub on_exit: Option<RegistryKey>,
+    /// The [`Ceiling`] the job was started under, which its callbacks run
+    /// under too.
+    pub ceiling: Option<Ceiling>,
 }
 
 impl JobSpec {
@@ -155,6 +159,7 @@ impl JobSpec {
             on_stdout: None,
             on_stderr: None,
             on_exit: None,
+            ceiling: None,
         }
     }
 }
@@ -170,6 +175,7 @@ struct JobMeta {
     on_stdout: Option<RegistryKey>,
     on_stderr: Option<RegistryKey>,
     on_exit: Option<RegistryKey>,
+    ceiling: Option<Ceiling>,
     event_rx: Option<flume::Receiver<JobEvent>>,
     stdout_tail: VecDeque<String>,
     stderr_tail: VecDeque<String>,
@@ -292,6 +298,7 @@ impl JobStore {
             on_stdout,
             on_stderr,
             on_exit,
+            ceiling,
         } = spec;
         let mut command = cmd.build();
         strip_provider_keys(&mut command)
@@ -389,6 +396,7 @@ impl JobStore {
                 on_stdout,
                 on_stderr,
                 on_exit,
+                ceiling,
                 event_rx: Some(event_rx),
                 stdout_tail: VecDeque::new(),
                 stderr_tail: VecDeque::new(),
@@ -426,6 +434,10 @@ impl JobStore {
             JobEvent::Stderr(_) => meta.on_stderr.as_ref(),
             JobEvent::Exit(_) => meta.on_exit.as_ref(),
         }
+    }
+
+    pub fn ceiling(&self, job_id: u32) -> Option<Ceiling> {
+        self.jobs.get(&job_id)?.ceiling.clone()
     }
 
     pub fn take_receiver(
@@ -863,7 +875,7 @@ fn kill_job(job: &JobMeta) {
 fn jobstart(
     lua: &Lua,
     #[ctx] plugin: Arc<str>,
-    #[ctx] fs_write: bool,
+    #[ctx] grants: PluginPermissions,
     cmd: Value,
     opts: Option<Table>,
 ) -> LuaResult<Pair<u32>> {
@@ -885,8 +897,9 @@ fn jobstart(
         spec.on_stdout = callback_key(lua, opts, "on_stdout")?;
         spec.on_stderr = callback_key(lua, opts, "on_stderr")?;
         spec.on_exit = callback_key(lua, opts, "on_exit")?;
-        spec.stdout = parse_redirect(opts, "stdout", spec.on_stdout.is_some(), fs_write)?;
-        spec.stderr = parse_redirect(opts, "stderr", spec.on_stderr.is_some(), fs_write)?;
+        spec.ceiling = Ceiling::current_for(lua, &plugin);
+        spec.stdout = parse_redirect(lua, opts, "stdout", spec.on_stdout.is_some(), &grants)?;
+        spec.stderr = parse_redirect(lua, opts, "stderr", spec.on_stderr.is_some(), &grants)?;
         tail = opts.opt("tail").ok().flatten();
         if let Some(n) = tail
             && n > MAX_TAIL_LINES
@@ -927,10 +940,11 @@ fn parse_command(cmd: Value) -> LuaResult<JobCommand> {
 }
 
 fn parse_redirect(
+    lua: &Lua,
     opts: &Table,
     key: &str,
     has_callback: bool,
-    fs_write: bool,
+    grants: &PluginPermissions,
 ) -> LuaResult<Redirect> {
     let value = opts.get::<Value>(key)?;
     if value.is_nil() {
@@ -944,9 +958,7 @@ fn parse_redirect(
     match value {
         Value::Boolean(false) => Ok(Redirect::Discard),
         Value::String(path) => {
-            if !fs_write {
-                return Err(denied_error(Permission::FsWrite));
-            }
+            require(lua, grants, Permission::FsWrite)?;
             Ok(Redirect::File(expand_tilde(&path.to_str()?)))
         }
         _ => Err(mlua::Error::runtime(format!(
@@ -1298,11 +1310,12 @@ fn wait_result(
 /// poll loop it would die with "attempt to yield across metamethod /
 /// C-call boundary" on its first suspension.
 pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) -> LuaResult<()> {
-    let callback = with_jobs(lua, |store| {
+    let (callback, ceiling) = with_jobs(lua, |store| {
         store.record_event(job_id, event);
-        store
+        let callback = store
             .callback_key(job_id, event)
-            .and_then(|key| lua.registry_value::<Function>(key).ok())
+            .and_then(|key| lua.registry_value::<Function>(key).ok());
+        (callback, store.ceiling(job_id))
     });
     if let JobEvent::Exit(code) = event {
         with_jobs(lua, |store| store.complete(lua, job_id, *code));
@@ -1314,9 +1327,10 @@ pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) 
             }
             JobEvent::Exit(code) => Value::Integer(*code as i64),
         };
-        lua.create_thread(callback)?
-            .into_async::<()>((job_id, arg))?
-            .await?;
+        let call = lua
+            .create_thread(callback)?
+            .into_async::<()>((job_id, arg))?;
+        Narrowed::under(lua, ceiling, call).await?;
     }
     Ok(())
 }
@@ -1394,6 +1408,23 @@ fn winrestview(
     Ok((Some(true), None))
 }
 
+/// The current mode, like `vim.fn.mode()`: `"i"` while the chat input has
+/// the keyboard and takes typed text, `"n"` otherwise. See
+/// [Modes](/docs/lua-api/#modes). Always `"n"` without a UI.
+///
+/// @return (string) `"n"` or `"i"`.
+/// @example
+/// maki.keymap.set({ "n", "i" }, "<M-m>", function()
+///   maki.ui.set_mode(maki.fn.mode() == "n" and "i" or "n")
+/// end)
+#[lua_fn]
+fn mode(lua: &Lua) -> LuaResult<&'static str> {
+    let mode = lua
+        .app_data_ref::<KeymapWriter>()
+        .map_or(InputMode::Normal, |writer| writer.mode.get());
+    Ok(mode.letter())
+}
+
 lua_table! {
     /// Process and environment helpers, modeled after Neovim's `vim.fn` job
     /// control. Use these to run shell commands, wait for output, and check
@@ -1407,14 +1438,14 @@ lua_table! {
     "maki.fn" => pub(crate) fn create_fn_table(
         plugin: Arc<str>,
         perms: &PluginPermissions,
-        fs_write: bool,
+        grants: PluginPermissions,
         tx: Option<flume::Sender<UiAction>>,
     ), DOCS [
-        jobstart(perms, plugin, fs_write), jobstop(perms, plugin), jobforget(perms, plugin),
+        jobstart(perms, plugin, grants), jobstop(perms, plugin), jobforget(perms, plugin),
         jobwait(perms, plugin), jobinfo(perms, plugin), joblist(perms, plugin),
         jobattach(perms, plugin), jobfind(perms, plugin),
         executable(perms),
-        winsaveview(tx), winrestview(tx),
+        winsaveview(tx), winrestview(tx), mode,
     ]
 }
 
@@ -1487,6 +1518,7 @@ mod tests {
             on_stdout,
             on_stderr: None,
             on_exit,
+            ceiling: None,
             event_rx: None,
             stdout_tail: VecDeque::new(),
             stderr_tail: VecDeque::new(),

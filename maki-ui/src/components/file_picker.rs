@@ -347,6 +347,10 @@ impl FilePickerModal {
 }
 
 impl Overlay for FilePickerModal {
+    fn is_prompting(&self) -> bool {
+        false
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

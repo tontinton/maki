@@ -1,6 +1,8 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::future::poll_fn;
 use std::path::PathBuf;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -18,6 +20,8 @@ use crate::plugin_permissions::{Permission, PluginReach};
 
 pub const NO_UI_ERR: &str = "no interactive UI attached";
 pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
+pub(crate) const PLUGIN_LOADING_ERR: &str =
+    "not available while a plugin loads: call it from a callback";
 
 const ROW_REFINE: &str = "refine";
 const ROW_CLEAR_AND_IMPLEMENT: &str = "clear_and_implement";
@@ -607,9 +611,11 @@ pub struct InputEdit {
     /// The tab the offsets were read from, refused once another is focused.
     /// Required for the same reason as {version}.
     pub session_id: String,
-    /// Rides along on the `InputChanged` this edit fires, so one input plugin
-    /// can tell another's writes from its own.
-    pub plugin: Arc<str>,
+    /// What the edit may change, checked on the UI side, which alone knows
+    /// the text the edits land on. Its owner rides along on the
+    /// `InputChanged` this edit fires, so one input plugin can tell another's
+    /// writes from its own.
+    pub caller: PluginReach,
 }
 
 pub enum InputRequest {
@@ -645,9 +651,21 @@ pub enum BuiltinAction {
     NextChat,
     ModelPicker,
     InputRaw,
+    Undo,
+    Redo,
+    HistoryPrev,
+    HistoryNext,
+    Newline,
 }
 
 impl BuiltinAction {
+    /// The built-ins that change the chat input. A plugin runs them only
+    /// with `input`, like an edit. Switching chats is not one of them: it
+    /// shows another chat's own draft.
+    pub fn changes_input(self) -> bool {
+        self.needs().contains(&Permission::Input)
+    }
+
     /// What a plugin needs to run this through `maki.ui.action`, the same
     /// price as the API that does the same thing. Matched without a fallback,
     /// so a new action has to be priced before it builds.
@@ -655,7 +673,8 @@ impl BuiltinAction {
     /// Most actions open something the user then sees and drives, or move
     /// focus like `maki.task.focus`, so they are open. The plan form only
     /// shows, and the user decides there. Popping the queue throws away a
-    /// prompt the user wrote, with nobody asked.
+    /// prompt the user wrote, with nobody asked. An edit of the chat input
+    /// needs `input`, like `maki.ui.input_edit`.
     pub fn needs(self) -> &'static [Permission] {
         match self {
             Self::FilePicker
@@ -669,6 +688,9 @@ impl BuiltinAction {
             | Self::ModelPicker
             | Self::InputRaw => &[],
             Self::PopQueue => &[Permission::SessionWrite],
+            Self::Undo | Self::Redo | Self::HistoryPrev | Self::HistoryNext | Self::Newline => {
+                &[Permission::Input]
+            }
         }
     }
 }
@@ -721,7 +743,20 @@ pub enum UiAction {
     WinRestView {
         scroll_top: u32,
     },
-    Builtin(BuiltinAction),
+    /// `reply_tx` answers whether the action did anything, which is what lets
+    /// a key handler try one action and fall back to another.
+    Builtin {
+        action: BuiltinAction,
+        reply_tx: flume::Sender<bool>,
+    },
+    /// The handler of the keystroke with this ticket id returned. It comes
+    /// after everything the handler asked of the UI, so the keys typed after
+    /// that keystroke can go.
+    KeybindDone(u64),
+    /// The handler of the keystroke with this ticket id called
+    /// `ev.fallback()`: run what the host itself does for that key, before
+    /// the keys typed after it.
+    KeybindFallback(u64),
     /// `reply_tx` answers whether {cmdline} resolved to a known command, not
     /// how the command itself went: `/compact` streams for a minute, and the
     /// Lua caller must not park for that long.
@@ -785,6 +820,7 @@ impl UiAttachment {
 // handle through every `#[ctx]` sender.
 thread_local! {
     static UI_ATTACHMENT: RefCell<Option<UiAttachment>> = const { RefCell::new(None) };
+    static PLUGIN_LOADING: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(crate) fn install_ui_attachment(attachment: UiAttachment) {
@@ -816,9 +852,25 @@ pub(crate) fn ui_reachable(tx: Option<&flume::Sender<UiAction>>) -> bool {
     ui_attached() && tx.is_some_and(|tx| !tx.is_disconnected())
 }
 
+/// Runs a plugin's top level, where every [`ui_roundtrip`] fails at once.
+/// The host blocks on the load and starts the event loop only after every
+/// plugin loaded, so an answer would never come. The flag is up only while
+/// {load} itself is polled: a task the executor runs while the load is
+/// parked, and a callback the load scheduled, still reach the UI.
+pub(crate) async fn as_plugin_load<F: Future>(load: F) -> F::Output {
+    let mut load = pin!(load);
+    poll_fn(|cx| {
+        let outer = PLUGIN_LOADING.replace(true);
+        let polled = load.as_mut().poll(cx);
+        PLUGIN_LOADING.set(outer);
+        polled
+    })
+    .await
+}
+
 /// Send an action carrying a reply channel and await the answer. Only
 /// works from a callback: the loop drains `UiAction` between frames, so a
-/// call at config load time would wait forever.
+/// call from a plugin's top level fails, see [`as_plugin_load`].
 ///
 /// No deadline on purpose: the loop legitimately stops answering for a long
 /// time (`open_editor` holds it for as long as the editor is up). Teardown
@@ -827,6 +879,9 @@ pub(crate) async fn ui_roundtrip<T>(
     tx: Option<&flume::Sender<UiAction>>,
     action: impl FnOnce(flume::Sender<T>) -> UiAction,
 ) -> Result<T, &'static str> {
+    if PLUGIN_LOADING.get() {
+        return Err(PLUGIN_LOADING_ERR);
+    }
     let (reply_tx, reply_rx) = flume::bounded(1);
     ui_send(tx, action(reply_tx))?;
     reply_rx.recv_async().await.map_err(|_| UI_DROPPED_ERR)
@@ -849,6 +904,7 @@ pub(crate) async fn ui_json_roundtrip(
 mod tests {
     use super::*;
     use crate::plugin_permissions::PluginPermissions;
+    use futures_lite::future::{poll_once, zip};
     use mlua::Lua;
     use test_case::test_case;
 
@@ -938,6 +994,35 @@ mod tests {
         // `/reload` builds a new loop around the same handles.
         attachment.attach();
         assert!(ui_send(Some(&tx), UiAction::WinRestView { scroll_top: 0 }).is_ok());
+    }
+
+    /// The load is refused, while a task that runs as the load waits is not.
+    #[test]
+    fn only_the_plugin_load_itself_is_refused_a_roundtrip() {
+        let (tx, rx) = flume::unbounded();
+        let (resume_tx, resume_rx) = flume::bounded::<()>(1);
+
+        let (in_load, beside_load) = smol::block_on(zip(
+            as_plugin_load(async {
+                let refused =
+                    ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView { reply_tx }).await;
+                resume_rx.recv_async().await.ok();
+                refused
+            }),
+            async {
+                let sent = poll_once(ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView {
+                    reply_tx,
+                }))
+                .await;
+                resume_tx.send(()).ok();
+                sent
+            },
+        ));
+
+        assert_eq!(in_load.err(), Some(PLUGIN_LOADING_ERR));
+        assert!(beside_load.is_none(), "still waiting for the UI's answer");
+        assert!(matches!(rx.try_recv(), Ok(UiAction::WinSaveView { .. })));
+        assert!(rx.is_empty(), "the refused call never reached the UI");
     }
 
     #[test_case(Dimension::Abs(42), 200 => 42 ; "abs_ignores_total")]

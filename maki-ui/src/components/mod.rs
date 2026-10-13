@@ -53,6 +53,10 @@ pub(crate) fn chevron_span() -> ratatui::text::Span<'static> {
 pub(crate) trait Overlay {
     fn is_open(&self) -> bool;
     fn close(&mut self);
+    /// Whether it is up and answers a single key on its own, like `y` on a
+    /// permission prompt. Keys typed before one opened must never answer it,
+    /// so each overlay has to say.
+    fn is_prompting(&self) -> bool;
     /// Modal overlays block mouse interaction behind them.
     fn is_modal(&self) -> bool {
         true

@@ -152,6 +152,10 @@ pub struct PermissionPrompt {
 }
 
 impl Overlay for PermissionPrompt {
+    fn is_prompting(&self) -> bool {
+        self.is_open()
+    }
+
     fn is_open(&self) -> bool {
         !self.queue.is_empty()
     }
@@ -315,12 +319,14 @@ impl PermissionPrompt {
         }
     }
 
+    /// True while the prompt is up, since it owns the keyboard then. Only the
+    /// deny editor has a place for {text}, anywhere else it is dropped.
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        if !self.is_open() || self.state != PromptState::DenyEditing {
-            return false;
+        let open = self.is_open();
+        if open && self.state == PromptState::DenyEditing {
+            self.buffer.insert_text(text);
         }
-        self.buffer.insert_text(text);
-        true
+        open
     }
 
     fn build_lines(&self) -> Vec<Line<'static>> {
@@ -593,9 +599,11 @@ mod tests {
     }
 
     #[test]
-    fn handle_paste_requires_editing_mode() {
+    fn handle_paste_lands_only_in_the_deny_editor() {
+        assert!(!PermissionPrompt::new().handle_paste("closed"));
         let mut prompt = open_prompt();
-        assert!(!prompt.handle_paste("ignored"));
+        assert!(prompt.handle_paste("dropped"));
+        assert_eq!(prompt.buffer.value(), "");
         prompt.handle_key(key(KeyCode::Char('n')));
         assert!(prompt.handle_paste("accepted"));
         assert_eq!(prompt.buffer.value(), "accepted");

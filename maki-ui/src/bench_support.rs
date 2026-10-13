@@ -10,7 +10,7 @@ use maki_agent::{McpConfigErrors, McpSnapshotReader, SnapshotSpan, SpanStyle};
 use maki_config::{ModelPolicy, PermissionsConfig, ProjectConfig, UiConfig};
 use maki_lua::{
     EventHandle, HintReader, InputEdit, InputRule, InputRulesReader, KeymapReader,
-    LuaCommandReader, PatternRule, Reveal, SyntaxRule, TextEdit,
+    LuaCommandReader, PatternRule, PluginPermissions, PluginReach, Reveal, SyntaxRule, TextEdit,
 };
 use maki_providers::{Model, ModelTier};
 use maki_storage::StateDir;
@@ -112,7 +112,7 @@ pub fn plugin_edit(
         version: app.input_box.buffer.version(),
         strict: false,
         session_id: app.state.session.id.to_string(),
-        plugin: Arc::from(PLUGIN),
+        caller: PluginReach::new(PluginPermissions::trusted()).owned_by(Arc::from(PLUGIN)),
     };
     app.apply_input_edit(edit, area).map(drop)
 }

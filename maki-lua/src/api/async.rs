@@ -98,7 +98,12 @@ lua_class! {
 ///   process(data)
 /// end)
 #[lua_fn]
-fn run(lua: &Lua, r#fn: Function, on_finish: Option<Function>) -> LuaResult<()> {
+fn run(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    r#fn: Function,
+    on_finish: Option<Function>,
+) -> LuaResult<()> {
     let actual_work = if let Some(cb) = on_finish {
         lua.load(
             r#"
@@ -118,7 +123,7 @@ fn run(lua: &Lua, r#fn: Function, on_finish: Option<Function>) -> LuaResult<()> 
         r#fn
     };
     let work_key = lua.create_registry_value(actual_work)?;
-    enqueue_async_task(lua, work_key)?;
+    enqueue_async_task(lua, &plugin, work_key)?;
     Ok(())
 }
 
@@ -402,7 +407,7 @@ lua_table! {
     /// })
     /// ```
     extend "maki.async" => pub(crate) fn add_async_fns(plugin: Arc<str>), DOCS [
-        run, spawn(plugin), sleep, manual r#await, manual wrap, manual join, gather, semaphore, on_cancel,
+        run(plugin), spawn(plugin), sleep, manual r#await, manual wrap, manual join, gather, semaphore, on_cancel,
     ]
 }
 

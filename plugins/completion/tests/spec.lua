@@ -104,12 +104,11 @@ local HOST_GONE = "the host went away"
 -- index's answer. `h.before_rank` runs inside the ranking round-trip, which is
 -- where a close lands in the race the menu is written against. `h.on_close`
 -- runs inside `win:close`, which is how a case makes teardown fail. `h.edits`,
--- `h.rows`, `h.claimed`, `h.focus`, `h.opens`, `h.closes`, `h.flashes`,
+-- `h.rows`, `h.bound`, `h.focus`, `h.opens`, `h.closes`, `h.flashes`,
 -- `h.subscriptions` and `h.warnings` are what the menu did.
 --
--- The fake window answers `recv` with a close, so the popup's key loop ends
--- where it starts and a case drives keys through `Menu.handle_key`, the way
--- the loop does.
+-- A case presses a binding in `h.bound` the way the host does while the
+-- popup is on screen.
 --
 -- With `h.defer` set, a refresh handed off with `maki.async.run` waits in
 -- `h.pending` until `h.flush()`. That is the window the popup is on screen in
@@ -134,6 +133,8 @@ local function harness(body)
     del_autocmd = maki.api.del_autocmd,
     defer_fn = maki.defer_fn,
     warn = maki.log.warn,
+    keymap_set = maki.keymap.set,
+    keymap_del = maki.keymap.del,
   }
   local h = {
     input = INPUT,
@@ -142,10 +143,11 @@ local function harness(body)
     rows = {},
     warnings = {},
     flashes = {},
-    -- The keys the window was opened claiming, and whether it took focus.
-    claimed = nil,
+    -- The keys bound to the popup's buffer, by key, and whether the window
+    -- took focus.
+    bound = {},
     focus = nil,
-    -- Windows opened and closed, which is what a claim now lives and dies by.
+    -- Windows opened and closed.
     opens = 0,
     closes = 0,
     -- The live `FileIndexReady` callback, nil while nothing is listening.
@@ -200,14 +202,10 @@ local function harness(body)
   end
   maki.ui.open_win = function(_, win_opts)
     h.opens = h.opens + 1
-    h.claimed = win_opts.keys
     h.focus = win_opts.focus
     return {
       set_config = function() end,
       show = function() end,
-      recv = function()
-        return { type = "close" }
-      end,
       close = function()
         h.closes = h.closes + 1
         if h.on_close then
@@ -264,6 +262,14 @@ local function harness(body)
   maki.log.warn = function(msg)
     table.insert(h.warnings, msg)
   end
+  maki.keymap.set = function(mode, lhs, fn, set_opts)
+    eq(mode, "i", "the popup's keys rest while a vim plugin holds normal mode")
+    assert(set_opts.buffer, "the popup's keys are its buffer's")
+    h.bound[lhs] = fn
+  end
+  maki.keymap.del = function(_, lhs)
+    h.bound[lhs] = nil
+  end
 
   local ok, err = pcall(body, h)
 
@@ -277,6 +283,7 @@ local function harness(body)
   maki.api.create_autocmd, maki.api.del_autocmd = saved.create_autocmd, saved.del_autocmd
   maki.defer_fn = saved.defer_fn
   maki.log.warn = saved.warn
+  maki.keymap.set, maki.keymap.del = saved.keymap_set, saved.keymap_del
   for i = #offered, 1, -1 do
     offered[i] = nil
   end
@@ -368,21 +375,19 @@ case("accept_reports_a_refused_edit_instead_of_dropping_it", function()
   th.has(h.flashes[1], REFUSED, "with the host's reason in it")
 end)
 
--- The keys are declared once, on the window, and the host routes them here
--- while it is up. Unfocused is the whole point: the user goes on typing into
--- the chat input under the popup.
-case("the_popup_declares_its_keys_on_the_window_it_draws_in", function()
+-- Unfocused is the whole point: the user goes on typing into the chat input
+-- under the popup. The handlers hold the popup, so a binding left behind would
+-- keep it alive.
+case("the_popup_binds_its_keys_to_its_buffer_until_it_closes", function()
   local h = harness(function(hh)
     Menu.refresh(hh.input)
     eq(hh.focus, false, "the chat input keeps the keyboard")
-    th.has(table.concat(hh.claimed, " "), "<CR>")
-    th.has(table.concat(hh.claimed, " "), "<Esc>")
-    th.has(table.concat(hh.claimed, " "), "<C-p>")
+    assert(next(hh.bound), "the popup bound its keys")
   end)
-  eq(h.closes, 1, "and the close is what hands them back")
+  eq(next(h.bound), nil, "and the close unbinds them")
 end)
 
--- Nothing is re-asserted on a keystroke: the claim lives on the window, so a
+-- Nothing is re-asserted on a keystroke: the keys live on the buffer, so a
 -- popup that narrows on screen is still the same window holding the same keys.
 case("a_refresh_reuses_the_window_and_its_keys", function()
   local NEWER = { text = "explain @src/main", cursor = 17, version = 9, session_id = SESSION }
@@ -407,7 +412,7 @@ case("the_popup_keeps_its_keys_while_a_refresh_is_in_flight", function()
 
     Events.input_changed(NEWER)
     eq(Menu.session_id(), SESSION, "the popup is still up")
-    Menu.handle_key("<CR>")
+    hh.bound["<CR>"]({ key = "<CR>" })
 
     eq(#hh.edits, 1, "and it answered the key its footer advertises")
     eq(hh.edits[1].version, INPUT.version, "with the snapshot its rows were ranked for")
@@ -436,7 +441,7 @@ case("enter_with_nothing_to_insert_closes_the_popup_and_writes_nothing", functio
   local h = harness(function(hh)
     hh.found = { complete = true, items = {} }
     Menu.refresh(hh.input)
-    Menu.handle_key("<CR>")
+    hh.bound["<CR>"]({ key = "<CR>" })
     eq(Menu.session_id(), nil, "the popup went")
   end)
   eq(#h.edits, 0, "and nothing was inserted")
@@ -453,7 +458,7 @@ case("enter_while_the_walk_is_still_running_holds_the_popup_open", function()
     Menu.refresh(hh.input)
     eq(row(hh, 1), " " .. SCANNING)
 
-    Menu.handle_key("<CR>")
+    hh.bound["<CR>"]({ key = "<CR>" })
     eq(Menu.session_id(), SESSION, "the popup is still up for the rows on their way")
   end)
   eq(#h.edits, 0, "and nothing was inserted")
@@ -504,16 +509,18 @@ case("a_failed_teardown_step_still_takes_the_popup_down", function()
   eq(#h.warnings, 1, "and the failure was reported rather than swallowed")
 end)
 
--- A keypress that arrives for a popup that has gone belongs to nothing: the
--- key loop reads it after the close it was queued behind.
+-- The Lua thread can run a key after its popup closed and a new one opened.
+-- The new popup's rows are not what the user pressed Enter on.
 case("a_key_for_a_popup_that_closed_does_nothing", function()
   local h = harness(function(hh)
     Menu.refresh(hh.input)
+    local stale = hh.bound["<CR>"]
     Menu.close()
-    Menu.handle_key("<CR>")
+    Menu.refresh(hh.input)
+    stale({ key = "<CR>" })
+    eq(Menu.session_id(), SESSION, "the new popup is still up")
   end)
   eq(#h.edits, 0)
-  eq(Menu.session_id(), nil)
 end)
 
 -- The row the popup is highlighting, which is what a navigation key moves and
@@ -527,9 +534,9 @@ local function selected(h)
   return nil
 end
 
--- A claim the popup never answers is a key taken from the user and dropped,
--- so this presses every binding and checks the window claimed it too.
-case("every_claimed_key_is_answered", function()
+-- A binding the popup never answers is a key taken from the user and dropped,
+-- so this presses every binding the way the host does.
+case("every_bound_key_is_answered", function()
   for _, binding in ipairs(Menu.BINDINGS) do
     harness(function(hh)
       hh.found = {
@@ -538,17 +545,18 @@ case("every_claimed_key_is_answered", function()
         items = { { path = MATCH }, { path = OTHER_MATCH } },
       }
       Menu.refresh(hh.input)
-      th.has(table.concat(hh.claimed, " "), binding.claim, "the window claims " .. binding.claim)
+      local press = hh.bound[binding.lhs]
+      assert(press, binding.lhs .. " is bound")
 
       local before = selected(hh)
-      Menu.handle_key(binding.claim)
+      press({ key = binding.lhs })
       local answered = Menu.session_id() == nil or selected(hh) ~= before
-      eq(answered, true, binding.claim .. " reached a handler")
+      eq(answered, true, binding.lhs .. " reached a handler")
     end)
   end
 end)
 
--- Navigation is the other half of what the claimed keys are for. Up from the
+-- Navigation is the other half of what the bound keys are for. Up from the
 -- first row wraps to the last, which is where a list shown above the input
 -- keeps its nearest rows.
 case("the_navigation_keys_move_the_highlight", function()
@@ -561,9 +569,9 @@ case("the_navigation_keys_move_the_highlight", function()
       }
       Menu.refresh(hh.input)
       for _, key in ipairs(press) do
-        Menu.handle_key(key)
+        hh.bound[key]({ key = key })
       end
-      Menu.handle_key("<CR>")
+      hh.bound["<CR>"]({ key = "<CR>" })
     end)
     eq(h.edits[1].text, OTHER_MATCH .. " ", table.concat(press, " ") .. " landed on the second row")
   end
@@ -593,7 +601,7 @@ end)
 case("esc_closes_the_popup", function()
   local h = harness(function(hh)
     Menu.refresh(hh.input)
-    Menu.handle_key("<Esc>")
+    hh.bound["<Esc>"]({ key = "<Esc>" })
     eq(Menu.session_id(), nil)
   end)
   eq(h.closes, 1)
@@ -678,7 +686,7 @@ case("a_walk_landing_mid_keystroke_ranks_the_newest_input", function()
     end
     Menu.refresh(TYPED)
     hh.flush()
-    Menu.handle_key("<CR>")
+    hh.bound["<CR>"]({ key = "<CR>" })
   end)
   eq(h.edits[1].version, TYPED.version, ANSWERS_THE_LAST_KEYSTROKE)
 end)
@@ -691,7 +699,7 @@ case("a_look_queued_behind_a_newer_keystroke_ranks_the_newest_input", function()
     hh.found = { complete = true, root = ROOT, items = { { path = MATCH } } }
     Menu.refresh(TYPED)
     hh.flush()
-    Menu.handle_key("<CR>")
+    hh.bound["<CR>"]({ key = "<CR>" })
   end)
   eq(h.edits[1].version, TYPED.version, ANSWERS_THE_LAST_KEYSTROKE)
 end)
@@ -701,7 +709,7 @@ case("esc_during_a_scan_is_not_undone_by_a_queued_look", function()
     hh.found = { complete = false, root = ROOT, items = {} }
     hh.defer = true
     Menu.refresh(hh.input)
-    Menu.handle_key("<Esc>")
+    hh.bound["<Esc>"]({ key = "<Esc>" })
     hh.flush()
   end)
   eq(h.opens, 1, "the popup stayed closed")
@@ -744,7 +752,7 @@ case("a_walk_that_never_lands_stops_holding_enter", function()
     eq(row(hh, 1), " " .. NO_MATCHES, "the popup stops saying rows are on their way")
     eq(hh.on_index_ready, nil, "and stops listening for a walk that is not coming")
 
-    Menu.handle_key("<CR>")
+    hh.bound["<CR>"]({ key = "<CR>" })
     eq(Menu.session_id(), nil, "Enter closes the popup, the way it does on an empty list")
   end)
   eq(#h.edits, 0, "and nothing was inserted")
@@ -1048,7 +1056,7 @@ case("rows_carry_over_within_a_mention_and_not_across_one", function()
 
     Menu.refresh(OTHER)
     eq(row(hh, 1), " " .. SCANNING)
-    Menu.handle_key("<CR>")
+    hh.bound["<CR>"]({ key = "<CR>" })
     eq(#hh.edits, 0, "Enter waits for this mention's rows")
     eq(Menu.session_id(), SESSION, "and holds the popup open meanwhile")
   end)
@@ -1061,7 +1069,7 @@ case("a_carried_file_row_is_weighed_against_the_snapshot_it_was_ranked_for", fun
     source("people", Trigger.FILES, { { text = "@ann" } })
     Menu.refresh(hh.input)
     -- The source answered first, so the highlight followed its row down.
-    Menu.handle_key("<Up>")
+    hh.bound["<Up>"]({ key = "<Up>" })
     hh.defer = true
     hh.before_rank = function()
       hh.before_rank = nil
@@ -1083,7 +1091,7 @@ case("an_empty_list_while_the_files_rank_is_not_no_matches", function()
       hh.before_rank = nil
       hh.fire_timers()
       eq(row(hh, 1), " " .. SCANNING, "past the source deadline, the files are still coming")
-      Menu.handle_key("<CR>")
+      hh.bound["<CR>"]({ key = "<CR>" })
       eq(Menu.session_id(), SESSION, "so Enter waits for them")
     end
     Menu.refresh(hh.input)

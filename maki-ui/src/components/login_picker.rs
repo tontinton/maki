@@ -757,6 +757,10 @@ impl LoginPicker {
 }
 
 impl Overlay for LoginPicker {
+    fn is_prompting(&self) -> bool {
+        false
+    }
+
     fn is_open(&self) -> bool {
         !matches!(self.step, Step::Closed)
     }

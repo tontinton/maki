@@ -511,6 +511,10 @@ impl<T: PickerItem> ListPicker<T> {
 }
 
 impl<T: PickerItem> Overlay for ListPicker<T> {
+    fn is_prompting(&self) -> bool {
+        false
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

@@ -199,13 +199,18 @@ impl UndoStep {
 #[derive(Default)]
 struct UndoHistory {
     steps: VecDeque<UndoStep>,
+    /// What undo took back, newest last, for redo. Undo and redo only move
+    /// steps between the two, so together they never pass [`MAX_UNDO`].
+    undone: Vec<UndoStep>,
     /// The step the action in progress records into.
     open: Option<UndoStep>,
 }
 
 impl UndoHistory {
     /// An action that changed nothing leaves no step, so every undo rewinds
-    /// something the user can see.
+    /// something the user can see. One that did change something forgets
+    /// what redo could bring back, whose ranges point into the text from
+    /// before it.
     fn push(&mut self, step: UndoStep, text: &str) {
         // Only the newest inverse is sure to point into {text}. When it holds,
         // the text before it was {text} too, so the one before can be checked
@@ -218,11 +223,16 @@ impl UndoHistory {
         {
             return;
         }
+        self.undone.clear();
         if let Some(last) = self.steps.back_mut()
             && last.absorb(&step, text)
         {
             return;
         }
+        self.keep(step);
+    }
+
+    fn keep(&mut self, step: UndoStep) {
         if self.steps.len() == MAX_UNDO {
             self.steps.pop_front();
         }
@@ -417,7 +427,7 @@ impl TextBuffer {
     pub fn set_value(&mut self, value: &str) {
         self.swap_prompt(Prompt {
             text: value.to_owned(),
-            marks: Marks::default(),
+            ..Prompt::default()
         });
     }
 
@@ -457,13 +467,49 @@ impl TextBuffer {
         let Some(step) = self.undo.steps.pop_back() else {
             return false;
         };
-        for Inverse { start, end, text } in step.inverses.into_iter().rev() {
-            self.splice(start..end, &text, ChangeKind::Edit);
-        }
+        let redo = self.revert(step);
+        self.undo.undone.push(redo);
+        true
+    }
+
+    /// Puts back what the last undo took, as one version. `false` when there
+    /// is nothing to redo: no undo yet, or an edit made since.
+    pub fn redo(&mut self) -> bool {
+        let Some(step) = self.undo.undone.pop() else {
+            return false;
+        };
+        let undo = self.revert(step);
+        self.undo.keep(undo);
+        true
+    }
+
+    /// Applies {step} and returns the step that reverts it in turn, which
+    /// leaves the caret where it is now. Each inverse keeps the text it
+    /// replaces, so undo and redo stay O(edit) like the edit itself.
+    fn revert(&mut self, step: UndoStep) -> UndoStep {
+        let cursor = self.cursor_byte();
+        let inverses = step
+            .inverses
+            .into_iter()
+            .rev()
+            .map(|Inverse { start, end, text }| {
+                let removed = self.text[start..end].to_owned();
+                self.splice(start..end, &text, ChangeKind::Edit);
+                Inverse {
+                    start,
+                    end: start + text.len(),
+                    text: removed,
+                }
+            })
+            .collect();
         self.commit();
         self.place_cursor(step.cursor);
         self.settle_cursor();
-        true
+        UndoStep {
+            inverses,
+            cursor,
+            group: None,
+        }
     }
 
     /// Counts every change to the value, never a cursor move. `maki.ui.input`
@@ -1349,143 +1395,90 @@ impl TextBuffer {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> EditResult {
-        let m = key.modifiers;
-        let ctrl = m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT);
-        let alt = m.contains(KeyModifiers::ALT) && !m.contains(KeyModifiers::CONTROL);
-        let sup = m.contains(KeyModifiers::SUPER);
+        if self.handle_motion_key(key) == EditResult::Moved {
+            return EditResult::Moved;
+        }
+        let (ctrl, alt, sup) = modifiers(key);
         let group = match key.code {
             _ if ctrl || alt || sup => None,
             KeyCode::Char(_) => Some(EditGroup::Typing),
             KeyCode::Backspace => Some(EditGroup::Deleting),
             _ => None,
         };
-        self.undo_step(group, |buf| buf.apply_key(key.code, ctrl, alt, sup))
+        self.undo_step(group, |buf| buf.apply_edit_key(key.code, ctrl, alt, sup))
     }
 
-    fn apply_key(&mut self, code: KeyCode, ctrl: bool, alt: bool, sup: bool) -> EditResult {
-        if ctrl {
-            return match code {
-                KeyCode::Left => {
-                    self.move_word_left();
-                    EditResult::Moved
-                }
-                KeyCode::Right => {
-                    self.move_word_right();
-                    EditResult::Moved
-                }
-                KeyCode::Backspace | KeyCode::Char('w') => {
-                    self.remove_word_before_cursor();
-                    EditResult::Changed
-                }
-                KeyCode::Delete => {
-                    self.delete_word_after_cursor();
-                    EditResult::Changed
-                }
-                KeyCode::Char('k') => {
-                    self.kill_to_end_of_line();
-                    EditResult::Changed
-                }
-                KeyCode::Char('a') => {
-                    self.move_home();
-                    EditResult::Moved
-                }
-                KeyCode::Char('e') => {
-                    self.move_end();
-                    EditResult::Moved
-                }
-                _ => EditResult::Ignored,
-            };
-        }
+    /// Only the keys of [`Self::handle_key`] that move the cursor. Normal mode
+    /// uses this, so the text never changes under a vim plugin.
+    pub fn handle_motion_key(&mut self, key: KeyEvent) -> EditResult {
+        let (ctrl, alt, sup) = modifiers(key);
+        let Some(motion) = motion(key.code, ctrl, alt, sup) else {
+            return EditResult::Ignored;
+        };
+        motion(self);
+        EditResult::Moved
+    }
 
-        if alt {
-            return match code {
-                KeyCode::Left | KeyCode::Char('b') => {
-                    self.move_word_left();
-                    EditResult::Moved
-                }
-                KeyCode::Right | KeyCode::Char('f') => {
-                    self.move_word_right();
-                    EditResult::Moved
-                }
-                KeyCode::Backspace => {
-                    self.remove_word_before_cursor();
-                    EditResult::Changed
-                }
-                KeyCode::Delete | KeyCode::Char('d') => {
-                    self.delete_word_after_cursor();
-                    EditResult::Changed
-                }
-                _ => EditResult::Ignored,
-            };
-        }
-
-        if sup {
-            return match code {
-                KeyCode::Left => {
-                    self.move_home();
-                    EditResult::Moved
-                }
-                KeyCode::Right => {
-                    self.move_end();
-                    EditResult::Moved
-                }
-                KeyCode::Backspace => {
-                    self.kill_to_start_of_line();
-                    EditResult::Changed
-                }
-                // Cmd+Z only arrives on terminals that speak the kitty keyboard
-                // protocol. Most never send it, which is why the app binds Alt+Z.
-                KeyCode::Char('z') => {
-                    if self.undo() {
-                        EditResult::Changed
-                    } else {
-                        EditResult::Ignored
-                    }
-                }
-                _ => EditResult::Ignored,
-            };
-        }
-
+    fn apply_edit_key(&mut self, code: KeyCode, ctrl: bool, alt: bool, sup: bool) -> EditResult {
         match code {
-            KeyCode::Char(c) => {
-                self.push_char(c);
-                EditResult::Changed
+            KeyCode::Backspace | KeyCode::Char('w') if ctrl => self.remove_word_before_cursor(),
+            KeyCode::Delete if ctrl => self.delete_word_after_cursor(),
+            KeyCode::Char('k') if ctrl => self.kill_to_end_of_line(),
+            KeyCode::Backspace if alt => self.remove_word_before_cursor(),
+            KeyCode::Delete | KeyCode::Char('d') if alt => self.delete_word_after_cursor(),
+            _ if ctrl || alt => return EditResult::Ignored,
+            KeyCode::Backspace if sup => self.kill_to_start_of_line(),
+            // Cmd+Z only arrives on terminals that speak the kitty keyboard
+            // protocol. Most never send it, which is why the app binds Alt+Z.
+            KeyCode::Char('z') if sup => {
+                return if self.undo() {
+                    EditResult::Changed
+                } else {
+                    EditResult::Ignored
+                };
             }
-            KeyCode::Backspace => {
-                self.remove_char();
-                EditResult::Changed
-            }
-            KeyCode::Delete => {
-                self.delete_char();
-                EditResult::Changed
-            }
-            KeyCode::Left => {
-                self.move_left();
-                EditResult::Moved
-            }
-            KeyCode::Right => {
-                self.move_right();
-                EditResult::Moved
-            }
-            KeyCode::Home => {
-                self.move_home();
-                EditResult::Moved
-            }
-            KeyCode::End => {
-                self.move_end();
-                EditResult::Moved
-            }
-            KeyCode::Up => {
-                self.move_up();
-                EditResult::Moved
-            }
-            KeyCode::Down => {
-                self.move_down();
-                EditResult::Moved
-            }
-            _ => EditResult::Ignored,
+            _ if sup => return EditResult::Ignored,
+            KeyCode::Char(c) => self.push_char(c),
+            KeyCode::Backspace => self.remove_char(),
+            KeyCode::Delete => self.delete_char(),
+            _ => return EditResult::Ignored,
         }
+        EditResult::Changed
     }
+}
+
+/// `(ctrl, alt, super)`, with Ctrl and Alt held together counting as neither.
+fn modifiers(key: KeyEvent) -> (bool, bool, bool) {
+    let m = key.modifiers;
+    (
+        m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT),
+        m.contains(KeyModifiers::ALT) && !m.contains(KeyModifiers::CONTROL),
+        m.contains(KeyModifiers::SUPER),
+    )
+}
+
+/// A held modifier claims its key even when it has no motion for it, so
+/// `Ctrl+Home` does nothing instead of acting like a plain `Home`.
+fn motion(code: KeyCode, ctrl: bool, alt: bool, sup: bool) -> Option<fn(&mut TextBuffer)> {
+    Some(match code {
+        KeyCode::Left if ctrl || alt => TextBuffer::move_word_left,
+        KeyCode::Right if ctrl || alt => TextBuffer::move_word_right,
+        KeyCode::Char('a') if ctrl => TextBuffer::move_home,
+        KeyCode::Char('e') if ctrl => TextBuffer::move_end,
+        KeyCode::Char('b') if alt => TextBuffer::move_word_left,
+        KeyCode::Char('f') if alt => TextBuffer::move_word_right,
+        _ if ctrl || alt => return None,
+        KeyCode::Left if sup => TextBuffer::move_home,
+        KeyCode::Right if sup => TextBuffer::move_end,
+        _ if sup => return None,
+        KeyCode::Left => TextBuffer::move_left,
+        KeyCode::Right => TextBuffer::move_right,
+        KeyCode::Home => TextBuffer::move_home,
+        KeyCode::End => TextBuffer::move_end,
+        KeyCode::Up => TextBuffer::move_up,
+        KeyCode::Down => TextBuffer::move_down,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -1999,6 +1992,8 @@ mod tests {
         assert_eq!(buf.version(), before + 1);
         assert_eq!(undo_all(&mut buf), [PLANNED_ON]);
         assert_eq!(buf.version(), before + 2);
+        assert!(buf.redo());
+        assert_eq!((buf.value(), buf.version()), (EDITED, before + 3));
     }
 
     /// The cursor still counts in the value at {version}, so the user's typing
@@ -2213,11 +2208,12 @@ mod tests {
 
     #[test_case(|buf| buf.clear()                                          ; "after_an_action")]
     #[test_case(|buf| buf.undoable(|buf| { buf.push_char('!'); buf.clear() }) ; "inside_an_action")]
-    fn a_whole_value_write_forgets_the_history(write: fn(&mut TextBuffer)) {
+    fn a_whole_value_write_forgets_undo_and_redo(write: fn(&mut TextBuffer)) {
         let mut buf = TextBuffer::new(String::new());
-        type_keys(&mut buf, "sent");
+        type_keys(&mut buf, "hello world");
+        buf.undo();
         write(&mut buf);
-        assert!(!buf.undo());
+        assert_eq!((buf.undo(), buf.redo()), (false, false));
     }
 
     #[test]
@@ -2228,6 +2224,23 @@ mod tests {
         }
         assert_eq!(undo_all(&mut buf).len(), MAX_UNDO);
         assert_eq!(buf.value(), "a");
+    }
+
+    #[test]
+    fn redo_walks_forward_until_the_next_edit() {
+        let mut buf = TextBuffer::new(String::new());
+        type_keys(&mut buf, "hello world");
+        assert_eq!(undo_all(&mut buf), ["hello ", ""]);
+
+        assert!(buf.redo());
+        assert_eq!((buf.value(), buf.cursor_byte()), ("hello ", 6));
+        assert!(buf.redo());
+        assert_eq!((buf.value(), buf.cursor_byte()), ("hello world", 11));
+        assert!(!buf.redo());
+        assert_eq!(undo_all(&mut buf), ["hello ", ""]);
+
+        buf.push_char('!');
+        assert!(!buf.redo());
     }
 
     const PLUGIN: &str = "test";

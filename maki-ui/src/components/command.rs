@@ -44,10 +44,19 @@ pub enum PluginAccess {
     UserOnly,
 }
 
-/// Named, because the plugin is often an alias whose author never thought
-/// about what its target reaches.
-pub(crate) fn missing_refusal(command: &str, missing: &Missing) -> String {
-    format!("{command}: {missing}")
+impl PluginAccess {
+    /// Why {caller} may not do {what}, or `None` when it may. Every refusal a
+    /// plugin gets for something the user could have typed reads this way.
+    pub(crate) fn refusal(self, what: &str, caller: &PluginReach) -> Option<String> {
+        match self {
+            Self::Open => None,
+            Self::Needs(needed) => needed
+                .iter()
+                .find(|&&perm| !caller.is_allowed(perm))
+                .map(|&perm| Missing::Permission(perm).refusal(what)),
+            Self::UserOnly => Some(format!("{what}{USER_ONLY_SUFFIX}")),
+        }
+    }
 }
 
 pub struct BuiltinCommand {
@@ -391,6 +400,14 @@ impl CommandPalette {
         }
     }
 
+    /// The command Enter would run on {input}, looked up before it does.
+    pub fn enter_target(&mut self, input: &TextBuffer) -> Option<String> {
+        if !self.is_active(input) {
+            return None;
+        }
+        self.filtered.get(self.selected).map(|m| self.item_name(m))
+    }
+
     pub fn is_active(&mut self, input: &TextBuffer) -> bool {
         self.follow(input);
         self.is_open()
@@ -637,17 +654,10 @@ impl CommandPalette {
             CommandType::Lua(i) => {
                 return caller
                     .first_missing(&self.lua_commands[i].reach)
-                    .map(|missing| missing_refusal(&item.name, &missing));
+                    .map(|missing| missing.refusal(&item.name));
             }
         };
-        match access {
-            PluginAccess::Open => None,
-            PluginAccess::Needs(needed) => needed
-                .iter()
-                .find(|&&perm| !caller.is_allowed(perm))
-                .map(|&perm| missing_refusal(&item.name, &Missing::Permission(perm))),
-            PluginAccess::UserOnly => Some(format!("{}{USER_ONLY_SUFFIX}", item.name)),
-        }
+        access.refusal(&item.name, caller)
     }
 
     pub fn find_custom_command(&self, display_name: &str) -> Option<&CustomCommand> {

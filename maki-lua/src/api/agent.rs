@@ -49,7 +49,7 @@ use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json, lua_tool_res
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::background::{BackgroundInfo, BackgroundSession, BackgroundSessions};
-use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
+use crate::plugin_permissions::{Permission, PluginPermissions, require};
 use crate::runtime::{CANCELLED_MSG, active_task_cancel, host_ui};
 
 const SESSION_CLOSED_ERR: &str = "session closed";
@@ -764,9 +764,7 @@ async fn session(
             None,
         ),
         LuaEither::Right(opts) => {
-            if !perms.is_allowed(Permission::Agent) {
-                return Err(denied_error(Permission::Agent));
-            }
+            require(&lua, &perms, Permission::Agent)?;
             let Some((task, _)) = active_task_cancel(&lua) else {
                 return Ok(err_pair(TASK_REQUIRED_ERR));
             };
@@ -820,7 +818,12 @@ async fn session(
         None => vec![],
     };
     let reaches_mcp = mcp_enabled && agent_ctx.mcp.is_some();
-    try_pair!(delegated_reach(&lua, &perms, &tools_json, reaches_mcp));
+    try_pair!(delegated_reach(
+        &lua,
+        &perms.now(&lua),
+        &tools_json,
+        reaches_mcp
+    ));
 
     let mut local_map: HashMap<String, LocalTool> = HashMap::new();
     if let Some(tbl) = local_tools_tbl {

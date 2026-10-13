@@ -1,71 +1,178 @@
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use arc_swap::ArcSwap;
+use maki_agent::{SharedBuf, UiWaker};
+use maki_config::Permission;
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{AppDataRefMut, Lua, RegistryKey, Result as LuaResult, Table};
+use mlua::{AppDataRefMut, Lua, RegistryKey, Result as LuaResult, Table, Value};
+use serde::Serialize;
 
+use crate::api::action::ActionInfo;
+use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, pair};
 use crate::key::Key;
+use crate::plugin_permissions::{PluginPermissions, require};
+use crate::runtime::plugin_loaded;
 
 static NEXT_KEYMAP_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_TICKET_ID: AtomicU64 = AtomicU64::new(1);
 
 const NO_STORE_ERR: &str = "keymap store not initialized";
 const RESERVED_KEY_ERR: &str = "is reserved by the host and would never reach this binding";
 pub(crate) const TAKEN_ERR: &str = "is already mapped by";
-
-/// Keystrokes one plugin may have in flight before its bindings stop taking
-/// keys. Each plugin is counted on its own, so one that parks in a callback
-/// costs itself its keys and nobody else theirs.
-const MAX_IN_FLIGHT: usize = 8;
-
-/// What a key resolves to, handed to the Lua thread whole. Resolving by id
-/// over there instead can find nothing, which leaves the UI having consumed a
-/// key with nothing to act on it.
-#[derive(Clone, Debug)]
-struct Keybind {
-    callback: Arc<RegistryKey>,
-    /// Shared by every binding of one plugin.
-    in_flight: Arc<AtomicUsize>,
-    /// Shared by every binding of one plugin, and cleared when its load is
-    /// torn down.
-    live: Arc<AtomicBool>,
+const UNKNOWN_MODE_ERR: &str = "unsupported mode";
+const MODE_TYPE_ERR: &str = "mode must be a string or a list of strings";
+const NO_MODES_ERR: &str = "mode list is empty";
+const BUFFER_TYPE_ERR: &str = "buffer must be a buffer from maki.ui.buf()";
+const NORMAL: &str = "n";
+const INSERT: &str = "i";
+/// One mode for the whole app, like in Neovim. `Insert` means typed keys land
+/// in the chat input. `Normal` covers the rest: a plugin switched the input
+/// to normal mode, or something else has the keyboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputMode {
+    Normal,
+    Insert,
 }
 
-/// A keystroke on its way to the Lua thread, holding one slot of its plugin's
-/// budget until the callback finishes.
+impl InputMode {
+    pub fn letter(self) -> &'static str {
+        match self {
+            Self::Normal => NORMAL,
+            Self::Insert => INSERT,
+        }
+    }
+
+    pub(crate) fn parse(letter: &str) -> LuaResult<Self> {
+        match letter {
+            NORMAL => Ok(Self::Normal),
+            INSERT => Ok(Self::Insert),
+            _ => Err(mlua::Error::runtime(format!(
+                "{UNKNOWN_MODE_ERR}: {letter}"
+            ))),
+        }
+    }
+}
+
+/// The mode lives on two threads. A plugin picks it with `set_mode` on the
+/// Lua thread, but only the UI knows if the chat input has the keyboard.
+/// Each half is stored the moment it changes, so `maki.fn.mode()` right after
+/// `maki.ui.set_mode` already sees the new mode, and so does the next key.
+/// Without a UI nobody stores the focus, so the mode stays `Normal`.
+#[derive(Default)]
+pub(crate) struct ModeState {
+    normal: AtomicBool,
+    input_focused: AtomicBool,
+}
+
+impl ModeState {
+    pub(crate) fn set(&self, mode: InputMode) {
+        self.normal
+            .store(mode == InputMode::Normal, Ordering::Release);
+    }
+
+    pub(crate) fn get(&self) -> InputMode {
+        if self.input_focused.load(Ordering::Acquire) && !self.normal.load(Ordering::Acquire) {
+            InputMode::Insert
+        } else {
+            InputMode::Normal
+        }
+    }
+}
+
+/// The buffer a binding is scoped to, `None` for a global binding. Weak, so a
+/// binding never keeps its buffer alive. A weak pointer also keeps the memory
+/// from being reused, so comparing addresses never takes a new buffer for one
+/// that is gone.
+type Scope = Option<Weak<SharedBuf>>;
+
+fn scope_ptr(scope: &Scope) -> Option<*const SharedBuf> {
+    scope.as_ref().map(Weak::as_ptr)
+}
+
+/// The chat input, as `maki.ui.input` reports it.
+#[derive(Serialize)]
+pub struct InputSnapshot {
+    pub session_id: String,
+    pub text: String,
+    pub cursor: usize,
+    pub version: u64,
+}
+
+impl InputSnapshot {
+    pub(crate) fn to_lua(&self, lua: &Lua) -> LuaResult<Table> {
+        let table = lua.create_table_with_capacity(0, 4)?;
+        table.raw_set("session_id", self.session_id.as_str())?;
+        table.raw_set("text", self.text.as_str())?;
+        table.raw_set("cursor", self.cursor)?;
+        table.raw_set("version", self.version)?;
+        Ok(table)
+    }
+}
+
+/// A keystroke on its way to the Lua thread. The UI holds the keys typed
+/// after it until the Lua thread reports this ticket's handler done.
 pub struct KeybindTicket {
+    id: u64,
     callback: Arc<RegistryKey>,
-    in_flight: Arc<AtomicUsize>,
     live: Arc<AtomicBool>,
     plugin: Arc<str>,
+    grants: PluginPermissions,
     key: Key,
+    input: Option<InputSnapshot>,
+    text: Option<String>,
 }
 
 impl KeybindTicket {
-    /// Refuses the key when the plugin's load is gone or its budget is full.
-    /// Both answers are the host's to act on in the same key turn: it runs the
-    /// built-in binding instead, rather than handing the key to a callback
-    /// that cannot answer it.
+    /// Refuses the key when the plugin's load is gone, so the host runs the
+    /// built-in binding in the same key turn rather than handing the key to a
+    /// callback that cannot answer it.
     fn claim(entry: &KeymapEntry, key: Key) -> Option<Self> {
-        let bind = &entry.bind;
-        if !bind.live.load(Ordering::Acquire) {
-            return None;
-        }
-        bind.in_flight
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < MAX_IN_FLIGHT).then_some(n + 1)
-            })
-            .ok()?;
-        Some(Self {
-            callback: Arc::clone(&bind.callback),
-            in_flight: Arc::clone(&bind.in_flight),
-            live: Arc::clone(&bind.live),
+        entry.live.load(Ordering::Acquire).then(|| Self {
+            id: NEXT_TICKET_ID.fetch_add(1, Ordering::Relaxed),
+            callback: Arc::clone(&entry.callback),
+            live: Arc::clone(&entry.live),
             plugin: Arc::clone(&entry.plugin),
+            grants: entry.grants.clone(),
             key,
+            input: None,
+            text: None,
         })
+    }
+
+    /// Names this keystroke in the done report the Lua thread sends back, so
+    /// a slow handler finishing late cannot release the keys a later one holds.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The chat input as it stood when the key was pressed, handed to the
+    /// handler as `ev.input` if it may read the session.
+    pub fn with_input(self, input: InputSnapshot) -> Self {
+        Self {
+            input: Some(input),
+            ..self
+        }
+    }
+
+    pub fn take_input(&mut self) -> Option<InputSnapshot> {
+        self.input.take()
+    }
+
+    /// The pasted text of a `<Paste>`, handed to the handler as `ev.text` if
+    /// it may read the session.
+    pub fn with_text(self, text: String) -> Self {
+        Self {
+            text: Some(text),
+            ..self
+        }
+    }
+
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
     }
 
     pub fn callback(&self) -> &RegistryKey {
@@ -85,26 +192,45 @@ impl KeybindTicket {
         &self.plugin
     }
 
-    /// The keystroke the host consumed to get here, for the log on the one
-    /// path that loses it: a callback that cannot be reached at all.
+    pub(crate) fn grants(&self) -> &PluginPermissions {
+        &self.grants
+    }
+
     pub fn key(&self) -> Key {
         self.key
     }
 }
 
-impl Drop for KeybindTicket {
-    fn drop(&mut self) {
-        self.in_flight.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
+/// Carries what the key resolves to, handed to the Lua thread whole.
+/// Resolving by id over there instead can find nothing, which leaves the UI
+/// having consumed a key with nothing to act on it.
 #[derive(Clone, Debug)]
 pub struct KeymapEntry {
     pub key: Key,
+    pub mode: InputMode,
     pub desc: String,
     pub plugin: Arc<str>,
     pub id: u64,
-    bind: Keybind,
+    buffer: Scope,
+    grants: PluginPermissions,
+    /// Dropping the last reference hands the registry slot back to mlua, which
+    /// the next binding reuses, so a callback an in-flight keystroke still
+    /// holds frees itself once that keystroke is done.
+    callback: Arc<RegistryKey>,
+    /// Shared by every binding of one plugin, and cleared when its load is
+    /// torn down.
+    live: Arc<AtomicBool>,
+}
+
+impl KeymapEntry {
+    /// Bound for every window, not only those showing one buffer.
+    pub fn is_global(&self) -> bool {
+        self.buffer.is_none()
+    }
+
+    fn is_for(&self, key: Key, mode: InputMode, buffer: Option<*const SharedBuf>) -> bool {
+        self.key == key && self.mode == mode && scope_ptr(&self.buffer) == buffer
+    }
 }
 
 #[derive(Clone, Default)]
@@ -114,36 +240,60 @@ pub struct KeymapSnapshot {
 }
 
 #[derive(Clone)]
-pub struct KeymapReader(Arc<ArcSwap<KeymapSnapshot>>);
+pub struct KeymapReader {
+    snapshot: Arc<ArcSwap<KeymapSnapshot>>,
+    pub(crate) mode: Arc<ModeState>,
+    actions: Arc<ArcSwap<Vec<ActionInfo>>>,
+}
 
 impl KeymapReader {
     pub fn empty() -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(KeymapSnapshot::default())))
+        KeymapWriter::new().1
     }
 
     pub fn load(&self) -> arc_swap::Guard<Arc<KeymapSnapshot>> {
-        self.0.load()
+        self.snapshot.load()
     }
 
-    /// Hands {key} to the binding on it and reports whether it was taken.
+    /// The plugin actions, sorted by name.
+    pub fn actions(&self) -> arc_swap::Guard<Arc<Vec<ActionInfo>>> {
+        self.actions.load()
+    }
+
+    /// Stores whether the chat input has the keyboard and answers the mode a
+    /// key is matched in. The UI calls this right before it matches a key, so
+    /// a handler asking `maki.fn.mode()` sees the mode its own key matched.
+    pub fn sync_mode(&self, input_focused: bool) -> InputMode {
+        self.mode
+            .input_focused
+            .store(input_focused, Ordering::Release);
+        self.mode.get()
+    }
+
+    /// Hands {key} to the binding on it in {mode} and reports whether it was
+    /// taken. With {buffer}, only the bindings set for that buffer are asked,
+    /// which the host does for each window showing one before it asks the
+    /// global ones with `None`.
     ///
-    /// A key nothing took is reported untaken, and the host runs its own
-    /// binding for it in the same key turn. That is the whole of fall-through:
-    /// no key is ever handed back afterwards, because a keystroke replayed
-    /// into a UI that has moved on lands somewhere the user never aimed it. A
-    /// plugin with too many callbacks in flight, or one whose load is gone, is
-    /// a plugin that took nothing, settled here before any Lua runs.
-    ///
-    /// These are global bindings, live until the plugin drops them. A key a
-    /// popup should own only while it is on screen is not one of them: it is
-    /// declared in the `keys` of `maki.ui.open_win`, and the host routes it to
-    /// that window before it ever looks here.
-    pub fn dispatch(&self, key: Key, run: impl FnOnce(KeybindTicket) -> bool) -> bool {
-        let snapshot = self.0.load();
+    /// A key nothing took is reported untaken, and the host goes on to the
+    /// next step for it in the same key turn. That is the whole of
+    /// fall-through: no key is ever handed back afterwards, because a
+    /// keystroke replayed into a UI that has moved on lands somewhere the user
+    /// never aimed it. A plugin whose load is gone is a plugin that took
+    /// nothing, settled here before any Lua runs.
+    pub fn dispatch(
+        &self,
+        key: Key,
+        mode: InputMode,
+        buffer: Option<&Arc<SharedBuf>>,
+        run: impl FnOnce(KeybindTicket) -> bool,
+    ) -> bool {
+        let buffer = buffer.map(Arc::as_ptr);
+        let snapshot = self.snapshot.load();
         let ticket = snapshot
             .entries
             .iter()
-            .find(|e| e.key == key)
+            .find(|e| e.is_for(key, mode, buffer))
             .and_then(|entry| KeybindTicket::claim(entry, key));
         ticket.is_some_and(run)
     }
@@ -152,18 +302,32 @@ impl KeymapReader {
 pub(crate) struct KeymapWriter {
     store: Arc<ArcSwap<KeymapSnapshot>>,
     generation: AtomicU64,
+    pub(crate) mode: Arc<ModeState>,
+    actions: Arc<ArcSwap<Vec<ActionInfo>>>,
 }
 
 impl KeymapWriter {
     pub fn new() -> (Self, KeymapReader) {
         let inner = Arc::new(ArcSwap::from_pointee(KeymapSnapshot::default()));
+        let mode = Arc::<ModeState>::default();
+        let actions = Arc::new(ArcSwap::from_pointee(Vec::new()));
         (
             Self {
                 store: Arc::clone(&inner),
                 generation: AtomicU64::new(0),
+                mode: Arc::clone(&mode),
+                actions: Arc::clone(&actions),
             },
-            KeymapReader(inner),
+            KeymapReader {
+                snapshot: inner,
+                mode,
+                actions,
+            },
         )
+    }
+
+    pub fn publish_actions(&self, actions: Vec<ActionInfo>) {
+        self.actions.store(Arc::new(actions));
     }
 
     pub fn publish(&self, entries: Vec<KeymapEntry>) {
@@ -175,34 +339,11 @@ impl KeymapWriter {
     }
 }
 
-pub(crate) struct StoredKeymap {
-    id: u64,
-    key: Key,
-    /// Dropping the last reference hands the registry slot back to mlua, which
-    /// the next binding reuses, so a callback an in-flight keystroke still
-    /// holds frees itself once that keystroke is done.
-    callback: Arc<RegistryKey>,
-    plugin: Arc<str>,
-    desc: String,
-    state: PluginDispatch,
-}
-
-/// What every binding of one plugin shares: the keystroke budget they are
-/// counted against, and whether the load that registered them is still the one
-/// in place.
-#[derive(Clone)]
-struct PluginDispatch {
-    in_flight: Arc<AtomicUsize>,
-    live: Arc<AtomicBool>,
-}
-
-impl Default for PluginDispatch {
-    fn default() -> Self {
-        Self {
-            in_flight: Arc::default(),
-            live: Arc::new(AtomicBool::new(true)),
-        }
-    }
+#[derive(Default)]
+pub(crate) struct SetOpts {
+    pub desc: String,
+    pub unique: bool,
+    pub buffer: Scope,
 }
 
 /// What a `set` did. The caller does one thing per variant: nothing, warn,
@@ -219,96 +360,128 @@ pub(crate) enum SetOutcome {
     Stale,
 }
 
-/// Global bindings, newest first, and that is the only ordering in this file:
-/// [`Self::set`] inserts at the front, [`Self::snapshot_entries`] maps in
-/// order, and [`KeymapReader::dispatch`] takes the first match.
+/// Bindings, global and buffer-local together, newest first, and that is the
+/// only ordering in this file: [`Self::set`] inserts at the front,
+/// [`Self::snapshot_entries`] copies in order, and
+/// [`KeymapReader::dispatch`] takes the first match in its scope.
 pub(crate) struct KeymapStore {
-    globals: Vec<StoredKeymap>,
-    plugins: HashMap<Arc<str>, PluginDispatch>,
+    bindings: Vec<KeymapEntry>,
+    plugins: HashMap<Arc<str>, Arc<AtomicBool>>,
+    /// The plugin that last switched the input to normal mode.
+    normal_owner: Option<Arc<str>>,
 }
 
 impl KeymapStore {
     pub fn new() -> Self {
         Self {
-            globals: Vec::new(),
+            bindings: Vec::new(),
             plugins: HashMap::new(),
+            normal_owner: None,
         }
     }
 
-    /// The budget and the liveness every binding of {plugin} shares. A name
+    /// The liveness every binding of {plugin} shares. A name that
     /// [`Self::clear_plugin`] tombstoned gets that dead state back rather than
     /// a fresh live one: between a `/reload` and the load that replaces it, a
     /// handler of the load that is gone can still be running and still call
     /// `set`, and the `clear_plugin` that would have taken those bindings away
     /// has already run.
-    fn plugin_state(&mut self, plugin: &Arc<str>) -> PluginDispatch {
-        self.plugins.entry(Arc::clone(plugin)).or_default().clone()
+    fn plugin_live(&mut self, plugin: &Arc<str>) -> Arc<AtomicBool> {
+        let live = self
+            .plugins
+            .entry(Arc::clone(plugin))
+            .or_insert_with(|| Arc::new(AtomicBool::new(true)));
+        Arc::clone(live)
     }
 
-    /// Puts {plugin}'s binding for {key} on top of whatever else holds it.
+    /// Puts {plugin}'s binding for {key} on top of whatever else holds it in
+    /// the same scope, in each of {modes}.
     ///
-    /// Bindings stack per owner: the caller's own entry for the key is
-    /// replaced, everyone else's is shadowed and comes back when this one goes
-    /// away. A plugin cannot hold another plugin's `RegistryKey`, so the
-    /// save-and-restore vim leaves to `maparg()` has to be automatic here.
+    /// Every mode gets an entry of its own sharing the one callback, so a
+    /// `del` in one mode leaves the others bound, as in Neovim.
     ///
-    /// With {unique}, any existing binding for the key fails the call,
-    /// including the caller's own, which is what `:map <unique>` means. A
-    /// reload cannot trip on that because [`Self::revive`] clears the old
-    /// load's entries first.
+    /// Bindings stack per owner, mode and scope: the caller's own entry for
+    /// the key is replaced, everyone else's is shadowed and comes back when
+    /// this one goes away. A plugin cannot hold another plugin's
+    /// `RegistryKey`, so the save-and-restore vim leaves to `maparg()` has to
+    /// be automatic here. A buffer's bindings and the global ones never shadow
+    /// each other, because the host asks them at different steps.
+    ///
+    /// With `unique`, any existing binding for the key in any of {modes} and
+    /// the same scope fails the whole call, including the caller's own, which
+    /// is what `:map <unique>` means. A reload cannot trip on that because
+    /// [`Self::revive`] clears the old load's entries first.
     ///
     /// A `set` from a load that is gone stores nothing. Its binding could never
     /// fire, and on top of a live binding from another plugin it would make
     /// that key fall through to the host until the next reload.
+    ///
+    /// The bindings of buffers that are gone are dropped here, since none of
+    /// them can fire again and their callbacks hold registry slots.
     pub fn set(
         &mut self,
         key: Key,
+        modes: &[InputMode],
         callback: RegistryKey,
         plugin: Arc<str>,
-        desc: String,
-        unique: bool,
+        grants: PluginPermissions,
+        opts: SetOpts,
     ) -> SetOutcome {
-        let state = self.plugin_state(&plugin);
-        if !state.live.load(Ordering::Acquire) {
+        let live = self.plugin_live(&plugin);
+        if !live.load(Ordering::Acquire) {
             return SetOutcome::Stale;
         }
-        if unique && let Some(owner) = self.owner_of(key) {
+        self.bindings
+            .retain(|b| b.buffer.as_ref().is_none_or(|buf| buf.strong_count() > 0));
+        let buffer = &opts.buffer;
+        if opts.unique
+            && let Some(owner) = modes.iter().find_map(|&m| self.owner_of(key, m, buffer))
+        {
             return SetOutcome::Taken(owner);
         }
-        self.globals.retain(|b| b.key != key || b.plugin != plugin);
-        let shadowed = self.owner_of(key);
-        self.globals.insert(
-            0,
-            StoredKeymap {
-                id: NEXT_KEYMAP_ID.fetch_add(1, Ordering::Relaxed),
-                key,
-                callback: Arc::new(callback),
-                plugin,
-                desc,
-                state,
-            },
-        );
+        let callback = Arc::new(callback);
+        let mut shadowed = None;
+        for &mode in modes {
+            self.bindings
+                .retain(|b| !(b.is_for(key, mode, scope_ptr(buffer)) && b.plugin == plugin));
+            shadowed = shadowed.or_else(|| self.owner_of(key, mode, buffer));
+            self.bindings.insert(
+                0,
+                KeymapEntry {
+                    key,
+                    mode,
+                    desc: opts.desc.clone(),
+                    plugin: Arc::clone(&plugin),
+                    id: NEXT_KEYMAP_ID.fetch_add(1, Ordering::Relaxed),
+                    buffer: buffer.clone(),
+                    grants: grants.clone(),
+                    callback: Arc::clone(&callback),
+                    live: Arc::clone(&live),
+                },
+            );
+        }
         shadowed.map_or(SetOutcome::Free, SetOutcome::Shadowed)
     }
 
-    /// Only the caller's own entry goes, so whatever it shadowed comes back and
-    /// whatever sits on top stays. A plugin never removes another plugin's
-    /// binding. If it could, a key would stop working because some unrelated
-    /// plugin cleaned up, and nobody could tell why.
+    /// Only the caller's own entry in {buffer}'s scope goes, so whatever it
+    /// shadowed comes back and whatever sits on top stays. A plugin never
+    /// removes another plugin's binding. If it could, a key would stop working
+    /// because some unrelated plugin cleaned up, and nobody could tell why.
     ///
-    /// Returns whether the caller had a binding to remove.
-    pub fn del(&mut self, key: Key, plugin: &str) -> bool {
-        let mine = self
-            .globals
-            .iter()
-            .position(|b| b.key == key && b.plugin.as_ref() == plugin);
-        mine.map(|idx| self.globals.remove(idx)).is_some()
+    /// Returns whether the caller had a binding to remove in any of {modes}.
+    pub fn del(&mut self, key: Key, modes: &[InputMode], plugin: &str, buffer: &Scope) -> bool {
+        let before = self.bindings.len();
+        self.bindings.retain(|b| {
+            !(b.plugin.as_ref() == plugin
+                && modes.iter().any(|&m| b.is_for(key, m, scope_ptr(buffer))))
+        });
+        self.bindings.len() != before
     }
 
-    fn owner_of(&self, key: Key) -> Option<Arc<str>> {
-        self.globals
+    fn owner_of(&self, key: Key, mode: InputMode, buffer: &Scope) -> Option<Arc<str>> {
+        self.bindings
             .iter()
-            .find(|b| b.key == key)
+            .find(|b| b.is_for(key, mode, scope_ptr(buffer)))
             .map(|b| Arc::clone(&b.plugin))
     }
 
@@ -318,16 +491,15 @@ impl KeymapStore {
     /// chunk this tore down.
     ///
     /// The name is tombstoned rather than forgotten. A keybind handler holds
-    /// its budget slot for a bounded time and the drain barrier waits no
-    /// longer, so a `/reload` can land while one is still running; that
-    /// handler can call `set`, and a forgotten name would hand it a fresh live
-    /// state and publish bindings for a load that is gone, which the
-    /// `clear_plugin` that already ran will never clear. [`Self::revive`] is
-    /// the one way back.
+    /// the drain barrier for a bounded time only, so a `/reload` can land
+    /// while one is still running. That handler can call `set`, and a
+    /// forgotten name would hand it a fresh live state and publish bindings
+    /// for a load that is gone, which the `clear_plugin` that already ran will
+    /// never clear. [`Self::revive`] is the one way back.
     pub fn clear_plugin(&mut self, plugin: &str) {
-        self.globals.retain(|b| b.plugin.as_ref() != plugin);
-        if let Some(state) = self.plugins.get(plugin) {
-            state.live.store(false, Ordering::Release);
+        self.bindings.retain(|b| b.plugin.as_ref() != plugin);
+        if let Some(live) = self.plugins.get(plugin) {
+            live.store(false, Ordering::Release);
         }
     }
 
@@ -337,28 +509,32 @@ impl KeymapStore {
     /// the old one. Anything the old load's stragglers published in between
     /// goes with it: those bindings are dead and belong to nothing.
     pub fn revive(&mut self, plugin: &str) {
-        self.globals.retain(|b| b.plugin.as_ref() != plugin);
+        self.bindings.retain(|b| b.plugin.as_ref() != plugin);
         self.plugins.remove(plugin);
     }
 
-    /// Every global binding, newest first, which is dispatch order and the
-    /// order a keymap listing reads them in: the first entry per key is the
+    /// Every binding, newest first, which is dispatch order and the order a
+    /// keymap listing reads them in: the first entry per key and scope is the
     /// one that fires.
     pub fn snapshot_entries(&self) -> Vec<KeymapEntry> {
-        self.globals
-            .iter()
-            .map(|b| KeymapEntry {
-                key: b.key,
-                desc: b.desc.clone(),
-                plugin: Arc::clone(&b.plugin),
-                id: b.id,
-                bind: Keybind {
-                    callback: Arc::clone(&b.callback),
-                    in_flight: Arc::clone(&b.state.in_flight),
-                    live: Arc::clone(&b.state.live),
-                },
-            })
-            .collect()
+        self.bindings.clone()
+    }
+
+    /// The first global key {plugin} bound in normal mode alone, unless the
+    /// plugin manages modes itself: it bound a key in insert mode or holds
+    /// normal mode. Such a binding was likely written when normal mode
+    /// bindings also fired while typing, which they no longer do.
+    pub fn normal_only_key(&self, plugin: &str) -> Option<Key> {
+        let own = || self.bindings.iter().filter(|b| b.plugin.as_ref() == plugin);
+        let manages_modes = self.normal_owner.as_deref() == Some(plugin)
+            || own().any(|b| b.mode == InputMode::Insert);
+        if manages_modes {
+            return None;
+        }
+        own()
+            .rev()
+            .find(|b| b.mode == InputMode::Normal && b.is_global())
+            .map(|b| b.key)
     }
 }
 
@@ -385,66 +561,205 @@ fn publish_keymap_snapshot(lua: &Lua) {
     }
 }
 
+fn apply_mode(lua: &Lua, mode: InputMode) {
+    if let Some(writer) = lua.app_data_ref::<KeymapWriter>() {
+        writer.mode.set(mode);
+    }
+    if let Some(waker) = lua.app_data_ref::<UiWaker>() {
+        waker.wake();
+    }
+}
+
+/// What `maki.ui.set_mode` does for {plugin}, which then owns normal mode
+/// until anyone switches the mode again.
+///
+/// A handler can outlive its load, and [`release_mode`] already ran for it.
+/// A normal mode it switched to then would be owned by nothing that could
+/// ever switch it back, so the switch is dropped.
+pub(crate) fn switch_mode(lua: &Lua, mode: InputMode, plugin: &Arc<str>) {
+    if !plugin_loaded(lua, plugin) {
+        tracing::debug!(mode = mode.letter(), plugin = %plugin, "mode switch dropped: plugin unloaded");
+        return;
+    }
+    if let Some(mut store) = lua.app_data_mut::<KeymapStore>() {
+        store.normal_owner = (mode == InputMode::Normal).then(|| Arc::clone(plugin));
+    }
+    apply_mode(lua, mode);
+}
+
+/// Puts the input back in insert mode if {plugin} left it in normal mode.
+/// Once its load is gone, nothing is left to switch back and the chat input
+/// could never be typed in again.
+pub(crate) fn release_mode(lua: &Lua, plugin: &str) {
+    let owned = lua.app_data_mut::<KeymapStore>().is_some_and(|mut store| {
+        store
+            .normal_owner
+            .take_if(|owner| owner.as_ref() == plugin)
+            .is_some()
+    });
+    if owned {
+        apply_mode(lua, InputMode::Insert);
+    }
+}
+
 fn store_mut(lua: &Lua) -> LuaResult<AppDataRefMut<'_, KeymapStore>> {
     lua.app_data_mut::<KeymapStore>()
         .ok_or_else(|| mlua::Error::runtime(NO_STORE_ERR))
 }
 
-/// Bind a key to a Lua function, like `vim.keymap.set`. Only normal mode
-/// (`"n"`) is supported.
+fn parse_modes(mode: Value) -> LuaResult<Vec<InputMode>> {
+    let modes = match mode {
+        Value::String(letter) => vec![InputMode::parse(&letter.to_str()?)?],
+        Value::Table(letters) => letters
+            .sequence_values::<String>()
+            .map(|letter| InputMode::parse(&letter?))
+            .collect::<LuaResult<_>>()?,
+        _ => return Err(mlua::Error::runtime(MODE_TYPE_ERR)),
+    };
+    if modes.is_empty() {
+        return Err(mlua::Error::runtime(NO_MODES_ERR));
+    }
+    Ok(modes)
+}
+
+fn parse_buffer(opts: Option<&Table>) -> LuaResult<Scope> {
+    let Some(opts) = opts else {
+        return Ok(None);
+    };
+    match opts.get::<Value>("buffer")? {
+        Value::Nil => Ok(None),
+        Value::UserData(ud) => {
+            let handle = ud
+                .borrow::<BufHandle>()
+                .map_err(|_| mlua::Error::runtime(BUFFER_TYPE_ERR))?;
+            Ok(Some(Arc::downgrade(&handle.buf)))
+        }
+        _ => Err(mlua::Error::runtime(BUFFER_TYPE_ERR)),
+    }
+}
+
+/// Bind a key to a Lua function, like `vim.keymap.set`.
 ///
-/// Bindings are global and belong to the plugin that set them. They stack:
-/// the last `set` wins, and when that plugin calls `del` or unloads, the
-/// previous holder gets the key back. Shadowing another plugin's binding logs
-/// a warning naming both. Setting a key you already hold replaces your
-/// binding.
+/// The binding fires only in the [modes](/docs/lua-api/#modes) you list. A
+/// key bound in `"i"` no longer types, so bind keys like `<Tab>` or `<C-x>`
+/// there, rarely a letter. A binding on a key that types text, like `a`,
+/// `<Space>` or `<Paste>`, needs `session_read` in every mode, because it
+/// sees what the user types. A plugin may switch the mode itself, so a
+/// letter bound in `"n"` could hear every key the user meant to type. That
+/// goes for a buffer binding too, since its window can sit on screen while
+/// the user types into the chat input. Keys
+/// with `C-` or `M-`, function keys and keys like `<CR>`, `<Esc>`, `<Tab>`,
+/// `<BS>` or the arrows need nothing.
+/// [Key resolution](/docs/lua-api/#key-resolution) shows which binding gets
+/// a key.
 ///
-/// For a key a popup should own only while it is on screen, use the `keys`
-/// option of `maki.ui.open_win` instead.
+/// Bindings belong to the plugin that set them and stack per mode. The last
+/// `set` wins and logs a warning naming the plugin it shadows. When that
+/// plugin calls `del` or unloads, the shadowed binding comes back. Setting a
+/// key you already hold replaces your binding.
 ///
-/// A handler that runs consumes the key, even if it raises (the error is
-/// logged). If the plugin has too many callbacks in flight, the key goes to
-/// maki's built-in binding rather than to the binding underneath.
+/// A binding with `opts.buffer` comes before any global binding and goes
+/// away with the buffer. Use it for the keys of a popup. A handler that
+/// refers to the buffer keeps it alive, so `del` it when the popup closes.
 ///
-/// `<C-c>` and `<C-z>` are reserved so quit and suspend always work. Binding
-/// either is an error.
+/// The handler consumes the key, even when it throws (the error is logged).
+/// Call `ev.fallback()` to let maki handle the key after all. A handler that
+/// changes the text of the input needs `input`, see
+/// [chat input](/docs/lua-api/#chat-input).
 ///
-/// @param mode string Mode letter. Currently only `"n"` is accepted.
-/// @param lhs string Key in Vim notation, e.g. `"<C-t>"`, `"<Space>"`, `"a"`.
-/// @param rhs function Called when the key is pressed. The return value is ignored.
+/// While a handler runs, the keys, pastes and clicks after it wait, so its
+/// edits and mode switches are in place before the next key lands. Keys
+/// wait one second at most, and stop waiting when another window takes the
+/// keyboard, like a picker the handler opened. If a modal or a prompt opens
+/// meanwhile, like an alert, a permission prompt or a question, the waiting
+/// keys are dropped so they cannot answer it, and the status bar says so.
+///
+/// `<C-c>` and `<C-z>` never wait. Every other key waits its turn, `<Esc>`
+/// while the agent runs included. A `<C-c>` while keys wait only drops them
+/// and the pending `ev.fallback()`, and the status bar says so. The next
+/// `<C-c>` works as usual. With no keys waiting, `<C-c>` drops the pending
+/// `ev.fallback()` and works as usual.
+///
+/// Text that changed since a key was pressed is never sent by that key. If
+/// anything changed the input while a `<CR>` waited, or the keyboard moved
+/// meanwhile, the user never saw what it would send. The same goes for
+/// `ev.fallback()` on `<CR>` once the input changed since the press, your
+/// handler's own edits included. Maki drops that send and asks the user to
+/// press Enter again.
+///
+/// A handler that changes the text of the input needs `input`, see
+/// [chat input](/docs/lua-api/#chat-input).
+///
+/// Throws on an invalid mode or key, on `<C-c>` and `<C-z>`, which stay
+/// reserved for quit and suspend, on a taken key with `unique`, and with
+/// `permission denied` on a typing key in `"i"` without `session_read`.
+///
+/// @param mode string|string[] `"n"`, `"i"`, or a list of them.
+/// @param lhs string Key in Vim notation, e.g. `"<C-t>"`, `"a"`, or `"<Paste>"` for bracketed paste.
+/// @param rhs function Called with an event table `ev`. The return value is ignored. `ev` has:
+///   `key` (string) the key, in canonical notation.
+///   `input` (table?) the chat input at the press, as `maki.ui.input` returns it. Pass its `version` and `session_id` to `maki.ui.input_edit`. Only with `session_read`, else nil.
+///   `text` (string?) `<Paste>` only: the pasted text, with `\n` line endings. maki does not insert it. Only with `session_read`, else nil.
+///   `fallback` (function) runs maki's own handling of the key, as if no plugin had bound it. Call it once, before the handler returns.
+///     - It types, moves or sends in the chat input, or hands the key to a focused window's `win:recv`. It never runs another plugin's binding.
+///     - It lands after the handler's earlier `maki.ui` calls and before the waiting keys.
+///     - It returns `true` once the key is queued, or `nil` and an error.
+///     - The key is dropped if the keyboard, the mode, the cursor or the selection moved since the press, your handler's own changes included.
 /// @param opts table? Options:
-///   `desc` (string) short description shown in the keymap list.
-///   `unique` (boolean) fail the call, naming the owner, when anything
-///     already maps the key. Default false.
+///   `desc` (string) shown next to the key in `/help`.
+///   `unique` (boolean) throw, naming the owner, when the key is already
+///     bound in one of the modes. Default false.
+///   `buffer` (Buf) bind the key only while a window showing this buffer is
+///     on screen.
 /// @example
-/// maki.keymap.set("n", "<C-t>", function()
-///   print("toggle!")
-/// end, { desc = "Toggle panel" })
+/// -- Tab in an empty input starts a review prompt, else it switches plan/build:
+/// maki.keymap.set("i", "<Tab>", function(ev)
+///   local st = ev.input
+///   if st.text ~= "" then
+///     return ev.fallback()
+///   end
+///   maki.ui.input_edit({
+///     start = 0, stop = 0, text = "Review the staged changes: ",
+///     version = st.version, session_id = st.session_id,
+///   })
+/// end)
+///
+/// -- Keys of a popup, live only while it is on screen:
+/// local buf = maki.ui.buf()
+/// local win = maki.ui.open_win(buf, { focus = false, width = 20, height = 3 })
+/// maki.keymap.set("i", "<Esc>", function()
+///   maki.keymap.del("i", "<Esc>", { buffer = buf })
+///   win:close()
+/// end, { buffer = buf })
 #[lua_fn]
 fn set(
     lua: &Lua,
     #[ctx] plugin: Arc<str>,
-    mode: String,
+    #[ctx] grants: PluginPermissions,
+    mode: Value,
     lhs: String,
     rhs: mlua::Function,
     opts: Option<Table>,
 ) -> LuaResult<()> {
-    if mode != "n" {
-        return Err(mlua::Error::runtime(format!(
-            "unsupported keymap mode: {mode}"
-        )));
-    }
+    let modes = parse_modes(mode)?;
     let key = accept_key(&lhs)?;
-    let desc = opts
-        .as_ref()
-        .and_then(|o| o.get::<String>("desc").ok())
-        .unwrap_or_default();
-    let unique = opts
-        .as_ref()
-        .and_then(|o| o.opt_bool("unique"))
-        .unwrap_or(false);
+    let buffer = parse_buffer(opts.as_ref())?;
+    if key.types_text() {
+        require(lua, &grants, Permission::SessionRead)?;
+    }
+    let opts = SetOpts {
+        desc: opts
+            .as_ref()
+            .and_then(|o| o.get::<String>("desc").ok())
+            .unwrap_or_default(),
+        unique: opts
+            .as_ref()
+            .and_then(|o| o.opt_bool("unique"))
+            .unwrap_or(false),
+        buffer,
+    };
     let registry_key = lua.create_registry_value(rhs)?;
-    match store_mut(lua)?.set(key, registry_key, Arc::clone(&plugin), desc, unique) {
+    match store_mut(lua)?.set(key, &modes, registry_key, Arc::clone(&plugin), grants, opts) {
         SetOutcome::Free => {}
         SetOutcome::Shadowed(owner) => {
             tracing::warn!(key = %lhs, plugin = %plugin, shadowed = %owner, "keymap shadowed by plugin");
@@ -460,27 +775,37 @@ fn set(
     Ok(())
 }
 
-/// Remove your plugin's mapping for {lhs} in {mode}, like `vim.keymap.del`.
-/// The key goes back to whoever held it before you, or to maki's default
-/// binding.
+/// Remove your plugin's binding for {lhs} in {mode}, like `vim.keymap.del`.
+/// The key goes back to the binding yours shadowed, or to maki's default.
 ///
-/// A plugin can only remove its own mappings. If another plugin maps {lhs},
-/// nothing changes and a warning names that plugin. Does nothing if nothing
-/// maps {lhs}.
+/// Only your own bindings go. If another plugin holds {lhs}, nothing
+/// changes and a warning names it. Only the modes you list are removed: a
+/// binding set in `{ "n", "i" }` and removed in `"n"` stays in `"i"`.
+/// Throws on an invalid mode or key.
 ///
-/// @param mode string Mode letter (reserved for future modes).
+/// @param mode string|string[] `"n"`, `"i"`, or a list of them.
 /// @param lhs string Key to unmap, in Vim notation.
+/// @param opts table? Options:
+///   `buffer` (Buf) remove the binding set for this buffer instead of the
+///     global one.
 /// @example
-/// maki.keymap.del("n", "<C-t>")
+/// maki.keymap.del({ "n", "i" }, "<C-t>")
 #[lua_fn]
-fn del(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String, lhs: String) -> LuaResult<()> {
-    let _ = mode;
+fn del(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    mode: Value,
+    lhs: String,
+    opts: Option<Table>,
+) -> LuaResult<()> {
+    let modes = parse_modes(mode)?;
     let key = Key::parse(&lhs).map_err(mlua::Error::runtime)?;
+    let buffer = parse_buffer(opts.as_ref())?;
     let Some(mut store) = lua.app_data_mut::<KeymapStore>() else {
         return Ok(());
     };
-    if !store.del(key, &plugin) {
-        if let Some(owner) = store.owner_of(key) {
+    if !store.del(key, &modes, &plugin, &buffer) {
+        if let Some(owner) = modes.iter().find_map(|&m| store.owner_of(key, m, &buffer)) {
             tracing::warn!(key = %lhs, plugin = %plugin, owner = %owner, "keymap del ignored: key belongs to another plugin");
         }
         return Ok(());
@@ -506,10 +831,82 @@ lua_table! {
     /// Key mappings, modeled after `vim.keymap`.
     ///
     /// ```lua
-    /// maki.keymap.set("n", "<C-t>", function()
+    /// maki.keymap.set({ "n", "i" }, "<C-t>", function()
     ///   print("hello")
     /// end, { desc = "Say hello" })
     /// ```
+    ///
+    /// ## Modes
+    ///
+    /// As in Neovim, maki is in one mode at a time, and a binding fires only
+    /// in the modes it was set for.
+    ///
+    /// | Mode | When |
+    /// | --- | --- |
+    /// | `"i"` (insert, the default) | The chat input has the keyboard, and keys type into it. |
+    /// | `"n"` (normal) | Set by `maki.ui.set_mode("n")`, and while a picker, modal, prompt or focused window has the keyboard or a finished subagent's chat is shown. |
+    ///
+    /// The mode a plugin set comes back when the chat input gets the keyboard
+    /// again. In normal mode, keys never type or delete in the chat input.
+    /// Moving the cursor, history, pasting and `<CR>` to send still work.
+    ///
+    /// Bind a shortcut in `{ "n", "i" }` to make it work everywhere, as the
+    /// built-in plugins do. Read the mode with `maki.fn.mode()`, and watch it
+    /// with the `"ModeChanged"` autocmd.
+    ///
+    /// ```lua
+    /// -- A tiny vim mode: Esc leaves insert mode, i goes back.
+    /// maki.keymap.set("i", "<Esc>", function() maki.ui.set_mode("n") end)
+    /// maki.keymap.set("n", "i", function() maki.ui.set_mode("i") end)
+    ///
+    /// -- dd deletes the cursor's line. A lone d expires after 500 ms.
+    /// local pending
+    /// maki.keymap.set("n", "d", function(ev)
+    ///   if not pending then
+    ///     pending = maki.defer_fn(function() pending = nil end, 500)
+    ///     return
+    ///   end
+    ///   pending:stop()
+    ///   pending = nil
+    ///   local st = ev.input
+    ///   local head = st.text:sub(1, st.cursor):match("^.*\n")
+    ///   maki.ui.input_edit({
+    ///     start = head and #head or 0,
+    ///     stop = st.text:find("\n", st.cursor + 1, true) or #st.text,
+    ///     text = "", version = st.version, session_id = st.session_id,
+    ///   })
+    /// end)
+    /// ```
+    ///
+    /// With this `<Esc>` binding, the built-in `Esc Esc` (rewind) works only
+    /// from normal mode.
+    ///
+    /// Older versions fired `"n"` bindings while you typed. See
+    /// [Upgrading old keymaps](/docs/keybindings/#upgrading-old-keymaps).
+    ///
+    /// ## Key resolution
+    ///
+    /// Each key runs one handler: the first match in this list, for the
+    /// current mode.
+    ///
+    /// 1. `<C-c>` and `<C-z>`, which no binding can take. `<C-z>` suspends
+    ///    here, and `<C-c>` still goes to step 2 first.
+    /// 2. Maki's modals and prompts, then the focused window, then Maki's
+    ///    pickers. They take every key, except the plan form and the `/`
+    ///    command list, which pass on the keys they do not use. The focused
+    ///    window runs its buffer's bindings, then its `win:recv`.
+    /// 3. Windows on screen, front first: each one's buffer bindings, then
+    ///    the keys it claimed with the `keys` option of `maki.ui.open_win`.
+    /// 4. `<Esc>` while the agent runs, in either mode. Maki takes it, and a
+    ///    second one in a row cancels the turn.
+    /// 5. Global bindings, the last `set` first.
+    /// 6. Maki's built-in keys and the chat input.
+    ///
+    /// `ev.fallback()` jumps to step 6, or to `win:recv` for a binding on the
+    /// focused window's buffer. `<Paste>` follows the same list.
+    ///
+    /// To share one key between plugins, see
+    /// [Composing keys](/docs/keybindings/#composing-keys).
     ///
     /// ## Key notation
     ///
@@ -536,6 +933,7 @@ lua_table! {
     /// | Arrows | `<Up>`, `<Down>`, `<Left>`, `<Right>` | |
     /// | Navigation | `<Home>`, `<End>`, `<PageUp>`, `<PageDown>`, `<Insert>` | |
     /// | Function keys | `<F1>` through `<F24>` | |
+    /// | Bracketed paste | `<Paste>` | |
     ///
     /// Modifiers are `C-` (control), `M-` (alt) and `S-` (shift), in that
     /// order: `<C-M-x>`. `Ctrl-`, `Alt-`, `A-` and `Shift-` are accepted as
@@ -559,8 +957,8 @@ lua_table! {
     /// `"esc"`, `"ctrl+n"` and `"shift+tab"`. These now arrive as `<CR>`,
     /// `<Esc>`, `<C-n>` and `<S-Tab>`, and the load check flags the old
     /// spellings.
-    "maki.keymap" => pub(crate) fn create_keymap_table(plugin: Arc<str>), DOCS [
-        set(plugin), del(plugin), normalize,
+    "maki.keymap" => pub(crate) fn create_keymap_table(plugin: Arc<str>, grants: PluginPermissions), DOCS [
+        set(plugin, grants), del(plugin), normalize,
     ]
 }
 
@@ -572,16 +970,63 @@ mod tests {
     const PLUGIN: &str = "plug";
     const OTHER_PLUGIN: &str = "other";
     const TAB: &str = "<Tab>";
-    const ESC: &str = "<Esc>";
+    const MODE: InputMode = InputMode::Normal;
+    const BOTH: &[InputMode] = &[InputMode::Normal, InputMode::Insert];
 
     fn parsed(lhs: &str) -> Key {
         Key::parse(lhs).unwrap()
     }
 
     fn global(store: &mut KeymapStore, lua: &Lua, lhs: &str, plugin: &str) -> SetOutcome {
+        bind(store, lua, lhs, plugin, &[MODE], false)
+    }
+
+    fn bind(
+        store: &mut KeymapStore,
+        lua: &Lua,
+        lhs: &str,
+        plugin: &str,
+        modes: &[InputMode],
+        unique: bool,
+    ) -> SetOutcome {
+        let opts = SetOpts {
+            unique,
+            ..SetOpts::default()
+        };
+        set_with(store, lua, lhs, plugin, modes, opts)
+    }
+
+    fn bind_on(
+        store: &mut KeymapStore,
+        lua: &Lua,
+        plugin: &str,
+        buf: &Arc<SharedBuf>,
+    ) -> SetOutcome {
+        let opts = SetOpts {
+            buffer: Some(Arc::downgrade(buf)),
+            ..SetOpts::default()
+        };
+        set_with(store, lua, TAB, plugin, &[MODE], opts)
+    }
+
+    fn set_with(
+        store: &mut KeymapStore,
+        lua: &Lua,
+        lhs: &str,
+        plugin: &str,
+        modes: &[InputMode],
+        opts: SetOpts,
+    ) -> SetOutcome {
         let f = lua.create_function(|_, ()| Ok(())).unwrap();
         let k = lua.create_registry_value(f).unwrap();
-        store.set(parsed(lhs), k, Arc::from(plugin), String::new(), false)
+        store.set(
+            parsed(lhs),
+            modes,
+            k,
+            Arc::from(plugin),
+            PluginPermissions::trusted(),
+            opts,
+        )
     }
 
     fn published(store: &KeymapStore) -> KeymapReader {
@@ -592,8 +1037,16 @@ mod tests {
 
     /// Which plugin's binding for {lhs} fires.
     fn dispatching_owner(store: &KeymapStore, lhs: &str) -> Option<Arc<str>> {
+        owner_on(store, lhs, None)
+    }
+
+    fn owner_on(
+        store: &KeymapStore,
+        lhs: &str,
+        buffer: Option<&Arc<SharedBuf>>,
+    ) -> Option<Arc<str>> {
         let mut owner = None;
-        published(store).dispatch(parsed(lhs), |ticket| {
+        published(store).dispatch(parsed(lhs), MODE, buffer, |ticket| {
             owner = Some(Arc::clone(ticket.plugin()));
             true
         });
@@ -615,7 +1068,7 @@ mod tests {
             "the newest binding is the one that fires"
         );
 
-        store.del(parsed(TAB), OTHER_PLUGIN);
+        store.del(parsed(TAB), &[MODE], OTHER_PLUGIN, &None);
         assert_eq!(
             dispatching_owner(&store, TAB).as_deref(),
             Some(PLUGIN),
@@ -641,7 +1094,7 @@ mod tests {
         global(&mut store, &lua, TAB, PLUGIN);
         global(&mut store, &lua, TAB, PLUGIN);
 
-        store.del(parsed(TAB), PLUGIN);
+        store.del(parsed(TAB), &[MODE], PLUGIN, &None);
 
         assert_eq!(
             dispatching_owner(&store, TAB).as_deref(),
@@ -658,13 +1111,13 @@ mod tests {
         global(&mut store, &lua, TAB, PLUGIN);
         global(&mut store, &lua, TAB, OTHER_PLUGIN);
 
-        assert!(store.del(parsed(TAB), PLUGIN));
+        assert!(store.del(parsed(TAB), &[MODE], PLUGIN, &None));
 
         assert_eq!(
             dispatching_owner(&store, TAB).as_deref(),
             Some(OTHER_PLUGIN)
         );
-        store.del(parsed(TAB), OTHER_PLUGIN);
+        store.del(parsed(TAB), &[MODE], OTHER_PLUGIN, &None);
         assert_eq!(
             dispatching_owner(&store, TAB),
             None,
@@ -681,8 +1134,8 @@ mod tests {
         global(&mut store, &lua, "x", OTHER_PLUGIN);
 
         store.clear_plugin(PLUGIN);
-        assert_eq!(store.globals.len(), 1);
-        assert_eq!(store.globals[0].plugin.as_ref(), OTHER_PLUGIN);
+        assert_eq!(store.bindings.len(), 1);
+        assert_eq!(store.bindings[0].plugin.as_ref(), OTHER_PLUGIN);
     }
 
     #[test]
@@ -710,71 +1163,13 @@ mod tests {
         let mut store = KeymapStore::new();
         global(&mut store, &lua, TAB, PLUGIN);
 
-        published(&store).dispatch(parsed(TAB), |_| handed_off)
+        published(&store).dispatch(parsed(TAB), MODE, None, |_| handed_off)
     }
 
     #[test]
     fn dispatch_leaves_a_key_nobody_claimed_alone() {
         let store = KeymapStore::new();
-        assert!(!published(&store).dispatch(parsed(TAB), |_| unreachable!()));
-    }
-
-    /// A callback that parks holds its ticket, and the plugin that owns it
-    /// runs out of budget. Its keys then reach the built-in binding, and every
-    /// other plugin keeps dispatching.
-    #[test]
-    fn a_parked_plugin_stops_claiming_keys_and_leaves_the_others_alone() {
-        let lua = Lua::new();
-        let mut store = KeymapStore::new();
-        global(&mut store, &lua, TAB, PLUGIN);
-        global(&mut store, &lua, ESC, OTHER_PLUGIN);
-        let reader = published(&store);
-
-        let parked = exhaust(&reader, TAB);
-
-        assert!(
-            !reader.dispatch(parsed(TAB), |_| unreachable!()),
-            "the parked plugin is out of budget"
-        );
-        assert!(
-            reader.dispatch(parsed(ESC), |_| true),
-            "another plugin's keys still dispatch"
-        );
-
-        drop(parked);
-        assert!(
-            reader.dispatch(parsed(TAB), |_| true),
-            "finishing the callbacks gives the budget back"
-        );
-    }
-
-    /// Fills {plugin}'s budget and returns the tickets holding it.
-    fn exhaust(reader: &KeymapReader, lhs: &str) -> Vec<KeybindTicket> {
-        (0..MAX_IN_FLIGHT)
-            .map(|_| {
-                let mut held = None;
-                assert!(reader.dispatch(parsed(lhs), |t| {
-                    held = Some(t);
-                    true
-                }));
-                held.unwrap()
-            })
-            .collect()
-    }
-
-    /// A binding that cannot run its callback is a binding that is not there,
-    /// and the host runs its own in the same keystroke. Swallowing the key
-    /// instead leaves the user pressing a key nothing will answer.
-    #[test]
-    fn an_exhausted_binding_falls_through() {
-        let lua = Lua::new();
-        let mut store = KeymapStore::new();
-        global(&mut store, &lua, TAB, PLUGIN);
-        let reader = published(&store);
-
-        let _parked = exhaust(&reader, TAB);
-
-        assert!(!reader.dispatch(parsed(TAB), |_| unreachable!()));
+        assert!(!published(&store).dispatch(parsed(TAB), MODE, None, |_| unreachable!()));
     }
 
     /// A keystroke claimed a moment before a `/reload` carries the old chunk's
@@ -788,7 +1183,7 @@ mod tests {
         let reader = published(&store);
 
         let mut live = None;
-        assert!(reader.dispatch(parsed(TAB), |t| {
+        assert!(reader.dispatch(parsed(TAB), MODE, None, |t| {
             live = Some(t.plugin_live());
             true
         }));
@@ -796,7 +1191,7 @@ mod tests {
 
         store.clear_plugin(PLUGIN);
         assert!(
-            !reader.dispatch(parsed(TAB), |_| unreachable!()),
+            !reader.dispatch(parsed(TAB), MODE, None, |_| unreachable!()),
             "the stale snapshot no longer claims the key"
         );
     }
@@ -811,7 +1206,7 @@ mod tests {
         global(&mut store, &lua, TAB, PLUGIN);
 
         let mut held = None;
-        published(&store).dispatch(parsed(TAB), |t| {
+        published(&store).dispatch(parsed(TAB), MODE, None, |t| {
             held = Some(t);
             true
         });
@@ -833,7 +1228,7 @@ mod tests {
         global(&mut store, &lua, TAB, PLUGIN);
 
         let mut carried = None;
-        published(&store).dispatch(parsed(TAB), |t| {
+        published(&store).dispatch(parsed(TAB), MODE, None, |t| {
             carried = Some(t.key());
             true
         });
@@ -866,14 +1261,14 @@ mod tests {
         store.clear_plugin(PLUGIN);
         global(&mut store, &lua, TAB, PLUGIN);
         assert!(
-            !published(&store).dispatch(parsed(TAB), |_| unreachable!()),
+            !published(&store).dispatch(parsed(TAB), MODE, None, |_| unreachable!()),
             "a straggler of the torn down load publishes nothing that fires"
         );
 
         store.revive(PLUGIN);
         global(&mut store, &lua, TAB, PLUGIN);
         assert!(
-            published(&store).dispatch(parsed(TAB), |_| true),
+            published(&store).dispatch(parsed(TAB), MODE, None, |_| true),
             "the load that replaced it dispatches"
         );
     }
@@ -898,5 +1293,129 @@ mod tests {
             Some(OTHER_PLUGIN),
             "the live binding still fires"
         );
+    }
+
+    /// A letter bound in normal mode has to leave typing alone, and a
+    /// shortcut bound in both modes has to work in either.
+    #[test_case(&[InputMode::Normal], InputMode::Insert => false ; "normal_rests_while_typing")]
+    #[test_case(&[InputMode::Insert], InputMode::Normal => false ; "insert_rests_in_normal")]
+    #[test_case(BOTH,                 InputMode::Insert => true  ; "both_fires_while_typing")]
+    #[test_case(BOTH,                 InputMode::Normal => true  ; "both_fires_in_normal")]
+    fn a_binding_fires_only_in_its_modes(modes: &[InputMode], mode: InputMode) -> bool {
+        let lua = Lua::new();
+        let mut store = KeymapStore::new();
+        bind(&mut store, &lua, TAB, PLUGIN, modes, false);
+        published(&store).dispatch(parsed(TAB), mode, None, |_| true)
+    }
+
+    #[test]
+    fn del_in_one_mode_leaves_the_other_bound() {
+        let lua = Lua::new();
+        let mut store = KeymapStore::new();
+        bind(&mut store, &lua, TAB, PLUGIN, BOTH, false);
+
+        assert!(store.del(parsed(TAB), &[InputMode::Normal], PLUGIN, &None));
+
+        let reader = published(&store);
+        assert!(!reader.dispatch(parsed(TAB), InputMode::Normal, None, |_| unreachable!()));
+        assert!(reader.dispatch(parsed(TAB), InputMode::Insert, None, |_| true));
+    }
+
+    /// Half a binding is worse than none. The author asked for the key in
+    /// both modes and would only find out by pressing it in the wrong one.
+    #[test]
+    fn a_unique_bind_taken_in_one_mode_stores_nothing() {
+        let lua = Lua::new();
+        let mut store = KeymapStore::new();
+        bind(
+            &mut store,
+            &lua,
+            TAB,
+            OTHER_PLUGIN,
+            &[InputMode::Insert],
+            false,
+        );
+
+        let outcome = bind(&mut store, &lua, TAB, PLUGIN, BOTH, true);
+
+        assert!(matches!(outcome, SetOutcome::Taken(owner) if owner.as_ref() == OTHER_PLUGIN));
+        assert_eq!(
+            dispatching_owner(&store, TAB),
+            None,
+            "normal mode stayed free"
+        );
+    }
+
+    /// The host asks a buffer's bindings only for the windows showing it, and
+    /// at another step than the global ones. So a popup's key fires nowhere
+    /// else, and neither scope can hide the other.
+    #[test]
+    fn buffer_and_global_bindings_never_mix() {
+        let lua = Lua::new();
+        let mut store = KeymapStore::new();
+        let (mine, other) = (Arc::new(SharedBuf::new()), Arc::new(SharedBuf::new()));
+        global(&mut store, &lua, TAB, OTHER_PLUGIN);
+
+        let outcome = bind_on(&mut store, &lua, PLUGIN, &mine);
+        assert!(matches!(outcome, SetOutcome::Free), "no shadowing warning");
+        assert_eq!(owner_on(&store, TAB, Some(&mine)).as_deref(), Some(PLUGIN));
+        assert_eq!(owner_on(&store, TAB, Some(&other)), None);
+        assert_eq!(
+            dispatching_owner(&store, TAB).as_deref(),
+            Some(OTHER_PLUGIN)
+        );
+
+        assert!(store.del(parsed(TAB), &[MODE], PLUGIN, &Some(Arc::downgrade(&mine))));
+        assert_eq!(owner_on(&store, TAB, Some(&mine)), None);
+        assert_eq!(
+            dispatching_owner(&store, TAB).as_deref(),
+            Some(OTHER_PLUGIN),
+            "the del left the global binding alone"
+        );
+    }
+
+    /// No window can show a buffer that is gone, and each callback left behind
+    /// still holds a registry slot.
+    #[test]
+    fn the_bindings_of_a_buffer_that_is_gone_are_dropped() {
+        let lua = Lua::new();
+        let mut store = KeymapStore::new();
+        let buf = Arc::new(SharedBuf::new());
+        bind_on(&mut store, &lua, PLUGIN, &buf);
+
+        drop(buf);
+        global(&mut store, &lua, TAB, PLUGIN);
+
+        assert_eq!(store.bindings.len(), 1, "only the global binding is left");
+    }
+
+    #[test_case(r#""i""#,          Ok(&[InputMode::Insert]) ; "one_letter")]
+    #[test_case(r#"{ "n", "i" }"#, Ok(BOTH)                 ; "a_list")]
+    #[test_case(r#""v""#,          Err(UNKNOWN_MODE_ERR)    ; "an_unknown_letter")]
+    #[test_case("{}",              Err(NO_MODES_ERR)        ; "an_empty_list")]
+    fn modes_parse(src: &str, expected: Result<&[InputMode], &str>) {
+        let lua = Lua::new();
+        let parsed = parse_modes(lua.load(src).eval().unwrap()).map_err(|e| e.to_string());
+        match expected {
+            Ok(modes) => assert_eq!(parsed.unwrap(), modes),
+            Err(msg) => assert!(parsed.unwrap_err().contains(msg)),
+        }
+    }
+
+    /// `maki.fn.mode()` reads the Lua half and keys are matched with the UI
+    /// half, so both have to agree, and a plugin's pick only counts while
+    /// the chat input has the keyboard.
+    #[test_case(InputMode::Insert, true  => InputMode::Insert ; "typing")]
+    #[test_case(InputMode::Normal, true  => InputMode::Normal ; "a_plugin_picked_normal")]
+    #[test_case(InputMode::Insert, false => InputMode::Normal ; "the_input_lost_the_keyboard")]
+    fn the_mode_is_insert_only_while_the_input_has_the_keyboard(
+        picked: InputMode,
+        focused: bool,
+    ) -> InputMode {
+        let (writer, reader) = KeymapWriter::new();
+        writer.mode.set(picked);
+        let mode = reader.sync_mode(focused);
+        assert_eq!(writer.mode.get(), mode);
+        mode
     }
 }

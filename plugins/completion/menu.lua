@@ -100,7 +100,11 @@ end
 
 -- The only teardown. Closing the window is what hands every key back, which is
 -- how this plugin can take `<C-p>` while the sessions plugin has it the rest
--- of the time: the claim goes out with the float that drew it.
+-- of the time: the popup's keys are bound to its buffer, and a buffer's keys
+-- only fire while a window showing it is on screen.
+--
+-- The bindings go too, because their handlers hold the popup, buffer and all,
+-- and would keep it alive for as long as they are bound.
 --
 -- Each step is on its own, because an error unsubscribing must not leave the
 -- float on screen holding its keys.
@@ -115,6 +119,11 @@ function M.close()
   guarded(unwatch)
   guarded(function()
     closing.win:close()
+  end)
+  guarded(function()
+    for _, binding in ipairs(M.BINDINGS) do
+      maki.keymap.del("i", binding.lhs, { buffer = closing.buf })
+    end
   end)
 end
 
@@ -174,6 +183,17 @@ function M.accept()
   end
 end
 
+-- Backs the `completion.accept` action, which is `<CR>` on the popup for a
+-- user who wants it on another key. Without a popup it answers false, so
+-- their key can go on and do what it does otherwise.
+function M.accept_if_open()
+  if not popup then
+    return false
+  end
+  M.accept()
+  return true
+end
+
 local function next_row()
   move(1)
 end
@@ -183,60 +203,36 @@ local function prev_row()
 end
 
 -- Every key the popup takes while it is on screen. The popup is unfocused,
--- because the user goes on typing into the chat input beneath it, so the host
--- has to be told which keys are the popup's. Everything else reaches the input
--- as it always did. The list belongs to the window and dies with it, so there
--- is nothing to release and nothing that can outlive what the user can see.
---
--- One spelling: the notation a key is claimed in is the notation `win:recv`
--- reports the press under, so `claim` is also the handler's key.
+-- because the user goes on typing into the chat input beneath it, so its keys
+-- are bound to its buffer: the host asks them only while a window showing it
+-- is on screen, and before any global binding. Everything else reaches the
+-- input as it always did. They are bound in insert mode, so a vim plugin
+-- holding the input in normal mode keeps its own `<Esc>` and arrows.
 --
 -- Public so the spec can press every binding the popup declares.
 --
 -- No `<Tab>` here. It toggles the mode, and it should do that whether a popup
--- is up or not.
+-- is up or not. A user who wants `<Tab>` to accept binds it in `init.lua` to
+-- the `completion.accept` action, falling back to the mode toggle.
 M.BINDINGS = {
-  { claim = "<Down>", run = next_row },
-  { claim = "<Up>", run = prev_row },
-  { claim = "<C-n>", run = next_row },
-  { claim = "<C-p>", run = prev_row },
-  { claim = "<Esc>", run = M.close },
-  { claim = "<CR>", run = M.accept },
+  { lhs = "<Down>", run = next_row, desc = "Next completion" },
+  { lhs = "<Up>", run = prev_row, desc = "Previous completion" },
+  { lhs = "<C-n>", run = next_row, desc = "Next completion" },
+  { lhs = "<C-p>", run = prev_row, desc = "Previous completion" },
+  { lhs = "<Esc>", run = M.close, desc = "Close completions" },
+  { lhs = "<CR>", run = M.accept, desc = "Insert completion" },
 }
 
--- Derived, not written out a second time: a key on one list and not the other
--- would be claimed, consumed, and do nothing.
-local KEYS, HANDLERS = {}, {}
-for i, binding in ipairs(M.BINDINGS) do
-  KEYS[i] = binding.claim
-  HANDLERS[binding.claim] = binding.run
-end
-
-function M.handle_key(key)
-  local handler = HANDLERS[key]
-  if handler then
-    handler()
+-- A key pressed on one popup can be handled after a newer popup opened, and
+-- it says nothing about that one's rows, so {mine} has to still be the popup.
+local function bind_keys(mine)
+  for _, binding in ipairs(M.BINDINGS) do
+    maki.keymap.set("i", binding.lhs, function()
+      if popup == mine then
+        binding.run()
+      end
+    end, { buffer = mine.buf, desc = binding.desc })
   end
-end
-
--- The popup's key loop, one per window. It ends with the window: `close` takes
--- the float down and the host answers with a `close` event, so nothing has to
--- be kept in step and no loop can outlive the popup it reads for.
---
--- A key queued before a close can land after a newer popup has opened, and it
--- says nothing about that one's rows, so {mine} has to still be the popup.
-local function read_keys(mine)
-  maki.async.run(function()
-    while true do
-      local ev = mine.win:recv()
-      if not ev or ev.type == "close" then
-        return
-      end
-      if ev.type == "key" and popup == mine then
-        M.handle_key(ev.key)
-      end
-    end
-  end)
 end
 
 -- The ranked rows, or the one placeholder row that stands in for them.
@@ -296,14 +292,13 @@ local function ensure_popup()
     zindex = ZINDEX,
     focus = false,
     visible = false,
-    keys = KEYS,
   })
   popup = {
     win = win,
     buf = buf,
     sel = 1,
   }
-  read_keys(popup)
+  bind_keys(popup)
 end
 
 -- Ranks again, later, whatever the user typed last by the time it runs.
@@ -532,8 +527,8 @@ function M.refresh(st)
   end
   local start, query, trigger = Trigger.find(st.text, st.cursor, Trigger.FILES .. Sources.triggers(sources))
   -- A slash command owns the input while the command palette is up, so there
-  -- is no mention to complete in one. The palette's keys are the host's to
-  -- route, above every claim, so this is about the rows and not about them.
+  -- is no mention to complete in one. The palette handles its keys before any
+  -- binding, so this is about the rows and not about the keys.
   if not start or st.text:sub(1, 1) == "/" then
     return M.close()
   end

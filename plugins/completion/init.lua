@@ -3,8 +3,8 @@
 -- `sources.lua`).
 --
 -- Nothing here is special-cased in the host. The popup is an ordinary
--- unfocused float on the input caret anchor, the navigation keys are the
--- `keys` any window may declare, the ranking is the one the built-in file
+-- unfocused float on the input caret anchor, the navigation keys are
+-- keymaps bound to the popup's buffer, the ranking is the one the built-in file
 -- picker uses, and accepting is one `maki.ui.input_edit` over the range the
 -- `@` opened.
 --
@@ -20,6 +20,14 @@ local Sources = require("sources")
 
 Sources.declare()
 
+-- Accepting writes a ranked file path into the input, where any plugin can
+-- read it, so a caller has to be allowed to list files itself. The edit also
+-- costs `session_read`, like reading the input. The callback holds only this
+-- list.
+maki.api.register_action("accept", Menu.accept_if_open, {
+  capability = { "fs_read", "input", "session_read" },
+})
+
 maki.api.create_autocmd("InputChanged", {
   callback = function(ev)
     Events.input_changed(ev.data)
@@ -33,7 +41,7 @@ maki.api.create_autocmd("SessionReset", {
 })
 
 -- Cycling to a subagent tab stays within the session, so nothing else here
--- fires. The popup's keys are routed to it before the chat's own, so one left
+-- fires. The popup's keys are asked before the chat's own, so one left
 -- open over a subagent takes `<Up>` away from the input history and lets
 -- `<CR>` write a path into a tab the user is not looking at.
 maki.api.create_autocmd("TaskFocusChanged", {

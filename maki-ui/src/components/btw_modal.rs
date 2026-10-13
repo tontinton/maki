@@ -233,6 +233,10 @@ impl BtwModal {
 }
 
 impl Overlay for BtwModal {
+    fn is_prompting(&self) -> bool {
+        self.is_open()
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

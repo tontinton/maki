@@ -393,6 +393,9 @@ shows no rows, and the error is logged.
 `complete` runs with the permissions of the plugin that wrote it, so the example
 needs `run` as well.
 
+The popup does not open on a `!` line. Completion holds no `run`, so Enter
+would refuse a shell line it completed.
+
 ## Permission prompt
 
 `permission.prompt` fires where the permission prompt would show, once the

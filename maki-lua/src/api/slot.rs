@@ -13,7 +13,7 @@ use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 
 use crate::api::tool::permission_keys;
 use crate::api::util::dispatch::{DepthGuard, Reentry, call_swallowing};
-use crate::plugin_permissions::{Permission, PluginPermissions, grant_hint};
+use crate::plugin_permissions::{Ceiling, Permission, PluginPermissions, grant_hint};
 
 /// Slot names the host fires itself. A plugin declaring one would shadow a
 /// point whose firing order dispatch guarantees, so the namespace is closed.
@@ -23,6 +23,8 @@ pub(crate) const HOST_PREFIX: &str = "tool.";
 pub(crate) const UI_PREFIX: &str = "ui.";
 pub(crate) const AGENT_PREFIX: &str = "agent.";
 const PERMISSION_PREFIX: &str = "permission.";
+const DECLARE_SLOT: &str = "declare_slot";
+pub(crate) const UNGRANTED_PRICE_ERR: &str = "which this plugin was not granted";
 const HOST_PREFIXES: [&str; 4] = [HOST_PREFIX, UI_PREFIX, AGENT_PREFIX, PERMISSION_PREFIX];
 /// `tool.*.input` wraps every call, whichever tool it names.
 pub(crate) const ANY_TOOL: &str = "*";
@@ -45,6 +47,9 @@ const SEAM: &str = "slot";
 pub(crate) struct SlotLayer {
     pub plugin: Arc<str>,
     pub func: Function,
+    /// The [`Ceiling`] the layer was set under, which caps what it may steer
+    /// below its plugin's grants.
+    pub ceiling: Option<Ceiling>,
 }
 
 /// What a foreign layer pays to steer a declared slot, set by the owner at
@@ -242,7 +247,7 @@ fn set_state(cell: &PrevCell, state: PrevState) {
     *cell.lock().expect("prev state poisoned") = state;
 }
 
-type DelegationFn = Box<dyn Fn(&str, LayerCost<'_>, &str) -> bool>;
+type DelegationFn = Box<dyn Fn(&SlotLayer, LayerCost<'_>, &str) -> bool>;
 
 thread_local! {
     /// Lives on the Lua runtime thread, installed by the runtime because only
@@ -251,15 +256,15 @@ thread_local! {
     static LAYER_DELEGATION: RefCell<Option<DelegationFn>> = const { RefCell::new(None) };
 }
 
-pub(crate) fn set_layer_delegation(f: impl Fn(&str, LayerCost<'_>, &str) -> bool + 'static) {
+pub(crate) fn set_layer_delegation(f: impl Fn(&SlotLayer, LayerCost<'_>, &str) -> bool + 'static) {
     LAYER_DELEGATION.with(|c| *c.borrow_mut() = Some(Box::new(f)));
 }
 
-fn delegated(plugin: &str, cost: LayerCost<'_>, slot: &str) -> bool {
+fn delegated(layer: &SlotLayer, cost: LayerCost<'_>, slot: &str) -> bool {
     LAYER_DELEGATION.with(|c| {
         c.borrow()
             .as_ref()
-            .is_some_and(|gate| gate(plugin, cost, slot))
+            .is_some_and(|gate| gate(layer, cost, slot))
     })
 }
 
@@ -287,7 +292,7 @@ fn entitled_layers(
             None => LayerCost::TOTAL,
             Some(needed) => LayerCost::Named(needed),
         };
-        delegated(&layer.plugin, cost, name)
+        delegated(layer, cost, name)
     };
     if layers.iter().all(&entitled) {
         return layers;
@@ -462,9 +467,9 @@ pub(crate) fn host_slot_target(slot: &str) -> Option<(&str, HookStage)> {
 }
 
 /// Fires a host-owned slot: same layer contract as a declared one, with an
-/// identity default nobody can replace. `allow_layer` says which plugins'
-/// layers may see it, asked with the plugin and the name it layered, and
-/// living in the caller keeps slots ignorant of tools and permissions.
+/// identity default nobody can replace. `allow_layer` says which layers may
+/// see it, asked with the layer and the name it layered, and living in the
+/// caller keeps slots ignorant of tools and permissions.
 ///
 /// `None` means nothing ran, which the identity default handing back `args`
 /// would not say: the caller has to leave the value alone rather than report a
@@ -477,7 +482,7 @@ pub(crate) async fn run_host_chain(
     lua: &Lua,
     names: &[&str],
     args: MultiValue,
-    allow_layer: &dyn Fn(&str, &str) -> bool,
+    allow_layer: &dyn Fn(&SlotLayer, &str) -> bool,
 ) -> LuaResult<Option<MultiValue>> {
     run_host_chain_with(lua, names, identity_default(lua)?, args, allow_layer, None).await
 }
@@ -492,7 +497,7 @@ pub(crate) async fn run_host_chain_with(
     names: &[&str],
     default: Function,
     args: MultiValue,
-    allow_layer: &dyn Fn(&str, &str) -> bool,
+    allow_layer: &dyn Fn(&SlotLayer, &str) -> bool,
     observe: Option<ChainObserver>,
 ) -> LuaResult<Option<MultiValue>> {
     let [inner, ..] = names else {
@@ -504,7 +509,7 @@ pub(crate) async fn run_host_chain_with(
             layers.extend(
                 found
                     .iter()
-                    .filter(|layer| allow_layer(&layer.plugin, name))
+                    .filter(|layer| allow_layer(layer, name))
                     .cloned(),
             );
         }
@@ -600,7 +605,7 @@ fn declare_slot(
             name.trim_start_matches(prefix)
         )));
     }
-    let capability = parse_slot_capability(opts.as_ref(), &name, &permissions)?;
+    let capability = parse_capability(opts.as_ref(), DECLARE_SLOT, &name, &permissions.now(lua))?;
     {
         let mut store = slot_store_mut(lua)?;
         let entry = store.slots.entry(name.clone()).or_default();
@@ -621,12 +626,14 @@ fn declare_slot(
     make_callable(lua, name)
 }
 
-/// The price the owner set, weighed against what the owner itself holds: a
-/// plugin cannot price its slot in a capability it was never granted, the same
+/// The price the owner set in `opts.capability` for what other plugins pay,
+/// weighed against what the owner itself holds: a plugin cannot
+/// price its slot or action in a capability it was never granted, the same
 /// rule `register_tool` applies to the capability a tool exposes. Otherwise a
 /// denied plugin could mint a toll booth on reach it has no claim to.
-fn parse_slot_capability(
+pub(crate) fn parse_capability(
     opts: Option<&Table>,
+    api: &str,
     name: &str,
     permissions: &PluginPermissions,
 ) -> LuaResult<SlotPrice> {
@@ -638,7 +645,7 @@ fn parse_slot_capability(
         Value::Table(declared) => declared,
         _ => {
             return Err(mlua::Error::runtime(format!(
-                "declare_slot: '{name}' must give 'capability' as a list of permission names, \
+                "{api}: '{name}' must give 'capability' as a list of permission names, \
                  e.g. {{ capability = {{ \"net\" }} }} (valid: {})",
                 permission_keys()
             )));
@@ -649,13 +656,13 @@ fn parse_slot_capability(
         let key = key?;
         let permission = Permission::from_key(&key).ok_or_else(|| {
             mlua::Error::runtime(format!(
-                "declare_slot: '{name}' prices layers at unknown permission '{key}' (valid: {})",
+                "{api}: '{name}' lists unknown permission '{key}' in 'capability' (valid: {})",
                 permission_keys()
             ))
         })?;
         if !permissions.is_allowed(permission) {
             return Err(mlua::Error::runtime(format!(
-                "declare_slot: '{name}' prices layers at '{permission}', which this plugin was not granted. {}",
+                "{api}: '{name}' lists '{permission}' in 'capability', {UNGRANTED_PRICE_ERR}. {}",
                 grant_hint(&[permission])
             )));
         }
@@ -715,7 +722,9 @@ fn parse_slot_capability(
 /// you declared yourself is free. Like the `tool.*` slots, this is decided
 /// when the chain fires: the call skips a layer that is not entitled and
 /// carries on, and a reload that changes what you hold takes effect on the
-/// next call.
+/// next call. A layer set inside an
+/// [action](#maki-api-register_action) callback is weighed against the
+/// action's price too.
 ///
 /// @param name string Slot name to wrap.
 /// @param wrapper function Layer: `function(prev, ...)`. Call `prev(...)` to continue.
@@ -729,6 +738,7 @@ fn set_slot(lua: &Lua, #[ctx] plugin: Arc<str>, name: String, wrapper: Function)
     let mut store = slot_store_mut(lua)?;
     let entry = store.slots.entry(name.clone()).or_default();
     entry.layers.push(SlotLayer {
+        ceiling: Ceiling::current_for(lua, &plugin),
         plugin: Arc::clone(&plugin),
         func: wrapper,
     });
@@ -797,6 +807,7 @@ mod tests {
             .map(|p| SlotLayer {
                 plugin: Arc::from(*p),
                 func: noop(lua),
+                ceiling: None,
             })
             .collect()
     }
@@ -869,9 +880,9 @@ mod tests {
     /// Stands in for the gate the runtime installs: `full` holds everything,
     /// `netonly` holds `net`, and nobody else holds anything.
     fn grant_gate() {
-        set_layer_delegation(|plugin, cost, _| {
+        set_layer_delegation(|layer, cost, _| {
             let mut granted = PluginPermissions::denied();
-            match plugin {
+            match &*layer.plugin {
                 "full" => granted = PluginPermissions::trusted(),
                 "netonly" => granted.set(Permission::Net, true),
                 _ => {}

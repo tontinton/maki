@@ -60,6 +60,7 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::pack::DOCS,
         &api::tool::DOCS,
         &api::autocmd::DOCS,
+        &api::action::DOCS,
         &api::plan::DOCS,
         &api::slot::DOCS,
         &api::agent::DOCS,
@@ -113,7 +114,7 @@ mod tests {
 
     use super::{DocKind, api_docs};
     use crate::api::{Owner, create_maki_global};
-    use crate::plugin_permissions::PluginPermissions;
+    use crate::plugin_permissions::{PluginPermissions, PluginReach};
     use maki_providers::plugin::DeclAuthority;
 
     fn resolve_table(maki: &Table, path: &str) -> Table {
@@ -158,7 +159,7 @@ mod tests {
                 granted_providers: Arc::from(Vec::new()),
             },
             Some(ui_tx),
-            &PluginPermissions::trusted(),
+            &PluginReach::new(PluginPermissions::trusted()),
             Arc::default(),
         )
         .unwrap();

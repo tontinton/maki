@@ -39,7 +39,9 @@ use crate::api::util::command::{
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::pair::{Pair, try_pair};
-use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions, PluginReach};
+use crate::plugin_permissions::{
+    MANIFEST_FILE, Permission, PluginPermissions, PluginReach, require,
+};
 use crate::runtime::{
     HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, PromptTarget, Request,
     command_depth,
@@ -194,6 +196,11 @@ pub(crate) struct PendingRule {
     tool: Arc<str>,
     scope: String,
     effect: Effect,
+    /// What the plugin held for the code that declared the rule, which a
+    /// [`Ceiling`] may have cut below its grants.
+    ///
+    /// [`Ceiling`]: crate::plugin_permissions::Ceiling
+    granted: PluginPermissions,
 }
 
 pub(crate) type PendingRules = Arc<Mutex<Vec<PendingRule>>>;
@@ -793,8 +800,9 @@ fn register_tool(
 /// })
 #[lua_fn]
 fn register_permission_rule(
-    _lua: &Lua,
+    lua: &Lua,
     #[ctx] pending_rules: PendingRules,
+    #[ctx] reach: PluginReach,
     spec: Table,
 ) -> LuaResult<()> {
     for entry in spec.pairs::<String, LuaValue>() {
@@ -860,6 +868,7 @@ fn register_permission_rule(
             tool,
             scope,
             effect,
+            granted: reach.permissions().now(lua),
         });
     Ok(())
 }
@@ -915,7 +924,7 @@ fn allow_is_delegated(
             "the tool declares no permission_scopes, so it is never permission checked",
         );
     };
-    permissions.is_allowed(required)
+    (permissions.is_allowed(required) && rule.granted.is_allowed(required))
         || dropped(&format!(
             "allowing it exposes '{required}', which this plugin was not granted"
         ))
@@ -1010,7 +1019,7 @@ async fn run_command(
         ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
             cmdline,
             depth,
-            caller,
+            caller: caller.now(&lua),
             reply_tx,
         })
         .await
@@ -1206,7 +1215,7 @@ lua_table! {
     /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
     extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, reach: PluginReach, plugin: Arc<str>, opts: PluginOpts), DOCS [
-        register_tool(pending, reach), register_permission_rule(pending_rules), register_command(plugin, reach),
+        register_tool(pending, reach), register_permission_rule(pending_rules, reach), register_command(plugin, reach),
         register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
         get_tools, get_tool,
         manual run_command,
@@ -1538,6 +1547,7 @@ fn parse_tool_permission(
              Add `{permission} = true` under `[permissions]` in the {MANIFEST_FILE} next to the plugin file"
         )));
     }
+    require(lua, permissions, permission)?;
 
     let scopes = match scopes {
         LuaValue::Nil => None,

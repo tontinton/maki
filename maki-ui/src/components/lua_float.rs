@@ -91,6 +91,10 @@ struct FloatWindow {
 }
 
 impl FloatWindow {
+    fn needs_input(&self) -> bool {
+        self.visible && self.config.needs_input
+    }
+
     fn layout(&self) -> Layout {
         Layout::new(
             self.config.reserved_top,
@@ -152,6 +156,9 @@ pub(crate) struct FloatManager {
     focused_id: Option<u32>,
     focused_rect: Option<Rect>,
     next_id: u32,
+    /// How many times a window started waiting on the user, by opening,
+    /// showing or being reconfigured to need input.
+    prompts_opened: u64,
 }
 
 impl FloatManager {
@@ -161,7 +168,16 @@ impl FloatManager {
             focused_id: None,
             focused_rect: None,
             next_id: 0,
+            prompts_opened: 0,
         }
+    }
+
+    pub fn prompts_opened(&self) -> u64 {
+        self.prompts_opened
+    }
+
+    pub fn focused_id(&self) -> Option<u32> {
+        self.focused_id
     }
 
     /// The windows this frame lays out. A hidden one takes no cells and is
@@ -253,6 +269,7 @@ impl FloatManager {
             event_tx,
             cmd_rx,
         };
+        self.prompts_opened += u64::from(win.needs_input());
 
         self.windows.push(win);
         self.windows.sort_by_key(|w| w.config.zindex);
@@ -283,19 +300,22 @@ impl FloatManager {
     /// on the Lua thread, and until that command is drained the window is
     /// still here, still claiming its keys, and the next key would be taken
     /// from the user by a window that is on its way out and hands it to a loop
-    /// that has already stopped reading.
+    /// that has already stopped reading. A key handler's done report and its
+    /// `ev.fallback()` drain too, since nothing orders them with the window's
+    /// own channel.
     ///
     /// A patch that carried a `zindex` re-sorts the list, because z-order is
     /// what decides both who is drawn in front and who answers a claimed key:
     /// a window raised over another and left where it was opened would be drawn
     /// in front while the one underneath went on taking the key. The sort is
     /// stable, so windows sharing a `zindex` keep open order.
-    fn drain_commands(&mut self) -> Dirty {
+    pub fn drain_commands(&mut self) -> Dirty {
         let mut closed_ids = Vec::new();
         let mut dirty = Dirty::NO;
         let mut restack = false;
 
         for win in &mut self.windows {
+            let needed_input = win.needs_input();
             loop {
                 match win.cmd_rx.try_recv() {
                     Ok(WinCommand::SetConfig(patch)) => {
@@ -316,6 +336,7 @@ impl FloatManager {
                 }
                 dirty = Dirty::YES;
             }
+            self.prompts_opened += u64::from(!needed_input && win.needs_input());
         }
 
         if restack {
@@ -339,9 +360,7 @@ impl FloatManager {
     /// itself instead of using [`Self::laid_out`], because this is about who
     /// can answer, not about layout. Nobody can answer a window they cannot see.
     pub fn needs_input(&self) -> bool {
-        self.windows
-            .iter()
-            .any(|win| win.visible && win.config.needs_input)
+        self.windows.iter().any(FloatWindow::needs_input)
     }
 
     /// The focused window is handed every key, ahead of every overlay the host
@@ -351,10 +370,7 @@ impl FloatManager {
     /// nothing sent. Letting it through would run a built-in binding on the
     /// chat hidden behind the window.
     pub fn handle_focused_key(&self, key: KeyEvent) -> bool {
-        let Some(win) = self
-            .focused_id
-            .and_then(|fid| self.windows.iter().find(|w| w.id == fid))
-        else {
+        let Some(win) = self.focused() else {
             return false;
         };
         if let Some(key) = Key::from_event(key) {
@@ -363,52 +379,56 @@ impl FloatManager {
         true
     }
 
-    /// The keys an unfocused window declared at open, which it takes only
-    /// after every overlay the host owns has passed: a claim is up while the
-    /// user goes on working under it, so it must not outrank a modal opened
-    /// over it. A key it does claim is consumed here and never also reaches
-    /// the chat input under it, a plugin binding, or a built-in key.
+    fn focused(&self) -> Option<&FloatWindow> {
+        let fid = self.focused_id?;
+        self.windows.iter().find(|w| w.id == fid)
+    }
+
+    pub fn focused_buf(&self) -> Option<Arc<SharedBuf>> {
+        self.focused().map(|w| Arc::clone(&w.buf))
+    }
+
+    /// Front first, so a popup opened over another popup gets the key.
+    /// `windows` is sorted by `zindex`, which is why this walks it backwards.
+    ///
+    /// Being on screen is the whole gate, and it means the last frame painted
+    /// this window into a rect with cells in it. A window sized to nothing, one
+    /// that has not painted yet and a float the plugin hid all paint nothing,
+    /// so none of them takes a key. Otherwise a window nobody can see would
+    /// hold keys for the rest of the run while drawing no footer to say so.
+    pub fn on_screen_bufs(&mut self) -> Vec<(u32, Arc<SharedBuf>)> {
+        // The frame this key was pressed in repaints whatever this drops, so
+        // the debt is already owed and there is nothing to report.
+        let _ = self.drain_commands();
+        self.windows
+            .iter()
+            .rev()
+            .filter(|w| w.on_screen)
+            .map(|w| (w.id, Arc::clone(&w.buf)))
+            .collect()
+    }
+
+    /// Hands {key} to window {id} if it declared it in its `keys` at open. A
+    /// claimed key is consumed here and never also reaches the chat input
+    /// under it, a global binding, or a built-in key.
     ///
     /// Nothing has to be released. The claim list lives on the window, so it
     /// goes when the window does, through the one removal path, and a list can
     /// never outlive what the user can see.
-    pub fn handle_claimed_key(&mut self, key: KeyEvent) -> bool {
-        // The frame this key was pressed in repaints whatever this drops, so
-        // the debt is already owed and there is nothing to report.
-        let _ = self.drain_commands();
-        let Some(key) = Key::from_event(key) else {
-            return false;
-        };
-        let Some(win) = self.claimant(key) else {
+    pub fn take_claimed(&self, id: u32, key: Key) -> bool {
+        let Some(win) = self
+            .windows
+            .iter()
+            .find(|w| w.id == id && w.config.keys.contains(&key))
+        else {
             return false;
         };
         send_key(win, key);
         true
     }
 
-    /// The topmost window on screen claiming {key}. `windows` is sorted by
-    /// `zindex`, so walking it backwards is the order the user sees, front
-    /// first, and a popup opened over a popup answers the key.
-    ///
-    /// Being on screen is the whole gate, and it means the last frame painted
-    /// this window into a rect with cells in it. A window sized to nothing, one
-    /// that has not painted yet and a float the plugin hid all paint nothing,
-    /// so all three advertise nothing. Otherwise a window nobody can see would
-    /// hold keys for the rest of the run while drawing no footer to say so, and
-    /// unlike a `maki.keymap.set` binding a claim appears in no list the user
-    /// can read.
-    fn claimant(&self, key: Key) -> Option<&FloatWindow> {
-        self.windows
-            .iter()
-            .rev()
-            .find(|w| w.on_screen && w.config.keys.contains(&key))
-    }
-
     pub fn handle_paste(&self, text: &str) -> bool {
-        let Some(fid) = self.focused_id else {
-            return false;
-        };
-        let Some(win) = self.windows.iter().find(|w| w.id == fid) else {
+        let Some(win) = self.focused() else {
             return false;
         };
         let _ = win.event_tx.try_send(WinEvent::Paste {
@@ -907,6 +927,10 @@ impl Drop for FloatManager {
 }
 
 impl Overlay for FloatManager {
+    fn is_prompting(&self) -> bool {
+        self.needs_input()
+    }
+
     fn is_open(&self) -> bool {
         self.focused_id.is_some()
     }
@@ -1648,6 +1672,33 @@ mod tests {
         assert!(!mgr.needs_input());
     }
 
+    /// A question shown again is a prompt the user has not seen yet, so it
+    /// counts as opening once more. Other commands leave the count alone.
+    #[test]
+    fn prompts_opened_counts_each_time_a_window_starts_needing_input() {
+        let mut mgr = FloatManager::new();
+        let (_event_rx, cmd_tx) = open_with_lines(&mut mgr, &["a"]);
+        let needs_input = |on| {
+            WinCommand::SetConfig(FloatConfigPatch {
+                needs_input: Some(on),
+                ..FloatConfigPatch::default()
+            })
+        };
+        let steps = [
+            (needs_input(true), 1),
+            (WinCommand::SetCursor(0), 1),
+            (WinCommand::SetVisible(false), 1),
+            (WinCommand::SetVisible(true), 2),
+            (needs_input(false), 2),
+            (needs_input(true), 3),
+        ];
+        for (command, opened) in steps {
+            cmd_tx.send(command).unwrap();
+            let _ = mgr.tick();
+            assert_eq!(mgr.prompts_opened(), opened);
+        }
+    }
+
     #[test]
     fn close_command_from_lua() {
         let mut mgr = FloatManager::new();
@@ -1679,8 +1730,8 @@ mod tests {
             "handle_focused_key should return false with no windows"
         );
         assert!(
-            !mgr.handle_claimed_key(press("a")),
-            "handle_claimed_key should return false with no windows"
+            !claimed(&mut mgr, press("a")),
+            "no window claims anything with no windows"
         );
     }
 
@@ -1718,6 +1769,17 @@ mod tests {
         (event_rx, cmd_tx)
     }
 
+    /// What the app does for unfocused windows when no buffer binding takes
+    /// the key.
+    fn claimed(mgr: &mut FloatManager, press: KeyEvent) -> bool {
+        let Some(key) = Key::from_event(press) else {
+            return false;
+        };
+        mgr.on_screen_bufs()
+            .into_iter()
+            .any(|(id, _)| mgr.take_claimed(id, key))
+    }
+
     fn took_a_key(events: &flume::Receiver<WinEvent>) -> bool {
         events.drain().any(|e| matches!(e, WinEvent::Key { .. }))
     }
@@ -1730,7 +1792,7 @@ mod tests {
         let mut mgr = FloatManager::new();
         let (events, _cmd_tx) = open_claiming(&mut mgr, &["<Tab>"], 50);
 
-        assert!(mgr.handle_claimed_key(press("<Tab>")));
+        assert!(claimed(&mut mgr, press("<Tab>")));
         assert!(took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
     }
 
@@ -1741,7 +1803,7 @@ mod tests {
         let mut mgr = FloatManager::new();
         let (events, _cmd_tx) = open_claiming(&mut mgr, &["<Tab>"], 50);
 
-        assert!(!mgr.handle_claimed_key(press("a")));
+        assert!(!claimed(&mut mgr, press("a")));
         assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
     }
 
@@ -1752,7 +1814,7 @@ mod tests {
         let mut mgr = FloatManager::new();
         let (events, _cmd_tx) = open_claiming(&mut mgr, &["<C-n>"], 50);
 
-        assert!(!mgr.handle_claimed_key(press("n")));
+        assert!(!claimed(&mut mgr, press("n")));
         assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
     }
 
@@ -1764,7 +1826,7 @@ mod tests {
         let (under, _under_tx) = open_claiming(&mut mgr, &["<Esc>"], 10);
         let (over, _over_tx) = open_claiming(&mut mgr, &["<Esc>"], 90);
 
-        assert!(mgr.handle_claimed_key(press("<Esc>")));
+        assert!(claimed(&mut mgr, press("<Esc>")));
         assert!(took_a_key(&over), "{CLAIM_NOT_DELIVERED}");
         assert!(!took_a_key(&under), "{CLAIM_LEAKED}");
     }
@@ -1786,7 +1848,7 @@ mod tests {
             }))
             .unwrap();
 
-        assert!(mgr.handle_claimed_key(press("<CR>")));
+        assert!(claimed(&mut mgr, press("<CR>")));
         assert!(took_a_key(&under), "{CLAIM_NOT_DELIVERED}");
         assert!(!took_a_key(&over), "{CLAIM_LEAKED}");
     }
@@ -1806,7 +1868,7 @@ mod tests {
             }))
             .unwrap();
 
-        assert!(mgr.handle_claimed_key(press("<Tab>")));
+        assert!(claimed(&mut mgr, press("<Tab>")));
         assert!(took_a_key(&over), "{CLAIM_NOT_DELIVERED}");
         assert!(!took_a_key(&under), "{CLAIM_LEAKED}");
     }
@@ -1824,7 +1886,7 @@ mod tests {
         let mut mgr = FloatManager::new();
         let (events, _cmd_tx) = open_claiming(&mut mgr, &["<S-Tab>"], 50);
 
-        assert!(mgr.handle_claimed_key(KeyEvent::new(code, modifiers)));
+        assert!(claimed(&mut mgr, KeyEvent::new(code, modifiers)));
         assert!(took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
     }
 
@@ -1847,7 +1909,10 @@ mod tests {
         let mut mgr = FloatManager::new();
         let (events, _cmd_tx) = open_claiming(&mut mgr, &["<CR>"], 50);
 
-        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER)));
+        assert!(!claimed(
+            &mut mgr,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER)
+        ));
         assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
     }
 
@@ -1861,7 +1926,7 @@ mod tests {
         let mut mgr = FloatManager::new();
         let (events, _cmd_tx) = open_claiming(&mut mgr, &[lhs], 50);
 
-        assert!(mgr.handle_claimed_key(press(lhs)));
+        assert!(claimed(&mut mgr, press(lhs)));
         let delivered = events
             .drain()
             .find_map(|e| match e {
@@ -1881,7 +1946,7 @@ mod tests {
 
         mgr.close_all();
 
-        assert!(!mgr.handle_claimed_key(press("<Tab>")));
+        assert!(!claimed(&mut mgr, press("<Tab>")));
         assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
     }
 
@@ -1896,7 +1961,7 @@ mod tests {
 
         cmd_tx.send(WinCommand::Close).unwrap();
 
-        assert!(!mgr.handle_claimed_key(press("<CR>")));
+        assert!(!claimed(&mut mgr, press("<CR>")));
         assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
         assert!(!mgr.is_open(), "{EXPECT_CLOSED}");
     }
@@ -1915,7 +1980,7 @@ mod tests {
         mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
         paint(&mut mgr);
 
-        assert!(!mgr.handle_claimed_key(press("<Tab>")));
+        assert!(!claimed(&mut mgr, press("<Tab>")));
         assert!(!took_a_key(&event_rx), "{CLAIM_LEAKED}");
     }
 
@@ -1941,7 +2006,7 @@ mod tests {
         });
 
         assert!(!mgr.windows[0].on_screen, "{EXPECT_HIDDEN_UNPAINTED}");
-        assert!(!mgr.handle_claimed_key(press("<Esc>")));
+        assert!(!claimed(&mut mgr, press("<Esc>")));
         assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
     }
 
@@ -1962,7 +2027,7 @@ mod tests {
         mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
         paint(&mut mgr);
 
-        assert!(!mgr.handle_claimed_key(press("<CR>")));
+        assert!(!claimed(&mut mgr, press("<CR>")));
         assert!(!took_a_key(&event_rx), "{CLAIM_LEAKED}");
     }
 
@@ -1979,12 +2044,12 @@ mod tests {
         };
         mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
 
-        assert!(!mgr.handle_claimed_key(press("<Tab>")));
+        assert!(!claimed(&mut mgr, press("<Tab>")));
         assert!(!took_a_key(&event_rx), "{CLAIM_LEAKED}");
 
         paint(&mut mgr);
 
-        assert!(mgr.handle_claimed_key(press("<Tab>")));
+        assert!(claimed(&mut mgr, press("<Tab>")));
         assert!(took_a_key(&event_rx), "{CLAIM_NOT_DELIVERED}");
     }
 
@@ -2972,7 +3037,7 @@ mod tests {
 
         assert_eq!(draw_one_frame(&mut mgr, area), 0, "{EXPECT_NO_ROOM}");
         assert!(!mgr.windows[0].on_screen, "{EXPECT_NO_PAINT}");
-        assert!(!mgr.handle_claimed_key(press("<Tab>")), "{EXPECT_NO_CLAIM}");
+        assert!(!claimed(&mut mgr, press("<Tab>")), "{EXPECT_NO_CLAIM}");
         assert!(!took_a_key(&events), "{EXPECT_NO_CLAIM}");
 
         cmd_tx.send(WinCommand::SetVisible(true)).unwrap();
@@ -2984,10 +3049,7 @@ mod tests {
             "showing it asks for room again, except a float which never does"
         );
         assert!(mgr.windows[0].on_screen, "showing it paints it again");
-        assert!(
-            mgr.handle_claimed_key(press("<Tab>")),
-            "and its claim is back"
-        );
+        assert!(claimed(&mut mgr, press("<Tab>")), "and its claim is back");
         assert!(took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
     }
 

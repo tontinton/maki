@@ -99,6 +99,10 @@ impl ThemePicker {
 }
 
 impl Overlay for ThemePicker {
+    fn is_prompting(&self) -> bool {
+        false
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

@@ -19,6 +19,10 @@
 //! should cost a line of output, not a plugin that will not start. User Lua is
 //! linted as it enters the VM (`runtime::load_user_source`), modules included.
 //! Bundled Lua is linted by a test instead, so users never pay for our typos.
+//!
+//! The same status bar line carries one check that reads the keymap instead
+//! of the source: a plugin whose global bindings are in normal mode only, see
+//! `KeymapStore::normal_only_key`.
 
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -32,6 +36,9 @@ const MAX_EDIT_DISTANCE: usize = 1;
 
 const STRING_CONTENT_KIND: &str = "string_content";
 pub const KEY_WARNING: &str = "key spelling";
+pub(crate) const MODE_WARNING: &str = "keymap mode";
+const NORMAL_ONLY_HINT: &str = "in \"n\" only, so it does not fire while you type";
+pub(crate) const UPGRADE_DOCS: &str = "https://maki.sh/docs/keybindings/#upgrading-old-keymaps";
 pub(crate) const LEGACY_HINT: &str = "is the old spelling of";
 pub(crate) const MISSPELLED_HINT: &str = "is not a key; did you mean";
 pub(crate) const MORE_IN_LOG: &str = "more in the log";
@@ -47,6 +54,9 @@ struct KeyLintState {
     /// A module two plugins `require` is one file, and reporting it twice
     /// would look like two problems.
     linted: HashSet<String>,
+    /// Plugins already told about a normal mode only key, so a reload does
+    /// not repeat it.
+    mode_warned: HashSet<String>,
     unreported: Vec<String>,
 }
 
@@ -64,8 +74,26 @@ impl KeyLint {
             tracing::warn!(chunk, finding = %finding, "{KEY_WARNING}");
         }
         if let Ok(mut state) = self.0.lock() {
+            let findings = findings
+                .iter()
+                .map(|finding| format!("{KEY_WARNING}: {finding}"));
             state.unreported.extend(findings);
         }
+    }
+
+    /// Once per plugin, for the key `KeymapStore::normal_only_key` found.
+    pub(crate) fn check_normal_only(&self, plugin: &str, key: Key) {
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+        if !state.mode_warned.insert(plugin.to_owned()) {
+            return;
+        }
+        let key = key.notation();
+        tracing::warn!(plugin, key = %key, "{MODE_WARNING}");
+        state.unreported.push(format!(
+            "{MODE_WARNING}: {plugin} binds {key} {NORMAL_ONLY_HINT} ({UPGRADE_DOCS})"
+        ));
     }
 
     /// One status bar line for every finding since the last take: the first
@@ -78,8 +106,8 @@ impl KeyLint {
             .unwrap_or_default();
         let (first, rest) = findings.split_first()?;
         Some(match rest.len() {
-            0 => format!("{KEY_WARNING}: {first}"),
-            more => format!("{KEY_WARNING}: {first} (+{more} {MORE_IN_LOG})"),
+            0 => first.clone(),
+            more => format!("{first} (+{more} {MORE_IN_LOG})"),
         })
     }
 }

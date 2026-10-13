@@ -426,4 +426,4 @@ maki.api.register_command({
   handler = open,
 })
 
-maki.keymap.set("n", "<C-x>", open, { desc = "Open tasks" })
+maki.keymap.set({ "n", "i" }, "<C-x>", open, { desc = "Open tasks" })

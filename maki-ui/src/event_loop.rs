@@ -7,6 +7,7 @@
 //! waits on every event source at once and wakes the moment a plugin action,
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
+use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,9 +35,9 @@ use maki_lua::session_snapshot::{
     SessionSnapshot,
 };
 use maki_lua::{
-    EventHandle, HintReader, InputRequest, InputRulesReader, Key, KeymapReader, LuaCommandReader,
-    ModelRequest, PackCommand, PackPreparation, PlanRequest, SessionEndReason, SessionRequest,
-    TaskRequest, UiAction, UiAttachment, UiReply,
+    EventHandle, HintReader, InputMode, InputRequest, InputRulesReader, Key, KeymapReader,
+    LuaCommandReader, ModelRequest, PackCommand, PackPreparation, PlanRequest, SessionEndReason,
+    SessionRequest, TaskRequest, UiAction, UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
@@ -491,6 +492,8 @@ pub(crate) struct EventLoop<'t> {
     focused: usize,
     /// The `(session, task)` pair whose transcript was on screen last frame.
     last_focus: Option<(MakiId, Arc<str>)>,
+    /// The mode `ModeChanged` last announced, one for all tabs.
+    last_mode: InputMode,
     focus: Focus,
     notifier: Option<terminal::TerminalNotifier>,
     ctx: SpawnCtx,
@@ -710,7 +713,7 @@ impl<'t> EventLoop<'t> {
             app.queue_flash(warning);
         }
         if let Some(alert) = startup_alert {
-            app.alert_modal.open(alert);
+            app.open_alert(alert);
         }
 
         let (pack_tx, pack_rx) = flume::unbounded();
@@ -719,6 +722,7 @@ impl<'t> EventLoop<'t> {
             sessions: runtimes,
             focused,
             last_focus: None,
+            last_mode: InputMode::Insert,
             focus: Focus::default(),
             notifier,
             ctx,
@@ -800,7 +804,7 @@ impl<'t> EventLoop<'t> {
             }) {
                 // A backgrounded session can finish an `exit_on_done` turn;
                 // focus it so shutdown reports its exit code and id.
-                self.focused = i;
+                self.set_focused(i);
                 self.emit_notifications();
                 break Ok(());
             }
@@ -908,6 +912,7 @@ impl<'t> EventLoop<'t> {
             let actions = std::mem::take(&mut self.sessions[i].app.pending_actions);
             self.dispatch(i, actions);
         }
+        self.replay_typeahead();
         dirty
     }
 
@@ -959,6 +964,9 @@ impl<'t> EventLoop<'t> {
         // These only fire Lua autocmds. Anything a handler does comes back
         // as a `UiAction` on the next wake, which repaints then.
         self.emit_focus_changes();
+        self.sessions[self.focused]
+            .app
+            .announce_mode(&mut self.last_mode);
         dirty |= self.start_mailbox_runs();
         self.emit_status_changes();
         self.emit_title_changes();
@@ -1035,8 +1043,22 @@ impl<'t> EventLoop<'t> {
             UiAction::WinRestView { scroll_top } => {
                 self.focused_app().scroll_to_row(scroll_top);
             }
-            UiAction::Builtin(action) => {
-                let actions = self.focused_app().run_builtin(action);
+            // Answered before dispatching, which can hold the loop for as long
+            // as `$EDITOR` is open.
+            UiAction::Builtin { action, reply_tx } => {
+                let (handled, actions) = self.focused_app().run_action(action);
+                let _ = reply_tx.send(handled);
+                self.dispatch(self.focused, actions);
+            }
+            // Only the focused tab can be holding keys. A tab that loses focus
+            // hands them over in `set_focused`.
+            UiAction::KeybindDone(ticket) => {
+                let actions = self.focused_app().keybind_done(ticket);
+                self.dispatch(self.focused, actions);
+                self.replay_typeahead();
+            }
+            UiAction::KeybindFallback(ticket) => {
+                let actions = self.focused_app().keybind_fallback(ticket);
                 self.dispatch(self.focused, actions);
             }
             UiAction::RunCommand {
@@ -1525,7 +1547,7 @@ impl<'t> EventLoop<'t> {
             let _ = self.submit_text(idx, prompt);
         }
         if focus {
-            self.focused = idx;
+            self.set_focused(idx);
         }
         let _ = reply_tx.send(Ok(json!(id)));
     }
@@ -1605,6 +1627,21 @@ impl<'t> EventLoop<'t> {
         rt
     }
 
+    /// The single place the focused tab changes. Keys held behind a key
+    /// handler were typed at the keyboard, so they follow it to the new tab
+    /// rather than replay into the one left behind. They keep waiting there:
+    /// the handler that switched is usually not done, and its `KeybindDone`
+    /// goes to the focused tab.
+    fn set_focused(&mut self, idx: usize) {
+        if idx == self.focused {
+            return;
+        }
+        let left = mem::replace(&mut self.focused, idx);
+        if let Ok([from, to]) = self.sessions.get_disjoint_mut([left, idx]) {
+            from.app.hand_typeahead_to(&mut to.app);
+        }
+    }
+
     fn push_runtime(&mut self, rt: SessionRuntime) -> usize {
         self.sessions.push(rt);
         self.sessions.len() - 1
@@ -1615,7 +1652,7 @@ impl<'t> EventLoop<'t> {
     /// as a new runtime so the session you came from stays live.
     fn focus_session(&mut self, id: MakiId) -> Result<(), String> {
         if let Some(i) = self.position(id) {
-            self.focused = i;
+            self.set_focused(i);
             return Ok(());
         }
         // A session another maki owns is refused here, where it costs a flash,
@@ -1632,7 +1669,8 @@ impl<'t> EventLoop<'t> {
             self.apply_model(idx, slot);
             self.respawn_agent(idx, history);
         } else {
-            self.focused = self.push_runtime(self.ctx.spawn_runtime(open, slot));
+            let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
+            self.set_focused(idx);
         }
         if let Some(reason) = reason {
             self.focused_app().flash(reason);
@@ -1760,6 +1798,20 @@ impl<'t> EventLoop<'t> {
         (latest, leftover)
     }
 
+    /// Held keys replay up to the next one with actions, and those run before
+    /// the keys after it replay, in whichever tab has the keyboard by then.
+    /// So the keys typed after `/fork` land in the fork. Every round replays
+    /// at least one key, so this ends.
+    fn replay_typeahead(&mut self) {
+        loop {
+            let actions = self.focused_app().replay_typeahead();
+            if actions.is_empty() {
+                return;
+            }
+            self.dispatch(self.focused, actions);
+        }
+    }
+
     fn dispatch(&mut self, idx: usize, actions: Vec<Action>) {
         for action in actions {
             self.handle_action(idx, action);
@@ -1812,7 +1864,8 @@ impl<'t> EventLoop<'t> {
     /// already built.
     fn open_fork(&mut self, idx: usize, open: OpenSession) {
         let slot = self.sessions[idx].slot.load_full();
-        self.focused = self.push_runtime(self.ctx.spawn_runtime(open, slot));
+        let fork = self.push_runtime(self.ctx.spawn_runtime(open, slot));
+        self.set_focused(fork);
         let id = self.sessions[self.focused].id();
         maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(&id.to_string()));
         self.focused_app()

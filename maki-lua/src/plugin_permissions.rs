@@ -1,4 +1,3 @@
-use std::fmt;
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -18,6 +17,11 @@ pub(crate) const MANIFEST_FILE: &str = "plugin.toml";
 pub(crate) const NET_HOSTS_KEY: &str = "net_hosts";
 const PROVIDERS_KEY: &str = "providers";
 const MIN_MAKI_VERSION: &str = "min_maki_version";
+const PERMISSION_DENIED: &str = "permission denied";
+pub(crate) const OUTSIDE_CEILING: &str =
+    "is not in the capability of the action this code runs for";
+const PROVIDER_ORIGIN_SHORTFALL: &str =
+    "reaches a provider address only its own plugin, or one granted 'run', may use";
 const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The hosts a plugin declared it talks to, or `None` when it declared no
@@ -45,7 +49,7 @@ pub type OwnedSlugs = Arc<Mutex<Vec<String>>>;
 /// it out made a provider's own `fetch_usage` unreachable for exactly the
 /// users who need it, while the codec went to that very origin with the very
 /// same credentials and was never questioned.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct NetEgress {
     declared: NetHosts,
     providers: OwnedSlugs,
@@ -144,6 +148,9 @@ impl NetEgress {
 pub struct PluginPermissions {
     allowed: [bool; Permission::COUNT],
     net_hosts: NetHosts,
+    /// The plugin whose `maki` global holds these grants, which a
+    /// [`Ceiling`] is matched against. `None` for grants no global holds yet.
+    owner: Option<Arc<str>>,
 }
 
 impl PluginPermissions {
@@ -151,6 +158,7 @@ impl PluginPermissions {
         Self {
             allowed: [true; Permission::COUNT],
             net_hosts: None,
+            owner: None,
         }
     }
 
@@ -158,7 +166,19 @@ impl PluginPermissions {
         Self {
             allowed: [false; Permission::COUNT],
             net_hosts: None,
+            owner: None,
         }
+    }
+
+    /// These grants as {plugin}'s, so the [`Ceiling`] of an action {plugin}
+    /// owns applies to them.
+    pub(crate) fn owned_by(mut self, plugin: Arc<str>) -> Self {
+        self.owner = Some(plugin);
+        self
+    }
+
+    pub fn owner(&self) -> Option<&str> {
+        self.owner.as_deref()
     }
 
     pub fn net_hosts(&self) -> NetHosts {
@@ -220,6 +240,7 @@ impl PluginPermissions {
         Self {
             allowed,
             net_hosts: net_hosts_from_manifest(manifest),
+            owner: None,
         }
     }
 
@@ -232,8 +253,26 @@ impl PluginPermissions {
         needed.iter().copied().find(|&perm| !self.is_allowed(perm))
     }
 
+    /// The grants both this and {other} hold, with this set's hosts and owner.
+    pub(crate) fn intersect(&self, other: &Self) -> Self {
+        let mut out = self.clone();
+        for &perm in Permission::ALL {
+            out.set(perm, self.is_allowed(perm) && other.is_allowed(perm));
+        }
+        out
+    }
+
+    /// This grant as far as the code running now may use it, see [`Ceiling`].
+    pub(crate) fn now(&self, lua: &Lua) -> Self {
+        match lua.app_data_ref::<Ceiling>() {
+            Some(ceiling) if ceiling.binds(self.owner()) => self.intersect(&ceiling.0),
+            _ => self.clone(),
+        }
+    }
+
     /// A function that needs every permission in {needed}. Without one of
-    /// them it is replaced by a stub naming the first one missing.
+    /// them it is replaced by a stub naming the first one missing, and with
+    /// them all it still asks the [`Ceiling`] at every call.
     pub fn guard<F, A, R>(&self, needed: &[Permission], lua: &Lua, f: F) -> LuaResult<Function>
     where
         F: Fn(&Lua, A) -> LuaResult<R> + Send + 'static,
@@ -241,7 +280,14 @@ impl PluginPermissions {
         R: IntoLuaMulti,
     {
         match self.first_denied(needed) {
-            None => lua.create_function(f),
+            None => {
+                let owner = self.owner.clone();
+                let needed: Box<[Permission]> = needed.into();
+                lua.create_function(move |lua, args| {
+                    check_ceiling(lua, owner.as_deref(), &needed)?;
+                    f(lua, args)
+                })
+            }
             Some(perm) => denied_stub(lua, perm),
         }
     }
@@ -259,7 +305,15 @@ impl PluginPermissions {
         R: IntoLuaMulti,
     {
         match self.first_denied(needed) {
-            None => lua.create_async_function(f),
+            None => {
+                let owner = self.owner.clone();
+                let needed: Box<[Permission]> = needed.into();
+                lua.create_async_function(move |lua, args| {
+                    let call =
+                        check_ceiling(&lua, owner.as_deref(), &needed).map(|()| f(lua, args));
+                    async move { call?.await }
+                })
+            }
             Some(perm) => denied_stub(lua, perm),
         }
     }
@@ -271,7 +325,7 @@ impl PluginPermissions {
 /// about each provider as the plugin registers it, so a command has to carry
 /// this very value. A fresh one would know none of them and let through the
 /// borrowing it is meant to catch.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PluginReach {
     permissions: PluginPermissions,
     egress: NetEgress,
@@ -290,12 +344,47 @@ impl PluginReach {
         self.permissions.is_allowed(perm)
     }
 
+    /// The plugin this reach is, `None` for one that no `maki` global holds.
+    pub fn owner(&self) -> Option<&Arc<str>> {
+        self.permissions.owner.as_ref()
+    }
+
+    /// See [`PluginPermissions::owned_by`].
+    pub fn owned_by(&self, plugin: Arc<str>) -> Self {
+        Self {
+            permissions: self.permissions.clone().owned_by(plugin),
+            egress: self.egress.clone(),
+        }
+    }
+
     pub(crate) fn permissions(&self) -> &PluginPermissions {
         &self.permissions
     }
 
     pub(crate) fn egress(&self) -> &NetEgress {
         &self.egress
+    }
+
+    /// This reach as far as the code running now may use it, see [`Ceiling`].
+    pub(crate) fn now(&self, lua: &Lua) -> Self {
+        Self {
+            permissions: self.permissions.now(lua),
+            egress: self.egress.clone(),
+        }
+    }
+
+    /// This reach cut down to {perms}, the part of it an owner says a caller
+    /// has to match. The egress stays, so a `net` among them is still
+    /// weighed host by host.
+    pub(crate) fn only(&self, perms: &[Permission]) -> Self {
+        let mut permissions = self.permissions.clone();
+        for &perm in Permission::ALL {
+            permissions.set(perm, perms.contains(&perm));
+        }
+        Self {
+            permissions,
+            egress: self.egress.clone(),
+        }
     }
 
     /// Asked when one plugin runs another's command. The handler runs with
@@ -328,21 +417,33 @@ pub enum Missing {
     ProviderOrigin,
 }
 
-impl fmt::Display for Missing {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Missing {
+    /// What the plugin lacks, after the name of what it tried to run.
+    fn shortfall(&self) -> String {
         match self {
-            Self::Permission(perm) => write!(
-                f,
-                "permission denied: '{perm}' not granted for this plugin. {}",
-                grant_hint(&[*perm])
-            ),
-            Self::Hosts => write!(
-                f,
-                "permission denied: the command reaches hosts this plugin's {NET_HOSTS_KEY} leaves out (list them in {MANIFEST_FILE} next to the plugin file)"
-            ),
-            Self::ProviderOrigin => f.write_str(
-                "permission denied: the command reaches a provider address only its own plugin, or one granted 'run', may use",
-            ),
+            Self::Permission(perm) => format!("needs '{perm}'"),
+            Self::Hosts => format!("reaches hosts this plugin's {NET_HOSTS_KEY} leaves out"),
+            Self::ProviderOrigin => PROVIDER_ORIGIN_SHORTFALL.to_owned(),
+        }
+    }
+
+    fn fix(&self) -> Option<String> {
+        let fix = match self {
+            Self::Permission(_) => "grant it",
+            Self::Hosts => "list them",
+            Self::ProviderOrigin => return None,
+        };
+        Some(format!("{fix} in {MANIFEST_FILE} next to the plugin file"))
+    }
+
+    /// The refusal for {name}, short enough to flash: the name, what is
+    /// missing and the fix come first, so a line cut to the screen's width
+    /// still says all three.
+    pub fn refusal(&self, name: &str) -> String {
+        let shortfall = self.shortfall();
+        match self.fix() {
+            Some(fix) => format!("{name} {shortfall}: {fix}"),
+            None => format!("{name} {shortfall}"),
         }
     }
 }
@@ -399,6 +500,7 @@ impl Requested {
             permissions: PluginPermissions {
                 allowed,
                 net_hosts: net_hosts_from_manifest(manifest),
+                owner: None,
             },
             providers: providers_from_manifest(manifest),
         }
@@ -550,8 +652,66 @@ fn denied_stub(lua: &Lua, perm: Permission) -> LuaResult<Function> {
     })
 }
 
+/// The most the code of one plugin may use while it runs, kept as Lua app
+/// data.
+///
+/// A plugin action runs for its caller with only its price, the owner's
+/// grants cut down to the capability it declared. The caller set up what the
+/// callback reads, like the chat input, so with the owner's other grants it
+/// could steer them. Every guarded call of the owner checks this, and so does
+/// the reach a call hands to the UI. The tasks and timers the owner starts
+/// meanwhile inherit it. Other plugins' code that runs inside, like an
+/// autocmd the callback fires, keeps its own grants: the owner's grants
+/// were never theirs to lose.
+#[derive(Clone, Debug)]
+pub(crate) struct Ceiling(pub(crate) PluginPermissions);
+
+impl Ceiling {
+    /// The ceiling up now when it binds {plugin}, which a task {plugin}
+    /// starts runs under.
+    pub(crate) fn current_for(lua: &Lua, plugin: &str) -> Option<Self> {
+        lua.app_data_ref::<Self>()
+            .filter(|ceiling| ceiling.binds(Some(plugin)))
+            .map(|ceiling| ceiling.clone())
+    }
+
+    /// Grants no `maki` global holds belong to no plugin, so no ceiling is
+    /// theirs, not even one that lost its owner by mistake.
+    fn binds(&self, owner: Option<&str>) -> bool {
+        owner.is_some() && self.0.owner() == owner
+    }
+}
+
+fn check_ceiling(lua: &Lua, owner: Option<&str>, needed: &[Permission]) -> LuaResult<()> {
+    match lua.app_data_ref::<Ceiling>() {
+        Some(ceiling) if ceiling.binds(owner) => match ceiling.0.first_denied(needed) {
+            Some(perm) => Err(ceiling_error(perm)),
+            None => Ok(()),
+        },
+        _ => Ok(()),
+    }
+}
+
+/// `Err` when {granted}, checked outside [`PluginPermissions::guard`], does
+/// not hold {perm} for the code running now.
+pub(crate) fn require(lua: &Lua, granted: &PluginPermissions, perm: Permission) -> LuaResult<()> {
+    if !granted.is_allowed(perm) {
+        return Err(denied_error(perm));
+    }
+    check_ceiling(lua, granted.owner(), &[perm])
+}
+
+fn ceiling_error(perm: Permission) -> LuaError {
+    let msg = format!("{PERMISSION_DENIED}: '{perm}' {OUTSIDE_CEILING}");
+    warn!(permission = %perm, "{msg}");
+    LuaError::runtime(msg)
+}
+
 pub(crate) fn denied_error(perm: Permission) -> LuaError {
-    let msg = Missing::Permission(perm).to_string();
+    let msg = format!(
+        "{PERMISSION_DENIED}: '{perm}' not granted for this plugin. {}",
+        grant_hint(&[perm])
+    );
     warn!(permission = %perm, "{msg}");
     LuaError::runtime(msg)
 }

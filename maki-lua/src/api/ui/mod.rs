@@ -7,9 +7,9 @@ use maki_agent::tools::compact_duration;
 use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
-use strum::VariantNames;
 
-use crate::api::keymap::accept_key;
+use crate::api::action::run_plugin_action;
+use crate::api::keymap::{InputMode, accept_key, switch_mode};
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
     InputRequest, Split, TextEdit, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip,
@@ -19,7 +19,7 @@ use crate::api::util::convert::{TableExt, reject_unknown_fields, required};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 use crate::key::Key;
-use crate::plugin_permissions::{PluginPermissions, PluginReach, denied_error};
+use crate::plugin_permissions::{PluginReach, require};
 pub(crate) mod blit;
 pub(crate) mod buf;
 pub(crate) mod marks;
@@ -153,7 +153,8 @@ pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
 /// the tool runs, which is what the tool's own output pane wants. A
 /// float that opens during a tool call would take that spot away, so
 /// create its buffer with `{ scratch = true }`. It matches nvim's
-/// `nvim_create_buf(false, true)`.
+/// `nvim_create_buf(false, true)`. A buffer belongs to the task that
+/// made it, so this throws at a plugin's top level.
 ///
 /// @param opts table? Optional. `scratch` (boolean) keeps the buffer out of the live slot, default false.
 /// @return (Buf) Buffer handle.
@@ -168,13 +169,13 @@ pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
 #[lua_fn]
 fn buf(lua: &Lua, opts: Option<Table>) -> LuaResult<buf::BufHandle> {
     let scratch = opts.and_then(|t| t.opt_bool("scratch")).unwrap_or(false);
-    Ok(with_task_bufs(lua, |store| {
+    with_task_bufs(lua, |store| {
         if scratch {
             store.create()
         } else {
             store.create_live()
         }
-    }))
+    })
 }
 
 /// Looks up a color the syntax theme names, such as "background",
@@ -420,53 +421,111 @@ fn set_window_title(
     Ok(())
 }
 
-/// Runs a built-in UI action by name, exactly as its default keybinding
-/// would. Handy when a default key never reaches maki because tmux or
-/// your terminal grabs it first: bind a new key with `maki.keymap.set`
-/// and call this from it.
+/// Switches the chat input to normal mode (`"n"`) or insert mode (`"i"`),
+/// like leaving and entering insert mode in Neovim.
 ///
-/// Valid names: `"file_picker"`, `"search"`, `"help"`,
-/// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
-/// `"prev_chat"`, `"next_chat"`, `"model_picker"`, `"input_raw"`.
+/// The mode is global and stays until a plugin switches it again, apart from
+/// the times [Modes](/docs/lua-api/#modes) lists. It applies at once:
+/// `maki.fn.mode()` returns it and the next key is matched against it. If
+/// your plugin unloads while the input is in normal mode, maki switches it
+/// back to insert mode.
 ///
-/// `"input_raw"` has no default key. It switches the chat input between
-/// drawing what plugins conceal and showing the text under it, which is
-/// what gets sent. Run it again to switch back.
+/// Throws on any mode but `"n"` and `"i"`.
 ///
-/// Most actions are free, since they open something the user then sees and
-/// drives. `"pop_queue"` needs `session_write`, because it throws away a
-/// queued prompt. Without it the call raises the usual `permission denied`
-/// error.
-///
-/// There is no action for sending the user's message. To take keys like
-/// `<CR>` while a popup is open, use the `keys` option of `maki.ui.open_win`.
-///
-/// For slash commands rather than keybound actions, see
-/// `maki.api.run_command`.
-///
-/// @param name string Action name, e.g. `"file_picker"`.
-/// @return (boolean|nil, string|nil) `true` on success, or nil and an error for an unknown name or a missing UI.
+/// @param mode string `"n"` or `"i"`.
+/// @return
 /// @example
-/// -- Open the built-in file picker with Ctrl+Q instead of Ctrl+S:
-/// maki.keymap.set("n", "<C-q>", function()
-///   maki.ui.action("file_picker")
-/// end)
+/// maki.keymap.set("n", "i", function() maki.ui.set_mode("i") end)
 #[lua_fn]
-fn action(
-    _lua: &Lua,
+fn set_mode(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String) -> LuaResult<()> {
+    switch_mode(lua, InputMode::parse(&mode)?, &plugin);
+    Ok(())
+}
+
+/// Runs a built-in or plugin action by name, and returns whether it handled
+/// the request.
+///
+/// A built-in does what its default key does, so you can move it to another
+/// key:
+///
+/// | Built-in | What it does | `false` when |
+/// | --- | --- | --- |
+/// | `"file_picker"` | Opens the file picker | |
+/// | `"search"` | Opens message search | |
+/// | `"help"` | Opens or closes `/help` | |
+/// | `"model_picker"` | Opens the model picker | |
+/// | `"plan_toggle"` | Opens or closes the plan form | no plan is ready |
+/// | `"plan_editor"` | Opens the plan in your editor | there is no plan |
+/// | `"edit_input"` | Opens the chat input in your editor | |
+/// | `"pop_queue"` | Removes the first queued message | |
+/// | `"prev_chat"`, `"next_chat"` | Shows the previous or next chat, with its own draft | |
+/// | `"input_raw"` | Switches the input between drawing what plugins conceal and showing the text under it, which is what gets sent | |
+/// | `"undo"`, `"redo"` | Undoes or redoes one input edit | nothing to undo or redo |
+/// | `"history_prev"`, `"history_next"` | Recalls the previous or next prompt | at either end of the history |
+/// | `"newline"` | Inserts a new line | |
+///
+/// `"undo"`, `"redo"`, `"history_prev"`, `"history_next"` and `"newline"`
+/// edit the chat input, also in normal mode. They need the `input`
+/// permission, see [chat input](#chat-input), and throw without it like any
+/// gated call. They return `false` in a finished subagent's chat, which has
+/// no input. `"pop_queue"` needs `session_write`, because it throws away a
+/// queued prompt. The other built-ins need no permission.
+///
+/// A built-in runs in the UI after your earlier `maki.ui` calls, and
+/// `action` waits for its answer. While your plugin loads, it returns `nil`
+/// and an error at once.
+///
+/// A plugin action has a dot in its name, like `"completion.accept"`. It
+/// comes from [`maki.api.register_action`](#maki-api-register_action), which
+/// also says what permissions a caller needs. It runs at once, also while
+/// your plugin loads, and `action` returns what it returned.
+///
+/// `action` returns `nil` and an error, which an `if` treats as not handled,
+/// when:
+///
+/// - The action's plugin is not loaded.
+/// - The action threw.
+/// - Your plugin lacks a permission a plugin action needs. The status bar
+///   shows this too.
+/// - A built-in runs without a UI.
+///
+/// It throws on a name that cannot be right: no dot and not a built-in, or
+/// one its loaded plugin never registered.
+///
+/// To try several actions on one key, see
+/// [Composing keys](/docs/keybindings/#composing-keys). For slash commands,
+/// see `maki.api.run_command`.
+///
+/// @param name string Action name, e.g. `"file_picker"` or `"completion.accept"`.
+/// @return (boolean|nil, string|nil) Whether the action handled it, or nil and an error.
+/// @example
+/// -- A vim plugin's undo in normal mode, which needs `input`:
+/// maki.keymap.set("n", "u", function() maki.ui.action("undo") end)
+///
+/// -- A key for a built-in that has none:
+/// maki.keymap.set({ "n", "i" }, "<M-r>", function() maki.ui.action("input_raw") end)
+#[lua_fn]
+async fn action(
+    lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
-    #[ctx] perms: PluginPermissions,
+    #[ctx] plugin: Arc<str>,
+    #[ctx] caller: PluginReach,
     name: String,
 ) -> LuaResult<Pair<bool>> {
-    let builtin = try_pair!(name.parse::<BuiltinAction>().map_err(|_| format!(
-        "unknown action '{name}' (valid: {})",
-        BuiltinAction::VARIANTS.join(", ")
-    )));
-    if let Some(perm) = perms.first_denied(builtin.needs()) {
-        return Err(denied_error(perm));
+    let Ok(builtin) = name.parse::<BuiltinAction>() else {
+        return run_plugin_action(&lua, tx.as_ref(), &name, &plugin, &caller).await;
+    };
+    for &perm in builtin.needs() {
+        require(&lua, caller.permissions(), perm)?;
     }
-    try_pair!(ui_send(tx.as_ref(), UiAction::Builtin(builtin)));
-    Ok((Some(true), None))
+    let reply = try_pair!(
+        ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::Builtin {
+            action: builtin,
+            reply_tx,
+        })
+        .await
+    );
+    Ok((Some(reply), None))
 }
 
 async fn input_roundtrip(
@@ -564,7 +623,7 @@ fn table_list(list: Table, func: &str, key: &str) -> LuaResult<Vec<Table>> {
 ///
 /// Read again and retry on any of them.
 ///
-/// What a change needs is in [chat input](#chat-input).
+/// A change needs `input`, see [chat input](#chat-input).
 ///
 /// Tabs and carriage returns in `text` become spaces and newlines, and the
 /// other control characters are dropped, the way a paste is rewritten. With
@@ -606,11 +665,11 @@ fn table_list(list: Table, func: &str, key: &str) -> LuaResult<Vec<Table>> {
 ///   version = st.version,
 ///   session_id = st.session_id,
 /// })
-#[lua_fn(guard = [SessionRead, Input])]
+#[lua_fn(guard = [Input, SessionRead])]
 async fn input_edit(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
-    #[ctx] plugin: Arc<str>,
+    #[ctx] caller: PluginReach,
     opts: Table,
 ) -> LuaResult<Pair<mlua::Value>> {
     reject_unknown_fields(&opts, EDIT_OPTIONS, INPUT_EDIT)?;
@@ -641,7 +700,7 @@ async fn input_edit(
         version: required(&opts, INPUT_EDIT, "version")?,
         strict: opts.opt_bool("strict").unwrap_or_default(),
         session_id: required(&opts, INPUT_EDIT, "session_id")?,
-        plugin,
+        caller: caller.now(&lua),
     });
     input_roundtrip(lua, tx.as_ref(), req).await
 }
@@ -691,6 +750,9 @@ async fn input_edit(
 ///
 /// maki draws the `!` of a shell command and its bash colors itself, under
 /// every rule.
+///
+/// A mark never edits the text, so a send carries the raw text, concealed
+/// ranges included.
 ///
 /// @param opts table Options:
 ///   `ns` (string) the name of the rule, unique per plugin. Code in the global and the project `init.lua` runs as plugins `"global/init.lua"` and `"project/init.lua"`.
@@ -828,7 +890,7 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
 ///   - split (string): dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
 ///   - order (integer): paint order among split windows at the same edge. Default 50.
 ///   - focus (boolean): whether the window takes keyboard focus on open. Default true.
-///   - keys (table): keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or `maki.keymap.set` bindings. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
+///   - keys (table): keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. `maki.keymap.set` with `{ buffer = buf }` is the newer way to give a popup keys, with a handler per key, a mode, and `ev.fallback()`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or global `maki.keymap.set` bindings. The window's buffer bindings are asked first. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
 ///   - visible (boolean): whether the window is initially visible. Default true. See `win:hide()` for what hiding does.
 ///   - needs_input (boolean): whether the window means the session needs user input. Default false.
 ///   - stack (boolean): offset the window past the other stacked windows sharing its anchor, in open order, with a one row gap. Closing one moves the rest up. Floating windows only. Default false.
@@ -973,10 +1035,11 @@ lua_table! {
     /// Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
     /// still work. The calls that need a screen behave like this:
     ///
-    /// - `action`, `input`, and `input_edit` return `nil, "no interactive UI attached"`.
+    /// - `input`, `input_edit`, and `action` on a built-in name return
+    ///   `nil, "no interactive UI attached"`. Plugin actions still run.
     /// - `open_editor` returns -1.
     /// - `flash` writes to the log.
-    /// - `open_win`, `set_status_hint`, `set_window_title`, and `input_rules` have no effect.
+    /// - `open_win`, `set_status_hint`, `set_window_title`, `set_mode` and `input_rules` have no effect.
     ///   `input_rules` still throws on a bad rule, so a plugin's tests catch it.
     ///
     /// ### Chat input
@@ -997,21 +1060,23 @@ lua_table! {
     ///
     /// Changing the chat input needs the `input` permission. That covers its
     /// text and its cursor, since your next Enter sends the text and your
-    /// next key lands at the cursor. Without `input`, `input_edit` raises
-    /// `permission denied`. A plugin without it can still read the input
-    /// and style it with `input_rules`. Your own `init.lua` needs a
-    /// `plugin.toml` next to it for this, like any plugin, see
+    /// next key lands at the cursor. It covers `input_edit` and the
+    /// built-in [actions](#maki-ui-action) that change the input, like
+    /// `undo` or a history recall. Without `input` they raise
+    /// `permission denied`. A plugin without it can still read the input and
+    /// style it with `input_rules`. Your own `init.lua` needs a `plugin.toml`
+    /// next to it for this, like any plugin, see
     /// [plugin permissions](#plugin-permissions).
     ///
     /// Upgrading: `input_edit` needed no permission in earlier releases.
-    /// Plugins and `init.lua` files that call it need `input` now. A
-    /// `plugin.toml` you wrote yourself grants it unless it sets
-    /// `input = false`. A package needs its author to add `input`, and you to
-    /// approve the package again.
+    /// Plugins and `init.lua` files that call it or an editing built-in
+    /// action need `input` now. A `plugin.toml` you wrote yourself grants it
+    /// unless it sets `input = false`. A package needs its author to add
+    /// `input`, and you to approve the package again.
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
-        manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
+        manual set_mode, manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
         manual set_window_title, manual input, manual input_edit, manual input_rules,
     ]
 }
@@ -1027,7 +1092,14 @@ pub(crate) fn create_ui_table(
 
     flash__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     set_window_title__register(&t, lua, ui_action_tx.clone())?;
-    action__register(&t, lua, ui_action_tx.clone(), reach.permissions().clone())?;
+    set_mode__register(&t, lua, Arc::clone(&plugin))?;
+    action__register(
+        &t,
+        lua,
+        ui_action_tx.clone(),
+        Arc::clone(&plugin),
+        reach.clone(),
+    )?;
     open_editor__register(&t, lua, ui_action_tx.clone())?;
     input__register(&t, lua, reach.permissions(), ui_action_tx.clone())?;
     input_edit__register(
@@ -1035,7 +1107,7 @@ pub(crate) fn create_ui_table(
         lua,
         reach.permissions(),
         ui_action_tx.clone(),
-        Arc::clone(&plugin),
+        reach.clone(),
     )?;
     input_rules__register(&t, lua, Arc::clone(&plugin))?;
     open_win__register(&t, lua, ui_action_tx, Arc::clone(&plugin))?;
@@ -1239,7 +1311,7 @@ mod tests {
     use super::*;
     use crate::api::util::command::UiReply;
     use crate::api::util::convert::{UNKNOWN_FIELD_ERR, lua_to_json};
-    use crate::plugin_permissions::{Missing, Permission};
+    use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
     use maki_highlight::StyledSegment;
     use mlua::Lua;
     use test_case::test_case;
@@ -2013,12 +2085,16 @@ mod tests {
                 let _ = reply_tx.send(reply);
             }
         });
+        lua_with_ui(Some(tx))
+    }
+
+    fn lua_with_ui(tx: Option<flume::Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
         let t = create_ui_table(
             &lua,
-            Some(tx),
+            tx,
             Arc::from(INPUT_PLUGIN),
-            PluginReach::new(PluginPermissions::trusted()),
+            PluginReach::new(PluginPermissions::trusted()).owned_by(Arc::from(INPUT_PLUGIN)),
         )
         .unwrap();
         lua.globals().set("ui", t).unwrap();
@@ -2039,7 +2115,7 @@ mod tests {
             "version": edit.version,
             "strict": edit.strict,
             "session_id": edit.session_id,
-            "plugin": edit.plugin,
+            "plugin": edit.caller.owner(),
         }))
     }
 
@@ -2156,36 +2232,14 @@ mod tests {
         .copied()
         .collect::<Vec<_>>()
         .join(", ");
-        let err = smol::block_on(
-            lua.load(format!(
+        let err = eval_err(
+            &lua,
+            &format!(
                 r#"local st = ui.input()
                    return ui.input_edit({{ start = 0, stop = 5, {kept} }})"#
-            ))
-            .eval_async::<mlua::Value>(),
-        )
-        .unwrap_err()
-        .to_string();
+            ),
+        );
         assert!(err.contains(missing), "the error has to name it: {err}");
-    }
-
-    /// The host stamps the name on, so a caller cannot claim another plugin's.
-    #[test]
-    fn input_edit_names_the_calling_plugin() {
-        let lua = ui_with_input(echo_edit);
-        let (val, err) = eval(&lua, &edit_script("start = 0, stop = 0, text = \"x\""));
-        assert_eq!(err, None);
-        assert_eq!(val["plugin"], INPUT_PLUGIN);
-    }
-
-    /// Both guards have to reach the UI, or an edit planned against text that
-    /// has moved on lands anyway.
-    #[test]
-    fn input_edit_forwards_the_version_and_the_session() {
-        let lua = ui_with_input(echo_edit);
-        let (val, err) = eval(&lua, &edit_script("start = 0, stop = 5, text = \"x\""));
-        assert_eq!(err, None);
-        assert_eq!(val["version"], 7);
-        assert_eq!(val["session_id"], READ_SESSION_ID);
     }
 
     /// A handler writes after the key that woke it, so a range the user has
@@ -2204,16 +2258,25 @@ mod tests {
     #[test_case("pop_queue", Some(Permission::SessionWrite) ; "pop_queue_needs_session_write")]
     #[test_case("file_picker", None ; "file_picker_is_free")]
     fn action_charges_what_its_api_would(name: &str, needed: Option<Permission>) {
-        let (tx, _rx) = flume::unbounded();
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        std::thread::spawn(move || {
+            while let Ok(action) = rx.recv() {
+                if let UiAction::Builtin { reply_tx, .. } = action {
+                    let _ = reply_tx.send(true);
+                }
+            }
+        });
         let run = |perms: &PluginPermissions| {
             let lua = Lua::new();
             let reach = PluginReach::new(perms.clone());
             let t =
                 create_ui_table(&lua, Some(tx.clone()), Arc::from(INPUT_PLUGIN), reach).unwrap();
             lua.globals().set("ui", t).unwrap();
-            lua.load(format!("return ui.action('{name}')"))
-                .eval::<Option<bool>>()
-                .map_err(|e| e.to_string())
+            smol::block_on(
+                lua.load(format!("return ui.action('{name}')"))
+                    .eval_async::<Option<bool>>(),
+            )
+            .map_err(|e| e.to_string())
         };
         let denied = run(&PluginPermissions::denied());
         let Some(perm) = needed else {
@@ -2221,10 +2284,7 @@ mod tests {
             return;
         };
         let err = denied.unwrap_err();
-        assert!(
-            err.contains(&Missing::Permission(perm).to_string()),
-            "{err}"
-        );
+        assert!(err.contains(&denied_error(perm).to_string()), "{err}");
         let mut granted = PluginPermissions::denied();
         granted.set(perm, true);
         assert_eq!(run(&granted), Ok(Some(true)));

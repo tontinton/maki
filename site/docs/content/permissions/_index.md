@@ -234,13 +234,13 @@ Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to th
 It runs after [folder trust](/docs/folder-trust/) has let the Lua file load, and
 limits which APIs the file reaches rather than sandboxing the file.
 
-A plugin that changes the chat input needs `input`, see [chat input](/docs/lua-api/#chat-input).
+A plugin that changes the chat input needs `input`. `maki.ui.input_edit` needs `session_read` as well. Enter refuses a `/` command or a `!` line when a plugin that changed the text may not run it itself, see [chat input](/docs/lua-api/#chat-input).
 
 ### Session permissions
 
 Three keys cover the session APIs, split by what a call does to the transcript:
 
-- `session_read`: any call that reads what the conversation says, such as `maki.session.export`, `maki.session.messages` and `maki.ui.input`.
+- `session_read`: any call that reads what the conversation says, such as `maki.session.export`, `maki.session.messages`, `maki.ui.input` and `maki.ui.input_edit`. It also covers `ev.input` and `ev.text` in a key handler, and a key binding on a key that types text, in any mode.
 - `session_write`: any call that adds to, removes, or creates conversation content, such as `new`, `prompt`, `notify`, `delete` and `maki.task.remove`.
 - `session_settings`: any call that changes how a session runs without touching its content, such as `set_mode`, `set_title` and `maki.model.set`.
 

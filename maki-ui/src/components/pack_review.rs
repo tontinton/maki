@@ -25,6 +25,10 @@ pub(crate) enum PackReview {
 }
 
 impl Overlay for PackReview {
+    fn is_prompting(&self) -> bool {
+        self.is_open()
+    }
+
     fn is_open(&self) -> bool {
         matches!(self, Self::Open { .. })
     }

@@ -191,7 +191,7 @@ async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaR
 /// @example
 /// maki.model.set("anthropic/claude-opus-4-6")
 /// maki.model.set({ spec = "zai/glm-5", thinking = "high" })
-/// maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
+/// maki.keymap.set({ "n", "i" }, "<M-t>", function() maki.model.set({ thinking = "" }) end)
 #[lua_fn(guard = SessionSettings)]
 async fn set(
     lua: Lua,

@@ -199,6 +199,7 @@ impl Drop for LuaHookKeys {
                 delay: Duration::ZERO,
                 plugin: Arc::clone(&self.plugin),
                 cancel: Arc::new(AtomicBool::new(true)),
+                ceiling: None,
             });
         }
     }
@@ -785,7 +786,7 @@ fn register(
     lua: &Lua,
     #[ctx] owner: crate::api::Owner,
     #[ctx] egress: NetEgress,
-    #[ctx] reads_env: bool,
+    #[ctx] grants: PluginPermissions,
     spec: Table,
 ) -> LuaResult<()> {
     let crate::api::Owner {
@@ -794,7 +795,7 @@ fn register(
         granted_providers: granted,
     } = owner;
     let (hook_keys, mut decl) = declaration(lua, &spec)?;
-    if decl.api_key_env.is_some() && !reads_env {
+    if decl.api_key_env.is_some() && !grants.now(lua).is_allowed(Permission::Env) {
         return Err(register_error(API_KEY_ENV_NEEDS_ENV));
     }
     decl.net_hosts = egress
@@ -1052,8 +1053,8 @@ lua_table! {
     ///   models = { { prefixes = { "acme-large" }, tier = "strong" } },
     /// })
     /// ```
-    "maki.provider" => pub(crate) fn create_provider_table(perms: &PluginPermissions, owner: crate::api::Owner, egress: NetEgress, reads_env: bool), DOCS [
-        register(perms, owner, egress, reads_env),
+    "maki.provider" => pub(crate) fn create_provider_table(perms: &PluginPermissions, owner: crate::api::Owner, egress: NetEgress, grants: PluginPermissions), DOCS [
+        register(perms, owner, egress, grants),
         is_selected(owner),
         http_error,
     ]
@@ -1070,8 +1071,7 @@ pub(crate) fn create_provider_namespace(
     egress: NetEgress,
 ) -> LuaResult<Table> {
     let owned = egress.owned();
-    let reads_env = permissions.is_allowed(Permission::Env);
-    let provider = create_provider_table(lua, permissions, owner, egress, reads_env)?;
+    let provider = create_provider_table(lua, permissions, owner, egress, permissions.clone())?;
     provider.set("auth", create_auth_table(lua, owned)?)?;
     Ok(provider)
 }
@@ -1482,6 +1482,8 @@ mod tests {
     /// overrides to cover.
     fn provider_lua(reads_env: bool) -> Lua {
         let lua = Lua::new();
+        let mut grants = PluginPermissions::trusted();
+        grants.set(Permission::Env, reads_env);
         let table = create_provider_table(
             &lua,
             &PluginPermissions::trusted(),
@@ -1491,7 +1493,7 @@ mod tests {
                 granted_providers: Arc::from(vec![SLUG_NAME.to_owned()]),
             },
             NetEgress::default(),
-            reads_env,
+            grants,
         )
         .unwrap();
         lua.globals().set("provider", table).unwrap();

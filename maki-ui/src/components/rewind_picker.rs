@@ -127,6 +127,10 @@ impl RewindPicker {
 }
 
 impl Overlay for RewindPicker {
+    fn is_prompting(&self) -> bool {
+        false
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

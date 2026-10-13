@@ -8,11 +8,12 @@ use crate::selection::{
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
+use crate::components::input::InputAction;
 use crate::image;
 use crate::repaint::Dirty;
 
-use super::App;
 use super::image_paste::{spawn_read, take_ready};
+use super::{App, InputWriter, Msg};
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -66,30 +67,34 @@ impl App {
         }
     }
 
-    /// An image path anywhere in the paste wins and the text is dropped, the
-    /// same rule a bracketed paste follows.
-    pub(super) fn insert_pasted(&mut self, text: String) {
-        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    /// What the chat input does with a paste no one else took: a line that is
+    /// an image path attaches the image, otherwise the text goes in.
+    pub(super) fn builtin_paste(&mut self, text: &str) {
+        if !self.chat_accepts_input() {
+            return;
+        }
         let mut any_image = false;
-        if self.chat_accepts_input() {
-            for line in text.lines() {
-                if let Some((path, media_type)) = image::try_parse_image_path(line) {
-                    self.start_file_image_paste(path, media_type);
-                    any_image = true;
-                }
+        for line in text.lines() {
+            if let Some((path, media_type)) = image::try_parse_image_path(line) {
+                self.start_file_image_paste(path, media_type);
+                any_image = true;
             }
         }
-        if !any_image {
-            self.route_text_paste(&text);
+        if !any_image && let InputAction::Changed = self.input_box.handle_paste(text) {
+            self.input_changed(InputWriter::Anyone);
         }
     }
 
+    /// The selection is read in the background, so it comes back as a paste
+    /// typed now and waits behind any keys still held, like one from the
+    /// terminal.
     pub fn poll_primary_paste(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
         while let Some(selection) = take_ready(&mut self.primary_paste_rx) {
             dirty = Dirty::YES;
-            if let Some(text) = selection {
-                self.insert_pasted(text);
+            if let Some(text) = selection.filter(|text| !text.is_empty()) {
+                let actions = self.update(Msg::Paste(text));
+                self.pending_actions.extend(actions);
             }
         }
         dirty

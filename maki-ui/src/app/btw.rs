@@ -51,7 +51,7 @@ impl App {
         messages.push(btw_question(&question));
 
         let (tx, rx) = flume::bounded(64);
-        self.btw_modal.open(&question, rx);
+        self.open_prompt(|app| app.btw_modal.open(&question, rx));
 
         let session_id = SessionRef::from(self.state.session.id);
         smol::spawn(run_btw(

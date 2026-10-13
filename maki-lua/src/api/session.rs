@@ -24,7 +24,7 @@ use crate::api::util::command::{
 };
 use crate::api::util::convert::{TableExt, json_to_lua, json_to_lua_exact, lua_to_json};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
-use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
+use crate::plugin_permissions::{Permission, PluginPermissions, require};
 use crate::session_snapshot::SessionSnapshot;
 
 /// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
@@ -621,7 +621,7 @@ fn headless_cwd(lua: &Lua) -> Result<String, String> {
 async fn new(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
-    #[ctx] may_run_agents: bool,
+    #[ctx] grants: PluginPermissions,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
     let opts = match opts {
@@ -630,8 +630,8 @@ async fn new(
     };
     let prompt: Option<String> = opts.opt(PROMPT_KEY)?;
     let focus = opts.opt_bool(FOCUS_KEY).unwrap_or(false);
-    if prompt.is_some() && !may_run_agents {
-        return Err(denied_error(Permission::Agent));
+    if prompt.is_some() {
+        require(&lua, &grants, Permission::Agent)?;
     }
     let opens = prompt.is_some() || focus;
     // Asked once: a UI that detaches after this fails the roundtrip below
@@ -706,8 +706,8 @@ async fn prompt(
 /// maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
 #[lua_fn(guard = SessionWrite)]
 fn notify(
-    _lua: &Lua,
-    #[ctx] may_run_agents: bool,
+    lua: &Lua,
+    #[ctx] grants: PluginPermissions,
     text: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<bool>> {
@@ -715,8 +715,8 @@ fn notify(
         .as_ref()
         .and_then(|t| t.opt_bool("wake"))
         .unwrap_or(false);
-    if wake && !may_run_agents {
-        return Err(denied_error(Permission::Agent));
+    if wake {
+        require(lua, &grants, Permission::Agent)?;
     }
     if text.trim().is_empty() {
         return Ok(err_pair(BLANK_NOTIFY_ERR));
@@ -791,12 +791,12 @@ lua_table! {
     "maki.session" => pub(crate) fn create_session_table(
         tx: Option<flume::Sender<UiAction>>,
         perms: &PluginPermissions,
-        may_run_agents: bool,
+        grants: PluginPermissions,
     ),
     DOCS [
         list(tx), live(tx), current(tx), read(tx), export(perms, tx), messages(perms, tx), focus(tx),
-        delete(perms, tx), new(perms, tx, may_run_agents), prompt(perms, tx),
-        notify(perms, may_run_agents), set_mode(perms, tx), set_title(perms, tx),
+        delete(perms, tx), new(perms, tx, grants), prompt(perms, tx), notify(perms, grants),
+        set_mode(perms, tx), set_title(perms, tx),
     ]
 }
 
@@ -846,7 +846,13 @@ mod tests {
 
     fn lua_with_session(tx: Option<flume::Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
-        let t = create_session_table(&lua, tx, &PluginPermissions::trusted(), true).unwrap();
+        let t = create_session_table(
+            &lua,
+            tx,
+            &PluginPermissions::trusted(),
+            PluginPermissions::trusted(),
+        )
+        .unwrap();
         lua.globals().set("session", t).unwrap();
         lua
     }

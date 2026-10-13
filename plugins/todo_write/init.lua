@@ -173,7 +173,7 @@ local function toggle()
   sync_panel()
 end
 
-maki.keymap.set("n", "<C-t>", toggle, { desc = "Toggle todo panel" })
+maki.keymap.set({ "n", "i" }, "<C-t>", toggle, { desc = "Toggle todo panel" })
 
 -- Subagents run inside the parent's turn, so its end clears their lists too.
 maki.api.create_autocmd({ "TurnEnd", "SessionReset", "SessionEnd" }, {

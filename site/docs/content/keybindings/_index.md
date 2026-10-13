@@ -27,7 +27,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 |-----|--------|
 | `Enter` | Submit prompt |
 | `Shift+Enter` / `Ctrl+Enter` / `Ctrl+J` / `Alt+Enter` | Newline |
-| `Tab` | Toggle mode |
+| `Tab` | Switch between plan and build |
 | `/command` | Open command palette |
 | `Ctrl+W` | Delete word backward |
 | `Alt+←` / `Alt+→` | Move word left / right |
@@ -114,18 +114,63 @@ Child contexts inherit their parent's bindings and add their own.
 
 ## Overriding Keybindings
 
-Plugins and `init.lua` can rebind keys at runtime with `maki.keymap.set` and `maki.keymap.del`. The tables above are the built-in defaults. An override on the same key wins, unless a modal or overlay is open (help, plan form, permission prompt).
+Rebind a single key from your `init.lua` with [`maki.keymap.set`](/docs/lua-api/#maki-keymap-set). To move a built-in to another key, call its [action](/docs/lua-api/#maki-ui-action). This opens the file picker on `Alt+S`, for terminals that take `Ctrl+S`:
 
-Precedence, high to low:
+```lua
+maki.keymap.set({ "n", "i" }, "<M-s>", function()
+  maki.ui.action("file_picker")
+end)
+```
 
-1. **Suspend** (`Ctrl+Z`, Unix). Always wins.
-2. **Modal and overlay keys.** An open modal or picker consumes its keys first, so they cannot be shadowed while open.
-3. **Lua overrides** from `maki.keymap.set`. The last set wins. Shadowing another plugin's binding logs a warning, and the shadowed binding returns when the plugin on top deletes it or unloads.
-4. **Built-in defaults.** Any override on the same key shadows them, and the default returns once every override on it is gone. A plugin's `maki.keymap.del` only removes its own binding.
+`{ "n", "i" }` lists both [modes](/docs/lua-api/#modes). Your binding replaces the default on that key, and the default comes back when the binding is removed. When two bindings share a key, the last `set` wins, and the log names both.
 
-`Ctrl+C` and `Ctrl+Z` cannot be rebound, so quit and suspend always work. Only single-key bindings can be overridden. Multi-key combinations and non-key rows (like `Type` to filter) cannot.
+Some keys stay out of reach (the full order is in [Key resolution](/docs/lua-api/#key-resolution)):
 
-The `/help` modal and the splash show default labels, not live overrides, but pressing the key still runs the override.
+- `Ctrl+C` and `Ctrl+Z`, so quit and suspend always work.
+- `Esc` while the agent runs, so `Esc Esc` can cancel the turn.
+- The keys of an open modal, picker or prompt, which it handles first.
+- Keys a plugin binds while it loads, like `Ctrl+P`. Plugins load after your global and project `init.lua`, so their `set` comes last.
+- Multi-key combinations and rows like `Type` to filter. Only single keys can be bound.
+
+`/help` and the splash show the default labels, even for a key you rebound. Below them, `/help` lists every key that plugins and your `init.lua` bound, with its modes and owner, and every action you can call.
+
+### Upgrading old keymaps
+
+Older versions fired `"n"` bindings while you typed in the chat input. Now they fire only in normal mode, so a shortcut set in `"n"` alone stops working while you type. List both modes:
+
+```lua
+-- Before:
+maki.keymap.set("n", "<M-n>", open_notes)
+-- After:
+maki.keymap.set({ "n", "i" }, "<M-n>", open_notes)
+```
+
+At startup, the status bar warns about a plugin or `init.lua` that binds a key in `"n"` alone. One that also binds a key in `"i"`, like a vim mode, handles modes itself and gets no warning.
+
+### Composing keys
+
+`Tab` switches between plan and build. To make it accept a file completion first while the completion menu is open, bind it in your `init.lua` and try each [action](/docs/lua-api/#maki-ui-action) in turn. `ev.fallback()` hands the key back to Maki when none of them took it:
+
+```lua
+maki.keymap.set("i", "<Tab>", function(ev)
+  if maki.ui.action("completion.accept") then return end
+  if maki.ui.action("ghost.accept") then return end
+  ev.fallback()
+end)
+```
+
+`ghost.accept` stands for another plugin's action. An action returns `true` when it handled the key. If its plugin is not installed or is disabled, it returns `nil` and the binding moves on.
+
+`completion.accept` writes file paths into the input, so calling it needs `fs_read`, `input` and `session_read` in `~/.config/maki/plugin.toml` (see [plugin permissions](/docs/lua-api/#plugin-permissions)):
+
+```toml
+[permissions]
+fs_read = true
+input = true
+session_read = true
+```
+
+Without them the action returns `nil`, `Tab` switches between plan and build, and the status bar names the missing permission.
 
 ### Recovering from a bad keymap
 

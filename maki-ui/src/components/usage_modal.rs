@@ -367,6 +367,10 @@ fn model_row(
 }
 
 impl crate::components::Overlay for UsageModal {
+    fn is_prompting(&self) -> bool {
+        self.is_open()
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }
