@@ -23,11 +23,22 @@ const TIPS: &[(&str, &str)] = &[
         key::FILE_PICKER.label,
         "to grab file paths with fuzzy search",
     ),
-    ("/tasks", "to see what your subagents are up to"),
     (key::SEARCH.label, "to find things in the conversation"),
+    (key::MODEL_PICKER.label, "to switch models mid-session"),
+    (key::EDIT_INPUT.label, "to write your prompt in $EDITOR"),
+    ("Tab", "to toggle plan mode"),
+    ("Esc Esc", "to rewind to an earlier prompt"),
+    ("!cmd", "to run a shell command and share its output"),
+    ("!!cmd", "to run a shell command without telling the agent"),
+    (key::TASKS.label, "to see what your subagents are up to"),
     ("/btw", "to ask something without interrupting the session"),
     ("/memory", "to view, edit, and delete persistent notes"),
     ("/cd", "to switch to a different directory"),
+    (key::SESSIONS.label, "to pick up where you left off"),
+    ("/compact", "with a hint to steer what gets kept"),
+    ("/thinking", "to set how hard the model thinks"),
+    ("/workflow", "to let code_execution spawn subagents"),
+    ("/reload", "to apply plugin and config changes"),
 ];
 
 const COLOR_TRANSITION_SECS: f32 = 0.4;
