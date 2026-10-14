@@ -73,7 +73,11 @@ struct Usage {
     cache_creation_input_tokens: u32,
     #[serde(default)]
     cache_read_input_tokens: u32,
-    #[serde(default, deserialize_with = "crate::providers::lenient_cost")]
+    #[serde(
+        default,
+        alias = "response_cost",
+        deserialize_with = "crate::providers::lenient_cost"
+    )]
     cost: Option<f64>,
     #[serde(default)]
     cost_details: Option<Value>,
@@ -129,7 +133,11 @@ fn lenient_transformations<'de, D: Deserializer<'de>>(
 struct MessagePayload {
     #[serde(default)]
     usage: Option<Usage>,
-    #[serde(default, deserialize_with = "crate::providers::lenient_cost")]
+    #[serde(
+        default,
+        alias = "response_cost",
+        deserialize_with = "crate::providers::lenient_cost"
+    )]
     cost: Option<f64>,
     #[serde(default, deserialize_with = "lenient_transformations")]
     input_transformations: Option<Vec<InputTransformation>>,
@@ -138,7 +146,11 @@ struct MessagePayload {
 #[derive(Deserialize)]
 struct MessageStartEvent {
     message: MessagePayload,
-    #[serde(default, deserialize_with = "crate::providers::lenient_cost")]
+    #[serde(
+        default,
+        alias = "response_cost",
+        deserialize_with = "crate::providers::lenient_cost"
+    )]
     cost: Option<f64>,
 }
 
@@ -188,7 +200,11 @@ struct MessageDeltaEvent {
     delta: Option<MessageDeltaPayload>,
     #[serde(default)]
     usage: Option<Usage>,
-    #[serde(default, deserialize_with = "crate::providers::lenient_cost")]
+    #[serde(
+        default,
+        alias = "response_cost",
+        deserialize_with = "crate::providers::lenient_cost"
+    )]
     cost: Option<f64>,
     #[serde(default)]
     copilot_usage: Option<Value>,

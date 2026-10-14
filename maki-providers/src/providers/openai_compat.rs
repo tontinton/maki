@@ -547,7 +547,11 @@ struct ChunkUsage {
     #[serde(default)]
     prompt_cache_hit_tokens: u32,
     /// What the request billed, which routers like OpenRouter attach to usage.
-    #[serde(default, deserialize_with = "super::lenient_cost")]
+    #[serde(
+        default,
+        alias = "response_cost",
+        deserialize_with = "super::lenient_cost"
+    )]
     cost: Option<f64>,
     #[serde(default)]
     cost_details: Option<Value>,
@@ -571,7 +575,11 @@ struct SseChunk {
     #[serde(default)]
     choices: Vec<ChunkChoice>,
     usage: Option<ChunkUsage>,
-    #[serde(default, deserialize_with = "super::lenient_cost")]
+    #[serde(
+        default,
+        alias = "response_cost",
+        deserialize_with = "super::lenient_cost"
+    )]
     cost: Option<f64>,
     copilot_usage: Option<Value>,
 }

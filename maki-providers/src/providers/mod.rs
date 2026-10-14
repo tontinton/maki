@@ -49,6 +49,8 @@ const BEARER_PREFIX: &str = "Bearer ";
 const COST_KEYS: &[&str] = &[
     "request_cost_usd",
     "request_cost",
+    "response_cost_usd",
+    "response_cost",
     "total_cost_usd",
     "total_cost",
     "cost_usd",
@@ -104,19 +106,24 @@ pub(crate) fn parse_cost_details(details: &Value) -> Option<f64> {
 }
 
 pub(crate) fn parse_usage_cost(usage: &Value) -> Option<f64> {
-    let cost = usage.get("cost").and_then(parse_cost_value);
-    if let Some(c) = cost
-        && c > 0.0
-    {
-        return Some(c);
+    let Value::Object(map) = usage else {
+        return None;
+    };
+    for key in COST_KEYS {
+        if let Some(val) = map.get(*key)
+            && let Some(cost) = parse_cost_value(val)
+            && cost > 0.0
+        {
+            return Some(cost);
+        }
     }
-    let details_cost = usage.get("cost_details").and_then(parse_cost_details);
-    if let Some(c) = details_cost
-        && c > 0.0
+    if let Some(details) = map.get("cost_details")
+        && let Some(cost) = parse_cost_details(details)
+        && cost > 0.0
     {
-        return Some(c);
+        return Some(cost);
     }
-    cost.or(details_cost)
+    parse_cost_value(usage)
 }
 
 pub(crate) fn parse_cost_comment(line: &str) -> Option<f64> {
@@ -1305,6 +1312,8 @@ mod tests {
     #[test_case(serde_json::json!("0.00045"), Some(COST_VAL) ; "quoted_numeric")]
     #[test_case(serde_json::json!({"request_cost_usd": COST_VAL}), Some(COST_VAL) ; "request_cost_usd")]
     #[test_case(serde_json::json!({"request_cost": COST_VAL}), Some(COST_VAL) ; "request_cost")]
+    #[test_case(serde_json::json!({"response_cost_usd": COST_VAL}), Some(COST_VAL) ; "response_cost_usd")]
+    #[test_case(serde_json::json!({"response_cost": COST_VAL}), Some(COST_VAL) ; "response_cost")]
     #[test_case(serde_json::json!({"total_cost_usd": COST_VAL}), Some(COST_VAL) ; "total_cost_usd")]
     #[test_case(serde_json::json!({"total_cost": COST_VAL}), Some(COST_VAL) ; "total_cost")]
     #[test_case(serde_json::json!({"cost_usd": COST_VAL}), Some(COST_VAL) ; "cost_usd")]
@@ -1349,6 +1358,17 @@ mod tests {
             "cost_details": {
                 "upstream_inference_cost": COST_VAL
             }
+        });
+        let got = parse_usage_cost(&usage).unwrap();
+        assert!((got - COST_VAL).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_usage_cost_accepts_response_cost_field() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "response_cost": COST_VAL
         });
         let got = parse_usage_cost(&usage).unwrap();
         assert!((got - COST_VAL).abs() < 1e-9);
