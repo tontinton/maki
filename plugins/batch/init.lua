@@ -143,7 +143,7 @@ local function header_spans(tool, params)
 end
 
 -- The chat and the reason travel along so a child keying per-chat state
--- (todo_write) files the call where it would standalone. From the handler
+-- files the call where it would standalone. From the handler
 -- `restore_reason` is nil, which reads as a rerender: the child's own
 -- handler already ran.
 local function child_ctx(ctx)

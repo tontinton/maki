@@ -557,10 +557,10 @@ pub struct RestoreItem {
     pub reason: RestoreReason,
 }
 
-/// Why a call is being restored. A tool whose restore has side effects (the
-/// todo panel refilling itself) acts on `Load` only: a rerender replays a
-/// single call whose state the tool already holds, possibly an old one.
-/// Lua sees the lowercase variant names through `ctx:restore_reason()`.
+/// Why a call is being restored. A tool whose restore has side effects acts
+/// on `Load` only: a rerender replays a single call whose state the tool
+/// already holds, possibly an old one. Lua sees the lowercase variant names
+/// through `ctx:restore_reason()`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, EnumString, IntoStaticStr)]
 #[strum(serialize_all = "lowercase")]
 pub enum RestoreReason {
