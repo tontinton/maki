@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use futures::TryStreamExt;
 use reqwest::redirect::Policy;
 use reqwest::{Client, ClientBuilder, Proxy, Request, RequestBuilder, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, Lines};
 use tokio::time::timeout;
@@ -46,6 +46,100 @@ pub(crate) const UNAUTHORIZED_STATUS: u16 = 401;
 const BAD_REQUEST_STATUS: u16 = 400;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
+const COST_KEYS: &[&str] = &[
+    "request_cost_usd",
+    "request_cost",
+    "total_cost_usd",
+    "total_cost",
+    "cost_usd",
+    "cost",
+    "total",
+    "amount",
+];
+
+pub(crate) fn parse_cost_value(value: &Value) -> Option<f64> {
+    let raw = match value {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.parse().ok(),
+        Value::Object(map) => {
+            for key in COST_KEYS {
+                if let Some(val) = map.get(*key)
+                    && let Some(cost) = parse_cost_value(val)
+                {
+                    return Some(cost);
+                }
+            }
+            if let Some(details) = map.get("cost_details") {
+                return parse_cost_details(details);
+            }
+            None
+        }
+        _ => None,
+    };
+    raw.filter(|c| c.is_finite() && *c >= 0.0)
+}
+
+pub(crate) fn parse_cost_details(details: &Value) -> Option<f64> {
+    let Value::Object(map) = details else {
+        return None;
+    };
+    if let Some(total) = map.get("upstream_inference_cost")
+        && let Some(cost) = parse_cost_value(total)
+    {
+        return Some(cost);
+    }
+    let prompt = map
+        .get("upstream_inference_prompt_cost")
+        .and_then(parse_cost_value);
+    let completion = map
+        .get("upstream_inference_completions_cost")
+        .and_then(parse_cost_value);
+    if prompt.is_some() || completion.is_some() {
+        let total = prompt.unwrap_or(0.0) + completion.unwrap_or(0.0);
+        if total.is_finite() && total >= 0.0 {
+            return Some(total);
+        }
+    }
+    None
+}
+
+pub(crate) fn parse_usage_cost(usage: &Value) -> Option<f64> {
+    let cost = usage.get("cost").and_then(parse_cost_value);
+    if let Some(c) = cost
+        && c > 0.0
+    {
+        return Some(c);
+    }
+    let details_cost = usage.get("cost_details").and_then(parse_cost_details);
+    if let Some(c) = details_cost
+        && c > 0.0
+    {
+        return Some(c);
+    }
+    cost.or(details_cost)
+}
+
+pub(crate) fn parse_cost_comment(line: &str) -> Option<f64> {
+    let comment = line.strip_prefix(':').unwrap_or(line).trim_start();
+    let payload = comment.strip_prefix("cost")?.trim_start();
+    let payload = payload.strip_prefix(':').unwrap_or(payload).trim_start();
+    if payload.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .as_ref()
+        .and_then(parse_cost_value)
+        .or_else(|| payload.parse().ok())
+        .filter(|c: &f64| c.is_finite() && *c >= 0.0)
+}
+
+pub(crate) fn lenient_cost<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<f64>, D::Error> {
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.as_ref().and_then(parse_cost_value))
+}
 
 fn bearer_value(api_key: &str) -> String {
     format!("{BEARER_PREFIX}{api_key}")
@@ -1202,5 +1296,61 @@ mod tests {
 
         assert!(!KeyRotation::new(&pool, &auth, KeyHeader::Bearer).rotate());
         assert_eq!(pool.current(), KEY_1);
+    }
+
+    const COST_VAL: f64 = 0.00045;
+    const SPLIT_COST: f64 = 0.00006;
+
+    #[test_case(serde_json::json!(COST_VAL), Some(COST_VAL) ; "numeric")]
+    #[test_case(serde_json::json!("0.00045"), Some(COST_VAL) ; "quoted_numeric")]
+    #[test_case(serde_json::json!({"request_cost_usd": COST_VAL}), Some(COST_VAL) ; "request_cost_usd")]
+    #[test_case(serde_json::json!({"request_cost": COST_VAL}), Some(COST_VAL) ; "request_cost")]
+    #[test_case(serde_json::json!({"total_cost_usd": COST_VAL}), Some(COST_VAL) ; "total_cost_usd")]
+    #[test_case(serde_json::json!({"total_cost": COST_VAL}), Some(COST_VAL) ; "total_cost")]
+    #[test_case(serde_json::json!({"cost_usd": COST_VAL}), Some(COST_VAL) ; "cost_usd")]
+    #[test_case(serde_json::json!({"cost": COST_VAL}), Some(COST_VAL) ; "nested_cost")]
+    #[test_case(serde_json::json!({"amount": COST_VAL}), Some(COST_VAL) ; "amount")]
+    #[test_case(serde_json::json!({"cost_details": {"upstream_inference_cost": COST_VAL}}), Some(COST_VAL) ; "cost_details_total")]
+    #[test_case(serde_json::json!({"cost_details": {"upstream_inference_prompt_cost": 0.00002, "upstream_inference_completions_cost": 0.00004}}), Some(SPLIT_COST) ; "cost_details_split")]
+    #[test_case(serde_json::json!("free"), None ; "unparsable_string")]
+    #[test_case(serde_json::json!({"usd": COST_VAL}), None ; "unrecognized_key")]
+    #[test_case(serde_json::json!(null), None ; "null_value")]
+    fn parse_cost_value_variants(input: Value, expected: Option<f64>) {
+        let got = parse_cost_value(&input);
+        match (got, expected) {
+            (Some(g), Some(e)) => assert!((g - e).abs() < 1e-9),
+            (None, None) => {}
+            _ => panic!("got {got:?}, expected {expected:?}"),
+        }
+    }
+
+    #[test_case(": cost {\"request_cost_usd\": 0.00045}", Some(COST_VAL) ; "cost_object")]
+    #[test_case(": cost 0.00045", Some(COST_VAL) ; "cost_number")]
+    #[test_case(":cost {\"amount\": 0.00045}", Some(COST_VAL) ; "compact_colon")]
+    #[test_case(": cost: 0.00045", Some(COST_VAL) ; "cost_with_colon")]
+    #[test_case(": energy {\"total\": 1}", None ; "energy_comment")]
+    #[test_case(": keepalive", None ; "keepalive_comment")]
+    #[test_case(": cost", None ; "empty_cost_comment")]
+    fn parse_cost_comment_variants(line: &str, expected: Option<f64>) {
+        let got = parse_cost_comment(line);
+        match (got, expected) {
+            (Some(g), Some(e)) => assert!((g - e).abs() < 1e-9),
+            (None, None) => {}
+            _ => panic!("got {got:?}, expected {expected:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_usage_cost_prefers_non_zero_over_zero() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "cost": 0.0,
+            "cost_details": {
+                "upstream_inference_cost": COST_VAL
+            }
+        });
+        let got = parse_usage_cost(&usage).unwrap();
+        assert!((got - COST_VAL).abs() < 1e-9);
     }
 }
