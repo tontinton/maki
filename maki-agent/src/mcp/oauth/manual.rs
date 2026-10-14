@@ -85,6 +85,7 @@ mod tests {
     const STATE: &str = "expected-state";
 
     #[test_case("http://127.0.0.1:19876/mcp/oauth/callback?code=abc&state=expected-state", "abc" ; "full_redirect_url")]
+    #[test_case("https://localhost:3119/callback?code=abc&state=expected-state", "abc" ; "https_redirect_url")]
     #[test_case("code=abc&state=expected-state", "abc" ; "bare_query_string")]
     #[test_case("code=a%2Bb%20c&state=expected-state", "a+b c" ; "url_encoded_code")]
     #[test_case("http://127.0.0.1:19876/mcp/oauth/callback?state=expected-state&code=xyz#frag", "xyz" ; "fragment_stripped")]

@@ -21,7 +21,7 @@ use self::callback::{CallbackResult, CallbackServer};
 use self::discovery::{
     AuthServerMetadata, ResourceMetadata, WwwAuthenticateInfo, parse_www_authenticate,
 };
-use super::config::OauthClientConfig;
+use super::config::{CallbackScheme, HTTPS_CALLBACK_NEEDS_PORT, OauthClientConfig};
 use super::error::McpError;
 use super::http::build_client;
 
@@ -30,6 +30,8 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// In-band refresh blocks requests waiting on the transport's auth lock, so it
 /// gets a much tighter budget than the interactive flow.
 const SILENT_REFRESH_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTPS_PASTE_PROMPT: &str = "After you approve, the browser shows a connection error. That is expected.\nCopy the full URL from the address bar and paste it here:";
+const HTTPS_NEEDS_PASTE: &str = "https callback needs the redirect URL pasted by hand";
 
 #[derive(Debug, thiserror::Error)]
 pub enum OAuthError {
@@ -79,6 +81,16 @@ pub async fn authenticate(
         }
     }
 
+    if matches!(interaction, Interaction::Background)
+        && static_client
+            .as_ref()
+            .is_some_and(|c| c.callback_scheme == CallbackScheme::Https)
+    {
+        return Err(wrap(OAuthError::Other(format!(
+            "{HTTPS_NEEDS_PASTE}; run 'maki mcp auth {server_name}'"
+        ))));
+    }
+
     let www_auth = www_authenticate.and_then(parse_www_authenticate);
 
     let (resource_meta, auth_server) =
@@ -97,22 +109,36 @@ pub async fn authenticate(
         )));
     }
 
-    let callback = CallbackServer::bind(
-        static_client.as_ref().and_then(|c| c.callback_port),
-        static_client
-            .as_ref()
-            .and_then(|c| c.callback_path.as_deref()),
-        static_client
-            .as_ref()
-            .and_then(|c| c.callback_hostname.as_deref()),
-    )
-    .await
-    .map_err(|e| wrap(OAuthError::Other(e)))?;
-    let redirect_uri = callback.redirect_uri();
+    let port = static_client.as_ref().and_then(|c| c.callback_port);
+    let path = static_client
+        .as_ref()
+        .and_then(|c| c.callback_path.as_deref());
+    let hostname = static_client
+        .as_ref()
+        .and_then(|c| c.callback_hostname.as_deref());
+    let scheme = static_client
+        .as_ref()
+        .map_or(CallbackScheme::Http, |c| c.callback_scheme);
+    let (callback, redirect_uri) = match scheme {
+        CallbackScheme::Https => {
+            let port =
+                port.ok_or_else(|| wrap(OAuthError::Other(HTTPS_CALLBACK_NEEDS_PORT.into())))?;
+            (None, callback::redirect_uri(scheme, hostname, port, path))
+        }
+        CallbackScheme::Http => {
+            let server = CallbackServer::bind(port, path, hostname)
+                .await
+                .map_err(|e| wrap(OAuthError::Other(e)))?;
+            let uri = server.redirect_uri();
+            (Some(server), uri)
+        }
+    };
 
-    let reg = if let Some(c) = static_client {
+    let reg = if let Some(c) = static_client
+        && let Some(client_id) = c.client_id
+    {
         registration::ClientRegistration {
-            client_id: c.client_id,
+            client_id,
             client_secret: c.client_secret,
             client_secret_expires_at: None,
         }
@@ -172,18 +198,30 @@ pub async fn authenticate(
                 warn!(server = server_name, error = %e, "failed to open browser");
             }
 
-            eprintln!("Waiting for callback on {redirect_uri}...");
-            eprintln!("If this machine has no browser, log in on another device and paste");
-            eprintln!("the full redirect URL ({redirect_uri}?...) here:");
+            if callback.is_some() {
+                eprintln!("Waiting for callback on {redirect_uri}...");
+                eprintln!("If this machine has no browser, log in on another device and paste");
+                eprintln!("the full redirect URL ({redirect_uri}?...) here:");
+            } else {
+                eprintln!("{HTTPS_PASTE_PROMPT}");
+            }
 
             let callback_or_paste = future::race(
-                callback.wait_for_callback(&state),
+                async {
+                    match callback {
+                        Some(callback) => callback.wait_for_callback(&state).await,
+                        None => future::pending().await,
+                    }
+                },
                 manual::wait_for_paste(&state),
             );
 
             future::race(callback_or_paste, auth_timeout()).await
         }
         Interaction::Background => {
+            let Some(callback) = callback else {
+                return Err(wrap(OAuthError::Other(HTTPS_NEEDS_PASTE.into())));
+            };
             let cause = if is_headless() {
                 Some("no display to open a browser".to_string())
             } else {

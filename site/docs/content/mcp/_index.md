@@ -75,7 +75,7 @@ Maki checks certificates against the operating system's trust store, so a CA tha
 | `url` | string | | HTTP: server URL |
 | `environment` | map | | Stdio only. Values expand `${VAR}` from the environment |
 | `headers` | map | | HTTP only. Values expand `${VAR}` from the environment |
-| `oauth` | table | | HTTP only: static client (`client_id`, optional `client_secret`, optional `callback_port`, optional `callback_path`, optional `callback_hostname`) |
+| `oauth` | table | | HTTP only: OAuth client (optional `client_id`, optional `client_secret`, optional `callback_port`, optional `callback_path`, optional `callback_hostname`, optional `callback_scheme`) |
 | `ca_file` | path | | HTTP only. PEM bundle that replaces the default CAs for this server and its OAuth |
 | `timeout` | u64 | 30000 | Milliseconds (1-300000) |
 | `enabled` | bool | true | |
@@ -187,17 +187,20 @@ maki mcp auth <server-name>     # manually trigger auth
 maki mcp logout <server-name>   # remove stored tokens
 ```
 
-Servers without dynamic client registration need a client you registered yourself (e.g. your own app on their platform). Add it to the server config so the auth flow uses it instead of trying to register:
+Servers without dynamic client registration need a client you registered yourself (e.g. your own app on their platform). Add it to the server config so the auth flow uses it instead of trying to register. Without `client_id`, the `callback_*` fields still apply and Maki registers a client dynamically with that redirect URI:
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `client_id` | string | Client id of your registered app |
-| `client_secret` | string | Optional, for confidential clients |
+| `client_id` | string | Optional, client id of your registered app |
+| `client_secret` | string | Optional, for confidential clients (needs `client_id`) |
 | `callback_port` | u16 | Optional, pins the loopback port so the redirect URI can be pre-registered |
 | `callback_path` | string | Optional, loopback path of the redirect URI (default `/mcp/oauth/callback`) |
 | `callback_hostname` | string | Optional, loopback hostname of the redirect URI (default `127.0.0.1`) |
+| `callback_scheme` | string | Optional, `http` (default) or `https` |
 
 Set `callback_port` when the server only accepts exact redirect URIs. Otherwise Maki falls back to its default port, then to any free port, so the redirect URI changes between runs. Set `callback_path` when the server registered a different path (e.g. `/callback`). Set `callback_hostname` to `localhost` when the server registered the name form instead of the IP (the listener still binds to 127.0.0.1).
+
+Set `callback_scheme = "https"` (needs `callback_port`) when the server only accepts https redirect URIs, such as `https://localhost:3119/callback`. Maki runs no https listener, so the login must run in `maki mcp auth <server-name>` (the TUI can't finish it). When the browser shows a connection error, paste the full URL from its address bar into the terminal.
 
 ### Headless machines
 

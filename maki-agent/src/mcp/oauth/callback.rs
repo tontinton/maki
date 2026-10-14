@@ -1,6 +1,8 @@
 use futures_lite::AsyncWriteExt;
 use smol::net::TcpListener;
 
+use crate::mcp::config::CallbackScheme;
+
 const PREFERRED_PORT: u16 = 19876;
 const MAX_HEADER_SIZE: usize = 8192;
 const CALLBACK_PATH: &str = "/mcp/oauth/callback";
@@ -53,7 +55,12 @@ impl CallbackServer {
     }
 
     pub fn redirect_uri(&self) -> String {
-        format!("http://{}:{}{}", self.hostname, self.port, self.path)
+        redirect_uri(
+            CallbackScheme::Http,
+            Some(&self.hostname),
+            self.port,
+            Some(&self.path),
+        )
     }
 
     pub async fn wait_for_callback(self, expected_state: &str) -> Result<CallbackResult, String> {
@@ -127,6 +134,23 @@ impl CallbackServer {
     }
 }
 
+pub fn redirect_uri(
+    scheme: CallbackScheme,
+    hostname: Option<&str>,
+    port: u16,
+    path: Option<&str>,
+) -> String {
+    let scheme = match scheme {
+        CallbackScheme::Http => "http",
+        CallbackScheme::Https => "https",
+    };
+    format!(
+        "{scheme}://{}:{port}{}",
+        hostname.unwrap_or(DEFAULT_HOSTNAME),
+        path.unwrap_or(CALLBACK_PATH)
+    )
+}
+
 pub(crate) fn parse_query(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
@@ -188,6 +212,20 @@ async fn respond(
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    const PINNED_PORT: u16 = 3119;
+
+    #[test_case(CallbackScheme::Https, Some("localhost"), Some("/callback"), "https://localhost:3119/callback" ; "https_custom_host_and_path")]
+    #[test_case(CallbackScheme::Https, None, None, "https://127.0.0.1:3119/mcp/oauth/callback" ; "https_defaults")]
+    #[test_case(CallbackScheme::Http, None, None, "http://127.0.0.1:3119/mcp/oauth/callback" ; "http_defaults")]
+    fn builds_redirect_uri(
+        scheme: CallbackScheme,
+        hostname: Option<&str>,
+        path: Option<&str>,
+        expected: &str,
+    ) {
+        assert_eq!(redirect_uri(scheme, hostname, PINNED_PORT, path), expected);
+    }
 
     #[test_case("code=abc&state=xyz", &[("code", "abc"), ("state", "xyz")] ; "basic_params")]
     #[test_case("msg=hello%20world&foo=bar%2Bbaz", &[("msg", "hello world"), ("foo", "bar+baz")] ; "percent_encoded")]

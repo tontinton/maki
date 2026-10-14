@@ -13,6 +13,8 @@ use toml_edit::DocumentMut;
 const MCP_CONFIG_FILE: &str = "mcp.toml";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
+const SECRET_NEEDS_CLIENT_ID: &str = "oauth.client_secret needs client_id";
+pub(super) const HTTPS_CALLBACK_NEEDS_PORT: &str = "oauth.callback_scheme \"https\" needs callback_port to match the redirect URI registered with the provider";
 
 #[derive(Debug, Clone)]
 pub enum McpConfigError {
@@ -198,10 +200,12 @@ pub struct ServerConfig {
     pub transport: Transport,
 }
 
-/// Static OAuth client used when the server has no registration endpoint.
+/// OAuth client settings. Without `client_id`, a client is registered
+/// dynamically with the redirect URI built from the callback settings.
 #[derive(Deserialize, Clone, Debug)]
 pub struct OauthClientConfig {
-    pub client_id: String,
+    #[serde(default)]
+    pub client_id: Option<String>,
     #[serde(default)]
     pub client_secret: Option<String>,
     /// Fixed loopback port so the redirect URI can be pre-registered.
@@ -213,6 +217,18 @@ pub struct OauthClientConfig {
     /// Loopback hostname of the redirect URI (defaults to `127.0.0.1`).
     #[serde(default)]
     pub callback_hostname: Option<String>,
+    /// `https` is for providers that only accept https redirect URIs. Maki runs
+    /// no TLS listener, so the user pastes the redirect URL from the browser.
+    #[serde(default)]
+    pub callback_scheme: CallbackScheme,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CallbackScheme {
+    #[default]
+    Http,
+    Https,
 }
 
 #[derive(Clone, Debug)]
@@ -343,6 +359,22 @@ pub fn parse_server(
             {
                 return Err(McpError::Config(format!(
                     "server '{name}' oauth.callback_path must start with '/'"
+                )));
+            }
+            if let Some(oauth) = &cfg.oauth
+                && oauth.client_secret.is_some()
+                && oauth.client_id.is_none()
+            {
+                return Err(McpError::Config(format!(
+                    "server '{name}' {SECRET_NEEDS_CLIENT_ID}"
+                )));
+            }
+            if let Some(oauth) = &cfg.oauth
+                && oauth.callback_scheme == CallbackScheme::Https
+                && oauth.callback_port.is_none()
+            {
+                return Err(McpError::Config(format!(
+                    "server '{name}' {HTTPS_CALLBACK_NEEDS_PORT}"
                 )));
             }
             Transport::Http {
@@ -693,7 +725,7 @@ oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3
             Transport::Http { url, oauth, .. } => {
                 assert_eq!(url, "https://mcp.acme.example.com/mcp");
                 let oauth = oauth.unwrap();
-                assert_eq!(oauth.client_id, "acme-client");
+                assert_eq!(oauth.client_id.as_deref(), Some("acme-client"));
                 assert_eq!(oauth.client_secret.as_deref(), Some("s3cret"));
                 assert_eq!(oauth.callback_port, Some(3118));
                 assert_eq!(oauth.callback_path.as_deref(), Some("/callback"));
@@ -728,6 +760,42 @@ oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3
         .unwrap();
         let err = parse("acme", config.mcp["acme"].clone()).unwrap_err();
         assert!(err.to_string().contains("callback_path"));
+    }
+
+    #[test_case("callback_port = 3119, callback_scheme = \"https\"", CallbackScheme::Https ; "https")]
+    #[test_case("callback_port = 3119", CallbackScheme::Http ; "defaults_to_http")]
+    fn oauth_callback_scheme_parses(fields: &str, expected: CallbackScheme) {
+        let config: McpConfig = toml::from_str(&format!(
+            "[mcp.acme]\nurl = \"https://mcp.acme.example.com/mcp\"\noauth = {{ client_id = \"acme-client\", {fields} }}\n"
+        ))
+        .unwrap();
+        match parse("acme", config.mcp["acme"].clone()).unwrap().transport {
+            Transport::Http { oauth, .. } => assert_eq!(oauth.unwrap().callback_scheme, expected),
+            _ => panic!("expected Http"),
+        }
+    }
+
+    #[test_case("client_id = \"acme-client\", callback_scheme = \"https\"", HTTPS_CALLBACK_NEEDS_PORT ; "https_without_port")]
+    #[test_case("client_secret = \"s3cret\"",                                  SECRET_NEEDS_CLIENT_ID    ; "secret_without_client_id")]
+    fn oauth_invalid_rejected(fields: &str, expected: &str) {
+        let config: McpConfig = toml::from_str(&format!(
+            "[mcp.acme]\nurl = \"https://mcp.acme.example.com/mcp\"\noauth = {{ {fields} }}\n"
+        ))
+        .unwrap();
+        let err = parse("acme", config.mcp["acme"].clone()).unwrap_err();
+        assert!(err.to_string().contains(expected));
+    }
+
+    #[test]
+    fn oauth_without_client_id_parses() {
+        let config: McpConfig = toml::from_str(
+            "[mcp.acme]\nurl = \"https://mcp.acme.example.com/mcp\"\noauth = { callback_scheme = \"https\", callback_port = 3119, callback_path = \"/callback\", callback_hostname = \"localhost\" }\n",
+        )
+        .unwrap();
+        match parse("acme", config.mcp["acme"].clone()).unwrap().transport {
+            Transport::Http { oauth, .. } => assert_eq!(oauth.unwrap().client_id, None),
+            _ => panic!("expected Http"),
+        }
     }
 
     #[test_case("certs/ca.pem",                         "/etc/maki/certs/ca.pem" ; "relative_to_config_dir")]
