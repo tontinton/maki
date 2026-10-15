@@ -116,7 +116,9 @@ maki.provider.register({
   },
   openai = {
     thinking = { dialect = "high-only" },
-    session_id = { header = "x-affinity" },
+    -- Mistral caches on the `prompt_cache_key` body field and routes a
+    -- session to one backend by the `x-affinity` header; send both.
+    session_id = { header = "x-affinity", body_field = "prompt_cache_key" },
     -- Mistral's small models refuse reasoning whatever the model table says.
     thinking_overrides = { ["ministral-"] = "no" },
   },

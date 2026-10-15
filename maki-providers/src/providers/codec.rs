@@ -105,18 +105,19 @@ pub struct ThinkingWire {
 pub struct EffortField(Box<[String]>);
 
 /// Where the session id rides, for a provider that routes a session to the
-/// same backend by it. Absent, the id is not sent at all.
-#[derive(Clone, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionCarrier {
-    Header(
-        #[serde(
-            serialize_with = "serialize_header_name",
-            deserialize_with = "deserialize_header_name"
-        )]
-        HeaderName,
-    ),
-    BodyField(String),
+/// same backend by it: a header, a body field, or both. Absent, the id is
+/// not sent at all.
+#[derive(Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionCarrier {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_session_header",
+        deserialize_with = "deserialize_session_header"
+    )]
+    pub header: Option<HeaderName>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_field: Option<String>,
 }
 
 /// One request, as every pass after the codec's own body sees it. Built once
@@ -158,7 +159,9 @@ impl OpenAiWire {
                 .thinking
                 .apply_thinking(body, ctx.model, ThinkingFallback::None),
         }
-        if let (Some(SessionCarrier::BodyField(field)), Some(session)) = (session_id, ctx.session)
+        if let Some(carrier) = session_id
+            && let Some(field) = &carrier.body_field
+            && let Some(session) = ctx.session
             && let Some(object) = body.as_object_mut()
         {
             object.insert(field.clone(), json!(session.as_str()));
@@ -181,9 +184,10 @@ impl OpenAiWire {
             thinking_overrides: _,
         } = self;
         let session = match (session_id, session) {
-            (Some(SessionCarrier::Header(name)), Some(session)) => {
-                Some((name.as_str(), session.as_str()))
-            }
+            (Some(carrier), Some(session)) => carrier
+                .header
+                .as_ref()
+                .map(|name| (name.as_str(), session.as_str())),
             _ => None,
         };
         headers
@@ -333,17 +337,22 @@ fn deserialize_headers<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Hea
     declared_headers(BTreeMap::deserialize(deserializer)?).map_err(D::Error::custom)
 }
 
-fn serialize_header_name<S: Serializer>(
-    name: &HeaderName,
+fn serialize_session_header<S: Serializer>(
+    name: &Option<HeaderName>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(name.as_str())
+    match name {
+        Some(name) => serializer.serialize_str(name.as_str()),
+        None => serializer.serialize_none(),
+    }
 }
 
-fn deserialize_header_name<'de, D: Deserializer<'de>>(
+fn deserialize_session_header<'de, D: Deserializer<'de>>(
     deserializer: D,
-) -> Result<HeaderName, D::Error> {
-    declared_header_name(&String::deserialize(deserializer)?).map_err(D::Error::custom)
+) -> Result<Option<HeaderName>, D::Error> {
+    Option::<String>::deserialize(deserializer)?
+        .map(|name| declared_header_name(&name).map_err(D::Error::custom))
+        .transpose()
 }
 
 /// Everything a provider declaration tells the codec about its wire: what an
@@ -750,6 +759,33 @@ mod tests {
                 "cache_control": { "type": "ephemeral" },
                 SESSION_FIELD: session.as_str(),
             })
+        );
+    }
+
+    /// A provider whose cache keys off a body field while it routes by a
+    /// header (Mistral speaks both) declares the two together, and both
+    /// leave with the turn.
+    #[test]
+    fn the_session_id_can_ride_a_header_and_a_body_field() {
+        const CACHE_KEY_FIELD: &str = "prompt_cache_key";
+        let wire = wire(json!({
+            "session_id": { "header": AFFINITY_HEADER, "body_field": CACHE_KEY_FIELD },
+        }))
+        .unwrap();
+        let model = curated_model();
+        let session = SessionRef::generate();
+        let ctx = RequestCtx {
+            session: Some(&session),
+            ..ctx(&model, ThinkingConfig::default())
+        };
+        let mut body = json!({});
+
+        wire.apply_body(&mut body, &ctx);
+
+        assert_eq!(body[CACHE_KEY_FIELD], session.as_str());
+        assert_eq!(
+            wire.request_headers(Some(&session)),
+            [(AFFINITY_HEADER, session.as_str())]
         );
     }
 

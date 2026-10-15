@@ -717,7 +717,8 @@ fn is_selected(_lua: &Lua, #[ctx] plugin: Arc<str>, slug: String) -> LuaResult<b
 ///             `connection` are refused.
 ///     `extra_body` (table) Merged into every request body.
 ///     `session_id` (table) Sends the session id, as
-///             `{ header = "x-affinity" }` or `{ body_field = "session_id" }`.
+///             `{ header = "x-affinity" }`, `{ body_field = "prompt_cache_key" }`,
+///             or both at once.
 ///     `thinking_overrides` (table) Model id prefix to `"no"`, `"yes"` or
 ///             `"required"`, overriding the model table. Longest prefix wins.
 ///   `models` (table) Static model rows, read once at registration. They
