@@ -719,14 +719,17 @@ impl Model {
             .map(|n| (n / 2).max(MIN_THINKING_BUDGET))
     }
 
-    /// Every thinking value this model accepts, cheapest first, with the budget
-    /// each effort level resolves to here. Empty exactly when the model has no
-    /// thinking support, so an empty list is the one check a caller needs
-    /// before offering the ladder.
+    /// Named thinking choices, cheapest first. Explicit wire-level names take
+    /// precedence over the generic budget ladder and carry no invented token
+    /// counts. Empty exactly when the model has no thinking support.
     pub fn thinking_options(&self) -> Vec<ThinkingOption> {
         if !self.supports_thinking() {
             return Vec::new();
         }
+        let declared = self
+            .thinking_fields
+            .as_ref()
+            .filter(|fields| !fields.levels.is_empty());
         let max = self
             .max_thinking_budget()
             .unwrap_or(FALLBACK_MAX_THINKING_BUDGET);
@@ -735,10 +738,15 @@ impl Model {
             .into_iter()
             .chain([THINKING_ADAPTIVE])
             .map(|name| ThinkingOption { name, tokens: None })
-            .chain(Effort::ALL.map(|level| ThinkingOption {
-                name: level.as_str(),
-                tokens: Some(level.budget(max)),
-            }))
+            .chain(
+                Effort::ALL
+                    .into_iter()
+                    .filter(|level| declared.is_none_or(|fields| fields.levels.contains_key(level)))
+                    .map(|level| ThinkingOption {
+                        name: level.as_str(),
+                        tokens: declared.is_none().then(|| level.budget(max)),
+                    }),
+            )
             .collect()
     }
 
@@ -1134,6 +1142,8 @@ mod tests {
     use crate::test_support::register_bundled;
     use serde_json::json;
     use test_case::test_case;
+
+    const NATIVE_LADDER: [&str; 5] = ["off", "adaptive", "low", "medium", "xhigh"];
 
     fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
         ModelPolicy::new(
@@ -1936,6 +1946,37 @@ mod tests {
         let options = ladder_model(support, Some(ROOMY_OUTPUT)).thinking_options();
         let names: Vec<&str> = options.iter().map(|option| option.name).collect();
         assert_eq!(names, expected);
+    }
+
+    #[test_case(ThinkingSupport::No, &[] ; "no_support_no_rows")]
+    #[test_case(ThinkingSupport::Yes, &NATIVE_LADDER ; "declared_names_only")]
+    #[test_case(ThinkingSupport::Required, &NATIVE_LADDER[1..] ; "required_thinking_drops_off")]
+    fn thinking_options_use_declared_levels(support: ThinkingSupport, expected: &[&str]) {
+        let mut model = ladder_model(support, Some(ROOMY_OUTPUT));
+        model.thinking_fields = Some(Box::new(
+            serde_json::from_value(json!({
+                "off": {"reasoning_effort": "none"},
+                "adaptive": {"reasoning_effort": "medium"},
+                "low": {"reasoning_effort": "low"},
+                "medium": {"reasoning_effort": "medium"},
+                "xhigh": {"reasoning_effort": "xhigh"},
+            }))
+            .unwrap(),
+        ));
+
+        let options = model.thinking_options();
+        let names: Vec<&str> = options.iter().map(|option| option.name).collect();
+        assert_eq!(names, expected);
+        assert!(options.iter().all(|option| option.tokens.is_none()));
+    }
+
+    #[test_case(json!({}) ; "empty_fields")]
+    #[test_case(json!({"off": {"enable_thinking": false}, "adaptive": {"enable_thinking": true}}) ; "toggle_without_named_levels")]
+    fn thinking_options_without_declared_levels_keep_budget_fallback(fields: Value) {
+        let mut model = ladder_model(ThinkingSupport::Yes, Some(ROOMY_OUTPUT));
+        let expected = model.thinking_options();
+        model.thinking_fields = Some(Box::new(serde_json::from_value(fields).unwrap()));
+        assert_eq!(model.thinking_options(), expected);
     }
 
     /// The numbers are [`Effort::budget`]'s, so what this pins is which ceiling

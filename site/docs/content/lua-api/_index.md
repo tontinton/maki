@@ -3791,11 +3791,11 @@ Reads the focused session's model, thinking level, and fast mode.
 `thinking` comes back in the spelling `set` accepts, so a table from here
 can go straight back in.
 
-`thinking_options` is every thinking value this model accepts, cheapest
-first: `{name, tokens?}` per row, where `tokens` is the budget maki would
-send for that row and is absent on `off` and `adaptive`. It is empty exactly
-when `supports_thinking` is false, so a picker can render the ladder from it
-without knowing the levels.
+`thinking_options` lists named thinking choices, cheapest first, as
+`{name, tokens?}` per row. Models with named `thinking_fields` expose those
+levels without token counts. Otherwise the generic budget ladder applies.
+`tokens` is absent on `off` and `adaptive` too. The list is empty exactly
+when `supports_thinking` is false.
 
 **Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, thinking,
   thinking_options, fast, supports_thinking, supports_fast}`, or nil and an
