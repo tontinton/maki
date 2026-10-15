@@ -318,9 +318,8 @@ pub fn generation() -> u64 {
 }
 
 pub fn load_by_name(name: &str) -> Result<Theme, String> {
-    if let Some(path) = user_themes_dirs()
-        .map(|dir| dir.join(format!("{name}.toml")))
-        .find(|path| path.is_file())
+    if let Some(path) = user_themes_dir().map(|dir| dir.join(format!("{name}.toml")))
+        && path.is_file()
         && let Ok(toml) = std::fs::read_to_string(&path)
     {
         return Theme::from_toml(&toml).map_err(|e| format!("{}: {e}", path.display()));
@@ -332,14 +331,15 @@ pub fn load_by_name(name: &str) -> Result<Theme, String> {
         .unwrap_or_else(|| Err(format!("unknown theme: {name}")))
 }
 
-fn user_themes_dirs() -> impl Iterator<Item = PathBuf> {
-    maki_storage::paths::config_search_dirs()
-        .into_iter()
+fn user_themes_dir() -> Option<PathBuf> {
+    maki_storage::paths::config_dir()
+        .ok()
         .map(|dir| dir.join(THEMES_DIR))
 }
 
 pub fn all_theme_names() -> Vec<String> {
-    let user_names = user_themes_dirs()
+    let user_names = user_themes_dir()
+        .into_iter()
         .filter_map(|dir| std::fs::read_dir(dir).ok())
         .flatten()
         .flatten()
