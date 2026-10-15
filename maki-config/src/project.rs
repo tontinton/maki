@@ -102,9 +102,9 @@ impl ProjectConfig {
     }
 
     /// The walk stops below `home`, and a start in `home` itself is the same
-    /// rule seen from the other side: `PROJECT_DIR` there is the user's own
-    /// global config, not something a repository shipped, so there is no
-    /// project to load and nothing to ask about.
+    /// rule seen from the other side: the home directory is the user's own
+    /// space, not a repository that shipped anything, so there is no project
+    /// to load and nothing to ask about.
     pub(crate) fn rooted(cwd: &Path, home: Option<&Path>) -> Self {
         let cwd = canonicalize_clean(cwd);
         let at_home = home == Some(cwd.as_path());
@@ -356,9 +356,9 @@ fn resolve_recorded(storage: &StateDir, project_config: ProjectConfig) -> Projec
     // Every config that leaves here carries the store its answer came from,
     // trusted or not, so a later write can find the same answer again.
     let project_config = project_config.with_trust_store(storage);
-    // Maki loads the home directory's own `.maki` as global config already, so
-    // a start there has nothing a project shipped. Asking would be a question
-    // about the user's own files, and a yes would load that config twice.
+    // The home directory is nobody's project, so a start there has nothing a
+    // repository shipped. Asking would be a question about the user's own
+    // files.
     if project_config.at_home {
         return ProjectDecision::new(project_config, TrustState::Inert, None);
     }

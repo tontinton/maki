@@ -415,7 +415,7 @@ Maki follows platform directory conventions. On Linux and macOS that is XDG. On 
 
 Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, folder trust, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\maki` on Windows; that is separate from these runtime dirs.
 
-`~/.maki/` (or `%USERPROFILE%\\.maki\\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
+`~/.maki/` (or `%USERPROFILE%\\.maki\\`) is the layout older versions used. Maki does not read it anymore.
 
 ### Migrating from ~/.maki/
 
@@ -423,7 +423,7 @@ Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `
 maki migrate xdg
 ```
 
-This safely moves sessions, auth, plans, memories, logs, and preferences to the platform locations above. Where both old and new files exist, they are merged (input history, model tiers, etc.). Nothing is deleted until it has been copied. At the end you get a summary of where everything lives now.
+Run this once if you used an older version. It moves state, preferences and config into the locations above: sessions, auth, plans, memories and logs, plus `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, `.env`, `AGENTS.md`, `commands/`, `themes/` and `providers/`. Where both old and new files exist they are merged (input history, model tiers, etc.). Nothing is deleted until it has been copied, and at the end it prints where everything lives now.
 
 Safe to run more than once.
 

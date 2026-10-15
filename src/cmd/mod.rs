@@ -35,6 +35,18 @@ fn report_warnings(warnings: Vec<String>) {
     }
 }
 
+/// The app no longer reads `~/.maki`, so a user who never migrated would
+/// silently see an empty install. Point them at the command that moves it.
+fn warn_legacy_layout() {
+    if let Some(legacy) = maki_storage::paths::legacy_data_dir() {
+        eprintln!(
+            "warning: found legacy maki data in {}, which maki no longer uses.\n\
+             \x20        Run `maki migrate xdg` to move it to the XDG directories.",
+            maki_storage::paths::tilde(&legacy)
+        );
+    }
+}
+
 /// What a builtin that fails to load means for the run in progress.
 #[derive(Clone, Copy)]
 enum BuiltinFailure {
@@ -198,6 +210,9 @@ fn cli_stack(
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {
+    if !matches!(cli.command, Some(Command::Migrate { .. })) {
+        warn_legacy_layout();
+    }
     // `--trust` is a grant for this process, so every entry point under it
     // reads the same shared project config the TUI would.
     let trust_mode = if cli.trust {

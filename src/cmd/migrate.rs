@@ -310,46 +310,69 @@ fn clipboard_command() -> &'static str {
     }
 }
 
+/// A plain config file has nothing to merge, so the new copy wins and the old
+/// one is left alone rather than clobbered.
+fn move_if_absent(src: &Path, dst: &Path) -> Result<()> {
+    if !src.exists() || dst.exists() {
+        return Ok(());
+    }
+    move_file(src, dst)?;
+    let name = src.file_name().unwrap_or_default().to_string_lossy();
+    log_move(&name, dst.parent().unwrap_or(dst), None);
+    Ok(())
+}
+
 pub fn xdg() -> Result<()> {
     let Some(legacy) = paths::legacy_home_dir() else {
         println!("Nothing to migrate. You are already using XDG directories.");
         return Ok(());
     };
 
-    let xdg = paths::xdg_paths().context("determine XDG directories")?;
-
-    for dir in [&xdg.state, &xdg.config, &xdg.logs] {
-        fs::create_dir_all(dir).with_context(|| format!("create {}", tilde(dir)))?;
-    }
+    let config = paths::config_dir().context("determine config directory")?;
+    let state = paths::state_dir().context("determine state directory")?;
+    let logs = paths::logs_dir().context("determine log directory")?;
 
     println!("Moving files from ~/.maki/ ...\n");
 
-    move_auth(&legacy.join("auth"), &xdg.state.join("auth"))?;
+    move_auth(&legacy.join("auth"), &state.join("auth"))?;
 
-    merge_dir(&legacy, &xdg.state, "sessions", false)?;
-    merge_dir(&legacy, &xdg.state, "plans", false)?;
-    merge_dir(&legacy, &xdg.state, "projects", true)?;
-    merge_dir(&legacy, &xdg.config, "providers", false)?;
+    merge_dir(&legacy, &state, "sessions", false)?;
+    merge_dir(&legacy, &state, "plans", false)?;
+    merge_dir(&legacy, &state, "projects", true)?;
+    merge_dir(&legacy, &config, "providers", false)?;
+
+    for name in [
+        "init.lua",
+        "permissions.toml",
+        "mcp.toml",
+        "providers.toml",
+        ".env",
+        "AGENTS.md",
+    ] {
+        move_if_absent(&legacy.join(name), &config.join(name))?;
+    }
+    merge_dir(&legacy, &config, "commands", false)?;
+    merge_dir(&legacy, &config, "themes", false)?;
 
     merge_json_file(
         &legacy.join("cwd_latest.json"),
-        &xdg.state.join("cwd_latest.json"),
+        &state.join("cwd_latest.json"),
         "cwd_latest.json",
     )?;
     merge_input_history(
         &legacy.join("input_history.json"),
-        &xdg.state.join("input_history.json"),
+        &state.join("input_history.json"),
     )?;
     merge_json_file(
         &legacy.join("model-tiers"),
-        &xdg.state.join("model-tiers"),
+        &state.join("model-tiers"),
         "model-tiers",
     )?;
 
     for name in ["theme", "model"] {
         let src = legacy.join(name);
         if src.exists() {
-            let dst = xdg.state.join(name);
+            let dst = state.join(name);
             if dst.exists() {
                 fs::remove_file(&dst)
                     .with_context(|| format!("remove existing {}", tilde(&dst)))?;
@@ -359,7 +382,7 @@ pub fn xdg() -> Result<()> {
         }
     }
 
-    move_logs(&legacy, &xdg.logs)?;
+    move_logs(&legacy, &logs)?;
 
     let lock_file = legacy.join("maki.log.lock");
     if lock_file.exists() {
@@ -389,15 +412,16 @@ pub fn xdg() -> Result<()> {
     println!(
         "\nAll done! Your files now live here:\n\n\
          \x20 Config   {}\n\
-         \x20          init.lua, permissions.toml, mcp.toml, providers/\n\n\
+         \x20          init.lua, permissions.toml, mcp.toml, providers.toml,\n\
+         \x20          .env, AGENTS.md, commands/, themes/, providers/\n\n\
          \x20 State    {}\n\
          \x20          sessions, auth, plans, memories, input history, preferences\n\n\
          \x20 Logs     {}\n\n\
          Per-project settings (.maki/ in your repos) are not affected.\n\n\
          Removed ~/.maki/.",
-        tilde(&xdg.config),
-        tilde(&xdg.state),
-        tilde(&xdg.logs),
+        tilde(&config),
+        tilde(&state),
+        tilde(&logs),
     );
 
     if has_leftovers {

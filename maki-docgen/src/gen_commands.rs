@@ -219,11 +219,7 @@ pub fn generate() -> String {
     )
     .unwrap();
     writeln!(out).unwrap();
-    writeln!(
-        out,
-        "1. User config: `~/.config/maki/commands/` (and legacy `~/.maki/commands/` if present)"
-    )
-    .unwrap();
+    writeln!(out, "1. User config: `~/.config/maki/commands/`").unwrap();
     writeln!(out, "2. User third-party: `~/.claude/commands/`").unwrap();
     writeln!(
         out,
