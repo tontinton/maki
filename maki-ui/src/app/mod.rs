@@ -556,6 +556,7 @@ impl App {
         // started with, so a tab that resumes or spawns blank runs on
         // `--yolo` until its own meta is read back here.
         app.apply_stored_permissions(&app.state.session.meta);
+        app.request_git_status();
         app
     }
 
@@ -1647,6 +1648,7 @@ impl App {
         };
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {
+            self.request_git_status();
             if self.state.mode == Mode::Plan
                 && self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
             {
@@ -2121,6 +2123,7 @@ impl App {
                         .set_cwd(canonical.to_string_lossy().into_owned());
                 }
                 self.status_bar.refresh_cwd();
+                self.request_git_status();
                 self.flash(format!("cd {}", path.display()))
             }
             Err(e) => self.flash(format!("cd: {e}")),
@@ -2231,7 +2234,7 @@ impl App {
             | self.poll_image_paste()
             | self.poll_primary_paste()
             | self.btw_modal.poll()
-            | self.status_bar.poll_branch_update()
+            | self.poll_status_git()
             | self.status_bar.clear_expired_hint()
             | self.mcp_picker.refresh()
             | self.model_picker.refresh()
@@ -2241,6 +2244,35 @@ impl App {
             | self.tick_file_picker()
             | self.tick_input_changed()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
+    }
+
+    /// The git segment's pollers: the branch watcher, and the answer to a
+    /// `ui.status_git` request. A real branch switch stalemates whatever a
+    /// plugin answered, so it asks the chain again.
+    fn poll_status_git(&mut self) -> Dirty {
+        let branch = self.status_bar.poll_branch_update();
+        if branch == Dirty::YES {
+            self.request_git_status();
+        }
+        branch | self.status_bar.poll_git_update()
+    }
+
+    /// Asks the `ui.status_git` chain for the bar's git segment, but only
+    /// when a plugin has layered it and no answer is already in flight: a
+    /// stock install never leaves its thread for a chain nobody joined.
+    fn request_git_status(&mut self) {
+        if !self.lua_event_handle.status_git_layered() || self.status_bar.git_pending() {
+            return;
+        }
+        let cwd = env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".into());
+        let rx = self.lua_event_handle.refresh_status_git(
+            cwd,
+            self.status_bar.branch().map(str::to_owned),
+            self.status_bar.builtin_label().to_owned(),
+        );
+        self.status_bar.request_git(rx);
     }
 
     /// Both halves of the plan surface the Lua host answers asynchronously:

@@ -33,6 +33,11 @@ pub(crate) const PLAN_FORM_SLOT: &str = "ui.plan_form";
 /// Fired just before the plan form opens. The default answers with the
 /// built-in rows.
 pub(crate) const PLAN_FORM_ACTIONS_SLOT: &str = "ui.plan_form.actions";
+/// Fired when the status bar's git segment is built or goes stale. The
+/// default answers with the built-in `cwd:branch` label, so a layer answers
+/// with the string to show. The event carries inert strings, so layering
+/// costs nothing.
+pub(crate) const STATUS_GIT_SLOT: &str = "ui.status_git";
 
 const SEAM: &str = "slot";
 
@@ -620,6 +625,13 @@ fn parse_slot_capability(
 /// `ev = { path, session }`. `ui.plan_form.actions` asks for the form's
 /// menu, and `ui.plan_form` asks whether the form opens at all. Both are
 /// documented under [maki.plan](/docs/lua-api/#maki-plan).
+///
+/// Maki fires `ui.status_git` when the status bar's git segment is built
+/// or goes stale, with `ev = { cwd, branch, label }`: the raw working
+/// directory, the branch (`nil` when there is none), and the label the
+/// host would draw without a layer. A layer answers with the string to
+/// show, e.g. `prev(ev) .. " ±3"`. The event is inert strings, so
+/// layering it costs nothing.
 ///
 /// Maki fires two slots per tool itself: `tool.<name>.input` before
 /// permissions look at the call, and `tool.<name>.output` on the text it

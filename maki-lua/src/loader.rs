@@ -14,7 +14,7 @@ use maki_providers::plugin::DeclAuthority;
 
 use crate::api::keymap::{KeybindTicket, KeymapReader};
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
-use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
+use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT, STATUS_GIT_SLOT};
 use crate::api::util::command::{
     HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
 };
@@ -1063,6 +1063,32 @@ impl EventHandle {
     pub fn plan_form_layered(&self) -> bool {
         self.layered.layers_surface(PLAN_FORM_SLOT)
             || self.layered.layers_surface(PLAN_FORM_ACTIONS_SLOT)
+    }
+
+    /// Whether a plugin is layering `ui.status_git`. False on a stock install,
+    /// where the bar draws its own `cwd:branch` label without asking anyone.
+    pub fn status_git_layered(&self) -> bool {
+        self.layered.layers_surface(STATUS_GIT_SLOT)
+    }
+
+    /// Asks the `ui.status_git` chain for the string the status bar draws in
+    /// its git segment, given the raw {cwd}, the {branch} it sits on, and the
+    /// built-in {label}. The receiver is polled, not awaited: `None` keeps the
+    /// built-in, and a chain that never answers leaves the bar as it was.
+    pub fn refresh_status_git(
+        &self,
+        cwd: String,
+        branch: Option<String>,
+        label: String,
+    ) -> flume::Receiver<Option<String>> {
+        let (reply, rx) = flume::bounded(1);
+        let _ = self.tx.try_send(Request::StatusGit {
+            cwd,
+            branch,
+            label,
+            reply,
+        });
+        rx
     }
 
     /// Runs the handler behind a plugin row of {session}'s plan form, named
