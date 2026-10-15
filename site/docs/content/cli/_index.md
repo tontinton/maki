@@ -168,11 +168,8 @@ Debug helper for inspecting the prompt and tool surface the agent sees. `--plan`
 ### `maki migrate`
 
 ```bash
-maki migrate xdg
 maki migrate providers
 ```
-
-`xdg` moves data from `~/.maki/` into platform directories. Safe to re-run. See [Configuration](/docs/configuration/#directory-layout).
 
 `providers` lists the old provider scripts that no Lua plugin replaces yet, and prints a prompt that asks a coding agent to port them. The prompt goes to stdout, so `maki "$(maki migrate providers)"` starts maki on it. See [Migrating from provider scripts](/docs/providers/#migrating-from-provider-scripts).
 
