@@ -1723,12 +1723,14 @@ mod tests {
     use maki_agent::prompt::{PromptId, ResolvedPrompts};
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::{DoneReason, TurnCompleteEvent};
+    use maki_providers::model::ThinkingSupport;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         AgentError, ContentBlock, Message, ModelInfo, ProviderEvent, Role, StopReason,
         StreamResponse, TokenUsage,
     };
     use maki_storage::id::SessionRef;
+    use maki_storage::sessions::Effort;
     use mlua::AnyUserData;
     use serde_json::json;
     use test_case::test_case;
@@ -1741,6 +1743,41 @@ mod tests {
     const PARTIAL_TEXT: &str = "partial response";
     const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
     const CLOSE_SESSION: &str = "function(sess) sess:close() end";
+    const THINKING_BUDGET: u32 = 2048;
+
+    #[test_case(ThinkingConfig::Effort(Effort::Low), json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Low) ; "toggle_keeps_ancestor_effort_ceiling")]
+    #[test_case(ThinkingConfig::Adaptive, json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Max) ; "explicit_adaptive_stays_unbounded")]
+    #[test_case(ThinkingConfig::Budget(THINKING_BUDGET), json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Budget(THINKING_BUDGET), ThinkingConfig::Budget(THINKING_BUDGET) ; "toggle_keeps_ancestor_numeric_ceiling")]
+    #[test_case(ThinkingConfig::Effort(Effort::Low), json!({"max": {"reasoning_effort": "xhigh"}}), ThinkingConfig::Effort(Effort::Max), ThinkingConfig::Effort(Effort::Low) ; "snapping_up_does_not_raise_ancestor_ceiling")]
+    #[test_case(ThinkingConfig::Effort(Effort::High), json!({"low": {"reasoning_effort": "low"}}), ThinkingConfig::Effort(Effort::Low), ThinkingConfig::Effort(Effort::High) ; "snapping_down_keeps_ancestor_intent")]
+    fn native_thinking_display_preserves_nested_delegation_ceiling(
+        parent: ThinkingConfig,
+        fields: JsonValue,
+        shown: ThinkingConfig,
+        expected_grandchild: ThinkingConfig,
+    ) {
+        let mut model = Model::from_spec("llama-cpp/default").unwrap();
+        model.thinking_override = Some(ThinkingSupport::Yes);
+        let mut intermediate = model.clone();
+        intermediate.thinking_fields = Some(Box::new(serde_json::from_value(fields).unwrap()));
+        let root = RequestOptions {
+            thinking: parent,
+            fast: false,
+        };
+
+        for requested in [None, Some(ThinkingConfig::Adaptive)] {
+            let child = session_opts(requested, None, root, &intermediate);
+            assert_eq!(child.thinking, parent);
+            assert_eq!(child.thinking.shown(&intermediate), shown);
+            let grandchild = session_opts(
+                Some(ThinkingConfig::Effort(Effort::Max)),
+                None,
+                child,
+                &model,
+            );
+            assert_eq!(grandchild.thinking, expected_grandchild);
+        }
+    }
 
     struct PendingProvider(flume::Sender<()>);
 

@@ -100,9 +100,9 @@ local function row_name(row)
 end
 
 -- {model} is a `maki.model.get()` table. The cursor opens on the row named by
--- the value the session shows, which is the level `adaptive` is sent as on a
--- model that does not list it. A value no row names is a raw token budget, so
--- the custom row takes it, pre-filled.
+-- the effective mode the session shows, while the stored intent remains held.
+-- A value no row names is a raw token budget, so the custom row takes it,
+-- pre-filled.
 function M.new(model)
   local rows = build_rows(model.thinking_options)
   local state = { rows = rows, custom = "", editing = false, max_tokens = 0, held = model.thinking }
@@ -124,8 +124,8 @@ function M.new(model)
 end
 
 -- Until the cursor moves, the row the picker opened on sends what the session
--- holds. That row may be the level a hidden `adaptive` is sent as, and storing
--- the level would cap subagents where `adaptive` does not.
+-- holds. Replacing intent with a snapped level or toggle would change the
+-- delegation ceiling even though the user did not choose a different mode.
 function M.value(state)
   if state.cursor == state.opened then
     return state.held

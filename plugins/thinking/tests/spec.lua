@@ -12,6 +12,7 @@ local MEDIUM = "medium"
 local ADAPTIVE = "adaptive"
 local HIGH = "high"
 local RAW_BUDGET = "8192"
+local TOKENS_LABEL = " tokens"
 local REJECTED = "Usage: /thinking [off|adaptive|minimal|low|medium|high|xhigh|max|<budget>]"
 local UNSUPPORTED = "Thinking requires a model that supports it"
 local CUSTOM_ROW_NAME = "custom…"
@@ -37,6 +38,14 @@ local CLAMPED_LADDER = {
   { name = "low", tokens = 1024 },
   { name = "max", tokens = 1024 },
 }
+local NATIVE_LADDER = {
+  { name = "off" },
+  { name = "adaptive" },
+  { name = "low" },
+  { name = "medium" },
+  { name = "xhigh" },
+}
+local TOGGLE_LADDER = { { name = "off" }, { name = "adaptive" } }
 
 -- What a model without an adaptive mode offers: the host's ladder minus that
 -- row.
@@ -129,6 +138,52 @@ case("confirming_the_opened_row_keeps_a_hidden_adaptive", function()
   local clicked = hidden()
   Picker.click(clicked, clicked.cursor)
   eq(Picker.value(clicked), ADAPTIVE, "a click on the opened row is not a move")
+end)
+
+case("native_levels_skip_unsupported_choices_and_do_not_claim_token_budgets", function()
+  local state = picker_on(MEDIUM, NATIVE_LADDER)
+  eq(press(state, { "<Down>", "<CR>" }), "xhigh")
+  eq(press(state, { "<Up>", "<Up>", "<CR>" }), "low")
+  local lines = Picker.render(state, WIDE)
+  local names = {}
+  for i, row in ipairs(state.rows) do
+    if row.option then
+      names[#names + 1] = row.option.name
+      eq(line_text(lines[i]):find(TOKENS_LABEL, 1, true), nil)
+    end
+  end
+  eq(table.concat(names, ","), "off,adaptive,low,medium,xhigh")
+  eq(#level_lines(state, lines), 0)
+end)
+
+case("toggle_only_models_offer_modes_without_token_counts", function()
+  local state = picker_on(ADAPTIVE, TOGGLE_LADDER)
+  eq(state.rows[state.cursor].option.name, ADAPTIVE)
+  eq(press(state, { "<Up>", "<CR>" }), "off")
+  eq(press(state, { "<Down>", "<CR>" }), ADAPTIVE)
+  local lines = Picker.render(state, WIDE)
+  for i, row in ipairs(state.rows) do
+    if row.option then
+      eq(line_text(lines[i]):find(TOKENS_LABEL, 1, true), nil)
+    end
+  end
+  eq(press(state, { "8", "1", "9", "2", "<CR>" }), RAW_BUDGET)
+end)
+
+case("snapped_effort_opens_the_effective_row_without_rewriting_intent", function()
+  local state = Picker.new(model_with(HIGH, NATIVE_LADDER, MEDIUM))
+  eq(state.rows[state.cursor].option.name, MEDIUM)
+  eq(press(state, { "<CR>" }), HIGH)
+  eq(state.custom, "")
+  eq(press(state, { "<Up>", "<Down>", "<CR>" }), MEDIUM)
+end)
+
+case("toggle_row_keeps_the_delegation_ceiling_until_the_user_changes_it", function()
+  local state = Picker.new(model_with(HIGH, TOGGLE_LADDER, ADAPTIVE))
+  eq(state.rows[state.cursor].option.name, ADAPTIVE)
+  eq(press(state, { "<CR>" }), HIGH)
+  eq(state.custom, "")
+  eq(press(state, { "<Up>", "<Down>", "<CR>" }), ADAPTIVE)
 end)
 
 -- The one fallback: a value no row names is a raw token budget.

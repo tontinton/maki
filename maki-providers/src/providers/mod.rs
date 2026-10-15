@@ -15,7 +15,9 @@ use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, lock_tokens, save_tokens};
 
 use crate::AgentError;
+use crate::model::Model;
 use crate::retry::RetryPolicy;
+use crate::spec::ProviderSpec;
 
 pub(crate) mod anthropic;
 pub(crate) mod aperture;
@@ -42,6 +44,17 @@ pub(crate) const UNAUTHORIZED_STATUS: u16 = 401;
 const BAD_REQUEST_STATUS: u16 = 400;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
+
+fn native_uses_thinking_fields(spec: &ProviderSpec, model: &Model) -> bool {
+    match spec.slug {
+        slug if [local::LLAMACPP.slug, local::OLLAMA.slug].contains(&slug) => {
+            local::uses_thinking_fields(slug)
+        }
+        openai::SLUG => openai::uses_thinking_fields(model),
+        aperture::SLUG => aperture::uses_thinking_fields(model),
+        _ => false,
+    }
+}
 
 fn bearer_value(api_key: &str) -> String {
     format!("{BEARER_PREFIX}{api_key}")

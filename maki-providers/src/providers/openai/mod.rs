@@ -3,6 +3,7 @@ mod platform;
 pub(crate) mod responses;
 
 pub use platform::OpenAi;
+pub(super) use platform::uses_thinking_fields;
 
 use std::sync::{Arc, Mutex};
 

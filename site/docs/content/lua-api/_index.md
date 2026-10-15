@@ -3874,16 +3874,19 @@ Reads the focused session's model, thinking level, and fast mode.
 `thinking` comes back in the spelling `set` accepts, so a table from here
 can go straight back in.
 
-`thinking_options` is every thinking value this model accepts, cheapest
-first: `{name, tokens?}` per row, where `tokens` is the budget maki would
-send for that row and is absent on `off` and `adaptive`. It is empty exactly
-when `supports_thinking` is false, so a picker can render the ladder from it
-without knowing the levels.
+`thinking_options` lists named thinking choices, cheapest first, as
+`{name, tokens?}` per row. Request paths that use named `thinking_fields`
+expose those levels without token counts. Toggle-only fields expose
+`adaptive` and, when allowed, `off`. Otherwise the generic budget ladder applies.
+`tokens` is absent on `off` and `adaptive` too. The list is empty exactly
+when `supports_thinking` is false.
 
-A model whose API has no adaptive mode leaves `adaptive` out of the ladder.
-A session set to `adaptive` keeps that in `thinking`, and `thinking_shown`
-names the level it is sent as, which is the row to highlight. Everywhere
-else the two are equal.
+`thinking` keeps the session's intent and delegation ceiling.
+`thinking_shown` names the effective row to highlight, including snapped
+effort levels and efforts sent as a toggle. On the generic ladder, a model
+whose API has no adaptive mode leaves `adaptive` out and shows its fixed level.
+Declared effort fields keep `adaptive` separate because their fragments can
+differ from the provider fallback.
 
 **Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, thinking,
   thinking_shown, thinking_options, fast, supports_thinking,

@@ -562,6 +562,11 @@ pub(super) fn adaptive_effort(model: &Model) -> Option<Effort> {
     }
 }
 
+pub(crate) fn uses_thinking_fields(model: &Model) -> bool {
+    let discovered = model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
+    plan_effort_dialect(&model.id, discovered.as_deref()).is_none()
+}
+
 impl Provider for OpenAi {
     fn stream_message<'a>(
         &'a self,
@@ -922,6 +927,26 @@ mod tests {
             supports_fast,
             account_id: Some(ACCOUNT_ID.into()),
         }
+    }
+
+    #[test_case("discovered-thinking-model" ; "opaque_id")]
+    #[test_case("gpt-6.1-unlisted" ; "gpt_id_not_in_static_fallback")]
+    fn discovered_responses_routes_ignore_native_fields(model_id: &str) {
+        let mut model = Model::from_spec(&format!("{}/{model_id}", CONFIG.slug)).unwrap();
+        model.thinking_fields = Some(Box::new(
+            serde_json::from_value(json!({"adaptive": {"enable_thinking": true}})).unwrap(),
+        ));
+        assert!(model.effective_thinking_fields().is_some());
+        model_registry::set_known_models(
+            &CONFIG.slug,
+            vec![ModelInfo {
+                id: model_id.into(),
+                provider_info: Some(Arc::new(plan_model_info(false))),
+                ..ModelInfo::default()
+            }],
+        );
+        assert!(model.effective_thinking_fields().is_none());
+        assert!(!model.thinking_options().is_empty());
     }
 
     #[test_case(true, Some(ACCOUNT_ID), None, false, FastSupport::Pending ; "oauth_waits_for_discovery")]
