@@ -11,7 +11,7 @@ use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
-use maki_providers::plugin::DeclAuthority;
+use maki_providers::plugin::{DeclAuthority, keep_granted};
 
 use crate::agent_autocmd::HostEvent;
 use crate::api::keymap::{KeybindTicket, KeymapReader};
@@ -25,7 +25,7 @@ use crate::error::PluginError;
 use crate::pack::{DiscoveredPackage, Interaction};
 use crate::plugin_permissions::{
     MANIFEST_FILE, PluginPermissions, Requested, check_plugin_compatibility,
-    load_plugin_permissions,
+    load_plugin_granted_providers, load_plugin_permissions,
 };
 use crate::runtime::{
     self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, Request,
@@ -676,6 +676,20 @@ impl PluginHost {
         )
     }
 
+    /// Runs a source with a provider grant, for tests and embedders that load
+    /// a plugin registering providers outside the package system.
+    pub fn load_source_with_grant(
+        &self,
+        name: &str,
+        source: &str,
+        permissions: PluginPermissions,
+        granted_providers: Vec<String>,
+    ) -> Result<(), PluginError> {
+        let mut context = LoadContext::plain(None, permissions);
+        context.granted_providers = Arc::from(granted_providers);
+        self.send_load(Arc::from(name), vec![LoadChunk::new(name, source)], context)
+    }
+
     pub fn load_plugin_file(&self, path: &Path) -> Result<(), PluginError> {
         let source = fs::read_to_string(path).map_err(|e| PluginError::Io {
             path: path.to_path_buf(),
@@ -684,14 +698,17 @@ impl PluginHost {
         let plugin_dir = path.parent().map(Path::to_path_buf);
         check_plugin_compatibility(USER_PLUGIN, plugin_dir.as_deref())?;
         let permissions = load_plugin_permissions(plugin_dir.as_deref());
+        let granted_providers = load_plugin_granted_providers(plugin_dir.as_deref());
         // Test-only path today. Once user plugin dirs exist: derive a real
         // plugin name, since the hardcoded "user" would collide across files,
         // pass the `plugins.<name>` opts through, and teach the
         // unknown-plugin guards about user plugin names.
+        let mut context = LoadContext::plain(plugin_dir, permissions);
+        context.granted_providers = Arc::from(granted_providers);
         self.send_load(
             Arc::from(USER_PLUGIN),
             vec![LoadChunk::new(path.display().to_string(), source)],
-            LoadContext::plain(plugin_dir, permissions),
+            context,
         )
     }
 
@@ -713,6 +730,7 @@ impl PluginHost {
         declared: crate::api::pack::Declared,
         package: &DiscoveredPackage,
         permissions: PluginPermissions,
+        granted_providers: Arc<[String]>,
         opts: PluginOpts,
     ) -> Result<(), PluginError> {
         check_plugin_compatibility(&package.name, Some(&package.dir))?;
@@ -724,6 +742,7 @@ impl PluginHost {
                 context: LoadContext {
                     plugin_dir: Some(package.dir.clone()),
                     permissions,
+                    granted_providers,
                     opts,
                     revision_guard: package.revision_guard.clone(),
                     package: true,
@@ -747,7 +766,7 @@ impl PluginHost {
         permissions: PluginPermissions,
         opts: PluginOpts,
     ) -> Result<(), PluginError> {
-        self.load_package_with_guard(name, dir, permissions, opts, None)
+        self.load_package_with_guard(name, dir, permissions, Arc::from(Vec::new()), opts, None)
     }
 
     fn load_package_with_guard(
@@ -755,6 +774,7 @@ impl PluginHost {
         name: &str,
         dir: &Path,
         permissions: PluginPermissions,
+        granted_providers: Arc<[String]>,
         opts: PluginOpts,
         revision_guard: Option<Arc<maki_pack::lock::Lock>>,
     ) -> Result<(), PluginError> {
@@ -801,6 +821,7 @@ impl PluginHost {
             LoadContext {
                 plugin_dir: Some(root),
                 permissions,
+                granted_providers,
                 opts,
                 revision_guard,
                 package: true,
@@ -900,7 +921,12 @@ impl PluginHost {
                     .cloned()
                     .map(Arc::new)
                     .unwrap_or_default();
-                let permissions = crate::pack::effective_permissions(pkg);
+                let (permissions, granted_providers) = crate::pack::effective_grant(pkg);
+                let granted_providers = Arc::from(granted_providers);
+                // Keep the granted slugs owned even if the load fails, so the
+                // catalog client cannot take over the slug and receive the
+                // key the user saved for it.
+                keep_granted(&pkg.name, &granted_providers);
                 loaded.push(&pkg.name);
                 let custom = declared
                     .iter()
@@ -914,13 +940,18 @@ impl PluginHost {
                             )
                     });
                 let result = match custom {
-                    Some(declaration) => {
-                        self.run_pack_loader(declaration.clone(), pkg, permissions, opts)
-                    }
+                    Some(declaration) => self.run_pack_loader(
+                        declaration.clone(),
+                        pkg,
+                        permissions,
+                        granted_providers,
+                        opts,
+                    ),
                     None => self.load_package_with_guard(
                         &pkg.name,
                         &pkg.dir,
                         permissions,
+                        granted_providers,
                         opts,
                         pkg.revision_guard.clone(),
                     ),

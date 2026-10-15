@@ -291,7 +291,7 @@ impl ProviderRegistry {
 /// knows about a slug: a catalog-backed builtin has a spec row and is still
 /// `Catalog` here.
 pub enum Owner {
-    /// A selected or registered declaration.
+    /// A registered declaration.
     Plugin,
     /// Carries the constructor rather than the spec, so "builtin" and
     /// "buildable" cannot come apart.
@@ -305,17 +305,27 @@ pub enum Owner {
 
 impl Owner {
     pub fn of(slug: &str) -> Self {
-        // Registration refuses a built-in slug, so a declaration never
-        // shadows a row below.
-        if plugin::owns_slug(slug) {
+        // A registered declaration wins over every row below it: a bundled
+        // provider plugin may keep a slug maki also ships (`[openrouter]` with
+        // a `protocol` line in `providers.toml` must not swap the plugin out
+        // for the bare custom client).
+        if plugin::is_registered(slug) {
             return Self::Plugin;
         }
+        // A slug granted to an enabled package stays owned even when its load
+        // fails, so the catalog client cannot take it over and receive the key
+        // saved for it. The grant only blocks the catalog client: registration
+        // refuses the rows above, so a grant on one of them is a leftover from
+        // a refused takeover that must not break the row itself.
         let builtin = ProviderRegistry::compiled(slug);
         if let Some(native) = builtin.and_then(ProviderSpec::native) {
             return Self::Builtin(native.new);
         }
         if custom::base_spec(slug).is_some() {
             return Self::Custom;
+        }
+        if plugin::owns_slug(slug) {
+            return Self::Plugin;
         }
         if builtin.is_some() {
             return Self::Catalog;
@@ -421,5 +431,23 @@ mod tests {
     fn a_spec_row_without_a_constructor_still_belongs_to_the_catalog() {
         assert!(matches!(Owner::of(anthropic::SLUG), Owner::Builtin(_)));
         assert!(matches!(Owner::of(opencode::GO_SLUG), Owner::Catalog));
+    }
+
+    /// Registration refuses a takeover of a built-in or custom slug, but the
+    /// grant is recorded before registration runs and survives the failure.
+    /// Such a leftover grant must not shadow the row itself; it only blocks
+    /// the catalog client.
+    #[test]
+    fn a_leftover_grant_does_not_shadow_a_builtin_or_custom_row() {
+        const CATALOG_SLUG: &str = "leftover-grant-slug";
+
+        plugin::keep_granted(
+            "broken-package",
+            &[anthropic::SLUG.to_owned(), CATALOG_SLUG.to_owned()],
+        );
+        assert!(matches!(Owner::of(anthropic::SLUG), Owner::Builtin(_)));
+        assert!(matches!(Owner::of(CATALOG_SLUG), Owner::Plugin));
+        plugin::release_granted("broken-package");
+        assert!(matches!(Owner::of(CATALOG_SLUG), Owner::Unknown));
     }
 }

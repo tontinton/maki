@@ -16,6 +16,7 @@ pub use maki_config::Permission;
 
 pub(crate) const MANIFEST_FILE: &str = "plugin.toml";
 pub(crate) const NET_HOSTS_KEY: &str = "net_hosts";
+const PROVIDERS_KEY: &str = "providers";
 const MIN_MAKI_VERSION: &str = "min_maki_version";
 const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -368,11 +369,20 @@ pub(crate) fn grant_hint(perms: &[Permission]) -> String {
 /// This is a distinct type so an effective grant can never be built by
 /// accident from a request alone.
 #[derive(Debug, Clone)]
-pub struct Requested(PluginPermissions);
+pub struct Requested {
+    permissions: PluginPermissions,
+    /// Catalog provider names the package takes over, as its manifest lists
+    /// them. Shown in the approval prompt so the user sees the package will
+    /// receive the key saved for each name.
+    providers: Vec<String>,
+}
 
 impl Requested {
     pub fn none() -> Self {
-        Self(PluginPermissions::denied())
+        Self {
+            permissions: PluginPermissions::denied(),
+            providers: Vec::new(),
+        }
     }
 
     pub fn from_manifest(manifest: &toml::Value) -> Self {
@@ -384,21 +394,40 @@ impl Requested {
                 .and_then(toml::Value::as_bool)
                 .unwrap_or(false);
         }
-        Self(PluginPermissions {
-            allowed,
-            net_hosts: net_hosts_from_manifest(manifest),
-        })
+        Self {
+            permissions: PluginPermissions {
+                allowed,
+                net_hosts: net_hosts_from_manifest(manifest),
+            },
+            providers: providers_from_manifest(manifest),
+        }
     }
 
     pub fn is_requested(&self, perm: Permission) -> bool {
-        self.0.is_allowed(perm)
+        self.permissions.is_allowed(perm)
     }
 
     /// The hosts the manifest asks to reach, `None` for every host. A request,
     /// like every other name in here, so the approval store is what decides
     /// whether they are granted.
     pub fn net_hosts(&self) -> Option<&[String]> {
-        self.0.net_hosts.as_deref()
+        self.permissions.net_hosts.as_deref()
+    }
+
+    /// Every slug the manifest lists as registered by the package.
+    pub fn providers(&self) -> &[String] {
+        &self.providers
+    }
+
+    /// Slugs the request and the approval both name: what a load may
+    /// register. A manifest alone is a request, like every other name in
+    /// here, so a slug the approval never covered stays out.
+    pub fn granted_providers(&self, approved: &[String]) -> Vec<String> {
+        self.providers
+            .iter()
+            .filter(|slug| approved.contains(slug))
+            .cloned()
+            .collect()
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -413,7 +442,7 @@ impl Requested {
     /// user installed by hand, or a plugin bundled into the binary. Only a
     /// package maki downloaded has to be intersected with an approval.
     pub fn granted(self) -> PluginPermissions {
-        self.0
+        self.permissions
     }
 
     /// Effective permissions for a managed package: the request and the user's
@@ -426,11 +455,32 @@ impl Requested {
     pub fn intersect(&self, approved: &PluginPermissions) -> PluginPermissions {
         let mut out = PluginPermissions::denied();
         for &perm in Permission::ALL {
-            out.set(perm, self.0.is_allowed(perm) && approved.is_allowed(perm));
+            out.set(
+                perm,
+                self.permissions.is_allowed(perm) && approved.is_allowed(perm),
+            );
         }
-        out.set_net_hosts(self.0.net_hosts());
+        out.set_net_hosts(self.permissions.net_hosts());
         out
     }
+}
+
+/// `providers = ["greenpt"]` at the top level of `plugin.toml`.
+///
+/// Entries that are not strings are dropped, since a manifest cannot be
+/// trusted to be well formed and a malformed entry must not widen the list
+/// it appears in.
+fn providers_from_manifest(manifest: &toml::Value) -> Vec<String> {
+    manifest
+        .get(PROVIDERS_KEY)
+        .and_then(toml::Value::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|slug| slug.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `[permissions] net_hosts = ["api.example.com", "*.example.com"]`.
@@ -509,6 +559,15 @@ pub(crate) fn load_plugin_permissions(plugin_dir: Option<&Path>) -> PluginPermis
     load_plugin_manifest(plugin_dir)
         .as_ref()
         .map_or_else(PluginPermissions::denied, PluginPermissions::from_manifest)
+}
+
+/// The `providers` list a `plugin.toml` asks for. A plugin loaded straight
+/// from disk has no approval store behind it, so its own manifest is the grant.
+pub(crate) fn load_plugin_granted_providers(plugin_dir: Option<&Path>) -> Vec<String> {
+    load_plugin_manifest(plugin_dir)
+        .as_ref()
+        .map(|manifest| Requested::from_manifest(manifest).providers().to_vec())
+        .unwrap_or_default()
 }
 
 /// Host-side gate, run before any Lua from `plugin_dir` reaches the runtime.
@@ -747,6 +806,45 @@ mod tests {
         let value: toml::Value = toml::from_str(manifest).unwrap();
         let hosts = PluginPermissions::from_manifest(&value).net_hosts();
         assert_eq!(hosts.as_deref().map(<[String]>::to_vec), expected);
+    }
+
+    /// `providers` in the same shape: a list that is not there asks for
+    /// nothing, and a malformed entry must not widen what the prompt shows.
+    #[test_case("[package]\nname = \"p\"\n", Vec::new() ; "an_absent_list_takes_over_nothing")]
+    #[test_case(
+        "providers = [\"greenpt\"]\n",
+        vec!["greenpt".to_owned()] ;
+        "declared_names_are_carried"
+    )]
+    #[test_case(
+        "providers = [\"greenpt\", 7]\n",
+        vec!["greenpt".to_owned()] ;
+        "a_malformed_entry_widens_nothing"
+    )]
+    #[test_case("providers = \"greenpt\"\n", Vec::new() ; "not_a_list_takes_over_nothing")]
+    fn providers_from_a_manifest(manifest: &str, expected: Vec<String>) {
+        let value: toml::Value = toml::from_str(manifest).unwrap();
+        assert_eq!(
+            Requested::from_manifest(&value).providers(),
+            expected.as_slice()
+        );
+    }
+
+    /// The catalog names a load may take over are the ones the approval
+    /// covered, not the ones the manifest merely asks for.
+    #[test]
+    fn granted_providers_need_both_request_and_approval() {
+        const APPROVED: &str = "greenpt";
+        const UNAPPROVED: &str = "rival";
+        let value: toml::Value =
+            toml::from_str(&format!("providers = [{APPROVED:?}, {UNAPPROVED:?}]\n")).unwrap();
+        let requested = Requested::from_manifest(&value);
+
+        assert_eq!(
+            requested.granted_providers(&[APPROVED.to_owned()]),
+            [APPROVED.to_owned()]
+        );
+        assert_eq!(requested.granted_providers(&[]), Vec::<String>::new());
     }
 
     #[test]

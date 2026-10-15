@@ -72,6 +72,7 @@ fn load_plugins(
     // registered: on a `/reload` this host is a new one, and an entry the old
     // one left behind answers on a channel nobody serves.
     maki_providers::plugin::begin_load();
+    let legacy_warnings = maki_providers::plugin::keep_legacy_selections();
 
     let discovery = maki_lua::discover_installed(no_plugins);
     // Includes the names discovery refused, so a package it could not read does
@@ -82,6 +83,7 @@ fn load_plugins(
         .into_iter()
         .map(|problem| format!("skipping package: {problem}"))
         .collect();
+    warnings.extend(legacy_warnings);
 
     let config = build_config(
         host,

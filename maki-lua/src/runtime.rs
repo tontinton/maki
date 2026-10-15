@@ -260,6 +260,10 @@ fn load_user_source<'a>(lua: &'a Lua, name: &str, source: &'a str) -> Chunk<'a> 
 pub struct LoadContext {
     pub plugin_dir: Option<PathBuf>,
     pub permissions: PluginPermissions,
+    /// The slugs this load may register: the manifest's `providers` list
+    /// intersected with the user's approval. Everything but a package loads
+    /// with none, so every third-party slug stays refused.
+    pub granted_providers: Arc<[String]>,
     pub opts: PluginOpts,
     /// Shared lock on the revision directory being loaded, held until the
     /// owner is dropped so a prune cannot delete code that is still running.
@@ -283,10 +287,26 @@ impl LoadContext {
         Self {
             plugin_dir,
             permissions,
+            granted_providers: Arc::from(Vec::new()),
             opts: PluginOpts::default(),
             revision_guard: None,
             package: false,
             authority: DeclAuthority::ThirdParty,
+        }
+    }
+
+    /// A config file load (`init.lua`). The user's own code runs with every
+    /// permission the config dir's `plugin.toml` grants, so it may register
+    /// any slug maki does not ship without a separate grant.
+    pub fn config(plugin_dir: Option<PathBuf>, permissions: PluginPermissions) -> Self {
+        Self {
+            plugin_dir,
+            permissions,
+            granted_providers: Arc::from(Vec::new()),
+            opts: PluginOpts::default(),
+            revision_guard: None,
+            package: false,
+            authority: DeclAuthority::Config,
         }
     }
 }
@@ -3088,6 +3108,7 @@ impl LuaRuntime {
         let LoadContext {
             plugin_dir,
             permissions,
+            granted_providers,
             opts,
             revision_guard,
             package,
@@ -3121,6 +3142,7 @@ impl LuaRuntime {
             Owner {
                 name: Arc::clone(&name),
                 authority,
+                granted_providers,
             },
             self.ui_action_tx.clone(),
             &permissions,
@@ -3285,6 +3307,10 @@ impl LuaRuntime {
     /// Undoes a load that failed after its chunks ran: the tools it was about
     /// to register, the package operations it queued, the providers it staged,
     /// and the commands, keymaps, hints and slots it published on the way.
+    ///
+    /// The provider grant is kept: a package whose load failed still owns its
+    /// slugs, so the catalog client cannot take them over. Only the explicit
+    /// unload releases a grant.
     fn rollback_load(&mut self, plugin: &str, pending: Vec<PendingTool>, pack_ops: usize) {
         self.discard_pending(pending);
         with_packs(&self.lua, |packs| packs.pending.truncate(pack_ops));
@@ -3390,7 +3416,7 @@ impl LuaRuntime {
         self.load_source(
             Arc::from(scope.label()),
             PluginLoad::Chunks(&[LoadChunk::new(scope.label(), source)]),
-            LoadContext::plain(plugin_dir, permissions),
+            LoadContext::config(plugin_dir, permissions),
             Some(ConfigLoad {
                 store: &config_store,
                 scope: &scope,
@@ -4720,6 +4746,9 @@ pub fn spawn(
                         Request::ClearPlugin { plugin, reply } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
                             rt.clear_plugin(&plugin);
+                            // The explicit unload: the one place a package's
+                            // grant is released.
+                            maki_providers::plugin::release_granted(&plugin);
                             let _ = reply.send(());
                         }
                         Request::RunPlanAction {

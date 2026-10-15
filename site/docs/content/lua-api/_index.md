@@ -4365,6 +4365,12 @@ while the plugin loads. The plugin needs a non-empty `net_hosts` list in its
 `plugin.toml`. The [Providers guide](/docs/providers/#plugin-providers)
 walks through a full example.
 
+A slug models.dev serves has to be one the package was granted: the
+manifest lists it under `providers`, and the install approval covers it.
+List every slug the package registers, so a name the catalog adds later
+is already approved. A slug maki ships is reserved. See
+[granted slugs](/docs/providers/#granted-slugs).
+
 Set exactly one of `codec` or `base`. An unknown key, or an option the
 chosen codec cannot honour, fails registration.
 
@@ -4529,9 +4535,10 @@ maki.provider.register({
 maki.provider.is_selected({slug})
 ```
 
-Whether providers.toml selects this package to implement {slug}. A package
-that ships several providers calls it at load time to skip the ones the user
-did not [select](/docs/providers/#select-a-provider-package).
+Whether this package was granted {slug}: the manifest lists it under
+`providers` and the install approval covers it. Kept from maki 0.6.3,
+where multi-provider packages called it to skip the ones the user did not
+select; it now answers from the same list.
 
 **Parameters:**
 

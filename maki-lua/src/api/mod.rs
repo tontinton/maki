@@ -42,12 +42,14 @@ use crate::plugin_permissions::{
 use maki_providers::plugin::DeclAuthority;
 
 /// Who a `maki` global belongs to: the name everything it registers is filed
-/// under, and whether that code shipped inside the binary. One value, so a
-/// call site cannot hand over the name and forget the authority behind it.
+/// under, whether that code shipped inside the binary, and the slugs the trust
+/// layer granted this load to register. One value, so a call site cannot hand
+/// over the name and forget the authority behind it.
 #[derive(Clone)]
 pub(crate) struct Owner {
     pub name: Arc<str>,
     pub authority: DeclAuthority,
+    pub granted_providers: Arc<[String]>,
 }
 
 pub(crate) fn create_maki_global(
@@ -59,10 +61,7 @@ pub(crate) fn create_maki_global(
     permissions: &PluginPermissions,
     opts: PluginOpts,
 ) -> LuaResult<Table> {
-    let Owner {
-        name: plugin,
-        authority,
-    } = owner;
+    let plugin = Arc::clone(&owner.name);
     let maki = lua.create_table()?;
     let reach = PluginReach::new(permissions.clone());
 
@@ -110,13 +109,7 @@ pub(crate) fn create_maki_global(
     )?;
     maki.set(
         "provider",
-        provider::create_provider_namespace(
-            lua,
-            permissions,
-            Arc::clone(&plugin),
-            egress,
-            authority,
-        )?,
+        provider::create_provider_namespace(lua, permissions, owner, egress)?,
     )?;
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set(

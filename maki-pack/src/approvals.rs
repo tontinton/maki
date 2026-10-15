@@ -63,6 +63,11 @@ pub struct Entry {
     /// again, while one that adds a list to an old approval is narrowing it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     net_hosts: Option<Vec<String>>,
+    /// Slugs the package registers, as its manifest listed them when the
+    /// user approved it. A package that later adds a name is asking to
+    /// receive a key the user never granted it for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    providers: Vec<String>,
 }
 
 impl Entry {
@@ -72,6 +77,10 @@ impl Entry {
 
     pub fn net_hosts(&self) -> Option<&[String]> {
         self.net_hosts.as_deref()
+    }
+
+    pub fn providers(&self) -> &[String] {
+        &self.providers
     }
 }
 
@@ -88,6 +97,7 @@ impl Approvals {
         key: &ApprovalKey,
         permissions: Vec<String>,
         net_hosts: Option<Vec<String>>,
+        providers: Vec<String>,
     ) {
         self.entries.insert(
             key.name.clone(),
@@ -95,6 +105,7 @@ impl Approvals {
                 src: key.src.clone(),
                 permissions,
                 net_hosts,
+                providers,
             },
         );
     }
@@ -124,6 +135,7 @@ mod tests {
             &ApprovalKey::new(name, src),
             permissions.iter().map(|p| (*p).to_owned()).collect(),
             None,
+            Vec::new(),
         );
     }
 
@@ -188,6 +200,7 @@ mod tests {
             &ApprovalKey::new("pkg", SRC),
             vec!["net".to_owned()],
             Some(vec![HOST.to_owned()]),
+            vec!["greenpt".to_owned()],
         );
 
         let text = serde_json::to_string(&store).unwrap();
@@ -195,6 +208,7 @@ mod tests {
         let entry = back.get(&ApprovalKey::new("pkg", SRC)).unwrap();
         assert_eq!(entry.permissions(), ["net".to_owned()]);
         assert_eq!(entry.net_hosts(), Some([HOST.to_owned()].as_slice()));
+        assert_eq!(entry.providers(), ["greenpt".to_owned()]);
     }
 
     /// Files written before hosts were recorded still load, and grant what an

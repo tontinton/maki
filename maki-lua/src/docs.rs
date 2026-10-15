@@ -155,6 +155,7 @@ mod tests {
             Owner {
                 name: Arc::from("docs-test"),
                 authority: DeclAuthority::ThirdParty,
+                granted_providers: Arc::from(Vec::new()),
             },
             Some(ui_tx),
             &PluginPermissions::trusted(),

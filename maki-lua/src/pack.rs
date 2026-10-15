@@ -30,6 +30,10 @@ const PLUGIN_MANIFEST: &str = "plugin.toml";
 const NET_HOST_LABEL: &str = "net host";
 /// How a reach of every host is listed beside the named ones.
 const ANY_HOST: &str = "*";
+/// Sets a taken-over catalog name apart from the permission names it is
+/// listed beside when a package still needs approving, in the install prompt
+/// and in the update diff alike.
+const PROVIDER_TAKEOVER_LABEL: &str = "takes over provider";
 const APPROVALS_FILE: &str = "pack-approvals.json";
 const REVIEW_PROMPT_HEADER: &str = "Apply these package changes?";
 const REVIEW_DELETE_LINE: &str = "remove";
@@ -172,13 +176,14 @@ fn try_read_approvals() -> Option<maki_pack::approvals::Approvals> {
     }
 }
 
-/// Effective permissions for a package about to load.
+/// Effective permissions, and the slugs the package may register, for a
+/// package about to load.
 ///
 /// The whole point of `Origin`: a fetched package's own manifest is a request,
 /// and a request is not a grant.
-pub fn effective_permissions(
+pub fn effective_grant(
     pkg: &DiscoveredPackage,
-) -> crate::plugin_permissions::PluginPermissions {
+) -> (crate::plugin_permissions::PluginPermissions, Vec<String>) {
     granted(pkg, &read_approvals())
 }
 
@@ -190,20 +195,26 @@ pub fn effective_permissions(
 pub fn granted(
     pkg: &DiscoveredPackage,
     approvals: &maki_pack::approvals::Approvals,
-) -> crate::plugin_permissions::PluginPermissions {
+) -> (crate::plugin_permissions::PluginPermissions, Vec<String>) {
     match &pkg.origin {
-        Origin::Manual => pkg.requested.clone().granted(),
+        Origin::Manual => (
+            pkg.requested.clone().granted(),
+            pkg.requested.providers().to_vec(),
+        ),
         Origin::Fetched { src } => {
             let key = maki_pack::approvals::ApprovalKey::new(pkg.name.clone(), src);
-            let approved = crate::plugin_permissions::PluginPermissions::from_approved(
-                approvals
-                    .get(&key)
+            let approved = approvals.get(&key);
+            let permissions = crate::plugin_permissions::PluginPermissions::from_approved(
+                approved
                     .map(Entry::permissions)
                     .unwrap_or_default()
                     .iter()
                     .map(String::as_str),
             );
-            pkg.requested.intersect(&approved)
+            let providers = pkg
+                .requested
+                .granted_providers(approved.map(Entry::providers).unwrap_or_default());
+            (pkg.requested.intersect(&permissions), providers)
         }
     }
 }
@@ -364,7 +375,8 @@ fn approval_required(resolved: &Resolved) -> String {
 ///
 /// Hosts count the same way permissions do: an update that widens `net_hosts`,
 /// or drops the list and with it every limit, is asking for reach the user
-/// never granted.
+/// never granted. Registered slugs count the same way: a package that adds a
+/// name is asking to receive a key the user never granted it for.
 fn missing_grants(requested: &Requested, approved: Option<&Entry>) -> Vec<String> {
     let permissions = approved.map(Entry::permissions).unwrap_or_default();
     let missing_names = requested
@@ -375,7 +387,16 @@ fn missing_grants(requested: &Requested, approved: Option<&Entry>) -> Vec<String
         .beyond(Reach::granted(approved))
         .into_iter()
         .map(|host| format!("{NET_HOST_LABEL} {host}"));
-    missing_names.chain(missing_hosts).collect()
+    let approved_providers = approved.map(Entry::providers).unwrap_or_default();
+    let missing_providers = requested
+        .providers()
+        .iter()
+        .filter(|slug| !approved_providers.contains(slug))
+        .map(|slug| format!("{PROVIDER_TAKEOVER_LABEL} '{slug}'"));
+    missing_names
+        .chain(missing_hosts)
+        .chain(missing_providers)
+        .collect()
 }
 
 /// How far a package reaches over the network, on one side of an approval.
@@ -520,6 +541,7 @@ fn grant_installed(
                     .requested
                     .net_hosts()
                     .map(<[String]>::to_vec),
+                resolved.package.requested.providers().to_vec(),
             );
             approvals_changed = true;
             newly_approved.insert(name.clone());
@@ -965,6 +987,7 @@ struct PendingApproval {
     src: String,
     names: Vec<String>,
     net_hosts: Option<Vec<String>>,
+    providers: Vec<String>,
 }
 
 pub fn prepare_pack_command(command: &PackCommand, context: &PackContext) -> PackPreparation {
@@ -1114,6 +1137,7 @@ fn prepare_pack_ops_at(
                         src: spec.src.clone(),
                         names: requested.names(),
                         net_hosts: requested.net_hosts().map(<[String]>::to_vec),
+                        providers: requested.providers().to_vec(),
                     });
                 }
                 prepared.push(PreparedPackOp::Update {
@@ -1217,6 +1241,7 @@ pub fn apply_pack_plan(plan: PackPlan) -> PackReport {
                                 &maki_pack::approvals::ApprovalKey::new(&name, &approve.src),
                                 approve.names,
                                 approve.net_hosts,
+                                approve.providers,
                             );
                             unsaved.push(failure);
                         }
@@ -1324,6 +1349,16 @@ fn update_permission_diff(requested: &Requested, approved: &Entry) -> String {
             .into_iter()
             .map(|host| format!("-{NET_HOST_LABEL} {host}")),
     );
+    for slug in requested.providers() {
+        if !approved.providers().contains(slug) {
+            additions.push(format!("+{PROVIDER_TAKEOVER_LABEL} '{slug}'"));
+        }
+    }
+    for slug in approved.providers() {
+        if !requested.providers().contains(slug) {
+            removals.push(format!("-{PROVIDER_TAKEOVER_LABEL} '{slug}'"));
+        }
+    }
     additions.extend(removals);
     if additions.is_empty() {
         "unchanged".to_owned()
@@ -1605,7 +1640,8 @@ mod tests {
         Problem, REVIEW_DELETE_LINE, REVIEW_PROMPT_HEADER, REVIEW_REVISION_LEN,
         UNAVAILABLE_OLD_REVISION, UpdateOptions, UpdateTarget, apply_pack_plan, discover, granted,
         installed_from_declared_source, missing_grants, prepare_pack_ops_at, read_approvals_file,
-        read_lockfile, resolved_on_disk, sanitize_message, write_approvals_at, write_lockfile,
+        read_lockfile, resolved_on_disk, sanitize_message, update_permission_diff,
+        write_approvals_at, write_lockfile,
     };
 
     const NET_MANIFEST: &str = "[permissions]\nnet = true\n";
@@ -1623,6 +1659,10 @@ mod tests {
     const APPROVED_PINNED_HOST: &str = "api.example.com:7777";
     /// [`NARROW_HOSTS_MANIFEST`]'s host with no port, which reaches every port.
     const MISSING_UNPINNED_HOST: &str = "net host api.example.com";
+    const APPROVED_TAKEOVER: &str = "greenpt";
+    /// What the approval prompt lists for [`APPROVED_TAKEOVER`] when the
+    /// approval never covered it.
+    const MISSING_TAKEOVER: &str = "takes over provider 'greenpt'";
     const TEST_REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OTHER_REV: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -1673,15 +1713,8 @@ mod tests {
         dir
     }
 
-    /// Builds a package whose manifest asks for everything, which is the
-    /// interesting case: the question is never what it asked for, but whose
-    /// word turns the request into a grant.
-    fn greedy(name: &str, origin: Origin) -> DiscoveredPackage {
-        let asks: String = Permission::ALL
-            .iter()
-            .map(|perm| format!("{perm} = true\n"))
-            .collect();
-        let manifest = toml::from_str::<toml::Value>(&format!("[permissions]\n{asks}")).unwrap();
+    fn greedy_with(manifest: &str, name: &str, origin: Origin) -> DiscoveredPackage {
+        let manifest = toml::from_str::<toml::Value>(manifest).unwrap();
         DiscoveredPackage {
             name: name.to_owned(),
             dir: PathBuf::from("/nowhere"),
@@ -1692,12 +1725,27 @@ mod tests {
         }
     }
 
+    /// Builds a package whose manifest asks for everything, which is the
+    /// interesting case: the question is never what it asked for, but whose
+    /// word turns the request into a grant.
+    fn greedy(name: &str, origin: Origin) -> DiscoveredPackage {
+        let asks: String = Permission::ALL
+            .iter()
+            .map(|perm| format!("{perm} = true\n"))
+            .collect();
+        greedy_with(
+            &format!("providers = [\"greenpt\"]\n[permissions]\n{asks}"),
+            name,
+            origin,
+        )
+    }
+
     /// A package the user placed by hand is trusted like `init.lua`: they put
     /// the files there, so its manifest is their own statement.
     #[test]
     fn a_manual_package_is_granted_what_its_manifest_asks_for() {
         let pkg = greedy("demo", Origin::Manual);
-        let effective = granted(&pkg, &maki_pack::approvals::Approvals::default());
+        let (effective, takeovers) = granted(&pkg, &maki_pack::approvals::Approvals::default());
 
         for &perm in Permission::ALL {
             assert!(
@@ -1705,6 +1753,7 @@ mod tests {
                 "{perm} should be granted to a manually installed package"
             );
         }
+        assert_eq!(takeovers, ["greenpt".to_owned()]);
     }
 
     /// The negative half of the pair above, and the defect this exists to
@@ -1718,7 +1767,7 @@ mod tests {
                 src: "https://example.com/demo".to_owned(),
             },
         );
-        let effective = granted(&pkg, &maki_pack::approvals::Approvals::default());
+        let (effective, takeovers) = granted(&pkg, &maki_pack::approvals::Approvals::default());
 
         for &perm in Permission::ALL {
             assert!(
@@ -1726,14 +1775,25 @@ mod tests {
                 "{perm} must not be granted to fetched code with no approval"
             );
         }
+        assert!(
+            takeovers.is_empty(),
+            "a takeover must not be granted to fetched code with no approval"
+        );
     }
 
     /// An approval grants only what it names, and only where the package also
     /// asked for it. Both halves have to agree.
     #[test]
     fn a_fetched_package_is_granted_the_intersection_of_request_and_approval() {
+        const GRANTED_TAKEOVER: &str = "greenpt";
+        const UNGRANTED_TAKEOVER: &str = "rival";
+        const NO_TAKEOVER_MESSAGE: &str = "a requested takeover the approval never named";
         let src = "https://example.com/demo";
-        let pkg = greedy(
+        let manifest = format!(
+            "providers = [{GRANTED_TAKEOVER:?}, {UNGRANTED_TAKEOVER:?}]\n[permissions]\nrun = true\nnet = true\n"
+        );
+        let pkg = greedy_with(
+            manifest.as_str(),
             "demo",
             Origin::Fetched {
                 src: src.to_owned(),
@@ -1745,13 +1805,19 @@ mod tests {
             &maki_pack::approvals::ApprovalKey::new("demo", src),
             vec!["run".to_owned()],
             None,
+            vec![GRANTED_TAKEOVER.to_owned()],
         );
-        let effective = granted(&pkg, &approvals);
+        let (effective, takeovers) = granted(&pkg, &approvals);
 
         assert!(effective.is_allowed(Permission::Run), "run was approved");
         assert!(
             !effective.is_allowed(Permission::Net),
             "net was requested but never approved"
+        );
+        assert_eq!(
+            takeovers,
+            [GRANTED_TAKEOVER.to_owned()],
+            "{NO_TAKEOVER_MESSAGE}"
         );
     }
 
@@ -1765,6 +1831,7 @@ mod tests {
             &maki_pack::approvals::ApprovalKey::new("demo", "https://example.com/demo"),
             vec!["run".to_owned()],
             None,
+            Vec::new(),
         );
 
         let moved = greedy(
@@ -1774,18 +1841,19 @@ mod tests {
             },
         );
         assert!(
-            !granted(&moved, &approvals).is_allowed(Permission::Run),
+            !granted(&moved, &approvals).0.is_allowed(Permission::Run),
             "an approval for one repository must not grant another"
         );
     }
 
     /// What a package with this manifest would still have to be asked about,
-    /// given an approval for these permissions and these hosts, `None` being
-    /// every host.
+    /// given an approval for these permissions, these hosts and these
+    /// takeovers, `None` being every host.
     fn still_missing(
         manifest: &str,
         permissions: &[&str],
         net_hosts: Option<&[&str]>,
+        providers: &[&str],
     ) -> Vec<String> {
         let key = maki_pack::approvals::ApprovalKey::new("demo", APPROVAL_SRC);
         let mut store = maki_pack::approvals::Approvals::default();
@@ -1793,6 +1861,7 @@ mod tests {
             &key,
             permissions.iter().map(|name| (*name).to_owned()).collect(),
             net_hosts.map(|hosts| hosts.iter().map(|host| (*host).to_owned()).collect()),
+            providers.iter().map(|slug| (*slug).to_owned()).collect(),
         );
         let requested = Requested::from_manifest(&toml::from_str::<toml::Value>(manifest).unwrap());
         missing_grants(&requested, store.get(&key))
@@ -1804,7 +1873,8 @@ mod tests {
             still_missing(
                 "[permissions]\nfs_read = true\nnet = true\nrun = true\n",
                 &["net"],
-                None
+                None,
+                &[]
             ),
             ["fs_read".to_owned(), "run".to_owned()]
         );
@@ -1824,7 +1894,44 @@ mod tests {
         approved: Option<&[&str]>,
         expected: &[&str],
     ) {
-        assert_eq!(still_missing(manifest, &["net"], approved), expected);
+        assert_eq!(still_missing(manifest, &["net"], approved, &[]), expected);
+    }
+
+    /// `providers` is approved the same way: a name the answer never covered
+    /// asks again, because the package would be receiving a key the user
+    /// never granted it for, while an approved takeover asks nothing.
+    #[test_case(&[], &[MISSING_TAKEOVER] ; "an_unapproved_takeover_asks_again")]
+    #[test_case(&[APPROVED_TAKEOVER], &[] ; "an_approved_takeover_asks_nothing")]
+    fn taken_over_providers_are_approved_like_permissions(approved: &[&str], expected: &[&str]) {
+        assert_eq!(
+            still_missing(
+                &format!("providers = [{APPROVED_TAKEOVER:?}]\n"),
+                &[],
+                None,
+                approved
+            ),
+            expected
+        );
+    }
+
+    /// The update prompt's takeover rows: a name the update adds is asking for
+    /// a new key, and one it drops releases the old grant.
+    #[test]
+    fn an_update_lists_its_provider_takeovers() {
+        const ADDED_TAKEOVER: &str = "rival";
+        const ADDED_ROW: &str = "+takes over provider 'rival'";
+        const DROPPED_ROW: &str = "-takes over provider 'greenpt'";
+        let key = maki_pack::approvals::ApprovalKey::new("demo", APPROVAL_SRC);
+        let mut store = maki_pack::approvals::Approvals::default();
+        store.approve(&key, Vec::new(), None, vec![APPROVED_TAKEOVER.to_owned()]);
+        let requested = Requested::from_manifest(
+            &toml::from_str::<toml::Value>(&format!("providers = [{ADDED_TAKEOVER:?}]\n")).unwrap(),
+        );
+
+        let diff = update_permission_diff(&requested, store.get(&key).unwrap());
+
+        assert!(diff.contains(ADDED_ROW), "{diff}");
+        assert!(diff.contains(DROPPED_ROW), "{diff}");
     }
 
     fn declared_pack(name: &str, src: &str) -> crate::api::pack::Declared {
@@ -2226,6 +2333,7 @@ mod tests {
             &maki_pack::approvals::ApprovalKey::new("demo", &fixture.declared[0].spec.src),
             names.iter().map(|name| (*name).to_owned()).collect(),
             hosts.map(|hosts| hosts.iter().map(|host| (*host).to_owned()).collect()),
+            Vec::new(),
         );
         assert!(write_approvals_at(&path, &approvals));
     }

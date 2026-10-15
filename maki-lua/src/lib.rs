@@ -38,8 +38,8 @@ pub use maki_agent::SessionEndReason;
 pub use pack::{
     DeleteTarget, DiscoveredPackage, Discovery, InstallReport, Interaction, MANAGED_GROUP, Origin,
     PackCommand, PackContext, PackPlan, PackPreparation, PackReport, PlannedOp, UpdateOptions,
-    UpdateTarget, apply_pack_plan, discover, discover_installed, install_declared, installed_names,
-    lockfile_path, prepare_pack_command, sanitize_message, site_dir,
+    UpdateTarget, apply_pack_plan, approvals_path, discover, discover_installed, install_declared,
+    installed_names, lockfile_path, prepare_pack_command, sanitize_message, site_dir,
 };
 pub use plugin_permissions::{Missing, Permission, PluginPermissions, PluginReach, Requested};
 pub use runtime::{
