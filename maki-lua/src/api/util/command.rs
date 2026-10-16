@@ -13,6 +13,7 @@ use strum::{EnumString, VariantNames};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::key::Key;
+use crate::plugin_permissions::PluginPermissions;
 
 pub const NO_UI_ERR: &str = "no interactive UI attached";
 pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
@@ -26,6 +27,10 @@ pub struct LuaCommandInfo {
     pub name: Arc<str>,
     pub description: Arc<str>,
     pub plugin: Arc<str>,
+    /// The handler runs with these, so a plugin calling it through
+    /// `maki.api.run_command` must hold as much. Otherwise it could borrow
+    /// this plugin's reach and pick the arguments.
+    pub permissions: PluginPermissions,
     pub max_args: usize,
 }
 
@@ -136,6 +141,7 @@ impl HintWriter {
 pub(crate) struct CommandEntry {
     pub handler: RegistryKey,
     pub description: Arc<str>,
+    pub permissions: PluginPermissions,
     pub max_args: usize,
 }
 
@@ -149,6 +155,7 @@ pub(crate) fn publish_command_snapshot(map: &CommandHandlerMap, writer: &LuaComm
                 name: Arc::clone(name),
                 description: Arc::clone(&entry.description),
                 plugin: Arc::clone(plugin),
+                permissions: entry.permissions.clone(),
                 max_args: entry.max_args,
             })
         })
@@ -668,6 +675,9 @@ pub enum UiAction {
     RunCommand {
         cmdline: String,
         depth: u8,
+        /// Checked on the UI side, since only the UI knows what each command
+        /// can reach.
+        caller: PluginPermissions,
         reply_tx: flume::Sender<Result<(), String>>,
     },
     /// An event from a subagent session a plugin opened on a chat session,
@@ -783,6 +793,7 @@ mod tests {
         CommandEntry {
             handler: key,
             description: Arc::from(desc),
+            permissions: PluginPermissions::trusted(),
             max_args: 0,
         }
     }

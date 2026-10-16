@@ -1022,11 +1022,12 @@ impl<'t> EventLoop<'t> {
             UiAction::RunCommand {
                 cmdline,
                 depth,
+                caller,
                 reply_tx,
             } => {
                 // Answer before dispatching: the caller only waits on the name
                 // resolving, and dispatch may take a while (or exit the app).
-                match self.focused_app().run_cmdline(&cmdline, depth) {
+                match self.focused_app().run_cmdline(&cmdline, depth, &caller) {
                     Ok(actions) => {
                         let _ = reply_tx.send(Ok(()));
                         self.dispatch(self.focused, actions);

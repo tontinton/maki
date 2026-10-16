@@ -41,7 +41,7 @@ pub use pack::{
     UpdateTarget, apply_pack_plan, discover, discover_installed, install_declared, installed_names,
     lockfile_path, prepare_pack_command, sanitize_message, site_dir,
 };
-pub use plugin_permissions::{Permission, PluginPermissions, Requested};
+pub use plugin_permissions::{Permission, PluginPermissions, Requested, denied_message};
 pub use runtime::{
     KILL_GRACE, MAX_INFLIGHT_TOOLS, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE,
     RestoreItem, RestoreReason, WARM_TOOL_CAP,

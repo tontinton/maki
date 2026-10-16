@@ -952,8 +952,13 @@ fn allow_is_delegated(
 ///   end,
 /// })
 #[lua_fn]
-fn register_command(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
-    register_command_from_lua(lua, &spec, plugin)
+fn register_command(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    #[ctx] permissions: PluginPermissions,
+    spec: Table,
+) -> LuaResult<()> {
+    register_command_from_lua(lua, &spec, plugin, permissions)
 }
 
 /// Runs a slash command by name, exactly as typing it in the input would.
@@ -973,8 +978,12 @@ fn register_command(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResul
 /// finishes, so aliasing something long-running like `/compact` does not
 /// block your handler.
 ///
+/// A plugin can only run what its own permissions cover, and a few commands
+/// only run when you type them. [Commands](/docs/commands/#aliasing-commands)
+/// lists what each one needs.
+///
 /// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
-/// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message for an unknown command.
+/// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message for an unknown or denied command.
 /// @example
 /// -- /resume as an alias for the built-in session picker:
 /// maki.api.register_command({
@@ -991,6 +1000,7 @@ fn register_command(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResul
 async fn run_command(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] caller: PluginPermissions,
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
     let depth = command_depth(&lua).saturating_add(1);
@@ -998,6 +1008,7 @@ async fn run_command(
         ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
             cmdline,
             depth,
+            caller,
             reply_tx,
         })
         .await
@@ -1186,7 +1197,7 @@ lua_table! {
     /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
     extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, permissions: PluginPermissions, plugin: Arc<str>, opts: PluginOpts), DOCS [
-        register_tool(pending, permissions), register_permission_rule(pending_rules), register_command(plugin),
+        register_tool(pending, permissions), register_permission_rule(pending_rules), register_command(plugin, permissions),
         register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
         get_tools, get_tool,
         manual run_command,
@@ -1203,8 +1214,8 @@ pub(crate) fn create_api_table(
     ui_action_tx: Option<flume::Sender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
+    run_command__register(&t, lua, ui_action_tx, permissions.clone())?;
     add_tool_fns(&t, lua, pending, pending_rules, permissions, plugin, opts)?;
-    run_command__register(&t, lua, ui_action_tx)?;
     Ok(t)
 }
 
@@ -1633,7 +1644,12 @@ fn parse_nargs(spec: &Table) -> LuaResult<usize> {
     }
 }
 
-fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaResult<()> {
+fn register_command_from_lua(
+    lua: &Lua,
+    spec: &Table,
+    plugin: Arc<str>,
+    permissions: PluginPermissions,
+) -> LuaResult<()> {
     let mut name: String = spec
         .get("name")
         .map_err(|_| mlua::Error::runtime("register_command: missing 'name'"))?;
@@ -1664,6 +1680,7 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
             CommandEntry {
                 handler: handler_key,
                 description,
+                permissions,
                 max_args,
             },
         );

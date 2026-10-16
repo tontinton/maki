@@ -5,7 +5,7 @@ use crate::agent::shared_queue;
 use crate::app::tasks::TaskStatus;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX};
 use crate::components::btw_modal::BtwEvent;
-use crate::components::command::ParsedCommand;
+use crate::components::command::{ParsedCommand, USER_ONLY_SUFFIX};
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::messages::ScrollPos;
@@ -17,6 +17,7 @@ use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
 use crate::theme;
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::{
     AgentMode, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
@@ -27,8 +28,8 @@ use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, Tool
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{
     BuiltinAction, Dimension, FloatConfig, HintReader, KeymapReader, LuaCommandInfo,
-    LuaCommandReader, PackCommand, PackPlan, PackPreparation, PackReport, SessionEndReason, Split,
-    WinCommand, WinEvent,
+    LuaCommandReader, PackCommand, PackPlan, PackPreparation, PackReport, Permission,
+    SessionEndReason, Split, WinCommand, WinEvent, denied_message,
 };
 use maki_providers::{
     ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, ThinkingSupport,
@@ -115,6 +116,10 @@ const OTHER_SESSION_ID: &str = "11111111-1111-1111-1111-111111111111";
 const EDIT_PLUGIN: &str = "completion";
 const CD_TARGET_DIR: &str = "other";
 const CD_TARGET_PROMPT: &str = "typed in the other project";
+const CUSTOM_COMMAND_NAME: &str = "fix";
+const CUSTOM_COMMAND_CONTENT: &str = "Fix $ARGUMENTS";
+const RUNNING_PLUGIN: &str = "runner";
+const RUNNING_PLUGIN_COMMAND: &str = "/runit";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -4097,6 +4102,7 @@ fn typed_lua_command_with_args_executes() {
             name: "/rename".into(),
             description: "Rename the current session".into(),
             plugin: "sessions".into(),
+            permissions: PluginPermissions::trusted(),
             max_args: usize::MAX,
         }]),
     );
@@ -4111,6 +4117,8 @@ fn typed_lua_command_with_args_executes() {
 
 const RUN_CMDLINE_REJECTED: &str = "a rejected cmdline must not run anything";
 
+/// The caller holds nothing at all, because a local command like `/new` runs
+/// for any plugin.
 #[test_case("/new" ; "plain")]
 #[test_case("/NEW" ; "uppercase")]
 #[test_case("  /new  " ; "surrounding_whitespace")]
@@ -4118,7 +4126,9 @@ const RUN_CMDLINE_REJECTED: &str = "a rejected cmdline must not run anything";
 fn run_cmdline_executes_builtin(cmdline: &str) {
     let mut app = test_app();
 
-    let actions = app.run_cmdline(cmdline, 0).unwrap();
+    let actions = app
+        .run_cmdline(cmdline, 0, &PluginPermissions::denied())
+        .unwrap();
 
     assert!(matches!(&actions[..], [Action::RestartAgent(h)] if h.is_empty()));
 }
@@ -4127,7 +4137,9 @@ fn run_cmdline_executes_builtin(cmdline: &str) {
 fn run_cmdline_splits_args_off_the_name() {
     let mut app = test_app();
 
-    let actions = app.run_cmdline("/btw what is rust?", 0).unwrap();
+    let actions = app
+        .run_cmdline("/btw what is rust?", 0, &PluginPermissions::trusted())
+        .unwrap();
 
     assert!(matches!(&actions[..], [Action::Btw(q)] if q == "what is rust?"));
 }
@@ -4139,7 +4151,8 @@ fn run_cmdline_keeps_typed_input() {
     let mut app = test_app();
     app.input_box.set_input("half written".into());
 
-    app.run_cmdline("/usage", 0).unwrap();
+    app.run_cmdline("/usage", 0, &PluginPermissions::trusted())
+        .unwrap();
 
     assert_eq!(app.input_box.buffer.value(), "half written");
 }
@@ -4150,7 +4163,7 @@ fn run_cmdline_unknown_name_errors_without_dispatching() {
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
 
-    let Err(err) = app.run_cmdline("/nope", 0) else {
+    let Err(err) = app.run_cmdline("/nope", 0, &PluginPermissions::trusted()) else {
         panic!("{RUN_CMDLINE_REJECTED}");
     };
 
@@ -4162,16 +4175,81 @@ fn run_cmdline_unknown_name_errors_without_dispatching() {
 fn run_cmdline_rejects_past_max_depth() {
     let mut app = test_app();
 
-    let Err(err) = app.run_cmdline("/new", crate::app::MAX_COMMAND_DEPTH + 1) else {
+    let Err(err) = app.run_cmdline(
+        "/new",
+        crate::app::MAX_COMMAND_DEPTH + 1,
+        &PluginPermissions::trusted(),
+    ) else {
         panic!("{RUN_CMDLINE_REJECTED}");
     };
 
     assert_eq!(err, crate::app::COMMAND_DEPTH_MSG);
     assert!(
-        app.run_cmdline("/new", crate::app::MAX_COMMAND_DEPTH)
-            .is_ok(),
+        app.run_cmdline(
+            "/new",
+            crate::app::MAX_COMMAND_DEPTH,
+            &PluginPermissions::trusted()
+        )
+        .is_ok(),
         "the cap itself must still run"
     );
+}
+
+fn without(permission: Permission) -> PluginPermissions {
+    let mut permissions = PluginPermissions::trusted();
+    permissions.set(permission, false);
+    permissions
+}
+
+/// A model turn needs `agent`, and another plugin's command needs whatever
+/// its handler runs with. Holding only that one permission is enough, and
+/// holding everything else is not.
+#[test_case("/btw what is rust?", Permission::Agent ; "btw")]
+#[test_case("/compact", Permission::Agent ; "compact")]
+#[test_case("/user:fix the tests", Permission::Agent ; "custom_command")]
+#[test_case(RUNNING_PLUGIN_COMMAND, Permission::Run ; "plugin_command")]
+fn run_cmdline_needs_what_the_command_reaches(cmdline: &str, needed: Permission) {
+    let mut app = test_app();
+    app.command_palette = CommandPalette::new(
+        Arc::from([CustomCommand {
+            name: CUSTOM_COMMAND_NAME.into(),
+            description: String::new(),
+            content: CUSTOM_COMMAND_CONTENT.into(),
+            scope: CommandScope::User,
+            accepts_args: true,
+        }]),
+        McpSnapshotReader::empty(),
+        LuaCommandReader::from_commands(vec![LuaCommandInfo {
+            name: RUNNING_PLUGIN_COMMAND.into(),
+            description: String::new().into(),
+            plugin: RUNNING_PLUGIN.into(),
+            permissions: PluginPermissions::from_approved([Permission::Run.manifest_key()]),
+            max_args: 0,
+        }]),
+    );
+
+    assert_eq!(
+        app.run_cmdline(cmdline, 1, &without(needed)).err(),
+        Some(denied_message(needed))
+    );
+    let only_needed = PluginPermissions::from_approved([needed.manifest_key()]);
+    assert_eq!(app.run_cmdline(cmdline, 1, &only_needed).err(), None);
+}
+
+#[test_case("/yolo" ; "yolo")]
+#[test_case("/trust" ; "trust")]
+#[test_case(PACKUPDATE ; "packupdate")]
+#[test_case("/packdel" ; "packdel")]
+fn run_cmdline_leaves_user_only_commands_to_the_user(cmdline: &str) {
+    let mut app = test_app();
+
+    assert_eq!(
+        app.run_cmdline(cmdline, 1, &PluginPermissions::trusted())
+            .err(),
+        Some(format!("{cmdline}{USER_ONLY_SUFFIX}"))
+    );
+    assert!(!app.permissions.is_yolo());
+    assert_eq!(app.exit_request, ExitRequest::None);
 }
 
 /// A Lua command reached through an alias carries the hop count onward, or a
@@ -4187,13 +4265,15 @@ fn run_cmdline_forwards_depth_to_lua_command() {
             name: "/Sessions".into(),
             description: "Browse sessions".into(),
             plugin: "sessions".into(),
+            permissions: PluginPermissions::trusted(),
             max_args: 0,
         }]),
     );
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
 
-    app.run_cmdline("/sessions", 3).unwrap();
+    app.run_cmdline("/sessions", 3, &PluginPermissions::trusted())
+        .unwrap();
 
     assert_eq!(
         probe.try_recv_command(),
@@ -5778,20 +5858,13 @@ fn bash_prefix_overrides_mode() {
 }
 
 #[test]
-fn package_commands_are_user_only_and_preserve_update_bang() {
+fn package_update_preserves_typed_bang() {
     let mut app = test_app();
     let typed = || ParsedCommand {
         name: PACKUPDATE.into(),
         args: PACK_NAME.into(),
         bang: true,
     };
-
-    app.execute_command(typed(), 1);
-    assert_eq!(app.exit_request, ExitRequest::None);
-    assert_eq!(
-        app.status_bar.flash_text().unwrap(),
-        format!("{PACKUPDATE}{PACK_USER_ONLY_SUFFIX}")
-    );
 
     let actions = app.execute_command(typed(), 0);
     assert_eq!(app.exit_request, ExitRequest::None);

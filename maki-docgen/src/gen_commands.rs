@@ -1,6 +1,7 @@
 use std::fmt::Write;
 
-use maki_ui::BUILTIN_COMMANDS;
+use maki_config::Permission;
+use maki_ui::{BUILTIN_COMMANDS, PluginAccess, STARTS_TURNS};
 
 use crate::lua_util;
 
@@ -29,7 +30,51 @@ for _, alias in ipairs(aliases) do
 end
 ```
 
-Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for any command listed above, plus plugin commands and MCP prompts. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name."#;
+Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for the commands listed above, plus plugin commands and MCP prompts. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name."#;
+
+fn builtin_names(access: PluginAccess) -> Vec<String> {
+    BUILTIN_COMMANDS
+        .iter()
+        .filter(|cmd| cmd.plugin_access == access)
+        .map(|cmd| format!("`{}`", cmd.name))
+        .collect()
+}
+
+fn write_plugin_access(out: &mut String) {
+    writeln!(
+        out,
+        "A plugin can only run what its own permissions cover. Every command not listed here runs for any plugin."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    for &perm in Permission::ALL {
+        let access = PluginAccess::Needs(perm);
+        let mut names = builtin_names(access);
+        if access == STARTS_TURNS {
+            names.extend(["custom commands".into(), "MCP prompts".into()]);
+        }
+        if !names.is_empty() {
+            writeln!(
+                out,
+                "- Needs `{}`: {}.",
+                perm.manifest_key(),
+                names.join(", ")
+            )
+            .unwrap();
+        }
+    }
+    writeln!(
+        out,
+        "- Needs every permission of the plugin that registered it: plugin commands, since the handler runs with them."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "- Only when you type it: {}. These widen what plugins and the model may do.",
+        builtin_names(PluginAccess::UserOnly).join(", ")
+    )
+    .unwrap();
+}
 
 fn write_row(out: &mut String, name: &str, description: &str) {
     writeln!(out, "| `{name}` | {} |", description.replace('|', "\\|")).unwrap();
@@ -192,6 +237,8 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(out).unwrap();
     writeln!(out, "{ALIASING}").unwrap();
+    writeln!(out).unwrap();
+    write_plugin_access(&mut out);
 
     writeln!(out).unwrap();
     writeln!(

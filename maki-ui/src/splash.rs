@@ -642,6 +642,7 @@ mod tests {
             name: THINKING_COMMAND.into(),
             description: "".into(),
             plugin: "thinking".into(),
+            permissions: maki_lua::PluginPermissions::trusted(),
             max_args: 0,
         }];
         let lua_commands: &[LuaCommandInfo] = if loaded { &thinking } else { &[] };

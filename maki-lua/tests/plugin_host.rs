@@ -4149,12 +4149,16 @@ const RUN_COMMAND_NO_ACTION: &str = "run_command did not reach the UI";
 /// `/go` asks for `/cd ~/src` and flashes the `ok, err` pair it gets back. The
 /// command line travels untouched, since the UI is the side that parses it, and
 /// a handler reached at depth 0 asks for depth 1 so a chain of aliases keeps
-/// counting toward the cap.
+/// counting toward the cap. The plugin lacks `agent`, so we can tell its own
+/// permissions rode along on the request and on the command it registered,
+/// and not some trusted default.
 #[test_case::test_case(Ok(()), "true|nil" ; "dispatched")]
 #[test_case::test_case(Err("unknown command".into()), "nil|unknown command" ; "rejected")]
 fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash: &str) {
     let host = PluginHost::new(fresh_registry()).unwrap();
-    host.load_source(
+    let mut perms = maki_lua::PluginPermissions::trusted();
+    perms.set(maki_lua::Permission::Agent, false);
+    host.load_source_with_permissions(
         "p",
         r#"
         maki.api.register_command({
@@ -4165,8 +4169,14 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
             end,
         })
         "#,
+        perms,
     )
     .unwrap();
+    assert!(
+        !host.command_reader().load().commands[0]
+            .permissions
+            .is_allowed(maki_lua::Permission::Agent)
+    );
     let rx = host.ui_action_rx();
     host.event_handle()
         .run_command(Arc::from("p"), Arc::from("/go"), String::new(), 0);
@@ -4174,6 +4184,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
     let maki_lua::UiAction::RunCommand {
         cmdline,
         depth,
+        caller,
         reply_tx,
     } = rx
         .recv_timeout(Duration::from_secs(5))
@@ -4182,6 +4193,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
         panic!("{RUN_COMMAND_NO_ACTION}");
     };
     assert_eq!((cmdline.as_str(), depth), ("/cd ~/src", 1));
+    assert!(!caller.is_allowed(maki_lua::Permission::Agent));
     reply_tx.send(reply).unwrap();
 
     let action = rx

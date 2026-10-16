@@ -171,6 +171,26 @@ impl PluginPermissions {
             .all(|&perm| perm == Permission::Agent || self.is_allowed(perm))
     }
 
+    /// Holding the `net` flag is not enough when {needed} may reach hosts our
+    /// list leaves out, or one plugin could borrow another's wider reach.
+    pub fn first_missing(&self, needed: &Self) -> Option<Permission> {
+        Permission::ALL.iter().copied().find(|&perm| {
+            let held =
+                self.is_allowed(perm) && (perm != Permission::Net || self.net_covers(needed));
+            needed.is_allowed(perm) && !held
+        })
+    }
+
+    /// Hosts compare as plain text, so `*.example.com` does not cover
+    /// `api.example.com`. That only ever refuses too much, never too little.
+    fn net_covers(&self, needed: &Self) -> bool {
+        match (&self.net_hosts, &needed.net_hosts) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(mine), Some(theirs)) => theirs.iter().all(|host| mine.contains(host)),
+        }
+    }
+
     pub fn from_manifest(manifest: &toml::Value) -> Self {
         let perms = manifest.get("permissions");
         let mut allowed = [true; Permission::COUNT];
@@ -363,12 +383,16 @@ pub(crate) fn requested_permissions_from_text(
         })
 }
 
-pub(crate) fn denied_error(perm: Permission) -> LuaError {
+pub fn denied_message(perm: Permission) -> String {
     let msg = format!(
         "permission denied: '{perm}' not granted for this plugin (grant it in {MANIFEST_FILE} next to the plugin file)"
     );
     warn!(permission = %perm, "{msg}");
-    LuaError::runtime(msg)
+    msg
+}
+
+pub(crate) fn denied_error(perm: Permission) -> LuaError {
+    LuaError::runtime(denied_message(perm))
 }
 
 pub(crate) fn load_plugin_permissions(plugin_dir: Option<&Path>) -> PluginPermissions {
@@ -523,6 +547,28 @@ mod tests {
 
         p.set(Permission::Env, false);
         assert!(!p.holds_all_reach());
+    }
+
+    fn with_hosts(hosts: Option<&[&str]>) -> PluginPermissions {
+        let mut p = PluginPermissions::trusted();
+        p.set_net_hosts(hosts.map(|hosts| hosts.iter().map(|h| (*h).to_owned()).collect()));
+        p
+    }
+
+    #[test_case(None, None, None ; "any_host_covers_any_host")]
+    #[test_case(None, Some(&[DECLARED_HOST]), None ; "any_host_covers_a_list")]
+    #[test_case(Some(&[DECLARED_HOST]), None, Some(Permission::Net) ; "a_list_does_not_cover_any_host")]
+    #[test_case(Some(&[DECLARED_HOST]), Some(&[DECLARED_HOST]), None ; "a_list_covers_itself")]
+    #[test_case(Some(&[DECLARED_HOST]), Some(&[OTHER_HOST]), Some(Permission::Net) ; "a_list_does_not_cover_another_host")]
+    fn first_missing_compares_net_hosts(
+        caller: Option<&[&str]>,
+        needed: Option<&[&str]>,
+        expected: Option<Permission>,
+    ) {
+        assert_eq!(
+            with_hosts(caller).first_missing(&with_hosts(needed)),
+            expected
+        );
     }
 
     #[test]

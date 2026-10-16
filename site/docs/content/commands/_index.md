@@ -113,6 +113,12 @@ for _, alias in ipairs(aliases) do
 end
 ```
 
-Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for any command listed above, plus plugin commands and MCP prompts. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name.
+Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for the commands listed above, plus plugin commands and MCP prompts. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name.
+
+A plugin can only run what its own permissions cover. Every command not listed here runs for any plugin.
+
+- Needs `agent`: `/compact`, `/btw`, custom commands, MCP prompts.
+- Needs every permission of the plugin that registered it: plugin commands, since the handler runs with them.
+- Only when you type it: `/yolo`, `/trust`, `/packupdate`, `/packdel`. These widen what plugins and the model may do.
 
 Related: [CLI](/docs/cli/) for shell flags and subcommands, [Skills](/docs/skills/) for on-demand playbooks.

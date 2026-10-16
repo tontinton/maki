@@ -770,11 +770,15 @@ This returns as soon as the command has been dispatched, not when it
 finishes, so aliasing something long-running like `/compact` does not
 block your handler.
 
+A plugin can only run what its own permissions cover, and a few commands
+only run when you type them. [Commands](/docs/commands/#aliasing-commands)
+lists what each one needs.
+
 **Parameters:**
 
 - `{cmdline}` (`string`) Command line, e.g. `"/new"` or `"/cd ~/src"`.
 
-**Returns:** (`boolean|nil`, `string|nil`) `true` once dispatched, or nil and an error message for an unknown command.
+**Returns:** (`boolean|nil`, `string|nil`) `true` once dispatched, or nil and an error message for an unknown or denied command.
 
 **Example:**
 

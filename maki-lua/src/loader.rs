@@ -1447,6 +1447,7 @@ mod tests {
             name: Arc::from("/test"),
             description: Arc::from("desc"),
             plugin: Arc::from("p"),
+            permissions: PluginPermissions::trusted(),
             max_args: 0,
         }]);
         let snap = reader.load();

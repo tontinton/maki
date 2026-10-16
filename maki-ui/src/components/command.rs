@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_agent::command::CustomCommand;
 use maki_agent::{McpPromptInfo, McpSnapshotReader};
-use maki_lua::{LuaCommandInfo, LuaCommandReader};
+use maki_lua::{LuaCommandInfo, LuaCommandReader, Permission, PluginPermissions, denied_message};
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use ratatui::Frame;
@@ -17,6 +17,18 @@ use crate::text_buffer::TextBuffer;
 use crate::theme;
 
 const TICK_TIMEOUT_MS: u64 = 10;
+pub(crate) const USER_ONLY_SUFFIX: &str = " can only be run by you";
+pub const STARTS_TURNS: PluginAccess = PluginAccess::Needs(Permission::Agent);
+
+/// What a plugin must hold to run a command through `maki.api.run_command`.
+/// Typing a command is the user saying yes, so none of this applies there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PluginAccess {
+    Open,
+    Needs(Permission),
+    /// These widen what plugins or the model may do, so no grant unlocks them.
+    UserOnly,
+}
 
 pub struct BuiltinCommand {
     pub name: &'static str,
@@ -25,6 +37,7 @@ pub struct BuiltinCommand {
     /// A typed `!` filters the palette down to commands that read one, so no
     /// handler can be reached by a bang it ignores.
     pub bang: bool,
+    pub plugin_access: PluginAccess,
 }
 
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
@@ -33,120 +46,140 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Summarize and compact conversation history (optional guidance)",
         max_args: usize::MAX,
         bang: false,
+        plugin_access: STARTS_TURNS,
     },
     BuiltinCommand {
         name: "/new",
         description: "Start a new session",
         max_args: 0,
         bang: false,
+        plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
         name: "/fork",
         description: "Fork this session and switch to the copy",
         max_args: 0,
         bang: false,
+        plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
         name: "/help",
         description: "Show keybindings",
         max_args: 0,
         bang: false,
+        plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
         name: "/usage",
         description: "Show token usage breakdown",
         max_args: 0,
         bang: false,
+        plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
         name: "/queue",
         description: "Remove items from queue",
         max_args: 0,
         bang: false,
+        plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
         name: "/model",
         description: "Switch model",
         max_args: 0,
         bang: false,
+        plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
         name: "/theme",
         description: "Switch color theme",
         max_args: 0,
         bang: false,
+        plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
         name: "/mcp",
         description: "Configure MCP servers",
         max_args: 0,
         bang: false,
+        plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
         name: "/login",
         description: "Authenticate with an LLM provider",
         max_args: 0,
         bang: false,
+        plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
         name: "/cd",
         description: "Change working directory",
         max_args: 1,
         bang: false,
+        plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
         name: "/btw",
         description: "Ask a quick question (no tools, no history pollution)",
         max_args: usize::MAX,
         bang: false,
+        plugin_access: STARTS_TURNS,
     },
     BuiltinCommand {
         name: "/yolo",
         description: "Toggle YOLO mode (skip all permission prompts)",
         max_args: 0,
         bang: false,
+        plugin_access: PluginAccess::UserOnly,
     },
     BuiltinCommand {
         name: "/fast",
         description: "Toggle fast mode (Anthropic Opus or Codex subscription models)",
         max_args: 0,
         bang: false,
+        plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
         name: "/workflow",
         description: "Toggle workflow mode (task callable inside code_execution)",
         max_args: 0,
         bang: false,
+        plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
         name: "/exit",
         description: "Exit the application",
         max_args: 0,
         bang: false,
+        plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
         name: "/reload",
         description: "Reload plugins and config",
         max_args: 0,
         bang: false,
+        plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
         name: "/trust",
         description: "Trust this folder and load its shared project config",
         max_args: 0,
         bang: false,
+        plugin_access: PluginAccess::UserOnly,
     },
     BuiltinCommand {
         name: "/packupdate",
         description: "Update packages (++lockfile, ! skips review)",
         max_args: 2,
         bang: true,
+        plugin_access: PluginAccess::UserOnly,
     },
     BuiltinCommand {
         name: "/packdel",
         description: "Remove undeclared packages (++all, or a name)",
         max_args: 1,
         bang: true,
+        plugin_access: PluginAccess::UserOnly,
     },
 ];
 
@@ -415,7 +448,7 @@ impl CommandPalette {
             // The command exists but this input ruled it out: too many args, or
             // a bang it does not read. Its fuzzy neighbors are still here and
             // Enter would run one, so `/cd a b` would launch `/packupdate`.
-            None if self.resolve(&typed).is_some() => self.filtered.clear(),
+            None if self.find_item(&typed).is_some() => self.filtered.clear(),
             None => {}
         }
     }
@@ -557,14 +590,45 @@ impl CommandPalette {
         })
     }
 
-    /// Name lookup for `maki.api.run_command`, returning the registered
-    /// spelling that [`crate::app::App`] dispatches on. Case-insensitive like
-    /// typing, but never fuzzy: an alias names one command on purpose, and a
-    /// typo should report itself instead of running the closest neighbor.
-    pub fn resolve(&self, name: &str) -> Option<String> {
+    /// Exact name lookup, case-insensitive like typing, but never fuzzy: an
+    /// alias names one command on purpose, and a typo should report itself
+    /// instead of running the closest neighbor.
+    fn find_item(&self, name: &str) -> Option<CommandItem> {
         Self::items(&self.custom, &self.mcp_prompts, &self.lua_commands)
-            .map(|item| item.name)
-            .find(|n| n.eq_ignore_ascii_case(name))
+            .find(|item| item.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Hands back the registered spelling, because that is the only one
+    /// [`crate::app::App`] dispatches on. `Err` goes back to the plugin as is.
+    pub fn resolve_for_plugin(
+        &self,
+        name: &str,
+        caller: &PluginPermissions,
+    ) -> Result<String, String> {
+        let item = self
+            .find_item(name)
+            .ok_or_else(|| format!("unknown command '{name}'"))?;
+        match self.plugin_refusal(&item, caller) {
+            Some(refusal) => Err(refusal),
+            None => Ok(item.name),
+        }
+    }
+
+    fn plugin_refusal(&self, item: &CommandItem, caller: &PluginPermissions) -> Option<String> {
+        let access = match item.command_type {
+            CommandType::Builtin(cmd) => cmd.plugin_access,
+            CommandType::Custom(_) | CommandType::McpPrompt(_) => STARTS_TURNS,
+            CommandType::Lua(i) => {
+                return caller
+                    .first_missing(&self.lua_commands[i].permissions)
+                    .map(denied_message);
+            }
+        };
+        match access {
+            PluginAccess::Open => None,
+            PluginAccess::Needs(perm) => (!caller.is_allowed(perm)).then(|| denied_message(perm)),
+            PluginAccess::UserOnly => Some(format!("{}{USER_ONLY_SUFFIX}", item.name)),
+        }
     }
 
     pub fn find_custom_command(&self, display_name: &str) -> Option<&CustomCommand> {
@@ -1036,12 +1100,14 @@ mod tests {
                 name: Arc::from("/memory"),
                 description: Arc::from("View memory files"),
                 plugin: Arc::from("memory"),
+                permissions: PluginPermissions::trusted(),
                 max_args: 0,
             },
             LuaCommandInfo {
                 name: Arc::from("/deploy"),
                 description: Arc::from("Deploy the project"),
                 plugin: Arc::from("deploy_plugin"),
+                permissions: PluginPermissions::trusted(),
                 max_args: 0,
             },
         ])
@@ -1052,6 +1118,7 @@ mod tests {
             name: Arc::from("/rename"),
             description: Arc::from("Rename the current session"),
             plugin: Arc::from("sessions"),
+            permissions: PluginPermissions::trusted(),
             max_args,
         }]);
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
@@ -1139,6 +1206,7 @@ mod tests {
             name: Arc::from("/models"),
             description: Arc::from("List models"),
             plugin: Arc::from("models"),
+            permissions: PluginPermissions::trusted(),
             max_args: 0,
         }]);
         let mut palette = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
@@ -1172,6 +1240,7 @@ mod tests {
             name: Arc::from("/old"),
             description: Arc::from("old command"),
             plugin: Arc::from("p"),
+            permissions: PluginPermissions::trusted(),
             max_args: 0,
         }]);
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
@@ -1188,12 +1257,14 @@ mod tests {
                 name: Arc::from("/new1"),
                 description: Arc::from("new"),
                 plugin: Arc::from("p"),
+                permissions: PluginPermissions::trusted(),
                 max_args: 0,
             },
             LuaCommandInfo {
                 name: Arc::from("/new2"),
                 description: Arc::from("new2"),
                 plugin: Arc::from("p"),
+                permissions: PluginPermissions::trusted(),
                 max_args: 0,
             },
         ]);

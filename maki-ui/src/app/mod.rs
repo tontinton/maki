@@ -68,7 +68,8 @@ use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, Key, KeymapReader,
     LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
-    PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, WinView, is_reserved,
+    PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, PluginPermissions, WinView,
+    is_reserved,
 };
 use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
@@ -135,7 +136,6 @@ const TRUSTED_PREFIX: &str = "Trusted this folder: ";
 const PROVIDER_FOLDED_SUFFIX: &str = ": folded away";
 const PROVIDER_UNFOLDED_SUFFIX: &str = ": unfolded";
 const PACK_CHANGES_DECLINED: &str = "Package changes declined";
-const PACK_USER_ONLY_SUFFIX: &str = " can only be run by you";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
@@ -1937,7 +1937,12 @@ impl App {
     /// Entry point for `maki.api.run_command`: splits a command line into the
     /// name and args the input bar would hand over, leading slash optional.
     /// `Err` means nothing ran at all, so the Lua caller can say why.
-    pub(crate) fn run_cmdline(&mut self, cmdline: &str, depth: u8) -> Result<Vec<Action>, String> {
+    pub(crate) fn run_cmdline(
+        &mut self,
+        cmdline: &str,
+        depth: u8,
+        caller: &PluginPermissions,
+    ) -> Result<Vec<Action>, String> {
         if depth > MAX_COMMAND_DEPTH {
             return Err(COMMAND_DEPTH_MSG.to_string());
         }
@@ -1947,8 +1952,7 @@ impl App {
             .unwrap_or((trimmed, ""));
         let resolved = self
             .command_palette
-            .resolve(&format!("/{}", name.trim_start_matches('/')))
-            .ok_or_else(|| format!("unknown command '{name}'"))?;
+            .resolve_for_plugin(&format!("/{}", name.trim_start_matches('/')), caller)?;
         Ok(self.execute_command(
             ParsedCommand {
                 name: resolved,
@@ -2060,10 +2064,6 @@ impl App {
             // --yes`, so there is no second question to ask here.
             "/trust" => self.trust_folder(),
             name @ ("/packupdate" | "/packdel") => {
-                if depth > 0 {
-                    self.flash(format!("{name}{PACK_USER_ONLY_SUFFIX}"));
-                    return vec![];
-                }
                 match PackCommand::parse(name, &cmd.args, cmd.bang) {
                     Ok(command) => vec![Action::PreparePack(command)],
                     Err(message) => {
