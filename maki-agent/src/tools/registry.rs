@@ -36,6 +36,17 @@ bitflags! {
     }
 }
 
+/// What a tool declares it reaches. `permission` is the capability it exposes
+/// to the model, and the price of hooking it, pre-approving it or handing it
+/// to a session. `prompted` tells whether a call ever meets the permission
+/// prompt, because a rule pre-approving a tool that never prompts would never
+/// be consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolReach {
+    pub permission: Permission,
+    pub prompted: bool,
+}
+
 impl Default for ToolAudience {
     fn default() -> Self {
         Self::all()
@@ -234,17 +245,9 @@ pub trait Tool: Send + Sync + 'static {
     fn tool_kind(&self) -> Option<&str> {
         None
     }
-    /// The capability the tool exposes to the model: what a hook on it lends,
-    /// what a plugin pre-approving it must hold, what a session handed it
-    /// pays. `None` is undeclared reach, which every consumer prices as
-    /// everything.
-    fn required_permission(&self) -> Option<Permission> {
+    /// `None` is undeclared reach, which every consumer prices as everything.
+    fn reach(&self) -> Option<ToolReach> {
         None
-    }
-    /// Whether a call is ever put in front of the permission prompt. A rule
-    /// pre-approving a tool that never prompts would never be consulted.
-    fn permission_checked(&self) -> bool {
-        false
     }
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError>;
 }

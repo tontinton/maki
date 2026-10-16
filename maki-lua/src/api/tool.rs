@@ -15,7 +15,7 @@ use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, vali
 use maki_agent::tools::{
     BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
     PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
-    is_tool_enabled, timeout_annotation,
+    ToolReach, is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, SharedBuf, TextOutput, ToolOutput,
@@ -269,12 +269,11 @@ impl Tool for LuaTool {
         self.examples.clone()
     }
 
-    fn required_permission(&self) -> Option<Permission> {
-        Some(self.permission.as_ref()?.permission)
-    }
-
-    fn permission_checked(&self) -> bool {
-        self.permission.as_ref().is_some_and(|p| p.scopes.is_some())
+    fn reach(&self) -> Option<ToolReach> {
+        self.permission.as_ref().map(|p| ToolReach {
+            permission: p.permission,
+            prompted: p.scopes.is_some(),
+        })
     }
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
@@ -867,11 +866,10 @@ fn allow_is_delegated(
         // Disabled by config, or owned by a plugin nobody loaded.
         return dropped("no such tool is registered");
     };
-    let Some(required) = registered
-        .tool
-        .permission_checked()
-        .then(|| registered.tool.required_permission())
-        .flatten()
+    let Some(ToolReach {
+        permission: required,
+        prompted: true,
+    }) = registered.tool.reach()
     else {
         return dropped(
             "the tool declares no permission_scopes, so it is never permission checked",

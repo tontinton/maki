@@ -2273,14 +2273,13 @@ mod bundled_manifests {
 
         let mut out: BTreeMap<String, BTreeSet<Permission>> = BTreeMap::new();
         for tool in registry.iter().iter() {
-            let (ToolSource::Lua { plugin }, Some(permission)) =
-                (&tool.source, tool.tool.required_permission())
+            let (ToolSource::Lua { plugin }, Some(reach)) = (&tool.source, tool.tool.reach())
             else {
                 continue;
             };
             out.entry(plugin.to_string())
                 .or_default()
-                .insert(permission);
+                .insert(reach.permission);
         }
         out
     }

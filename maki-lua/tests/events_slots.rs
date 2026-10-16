@@ -428,13 +428,14 @@ fn fire(
     value: serde_json::Value,
 ) -> Verdict {
     let entry = reg.get(tool).expect("tool registered");
-    let authority = entry
-        .tool
-        .required_permission()
-        .map_or(Authority::Unbounded, Authority::Capability);
     fire_call(
         reg,
-        &call_of(tool, authority, origin, &CancelToken::none()),
+        &call_of(
+            tool,
+            Authority::from(entry.tool.reach()),
+            origin,
+            &CancelToken::none(),
+        ),
         stage,
         value,
     )

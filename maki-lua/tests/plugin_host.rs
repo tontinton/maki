@@ -12,8 +12,8 @@ use maki_agent::template::Vars;
 use maki_agent::tools::test_support::stub_seed;
 use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolAudience,
-    ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
-    timeout_annotation,
+    ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolReach, ToolRegistry,
+    ToolSource, timeout_annotation,
 };
 use maki_agent::{AgentMode, AgentSeed, CancelToken, ModelSlot, SessionMailbox, ToolOutput};
 use maki_config::{
@@ -651,8 +651,13 @@ fn permission_without_scopes_declares_reach_and_never_prompts() {
     let tool = &reg.get("edit").unwrap().tool;
     let inv = tool.parse(&json!({})).unwrap();
 
-    assert_eq!(tool.required_permission(), Some(Permission::FsRead));
-    assert!(!tool.permission_checked());
+    assert_eq!(
+        tool.reach(),
+        Some(ToolReach {
+            permission: Permission::FsRead,
+            prompted: false,
+        })
+    );
     assert!(smol::block_on(inv.permission_scopes()).is_none());
 }
 
@@ -3873,7 +3878,7 @@ fn fs_write_tools_match_file_write_tools() {
     let snapshot = reg.iter();
     let mut declared: Vec<&str> = snapshot
         .iter()
-        .filter(|t| t.tool.required_permission() == Some(Permission::FsWrite))
+        .filter(|t| t.tool.reach().map(|r| r.permission) == Some(Permission::FsWrite))
         .map(|t| t.name())
         .collect();
     declared.sort_unstable();

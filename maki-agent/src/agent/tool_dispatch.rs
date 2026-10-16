@@ -374,12 +374,7 @@ impl Route<'_> {
     /// likes.
     fn authority(&self) -> Option<Authority> {
         match self {
-            Self::Native(entry) => Some(
-                entry
-                    .tool
-                    .required_permission()
-                    .map_or(Authority::Unbounded, Authority::Capability),
-            ),
+            Self::Native(entry) => Some(Authority::from(entry.tool.reach())),
             Self::ToolSearch(_) | Self::Local(_) | Self::Mcp(..) => Some(Authority::Unbounded),
             // A rewrite cannot make the name exist, so firing here would hand
             // out a tool's authority without the tool.
@@ -1136,7 +1131,7 @@ mod tests {
     use crate::tools::{
         BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
         ParseError, PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience,
-        ToolExecResult, ToolFilter, ToolHook, local_tool,
+        ToolExecResult, ToolFilter, ToolHook, ToolReach, local_tool,
     };
     use crate::{AgentMode, Envelope, EventSender, InstructionBlock};
 
@@ -1381,8 +1376,11 @@ mod tests {
         fn schema(&self) -> Value {
             serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}})
         }
-        fn required_permission(&self) -> Option<Permission> {
-            self.0
+        fn reach(&self) -> Option<ToolReach> {
+            self.0.map(|permission| ToolReach {
+                permission,
+                prompted: true,
+            })
         }
         fn tool_kind(&self) -> Option<&str> {
             Some(HOOK_TOOL_KIND)

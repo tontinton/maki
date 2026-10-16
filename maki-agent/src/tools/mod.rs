@@ -18,7 +18,7 @@ pub use file_access::{FileAccess, FileKey};
 pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
-    RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation,
+    RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation, ToolReach,
     ToolRegistry, ToolSource,
 };
 

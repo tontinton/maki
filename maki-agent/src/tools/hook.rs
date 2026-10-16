@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 
-use super::registry::BoxFuture;
+use super::registry::{BoxFuture, ToolReach};
 use super::{CallOrigin, ToolOutputMode};
 use crate::cancel::CancelToken;
 use maki_config::Permission;
@@ -57,6 +57,12 @@ pub enum Authority {
     /// an ACP client tool, search. A layer needs every capability, because no
     /// narrower answer would be honest.
     Unbounded,
+}
+
+impl From<Option<ToolReach>> for Authority {
+    fn from(reach: Option<ToolReach>) -> Self {
+        reach.map_or(Self::Unbounded, |reach| Self::Capability(reach.permission))
+    }
 }
 
 pub struct HookCall<'a> {
