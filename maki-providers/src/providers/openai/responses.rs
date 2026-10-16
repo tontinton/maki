@@ -519,7 +519,6 @@ pub(crate) async fn parse_sse(
                     usage = parse_usage(u, resp, &parsed, comment_cost);
                     usage.cost = copilot_usd(&parsed["copilot_usage"]).or(usage.cost);
                 }
-                }
 
                 let status = resp["status"].as_str().unwrap_or("completed");
                 stop_reason = Some(match status {
@@ -544,7 +543,6 @@ pub(crate) async fn parse_sse(
                 if let Some(u) = resp.get("usage").or_else(|| parsed.get("usage")) {
                     usage = parse_usage(u, resp, &parsed, comment_cost);
                     usage.cost = copilot_usd(&parsed["copilot_usage"]).or(usage.cost);
-                }
                 }
                 stop_reason = Some(StopReason::MaxTokens);
             }
